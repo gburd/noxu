@@ -1,0 +1,404 @@
+//! Pool of log buffers for managing write buffering.
+//!
+//! Port of `com.sleepycat.je.log.LogBufferPool`.
+//!
+//! LogBufferPool manages a circular pool of LogBuffers. The currentWriteBuffer
+//! is the buffer that is currently used to add data. When the buffer is full,
+//! the next (adjacent) buffer is made available for writing. The buffer pool
+//! has a dirty list of buffers. A buffer becomes a member of the dirty list
+//! when the currentWriteBuffer is moved to another buffer. Buffers are removed
+//! from the dirty list when they are written.
+//!
+//! The dirtyStart/dirtyEnd variables indicate the list of dirty buffers.
+//! A value of -1 for either variable indicates that there are no dirty buffers.
+//! These variables are synchronized via the bufferPoolLatch. The
+//! LogManager.logWriteLatch (aka LWL) is used to serialize access to the
+//! currentWriteBuffer, so that entries are added in write/LSN order.
+
+use crate::log_buffer::LogBuffer;
+use noxu_latch::ExclusiveLatch;
+use noxu_util::lsn::Lsn;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+/// Manages a circular pool of LogBuffers.
+///
+/// Port of `com.sleepycat.je.log.LogBufferPool`.
+pub struct LogBufferPool {
+    /// The pool of buffers (typically 3 buffers).
+    buffers: Vec<Arc<Mutex<LogBuffer>>>,
+
+    /// Index of the first dirty buffer (-1 if none).
+    dirty_start: i32,
+
+    /// Index of the last dirty buffer (-1 if none).
+    dirty_end: i32,
+
+    /// Buffer that holds the current log end. All writes go to this buffer.
+    /// Protected by the LogManager.logWriteLatch.
+    current_write_buffer_index: usize,
+
+    /// Total number of buffers in the pool.
+    num_buffers: usize,
+
+    /// Size of each buffer in bytes.
+    buffer_size: usize,
+
+    /// Synchronizes access and changes to the buffer pool.
+    buffer_pool_latch: ExclusiveLatch,
+
+    /// A minimum LSN property for the pool that can be checked without latching.
+    /// An LSN less than min_buffer_lsn is guaranteed not to be in the pool.
+    min_buffer_lsn: Lsn,
+
+    /// Statistics counters.
+    n_not_resident: u64,
+    n_cache_miss: u64,
+    n_no_free_buffer: u64,
+}
+
+impl LogBufferPool {
+    /// Creates a new LogBufferPool with the specified number of buffers and buffer size.
+    pub fn new(num_buffers: usize, buffer_size: usize) -> Self {
+        let mut buffers = Vec::with_capacity(num_buffers);
+        for _ in 0..num_buffers {
+            buffers.push(Arc::new(Mutex::new(LogBuffer::new(buffer_size))));
+        }
+
+        LogBufferPool {
+            buffers,
+            dirty_start: -1,
+            dirty_end: -1,
+            current_write_buffer_index: 0,
+            num_buffers,
+            buffer_size,
+            buffer_pool_latch: ExclusiveLatch::named("LogBufferPool"),
+            min_buffer_lsn: Lsn::from_u64(0),
+            n_not_resident: 0,
+            n_cache_miss: 0,
+            n_no_free_buffer: 0,
+        }
+    }
+
+    /// Returns the configured log buffer size.
+    pub fn get_log_buffer_size(&self) -> usize {
+        self.buffer_size
+    }
+
+    /// Gets the current write buffer for writing an entry of size_needed bytes.
+    ///
+    /// The LWL must be held.
+    ///
+    /// If size_needed won't fit in currentWriteBuffer, but is LTE the LogBuffer
+    /// capacity, we bump the buffer to get an empty currentWriteBuffer. If there
+    /// are no free write buffers, then all dirty buffers must be flushed.
+    ///
+    /// If size_needed is greater than the LogBuffer capacity, flush all dirty
+    /// buffers and return an empty (but too small) currentWriteBuffer. The caller
+    /// must then write the entry to the file directly.
+    pub fn get_write_buffer(
+        &mut self,
+        size_needed: usize,
+        flipped_file: bool,
+    ) -> Arc<Mutex<LogBuffer>> {
+        // If we've flipped to a new file or the current buffer is full, handle it
+        if flipped_file {
+            self.bump_and_write_dirty(size_needed, true);
+        } else {
+            let current = self.buffers[self.current_write_buffer_index].lock();
+            let has_room = current.has_room(size_needed);
+            drop(current);
+
+            if !has_room {
+                if !self.bump_current(size_needed) {
+                    // Could not bump, need to write dirty buffers
+                    self.bump_and_write_dirty(size_needed, false);
+                } else {
+                    let current =
+                        self.buffers[self.current_write_buffer_index].lock();
+                    let has_room_after_bump = current.has_room(size_needed);
+                    drop(current);
+
+                    if !has_room_after_bump {
+                        // Item is larger than buffer size, write dirty to prepare for direct write
+                        self.bump_and_write_dirty(size_needed, false);
+                    }
+                }
+            }
+        }
+
+        Arc::clone(&self.buffers[self.current_write_buffer_index])
+    }
+
+    /// Bumps current write buffer and writes the dirty buffers.
+    ///
+    /// The LWL must be held.
+    fn bump_and_write_dirty(
+        &mut self,
+        size_needed: usize,
+        flush_write_queue: bool,
+    ) {
+        if !self.bump_current(size_needed) {
+            // Could not bump, write dirty buffers first
+            self.write_dirty(flush_write_queue);
+
+            if !self.bump_current(size_needed) {
+                // Should not happen - after writing dirty buffers we should be able to bump
+                panic!("No free log buffers after flushing dirty buffers");
+            }
+        }
+
+        // Write the dirty buffers
+        self.write_dirty(flush_write_queue);
+    }
+
+    /// Moves the current write buffer to the next buffer in the pool.
+    ///
+    /// The LWL must be held.
+    ///
+    /// Returns false when the buffer needs flushing but there are no free buffers.
+    /// Returns true when the buffer is empty or when the buffer is non-empty and is bumped.
+    fn bump_current(&mut self, _size_needed: usize) -> bool {
+        let _guard = self.buffer_pool_latch.acquire();
+
+        let current = self.buffers[self.current_write_buffer_index].lock();
+        current.latch_for_write();
+
+        // Is there anything in this write buffer?
+        if current.get_first_lsn().is_null() {
+            current.release();
+            return true;
+        }
+
+        // Check if there is an undirty buffer to use
+        if self.dirty_start >= 0 {
+            let next_slot = self.get_next_slot(self.current_write_buffer_index);
+            if next_slot == self.dirty_start as usize {
+                self.n_no_free_buffer += 1;
+                current.release();
+                return false;
+            }
+        } else {
+            self.dirty_start = self.current_write_buffer_index as i32;
+        }
+
+        self.dirty_end = self.current_write_buffer_index as i32;
+        self.current_write_buffer_index =
+            self.get_next_slot(self.current_write_buffer_index);
+
+        let next_buffer_index = self.current_write_buffer_index;
+        let new_initial_buffer_index =
+            self.get_next_slot(self.current_write_buffer_index);
+
+        current.release();
+        drop(current);
+
+        // Reinit the next buffer
+        let mut next_to_use = self.buffers[next_buffer_index].lock();
+        next_to_use.reinit();
+        drop(next_to_use);
+
+        // Update min_buffer_lsn
+        let new_initial_buffer = self.buffers[new_initial_buffer_index].lock();
+        let new_min_lsn = new_initial_buffer.get_first_lsn();
+        drop(new_initial_buffer);
+
+        if !new_min_lsn.is_null() {
+            self.min_buffer_lsn = new_min_lsn;
+        }
+
+        true
+    }
+
+    /// Returns the next buffer slot number from the input buffer slot number.
+    ///
+    /// The bufferPoolLatch must be held.
+    fn get_next_slot(&self, slot_number: usize) -> usize {
+        if slot_number < self.buffers.len() - 1 { slot_number + 1 } else { 0 }
+    }
+
+    /// Writes the dirty log buffers.
+    ///
+    /// Note: This is a simplified version. In the real implementation, this would
+    /// call FileManager.writeLogBuffer for each dirty buffer.
+    fn write_dirty(&mut self, _flush_write_queue: bool) {
+        let _guard = self.buffer_pool_latch.acquire();
+
+        if self.dirty_start < 0 {
+            return;
+        }
+
+        let mut current_dirty = self.dirty_start as usize;
+        loop {
+            let buffer = self.buffers[current_dirty].lock();
+            buffer.wait_for_zero_and_latch();
+
+            // Flush the buffer to disk via the FileManager.
+            // The FileManager integration is handled at the LogManager layer;
+            // here we simply release the latch so the buffer can be reused.
+            buffer.release();
+            drop(buffer);
+
+            if current_dirty == self.dirty_end as usize {
+                break;
+            } else {
+                current_dirty = self.get_next_slot(current_dirty);
+            }
+        }
+
+        self.dirty_start = -1;
+        self.dirty_end = -1;
+    }
+
+    /// Finds a buffer that contains the given LSN location.
+    ///
+    /// No latches need be held.
+    ///
+    /// Returns the buffer that contains the given LSN location, latched and ready
+    /// to read, or returns None.
+    pub fn get_read_buffer_by_lsn(
+        &mut self,
+        lsn: Lsn,
+    ) -> Option<Arc<Mutex<LogBuffer>>> {
+        self.n_not_resident += 1;
+
+        // Avoid latching if the LSN is known not to be in the pool
+        if lsn < self.min_buffer_lsn {
+            self.n_cache_miss += 1;
+            return None;
+        }
+
+        // Latch and check the buffer pool
+        let _guard = self.buffer_pool_latch.acquire();
+
+        for buffer_arc in &self.buffers {
+            let buffer = buffer_arc.lock();
+            if buffer.contains_lsn(lsn) {
+                // Buffer is latched by contains_lsn if it returns true
+                drop(buffer);
+                return Some(Arc::clone(buffer_arc));
+            }
+            drop(buffer);
+        }
+
+        self.n_cache_miss += 1;
+        None
+    }
+
+    /// Returns a snapshot of all buffer arcs in the pool.
+    ///
+    /// Used by `LogManager::flush_dirty_buffers()` to drain all buffers to
+    /// disk, matching JE's `LogBufferPool.writeDirty()` traversal.
+    pub fn get_all_buffers(&self) -> Vec<Arc<Mutex<LogBuffer>>> {
+        self.buffers.clone()
+    }
+
+    /// Returns statistics about buffer pool usage.
+    pub fn get_stats(&self) -> BufferPoolStats {
+        BufferPoolStats {
+            num_buffers: self.num_buffers,
+            buffer_size: self.buffer_size,
+            n_not_resident: self.n_not_resident,
+            n_cache_miss: self.n_cache_miss,
+            n_no_free_buffer: self.n_no_free_buffer,
+        }
+    }
+}
+
+/// Statistics for the buffer pool.
+#[derive(Debug, Clone)]
+pub struct BufferPoolStats {
+    pub num_buffers: usize,
+    pub buffer_size: usize,
+    pub n_not_resident: u64,
+    pub n_cache_miss: u64,
+    pub n_no_free_buffer: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_pool() {
+        let pool = LogBufferPool::new(3, 1024);
+        assert_eq!(pool.get_log_buffer_size(), 1024);
+        assert_eq!(pool.num_buffers, 3);
+    }
+
+    #[test]
+    fn test_get_write_buffer() {
+        let mut pool = LogBufferPool::new(3, 1024);
+        let buffer = pool.get_write_buffer(100, false);
+        let buf = buffer.lock();
+        assert!(buf.has_room(100));
+    }
+
+    #[test]
+    fn test_buffer_cycling() {
+        let mut pool = LogBufferPool::new(3, 100);
+
+        // Fill first buffer
+        {
+            let buffer = pool.get_write_buffer(50, false);
+            let mut buf = buffer.lock();
+            buf.latch_for_write();
+            buf.register_lsn(Lsn::new(0, 0));
+            buf.allocate(50);
+            buf.release();
+        }
+
+        // Request more space, should bump to next buffer
+        {
+            let buffer = pool.get_write_buffer(60, false);
+            let buf = buffer.lock();
+            assert!(buf.has_room(60));
+        }
+    }
+
+    #[test]
+    fn test_get_next_slot() {
+        let pool = LogBufferPool::new(3, 1024);
+        assert_eq!(pool.get_next_slot(0), 1);
+        assert_eq!(pool.get_next_slot(1), 2);
+        assert_eq!(pool.get_next_slot(2), 0); // Wrap around
+    }
+
+    #[test]
+    fn test_stats_initial() {
+        let pool = LogBufferPool::new(3, 1024);
+        let stats = pool.get_stats();
+        assert_eq!(stats.num_buffers, 3);
+        assert_eq!(stats.buffer_size, 1024);
+        assert_eq!(stats.n_not_resident, 0);
+        assert_eq!(stats.n_cache_miss, 0);
+        assert_eq!(stats.n_no_free_buffer, 0);
+    }
+
+    #[test]
+    fn test_read_buffer_lsn_below_min_is_miss() {
+        let mut pool = LogBufferPool::new(3, 1024);
+        // min_buffer_lsn starts at 0, so any LSN >= Lsn(0,0) could be
+        // searched. We force a cache miss by searching for a high LSN
+        // in a pool whose buffers have no registered LSNs yet.
+        let lsn = Lsn::new(99, 5000);
+        let result = pool.get_read_buffer_by_lsn(lsn);
+        assert!(result.is_none());
+        assert_eq!(pool.get_stats().n_cache_miss, 1);
+    }
+
+    #[test]
+    fn test_write_buffer_has_enough_space() {
+        let mut pool = LogBufferPool::new(3, 512);
+        let buf = pool.get_write_buffer(256, false);
+        let inner = buf.lock();
+        assert!(inner.has_room(256));
+    }
+
+    #[test]
+    fn test_two_buffers_pool_wraps_around() {
+        let pool = LogBufferPool::new(2, 64);
+        assert_eq!(pool.get_next_slot(0), 1);
+        assert_eq!(pool.get_next_slot(1), 0);
+    }
+}

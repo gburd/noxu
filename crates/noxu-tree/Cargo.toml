@@ -1,0 +1,26 @@
+[package]
+name = "noxu-tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "B-tree implementation for Noxu DB"
+
+[dependencies]
+noxu-util = { workspace = true }
+noxu-latch = { workspace = true }
+noxu-log = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "tree_bench"
+harness = false
+
+[lints]
+workspace = true

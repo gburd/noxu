@@ -1,0 +1,27 @@
+[package]
+name = "noxu-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Engine orchestration for Noxu DB"
+
+[dependencies]
+noxu-util = { workspace = true }
+noxu-config = { workspace = true }
+noxu-latch = { workspace = true }
+noxu-log = { workspace = true }
+noxu-tree = { workspace = true }
+noxu-txn = { workspace = true }
+noxu-evictor = { workspace = true }
+noxu-cleaner = { workspace = true }
+noxu-recovery = { workspace = true }
+noxu-dbi = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.8"

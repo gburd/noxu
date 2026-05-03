@@ -1,0 +1,17 @@
+[package]
+name = "noxu-latch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Latching primitives for Noxu DB (shared/exclusive latches)"
+
+[dependencies]
+noxu-util = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

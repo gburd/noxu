@@ -1,0 +1,23 @@
+[package]
+name = "noxu-util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Internal utilities for Noxu DB (LSN, VLSN, byte encoding, stats framework)"
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+crc32fast = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "util_bench"
+harness = false
+
+[lints]
+workspace = true

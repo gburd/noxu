@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Noxu DB Discussions
+    url: https://github.com/gburd/lamdb/discussions
+    about: Please ask questions in the discussions tab.
