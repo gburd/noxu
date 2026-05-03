@@ -1,0 +1,25 @@
+[package]
+name = "noxu-comparison-benches"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# ⚠  Noxu DB 1.0.0 caveat: WAL writes, blocking lock acquisition, and
+# B-tree merge/compress are not yet implemented.  Put() benchmarks measure
+# the in-memory B-tree path only and will be faster than a complete
+# implementation.  These benchmarks are most useful for tracking regressions
+# within Noxu and for comparing the workload *shape* across engines.
+
+[dev-dependencies]
+noxu-db = { workspace = true }
+criterion = { workspace = true }
+tempfile = "3"
+
+# Comparison engines
+heed    = "0.22"   # LMDB via Meilisearch's typed wrapper (bundles liblmdb)
+sled    = "0.34"   # pure-Rust log-structured tree
+redb    = "4"      # pure-Rust B-tree (copy-on-write)
+
+[[bench]]
+name = "comparison"
+harness = false
