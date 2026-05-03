@@ -1,0 +1,32 @@
+[package]
+name = "noxu-dbi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Database internals for Noxu DB"
+
+[dependencies]
+noxu-util = { workspace = true }
+noxu-config = { workspace = true }
+noxu-latch = { workspace = true }
+noxu-log = { workspace = true }
+noxu-tree = { workspace = true }
+noxu-txn = { workspace = true }
+noxu-evictor = { workspace = true }
+noxu-cleaner = { workspace = true }
+noxu-recovery = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+
+[features]
+# Exposes test-only cursor-failure hooks for use by integration tests in
+# dependent crates (e.g. noxu-db).  Never enable this in production builds.
+testing = []
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

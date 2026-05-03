@@ -1,0 +1,18 @@
+[package]
+name = "noxu-collections"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Iterator-based collection views for Noxu DB"
+
+[dependencies]
+noxu-db = { workspace = true }
+noxu-bind = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3"

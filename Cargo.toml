@@ -1,0 +1,138 @@
+[package]
+name = "noxu-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Examples for Noxu DB"
+publish = false
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/noxu-util",
+    "crates/noxu-latch",
+    "crates/noxu-config",
+    "crates/noxu-log",
+    "crates/noxu-tree",
+    "crates/noxu-txn",
+    "crates/noxu-evictor",
+    "crates/noxu-cleaner",
+    "crates/noxu-recovery",
+    "crates/noxu-dbi",
+    "crates/noxu-engine",
+    "crates/noxu-db",
+    "crates/noxu-bind",
+    "crates/noxu-collections",
+    "crates/noxu-persist",
+    "crates/noxu-rep",
+]
+
+[dependencies]
+noxu-db = { workspace = true }
+noxu-bind = { workspace = true }
+noxu-collections = { workspace = true }
+noxu-persist = { workspace = true }
+parking_lot = { workspace = true }
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
+[[example]]
+name = "transactions"
+path = "examples/transactions.rs"
+
+[[example]]
+name = "cursor_scan"
+path = "examples/cursor_scan.rs"
+
+[[example]]
+name = "binding"
+path = "examples/binding.rs"
+
+[[example]]
+name = "collections"
+path = "examples/collections.rs"
+
+[[example]]
+name = "persist"
+path = "examples/persist.rs"
+
+[[example]]
+name = "secondary"
+path = "examples/secondary.rs"
+
+[[example]]
+name = "sequence"
+path = "examples/sequence.rs"
+
+[[example]]
+name = "getting_started"
+path = "examples/getting_started.rs"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/gburd/lamdb"
+description = "Noxu DB - An embedded transactional database engine"
+
+[workspace.dependencies]
+# Internal crates
+noxu-util = { path = "crates/noxu-util" }
+noxu-latch = { path = "crates/noxu-latch" }
+noxu-config = { path = "crates/noxu-config" }
+noxu-log = { path = "crates/noxu-log" }
+noxu-tree = { path = "crates/noxu-tree" }
+noxu-txn = { path = "crates/noxu-txn" }
+noxu-evictor = { path = "crates/noxu-evictor" }
+noxu-cleaner = { path = "crates/noxu-cleaner" }
+noxu-recovery = { path = "crates/noxu-recovery" }
+noxu-dbi = { path = "crates/noxu-dbi" }
+noxu-engine = { path = "crates/noxu-engine" }
+noxu-db = { path = "crates/noxu-db" }
+noxu-bind = { path = "crates/noxu-bind" }
+noxu-collections = { path = "crates/noxu-collections" }
+noxu-persist = { path = "crates/noxu-persist" }
+noxu-rep = { path = "crates/noxu-rep" }
+
+# External crates (approved core set)
+parking_lot = "0.12"
+thiserror = "2"
+log = "0.4"
+bytes = "1"
+crc32fast = "1"
+byteorder = "1"
+memmap2 = "0.9"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
+[workspace.lints.clippy]
+or_fun_call = "warn"
+redundant_clone = "warn"
+large_stack_frames = "warn"
+large_types_passed_by_value = "warn"
+
+[profile.dev]
+# Use a single codegen unit so that llvm-cov does not double-count functions
+# that are duplicated across units, which would otherwise halve reported coverage.
+codegen-units = 1
+
+[profile.release]
+debug = "line-tables-only"
+codegen-units = 4
+lto = "thin"
+
+[profile.fuzzing]
+inherits = "dev"
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.bench-profile]
+inherits = "release"
+debug = true
+lto = false
+codegen-units = 16

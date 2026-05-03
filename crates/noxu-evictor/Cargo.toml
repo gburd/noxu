@@ -1,0 +1,18 @@
+[package]
+name = "noxu-evictor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cache eviction for Noxu DB"
+
+[dependencies]
+noxu-util = { workspace = true }
+noxu-latch = { workspace = true }
+noxu-tree = { workspace = true }
+noxu-log = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[lints]
+workspace = true

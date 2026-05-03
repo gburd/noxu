@@ -1,0 +1,57 @@
+[package]
+name = "noxu-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+noxu-db = { path = "../../crates/noxu-db" }
+noxu-util = { path = "../../crates/noxu-util" }
+byteorder = "1"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_model"
+path = "fuzz_targets/fuzz_model.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_serialization"
+path = "fuzz_targets/fuzz_serialization.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cursor"
+path = "fuzz_targets/fuzz_cursor.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_packed_int"
+path = "fuzz_targets/fuzz_packed_int.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_transactions"
+path = "fuzz_targets/fuzz_transactions.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_recovery"
+path = "fuzz_targets/fuzz_recovery.rs"
+test = false
+doc = false
