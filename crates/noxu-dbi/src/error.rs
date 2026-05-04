@@ -19,6 +19,13 @@ pub enum DbiError {
     #[error("database already exists: {0}")]
     DatabaseExists(String),
 
+    /// Database cannot be deleted or renamed while handles are open.
+    ///
+    /// Port of `com.sleepycat.je.DatabaseException` thrown when
+    /// `EnvironmentImpl.dbRemove()`/`dbRename()` detect open handles.
+    #[error("database is in use (open handles exist): {0}")]
+    DatabaseInUse(String),
+
     /// Environment failure.
     #[error("environment failure: {reason}")]
     EnvironmentFailure { reason: String },

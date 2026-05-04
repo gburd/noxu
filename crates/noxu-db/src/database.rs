@@ -321,6 +321,7 @@ impl Database {
         }
 
         self.open.store(false, Ordering::Release);
+        let _ = self.env_impl.lock().close_database(noxu_dbi::DatabaseId::new(self.id as i64));
         Ok(())
     }
 

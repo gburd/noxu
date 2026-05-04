@@ -601,7 +601,9 @@ impl FileManager {
 
         let handle = self.get_file_handle(file_num)?;
         let mut guard = handle.acquire();
-        guard.sync()?;
+        // Use fdatasync (sync_data) — only log data must be durable here,
+        // not file metadata.  JE uses FileChannel.force(false) for this.
+        guard.sync_data()?;
         Ok(())
     }
 

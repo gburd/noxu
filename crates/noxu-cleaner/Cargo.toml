@@ -14,5 +14,9 @@ parking_lot = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = "3"
+
 [lints]
 workspace = true

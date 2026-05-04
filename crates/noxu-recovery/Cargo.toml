@@ -14,9 +14,11 @@ parking_lot = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = "3"
 
 [[bench]]
 name = "recovery_bench"

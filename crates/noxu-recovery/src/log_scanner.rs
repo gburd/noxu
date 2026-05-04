@@ -43,6 +43,18 @@ pub struct LnRecord {
     pub abort_lsn: Lsn,
     /// Whether the slot was known-deleted before this operation.
     pub abort_known_deleted: bool,
+    /// Key of the before-image (None when same as `key`).
+    ///
+    /// Port of `LNLogEntry.getAbortKey()` in JE — populated when an embedded
+    /// before-image has a different key (key-updating operations).
+    pub abort_key: Option<Vec<u8>>,
+    /// Data of the before-image (embedded in the log entry itself).
+    ///
+    /// Port of `LNLogEntry.getAbortData()` in JE — populated for all embedded
+    /// LNs in the NoSQL fork so that undo does NOT need to re-read the log.
+    /// `None` for non-embedded LNs (rare in modern JE) and for first writes
+    /// where the before-image is "deleted" (use `abort_known_deleted` instead).
+    pub abort_data: Option<Vec<u8>>,
     /// Whether this entry has been marked invisible (rolled-back by HA).
     pub is_invisible: bool,
     /// Whether this entry belongs to a replicated transaction.
@@ -68,6 +80,8 @@ impl LnRecord {
             data,
             abort_lsn,
             abort_known_deleted,
+            abort_key: None,
+            abort_data: None,
             is_invisible: false,
             is_replicated: false,
         }
@@ -238,6 +252,16 @@ pub trait LogScanner {
         start_lsn: Lsn,
         stop_lsn: Lsn,
     ) -> Vec<PositionedEntry>;
+
+    /// Read the single log entry at exactly `lsn`.
+    ///
+    /// Returns `None` if the entry is not found.  Used during the undo phase
+    /// to fetch the before-image of a disk-resident LN at its `abort_lsn`.
+    ///
+    /// Port of `RecoveryManager.undo()` in JE which calls
+    /// `fetchTarget(db, bin, idx, abortLsn, ...)` to read the before-image
+    /// directly from the log when it is not embedded in the LN log entry.
+    fn read_at_lsn(&self, lsn: Lsn) -> Option<LogEntry>;
 }
 
 /// An in-memory `LogScanner` backed by a `Vec<PositionedEntry>`.
@@ -331,6 +355,13 @@ impl LogScanner for InMemoryLogScanner {
             .collect();
         result.sort_by(|a, b| b.lsn.cmp(&a.lsn));
         result
+    }
+
+    fn read_at_lsn(&self, target_lsn: Lsn) -> Option<LogEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.lsn == target_lsn)
+            .map(|e| e.entry.clone())
     }
 }
 

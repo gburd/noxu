@@ -692,6 +692,11 @@ impl RecoveryManager {
     ///   already present; the slot is updated to the logged LSN.
     /// - `delete(key)` is a no-op when the key is absent.
     fn redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
+        // Only replay into the matching database's tree.
+        // Port of the db-id check in JE's LNFileReader / redoOneLN.
+        if tree.get_database_id() != rec.db_id {
+            return;
+        }
         match rec.operation {
             LnOperation::Insert | LnOperation::Update => {
                 // Insert the logged version.  `tree.insert` updates the slot
@@ -849,29 +854,70 @@ impl RecoveryManager {
                         // in JE.  Delete the slot; if it was already removed by
                         // a later operation, this is a no-op.
                         if let Some(t) = tree.as_deref_mut() {
-                            t.delete(&rec.key);
+                            // Only undo into the matching database's tree.
+                            if t.get_database_id() == rec.db_id {
+                                t.delete(&rec.key);
+                            }
                         }
                         self.stats.lns_undone += 1;
                         self.stats.active_txns_undone += 1;
                     }
                     UndoAction::RevertToAbortLsn { abort_lsn } => {
-                        // Port of: RecoveryManager.undo() → bin.updateEntry()
-                        // with the abort-lsn in JE.  The full implementation
-                        // would fetch the before-image data from the log at
-                        // `abort_lsn` and re-insert it.  Until the log-reader
-                        // is wired, we can only update the slot's LSN.  We
-                        // use a delete here as a safe placeholder: aborting an
-                        // update still leaves the key in the tree, but without
-                        // the before-image data we cannot reconstruct the prior
-                        // value.  Deleting is conservative (avoids stale data
-                        // being visible) and is correct for Insert→Abort.
+                        // Port of: RecoveryManager.undo() in JE.
                         //
-                        // TODO: fetch before-image from log at `abort_lsn`
-                        //       and call tree.insert(key, before_data, abort_lsn).
-                        let _ = abort_lsn; // will be used when log-reader is wired
-                        if let Some(t) = tree.as_deref_mut() {
-                            t.delete(&rec.key);
-                        }
+                        // Decision table (from JE RecoveryManager.undo()):
+                        //
+                        //  abort_known_deleted == true
+                        //    → key was deleted before this write; restore
+                        //      deleted state by removing the slot.
+                        //
+                        //  abort_data.is_some()  (embedded before-image)
+                        //    → re-insert the prior key/value at abort_lsn.
+                        //      JE stores the before-image inline in every
+                        //      LNLogEntry (getAbortKey/getAbortData) so that
+                        //      undo never has to re-read the log.
+                        //
+                        //  abort_data.is_none() && !abort_known_deleted
+                        //    → non-embedded LN: read the before-image from
+                        //      the log at abort_lsn.  JE calls
+                        //      `fetchTarget(db, bin, idx, abortLsn, ...)` for
+                        //      this case.  We call scanner.read_at_lsn().
+                        if let Some(t) = tree.as_deref_mut()
+                            && t.get_database_id() == rec.db_id {
+                                if rec.abort_known_deleted {
+                                    // Before this write the slot was deleted.
+                                    t.delete(&rec.key);
+                                } else if let Some(abort_data) = &rec.abort_data {
+                                    // Embedded before-image: re-insert prior value.
+                                    let key = rec.abort_key
+                                        .clone()
+                                        .unwrap_or_else(|| rec.key.clone());
+                                    let _ = t.insert(key, abort_data.clone(), *abort_lsn);
+                                } else {
+                                    // Non-embedded LN: fetch before-image from log.
+                                    //
+                                    // Port of JE `fetchTarget(db, bin, idx, abortLsn)`:
+                                    // read the LN at abort_lsn and apply its key/data.
+                                    // If the log read fails (e.g. the file was cleaned
+                                    // away), fall back to deleting the slot — a safe
+                                    // conservative action that avoids exposing a stale
+                                    // value.
+                                    let before_image = scanner.read_at_lsn(*abort_lsn);
+                                    if let Some(LogEntry::Ln(before_rec)) = before_image {
+                                        if let Some(before_data) = before_rec.data {
+                                            let key = before_rec.abort_key
+                                                .unwrap_or(before_rec.key);
+                                            let _ = t.insert(key, before_data, *abort_lsn);
+                                        } else {
+                                            // Before-image was itself a delete.
+                                            t.delete(&rec.key);
+                                        }
+                                    } else {
+                                        // Before-image unavailable (log cleaned).
+                                        t.delete(&rec.key);
+                                    }
+                                }
+                            }
                         self.stats.lns_undone += 1;
                         self.stats.active_txns_undone += 1;
                     }

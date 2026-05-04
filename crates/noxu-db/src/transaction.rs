@@ -131,8 +131,8 @@ impl Transaction {
 
         // Write TxnCommit to the WAL before marking committed.
         // Durability controls whether we fsync, flush, or just buffer.
-        if !self.read_only {
-            if let Some(lm) = &self.log_manager {
+        if !self.read_only
+            && let Some(lm) = &self.log_manager {
                 let (fsync, flush) = match durability.local_sync {
                     SyncPolicy::Sync => (true, true),
                     SyncPolicy::WriteNoSync => (false, true),
@@ -140,7 +140,6 @@ impl Transaction {
                 };
                 self.write_txn_end(lm, true, fsync, flush)?;
             }
-        }
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Committed;
@@ -172,11 +171,10 @@ impl Transaction {
         }
 
         // Write TxnAbort to WAL before marking aborted (no fsync needed).
-        if !self.read_only {
-            if let Some(lm) = &self.log_manager {
+        if !self.read_only
+            && let Some(lm) = &self.log_manager {
                 self.write_txn_end(lm, false, false, false)?;
             }
-        }
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Aborted;

@@ -28,7 +28,7 @@ pub use error::{CleanerError, Result};
 pub use expiration_tracker::ExpirationTracker;
 pub use file_processor::{
     BinLookupResult, FileProcessResult, FileProcessor, InLookupResult,
-    MigrationOutcome, RealTreeLookup, TreeLookup,
+    MigrationOutcome, RealTreeLookup, SharedTreeLookup, TreeLookup,
 };
 pub use file_protector::FileProtector;
 pub use file_selector::{

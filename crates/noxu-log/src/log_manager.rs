@@ -37,6 +37,7 @@ use crate::entry_header::{CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::entry_type::LogEntryType;
 use crate::error::{NoxuLogError, Result};
 use crate::file_manager::FileManager;
+use crate::fsync_manager::FsyncManager;
 use crate::log_buffer_pool::LogBufferPool;
 use crate::provisional::Provisional;
 use noxu_util::lsn::{Lsn, NULL_LSN};
@@ -67,6 +68,13 @@ pub struct LogManager {
 
     /// The FileManager that owns the on-disk log files.
     file_manager: Arc<FileManager>,
+
+    /// Coalesces concurrent fsync requests (group commit).
+    ///
+    /// Port of `com.sleepycat.je.log.FSyncManager`.
+    /// Initialised with threshold=0, interval=0 (group commit disabled),
+    /// matching JE's default configuration.
+    fsync_manager: FsyncManager,
 }
 
 impl LogManager {
@@ -93,6 +101,10 @@ impl LogManager {
             n_temp_buffer_writes: AtomicU64::new(0),
             read_buffer_size,
             file_manager,
+            // Group commit disabled by default (threshold=0, interval=0),
+            // matching JE's LOG_GROUP_COMMIT_THRESHOLD / LOG_GROUP_COMMIT_INTERVAL
+            // defaults of 0.
+            fsync_manager: FsyncManager::new(0, 0),
         }
     }
 
@@ -257,14 +269,42 @@ impl LogManager {
         Ok(lsn)
     }
 
-    /// Flushes all dirty write buffers to disk and performs an fsync.
+    /// Flushes all dirty write buffers to disk and performs an fdatasync.
     ///
-    /// Port of `FileManager.syncLogEnd()` invoked after flush.
+    /// This is the durable commit path.  The implementation mirrors JE's
+    /// group-commit pattern (`FSyncManager`):
+    ///
+    /// 1. Acquire the LWL, drain all dirty write buffers to disk, then
+    ///    **release the LWL**.  Releasing before the fsync is the key to
+    ///    group commit: other threads can now enter `flush_sync()` and add
+    ///    their writes to the same batch.
+    /// 2. Call `fsync_manager.fsync()` **outside** the LWL.  Concurrent
+    ///    callers elect one leader; the leader does a single fdatasync and
+    ///    all waiters return together.  This turns N per-commit fsyncs into
+    ///    ≈1 fsync for a burst of N concurrent commits (identical to JE's
+    ///    `FSyncManager.fsync()` flow).
+    ///
+    /// Port of `LogManager.logForceFlush()` → `FSyncManager.fsync()` in JE.
     pub fn flush_sync(&self) -> Result<Lsn> {
-        let _lwl = self.log_write_latch.lock();
-        self.flush_dirty_buffers()?;
-        self.file_manager.sync_log_end()?;
-        let eol = self.file_manager.get_next_available_lsn();
+        // Phase 1: flush dirty buffers under the LWL, then release it.
+        let eol = {
+            let _lwl = self.log_write_latch.lock();
+            self.flush_dirty_buffers()?;
+            self.file_manager.get_next_available_lsn()
+        };
+        // LWL released here — other threads can now enter flush_sync()
+        // concurrently, enabling group-commit coalescing in phase 2.
+
+        // Phase 2: fdatasync outside the LWL via FSyncManager.
+        // The closure converts NoxuLogError -> io::Error (FsyncManager uses
+        // std::io); the outer ? converts io::Error back to NoxuLogError.
+        let fm = &self.file_manager;
+        self.fsync_manager.fsync(|| {
+            fm.sync_log_end().map_err(|e| {
+                std::io::Error::other(e.to_string())
+            })
+        })?;
+
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Relaxed);
         Ok(eol)
     }

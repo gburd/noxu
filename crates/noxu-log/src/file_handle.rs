@@ -160,7 +160,11 @@ impl<'a> FileHandleGuard<'a> {
         Ok(file.write(buf)?)
     }
 
-    /// Syncs the file to disk.
+    /// Syncs all file data and metadata to disk (fsync).
+    ///
+    /// Use this when the file's metadata (size, mtime) must also be durable —
+    /// typically for file-header writes.  For log-data writes prefer
+    /// `sync_data()` which is faster.
     pub fn sync(&mut self) -> Result<()> {
         let mut file_guard = self.handle.file.lock();
         let file = file_guard.as_mut().ok_or_else(|| {
@@ -168,6 +172,23 @@ impl<'a> FileHandleGuard<'a> {
         })?;
 
         file.sync_all()?;
+        Ok(())
+    }
+
+    /// Syncs only the file data to disk (fdatasync).
+    ///
+    /// Faster than `sync()` because it does not flush file metadata (mtime
+    /// etc.).  JE uses `FileChannel.force(false)` (= fdatasync) for all
+    /// log-data writes and `force(true)` (= fsync) only for file-header writes.
+    ///
+    /// Port of `FileManager.syncLogEnd()` / `FileChannel.force(false)`.
+    pub fn sync_data(&mut self) -> Result<()> {
+        let mut file_guard = self.handle.file.lock();
+        let file = file_guard.as_mut().ok_or_else(|| {
+            LogError::Internal("FileHandle not initialized".to_string())
+        })?;
+
+        file.sync_data()?;
         Ok(())
     }
 

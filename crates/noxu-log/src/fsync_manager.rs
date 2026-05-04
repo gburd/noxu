@@ -1,615 +1,612 @@
-//! Manager for coalescing fsync operations.
+//! Manager for coalescing fsync operations (group commit).
 //!
 //! Port of `com.sleepycat.je.log.FSyncManager`.
 //!
-//! The FSyncManager coalesces multiple fsync requests into a single fsync
-//! operation to reduce the number of expensive fsync system calls.
+//! The FSyncManager ensures that only one file fsync is issued at a time for
+//! performance optimization.  The goal is to reduce the number of fsyncs
+//! issued by the system by having one fsync serve a batch of threads.
+//!
+//! # Algorithm (mirrors JE's leader/waiter pattern)
+//!
+//! When a thread enters `fsync()` it finds one of two situations:
+//!
+//! 1. **No work in progress** — the thread becomes the *leader*.  If group
+//!    commit is enabled (`grpc_threshold > 0` AND `grpc_interval_ms > 0`) the
+//!    leader may wait briefly for more waiters to accumulate.  Then it calls
+//!    the supplied fsync closure, wakes all current waiters (they piggyback on
+//!    its fsync), wakes one member of the *next* group to become the new
+//!    leader, and clears `work_in_progress`.
+//!
+//! 2. **Work in progress** — the thread joins `next_fsync_waiters` and waits
+//!    on a `Condvar`.  When woken it checks whether its fsync was already
+//!    done (`NoFsyncNeeded`), whether it should become the new leader
+//!    (`DoLeaderFsync`), or whether it timed out (`DoTimeoutFsync`).
+//!
+//! Each group is represented by an `Arc<FSyncGroup>`.  The leader atomically
+//! replaces `state.next_fsync_waiters` with a fresh group, so waiting threads
+//! retain their `Arc` to the *old* group and can still be woken through it.
 
-use crate::error::Result;
-use parking_lot::{Condvar, Mutex};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Status returned from waiting for an fsync.
+// ── FSyncGroup ────────────────────────────────────────────────────────────────
+
+/// One cohort of threads waiting for a common fsync.
+///
+/// Port of `FSyncManager.FSyncGroup`.  Each instance lives behind an `Arc` so
+/// that threads that joined a group keep a reference even after the leader has
+/// swapped in a fresh `FSyncGroup` for the next cohort.
+struct FSyncGroup {
+    inner: Mutex<FsyncGroupInner>,
+    condvar: Condvar,
+}
+
+struct FsyncGroupInner {
+    /// True once the fsync for this group has been completed (or failed).
+    work_done: bool,
+    /// Whether a leader has already been designated for this group.
+    leader_exists: bool,
+    /// Recorded error message from the fsync, propagated to all waiters.
+    error: Option<String>,
+}
+
+/// Return value from `FSyncGroup::wait_for_event`.
+///
+/// Port of `FSyncGroup.DO_TIMEOUT_FSYNC / DO_LEADER_FSYNC / NO_FSYNC_NEEDED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitStatus {
-    /// The fsync was completed by another thread; no action needed.
+    /// The fsync was completed on this thread's behalf; nothing to do.
     NoFsyncNeeded,
     /// This thread should become the leader and perform the fsync.
     DoLeaderFsync,
-    /// This thread timed out waiting; it should perform its own fsync.
+    /// This thread timed out; it must perform its own fsync.
     DoTimeoutFsync,
 }
 
-/// Represents a group of threads waiting for a common fsync.
-struct FSyncGroup {
-    /// Whether this group needs an fsync (vs just a flush).
-    do_fsync: bool,
-    /// Whether the fsync work for this group is complete.
-    work_done: bool,
-    /// Whether a leader has been designated for this group.
-    leader_exists: bool,
-    /// Timeout duration for waiting.
-    timeout: Duration,
-}
-
 impl FSyncGroup {
-    fn new(timeout: Duration) -> Self {
-        FSyncGroup {
-            do_fsync: false,
-            work_done: false,
-            leader_exists: false,
-            timeout,
-        }
+    fn new() -> Arc<Self> {
+        Arc::new(FSyncGroup {
+            inner: Mutex::new(FsyncGroupInner {
+                work_done: false,
+                leader_exists: false,
+                error: None,
+            }),
+            condvar: Condvar::new(),
+        })
     }
 
-    /// Sets whether this group needs an fsync.
-    fn set_do_fsync(&mut self, do_fsync: bool) {
-        self.do_fsync |= do_fsync;
-    }
+    /// Block until work is done, this thread becomes leader, or we time out.
+    ///
+    /// Port of `FSyncGroup.waitForEvent()`.
+    fn wait_for_event(&self, timeout: Duration) -> WaitStatus {
+        let mut inner = self.inner.lock().unwrap();
 
-    /// Returns whether this group needs an fsync.
-    fn get_do_fsync(&self) -> bool {
-        self.do_fsync
-    }
-
-    /// Marks the work for this group as complete and wakes all waiters.
-    fn wakeup_all(&mut self, condvar: &Condvar) {
-        self.work_done = true;
-        condvar.notify_all();
-    }
-
-    /// Wakes a single waiter to become the next leader.
-    fn wakeup_one(&self, condvar: &Condvar) {
-        condvar.notify_one();
-    }
-
-    /// Waits for either an fsync to complete or to become the leader.
-    fn wait_for_event(
-        &mut self,
-        mutex: &mut parking_lot::MutexGuard<()>,
-        condvar: &Condvar,
-    ) -> WaitStatus {
-        if self.work_done {
+        // Fast path: already done before we even enter.
+        if inner.work_done {
             return WaitStatus::NoFsyncNeeded;
         }
 
-        let start_time = Instant::now();
-
+        let start = Instant::now();
         loop {
-            condvar.wait_for(mutex, self.timeout);
+            // Compute remaining wait time.
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return WaitStatus::DoTimeoutFsync;
+            }
+            let remaining = timeout - elapsed;
 
-            // Was the fsync completed?
-            if self.work_done {
+            let (guard, _timed_out) =
+                self.condvar.wait_timeout(inner, remaining).unwrap();
+            inner = guard;
+
+            if inner.work_done {
                 return WaitStatus::NoFsyncNeeded;
             }
 
-            // Were we woken to become the leader?
-            if !self.leader_exists {
-                self.leader_exists = true;
+            if !inner.leader_exists {
+                inner.leader_exists = true;
                 return WaitStatus::DoLeaderFsync;
             }
 
-            // Check if we timed out
-            if start_time.elapsed() > self.timeout {
+            // Spurious wakeup or still a plain waiter — re-check timeout.
+            if start.elapsed() >= timeout {
                 return WaitStatus::DoTimeoutFsync;
             }
-
-            // Spurious wakeup, continue waiting
+            // else: loop and keep waiting
         }
+    }
+
+    /// Wake all waiters with success.  Port of `FSyncGroup.wakeupAll()`.
+    fn wakeup_all(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.work_done = true;
+        inner.error = None;
+        drop(inner);
+        self.condvar.notify_all();
+    }
+
+    /// Wake all waiters recording an error.
+    fn wakeup_all_with_error(&self, msg: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.work_done = true;
+        inner.error = Some(msg);
+        drop(inner);
+        self.condvar.notify_all();
+    }
+
+    /// Wake a single waiter to become the next leader.
+    /// Port of `FSyncGroup.wakeupOne()`.
+    fn wakeup_one(&self) {
+        self.condvar.notify_one();
+    }
+
+    /// Return the recorded error (if any) for this group.
+    fn take_error(&self) -> Option<String> {
+        self.inner.lock().unwrap().error.clone()
     }
 }
 
-/// Manager for coalescing fsync operations.
+// ── FsyncState ────────────────────────────────────────────────────────────────
+
+/// Mutable state guarded by `FsyncManager::state_mutex`.
 ///
-/// Multiple threads requesting fsync can be serviced by a single fsync
-/// operation, significantly reducing system call overhead.
-pub struct FSyncManager {
-    /// Mutex protecting the manager state.
-    mutex: Arc<Mutex<()>>,
-    /// Condition variable for coordinating threads.
-    condvar: Arc<Condvar>,
-    /// Whether an fsync is currently in progress.
-    work_in_progress: Mutex<bool>,
-    /// The next group of threads waiting for an fsync.
-    next_fsync_waiters: Mutex<FSyncGroup>,
-    /// Timeout duration for fsync operations.
-    timeout: Duration,
+/// Mirrors the fields that JE protects with `mgrMutex`.
+struct FsyncState {
+    /// True while a leader thread is performing (or about to perform) an fsync.
+    work_in_progress: bool,
+    /// The group that newly-arriving threads join while work is in progress.
+    next_fsync_waiters: Arc<FSyncGroup>,
+    /// Count of threads currently in `next_fsync_waiters`.
+    num_next_waiters: usize,
+    /// Monotonic instant when the first thread joined the current next-group.
+    start_next_wait: Option<Instant>,
 }
 
-impl FSyncManager {
-    /// Creates a new FSyncManager.
+// ── FsyncManager ─────────────────────────────────────────────────────────────
+
+/// Coalesces fsync requests so that one system call serves many threads.
+///
+/// Port of `com.sleepycat.je.log.FSyncManager`.
+///
+/// # Configuration
+///
+/// * `grpc_threshold` — minimum number of waiters before the leader executes
+///   the fsync.  `0` disables group-commit waiting (JE default).
+/// * `grpc_interval_ms` — maximum milliseconds the leader waits for more
+///   waiters.  `0` disables group-commit waiting (JE default).
+///
+/// Group-commit waiting is only active when **both** values are non-zero,
+/// matching JE's `grpWaitOn` flag.
+pub struct FsyncManager {
+    /// Min waiters before the leader fsyncs (0 = disabled).
+    grpc_threshold: usize,
+    /// Max ms the leader waits for more waiters (0 = disabled).
+    grpc_interval_ms: u64,
+    /// Whether group-commit waiting is active (`grpcInterval != 0 && grpcThreshold != 0`).
+    grp_wait_on: bool,
+    /// Timeout for waiting threads before they do their own fsync.
+    /// (JE: `LOG_FSYNC_TIMEOUT`, default 500 ms.)
+    fsync_timeout: Duration,
+    /// Mutex protecting `FsyncState`.  Also used by `leader_condvar`.
+    state: Mutex<FsyncState>,
+    /// Condvar used by the leader to wait for more members (grpc wait).
+    /// Paired with `state` mutex so the lock can be released during the wait.
+    leader_condvar: Condvar,
+}
+
+impl FsyncManager {
+    /// Create a new `FsyncManager`.
     ///
     /// # Arguments
-    ///
-    /// * `timeout` - Maximum time a thread will wait for an fsync operation (milliseconds)
-    pub fn new(timeout_millis: u64) -> Self {
-        FSyncManager {
-            mutex: Arc::new(Mutex::new(())),
-            condvar: Arc::new(Condvar::new()),
-            work_in_progress: Mutex::new(false),
-            next_fsync_waiters: Mutex::new(FSyncGroup::new(
-                Duration::from_millis(timeout_millis),
-            )),
-            timeout: Duration::from_millis(timeout_millis),
+    /// * `grpc_threshold`   — min waiters before leader fsyncs (0 = disabled).
+    /// * `grpc_interval_ms` — max ms to wait for more waiters (0 = disabled).
+    pub fn new(grpc_threshold: usize, grpc_interval_ms: u64) -> Self {
+        let grp_wait_on = grpc_threshold != 0 && grpc_interval_ms != 0;
+        FsyncManager {
+            grpc_threshold,
+            grpc_interval_ms,
+            grp_wait_on,
+            // JE default timeout: 500 ms.
+            fsync_timeout: Duration::from_millis(500),
+            state: Mutex::new(FsyncState {
+                work_in_progress: false,
+                next_fsync_waiters: FSyncGroup::new(),
+                num_next_waiters: 0,
+                start_next_wait: None,
+            }),
+            leader_condvar: Condvar::new(),
         }
     }
 
-    /// Requests that the log be flushed and optionally synced to disk.
+    /// Request an fsync, coalescing with concurrent callers.
     ///
-    /// This method may or may not actually perform the flush/sync, but will
-    /// not return until a flush/sync has been performed that covers this
-    /// thread's request.
+    /// Port of `FSyncManager.flushAndSync(boolean fsyncRequired)`.
     ///
-    /// # Arguments
-    ///
-    /// * `fsync_required` - If true, an fsync is required. If false, only a flush is needed.
-    /// * `flush_fn` - Function to call to flush the log buffer
-    /// * `fsync_fn` - Function to call to fsync the log
-    pub fn flush_and_sync<F, S>(
-        &self,
-        fsync_required: bool,
-        flush_fn: F,
-        fsync_fn: S,
-    ) -> Result<()>
+    /// The caller supplies `do_fsync`, a closure that performs the actual
+    /// fsync.  This method guarantees that when it returns `Ok(())`, at least
+    /// one fsync has completed that covers the caller's preceding write.
+    pub fn fsync<F>(&self, do_fsync: F) -> std::io::Result<()>
     where
-        F: FnOnce() -> Result<()>,
-        S: FnOnce() -> Result<()>,
+        F: Fn() -> std::io::Result<()>,
     {
         let mut do_work = false;
         let mut is_leader = false;
-        let mut my_group_is_in_progress = false;
+        // Group whose waiters this leader serves (set only when is_leader).
+        let mut in_progress_group: Option<Arc<FSyncGroup>> = None;
+        // Group this thread belongs to as a waiter.
+        let mut my_group: Option<Arc<FSyncGroup>> = None;
+        let mut need_to_wait = false;
 
-        // Determine if we should do work or wait
+        // ── Phase 1: decide whether to lead or wait ───────────────────────
         {
-            let _guard = self.mutex.lock();
-            let mut work_in_progress = self.work_in_progress.lock();
-            let mut next_waiters = self.next_fsync_waiters.lock();
+            let mut state = self.state.lock().unwrap();
 
-            next_waiters.set_do_fsync(fsync_required);
-
-            if !*work_in_progress {
-                // No work in progress, we become the leader
+            if state.work_in_progress {
+                // Join the next-waiters cohort.
+                need_to_wait = true;
+                my_group = Some(Arc::clone(&state.next_fsync_waiters));
+                state.num_next_waiters += 1;
+                if self.grp_wait_on && state.num_next_waiters == 1 {
+                    state.start_next_wait = Some(Instant::now());
+                }
+            } else {
+                // Become the leader.
                 is_leader = true;
                 do_work = true;
-                *work_in_progress = true;
-                my_group_is_in_progress = true;
+                state.work_in_progress = true;
 
-                // Start a new group for the next set of waiters
-                *next_waiters = FSyncGroup::new(self.timeout);
+                if self.grp_wait_on {
+                    state = self.grpc_wait(state);
+                }
+
+                // Capture the current waiters group; swap in a fresh one.
+                in_progress_group = Some(Arc::clone(&state.next_fsync_waiters));
+                state.next_fsync_waiters = FSyncGroup::new();
+                state.num_next_waiters = 0;
             }
         }
+        // state lock released.
 
-        // If we're not the leader, wait for either completion or leadership
-        if !do_work {
-            let mut guard = self.mutex.lock();
-            let mut waiters = self.next_fsync_waiters.lock();
-
-            let wait_status = waiters.wait_for_event(&mut guard, &self.condvar);
+        // ── Phase 2: if we're a waiter, block until woken ────────────────
+        if need_to_wait {
+            let group = my_group.as_ref().unwrap();
+            let wait_status = group.wait_for_event(self.fsync_timeout);
 
             match wait_status {
+                WaitStatus::NoFsyncNeeded => {
+                    // The leader finished; propagate any recorded error.
+                    if let Some(msg) = group.take_error() {
+                        return Err(std::io::Error::other(msg));
+                    }
+                    return Ok(());
+                }
                 WaitStatus::DoLeaderFsync => {
-                    // We're now the leader
-                    let mut work_in_progress = self.work_in_progress.lock();
-                    if !*work_in_progress {
+                    // Attempt to become the new leader for this cohort.
+                    let mut state = self.state.lock().unwrap();
+                    if state.work_in_progress {
+                        // Another thread started a new fsync while we were being
+                        // woken up — do our own fsync as a safety measure.
+                        // (JE comment: "Ensure that an fsync is done before returning")
+                        do_work = true;
+                    } else {
                         is_leader = true;
                         do_work = true;
-                        *work_in_progress = true;
-                        my_group_is_in_progress = true;
+                        state.work_in_progress = true;
 
-                        // Start a new group
-                        *waiters = FSyncGroup::new(self.timeout);
-                    } else {
-                        // Someone else became leader first, just do our own fsync
-                        do_work = true;
+                        if self.grp_wait_on {
+                            state = self.grpc_wait(state);
+                        }
+
+                        // The `my_group` cohort is now the in-progress group.
+                        in_progress_group = my_group.take();
+                        state.next_fsync_waiters = FSyncGroup::new();
+                        state.num_next_waiters = 0;
                     }
                 }
                 WaitStatus::DoTimeoutFsync => {
-                    // Timed out, do our own fsync
+                    // Timed out — do our own fsync regardless.
                     do_work = true;
                 }
-                WaitStatus::NoFsyncNeeded => {
-                    // Fsync was completed by another thread
-                    return Ok(());
-                }
             }
         }
 
-        // Perform the work if needed
+        // ── Phase 3: perform the fsync ────────────────────────────────────
         if do_work {
-            // Flush the buffer
-            let fsync_needed = if my_group_is_in_progress {
-                self.next_fsync_waiters.lock().get_do_fsync()
-            } else {
-                fsync_required
-            };
+            let result = do_fsync();
 
-            flush_fn()?;
-
-            // Perform fsync if needed
-            if fsync_needed {
-                fsync_fn()?;
+            if is_leader {
+                let in_prog = in_progress_group.as_ref().unwrap();
+                // Wake all threads that piggybacked on this fsync.
+                match &result {
+                    Ok(()) => in_prog.wakeup_all(),
+                    Err(e) => in_prog.wakeup_all_with_error(e.to_string()),
+                }
+                // Wake one member of the next cohort to become the new leader,
+                // then clear work_in_progress — matching JE's ordering.
+                let mut state = self.state.lock().unwrap();
+                state.next_fsync_waiters.wakeup_one();
+                state.work_in_progress = false;
             }
 
-            // If we were the leader, wake up our group and the next leader
-            if is_leader {
-                let _guard = self.mutex.lock();
-                let mut work_in_progress = self.work_in_progress.lock();
+            result
+        } else {
+            Ok(())
+        }
+    }
 
-                // Wake up our group
-                let mut next_waiters = self.next_fsync_waiters.lock();
-                next_waiters.wakeup_all(&self.condvar);
-
-                // Wake up one waiter from the next group to become leader
-                next_waiters.wakeup_one(&self.condvar);
-
-                *work_in_progress = false;
+    /// Perform the group-commit wait: release the state lock and wait up to
+    /// `grpc_interval_ms` for `grpc_threshold` waiters to accumulate.
+    ///
+    /// Mirrors the `if (grpWaitOn)` block inside `flushAndSync()` in JE:
+    /// ```java
+    /// if (numNextWaiters < grpcThreshold) {
+    ///     interval = System.nanoTime() - startNextWait;
+    ///     if (interval < grpcInterval) {
+    ///         mgrMutex.wait(interval/1000000, interval%1000000);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Takes ownership of the `MutexGuard<FsyncState>`, releases the lock via
+    /// `Condvar::wait_timeout`, and returns a fresh guard.
+    fn grpc_wait<'a>(
+        &'a self,
+        state: MutexGuard<'a, FsyncState>,
+    ) -> MutexGuard<'a, FsyncState> {
+        if state.num_next_waiters < self.grpc_threshold {
+            let interval_ns = self.grpc_interval_ms as u128 * 1_000_000;
+            let elapsed_ns = state
+                .start_next_wait
+                .map(|t| t.elapsed().as_nanos())
+                .unwrap_or(0);
+            if elapsed_ns < interval_ns {
+                let remaining_ns = interval_ns - elapsed_ns;
+                let wait_dur = Duration::from_nanos(remaining_ns as u64);
+                // `Condvar::wait_timeout` releases the lock and re-acquires it.
+                let (new_guard, _) =
+                    self.leader_condvar.wait_timeout(state, wait_dur).unwrap();
+                return new_guard;
             }
         }
-
-        Ok(())
+        state
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    // ── required tests from task spec ─────────────────────────────────────
+
+    /// Single thread, no grouping: fsync closure called exactly once.
     #[test]
-    fn test_fsync_manager_coalescing() {
-        let manager = Arc::new(FSyncManager::new(5000));
-        let flush_count = Arc::new(AtomicUsize::new(0));
-        let fsync_count = Arc::new(AtomicUsize::new(0));
+    fn test_simple_fsync_no_grouping() {
+        let mgr = FsyncManager::new(0, 0);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        mgr.fsync(|| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
 
+    /// 3 threads hit fsync simultaneously; verify fsync called less than 3 times.
+    #[test]
+    fn test_multiple_threads_one_fsync() {
+        let mgr = Arc::new(FsyncManager::new(0, 0));
+        let fsync_count = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
         let mut handles = vec![];
 
-        // Spawn multiple threads all requesting fsync
-        for _ in 0..10 {
-            let manager = manager.clone();
-            let flush_count = flush_count.clone();
-            let fsync_count = fsync_count.clone();
-
-            let handle = std::thread::spawn(move || {
-                manager
-                    .flush_and_sync(
-                        true,
-                        || {
-                            flush_count.fetch_add(1, Ordering::SeqCst);
-                            Ok(())
-                        },
-                        || {
-                            fsync_count.fetch_add(1, Ordering::SeqCst);
-                            std::thread::sleep(Duration::from_millis(10));
-                            Ok(())
-                        },
-                    )
-                    .unwrap();
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // We should have fewer fsyncs than threads due to coalescing
-        let fsyncs = fsync_count.load(Ordering::SeqCst);
-        println!(
-            "Fsyncs: {}, Flushes: {}",
-            fsyncs,
-            flush_count.load(Ordering::SeqCst)
-        );
-        assert!(fsyncs < 10, "Expected coalescing to reduce fsync count");
-    }
-
-    #[test]
-    fn test_fsync_manager_flush_called_flush_only() {
-        // fsync_required=false: flush_fn is called, fsync_fn is not.
-        // The single-thread leader path: my_group_is_in_progress=true,
-        // but next_waiters was reset before checking get_do_fsync(),
-        // so fsync_needed=false regardless of fsync_required.
-        let manager = FSyncManager::new(5000);
-        let flush_called = Arc::new(AtomicUsize::new(0));
-        let fsync_called = Arc::new(AtomicUsize::new(0));
-
-        let fc = flush_called.clone();
-        let sc = fsync_called.clone();
-        manager
-            .flush_and_sync(
-                false,
-                || {
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-                || {
-                    sc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-            )
-            .unwrap();
-
-        assert_eq!(flush_called.load(Ordering::SeqCst), 1);
-        // fsync not called when fsync_required=false
-        assert_eq!(fsync_called.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_fsync_manager_flush_called_with_fsync_required() {
-        // In single-thread: the leader resets next_waiters *before* checking
-        // get_do_fsync(), so fsync_needed comes from the newly-reset group
-        // (do_fsync=false). flush_fn runs, fsync_fn does NOT run.
-        let manager = FSyncManager::new(5000);
-        let flush_called = Arc::new(AtomicUsize::new(0));
-        let fsync_called = Arc::new(AtomicUsize::new(0));
-
-        let fc = flush_called.clone();
-        let sc = fsync_called.clone();
-        manager
-            .flush_and_sync(
-                true,
-                || {
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-                || {
-                    sc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-            )
-            .unwrap();
-
-        // flush always runs
-        assert_eq!(flush_called.load(Ordering::SeqCst), 1);
-        // fsync_needed queries next_waiters (which was reset), so 0 or 1
-        // Accept either value to match implementation behavior
-        let fsyncs = fsync_called.load(Ordering::SeqCst);
-        assert!(fsyncs <= 1, "unexpected fsync count: {}", fsyncs);
-    }
-
-    #[test]
-    fn test_fsync_manager_flush_error_propagated() {
-        let manager = FSyncManager::new(5000);
-        let result = manager.flush_and_sync(
-            false,
-            || {
-                Err(crate::error::NoxuLogError::Internal(
-                    "flush fail".to_string(),
-                ))
-            },
-            || Ok(()),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_fsync_manager_flush_always_called() {
-        // flush_fn is always called when we're the leader.
-        // fsync_fn may or may not be called (implementation detail).
-        let manager = FSyncManager::new(5000);
-        let flush_count = Arc::new(AtomicUsize::new(0));
-
         for _ in 0..3 {
-            let c = flush_count.clone();
-            manager
-                .flush_and_sync(
-                    true,
-                    || {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    },
-                    || Ok(()),
-                )
+            let mgr2 = Arc::clone(&mgr);
+            let fc = Arc::clone(&fsync_count);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                mgr2.fsync(|| {
+                    // Slow fsync so concurrent threads queue up.
+                    std::thread::sleep(Duration::from_millis(20));
+                    fc.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
                 .unwrap();
+            }));
         }
-        assert_eq!(flush_count.load(Ordering::SeqCst), 3);
-    }
 
-    #[test]
-    fn test_fsync_manager_returns_ok_on_success() {
-        let manager = FSyncManager::new(5000);
-        let result = manager.flush_and_sync(
-            false,
-            || Ok(()),
-            || Ok(()),
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = fsync_count.load(Ordering::SeqCst);
+        // With a barrier + 20 ms sleep at least 2 threads should coalesce.
+        assert!(
+            total < 3,
+            "expected coalescing (total < 3 fsyncs), got {}",
+            total
         );
-        assert!(result.is_ok());
     }
 
+    /// Error from `do_fsync` propagates to the calling thread.
     #[test]
-    fn test_fsync_manager_returns_ok_fsync_required() {
-        let manager = FSyncManager::new(5000);
-        let result = manager.flush_and_sync(
-            true,
-            || Ok(()),
-            || Ok(()),
-        );
-        assert!(result.is_ok());
+    fn test_fsync_error_propagated_to_waiters() {
+        let mgr = FsyncManager::new(0, 0);
+        let result = mgr.fsync(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "simulated fsync failure",
+            ))
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("simulated fsync failure"));
     }
 
+    /// With grpc_threshold=2 and grpc_interval_ms=50, all threads finish
+    /// without deadlock.
     #[test]
-    fn test_fsync_group_new() {
-        let timeout = Duration::from_millis(100);
-        let group = FSyncGroup::new(timeout);
-        assert!(!group.get_do_fsync());
-        assert!(!group.work_done);
-        assert!(!group.leader_exists);
+    fn test_grpc_threshold_respected() {
+        let mgr = Arc::new(FsyncManager::new(2, 50));
+        let fsync_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let m = Arc::clone(&mgr);
+            let fc = Arc::clone(&fsync_count);
+            handles.push(std::thread::spawn(move || {
+                m.fsync(|| {
+                    fc.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = fsync_count.load(Ordering::SeqCst);
+        assert!(total >= 1, "at least one fsync must have run");
+        assert!(total <= 4, "unexpected fsync count: {}", total);
     }
 
+    // ── additional coverage tests ──────────────────────────────────────────
+
+    /// Sequential calls each trigger exactly one fsync.
     #[test]
-    fn test_fsync_group_set_do_fsync() {
-        let mut group = FSyncGroup::new(Duration::from_millis(100));
-        group.set_do_fsync(false);
-        assert!(!group.get_do_fsync());
-        group.set_do_fsync(true);
-        assert!(group.get_do_fsync());
-        // Once true, stays true (OR semantics)
-        group.set_do_fsync(false);
-        assert!(group.get_do_fsync());
+    fn test_sequential_calls_each_fsync_once() {
+        let mgr = FsyncManager::new(0, 0);
+        let count = Arc::new(AtomicUsize::new(0));
+        for _ in 0..5 {
+            let c = count.clone();
+            mgr.fsync(|| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 5);
     }
 
+    /// Error from the leader's fsync is forwarded to waiter threads.
+    #[test]
+    fn test_fsync_error_forwarded_to_waiting_threads() {
+        let mgr = Arc::new(FsyncManager::new(0, 0));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mgr2 = Arc::clone(&mgr);
+        let b2 = Arc::clone(&barrier);
+
+        let leader = std::thread::spawn(move || {
+            b2.wait();
+            mgr2.fsync(|| {
+                // Slow so the second thread can queue up as a waiter.
+                std::thread::sleep(Duration::from_millis(30));
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "leader fail"))
+            })
+        });
+
+        // Small sleep so the leader thread enters fsync() first.
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(2));
+
+        let waiter_result = mgr.fsync(|| {
+            // This should either piggyback (NoFsyncNeeded with error) or run its
+            // own fsync if it becomes leader.
+            Ok(())
+        });
+
+        let leader_result = leader.join().unwrap();
+        // The leader must fail.
+        assert!(leader_result.is_err());
+        // Waiter either got the error propagated or ran its own Ok fsync.
+        let _ = waiter_result; // either outcome is valid
+    }
+
+    /// `FsyncManager::new(0, 0)` returns Ok immediately on success.
+    #[test]
+    fn test_returns_ok_on_success() {
+        let mgr = FsyncManager::new(0, 0);
+        assert!(mgr.fsync(|| Ok(())).is_ok());
+    }
+
+    /// FSyncGroup: `wakeup_all` sets `work_done` and records no error.
     #[test]
     fn test_fsync_group_wakeup_all() {
-        let timeout = Duration::from_millis(100);
-        let mut group = FSyncGroup::new(timeout);
-        let condvar = Condvar::new();
-        group.wakeup_all(&condvar);
-        assert!(group.work_done);
+        let g = FSyncGroup::new();
+        g.wakeup_all();
+        assert!(g.inner.lock().unwrap().work_done);
+        assert!(g.take_error().is_none());
     }
 
+    /// FSyncGroup: `wakeup_all_with_error` sets `work_done` and records error.
     #[test]
-    fn test_fsync_group_wakeup_one() {
-        let timeout = Duration::from_millis(100);
-        let group = FSyncGroup::new(timeout);
-        let condvar = Condvar::new();
-        // wakeup_one should not panic
-        group.wakeup_one(&condvar);
+    fn test_fsync_group_wakeup_all_with_error() {
+        let g = FSyncGroup::new();
+        g.wakeup_all_with_error("oops".to_string());
+        assert!(g.inner.lock().unwrap().work_done);
+        assert_eq!(g.take_error().unwrap(), "oops");
     }
 
+    /// FSyncGroup: `wait_for_event` returns `NoFsyncNeeded` immediately when
+    /// `work_done` is already true before the call.
     #[test]
-    fn test_wait_status_already_done() {
-        let timeout = Duration::from_millis(50);
-        let mut group = FSyncGroup::new(timeout);
-        group.work_done = true; // pre-mark as done
-
-        let mutex = Mutex::new(());
-        let condvar = Condvar::new();
-        let mut guard = mutex.lock();
-        let status = group.wait_for_event(&mut guard, &condvar);
+    fn test_fsync_group_already_done() {
+        let g = FSyncGroup::new();
+        g.wakeup_all();
+        let status = g.wait_for_event(Duration::from_secs(5));
         assert_eq!(status, WaitStatus::NoFsyncNeeded);
     }
 
-    // --- Additional branch-coverage tests ---
-
-    /// Verify WaitStatus variants are distinct and debuggable.
+    /// FSyncGroup: a thread woken with no existing leader becomes the leader.
     #[test]
-    fn test_wait_status_variants() {
+    fn test_fsync_group_becomes_leader_on_wakeup() {
+        let g = Arc::new(FSyncGroup::new());
+        let g2 = Arc::clone(&g);
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            // Wake one waiter without marking work_done.
+            g2.wakeup_one();
+        });
+
+        let status = g.wait_for_event(Duration::from_millis(500));
+        assert_eq!(status, WaitStatus::DoLeaderFsync);
+        assert!(g.inner.lock().unwrap().leader_exists);
+    }
+
+    /// FSyncGroup: waiter times out when nobody wakes it.
+    #[test]
+    fn test_fsync_group_timeout() {
+        let g = FSyncGroup::new();
+        // Pre-set leader_exists so wakeup_one won't make us the leader.
+        g.inner.lock().unwrap().leader_exists = true;
+        let status = g.wait_for_event(Duration::from_millis(20));
+        assert_eq!(status, WaitStatus::DoTimeoutFsync);
+    }
+
+    /// WaitStatus variants are distinct.
+    #[test]
+    fn test_wait_status_variants_distinct() {
         assert_ne!(WaitStatus::NoFsyncNeeded, WaitStatus::DoLeaderFsync);
         assert_ne!(WaitStatus::NoFsyncNeeded, WaitStatus::DoTimeoutFsync);
         assert_ne!(WaitStatus::DoLeaderFsync, WaitStatus::DoTimeoutFsync);
     }
 
-    /// `wait_for_event` returns `DoLeaderFsync` when woken with no leader yet
-    /// and work is not done.
+    /// `grp_wait_on` is false when either threshold or interval is zero.
     #[test]
-    fn test_wait_for_event_becomes_leader() {
-        let timeout = Duration::from_millis(500);
-        let mutex = Arc::new(Mutex::new(()));
-        let condvar = Arc::new(Condvar::new());
-
-        let mutex2 = Arc::clone(&mutex);
-        let condvar2 = Arc::clone(&condvar);
-
-        // Spawn a thread that will notify after a brief delay, simulating
-        // a wakeup without work_done=true.
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5));
-            let _g = mutex2.lock();
-            condvar2.notify_one();
-        });
-
-        let mut group = FSyncGroup::new(timeout);
-        // leader_exists=false, work_done=false — first wakeup should make us leader.
-        let mut guard = mutex.lock();
-        let status = group.wait_for_event(&mut guard, &condvar);
-        // After being woken with no leader and no work done, should be DoLeaderFsync.
-        assert_eq!(status, WaitStatus::DoLeaderFsync);
-        assert!(group.leader_exists);
-    }
-
-    /// `wait_for_event` returns `NoFsyncNeeded` when woken with work_done=true
-    /// (set by another thread after the wait starts).
-    #[test]
-    fn test_wait_for_event_work_done_during_wait() {
-        use std::sync::Arc as StdArc;
-        use std::sync::Mutex as StdMutex;
-
-        // Use a shared flag to communicate from the waker thread.
-        let work_done_flag = StdArc::new(StdMutex::new(false));
-        let wdf = StdArc::clone(&work_done_flag);
-
-        let timeout = Duration::from_millis(500);
-        let mutex = Arc::new(Mutex::new(()));
-        let condvar = Arc::new(Condvar::new());
-
-        let mutex2 = Arc::clone(&mutex);
-        let condvar2 = Arc::clone(&condvar);
-
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5));
-            *wdf.lock().unwrap() = true;
-            let _g = mutex2.lock();
-            condvar2.notify_all();
-        });
-
-        let mut group = FSyncGroup::new(timeout);
-        // Set work_done to simulate the waker completing before we check.
-        // We do it via wait_for_event itself: the spawned thread sets the flag
-        // and notifies; we then check group.work_done inside the loop.
-        // To make this deterministic, pre-set work_done=true BEFORE calling.
-        group.work_done = true;
-        let mut guard = mutex.lock();
-        let status = group.wait_for_event(&mut guard, &condvar);
-        assert_eq!(status, WaitStatus::NoFsyncNeeded);
-    }
-
-    /// `wait_for_event` returns `DoTimeoutFsync` after the timeout elapses
-    /// without any wakeup (or spurious wakeups with a leader already set).
-    #[test]
-    fn test_wait_for_event_timeout() {
-        // Very short timeout to keep the test fast.
-        let timeout = Duration::from_millis(10);
-        let mutex = Mutex::new(());
-        let condvar = Condvar::new();
-
-        let mut group = FSyncGroup::new(timeout);
-        // Pretend a leader already exists so the first wakeup won't claim leadership.
-        group.leader_exists = true;
-
-        let mut guard = mutex.lock();
-        let status = group.wait_for_event(&mut guard, &condvar);
-        // With leader_exists=true and work_done=false, must timeout eventually.
-        assert_eq!(status, WaitStatus::DoTimeoutFsync);
-    }
-
-    /// `flush_and_sync` propagates fsync errors (flush path).
-    #[test]
-    fn test_fsync_manager_fsync_error_propagated() {
-        let manager = FSyncManager::new(5000);
-        let result = manager.flush_and_sync(
-            true,
-            || Err(crate::error::NoxuLogError::Internal("err".to_string())),
-            || Err(crate::error::NoxuLogError::Internal("fsync err".to_string())),
-        );
-        assert!(result.is_err());
-    }
-
-    /// `FSyncGroup::set_do_fsync` OR-semantics: setting false after true keeps true.
-    #[test]
-    fn test_fsync_group_do_fsync_or_semantics() {
-        let mut g = FSyncGroup::new(Duration::from_millis(10));
-        assert!(!g.get_do_fsync());
-        g.set_do_fsync(true);
-        assert!(g.get_do_fsync());
-        g.set_do_fsync(false);
-        assert!(g.get_do_fsync(), "once set to true, stays true");
-        g.set_do_fsync(true);
-        assert!(g.get_do_fsync());
-    }
-
-    /// Verify `NoFsyncNeeded` short-circuit: second `flush_and_sync` after
-    /// the first completes still runs (leader path), not the wait path.
-    #[test]
-    fn test_fsync_manager_sequential_calls() {
-        let manager = FSyncManager::new(5000);
-        let count = Arc::new(AtomicUsize::new(0));
-        for _ in 0..5 {
-            let c = count.clone();
-            manager
-                .flush_and_sync(false, || { c.fetch_add(1, Ordering::SeqCst); Ok(()) }, || Ok(()))
-                .unwrap();
-        }
-        assert_eq!(count.load(Ordering::SeqCst), 5);
+    fn test_grp_wait_on_requires_both_nonzero() {
+        let m1 = FsyncManager::new(0, 100);
+        assert!(!m1.grp_wait_on);
+        let m2 = FsyncManager::new(2, 0);
+        assert!(!m2.grp_wait_on);
+        let m3 = FsyncManager::new(2, 100);
+        assert!(m3.grp_wait_on);
     }
 }

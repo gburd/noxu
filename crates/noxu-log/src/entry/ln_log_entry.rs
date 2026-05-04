@@ -331,7 +331,15 @@ impl LnLogEntry {
     }
 
     /// Reads an entry from a buffer.
-    pub fn read_from_log(buf: &[u8]) -> Result<Self, LnLogEntryError> {
+    ///
+    /// `is_transactional` must match the log entry type used when the entry was
+    /// written (e.g. `InsertLNTxn` → true, `InsertLN` → false).  JE stores
+    /// this information in the outer `LogEntryType` byte, not in the LN payload
+    /// flags, so callers must pass it explicitly.
+    pub fn read_from_log(
+        buf: &[u8],
+        is_transactional: bool,
+    ) -> Result<Self, LnLogEntryError> {
         let mut cursor = Cursor::new(buf);
 
         // Read flags
@@ -339,13 +347,6 @@ impl LnLogEntry {
 
         // Database ID
         let db_id = cursor.read_u64::<BigEndian>()?;
-
-        // Determine if transactional (heuristic: check remaining bytes)
-        let position_after_dbid = cursor.position() as usize;
-        let _remaining = buf.len() - position_after_dbid;
-
-        // For now, assume transactional if flags indicate abort fields
-        let is_transactional = flags.have_abort_lsn() || flags.have_abort_key();
 
         // Transactional fields
         let (txn_id, abort_lsn) = if is_transactional {
@@ -459,7 +460,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = LnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = LnLogEntry::read_from_log(&buf, true).unwrap();
         assert_eq!(entry.db_id, decoded.db_id);
         assert_eq!(entry.txn_id, decoded.txn_id);
         assert_eq!(entry.key, decoded.key);
@@ -488,7 +489,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = LnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = LnLogEntry::read_from_log(&buf, false).unwrap();
         assert_eq!(entry.db_id, decoded.db_id);
         assert_eq!(entry.key, decoded.key);
         assert!(decoded.is_deleted());
@@ -515,7 +516,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = LnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = LnLogEntry::read_from_log(&buf, true).unwrap();
         assert_eq!(entry.abort_lsn, decoded.abort_lsn);
         assert_eq!(entry.abort_known_deleted, decoded.abort_known_deleted);
         assert_eq!(entry.abort_key, decoded.abort_key);
