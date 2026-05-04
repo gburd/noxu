@@ -206,10 +206,17 @@ impl NameLnLogEntry {
     }
 
     /// Reads an entry from a buffer.
-    pub fn read_from_log(buf: &[u8]) -> Result<Self, NameLnLogEntryError> {
+    ///
+    /// `is_transactional` must be true when the NameLN was written inside a
+    /// transaction (i.e. the outer `LogEntryType` is a `*Txn` variant).
+    /// NameLN operations (create, rename, truncate) are typically transactional.
+    pub fn read_from_log(
+        buf: &[u8],
+        is_transactional: bool,
+    ) -> Result<Self, NameLnLogEntryError> {
         // Read the base LN entry first
         // We need to track position manually since LnLogEntry consumes variable bytes
-        let ln_entry = LnLogEntry::read_from_log(buf)?;
+        let ln_entry = LnLogEntry::read_from_log(buf, is_transactional)?;
 
         // Calculate how many bytes the LN entry consumed
         let mut temp_buf = BytesMut::new();
@@ -258,7 +265,6 @@ mod tests {
     use noxu_util::lsn::NULL_LSN;
 
     #[test]
-    #[ignore] // TODO: Fix LnLogEntry transactional serialization round-trip
     fn test_name_ln_create_roundtrip() {
         let entry = NameLnLogEntry::new_create(
             100,
@@ -272,7 +278,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = NameLnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = NameLnLogEntry::read_from_log(&buf, true).unwrap();
         assert_eq!(entry.operation_type, decoded.operation_type);
         assert_eq!(entry.ln_entry.db_id, decoded.ln_entry.db_id);
         assert_eq!(entry.ln_entry.key, decoded.ln_entry.key);
@@ -290,7 +296,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = NameLnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = NameLnLogEntry::read_from_log(&buf, false).unwrap();
         assert_eq!(entry.operation_type, DbOperationType::Remove);
         assert_eq!(decoded.operation_type, DbOperationType::Remove);
         assert!(decoded.ln_entry.is_deleted());
@@ -310,7 +316,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = NameLnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = NameLnLogEntry::read_from_log(&buf, true).unwrap();
         assert_eq!(entry.operation_type, DbOperationType::Truncate);
         assert_eq!(decoded.truncate_old_db_id, Some(999));
     }
@@ -465,7 +471,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = NameLnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = NameLnLogEntry::read_from_log(&buf, false).unwrap();
         assert_eq!(decoded.operation_type, DbOperationType::Rename);
         assert!(decoded.replicated_create_config.is_none());
         assert!(decoded.truncate_old_db_id.is_none());
@@ -503,7 +509,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = NameLnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = NameLnLogEntry::read_from_log(&buf, false).unwrap();
         assert_eq!(decoded.operation_type, DbOperationType::UpdateConfig);
         assert_eq!(decoded.replicated_create_config, Some(config_bytes));
         assert!(decoded.truncate_old_db_id.is_none());
@@ -535,7 +541,7 @@ mod tests {
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
 
-        let decoded = NameLnLogEntry::read_from_log(&buf).unwrap();
+        let decoded = NameLnLogEntry::read_from_log(&buf, false).unwrap();
         assert_eq!(decoded.operation_type, DbOperationType::None);
         assert!(decoded.replicated_create_config.is_none());
         assert!(decoded.truncate_old_db_id.is_none());

@@ -5,16 +5,10 @@
 //! Scans backward from the end of log looking for checkpoint entries.
 //! Used during recovery to find the last checkpoint.
 
+use crate::entry_type::LogEntryType;
 use crate::error::Result;
 use crate::file_reader::{FileReader, LogFileAccess};
 use noxu_util::lsn::Lsn;
-
-/// Entry type constants (stub - will be replaced with actual LogEntryType enum).
-///
-/// TODO: Replace with actual entry type definitions from entry module.
-const LOG_CKPT_END: u8 = 1;
-const LOG_CKPT_START: u8 = 2;
-const LOG_DBTREE: u8 = 3;
 
 /// Searches for checkpoint and DbTree entries.
 ///
@@ -88,15 +82,15 @@ impl<F: LogFileAccess> CheckpointFileReader<F> {
             // Check if this entry is a checkpoint-related type
             if let Some(header) = self.reader.get_current_entry_header() {
                 let is_target = match header.entry_type {
-                    LOG_CKPT_END => {
+                    t if t == LogEntryType::CkptEnd as u8 => {
                         self.is_checkpoint_end = true;
                         true
                     }
-                    LOG_CKPT_START => {
+                    t if t == LogEntryType::CkptStart as u8 => {
                         self.is_checkpoint_start = true;
                         true
                     }
-                    LOG_DBTREE => {
+                    t if t == LogEntryType::DbTree as u8 => {
                         self.is_db_tree = true;
                         true
                     }

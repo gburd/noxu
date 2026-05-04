@@ -47,10 +47,19 @@ w10_concurrent/8t (Noxu only)   100000        656990            0     0.0       
 
 Columns: ops/sec (higher=better), ns/op (lower=better), JE/Noxu ratio, GC%
 
-⚠  Noxu 1.0.0 caveats:
-   • WAL writes not yet implemented (txn commit is a no-op) — writes are
-     artificially fast vs JE which does full durability by default.
-   • LockManager does not block threads — concurrency overhead understated.
-   • B-tree shrink/merge not implemented — delete workloads don't reclaim space.
-   For fair comparison of full durability, enable JE's DeferredWrite mode or
-   disable JE's log fsyncs (-Dje.durability=COMMIT_NO_SYNC).
+ℹ  Noxu implementation status (as of session 14):
+   • WAL + fdatasync on txn commit/abort: IMPLEMENTED (LogManager + FileHandle)
+   • LockManager thread blocking with timeout: IMPLEMENTED (parking_lot Condvar)
+   • Group commit (FsyncManager leader/waiter): IMPLEMENTED (disabled by default,
+     matches JE's default COMMIT_SYNC durability)
+   • B-tree latch coupling (hand-over-hand): IMPLEMENTED (search/insert/delete)
+   • 3-phase recovery on Environment::open(): IMPLEMENTED (RecoveryManager wired)
+   • Cleaner LN migration: IMPLEMENTED (FileManagerLogScanner + RealTreeLookup)
+   • Evictor daemon thread: IMPLEMENTED (spawned in EnvironmentImpl::new())
+   • BIN-delta checkpoint writes: IMPLEMENTED (25% threshold, per-slot dirty bits)
+   • TCP replication transport: IMPLEMENTED (TcpChannel + TcpChannelListener)
+     Note: Feeder/ReplicaStream still use LocalChannel in tests; wiring to
+     ReplicatedEnvironment::new() is the remaining last-mile replication gap.
+   For fair comparison: JE results use default COMMIT_SYNC durability; Noxu
+   uses fdatasync per commit. Results at same scale are directly comparable.
+

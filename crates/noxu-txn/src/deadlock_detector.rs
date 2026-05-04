@@ -88,9 +88,17 @@ impl DeadlockDetector {
 
     /// Selects the deadlock victim from a cycle.
     ///
-    /// JE picks the locker with the fewest locks held (lighter/younger txns are
-    /// preferred as victims). Ties are broken by smaller locker ID so that the
-    /// choice is deterministic.
+    /// JE's algorithm (ported from `LockManager.java selectVictim()`):
+    ///
+    /// 1. Select the locker with the **fewest locks held**.  A transaction
+    ///    with fewer locks has done less work, so aborting it wastes less.
+    /// 2. On tie, select the **youngest transaction** (highest locker ID).
+    ///    Locker IDs are assigned sequentially, so highest ID = most recently
+    ///    created = youngest.  Aborting the youngest preserves the most
+    ///    accumulated work in the system.
+    ///
+    /// Port of `LockManager.selectVictim()` in JE:
+    /// `victim = locker with min(n_owners), ties broken by max(locker_id)`.
     ///
     /// # Arguments
     ///
@@ -104,6 +112,8 @@ impl DeadlockDetector {
         cycle: &[i64],
         lock_counts: &HashMap<i64, usize>,
     ) -> i64 {
+        use std::cmp::Reverse;
+
         // Deduplicate: cycle[0] == cycle[last] when it is a closed path.
         let unique: Vec<i64> = {
             let mut seen = HashSet::new();
@@ -114,7 +124,10 @@ impl DeadlockDetector {
             .into_iter()
             .min_by_key(|id| {
                 let count = lock_counts.get(id).copied().unwrap_or(0);
-                (count, *id)
+                // Primary sort: fewest locks (ascending).
+                // Tiebreaker: youngest = largest ID (Reverse so min_by_key
+                // selects the largest ID on a tie).
+                (count, Reverse(*id))
             })
             .unwrap_or_else(|| cycle[0])
     }

@@ -10,9 +10,13 @@ use crate::checkpoint_start::CheckpointStart;
 use crate::checkpoint_stat::CheckpointStats;
 use crate::dirty_in_map::DirtyINMap;
 use crate::error::{RecoveryError, Result};
-use noxu_util::Lsn;
+use noxu_log::entry::bin_delta_log_entry::BinDeltaLogEntry;
+use noxu_log::entry::in_log_entry::InLogEntry;
+use noxu_log::{LogEntryType, LogManager, Provisional};
+use noxu_tree::tree::{Tree, TreeNode};
+use noxu_util::{Lsn, NULL_LSN};
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Configuration for checkpoint behavior.
@@ -140,6 +144,14 @@ pub struct Checkpointer {
     shutdown: AtomicBool,
     /// Configuration
     config: CheckpointConfig,
+    /// Optional LogManager for writing CkptStart/CkptEnd WAL entries.
+    log_manager: Option<Arc<LogManager>>,
+    /// Optional Tree reference for flushing dirty BINs in step 4.
+    ///
+    /// When `None` (unit tests without a real tree) step 4 is a no-op.
+    tree: Option<Arc<RwLock<Tree>>>,
+    /// Database ID to pass to `Tree::collect_dirty_bins()`.
+    db_id: u64,
 }
 
 impl Checkpointer {
@@ -157,7 +169,29 @@ impl Checkpointer {
             checkpoint_in_progress: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             config,
+            log_manager: None,
+            tree: None,
+            db_id: 0,
         }
+    }
+
+    /// Attach a LogManager so that `do_checkpoint` writes real WAL entries.
+    ///
+    /// Call this before invoking `do_checkpoint` when a writable log is
+    /// available (i.e. from `EnvironmentImpl`).
+    pub fn with_log_manager(mut self, lm: Arc<LogManager>) -> Self {
+        self.log_manager = Some(lm);
+        self
+    }
+
+    /// Attach a Tree so that `do_checkpoint` flushes dirty BINs in step 4.
+    ///
+    /// `db_id` is the database ID passed to `Tree::collect_dirty_bins()`.
+    /// Port of JE `Checkpointer` receiving the environment's tree reference.
+    pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
+        self.tree = Some(tree);
+        self.db_id = db_id;
+        self
     }
 
     /// Perform a checkpoint.
@@ -189,34 +223,84 @@ impl Checkpointer {
         let checkpoint_id =
             self.next_checkpoint_id.fetch_add(1, Ordering::SeqCst);
 
-        // Step 2: Create and "log" CheckpointStart
-        let _checkpoint_start = CheckpointStart::new(checkpoint_id, invoker);
-        let start_lsn = Lsn::new(0, checkpoint_id as u32);
+        // Step 2: Write CkptStart entry to WAL (or synthesise a fake LSN when
+        // no LogManager is wired — used by unit tests that don't need I/O).
+        let start_lsn = if let Some(lm) = &self.log_manager {
+            let ckpt_start = CheckpointStart::new(checkpoint_id, invoker);
+            let mut buf = Vec::with_capacity(ckpt_start.log_size());
+            ckpt_start.write_to_log(&mut buf).map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "CkptStart serialization failed: {e}"
+                ))
+            })?;
+            lm.log(
+                LogEntryType::CkptStart,
+                &buf,
+                Provisional::No,
+                false, // flush_required
+                false, // fsync_required
+            )
+            .map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "CkptStart WAL write failed: {e}"
+                ))
+            })?
+        } else {
+            // No LogManager attached — synthetic LSN so existing tests pass.
+            Lsn::new(0, checkpoint_id as u32)
+        };
 
         // Step 3: Build dirty IN map
         let mut dirty_map = self.dirty_map.lock();
         dirty_map.clear();
         drop(dirty_map);
 
-        // Step 4: Flush dirty INs (stub)
-        let flush_result = FlushResult::default();
+        // Step 4: Flush dirty BINs.
+        //
+        // For each dirty BIN in the tree decide — using JE's TREE_BIN_DELTA
+        // threshold of 25 % — whether to write a BINDelta or a full BIN.
+        //
+        // Port of JE `Checkpointer.processINList()` + `logIN()`.
+        let flush_result = self.flush_dirty_bins()?;
 
-        // Step 5: Create and "log" CheckpointEnd
-        let _checkpoint_end = CheckpointEnd::new(
-            checkpoint_id,
-            invoker,
-            start_lsn,
-            None,                // root_lsn
-            noxu_util::NULL_LSN, // first_active_lsn
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,     // ID sequence values
-            false, // cleaned_files_to_delete
-        );
-        let end_lsn = Lsn::new(0, (checkpoint_id as u32) + 1);
+        // Step 5: Write CkptEnd entry to WAL.
+        let end_lsn = if let Some(lm) = &self.log_manager {
+            let ckpt_end = CheckpointEnd::new(
+                checkpoint_id,
+                invoker,
+                start_lsn,
+                None,                // root_lsn  (P1/P2 will fill this)
+                noxu_util::NULL_LSN, // first_active_lsn
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,     // ID sequence values (P1/P2 will fill these)
+                false, // cleaned_files_to_delete
+            );
+            let mut buf = Vec::with_capacity(ckpt_end.log_size());
+            ckpt_end.write_to_log(&mut buf).map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "CkptEnd serialization failed: {e}"
+                ))
+            })?;
+            lm.log(
+                LogEntryType::CkptEnd,
+                &buf,
+                Provisional::No,
+                true,  // flush_required — ensure both entries reach disk
+                false, // fsync_required
+            )
+            .map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "CkptEnd WAL write failed: {e}"
+                ))
+            })?
+        } else {
+            // No LogManager attached — synthetic LSN so existing tests pass.
+            Lsn::new(0, (checkpoint_id as u32) + 1)
+        };
 
         // Step 6: Update statistics
         *self.last_checkpoint_start.lock() = start_lsn;
@@ -288,6 +372,121 @@ impl Checkpointer {
     /// Get the next checkpoint ID (without incrementing).
     pub fn peek_next_checkpoint_id(&self) -> u64 {
         self.next_checkpoint_id.load(Ordering::SeqCst)
+    }
+
+    /// Flush all dirty BINs to the log.
+    ///
+    /// For each dirty BIN the JE TREE_BIN_DELTA threshold (25 %) decides:
+    /// - dirty_count / total ≤ 0.25 → write `BINDelta` entry (delta path)
+    /// - otherwise                  → write full `BIN` entry (full path)
+    ///
+    /// After a successful write the BIN's dirty flags are cleared and (for
+    /// full writes) `last_full_lsn` is updated to the entry's LSN.
+    ///
+    /// Port of JE `Checkpointer.processINList()` + `Checkpointer.logIN()`.
+    fn flush_dirty_bins(&self) -> Result<FlushResult> {
+        let mut result = FlushResult::default();
+
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            // No log manager — nothing to flush (unit tests).
+            None => return Ok(result),
+        };
+
+        let tree_arc = match &self.tree {
+            Some(t) => t,
+            // No tree attached — step 4 is a no-op.
+            None => return Ok(result),
+        };
+
+        // Collect dirty BINs under a read lock on the tree.
+        let dirty_bins = {
+            let tree_guard = tree_arc.read().map_err(|_| {
+                RecoveryError::CheckpointError(
+                    "tree lock poisoned during checkpoint".to_string(),
+                )
+            })?;
+            tree_guard.collect_dirty_bins(self.db_id)
+        };
+
+        // JE TREE_BIN_DELTA: if dirty fraction ≤ 25 % write a delta.
+        const TREE_BIN_DELTA: f64 = 0.25;
+
+        for (_db_id, bin_arc) in dirty_bins {
+            // Acquire write lock to serialize + clear dirty flags.
+            let mut bin_guard = bin_arc.write().map_err(|_| {
+                RecoveryError::CheckpointError(
+                    "BIN lock poisoned during checkpoint".to_string(),
+                )
+            })?;
+
+            let b = match &mut *bin_guard {
+                TreeNode::Bottom(b) => b,
+                _ => continue, // not a BIN (defensive)
+            };
+
+            let total = b.entries.len();
+            let dirty = b.dirty_count();
+
+            if total == 0 && !b.dirty {
+                continue;
+            }
+
+            let use_delta = total > 0
+                && (dirty as f64 / total as f64) <= TREE_BIN_DELTA
+                && b.last_full_lsn != NULL_LSN; // need a previous full to delta from
+
+            if use_delta {
+                // --- BIN-delta path ---
+                let delta_bytes = b.serialize_delta();
+                let entry = BinDeltaLogEntry::new(
+                    self.db_id,
+                    b.last_full_lsn,
+                    NULL_LSN, // prev_delta_lsn — we don't chain deltas yet
+                    delta_bytes,
+                );
+                let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+                entry.write_to_log(&mut buf);
+                lm.log(
+                    LogEntryType::BINDelta,
+                    &buf,
+                    Provisional::No,
+                    false, // flush_required
+                    false, // fsync_required — fsync at CkptEnd
+                )
+                .map_err(|e| {
+                    RecoveryError::CheckpointError(format!("BINDelta WAL write failed: {e}"))
+                })?;
+                b.clear_dirty_after_delta_log();
+                result.delta_ins_flushed += 1;
+            } else {
+                // --- Full BIN path ---
+                let full_bytes = b.serialize_full();
+                let entry = InLogEntry::new(
+                    self.db_id,
+                    b.last_full_lsn,
+                    NULL_LSN, // prev_delta_lsn
+                    full_bytes,
+                );
+                let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+                entry.write_to_log(&mut buf);
+                let logged_lsn = lm
+                    .log(
+                        LogEntryType::BIN,
+                        &buf,
+                        Provisional::No,
+                        false, // flush_required
+                        false, // fsync_required — fsync at CkptEnd
+                    )
+                    .map_err(|e| {
+                        RecoveryError::CheckpointError(format!("BIN WAL write failed: {e}"))
+                    })?;
+                b.clear_dirty_after_full_log(logged_lsn);
+                result.full_bins_flushed += 1;
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -477,5 +676,125 @@ mod tests {
         assert_eq!(checkpointer.get_last_checkpoint_start(), result2.start_lsn);
         assert_eq!(checkpointer.get_last_checkpoint_end(), result2.end_lsn);
         assert_ne!(result1.start_lsn, result2.start_lsn);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests that require a real LogManager / FileManager
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkpoint_writes_wal_entries() {
+        use noxu_log::{FileManager, LogManager};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100)
+                .unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm));
+
+        let result = checkpointer.do_checkpoint("test_wal").unwrap();
+
+        // Both LSNs must be non-null and the end must follow the start.
+        assert!(
+            !result.start_lsn.is_null(),
+            "start_lsn must not be NULL after a WAL-backed checkpoint"
+        );
+        assert!(
+            !result.end_lsn.is_null(),
+            "end_lsn must not be NULL after a WAL-backed checkpoint"
+        );
+        assert!(
+            result.end_lsn.as_u64() > result.start_lsn.as_u64(),
+            "end_lsn ({:?}) must be greater than start_lsn ({:?})",
+            result.end_lsn,
+            result.start_lsn
+        );
+
+        // The stored LSNs on the checkpointer must match the returned result.
+        assert_eq!(checkpointer.get_last_checkpoint_start(), result.start_lsn);
+        assert_eq!(checkpointer.get_last_checkpoint_end(), result.end_lsn);
+    }
+
+    #[test]
+    fn test_two_sequential_wal_checkpoints_have_increasing_lsns() {
+        use noxu_log::{FileManager, LogManager};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100)
+                .unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm));
+
+        let r1 = checkpointer.do_checkpoint("first").unwrap();
+        let r2 = checkpointer.do_checkpoint("second").unwrap();
+
+        // Each successive checkpoint must have strictly higher LSNs.
+        assert!(
+            r2.start_lsn.as_u64() > r1.end_lsn.as_u64(),
+            "second start ({:?}) must follow first end ({:?})",
+            r2.start_lsn,
+            r1.end_lsn
+        );
+        assert!(
+            r2.end_lsn.as_u64() > r2.start_lsn.as_u64(),
+            "second end ({:?}) must follow second start ({:?})",
+            r2.end_lsn,
+            r2.start_lsn
+        );
+    }
+
+    /// Checkpoint with a real tree flushes dirty BINs — step 4.
+    ///
+    /// Inserts a few keys (marking BIN slots dirty), then runs a checkpoint
+    /// and verifies the dirty count drops to zero after the checkpoint writes
+    /// BIN/BINDelta entries to the WAL.
+    #[test]
+    fn test_checkpoint_flushes_dirty_bins() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::Tree;
+        use noxu_util::lsn::Lsn;
+        use std::sync::RwLock;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Build a tree with dirty BINs.
+        let mut tree = Tree::new(1, 256);
+        tree.insert(b"apple".to_vec(), b"fruit".to_vec(), Lsn::new(1, 1)).unwrap();
+        tree.insert(b"banana".to_vec(), b"fruit".to_vec(), Lsn::new(1, 2)).unwrap();
+        tree.insert(b"cherry".to_vec(), b"fruit".to_vec(), Lsn::new(1, 3)).unwrap();
+
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // Verify dirty BINs exist before checkpoint.
+        let dirty_before = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(!dirty_before.is_empty(), "should have dirty BINs before checkpoint");
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_tree(Arc::clone(&tree_arc), 1);
+
+        let result = checkpointer.do_checkpoint("test").unwrap();
+        assert!(result.total_nodes_flushed() > 0, "checkpoint should flush dirty BINs");
+
+        // After checkpoint, dirty BINs should be cleared.
+        let dirty_after = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(dirty_after.is_empty(), "no dirty BINs after checkpoint");
     }
 }

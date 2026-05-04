@@ -408,7 +408,7 @@ fn test_loggable_ln_log_entry_roundtrip() {
 
     assert_eq!(buf.len(), orig.log_size(), "LnLogEntry log_size mismatch");
 
-    let decoded = LnLogEntry::read_from_log(&buf).unwrap();
+    let decoded = LnLogEntry::read_from_log(&buf, true).unwrap();
     assert_eq!(orig.txn_id, decoded.txn_id);
     assert_eq!(orig.key, decoded.key);
     assert_eq!(orig.data, decoded.data);
@@ -440,7 +440,7 @@ fn test_loggable_ln_log_entry_delete_roundtrip() {
 
     assert_eq!(buf.len(), orig.log_size());
 
-    let decoded = LnLogEntry::read_from_log(&buf).unwrap();
+    let decoded = LnLogEntry::read_from_log(&buf, false).unwrap();
     assert!(decoded.data.is_none(), "deleted entry must have None data");
     assert!(decoded.is_deleted());
     assert_eq!(orig.key, decoded.key);
@@ -631,38 +631,32 @@ fn test_header_post_marshalling_roundtrip() {
 // FSyncManagerTest — coalescing behavior
 // ============================================================================
 
-use noxu_log::fsync_manager::FSyncManager;
+use noxu_log::fsync_manager::FsyncManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Port of `FSyncManagerTest.testBasic` — multiple threads requesting fsync
 /// should result in fewer actual fsyncs than threads (coalescing).
 #[test]
 fn test_fsync_manager_grouping_reduces_fsyncs() {
-    let manager = Arc::new(FSyncManager::new(5000));
+    let manager = Arc::new(FsyncManager::new(0, 0));
     let fsync_count = Arc::new(AtomicUsize::new(0));
-    let flush_count = Arc::new(AtomicUsize::new(0));
 
     let n_threads = 8usize;
+    let barrier = Arc::new(std::sync::Barrier::new(n_threads));
     let mut handles = Vec::with_capacity(n_threads);
 
     for _ in 0..n_threads {
         let mgr = Arc::clone(&manager);
-        let fc = Arc::clone(&flush_count);
         let sc = Arc::clone(&fsync_count);
+        let b = Arc::clone(&barrier);
 
         let handle = std::thread::spawn(move || {
-            mgr.flush_and_sync(
-                true,
-                || {
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-                || {
-                    sc.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    Ok(())
-                },
-            )
+            b.wait();
+            mgr.fsync(|| {
+                sc.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                Ok(())
+            })
             .unwrap();
         });
 
@@ -674,61 +668,38 @@ fn test_fsync_manager_grouping_reduces_fsyncs() {
     }
 
     let fsyncs = fsync_count.load(Ordering::SeqCst);
-    let flushes = flush_count.load(Ordering::SeqCst);
     // Every thread must have completed (proven by join() above).
-    // Coalescing means fsyncs <= threads; strictly 0 is also valid when the
-    // leader's group was reset before it checked get_do_fsync().
+    // Coalescing means fsyncs < threads.
     assert!(
-        fsyncs <= n_threads,
-        "fsync_count ({}) should be <= n_threads ({})",
+        fsyncs < n_threads,
+        "fsync_count ({}) should be < n_threads ({}) due to coalescing",
         fsyncs,
         n_threads
     );
-    // Every thread must have contributed at least one flush call.
-    assert_eq!(
-        flushes, n_threads,
-        "each thread must have triggered exactly one flush"
-    );
 }
 
-/// Port of `FSyncManagerTest.testBasic` — flush_only path: flush is called
-/// but fsync is not required.
+/// Port of `FSyncManagerTest` — single-thread fsync: closure called once.
 #[test]
 fn test_fsync_manager_flush_only_no_fsync() {
-    let manager = FSyncManager::new(5000);
-    let flush_count = Arc::new(AtomicUsize::new(0));
-    let fsync_count = Arc::new(AtomicUsize::new(0));
+    let manager = FsyncManager::new(0, 0);
+    let call_count = Arc::new(AtomicUsize::new(0));
 
-    let fc = Arc::clone(&flush_count);
-    let sc = Arc::clone(&fsync_count);
-
+    let c = Arc::clone(&call_count);
     manager
-        .flush_and_sync(
-            false, // fsync_required = false
-            || {
-                fc.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            || {
-                sc.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        )
+        .fsync(|| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
         .unwrap();
 
-    assert_eq!(flush_count.load(Ordering::SeqCst), 1, "flush must be called");
-    assert_eq!(
-        fsync_count.load(Ordering::SeqCst),
-        0,
-        "fsync must NOT be called when fsync_required=false"
-    );
+    assert_eq!(call_count.load(Ordering::SeqCst), 1, "closure must be called once");
 }
 
 /// Port of `FSyncManagerTest` — waiter is notified after leader completes.
 #[test]
 fn test_fsync_manager_waiter_notified() {
     use std::sync::Barrier;
-    let manager = Arc::new(FSyncManager::new(5000));
+    let manager = Arc::new(FsyncManager::new(0, 0));
     let barrier = Arc::new(Barrier::new(2));
 
     let mgr1 = Arc::clone(&manager);
@@ -741,23 +712,18 @@ fn test_fsync_manager_waiter_notified() {
     let done2 = Arc::clone(&fsync_done);
 
     let t1 = std::thread::spawn(move || {
-        // Signal t2 that t1 is about to request fsync
         bar1.wait();
-        mgr1.flush_and_sync(
-            true,
-            || Ok(()),
-            || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                Ok(())
-            },
-        )
+        mgr1.fsync(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(())
+        })
         .unwrap();
         done1.fetch_add(1, Ordering::SeqCst);
     });
 
     let t2 = std::thread::spawn(move || {
         bar2.wait();
-        mgr2.flush_and_sync(true, || Ok(()), || Ok(())).unwrap();
+        mgr2.fsync(|| Ok(())).unwrap();
         done2.fetch_add(1, Ordering::SeqCst);
     });
 
@@ -772,42 +738,39 @@ fn test_fsync_manager_waiter_notified() {
     );
 }
 
-/// Port of `FSyncManagerTest` — error from flush propagates to caller.
+/// Port of `FSyncManagerTest` — error propagates to caller.
 #[test]
 fn test_fsync_manager_flush_error_propagates() {
-    let manager = FSyncManager::new(5000);
-    let result = manager.flush_and_sync(
-        false,
-        || {
-            Err(noxu_log::error::NoxuLogError::Internal(
-                "simulated flush error".to_string(),
-            ))
-        },
-        || Ok(()),
-    );
-    assert!(result.is_err(), "flush error must be propagated to caller");
+    let manager = FsyncManager::new(0, 0);
+    let result = manager.fsync(|| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "simulated flush error",
+        ))
+    });
+    assert!(result.is_err(), "error must be propagated to caller");
 }
 
-/// Port of `FSyncManagerTest` — consecutive single-threaded calls each flush.
+/// Port of `FSyncManagerTest` — consecutive single-threaded calls each run the closure.
 #[test]
 fn test_fsync_manager_sequential_calls_each_flush() {
-    let manager = FSyncManager::new(5000);
-    let flush_count = Arc::new(AtomicUsize::new(0));
+    let manager = FsyncManager::new(0, 0);
+    let call_count = Arc::new(AtomicUsize::new(0));
 
     for _ in 0..5 {
-        let c = Arc::clone(&flush_count);
+        let c = Arc::clone(&call_count);
         manager
-            .flush_and_sync(false, || {
+            .fsync(|| {
                 c.fetch_add(1, Ordering::SeqCst);
                 Ok(())
-            }, || Ok(()))
+            })
             .unwrap();
     }
 
     assert_eq!(
-        flush_count.load(Ordering::SeqCst),
+        call_count.load(Ordering::SeqCst),
         5,
-        "each sequential call must flush"
+        "each sequential call must run the fsync closure"
     );
 }
 

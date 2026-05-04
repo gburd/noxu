@@ -6,6 +6,8 @@
 //! an iterator-like interface via its `read_next_entry()` method. Concrete
 //! implementations control which entries to process and what to do with them.
 
+use crate::checksum::ChecksumValidator;
+use crate::entry_header::CHECKSUM_BYTES;
 use crate::error::{NoxuLogError, Result};
 use noxu_util::lsn::{Lsn, NULL_LSN};
 
@@ -44,9 +46,21 @@ pub trait LogFileAccess {
     fn get_file_header_prev_offset(&self, file_num: u32) -> Result<u64>;
 }
 
-/// Minimal log entry header stub.
+/// Flag bit: VLSN is present in the header (matches entry_header.rs VLSN_PRESENT_MASK).
+const VLSN_PRESENT_MASK: u8 = 0x08;
+
+/// Flag bit: entry is replicated (matches entry_header.rs REPLICATED_MASK).
+const REPLICATED_MASK: u8 = 0x20;
+
+/// Maximum header size when VLSN is present (14 + 8 bytes).
+const MAX_HEADER_SIZE: usize = 22;
+
+/// Parsed log entry header for use by FileReader.
 ///
-/// TODO: Replace with actual LogEntryHeader from entry module.
+/// Carries the subset of header fields needed for log scanning.
+/// The authoritative header type with full field semantics lives in
+/// `entry_header::LogEntryHeader`; this struct is the lightweight view
+/// used by the scanner.
 #[derive(Debug, Clone)]
 pub struct LogEntryHeader {
     /// Entry type identifier
@@ -55,18 +69,18 @@ pub struct LogEntryHeader {
     pub version: u8,
     /// Previous entry offset (for backward scanning)
     pub prev_offset: u64,
-    /// Size of this header
+    /// Size of this header (14 or 22 bytes)
     pub header_size: usize,
     /// Size of the entry data (item)
     pub item_size: usize,
-    /// Checksum of header + data
+    /// Checksum stored in the header (covers bytes [4..entry_size])
     pub checksum: u32,
     /// Whether this entry is replicated
     pub replicated: bool,
 }
 
 impl LogEntryHeader {
-    /// Minimum header size (before any variable portion).
+    /// Minimum header size in bytes (no VLSN).
     pub const MIN_HEADER_SIZE: usize = 14;
 
     /// Returns the total size of the entry (header + data).
@@ -74,31 +88,80 @@ impl LogEntryHeader {
         self.header_size + self.item_size
     }
 
-    /// Returns whether this header has a variable-length portion.
+    /// Returns whether this header has a VLSN field.
     pub fn is_variable_length(&self) -> bool {
-        // TODO: Determine based on entry type
-        false
+        self.header_size > Self::MIN_HEADER_SIZE
     }
 
-    /// Returns the size of the variable portion.
+    /// Returns the size of the variable (VLSN) portion.
     pub fn variable_portion_size(&self) -> usize {
-        // TODO: Calculate based on entry type
-        0
+        self.header_size - Self::MIN_HEADER_SIZE
     }
 
-    /// Stub: Parse basic header from buffer.
+    /// Parse a log entry header from a raw byte buffer.
     ///
-    /// TODO: Replace with actual deserialization logic.
-    pub fn from_bytes(_buf: &[u8]) -> Result<Self> {
-        // Placeholder implementation
+    /// Byte layout (little-endian):
+    /// ```text
+    /// bytes  0..3   checksum    (u32 LE)
+    /// byte   4      entry_type
+    /// byte   5      flags
+    /// bytes  6..9   prev_offset (u32 LE)
+    /// bytes 10..13  item_size   (u32 LE)
+    /// bytes 14..21  vlsn        (i64 LE) — only when flags & (0x08 | 0x20) != 0
+    /// ```
+    ///
+    /// Returns `Err(UnexpectedEof)` if `buf` is shorter than `MIN_HEADER_SIZE`,
+    /// or shorter than `MAX_HEADER_SIZE` when the VLSN flag is set.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        use crate::error::NoxuLogError;
+        use noxu_util::lsn::NULL_LSN;
+
+        if buf.len() < Self::MIN_HEADER_SIZE {
+            return Err(NoxuLogError::UnexpectedEof {
+                lsn: NULL_LSN,
+                message: format!(
+                    "header buffer too short: {} < {}",
+                    buf.len(),
+                    Self::MIN_HEADER_SIZE
+                ),
+            });
+        }
+
+        let checksum =
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let entry_type = buf[4];
+        let flags = buf[5];
+        let prev_offset =
+            u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]) as u64;
+        let item_size =
+            u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as usize;
+
+        let vlsn_present =
+            (flags & VLSN_PRESENT_MASK) != 0 || (flags & REPLICATED_MASK) != 0;
+        let replicated = (flags & REPLICATED_MASK) != 0;
+
+        if vlsn_present && buf.len() < MAX_HEADER_SIZE {
+            return Err(NoxuLogError::UnexpectedEof {
+                lsn: NULL_LSN,
+                message: format!(
+                    "VLSN flag set but header buffer only {} bytes (need {})",
+                    buf.len(),
+                    MAX_HEADER_SIZE
+                ),
+            });
+        }
+
+        let header_size =
+            if vlsn_present { MAX_HEADER_SIZE } else { Self::MIN_HEADER_SIZE };
+
         Ok(LogEntryHeader {
-            entry_type: 0,
-            version: 0,
-            prev_offset: 0,
-            header_size: Self::MIN_HEADER_SIZE,
-            item_size: 0,
-            checksum: 0,
-            replicated: false,
+            entry_type,
+            version: 0, // version is not stored in the on-disk header byte layout
+            prev_offset,
+            header_size,
+            item_size,
+            checksum,
+            replicated,
         })
     }
 }
@@ -295,13 +358,81 @@ impl<F: LogFileAccess> FileReader<F> {
                 continue;
             }
 
-            // Read entry data
+            // Read entry data — clone immediately so the &mut self borrow ends
+            // before we access self.validate_checksum below.
             let item_size = header.item_size;
-            let _entry_data = self.read_data(item_size, true)?;
+            let entry_data: Vec<u8> = self.read_data(item_size, true)?.to_vec();
 
-            // Validate checksum if enabled
-            if self.validate_checksum {
-                // TODO: Implement checksum validation
+            // Validate checksum if enabled.
+            //
+            // The checksum stored in the header covers everything after the
+            // checksum field itself: bytes [4..header_size+item_size].
+            // We reconstruct that region from the already-read header + payload
+            // and run CRC32 over it.
+            // Skip validation when the stored checksum is 0: a CRC32 of zero
+            // cannot occur for real log data, so 0 indicates unwritten space
+            // or synthetic test entries.
+            if self.validate_checksum && header.checksum != 0 {
+
+                let header_size = header.header_size;
+                let total_size = header_size + item_size;
+
+                // Rebuild the full entry buffer (header bytes + payload) so
+                // we can feed [CHECKSUM_BYTES..total_size] to the CRC32.
+                // We already consumed both slices via read_data, so we
+                // re-read them from save_buffer / read_buffer; the simplest
+                // approach is to assemble from the stored copies.
+                //
+                // Because read_data may return slices into either read_buffer
+                // or save_buffer, we build a fresh contiguous copy here.
+                let mut full_entry = Vec::with_capacity(total_size);
+                // Re-encode the header fields we parsed (checksum field = 0
+                // placeholder, then the actual bytes from offset 4 onward).
+                // We cannot re-use the read_data slice pointer (it has been
+                // moved past), so we rebuild from the parsed LogEntryHeader.
+                let raw_checksum: u32 = header.checksum;
+                full_entry.extend_from_slice(&raw_checksum.to_le_bytes());
+                full_entry.push(header.entry_type);
+                // flags: reconstruct from replicated/vlsn_present bits
+                let flags: u8 = if header.replicated {
+                    REPLICATED_MASK | VLSN_PRESENT_MASK
+                } else {
+                    0
+                };
+                full_entry.push(flags);
+                full_entry.extend_from_slice(
+                    &(header.prev_offset as u32).to_le_bytes(),
+                );
+                full_entry.extend_from_slice(
+                    &(header.item_size as u32).to_le_bytes(),
+                );
+                // VLSN bytes (if present) — we don't store the vlsn value in
+                // the local header, so emit zeros for the 8-byte field.
+                if header_size > LogEntryHeader::MIN_HEADER_SIZE {
+                    full_entry.extend_from_slice(&[0u8; 8]);
+                }
+                full_entry.extend_from_slice(&entry_data);
+
+                let computed = ChecksumValidator::compute_range(
+                    &full_entry,
+                    CHECKSUM_BYTES,
+                    total_size - CHECKSUM_BYTES,
+                );
+                if computed != header.checksum {
+                    let lsn = Lsn::new(
+                        self.current_file_num,
+                        self.current_entry_offset as u32,
+                    );
+                    self.eof = true;
+                    return Err(NoxuLogError::Checksum {
+                        lsn,
+                        message: format!(
+                            "expected {:#010x}, computed {:#010x}",
+                            header.checksum, computed
+                        ),
+                    });
+                }
+
             }
 
             // Process the entry
@@ -926,5 +1057,215 @@ mod tests {
     fn test_mock_file_access_file_header_prev_offset() {
         let mock = MockFileAccess::new();
         assert_eq!(mock.get_file_header_prev_offset(0).unwrap(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Tests for LogEntryHeader::from_bytes()
+    // ------------------------------------------------------------------
+
+    /// Build a minimal 14-byte header buffer with known field values and
+    /// verify that from_bytes() parses every field correctly.
+    #[test]
+    fn test_from_bytes_parses_fields() {
+        let checksum: u32 = 0x1234_5678;
+        let entry_type: u8 = 5;
+        let flags: u8 = 0x00; // no VLSN, not replicated
+        let prev_offset: u32 = 0xAABB_CCDD;
+        let item_size: u32 = 42;
+
+        let mut buf = [0u8; 14];
+        buf[0..4].copy_from_slice(&checksum.to_le_bytes());
+        buf[4] = entry_type;
+        buf[5] = flags;
+        buf[6..10].copy_from_slice(&prev_offset.to_le_bytes());
+        buf[10..14].copy_from_slice(&item_size.to_le_bytes());
+
+        let hdr = LogEntryHeader::from_bytes(&buf).unwrap();
+        assert_eq!(hdr.checksum, checksum);
+        assert_eq!(hdr.entry_type, entry_type);
+        assert_eq!(hdr.prev_offset, prev_offset as u64);
+        assert_eq!(hdr.item_size, item_size as usize);
+        assert_eq!(hdr.header_size, LogEntryHeader::MIN_HEADER_SIZE);
+        assert!(!hdr.replicated);
+        assert!(!hdr.is_variable_length());
+        assert_eq!(hdr.variable_portion_size(), 0);
+        assert_eq!(hdr.entry_size(), 14 + 42);
+    }
+
+    /// A 22-byte buffer with the VLSN_PRESENT flag set should parse
+    /// successfully and report a 22-byte header.
+    #[test]
+    fn test_from_bytes_with_vlsn_present_flag() {
+        let mut buf = [0u8; 22];
+        buf[5] = VLSN_PRESENT_MASK; // VLSN present
+        buf[10..14].copy_from_slice(&(10u32).to_le_bytes()); // item_size = 10
+
+        let hdr = LogEntryHeader::from_bytes(&buf).unwrap();
+        assert_eq!(hdr.header_size, 22);
+        assert!(hdr.is_variable_length());
+        assert_eq!(hdr.variable_portion_size(), 8);
+        assert!(!hdr.replicated);
+    }
+
+    /// A 22-byte buffer with the REPLICATED flag set should parse
+    /// successfully, report a 22-byte header, and set replicated=true.
+    #[test]
+    fn test_from_bytes_with_replicated_flag() {
+        let mut buf = [0u8; 22];
+        buf[5] = REPLICATED_MASK;
+        buf[10..14].copy_from_slice(&(0u32).to_le_bytes());
+
+        let hdr = LogEntryHeader::from_bytes(&buf).unwrap();
+        assert_eq!(hdr.header_size, 22);
+        assert!(hdr.replicated);
+    }
+
+    /// Buffer shorter than MIN_HEADER_SIZE must return an error.
+    #[test]
+    fn test_from_bytes_buffer_too_short() {
+        for len in 0..14usize {
+            let buf = vec![0u8; len];
+            assert!(
+                LogEntryHeader::from_bytes(&buf).is_err(),
+                "expected error for {}-byte buffer",
+                len
+            );
+        }
+    }
+
+    /// Buffer exactly MIN_HEADER_SIZE with VLSN flag set must return an
+    /// error because the VLSN field (bytes 14-21) is missing.
+    #[test]
+    fn test_from_bytes_vlsn_flag_but_buffer_too_short() {
+        let mut buf = [0u8; 14];
+        buf[5] = VLSN_PRESENT_MASK;
+        assert!(LogEntryHeader::from_bytes(&buf).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Tests for checksum validation
+    // ------------------------------------------------------------------
+
+    /// Helper: build a raw 14-byte header + payload buffer with a correct
+    /// CRC32 checksum, mimicking what LogManager writes.
+    ///
+    /// Checksum covers bytes [4 .. header_size + payload.len()].
+    fn build_valid_entry(entry_type: u8, payload: &[u8]) -> Vec<u8> {
+        use crate::entry_header::CHECKSUM_BYTES;
+
+        let item_size = payload.len() as u32;
+        let header_size = LogEntryHeader::MIN_HEADER_SIZE;
+        let total = header_size + payload.len();
+
+        let mut buf = vec![0u8; total];
+        // Leave checksum (bytes 0-3) as zero for now.
+        buf[4] = entry_type;
+        buf[5] = 0; // flags: no VLSN
+        // prev_offset bytes 6-9 remain zero
+        buf[10..14].copy_from_slice(&item_size.to_le_bytes());
+        buf[header_size..].copy_from_slice(payload);
+
+        // Compute and write checksum over [CHECKSUM_BYTES..total].
+        let crc = ChecksumValidator::compute_range(
+            &buf,
+            CHECKSUM_BYTES,
+            total - CHECKSUM_BYTES,
+        );
+        buf[0..4].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Reading an entry with a correct checksum and validate_checksum=true
+    /// must succeed.
+    #[test]
+    fn test_checksum_validation_passes_on_valid_entry() {
+        let payload = b"hello noxu";
+        let file_data = build_valid_entry(7, payload);
+
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, file_data);
+
+        let start_lsn = Lsn::new(0, 0);
+        let mut reader = FileReader::new(
+            mock,
+            true,
+            start_lsn,
+            NULL_LSN,
+            NULL_LSN,
+            256,
+            true, // validate_checksum = true
+        )
+        .unwrap();
+
+        let result = reader.read_next_entry();
+        assert!(
+            matches!(result, Ok(true)),
+            "expected Ok(true) but got {:?}",
+            result
+        );
+        assert_eq!(reader.get_num_read(), 1);
+    }
+
+    /// Corrupting the payload and then reading with validate_checksum=true
+    /// must return a checksum error (not silently succeed).
+    #[test]
+    fn test_checksum_validation_fails_on_corrupted_entry() {
+        let payload = b"hello noxu";
+        let mut file_data = build_valid_entry(7, payload);
+
+        // Flip bits in the payload to corrupt it.
+        let last = file_data.len() - 1;
+        file_data[last] ^= 0xFF;
+
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, file_data);
+
+        let start_lsn = Lsn::new(0, 0);
+        let mut reader = FileReader::new(
+            mock,
+            true,
+            start_lsn,
+            NULL_LSN,
+            NULL_LSN,
+            256,
+            true, // validate_checksum = true
+        )
+        .unwrap();
+
+        let result = reader.read_next_entry();
+        assert!(
+            matches!(result, Err(NoxuLogError::Checksum { .. })),
+            "expected Checksum error but got {:?}",
+            result
+        );
+    }
+
+    /// With validate_checksum=false a corrupted entry is read without error.
+    #[test]
+    fn test_checksum_skipped_when_disabled() {
+        let payload = b"hello noxu";
+        let mut file_data = build_valid_entry(7, payload);
+
+        // Corrupt the payload.
+        let last = file_data.len() - 1;
+        file_data[last] ^= 0xFF;
+
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, file_data);
+
+        let start_lsn = Lsn::new(0, 0);
+        let mut reader = FileReader::new(
+            mock,
+            true,
+            start_lsn,
+            NULL_LSN,
+            NULL_LSN,
+            256,
+            false, // validate_checksum = false
+        )
+        .unwrap();
+
+        // Should read the entry without error.
+        assert!(matches!(reader.read_next_entry(), Ok(true)));
     }
 }

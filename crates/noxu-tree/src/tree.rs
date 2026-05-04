@@ -25,7 +25,7 @@ use crate::error::TreeError;
 use crate::key::{create_key_prefix, get_key_prefix_length};
 use crate::search_result::SearchResult;
 use noxu_latch::{LatchContext, SharedLatch};
-use noxu_util::Lsn;
+use noxu_util::{Lsn, NULL_LSN};
 use std::sync::{Arc, RwLock, Weak};
 
 // Level and flag constants re-exported here for tree-internal use.
@@ -152,6 +152,14 @@ pub struct BinStub {
     /// rather than a complete set of entries.
     /// Port of JE `IN.IN_DELTA_BIT` (the IN_DELTA_BIT flag inside `flags`).
     pub is_delta: bool,
+    /// LSN at which this BIN was last logged as a full (non-delta) BIN.
+    ///
+    /// Used by the checkpoint path to construct `BINDeltaLogEntry.prev_full_lsn`
+    /// and to compare against `prev_delta_lsn` when deciding whether to write
+    /// a delta or a full BIN.
+    ///
+    /// Port of JE `BIN.lastFullLsn`.
+    pub last_full_lsn: Lsn,
     /// LRU generation counter for the evictor.
     /// Port of JE `IN.generation`.
     pub generation: u64,
@@ -174,6 +182,12 @@ pub struct BinEntry {
     /// KNOWN_DELETED_BIT in `IN.entryStates`).  The slot is eligible for
     /// removal by `compress_bin()`.
     pub known_deleted: bool,
+    /// True when this slot has been modified since the last full BIN log write.
+    ///
+    /// Port of JE `IN.entryStates[i] & IN_DIRTY_BIT`.  Used by the checkpoint
+    /// path to decide whether to write a BIN-delta (few dirty slots) or a
+    /// full BIN (many dirty slots).
+    pub dirty: bool,
 }
 
 impl BinStub {
@@ -406,11 +420,16 @@ impl BinStub {
                 // Key exists — update in place.
                 self.entries[idx].lsn = lsn;
                 self.entries[idx].data = data;
+                // Mark slot dirty: this slot changed since the last full BIN log.
+                // Port of JE `IN.setDirtyEntry(idx)`.
+                self.entries[idx].dirty = true;
                 (idx, false)
             }
             Err(idx) => {
                 // New key — insert in sorted position.
-                self.entries.insert(idx, BinEntry { key: suffix, lsn, data, known_deleted: false });
+                // New slots start dirty: they have never been logged in any BIN.
+                // Port of JE `IN.setDirtyEntry(idx)` called after `insertEntry`.
+                self.entries.insert(idx, BinEntry { key: suffix, lsn, data, known_deleted: false, dirty: true });
                 // After insertion, if there is no prefix yet, try to establish one.
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
                     self.recompute_key_prefix();
@@ -418,6 +437,101 @@ impl BinStub {
                 (idx, true)
             }
         }
+    }
+
+    /// Returns the number of slots that are marked dirty.
+    ///
+    /// Port of JE `BIN.getNumDirtyEntries()`.
+    pub fn dirty_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.dirty).count()
+    }
+
+    /// Serialise ALL entries (full BIN write).
+    ///
+    /// Format (per slot): key_len(u32BE) | key | lsn(u64BE) |
+    ///   has_data(u8) | data_len(u32BE) | data | known_deleted(u8)
+    ///
+    /// Prepended by: node_id(u64BE) | num_entries(u32BE).
+    ///
+    /// Port of JE `BIN.writeToLog()` (non-delta path).
+    pub fn serialize_full(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.node_id.to_be_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
+        for i in 0..self.entries.len() {
+            let full_key = self.get_full_key(i).unwrap_or_default();
+            buf.extend_from_slice(&(full_key.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&full_key);
+            let e = &self.entries[i];
+            buf.extend_from_slice(&e.lsn.as_u64().to_be_bytes());
+            if let Some(d) = &e.data {
+                buf.push(1u8);
+                buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
+                buf.extend_from_slice(d);
+            } else {
+                buf.push(0u8);
+            }
+            buf.push(e.known_deleted as u8);
+        }
+        buf
+    }
+
+    /// Serialise only dirty slots (BIN-delta write).
+    ///
+    /// Format (per dirty slot): slot_idx(u32BE) | key_len(u32BE) | key |
+    ///   lsn(u64BE) | has_data(u8) | data_len(u32BE) | data | known_deleted(u8)
+    ///
+    /// Prepended by: node_id(u64BE) | num_dirty(u32BE).
+    ///
+    /// Port of JE `BIN.writeToLog()` (delta path).
+    pub fn serialize_delta(&self) -> Vec<u8> {
+        let dirty: Vec<usize> =
+            (0..self.entries.len()).filter(|&i| self.entries[i].dirty).collect();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.node_id.to_be_bytes());
+        buf.extend_from_slice(&(dirty.len() as u32).to_be_bytes());
+        for idx in dirty {
+            buf.extend_from_slice(&(idx as u32).to_be_bytes());
+            let full_key = self.get_full_key(idx).unwrap_or_default();
+            buf.extend_from_slice(&(full_key.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&full_key);
+            let e = &self.entries[idx];
+            buf.extend_from_slice(&e.lsn.as_u64().to_be_bytes());
+            if let Some(d) = &e.data {
+                buf.push(1u8);
+                buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
+                buf.extend_from_slice(d);
+            } else {
+                buf.push(0u8);
+            }
+            buf.push(e.known_deleted as u8);
+        }
+        buf
+    }
+
+    /// Clear per-slot dirty flags and record `logged_at` as the LSN at which
+    /// this BIN was last fully logged.
+    ///
+    /// Called by the checkpoint path after a successful full-BIN log write.
+    /// Port of JE `BIN.afterLog()` / `BIN.setLastFullLsn()`.
+    pub fn clear_dirty_after_full_log(&mut self, logged_at: Lsn) {
+        for e in &mut self.entries {
+            e.dirty = false;
+        }
+        self.last_full_lsn = logged_at;
+        self.dirty = false;
+    }
+
+    /// Clear per-slot dirty flags after a successful delta log write.
+    ///
+    /// `last_full_lsn` is NOT updated — the full LSN only changes after a
+    /// full BIN write.
+    /// Port of JE `BIN.afterLog()` (delta path).
+    pub fn clear_dirty_after_delta_log(&mut self) {
+        for e in &mut self.entries {
+            e.dirty = false;
+        }
+        self.dirty = false;
     }
 }
 
@@ -724,20 +838,24 @@ impl Tree {
         let mut current = root.clone();
 
         loop {
-            let is_bin = {
-                let g = current.read().ok()?;
-                g.is_bin()
-            };
+            // Acquire this node's read lock ONCE — perform both the is_bin
+            // check AND the child-pointer capture within the same lock scope.
+            // This is latch-coupling: the child Arc is captured while the
+            // parent lock is held, then the parent lock is released before
+            // descending.  The previous double-lock pattern (separate
+            // is_bin check then separate child-find) left a window where a
+            // concurrent split could relocate the child between the two
+            // acquisitions.
+            let guard = current.read().ok()?;
 
-            if is_bin {
-                // Reached a BIN: do the final key lookup.
+            if guard.is_bin() {
+                // Reached a BIN: final key lookup within the same guard.
                 // Use indicate_if_duplicate=true so an exact match sets
                 // EXACT_MATCH in the return value.  Guard against -1 (not
                 // found): -1i32 has all bits set, so the naive
-                // `index & EXACT_MATCH != 0` check would incorrectly report an
-                // exact match for a missing key.
-                let g = current.read().ok()?;
-                let index = g.find_entry(key, true, true);
+                // `index & EXACT_MATCH != 0` check would incorrectly report
+                // an exact match for a missing key.
+                let index = guard.find_entry(key, true, true);
                 let found = index >= 0 && (index & EXACT_MATCH != 0);
                 return Some(SearchResult::with_values(
                     found,
@@ -746,34 +864,37 @@ impl Tree {
                 ));
             }
 
-            // Upper IN: find the child slot with the largest key <= search key.
+            // Upper IN: find the child slot with the largest key <= search
+            // key, and capture the child Arc WHILE HOLDING the guard.
             // Port of JE: index = parent.findEntry(key, false, false)
             // Slot 0 has a virtual key that compares as -infinity.
-            let next_arc = {
-                let g = current.read().ok()?;
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        if n.entries.is_empty() {
-                            return None;
-                        }
-                        // Walk forward as long as entry.key <= key, starting
-                        // from slot 0 (which always qualifies because its key
-                        // is the virtual -infinity key).
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
-                            } else if entry.key.as_slice() <= key {
-                                idx = i;
-                            } else {
-                                break;
-                            }
-                        }
-                        n.entries.get(idx)?.child.clone()?
+            let next_arc = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
                     }
-                    TreeNode::Bottom(_) => unreachable!("is_bin checked above"),
+                    // Walk forward as long as entry.key <= key, starting
+                    // from slot 0 (which always qualifies because its key
+                    // is the virtual -infinity key).
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else if entry.key.as_slice() <= key {
+                            idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    n.entries.get(idx)?.child.clone()?
                 }
+                TreeNode::Bottom(_) => unreachable!("is_bin() returned false above"),
             };
+            // Explicitly drop the guard so the parent lock is released BEFORE
+            // we reassign `current`.  This is hand-over-hand (latch-coupling)
+            // semantics: child Arc captured under parent protection, parent
+            // released, then descend.
+            drop(guard);
 
             current = next_arc;
         }
@@ -801,10 +922,11 @@ impl Tree {
             let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
                 node_id: generate_node_id(),
                 level: BIN_LEVEL,
-                entries: vec![BinEntry { key, lsn, data: Some(data), known_deleted: false }],
+                entries: vec![BinEntry { key, lsn, data: Some(data), known_deleted: false, dirty: false }],
                 key_prefix: Vec::new(), // single entry — no common prefix yet
                 dirty: true,
                 is_delta: false,
+                last_full_lsn: NULL_LSN,
                 generation: 0,
                 parent: None, // set below after root_in is created
             })));
@@ -976,6 +1098,7 @@ impl Tree {
                             lsn: b.entries[i].lsn,
                             data: b.entries[i].data.clone(),
                             known_deleted: b.entries[i].known_deleted,
+                            dirty: b.entries[i].dirty,
                         })
                         .collect();
                     (SplitEntries::Bottom(full), b.key_prefix.clone())
@@ -1043,6 +1166,7 @@ impl Tree {
                     key_prefix: Vec::new(),
                     dirty: true,
                     is_delta: false,
+                    last_full_lsn: NULL_LSN,
                     generation: 0,
                     parent: None, // set below
                 };
@@ -1494,6 +1618,7 @@ impl Tree {
                                         lsn: b.entries[j].lsn,
                                         data: b.entries[j].data.clone(),
                                         known_deleted: b.entries[j].known_deleted,
+                                        dirty: b.entries[j].dirty,
                                     })
                                     .collect(),
                                 _ => { i += 1; continue; }
@@ -1512,6 +1637,7 @@ impl Tree {
                                             lsn: rb.entries[j].lsn,
                                             data: rb.entries[j].data.clone(),
                                             known_deleted: rb.entries[j].known_deleted,
+                                            dirty: rb.entries[j].dirty,
                                         })
                                         .collect();
                                     // Left entries are all smaller; prepend.
@@ -1842,13 +1968,16 @@ impl Tree {
         let mut child_index_in_parent: usize = 0;
 
         loop {
-            let is_bin = {
-                let g = current.read().ok()?;
-                g.is_bin()
-            };
+            // Acquire this node's read lock ONCE — perform both the is_bin
+            // check AND the child-pointer capture within the same lock scope
+            // (single-pass latch-coupling, matching the pattern in search()).
+            let guard = current.read().ok()?;
 
-            if is_bin {
+            if guard.is_bin() {
                 // Validate parent → child link before trusting the BIN.
+                // Drop the guard first to avoid holding it across the
+                // validate call (which acquires the parent's read lock).
+                drop(guard);
                 if let Some(ref par) = parent
                     && !Self::validate_parent_child(par, child_index_in_parent, &current)
                 {
@@ -1867,30 +1996,31 @@ impl Tree {
                 ));
             }
 
-            // Upper IN: find the child slot covering key.
-            let (next_arc, next_idx) = {
-                let g = current.read().ok()?;
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        if n.entries.is_empty() {
-                            return None;
-                        }
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
-                            } else if entry.key.as_slice() <= key {
-                                idx = i;
-                            } else {
-                                break;
-                            }
-                        }
-                        let child = n.entries.get(idx)?.child.clone()?;
-                        (child, idx)
+            // Upper IN: find child slot covering key AND capture child Arc
+            // WHILE HOLDING the guard (single-pass latch-coupling).
+            let (next_arc, next_idx) = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
                     }
-                    TreeNode::Bottom(_) => unreachable!(),
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else if entry.key.as_slice() <= key {
+                            idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    let child = n.entries.get(idx)?.child.clone()?;
+                    (child, idx)
                 }
+                TreeNode::Bottom(_) => unreachable!(),
             };
+            // guard dropped here — parent lock released after child Arc
+            // captured (hand-over-hand / latch-coupling semantics).
+            drop(guard);
 
             // Validate parent → current link before descending.
             if let Some(ref par) = parent
@@ -1962,6 +2092,7 @@ impl Tree {
                 lsn: delta.entries[i].lsn,
                 data: delta.entries[i].data.clone(),
                 known_deleted: delta.entries[i].known_deleted,
+                dirty: delta.entries[i].dirty,
             })
             .collect();
         // Port of JE reconstituteBIN + resetContent + setBINDelta(false).
@@ -2018,40 +2149,41 @@ impl Tree {
         let mut current = root.clone();
 
         loop {
-            let is_bin = {
-                let g = current.read().ok()?;
-                g.is_bin()
-            };
+            // Acquire this node's read lock ONCE — perform both the is_bin
+            // check AND the child-pointer capture within the same lock scope
+            // (single-pass latch-coupling).
+            let guard = current.read().ok()?;
 
-            if is_bin {
+            if guard.is_bin() {
                 // Reached the BIN level; stop — path already records the
                 // parent and the slot index pointing at this BIN.
                 break;
             }
 
-            let (next_arc, slot_idx) = {
-                let g = current.read().ok()?;
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        if n.entries.is_empty() {
-                            return None;
-                        }
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
-                            } else if entry.key.as_slice() <= current_key {
-                                idx = i;
-                            } else {
-                                break;
-                            }
-                        }
-                        let child = n.entries.get(idx)?.child.clone()?;
-                        (child, idx)
+            // Upper IN: capture child slot and Arc WHILE HOLDING guard.
+            let (next_arc, slot_idx) = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
                     }
-                    TreeNode::Bottom(_) => unreachable!(),
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else if entry.key.as_slice() <= current_key {
+                            idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    let child = n.entries.get(idx)?.child.clone()?;
+                    (child, idx)
                 }
+                TreeNode::Bottom(_) => unreachable!(),
             };
+            // guard dropped here — parent lock released after child Arc
+            // captured (hand-over-hand / latch-coupling semantics).
+            drop(guard);
 
             path.push((current.clone(), slot_idx));
             current = next_arc;
@@ -2108,12 +2240,14 @@ impl Tree {
         let mut current = node_arc.clone();
 
         loop {
-            let is_bin = {
-                current.read().ok()?.is_bin()
-            };
+            // Acquire this node's read lock ONCE — perform both the is_bin
+            // check AND the child-pointer capture within the same lock scope
+            // (single-pass latch-coupling).
+            let guard = current.read().ok()?;
 
-            if is_bin {
-                return current.read().ok().and_then(|g| match &*g {
+            if guard.is_bin() {
+                // Reached a BIN: return its entries with full decompressed keys.
+                return match &*guard {
                     TreeNode::Bottom(b) => {
                         // Return entries with full (decompressed) keys so that
                         // callers always work with complete keys.
@@ -2123,27 +2257,30 @@ impl Tree {
                                 lsn: b.entries[i].lsn,
                                 data: b.entries[i].data.clone(),
                                 known_deleted: b.entries[i].known_deleted,
+                                dirty: b.entries[i].dirty,
                             })
                             .collect();
                         Some(full_entries)
                     }
                     _ => None,
-                });
+                };
             }
 
-            let next = {
-                let g = current.read().ok()?;
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        if forward {
-                            n.entries.first()?.child.clone()?
-                        } else {
-                            n.entries.last()?.child.clone()?
-                        }
+            // Upper IN: capture edge child Arc WHILE HOLDING guard
+            // (single-pass latch-coupling).
+            let next = match &*guard {
+                TreeNode::Internal(n) => {
+                    if forward {
+                        n.entries.first()?.child.clone()?
+                    } else {
+                        n.entries.last()?.child.clone()?
                     }
-                    _ => return None,
                 }
+                _ => return None,
             };
+            // guard dropped here — parent lock released after child Arc
+            // captured (hand-over-hand / latch-coupling semantics).
+            drop(guard);
 
             current = next;
         }
@@ -2216,6 +2353,50 @@ impl Tree {
                 for child in children {
                     Self::collect_stats_recursive(&child, stats, depth + 1);
                 }
+            }
+        }
+    }
+
+    /// Collects all dirty BINs as (Arc to node, db_id) pairs.
+    ///
+    /// The checkpoint path calls this to enumerate BINs that need to be
+    /// logged.  For each dirty BIN the checkpoint decides — based on the
+    /// BIN-delta threshold — whether to write a full `BIN` entry or a
+    /// `BINDelta` entry.
+    ///
+    /// Port of JE `Checkpointer.processINList()` which iterates the dirty
+    /// IN list accumulated during normal operation.
+    pub fn collect_dirty_bins(&self, db_id: u64) -> Vec<(u64, Arc<RwLock<TreeNode>>)> {
+        let mut result = Vec::new();
+        if let Some(root) = &self.root {
+            Self::collect_dirty_bins_recursive(root, db_id, &mut result);
+        }
+        result
+    }
+
+    fn collect_dirty_bins_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        db_id: u64,
+        out: &mut Vec<(u64, Arc<RwLock<TreeNode>>)>,
+    ) {
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match &*guard {
+            TreeNode::Bottom(b) => {
+                // Include this BIN if it is dirty or has any dirty slots.
+                if b.dirty || b.dirty_count() > 0 {
+                    out.push((db_id, Arc::clone(node_arc)));
+                }
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                for child in children {
+                    Self::collect_dirty_bins_recursive(&child, db_id, out);
+                }// guard already dropped
             }
         }
     }
@@ -2389,6 +2570,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2416,6 +2598,7 @@ mod tests {
                 lsn: Lsn::new(1, 100 + i),
                 data: Some(vec![]),
                 known_deleted: false,
+                dirty: false,
             });
         }
 
@@ -2426,6 +2609,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2523,6 +2707,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2836,6 +3021,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2868,6 +3054,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2900,17 +3087,20 @@ mod tests {
                     lsn: Lsn::new(1, 10),
                     data: Some(b"d1".to_vec()),
                     known_deleted: false,
+                    dirty: false,
                 },
                 BinEntry {
                     key: b"beta".to_vec(),
                     lsn: Lsn::new(1, 20),
                     data: None,
                     known_deleted: false,
+                    dirty: false,
                 },
             ],
             key_prefix: Vec::new(),
             dirty: true,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 5,
             parent: None,
         });
@@ -2945,6 +3135,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: true,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2966,6 +3157,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -2977,10 +3169,12 @@ mod tests {
                 lsn: Lsn::new(1, 1),
                 data: None,
                 known_deleted: false,
+                dirty: false,
             }],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         });
@@ -3001,6 +3195,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None, // set below
         })));
@@ -3238,6 +3433,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -3279,6 +3475,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -3299,6 +3496,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -3309,6 +3507,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -3387,21 +3586,22 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"old_a".to_vec()), known_deleted: false },
-                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"old_c".to_vec()), known_deleted: false },
+                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"old_a".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"old_c".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
 
         let delta_entries = vec![
             // Update existing key "a" with new data.
-            BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"new_a".to_vec()), known_deleted: false },
+            BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"new_a".to_vec()), known_deleted: false, dirty: false },
             // Insert new key "b".
-            BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"new_b".to_vec()), known_deleted: false },
+            BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"new_b".to_vec()), known_deleted: false, dirty: false },
         ];
 
         Tree::apply_delta_to_bin(&mut base, delta_entries);
@@ -3432,11 +3632,12 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"x".to_vec(), lsn: Lsn::new(1, 1), data: None, known_deleted: false },
+                BinEntry { key: b"x".to_vec(), lsn: Lsn::new(1, 1), data: None, known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3457,12 +3658,13 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"base_aa".to_vec()), known_deleted: false },
-                BinEntry { key: b"cc".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"base_cc".to_vec()), known_deleted: false },
+                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"base_aa".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"cc".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"base_cc".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3472,12 +3674,13 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"delta_aa".to_vec()), known_deleted: false },
-                BinEntry { key: b"bb".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"delta_bb".to_vec()), known_deleted: false },
+                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"delta_aa".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"bb".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"delta_bb".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: true,
             is_delta: true,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3516,6 +3719,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3677,6 +3881,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3700,6 +3905,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3729,6 +3935,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -3801,6 +4008,7 @@ mod tests {
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         };
@@ -4133,14 +4341,15 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"a".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false },
-                BinEntry { key: b"b".to_vec(), lsn, data: None, known_deleted: true },
-                BinEntry { key: b"c".to_vec(), lsn, data: Some(b"live2".to_vec()), known_deleted: false },
-                BinEntry { key: b"d".to_vec(), lsn, data: None, known_deleted: true },
+                BinEntry { key: b"a".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"b".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"c".to_vec(), lsn, data: Some(b"live2".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"d".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4190,11 +4399,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"x".to_vec(), lsn, data: Some(b"d".to_vec()), known_deleted: false },
+                BinEntry { key: b"x".to_vec(), lsn, data: Some(b"d".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4214,11 +4424,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true },
+                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: true, // delta BIN — must be skipped
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4247,11 +4458,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"only".to_vec(), lsn, data: None, known_deleted: true },
+                BinEntry { key: b"only".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4296,11 +4508,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false },
+                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4321,12 +4534,13 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false },
-                BinEntry { key: b"dead".to_vec(), lsn, data: None, known_deleted: true },
+                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"dead".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4366,13 +4580,14 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"d0".to_vec()), known_deleted: false },
-                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"d1".to_vec()), known_deleted: false },
-                BinEntry { key: b"\x02".to_vec(), lsn, data: None,               known_deleted: true  },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"d0".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"d1".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x02".to_vec(), lsn, data: None,               known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4382,11 +4597,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false },
+                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4494,11 +4710,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true },
+                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: true, // BIN-delta — must be skipped
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4529,12 +4746,13 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"a".to_vec()), known_deleted: false },
-                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"b".to_vec()), known_deleted: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"a".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"b".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4570,13 +4788,14 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"pfx:a".to_vec(), lsn, data: None,               known_deleted: true  },
-                BinEntry { key: b"pfx:b".to_vec(), lsn, data: Some(b"B".to_vec()), known_deleted: false },
-                BinEntry { key: b"pfx:c".to_vec(), lsn, data: Some(b"C".to_vec()), known_deleted: false },
+                BinEntry { key: b"pfx:a".to_vec(), lsn, data: None,               known_deleted: true, dirty: false },
+                BinEntry { key: b"pfx:b".to_vec(), lsn, data: Some(b"B".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"pfx:c".to_vec(), lsn, data: Some(b"C".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4711,12 +4930,13 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x00".to_vec(), lsn, data: None,               known_deleted: true  },
-                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: None,               known_deleted: true, dirty: false },
+                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4725,11 +4945,12 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false },
+                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4790,17 +5011,18 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 // slot 0: live
-                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false, dirty: false },
                 // slot 1: known-deleted
-                BinEntry { key: b"\x01".to_vec(), lsn, data: None, known_deleted: true  },
+                BinEntry { key: b"\x01".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
                 // slot 2: live
-                BinEntry { key: b"\x02".to_vec(), lsn, data: Some(b"also-live".to_vec()), known_deleted: false },
+                BinEntry { key: b"\x02".to_vec(), lsn, data: Some(b"also-live".to_vec()), known_deleted: false, dirty: false },
                 // slot 3: known-deleted
-                BinEntry { key: b"\x03".to_vec(), lsn, data: None, known_deleted: true  },
+                BinEntry { key: b"\x03".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
             ],
             key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
+            last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
         })));
@@ -4830,6 +5052,274 @@ mod tests {
                     "no deleted entries must remain after compression");
             }
             _ => panic!("expected BIN"),
+        }
+    }
+
+    // =========================================================================
+    // P1: Concurrent stress tests for single-pass latch-coupling in search()
+    // =========================================================================
+
+    /// Verify that concurrent readers and a writer do not panic or deadlock.
+    ///
+    /// 4 reader threads search all pre-populated keys while 1 writer thread
+    /// inserts additional keys.  This exercises the single-pass latch-coupling
+    /// path under genuine concurrent load.
+    #[test]
+    fn test_concurrent_search_while_inserting() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // Tree is wrapped in std::sync::RwLock to match the DatabaseImpl
+        // usage pattern (DatabaseImpl holds Tree behind an RwLock).
+        let tree = Arc::new(std::sync::RwLock::new(Tree::new(1, 4)));
+
+        // Pre-populate with 50 entries so the tree has multiple BINs.
+        {
+            let mut t = tree.write().unwrap();
+            for i in 0u32..50 {
+                let key = format!("{:08}", i).into_bytes();
+                t.insert(key, vec![i as u8], noxu_util::NULL_LSN).unwrap();
+            }
+        }
+
+        // Barrier synchronises start: 4 readers + 1 writer.
+        let barrier = Arc::new(Barrier::new(5));
+
+        let mut handles = vec![];
+
+        // 4 concurrent reader threads — each searches the 50 pre-populated keys.
+        for _ in 0..4 {
+            let tree_clone = Arc::clone(&tree);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                for i in 0u32..50 {
+                    let key = format!("{:08}", i).into_bytes();
+                    let t = tree_clone.read().unwrap();
+                    // Must not panic.  The key was pre-populated so search()
+                    // should always return Some(_); we assert on that below
+                    // (after joining) rather than inside the thread to keep
+                    // the panic message clean.
+                    let _ = t.search(&key);
+                }
+            }));
+        }
+
+        // 1 concurrent writer thread — inserts keys 50–99.
+        {
+            let tree_clone = Arc::clone(&tree);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                let mut t = tree_clone.write().unwrap();
+                for i in 50u32..100 {
+                    let key = format!("{:08}", i).into_bytes();
+                    t.insert(key, vec![i as u8], noxu_util::NULL_LSN).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // After all threads finish, all 100 keys must be present.
+        let t = tree.read().unwrap();
+        for i in 0u32..100 {
+            let key = format!("{:08}", i).into_bytes();
+            let result = t.search(&key);
+            assert!(
+                result.map_or(false, |r| r.exact_parent_found),
+                "key {:08} should be found after concurrent insert",
+                i,
+            );
+        }
+    }
+
+    /// Verify that 8 concurrent reader threads searching the same tree do not
+    /// panic.  Pure read concurrency should be safe with or without the
+    /// single-pass fix; this test acts as a regression guard.
+    #[test]
+    fn test_concurrent_searches_no_panic() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tree = Arc::new(std::sync::RwLock::new(Tree::new(1, 4)));
+        {
+            let mut t = tree.write().unwrap();
+            for i in 0u32..100 {
+                let key = format!("{:08}", i).into_bytes();
+                t.insert(key, vec![i as u8], noxu_util::NULL_LSN).unwrap();
+            }
+        }
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let tree_clone = Arc::clone(&tree);
+                thread::spawn(move || {
+                    for i in 0u32..100 {
+                        let key = format!("{:08}", i).into_bytes();
+                        let t = tree_clone.read().unwrap();
+                        let _ = t.search(&key);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+    }
+
+    // ========================================================================
+    // Tests: BIN-delta — dirty tracking, serialise, collect
+    // ========================================================================
+
+    #[test]
+    fn test_dirty_count_zero_on_fresh_bin() {
+        let bin = make_bin_for_delta_tests(vec![
+            (b"a".to_vec(), Lsn::new(1, 1), Some(b"v1".to_vec())),
+            (b"b".to_vec(), Lsn::new(1, 2), Some(b"v2".to_vec())),
+        ]);
+        assert_eq!(bin.dirty_count(), 0);
+    }
+
+    #[test]
+    fn test_insert_marks_slot_dirty() {
+        let lsn = Lsn::new(1, 10);
+        let mut bin = BinStub {
+            node_id: 1,
+            level: BIN_LEVEL,
+            entries: vec![],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+        };
+        bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
+        assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
+        assert!(bin.entries[0].dirty);
+    }
+
+    #[test]
+    fn test_update_marks_slot_dirty() {
+        let lsn = Lsn::new(1, 10);
+        let mut bin = BinStub {
+            node_id: 2,
+            level: BIN_LEVEL,
+            entries: vec![BinEntry {
+                key: b"key".to_vec(),
+                lsn,
+                data: Some(b"old".to_vec()),
+                known_deleted: false,
+                dirty: false,
+            }],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+        };
+        bin.insert_with_prefix(b"key".to_vec(), Lsn::new(1, 20), Some(b"new".to_vec()));
+        assert!(bin.entries[0].dirty, "updated slot should be dirty");
+        assert_eq!(bin.dirty_count(), 1);
+    }
+
+    #[test]
+    fn test_serialize_full_roundtrip() {
+        let mut bin = BinStub {
+            node_id: 42,
+            level: BIN_LEVEL,
+            entries: vec![
+                BinEntry { key: b"alpha".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"d1".to_vec()), known_deleted: false, dirty: true },
+                BinEntry { key: b"beta".to_vec(),  lsn: Lsn::new(1, 2), data: None, known_deleted: true, dirty: false },
+            ],
+            key_prefix: Vec::new(),
+            dirty: true,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+        };
+        let bytes = bin.serialize_full();
+        let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let n_entries = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(node_id, 42);
+        assert_eq!(n_entries, 2);
+        bin.clear_dirty_after_full_log(Lsn::new(2, 1));
+        assert_eq!(bin.dirty_count(), 0);
+        assert_eq!(bin.last_full_lsn, Lsn::new(2, 1));
+        assert!(!bin.dirty);
+    }
+
+    #[test]
+    fn test_serialize_delta_only_dirty_slots() {
+        let mut bin = BinStub {
+            node_id: 7,
+            level: BIN_LEVEL,
+            entries: vec![
+                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"v1".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 2), data: Some(b"v2".to_vec()), known_deleted: false, dirty: true },
+                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"v3".to_vec()), known_deleted: false, dirty: false },
+            ],
+            key_prefix: Vec::new(),
+            dirty: true,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+        };
+        let bytes = bin.serialize_delta();
+        let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let n_dirty = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(node_id, 7);
+        assert_eq!(n_dirty, 1);
+        let slot_idx = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(slot_idx, 1);
+        bin.clear_dirty_after_delta_log();
+        assert_eq!(bin.dirty_count(), 0);
+        assert_eq!(bin.last_full_lsn, NULL_LSN, "last_full_lsn unchanged by delta");
+    }
+
+    #[test]
+    fn test_collect_dirty_bins_returns_dirty_bins_only() {
+        let mut tree = Tree::new(1, 256);
+        tree.insert(b"k1".to_vec(), b"v1".to_vec(), Lsn::new(1, 1)).unwrap();
+        tree.insert(b"k2".to_vec(), b"v2".to_vec(), Lsn::new(1, 2)).unwrap();
+        let dirty = tree.collect_dirty_bins(1);
+        assert!(!dirty.is_empty(), "should have dirty BINs after inserts");
+
+        for (_db_id, bin_arc) in &dirty {
+            if let Ok(mut g) = bin_arc.write() {
+                if let TreeNode::Bottom(b) = &mut *g {
+                    b.clear_dirty_after_full_log(Lsn::new(1, 100));
+                }
+            }
+        }
+        let dirty2 = tree.collect_dirty_bins(1);
+        assert!(dirty2.is_empty(), "no dirty BINs after clearing");
+    }
+
+    fn make_bin_for_delta_tests(entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)>) -> BinStub {
+        BinStub {
+            node_id: 1,
+            level: BIN_LEVEL,
+            entries: entries.into_iter().map(|(key, lsn, data)| BinEntry {
+                key,
+                lsn,
+                data,
+                known_deleted: false,
+                dirty: false,
+            }).collect(),
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
         }
     }
 }

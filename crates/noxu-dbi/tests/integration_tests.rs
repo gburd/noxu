@@ -325,7 +325,8 @@ fn environment_impl_remove_database() {
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
-    env.open_database("to_remove", &cfg).unwrap();
+    let db = env.open_database("to_remove", &cfg).unwrap();
+    env.close_database(db.read().get_id()).unwrap();
     env.remove_database("to_remove").unwrap();
 
     let result = env.open_database("to_remove", &DatabaseConfig::new());
@@ -340,6 +341,7 @@ fn environment_impl_rename_database() {
 
     let db = env.open_database("old", &cfg).unwrap();
     let original_id = db.read().get_id();
+    env.close_database(original_id).unwrap();
 
     env.rename_database("old", "new").unwrap();
 

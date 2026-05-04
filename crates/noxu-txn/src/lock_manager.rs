@@ -56,6 +56,16 @@ pub struct LockManager {
 
     /// Statistics tracking.
     stats: LockManagerStats,
+
+    /// Default lock-wait timeout in milliseconds.
+    ///
+    /// 0 means wait forever (JE `EnvironmentConfig.setLockTimeout(0)`).
+    /// Corresponds to `EnvironmentConfig.lock_timeout_ms`.
+    /// Configured at open time from `EnvironmentConfig`; can be overridden
+    /// per-call via `lock_with_timeout()`.
+    ///
+    /// Port of `LockManager.lockTimeout` in JE.
+    lock_timeout_ms: AtomicU64,
 }
 
 /// Internal statistics tracking.
@@ -68,8 +78,18 @@ struct LockManagerStats {
 }
 
 impl LockManager {
-    /// Creates a new LockManager with N_LOCK_TABLES shards.
+    /// Creates a new LockManager with N_LOCK_TABLES shards and the default
+    /// lock timeout of 500 ms (matching JE's default).
     pub fn new() -> Self {
+        Self::with_lock_timeout(500)
+    }
+
+    /// Creates a new LockManager with a specific default lock timeout.
+    ///
+    /// `timeout_ms == 0` means wait forever (JE `setLockTimeout(0, MILLISECONDS)`).
+    ///
+    /// Call this from `EnvironmentImpl` after reading `EnvironmentConfig.lock_timeout_ms`.
+    pub fn with_lock_timeout(timeout_ms: u64) -> Self {
         let mut lock_tables = Vec::with_capacity(N_LOCK_TABLES);
         for _ in 0..N_LOCK_TABLES {
             lock_tables.push(Mutex::new(HashMap::new()));
@@ -81,7 +101,21 @@ impl LockManager {
                 lock_requests: AtomicU64::new(0),
                 lock_waits: AtomicU64::new(0),
             },
+            lock_timeout_ms: AtomicU64::new(timeout_ms),
         }
+    }
+
+    /// Updates the default lock timeout.
+    ///
+    /// Thread-safe; takes effect for subsequent `lock()` calls.
+    /// Port of `LockManager.setLockTimeout()` in JE.
+    pub fn set_lock_timeout(&self, timeout_ms: u64) {
+        self.lock_timeout_ms.store(timeout_ms, Ordering::Relaxed);
+    }
+
+    /// Returns the current default lock timeout in milliseconds.
+    pub fn get_lock_timeout_ms(&self) -> u64 {
+        self.lock_timeout_ms.load(Ordering::Relaxed)
     }
 
     /// Acquires a lock on the given LSN for the given locker, blocking the
@@ -124,7 +158,7 @@ impl LockManager {
             lock_type,
             non_blocking,
             jump_ahead_of_waiters,
-            500, // default 500 ms timeout
+            self.lock_timeout_ms.load(Ordering::Relaxed),
         )
     }
 

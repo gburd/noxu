@@ -75,15 +75,14 @@ impl UtilizationProfile {
     ///
     /// JE selects files using a cost/benefit score:
     ///
-    ///   benefit = obsolete_bytes
-    ///   cost    = file_size * (1 - utilization)
-    ///   score   = benefit / cost
+    ///   benefit = obsolete_bytes  (more bytes freed = better)
+    ///   cost    = active_bytes    (live bytes needing migration = more work)
+    ///   score   = benefit / max(1, cost)
     ///
     /// Files are ranked by descending score so that the file with the best
     /// ratio of obsolete data to migration work is cleaned first.
     ///
-    /// Current implementation: simple selection by lowest utilization.
-    /// TODO: implement cost/benefit scoring to match JE's prioritization.
+    /// Port of `UtilizationCalculator.getBestFile()` in JE.
     pub fn get_best_file_for_cleaning(
         &self,
         min_utilization: f64,
@@ -91,11 +90,18 @@ impl UtilizationProfile {
         self.file_summaries
             .iter()
             .filter(|(_, summary)| !summary.is_empty())
-            .map(|(&file_num, summary)| (file_num, summary.get_utilization()))
-            .filter(|&(_, util)| util < min_utilization)
-            .min_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            .map(|(&file_num, summary)| {
+                let util = summary.get_utilization();
+                let benefit = summary.get_obsolete_size() as f64;
+                let cost = (summary.get_active_size() as f64).max(1.0);
+                let score = benefit / cost;
+                (file_num, util, score)
             })
+            .filter(|&(_, util, _)| util < min_utilization)
+            .max_by(|a, b| {
+                a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(file_num, util, _)| (file_num, util))
     }
 
     /// Returns all files with utilization below the threshold, sorted by utilization.

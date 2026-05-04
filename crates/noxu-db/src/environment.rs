@@ -133,6 +133,11 @@ impl Environment {
             EnvironmentImpl::new(home.clone(), config.read_only, config.transactional)
                 .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))?;
 
+        // Thread the configured lock timeout from EnvironmentConfig into the
+        // LockManager.  JE does this in EnvironmentImpl constructor; we do it
+        // here because EnvironmentConfig lives in noxu-db, not noxu-dbi.
+        env_impl.get_lock_manager().set_lock_timeout(config.lock_timeout_ms);
+
         Ok(Environment {
             home,
             config,
@@ -645,7 +650,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Simplified implementation doesn't track open database handles
     fn test_remove_open_database_fails() {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
@@ -695,7 +699,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Simplified implementation doesn't track open database handles
     fn test_rename_open_database_fails() {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
@@ -861,12 +864,15 @@ mod tests {
         let env = Environment::open(config).unwrap();
 
         // Create the DB using env_impl directly (bypassing Environment::open_database
-        // so the handle is NOT in the databases map).
+        // so the handle is NOT in the databases map), then immediately close it
+        // so that reference_count returns to 0 (no open user handles).
         {
             let env_impl = env.env_impl.lock();
             let mut dbi_config = noxu_dbi::DatabaseConfig::new();
             dbi_config.set_allow_create(true);
-            let _ = env_impl.open_database("ghost_db", &dbi_config).unwrap();
+            let db_arc = env_impl.open_database("ghost_db", &dbi_config).unwrap();
+            let db_id = db_arc.read().get_id();
+            env_impl.close_database(db_id).unwrap();
         }
 
         // rename_database should succeed and hit the `if let Some(handle)` false branch.

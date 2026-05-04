@@ -201,6 +201,14 @@ impl DatabaseImpl {
         self.real_tree.as_mut()
     }
 
+    /// Replace the real B+tree with a tree recovered from the log.
+    ///
+    /// Called by `EnvironmentImpl::open_database()` when a matching
+    /// `recovered_trees` entry exists (Approach B of P1b wiring).
+    pub fn set_recovered_tree(&mut self, tree: Tree) {
+        self.real_tree = Some(tree);
+    }
+
     // Configuration
     pub fn max_tree_entries_per_node(&self) -> i32 {
         self.max_tree_entries_per_node
