@@ -530,16 +530,12 @@ impl FileManager {
             guard.write_at(file_offset, data)?;
         }
 
-        // Advance last_used_lsn to the byte after what we just wrote.
-        let end_offset = file_offset + data.len() as u64;
-        self.last_used_lsn.store(
-            Lsn::new(file_num, end_offset as u32).as_u64(),
-            Ordering::Release,
-        );
-        self.next_available_lsn.store(
-            Lsn::new(file_num, end_offset as u32).as_u64(),
-            Ordering::Release,
-        );
+        // Do NOT update next_available_lsn or last_used_lsn here.
+        // Those are managed exclusively by set_last_position() under the LWL
+        // in LogManager::log().  flush_dirty_buffers() writes pool buffers in
+        // pool-index order (not temporal/LSN order); unconditionally storing
+        // file_offset+len here would set next_available_lsn backward whenever
+        // an older buffer is written after a newer one (ring-wrapped pool).
 
         // Check whether we need to flip to a new file.
         let path = self.file_path(file_num);
