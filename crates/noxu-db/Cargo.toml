@@ -1,0 +1,30 @@
+[package]
+name = "noxu-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Noxu DB - An embedded transactional database engine"
+
+[dependencies]
+bytes = { workspace = true }
+noxu-dbi = { workspace = true }
+noxu-engine = { workspace = true }
+noxu-log = { workspace = true }
+noxu-util = { workspace = true }
+noxu-config = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = "3"
+noxu-dbi = { workspace = true, features = ["testing"] }
+
+[[bench]]
+name = "api_bench"
+harness = false

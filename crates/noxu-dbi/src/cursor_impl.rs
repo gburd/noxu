@@ -25,8 +25,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 #[cfg(any(test, feature = "testing"))]
 use std::cell::Cell;
 
+use bytes::BytesMut;
+use noxu_log::{
+    LogEntryType, LogManager, Provisional,
+    entry::LnLogEntry,
+};
 use noxu_tree::Tree;
-use noxu_util::Lsn;
+use noxu_util::{Lsn, vlsn::NULL_VLSN};
 use parking_lot::RwLock;
 
 use crate::{
@@ -138,6 +143,10 @@ pub struct CursorImpl {
     ///
     /// In JE this is `CursorImpl.index`. -1 means "before first entry".
     current_index: i32,
+
+    /// Write-ahead log manager for recording data operations.
+    /// None for read-only cursors or cursors created outside a real env.
+    log_manager: Option<Arc<LogManager>>,
 }
 
 impl CursorImpl {
@@ -161,6 +170,29 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            log_manager: None,
+        }
+    }
+
+    /// Creates a new CursorImpl wired to a WAL.
+    ///
+    /// Write operations (`put`, `delete`) will record `LnLogEntry` entries in
+    /// the provided `LogManager` before mutating the in-memory tree.
+    pub fn with_log_manager(
+        db_impl: Arc<RwLock<DatabaseImpl>>,
+        locker_id: i64,
+        log_manager: Arc<LogManager>,
+    ) -> Self {
+        CursorImpl {
+            id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
+            db_impl,
+            locker_id,
+            state: CursorState::NotInitialized,
+            current_key: None,
+            current_data: None,
+            current_lsn: noxu_util::NULL_LSN.as_u64(),
+            current_index: -1,
+            log_manager: Some(log_manager),
         }
     }
 
@@ -840,13 +872,14 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
+                let new_lsn =
+                    self.log_ln_write(&current_key, Some(data), self.locker_id)?;
                 let mut db = self.db_impl.write();
                 if let Some(tree) = db.get_real_tree_mut() {
-                    let lsn = Lsn::from_u64(self.current_lsn);
-                    // insert() with the same key will update the existing slot.
-                    let _ = tree.insert(current_key, data.to_vec(), lsn);
+                    let _ = tree.insert(current_key, data.to_vec(), new_lsn);
                 }
                 self.current_data = Some(data.to_vec());
+                self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
             }
             PutMode::NoOverwrite => {
@@ -864,8 +897,8 @@ impl CursorImpl {
                 if key_exists {
                     return Ok(OperationStatus::KeyExist);
                 }
-                // Insert the new record.
-                let new_lsn = Lsn::from_u64(noxu_util::NULL_LSN.as_u64());
+                // Write LN entry then insert.
+                let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
                     let mut db = self.db_impl.write();
                     if let Some(tree) = db.get_real_tree_mut() {
@@ -874,14 +907,14 @@ impl CursorImpl {
                 }
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(data.to_vec());
-                self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                self.current_lsn = new_lsn.as_u64();
                 self.current_index = 0;
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
             }
             PutMode::Overwrite | PutMode::NoDupData => {
-                // Insert or update the record unconditionally.
-                let new_lsn = Lsn::from_u64(noxu_util::NULL_LSN.as_u64());
+                // Write LN entry then insert or update.
+                let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
                     let mut db = self.db_impl.write();
                     if let Some(tree) = db.get_real_tree_mut() {
@@ -890,7 +923,7 @@ impl CursorImpl {
                 }
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(data.to_vec());
-                self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                self.current_lsn = new_lsn.as_u64();
                 self.current_index = 0;
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
@@ -898,16 +931,61 @@ impl CursorImpl {
         }
     }
 
+    /// Writes an LN (Leaf Node) log entry for a put or delete operation.
+    ///
+    /// Returns the LSN assigned to the entry, or NULL_LSN if no log manager
+    /// is configured (e.g., read-only or test cursor).
+    fn log_ln_write(
+        &self,
+        key: &[u8],
+        data: Option<&[u8]>,
+        txn_id: i64,
+    ) -> Result<Lsn, DbiError> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(noxu_util::NULL_LSN),
+        };
+
+        let db_id = self.db_impl.read().get_id().id() as u64;
+        let txn_id_opt = if txn_id != 0 { Some(txn_id) } else { None };
+
+        let entry = LnLogEntry::new(
+            db_id,
+            txn_id_opt,
+            noxu_util::NULL_LSN,   // abort_lsn (not yet tracked per-txn)
+            false,                 // abort_known_deleted
+            None,                  // abort_key
+            None,                  // abort_data
+            NULL_VLSN,             // abort_vlsn
+            0,                     // abort_expiration
+            true,                  // embedded_ln
+            key.to_vec(),
+            data.map(|d| d.to_vec()),
+            0,                     // expiration
+            NULL_VLSN,             // vlsn
+        );
+
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        let entry_type = if data.is_some() {
+            LogEntryType::InsertLN
+        } else {
+            LogEntryType::DeleteLN
+        };
+
+        lm.log(entry_type, &buf, Provisional::No, false, false)
+            .map_err(DbiError::from)
+    }
+
     /// Deletes the record at the cursor position.
     ///
     /// Port of the delete path in `CursorImpl.delete()` from JE:
     ///
     /// 1. Checks that the cursor is initialized.
-    /// 2. Calls `Tree::delete(key)` to remove the entry from the BIN.
-    /// 3. Resets cursor to NotInitialized (matching JE behaviour).
-    ///
-    /// Note: write locking and WAL log entry emission are not yet wired
-    /// (P0 gap — requires LogManager integration).
+    /// 2. Writes a DeleteLN log entry to the WAL (if log manager is present).
+    /// 3. Calls `Tree::delete(key)` to remove the entry from the BIN.
+    /// 4. Resets cursor to NotInitialized (matching JE behaviour).
     ///
     /// # Returns
     ///
@@ -920,8 +998,9 @@ impl CursorImpl {
     pub fn delete(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_initialized()?;
 
-        // Remove the record from the real tree.
+        // Write DeleteLN to WAL before modifying the tree.
         if let Some(key) = self.current_key.clone() {
+            self.log_ln_write(&key, None, self.locker_id)?;
             let mut db = self.db_impl.write();
             if let Some(tree) = db.get_real_tree_mut() {
                 tree.delete(&key);
@@ -988,8 +1067,14 @@ impl CursorImpl {
     pub fn dup(&self, same_position: bool) -> Result<CursorImpl, DbiError> {
         self.check_state()?;
 
-        let mut new_cursor =
-            CursorImpl::new(self.db_impl.clone(), self.locker_id);
+        let mut new_cursor = match &self.log_manager {
+            Some(lm) => CursorImpl::with_log_manager(
+                self.db_impl.clone(),
+                self.locker_id,
+                lm.clone(),
+            ),
+            None => CursorImpl::new(self.db_impl.clone(), self.locker_id),
+        };
 
         if same_position && self.state == CursorState::Initialized {
             new_cursor.current_key = self.current_key.clone();

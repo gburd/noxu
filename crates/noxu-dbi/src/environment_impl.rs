@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use bytes::BytesMut;
 use parking_lot::RwLock;
 
 use crate::database_impl::DatabaseImpl;
@@ -14,7 +15,12 @@ use crate::{
     DatabaseConfig, DatabaseId, DbType, DbiError, EnvState,
     EnvironmentFailureReason, NodeSequence,
 };
+use noxu_log::{
+    FileManager, LogManager, LogEntryType, Provisional,
+    entry::TxnEndEntry,
+};
 use noxu_txn::{LockManager, Txn, TxnManager};
+use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
 
 /// The internal representation of an environment.
 ///
@@ -55,6 +61,9 @@ pub struct EnvironmentImpl {
 
     /// Creation time in milliseconds.
     creation_time_ms: u64,
+
+    /// Write-ahead log manager (None for read-only environments).
+    log_manager: Option<Arc<LogManager>>,
 }
 
 impl EnvironmentImpl {
@@ -76,6 +85,38 @@ impl EnvironmentImpl {
         let lock_manager = Arc::new(LockManager::new());
         let txn_manager = TxnManager::new(lock_manager.clone());
 
+        // Ensure the environment directory exists (create if needed).
+        if !env_home.exists() {
+            std::fs::create_dir_all(&env_home).map_err(|e| {
+                DbiError::EnvironmentFailure {
+                    reason: format!(
+                        "cannot create environment directory {}: {}",
+                        env_home.display(),
+                        e
+                    ),
+                }
+            })?;
+        }
+
+        // Initialize the WAL (LogManager) for writable environments.
+        // Read-only environments don't need to write log entries.
+        let log_manager = if !read_only {
+            let fm = Arc::new(
+                FileManager::new(
+                    &env_home,
+                    false,
+                    64 * 1024 * 1024, // 64 MiB per log file
+                    100,              // file handle cache size
+                )
+                .map_err(|e| DbiError::EnvironmentFailure {
+                    reason: format!("failed to init FileManager: {e}"),
+                })?,
+            );
+            Some(Arc::new(LogManager::new(fm, 3, 1024 * 1024, 65536)))
+        } else {
+            None
+        };
+
         let env = EnvironmentImpl {
             env_home,
             state: RwLock::new(EnvState::Init),
@@ -93,6 +134,7 @@ impl EnvironmentImpl {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            log_manager,
         };
 
         // Mark as open
@@ -270,6 +312,68 @@ impl EnvironmentImpl {
         &self.node_sequence
     }
 
+    /// Returns a clone of the shared LogManager, if any.
+    ///
+    /// Returns `None` for read-only environments.
+    pub fn get_log_manager(&self) -> Option<Arc<LogManager>> {
+        self.log_manager.clone()
+    }
+
+    /// Writes a TxnCommit entry to the WAL and flushes according to durability.
+    ///
+    /// - `SyncPolicy::Sync`        → fsync after writing (default, safest)
+    /// - `SyncPolicy::WriteNoSync` → flush to OS buffers, no fsync
+    /// - `SyncPolicy::NoSync`      → write to log buffer only, no flush
+    ///
+    /// Port of `Txn.commit()` → `LogManager.flushTo()` → `FileManager.syncLogEnd()`.
+    pub fn log_txn_commit(
+        &self,
+        txn_id: i64,
+        fsync: bool,
+        flush: bool,
+    ) -> Result<(), DbiError> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(()), // read-only env: nothing to log
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = TxnEndEntry::new_commit(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, flush, fsync)
+            .map(|_| ())
+            .map_err(DbiError::from)
+    }
+
+    /// Writes a TxnAbort entry to the WAL (no fsync needed on abort).
+    ///
+    /// Port of `Txn.abort()` → log abort entry.
+    pub fn log_txn_abort(&self, txn_id: i64) -> Result<(), DbiError> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(()),
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = TxnEndEntry::new_abort(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        lm.log(LogEntryType::TxnAbort, &buf, Provisional::No, false, false)
+            .map(|_| ())
+            .map_err(DbiError::from)
+    }
+
     /// Returns the number of active transactions.
     pub fn n_active_txns(&self) -> usize {
         self.txn_manager.n_active_txns()
@@ -288,12 +392,11 @@ impl EnvironmentImpl {
         }
         *state = EnvState::Closing;
 
-        // In a full implementation:
-        // 1. Run final checkpoint
-        // 2. Stop daemon threads
-        // 3. Close all databases
-        // 4. Close log files
-        // 5. Release env lock
+        // Flush and fsync the WAL so no buffered data is lost on close.
+        if let Some(lm) = &self.log_manager {
+            // Best-effort: ignore flush errors on close (env is shutting down).
+            let _ = lm.flush_sync();
+        }
 
         *state = EnvState::Closed;
         Ok(())
@@ -303,11 +406,19 @@ impl EnvironmentImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn make_env(read_only: bool) -> (TempDir, EnvironmentImpl) {
+        let dir = TempDir::new().unwrap();
+        let env =
+            EnvironmentImpl::new(dir.path(), read_only, true).unwrap();
+        (dir, env)
+    }
 
     #[test]
     fn test_environment_creation() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
-        assert_eq!(env.get_env_home(), Path::new("/tmp/test_env"));
+        let (dir, env) = make_env(false);
+        assert_eq!(env.get_env_home(), dir.path());
         assert!(!env.is_read_only());
         assert!(env.is_transactional());
         assert!(env.is_open());
@@ -317,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_open_database_with_create() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
@@ -329,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_open_database_without_create() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let config = DatabaseConfig::new();
         let result = env.open_database("test_db", &config);
@@ -339,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_open_same_database_twice() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
@@ -354,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_remove_database() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
@@ -369,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_rename_database() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
@@ -390,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_get_database_names() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
@@ -408,14 +519,14 @@ mod tests {
 
     #[test]
     fn test_begin_txn() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
         let _txn = env.begin_txn().unwrap();
         assert_eq!(env.n_active_txns(), 1);
     }
 
     #[test]
     fn test_invalidate_environment() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         assert!(env.is_valid());
 
@@ -430,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_close_environment() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         assert!(env.is_open());
 
@@ -445,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_operations_on_closed_environment() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         env.close().unwrap();
 
@@ -461,13 +572,13 @@ mod tests {
 
     #[test]
     fn test_read_only_mode() {
-        let env = EnvironmentImpl::new("/tmp/test_env", true, true).unwrap();
+        let (_dir, env) = make_env(true);
         assert!(env.is_read_only());
     }
 
     #[test]
     fn test_multiple_databases_coexist() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
@@ -483,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_n_active_txns() {
-        let env = EnvironmentImpl::new("/tmp/test_env", false, true).unwrap();
+        let (_dir, env) = make_env(false);
 
         assert_eq!(env.n_active_txns(), 0);
 
@@ -492,5 +603,25 @@ mod tests {
 
         let _txn2 = env.begin_txn().unwrap();
         assert_eq!(env.n_active_txns(), 2);
+    }
+
+    #[test]
+    fn test_log_txn_commit() {
+        let (_dir, env) = make_env(false);
+        // Should succeed without error (fsync = true, flush = true)
+        env.log_txn_commit(1, true, true).unwrap();
+    }
+
+    #[test]
+    fn test_log_txn_abort() {
+        let (_dir, env) = make_env(false);
+        env.log_txn_abort(2).unwrap();
+    }
+
+    #[test]
+    fn test_log_txn_commit_read_only_is_noop() {
+        let (_dir, env) = make_env(true);
+        // Read-only env has no log manager; commit is a no-op.
+        env.log_txn_commit(3, true, true).unwrap();
     }
 }

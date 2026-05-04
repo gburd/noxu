@@ -58,6 +58,10 @@ pub enum DbiError {
     /// I/O error.
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// Log subsystem error.
+    #[error("log error: {0}")]
+    LogError(#[from] noxu_log::NoxuLogError),
 }
 
 /// Result type for DBI operations.
