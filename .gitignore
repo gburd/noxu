@@ -2,7 +2,7 @@ CLAUDE.md
 fuzz-*.log
 *.ndb
 timing_test*
-*db
+default.db
 crash_test_files
 *conf
 *snap.*

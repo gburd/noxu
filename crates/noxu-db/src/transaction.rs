@@ -1,0 +1,498 @@
+//! Transaction handle for Noxu DB.
+//!
+//! Port of `com.sleepycat.je.Transaction`.
+
+use crate::durability::{Durability, SyncPolicy};
+use crate::error::{NoxuError, Result};
+use crate::transaction_config::TransactionConfig;
+use noxu_log::LogManager;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Transaction state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionState {
+    /// Transaction is open and can be used for operations.
+    Open,
+    /// Transaction has been committed.
+    Committed,
+    /// Transaction has been aborted.
+    Aborted,
+    /// Transaction must be aborted (error occurred).
+    MustAbort,
+}
+
+/// A transaction handle.
+///
+/// Port of `com.sleepycat.je.Transaction`.
+///
+/// Transaction handles are used to protect database operations.
+/// A single Transaction may be used for operations on multiple databases
+/// within the same environment.
+///
+/// Transaction handles are free-threaded; they may be used concurrently
+/// by multiple threads. Once committed or aborted, the handle must not
+/// be used for any further operations.
+///
+/// # Example
+/// ```ignore
+/// use noxu_db::{Environment, EnvironmentConfig};
+/// use std::path::PathBuf;
+///
+/// let config = EnvironmentConfig::new(PathBuf::from("/tmp/mydb"))
+///     .allow_create(true)
+///     .transactional(true);
+/// let env = Environment::open(config).unwrap();
+/// let txn = env.begin_transaction(None, None).unwrap();
+/// // ... do operations ...
+/// txn.commit().unwrap();
+/// ```
+pub struct Transaction {
+    /// Transaction ID
+    id: u64,
+    /// Current state
+    state: Mutex<TransactionState>,
+    /// When this transaction was created
+    start_time: Instant,
+    /// Whether this is read-only
+    read_only: bool,
+    /// Durability override (None = use environment default)
+    durability: Option<Durability>,
+    /// Lock timeout in milliseconds (0 = use environment default)
+    lock_timeout_ms: Mutex<u64>,
+    /// Transaction timeout in milliseconds (0 = use environment default)
+    txn_timeout_ms: Mutex<u64>,
+    /// Write-ahead log manager (None when created outside of an Environment).
+    log_manager: Option<Arc<LogManager>>,
+}
+
+impl Transaction {
+    /// Create a new transaction handle.
+    ///
+    /// # Arguments
+    /// * `id` - Unique transaction ID
+    /// * `config` - Transaction configuration
+    pub fn new(id: u64, config: TransactionConfig) -> Self {
+        Self {
+            id,
+            state: Mutex::new(TransactionState::Open),
+            start_time: Instant::now(),
+            read_only: config.read_only,
+            durability: Some(config.durability),
+            lock_timeout_ms: Mutex::new(0),
+            txn_timeout_ms: Mutex::new(0),
+            log_manager: None,
+        }
+    }
+
+    /// Create a new transaction backed by a real WAL.
+    ///
+    /// Called by `Environment::begin_transaction()` to wire the transaction to
+    /// the environment's log manager so that commit/abort write WAL entries.
+    pub fn with_log_manager(
+        id: u64,
+        config: TransactionConfig,
+        log_manager: Arc<LogManager>,
+    ) -> Self {
+        Self {
+            id,
+            state: Mutex::new(TransactionState::Open),
+            start_time: Instant::now(),
+            read_only: config.read_only,
+            durability: Some(config.durability),
+            lock_timeout_ms: Mutex::new(0),
+            txn_timeout_ms: Mutex::new(0),
+            log_manager: Some(log_manager),
+        }
+    }
+
+    /// Commit the transaction.
+    ///
+    /// All operations performed under this transaction are made durable
+    /// and visible to other transactions.
+    ///
+    /// # Errors
+    /// Returns error if the transaction is not in Open state.
+    pub fn commit(&self) -> Result<()> {
+        let durability =
+            self.durability.unwrap_or(Durability::COMMIT_SYNC);
+        self.commit_with_durability(durability)
+    }
+
+    /// Commit the transaction with specific durability.
+    ///
+    /// # Arguments
+    /// * `durability` - Durability settings for this commit
+    ///
+    /// # Errors
+    /// Returns error if the transaction is not in Open state.
+    pub fn commit_with_durability(&self, durability: Durability) -> Result<()> {
+        self.check_open()?;
+
+        // Write TxnCommit to the WAL before marking committed.
+        // Durability controls whether we fsync, flush, or just buffer.
+        if !self.read_only {
+            if let Some(lm) = &self.log_manager {
+                let (fsync, flush) = match durability.local_sync {
+                    SyncPolicy::Sync => (true, true),
+                    SyncPolicy::WriteNoSync => (false, true),
+                    SyncPolicy::NoSync => (false, false),
+                };
+                self.write_txn_end(lm, true, fsync, flush)?;
+            }
+        }
+
+        let mut state = self.state.lock().unwrap();
+        *state = TransactionState::Committed;
+        Ok(())
+    }
+
+    /// Abort the transaction.
+    ///
+    /// All operations performed under this transaction are rolled back.
+    ///
+    /// # Errors
+    /// Returns error if the transaction is already committed or aborted.
+    pub fn abort(&self) -> Result<()> {
+        {
+            let state = self.state.lock().unwrap();
+            match *state {
+                TransactionState::Committed => {
+                    return Err(NoxuError::OperationNotAllowed(
+                        "Cannot abort a committed transaction".to_string(),
+                    ));
+                }
+                TransactionState::Aborted => {
+                    return Err(NoxuError::OperationNotAllowed(
+                        "Transaction already aborted".to_string(),
+                    ));
+                }
+                TransactionState::Open | TransactionState::MustAbort => {}
+            }
+        }
+
+        // Write TxnAbort to WAL before marking aborted (no fsync needed).
+        if !self.read_only {
+            if let Some(lm) = &self.log_manager {
+                self.write_txn_end(lm, false, false, false)?;
+            }
+        }
+
+        let mut state = self.state.lock().unwrap();
+        *state = TransactionState::Aborted;
+        Ok(())
+    }
+
+    /// Serializes a TxnCommit or TxnAbort entry and writes it to `lm`.
+    fn write_txn_end(
+        &self,
+        lm: &LogManager,
+        is_commit: bool,
+        fsync: bool,
+        flush: bool,
+    ) -> Result<()> {
+        use bytes::BytesMut;
+        use noxu_log::{LogEntryType, Provisional, entry::TxnEndEntry};
+        use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = if is_commit {
+            TxnEndEntry::new_commit(
+                self.id as i64, NULL_LSN, timestamp, 0, NULL_VLSN,
+            )
+        } else {
+            TxnEndEntry::new_abort(
+                self.id as i64, NULL_LSN, timestamp, 0, NULL_VLSN,
+            )
+        };
+
+        let entry_type = if is_commit {
+            LogEntryType::TxnCommit
+        } else {
+            LogEntryType::TxnAbort
+        };
+
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        lm.log(entry_type, &buf, Provisional::No, flush, fsync)
+            .map(|_| ())
+            .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))
+    }
+
+    /// Get the transaction ID.
+    pub fn get_id(&self) -> u64 {
+        self.id
+    }
+
+    /// Get the current transaction state.
+    pub fn get_state(&self) -> TransactionState {
+        *self.state.lock().unwrap()
+    }
+
+    /// Check if the transaction is valid (in Open state).
+    pub fn is_valid(&self) -> bool {
+        matches!(self.get_state(), TransactionState::Open)
+    }
+
+    /// Set the lock timeout for this transaction.
+    ///
+    /// # Arguments
+    /// * `timeout_ms` - Lock timeout in milliseconds (0 = use environment default)
+    pub fn set_lock_timeout(&self, timeout_ms: u64) {
+        *self.lock_timeout_ms.lock().unwrap() = timeout_ms;
+    }
+
+    /// Get the lock timeout for this transaction.
+    pub fn get_lock_timeout(&self) -> u64 {
+        *self.lock_timeout_ms.lock().unwrap()
+    }
+
+    /// Set the transaction timeout.
+    ///
+    /// # Arguments
+    /// * `timeout_ms` - Transaction timeout in milliseconds (0 = use environment default)
+    pub fn set_txn_timeout(&self, timeout_ms: u64) {
+        *self.txn_timeout_ms.lock().unwrap() = timeout_ms;
+    }
+
+    /// Get the transaction timeout for this transaction.
+    pub fn get_txn_timeout(&self) -> u64 {
+        *self.txn_timeout_ms.lock().unwrap()
+    }
+
+    /// Get the durability setting for this transaction.
+    pub fn get_durability(&self) -> Option<Durability> {
+        self.durability
+    }
+
+    /// Check if this is a read-only transaction.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Get the elapsed time since transaction start.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Check that the transaction is in Open state.
+    ///
+    /// # Errors
+    /// Returns error if the transaction is not Open.
+    fn check_open(&self) -> Result<()> {
+        let state = self.get_state();
+        match state {
+            TransactionState::Open => Ok(()),
+            TransactionState::Committed => Err(NoxuError::OperationNotAllowed(
+                "Transaction has been committed".to_string(),
+            )),
+            TransactionState::Aborted => Err(NoxuError::OperationNotAllowed(
+                "Transaction has been aborted".to_string(),
+            )),
+            TransactionState::MustAbort => Err(NoxuError::OperationNotAllowed(
+                "Transaction must be aborted due to previous error".to_string(),
+            )),
+        }
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        // Warn if transaction wasn't explicitly committed or aborted
+        let state = *self.state.lock().unwrap();
+        if matches!(state, TransactionState::Open | TransactionState::MustAbort)
+        {
+            log::warn!(
+                "Transaction {} dropped without commit or abort, implicitly aborting",
+                self.id
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_transaction() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(1, config);
+        assert_eq!(txn.get_id(), 1);
+        assert_eq!(txn.get_state(), TransactionState::Open);
+        assert!(txn.is_valid());
+        assert!(!txn.is_read_only());
+    }
+
+    #[test]
+    fn test_read_only_transaction() {
+        let config = TransactionConfig::default().with_read_only(true);
+        let txn = Transaction::new(2, config);
+        assert!(txn.is_read_only());
+        assert!(txn.is_valid());
+    }
+
+    #[test]
+    fn test_commit() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(3, config);
+        assert!(txn.commit().is_ok());
+        assert_eq!(txn.get_state(), TransactionState::Committed);
+        assert!(!txn.is_valid());
+    }
+
+    #[test]
+    fn test_commit_twice_fails() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(4, config);
+        assert!(txn.commit().is_ok());
+        let result = txn.commit();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            NoxuError::OperationNotAllowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_abort() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(5, config);
+        assert!(txn.abort().is_ok());
+        assert_eq!(txn.get_state(), TransactionState::Aborted);
+        assert!(!txn.is_valid());
+    }
+
+    #[test]
+    fn test_abort_twice_fails() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(6, config);
+        assert!(txn.abort().is_ok());
+        let result = txn.abort();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_commit_after_abort_fails() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(7, config);
+        assert!(txn.abort().is_ok());
+        let result = txn.commit();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_abort_after_commit_fails() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(8, config);
+        assert!(txn.commit().is_ok());
+        let result = txn.abort();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_timeout() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(9, config);
+        assert_eq!(txn.get_lock_timeout(), 0);
+        txn.set_lock_timeout(5000);
+        assert_eq!(txn.get_lock_timeout(), 5000);
+    }
+
+    #[test]
+    fn test_txn_timeout() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(10, config);
+        assert_eq!(txn.get_txn_timeout(), 0);
+        txn.set_txn_timeout(10000);
+        assert_eq!(txn.get_txn_timeout(), 10000);
+    }
+
+    #[test]
+    fn test_durability() {
+        let dur = Durability::COMMIT_SYNC;
+        let config = TransactionConfig::default().with_durability(dur);
+        let txn = Transaction::new(11, config);
+        assert_eq!(txn.get_durability(), Some(dur));
+    }
+
+    #[test]
+    fn test_elapsed_time() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(12, config);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let elapsed = txn.elapsed();
+        assert!(elapsed.as_millis() >= 10);
+    }
+
+    #[test]
+    fn test_commit_with_durability() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(13, config);
+        let dur = Durability::COMMIT_NO_SYNC;
+        assert!(txn.commit_with_durability(dur).is_ok());
+        assert_eq!(txn.get_state(), TransactionState::Committed);
+    }
+
+    #[test]
+    fn test_must_abort_state() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(14, config);
+        {
+            let mut state = txn.state.lock().unwrap();
+            *state = TransactionState::MustAbort;
+        }
+        assert_eq!(txn.get_state(), TransactionState::MustAbort);
+        assert!(!txn.is_valid());
+
+        // Can still abort a MustAbort transaction
+        assert!(txn.abort().is_ok());
+        assert_eq!(txn.get_state(), TransactionState::Aborted);
+    }
+
+    #[test]
+    fn test_must_abort_cannot_commit() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(15, config);
+        {
+            let mut state = txn.state.lock().unwrap();
+            *state = TransactionState::MustAbort;
+        }
+
+        let result = txn.commit();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            NoxuError::OperationNotAllowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_state_transitions() {
+        let config = TransactionConfig::default();
+        // Open -> Committed
+        let txn1 = Transaction::new(16, config.clone());
+        assert_eq!(txn1.get_state(), TransactionState::Open);
+        txn1.commit().unwrap();
+        assert_eq!(txn1.get_state(), TransactionState::Committed);
+
+        // Open -> Aborted
+        let txn2 = Transaction::new(17, config);
+        assert_eq!(txn2.get_state(), TransactionState::Open);
+        txn2.abort().unwrap();
+        assert_eq!(txn2.get_state(), TransactionState::Aborted);
+    }
+
+    #[test]
+    fn test_transaction_id_uniqueness() {
+        let config = TransactionConfig::default();
+        let txn1 = Transaction::new(100, config.clone());
+        let txn2 = Transaction::new(101, config);
+        assert_ne!(txn1.get_id(), txn2.get_id());
+    }
+}

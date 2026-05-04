@@ -13,6 +13,13 @@ use noxu_dbi::{
     CursorImpl, DatabaseConfig, DatabaseId, DatabaseImpl, DbType,
     EnvironmentImpl, GetMode, OperationStatus, PutMode, SearchMode,
 };
+use tempfile::TempDir;
+
+fn tmp_env() -> (TempDir, EnvironmentImpl) {
+    let dir = TempDir::new().unwrap();
+    let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+    (dir, env)
+}
 use parking_lot::RwLock;
 
 // ============================================================================
@@ -258,7 +265,7 @@ fn database_impl_serialization_roundtrip() {
 
 #[test]
 fn environment_impl_create_and_open() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     assert!(!env.is_read_only());
     assert!(env.is_transactional());
     assert!(env.is_open());
@@ -267,7 +274,7 @@ fn environment_impl_create_and_open() {
 
 #[test]
 fn environment_impl_open_database_with_create() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
@@ -278,7 +285,7 @@ fn environment_impl_open_database_with_create() {
 
 #[test]
 fn environment_impl_open_database_no_create_fails() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let cfg = DatabaseConfig::new();
     let result = env.open_database("nonexistent", &cfg);
     assert!(result.is_err());
@@ -286,7 +293,7 @@ fn environment_impl_open_database_no_create_fails() {
 
 #[test]
 fn environment_impl_open_same_database_twice_increments_ref() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
@@ -299,7 +306,7 @@ fn environment_impl_open_same_database_twice_increments_ref() {
 
 #[test]
 fn environment_impl_multiple_databases_unique_ids() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
@@ -314,7 +321,7 @@ fn environment_impl_multiple_databases_unique_ids() {
 
 #[test]
 fn environment_impl_remove_database() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
@@ -327,7 +334,7 @@ fn environment_impl_remove_database() {
 
 #[test]
 fn environment_impl_rename_database() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
@@ -343,7 +350,7 @@ fn environment_impl_rename_database() {
 
 #[test]
 fn environment_impl_get_database_names() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 
@@ -357,7 +364,7 @@ fn environment_impl_get_database_names() {
 
 #[test]
 fn environment_impl_begin_txn_tracks_active() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     assert_eq!(env.n_active_txns(), 0);
     let _t1 = env.begin_txn().unwrap();
     assert_eq!(env.n_active_txns(), 1);
@@ -367,7 +374,7 @@ fn environment_impl_begin_txn_tracks_active() {
 
 #[test]
 fn environment_impl_close() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     assert!(env.is_open());
     env.close().unwrap();
     assert!(!env.is_open());
@@ -377,7 +384,7 @@ fn environment_impl_close() {
 
 #[test]
 fn environment_impl_ops_on_closed_env_fail() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     env.close().unwrap();
 
     let mut cfg = DatabaseConfig::new();
@@ -873,7 +880,7 @@ fn cursor_get_first_after_all_keys_deleted_returns_not_found() {
 
 #[test]
 fn environment_cursor_put_get_delete() {
-    let env = EnvironmentImpl::new("/tmp/noxu_test", false, true).unwrap();
+    let (_dir, env) = tmp_env();
     let mut cfg = DatabaseConfig::new();
     cfg.set_allow_create(true);
 

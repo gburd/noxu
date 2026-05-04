@@ -19,6 +19,7 @@ parking_lot = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
+bytes = { workspace = true }
 
 [features]
 # Exposes test-only cursor-failure hooks for use by integration tests in
@@ -27,6 +28,7 @@ testing = []
 
 [dev-dependencies]
 proptest = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true
