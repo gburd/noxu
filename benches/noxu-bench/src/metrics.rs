@@ -1,23 +1,7 @@
 //! Metrics collection helpers for the noxu workload benchmark.
 //!
-//! All reads are Linux-specific (/proc/self/status and /proc/self/io).
+//! All reads are Linux-specific (/proc/self/status, /proc/self/io, /proc/self/stat).
 //! On non-Linux platforms every function returns 0 rather than panicking.
-
-/// Snapshot of per-run performance metrics.
-#[derive(Debug, Default)]
-pub struct Metrics {
-    pub elapsed_ms: f64,
-    pub ns_per_op: f64,
-    pub ops_per_sec: f64,
-    /// RSS after workload minus RSS before workload (kilobytes).
-    pub rss_delta_kb: i64,
-    /// Bytes read from storage during the workload (kilobytes, from /proc/self/io).
-    pub read_bytes_kb: u64,
-    /// Bytes written to storage during the workload (kilobytes, from /proc/self/io).
-    pub write_bytes_kb: u64,
-    /// Total size of the data directory after the workload (kilobytes).
-    pub disk_kb: u64,
-}
 
 /// Read VmRSS from /proc/self/status and return the value in kilobytes.
 ///
@@ -74,6 +58,37 @@ pub fn proc_io() -> (u64, u64) {
     #[cfg(not(target_os = "linux"))]
     {
         (0, 0)
+    }
+}
+
+/// Read process CPU time (user + system) from /proc/self/stat, in milliseconds.
+///
+/// Fields 14 (utime) and 15 (stime) are in jiffies (USER_HZ = 100), so
+/// each jiffy = 10 ms.  Returns 0 on any parse error or non-Linux.
+pub fn cpu_time_ms() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let text = match std::fs::read_to_string("/proc/self/stat") {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        // The comm field (field 2) may contain spaces; skip past the last ')'.
+        let after_comm = match text.rfind(')') {
+            Some(pos) => &text[pos + 2..],
+            None => return 0,
+        };
+        // After ')': state(1) ppid(2) ... utime is index 11, stime is index 12
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        if fields.len() < 14 {
+            return 0;
+        }
+        let utime: u64 = fields[11].parse().unwrap_or(0);
+        let stime: u64 = fields[12].parse().unwrap_or(0);
+        (utime + stime) * 10 // jiffies → ms (USER_HZ = 100)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
     }
 }
 
