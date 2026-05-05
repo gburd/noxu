@@ -169,6 +169,29 @@ impl Cleaner {
     /// BIN slot LSNs are updated.
     ///
     /// Port of the tree-access wiring in JE's `FileProcessor.processFile()`.
+    ///
+    /// # CLUSTER-C-WIRING
+    ///
+    /// `environment_impl.rs` needs to pass the environment's `Arc<LockManager>`
+    /// into `SharedTreeLookup::with_lock_manager(tree, log_manager, lock_manager)`
+    /// instead of letting `SharedTreeLookup::new` allocate a fresh one.
+    ///
+    /// Until that wiring is done, `SharedTreeLookup::new` allocates a private
+    /// `LockManager` (no lock-table sharing with transactions), which is safe
+    /// but means cleaner locks do not contend with user transactions.
+    ///
+    /// To complete the wiring, update `EnvironmentImpl::new` and/or
+    /// `EnvironmentImpl::open_cleaner` to call:
+    /// ```ignore
+    /// Cleaner::with_file_manager_tree_and_lock_manager(
+    ///     min_util, min_count, min_age,
+    ///     self.file_manager.clone(),
+    ///     self.primary_tree.clone(),
+    ///     self.log_manager.clone(),
+    ///     self.lock_manager.clone(),   // ← the environment's LockManager
+    /// )
+    /// ```
+    /// and add the corresponding constructor to `Cleaner`.
     pub fn with_file_manager_and_tree(
         min_utilization: u32,
         min_file_count: u32,
