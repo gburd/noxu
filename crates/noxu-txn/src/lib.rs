@@ -94,7 +94,7 @@ mod txn_abort;
 pub use txn_abort::TxnAbort;
 
 mod txn;
-pub use txn::{Txn, UndoRecord};
+pub use txn::{Durability, Txn, UndoRecord};
 
 mod txn_manager;
 pub use txn_manager::{TxnManager, TxnStats};

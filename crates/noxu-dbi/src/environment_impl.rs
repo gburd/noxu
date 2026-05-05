@@ -228,29 +228,32 @@ impl EnvironmentImpl {
             //          recovered DbTree to each DatabaseImpl.
             let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
             let mut rmgr = RecoveryManager::new();
-            // Build the recovery tree for db_id=1.  We run recovery into a
-            // locally-owned Tree so we can move it into `recovered_trees`
-            // after recovery completes, giving `open_database()` access to
-            // the crash-consistent state.
+            // Multi-DB recovery: discover every db_id in the log and build
+            // a Tree for each one.  Port of JE's RecoveryManager.recoverInternal()
+            // which populates DbTree.dbIdToDb (a Map<DatabaseId, DatabaseImpl>)
+            // during the analysis phase and routes each LN/BIN to the correct DB.
             //
-            // Port of JE: RecoveryManager.recover() returns RecoveryInfo;
-            // the recovered per-database trees are later used by
-            // EnvironmentImpl.setupDbEnvironment() →
-            // DatabaseImpl.setTree(recoveredTree).
-            let mut recovery_tree = noxu_tree::Tree::new(1, 256);
+            // We seed the map with db_id=1 (the primary user database) and let
+            // recover_all() auto-insert entries for any other db_ids it discovers.
+            let mut recovery_trees: std::collections::HashMap<u64, noxu_tree::Tree> =
+                std::collections::HashMap::new();
+            recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+
             if let Err(e) =
-                rmgr.recover(&mut scanner, Some(&mut recovery_tree), true)
+                rmgr.recover_all(&mut scanner, &mut recovery_trees, true)
             {
                 return Err(DbiError::EnvironmentFailure {
                     reason: format!("recovery failed: {e}"),
                 });
             }
 
-            // Stash the recovered tree keyed by db_id=1 so that
-            // open_database() can transplant it into the DatabaseImpl via
-            // set_recovered_tree().  Port of JE's per-database tree
-            // population from RecoveryManager.getDbIdToDbMap().
-            recovered.insert(1u64, recovery_tree);
+            // Install all recovered trees keyed by db_id so that
+            // open_database() can transplant each into the matching DatabaseImpl.
+            // Port of JE's per-database tree population from
+            // RecoveryManager.getDbIdToDbMap().
+            for (db_id, tree) in recovery_trees {
+                recovered.insert(db_id, tree);
+            }
 
             Some(Arc::new(LogManager::new(fm, 3, 1024 * 1024, 65536)))
         } else {
@@ -304,13 +307,18 @@ impl EnvironmentImpl {
         // constructor (called after RecoveryManager.recover()).
         let cleaner = log_manager.as_ref().map(|lm| {
             let fm = Arc::clone(lm.file_manager());
-            Cleaner::with_file_manager_and_tree(
+            // Pass the environment's shared LockManager so that cleaner-held
+            // locks contend with user transactions for correct deadlock
+            // detection.  Port of JE: Cleaner uses
+            // env.getTxnManager().getLockManager().
+            Cleaner::with_file_manager_tree_and_lock_manager(
                 50,                      // min_utilization (50 %)
                 2,                       // min_file_count
                 0,                       // min_age (seconds)
                 fm,
                 Arc::clone(&primary_tree),
                 Arc::clone(lm),
+                Arc::clone(&lock_manager),
             )
         });
 

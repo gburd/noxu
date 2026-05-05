@@ -37,6 +37,7 @@ use crate::log_scanner::{LnOperation, LnRecord, LogEntry, LogScanner};
 use crate::recovery_info::RecoveryInfo;
 use crate::rollback_tracker::RollbackTracker;
 use noxu_util::{Lsn, NULL_LSN};
+use std::collections::HashMap;
 
 // ============================================================================
 // Recovery progress
@@ -323,6 +324,181 @@ impl RecoveryManager {
         self.set_progress(RecoveryProgress::Complete);
 
         Ok(self.info.clone())
+    }
+
+    /// Multi-database 3-phase recovery.
+    ///
+    /// Identical to `recover()` but accepts a `HashMap<u64, Tree>` keyed by
+    /// database ID.  During redo and undo, each LN is routed to the tree
+    /// whose key matches `rec.db_id`, rather than being gated on a single
+    /// database.  New `db_id` values encountered in the log are auto-inserted
+    /// into `trees` (with max_entries=256) so that all databases discovered
+    /// during recovery are fully reconstructed.
+    ///
+    /// Port of `RecoveryManager.recoverInternal()` + `DbTree.dbIdToDb` map
+    /// in JE: the map is populated during the analysis phase and every redo /
+    /// undo entry is dispatched to the correct per-database tree.
+    pub fn recover_all(
+        &mut self,
+        scanner: &mut dyn LogScanner,
+        trees: &mut HashMap<u64, noxu_tree::Tree>,
+        use_checkpoint: bool,
+    ) -> Result<RecoveryInfo> {
+        self.use_existing_checkpoint = use_checkpoint;
+
+        self.set_progress(RecoveryProgress::FindEndOfLog);
+        self.find_end_of_log(scanner)?;
+
+        self.set_progress(RecoveryProgress::FindLastCheckpoint);
+        if self.use_existing_checkpoint {
+            self.find_last_checkpoint(scanner)?;
+        } else {
+            self.info.checkpoint_start_lsn = NULL_LSN;
+            self.info.first_active_lsn = Lsn::new(0, 0);
+        }
+
+        self.set_progress(RecoveryProgress::BuildTree);
+        let analysis = self.run_analysis(scanner)?;
+
+        self.info.checkpoint_start_lsn = analysis.checkpoint_start_lsn;
+        self.info.checkpoint_end_lsn = analysis.checkpoint_end_lsn;
+        self.info.first_active_lsn = analysis.first_active_lsn;
+        self.info.use_root_lsn = analysis.use_root_lsn;
+        self.info.use_max_node_id =
+            self.info.use_max_node_id.max(analysis.max_node_id);
+        self.info.use_max_db_id =
+            self.info.use_max_db_id.max(analysis.max_db_id);
+        self.info.use_max_txn_id =
+            self.info.use_max_txn_id.max(analysis.max_txn_id);
+
+        self.stats.committed_txns = analysis.committed_count() as u64;
+        self.stats.aborted_txns = analysis.aborted_count() as u64;
+
+        // Auto-insert trees for any db_id encountered in the redo entries.
+        // Port of JE: DbTree.dbIdToDb is populated during analysis.
+        for (_lsn, rec) in &self.redo_entries {
+            trees.entry(rec.db_id)
+                .or_insert_with(|| noxu_tree::Tree::new(rec.db_id, 256));
+        }
+
+        self.set_progress(RecoveryProgress::ReplayLNs);
+        self.run_redo_all(scanner, &analysis, trees)?;
+
+        self.set_progress(RecoveryProgress::UndoLNs);
+        self.run_undo_all(scanner, &analysis, trees)?;
+
+        self.set_progress(RecoveryProgress::Complete);
+        Ok(self.info.clone())
+    }
+
+    /// Multi-DB redo pass.
+    fn run_redo_all(
+        &mut self,
+        _scanner: &dyn LogScanner,
+        analysis: &AnalysisResult,
+        trees: &mut HashMap<u64, noxu_tree::Tree>,
+    ) -> Result<()> {
+        let in_entries: Vec<_> = {
+            let mut levels = Vec::new();
+            while let Some(level) = self.dirty_in_map.get_lowest_level() {
+                let refs = self.dirty_in_map.select_dirty_ins_for_level(level);
+                for r in refs {
+                    levels.push((level, r));
+                }
+            }
+            levels
+        };
+        self.stats.ins_replayed += in_entries.len() as u64;
+
+        let ckpt_start = analysis.checkpoint_start_lsn;
+        let redo_entries: Vec<(Lsn, LnRecord)> =
+            std::mem::take(&mut self.redo_entries);
+
+        for (lsn, rec) in &redo_entries {
+            self.stats.lns_read_redo += 1;
+            let action = self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
+            if let RedoAction::Apply = action {
+                if let Some(t) = trees.get_mut(&rec.db_id) {
+                    Self::redo_ln(t, rec, *lsn);
+                }
+                self.stats.lns_redone += 1;
+            }
+        }
+        self.redo_entries = redo_entries;
+        Ok(())
+    }
+
+    /// Multi-DB undo pass.
+    fn run_undo_all(
+        &mut self,
+        scanner: &dyn LogScanner,
+        analysis: &AnalysisResult,
+        trees: &mut HashMap<u64, noxu_tree::Tree>,
+    ) -> Result<()> {
+        let last_used = self.info.last_used_lsn;
+        let first_active = analysis.first_active_lsn;
+        if last_used == NULL_LSN {
+            return Ok(());
+        }
+        let stop = if first_active == NULL_LSN {
+            Lsn::new(0, 0)
+        } else {
+            first_active
+        };
+        let entries = scanner.scan_backward(last_used, stop);
+        for pe in &entries {
+            if let LogEntry::Ln(rec) = &pe.entry {
+                self.stats.lns_read_undo += 1;
+                let txn_id = match rec.txn_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                if self.rollback_tracker.is_in_rollback_period(pe.lsn) {
+                    continue;
+                }
+                if analysis.is_committed(txn_id) {
+                    continue;
+                }
+                let action = Self::compute_undo_action(rec);
+                if let Some(t) = trees.get_mut(&rec.db_id) {
+                    match &action {
+                        UndoAction::DeleteSlot => {
+                            t.delete(&rec.key);
+                            self.stats.lns_undone += 1;
+                            self.stats.active_txns_undone += 1;
+                        }
+                        UndoAction::RevertToAbortLsn { abort_lsn } => {
+                            if rec.abort_known_deleted {
+                                t.delete(&rec.key);
+                            } else if let Some(abort_data) = &rec.abort_data {
+                                let key = rec.abort_key
+                                    .clone()
+                                    .unwrap_or_else(|| rec.key.clone());
+                                let _ = t.insert(key, abort_data.clone(), *abort_lsn);
+                            } else {
+                                // Non-embedded: read before-image from log.
+                                let before_image = scanner.read_at_lsn(*abort_lsn);
+                                if let Some(LogEntry::Ln(before_rec)) = before_image {
+                                    if let Some(before_data) = before_rec.data {
+                                        let key = before_rec.abort_key
+                                            .unwrap_or(before_rec.key);
+                                        let _ = t.insert(key, before_data, *abort_lsn);
+                                    } else {
+                                        t.delete(&rec.key);
+                                    }
+                                } else {
+                                    t.delete(&rec.key);
+                                }
+                            }
+                            self.stats.lns_undone += 1;
+                            self.stats.active_txns_undone += 1;
+                        }
+                        UndoAction::NoAction => {}
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // ====================================================================

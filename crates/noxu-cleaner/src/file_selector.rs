@@ -69,6 +69,19 @@ pub struct FileSelector {
     checkpointed: HashSet<u32>,
     /// Files that are safe to delete.
     safe_to_delete: HashSet<u32>,
+    /// Two-pass cleaning: required utilization threshold for next selection pass.
+    ///
+    /// When a first pass fails to reclaim enough space, `check_for_required_util`
+    /// raises this threshold and sets `force_cleaning=true` to force a second pass
+    /// targeting lower-utilization files.
+    ///
+    /// Port of `FileSelector.requiredUtil` in JE.
+    required_util: Option<i32>,
+    /// Two-pass cleaning: if true, bypass normal utilization threshold and
+    /// always select the best candidate file.
+    ///
+    /// Port of `FileSelector.forceCleaning` in JE.
+    force_cleaning: bool,
 }
 
 impl FileSelector {
@@ -81,7 +94,41 @@ impl FileSelector {
             cleaned: HashSet::new(),
             checkpointed: HashSet::new(),
             safe_to_delete: HashSet::new(),
+            required_util: None,
+            force_cleaning: false,
         }
+    }
+
+    /// Checks whether a second cleaning pass is required.
+    ///
+    /// Called after each cleaning pass completes.  If `actual_util` is still
+    /// above `target_util`, raises `required_util` by the gap and enables
+    /// `force_cleaning` for the next pass.
+    ///
+    /// Port of `FileSelector.checkForRequiredUtilization()` in JE.
+    pub fn check_for_required_util(&mut self, actual_util: i32, target_util: i32) {
+        if actual_util > target_util {
+            // Raise the threshold by the shortfall, capped at 100.
+            let gap = actual_util - target_util;
+            let new_req = actual_util.saturating_add(gap).min(100);
+            self.required_util = Some(new_req);
+            self.force_cleaning = true;
+        } else {
+            self.required_util = None;
+            self.force_cleaning = false;
+        }
+    }
+
+    /// Returns the current required utilization threshold (`None` if none set).
+    ///
+    /// Port of `FileSelector.getRequiredUtil()` in JE.
+    pub fn required_util(&self) -> Option<i32> {
+        self.required_util
+    }
+
+    /// Returns true if force-cleaning mode is active.
+    pub fn is_force_cleaning(&self) -> bool {
+        self.force_cleaning
     }
 
     /// Selects the next file for cleaning from the queue.
@@ -191,11 +238,18 @@ impl FileSelector {
             // Without expiration: minUtil == maxUtil == utilization().
             let avg_util = Self::utilization_pct(summary);
 
-            // Apply the utilization threshold filter (unless force_cleaning).
-            // JE: predictedMinUtil < totalThreshold → clean; otherwise skip.
-            // We check the file-level utilization directly since we don't
-            // maintain the predicted total utilization here.
-            if !force_cleaning && avg_util >= min_utilization_pct as i32 {
+            // Apply the utilization threshold filter.
+            // During a second pass (`self.force_cleaning`), override the caller's
+            // threshold with `self.required_util` if it is stricter (lower).
+            // Port of JE: FileSelector picks files below requiredUtil when
+            // forceCleaning is active.
+            let effective_threshold = if self.force_cleaning {
+                self.required_util.unwrap_or(min_utilization_pct as i32)
+                    .min(min_utilization_pct as i32)
+            } else {
+                min_utilization_pct as i32
+            };
+            if !force_cleaning && !self.force_cleaning && avg_util >= effective_threshold {
                 continue;
             }
 

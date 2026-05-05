@@ -269,6 +269,15 @@ impl DatabaseImpl {
     }
 
     pub fn read_from_log(buf: &[u8]) -> std::io::Result<Self> {
+        // Helper: port of JE DatabaseImpl.typeForDbName()
+        fn type_for_db_name(name: &str) -> DbType {
+            match name {
+                "_jeIdMap" | "_noxuIdMap" => DbType::Id,
+                "_jeNameMap" | "_noxuNameMap" => DbType::Name,
+                "_jeUtilization" | "_noxuUtilization" => DbType::Utilization,
+                _ => DbType::User,
+            }
+        }
         use std::io::Cursor;
 
         let mut cursor = Cursor::new(buf);
@@ -294,7 +303,7 @@ impl DatabaseImpl {
         let max_entries = cursor.read_i32::<BigEndian>()?;
         let root_lsn = cursor.read_u64::<BigEndian>()?;
 
-        let db_type = DbType::User; // Simplified  -  actual type determined by context
+        let db_type = type_for_db_name(&name);
 
         let mut tree = DatabaseTree::new();
         tree.root_lsn = root_lsn;

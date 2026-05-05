@@ -1071,27 +1071,111 @@ impl Bin {
     }
 
     // =========================================================================
-    // LN eviction stubs
+    // LN eviction
     // =========================================================================
 
-    /// Evicts all resident LN targets from this BIN.
+    /// Evicts all resident embedded-LN values from this BIN.
     ///
-    /// No-op in this implementation (no LN target cache). Returns 0 bytes freed.
+    /// Iterates every slot that has embedded data.  For each such slot:
+    /// - If the slot is dirty and a `log_manager` is provided, the LN is
+    ///   written to the WAL first so that its latest value is durable before
+    ///   the in-memory copy is dropped.
+    /// - Non-dirty embedded LNs are evicted without a log write (the data is
+    ///   already captured in a previously written BIN or BIN-delta entry).
     ///
-    /// Port of `BIN.evictLNs()`.
-    pub fn evict_lns(&mut self) -> usize {
+    /// Returns the total bytes freed (estimated as key-len + data-len per slot).
+    ///
+    /// Port of `BIN.evictLNs()` in JE.
+    pub fn evict_lns(
+        &mut self,
+        log_manager: Option<&noxu_log::LogManager>,
+    ) -> usize {
         if self.has_cursors() {
             return 0;
         }
-        log::trace!("BIN.evict_lns: no-op (LN target cache not implemented)");
-        0
+        let n = self.get_n_entries();
+        let mut freed = 0;
+        for i in 0..n {
+            freed += self.evict_ln(i, log_manager);
+        }
+        freed
     }
 
-    /// Evicts the LN target at the given slot. No-op in this implementation.
+    /// Evicts the embedded LN value at slot `index`.
     ///
-    /// Port of `BIN.evictLN(int index)`.
-    pub fn evict_ln(&mut self, _index: usize) {
-        log::trace!("BIN.evict_ln: no-op (LN target cache not implemented)");
+    /// - Returns 0 if the slot has no resident embedded data.
+    /// - If the slot is dirty and `log_manager` is `Some`, writes a
+    ///   non-transactional `LN` log entry so the value is durable, then
+    ///   updates the slot LSN to the new entry's position.
+    /// - Clears `EMBEDDED_LN_BIT` from the slot state and sets the slot's
+    ///   embedded data to `None`.
+    ///
+    /// Returns an estimate of the bytes freed (key-len + data-len).
+    ///
+    /// Port of `BIN.evictLN(int index)` in JE.
+    pub fn evict_ln(
+        &mut self,
+        index: usize,
+        log_manager: Option<&noxu_log::LogManager>,
+    ) -> usize {
+        // Only embedded-LN slots have resident data to evict.
+        if self.get_embedded_data(index).is_none() {
+            return 0;
+        }
+
+        let key = match self.get_full_key(index) {
+            Some(k) => k,
+            None => return 0,
+        };
+        let data = self
+            .slot_embedded_data
+            .get(index)
+            .and_then(|d| d.clone())
+            .unwrap_or_default();
+        let freed = key.len() + data.len();
+
+        // If the slot is dirty and we have a log manager, write the LN entry
+        // to the WAL before dropping the in-memory copy.
+        if self.inner.is_entry_dirty(index)
+            && let Some(lm) = log_manager
+        {
+            let entry = noxu_log::entry::LnLogEntry::new(
+                self.inner.db_id,
+                None,
+                noxu_util::NULL_LSN,
+                false,
+                None,
+                None,
+                noxu_util::NULL_VLSN,
+                0,
+                false,
+                key,
+                Some(data),
+                0,
+                noxu_util::NULL_VLSN,
+            );
+            let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            if let Ok(new_lsn) = lm.log(
+                noxu_log::LogEntryType::InsertLN,
+                &buf,
+                noxu_log::Provisional::No,
+                false,
+                false,
+            ) {
+                self.inner.set_lsn(index, new_lsn);
+            }
+        }
+
+        // Clear embedded data and remove EMBEDDED_LN_BIT from slot state.
+        if let Some(slot) = self.slot_embedded_data.get_mut(index) {
+            *slot = None;
+        }
+        if let Some(state) = self.inner.states.get_mut(index) {
+            *state &= !crate::entry_states::EMBEDDED_LN_BIT;
+        }
+
+        freed
     }
 
     // =========================================================================

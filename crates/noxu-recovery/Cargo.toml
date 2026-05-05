@@ -11,6 +11,7 @@ noxu-log = { workspace = true }
 noxu-tree = { workspace = true }
 noxu-txn = { workspace = true }
 noxu-sync = { workspace = true }
+noxu-cleaner = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }

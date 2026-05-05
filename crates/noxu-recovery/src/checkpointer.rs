@@ -10,8 +10,10 @@ use crate::checkpoint_start::CheckpointStart;
 use crate::checkpoint_stat::CheckpointStats;
 use crate::dirty_in_map::DirtyINMap;
 use crate::error::{RecoveryError, Result};
+use noxu_cleaner::UtilizationTracker;
 use noxu_log::entry::bin_delta_log_entry::BinDeltaLogEntry;
 use noxu_log::entry::in_log_entry::InLogEntry;
+use noxu_log::entry::FileSummaryLnEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_tree::tree::{Tree, TreeNode};
 use noxu_util::{Lsn, NULL_LSN};
@@ -174,6 +176,11 @@ pub struct Checkpointer {
     ///
     /// Default: 10 MiB (10 * 1024 * 1024).  Set to 0 to disable.
     checkpoint_bytes_interval: u64,
+    /// Optional utilization tracker for persisting file summaries.
+    ///
+    /// When set, `persist_file_summaries()` iterates tracked summaries and
+    /// writes `FileSummaryLN` WAL entries — port of JE `Checkpointer.flushUtilizationDb()`.
+    utilization_tracker: Option<Arc<std::sync::Mutex<UtilizationTracker>>>,
 }
 
 impl Checkpointer {
@@ -198,6 +205,7 @@ impl Checkpointer {
             db_id: 0,
             bytes_since_checkpoint: AtomicU64::new(0),
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
+            utilization_tracker: None,
         }
     }
 
@@ -225,6 +233,18 @@ impl Checkpointer {
     pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
         self.tree = Some(tree);
         self.db_id = db_id;
+        self
+    }
+
+    /// Attach a UtilizationTracker so that `persist_file_summaries()` writes
+    /// real `FileSummaryLN` WAL entries during each checkpoint.
+    ///
+    /// Port of JE `Checkpointer` receiving the environment's utilization tracker.
+    pub fn with_utilization_tracker(
+        mut self,
+        tracker: Arc<std::sync::Mutex<UtilizationTracker>>,
+    ) -> Self {
+        self.utilization_tracker = Some(tracker);
         self
     }
 
@@ -279,15 +299,50 @@ impl Checkpointer {
     ///
     /// Port of `Checkpointer.flushUtilizationDb()` in JE.
     ///
-    /// # Current status
-    ///
-    /// Stub implementation: if a LogManager is wired the method logs a debug
-    /// message and returns `Ok(())`.  Full persisting of `FileSummaryLN`
-    /// entries requires the utilization tracker to be wired, which is a
-    /// future task.
+    /// Requires both a `LogManager` (via `with_log_manager`) and a
+    /// `UtilizationTracker` (via `with_utilization_tracker`) to be wired.
+    /// Returns `Ok(())` without writing if either is absent.
     pub fn persist_file_summaries(&self) -> Result<()> {
-        if self.log_manager.is_some() {
-            log::debug!("persist_file_summaries: stub — no FileSummaryLN entries written");
+        let (Some(lm), Some(tracker_lock)) = (&self.log_manager, &self.utilization_tracker) else {
+            return Ok(());
+        };
+
+        let tracker = tracker_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let tracked_files = tracker.get_tracked_files();
+        if tracked_files.is_empty() {
+            return Ok(());
+        }
+
+        for (file_number, tracked) in tracked_files {
+            let summary = tracked.get_summary();
+            let obsolete_count =
+                (summary.obsolete_ln_count + summary.obsolete_in_count) as i64;
+            let entry = FileSummaryLnEntry::new(
+                *file_number as u64,
+                summary.total_count as i64,
+                summary.total_size as i64,
+                obsolete_count,
+                summary.obsolete_ln_size as i64,
+                summary.obsolete_ln_size_counted > 0,
+            );
+            let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            lm.log(
+                LogEntryType::FileSummaryLN,
+                &buf,
+                Provisional::No,
+                false,
+                false,
+            )
+            .map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "persist_file_summaries log write failed: {e}"
+                ))
+            })?;
+            log::debug!(
+                "persist_file_summaries: wrote FileSummaryLN for file {}",
+                file_number
+            );
         }
         Ok(())
     }
