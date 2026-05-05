@@ -59,10 +59,30 @@ pub struct InNode {
     lsns: Vec<Lsn>,
     states: Vec<u8>,
     is_delta: bool,
+    /// Node-level dirty flag.
+    ///
+    /// Port of JE `IN.dirty` (IN_DIRTY_BIT in `flags`).
+    dirty: bool,
+    /// When true, the next checkpoint must write a full BIN rather than a delta.
+    ///
+    /// Set when a dirty slot is compressed away — JE sets this in
+    /// `BIN.compress()` to prevent a subsequent delta from omitting the
+    /// compressed slot.  Port of JE `BIN.prohibitNextDelta`.
+    prohibit_next_delta: bool,
+    /// Persistent node ID assigned at creation.
+    ///
+    /// Port of JE `IN.nodeId` (allocated from `NodeSequence`).
+    node_id: u64,
 }
+
+/// Monotonic counter for BIN node IDs (mirrors JE's NodeSequence).
+static NEXT_BIN_NODE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 impl InNode {
     pub fn new(db_id: u64, level: i32, max_entries: usize) -> Self {
+        let node_id =
+            NEXT_BIN_NODE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             db_id,
             level,
@@ -71,6 +91,9 @@ impl InNode {
             lsns: Vec::new(),
             states: Vec::new(),
             is_delta: false,
+            dirty: false,
+            prohibit_next_delta: false,
+            node_id,
         }
     }
 
@@ -221,25 +244,39 @@ impl InNode {
         }
     }
 
-    /// Returns false — the local InNode stub has no node-level dirty flag.
+    /// Returns the node-level dirty flag.
+    ///
+    /// Port of JE `IN.isDirty()`.
     pub fn is_dirty(&self) -> bool {
-        false
+        self.dirty
     }
 
-    /// No-op — the local InNode stub has no node-level dirty flag.
-    pub fn set_dirty(&mut self, _dirty: bool) {}
+    /// Sets or clears the node-level dirty flag.
+    ///
+    /// Port of JE `IN.setDirty(boolean)`.
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
 
-    /// Returns false — no prohibit-next-delta flag in local stub.
+    /// Returns true if the next checkpoint must write a full BIN (not a delta).
+    ///
+    /// Port of JE `BIN.getProhibitNextDelta()`.
     pub fn get_prohibit_next_delta(&self) -> bool {
-        false
+        self.prohibit_next_delta
     }
 
-    /// No-op — no prohibit-next-delta flag in local stub.
-    pub fn set_prohibit_next_delta(&mut self, _val: bool) {}
+    /// Sets or clears the prohibit-next-delta flag.
+    ///
+    /// Port of JE `BIN.setProhibitNextDelta(boolean)`.
+    pub fn set_prohibit_next_delta(&mut self, val: bool) {
+        self.prohibit_next_delta = val;
+    }
 
-    /// Returns 0 — local stub has no persistent node ID.
+    /// Returns the persistent node ID.
+    ///
+    /// Port of JE `Node.getNodeId()`.
     pub fn node_id(&self) -> i64 {
-        0
+        self.node_id as i64
     }
 
     pub fn set_lsn(&mut self, index: usize, lsn: Lsn) {
@@ -908,12 +945,24 @@ impl Bin {
         self.inner.is_entry_known_deleted(index) || self.inner.is_entry_pending_deleted(index)
     }
 
-    /// Returns true if the slot is deleted (expiration is a stub — not yet tracked).
+    /// Returns true if the slot is defunct (deleted or TTL-expired).
     ///
-    /// Port of `BIN.isDefunct()`.
+    /// A slot is defunct when it is known-deleted/pending-deleted OR when its
+    /// TTL expiration time has passed.  Port of `BIN.isDefunct()` from JE.
     #[inline]
     pub fn is_defunct(&self, index: usize) -> bool {
-        self.is_deleted(index)
+        if self.is_deleted(index) {
+            return true;
+        }
+        // Check TTL expiration if tracked for this slot.
+        if let Some(ref expirations) = self.slot_expirations {
+            if let Some(&exp) = expirations.get(index) {
+                if noxu_util::ttl::is_expired(exp, true) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Returns true if the slot is defunct, optionally treating tombstones as defunct.
@@ -1916,24 +1965,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_dirty_and_set_dirty_stubs() {
+    fn test_is_dirty_and_set_dirty() {
         let mut node = InNode::new(1, 1, 128);
-        // Local InNode stub always returns false for is_dirty.
+        // New nodes start clean.
         assert!(!node.is_dirty());
         node.set_dirty(true);
-        assert!(!node.is_dirty(), "stub always returns false");
+        assert!(node.is_dirty());
         node.set_dirty(false);
         assert!(!node.is_dirty());
     }
 
     #[test]
-    fn test_get_prohibit_next_delta_and_set_stubs() {
+    fn test_get_prohibit_next_delta_and_set() {
         let mut node = InNode::new(1, 1, 128);
         assert!(!node.get_prohibit_next_delta());
         node.set_prohibit_next_delta(true);
-        assert!(!node.get_prohibit_next_delta(), "stub always returns false");
+        assert!(node.get_prohibit_next_delta());
         node.set_prohibit_next_delta(false);
         assert!(!node.get_prohibit_next_delta());
+    }
+
+    #[test]
+    fn test_node_id_unique() {
+        let node1 = InNode::new(1, 1, 128);
+        let node2 = InNode::new(1, 1, 128);
+        // Each new InNode must have a distinct positive node_id.
+        assert!(node1.node_id() > 0);
+        assert!(node2.node_id() > 0);
+        assert_ne!(node1.node_id(), node2.node_id());
     }
 
     #[test]
@@ -2475,13 +2534,13 @@ mod tests {
     }
 
     // ========================================================================
-    // InNode::node_id is 0 for local stub
+    // InNode::node_id is assigned a unique positive value at construction
     // ========================================================================
 
     #[test]
-    fn test_in_node_node_id_is_zero() {
+    fn test_in_node_node_id_positive() {
         let node = InNode::new(1, 1, 128);
-        assert_eq!(node.node_id(), 0);
+        assert!(node.node_id() > 0, "node_id must be a positive assigned value");
     }
 
     // ========================================================================
