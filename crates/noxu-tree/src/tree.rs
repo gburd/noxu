@@ -1168,6 +1168,21 @@ impl Tree {
         self.database_id
     }
 
+    /// Release a parent node latch after capturing the child Arc pointer.
+    ///
+    /// Implements JE's hand-over-hand (latch-coupling) protocol:
+    /// acquire the child Arc while holding the parent latch, then call this
+    /// to release the parent before descending.
+    ///
+    /// Port of JE `IN.releaseLatch()` / the explicit release in
+    /// `Tree.searchSubTree()`.
+    #[inline]
+    fn latch_coupling_release<G>(_guard: G) {
+        // Moving `_guard` into this function drops it, releasing the lock.
+        // Named helper rather than bare `drop()` to make the coupling
+        // semantics explicit and match JE's IN.releaseLatch() call sites.
+    }
+
     /// Search for a BIN that should contain the given key.
     ///
     /// This is the core tree traversal operation. It walks from root to BIN
@@ -1284,11 +1299,9 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!("is_bin() returned false above"),
             };
-            // Explicitly drop the guard so the parent lock is released BEFORE
-            // we reassign `current`.  This is hand-over-hand (latch-coupling)
-            // semantics: child Arc captured under parent protection, parent
-            // released, then descend.
-            drop(guard);
+            // Release parent latch now that child Arc has been captured.
+            // Port of JE IN.releaseLatch() in Tree.searchSubTree().
+            Self::latch_coupling_release(guard);
 
             current = next_arc;
         }
@@ -1362,7 +1375,8 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            drop(guard);
+            // Release parent latch — port of JE IN.releaseLatch().
+            Self::latch_coupling_release(guard);
             current = next_arc;
         }
     }
@@ -2527,9 +2541,8 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // guard dropped here — parent lock released after child Arc
-            // captured (hand-over-hand / latch-coupling semantics).
-            drop(guard);
+            // Release parent latch — port of JE IN.releaseLatch().
+            Self::latch_coupling_release(guard);
 
             // Validate parent → current link before descending.
             if let Some(ref par) = parent
@@ -2691,9 +2704,8 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // guard dropped here — parent lock released after child Arc
-            // captured (hand-over-hand / latch-coupling semantics).
-            drop(guard);
+            // Release parent latch — port of JE IN.releaseLatch().
+            Self::latch_coupling_release(guard);
 
             path.push((current.clone(), slot_idx));
             current = next_arc;
@@ -2789,9 +2801,8 @@ impl Tree {
                 }
                 _ => return None,
             };
-            // guard dropped here — parent lock released after child Arc
-            // captured (hand-over-hand / latch-coupling semantics).
-            drop(guard);
+            // Release parent latch — port of JE IN.releaseLatch().
+            Self::latch_coupling_release(guard);
 
             current = next;
         }
@@ -3027,7 +3038,8 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!("is_bin() returned false above"),
             };
-            drop(guard);
+            // Release parent latch — port of JE IN.releaseLatch().
+            Self::latch_coupling_release(guard);
             current = next_arc;
         }
     }

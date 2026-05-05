@@ -13,6 +13,7 @@ noxu-sync = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

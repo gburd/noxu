@@ -40,6 +40,29 @@ pub struct UndoRecord {
     pub abort_key: Option<Vec<u8>>,
 }
 
+/// Durability policy for transaction commit.
+///
+/// Controls whether the log is flushed/fsynced on commit.
+///
+/// Port of `com.sleepycat.je.Durability` SyncPolicy in JE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// Flush and fsync before returning from commit.  Guarantees data is on
+    /// durable storage.  This is the default.
+    ///
+    /// Port of `Durability.SyncPolicy.SYNC`.
+    CommitSync,
+    /// Flush write buffers (OS page cache) but do not fsync.  Data survives
+    /// process crash but not OS/power failure.
+    ///
+    /// Port of `Durability.SyncPolicy.WRITE_NO_SYNC`.
+    CommitWriteNoSync,
+    /// Do not flush or fsync.  Fastest; data may be lost on crash.
+    ///
+    /// Port of `Durability.SyncPolicy.NO_SYNC`.
+    CommitNoSync,
+}
+
 /// Internal transaction flags.
 const IS_PREPARED: u8 = 1;
 const PAST_ROLLBACK: u8 = 4;
@@ -113,6 +136,21 @@ pub struct Txn {
     /// LSN of the TxnAbort record written during `abort()`.
     /// `NULL_LSN` until abort is called (and if the txn had logged entries).
     abort_lsn: u64,
+
+    /// Hook called immediately before writing the TxnCommit log entry.
+    ///
+    /// Used by replication (`MasterTxn`) to pre-register the commit in VLSN
+    /// tracking before it becomes durable.
+    ///
+    /// Port of `Txn.preLogCommitHook()` in JE.
+    pre_commit_hook: Option<Box<dyn Fn() + Send + Sync>>,
+
+    /// Hook called immediately after the TxnCommit log entry is written.
+    ///
+    /// Used by replication to queue the commit LSN for ACK tracking.
+    ///
+    /// Port of `Txn.postLogCommitHook()` in JE.
+    post_commit_hook: Option<Box<dyn Fn(Lsn) + Send + Sync>>,
 }
 
 impl Txn {
@@ -140,6 +178,8 @@ impl Txn {
             log_manager: None,
             commit_lsn: NULL_LSN.as_u64(),
             abort_lsn: NULL_LSN.as_u64(),
+            pre_commit_hook: None,
+            post_commit_hook: None,
         }
     }
 
@@ -169,6 +209,72 @@ impl Txn {
     /// Returns the abort LSN (`NULL_LSN` if not yet aborted or read-only).
     pub fn abort_lsn(&self) -> Lsn {
         Lsn::from_u64(self.abort_lsn)
+    }
+
+    /// Commits with an explicit durability policy.
+    ///
+    /// Port of `Txn.commit(Durability)` in JE.
+    ///
+    /// - `CommitSync` (default): flush and fsync before returning.
+    /// - `CommitWriteNoSync`: write to OS page cache but don't fsync.
+    /// - `CommitNoSync`: don't flush; fastest but least durable.
+    pub fn commit_with_durability(&mut self, durability: Durability) -> Result<Lsn, TxnError> {
+        self.check_state()?;
+        if self.has_open_cursors() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "has open cursors".into(),
+            });
+        }
+        for lsn in self.read_locks.drain().collect::<Vec<_>>() {
+            let _ = self.lock_manager.release(lsn, self.id);
+        }
+        let fsync = matches!(durability, Durability::CommitSync);
+        let assigned_lsn = if self.has_logged_entries() {
+            if let Some(ref hook) = self.pre_commit_hook {
+                hook();
+            }
+            let commit =
+                TxnCommit::new(self.id, self.last_lsn, 0, 0);
+            let mut payload = Vec::with_capacity(commit.log_size());
+            commit.write_to_log(&mut payload);
+            let lsn = self.log_entry(LogEntryType::TxnCommit, &payload, fsync)?;
+            if let Some(ref hook) = self.post_commit_hook {
+                hook(lsn);
+            }
+            lsn
+        } else {
+            NULL_LSN
+        };
+        self.commit_lsn = assigned_lsn.as_u64();
+        for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
+            let _ = self.lock_manager.release(lsn, self.id);
+        }
+        self.write_locks.clear();
+        self.state = TxnState::Committed;
+        Ok(assigned_lsn)
+    }
+
+    /// Sets the pre-commit hook called before writing the TxnCommit log entry.
+    ///
+    /// Port of `Txn.preLogCommitHook()` hook registration in JE.
+    pub fn set_pre_commit_hook<F>(&mut self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.pre_commit_hook = Some(Box::new(hook));
+    }
+
+    /// Sets the post-commit hook called after writing the TxnCommit log entry.
+    ///
+    /// The hook receives the LSN of the committed TxnCommit record.
+    ///
+    /// Port of `Txn.postLogCommitHook()` hook registration in JE.
+    pub fn set_post_commit_hook<F>(&mut self, hook: F)
+    where
+        F: Fn(Lsn) + Send + Sync + 'static,
+    {
+        self.post_commit_hook = Some(Box::new(hook));
     }
 
     /// Returns the current transaction state.
@@ -320,17 +426,26 @@ impl Txn {
         // Per JE: "If nothing was written to log for this txn, no need to
         // log a commit." (Txn.commit lines 764-785)
         //
-        // JE logCommitEntry() builds a CommitLogEntry wrapping TxnCommit and
-        // calls logManager.log(params) with flush/fsync flags derived from
-        // the durability SyncPolicy.  We default to SYNC (fsync=true) which
-        // is the safest choice; a future `commit_with_durability` method can
-        // expose the choice.
+        // JE logCommitEntry() calls preLogCommitHook() before and
+        // postLogCommitHook() after writing the TxnCommit entry.
+        // Port of `Txn.logCommitEntry()` in JE.
         let assigned_lsn = if self.has_logged_entries() {
+            // Pre-commit hook (JE: preLogCommitHook).
+            if let Some(ref hook) = self.pre_commit_hook {
+                hook();
+            }
+
             let commit =
                 TxnCommit::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
             let mut payload = Vec::with_capacity(commit.log_size());
             commit.write_to_log(&mut payload);
-            self.log_entry(LogEntryType::TxnCommit, &payload, true /* fsync */)?
+            let lsn = self.log_entry(LogEntryType::TxnCommit, &payload, true /* fsync */)?;
+
+            // Post-commit hook (JE: postLogCommitHook).
+            if let Some(ref hook) = self.post_commit_hook {
+                hook(lsn);
+            }
+            lsn
         } else {
             NULL_LSN
         };

@@ -84,6 +84,16 @@ pub struct Cleaner {
     /// Optional LogManager used by `SharedTreeLookup::migrate_ln_slot` to
     /// obtain a fresh LSN for the migrated LN entry.
     log_manager: Option<Arc<LogManager>>,
+
+    /// Optional shared `LockManager` from the environment.
+    ///
+    /// When `Some`, the cleaner uses the environment's lock table so that
+    /// cleaner-held locks contend with user transactions for correct deadlock
+    /// detection.  When `None`, `SharedTreeLookup::new` allocates a private
+    /// manager (safe but no cross-component deadlock detection).
+    ///
+    /// Port of `JE Cleaner` using `env.getTxnManager().getLockManager()`.
+    lock_manager: Option<Arc<noxu_txn::LockManager>>,
 }
 
 /// Result of a cleaning operation.
@@ -125,6 +135,7 @@ impl Cleaner {
             file_manager: None,
             tree: None,
             log_manager: None,
+            lock_manager: None,
         }
     }
 
@@ -155,6 +166,7 @@ impl Cleaner {
             file_manager: Some(file_manager),
             tree: None,
             log_manager: None,
+            lock_manager: None,
         }
     }
 
@@ -170,28 +182,9 @@ impl Cleaner {
     ///
     /// Port of the tree-access wiring in JE's `FileProcessor.processFile()`.
     ///
-    /// # CLUSTER-C-WIRING
-    ///
-    /// `environment_impl.rs` needs to pass the environment's `Arc<LockManager>`
-    /// into `SharedTreeLookup::with_lock_manager(tree, log_manager, lock_manager)`
-    /// instead of letting `SharedTreeLookup::new` allocate a fresh one.
-    ///
-    /// Until that wiring is done, `SharedTreeLookup::new` allocates a private
-    /// `LockManager` (no lock-table sharing with transactions), which is safe
-    /// but means cleaner locks do not contend with user transactions.
-    ///
-    /// To complete the wiring, update `EnvironmentImpl::new` and/or
-    /// `EnvironmentImpl::open_cleaner` to call:
-    /// ```ignore
-    /// Cleaner::with_file_manager_tree_and_lock_manager(
-    ///     min_util, min_count, min_age,
-    ///     self.file_manager.clone(),
-    ///     self.primary_tree.clone(),
-    ///     self.log_manager.clone(),
-    ///     self.lock_manager.clone(),   // ← the environment's LockManager
-    /// )
-    /// ```
-    /// and add the corresponding constructor to `Cleaner`.
+    /// Note: allocates a private `LockManager` (no lock-table sharing with
+    /// transactions).  Use `with_file_manager_tree_and_lock_manager` to pass
+    /// the environment's shared LockManager for correct deadlock detection.
     pub fn with_file_manager_and_tree(
         min_utilization: u32,
         min_file_count: u32,
@@ -214,6 +207,43 @@ impl Cleaner {
             file_manager: Some(file_manager),
             tree: Some(tree),
             log_manager: Some(log_manager),
+            lock_manager: None,
+        }
+    }
+
+    /// Creates a new cleaner wired to a `FileManager`, shared B-tree,
+    /// `LogManager`, and the environment's shared `LockManager`.
+    ///
+    /// This is the preferred constructor for production use.  Passing the
+    /// environment's `LockManager` ensures that locks held by the cleaner
+    /// contend with user transactions, enabling correct deadlock detection.
+    ///
+    /// Port of JE: `Cleaner` obtains the lock manager via
+    /// `env.getTxnManager().getLockManager()`.
+    pub fn with_file_manager_tree_and_lock_manager(
+        min_utilization: u32,
+        min_file_count: u32,
+        min_age: u64,
+        file_manager: Arc<FileManager>,
+        tree: Arc<RwLock<noxu_tree::Tree>>,
+        log_manager: Arc<LogManager>,
+        lock_manager: Arc<noxu_txn::LockManager>,
+    ) -> Self {
+        Self {
+            file_selector: Mutex::new(FileSelector::new()),
+            file_protector: FileProtector::new(),
+            stats: Arc::new(CleanerStats::new()),
+            running: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            min_utilization: min_utilization.min(100),
+            min_file_count,
+            min_age,
+            n_runs: AtomicU64::new(0),
+            pending_deletions: Mutex::new(Vec::new()),
+            file_manager: Some(file_manager),
+            tree: Some(tree),
+            log_manager: Some(log_manager),
+            lock_manager: Some(lock_manager),
         }
     }
 
@@ -342,10 +372,21 @@ impl Cleaner {
             &self.log_manager,
         ) {
             let entries = self.decode_ln_entries_from_file(fm, file_number);
-            let tree_lookup = SharedTreeLookup::new(
-                Arc::clone(tree),
-                Arc::clone(lm),
-            );
+            // Use the environment's shared LockManager when available so that
+            // cleaner-held locks contend with user transactions (JE fidelity).
+            // Port of JE: Cleaner uses env.getTxnManager().getLockManager().
+            let tree_lookup = if let Some(ref shared_lm) = self.lock_manager {
+                SharedTreeLookup::with_lock_manager(
+                    Arc::clone(tree),
+                    Arc::clone(lm),
+                    Arc::clone(shared_lm),
+                )
+            } else {
+                SharedTreeLookup::new(
+                    Arc::clone(tree),
+                    Arc::clone(lm),
+                )
+            };
             return processor.process_file(
                 file_number,
                 &file_summary,
@@ -360,21 +401,16 @@ impl Cleaner {
     /// Decodes LN log entries from a file into `LogEntry` values suitable
     /// for `FileProcessor::process_file`.
     ///
-    /// Scans the file sequentially, reading each entry header.  For LN-family
-    /// entries (type bytes 4–9) the entry is added to the result vector so
-    /// that the cleaner can look them up in the tree and migrate live ones.
+    /// Scans the file sequentially, reading each entry header and payload.
+    /// For LN-family entries (type bytes 4–9) the payload is parsed using
+    /// `LnLogEntry::read_from_log` to extract the real record key.  This
+    /// mirrors the way JE's `CleanerFileReader` extracts keys from log entries
+    /// before passing them to `FileProcessor.processFile()`.
+    ///
     /// IN, BIN-delta, and all other entry types are represented as
     /// `LogEntryType::Other` (they will be skipped by the migration loop).
     ///
-    /// The key bytes for an LN entry are not stored in the header itself; we
-    /// use a synthetic key derived from the file offset so that each entry has
-    /// a unique identity.  A full implementation would read and deserialise
-    /// the LN payload to extract the real key — that is deferred until the LN
-    /// serialisation layer is wired in.
-    ///
-    /// # JE correspondence
-    /// Port of the `CleanerFileReader.readNextEntry()` loop that feeds entries
-    /// into `FileProcessor.processFile()`.
+    /// Port of `CleanerFileReader.readNextEntry()` in JE.
     fn decode_ln_entries_from_file(
         &self,
         fm: &Arc<FileManager>,
@@ -417,17 +453,54 @@ impl Cleaner {
 
             // Build a LogEntry for LN-family types only; everything else
             // is emitted as LogEntryType::Other so the processor skips it.
+            // For LN entries, read the payload and deserialise the real key.
+            // Port of JE CleanerFileReader reading actual record keys via
+            // LN payload deserialization.
             let log_entry_type = match entry_type_byte {
-                // InsertLN=4, InsertLNTxn=5, UpdateLN=6, UpdateLNTxn=7
-                // — active (non-deleted) LN entries that may need migration.
+                // InsertLN=4, UpdateLN=6 (non-transactional) — active entries
+                // that may need migration. Read payload to extract real key.
                 4 | 6 => {
-                    // Use the file offset as a synthetic unique key so each
-                    // LN has a distinct identity in the look-ahead cache.
-                    // A real implementation reads the payload to get the
-                    // actual record key.
-                    let key = file_offset.to_le_bytes().to_vec();
+                    let payload_offset = offset + header_size as u64;
+                    let mut payload = vec![0u8; item_size];
+                    let (key, db_id): (Vec<u8>, i64) = if item_size > 0
+                        && fm.read_from_file(file_number, payload_offset, &mut payload).is_ok()
+                    {
+                        use noxu_log::entry::LnLogEntry;
+                        match LnLogEntry::read_from_log(&payload, false) {
+                            Ok(ln) => (ln.key.clone(), ln.db_id as i64),
+                            Err(_) => (file_offset.to_le_bytes().to_vec(), 1i64),
+                        }
+                    } else {
+                        (file_offset.to_le_bytes().to_vec(), 1i64)
+                    };
                     LogEntryType::Ln {
-                        db_id: 1, // default single-DB id; multi-DB requires payload parse
+                        db_id,
+                        key,
+                        deleted: false,
+                        expiration_time: 0,
+                        entry_size: entry_size as i32,
+                    }
+                }
+                // InsertLNTxn=5, UpdateLNTxn=7 — transactional variants.
+                // Read payload using transactional deserialization.
+                5 | 7 => {
+                    let payload_offset = offset + header_size as u64;
+                    let mut payload = vec![0u8; item_size];
+                    let (key, db_id): (Vec<u8>, i64) = if item_size > 0
+                        && fm.read_from_file(file_number, payload_offset, &mut payload).is_ok()
+                    {
+                        use noxu_log::entry::LnLogEntry;
+                        match LnLogEntry::read_from_log(&payload, true) {
+                            Ok(ln) => (ln.key.clone(), ln.db_id as i64),
+                            Err(_) => (file_offset.to_le_bytes().to_vec(), 1i64),
+                        }
+                    } else {
+                        (file_offset.to_le_bytes().to_vec(), 1i64)
+                    };
+                    // Transactional variants are considered live during
+                    // cleaning — the cleaner migrates them.
+                    LogEntryType::Ln {
+                        db_id,
                         key,
                         deleted: false,
                         expiration_time: 0,
@@ -437,21 +510,22 @@ impl Cleaner {
                 // DeleteLN=8, DeleteLNTxn=9 — deleted LN entries are
                 // immediately obsolete; emit as Ln { deleted: true }.
                 8 | 9 => {
-                    let key = file_offset.to_le_bytes().to_vec();
+                    let payload_offset = offset + header_size as u64;
+                    let mut payload = vec![0u8; item_size];
+                    let (key, db_id): (Vec<u8>, i64) = if item_size > 0
+                        && fm.read_from_file(file_number, payload_offset, &mut payload).is_ok()
+                    {
+                        use noxu_log::entry::LnLogEntry;
+                        let is_txn = entry_type_byte == 9;
+                        match LnLogEntry::read_from_log(&payload, is_txn) {
+                            Ok(ln) => (ln.key.clone(), ln.db_id as i64),
+                            Err(_) => (file_offset.to_le_bytes().to_vec(), 1i64),
+                        }
+                    } else {
+                        (file_offset.to_le_bytes().to_vec(), 1i64)
+                    };
                     LogEntryType::Ln {
-                        db_id: 1,
-                        key,
-                        deleted: true,
-                        expiration_time: 0,
-                        entry_size: entry_size as i32,
-                    }
-                }
-                // Transactional LN variants: treat as deleted/obsolete to
-                // be safe — full support requires reading the payload.
-                5 | 7 => {
-                    let key = file_offset.to_le_bytes().to_vec();
-                    LogEntryType::Ln {
-                        db_id: 1,
+                        db_id,
                         key,
                         deleted: true,
                         expiration_time: 0,

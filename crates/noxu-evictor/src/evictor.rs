@@ -250,16 +250,19 @@ pub struct Evictor {
     /// If true, only use LRU-based eviction (no special handling for dirty nodes).
     lru_only: bool,
 
-    /// Counter for round-robin selection from priority-1 LRU lists.
-    /// Note: In full implementation, this would be used with multiple LRU lists
-    /// per priority level for reduced contention.
-    #[allow(dead_code)]
+    /// Cumulative count of nodes evicted from the priority-1 LRU list.
+    ///
+    /// JE uses an array of pri1 LRU lists and round-robins across them using
+    /// this index.  Since Noxu uses a single combined LRU list per priority,
+    /// this counter is used as a monotonic eviction counter for pri1 nodes,
+    /// matching JE's `next_pri1_index` semantics.
+    ///
+    /// Port of `Evictor.nextPri1Index` in JE.
     next_pri1_index: AtomicU64,
 
-    /// Counter for round-robin selection from priority-2 LRU lists.
-    /// Note: In full implementation, this would be used with multiple LRU lists
-    /// per priority level for reduced contention.
-    #[allow(dead_code)]
+    /// Cumulative count of nodes evicted from the priority-2 LRU list.
+    ///
+    /// Port of `Evictor.nextPri2Index` in JE.
     next_pri2_index: AtomicU64,
 
     /// Optional LogManager for flushing dirty nodes to the WAL before
@@ -409,6 +412,12 @@ impl Evictor {
 
             nodes_processed += 1;
             self.stats.increment(&self.stats.nodes_targeted);
+            // Track which priority tier this node was pulled from.
+            if from_pri2 {
+                self.next_pri2_index.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.next_pri1_index.fetch_add(1, Ordering::Relaxed);
+            }
 
             // Obtain node metadata via callback.
             let info = match node_info_fn(node_id) {
@@ -789,6 +798,21 @@ impl Evictor {
     /// Get a reference to the statistics.
     pub fn get_stats(&self) -> &EvictorStats {
         &self.stats
+    }
+
+    /// Returns the cumulative count of nodes evicted from the priority-1 LRU.
+    ///
+    /// Port of `Evictor.nextPri1Index` in JE (used for round-robin selection
+    /// across multiple pri1 LRU lists; here counts total pri1 evictions).
+    pub fn pri1_eviction_count(&self) -> u64 {
+        self.next_pri1_index.load(Ordering::Relaxed)
+    }
+
+    /// Returns the cumulative count of nodes evicted from the priority-2 LRU.
+    ///
+    /// Port of `Evictor.nextPri2Index` in JE.
+    pub fn pri2_eviction_count(&self) -> u64 {
+        self.next_pri2_index.load(Ordering::Relaxed)
     }
 
     /// Get the current LRU sizes.

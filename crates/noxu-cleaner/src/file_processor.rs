@@ -769,6 +769,17 @@ pub enum LogEntryType {
         node_id: i64,
     },
 
+    /// A BIN-delta record.
+    ///
+    /// Carries the same fields as `In` — the cleaner processes it by marking
+    /// the parent BIN dirty so the next checkpoint re-logs the full node.
+    BinDelta {
+        /// Database the BIN-delta belongs to.
+        db_id: i64,
+        /// Node ID of the associated BIN.
+        node_id: i64,
+    },
+
     /// Any other entry type (file header, commit records, …).
     /// The cleaner considers these immediately obsolete and skips them.
     Other,
@@ -1106,6 +1117,13 @@ impl FileProcessor {
                     self.process_in(*db_id, *node_id, lsn, tree, &mut result);
                 }
 
+                // ── BIN-delta entry ────────────────────────────────────────
+                // JE: `FileProcessor.processBINDelta()` — mark parent BIN dirty
+                // so the next checkpoint re-logs the full node.
+                LogEntryType::BinDelta { db_id, node_id } => {
+                    self.process_bin_delta(*db_id, *node_id, lsn, tree, &mut result);
+                }
+
                 // ── Other / unknown entries ────────────────────────────────
                 // JE: "Consider all entries we do not process as obsolete."
                 LogEntryType::Other => {
@@ -1342,23 +1360,36 @@ impl FileProcessor {
 
     /// Processes a BIN-delta entry.
     ///
-    /// BIN-delta migration is handled by marking the parent BIN dirty via
-    /// `process_in()`.  Full BIN-delta support (including fetching the parent
-    /// IN by level) is deferred until the B-tree integration is complete.
-    /// For now this is a no-op that counts the entry as cleaned.
+    /// Port of `FileProcessor.processBINDelta()` in JE.
     ///
-    /// Port of `FileProcessor.processBINDelta()` in JE (future work).
-    #[allow(dead_code)]
-    fn process_bin_delta<T: TreeLookup>(
+    /// Marks the parent BIN dirty by delegating to `process_in()`.  This
+    /// causes the next checkpoint to re-log the full BIN, making the
+    /// cleaned file's copy of the delta obsolete.
+    pub fn process_bin_delta<T: TreeLookup>(
         &self,
-        _db_id: i64,
-        _node_id: i64,
-        _log_lsn: Lsn,
-        _tree: &T,
+        db_id: i64,
+        node_id: i64,
+        log_lsn: Lsn,
+        tree: &T,
         result: &mut FileProcessResult,
     ) {
         result.bin_deltas_cleaned += 1;
         self.stats.bin_deltas_cleaned.fetch_add(1, Ordering::Relaxed);
+        // Delegate to process_in: find the node in the tree by node_id,
+        // compare its LSN, and mark it dirty so the next checkpoint re-logs
+        // the full BIN — this supersedes the old delta.
+        //
+        // Port of JE `FileProcessor.processBINDelta()` which calls
+        // `findINInTree()` and `IN.setDirty(true)` on the found node.
+        self.process_in(db_id, node_id, log_lsn, tree, result);
+        // Move the in_* counters over to bin_delta_* since this is a delta.
+        if result.ins_migrated > 0 {
+            result.ins_migrated -= 1;
+            result.bin_deltas_migrated += 1;
+        } else if result.ins_dead > 0 {
+            result.ins_dead -= 1;
+            result.bin_deltas_dead += 1;
+        }
     }
 
     /// Returns whether shutdown has been requested.
