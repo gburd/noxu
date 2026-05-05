@@ -1,0 +1,7 @@
+# JE benchmark temp directories
+je-tmp/
+*.jdb
+je.lck
+je.info.*
+je.config.csv
+je.stat.csv
