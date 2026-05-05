@@ -9,3 +9,4 @@ je.stat.csv
 *.csv
 *.txt
 *.log
+je_gc.log.*
