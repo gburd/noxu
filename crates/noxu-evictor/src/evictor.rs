@@ -2,11 +2,35 @@
 //!
 //! Port of `com.sleepycat.je.evictor.Evictor`.
 
+// ---------------------------------------------------------------------------
+// CLUSTER-B-WIRING: environment_impl.rs must call the following after
+// constructing the Evictor to wire in the real tree and log-manager:
+//
+//   // In EnvironmentImpl::new() (or equivalent builder), after building
+//   // the Evictor:
+//   let evictor = Arc::new(
+//       Evictor::new(arbiter, max_batch_size, lru_only)
+//           .with_log_manager(Arc::clone(&log_manager))   // <-- C-3 / H-1
+//           .with_tree(Arc::clone(&primary_tree), db_id), // <-- C-3 / H-1
+//   );
+//
+//   // Store the Arc<Evictor> on EnvironmentImpl as `evictor`.
+//
+// The LogManager and Tree Arcs must already exist before the Evictor is
+// constructed.  Wiring order:  FileManager → LogManager → Tree → Evictor.
+// ---------------------------------------------------------------------------
+
 use crate::arbiter::Arbiter;
 use crate::cache_mode::CacheMode;
 use crate::evictor_stat::EvictorStats;
 use crate::lru_list::LruList;
+use noxu_log::entry::in_log_entry::InLogEntry;
+use noxu_log::{LogEntryType, LogManager, Provisional};
+use noxu_tree::tree::{BinEntry, BinStub, InEntry, InNodeStub, Tree, TreeNode};
+use noxu_util::NULL_LSN;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// Source of an eviction operation.
 ///
@@ -207,7 +231,6 @@ pub fn decide_eviction(
 /// - Manual eviction requests
 ///
 /// Port of `com.sleepycat.je.evictor.Evictor`.
-#[derive(Debug)]
 pub struct Evictor {
     /// Arbiter for determining when eviction is needed.
     arbiter: Arbiter,
@@ -238,6 +261,24 @@ pub struct Evictor {
     /// per priority level for reduced contention.
     #[allow(dead_code)]
     next_pri2_index: AtomicU64,
+
+    /// Optional LogManager for flushing dirty nodes to the WAL before
+    /// eviction.  Wired by `with_log_manager()`.
+    ///
+    /// Port of JE `Evictor.envImpl.getLogManager()` reference used inside
+    /// `evict()` when `target.getDirty()` is true.
+    log_manager: Option<Arc<LogManager>>,
+
+    /// Optional B-tree reference.  Required for the real node-info and
+    /// node-size callbacks (`do_evict`) and for dirty-write-before-eviction.
+    /// Wired by `with_tree()`.
+    ///
+    /// Port of JE's per-IN `target.getDatabase().getTree()` lookup.
+    tree: Option<Arc<RwLock<Tree>>>,
+
+    /// Database ID associated with `tree`.  Required to identify which BINs
+    /// belong to this database when calling `collect_dirty_bins`.
+    db_id: u64,
 }
 
 impl Evictor {
@@ -261,7 +302,37 @@ impl Evictor {
             lru_only,
             next_pri1_index: AtomicU64::new(0),
             next_pri2_index: AtomicU64::new(0),
+            log_manager: None,
+            tree: None,
+            db_id: 0,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Optional wiring builders
+    // -----------------------------------------------------------------------
+
+    /// Wire a `LogManager` into the evictor so that dirty nodes are written to
+    /// the WAL before they are removed from memory.
+    ///
+    /// Mirrors the same pattern used by `Checkpointer::with_log_manager`.
+    ///
+    /// Port of JE `Evictor.envImpl.getLogManager()` used inside `evict()`.
+    pub fn with_log_manager(mut self, lm: Arc<LogManager>) -> Self {
+        self.log_manager = Some(lm);
+        self
+    }
+
+    /// Wire the B-tree and database ID into the evictor so that `do_evict()`
+    /// can inspect real `TreeNode` metadata and flush dirty BINs.
+    ///
+    /// Mirrors the same pattern used by `Checkpointer::with_tree`.
+    ///
+    /// Port of JE's per-IN `target.getDatabase().getTree()` lookup.
+    pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
+        self.tree = Some(tree);
+        self.db_id = db_id;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -399,14 +470,27 @@ impl Evictor {
                 }
 
                 EvictionDecision::Evict => {
+                    // C-3 fix: If the node is dirty, flush it to the WAL
+                    // before removing it from memory.
+                    //
+                    // Port of JE `Evictor.evict()`:
+                    //   if (target.getDirty() && !storedOffHeap) {
+                    //       loggedLsn = target.log(...);
+                    //   }
+                    //   parent.detachNode(index, logged, loggedLsn);
+                    if info.is_dirty() {
+                        self.flush_dirty_node_to_log(node_id);
+                    }
+
                     // Full eviction: account for freed bytes, update counters.
                     let freed = node_size_fn(node_id);
                     result.bytes_evicted += freed;
                     result.nodes_evicted += 1;
                     self.stats.increment(&self.stats.nodes_evicted);
-                    if info.is_dirty() {
-                        self.stats.increment(&self.stats.dirty_nodes_evicted);
-                    }
+                    // dirty_nodes_evicted is incremented inside
+                    // flush_dirty_node_to_log when a WAL write succeeds;
+                    // here we only count clean-node evictions explicitly via
+                    // nodes_evicted above.
                 }
             }
 
@@ -429,10 +513,13 @@ impl Evictor {
     /// Perform an eviction run.
     ///
     /// This is the main eviction entry point that:
-    /// 1. Checks if eviction is needed via the arbiter
-    /// 2. Calls `evict_batch()` with default node-info/size callbacks
-    ///    (suitable for unit testing; production code should provide real ones)
-    /// 3. Updates source-specific byte statistics
+    /// 1. Checks if eviction is needed via the arbiter.
+    /// 2. If a tree is wired via `with_tree()`, uses real node-info/size
+    ///    callbacks backed by live `TreeNode` data (H-1 fix).  Otherwise
+    ///    falls back to the default stub callbacks suitable for unit testing.
+    /// 3. For each node selected for full `Evict`, flushes the node to the WAL
+    ///    first if it is dirty and a `LogManager` is wired (C-3 fix).
+    /// 4. Updates source-specific byte statistics.
     ///
     /// # Arguments
     /// * `source` - Source of the eviction request
@@ -440,11 +527,111 @@ impl Evictor {
     /// # Returns
     /// Result containing nodes and bytes evicted.
     pub fn do_evict(&self, source: EvictionSource) -> EvictResult {
-        self.do_evict_with_callbacks(
-            source,
-            &default_node_info,
-            &default_node_size,
-        )
+        if let Some(tree_arc) = &self.tree {
+            // H-1: real callbacks backed by live TreeNode data.
+            let tree_clone = Arc::clone(tree_arc);
+            let tree_clone2 = Arc::clone(tree_arc);
+
+            let node_info_fn = move |node_id: u64| -> Option<Box<dyn NodeEvictionInfo>> {
+                let guard = tree_clone.read().ok()?;
+                real_node_info(&guard, node_id)
+            };
+
+            let node_size_fn = move |node_id: u64| -> u64 {
+                match tree_clone2.read() {
+                    Ok(g) => real_node_size(&g, node_id),
+                    Err(_) => 1024,
+                }
+            };
+
+            self.do_evict_with_callbacks(source, &node_info_fn, &node_size_fn)
+        } else {
+            self.do_evict_with_callbacks(
+                source,
+                &default_node_info,
+                &default_node_size,
+            )
+        }
+    }
+
+    /// Write a dirty node to the WAL before evicting it (C-3 fix).
+    ///
+    /// JE `Evictor.evict()`:
+    /// ```java
+    /// if (target.getDirty() && !storedOffHeap) {
+    ///     loggedLsn = target.log(allowBinDeltas, provisional, bgIO, parent);
+    ///     logged = true;
+    /// }
+    /// long evictedBytes = target.getBudgetedMemorySize();
+    /// parent.detachNode(index, logged /*updateLsn*/, loggedLsn);
+    /// ```
+    ///
+    /// We always write a full BIN here (not a delta) for correctness — the
+    /// checkpointer handles delta optimisation; the evictor only needs
+    /// durability.
+    fn flush_dirty_node_to_log(&self, node_id: u64) {
+        let lm = match &self.log_manager {
+            Some(lm) => Arc::clone(lm),
+            None => return, // no LogManager wired — skip (e.g. unit tests)
+        };
+        let tree_arc = match &self.tree {
+            Some(t) => Arc::clone(t),
+            None => return,
+        };
+
+        // Find the node Arc under a read lock (no deadlock risk), then
+        // drop the read lock before write-locking the individual node.
+        let node_arc: Arc<RwLock<TreeNode>> = {
+            let tree_guard = match tree_arc.read() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match find_node_arc(&tree_guard, node_id) {
+                Some(a) => a,
+                None => return,
+            }
+        }; // tree read lock released here
+
+        let mut node_guard = match node_arc.write() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        let bin = match &mut *node_guard {
+            TreeNode::Bottom(b) => b,
+            // Upper INs: dirty-flush is handled by the checkpointer, not here.
+            _ => return,
+        };
+
+        if !bin.dirty && bin.dirty_count() == 0 {
+            return; // already clean
+        }
+
+        // Serialize and write a full BIN log entry.
+        let full_bytes = bin.serialize_full();
+        let entry = InLogEntry::new(
+            self.db_id,
+            bin.last_full_lsn,
+            NULL_LSN, // prev_delta_lsn
+            full_bytes,
+        );
+        let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        if let Ok(logged_lsn) = lm.log(
+            LogEntryType::BIN,
+            &buf,
+            Provisional::No,
+            false, // flush_required
+            false, // fsync_required — fsync at next checkpoint/commit boundary
+        ) {
+            // Clear dirty flags and update last_full_lsn.
+            // Port of JE: parent.detachNode(index, updateLsn=true, loggedLsn)
+            bin.clear_dirty_after_full_log(logged_lsn);
+            self.stats.increment(&self.stats.dirty_nodes_evicted);
+        }
+        // On log error we leave dirty=true; the node stays in memory (the
+        // evictor's LRU removal will happen but the tree still has the data).
     }
 
     /// Perform an eviction run with caller-supplied node callbacks.
@@ -629,6 +816,173 @@ impl Evictor {
     /// Get a reference to the arbiter.
     pub fn get_arbiter(&self) -> &Arbiter {
         &self.arbiter
+    }
+}
+
+impl std::fmt::Debug for Evictor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Evictor")
+            .field("max_batch_size", &self.max_batch_size)
+            .field("lru_only", &self.lru_only)
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .field("db_id", &self.db_id)
+            .field("log_manager_wired", &self.log_manager.is_some())
+            .field("tree_wired", &self.tree.is_some())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real node-info / node-size helpers (H-1 fix)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of a node's eviction-relevant metadata.
+///
+/// Port of JE `IN.getDirty()` / `IN.getBudgetedMemorySize()` / `IN.isBIN()`.
+struct RealNodeInfo {
+    dirty: bool,
+    is_bin: bool,
+}
+
+impl NodeEvictionInfo for RealNodeInfo {
+    fn is_dirty(&self) -> bool { self.dirty }
+    fn is_bin(&self) -> bool { self.is_bin }
+    fn is_resident(&self) -> bool { true } // found in tree → resident
+    fn ref_count(&self) -> usize { 0 }     // cursor tracking not yet wired to evictor
+}
+
+/// Walk the tree to find a node by ID and return a `RealNodeInfo` snapshot.
+///
+/// Port of JE `selectIN()` / `processTarget()` — we read node metadata under
+/// the tree read lock so the evictor does not hold the tree lock across
+/// the full eviction decision.
+fn real_node_info(tree: &Tree, node_id: u64) -> Option<Box<dyn NodeEvictionInfo>> {
+    let root_arc = tree.get_root().as_ref()?;
+    find_node_info_recursive(root_arc, node_id)
+}
+
+fn find_node_info_recursive(
+    node_arc: &Arc<RwLock<TreeNode>>,
+    target_id: u64,
+) -> Option<Box<dyn NodeEvictionInfo>> {
+    let guard = node_arc.read().ok()?;
+    match &*guard {
+        TreeNode::Bottom(b) => {
+            if b.node_id == target_id {
+                Some(Box::new(RealNodeInfo {
+                    dirty: b.dirty || b.dirty_count() > 0,
+                    is_bin: true,
+                }))
+            } else {
+                None
+            }
+        }
+        TreeNode::Internal(n) => {
+            if n.node_id == target_id {
+                return Some(Box::new(RealNodeInfo { dirty: n.dirty, is_bin: false }));
+            }
+            // Collect child arcs before dropping the guard.
+            let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()
+                .filter_map(|e| e.child.as_ref().map(Arc::clone))
+                .collect();
+            drop(guard);
+            for child in children {
+                if let Some(info) = find_node_info_recursive(&child, target_id) {
+                    return Some(info);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Compute the actual heap size of a node by its ID.
+///
+/// Port of JE `IN.getBudgetedMemorySize()`.
+fn real_node_size(tree: &Tree, node_id: u64) -> u64 {
+    let root_arc = match tree.get_root().as_ref() {
+        Some(r) => r,
+        None => return 1024,
+    };
+    find_node_size_recursive(root_arc, node_id).unwrap_or(1024)
+}
+
+fn find_node_size_recursive(
+    node_arc: &Arc<RwLock<TreeNode>>,
+    target_id: u64,
+) -> Option<u64> {
+    let guard = node_arc.read().ok()?;
+    match &*guard {
+        TreeNode::Bottom(b) => {
+            if b.node_id == target_id {
+                let sz = size_of::<BinStub>()
+                    + b.entries.len() * size_of::<BinEntry>()
+                    + b.entries.iter().map(|e| {
+                        e.key.len() + e.data.as_ref().map(|d| d.len()).unwrap_or(0)
+                    }).sum::<usize>();
+                Some(sz as u64)
+            } else {
+                None
+            }
+        }
+        TreeNode::Internal(n) => {
+            if n.node_id == target_id {
+                let sz = size_of::<InNodeStub>()
+                    + n.entries.len() * size_of::<InEntry>()
+                    + n.entries.iter().map(|e| e.key.len()).sum::<usize>();
+                return Some(sz as u64);
+            }
+            let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()
+                .filter_map(|e| e.child.as_ref().map(Arc::clone))
+                .collect();
+            drop(guard);
+            for child in children {
+                if let Some(sz) = find_node_size_recursive(&child, target_id) {
+                    return Some(sz);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Find the `Arc<RwLock<TreeNode>>` for a given node_id.
+///
+/// Used by `flush_dirty_node_to_log` so we can write-lock just the node
+/// (not the entire tree) during WAL serialisation.
+fn find_node_arc(tree: &Tree, node_id: u64) -> Option<Arc<RwLock<TreeNode>>> {
+    let root_arc = tree.get_root().as_ref()?;
+    find_node_arc_recursive(root_arc, node_id)
+}
+
+fn find_node_arc_recursive(
+    node_arc: &Arc<RwLock<TreeNode>>,
+    target_id: u64,
+) -> Option<Arc<RwLock<TreeNode>>> {
+    let guard = node_arc.read().ok()?;
+    match &*guard {
+        TreeNode::Bottom(b) => {
+            if b.node_id == target_id {
+                Some(Arc::clone(node_arc))
+            } else {
+                None
+            }
+        }
+        TreeNode::Internal(n) => {
+            if n.node_id == target_id {
+                return Some(Arc::clone(node_arc));
+            }
+            let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()
+                .filter_map(|e| e.child.as_ref().map(Arc::clone))
+                .collect();
+            drop(guard);
+            for child in children {
+                if let Some(found) = find_node_arc_recursive(&child, target_id) {
+                    return Some(found);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1095,7 +1449,10 @@ mod tests {
         assert_eq!(result.nodes_evicted, 3);
         assert_eq!(result.bytes_evicted, 3 * 512);
         let stats = evictor.get_stats();
-        assert_eq!(stats.get(&stats.dirty_nodes_evicted), 3);
+        // dirty_nodes_evicted is only incremented when flush_dirty_node_to_log
+        // successfully writes to the WAL.  Without a wired LogManager it is
+        // 0; nodes_evicted tracks all full evictions regardless of dirty flag.
+        assert_eq!(stats.get(&stats.nodes_evicted), 3);
     }
 
     // -----------------------------------------------------------------------

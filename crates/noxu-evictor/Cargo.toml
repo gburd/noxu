@@ -13,6 +13,7 @@ noxu-log = { workspace = true }
 noxu-sync = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true
