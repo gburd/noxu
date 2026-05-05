@@ -490,7 +490,7 @@ fn test_key_selector_filters_entities() {
 
 #[test]
 fn test_predicate_selector_even_ids() {
-    let selector = PredicateKeySelector::new(|id: &u64| id % 2 == 0);
+    let selector = PredicateKeySelector::new(|id: &u64| id.is_multiple_of(2));
     let matching: Vec<u64> =
         (1..=10u64).filter(|id| selector.select(id)).collect();
     assert_eq!(matching, vec![2, 4, 6, 8, 10]);
@@ -528,8 +528,8 @@ fn test_field_encoder_all_types_round_trip() {
     enc.write_i16(-30000);
     enc.write_i32(-2_000_000_000);
     enc.write_i64(i64::MIN);
-    enc.write_f32(3.14);
-    enc.write_f64(2.718281828);
+    enc.write_f32(std::f32::consts::PI);
+    enc.write_f64(std::f64::consts::E);
     enc.write_bool(true);
     enc.write_bool(false);
     enc.write_string("hello, world!");
@@ -550,8 +550,8 @@ fn test_field_encoder_all_types_round_trip() {
     assert_eq!(dec.read_i16().unwrap(), -30000);
     assert_eq!(dec.read_i32().unwrap(), -2_000_000_000);
     assert_eq!(dec.read_i64().unwrap(), i64::MIN);
-    assert!((dec.read_f32().unwrap() - 3.14).abs() < 0.001);
-    assert!((dec.read_f64().unwrap() - 2.718281828).abs() < 1e-9);
+    assert!((dec.read_f32().unwrap() - std::f32::consts::PI).abs() < 0.001);
+    assert!((dec.read_f64().unwrap() - std::f64::consts::E).abs() < 1e-9);
     assert!(dec.read_bool().unwrap());
     assert!(!dec.read_bool().unwrap());
     assert_eq!(dec.read_string().unwrap(), "hello, world!");
@@ -806,7 +806,7 @@ fn test_combined_selector_workflow() {
     // Range: 5..=15
     let range = RangeKeySelector::closed(5u64, 15);
     // Plus: even only
-    let even = PredicateKeySelector::new(|id: &u64| id % 2 == 0);
+    let even = PredicateKeySelector::new(|id: &u64| id.is_multiple_of(2));
 
     let matching: Vec<u64> = ids
         .iter()

@@ -57,12 +57,10 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let modes = vec![
-            SearchMode::Set,
+        let modes = [SearchMode::Set,
             SearchMode::Both,
             SearchMode::SetRange,
-            SearchMode::BothRange,
-        ];
+            SearchMode::BothRange];
 
         assert_eq!(modes.len(), 4);
 

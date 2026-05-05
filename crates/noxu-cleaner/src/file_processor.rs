@@ -1658,7 +1658,7 @@ mod tests {
     fn test_shutdown_check() {
         let stats = Arc::new(CleanerStats::new());
         let shutdown = Arc::new(AtomicBool::new(false));
-        let processor = FileProcessor::new(stats.clone(), shutdown.clone());
+        let processor = FileProcessor::new(stats, shutdown.clone());
 
         assert!(!processor.is_shutdown());
 
@@ -1883,7 +1883,7 @@ mod tests {
         let info = make_ln_info(1, 100, 1);
         let mem_before = cache.used_mem;
 
-        cache.add(100, info.clone());
+        cache.add(100, info);
         let mem_after_add = cache.used_mem;
         assert!(mem_after_add > mem_before);
 

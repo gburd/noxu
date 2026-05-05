@@ -111,7 +111,7 @@ mod tests {
             42,
             Lsn::new(10, 5000),
             NULL_LSN,
-            node_data.clone(),
+            node_data,
         );
 
         let mut buf = BytesMut::new();

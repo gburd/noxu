@@ -1575,12 +1575,11 @@ impl SecondaryKeyCreator for FirstByteCreator {
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        if let Some(d) = data.get_data() {
-            if !d.is_empty() {
+        if let Some(d) = data.get_data()
+            && !d.is_empty() {
                 result.set_data(&d[..1]);
                 return true;
             }
-        }
         false
     }
 }
@@ -1644,7 +1643,7 @@ fn pri_put_and_index(
     let pk = DatabaseEntry::from_bytes(k);
     let new_data = DatabaseEntry::from_bytes(v);
     primary.lock().put(None, &pk, &new_data).unwrap();
-    let old_entry = old_v.map(|b| DatabaseEntry::from_bytes(b));
+    let old_entry = old_v.map(DatabaseEntry::from_bytes);
     secondary
         .update_secondary(&pk, old_entry.as_ref(), Some(&new_data))
         .unwrap();
@@ -2115,12 +2114,11 @@ fn sec_num_recs_put_get_round_trip() {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data() {
-                if d.len() >= 8 {
+            if let Some(d) = data.get_data()
+                && d.len() >= 8 {
                     result.set_data(&d[4..8]);
                     return true;
                 }
-            }
             false
         }
     }
@@ -2167,7 +2165,7 @@ fn sec_num_recs_put_get_round_trip() {
     }
 
     // Look up sec_key = NUM_RECS + KEY_OFFSET → NotFound.
-    let missing_sec = ((NUM_RECS + KEY_OFFSET)).to_be_bytes();
+    let missing_sec = (NUM_RECS + KEY_OFFSET).to_be_bytes();
     let mut pk_out = DatabaseEntry::new();
     let mut data_out = DatabaseEntry::new();
     let status = secondary

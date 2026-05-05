@@ -83,11 +83,11 @@ fn read_packed_int_from_end(buf: &[u8]) -> Option<(usize, usize)> {
     }
     let marker = buf[buf.len() - 1];
     let marker_i = marker as i8;
-    if marker_i >= 0 && marker_i <= 119 {
+    if (0..=119).contains(&marker_i) {
         return Some((marker as usize, 1));
     }
     // Positive multi-byte: marker is 120–123.
-    if marker < 120 || marker > 123 {
+    if !(120..=123).contains(&marker) {
         return None; // negative or out of range — invalid for key sizes
     }
     let byte_len = (marker - 119) as usize; // number of value bytes before marker

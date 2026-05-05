@@ -743,8 +743,7 @@ fn test_fsync_manager_waiter_notified() {
 fn test_fsync_manager_flush_error_propagates() {
     let manager = FsyncManager::new(0, 0);
     let result = manager.fsync(|| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "simulated flush error",
         ))
     });

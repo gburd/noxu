@@ -27,11 +27,9 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let ops = vec![
-            Operation::Put,
+        let ops = [Operation::Put,
             Operation::NoOverwrite,
-            Operation::Placeholder,
-        ];
+            Operation::Placeholder];
 
         assert_eq!(ops.len(), 3);
     }

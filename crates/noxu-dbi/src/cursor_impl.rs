@@ -713,11 +713,10 @@ impl CursorImpl {
 
         // For sorted-dup databases the tree stores two-part composite keys.
         // current_key holds the raw two-part key; split it for the caller.
-        if self.is_sorted_dup() {
-            if let Some((pk, data)) = dup_key_data::split(&raw_key) {
+        if self.is_sorted_dup()
+            && let Some((pk, data)) = dup_key_data::split(&raw_key) {
                 return Ok((pk, data));
             }
-        }
         Ok((raw_key, raw_data))
     }
 
@@ -1514,6 +1513,7 @@ impl Drop for CursorImpl {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::{DatabaseConfig, DatabaseId, DbType};
@@ -1689,7 +1689,7 @@ mod tests {
     #[test]
     fn test_dup_with_same_position() {
         let db = create_test_database();
-        let mut cursor = CursorImpl::new(db.clone(), 100);
+        let mut cursor = CursorImpl::new(db, 100);
 
         let key = b"key1";
         let data = b"data1";
@@ -1712,7 +1712,7 @@ mod tests {
     #[test]
     fn test_dup_without_same_position() {
         let db = create_test_database();
-        let mut cursor = CursorImpl::new(db.clone(), 100);
+        let mut cursor = CursorImpl::new(db, 100);
 
         let key = b"key1";
         let data = b"data1";
@@ -2331,7 +2331,7 @@ mod tests {
         }
 
         // Backward scan: get_last + repeated get_prev.
-        let mut cursor_back = CursorImpl::new(db.clone(), 3);
+        let mut cursor_back = CursorImpl::new(db, 3);
         let s = cursor_back.get_last().unwrap();
         assert_eq!(s, OperationStatus::Success, "get_last should succeed");
 

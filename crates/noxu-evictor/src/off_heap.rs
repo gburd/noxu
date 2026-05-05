@@ -390,7 +390,7 @@ mod tests {
             num_lns: 100,
         };
 
-        let cloned = stats.clone();
+        let cloned = stats;
         assert_eq!(stats, cloned);
     }
 

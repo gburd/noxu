@@ -434,11 +434,10 @@ mod tests {
                 &mut self,
                 from_vlsn: u64,
             ) -> Option<(u64, u8, Vec<u8>)> {
-                if let Some(&(v, _, _)) = self.items.front() {
-                    if v >= from_vlsn {
+                if let Some(&(v, _, _)) = self.items.front()
+                    && v >= from_vlsn {
                         return self.items.pop_front();
                     }
-                }
                 None
             }
         }

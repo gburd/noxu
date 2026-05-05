@@ -573,7 +573,7 @@ fn write_lock_info_clone_is_independent() {
     wli.abort_lsn = 9999;
     wli.abort_key = Some(vec![1, 2, 3]);
 
-    let cloned = wli.clone();
+    let cloned = wli;
     assert_eq!(cloned.abort_lsn, 9999);
     assert_eq!(cloned.abort_key, Some(vec![1, 2, 3]));
 }

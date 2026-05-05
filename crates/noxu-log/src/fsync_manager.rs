@@ -439,8 +439,7 @@ mod tests {
     fn test_fsync_error_propagated_to_waiters() {
         let mgr = FsyncManager::new(0, 0);
         let result = mgr.fsync(|| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "simulated fsync failure",
             ))
         });
@@ -508,7 +507,7 @@ mod tests {
             mgr2.fsync(|| {
                 // Slow so the second thread can queue up as a waiter.
                 std::thread::sleep(Duration::from_millis(30));
-                Err(std::io::Error::new(std::io::ErrorKind::Other, "leader fail"))
+                Err(std::io::Error::other("leader fail"))
             })
         });
 

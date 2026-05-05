@@ -76,7 +76,7 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
     /// * `file_access`      – file I/O provider
     /// * `_read_buffer_size`– ignored (kept for API compatibility)
     /// * `start_lsn`        – where to begin scanning (use `NULL_LSN` for file
-    ///                        start; `file_num` takes precedence for the file)
+    ///   start; `file_num` takes precedence for the file)
     /// * `file_num`         – the log file number to scan
     pub fn new(
         file_access: F,
@@ -195,13 +195,13 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
             let entry_type = LogEntryType::from_type_num(entry_type_num);
 
             let (category, parsed) = match entry_type {
-                Some(t) if t == LogEntryType::FileHeader => {
+                Some(LogEntryType::FileHeader) => {
                     (CAT_FILE_HEADER, CurrentEntry::Other)
                 }
-                Some(t) if t == LogEntryType::DbTree => {
+                Some(LogEntryType::DbTree) => {
                     (CAT_DBTREE, CurrentEntry::Other)
                 }
-                Some(t) if t == LogEntryType::BINDelta => {
+                Some(LogEntryType::BINDelta) => {
                     let e = BinDeltaLogEntry::read_from_log(payload)
                         .unwrap_or_else(|_| {
                             BinDeltaLogEntry::new(0, NULL_LSN, NULL_LSN, vec![])
@@ -608,7 +608,7 @@ mod tests {
         let r1 = make_raw_entry(LogEntryType::InsertLN, &p1);
         let p2 = make_ln_payload(6);
         let r2 = make_raw_entry(LogEntryType::InsertLN, &p2);
-        let mut data = r1.clone();
+        let mut data = r1;
         data.extend_from_slice(&r2);
 
         let mut mock = MockFileAccess::new();

@@ -288,7 +288,7 @@ pub fn verify_tree(
     };
 
     let mut records: u64 = 0;
-    verify_node(&root, None, db_name, config, &mut result, &mut records);
+    verify_node(root, None, db_name, config, &mut result, &mut records);
     result.records_verified = records;
     result.databases_verified = 1;
     result
@@ -399,11 +399,11 @@ fn verify_bin_stub(
     records: &mut u64,
 ) {
     // Check that the BIN's first key is >= the routing key from the parent.
-    if let Some(pk) = parent_key {
-        if !bin.entries.is_empty() {
+    if let Some(pk) = parent_key
+        && !bin.entries.is_empty() {
             let first_full = bin.get_full_key(0);
-            if let Some(ref first_key) = first_full {
-                if first_key.as_slice() < pk {
+            if let Some(ref first_key) = first_full
+                && first_key.as_slice() < pk {
                     result.add_error(VerifyError::BtreeError {
                         db_name: db_name.to_string(),
                         description: format!(
@@ -412,9 +412,7 @@ fn verify_bin_stub(
                         ),
                     });
                 }
-            }
         }
-    }
 
     // Check each slot.
     for (i, entry) in bin.entries.iter().enumerate() {

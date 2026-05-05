@@ -196,8 +196,8 @@ mod tests {
         let factory = setup();
         let ids: Vec<i64> = (0..10).map(|_| factory.next_id()).collect();
 
-        for i in 0..10 {
-            assert_eq!(ids[i], (i + 1) as i64);
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(id, (i + 1) as i64);
         }
     }
 

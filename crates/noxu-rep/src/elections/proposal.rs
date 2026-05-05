@@ -181,22 +181,18 @@ mod tests {
 
     #[test]
     fn test_sort_picks_best_proposal() {
-        let proposals = vec![
-            Proposal::with_timestamp("low".into(), 50, 1, 1, 0),
+        let proposals = [Proposal::with_timestamp("low".into(), 50, 1, 1, 0),
             Proposal::with_timestamp("high_vlsn".into(), 200, 1, 1, 0),
-            Proposal::with_timestamp("high_prio".into(), 100, 99, 1, 0),
-        ];
+            Proposal::with_timestamp("high_prio".into(), 100, 99, 1, 0)];
         let best = proposals.iter().max().unwrap();
         assert_eq!(best.node_name, "high_vlsn");
     }
 
     #[test]
     fn test_sort_tiebreaker_chain() {
-        let mut proposals = vec![
-            Proposal::with_timestamp("c".into(), 100, 5, 1, 0),
+        let mut proposals = [Proposal::with_timestamp("c".into(), 100, 5, 1, 0),
             Proposal::with_timestamp("a".into(), 100, 5, 1, 0),
-            Proposal::with_timestamp("b".into(), 100, 5, 1, 0),
-        ];
+            Proposal::with_timestamp("b".into(), 100, 5, 1, 0)];
         proposals.sort();
         // Ascending: a < b < c
         assert_eq!(proposals[0].node_name, "a");

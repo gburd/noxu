@@ -356,7 +356,7 @@ mod tests {
         let latch2 = latch.clone();
         let barrier2 = barrier.clone();
         let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let held2 = held.clone();
+        let held2 = held;
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let released2 = released.clone();
 

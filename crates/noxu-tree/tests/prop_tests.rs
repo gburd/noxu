@@ -189,7 +189,7 @@ proptest! {
         let first = node.insert_entry(key.clone(), NULL_LSN, 0).unwrap();
         prop_assert_ne!(first & INSERT_SUCCESS, 0);
 
-        let second = node.insert_entry(key.clone(), Lsn::from_u64(999), 0).unwrap();
+        let second = node.insert_entry(key, Lsn::from_u64(999), 0).unwrap();
         // Second insert of same key should NOT have INSERT_SUCCESS set
         prop_assert_eq!(second & INSERT_SUCCESS, 0, "duplicate insert should not set INSERT_SUCCESS");
     }

@@ -1356,7 +1356,6 @@ mod tests {
     /// tree using those same values before running the cleaner.
     #[test]
     fn test_process_single_file_with_tree_migrates_live_ln() {
-        use noxu_log::{LogEntryType as LogET, Provisional};
         use noxu_util::Lsn;
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -1404,7 +1403,7 @@ mod tests {
         let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
         {
             let mut t = tree.write().unwrap();
-            t.insert(synthetic_key.clone(), b"value".to_vec(), entry_lsn)
+            t.insert(synthetic_key, b"value".to_vec(), entry_lsn)
                 .expect("insert should succeed");
         }
 

@@ -421,8 +421,8 @@ mod tests {
         let handler1 = Arc::new(CountingHandler::new("feeder"));
         let handler2 = Arc::new(CountingHandler::new("feeder"));
 
-        dispatcher.register(handler1.clone());
-        dispatcher.register(handler2.clone());
+        dispatcher.register(handler1);
+        dispatcher.register(handler2);
 
         // list_services should still have exactly one "feeder".
         assert_eq!(dispatcher.list_services(), vec!["feeder"]);

@@ -684,7 +684,7 @@ mod tests {
 
         // The wrapped value must be in [0, 4].
         assert!(
-            after_wrap >= 0 && after_wrap <= 4,
+            (0..=4).contains(&after_wrap),
             "wrapped value {after_wrap} not in [0, 4]"
         );
     }

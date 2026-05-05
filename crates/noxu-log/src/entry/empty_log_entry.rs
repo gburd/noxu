@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let entry = EmptyLogEntry::default();
+        let entry = EmptyLogEntry;
         assert_eq!(entry, EmptyLogEntry::new());
     }
 }

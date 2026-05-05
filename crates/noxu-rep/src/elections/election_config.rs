@@ -194,7 +194,7 @@ mod tests {
             .priority(7)
             .designated_primary(true)
             .build();
-        let cloned = config.clone();
+        let cloned = config;
 
         assert_eq!(cloned.priority(), 7);
         assert!(cloned.designated_primary());

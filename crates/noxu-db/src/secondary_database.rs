@@ -587,12 +587,11 @@ mod tests {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data() {
-                if !d.is_empty() {
+            if let Some(d) = data.get_data()
+                && !d.is_empty() {
                     result.set_data(&d[..1]);
                     return true;
                 }
-            }
             false
         }
     }

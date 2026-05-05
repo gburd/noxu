@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_deleted_keys_iter() {
         let keys = vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()];
-        let bin_ref = BinReference::new(1, 2, keys.clone());
+        let bin_ref = BinReference::new(1, 2, keys);
 
         let collected: Vec<&[u8]> = bin_ref.deleted_keys_iter().collect();
 

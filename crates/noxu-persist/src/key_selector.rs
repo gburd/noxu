@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_predicate_selector() {
-        let sel = PredicateKeySelector::new(|k: &u64| k % 2 == 0);
+        let sel = PredicateKeySelector::new(|k: &u64| k.is_multiple_of(2));
         assert!(sel.select(&0));
         assert!(!sel.select(&1));
         assert!(sel.select(&42));

@@ -828,10 +828,10 @@ mod tests {
                 cv.notify_all();
             }
             // Block until A releases (5 s timeout so test doesn't hang).
-            let result = lm_b.lock_with_timeout(
+            
+            lm_b.lock_with_timeout(
                 LSN, 2, LockType::Write, false, false, 5000,
-            );
-            result
+            )
         });
 
         // Wait until B has at least started, then give it a moment to block.

@@ -73,7 +73,7 @@ fn test_uncached_ln_from_bytes() {
 #[test]
 fn test_map_ln_basic() {
     let config = b"config data".to_vec();
-    let map_ln = MapLn::new(42, config.clone());
+    let map_ln = MapLn::new(42, config);
 
     assert_eq!(map_ln.get_db_id(), 42);
     assert!(!map_ln.is_deleted());

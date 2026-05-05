@@ -29,12 +29,10 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let modes = vec![
-            PutMode::Current,
+        let modes = [PutMode::Current,
             PutMode::NoDupData,
             PutMode::NoOverwrite,
-            PutMode::Overwrite,
-        ];
+            PutMode::Overwrite];
 
         assert_eq!(modes.len(), 4);
     }

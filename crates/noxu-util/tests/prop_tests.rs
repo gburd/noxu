@@ -186,7 +186,7 @@ proptest! {
     fn packed_i32_size_bounded(val: i32) {
         let mut buf = Vec::new();
         let size = write_packed_i32(&mut buf, val).unwrap();
-        prop_assert!(size >= 1 && size <= 5);
+        prop_assert!((1..=5).contains(&size));
         prop_assert_eq!(size, buf.len());
     }
 
@@ -195,7 +195,7 @@ proptest! {
     fn packed_i64_size_bounded(val: i64) {
         let mut buf = Vec::new();
         let size = write_packed_i64(&mut buf, val).unwrap();
-        prop_assert!(size >= 1 && size <= 9);
+        prop_assert!((1..=9).contains(&size));
         prop_assert_eq!(size, buf.len());
     }
 }

@@ -111,7 +111,7 @@ mod tests {
             99,
             Lsn::new(5, 2000),
             Lsn::new(6, 3000),
-            delta_data.clone(),
+            delta_data,
         );
 
         let mut buf = BytesMut::new();

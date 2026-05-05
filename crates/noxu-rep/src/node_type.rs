@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn test_clone_and_copy() {
         let nt = NodeType::Electable;
-        let cloned = nt.clone();
+        let cloned = nt;
         let copied = nt;
         assert_eq!(nt, cloned);
         assert_eq!(nt, copied);

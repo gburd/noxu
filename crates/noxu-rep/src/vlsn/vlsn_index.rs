@@ -375,16 +375,16 @@ mod tests {
         }
 
         // Spot-check: stride boundaries get their exact lsn.
-        assert_eq!(index.get_lsn(1), Some((file_num, 1 * offset)));
+        assert_eq!(index.get_lsn(1), Some((file_num, offset)));
         assert_eq!(index.get_lsn(4), Some((file_num, 4 * offset)));
         assert_eq!(index.get_lsn(7), Some((file_num, 7 * offset)));
         assert_eq!(index.get_lsn(25), Some((file_num, 25 * offset)));
 
         // Spot-check: non-boundary vlsns return LTE (nearest lower boundary).
         // vlsn 2 → LTE boundary is 1
-        assert_eq!(index.get_lsn(2), Some((file_num, 1 * offset)));
+        assert_eq!(index.get_lsn(2), Some((file_num, offset)));
         // vlsn 3 → LTE boundary is 1 (next is 4, not yet at 3)
-        assert_eq!(index.get_lsn(3), Some((file_num, 1 * offset)));
+        assert_eq!(index.get_lsn(3), Some((file_num, offset)));
         // vlsn 5 → LTE boundary is 4
         assert_eq!(index.get_lsn(5), Some((file_num, 4 * offset)));
         // vlsn 6 → LTE boundary is 4

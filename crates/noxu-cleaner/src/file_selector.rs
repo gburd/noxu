@@ -851,24 +851,28 @@ mod tests {
     #[test]
     fn test_utilization_pct_all_obsolete() {
         // File where everything is obsolete → 0% active → util = 0%.
-        let mut summary = FileSummary::default();
-        summary.total_size = 1000;
-        summary.total_ln_count = 1;
-        summary.total_ln_size = 1000;
-        summary.obsolete_ln_count = 1;
-        summary.obsolete_ln_size = 1000;
-        summary.obsolete_ln_size_counted = 1;
+        let summary = FileSummary {
+            total_size: 1000,
+            total_ln_count: 1,
+            total_ln_size: 1000,
+            obsolete_ln_count: 1,
+            obsolete_ln_size: 1000,
+            obsolete_ln_size_counted: 1,
+            ..Default::default()
+        };
         assert_eq!(FileSelector::utilization_pct(&summary), 0);
     }
 
     #[test]
     fn test_utilization_pct_all_active() {
         // File with no obsolete bytes → 100% util.
-        let mut summary = FileSummary::default();
-        summary.total_count = 1;
-        summary.total_size = 1000;
-        summary.total_ln_count = 1;
-        summary.total_ln_size = 1000;
+        let summary = FileSummary {
+            total_count: 1,
+            total_size: 1000,
+            total_ln_count: 1,
+            total_ln_size: 1000,
+            ..Default::default()
+        };
         // No obsolete
         assert_eq!(FileSelector::utilization_pct(&summary), 100);
     }
