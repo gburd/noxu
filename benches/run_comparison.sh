@@ -6,7 +6,10 @@
 #   bash benches/setup.sh     (installs Java, builds JE jar and fat jar)
 #
 # Usage:
-#   bash benches/run_comparison.sh [--skip-noxu] [--skip-je] [--gc g1|zgc|epsilon]
+#   bash benches/run_comparison.sh [--skip-noxu] [--skip-je] [--gc g1|zgc|epsilon] [--max-scale N]
+#
+# --max-scale N: limit JE run to scales <= N (e.g. --max-scale 100000 to skip 500K/1M,
+#   which take hours due to per-commit fsync).  Noxu always runs all 5 scales.
 #
 # GC strategies (--gc flag, applies to the JE run):
 #   g1      — G1GC, 4GB fixed heap, MaxGCPauseMillis=5 (default)
@@ -33,13 +36,24 @@ mkdir -p "$RESULTS" "$RESULTS/je-tmp"
 SKIP_NOXU=0
 SKIP_JE=0
 GC_STRATEGY="g1"
+MAX_SCALE=0   # 0 = no limit
 
 for arg in "$@"; do
     case $arg in
         --skip-noxu)    SKIP_NOXU=1 ;;
         --skip-je)      SKIP_JE=1   ;;
-        --gc)           shift; GC_STRATEGY="${1:-g1}" ;;
         --gc=*)         GC_STRATEGY="${arg#--gc=}" ;;
+        --max-scale=*)  MAX_SCALE="${arg#--max-scale=}" ;;
+        --gc)           ;;   # consumed via positional; handled below
+        --max-scale)    ;;   # consumed via positional; handled below
+    esac
+done
+# Handle space-separated --gc <val> and --max-scale <val>
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gc)           GC_STRATEGY="${2:-g1}"; shift 2 ;;
+        --max-scale)    MAX_SCALE="${2:-0}";    shift 2 ;;
+        *)              shift ;;
     esac
 done
 
@@ -60,7 +74,7 @@ fi
 # Run JE benchmark
 # ---------------------------------------------------------------------------
 if [[ $SKIP_JE -eq 0 ]]; then
-    JE_BENCH_JAR="$REPO_ROOT/benches/je-bench/target/je-bench-jar-with-dependencies.jar"
+    JE_BENCH_JAR="$REPO_ROOT/benches/je-bench/target/je-bench-1.0.0-jar-with-dependencies.jar"
 
     if [[ ! -f "$JE_BENCH_JAR" ]]; then
         echo "JE benchmark jar not found. Run 'bash benches/setup.sh' first."
@@ -124,10 +138,17 @@ if [[ $SKIP_JE -eq 0 ]]; then
     echo "  GC log: $RESULTS/je_gc.log"
     echo "════════════════════════════════════════════════════════"
 
+    JE_MAX_SCALE_FLAG=""
+    if [[ "${MAX_SCALE:-0}" -gt 0 ]]; then
+        JE_MAX_SCALE_FLAG="-Dnoxu.bench.max_scale=${MAX_SCALE}"
+        echo "  Max scale: ${MAX_SCALE}"
+    fi
+
     java \
         -server \
         "${GC_FLAGS[@]}" \
         "$GC_LOG" \
+        ${JE_MAX_SCALE_FLAG} \
         -Djava.io.tmpdir="$RESULTS/je-tmp" \
         -jar "$JE_BENCH_JAR" \
         2>&1 | tee "$RESULTS/je_stdout.txt"
@@ -172,14 +193,15 @@ all_keys = sorted(
 # ─────────────────────────────────────────────────────────────────────────────
 # Comparison table
 # ─────────────────────────────────────────────────────────────────────────────
-W = 130
+W = 155
 HDR = (
     f"{'Workload/threads':<28} {'Scale':>8}  "
     f"{'Noxu ops/s':>12} {'JE ops/s':>12} {'JE/Noxu':>7}  "
     f"{'Noxu ns/op':>11} {'JE ns/op':>11} {'JE/Noxu':>7}  "
     f"{'Noxu CPU':>9} {'JE CPU':>9}  "
     f"{'NoxuB/op':>9} {'JE B/op':>9}  "
-    f"{'GC%':>5} {'GCn':>4}"
+    f"{'GC%':>5} {'GCn':>4}  "
+    f"{'NoxuFsync':>9} {'JEFsync':>8}"
 )
 
 lines = []
@@ -205,18 +227,20 @@ for key in all_keys:
         v = d.get(k, default)
         return float(v) if v != '' else default
 
-    noxu_ops  = fv(n, 'ops_per_sec')
-    je_ops    = fv(j, 'ops_per_sec')
-    noxu_ns   = fv(n, 'ns_per_op')
-    je_ns     = fv(j, 'ns_per_op')
-    noxu_cpu  = fv(n, 'cpu_time_ms')
-    je_cpu    = fv(j, 'cpu_time_ms')
-    noxu_bop  = fv(n, 'disk_bytes_per_op')
-    je_bop    = fv(j, 'disk_bytes_per_op')
-    je_gc_ms  = fv(j, 'gc_time_ms')
-    je_gc_n   = int(fv(j, 'gc_count'))
-    je_el_ms  = fv(j, 'elapsed_ms', 1.0) or 1.0
-    gc_pct    = 100.0 * je_gc_ms / je_el_ms
+    noxu_ops    = fv(n, 'ops_per_sec')
+    je_ops      = fv(j, 'ops_per_sec')
+    noxu_ns     = fv(n, 'ns_per_op')
+    je_ns       = fv(j, 'ns_per_op')
+    noxu_cpu    = fv(n, 'cpu_time_ms')
+    je_cpu      = fv(j, 'cpu_time_ms')
+    noxu_bop    = fv(n, 'disk_bytes_per_op')
+    je_bop      = fv(j, 'disk_bytes_per_op')
+    je_gc_ms    = fv(j, 'gc_time_ms')
+    je_gc_n     = int(fv(j, 'gc_count'))
+    je_el_ms    = fv(j, 'elapsed_ms', 1.0) or 1.0
+    gc_pct      = 100.0 * je_gc_ms / je_el_ms
+    noxu_fsync  = int(fv(n, 'fsync_count'))
+    je_fsync    = int(fv(j, 'fsync_count'))
 
     ratio_ops = je_ops / max(noxu_ops, 1e-9)
     ratio_ns  = je_ns  / max(noxu_ns,  1e-9)
@@ -230,7 +254,8 @@ for key in all_keys:
         f"{noxu_ns:>11.1f} {je_ns:>11.1f} {ratio_ns:>7.2f}  "
         f"{noxu_cpu:>9.0f} {je_cpu:>9.0f}  "
         f"{noxu_bop:>9.1f} {je_bop:>9.1f}  "
-        f"{gc_pct:>5.1f} {je_gc_n:>4}"
+        f"{gc_pct:>5.1f} {je_gc_n:>4}  "
+        f"{noxu_fsync:>8} {je_fsync:>8}"
     )
 
     merged_rows.append({
@@ -256,6 +281,8 @@ for key in all_keys:
         'je_gc_time_ms':           f"{je_gc_ms:.0f}",
         'je_gc_count':             str(je_gc_n),
         'je_gc_pct':               f"{gc_pct:.1f}",
+        'noxu_fsync_count':        str(noxu_fsync),
+        'je_fsync_count':          str(je_fsync),
     })
 
 lines.append("─" * W)
@@ -267,6 +294,7 @@ lines.append("  CPU ms        — wall-clock CPU (user+sys) consumed by the work
 lines.append("  B/op          — on-disk bytes per logical operation (storage overhead)")
 lines.append("  GC%           — fraction of JE wall time lost to GC pauses")
 lines.append("  GCn           — GC collection count during JE workload")
+lines.append("  Fsync         — fdatasync calls during workload (Noxu: group commit; JE: per-commit)")
 lines.append("")
 lines.append("Known Noxu 1.0 gaps vs JE (affect benchmark fairness):")
 lines.append("  • LockManager does not block threads — concurrent workload overhead understated")

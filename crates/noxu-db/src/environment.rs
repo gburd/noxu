@@ -483,6 +483,19 @@ impl Environment {
         self.config.read_only
     }
 
+    /// Returns the total number of fdatasync calls performed by the log manager.
+    ///
+    /// Port of JE's `EnvironmentStats.getNFSyncs()`.  Useful for benchmarking
+    /// and for verifying that group commit is working (fewer fsyncs than commits).
+    /// Returns 0 if the environment is non-transactional (no log manager).
+    pub fn stat_fsync_count(&self) -> u64 {
+        self.env_impl
+            .lock()
+            .get_log_manager()
+            .map(|lm| lm.fsync_count())
+            .unwrap_or(0)
+    }
+
     /// Internal method to mark a database as closed.
     ///
     /// Called by Database::close().

@@ -5,3 +5,7 @@ je.lck
 je.info.*
 je.config.csv
 je.stat.csv
+# Generated benchmark outputs (run by benches/run_comparison.sh)
+*.csv
+*.txt
+*.log

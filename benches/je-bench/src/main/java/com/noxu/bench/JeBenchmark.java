@@ -266,12 +266,14 @@ public class JeBenchmark {
 
     /**
      * Runs one timed workload measurement with before/after snapshots of:
-     * RSS, GC time, GC count, CPU time, I/O bytes, and directory disk usage.
+     * RSS, GC time, GC count, CPU time, I/O bytes, directory disk usage,
+     * and fsync count (if env != null).
      *
      * If GC stole >5% of wall-clock time a warning is printed.
      */
     private static WorkloadResult measure(String name, int scale, int threads,
-                                          File envDir, Workload workload) throws Exception {
+                                          File envDir, Environment env,
+                                          Workload workload) throws Exception {
         Metrics.gcPause();
 
         long rssBefore      = Metrics.rssBytes();
@@ -279,6 +281,7 @@ public class JeBenchmark {
         long gcCountBefore  = Metrics.gcCount();
         long cpuTimeBefore  = Metrics.cpuTimeMs();
         long[] ioBefore     = Metrics.procIo();
+        long fsyncsBefore   = (env != null) ? env.getStats(null).getNFSyncs() : 0L;
 
         long startNs = System.nanoTime();
         long ops = workload.run();
@@ -290,6 +293,7 @@ public class JeBenchmark {
         long cpuTimeAfter   = Metrics.cpuTimeMs();
         long[] ioAfter      = Metrics.procIo();
         long diskKb         = (envDir != null) ? EnvHelper.dirSizeKb(envDir) : 0;
+        long fsyncsAfter    = (env != null) ? env.getStats(null).getNFSyncs() : 0L;
 
         double elapsedMs = (endNs - startNs) / 1_000_000.0;
 
@@ -302,7 +306,8 @@ public class JeBenchmark {
                 cpuTimeBefore, cpuTimeAfter,
                 ioBefore[0], ioAfter[0],
                 ioBefore[1], ioAfter[1],
-                diskKb
+                diskKb,
+                fsyncsBefore, fsyncsAfter
         );
 
         if (elapsedMs > 0 && result.gcTimeMs > elapsedMs * 0.05) {
@@ -341,11 +346,11 @@ public class JeBenchmark {
     // -------------------------------------------------------------------------
 
     private static final String TABLE_HEADER =
-            String.format("%-26s %8s %7s %10s %12s %14s %10s %10s %9s %9s %9s %9s %9s",
+            String.format("%-26s %8s %7s %10s %12s %14s %10s %10s %9s %9s %9s %9s %9s %8s",
                     "workload", "scale", "threads",
                     "elapsed_ms", "ns_per_op", "ops_per_sec",
                     "cpu_ms", "rss_dkb",
-                    "gc_ms", "gc_n", "read_kb", "write_kb", "disk_kb");
+                    "gc_ms", "gc_n", "read_kb", "write_kb", "disk_kb", "fsyncs");
 
     private static void printTable(List<WorkloadResult> results) {
         System.out.println();
@@ -353,12 +358,12 @@ public class JeBenchmark {
         System.out.println("-".repeat(TABLE_HEADER.length()));
         for (WorkloadResult r : results) {
             System.out.printf(
-                "%-26s %8d %7d %10.2f %12.1f %14.0f %10d %10d %9d %9d %9d %9d %9d%n",
+                "%-26s %8d %7d %10.2f %12.1f %14.0f %10d %10d %9d %9d %9d %9d %9d %8d%n",
                 r.workload, r.scale, r.threads,
                 r.elapsedMs, r.nsPerOp, r.opsPerSec,
                 r.cpuTimeMs, r.rssDeltaKb,
                 r.gcTimeMs, r.gcCount,
-                r.readKb, r.writeKb, r.diskKb);
+                r.readKb, r.writeKb, r.diskKb, r.fsyncCount);
         }
         System.out.println();
     }
@@ -368,15 +373,15 @@ public class JeBenchmark {
         try (PrintWriter pw = new PrintWriter(new java.io.FileWriter(outFile))) {
             pw.println("engine,workload,scale,threads,elapsed_ms,ns_per_op,ops_per_sec," +
                        "cpu_time_ms,rss_delta_kb,gc_time_ms,gc_count," +
-                       "read_kb,write_kb,disk_kb,disk_bytes_per_op");
+                       "read_kb,write_kb,disk_kb,disk_bytes_per_op,fsync_count");
             for (WorkloadResult r : results) {
-                pw.printf("je,%s,%d,%d,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f%n",
+                pw.printf("je,%s,%d,%d,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f,%d%n",
                         r.workload, r.scale, r.threads,
                         r.elapsedMs, r.nsPerOp, r.opsPerSec,
                         r.cpuTimeMs, r.rssDeltaKb,
                         r.gcTimeMs, r.gcCount,
                         r.readKb, r.writeKb, r.diskKb,
-                        r.diskBytesPerOp);
+                        r.diskBytesPerOp, r.fsyncCount);
             }
         }
         System.out.println("CSV written to: " + outFile.getAbsolutePath());
@@ -387,8 +392,14 @@ public class JeBenchmark {
     // -------------------------------------------------------------------------
 
     public static void main(String[] args) throws Exception {
-        // Scales: 1K, 10K, 100K, 500K, 1M
-        int[] scales = {1_000, 10_000, 100_000, 500_000, 1_000_000};
+        // Scales: 1K, 10K, 100K, 500K, 1M (can be limited via -Dnoxu.bench.max_scale=N)
+        int maxScale = Integer.getInteger("noxu.bench.max_scale", Integer.MAX_VALUE);
+        int[] allScales = {1_000, 10_000, 100_000, 500_000, 1_000_000};
+        int scaleCount = 0;
+        for (int s : allScales) { if (s <= maxScale) scaleCount++; else break; }
+        if (scaleCount == 0) scaleCount = 1;
+        int[] scales = new int[scaleCount];
+        System.arraycopy(allScales, 0, scales, 0, scaleCount);
 
         // W10 concurrent configurations: {readerThreads, writerThreads}
         // label → {readers, writers}
@@ -420,7 +431,7 @@ public class JeBenchmark {
                 File dir = makeTempDir("w01");
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
-                WorkloadResult r = measure("w01_seq_write", n, 1, dir, () -> seqWrite(db, n));
+                WorkloadResult r = measure("w01_seq_write", n, 1, dir, env, () -> seqWrite(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w01_seq_write", n, 1, r);
@@ -431,7 +442,7 @@ public class JeBenchmark {
                 File dir = makeTempDir("w02");
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
-                WorkloadResult r = measure("w02_rand_write", n, 1, dir, () -> randWrite(db, n));
+                WorkloadResult r = measure("w02_rand_write", n, 1, dir, env, () -> randWrite(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w02_rand_write", n, 1, r);
@@ -443,7 +454,7 @@ public class JeBenchmark {
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
-                WorkloadResult r = measure("w03_seq_read", n, 1, dir, () -> seqRead(db, n));
+                WorkloadResult r = measure("w03_seq_read", n, 1, dir, env, () -> seqRead(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w03_seq_read", n, 1, r);
@@ -455,7 +466,7 @@ public class JeBenchmark {
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
-                WorkloadResult r = measure("w04_rand_read", n, 1, dir, () -> randRead(db, n));
+                WorkloadResult r = measure("w04_rand_read", n, 1, dir, env, () -> randRead(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w04_rand_read", n, 1, r);
@@ -467,7 +478,7 @@ public class JeBenchmark {
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
-                WorkloadResult r = measure("w05_range_scan", n, 1, dir, () -> rangeScan(db, n));
+                WorkloadResult r = measure("w05_range_scan", n, 1, dir, env, () -> rangeScan(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w05_range_scan", n, 1, r);
@@ -479,7 +490,7 @@ public class JeBenchmark {
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
-                WorkloadResult r = measure("w06_write_heavy", n, 1, dir, () -> writeHeavy(db, n));
+                WorkloadResult r = measure("w06_write_heavy", n, 1, dir, env, () -> writeHeavy(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w06_write_heavy", n, 1, r);
@@ -491,7 +502,7 @@ public class JeBenchmark {
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
-                WorkloadResult r = measure("w07_read_heavy", n, 1, dir, () -> readHeavy(db, n));
+                WorkloadResult r = measure("w07_read_heavy", n, 1, dir, env, () -> readHeavy(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress("w07_read_heavy", n, 1, r);
@@ -503,7 +514,7 @@ public class JeBenchmark {
                 Environment env = EnvHelper.openEnv(dir);
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
-                WorkloadResult r = measure("w08_delete_insert", n, 1, dir,
+                WorkloadResult r = measure("w08_delete_insert", n, 1, dir, env,
                         () -> deleteInsert(db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
@@ -517,7 +528,7 @@ public class JeBenchmark {
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, n);
                 final Environment fenv = env;
-                WorkloadResult r = measure("w09_txn_multi", n, 1, dir,
+                WorkloadResult r = measure("w09_txn_multi", n, 1, dir, env,
                         () -> txnMulti(fenv, db, n));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
@@ -540,11 +551,34 @@ public class JeBenchmark {
                 Database db = EnvHelper.openDb(env);
                 EnvHelper.populate(db, opsN);
                 final int finalOpsN = opsN;
-                WorkloadResult r = measure(label, n, total, dir,
+                WorkloadResult r = measure(label, n, total, dir, env,
                         () -> concurrent(db, finalOpsN, rthreads, wthreads));
                 db.close(); env.close(); deleteDir(dir);
                 results.add(r);
                 printProgress(label, n, total, r);
+            }
+
+            // W11: recovery/startup time
+            // Pre-populate outside the timer; time only the re-open.
+            // JE runs full 3-phase recovery (analysis+redo+undo) on open.
+            {
+                File dir = makeTempDir("w11");
+                // Pre-populate (not timed)
+                Environment envPre = EnvHelper.openEnv(dir);
+                Database dbPre = EnvHelper.openDb(envPre);
+                EnvHelper.populate(dbPre, n);
+                dbPre.close(); envPre.close();
+                // Time only the re-open; env is fully closed before timing — no file-lock conflict.
+                // Pass null for env (fsync_count not applicable for open timing).
+                WorkloadResult r = measure("w11_recovery", n, 1, dir, null, () -> {
+                    Environment env2 = EnvHelper.openEnv(dir);
+                    Database db2 = EnvHelper.openDb(env2);
+                    db2.close(); env2.close();
+                    return 1L;
+                });
+                deleteDir(dir);
+                results.add(r);
+                printProgress("w11_recovery", n, 1, r);
             }
         }
 

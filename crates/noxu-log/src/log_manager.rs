@@ -284,6 +284,13 @@ impl LogManager {
     ///    ≈1 fsync for a burst of N concurrent commits (identical to JE's
     ///    `FSyncManager.fsync()` flow).
     ///
+    /// Returns the total number of fdatasync calls performed by this log manager.
+    ///
+    /// Port of JE's `nFSyncs` stat in `EnvironmentStats`.
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_manager.fsync_count()
+    }
+
     /// Port of `LogManager.logForceFlush()` → `FSyncManager.fsync()` in JE.
     pub fn flush_sync(&self) -> Result<Lsn> {
         // Phase 1: flush dirty buffers under the LWL, then release it.

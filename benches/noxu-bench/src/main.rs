@@ -69,6 +69,8 @@ struct WorkloadResult {
     write_kb: u64,
     disk_kb: u64,
     disk_bytes_per_op: f64,
+    /// Number of fdatasync calls during this workload (port of JE nFSyncs stat).
+    fsync_count: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,11 +82,13 @@ fn run_timed<F: FnOnce() -> usize>(
     scale: usize,
     threads: usize,
     data_dir: &Path,
+    env: Option<&Environment>,
     f: F,
 ) -> WorkloadResult {
     let rss0 = rss_kb();
     let io0 = proc_io();
     let cpu0 = cpu_time_ms();
+    let fsync0 = env.map(|e| e.stat_fsync_count()).unwrap_or(0);
 
     let t0 = std::time::Instant::now();
     let ops = f();
@@ -94,6 +98,7 @@ fn run_timed<F: FnOnce() -> usize>(
     let rss1 = rss_kb();
     let io1 = proc_io();
     let disk_kb = dir_size_kb(data_dir);
+    let fsync1 = env.map(|e| e.stat_fsync_count()).unwrap_or(0);
 
     let disk_bytes_per_op = if ops > 0 { (disk_kb * 1024) as f64 / ops as f64 } else { 0.0 };
 
@@ -110,6 +115,7 @@ fn run_timed<F: FnOnce() -> usize>(
         write_kb: io1.1.saturating_sub(io0.1) / 1024,
         disk_kb,
         disk_bytes_per_op,
+        fsync_count: fsync1.saturating_sub(fsync0),
     }
 }
 
@@ -147,7 +153,7 @@ fn main() {
         {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
-            let r = run_timed("w01_seq_write", n, 1, dir.path(), || {
+            let r = run_timed("w01_seq_write", n, 1, dir.path(), Some(&env), || {
                 workloads::w01_seq_write(&db, n)
             });
             print_progress(&r);
@@ -159,7 +165,7 @@ fn main() {
         {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
-            let r = run_timed("w02_rand_write", n, 1, dir.path(), || {
+            let r = run_timed("w02_rand_write", n, 1, dir.path(), Some(&env), || {
                 workloads::w02_rand_write(&db, n)
             });
             print_progress(&r);
@@ -172,7 +178,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, n);
-            let r = run_timed("w03_seq_read", n, 1, dir.path(), || {
+            let r = run_timed("w03_seq_read", n, 1, dir.path(), Some(&env), || {
                 workloads::w03_seq_read(&db, n)
             });
             print_progress(&r);
@@ -185,7 +191,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, n);
-            let r = run_timed("w04_rand_read", n, 1, dir.path(), || {
+            let r = run_timed("w04_rand_read", n, 1, dir.path(), Some(&env), || {
                 workloads::w04_rand_read(&db, n)
             });
             print_progress(&r);
@@ -198,7 +204,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, n);
-            let r = run_timed("w05_range_scan", n, 1, dir.path(), || {
+            let r = run_timed("w05_range_scan", n, 1, dir.path(), Some(&env), || {
                 workloads::w05_range_scan(&db, n)
             });
             print_progress(&r);
@@ -211,7 +217,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, n);
-            let r = run_timed("w06_write_heavy", n, 1, dir.path(), || {
+            let r = run_timed("w06_write_heavy", n, 1, dir.path(), Some(&env), || {
                 workloads::w06_write_heavy(&db, n)
             });
             print_progress(&r);
@@ -224,7 +230,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, n);
-            let r = run_timed("w07_read_heavy", n, 1, dir.path(), || {
+            let r = run_timed("w07_read_heavy", n, 1, dir.path(), Some(&env), || {
                 workloads::w07_read_heavy(&db, n)
             });
             print_progress(&r);
@@ -237,7 +243,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, n);
-            let r = run_timed("w08_delete_insert", n, 1, dir.path(), || {
+            let r = run_timed("w08_delete_insert", n, 1, dir.path(), Some(&env), || {
                 workloads::w08_delete_insert(&db, n)
             });
             print_progress(&r);
@@ -253,7 +259,7 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, w09_n);
-            let r = run_timed("w09_txn_multi", w09_n, 1, dir.path(), || {
+            let r = run_timed("w09_txn_multi", w09_n, 1, dir.path(), Some(&env), || {
                 workloads::w09_txn_multi(&env, &db, w09_n)
             });
             print_progress(&r);
@@ -306,6 +312,7 @@ fn main() {
                 disk_bytes_per_op: if total_ops > 0 {
                     (disk_kb * 1024) as f64 / total_ops as f64
                 } else { 0.0 },
+                fsync_count: env.stat_fsync_count(),
             };
             print_progress(&r);
             results.push(r);
@@ -313,26 +320,47 @@ fn main() {
             drop(db_arc);
             drop(env);
         }
+
+        // W11: recovery/startup time
+        // Pre-populate outside the timer; time only the re-open.
+        // Noxu does not call RecoveryManager on open (known gap); JE runs
+        // full 3-phase recovery — so this workload makes the gap visible.
+        {
+            let dir = TempDir::new().unwrap();
+            {
+                let (env_pre, db_pre) = open_db(dir.path());
+                populate(&db_pre, n);
+                drop(db_pre); drop(env_pre);
+            }
+            // Time only the re-open; env is closed before and after — no file-lock conflict.
+            let r = run_timed("w11_recovery", n, 1, dir.path(), None, || {
+                let (env2, db2) = open_db(dir.path());
+                drop(db2); drop(env2);
+                1
+            });
+            print_progress(&r);
+            results.push(r);
+        }
     }
 
     // ── Print table ───────────────────────────────────────────────────────────
     let hdr = format!(
-        "{:<26} {:>8} {:>7} {:>10} {:>12} {:>12} {:>8} {:>9} {:>8} {:>8} {:>8} {:>9}",
+        "{:<26} {:>8} {:>7} {:>10} {:>12} {:>12} {:>8} {:>9} {:>8} {:>8} {:>8} {:>9} {:>8}",
         "Workload", "Scale", "Threads", "Time(ms)",
         "ns/op", "ops/sec", "CPU(ms)", "RSS_d(KB)",
-        "rIO(KB)", "wIO(KB)", "Disk(KB)", "B/op"
+        "rIO(KB)", "wIO(KB)", "Disk(KB)", "B/op", "Fsyncs"
     );
     println!("\n{}", "=".repeat(hdr.len()));
     println!("{hdr}");
     println!("{}", "-".repeat(hdr.len()));
     for r in &results {
         println!(
-            "{:<26} {:>8} {:>7} {:>10.1} {:>12.0} {:>12.0} {:>8} {:>9} {:>8} {:>8} {:>8} {:>9.1}",
+            "{:<26} {:>8} {:>7} {:>10.1} {:>12.0} {:>12.0} {:>8} {:>9} {:>8} {:>8} {:>8} {:>9.1} {:>8}",
             r.workload, r.scale, r.threads,
             r.elapsed_ms, r.ns_per_op, r.ops_per_sec,
             r.cpu_ms, r.rss_delta_kb,
             r.read_kb, r.write_kb, r.disk_kb,
-            r.disk_bytes_per_op
+            r.disk_bytes_per_op, r.fsync_count
         );
     }
     println!("{}", "=".repeat(hdr.len()));
@@ -344,18 +372,18 @@ fn main() {
     writeln!(
         f,
         "engine,workload,scale,threads,elapsed_ms,ns_per_op,ops_per_sec,\
-         cpu_time_ms,rss_delta_kb,read_kb,write_kb,disk_kb,disk_bytes_per_op"
+         cpu_time_ms,rss_delta_kb,read_kb,write_kb,disk_kb,disk_bytes_per_op,fsync_count"
     )
     .unwrap();
     for r in &results {
         writeln!(
             f,
-            "noxu,{},{},{},{:.3},{:.1},{:.0},{},{},{},{},{},{:.2}",
+            "noxu,{},{},{},{:.3},{:.1},{:.0},{},{},{},{},{},{:.2},{}",
             r.workload, r.scale, r.threads,
             r.elapsed_ms, r.ns_per_op, r.ops_per_sec,
             r.cpu_ms, r.rss_delta_kb,
             r.read_kb, r.write_kb, r.disk_kb,
-            r.disk_bytes_per_op
+            r.disk_bytes_per_op, r.fsync_count
         )
         .unwrap();
     }
