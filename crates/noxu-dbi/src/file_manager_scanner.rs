@@ -168,26 +168,37 @@ impl FileManagerLogScanner {
             // IN / BIN entries ────────────────────────────────────────
             LogEntryType::IN | LogEntryType::BIN => {
                 let e = InLogEntry::read_from_log(payload).ok()?;
-                // node_id and level are embedded in the opaque node_data
-                // blob (tree node serialization).  We cannot extract them
-                // without noxu-tree integration, so use stub values.
-                // Recovery called with tree=None is not affected.
+                // Extract node_id from the serialized node_data so the
+                // recovery redo pass can key on it.  The format written by
+                // BinStub::serialize_full() starts with node_id(u64BE).
+                let node_id = if e.node_data.len() >= 8 {
+                    u64::from_be_bytes(e.node_data[0..8].try_into().ok()?)
+                } else {
+                    0
+                };
                 Some(LogEntry::In(InRecord {
                     db_id: e.db_id,
-                    node_id: 0,
-                    level: 0,
+                    node_id,
+                    level: 0,    // level not embedded in this format; 0 = BIN
                     is_root: false,
                     is_delta: false,
+                    node_data: Some(e.node_data),
                 }))
             }
             LogEntryType::BINDelta => {
                 let e = BinDeltaLogEntry::read_from_log(payload).ok()?;
+                let node_id = if e.delta_data.len() >= 8 {
+                    u64::from_be_bytes(e.delta_data[0..8].try_into().ok()?)
+                } else {
+                    0
+                };
                 Some(LogEntry::In(InRecord {
                     db_id: e.db_id,
-                    node_id: 0,
+                    node_id,
                     level: 0,
                     is_root: false,
                     is_delta: true,
+                    node_data: Some(e.delta_data),
                 }))
             }
 

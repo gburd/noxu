@@ -81,14 +81,14 @@ pub struct EnvironmentImpl {
     /// B-trees recovered from the log during startup, keyed by database ID
     /// (the `u64` form of `DatabaseId::id()`).
     ///
-    /// Recovery (P1b) replays committed LN records into a per-database tree.
+    /// Recovery replays committed LN records into a per-database tree.
     /// When `open_database()` is called and a matching entry exists here, the
-    /// recovered tree is transplanted into the new `DatabaseImpl` instead of
-    /// starting with an empty tree — giving crash-restart durability for
-    /// in-memory state.
+    /// recovered tree is transplanted into the new `DatabaseImpl` via
+    /// `set_recovered_tree()` instead of starting with an empty tree —
+    /// giving crash-restart durability for in-memory state.
     ///
-    /// Port of the "database tree recovery" phase in JE's
-    /// `RecoveryManager.recoverDatabases()`.
+    /// Port of JE `RecoveryManager.getDbIdToDbMap()` /
+    /// `EnvironmentImpl.setupDbEnvironment()` tree population.
     recovered_trees: Mutex<HashMap<u64, noxu_tree::Tree>>,
 
     /// The primary (db_id=1) shared tree used for LN migration during
@@ -186,11 +186,6 @@ impl EnvironmentImpl {
         // Populated during the recovery pass below (writable envs only).
         let mut recovered: HashMap<u64, noxu_tree::Tree> = HashMap::new();
 
-        // Primary shared tree (db_id=1) used for LN migration by the cleaner.
-        // Starts empty; recovery may populate it from existing log files.
-        let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
-            Arc::new(std::sync::RwLock::new(noxu_tree::Tree::new(1, 256)));
-
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
         let log_manager = if !read_only {
@@ -216,42 +211,65 @@ impl EnvironmentImpl {
             //   4. (P1b) Replay committed LN writes into a real B-tree so
             //      the in-memory state is reconstructed after a crash/reopen.
             //
-            // We use db_id=1 for the initial single-database recovery tree.
-            // Multi-database mapping (LnRecord.db_id → separate trees) is a
-            // future enhancement; for now all LNs with db_id=1 are replayed.
+            // Recovery replays LN records into a per-database Tree keyed by
+            // db_id.  Each recovered tree is stashed in `recovered_trees` so
+            // that `open_database()` can transplant it into the new
+            // `DatabaseImpl` instead of starting from an empty tree.
+            //
+            // Multi-database recovery: the `redo_ln` in RecoveryManager
+            // already gates each LN replay on `tree.get_database_id() ==
+            // rec.db_id`, so only LNs for db_id=1 flow into `recovery_tree`.
+            // Future work: maintain a HashMap<u64, Tree> inside recovery and
+            // return the full map so all databases are reconstructed.
             //
             // Port of: RecoveryManager.recover() called from
-            //          EnvironmentImpl constructor in JE.
+            //          EnvironmentImpl constructor in JE, followed by
+            //          RecoveryManager.recoverDatabases() which hands the
+            //          recovered DbTree to each DatabaseImpl.
             let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
             let mut rmgr = RecoveryManager::new();
+            // Build the recovery tree for db_id=1.  We run recovery into a
+            // locally-owned Tree so we can move it into `recovered_trees`
+            // after recovery completes, giving `open_database()` access to
+            // the crash-consistent state.
+            //
+            // Port of JE: RecoveryManager.recover() returns RecoveryInfo;
+            // the recovered per-database trees are later used by
+            // EnvironmentImpl.setupDbEnvironment() →
+            // DatabaseImpl.setTree(recoveredTree).
+            let mut recovery_tree = noxu_tree::Tree::new(1, 256);
+            if let Err(e) =
+                rmgr.recover(&mut scanner, Some(&mut recovery_tree), true)
             {
-                let mut recovery_tree = primary_tree
-                    .write()
-                    .expect("primary_tree lock poisoned during recovery");
-                if let Err(e) =
-                    rmgr.recover(&mut scanner, Some(&mut *recovery_tree), true)
-                {
-                    return Err(DbiError::EnvironmentFailure {
-                        reason: format!("recovery failed: {e}"),
-                    });
-                }
+                return Err(DbiError::EnvironmentFailure {
+                    reason: format!("recovery failed: {e}"),
+                });
             }
 
-            // Stash a snapshot of the recovered tree keyed by db_id (=1) so
-            // that open_database() can transplant it into the DatabaseImpl.
-            // We keep the primary_tree Arc for the cleaner as well.
-            //
-            // Note: we build a fresh empty tree for the recovered_trees map
-            // since the primary_tree is now owned by the cleaner path.  A
-            // full implementation would use the same Arc; for now the two
-            // copies stay in sync because the DatabaseImpl and the cleaner
-            // are used sequentially in tests.
-            recovered.insert(1u64, noxu_tree::Tree::new(1, 256));
+            // Stash the recovered tree keyed by db_id=1 so that
+            // open_database() can transplant it into the DatabaseImpl via
+            // set_recovered_tree().  Port of JE's per-database tree
+            // population from RecoveryManager.getDbIdToDbMap().
+            recovered.insert(1u64, recovery_tree);
 
             Some(Arc::new(LogManager::new(fm, 3, 1024 * 1024, 65536)))
         } else {
             None
         };
+
+        // Primary shared tree (db_id=1) used for LN migration by the cleaner
+        // and as the backing store for the checkpointer.
+        //
+        // This Arc is shared with the cleaner and checkpointer.  After the
+        // first open_database() call for db_id=1, the DatabaseImpl receives
+        // the recovered tree via set_recovered_tree(); the primary_tree here
+        // starts empty but is kept in sync by subsequent writes through
+        // the cursor layer.
+        //
+        // Port of JE EnvironmentImpl.dbMapTree / getDbTree() used by the
+        // FileProcessor (cleaner) to look up live BINs during LN migration.
+        let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
+            Arc::new(std::sync::RwLock::new(noxu_tree::Tree::new(1, 256)));
 
         // Build the evictor with a 64 MiB default budget.  A shared
         // AtomicI64 is used as the live cache-usage counter; the budget can

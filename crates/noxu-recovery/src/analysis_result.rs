@@ -214,7 +214,7 @@ mod tests {
     use crate::log_scanner::InRecord;
 
     fn make_in(db_id: u64, node_id: u64, level: i32, is_root: bool) -> InRecord {
-        InRecord { db_id, node_id, level, is_root, is_delta: false }
+        InRecord { db_id, node_id, level, is_root, is_delta: false, node_data: None }
     }
 
     fn lsn(file: u32, offset: u32) -> Lsn {

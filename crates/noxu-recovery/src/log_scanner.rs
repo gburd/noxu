@@ -103,6 +103,13 @@ pub struct InRecord {
     pub is_root: bool,
     /// Whether this is a BIN-delta.
     pub is_delta: bool,
+    /// Raw serialized node bytes as written by `BinStub::serialize_full()` or
+    /// `BinStub::serialize_delta()`.  Present when the log scanner can parse
+    /// the payload; `None` for scanner stubs that don't carry node data.
+    ///
+    /// Port of `INLogEntry.getMainItem()` / `BINDeltaLogEntry.getMainItem()`
+    /// in JE — the deserialized IN/BIN object available after `readEntry()`.
+    pub node_data: Option<Vec<u8>>,
 }
 
 /// A checkpoint-start record.
@@ -501,6 +508,7 @@ mod tests {
             level: 2,
             is_root: true,
             is_delta: false,
+            node_data: None,
         };
         assert_eq!(rec.level, 2);
         assert!(rec.is_root);

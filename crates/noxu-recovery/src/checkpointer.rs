@@ -125,8 +125,13 @@ impl CheckpointResult {
 /// 5. Create and log CheckpointEnd
 /// 6. Update statistics
 ///
-/// This implementation is a well-structured stub. Actual tree traversal
-/// and IN flushing will be integrated when wiring to noxu-tree.
+/// This implementation flushes dirty BINs via `flush_dirty_bins_internal()`,
+/// which writes full BIN or BINDelta log entries depending on the dirty-slot
+/// fraction (JE TREE_BIN_DELTA = 25%). Upper INs (level ≥ 2) are flushed
+/// by `flush_upper_ins_internal()` after the BIN pass, bottom-up, using
+/// `Provisional::Yes` for intermediate levels and `Provisional::No` for
+/// the root. File utilization summaries are persisted via
+/// `persist_file_summaries()` at the end of each checkpoint.
 pub struct Checkpointer {
     /// Checkpoint statistics
     stats: Arc<CheckpointStats>,
@@ -340,13 +345,25 @@ impl Checkpointer {
         dirty_map.clear();
         drop(dirty_map);
 
-        // Step 4: Flush dirty BINs.
+        // Step 4a: Flush dirty BINs.
         //
         // For each dirty BIN in the tree decide — using JE's TREE_BIN_DELTA
         // threshold of 25 % — whether to write a BINDelta or a full BIN.
         //
-        // Port of JE `Checkpointer.processINList()` + `logIN()`.
-        let flush_result = self.flush_dirty_bins_internal()?;
+        // Port of JE `Checkpointer.processINList()` + `logIN()` (BIN path).
+        let mut flush_result = self.flush_dirty_bins_internal()?;
+
+        // Step 4b: Flush dirty upper INs (level ≥ 2) bottom-up.
+        //
+        // After BINs are written their parent INs are dirtied by splits.
+        // These must be logged before CkptEnd to make the checkpoint complete.
+        // Intermediate levels use Provisional::Yes (subsumed by root);
+        // the root level uses Provisional::No (anchors the checkpoint).
+        //
+        // Port of JE `Checkpointer.processINList()` upper-IN loop +
+        // `Checkpointer.logIN()` for non-BIN nodes.
+        let upper_result = self.flush_upper_ins_internal()?;
+        flush_result.full_ins_flushed += upper_result.full_ins_flushed;
 
         // Step 5: Write CkptEnd entry to WAL.
         let end_lsn = if let Some(lm) = &self.log_manager {
@@ -587,6 +604,93 @@ impl Checkpointer {
 
         // Persist file utilization summaries so they survive restarts.
         self.persist_file_summaries()?;
+
+        Ok(result)
+    }
+
+    /// Flush all dirty upper INs (level ≥ 2) bottom-up to the WAL.
+    ///
+    /// Iterates `tree.collect_dirty_upper_ins()` (sorted lowest-level-first)
+    /// and writes each dirty upper IN using `LogEntryType::IN` with
+    /// `Provisional::Yes` for intermediate levels and `Provisional::No` for
+    /// the root (the level with the highest numeric value in the set).
+    ///
+    /// After a successful write the IN's dirty flag is cleared.
+    ///
+    /// Port of JE `Checkpointer.processINList()` upper-IN pass +
+    /// `Checkpointer.logIN()` for `TreeNode::Internal` nodes.
+    fn flush_upper_ins_internal(&self) -> Result<FlushResult> {
+        let mut result = FlushResult::default();
+
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(result),
+        };
+
+        let tree_arc = match &self.tree {
+            Some(t) => t,
+            None => return Ok(result),
+        };
+
+        // Collect dirty upper INs under a read lock.
+        let dirty_ins = {
+            let tree_guard = tree_arc.read().map_err(|_| {
+                RecoveryError::CheckpointError(
+                    "tree lock poisoned during upper-IN flush".to_string(),
+                )
+            })?;
+            tree_guard.collect_dirty_upper_ins(self.db_id)
+        };
+
+        if dirty_ins.is_empty() {
+            return Ok(result);
+        }
+
+        // The maximum level present is the root level; it must be logged
+        // Provisional::No.  All others use Provisional::Yes.
+        let max_level = dirty_ins.iter().map(|(lvl, _)| *lvl).max().unwrap_or(0);
+
+        for (level, node_arc) in &dirty_ins {
+            let mut node_guard = node_arc.write().map_err(|_| {
+                RecoveryError::CheckpointError(
+                    "IN lock poisoned during checkpoint".to_string(),
+                )
+            })?;
+
+            if !node_guard.is_dirty() {
+                continue; // may have been cleared by a concurrent checkpoint
+            }
+
+            // Serialize the upper IN using the existing `write_to_bytes()` path.
+            let node_bytes = node_guard.write_to_bytes();
+            let provisional = if *level == max_level {
+                Provisional::No
+            } else {
+                Provisional::Yes
+            };
+
+            let entry = InLogEntry::new(
+                self.db_id,
+                noxu_util::NULL_LSN, // prev_full_lsn — no previous version tracking for upper INs yet
+                noxu_util::NULL_LSN, // prev_delta_lsn
+                node_bytes,
+            );
+            let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            lm.log(
+                LogEntryType::IN,
+                &buf,
+                provisional,
+                false, // flush_required
+                false, // fsync_required — fsync at CkptEnd
+            )
+            .map_err(|e| {
+                RecoveryError::CheckpointError(format!("IN WAL write failed: {e}"))
+            })?;
+
+            node_guard.set_dirty(false);
+            result.full_ins_flushed += 1;
+        }
 
         Ok(result)
     }
