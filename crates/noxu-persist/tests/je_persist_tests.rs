@@ -2,12 +2,12 @@
 //!
 //! Covers the key invariants from:
 //!   - `OperationTest.java`  — EntityStore open/close, put/get/delete, count,
-//!                             put-replaces, read-only reopening.
+//!     put-replaces, read-only reopening.
 //!   - `IndexTest.java`      — PrimaryIndex iteration/cursor first/next/last/
-//!                             prev, sub-range; secondary index lookup.
+//!     prev, sub-range; secondary index lookup.
 //!   - `EvolveTest.java`     — Renamer mutation (field readable after rename),
-//!                             Deleter mutation (record removed), EvolveStats
-//!                             n_read/n_converted tracking.
+//!     Deleter mutation (record removed), EvolveStats
+//!     n_read/n_converted tracking.
 //!
 //! The Rust API does not use annotations or Java-style generics; instead,
 //! `EntityStore`, `PrimaryIndex`, `SecondaryIndex`, and `EntitySerializer`
@@ -523,7 +523,7 @@ fn test_secondary_lookup_by_key() {
 
     // Insert 5 entities with distinct secondary keys.
     for i in 0..5i32 {
-        index.put(&ser, &my_entity(i, Some(i * -1))).unwrap();
+        index.put(&ser, &my_entity(i, Some(-i))).unwrap();
     }
 
     // get() via secondary key.

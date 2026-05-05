@@ -33,7 +33,7 @@ proptest! {
     #[test]
     fn prop_string_binding_round_trip(v in "[^\x00]*") {
         let binding = StringBinding::new();
-        let s = v.to_string();
+        let s = v;
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&s, &mut entry).unwrap();
         let result = binding.entry_to_object(&entry).unwrap();

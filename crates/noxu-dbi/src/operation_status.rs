@@ -64,12 +64,10 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let statuses = vec![
-            OperationStatus::Success,
+        let statuses = [OperationStatus::Success,
             OperationStatus::NotFound,
             OperationStatus::KeyExist,
-            OperationStatus::KeyEmpty,
-        ];
+            OperationStatus::KeyEmpty];
 
         assert_eq!(statuses.len(), 4);
     }

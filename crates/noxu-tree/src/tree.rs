@@ -3278,7 +3278,7 @@ mod tests {
         let data = b"testdata".to_vec();
         let lsn = Lsn::new(1, 100);
 
-        let result = tree.insert(key.clone(), data.clone(), lsn);
+        let result = tree.insert(key.clone(), data, lsn);
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should be a new insert
 
@@ -3332,7 +3332,7 @@ mod tests {
         assert!(result1.unwrap()); // New insert
 
         // Second insert with same key - should be update
-        let result2 = tree.insert(key.clone(), data2, lsn2);
+        let result2 = tree.insert(key, data2, lsn2);
         assert!(result2.is_ok());
         assert!(!result2.unwrap()); // Update, not new insert
     }
@@ -3355,7 +3355,7 @@ mod tests {
         assert!(tree.get_last_node().is_none());
 
         // Insert some keys
-        let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let keys = [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
         for (i, key) in keys.iter().enumerate() {
             let data = format!("data{}", i).into_bytes();
             let lsn = Lsn::new(1, 100 + (i as u32) * 10);
@@ -4357,7 +4357,7 @@ mod tests {
             entries: vec![InEntry {
                 key: vec![],
                 lsn: Lsn::new(1, 1),
-                child: Some(bin_a.clone()),
+                child: Some(bin_a),
             }],
             dirty: false,
             generation: 0,
@@ -4399,7 +4399,7 @@ mod tests {
         let sr = tree.search_with_coupling(b"zzz");
         // The search result must either be None or have exact_parent_found=false.
         assert!(
-            sr.map_or(true, |r| !r.exact_parent_found),
+            sr.is_none_or(|r| !r.exact_parent_found),
             "search_with_coupling must not find a key that was never inserted"
         );
     }
@@ -4962,8 +4962,8 @@ mod tests {
         }
 
         // Even keys must no longer be found; odd keys must still be found.
-        for i in 0..n {
-            let sr = tree.search(&keys[i]);
+        for (i, key) in keys.iter().enumerate() {
+            let sr = tree.search(key);
             let found = sr.is_some() && sr.unwrap().exact_parent_found;
             if i % 2 == 0 {
                 assert!(!found, "deleted key {:?} must not be found", i);
@@ -5337,7 +5337,7 @@ mod tests {
         }
 
         let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc.clone());
+        tree.root = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when pruning");
@@ -5724,7 +5724,7 @@ mod tests {
         for key in absent {
             let sr = tree.search(key);
             // Either None (tree empty/not found) or SearchResult with exact=false.
-            let not_found = sr.map_or(true, |r| !r.exact_parent_found);
+            let not_found = sr.is_none_or(|r| !r.exact_parent_found);
             assert!(not_found, "absent key {:?} must not be found", key);
         }
 
@@ -5768,7 +5768,7 @@ mod tests {
         // Keys that were never inserted must not be found.
         for i in 200u8..210 {
             let sr = tree.search(&[i]);
-            let not_found = sr.map_or(true, |r| !r.exact_parent_found);
+            let not_found = sr.is_none_or(|r| !r.exact_parent_found);
             assert!(not_found, "key {} was never inserted and must not be found", i);
         }
     }
@@ -5991,7 +5991,7 @@ mod tests {
             let key = format!("{:08}", i).into_bytes();
             let result = t.search(&key);
             assert!(
-                result.map_or(false, |r| r.exact_parent_found),
+                result.is_some_and(|r| r.exact_parent_found),
                 "key {:08} should be found after concurrent insert",
                 i,
             );
@@ -6160,11 +6160,10 @@ mod tests {
         assert!(!dirty.is_empty(), "should have dirty BINs after inserts");
 
         for (_db_id, bin_arc) in &dirty {
-            if let Ok(mut g) = bin_arc.write() {
-                if let TreeNode::Bottom(b) = &mut *g {
+            if let Ok(mut g) = bin_arc.write()
+                && let TreeNode::Bottom(b) = &mut *g {
                     b.clear_dirty_after_full_log(Lsn::new(1, 100));
                 }
-            }
         }
         let dirty2 = tree.collect_dirty_bins(1);
         assert!(dirty2.is_empty(), "no dirty BINs after clearing");
@@ -6340,7 +6339,7 @@ mod tests {
         tree.insert(b"present".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
         let sr = tree.search_splits_allowed(b"absent");
         assert!(
-            sr.map_or(true, |r| !r.exact_parent_found),
+            sr.is_none_or(|r| !r.exact_parent_found),
             "search_splits_allowed must not find absent key"
         );
     }
@@ -6486,11 +6485,10 @@ mod tests {
             .iter()
             .filter_map(|a| {
                 let g = a.read().unwrap();
-                if g.is_bin() {
-                    if let TreeNode::Bottom(b) = &*g {
+                if g.is_bin()
+                    && let TreeNode::Bottom(b) = &*g {
                         return Some(b.node_id);
                     }
-                }
                 None
             })
             .collect();

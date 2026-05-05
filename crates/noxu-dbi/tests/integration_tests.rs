@@ -7,6 +7,8 @@
 //!   - DbType: all variants
 //!   - DatabaseId: creation, comparison
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 
 use noxu_dbi::{
@@ -534,7 +536,7 @@ fn cursor_impl_count_returns_one_after_search() {
 #[test]
 fn cursor_impl_dup_same_position() {
     let db = make_cursor_db();
-    let mut cursor = CursorImpl::new(db.clone(), 1);
+    let mut cursor = CursorImpl::new(db, 1);
     cursor.put(b"k", b"v", PutMode::Overwrite).unwrap();
     cursor.search(b"k", Some(b"v"), SearchMode::Set).unwrap();
 
@@ -548,7 +550,7 @@ fn cursor_impl_dup_same_position() {
 #[test]
 fn cursor_impl_dup_no_position() {
     let db = make_cursor_db();
-    let mut cursor = CursorImpl::new(db.clone(), 1);
+    let mut cursor = CursorImpl::new(db, 1);
     cursor.put(b"k", b"v", PutMode::Overwrite).unwrap();
     cursor.search(b"k", Some(b"v"), SearchMode::Set).unwrap();
 

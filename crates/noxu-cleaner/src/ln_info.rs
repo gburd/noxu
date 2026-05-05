@@ -121,7 +121,7 @@ mod tests {
     fn test_new_ln_info() {
         let lsn = Lsn::new(1, 1000);
         let key = vec![1, 2, 3, 4];
-        let info = LnInfo::new(lsn, 42, key.clone(), 128, false, 0);
+        let info = LnInfo::new(lsn, 42, key, 128, false, 0);
 
         assert_eq!(info.lsn(), lsn);
         assert_eq!(info.db_id(), 42);
@@ -229,7 +229,7 @@ mod tests {
     fn test_accessors() {
         let lsn = Lsn::new(5, 12345);
         let key = vec![10, 20, 30];
-        let info = LnInfo::new(lsn, 99, key.clone(), 256, true, 88888);
+        let info = LnInfo::new(lsn, 99, key, 256, true, 88888);
 
         assert_eq!(info.lsn(), Lsn::new(5, 12345));
         assert_eq!(info.db_id(), 99);

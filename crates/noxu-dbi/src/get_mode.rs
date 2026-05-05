@@ -52,14 +52,12 @@ mod tests {
     #[test]
     fn test_all_variants() {
         // Ensure all variants are tested
-        let modes = vec![
-            GetMode::Next,
+        let modes = [GetMode::Next,
             GetMode::Prev,
             GetMode::NextDup,
             GetMode::PrevDup,
             GetMode::NextNoDup,
-            GetMode::PrevNoDup,
-        ];
+            GetMode::PrevNoDup];
 
         assert_eq!(modes.len(), 6);
 

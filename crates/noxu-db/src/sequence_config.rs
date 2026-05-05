@@ -303,7 +303,7 @@ mod tests {
             .with_cache_size(10)
             .with_range(1, 100)
             .with_allow_create(true);
-        let cloned = original.clone();
+        let cloned = original;
         assert_eq!(cloned.cache_size, 10);
         assert_eq!(cloned.range_min, 1);
         assert_eq!(cloned.range_max, 100);

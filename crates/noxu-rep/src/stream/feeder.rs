@@ -333,11 +333,10 @@ mod tests {
             &mut self,
             from_vlsn: u64,
         ) -> Option<(u64, u8, Vec<u8>)> {
-            if let Some(&(vlsn, _, _)) = self.entries.front() {
-                if vlsn >= from_vlsn {
+            if let Some(&(vlsn, _, _)) = self.entries.front()
+                && vlsn >= from_vlsn {
                     return self.entries.pop_front();
                 }
-            }
             None
         }
     }
@@ -387,7 +386,7 @@ mod tests {
             })
         };
 
-        let mut scanner = VecLogScanner::new(entries.clone());
+        let mut scanner = VecLogScanner::new(entries);
         // FeederRunner polls for acks until the channel is closed.
         // Close the sender side after the scanner drains so run() returns.
         let runner = FeederRunner::new(Arc::clone(&sender), 1);
@@ -397,8 +396,8 @@ mod tests {
         let runner_ref = Arc::clone(&runner_arc);
         let sender_ref = Arc::clone(&sender);
         let run_handle = std::thread::spawn(move || {
-            let res = runner_ref.run(&mut scanner);
-            res
+            
+            runner_ref.run(&mut scanner)
         });
 
         // Wait for receiver to collect all 3 entries.
@@ -480,7 +479,7 @@ mod tests {
         // Verify message format: 8 bytes VLSN + 1 byte type + data.
         assert_eq!(messages[0].len(), 8 + 1 + 2);
         assert_eq!(messages[1].len(), 8 + 1 + 1);
-        assert_eq!(messages[2].len(), 8 + 1 + 0);
+        assert_eq!(messages[2].len(), (8 + 1));
 
         // Verify VLSN encoding.
         let vlsn_bytes: [u8; 8] = messages[0][0..8].try_into().unwrap();

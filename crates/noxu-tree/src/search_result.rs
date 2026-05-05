@@ -168,12 +168,12 @@ mod tests {
     #[test]
     fn test_clone() {
         let result1 = SearchResult::with_values(true, 42, true);
-        let result2 = result1.clone();
+        let result2 = result1;
 
         assert_eq!(result1, result2);
-        assert_eq!(result2.exact_parent_found, true);
+        assert!(result2.exact_parent_found);
         assert_eq!(result2.index, 42);
-        assert_eq!(result2.child_not_resident, true);
+        assert!(result2.child_not_resident);
     }
 
     #[test]

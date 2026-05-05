@@ -557,7 +557,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let home = temp_dir.path().join("nonexistent");
         let config =
-            EnvironmentConfig::new(home.clone()).with_allow_create(false);
+            EnvironmentConfig::new(home).with_allow_create(false);
 
         let result = Environment::open(config);
         assert!(result.is_err());

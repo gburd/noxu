@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_clone() {
         let get1 = Get::Search;
-        let get2 = get1.clone();
+        let get2 = get1;
         assert_eq!(get1, get2);
     }
 

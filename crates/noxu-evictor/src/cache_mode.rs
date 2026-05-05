@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn test_clone() {
         let mode = CacheMode::EvictLn;
-        let cloned = mode.clone();
+        let cloned = mode;
         assert_eq!(mode, cloned);
     }
 

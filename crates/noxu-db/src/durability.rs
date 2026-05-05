@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn test_durability_clone() {
         let d1 = Durability::COMMIT_SYNC;
-        let d2 = d1.clone();
+        let d2 = d1;
         assert_eq!(d1, d2);
     }
 

@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn test_uncached_ln_memory_tracking() {
         let data = vec![0u8; 1000];
-        let ln = make_uncached_ln(Some(data.clone()));
+        let ln = make_uncached_ln(Some(data));
 
         // Memory tracking works the same as regular LNs
         assert!(ln.get_memory_size() > 1000);

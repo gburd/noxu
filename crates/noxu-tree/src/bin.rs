@@ -955,13 +955,11 @@ impl Bin {
             return true;
         }
         // Check TTL expiration if tracked for this slot.
-        if let Some(ref expirations) = self.slot_expirations {
-            if let Some(&exp) = expirations.get(index) {
-                if noxu_util::ttl::is_expired(exp, true) {
+        if let Some(ref expirations) = self.slot_expirations
+            && let Some(&exp) = expirations.get(index)
+                && noxu_util::ttl::is_expired(exp, true) {
                     return true;
                 }
-            }
-        }
         false
     }
 
@@ -2705,8 +2703,7 @@ mod tests {
     fn test_je_key_prefix_subset_check() {
         fn is_prefix_of(prefix: Option<&[u8]>, key: &[u8]) -> bool {
             match prefix {
-                None => false,
-                Some(p) if p.is_empty() => false,
+                None | Some([]) => false,
                 Some(p) => key.starts_with(p),
             }
         }

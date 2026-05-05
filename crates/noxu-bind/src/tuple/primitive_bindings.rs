@@ -1337,7 +1337,7 @@ mod tests {
             let b = BoolBinding::new();
             let mut e = DatabaseEntry::new();
             b.object_to_entry(&true, &mut e).unwrap();
-            assert_eq!(b.entry_to_object(&e).unwrap(), true);
+            assert!(b.entry_to_object(&e).unwrap());
         }
         // u8 (byte)
         {

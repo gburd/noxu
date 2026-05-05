@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_map_ln_deleted() {
         let config = b"config".to_vec();
-        let mut map_ln = MapLn::new(200, config.clone());
+        let mut map_ln = MapLn::new(200, config);
 
         assert!(!map_ln.is_deleted());
 
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn test_map_ln_transient() {
         let config = b"transient config".to_vec();
-        let mut map_ln = MapLn::new(300, config.clone());
+        let mut map_ln = MapLn::new(300, config);
 
         assert!(!map_ln.is_transient());
 

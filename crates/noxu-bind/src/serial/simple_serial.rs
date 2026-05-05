@@ -1037,14 +1037,14 @@ mod tests {
 
     #[test]
     fn test_f32() {
-        round_trip(&3.14f32);
+        round_trip(&std::f32::consts::PI);
         round_trip(&0.0f32);
         round_trip(&f32::NEG_INFINITY);
     }
 
     #[test]
     fn test_f64() {
-        round_trip(&2.71828f64);
+        round_trip(&std::f64::consts::E);
         round_trip(&f64::MAX);
         round_trip(&f64::MIN);
     }
@@ -1172,7 +1172,7 @@ mod tests {
 
     #[test]
     fn test_enum_newtype_variant() {
-        round_trip(&Shape::Circle(3.14));
+        round_trip(&Shape::Circle(std::f64::consts::PI));
     }
 
     #[test]
@@ -1250,8 +1250,7 @@ mod tests {
 
     #[test]
     fn test_trailing_bytes_error() {
-        let bytes = to_bytes(&42u32).expect("serialize");
-        let mut padded = bytes.clone();
+        let mut padded = to_bytes(&42u32).expect("serialize");
         padded.push(0xFF);
         let result: std::result::Result<u32, _> = from_bytes(&padded);
         assert!(result.is_err());
@@ -1556,7 +1555,7 @@ mod tests {
         let record = SerialRecord {
             id: 99999,
             name: "test record".to_string(),
-            value: 3.14159,
+            value: std::f64::consts::PI,
             tags: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
             parent: Some(Box::new(SerialSimple { x: -42, label: "parent".to_string() })),
         };
@@ -1603,8 +1602,8 @@ mod tests {
         assert!(!to_bytes(&123i16).unwrap().is_empty());
         assert!(!to_bytes(&123i32).unwrap().is_empty());
         assert!(!to_bytes(&123i64).unwrap().is_empty());
-        assert!(!to_bytes(&3.14f32).unwrap().is_empty());
-        assert!(!to_bytes(&3.14f64).unwrap().is_empty());
+        assert!(!to_bytes(&std::f32::consts::PI).unwrap().is_empty());
+        assert!(!to_bytes(&std::f64::consts::PI).unwrap().is_empty());
         assert!(!to_bytes(&"hello".to_string()).unwrap().is_empty());
     }
 

@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_result_type() {
         let ok_result: Result<i32> = Ok(42);
-        assert_eq!(ok_result.unwrap(), 42);
+        assert!(ok_result.is_ok_and(|v| v == 42));
 
         let err_result: Result<i32> =
             Err(EvictorError::EvictionFailed("test".to_string()));

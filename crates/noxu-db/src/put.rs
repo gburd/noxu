@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn test_clone() {
         let put1 = Put::Current;
-        let put2 = put1.clone();
+        let put2 = put1;
         assert_eq!(put1, put2);
     }
 
