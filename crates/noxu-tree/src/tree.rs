@@ -663,6 +663,173 @@ impl BinStub {
         buf
     }
 
+    /// Deserialise a full BIN from the bytes produced by `serialize_full()`.
+    ///
+    /// Returns a `BinStub` with all entries populated and all slots marked
+    /// clean (they are already on disk at `last_full_lsn`).  Returns `None`
+    /// if the byte slice is malformed.
+    ///
+    /// Port of JE `INLogEntry.readEntry()` / `IN.readFromLog()` (non-delta).
+    pub fn deserialize_full(bytes: &[u8]) -> Option<BinStub> {
+        if bytes.len() < 12 {
+            return None;
+        }
+        let node_id = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
+        let num_entries = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as usize;
+        let mut pos = 12usize;
+        let mut entries = Vec::with_capacity(num_entries);
+        for _ in 0..num_entries {
+            // key_len(u32BE) | key | lsn(u64BE) | has_data(u8) [| data_len(u32BE) | data] | known_deleted(u8)
+            if pos + 4 > bytes.len() {
+                return None;
+            }
+            let key_len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if pos + key_len > bytes.len() {
+                return None;
+            }
+            let key = bytes[pos..pos + key_len].to_vec();
+            pos += key_len;
+            if pos + 8 > bytes.len() {
+                return None;
+            }
+            let lsn = Lsn::from_u64(u64::from_be_bytes(bytes[pos..pos + 8].try_into().ok()?));
+            pos += 8;
+            if pos + 1 > bytes.len() {
+                return None;
+            }
+            let has_data = bytes[pos] != 0;
+            pos += 1;
+            let data = if has_data {
+                if pos + 4 > bytes.len() {
+                    return None;
+                }
+                let data_len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+                pos += 4;
+                if pos + data_len > bytes.len() {
+                    return None;
+                }
+                let d = bytes[pos..pos + data_len].to_vec();
+                pos += data_len;
+                Some(d)
+            } else {
+                None
+            };
+            if pos + 1 > bytes.len() {
+                return None;
+            }
+            let known_deleted = bytes[pos] != 0;
+            pos += 1;
+            entries.push(BinEntry {
+                key,
+                lsn,
+                data,
+                known_deleted,
+                dirty: false, // freshly loaded from log — clean
+                expiration_time: 0,
+            });
+        }
+        Some(BinStub {
+            node_id,
+            level: BIN_LEVEL,
+            entries,
+            key_prefix: Vec::new(), // no prefix compression in serialized form
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN, // caller sets this to the logged LSN
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+        })
+    }
+
+    /// Deserialise a BIN delta from the bytes produced by `serialize_delta()`.
+    ///
+    /// Applies the dirty slots carried by `delta_bytes` onto `base`, which
+    /// must be a previously deserialized full BIN (from `deserialize_full()`).
+    /// Slots not mentioned in the delta are left unchanged.
+    ///
+    /// Returns `None` if `delta_bytes` is malformed.
+    ///
+    /// Port of JE `BINDeltaLogEntry.readEntry()` / `BIN.reconstituteBIN()`.
+    pub fn apply_delta(base: &mut BinStub, delta_bytes: &[u8]) -> Option<()> {
+        if delta_bytes.len() < 12 {
+            return None;
+        }
+        // node_id(u64BE) — must match base
+        let _node_id = u64::from_be_bytes(delta_bytes[0..8].try_into().ok()?);
+        let num_dirty = u32::from_be_bytes(delta_bytes[8..12].try_into().ok()?) as usize;
+        let mut pos = 12usize;
+        for _ in 0..num_dirty {
+            // slot_idx(u32BE) | key_len(u32BE) | key | lsn(u64BE) | has_data(u8) [| data_len | data] | known_deleted(u8)
+            if pos + 4 > delta_bytes.len() {
+                return None;
+            }
+            let slot_idx = u32::from_be_bytes(delta_bytes[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if pos + 4 > delta_bytes.len() {
+                return None;
+            }
+            let key_len = u32::from_be_bytes(delta_bytes[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if pos + key_len > delta_bytes.len() {
+                return None;
+            }
+            let key = delta_bytes[pos..pos + key_len].to_vec();
+            pos += key_len;
+            if pos + 8 > delta_bytes.len() {
+                return None;
+            }
+            let lsn = Lsn::from_u64(u64::from_be_bytes(delta_bytes[pos..pos + 8].try_into().ok()?));
+            pos += 8;
+            if pos + 1 > delta_bytes.len() {
+                return None;
+            }
+            let has_data = delta_bytes[pos] != 0;
+            pos += 1;
+            let data = if has_data {
+                if pos + 4 > delta_bytes.len() {
+                    return None;
+                }
+                let data_len = u32::from_be_bytes(delta_bytes[pos..pos + 4].try_into().ok()?) as usize;
+                pos += 4;
+                if pos + data_len > delta_bytes.len() {
+                    return None;
+                }
+                let d = delta_bytes[pos..pos + data_len].to_vec();
+                pos += data_len;
+                Some(d)
+            } else {
+                None
+            };
+            if pos + 1 > delta_bytes.len() {
+                return None;
+            }
+            let known_deleted = delta_bytes[pos] != 0;
+            pos += 1;
+
+            // Apply to base: update existing slot or insert new one.
+            if slot_idx < base.entries.len() {
+                base.entries[slot_idx].key = key;
+                base.entries[slot_idx].lsn = lsn;
+                base.entries[slot_idx].data = data;
+                base.entries[slot_idx].known_deleted = known_deleted;
+                base.entries[slot_idx].dirty = false;
+            } else {
+                // Slot index beyond current length — append.
+                base.entries.push(BinEntry {
+                    key,
+                    lsn,
+                    data,
+                    known_deleted,
+                    dirty: false,
+                    expiration_time: 0,
+                });
+            }
+        }
+        Some(())
+    }
+
     /// Clear per-slot dirty flags and record `logged_at` as the LSN at which
     /// this BIN was last fully logged.
     ///
@@ -2741,6 +2908,57 @@ impl Tree {
                 for child in children {
                     Self::collect_dirty_bins_recursive(&child, db_id, out);
                 }// guard already dropped
+            }
+        }
+    }
+
+    /// Collect all dirty upper (non-BIN) internal nodes, sorted ascending by
+    /// level (bottom-up order, BIN level excluded).
+    ///
+    /// Port of the upper-IN traversal in `Checkpointer.processINList()` from
+    /// JE — visits all `TreeNode::Internal` nodes whose `dirty` flag is set
+    /// and returns them together with their level, sorted lowest-level-first
+    /// so the checkpointer can log them bottom-up.  The root is always the
+    /// last entry (highest level), which must be logged `Provisional::No`.
+    pub fn collect_dirty_upper_ins(
+        &self,
+        _db_id: u64,
+    ) -> Vec<(i32, Arc<RwLock<TreeNode>>)> {
+        let mut result: Vec<(i32, Arc<RwLock<TreeNode>>)> = Vec::new();
+        if let Some(root) = &self.root {
+            Self::collect_dirty_upper_ins_recursive(root, 0, &mut result);
+        }
+        result.sort_by_key(|(level, _)| *level);
+        result
+    }
+
+    fn collect_dirty_upper_ins_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        depth: i32,
+        out: &mut Vec<(i32, Arc<RwLock<TreeNode>>)>,
+    ) {
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match &*guard {
+            TreeNode::Bottom(_) => {
+                // BINs are handled by flush_dirty_bins_internal; skip here.
+            }
+            TreeNode::Internal(n) => {
+                let is_dirty = n.dirty;
+                let level = depth;
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                // Recurse into children first (bottom-up ordering).
+                for child in &children {
+                    Self::collect_dirty_upper_ins_recursive(child, depth + 1, out);
+                }
+                // Add this node after children (so parent comes after all descendants).
+                if is_dirty {
+                    out.push((level, Arc::clone(node_arc)));
+                }
             }
         }
     }

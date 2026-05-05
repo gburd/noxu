@@ -41,7 +41,10 @@ pub struct InLogEntry {
     /// LSN of previous delta version (NULL_LSN if previous was full).
     pub prev_delta_lsn: Lsn,
     /// Serialized node data.
-    // TODO(noxu-tree): Replace with actual IN type when available
+    ///
+    /// Carries the actual BIN/IN serialization produced by `BinStub::serialize_full()`.
+    /// The format is: node_id(u64BE) | num_entries(u32BE) | per-slot data.
+    /// Deserialization is performed by `BinStub::deserialize_full()` during recovery.
     pub node_data: Vec<u8>,
 }
 

@@ -174,7 +174,10 @@ pub struct LnLogEntry {
     /// Record key.
     pub key: Vec<u8>,
     /// Record data (None for deletions).
-    // TODO(noxu-tree): Replace with actual LN type when available
+    ///
+    /// Carries the serialized LN value bytes for embedded LNs. For non-embedded
+    /// LNs this is `None` and the actual value resides at the LN's on-disk LSN.
+    /// For deletions this is always `None`.
     pub data: Option<Vec<u8>>,
     /// Expiration time (0 if none).
     pub expiration: i32,

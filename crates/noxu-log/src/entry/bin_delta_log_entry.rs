@@ -43,7 +43,10 @@ pub struct BinDeltaLogEntry {
     /// LSN of previous delta version (NULL_LSN if previous was full).
     pub prev_delta_lsn: Lsn,
     /// Serialized BIN delta data (dirty slots only).
-    // TODO(noxu-tree): Replace with actual BIN delta type when available
+    ///
+    /// Carries the actual delta serialization produced by `BinStub::serialize_delta()`.
+    /// The format is: node_id(u64BE) | num_dirty(u32BE) | per-slot (slot_idx + entry data).
+    /// Deserialization is performed by `BinStub::deserialize_delta()` during recovery.
     pub delta_data: Vec<u8>,
 }
 
