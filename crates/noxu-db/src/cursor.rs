@@ -212,14 +212,14 @@ impl Cursor {
         let put_mode = match put_type {
             Put::Overwrite => PutMode::Overwrite,
             Put::NoOverwrite => PutMode::NoOverwrite,
+            // NoDupData inserts only if the exact (key, data) pair does not
+            // already exist.  For sorted-dup databases this checks the full
+            // two-part composite key; for non-dup databases it behaves
+            // identically to NoOverwrite.  Port of JE `Cursor.putNoDupData()`.
+            Put::NoDupData => PutMode::NoDupData,
             Put::Current => {
                 self.check_initialized()?;
                 PutMode::Current
-            }
-            _ => {
-                return Err(NoxuError::OperationNotAllowed(
-                    "Put variant not yet implemented".to_string(),
-                ))
             }
         };
 
@@ -796,16 +796,38 @@ mod tests {
         assert_eq!(status, OperationStatus::NotFound);
     }
 
-    /// Put::NoDupData and other unimplemented Put variants return an error.
+    /// Put::NoDupData on a non-dup database inserts when the key is new.
+    ///
+    /// Port of JE `Cursor.putNoDupData()`: for a non-dup database NoDupData
+    /// behaves like NoOverwrite (returns KeyExists if the key is already
+    /// present, Success otherwise).
     #[test]
-    fn test_put_unimplemented_variant_returns_error() {
+    fn test_put_no_dup_data_inserts_new_key() {
         let mut cursor = make_cursor(false);
 
-        let key = DatabaseEntry::from_bytes(b"k");
+        let mut key = DatabaseEntry::from_bytes(b"k");
         let data = DatabaseEntry::from_bytes(b"v");
 
-        let result = cursor.put(&key, &data, Put::NoDupData);
-        assert!(result.is_err());
+        let status = cursor.put(&key, &data, Put::NoDupData).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+
+        // Verify the record is readable.
+        let mut out = DatabaseEntry::new();
+        let s = cursor.get(&mut key, &mut out, Get::Search, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(out.get_data().unwrap(), b"v");
+    }
+
+    /// Put::NoDupData returns KeyExists when the key already exists (non-dup DB).
+    #[test]
+    fn test_put_no_dup_data_key_exists() {
+        let mut cursor = make_cursor_with(vec![(b"k", b"v")]);
+
+        let key = DatabaseEntry::from_bytes(b"k");
+        let data = DatabaseEntry::from_bytes(b"v2");
+
+        let status = cursor.put(&key, &data, Put::NoDupData).unwrap();
+        assert_eq!(status, OperationStatus::KeyExists);
     }
 
     /// Put::Current when cursor is not initialized returns an error.

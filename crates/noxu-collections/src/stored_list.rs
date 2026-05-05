@@ -90,13 +90,46 @@ impl<'db> StoredList<'db> {
         Ok(val)
     }
 
-    /// Removes the value at the given index.
+    /// Removes the value at the given index and re-indexes all higher-indexed
+    /// elements so the list remains contiguous.
+    ///
+    /// After removing the element at `index`, every element stored at indices
+    /// `index+1 .. next_index` is read and re-written at the decremented key
+    /// (`old_index - 1`), then the original key is removed.  `next_index` is
+    /// decremented by 1.
+    ///
+    /// Port of JE `StoredList.remove(int index)`: JE re-numbers all higher-
+    /// indexed entries so that gaps are never left in the list.
     ///
     /// Returns the removed value, or `None` if no value was at that index.
-    /// Note: removing from the middle leaves a gap; indices are not shifted.
     pub fn remove(&self, index: usize) -> Result<Option<Vec<u8>>> {
+        let mut next = self.next_index.lock().unwrap();
+
+        // Remove the target element.
         let key = Self::index_to_key(index);
-        self.map.remove(&key)
+        let removed = self.map.remove(&key)?;
+
+        if removed.is_none() {
+            // Nothing was stored at this index; list is unchanged.
+            return Ok(None);
+        }
+
+        // Re-index all elements above `index` downward by 1.
+        let limit = *next;
+        for i in (index + 1)..limit {
+            let old_key = Self::index_to_key(i);
+            if let Some(val) = self.map.remove(&old_key)? {
+                let new_key = Self::index_to_key(i - 1);
+                self.map.put(&new_key, &val)?;
+            }
+        }
+
+        // Decrement the logical size.
+        if *next > index {
+            *next -= 1;
+        }
+
+        Ok(removed)
     }
 
     /// Returns the number of elements known to this list view.
@@ -228,10 +261,13 @@ mod tests {
         let removed = list.remove(1).unwrap();
         assert_eq!(removed, Some(b"beta".to_vec()));
 
-        // Index 0 and 2 still exist; index 1 is gone
+        // After remove(1), "gamma" shifts from index 2 to index 1.
+        // Port of JE StoredList: remove re-indexes all higher entries downward.
         assert_eq!(list.get(0).unwrap(), Some(b"alpha".to_vec()));
-        assert_eq!(list.get(1).unwrap(), None);
-        assert_eq!(list.get(2).unwrap(), Some(b"gamma".to_vec()));
+        assert_eq!(list.get(1).unwrap(), Some(b"gamma".to_vec()));
+        assert_eq!(list.get(2).unwrap(), None);
+        assert_eq!(list.next_index(), 2);
+        assert_eq!(list.len().unwrap(), 2);
     }
 
     #[test]

@@ -37,16 +37,23 @@ pub enum NameLnLogEntryError {
 /// - `replicated_create_config`: Database config (for create/update operations)
 /// - `truncate_old_db_id`: Old database ID (for truncate operations)
 ///
-/// NOTE: Database config is serialized as opaque bytes for now since
-/// DatabaseConfig types aren't implemented yet.
+/// The `replicated_create_config` field carries a length-prefixed byte
+/// serialization of the database configuration (4-byte big-endian length
+/// prefix + raw bytes), mirroring JE's `NameLNLogEntry.writeEntry()` /
+/// `readEntry()` which writes `replicatedCreateConfig` via
+/// `LogUtils.writeByteArray`.  Callers pass a pre-serialized `DatabaseConfig`
+/// byte representation.
 #[derive(Debug, Clone)]
 pub struct NameLnLogEntry {
     /// The underlying LN log entry.
     pub ln_entry: LnLogEntry,
     /// Database operation type.
     pub operation_type: DbOperationType,
-    /// Replicated database config (for CREATE/UPDATE_CONFIG operations).
-    // TODO(noxu-dbi): Replace with actual DatabaseConfig when available
+    /// Serialized `DatabaseConfig` for CREATE/UPDATE_CONFIG operations.
+    ///
+    /// On-disk format: 4-byte big-endian length prefix followed by the raw
+    /// config bytes.  `None` for operations that do not carry a config
+    /// (Remove, Truncate, Rename).
     pub replicated_create_config: Option<Vec<u8>>,
     /// Old database ID (for TRUNCATE operations).
     pub truncate_old_db_id: Option<u64>,
