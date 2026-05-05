@@ -187,6 +187,77 @@ impl RollbackTracker {
     pub fn get_scanner(&self) -> RollbackScanner {
         RollbackScanner::new(self.rollback_periods.clone())
     }
+
+    /// Record a RollbackStart entry from the analysis phase.
+    ///
+    /// Takes the LSN of the RollbackStart entry and the deserialized entry.
+    /// Called by `RecoveryManager::run_analysis()` when it encounters a
+    /// `RollbackStart` log entry.
+    ///
+    /// Port of `RollbackTracker.register(RollbackStart, lsn)` in JE.
+    pub fn record_rollback_start(
+        &mut self,
+        lsn: Lsn,
+        entry: &noxu_log::entry::RollbackStartEntry,
+    ) {
+        self.register_rollback_start(entry.matchpoint_lsn, lsn);
+    }
+
+    /// Record a RollbackEnd entry from the analysis phase.
+    ///
+    /// Closes the rollback period that was opened by the matching RollbackStart.
+    /// Called by `RecoveryManager::run_analysis()` when it encounters a
+    /// `RollbackEnd` log entry.
+    ///
+    /// Port of `RollbackTracker.register(RollbackEnd, lsn)` in JE.
+    pub fn record_rollback_end(
+        &mut self,
+        lsn: Lsn,
+        entry: &noxu_log::entry::RollbackEndEntry,
+    ) {
+        // RollbackEnd carries rollback_start_lsn; we need to find the period
+        // by its start_lsn to get the matchpoint_lsn for keying purposes.
+        // Look up the pending period that has rollback_start_lsn == entry.rollback_start_lsn.
+        let matchpoint = self
+            .pending_rollback_starts
+            .values()
+            .find(|p| p.rollback_start_lsn == entry.rollback_start_lsn)
+            .map(|p| p.matchpoint_lsn);
+        if let Some(mp) = matchpoint {
+            self.register_rollback_end(mp, lsn);
+        } else {
+            // No matching start found yet; store as pending using start_lsn as key.
+            let period = RollbackPeriod::new(NULL_LSN, entry.rollback_start_lsn, lsn);
+            self.pending_rollback_starts
+                .insert(entry.rollback_start_lsn.as_u64(), period);
+        }
+    }
+
+    /// Returns true if any rollback periods were found during analysis.
+    ///
+    /// Port of `RollbackTracker.isActive()` in JE.
+    pub fn is_active(&self) -> bool {
+        !self.rollback_periods.is_empty() || !self.pending_rollback_starts.is_empty()
+    }
+
+    /// Get all completed rollback periods.
+    ///
+    /// Alias for `get_rollback_periods()` matching the task API.
+    pub fn get_periods(&self) -> &[RollbackPeriod] {
+        &self.rollback_periods
+    }
+
+    /// Returns the earliest (minimum) `start_lsn` across all completed
+    /// rollback periods, or `None` if there are none.
+    ///
+    /// Used during recovery to know how far back in the log to replay.
+    /// Port of `RollbackTracker.getEarliestRollbackStart()` in JE.
+    pub fn earliest_rollback_start(&self) -> Option<Lsn> {
+        self.rollback_periods
+            .iter()
+            .map(|p| p.rollback_start_lsn)
+            .min_by_key(|lsn| lsn.as_u64())
+    }
 }
 
 impl Default for RollbackTracker {
@@ -515,5 +586,97 @@ mod tests {
         // Outside period
         assert!(!tracker.is_in_rollback_period(make_lsn(1, 500)));
         assert!(!tracker.is_in_rollback_period(make_lsn(2, 600)));
+    }
+
+    // ------------------------------------------------------------------ New API methods
+
+    #[test]
+    fn test_is_active_empty() {
+        let tracker = RollbackTracker::new();
+        assert!(!tracker.is_active());
+    }
+
+    #[test]
+    fn test_is_active_with_completed_period() {
+        let mut tracker = RollbackTracker::new();
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+        tracker.register_rollback_end(make_lsn(1, 100), make_lsn(1, 500));
+        assert!(tracker.is_active());
+    }
+
+    #[test]
+    fn test_get_periods_empty() {
+        let tracker = RollbackTracker::new();
+        assert!(tracker.get_periods().is_empty());
+    }
+
+    #[test]
+    fn test_get_periods_returns_completed() {
+        let mut tracker = RollbackTracker::new();
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+        tracker.register_rollback_end(make_lsn(1, 100), make_lsn(1, 500));
+
+        let periods = tracker.get_periods();
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].matchpoint_lsn, make_lsn(1, 100));
+    }
+
+    #[test]
+    fn test_earliest_rollback_start_empty() {
+        let tracker = RollbackTracker::new();
+        assert!(tracker.earliest_rollback_start().is_none());
+    }
+
+    #[test]
+    fn test_earliest_rollback_start_single() {
+        let mut tracker = RollbackTracker::new();
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+        tracker.register_rollback_end(make_lsn(1, 100), make_lsn(1, 500));
+
+        let earliest = tracker.earliest_rollback_start();
+        assert!(earliest.is_some());
+        assert_eq!(earliest.unwrap(), make_lsn(1, 400));
+    }
+
+    #[test]
+    fn test_earliest_rollback_start_multiple() {
+        let mut tracker = RollbackTracker::new();
+        // Period 1: start_lsn = lsn(1, 400)
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+        tracker.register_rollback_end(make_lsn(1, 100), make_lsn(1, 500));
+        // Period 2: start_lsn = lsn(1, 900) (larger)
+        tracker.register_rollback_start(make_lsn(1, 600), make_lsn(1, 900));
+        tracker.register_rollback_end(make_lsn(1, 600), make_lsn(1, 1000));
+
+        let earliest = tracker.earliest_rollback_start().unwrap();
+        assert_eq!(earliest, make_lsn(1, 400));
+    }
+
+    #[test]
+    fn test_record_rollback_start_and_end_via_entry_api() {
+        use noxu_log::entry::{RollbackEndEntry, RollbackStartEntry};
+
+        let mut tracker = RollbackTracker::new();
+        let start_entry = RollbackStartEntry::new(
+            make_lsn(1, 50),   // active_txn_start
+            make_lsn(1, 100),  // matchpoint_lsn
+        );
+        let start_lsn = make_lsn(1, 400);
+        tracker.record_rollback_start(start_lsn, &start_entry);
+
+        // Not yet complete
+        assert_eq!(tracker.period_count(), 0);
+        assert!(tracker.is_active());
+
+        let end_entry = RollbackEndEntry::new(start_lsn);
+        let end_lsn = make_lsn(1, 500);
+        tracker.record_rollback_end(end_lsn, &end_entry);
+
+        assert_eq!(tracker.period_count(), 1);
+        // LSN 200 is between matchpoint(100) and start(400) → in period
+        assert!(tracker.is_in_rollback_period(make_lsn(1, 200)));
+        assert!(!tracker.is_in_rollback_period(make_lsn(1, 50)));
+        // LSN 400 is the boundary (rollback_start) — not inside
+        assert!(!tracker.is_in_rollback_period(make_lsn(1, 400)));
     }
 }

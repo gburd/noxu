@@ -18,7 +18,7 @@
 use crate::log_buffer::LogBuffer;
 use noxu_latch::ExclusiveLatch;
 use noxu_util::lsn::Lsn;
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 
 /// Manages a circular pool of LogBuffers.

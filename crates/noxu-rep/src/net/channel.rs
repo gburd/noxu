@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use noxu_sync::{Condvar, Mutex};
 
 use crate::error::{RepError, Result};
 
@@ -205,7 +205,7 @@ impl Default for LocalChannelPair {
 /// Corresponds to JE's `SocketChannel`-backed `DataChannel`.
 pub struct TcpChannel {
     /// The underlying TCP stream, shared between sender and receiver sides.
-    /// `parking_lot::Mutex` is used rather than `std::sync::Mutex` for
+    /// `noxu_sync::Mutex` is used rather than `std::sync::Mutex` for
     /// consistency with the rest of the codebase.
     stream: Arc<Mutex<TcpStream>>,
     /// Whether the channel is still open (not yet explicitly closed).

@@ -30,9 +30,11 @@ use noxu_log::{
     LogEntryType, LogManager, Provisional,
     entry::LnLogEntry,
 };
-use noxu_tree::Tree;
+use noxu_tree::{BinEntry, Tree};
+
+use crate::dup_key_data;
 use noxu_util::{Lsn, vlsn::NULL_VLSN};
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 use crate::{
     DbiError, GetMode, OperationStatus, PutMode, SearchMode,
@@ -196,6 +198,15 @@ impl CursorImpl {
         }
     }
 
+    /// Returns true if the underlying database uses sorted duplicates.
+    ///
+    /// When true, every (key, data) pair is stored as a two-part composite
+    /// key via `dup_key_data::combine()` and the tree uses a custom comparator.
+    #[inline]
+    fn is_sorted_dup(&self) -> bool {
+        self.db_impl.read().get_sorted_duplicates()
+    }
+
     /// Returns the unique cursor ID.
     ///
     /// Used for debugging and cursor tracking.
@@ -294,17 +305,18 @@ impl CursorImpl {
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        // Use the real tree when available.
+        let is_dup = self.is_sorted_dup();
+
+        if is_dup {
+            return self.search_dup(key, data, search_mode);
+        }
+
+        // Non-dup path (original logic).
         let found = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
-                let result = tree.search(key);
-                match result {
-                    Some(sr) => sr.exact_parent_found,
-                    None => false,
-                }
+                tree.search(key).map(|sr| sr.exact_parent_found).unwrap_or(false)
             } else {
-                // No tree yet — treat as not found.
                 false
             }
         };
@@ -312,7 +324,6 @@ impl CursorImpl {
         match search_mode {
             SearchMode::Set | SearchMode::Both => {
                 if found {
-                    // Retrieve the data from the tree so current_data is accurate.
                     let data_from_tree: Option<Vec<u8>> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
@@ -332,9 +343,6 @@ impl CursorImpl {
                 }
             }
             SearchMode::SetRange | SearchMode::BothRange => {
-                // For range search, position at the first key >= search key.
-                // If exact match, position there; otherwise search for the
-                // smallest key that is >= the requested key.
                 if found {
                     let data_from_tree: Option<Vec<u8>> = {
                         let db = self.db_impl.read();
@@ -351,8 +359,6 @@ impl CursorImpl {
                     self.state = CursorState::Initialized;
                     Ok(OperationStatus::Success)
                 } else {
-                    // Position at the first key in the tree that is >= key.
-                    // Port of: CursorImpl.searchRange() + checking for NotFound
                     let next_entry: Option<(Vec<u8>, Vec<u8>)> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
@@ -374,6 +380,77 @@ impl CursorImpl {
                     }
                 }
             }
+        }
+    }
+
+    /// Sorted-dup variant of `search()`.
+    ///
+    /// For sorted-dup databases (key, data) pairs are stored as two-part
+    /// composite keys `[key][data][packed_key_len]`.  This method builds the
+    /// appropriate two-part search key and delegates to the tree's
+    /// comparator-aware range finder.
+    ///
+    /// Port of `CursorImpl.searchExact()` dup path from JE 7.5.
+    fn search_dup(
+        &mut self,
+        key: &[u8],
+        data: Option<&[u8]>,
+        search_mode: SearchMode,
+    ) -> Result<OperationStatus, DbiError> {
+        let search_two_part_key: Vec<u8> = match search_mode {
+            // Both / BothRange: search for the exact (key, data) pair.
+            SearchMode::Both | SearchMode::BothRange => {
+                dup_key_data::combine(key, data.unwrap_or(b""))
+            }
+            // Set / SetRange: position at the first entry whose primary key
+            // >= `key` — use the lower bound (smallest possible two-part key
+            // for this primary key).
+            SearchMode::Set | SearchMode::SetRange => {
+                dup_key_data::lower_bound(key)
+            }
+        };
+
+        let entry: Option<(Vec<u8>, Vec<u8>)> = {
+            let db = self.db_impl.read();
+            if let Some(tree) = db.get_real_tree() {
+                tree.first_entry_at_or_after(&search_two_part_key)
+            } else {
+                None
+            }
+        };
+
+        match entry {
+            Some((raw_key, _)) => {
+                // raw_key is the two-part key found; check that the primary
+                // key part matches what was requested (for Set and Both).
+                let matches = match search_mode {
+                    SearchMode::Set => {
+                        dup_key_data::matches_key(&raw_key, key)
+                    }
+                    SearchMode::Both => raw_key == search_two_part_key,
+                    SearchMode::SetRange => {
+                        // Any key >= the search key is valid.
+                        true
+                    }
+                    SearchMode::BothRange => {
+                        // Position at the first (key, data) where data >=
+                        // the given data; primary key must still match.
+                        dup_key_data::matches_key(&raw_key, key)
+                    }
+                };
+                if matches {
+                    // Store the raw two-part key; get_current() will decode it.
+                    self.current_key = Some(raw_key);
+                    self.current_data = None; // decoded lazily in get_current()
+                    self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                    self.current_index = 0;
+                    self.state = CursorState::Initialized;
+                    Ok(OperationStatus::Success)
+                } else {
+                    Ok(OperationStatus::NotFound)
+                }
+            }
+            None => Ok(OperationStatus::NotFound),
         }
     }
 
@@ -630,11 +707,18 @@ impl CursorImpl {
     pub fn get_current(&self) -> Result<(Vec<u8>, Vec<u8>), DbiError> {
         self.check_initialized()?;
 
-        let key =
+        let raw_key =
             self.current_key.clone().ok_or(DbiError::CursorNotInitialized)?;
-        let data = self.current_data.clone().unwrap_or_default();
+        let raw_data = self.current_data.clone().unwrap_or_default();
 
-        Ok((key, data))
+        // For sorted-dup databases the tree stores two-part composite keys.
+        // current_key holds the raw two-part key; split it for the caller.
+        if self.is_sorted_dup() {
+            if let Some((pk, data)) = dup_key_data::split(&raw_key) {
+                return Ok((pk, data));
+            }
+        }
+        Ok((raw_key, raw_data))
     }
 
     /// Moves the cursor to the next/previous record.
@@ -662,23 +746,29 @@ impl CursorImpl {
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        // If not yet positioned, return NotFound (port of JE assertion
-        // "mustBeInitialized" in getNext).
         if self.state == CursorState::NotInitialized {
             return Ok(OperationStatus::NotFound);
         }
 
-        let forward = mode.is_forward();
+        let is_dup = self.is_sorted_dup();
 
-        // Calculate the candidate next index within the current BIN.
+        // For NextDup/PrevDup/NextNoDup/PrevNoDup, capture the primary key of
+        // the current position before advancing.
+        let current_primary_key: Option<Vec<u8>> = if is_dup {
+            self.current_key.as_ref().and_then(|raw| {
+                dup_key_data::get_key(raw)
+            })
+        } else {
+            None
+        };
+
+        let forward = mode.is_forward();
         let next_index = if forward {
             self.current_index + 1
         } else {
             self.current_index - 1
         };
 
-        // Try to read the entry at next_index from the BIN containing
-        // current_key.
         let entry: Option<(Vec<u8>, Vec<u8>, i32)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
@@ -686,15 +776,8 @@ impl CursorImpl {
                     None
                 } else {
                     use noxu_tree::tree::TreeNode;
-                    // Find the BIN that contains current_key by searching the
-                    // tree for the key, then descend to that BIN.  We use
-                    // descend_to_bin / descend_to_last_bin as a simplification:
-                    // the search result tells us which BIN to look at.
                     let root = tree.get_root();
                     root.as_ref().and_then(|r| {
-                        // Descend to the BIN that should contain current_key.
-                        // For the correct BIN we use the search path rather
-                        // than always going to the leftmost/rightmost BIN.
                         let current_key_slice = self.current_key.as_deref()?;
                         let bin_arc =
                             Self::find_bin_for_key(r.clone(), current_key_slice)?;
@@ -704,13 +787,9 @@ impl CursorImpl {
                                 if next_index < 0
                                     || next_index >= bin.entries.len() as i32
                                 {
-                                    // BIN exhausted — signal caller to try
-                                    // cross-BIN navigation.
                                     None
                                 } else {
                                     let idx = next_index as usize;
-                                    // Use get_full_key to reconstruct
-                                    // prefix-compressed keys correctly.
                                     Some((
                                         bin.get_full_key(idx).unwrap_or_default(),
                                         bin.entries[idx].data.clone().unwrap_or_default(),
@@ -728,6 +807,14 @@ impl CursorImpl {
         };
 
         if let Some((key, data, idx)) = entry {
+            // For dup-mode traversal modes, filter by primary key.
+            if is_dup {
+                let s = self.apply_dup_filter(
+                    key, data, idx, mode, current_primary_key.as_deref(),
+                    forward,
+                )?;
+                return Ok(s);
+            }
             self.current_key = Some(key);
             self.current_data = Some(data);
             self.current_lsn = noxu_util::NULL_LSN.as_u64();
@@ -735,17 +822,13 @@ impl CursorImpl {
             return Ok(OperationStatus::Success);
         }
 
-        // Current BIN is exhausted.  Port of JE CursorImpl.getNext() lines
-        // 2605–2648: call tree.getNextBin(anchorBIN) / tree.getPrevBin().
-        // `current_key` is the anchor: the last key we were positioned on in
-        // the exhausted BIN (JE uses the BIN reference itself; we use the key
-        // since our tree API is key-addressed).
+        // Current BIN exhausted — cross to adjacent BIN.
         let anchor_key: Vec<u8> = match &self.current_key {
             Some(k) => k.clone(),
             None => return Ok(OperationStatus::NotFound),
         };
 
-        let adjacent_entries: Option<Vec<noxu_tree::tree::BinEntry>> = {
+        let adjacent_entries: Option<Vec<BinEntry>> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if forward {
@@ -760,11 +843,7 @@ impl CursorImpl {
 
         match adjacent_entries {
             Some(entries) if !entries.is_empty() => {
-                // Position at the first entry of the next BIN (forward) or
-                // the last entry of the previous BIN (backward).
-                // Port of JE: index = -1 then ++index for forward;
-                //             index = bin.getNEntries() then --index for backward.
-                let (key, data, idx) = if forward {
+                let (raw_key, raw_data, idx) = if forward {
                     let e = entries.into_iter().next().unwrap();
                     (e.key, e.data.unwrap_or_default(), 0i32)
                 } else {
@@ -772,13 +851,173 @@ impl CursorImpl {
                     let e = entries.into_iter().last().unwrap();
                     (e.key, e.data.unwrap_or_default(), last_idx)
                 };
-                self.current_key = Some(key);
-                self.current_data = Some(data);
+                if is_dup {
+                    let s = self.apply_dup_filter(
+                        raw_key, raw_data, idx, mode,
+                        current_primary_key.as_deref(), forward,
+                    )?;
+                    return Ok(s);
+                }
+                self.current_key = Some(raw_key);
+                self.current_data = Some(raw_data);
                 self.current_lsn = noxu_util::NULL_LSN.as_u64();
                 self.current_index = idx;
                 Ok(OperationStatus::Success)
             }
             _ => Ok(OperationStatus::NotFound),
+        }
+    }
+
+    /// Applies sorted-dup filtering rules after moving to `(raw_key, raw_data,
+    /// idx)`.
+    ///
+    /// * `NextDup` / `PrevDup` — succeed only if the new entry's primary key
+    ///   equals the saved primary key; return NotFound otherwise.
+    /// * `NextNoDup` / `PrevNoDup` — advance past all entries that share the
+    ///   same primary key as the saved position, returning the first entry with
+    ///   a DIFFERENT primary key.
+    /// * `Next` / `Prev` — accept any entry.
+    fn apply_dup_filter(
+        &mut self,
+        mut raw_key: Vec<u8>,
+        mut raw_data: Vec<u8>,
+        mut idx: i32,
+        mode: GetMode,
+        prev_primary_key: Option<&[u8]>,
+        forward: bool,
+    ) -> Result<OperationStatus, DbiError> {
+        loop {
+            let new_pk = dup_key_data::get_key(&raw_key);
+            match mode {
+                GetMode::NextDup | GetMode::PrevDup => {
+                    // Stay on the same primary key.
+                    let same = match (&new_pk, prev_primary_key) {
+                        (Some(npk), Some(ppk)) => npk.as_slice() == ppk,
+                        _ => false,
+                    };
+                    if same {
+                        self.current_key = Some(raw_key);
+                        self.current_data = Some(raw_data);
+                        self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                        self.current_index = idx;
+                        return Ok(OperationStatus::Success);
+                    } else {
+                        return Ok(OperationStatus::NotFound);
+                    }
+                }
+                GetMode::NextNoDup | GetMode::PrevNoDup => {
+                    // Skip entries with the same primary key as `prev_primary_key`.
+                    let same = match (&new_pk, prev_primary_key) {
+                        (Some(npk), Some(ppk)) => npk.as_slice() == ppk,
+                        _ => false,
+                    };
+                    if !same {
+                        self.current_key = Some(raw_key);
+                        self.current_data = Some(raw_data);
+                        self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                        self.current_index = idx;
+                        return Ok(OperationStatus::Success);
+                    }
+                    // Need to advance further.
+                    // Increment/decrement idx and try to read from the tree.
+                    if forward {
+                        idx += 1;
+                    } else {
+                        idx -= 1;
+                    }
+                    let next = {
+                        let db = self.db_impl.read();
+                        if let Some(tree) = db.get_real_tree() {
+                            if tree.is_empty() {
+                                None
+                            } else {
+                                use noxu_tree::tree::TreeNode;
+                                let root = tree.get_root();
+                                root.as_ref().and_then(|r| {
+                                    // Use the current raw_key to find the BIN.
+                                    let bin_arc =
+                                        Self::find_bin_for_key(r.clone(), &raw_key)?;
+                                    let g = bin_arc.read().ok()?;
+                                    match &*g {
+                                        TreeNode::Bottom(bin) => {
+                                            if idx < 0
+                                                || idx >= bin.entries.len() as i32
+                                            {
+                                                None
+                                            } else {
+                                                let i = idx as usize;
+                                                Some((
+                                                    bin.get_full_key(i)
+                                                        .unwrap_or_default(),
+                                                    bin.entries[i]
+                                                        .data
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    idx,
+                                                ))
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    match next {
+                        Some((k, d, i)) => {
+                            raw_key = k;
+                            raw_data = d;
+                            idx = i;
+                            // Loop continues.
+                        }
+                        None => {
+                            // BIN exhausted — cross to adjacent BIN.
+                            let anchor = raw_key.clone();
+                            let adj: Option<Vec<BinEntry>> = {
+                                let db = self.db_impl.read();
+                                if let Some(tree) = db.get_real_tree() {
+                                    if forward {
+                                        tree.get_next_bin(&anchor)
+                                    } else {
+                                        tree.get_prev_bin(&anchor)
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            match adj {
+                                Some(entries) if !entries.is_empty() => {
+                                    let (k, d, i) = if forward {
+                                        let e =
+                                            entries.into_iter().next().unwrap();
+                                        (e.key, e.data.unwrap_or_default(), 0i32)
+                                    } else {
+                                        let li = (entries.len() - 1) as i32;
+                                        let e =
+                                            entries.into_iter().last().unwrap();
+                                        (e.key, e.data.unwrap_or_default(), li)
+                                    };
+                                    raw_key = k;
+                                    raw_data = d;
+                                    idx = i;
+                                    // Loop continues.
+                                }
+                                _ => return Ok(OperationStatus::NotFound),
+                            }
+                        }
+                    }
+                }
+                // Next / Prev: accept any entry.
+                GetMode::Next | GetMode::Prev => {
+                    self.current_key = Some(raw_key);
+                    self.current_data = Some(raw_data);
+                    self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                    self.current_index = idx;
+                    return Ok(OperationStatus::Success);
+                }
+            }
         }
     }
 
@@ -863,11 +1102,16 @@ impl CursorImpl {
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
+        // For sorted-dup databases: encode (key, data) as a two-part composite
+        // key.  The tree stores `combine(key, data)` with no slot data.
+        // Port of `CursorImpl.putInternal()` dup path in JE 7.5.
+        if self.is_sorted_dup() {
+            return self.put_dup(key, data, put_mode);
+        }
+
         match put_mode {
             PutMode::Current => {
-                // Current mode requires cursor to be positioned (JE: must be initialized).
                 self.check_initialized()?;
-                // Update data in-place in the tree.
                 let current_key = self
                     .current_key
                     .clone()
@@ -883,7 +1127,6 @@ impl CursorImpl {
                 Ok(OperationStatus::Success)
             }
             PutMode::NoOverwrite => {
-                // Check if key already exists in the tree.
                 let key_exists = {
                     let db = self.db_impl.read();
                     if let Some(tree) = db.get_real_tree() {
@@ -897,7 +1140,6 @@ impl CursorImpl {
                 if key_exists {
                     return Ok(OperationStatus::KeyExist);
                 }
-                // Write LN entry then insert.
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
                     let mut db = self.db_impl.write();
@@ -913,7 +1155,6 @@ impl CursorImpl {
                 Ok(OperationStatus::Success)
             }
             PutMode::Overwrite | PutMode::NoDupData => {
-                // Write LN entry then insert or update.
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
                     let mut db = self.db_impl.write();
@@ -923,6 +1164,103 @@ impl CursorImpl {
                 }
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(data.to_vec());
+                self.current_lsn = new_lsn.as_u64();
+                self.current_index = 0;
+                self.state = CursorState::Initialized;
+                Ok(OperationStatus::Success)
+            }
+        }
+    }
+
+    /// Sorted-dup variant of `put()`.
+    ///
+    /// Encodes (key, data) as a two-part composite key and stores it in the
+    /// tree with empty slot data.  The tree's custom comparator ensures
+    /// correct ordering.
+    ///
+    /// Port of `CursorImpl.putInternal()` dup path from JE 7.5.
+    fn put_dup(
+        &mut self,
+        key: &[u8],
+        data: &[u8],
+        put_mode: PutMode,
+    ) -> Result<OperationStatus, DbiError> {
+        let two_part_key = dup_key_data::combine(key, data);
+
+        match put_mode {
+            PutMode::NoDupData | PutMode::NoOverwrite => {
+                // Return KeyExist if the exact (key, data) pair already exists.
+                let exists = {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        tree.search(&two_part_key)
+                            .map(|sr| sr.exact_parent_found)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if exists {
+                    return Ok(OperationStatus::KeyExist);
+                }
+                let new_lsn =
+                    self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
+                {
+                    let mut db = self.db_impl.write();
+                    if let Some(tree) = db.get_real_tree_mut() {
+                        let _ = tree.insert(two_part_key.clone(), vec![], new_lsn);
+                    }
+                }
+                self.current_key = Some(two_part_key);
+                self.current_data = None;
+                self.current_lsn = new_lsn.as_u64();
+                self.current_index = 0;
+                self.state = CursorState::Initialized;
+                Ok(OperationStatus::Success)
+            }
+            PutMode::Current => {
+                // Replace the data of the currently positioned record.
+                // In dup mode this means replacing the current two-part key
+                // with a new one (delete old, insert new).
+                self.check_initialized()?;
+                let old_key = self
+                    .current_key
+                    .clone()
+                    .ok_or(DbiError::CursorNotInitialized)?;
+                // Delete the old two-part key.
+                self.log_ln_write(&old_key, None, self.locker_id)?;
+                {
+                    let mut db = self.db_impl.write();
+                    if let Some(tree) = db.get_real_tree_mut() {
+                        tree.delete(&old_key);
+                    }
+                }
+                // Insert the new two-part key.
+                let new_lsn =
+                    self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
+                {
+                    let mut db = self.db_impl.write();
+                    if let Some(tree) = db.get_real_tree_mut() {
+                        let _ = tree.insert(two_part_key.clone(), vec![], new_lsn);
+                    }
+                }
+                self.current_key = Some(two_part_key);
+                self.current_data = None;
+                self.current_lsn = new_lsn.as_u64();
+                Ok(OperationStatus::Success)
+            }
+            PutMode::Overwrite => {
+                // Insert or replace the exact (key, data) pair.
+                let new_lsn =
+                    self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
+                {
+                    let mut db = self.db_impl.write();
+                    if let Some(tree) = db.get_real_tree_mut() {
+                        let _ = tree.insert(two_part_key.clone(), vec![], new_lsn);
+                    }
+                }
+                self.current_key = Some(two_part_key);
+                self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
                 self.current_index = 0;
                 self.state = CursorState::Initialized;
@@ -998,12 +1336,14 @@ impl CursorImpl {
     pub fn delete(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_initialized()?;
 
-        // Write DeleteLN to WAL before modifying the tree.
-        if let Some(key) = self.current_key.clone() {
-            self.log_ln_write(&key, None, self.locker_id)?;
+        // For sorted-dup databases, current_key IS the two-part composite key
+        // stored in the tree.  For non-dup databases it is the plain key.
+        // In both cases current_key is the correct tree-delete key.
+        if let Some(tree_key) = self.current_key.clone() {
+            self.log_ln_write(&tree_key, None, self.locker_id)?;
             let mut db = self.db_impl.write();
             if let Some(tree) = db.get_real_tree_mut() {
-                tree.delete(&key);
+                tree.delete(&tree_key);
             }
         }
 
@@ -1035,12 +1375,53 @@ impl CursorImpl {
     pub fn count(&self) -> Result<i64, DbiError> {
         self.check_initialized()?;
 
-        // Simplified: always 1 (no real dup counting)
-        // In a full implementation:
-        // 1. Save current position
-        // 2. Search for first duplicate of current key
-        // 3. Count all records until key changes
-        // 4. Restore position
+        // For sorted-dup databases, count all entries sharing the same primary
+        // key as the current position.
+        //
+        // Port of `CursorImpl.count()` from JE 7.5: position at the lower
+        // bound of the current primary key and iterate until the primary key
+        // changes.
+        if self.is_sorted_dup() {
+            let raw_key = match &self.current_key {
+                Some(k) => k.clone(),
+                None => return Ok(0),
+            };
+            let primary_key = match dup_key_data::get_key(&raw_key) {
+                Some(pk) => pk,
+                None => return Ok(1),
+            };
+            let lb = dup_key_data::lower_bound(&primary_key);
+            let mut count: i64 = 0;
+            let db = self.db_impl.read();
+            if let Some(tree) = db.get_real_tree() {
+                // Use first_entry_at_or_after to position, then count via
+                // get_next_bin until primary key changes.
+                let mut current_raw = match tree.first_entry_at_or_after(&lb) {
+                    Some((k, _)) => k,
+                    None => return Ok(0),
+                };
+                loop {
+                    if !dup_key_data::matches_key(&current_raw, &primary_key) {
+                        break;
+                    }
+                    count += 1;
+                    // Advance to next entry in the tree.
+                    match tree.get_next_bin(&current_raw) {
+                        Some(entries) if !entries.is_empty() => {
+                            let e = entries.into_iter().next().unwrap();
+                            // If the next BIN's first entry doesn't match, stop.
+                            if !dup_key_data::matches_key(&e.key, &primary_key) {
+                                break;
+                            }
+                            current_raw = e.key;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            return Ok(count.max(1));
+        }
+
         Ok(1)
     }
 
@@ -1633,6 +2014,237 @@ mod tests {
 
         let s = cursor.search(b"zzz", None, SearchMode::SetRange).unwrap();
         assert_eq!(s, OperationStatus::NotFound);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sorted-duplicate key tests
+    // -----------------------------------------------------------------------
+
+    fn create_dup_database() -> Arc<RwLock<DatabaseImpl>> {
+        let db_id = DatabaseId::new(2);
+        let mut config = DatabaseConfig::default();
+        config.sorted_duplicates = true;
+        let db_impl = DatabaseImpl::new(
+            db_id,
+            "dup_test_db".to_string(),
+            DbType::User,
+            &config,
+        );
+        Arc::new(RwLock::new(db_impl))
+    }
+
+    /// Basic put + get_current round-trip for sorted-dup database.
+    ///
+    /// Port of JE `DupKeyDataTest.testCombineSplit()`.
+    #[test]
+    fn test_dup_put_and_get_current() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        let s = cursor.put(b"key", b"data", PutMode::Overwrite).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"key");
+        assert_eq!(d, b"data");
+    }
+
+    /// Multiple data values for the same primary key.
+    ///
+    /// Port of JE `SortedDuplicatesTest.testMultipleDups()`.
+    #[test]
+    fn test_dup_multiple_data_per_key() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"aaa", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"bbb", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"ccc", PutMode::Overwrite).unwrap();
+
+        // search Set: positions at the first entry for "key"
+        let s = cursor.search(b"key", None, SearchMode::Set).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"key");
+        assert_eq!(d, b"aaa", "first dup should have smallest data");
+    }
+
+    /// search Both: positions at the exact (key, data) pair.
+    ///
+    /// Port of JE `CursorImpl.searchBothExact()` dup path.
+    #[test]
+    fn test_dup_search_both_exact() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"aaa", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"bbb", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"ccc", PutMode::Overwrite).unwrap();
+
+        let s = cursor
+            .search(b"key", Some(b"bbb"), SearchMode::Both)
+            .unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"key");
+        assert_eq!(d, b"bbb");
+    }
+
+    /// search Both: returns NotFound when exact pair doesn't exist.
+    #[test]
+    fn test_dup_search_both_not_found() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"aaa", PutMode::Overwrite).unwrap();
+
+        let s = cursor
+            .search(b"key", Some(b"zzz"), SearchMode::Both)
+            .unwrap();
+        assert_eq!(s, OperationStatus::NotFound);
+    }
+
+    /// NoDupData returns KeyExist when exact (key, data) already stored.
+    ///
+    /// Port of JE `SortedDuplicatesTest.testNoDupData()`.
+    #[test]
+    fn test_dup_no_dup_data_returns_key_exist() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"val", PutMode::Overwrite).unwrap();
+
+        let s = cursor.put(b"key", b"val", PutMode::NoDupData).unwrap();
+        assert_eq!(s, OperationStatus::KeyExist);
+    }
+
+    /// NoDupData succeeds for a different data value under the same key.
+    #[test]
+    fn test_dup_no_dup_data_different_data_ok() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"val1", PutMode::Overwrite).unwrap();
+
+        let s = cursor.put(b"key", b"val2", PutMode::NoDupData).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+    }
+
+    /// NextDup traversal visits all dups of the current primary key.
+    ///
+    /// Port of JE `CursorImpl.getNext(GetMode.NEXT_DUP)` path.
+    #[test]
+    fn test_dup_next_dup_traversal() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"a", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"b", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"c", PutMode::Overwrite).unwrap();
+        // Different primary key — should NOT appear in NextDup.
+        cursor.put(b"zzz", b"x", PutMode::Overwrite).unwrap();
+
+        // Position at first dup.
+        cursor.search(b"key", None, SearchMode::Set).unwrap();
+        let (_, d) = cursor.get_current().unwrap();
+        assert_eq!(d, b"a");
+
+        let s = cursor.retrieve_next(GetMode::NextDup).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"key");
+        assert_eq!(d, b"b");
+
+        let s = cursor.retrieve_next(GetMode::NextDup).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        let (_, d) = cursor.get_current().unwrap();
+        assert_eq!(d, b"c");
+
+        // No more dups for "key".
+        let s = cursor.retrieve_next(GetMode::NextDup).unwrap();
+        assert_eq!(s, OperationStatus::NotFound);
+    }
+
+    /// NextNoDup skips all dups of the current primary key.
+    ///
+    /// Port of JE `CursorImpl.getNext(GetMode.NEXT_NO_DUP)`.
+    #[test]
+    fn test_dup_next_no_dup_skips_dups() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"aaa", b"1", PutMode::Overwrite).unwrap();
+        cursor.put(b"aaa", b"2", PutMode::Overwrite).unwrap();
+        cursor.put(b"bbb", b"x", PutMode::Overwrite).unwrap();
+
+        // Position at first entry for "aaa".
+        cursor.search(b"aaa", None, SearchMode::Set).unwrap();
+        let (pk, _) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"aaa");
+
+        // NextNoDup should skip "aaa" dups and land on "bbb".
+        let s = cursor.retrieve_next(GetMode::NextNoDup).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"bbb");
+        assert_eq!(d, b"x");
+    }
+
+    /// Dup delete removes only the specific (key, data) pair.
+    ///
+    /// Port of JE `SortedDuplicatesTest.testDeleteDup()`.
+    #[test]
+    fn test_dup_delete_specific_pair() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        cursor.put(b"key", b"a", PutMode::Overwrite).unwrap();
+        cursor.put(b"key", b"b", PutMode::Overwrite).unwrap();
+
+        // Position at "key"/"b" and delete it.
+        cursor
+            .search(b"key", Some(b"b"), SearchMode::Both)
+            .unwrap();
+        cursor.delete().unwrap();
+
+        // "key"/"a" should still exist.
+        let s = cursor.search(b"key", None, SearchMode::Set).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"key");
+        assert_eq!(d, b"a");
+
+        // "key"/"b" should be gone.
+        let s = cursor
+            .search(b"key", Some(b"b"), SearchMode::Both)
+            .unwrap();
+        assert_eq!(s, OperationStatus::NotFound);
+    }
+
+    /// Dup prefix-ambiguity ordering is correct.
+    ///
+    /// Port of `DupKeyDataTest.testCmpCorrectnessPrefixAmbiguity()`.
+    /// Key "a" data "bc" must sort before key "ab" data "c".
+    #[test]
+    fn test_dup_ordering_prefix_ambiguity() {
+        let db = create_dup_database();
+        let mut cursor = CursorImpl::new(db, 1);
+
+        // "ab"/"c" inserted first to stress comparator.
+        cursor.put(b"ab", b"c", PutMode::Overwrite).unwrap();
+        cursor.put(b"a", b"bc", PutMode::Overwrite).unwrap();
+
+        // Forward scan should give ("a","bc") then ("ab","c").
+        cursor.get_first().unwrap();
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"a");
+        assert_eq!(d, b"bc");
+
+        cursor.retrieve_next(GetMode::Next).unwrap();
+        let (pk, d) = cursor.get_current().unwrap();
+        assert_eq!(pk, b"ab");
+        assert_eq!(d, b"c");
     }
 
     // -----------------------------------------------------------------------

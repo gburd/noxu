@@ -15,7 +15,7 @@ use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_tree::tree::{Tree, TreeNode};
 use noxu_util::{Lsn, NULL_LSN};
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -152,6 +152,17 @@ pub struct Checkpointer {
     tree: Option<Arc<RwLock<Tree>>>,
     /// Database ID to pass to `Tree::collect_dirty_bins()`.
     db_id: u64,
+    /// Bytes written to the log since the last checkpoint.
+    ///
+    /// Incremented by `wakeup_after_write()`. When this exceeds
+    /// `checkpoint_bytes_interval` a checkpoint is triggered immediately.
+    ///
+    /// Port of `Checkpointer.nFullINFlushThisRun` write-byte accumulation in JE.
+    bytes_since_checkpoint: AtomicU64,
+    /// Bytes-written threshold that triggers an immediate checkpoint.
+    ///
+    /// Default: 10 MiB (10 * 1024 * 1024).  Set to 0 to disable.
+    checkpoint_bytes_interval: u64,
 }
 
 impl Checkpointer {
@@ -172,7 +183,17 @@ impl Checkpointer {
             log_manager: None,
             tree: None,
             db_id: 0,
+            bytes_since_checkpoint: AtomicU64::new(0),
+            checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
         }
+    }
+
+    /// Set the bytes-written threshold that triggers an immediate checkpoint.
+    ///
+    /// Port of `EnvironmentParams.CHECKPOINTER_BYTES_INTERVAL` in JE.
+    pub fn with_bytes_interval(mut self, bytes: u64) -> Self {
+        self.checkpoint_bytes_interval = bytes;
+        self
     }
 
     /// Attach a LogManager so that `do_checkpoint` writes real WAL entries.
@@ -192,6 +213,70 @@ impl Checkpointer {
         self.tree = Some(tree);
         self.db_id = db_id;
         self
+    }
+
+    /// Accumulate bytes written and trigger a checkpoint when the threshold
+    /// is exceeded.
+    ///
+    /// Called after each WAL write from `EnvironmentImpl` (or LogManager) with
+    /// the number of bytes appended.  When the running total exceeds
+    /// `checkpoint_bytes_interval` the counter is reset and
+    /// `do_checkpoint("wakeup")` is invoked synchronously.
+    ///
+    /// Port of `Checkpointer.wakeupAfterWrite()` in JE.
+    pub fn wakeup_after_write(&self, bytes: u64) {
+        if self.checkpoint_bytes_interval == 0 {
+            return;
+        }
+        let prev = self.bytes_since_checkpoint.fetch_add(bytes, Ordering::Relaxed);
+        if prev + bytes >= self.checkpoint_bytes_interval {
+            // Reset counter *before* triggering so parallel callers don't
+            // all pile in at once — best-effort, not strictly once.
+            self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
+            // Ignore errors: a concurrent checkpoint may be in progress.
+            let _ = self.do_checkpoint("wakeup_after_write");
+        }
+    }
+
+    /// Returns `true` if the given BIN node has been checkpointed at least
+    /// once (its `last_full_lsn` is not NULL_LSN).
+    ///
+    /// The evictor calls this before evicting a node: a node that has never
+    /// been checkpointed would be lost on eviction because it has no on-disk
+    /// representation yet.
+    ///
+    /// Port of `Checkpointer.coordinateEvictionWithCheckpoint()` in JE.
+    pub fn is_checkpointed(node: &RwLock<TreeNode>) -> bool {
+        let guard = match node.read() {
+            Ok(g) => g,
+            Err(_) => return false, // poisoned lock — treat as not checkpointed
+        };
+        match &*guard {
+            TreeNode::Bottom(b) => b.last_full_lsn != NULL_LSN,
+            // Non-BIN internal nodes are always considered checkpointed for
+            // eviction purposes (they are reconstructed from their children).
+            _ => true,
+        }
+    }
+
+    /// Persist file utilization summaries to the WAL.
+    ///
+    /// Writes a `FileSummaryLN` log entry for each tracked file summary so
+    /// that utilization data survives a restart.
+    ///
+    /// Port of `Checkpointer.flushUtilizationDb()` in JE.
+    ///
+    /// # Current status
+    ///
+    /// Stub implementation: if a LogManager is wired the method logs a debug
+    /// message and returns `Ok(())`.  Full persisting of `FileSummaryLN`
+    /// entries requires the utilization tracker to be wired, which is a
+    /// future task.
+    pub fn persist_file_summaries(&self) -> Result<()> {
+        if self.log_manager.is_some() {
+            log::debug!("persist_file_summaries: stub — no FileSummaryLN entries written");
+        }
+        Ok(())
     }
 
     /// Perform a checkpoint.
@@ -261,7 +346,7 @@ impl Checkpointer {
         // threshold of 25 % — whether to write a BINDelta or a full BIN.
         //
         // Port of JE `Checkpointer.processINList()` + `logIN()`.
-        let flush_result = self.flush_dirty_bins()?;
+        let flush_result = self.flush_dirty_bins_internal()?;
 
         // Step 5: Write CkptEnd entry to WAL.
         let end_lsn = if let Some(lm) = &self.log_manager {
@@ -374,7 +459,18 @@ impl Checkpointer {
         self.next_checkpoint_id.load(Ordering::SeqCst)
     }
 
-    /// Flush all dirty BINs to the log.
+    /// Flush all dirty BINs to the log (public, unit-result API).
+    ///
+    /// Calls the internal flush logic and discards the detailed `FlushResult`,
+    /// returning only success/failure.  Use this from external callers (e.g.
+    /// daemon threads) that do not need per-BIN counts.
+    ///
+    /// Port of JE `Checkpointer.doCheckpoint()` partial flush path.
+    pub fn flush_dirty_bins(&self) -> Result<()> {
+        self.flush_dirty_bins_internal().map(|_| ())
+    }
+
+    /// Internal flush all dirty BINs to the log.
     ///
     /// For each dirty BIN the JE TREE_BIN_DELTA threshold (25 %) decides:
     /// - dirty_count / total ≤ 0.25 → write `BINDelta` entry (delta path)
@@ -383,8 +479,11 @@ impl Checkpointer {
     /// After a successful write the BIN's dirty flags are cleared and (for
     /// full writes) `last_full_lsn` is updated to the entry's LSN.
     ///
+    /// Also calls `persist_file_summaries()` to ensure utilization data is
+    /// durable.
+    ///
     /// Port of JE `Checkpointer.processINList()` + `Checkpointer.logIN()`.
-    fn flush_dirty_bins(&self) -> Result<FlushResult> {
+    fn flush_dirty_bins_internal(&self) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
         let lm = match &self.log_manager {
@@ -485,6 +584,9 @@ impl Checkpointer {
                 result.full_bins_flushed += 1;
             }
         }
+
+        // Persist file utilization summaries so they survive restarts.
+        self.persist_file_summaries()?;
 
         Ok(result)
     }
@@ -753,6 +855,112 @@ mod tests {
             r2.end_lsn,
             r2.start_lsn
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for new methods: wakeup_after_write, is_checkpointed,
+    // persist_file_summaries
+    // -----------------------------------------------------------------------
+
+    /// `wakeup_after_write` triggers a checkpoint once accumulated bytes
+    /// exceed the configured threshold.
+    #[test]
+    fn test_wakeup_after_write_triggers_checkpoint() {
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(100); // tiny threshold for testing
+
+        // Initial state: no checkpoints performed yet.
+        assert_eq!(
+            checkpointer.stats.checkpoints.load(Ordering::Relaxed),
+            0
+        );
+
+        // Write 99 bytes — below threshold; no checkpoint yet.
+        checkpointer.wakeup_after_write(99);
+        assert_eq!(
+            checkpointer.stats.checkpoints.load(Ordering::Relaxed),
+            0,
+            "no checkpoint should fire below the threshold"
+        );
+
+        // Write 1 more byte — reaches threshold; checkpoint fires.
+        checkpointer.wakeup_after_write(1);
+        assert_eq!(
+            checkpointer.stats.checkpoints.load(Ordering::Relaxed),
+            1,
+            "exactly one checkpoint should fire when threshold is reached"
+        );
+
+        // Counter should have been reset; another 100 bytes should trigger again.
+        checkpointer.wakeup_after_write(100);
+        assert_eq!(
+            checkpointer.stats.checkpoints.load(Ordering::Relaxed),
+            2,
+            "second checkpoint should fire after counter reset"
+        );
+    }
+
+    /// `wakeup_after_write` with interval=0 is a no-op.
+    #[test]
+    fn test_wakeup_after_write_disabled_when_interval_zero() {
+        let checkpointer =
+            Checkpointer::new(CheckpointConfig::default()).with_bytes_interval(0);
+
+        checkpointer.wakeup_after_write(u64::MAX);
+        assert_eq!(
+            checkpointer.stats.checkpoints.load(Ordering::Relaxed),
+            0,
+            "no checkpoint should fire when interval is 0"
+        );
+    }
+
+    /// `is_checkpointed` returns `false` for a BIN whose `last_full_lsn` is
+    /// NULL_LSN (never checkpointed) and `true` after setting a non-NULL LSN.
+    #[test]
+    fn test_is_checkpointed() {
+        use noxu_tree::tree::{BinStub, TreeNode};
+        use std::sync::RwLock;
+
+        // Build a BIN node with last_full_lsn = NULL_LSN.
+        let bin = BinStub {
+            node_id: 1,
+            level: 0,
+            entries: vec![],
+            key_prefix: vec![],
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: noxu_util::NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: false,
+        };
+        let node = RwLock::new(TreeNode::Bottom(bin));
+
+        // Not yet checkpointed.
+        assert!(
+            !Checkpointer::is_checkpointed(&node),
+            "fresh BIN should not be checkpointed"
+        );
+
+        // Simulate a checkpoint by setting last_full_lsn.
+        {
+            let mut guard = node.write().unwrap();
+            if let TreeNode::Bottom(ref mut b) = *guard {
+                b.last_full_lsn = Lsn::new(1, 100);
+            }
+        }
+
+        assert!(
+            Checkpointer::is_checkpointed(&node),
+            "BIN should be checkpointed after last_full_lsn is set"
+        );
+    }
+
+    /// `persist_file_summaries` returns Ok(()) without panicking.
+    #[test]
+    fn test_persist_file_summaries_is_ok() {
+        let checkpointer = Checkpointer::new(CheckpointConfig::default());
+        assert!(checkpointer.persist_file_summaries().is_ok());
     }
 
     /// Checkpoint with a real tree flushes dirty BINs — step 4.

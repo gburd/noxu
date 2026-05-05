@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 use crate::LockManager;
 use crate::txn::Txn;

@@ -10,12 +10,12 @@
 //! Idle -> Proposing -> Voting -> Complete | Failed
 //! ```
 //!
-//! Thread safety is achieved via `parking_lot::Mutex` on interior fields so
+//! Thread safety is achieved via `noxu_sync::Mutex` on interior fields so
 //! that vote recording can happen concurrently from multiple network threads.
 
 use std::collections::HashMap;
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 
 use super::election_config::ElectionConfig;
 use super::proposal::Proposal;
@@ -298,7 +298,7 @@ impl Election {
     }
 }
 
-// Safety: all interior mutability is behind parking_lot Mutexes.
+// Safety: all interior mutability is behind noxu_sync Mutexes.
 unsafe impl Send for Election {}
 unsafe impl Sync for Election {}
 

@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 
 use crate::error::{RepError, Result};
 

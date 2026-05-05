@@ -15,7 +15,7 @@ noxu-txn = { workspace = true }
 noxu-evictor = { workspace = true }
 noxu-cleaner = { workspace = true }
 noxu-recovery = { workspace = true }
-parking_lot = { workspace = true }
+noxu-sync = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }

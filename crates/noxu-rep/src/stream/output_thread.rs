@@ -4,7 +4,7 @@
 //! The `OutputQueue` decouples message production (by the feeder or
 //! replication logic) from message consumption (by the network I/O thread).
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Manages a queue of outbound replication messages.

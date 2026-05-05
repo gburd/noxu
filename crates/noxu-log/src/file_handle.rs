@@ -7,7 +7,7 @@
 
 use crate::error::{LogError, Result};
 use noxu_latch::{ExclusiveLatch, ExclusiveLatchGuard};
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;

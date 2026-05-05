@@ -8,7 +8,7 @@
 //! entries from the feeder channel, passes them to a [`LogWriter`], and sends
 //! acks back.
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 

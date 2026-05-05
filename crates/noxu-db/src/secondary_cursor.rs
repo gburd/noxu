@@ -355,7 +355,7 @@ mod tests {
     use crate::environment_config::EnvironmentConfig;
     use crate::secondary_config::{SecondaryConfig, SecondaryKeyCreator};
     use crate::secondary_database::SecondaryDatabase;
-    use parking_lot::Mutex;
+    use noxu_sync::Mutex;
     use std::sync::Arc;
     use tempfile::TempDir;
 

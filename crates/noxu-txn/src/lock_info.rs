@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::{Condvar, Mutex};
+use noxu_sync::{Condvar, Mutex};
 
 use crate::LockType;
 

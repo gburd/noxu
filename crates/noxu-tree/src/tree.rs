@@ -37,6 +37,18 @@ pub const BIN_LEVEL: i32 = MAIN_LEVEL | 1;
 pub const EXACT_MATCH: i32 = 1 << 16;
 pub const INSERT_SUCCESS: i32 = 1 << 17;
 
+/// Type alias for the key comparator used by sorted-duplicate databases.
+///
+/// The comparator takes two full (uncompressed) keys and returns their
+/// relative ordering.  For sorted-dup databases this is `DupKeyData::compare`,
+/// which splits each key into primary + data parts and applies separate
+/// comparators to each.  For normal databases this field is `None` and
+/// lexicographic byte comparison is used.
+///
+/// Port of JE `DatabaseImpl.btreeComparator` / `DatabaseImpl.dupComparator`.
+pub type KeyComparatorFn =
+    Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
+
 /// The B+tree.
 ///
 /// Port of `com.sleepycat.je.tree.Tree`.
@@ -63,6 +75,16 @@ pub struct Tree {
 
     /// Statistics: number of latch upgrades from shared to exclusive.
     relatches_required: u64,
+
+    /// Optional custom key comparator for sorted-duplicate databases.
+    ///
+    /// When `Some`, all key comparisons in tree traversal (upper IN routing
+    /// and BIN entry search/insert/delete) use this comparator instead of
+    /// lexicographic byte comparison.
+    ///
+    /// Port of JE's `btreeComparator` / `dupComparator` stored on the
+    /// database and consulted at every `IN.findEntry()` call.
+    pub key_comparator: Option<KeyComparatorFn>,
 }
 
 /// A node in the tree.
@@ -166,6 +188,13 @@ pub struct BinStub {
     /// Weak back-pointer to parent IN.
     /// Enables dirty-propagation and latch-coupling validation.
     pub parent: Option<Weak<RwLock<TreeNode>>>,
+    /// If true, `BinEntry.expiration_time` values in this BIN are packed hours
+    /// since epoch; if false, they are packed seconds since epoch.
+    ///
+    /// Default: `true` (hours, matching JE's TTL resolution).
+    ///
+    /// Port of JE `BIN.expirationInHours`.
+    pub expiration_in_hours: bool,
 }
 
 /// Entry in a BIN node.
@@ -188,6 +217,13 @@ pub struct BinEntry {
     /// path to decide whether to write a BIN-delta (few dirty slots) or a
     /// full BIN (many dirty slots).
     pub dirty: bool,
+    /// Packed expiration time (0 = no expiration).
+    ///
+    /// When the owning `BinStub.expiration_in_hours` is true, this value is
+    /// hours since Unix epoch; otherwise it is seconds since Unix epoch.
+    ///
+    /// Port of JE `IN.entryExpiration`.
+    pub expiration_time: u32,
 }
 
 impl BinStub {
@@ -429,7 +465,7 @@ impl BinStub {
                 // New key — insert in sorted position.
                 // New slots start dirty: they have never been logged in any BIN.
                 // Port of JE `IN.setDirtyEntry(idx)` called after `insertEntry`.
-                self.entries.insert(idx, BinEntry { key: suffix, lsn, data, known_deleted: false, dirty: true });
+                self.entries.insert(idx, BinEntry { key: suffix, lsn, data, known_deleted: false, dirty: true, expiration_time: 0 });
                 // After insertion, if there is no prefix yet, try to establish one.
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
                     self.recompute_key_prefix();
@@ -444,6 +480,124 @@ impl BinStub {
     /// Port of JE `BIN.getNumDirtyEntries()`.
     pub fn dirty_count(&self) -> usize {
         self.entries.iter().filter(|e| e.dirty).count()
+    }
+
+    /// Comparator-aware binary search: finds `full_key` using `cmp`.
+    ///
+    /// Unlike `find_entry_compressed` (which uses suffix-based lexicographic
+    /// comparison), this decompresses each entry's key to its full form and
+    /// applies the provided comparator — required for sorted-dup databases
+    /// where lexicographic suffix comparison would give wrong results when
+    /// different-length primary keys are in the same BIN.
+    ///
+    /// Returns `(idx, exact)`.  Does NOT do prefix compression.
+    ///
+    /// Port of JE `IN.findEntry` with btreeComparator active.
+    pub fn find_entry_cmp(
+        &self,
+        full_key: &[u8],
+        cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> (usize, bool) {
+        match self.entries.binary_search_by(|e| {
+            let entry_full = if self.key_prefix.is_empty() {
+                e.key.as_slice().to_vec()
+            } else {
+                let mut fk = Vec::with_capacity(
+                    self.key_prefix.len() + e.key.len(),
+                );
+                fk.extend_from_slice(&self.key_prefix);
+                fk.extend_from_slice(&e.key);
+                fk
+            };
+            cmp(&entry_full, full_key)
+        }) {
+            Ok(idx) => (idx, true),
+            Err(idx) => (idx, false),
+        }
+    }
+
+    /// Comparator-aware insert: inserts `full_key` into the BIN using `cmp`.
+    ///
+    /// Prefix compression is DISABLED: the key is stored as-is.  This is
+    /// intentional for sorted-dup databases where the custom comparator
+    /// requires full-key access at every comparison.
+    ///
+    /// Returns `(slot_index, is_new_insert)`.
+    ///
+    /// Port of JE BIN insert path with btreeComparator active.
+    pub fn insert_cmp(
+        &mut self,
+        full_key: Vec<u8>,
+        lsn: Lsn,
+        data: Option<Vec<u8>>,
+        cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> (usize, bool) {
+        match self.entries.binary_search_by(|e| {
+            let entry_full = if self.key_prefix.is_empty() {
+                e.key.as_slice().to_vec()
+            } else {
+                let mut fk = Vec::with_capacity(
+                    self.key_prefix.len() + e.key.len(),
+                );
+                fk.extend_from_slice(&self.key_prefix);
+                fk.extend_from_slice(&e.key);
+                fk
+            };
+            cmp(&entry_full, &full_key)
+        }) {
+            Ok(idx) => {
+                // Key exists — update in place.
+                self.entries[idx].lsn = lsn;
+                self.entries[idx].data = data;
+                self.entries[idx].dirty = true;
+                (idx, false)
+            }
+            Err(idx) => {
+                // New key — insert at sorted position (no prefix compression).
+                self.entries.insert(
+                    idx,
+                    BinEntry {
+                        key: full_key,
+                        lsn,
+                        data,
+                        known_deleted: false,
+                        dirty: true,
+                        expiration_time: 0,
+                    },
+                );
+                (idx, true)
+            }
+        }
+    }
+
+    /// Comparator-aware delete: removes `full_key` from the BIN using `cmp`.
+    ///
+    /// Returns `true` if the entry was found and removed.
+    pub fn delete_cmp(
+        &mut self,
+        full_key: &[u8],
+        cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> bool {
+        match self.entries.binary_search_by(|e| {
+            let entry_full = if self.key_prefix.is_empty() {
+                e.key.as_slice().to_vec()
+            } else {
+                let mut fk = Vec::with_capacity(
+                    self.key_prefix.len() + e.key.len(),
+                );
+                fk.extend_from_slice(&self.key_prefix);
+                fk.extend_from_slice(&e.key);
+                fk
+            };
+            cmp(&entry_full, full_key)
+        }) {
+            Ok(idx) => {
+                self.entries.remove(idx);
+                self.dirty = true;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Serialise ALL entries (full BIN write).
@@ -790,6 +944,38 @@ impl Tree {
             root_latch: SharedLatch::new(LatchContext::new("TreeRoot"), false),
             root_splits: 0,
             relatches_required: 0,
+            key_comparator: None,
+        }
+    }
+
+    /// Creates a new empty tree with a custom key comparator.
+    ///
+    /// Used for sorted-duplicate databases where keys are two-part
+    /// composite keys that require a custom ordering function.
+    ///
+    /// Port of `Tree` constructor with `btreeComparator` parameter.
+    pub fn new_with_comparator(
+        database_id: u64,
+        max_entries_per_node: usize,
+        comparator: KeyComparatorFn,
+    ) -> Self {
+        Tree {
+            database_id,
+            max_entries_per_node,
+            root: None,
+            root_latch: SharedLatch::new(LatchContext::new("TreeRoot"), false),
+            root_splits: 0,
+            relatches_required: 0,
+            key_comparator: Some(comparator),
+        }
+    }
+
+    /// Returns the key comparator if set, or performs lexicographic comparison.
+    #[inline]
+    fn key_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        match &self.key_comparator {
+            Some(cmp) => cmp(a, b),
+            None => a.cmp(b),
         }
     }
 
@@ -855,13 +1041,52 @@ impl Tree {
                 // found): -1i32 has all bits set, so the naive
                 // `index & EXACT_MATCH != 0` check would incorrectly report
                 // an exact match for a missing key.
-                let index = guard.find_entry(key, true, true);
-                let found = index >= 0 && (index & EXACT_MATCH != 0);
-                return Some(SearchResult::with_values(
-                    found,
-                    index & 0xFFFF,
-                    false,
-                ));
+                let (found, raw_idx) = match &*guard {
+                    TreeNode::Bottom(bin) => {
+                        match &self.key_comparator {
+                            Some(cmp) => {
+                                let (idx, exact) =
+                                    bin.find_entry_cmp(key, cmp.as_ref());
+                                (exact, idx as i32)
+                            }
+                            None => {
+                                let index =
+                                    guard.find_entry(key, true, true);
+                                let exact =
+                                    index >= 0 && (index & EXACT_MATCH != 0);
+                                (exact, index & 0xFFFF)
+                            }
+                        }
+                    }
+                    _ => {
+                        let index = guard.find_entry(key, true, true);
+                        let exact =
+                            index >= 0 && (index & EXACT_MATCH != 0);
+                        (exact, index & 0xFFFF)
+                    }
+                };
+                // Port of JE CursorImpl.isProbablyExpired(): if an exact match
+                // was found, check whether the entry's TTL has already elapsed.
+                // If it has, treat the slot as not found so callers skip it.
+                let found = if found {
+                    if let TreeNode::Bottom(bin) = &*guard {
+                        let idx = (raw_idx & 0x7FFF) as usize;
+                        if let Some(entry) = bin.entries.get(idx) {
+                            !(entry.expiration_time != 0
+                                && noxu_util::ttl::is_expired(
+                                    entry.expiration_time,
+                                    bin.expiration_in_hours,
+                                ))
+                        } else {
+                            found
+                        }
+                    } else {
+                        found
+                    }
+                } else {
+                    found
+                };
+                return Some(SearchResult::with_values(found, raw_idx, false));
             }
 
             // Upper IN: find the child slot with the largest key <= search
@@ -880,7 +1105,9 @@ impl Tree {
                     for (i, entry) in n.entries.iter().enumerate() {
                         if i == 0 {
                             idx = 0;
-                        } else if entry.key.as_slice() <= key {
+                        } else if self.key_cmp(entry.key.as_slice(), key)
+                            != std::cmp::Ordering::Greater
+                        {
                             idx = i;
                         } else {
                             break;
@@ -896,6 +1123,79 @@ impl Tree {
             // released, then descend.
             drop(guard);
 
+            current = next_arc;
+        }
+    }
+
+    /// Returns the key and data of the first BIN entry at or after `key`.
+    ///
+    /// Descends with the tree's key comparator (same path as `search()`), then
+    /// within the BIN finds the first slot whose stored key >= `key` using the
+    /// comparator.  Returns `None` if every entry in the tree is < `key`.
+    ///
+    /// Used by sorted-duplicate cursor `search(Set)` to position at the first
+    /// (key, data) pair whose two-part key >= `lower_bound(primary_key)`.
+    ///
+    /// Port of `CursorImpl.searchExact(POSITION_FIRST_DUP)` → BIN scan path.
+    pub fn first_entry_at_or_after(
+        &self,
+        key: &[u8],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let root = self.root.as_ref()?;
+        let mut current = root.clone();
+
+        loop {
+            let guard = current.read().ok()?;
+
+            if guard.is_bin() {
+                let result = match &*guard {
+                    TreeNode::Bottom(bin) => {
+                        let (idx, _exact) = match &self.key_comparator {
+                            Some(cmp) => {
+                                bin.find_entry_cmp(key, cmp.as_ref())
+                            }
+                            None => bin.find_entry_compressed(key),
+                        };
+                        if idx < bin.entries.len() {
+                            let full_key =
+                                bin.get_full_key(idx).unwrap_or_default();
+                            let data = bin.entries[idx]
+                                .data
+                                .clone()
+                                .unwrap_or_default();
+                            Some((full_key, data))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                return result;
+            }
+
+            // Upper IN: same descent as search().
+            let next_arc = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
+                    }
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else if self.key_cmp(entry.key.as_slice(), key)
+                            != std::cmp::Ordering::Greater
+                        {
+                            idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    n.entries.get(idx)?.child.clone()?
+                }
+                TreeNode::Bottom(_) => unreachable!(),
+            };
+            drop(guard);
             current = next_arc;
         }
     }
@@ -922,13 +1222,14 @@ impl Tree {
             let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
                 node_id: generate_node_id(),
                 level: BIN_LEVEL,
-                entries: vec![BinEntry { key, lsn, data: Some(data), known_deleted: false, dirty: false }],
+                entries: vec![BinEntry { key, lsn, data: Some(data), known_deleted: false, dirty: false, expiration_time: 0 }],
                 key_prefix: Vec::new(), // single entry — no common prefix yet
                 dirty: true,
                 is_delta: false,
                 last_full_lsn: NULL_LSN,
                 generation: 0,
                 parent: None, // set below after root_in is created
+                expiration_in_hours: false,
             })));
 
             // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
@@ -970,6 +1271,7 @@ impl Tree {
             data,
             lsn,
             self.max_entries_per_node,
+            self.key_comparator.as_ref(),
         )?;
 
         Ok(result)
@@ -1099,6 +1401,7 @@ impl Tree {
                             data: b.entries[i].data.clone(),
                             known_deleted: b.entries[i].known_deleted,
                             dirty: b.entries[i].dirty,
+                            expiration_time: b.entries[i].expiration_time,
                         })
                         .collect();
                     (SplitEntries::Bottom(full), b.key_prefix.clone())
@@ -1169,6 +1472,7 @@ impl Tree {
                     last_full_lsn: NULL_LSN,
                     generation: 0,
                     parent: None, // set below
+                    expiration_in_hours: false,
                 };
                 if sibling_bin.entries.len() >= 2 {
                     sibling_bin.recompute_key_prefix();
@@ -1232,6 +1536,7 @@ impl Tree {
         data: Vec<u8>,
         lsn: Lsn,
         max_entries: usize,
+        key_comparator: Option<&KeyComparatorFn>,
     ) -> Result<bool, TreeError> {
         // Determine if this is a BIN (leaf level).
         let is_bin = {
@@ -1247,12 +1552,20 @@ impl Tree {
                 node_arc.write().map_err(|_| TreeError::NodeNotEmpty)?;
             match &mut *guard {
                 TreeNode::Bottom(bin) => {
-                    // insert_with_prefix handles prefix recomputation when
-                    // the new key shrinks the existing prefix, and also
-                    // initialises the prefix when 2 entries are present for
-                    // the first time.
-                    let (_idx, is_new) =
-                        bin.insert_with_prefix(key, lsn, Some(data));
+                    let is_new = if let Some(cmp) = key_comparator {
+                        // Comparator-based insert: no prefix compression.
+                        let (_idx, new) =
+                            bin.insert_cmp(key, lsn, Some(data), cmp.as_ref());
+                        new
+                    } else {
+                        // insert_with_prefix handles prefix recomputation when
+                        // the new key shrinks the existing prefix, and also
+                        // initialises the prefix when 2 entries are present for
+                        // the first time.
+                        let (_idx, new) =
+                            bin.insert_with_prefix(key, lsn, Some(data));
+                        new
+                    };
                     // Mark dirty after any modification.
                     bin.dirty = true;
                     Ok(is_new)
@@ -1274,12 +1587,19 @@ impl Tree {
                         let mut idx = 0usize;
                         for (i, entry) in n.entries.iter().enumerate() {
                             if i == 0 {
-                                // Slot 0: virtual key, always <= any real key.
                                 idx = 0;
-                            } else if entry.key.as_slice() <= key.as_slice() {
-                                idx = i;
                             } else {
-                                break;
+                                let ord = match key_comparator {
+                                    Some(cmp) => {
+                                        cmp(entry.key.as_slice(), key.as_slice())
+                                    }
+                                    None => entry.key.as_slice().cmp(key.as_slice()),
+                                };
+                                if ord != std::cmp::Ordering::Greater {
+                                    idx = i;
+                                } else {
+                                    break;
+                                }
                             }
                         }
                         let child = n
@@ -1309,12 +1629,14 @@ impl Tree {
 
                 // After the split, re-find which child now covers key.
                 return Self::insert_recursive(
-                    node_arc, key, data, lsn, max_entries,
+                    node_arc, key, data, lsn, max_entries, key_comparator,
                 );
             }
 
             // Descend into the child.
-            Self::insert_recursive(&child_arc, key, data, lsn, max_entries)
+            Self::insert_recursive(
+                &child_arc, key, data, lsn, max_entries, key_comparator,
+            )
         }
     }
 
@@ -1419,12 +1741,16 @@ impl Tree {
             None => return false,
         };
 
-        Self::delete_recursive(&root, key)
+        Self::delete_recursive(&root, key, self.key_comparator.as_ref())
     }
 
     /// Recursive helper for `delete`: descend to the BIN that holds `key`
     /// and remove it.
-    fn delete_recursive(node_arc: &Arc<RwLock<TreeNode>>, key: &[u8]) -> bool {
+    fn delete_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        key: &[u8],
+        key_comparator: Option<&KeyComparatorFn>,
+    ) -> bool {
         let (is_bin, child_arc) = {
             let g = match node_arc.read() {
                 Ok(g) => g,
@@ -1439,10 +1765,16 @@ impl Tree {
                         for (i, entry) in n.entries.iter().enumerate() {
                             if i == 0 {
                                 idx = 0;
-                            } else if entry.key.as_slice() <= key {
-                                idx = i;
                             } else {
-                                break;
+                                let ord = match key_comparator {
+                                    Some(cmp) => cmp(entry.key.as_slice(), key),
+                                    None => entry.key.as_slice().cmp(key),
+                                };
+                                if ord != std::cmp::Ordering::Greater {
+                                    idx = i;
+                                } else {
+                                    break;
+                                }
                             }
                         }
                         n.entries.get(idx).and_then(|e| e.child.clone())
@@ -1462,24 +1794,32 @@ impl Tree {
             };
             match &mut *g {
                 TreeNode::Bottom(bin) => {
-                    // Entries store compressed (suffix) keys when key_prefix
-                    // is non-empty.  Compress the search key before comparing.
-                    let suffix = bin.compress_key(key);
-                    match bin.entries.binary_search_by(|e| e.key.as_slice().cmp(suffix.as_slice())) {
-                        Ok(idx) => {
-                            bin.entries.remove(idx);
-                            // Mark dirty after any modification.
-                            bin.dirty = true;
-                            true
+                    if let Some(cmp) = key_comparator {
+                        bin.delete_cmp(key, cmp.as_ref())
+                    } else {
+                        // Entries store compressed (suffix) keys when key_prefix
+                        // is non-empty.  Compress the search key before comparing.
+                        let suffix = bin.compress_key(key);
+                        match bin.entries.binary_search_by(|e| {
+                            e.key.as_slice().cmp(suffix.as_slice())
+                        }) {
+                            Ok(idx) => {
+                                bin.entries.remove(idx);
+                                // Mark dirty after any modification.
+                                bin.dirty = true;
+                                true
+                            }
+                            Err(_) => false,
                         }
-                        Err(_) => false,
                     }
                 }
                 _ => false,
             }
         } else {
             match child_arc {
-                Some(child) => Self::delete_recursive(&child, key),
+                Some(child) => {
+                    Self::delete_recursive(&child, key, key_comparator)
+                }
                 None => false,
             }
         }
@@ -1619,6 +1959,7 @@ impl Tree {
                                         data: b.entries[j].data.clone(),
                                         known_deleted: b.entries[j].known_deleted,
                                         dirty: b.entries[j].dirty,
+                                        expiration_time: b.entries[j].expiration_time,
                                     })
                                     .collect(),
                                 _ => { i += 1; continue; }
@@ -1638,6 +1979,7 @@ impl Tree {
                                             data: rb.entries[j].data.clone(),
                                             known_deleted: rb.entries[j].known_deleted,
                                             dirty: rb.entries[j].dirty,
+                                            expiration_time: rb.entries[j].expiration_time,
                                         })
                                         .collect();
                                     // Left entries are all smaller; prepend.
@@ -2093,6 +2435,7 @@ impl Tree {
                 data: delta.entries[i].data.clone(),
                 known_deleted: delta.entries[i].known_deleted,
                 dirty: delta.entries[i].dirty,
+                expiration_time: delta.entries[i].expiration_time,
             })
             .collect();
         // Port of JE reconstituteBIN + resetContent + setBINDelta(false).
@@ -2258,6 +2601,7 @@ impl Tree {
                                 data: b.entries[i].data.clone(),
                                 known_deleted: b.entries[i].known_deleted,
                                 dirty: b.entries[i].dirty,
+                                expiration_time: b.entries[i].expiration_time,
                             })
                             .collect();
                         Some(full_entries)
@@ -2399,6 +2743,265 @@ impl Tree {
                 }// guard already dropped
             }
         }
+    }
+
+    // ========================================================================
+    // JE Tree.java ports: 8 additional tree methods (Task #82)
+    // ========================================================================
+
+    /// Returns `true` if the root node is currently loaded in memory.
+    ///
+    /// Port of `Tree.isRootResident()` from JE.
+    pub fn is_root_resident(&self) -> bool {
+        self.root.is_some()
+    }
+
+    /// Returns the root node `Arc` if present, or `None`.
+    ///
+    /// Port of `Tree.getResidentRootIN()` from JE.
+    pub fn get_resident_root_in(&self) -> Option<Arc<RwLock<TreeNode>>> {
+        self.root.clone()
+    }
+
+    /// Returns the BIN that should contain a slot for `key` (the "parent" of
+    /// LN slots).
+    ///
+    /// Port of `Tree.getParentBINForChildLN()` from JE.  Descends the tree
+    /// exactly like `search()` and returns the leaf-level BIN arc, or `None`
+    /// if the tree is empty.
+    pub fn get_parent_bin_for_child_ln(
+        &self,
+        key: &[u8],
+    ) -> Option<Arc<RwLock<TreeNode>>> {
+        let root = self.root.as_ref()?;
+        let mut current = root.clone();
+
+        loop {
+            // Single-pass latch-coupling: check is_bin AND capture child Arc
+            // within the same lock scope.
+            let guard = current.read().ok()?;
+
+            if guard.is_bin() {
+                // Drop guard, return the BIN Arc we are currently holding.
+                drop(guard);
+                return Some(current);
+            }
+
+            // Upper IN: find child slot whose key is the largest <= search key.
+            let next_arc = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
+                    }
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else if self.key_cmp(entry.key.as_slice(), key)
+                            != std::cmp::Ordering::Greater
+                        {
+                            idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    n.entries.get(idx)?.child.clone()?
+                }
+                TreeNode::Bottom(_) => unreachable!("is_bin() returned false above"),
+            };
+            drop(guard);
+            current = next_arc;
+        }
+    }
+
+    /// Returns the BIN where `key` should be inserted.
+    ///
+    /// Port of `Tree.findBinForInsert()` from JE.  Semantically identical to
+    /// `get_parent_bin_for_child_ln` — expressed as a separate method to match
+    /// JE's API surface.
+    pub fn find_bin_for_insert(
+        &self,
+        key: &[u8],
+    ) -> Option<Arc<RwLock<TreeNode>>> {
+        self.get_parent_bin_for_child_ln(key)
+    }
+
+    /// Search for a BIN, allowing splits during descent (preemptive splitting).
+    ///
+    /// Port of `Tree.searchSplitsAllowed()` from JE.  This thin wrapper
+    /// delegates to `search()` and returns the result wrapped in `Some`.
+    /// The full split-allowed descent is performed by `insert()` internally;
+    /// this method exposes the same result type for callers that only need to
+    /// locate the BIN.
+    ///
+    /// Returns `None` if the tree is empty.
+    pub fn search_splits_allowed(&self, key: &[u8]) -> Option<SearchResult> {
+        self.search(key)
+    }
+
+    /// Traverses the entire tree and returns every IN and BIN node as a flat
+    /// list.
+    ///
+    /// Port of `Tree.rebuildINList()` from JE.  Used by recovery to rebuild
+    /// the in-memory IN list after log replay.  The walk is a BFS from the
+    /// root; every `Arc<RwLock<TreeNode>>` encountered (both Internal and
+    /// Bottom variants) is included in the result.
+    pub fn rebuild_in_list(&self) -> Vec<Arc<RwLock<TreeNode>>> {
+        let mut result = Vec::new();
+        if let Some(root) = &self.root {
+            Self::rebuild_in_list_recursive(root, &mut result);
+        }
+        result
+    }
+
+    fn rebuild_in_list_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        out: &mut Vec<Arc<RwLock<TreeNode>>>,
+    ) {
+        // Push this node unconditionally — both INs and BINs belong in the list.
+        out.push(Arc::clone(node_arc));
+
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        if let TreeNode::Internal(n) = &*guard {
+            // Collect child arcs while holding the guard, then drop it before
+            // recursing to avoid holding multiple locks simultaneously.
+            let children: Vec<Arc<RwLock<TreeNode>>> =
+                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            drop(guard);
+            for child in children {
+                Self::rebuild_in_list_recursive(&child, out);
+            }
+        }
+        // BIN nodes are leaves — no children to recurse into.
+    }
+
+    /// Validates internal tree consistency.
+    ///
+    /// Port of `Tree.validateINList()` from JE.  Primarily a debug/test tool.
+    ///
+    /// Rules checked:
+    /// - An empty tree (no root) is trivially valid → returns `true`.
+    /// - A non-empty tree must have a non-null root.
+    /// - Every Internal node must have at least one entry.
+    /// - Every child pointer that is `Some` must be readable (lock must be
+    ///   acquirable — i.e., no poisoned locks).
+    ///
+    /// Returns `true` if no inconsistencies are detected, `false` otherwise.
+    pub fn validate_in_list(&self) -> bool {
+        match &self.root {
+            None => true, // empty tree is always valid
+            Some(root) => Self::validate_node(root),
+        }
+    }
+
+    fn validate_node(node_arc: &Arc<RwLock<TreeNode>>) -> bool {
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return false, // poisoned lock → invalid
+        };
+
+        match &*guard {
+            TreeNode::Bottom(_bin) => {
+                // BIN nodes are always structurally valid at this level.
+                true
+            }
+            TreeNode::Internal(n) => {
+                // An Internal node must have at least one entry.
+                if n.entries.is_empty() {
+                    return false;
+                }
+                // Collect child arcs before dropping the guard.
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                // Recursively validate every resident child.
+                for child in children {
+                    if !Self::validate_node(&child) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Traverses the tree to find the parent IN that contains `child_node_id`
+    /// as one of its child slots.
+    ///
+    /// Port of `Tree.getParentINForChildIN()` from JE.  Used by the cleaner
+    /// migration path to re-insert migrated INs after eviction/fetch.
+    ///
+    /// Returns `(parent_arc, slot_index)` where `slot_index` is the position
+    /// in the parent's `entries` vector whose child matches `child_node_id`,
+    /// or `None` if no such parent is found.
+    pub fn get_parent_in_for_child_in(
+        &self,
+        child_node_id: u64,
+    ) -> Option<(Arc<RwLock<TreeNode>>, usize)> {
+        let root = self.root.as_ref()?;
+        Self::find_parent_of_node_id(root, child_node_id)
+    }
+
+    /// Recursive DFS helper for `get_parent_in_for_child_in`.
+    ///
+    /// Scans every entry in each Internal node.  When a child's node_id
+    /// matches `target_id` the parent arc and slot index are returned.
+    fn find_parent_of_node_id(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        target_id: u64,
+    ) -> Option<(Arc<RwLock<TreeNode>>, usize)> {
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+
+        let TreeNode::Internal(n) = &*guard else {
+            // BIN nodes have no IN children — cannot be a parent of another IN.
+            return None;
+        };
+
+        // Check whether any child of this IN has the target node_id.
+        let mut children: Vec<(usize, Arc<RwLock<TreeNode>>)> = Vec::new();
+        for (slot, entry) in n.entries.iter().enumerate() {
+            if let Some(child_arc) = &entry.child {
+                // Read the child's node_id under a separate lock (acquire child
+                // while parent guard is still held — this is intentional for
+                // the ID comparison only; we release both immediately after).
+                let child_id = match child_arc.read() {
+                    Ok(cg) => match &*cg {
+                        TreeNode::Internal(cn) => cn.node_id,
+                        TreeNode::Bottom(cb) => cb.node_id,
+                    },
+                    Err(_) => continue,
+                };
+
+                if child_id == target_id {
+                    // Found — return a clone of this node as parent.
+                    let parent_clone = Arc::clone(node_arc);
+                    return Some((parent_clone, slot));
+                }
+
+                // Not found at this slot; schedule this child for recursion.
+                children.push((slot, Arc::clone(child_arc)));
+            }
+        }
+        // Release parent guard before recursing.
+        drop(guard);
+
+        // Recurse into each Internal child.
+        for (_slot, child_arc) in children {
+            if let Some(result) =
+                Self::find_parent_of_node_id(&child_arc, target_id)
+            {
+                return Some(result);
+            }
+        }
+
+        None
     }
 
     /// Propagates the dirty flag upward from `node_arc` to the root.
@@ -2573,6 +3176,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         assert!(bin.is_bin());
         assert_eq!(bin.level(), BIN_LEVEL);
@@ -2599,6 +3203,7 @@ mod tests {
                 data: Some(vec![]),
                 known_deleted: false,
                 dirty: false,
+                expiration_time: 0,
             });
         }
 
@@ -2612,6 +3217,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
 
         // Search for existing key
@@ -2710,6 +3316,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         tree.set_root(bin);
         assert!(tree.get_root().is_some());
@@ -3024,6 +3631,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         assert!(!bin_node.is_dirty());
         bin_node.set_dirty(true);
@@ -3057,6 +3665,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         assert_eq!(bin_node.get_generation(), 0);
         bin_node.set_generation(42);
@@ -3088,6 +3697,7 @@ mod tests {
                     data: Some(b"d1".to_vec()),
                     known_deleted: false,
                     dirty: false,
+                    expiration_time: 0,
                 },
                 BinEntry {
                     key: b"beta".to_vec(),
@@ -3095,6 +3705,7 @@ mod tests {
                     data: None,
                     known_deleted: false,
                     dirty: false,
+                    expiration_time: 0,
                 },
             ],
             key_prefix: Vec::new(),
@@ -3103,6 +3714,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 5,
             parent: None,
+            expiration_in_hours: true,
         });
         assert_eq!(bin_node.log_size(), bin_node.write_to_bytes().len());
 
@@ -3138,6 +3750,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         let bytes = node.write_to_bytes();
         // First 8 bytes = node_id big-endian.
@@ -3160,6 +3773,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         let with_entry = TreeNode::Bottom(BinStub {
             node_id: 2,
@@ -3170,6 +3784,7 @@ mod tests {
                 data: None,
                 known_deleted: false,
                 dirty: false,
+                expiration_time: 0,
             }],
             key_prefix: Vec::new(),
             dirty: false,
@@ -3177,6 +3792,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         });
         assert!(
             with_entry.log_size() > empty.log_size(),
@@ -3198,6 +3814,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None, // set below
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -3436,6 +4053,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -3478,6 +4096,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         assert!(
@@ -3499,6 +4118,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
         let bin_b = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -3510,6 +4130,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -3586,8 +4207,8 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"old_a".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"old_c".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"old_a".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"old_c".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -3595,13 +4216,14 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         let delta_entries = vec![
             // Update existing key "a" with new data.
-            BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"new_a".to_vec()), known_deleted: false, dirty: false },
+            BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"new_a".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             // Insert new key "b".
-            BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"new_b".to_vec()), known_deleted: false, dirty: false },
+            BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"new_b".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
         ];
 
         Tree::apply_delta_to_bin(&mut base, delta_entries);
@@ -3632,7 +4254,7 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"x".to_vec(), lsn: Lsn::new(1, 1), data: None, known_deleted: false, dirty: false },
+                BinEntry { key: b"x".to_vec(), lsn: Lsn::new(1, 1), data: None, known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -3640,6 +4262,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
         let n_before = base.entries.len();
         Tree::apply_delta_to_bin(&mut base, vec![]);
@@ -3658,8 +4281,8 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"base_aa".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"cc".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"base_cc".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"base_aa".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"cc".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"base_cc".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -3667,6 +4290,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         // The delta has a new entry "bb" and overwrites "aa".
@@ -3674,8 +4298,8 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"delta_aa".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"bb".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"delta_bb".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"aa".to_vec(), lsn: Lsn::new(1, 10), data: Some(b"delta_aa".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"bb".to_vec(), lsn: Lsn::new(1, 20), data: Some(b"delta_bb".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: true,
@@ -3683,6 +4307,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         Tree::mutate_to_full_bin(&mut delta, base);
@@ -3722,6 +4347,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
@@ -3884,6 +4510,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         bin.insert_with_prefix(b"record:aaa".to_vec(), Lsn::new(1, 1), None);
@@ -3908,6 +4535,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         let keys = [b"pfx:first".as_ref(), b"pfx:second".as_ref(), b"pfx:third".as_ref()];
@@ -3938,6 +4566,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         for k in [b"db:alpha".as_ref(), b"db:beta".as_ref(), b"db:gamma".as_ref()] {
@@ -4011,6 +4640,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
 
         for k in [b"myapp:user:1".as_ref(), b"myapp:user:2".as_ref()] {
@@ -4341,10 +4971,10 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"a".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"b".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
-                BinEntry { key: b"c".to_vec(), lsn, data: Some(b"live2".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"d".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"a".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"b".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
+                BinEntry { key: b"c".to_vec(), lsn, data: Some(b"live2".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"d".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4352,6 +4982,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         // Wire a minimal parent IN so compress_bin can prune if needed.
@@ -4399,7 +5030,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"x".to_vec(), lsn, data: Some(b"d".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"x".to_vec(), lsn, data: Some(b"d".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4407,6 +5038,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -4424,7 +5056,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4432,6 +5064,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -4458,7 +5091,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"only".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"only".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4466,6 +5099,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -4508,7 +5142,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4516,6 +5150,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -4534,8 +5169,8 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"dead".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"live".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"dead".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4543,6 +5178,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -4580,9 +5216,9 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"d0".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"d1".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"\x02".to_vec(), lsn, data: None,               known_deleted: true, dirty: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"d0".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"d1".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"\x02".to_vec(), lsn, data: None,               known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4590,6 +5226,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         // Parent IN with two children: the BIN above plus a placeholder sibling.
@@ -4597,7 +5234,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4605,6 +5242,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -4710,7 +5348,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"k".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4718,6 +5356,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -4746,8 +5385,8 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"a".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"b".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"a".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"b".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4755,6 +5394,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -4788,9 +5428,9 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"pfx:a".to_vec(), lsn, data: None,               known_deleted: true, dirty: false },
-                BinEntry { key: b"pfx:b".to_vec(), lsn, data: Some(b"B".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"pfx:c".to_vec(), lsn, data: Some(b"C".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"pfx:a".to_vec(), lsn, data: None,               known_deleted: true, dirty: false , expiration_time: 0},
+                BinEntry { key: b"pfx:b".to_vec(), lsn, data: Some(b"B".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"pfx:c".to_vec(), lsn, data: Some(b"C".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4798,6 +5438,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         // Wire up a parent so compress_bin can run normally.
@@ -4930,8 +5571,8 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x00".to_vec(), lsn, data: None,               known_deleted: true, dirty: false },
-                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: None,               known_deleted: true, dirty: false , expiration_time: 0},
+                BinEntry { key: b"\x01".to_vec(), lsn, data: Some(b"v".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4939,13 +5580,14 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let sibling_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x40".to_vec(), lsn, data: Some(b"s".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -4953,6 +5595,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -5011,13 +5654,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 // slot 0: live
-                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x00".to_vec(), lsn, data: Some(b"live".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
                 // slot 1: known-deleted
-                BinEntry { key: b"\x01".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"\x01".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
                 // slot 2: live
-                BinEntry { key: b"\x02".to_vec(), lsn, data: Some(b"also-live".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"\x02".to_vec(), lsn, data: Some(b"also-live".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
                 // slot 3: known-deleted
-                BinEntry { key: b"\x03".to_vec(), lsn, data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"\x03".to_vec(), lsn, data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: false,
@@ -5025,6 +5668,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -5197,6 +5841,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
         bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
         assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
@@ -5215,6 +5860,7 @@ mod tests {
                 data: Some(b"old".to_vec()),
                 known_deleted: false,
                 dirty: false,
+                expiration_time: 0,
             }],
             key_prefix: Vec::new(),
             dirty: false,
@@ -5222,6 +5868,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
         bin.insert_with_prefix(b"key".to_vec(), Lsn::new(1, 20), Some(b"new".to_vec()));
         assert!(bin.entries[0].dirty, "updated slot should be dirty");
@@ -5234,8 +5881,8 @@ mod tests {
             node_id: 42,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"alpha".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"d1".to_vec()), known_deleted: false, dirty: true },
-                BinEntry { key: b"beta".to_vec(),  lsn: Lsn::new(1, 2), data: None, known_deleted: true, dirty: false },
+                BinEntry { key: b"alpha".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"d1".to_vec()), known_deleted: false, dirty: true , expiration_time: 0},
+                BinEntry { key: b"beta".to_vec(),  lsn: Lsn::new(1, 2), data: None, known_deleted: true, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: true,
@@ -5243,6 +5890,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
         let bytes = bin.serialize_full();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -5261,9 +5909,9 @@ mod tests {
             node_id: 7,
             level: BIN_LEVEL,
             entries: vec![
-                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"v1".to_vec()), known_deleted: false, dirty: false },
-                BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 2), data: Some(b"v2".to_vec()), known_deleted: false, dirty: true },
-                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"v3".to_vec()), known_deleted: false, dirty: false },
+                BinEntry { key: b"a".to_vec(), lsn: Lsn::new(1, 1), data: Some(b"v1".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
+                BinEntry { key: b"b".to_vec(), lsn: Lsn::new(1, 2), data: Some(b"v2".to_vec()), known_deleted: false, dirty: true , expiration_time: 0},
+                BinEntry { key: b"c".to_vec(), lsn: Lsn::new(1, 3), data: Some(b"v3".to_vec()), known_deleted: false, dirty: false , expiration_time: 0},
             ],
             key_prefix: Vec::new(),
             dirty: true,
@@ -5271,6 +5919,7 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
         };
         let bytes = bin.serialize_delta();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -5313,6 +5962,7 @@ mod tests {
                 data,
                 known_deleted: false,
                 dirty: false,
+                expiration_time: 0,
             }).collect(),
             key_prefix: Vec::new(),
             dirty: false,
@@ -5320,6 +5970,324 @@ mod tests {
             last_full_lsn: NULL_LSN,
             generation: 0,
             parent: None,
+            expiration_in_hours: true,
+        }
+    }
+
+    // ========================================================================
+    // Tests: Task #82 — 8 new Tree methods
+    // ========================================================================
+
+    // --- is_root_resident ---
+
+    #[test]
+    fn test_is_root_resident_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(!tree.is_root_resident(), "empty tree has no resident root");
+    }
+
+    #[test]
+    fn test_is_root_resident_after_insert() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"k".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
+        assert!(tree.is_root_resident(), "root must be resident after insert");
+    }
+
+    // --- get_resident_root_in ---
+
+    #[test]
+    fn test_get_resident_root_in_empty() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.get_resident_root_in().is_none());
+    }
+
+    #[test]
+    fn test_get_resident_root_in_single_entry() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"hello".to_vec(), b"world".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        let root = tree.get_resident_root_in();
+        assert!(root.is_some(), "root must be Some after insert");
+        let root_arc = tree.get_root().as_ref().unwrap();
+        assert!(
+            Arc::ptr_eq(root_arc, &root.unwrap()),
+            "get_resident_root_in must return the same Arc as get_root"
+        );
+    }
+
+    #[test]
+    fn test_get_resident_root_in_multi_entry() {
+        let mut tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let k = format!("rr{:04}", i).into_bytes();
+            tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+        assert!(tree.get_resident_root_in().is_some());
+    }
+
+    // --- get_parent_bin_for_child_ln ---
+
+    #[test]
+    fn test_get_parent_bin_for_child_ln_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.get_parent_bin_for_child_ln(b"key").is_none());
+    }
+
+    #[test]
+    fn test_get_parent_bin_for_child_ln_single_entry() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"alpha".to_vec(), b"val".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        let bin = tree.get_parent_bin_for_child_ln(b"alpha");
+        assert!(bin.is_some(), "must return Some for a present key");
+        assert!(
+            bin.unwrap().read().unwrap().is_bin(),
+            "returned node must be a BIN"
+        );
+    }
+
+    #[test]
+    fn test_get_parent_bin_for_child_ln_multi_key() {
+        let mut tree = Tree::new(1, 8);
+        let keys: &[&[u8]] = &[b"aa", b"bb", b"cc", b"dd", b"ee"];
+        for &k in keys {
+            tree.insert(k.to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
+        }
+        for &k in keys {
+            let bin = tree.get_parent_bin_for_child_ln(k);
+            assert!(bin.is_some(), "must return Some for {:?}", k);
+            assert!(bin.unwrap().read().unwrap().is_bin());
+        }
+    }
+
+    // --- find_bin_for_insert ---
+
+    #[test]
+    fn test_find_bin_for_insert_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.find_bin_for_insert(b"newkey").is_none());
+    }
+
+    #[test]
+    fn test_find_bin_for_insert_returns_bin() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"existing".to_vec(), b"data".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        let bin = tree.find_bin_for_insert(b"newkey");
+        assert!(bin.is_some());
+        assert!(bin.unwrap().read().unwrap().is_bin());
+    }
+
+    #[test]
+    fn test_find_bin_for_insert_same_as_parent_bin() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"foo".to_vec(), b"bar".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        let a = tree.get_parent_bin_for_child_ln(b"foo").unwrap();
+        let b_arc = tree.find_bin_for_insert(b"foo").unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b_arc),
+            "find_bin_for_insert must return the same BIN as get_parent_bin_for_child_ln"
+        );
+    }
+
+    // --- search_splits_allowed ---
+
+    #[test]
+    fn test_search_splits_allowed_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.search_splits_allowed(b"k").is_none());
+    }
+
+    #[test]
+    fn test_search_splits_allowed_finds_existing_key() {
+        let mut tree = Tree::new(1, 8);
+        for i in 0u32..10 {
+            let k = format!("sa{:04}", i).into_bytes();
+            tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+        for i in 0u32..10 {
+            let k = format!("sa{:04}", i).into_bytes();
+            let sr = tree.search_splits_allowed(&k);
+            assert!(
+                sr.is_some() && sr.unwrap().exact_parent_found,
+                "search_splits_allowed must find sa{:04}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_splits_allowed_missing_key() {
+        let mut tree = Tree::new(1, 8);
+        tree.insert(b"present".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
+        let sr = tree.search_splits_allowed(b"absent");
+        assert!(
+            sr.map_or(true, |r| !r.exact_parent_found),
+            "search_splits_allowed must not find absent key"
+        );
+    }
+
+    // --- rebuild_in_list ---
+
+    #[test]
+    fn test_rebuild_in_list_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.rebuild_in_list().is_empty());
+    }
+
+    #[test]
+    fn test_rebuild_in_list_single_entry() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"one".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
+        let list = tree.rebuild_in_list();
+        // Expect root IN + BIN = 2 nodes.
+        assert_eq!(list.len(), 2, "single-entry tree must have exactly 2 nodes");
+        let has_bin = list.iter().any(|a| a.read().unwrap().is_bin());
+        let has_in = list.iter().any(|a| !a.read().unwrap().is_bin());
+        assert!(has_bin, "list must contain at least one BIN");
+        assert!(has_in, "list must contain at least one upper IN");
+    }
+
+    #[test]
+    fn test_rebuild_in_list_multi_entry() {
+        let mut tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let k = format!("ri{:04}", i).into_bytes();
+            tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+        let list = tree.rebuild_in_list();
+        let stats = tree.collect_stats();
+        let expected_nodes = (stats.n_ins + stats.n_bins) as usize;
+        assert_eq!(
+            list.len(), expected_nodes,
+            "rebuild_in_list must return all {} nodes", expected_nodes
+        );
+    }
+
+    // --- validate_in_list ---
+
+    #[test]
+    fn test_validate_in_list_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.validate_in_list(), "empty tree must be valid");
+    }
+
+    #[test]
+    fn test_validate_in_list_single_entry() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"v".to_vec(), b"data".to_vec(), Lsn::new(1, 1)).unwrap();
+        assert!(tree.validate_in_list(), "single-entry tree must be valid");
+    }
+
+    #[test]
+    fn test_validate_in_list_multi_entry() {
+        let mut tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let k = format!("vl{:04}", i).into_bytes();
+            tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+        assert!(tree.validate_in_list(), "multi-entry tree must be valid");
+    }
+
+    #[test]
+    fn test_validate_in_list_empty_in_fails() {
+        // Manually build a tree where the root IN has no entries — invalid.
+        let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
+            node_id: generate_node_id(),
+            level: MAIN_LEVEL | 2,
+            entries: vec![], // empty — structurally invalid
+            dirty: false,
+            generation: 0,
+            parent: None,
+        })));
+        let mut tree = Tree::new(1, 128);
+        tree.root = Some(root_arc);
+        assert!(
+            !tree.validate_in_list(),
+            "a tree with an empty Internal node must fail validation"
+        );
+    }
+
+    // --- get_parent_in_for_child_in ---
+
+    #[test]
+    fn test_get_parent_in_for_child_in_empty_tree() {
+        let tree = Tree::new(1, 128);
+        assert!(tree.get_parent_in_for_child_in(999).is_none());
+    }
+
+    #[test]
+    fn test_get_parent_in_for_child_in_single_entry() {
+        // A single-insert tree has: root IN → BIN.
+        // The root IN is the parent of the BIN.
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"p".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
+
+        let root_arc = tree.get_root().as_ref().unwrap().clone();
+        let bin_node_id = {
+            let g = root_arc.read().unwrap();
+            match &*g {
+                TreeNode::Internal(n) => {
+                    let child = n.entries[0].child.as_ref().unwrap();
+                    let cg = child.read().unwrap();
+                    match &*cg {
+                        TreeNode::Bottom(b) => b.node_id,
+                        _ => panic!("expected BIN"),
+                    }
+                }
+                _ => panic!("expected Internal root"),
+            }
+        };
+
+        let result = tree.get_parent_in_for_child_in(bin_node_id);
+        assert!(result.is_some(), "must find parent of BIN");
+        let (parent_arc, slot) = result.unwrap();
+        assert!(Arc::ptr_eq(&parent_arc, &root_arc));
+        assert_eq!(slot, 0);
+    }
+
+    #[test]
+    fn test_get_parent_in_for_child_in_not_found() {
+        let mut tree = Tree::new(1, 128);
+        tree.insert(b"x".to_vec(), b"y".to_vec(), Lsn::new(1, 1)).unwrap();
+        assert!(tree.get_parent_in_for_child_in(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn test_get_parent_in_for_child_in_multi_level() {
+        // Build a tree with at least 3 levels so we test the recursive descent.
+        let mut tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let k = format!("ml{:04}", i).into_bytes();
+            tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+
+        // Collect all BIN node_ids via rebuild_in_list.
+        let nodes = tree.rebuild_in_list();
+        let bin_ids: Vec<u64> = nodes
+            .iter()
+            .filter_map(|a| {
+                let g = a.read().unwrap();
+                if g.is_bin() {
+                    if let TreeNode::Bottom(b) = &*g {
+                        return Some(b.node_id);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for bin_id in bin_ids {
+            let result = tree.get_parent_in_for_child_in(bin_id);
+            assert!(
+                result.is_some(),
+                "every BIN (id={}) must have a parent IN", bin_id
+            );
+            let (parent_arc, _slot) = result.unwrap();
+            assert!(
+                !parent_arc.read().unwrap().is_bin(),
+                "parent of a BIN must be an Internal node"
+            );
         }
     }
 }

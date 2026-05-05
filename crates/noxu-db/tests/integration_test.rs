@@ -1560,7 +1560,7 @@ fn seq_extreme_range_i64_max() {
 use noxu_db::{
     SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator, SecondaryMultiKeyCreator,
 };
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 
 /// A simple secondary key creator: sec_key = data[0..1] (first byte).

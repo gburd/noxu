@@ -14,7 +14,7 @@ noxu-util = { workspace = true }
 noxu-config = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-parking_lot = { workspace = true }
+noxu-sync = { workspace = true }
 
 [lints]
 workspace = true

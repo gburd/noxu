@@ -10,7 +10,7 @@ noxu-util = { workspace = true }
 noxu-log = { workspace = true }
 noxu-tree = { workspace = true }
 noxu-txn = { workspace = true }
-parking_lot = { workspace = true }
+noxu-sync = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }

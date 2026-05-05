@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 use crate::database_config::DatabaseConfig;
 use crate::database_impl::DatabaseImpl;

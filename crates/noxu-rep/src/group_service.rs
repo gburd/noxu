@@ -4,7 +4,7 @@
 //! group membership, tracking which nodes are in the group, their types, and
 //! their activity status.
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

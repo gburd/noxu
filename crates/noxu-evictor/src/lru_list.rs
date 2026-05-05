@@ -2,7 +2,7 @@
 //!
 //! Port of the LRU list implementation from `com.sleepycat.je.evictor.Evictor`.
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::collections::HashMap;
 
 // Sentinel index value used as the list head/tail marker.

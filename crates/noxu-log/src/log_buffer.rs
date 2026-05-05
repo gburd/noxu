@@ -20,8 +20,8 @@
 
 use bytes::BytesMut;
 use noxu_util::lsn::{Lsn, NULL_LSN};
-use parking_lot::RawMutex;
-use parking_lot::lock_api::RawMutex as RawMutexTrait;
+use noxu_sync::RawMutex;
+use noxu_sync::lock_api::RawMutex as RawMutexTrait;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;

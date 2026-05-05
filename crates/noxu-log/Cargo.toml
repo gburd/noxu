@@ -9,7 +9,7 @@ description = "Log-structured storage engine for Noxu DB"
 noxu-util = { workspace = true }
 noxu-latch = { workspace = true }
 noxu-config = { workspace = true }
-parking_lot = { workspace = true }
+noxu-sync = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }

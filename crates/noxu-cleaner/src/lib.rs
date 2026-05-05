@@ -8,6 +8,7 @@ pub mod cleaner;
 pub mod cleaner_stat;
 pub mod db_file_summary;
 pub mod error;
+pub mod expiration_profile;
 pub mod expiration_tracker;
 pub mod file_processor;
 pub mod file_protector;
@@ -25,6 +26,7 @@ pub use cleaner::{CleanResult, Cleaner};
 pub use cleaner_stat::{CleanerStats, CleanerStatsSnapshot};
 pub use db_file_summary::DbFileSummary;
 pub use error::{CleanerError, Result};
+pub use expiration_profile::ExpirationProfile;
 pub use expiration_tracker::ExpirationTracker;
 pub use file_processor::{
     BinLookupResult, FileProcessResult, FileProcessor, InLookupResult,

@@ -3,7 +3,7 @@
 //! Port of `com.sleepycat.je.rep.MasterTransferConfig`  -  allows transferring
 //! master status from the current master to a designated target node.
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::error::{RepError, Result};

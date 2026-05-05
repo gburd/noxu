@@ -3,8 +3,11 @@
 //! Port of `com.sleepycat.je.dbi.DatabaseImpl`.
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use noxu_tree::Tree;
+use noxu_tree::{KeyComparatorFn, Tree};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+use crate::dup_key_data;
 
 use crate::{DatabaseConfig, DatabaseId, DbType};
 
@@ -106,6 +109,17 @@ impl DatabaseImpl {
         }
 
         let max_entries = config.node_max_entries as usize;
+        let real_tree = if config.sorted_duplicates {
+            // Sorted-dup databases store (key, data) as two-part composite keys.
+            // A custom comparator is required: pure lexicographic ordering fails
+            // when a shorter primary key is a byte-prefix of a longer key's data.
+            let dup_cmp: KeyComparatorFn = Arc::new(|a: &[u8], b: &[u8]| {
+                dup_key_data::cmp_two_part_keys(a, b, |x, y| x.cmp(y), |x, y| x.cmp(y))
+            });
+            Tree::new_with_comparator(id.id() as u64, max_entries, dup_cmp)
+        } else {
+            Tree::new(id.id() as u64, max_entries)
+        };
         DatabaseImpl {
             id,
             name,
@@ -116,7 +130,7 @@ impl DatabaseImpl {
             max_tree_entries_per_node: config.node_max_entries,
             reference_count: AtomicI64::new(0),
             tree: Some(DatabaseTree::new()),
-            real_tree: Some(Tree::new(id.id() as u64, max_entries)),
+            real_tree: Some(real_tree),
             bt_comparator: None,
             dup_comparator: None,
         }
