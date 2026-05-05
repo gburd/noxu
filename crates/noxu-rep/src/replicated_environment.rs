@@ -27,6 +27,7 @@
 //! When the environment is closed, the node transitions to the Detached state.
 
 use noxu_sync::RwLock;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -36,6 +37,7 @@ use crate::elections::master_tracker::MasterTracker;
 use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
 use crate::master_transfer::MasterTransferConfig;
+use crate::net::service_dispatcher::TcpServiceDispatcher;
 use crate::node_state::{NodeState, NodeStateMachine};
 use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
@@ -110,6 +112,16 @@ pub struct ReplicatedEnvironment {
     listeners: RwLock<Vec<Arc<dyn StateChangeListener>>>,
     /// Shutdown flag.
     shutdown: AtomicBool,
+    /// TCP service dispatcher — listens on the replication port and routes
+    /// incoming connections to the appropriate service handler (feeder, etc.).
+    ///
+    /// Port of JE's `ServiceDispatcher`. Started in `new()` when a listen
+    /// address is available. `None` only when the bind address cannot be
+    /// resolved (e.g. in unit tests that use port 0 but want lazy init).
+    tcp_dispatcher: Option<TcpServiceDispatcher>,
+    /// The address the `tcp_dispatcher` is actually bound to (may differ from
+    /// the configured port when port 0 is used in tests).
+    bound_addr: Option<SocketAddr>,
 }
 
 impl ReplicatedEnvironment {
@@ -136,6 +148,57 @@ impl ReplicatedEnvironment {
         let replica_stream = ReplicaStream::new();
         let master_tracker = MasterTracker::new(DEFAULT_HEARTBEAT_TIMEOUT);
 
+        // Start the TCP service dispatcher.
+        //
+        // JE equivalent: `RepImpl.open()` calls `serviceDispatcher.start()`
+        // which binds a ServerSocketChannel on the configured port and begins
+        // accepting connections. We do the same here using the node_host and
+        // node_port from RepConfig.
+        let listen_addr_str = format!("{}:{}", config.node_host, config.node_port);
+        let (tcp_dispatcher, bound_addr) =
+            match listen_addr_str.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    match TcpServiceDispatcher::new(addr) {
+                        Ok(dispatcher) => match dispatcher.start() {
+                            Ok(bound) => {
+                                log::info!(
+                                    "Node '{}' TCP service dispatcher started on {}",
+                                    config.node_name,
+                                    bound
+                                );
+                                (Some(dispatcher), Some(bound))
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Node '{}' failed to start TCP dispatcher on {}: {}",
+                                    config.node_name,
+                                    listen_addr_str,
+                                    e
+                                );
+                                (None, None)
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!(
+                                "Node '{}' failed to create TCP dispatcher: {}",
+                                config.node_name,
+                                e
+                            );
+                            (None, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Node '{}' cannot parse listen address '{}': {}",
+                        config.node_name,
+                        listen_addr_str,
+                        e
+                    );
+                    (None, None)
+                }
+            };
+
         let env = Self {
             config,
             node_state,
@@ -148,9 +211,20 @@ impl ReplicatedEnvironment {
             master_tracker,
             listeners: RwLock::new(Vec::new()),
             shutdown: AtomicBool::new(false),
+            tcp_dispatcher,
+            bound_addr,
         };
 
         Ok(env)
+    }
+
+    /// Return the socket address the TCP service dispatcher is bound to.
+    ///
+    /// This may differ from the configured `node_port` when port 0 is used
+    /// (the OS assigns an ephemeral port). Returns `None` if the dispatcher
+    /// could not be started (e.g. the address is not resolvable).
+    pub fn bound_addr(&self) -> Option<SocketAddr> {
+        self.bound_addr
     }
 
     /// Get the current node state.
@@ -480,6 +554,15 @@ impl ReplicatedEnvironment {
             feeders.clear();
         }
 
+        // Stop the TCP service dispatcher (JE: serviceDispatcher.shutdown()).
+        if let Some(ref dispatcher) = self.tcp_dispatcher {
+            dispatcher.stop();
+            log::debug!(
+                "Node '{}' TCP service dispatcher stopped",
+                self.config.node_name.as_str()
+            );
+        }
+
         log::info!(
             "Replicated environment '{}' in group '{}' closed",
             self.config.node_name.as_str(),
@@ -543,10 +626,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
-    /// Helper to create a test config.
+    /// Helper to create a test config with a fixed port (unit-test style,
+    /// no real TCP bind needed — hostname "localhost" resolves but the port
+    /// might be in use; use `test_config_port0` for real TCP tests).
     fn test_config(node_name: &str) -> RepConfig {
         RepConfig::builder("test_group", node_name, "localhost")
             .node_port(5001)
+            .build()
+    }
+
+    /// Helper to create a test config that binds to an OS-assigned port.
+    fn test_config_port0(node_name: &str) -> RepConfig {
+        RepConfig::builder("test_group", node_name, "127.0.0.1")
+            .node_port(0)
             .build()
     }
 
@@ -818,6 +910,84 @@ mod tests {
         let env = ReplicatedEnvironment::new(test_config("node1")).unwrap();
         let _stats = env.get_stats();
         // Just verify we can access stats without panicking
+    }
+
+    // -----------------------------------------------------------------------
+    // TCP dispatcher tests (H-5 / H-7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tcp_dispatcher_starts_on_new() {
+        // Use port 0 so the OS assigns an ephemeral port.
+        let env =
+            ReplicatedEnvironment::new(test_config_port0("tcp_node")).unwrap();
+        // The dispatcher must have started and bound a real port.
+        let addr = env.bound_addr();
+        assert!(addr.is_some(), "expected a bound address");
+        let addr = addr.unwrap();
+        assert_ne!(addr.port(), 0, "OS should assign a non-zero port");
+    }
+
+    #[test]
+    fn test_tcp_dispatcher_stops_on_close() {
+        let env =
+            ReplicatedEnvironment::new(test_config_port0("tcp_node2")).unwrap();
+        // Dispatcher is running.
+        assert!(env.tcp_dispatcher.as_ref().map(|d| d.is_running()).unwrap_or(false));
+
+        env.close().unwrap();
+
+        // After close, dispatcher must be stopped.
+        assert!(
+            !env.tcp_dispatcher.as_ref().map(|d| d.is_running()).unwrap_or(false),
+            "dispatcher should be stopped after close"
+        );
+    }
+
+    #[test]
+    fn test_tcp_dispatcher_accepts_connection() {
+        use crate::net::service_dispatcher::connect_to_service;
+        use crate::net::ServiceHandler;
+        use crate::net::Channel;
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+        use std::time::Duration;
+
+        struct PingHandler {
+            count: AtomicU32,
+        }
+        impl ServiceHandler for PingHandler {
+            fn service_name(&self) -> &str { "ping" }
+            fn handle(&self, ch: Box<dyn Channel>) -> crate::error::Result<()> {
+                self.count.fetch_add(1, AO::SeqCst);
+                // Echo the first message back.
+                if let Ok(Some(msg)) = ch.receive(Duration::from_secs(2)) {
+                    let _ = ch.send(&msg);
+                }
+                Ok(())
+            }
+        }
+
+        let env =
+            ReplicatedEnvironment::new(test_config_port0("tcp_node3")).unwrap();
+        let addr = env.bound_addr().expect("dispatcher must be bound");
+
+        // Register a ping handler on the running dispatcher.
+        if let Some(ref disp) = env.tcp_dispatcher {
+            let handler = Arc::new(PingHandler { count: AtomicU32::new(0) });
+            disp.register("ping", handler.clone());
+
+            // Give the accept thread a moment.
+            std::thread::sleep(Duration::from_millis(20));
+
+            let client = connect_to_service(addr, "ping").unwrap();
+            client.send(b"hello").unwrap();
+            let reply = client.receive(Duration::from_secs(2)).unwrap();
+            assert_eq!(reply, Some(b"hello".to_vec()));
+
+            assert_eq!(handler.count.load(AO::SeqCst), 1);
+        }
+
+        env.close().unwrap();
     }
 
     #[test]
