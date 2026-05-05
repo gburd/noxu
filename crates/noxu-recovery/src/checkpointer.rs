@@ -16,7 +16,7 @@ use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_tree::tree::{Tree, TreeNode};
 use noxu_util::{Lsn, NULL_LSN};
 use noxu_sync::Mutex;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Configuration for checkpoint behavior.
@@ -147,6 +147,12 @@ pub struct Checkpointer {
     checkpoint_in_progress: AtomicBool,
     /// Shutdown flag
     shutdown: AtomicBool,
+    /// Condvar for interruptible daemon sleep — notified by `request_shutdown()`
+    /// so the daemon thread wakes up immediately instead of waiting the full
+    /// sleep interval.
+    shutdown_condvar: Condvar,
+    /// Mutex paired with `shutdown_condvar`.
+    shutdown_mutex: std::sync::Mutex<bool>,
     /// Configuration
     config: CheckpointConfig,
     /// Optional LogManager for writing CkptStart/CkptEnd WAL entries.
@@ -184,6 +190,8 @@ impl Checkpointer {
             last_checkpoint_end: Mutex::new(noxu_util::NULL_LSN),
             checkpoint_in_progress: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            shutdown_condvar: Condvar::new(),
+            shutdown_mutex: std::sync::Mutex::new(false),
             config,
             log_manager: None,
             tree: None,
@@ -462,13 +470,32 @@ impl Checkpointer {
     }
 
     /// Request shutdown of the checkpointer.
+    ///
+    /// Sets the shutdown flag AND wakes up the daemon thread so it exits
+    /// immediately without waiting the full sleep interval.
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        // Wake up any thread sleeping in wait_for_shutdown_or_timeout().
+        if let Ok(mut guard) = self.shutdown_mutex.lock() {
+            *guard = true;
+        }
+        self.shutdown_condvar.notify_all();
     }
 
     /// Check if shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Sleep for `duration` or until `request_shutdown()` is called.
+    ///
+    /// Used by the daemon thread in `EnvironmentImpl` instead of
+    /// `thread::sleep()` so that shutdown is immediate.
+    pub fn wait_for_shutdown_or_timeout(&self, duration: std::time::Duration) {
+        if let Ok(guard) = self.shutdown_mutex.lock() {
+            // wait_timeout returns immediately when the condvar is notified.
+            let _ = self.shutdown_condvar.wait_timeout(guard, duration);
+        }
     }
 
     /// Get the next checkpoint ID (without incrementing).

@@ -344,7 +344,9 @@ impl EnvironmentImpl {
                 .name("noxu-checkpointer".to_string())
                 .spawn(move || {
                     while !ckpt_clone.is_shutdown() {
-                        std::thread::sleep(interval);
+                        // Use condvar-based interruptible sleep so that
+                        // request_shutdown() wakes the thread immediately.
+                        ckpt_clone.wait_for_shutdown_or_timeout(interval);
                         if ckpt_clone.is_shutdown() {
                             break;
                         }

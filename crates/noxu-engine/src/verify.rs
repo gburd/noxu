@@ -847,13 +847,24 @@ mod tests {
     }
 
     /// verify_tree on a populated tree returns a passing result.
+    ///
+    /// Uses a real LogManager so that each put() receives a valid (non-NULL)
+    /// LSN — the verifier requires this for all non-deleted BIN entries.
     #[test]
     fn test_verify_tree_populated() {
         use noxu_dbi::{
             CursorImpl, DatabaseConfig, DatabaseId, DatabaseImpl, DbType, PutMode,
         };
+        use noxu_log::{FileManager, LogManager};
         use noxu_sync::RwLock;
         use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
 
         let db_id = DatabaseId::new(2);
         let config = DatabaseConfig::default();
@@ -862,7 +873,8 @@ mod tests {
         let db = Arc::new(RwLock::new(db_impl));
 
         {
-            let mut cursor = CursorImpl::new(Arc::clone(&db), 1);
+            let mut cursor =
+                CursorImpl::with_log_manager(Arc::clone(&db), 1, Arc::clone(&lm));
             cursor.put(b"alpha", b"1", PutMode::Overwrite).unwrap();
             cursor.put(b"beta", b"2", PutMode::Overwrite).unwrap();
             cursor.put(b"gamma", b"3", PutMode::Overwrite).unwrap();

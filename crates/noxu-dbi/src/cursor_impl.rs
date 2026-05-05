@@ -1153,7 +1153,38 @@ impl CursorImpl {
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
             }
-            PutMode::Overwrite | PutMode::NoDupData => {
+            // NoDupData on a non-dup database behaves like NoOverwrite:
+            // returns KeyExist if the key already exists, otherwise inserts.
+            // Port of JE `Cursor.putNoDupData()` non-dup branch.
+            PutMode::NoDupData => {
+                let key_exists = {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        tree.search(key)
+                            .map(|sr| sr.exact_parent_found)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if key_exists {
+                    return Ok(OperationStatus::KeyExist);
+                }
+                let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
+                {
+                    let mut db = self.db_impl.write();
+                    if let Some(tree) = db.get_real_tree_mut() {
+                        let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
+                    }
+                }
+                self.current_key = Some(key.to_vec());
+                self.current_data = Some(data.to_vec());
+                self.current_lsn = new_lsn.as_u64();
+                self.current_index = 0;
+                self.state = CursorState::Initialized;
+                Ok(OperationStatus::Success)
+            }
+            PutMode::Overwrite => {
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
                     let mut db = self.db_impl.write();
