@@ -26,6 +26,7 @@
 //! replaces `state.next_fsync_waiters` with a fresh group, so waiting threads
 //! retain their `Arc` to the *old* group and can still be woken through it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -192,6 +193,8 @@ pub struct FsyncManager {
     /// Condvar used by the leader to wait for more members (grpc wait).
     /// Paired with `state` mutex so the lock can be released during the wait.
     leader_condvar: Condvar,
+    /// Total number of fdatasync/fsync calls performed (port of JE nFSyncs stat).
+    n_fsyncs: AtomicU64,
 }
 
 impl FsyncManager {
@@ -215,6 +218,7 @@ impl FsyncManager {
                 start_next_wait: None,
             }),
             leader_condvar: Condvar::new(),
+            n_fsyncs: AtomicU64::new(0),
         }
     }
 
@@ -312,6 +316,7 @@ impl FsyncManager {
 
         // ── Phase 3: perform the fsync ────────────────────────────────────
         if do_work {
+            self.n_fsyncs.fetch_add(1, Ordering::Relaxed);
             let result = do_fsync();
 
             if is_leader {
@@ -332,6 +337,13 @@ impl FsyncManager {
         } else {
             Ok(())
         }
+    }
+
+    /// Returns the total number of fdatasync calls performed.
+    ///
+    /// Port of JE's `nFSyncs` stat (see `LogStatDefinition.N_FSYNCS`).
+    pub fn fsync_count(&self) -> u64 {
+        self.n_fsyncs.load(Ordering::Relaxed)
     }
 
     /// Perform the group-commit wait: release the state lock and wait up to

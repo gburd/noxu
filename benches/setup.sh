@@ -86,7 +86,7 @@ fi
 # 3. Build the JE benchmark fat jar
 # ---------------------------------------------------------------------------
 JE_BENCH_DIR="$REPO_ROOT/benches/je-bench"
-JE_BENCH_JAR="$JE_BENCH_DIR/target/je-bench-jar-with-dependencies.jar"
+JE_BENCH_JAR="$JE_BENCH_DIR/target/je-bench-1.0.0-jar-with-dependencies.jar"
 
 if [[ ! -f "$JE_BENCH_JAR" ]]; then
     echo ""

@@ -19,6 +19,8 @@ public class WorkloadResult {
     public final long diskKb;
     /** On-disk bytes written per logical operation (diskKb*1024/ops). */
     public final double diskBytesPerOp;
+    /** Number of fdatasync/fsync calls during this workload (port of JE nFSyncs stat). */
+    public final long fsyncCount;
 
     public WorkloadResult(String workload, int scale, int threads,
                           double elapsedMs, long ops,
@@ -28,7 +30,8 @@ public class WorkloadResult {
                           long cpuTimeBefore, long cpuTimeAfter,
                           long readBytesBefore, long readBytesAfter,
                           long writeBytesBefore, long writeBytesAfter,
-                          long diskKb) {
+                          long diskKb,
+                          long fsyncsBefore, long fsyncsAfter) {
         this.workload = workload;
         this.scale = scale;
         this.threads = threads;
@@ -43,5 +46,6 @@ public class WorkloadResult {
         this.writeKb = Math.max(0, writeBytesAfter - writeBytesBefore) / 1024;
         this.diskKb = diskKb;
         this.diskBytesPerOp = ops > 0 ? (diskKb * 1024.0) / ops : 0;
+        this.fsyncCount = Math.max(0, fsyncsAfter - fsyncsBefore);
     }
 }
