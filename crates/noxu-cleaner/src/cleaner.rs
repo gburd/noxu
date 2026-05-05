@@ -14,7 +14,7 @@ use noxu_log::{
     entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     file_header::FILE_HEADER_SIZE,
 };
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

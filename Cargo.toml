@@ -10,6 +10,7 @@ publish = false
 resolver = "2"
 members = [
     ".",
+    "crates/noxu-sync",
     "crates/noxu-util",
     "crates/noxu-latch",
     "crates/noxu-config",
@@ -35,7 +36,7 @@ noxu-db = { workspace = true }
 noxu-bind = { workspace = true }
 noxu-collections = { workspace = true }
 noxu-persist = { workspace = true }
-parking_lot = { workspace = true }
+noxu-sync = { workspace = true }
 
 [[example]]
 name = "simple"
@@ -82,6 +83,7 @@ description = "Noxu DB - An embedded transactional database engine"
 
 [workspace.dependencies]
 # Internal crates
+noxu-sync = { path = "crates/noxu-sync" }
 noxu-util = { path = "crates/noxu-util" }
 noxu-latch = { path = "crates/noxu-latch" }
 noxu-config = { path = "crates/noxu-config" }
@@ -100,7 +102,8 @@ noxu-persist = { path = "crates/noxu-persist" }
 noxu-rep = { path = "crates/noxu-rep" }
 
 # External crates (approved core set)
-parking_lot = "0.12"
+lock_api = "0.4"
+libc = "0.2"
 thiserror = "2"
 log = "0.4"
 bytes = "1"

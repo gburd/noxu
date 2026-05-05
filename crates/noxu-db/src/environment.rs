@@ -9,7 +9,7 @@ use crate::error::{NoxuError, Result};
 use crate::transaction::Transaction;
 use crate::transaction_config::TransactionConfig;
 use noxu_dbi::EnvironmentImpl;
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

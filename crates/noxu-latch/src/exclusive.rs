@@ -2,13 +2,13 @@
 //!
 //! Port of `com.sleepycat.je.latch.LatchImpl`.
 //!
-//! Provides exclusive latching implemented with `parking_lot::Mutex`.
+//! Provides exclusive latching implemented with `noxu_sync::Mutex`.
 //! Reentrancy is prevented: attempting to acquire a latch already held by
 //! the current thread will panic (matching JE's behavior of detecting
 //! accidental reentrant calls).
 
 use crate::LatchContext;
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -137,7 +137,7 @@ impl fmt::Debug for ExclusiveLatch {
 /// RAII guard for an exclusive latch. Releases the latch when dropped.
 pub struct ExclusiveLatchGuard<'a> {
     latch: &'a ExclusiveLatch,
-    _guard: parking_lot::MutexGuard<'a, ()>,
+    _guard: noxu_sync::MutexGuard<'a, ()>,
 }
 
 impl Drop for ExclusiveLatchGuard<'_> {

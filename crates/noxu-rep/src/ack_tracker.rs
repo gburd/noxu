@@ -4,7 +4,7 @@
 //! Tracks transaction commit acknowledgments from replicas to determine when
 //! a transaction's durability requirements have been satisfied.
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

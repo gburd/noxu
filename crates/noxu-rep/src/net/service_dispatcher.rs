@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 
 use super::channel::{Channel, TcpChannel};
 use crate::error::{RepError, Result};

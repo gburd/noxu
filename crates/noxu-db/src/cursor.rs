@@ -340,7 +340,7 @@ mod tests {
     use noxu_dbi::{
         DatabaseConfig as DbiDatabaseConfig, DatabaseId, DatabaseImpl, DbType,
     };
-    use parking_lot::RwLock;
+    use noxu_sync::RwLock;
     use std::sync::Arc;
 
     /// Creates a fresh in-memory DatabaseImpl and wraps it in a Cursor.

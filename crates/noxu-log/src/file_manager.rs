@@ -10,7 +10,7 @@ use crate::file_handle::FileHandle;
 use crate::file_header::{FILE_HEADER_SIZE, FileHeader, LOG_VERSION};
 use noxu_latch::ExclusiveLatch;
 use noxu_util::lsn::Lsn;
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

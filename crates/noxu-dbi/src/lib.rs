@@ -6,6 +6,7 @@
 
 pub mod cursor_impl;
 mod database_config;
+pub mod dup_key_data;
 mod file_manager_scanner;
 mod database_id;
 mod database_impl;

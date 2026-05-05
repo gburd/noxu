@@ -18,7 +18,7 @@ pub const LOG_VERSION: u8 = 1;
 pub const FIRST_LOG_VERSION: u8 = 1;
 
 /// Maximum number of entry types supported.
-const MAX_TYPE_NUM: usize = 64;
+const MAX_TYPE_NUM: usize = 128;
 
 /// Log entry type enumeration.
 ///
@@ -66,6 +66,23 @@ pub enum LogEntryType {
 
     // Replication
     Matchpoint = 61,
+
+    // HA rollback markers
+    RollbackStart = 62,
+    RollbackEnd = 63,
+
+    // Tree compression
+    INDeleteInfo = 64,
+    INDupDeleteInfo = 65,
+
+    // Legacy / old-format entries (for recovery compatibility)
+    OldBINDelta = 66,
+    OldLN = 67,
+    DelDupLN = 68,
+    DupCountLN = 69,
+
+    // File lifecycle
+    ImmutableFile = 70,
 }
 
 impl LogEntryType {
@@ -100,6 +117,15 @@ impl LogEntryType {
             50 => Some(LogEntryType::DbTree),
             60 => Some(LogEntryType::Trace),
             61 => Some(LogEntryType::Matchpoint),
+            62 => Some(LogEntryType::RollbackStart),
+            63 => Some(LogEntryType::RollbackEnd),
+            64 => Some(LogEntryType::INDeleteInfo),
+            65 => Some(LogEntryType::INDupDeleteInfo),
+            66 => Some(LogEntryType::OldBINDelta),
+            67 => Some(LogEntryType::OldLN),
+            68 => Some(LogEntryType::DelDupLN),
+            69 => Some(LogEntryType::DupCountLN),
+            70 => Some(LogEntryType::ImmutableFile),
             _ => None,
         }
     }
@@ -239,6 +265,15 @@ impl LogEntryType {
             LogEntryType::DbTree => "DbTree",
             LogEntryType::Trace => "Trace",
             LogEntryType::Matchpoint => "Matchpoint",
+            LogEntryType::RollbackStart => "RollbackStart",
+            LogEntryType::RollbackEnd => "RollbackEnd",
+            LogEntryType::INDeleteInfo => "INDeleteInfo",
+            LogEntryType::INDupDeleteInfo => "INDupDeleteInfo",
+            LogEntryType::OldBINDelta => "OldBINDelta",
+            LogEntryType::OldLN => "OldLN",
+            LogEntryType::DelDupLN => "DelDupLN",
+            LogEntryType::DupCountLN => "DupCountLN",
+            LogEntryType::ImmutableFile => "ImmutableFile",
         }
     }
 }
@@ -255,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_type_num_roundtrip() {
-        for type_num in 1u8..64 {
+        for type_num in 1u8..128 {
             if let Some(entry_type) = LogEntryType::from_type_num(type_num) {
                 assert_eq!(entry_type.type_num(), type_num);
             }
@@ -319,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_display_name_and_display_trait() {
-        for type_num in 1u8..64 {
+        for type_num in 1u8..128 {
             if let Some(entry_type) = LogEntryType::from_type_num(type_num) {
                 let name = entry_type.display_name();
                 assert!(!name.is_empty(), "display_name should not be empty");
@@ -361,6 +396,15 @@ mod tests {
             LogEntryType::DbTree,
             LogEntryType::Trace,
             LogEntryType::Matchpoint,
+            LogEntryType::RollbackStart,
+            LogEntryType::RollbackEnd,
+            LogEntryType::INDeleteInfo,
+            LogEntryType::INDupDeleteInfo,
+            LogEntryType::OldBINDelta,
+            LogEntryType::OldLN,
+            LogEntryType::DelDupLN,
+            LogEntryType::DupCountLN,
+            LogEntryType::ImmutableFile,
         ] {
             assert!(!t.is_node_type(), "{} should not be a node type", t);
         }
@@ -383,6 +427,6 @@ mod tests {
             }
         }
         // We expect exactly the number of variants defined in the enum.
-        assert_eq!(found, 22);
+        assert_eq!(found, 31);
     }
 }

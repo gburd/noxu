@@ -3,7 +3,7 @@
 //! Port of `com.sleepycat.je.rep.impl.node.NodeState`  -  encapsulates the
 //! current replicator state and the ability to validate state transitions.
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 use std::fmt;
 use std::time::{Duration, Instant};
 

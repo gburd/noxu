@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 /// The INList is a list of in-memory INs for a given environment.
 ///

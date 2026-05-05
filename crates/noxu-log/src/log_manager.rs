@@ -41,7 +41,7 @@ use crate::fsync_manager::FsyncManager;
 use crate::log_buffer_pool::LogBufferPool;
 use crate::provisional::Provisional;
 use noxu_util::lsn::{Lsn, NULL_LSN};
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

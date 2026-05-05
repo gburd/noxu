@@ -12,7 +12,7 @@ use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode};
-use parking_lot::{Mutex, RwLock};
+use noxu_sync::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

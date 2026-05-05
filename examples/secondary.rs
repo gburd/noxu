@@ -15,7 +15,7 @@ use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus, SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator,
 };
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

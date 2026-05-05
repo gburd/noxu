@@ -20,7 +20,7 @@ fn tmp_env() -> (TempDir, EnvironmentImpl) {
     let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
     (dir, env)
 }
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 // ============================================================================
 // 1. DatabaseId: creation, comparison, ordering

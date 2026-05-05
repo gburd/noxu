@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 /// Tracks the current known master of the replication group.
 ///
@@ -123,7 +123,7 @@ impl MasterTracker {
     }
 }
 
-// Safety: all interior mutability is behind parking_lot RwLocks.
+// Safety: all interior mutability is behind noxu_sync RwLocks.
 unsafe impl Send for MasterTracker {}
 unsafe impl Sync for MasterTracker {}
 

@@ -7,7 +7,7 @@ description = "Latching primitives for Noxu DB (shared/exclusive latches)"
 
 [dependencies]
 noxu-util = { workspace = true }
-parking_lot = { workspace = true }
+noxu-sync = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]

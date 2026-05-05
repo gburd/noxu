@@ -26,7 +26,7 @@
 //!
 //! When the environment is closed, the node transitions to the Detached state.
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -731,7 +731,7 @@ mod tests {
     fn test_state_change_listener_notification() {
         struct TestListener {
             call_count: AtomicU32,
-            last_new_state: parking_lot::Mutex<Option<NodeState>>,
+            last_new_state: noxu_sync::Mutex<Option<NodeState>>,
         }
 
         impl StateChangeListener for TestListener {
@@ -744,7 +744,7 @@ mod tests {
         let env = ReplicatedEnvironment::new(test_config("node1")).unwrap();
         let listener = Arc::new(TestListener {
             call_count: AtomicU32::new(0),
-            last_new_state: parking_lot::Mutex::new(None),
+            last_new_state: noxu_sync::Mutex::new(None),
         });
 
         // Setting the listener should trigger an immediate notification

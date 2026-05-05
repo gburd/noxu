@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use bytes::BytesMut;
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 use crate::database_impl::DatabaseImpl;
 use crate::file_manager_scanner::FileManagerLogScanner;
@@ -118,9 +118,24 @@ pub struct EnvironmentImpl {
     ///
     /// Port of `EnvironmentImpl.checkpointer` in JE.
     checkpointer: Option<Arc<noxu_recovery::checkpointer::Checkpointer>>,
+
+    /// Background checkpointer daemon thread handle.
+    ///
+    /// Wrapped in `Mutex<Option<…>>` so that `close()` (which takes `&self`)
+    /// can take ownership of the handle to join it.
+    checkpointer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+
+    /// Interval in milliseconds between periodic checkpoints.
+    ///
+    /// Default: 30,000 ms (30 seconds).  Passed to the checkpointer thread
+    /// at environment creation time.
+    checkpoint_interval_ms: u64,
 }
 
 impl EnvironmentImpl {
+    /// Default interval between periodic checkpoints: 30 seconds.
+    pub const DEFAULT_CHECKPOINT_INTERVAL_MS: u64 = 30_000;
+
     /// Creates a new EnvironmentImpl.
     ///
     /// In a full implementation, this would:
@@ -134,6 +149,21 @@ impl EnvironmentImpl {
         env_home: impl Into<PathBuf>,
         read_only: bool,
         transactional: bool,
+    ) -> Result<Self, DbiError> {
+        Self::new_with_config(
+            env_home,
+            read_only,
+            transactional,
+            Self::DEFAULT_CHECKPOINT_INTERVAL_MS,
+        )
+    }
+
+    /// Like `new()` but allows overriding the checkpoint interval for testing.
+    pub fn new_with_config(
+        env_home: impl Into<PathBuf>,
+        read_only: bool,
+        transactional: bool,
+        checkpoint_interval_ms: u64,
     ) -> Result<Self, DbiError> {
         let env_home = env_home.into();
         let lock_manager = Arc::new(LockManager::new());
@@ -281,6 +311,34 @@ impl EnvironmentImpl {
             )
         });
 
+        // Start the background checkpointer daemon thread.
+        //
+        // Mirrors the evictor pattern: the thread holds an Arc clone of the
+        // Checkpointer and loops with `thread::sleep(interval)` until the
+        // shutdown flag is set.
+        //
+        // Port of `Checkpointer.java` `run()` → periodic checkpoint loop.
+        let checkpointer_thread = checkpointer.as_ref().map(|ckpt| {
+            let ckpt_clone = Arc::clone(ckpt);
+            let interval =
+                std::time::Duration::from_millis(checkpoint_interval_ms);
+            std::thread::Builder::new()
+                .name("noxu-checkpointer".to_string())
+                .spawn(move || {
+                    while !ckpt_clone.is_shutdown() {
+                        std::thread::sleep(interval);
+                        if ckpt_clone.is_shutdown() {
+                            break;
+                        }
+                        // Ignore checkpoint errors in the daemon — the
+                        // environment may be closing or a concurrent
+                        // checkpoint may be in progress.
+                        let _ = ckpt_clone.do_checkpoint("daemon");
+                    }
+                })
+                .expect("failed to spawn noxu-checkpointer thread")
+        });
+
         let env = EnvironmentImpl {
             env_home,
             state: RwLock::new(EnvState::Init),
@@ -305,6 +363,8 @@ impl EnvironmentImpl {
             primary_tree,
             cleaner,
             checkpointer,
+            checkpointer_handle: Mutex::new(checkpointer_thread),
+            checkpoint_interval_ms,
         };
 
         // Mark as open
@@ -642,8 +702,16 @@ impl EnvironmentImpl {
             let _ = handle.join();
         }
 
-        // Flush dirty BINs (checkpoint) before final WAL sync so recovery
-        // can restart from the checkpoint rather than replaying the full log.
+        // Signal the checkpointer daemon to stop and wait for it to exit.
+        if let Some(ckpt) = &self.checkpointer {
+            ckpt.request_shutdown();
+        }
+        if let Some(handle) = self.checkpointer_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // Final (forced) checkpoint before WAL sync so recovery can restart
+        // from the checkpoint rather than replaying the full log.
         // Port of JE `EnvironmentImpl.close()` calling
         // `checkpointer.doCheckpoint(CheckpointConfig.FORCE)`.
         if let Some(ckpt) = &self.checkpointer {
@@ -667,6 +735,14 @@ impl Drop for EnvironmentImpl {
         // environment is dropped (e.g. in tests that don't call close()).
         self.evictor.shutdown();
         if let Some(handle) = self.evictor_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // Shut down the checkpointer daemon thread.
+        if let Some(ckpt) = &self.checkpointer {
+            ckpt.request_shutdown();
+        }
+        if let Some(handle) = self.checkpointer_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
     }
@@ -1069,5 +1145,81 @@ mod tests {
 
         // After close the evictor's shutdown flag must be set.
         assert!(evictor.is_shutdown(), "evictor should be shut down after close");
+    }
+
+    /// Verify that the checkpointer daemon thread starts and stops cleanly.
+    ///
+    /// Uses a very short checkpoint interval (50 ms) so the daemon wakes up
+    /// at least once before `close()`.  The test passes as long as no panic
+    /// occurs and the checkpointer's shutdown flag is set after `close()`.
+    #[test]
+    fn test_checkpointer_daemon_starts_and_stops() {
+        let dir = TempDir::new().unwrap();
+        // Use a short interval so the daemon fires during the test.
+        let env = EnvironmentImpl::new_with_config(
+            dir.path(),
+            false,
+            true,
+            50, // 50 ms interval
+        )
+        .unwrap();
+
+        // Checkpointer should exist for a writable environment.
+        assert!(
+            env.checkpointer.is_some(),
+            "checkpointer should be created for writable env"
+        );
+
+        // Write some data so there is a live log.
+        env.log_txn_commit(1, false, false).unwrap();
+
+        // Give the daemon at least two sleep cycles (100+ ms).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // close() must signal shutdown, join the thread, and not panic.
+        env.close().unwrap();
+
+        // After close the shutdown flag must be set.
+        let ckpt = env.checkpointer.as_ref().unwrap();
+        assert!(
+            ckpt.is_shutdown(),
+            "checkpointer should be shut down after close"
+        );
+    }
+
+    /// Verify that `wakeup_after_write` on the environment's Checkpointer
+    /// triggers a checkpoint when the accumulated bytes exceed the threshold.
+    ///
+    /// We reach into the checkpointer directly to call `wakeup_after_write`
+    /// with a tiny threshold (already configured on the Checkpointer via
+    /// `with_bytes_interval`) and verify the checkpoint count increases.
+    ///
+    /// Note: the Checkpointer built by EnvironmentImpl uses the default
+    /// 10 MiB threshold, so here we test the method on a standalone
+    /// Checkpointer with a tiny threshold, which is the correct unit-level
+    /// test for this behaviour (integration-level coverage is in
+    /// `noxu-recovery`).
+    #[test]
+    fn test_wakeup_after_write_triggers_checkpoint_via_env() {
+        use noxu_recovery::checkpointer::{Checkpointer, CheckpointConfig};
+        use std::sync::atomic::Ordering;
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(64); // 64-byte threshold
+
+        // Below threshold — no checkpoint.
+        checkpointer.wakeup_after_write(32);
+        assert_eq!(
+            checkpointer.get_stats().checkpoints.load(Ordering::Relaxed),
+            0
+        );
+
+        // Cross threshold — checkpoint fires.
+        checkpointer.wakeup_after_write(32);
+        assert_eq!(
+            checkpointer.get_stats().checkpoints.load(Ordering::Relaxed),
+            1,
+            "checkpoint should fire when threshold is crossed"
+        );
     }
 }

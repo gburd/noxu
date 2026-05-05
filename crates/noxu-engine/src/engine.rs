@@ -11,7 +11,7 @@ use noxu_recovery::{
     CheckpointConfig, CheckpointResult, Checkpointer, RecoveryManager,
     log_scanner::InMemoryLogScanner,
 };
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 

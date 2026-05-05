@@ -9,9 +9,9 @@
 //! sequence latch acquisition in an ordered fashion to avoid deadlocks.
 //!
 //! Key differences from JE's Java implementation:
-//! - Uses `parking_lot` for the underlying lock primitives (faster than std)
+//! - Uses `noxu_sync` for the underlying lock primitives (faster than std)
 //! - Reentrancy prevention is enforced (matching JE behavior)
-//! - Thread ownership tracking is always available via parking_lot
+//! - Thread ownership tracking is always available via noxu_sync
 
 mod exclusive;
 mod shared;

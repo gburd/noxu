@@ -8,7 +8,7 @@
 //! forward from a given VLSN, frames each entry, and sends it to the replica
 //! via a [`Channel`]. Acks are received on the same channel.
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

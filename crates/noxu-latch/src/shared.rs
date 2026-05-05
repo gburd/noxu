@@ -11,7 +11,7 @@
 //! exclusive-only mode, `acquire_shared()` behaves like `acquire_exclusive()`.
 
 use crate::LatchContext;
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 use std::cell::Cell;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +19,7 @@ use std::thread;
 
 // Thread-local counter tracking how many read guards the current thread holds
 // across all SharedLatch instances.  Used to detect read-to-write upgrade
-// attempts that would deadlock with parking_lot's non-reentrant RwLock.
+// attempts that would deadlock with noxu_sync's non-reentrant RwLock.
 thread_local! {
     static READ_HOLD_COUNT: Cell<u32> = const { Cell::new(0) };
 }
@@ -91,7 +91,7 @@ impl SharedLatch {
         }
 
         // Detect read-to-write upgrade: this thread already holds a read guard
-        // and attempting to acquire write would deadlock with parking_lot's
+        // and attempting to acquire write would deadlock with noxu_sync's
         // non-reentrant RwLock (matches JE's EnvironmentFailureException check
         // on getReadHoldCount() > 0).
         if read_hold_count() > 0 {
@@ -200,7 +200,7 @@ pub enum SharedLatchGuard<'a> {
 
 /// RAII guard for shared/read access. Releases when dropped.
 pub struct SharedLatchReadGuard<'a> {
-    _guard: parking_lot::RwLockReadGuard<'a, ()>,
+    _guard: noxu_sync::RwLockReadGuard<'a, ()>,
 }
 
 impl Drop for SharedLatchReadGuard<'_> {
@@ -214,7 +214,7 @@ impl Drop for SharedLatchReadGuard<'_> {
 /// RAII guard for exclusive/write access. Releases when dropped.
 pub struct SharedLatchWriteGuard<'a> {
     latch: &'a SharedLatch,
-    _guard: parking_lot::RwLockWriteGuard<'a, ()>,
+    _guard: noxu_sync::RwLockWriteGuard<'a, ()>,
 }
 
 impl Drop for SharedLatchWriteGuard<'_> {
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn test_je_multiple_readers_concurrent() {
         let latch = Arc::new(SharedLatch::named("je-multi-read", false));
-        let ready = Arc::new((parking_lot::Mutex::new(0usize), parking_lot::Condvar::new()));
+        let ready = Arc::new((noxu_sync::Mutex::new(0usize), noxu_sync::Condvar::new()));
         let mut handles = Vec::new();
 
         for _ in 0..4 {

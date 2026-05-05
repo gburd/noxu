@@ -26,7 +26,7 @@ use crate::secondary_config::SecondaryConfig;
 use crate::secondary_cursor::SecondaryCursor;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, GetMode};
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

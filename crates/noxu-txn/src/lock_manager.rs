@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use noxu_sync::{Condvar, Mutex};
 
 use crate::{DeadlockDetector, Lock, LockGrantType, LockStats, LockType, TxnError};
 use crate::lock_info::WaiterNotify;

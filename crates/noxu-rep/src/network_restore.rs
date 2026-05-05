@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use noxu_sync::Mutex;
 
 use crate::error::{RepError, Result};
 

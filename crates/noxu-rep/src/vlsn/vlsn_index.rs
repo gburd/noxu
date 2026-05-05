@@ -5,9 +5,9 @@
 //! covers a contiguous range of VLSNs with sparse stride-based mappings.
 //!
 //! The index automatically creates new buckets as VLSNs are registered.
-//! Thread-safe access is provided via `parking_lot::RwLock`.
+//! Thread-safe access is provided via `noxu_sync::RwLock`.
 
-use parking_lot::RwLock;
+use noxu_sync::RwLock;
 
 use super::vlsn_bucket::VlsnBucket;
 use super::vlsn_range::VlsnRange;
