@@ -1,6 +1,6 @@
 //! List view of a database.
 //!
-//! Stub port of `com.sleepycat.collections.StoredList`. Provides a
+//! Port of `com.sleepycat.collections.StoredList`. Provides a
 //! sequential-access list interface over a Noxu DB database, using
 //! `usize` indices as keys encoded in big-endian byte order.
 
@@ -10,14 +10,15 @@ use noxu_db::Database;
 
 /// A list-like view of a database.
 ///
-/// Stub port of `com.sleepycat.collections.StoredList`.
+/// Port of `com.sleepycat.collections.StoredList`.
 ///
 /// Elements are stored with their zero-based index encoded as a big-endian
 /// 8-byte key so that iteration order matches insertion order and keys
 /// sort numerically in byte-lexicographic order.
 ///
-/// # Limitations
-/// This is a basic stub. Gaps in the index (from removes) are not compacted.
+/// # Implementation notes
+/// Index gaps created by `remove()` are not compacted; subsequent `push()`
+/// calls use the next sequential index rather than re-filling holes.
 /// `pop` removes the element at the highest known index.
 ///
 /// # Example

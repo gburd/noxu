@@ -866,13 +866,16 @@ impl std::fmt::Debug for Evictor {
 struct RealNodeInfo {
     dirty: bool,
     is_bin: bool,
+    /// Number of cursors currently positioned on this node.
+    /// Port of JE `IN.cursorSet.size()` used by `Evictor.selectIN()`.
+    pin_count: usize,
 }
 
 impl NodeEvictionInfo for RealNodeInfo {
     fn is_dirty(&self) -> bool { self.dirty }
     fn is_bin(&self) -> bool { self.is_bin }
     fn is_resident(&self) -> bool { true } // found in tree → resident
-    fn ref_count(&self) -> usize { 0 }     // cursor tracking not yet wired to evictor
+    fn ref_count(&self) -> usize { self.pin_count }
 }
 
 /// Walk the tree to find a node by ID and return a `RealNodeInfo` snapshot.
@@ -896,6 +899,7 @@ fn find_node_info_recursive(
                 Some(Box::new(RealNodeInfo {
                     dirty: b.dirty || b.dirty_count() > 0,
                     is_bin: true,
+                    pin_count: b.cursor_count.max(0) as usize,
                 }))
             } else {
                 None
@@ -903,7 +907,7 @@ fn find_node_info_recursive(
         }
         TreeNode::Internal(n) => {
             if n.node_id == target_id {
-                return Some(Box::new(RealNodeInfo { dirty: n.dirty, is_bin: false }));
+                return Some(Box::new(RealNodeInfo { dirty: n.dirty, is_bin: false, pin_count: 0 }));
             }
             // Collect child arcs before dropping the guard.
             let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()

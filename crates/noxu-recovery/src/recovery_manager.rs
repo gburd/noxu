@@ -1155,9 +1155,10 @@ impl RecoveryManager {
     /// abort_lsn is valid → revert to abort_lsn (before-image)
     /// ```
     ///
-    /// The "found in tree" and "logLsn == slotLsn" checks are performed by
-    /// the tree layer (not yet wired); here we compute the *intended* action
-    /// from the log record metadata alone.
+    /// The "found in tree" and "logLsn == slotLsn" currency checks are
+    /// delegated to the tree layer (`Tree::delete` / `Tree::insert`) at the
+    /// call site; here we compute the *intended* action from the log record
+    /// metadata alone.
     fn compute_undo_action(rec: &LnRecord) -> UndoAction {
         if rec.abort_lsn == NULL_LSN {
             // This was the first write of this key: undo by deleting the slot.

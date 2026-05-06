@@ -1119,6 +1119,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: false,
+            cursor_count: 0,
         };
         let node = RwLock::new(TreeNode::Bottom(bin));
 

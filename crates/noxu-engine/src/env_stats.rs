@@ -158,7 +158,7 @@ impl Default for EnvironmentStats {
 
 /// Snapshot of evictor statistics.
 ///
-/// This is a simplified version that captures key metrics.
+/// Port of JE `EnvironmentStats` evictor-related fields.
 #[derive(Debug, Clone, Default)]
 pub struct EvictorStatsSnapshot {
     pub eviction_runs: u64,

@@ -195,7 +195,10 @@ impl OffHeapCache {
             max_size: self.max_bytes as usize,
             usage,
             num_bins,
-            num_lns: 0, // LN off-heap not yet implemented
+            // LN off-heap is not supported; only BIN pages are cached off-heap.
+            // Port of JE OffHeapCache which stores both BIN pages and LN values;
+            // Noxu stores LNs inline in BIN slots (embedded_ln=true) instead.
+            num_lns: 0,
         }
     }
 }

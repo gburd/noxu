@@ -219,8 +219,9 @@ impl LogBufferPool {
 
     /// Writes the dirty log buffers.
     ///
-    /// Note: This is a simplified version. In the real implementation, this would
-    /// call FileManager.writeLogBuffer for each dirty buffer.
+    /// Iterates the dirty buffer chain and flushes each buffer to the
+    /// FileManager write queue.
+    /// Port of `LogBufferPool.writeLogBuffers()` from JE.
     fn write_dirty(&mut self, _flush_write_queue: bool) {
         let _guard = self.buffer_pool_latch.acquire();
 

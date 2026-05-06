@@ -21,12 +21,16 @@ use crate::Result;
 use crate::entry_binding::{EntityBinding, EntryBinding};
 use crate::serial::serde_binding::SerdeBinding;
 
-/// Entity binding that uses serde for both key and data serialization.
+/// Entity binding that uses serde-binary encoding for keys and data.
 ///
-/// This is a simplified version of JE's `TupleSerialBinding`. In the full
-/// implementation, keys would use a dedicated tuple encoding for sort-order
-/// preservation; here both key and data use the compact serde binary format
-/// from [`SerdeBinding`].
+/// Port of JE's `TupleSerialBinding`.  JE uses a dedicated sort-preserving
+/// tuple format for keys so that byte-wise comparison of serialized keys
+/// produces the same order as comparing the original values.  This
+/// implementation uses the compact serde binary format from [`SerdeBinding`]
+/// for both key and data, which is correct for equality comparisons but does
+/// not preserve sort order for lexicographic key comparisons.  Applications
+/// requiring sorted key ranges should supply a custom key comparator via
+/// `DatabaseConfig::bt_comparator` that deserializes and compares the key type.
 ///
 /// The entity type `E` is split into a key part `K` and a data part `V` via
 /// user-provided extraction functions.
