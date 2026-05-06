@@ -6,9 +6,11 @@
 
 pub mod cleaner;
 pub mod cleaner_stat;
+pub mod data_eraser;
 pub mod db_file_summary;
 pub mod error;
 pub mod expiration_profile;
+pub mod extinction_scanner;
 pub mod expiration_tracker;
 pub mod file_processor;
 pub mod file_protector;
@@ -43,3 +45,5 @@ pub use packed_offsets::PackedOffsets;
 pub use tracked_file_summary::TrackedFileSummary;
 pub use utilization_profile::UtilizationProfile;
 pub use utilization_tracker::UtilizationTracker;
+pub use data_eraser::{DataEraser, EraseRequest};
+pub use extinction_scanner::{ExtinctionScanner, ExtinctionTask};

@@ -4,6 +4,7 @@
 //! Port of `com.sleepycat.je.dbi` - internal implementations including
 //! EnvironmentImpl, DatabaseImpl, CursorImpl, DbTree, MemoryBudget, INList.
 
+pub mod backup_manager;
 pub mod cursor_impl;
 mod database_config;
 pub mod dup_key_data;
@@ -26,6 +27,7 @@ mod put_mode;
 mod search_mode;
 mod truncate_result;
 
+pub use backup_manager::{BackupDestination, BackupManager};
 pub use cursor_impl::CursorImpl;
 #[cfg(any(test, feature = "testing"))]
 pub use cursor_impl::{clear_cursor_fail_flag, set_cursor_fail_after};

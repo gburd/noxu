@@ -96,5 +96,8 @@ pub use txn_abort::TxnAbort;
 mod txn;
 pub use txn::{Durability, Txn, UndoRecord};
 
+pub mod group_commit;
+pub use group_commit::{GroupCommit, GroupCommitMaster, GroupCommitReplica};
+
 mod txn_manager;
 pub use txn_manager::{TxnManager, TxnStats};

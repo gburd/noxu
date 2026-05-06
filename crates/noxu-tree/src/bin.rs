@@ -357,6 +357,25 @@ pub struct Bin {
     /// Embedded LN data for slots with EMBEDDED_LN_BIT set.
     /// Index i maps to embedded data for slot i; None if not embedded.
     slot_embedded_data: Vec<Option<Vec<u8>>>,
+
+    /// Per-slot last-modification time in milliseconds since epoch.
+    ///
+    /// Only populated for slots with embedded LN data. A value of 0 means
+    /// no modification time is recorded for that slot.
+    ///
+    /// Port of JE `BIN.modificationTimes` (`INLongRep` array, NoSQL fork).
+    /// JE's `INLongRep` uses variable-length encoding with a delta base to
+    /// pack times compactly; Noxu stores absolute millis in a plain Vec for
+    /// simplicity while preserving the same per-slot semantics.
+    pub(crate) modification_times: Vec<u64>,
+
+    /// Per-slot creation time in milliseconds since epoch.
+    ///
+    /// Only populated for slots with embedded LN data. A value of 0 means
+    /// no creation time is recorded for that slot.
+    ///
+    /// Port of JE `BIN.creationTimes` (`INLongRep` array, NoSQL fork).
+    pub(crate) creation_times: Vec<u64>,
 }
 
 impl Bin {
@@ -377,6 +396,8 @@ impl Bin {
             slot_vlsns: None,
             slot_expirations: None,
             slot_embedded_data: Vec::new(),
+            modification_times: Vec::new(),
+            creation_times: Vec::new(),
         }
     }
 
@@ -906,11 +927,59 @@ impl Bin {
     ///
     /// True if the entry was deleted, false if index was invalid
     pub fn delete_entry(&mut self, index: usize) -> bool {
-        // Also clean up slot_embedded_data
+        // Clean up per-slot auxiliary arrays.
         if index < self.slot_embedded_data.len() {
             self.slot_embedded_data.remove(index);
         }
+        if index < self.modification_times.len() {
+            self.modification_times.remove(index);
+        }
+        if index < self.creation_times.len() {
+            self.creation_times.remove(index);
+        }
         self.inner.delete_entry(index)
+    }
+
+    // ========================================================================
+    // Per-slot modification / creation time  —  NoSQL JE fork
+    // ========================================================================
+
+    /// Returns the last-modification time for slot `index` in milliseconds
+    /// since the Unix epoch, or `0` if not set.
+    ///
+    /// Port of JE `BIN.getModificationTime(int idx)` (NoSQL fork).
+    pub fn get_modification_time(&self, index: usize) -> u64 {
+        self.modification_times.get(index).copied().unwrap_or(0)
+    }
+
+    /// Sets the last-modification time for slot `index` in milliseconds
+    /// since the Unix epoch.
+    ///
+    /// Port of JE `BIN.setModificationTime(int idx, long time)` (NoSQL fork).
+    pub fn set_modification_time(&mut self, index: usize, time_ms: u64) {
+        while self.modification_times.len() <= index {
+            self.modification_times.push(0);
+        }
+        self.modification_times[index] = time_ms;
+    }
+
+    /// Returns the creation time for slot `index` in milliseconds since the
+    /// Unix epoch, or `0` if not set.
+    ///
+    /// Port of JE `BIN.getCreationTime(int idx)` (NoSQL fork).
+    pub fn get_creation_time(&self, index: usize) -> u64 {
+        self.creation_times.get(index).copied().unwrap_or(0)
+    }
+
+    /// Sets the creation time for slot `index` in milliseconds since the
+    /// Unix epoch.
+    ///
+    /// Port of JE `BIN.setCreationTime(int idx, long time)` (NoSQL fork).
+    pub fn set_creation_time(&mut self, index: usize, time_ms: u64) {
+        while self.creation_times.len() <= index {
+            self.creation_times.push(0);
+        }
+        self.creation_times[index] = time_ms;
     }
 
     // --- Latch operations  -  delegate to inner IN ---
@@ -1257,6 +1326,8 @@ impl Bin {
             let _ = self.delete_entry(0);
         }
         self.slot_embedded_data.clear();
+        self.modification_times.clear();
+        self.creation_times.clear();
         self.key_prefix.clear();
 
         for j in 0..delta_n {
