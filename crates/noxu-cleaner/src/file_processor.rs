@@ -284,13 +284,10 @@ impl TreeLookup for RealTreeLookup {
             };
             let slot_lsn = match &*parent_guard {
                 TreeNode::Internal(n) => {
-                    n.entries.get(slot_idx).and_then(|e| e.child.as_ref()).map(|_| {
-                        // The parent slot's LSN is the last logged LSN for
-                        // the child.  For BINs we prefer `last_full_lsn`.
-                        // For internal nodes we use NULL_LSN as a sentinel
-                        // (means never logged — return Obsolete).
-                        noxu_util::NULL_LSN // will be refined below via child
-                    })
+                    // The parent slot's LSN tracks the last logged position
+                    // for the child — used directly for upper INs (port of
+                    // JE INEntryInfo.prevFullLsn read from the log entry).
+                    n.entries.get(slot_idx).map(|e| e.lsn)
                 }
                 _ => None,
             };
@@ -327,16 +324,14 @@ impl TreeLookup for RealTreeLookup {
                     // For upper INs we don't have a per-node last_full_lsn;
                     // use NULL_LSN to indicate "use parent slot LSN".
                     TreeNode::Internal(_) => {
-                        // Treat parent slot presence as evidence that this
-                        // is the current node.  Compare at NULL_LSN → Obsolete
-                        // unless parent slot_lsn path is wired — for now
-                        // always mark dirty when the parent slot exists (JE
-                        // upper-IN path).
-                        let _ = slot_lsn;
-                        // Since we can't directly compare for upper INs,
-                        // return Obsolete conservatively to avoid spurious
-                        // dirty marks on unrelated nodes.
-                        return InLookupResult::Obsolete;
+                        // For upper INs, the parent slot LSN (InEntry.lsn) is
+                        // the last logged position for this node.  Port of JE:
+                        // FileProcessor uses INEntryInfo.prevFullLsn from the
+                        // log entry header to determine currency.
+                        match slot_lsn {
+                            Some(lsn) => lsn,
+                            None => return InLookupResult::Obsolete,
+                        }
                     }
                 }
             };

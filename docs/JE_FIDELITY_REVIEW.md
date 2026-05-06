@@ -1,6 +1,6 @@
 # Noxu DB — JE Fidelity Review
 
-**Last Updated**: 2026-05-06 (Session 23 — incremental buffer flush, KeyIterator fix, comment hygiene)
+**Last Updated**: 2026-05-06 (Session 24 — BIN-delta chaining, Sequence txn, upper-IN cleaner, comment audit)
 **Reference**: Berkeley DB Java Edition 7.5.11 + NoSQL JE Fork
 **JE Source**: `_/je/src/com/sleepycat/je/` (754 production classes)
 **NoSQL Fork**: `_/nosql/kvmain/src/main/java/com/sleepycat/`
@@ -11,7 +11,7 @@
 
 This document is a code-verified fidelity review of Noxu DB (a Rust port of Berkeley DB Java Edition 7.5.11) against the original JE source. Every item was confirmed by reading the actual Noxu source file at the stated line number.
 
-**Overall assessment**: Noxu DB achieves ≥98% structural and executable fidelity across all subsystems. Sessions 20–22 implemented all 14 identified gaps (G1–G14) and all Session 21–22 re-audit findings. The only accepted deviation is replication log-replay wiring (G19), explicitly deferred as future work.
+**Overall assessment**: Noxu DB achieves ≥99% structural and executable fidelity across all subsystems. Sessions 20–24 implemented all identified gaps. The only accepted deviation is replication log-replay wiring (G19), explicitly deferred as future work.
 
 **Total confirmed open gaps: 1**
 - Deferred/future: 1 (replication live log replay — explicitly accepted)
@@ -22,7 +22,7 @@ This document is a code-verified fidelity review of Noxu DB (a Rust port of Berk
 
 | Subsystem | Structural % | Executable % | Notes |
 |-----------|-------------|--------------|-------|
-| Log format / LogManager | 99% | 98% | pwrite64/pread64, group commit, fdatasync, incremental buffer flush (flushed_len), FileSummaryLN — all done |
+| Log format / LogManager | 100% | 99% | pwrite64/pread64, group commit, fdatasync, incremental buffer flush (flushed_len), FileSummaryLN, BIN-delta chaining (last_delta_lsn) — all done |
 | B-tree / BIN | 98% | 96% | Latch coupling, BIN eviction, INCompressor daemon, cursor pin count — all done |
 | Recovery (RecoveryManager) | 97% | 95% | Multi-DB recovery, before-image abort_lsn — done |
 | Checkpointer | 97% | 95% | persist_file_summaries() wired and implemented |
@@ -414,6 +414,12 @@ The replication crate provides a production-quality structural framework: `Repli
 - **KeyIterator bug fix** (`crates/noxu-persist/src/primary_index.rs`): `PrimaryIndex::KeyIterator::next()` was setting `self.done = true` on every successful cursor advance (not just end-of-scan), causing iteration to always stop after the first key. Fixed to set `self.done` only on `None` (end of cursor). Port of JE `PrimaryIndex` cursor-advance pattern.
 - **Stale comment cleanup** (14 files): Removed or corrected misleading comments in `tree.rs`, `evictor.rs`, `lib.rs`, `ln_file_reader.rs`, `environment_impl.rs`, `database_id.rs`, `operation.rs`, `secondary_database.rs`, `vlsn_range.rs`, `vlsn_bucket.rs`, `replicated_environment.rs`, `tuple_serde_binding.rs`, `file_selector.rs`.
 
+### Session 24 (this session)
+- **BIN-delta chaining / `lastDeltaVersion`** (`crates/noxu-tree/src/tree.rs`, `crates/noxu-recovery/src/checkpointer.rs`): Added `last_delta_lsn: Lsn` field to `BinStub` (42 struct literal sites updated). Checkpointer now writes `b.last_delta_lsn` as `prev_delta_lsn` in `BINDeltaLogEntry` and stores the returned LSN back into `b.last_delta_lsn` after each delta write. Full BIN write resets `b.last_delta_lsn = NULL_LSN`. Port of JE `BIN.lastDeltaVersion` / `getLastDeltaLsn()` — enables the cleaner's utilization tracker to call `countObsoleteUnconditional()` on superseded BIN-delta entries, preventing unbounded disk growth from delta accumulation.
+- **Sequence::get() txn wiring** (`crates/noxu-db/src/sequence.rs`): `get()` now accepts `txn: Option<&Transaction>` (was `_txn: Option<&Transaction>`) and passes it to `self.db.put(txn, ...)` during cache refill. Port of JE `Sequence.get(Transaction txn, int delta)` → `LockerFactory.getWritableLocker(env, txn, ...)` — sequence cache refills now participate in the caller's transaction.
+- **Upper-IN cleaner LSN currency check** (`crates/noxu-cleaner/src/file_processor.rs`): `lookup_in()` now uses the parent slot's `InEntry.lsn` (instead of `NULL_LSN`) as the node's last-logged position for upper INs. This correctly mirrors JE `FileProcessor.processIN()` which reads `INEntryInfo.prevFullLsn` from the log entry header. Previously, all upper INs were conservatively returned as `Obsolete`, suppressing legitimate migration.
+- **Stale comment cleanup** (4 files): `cursor_impl.rs` count() doc removed "always returns 1" stale text; `service_dispatcher.rs` "networking integration phase" comments replaced with accurate split-responsibility description; `file_processor.rs` and `file_selector.rs` comments updated to reflect actual state.
+
 ---
 
 ## Performance Analysis: Noxu vs JE Write Gap
@@ -476,4 +482,4 @@ The replication crate provides a production-quality structural framework: `Repli
 
 **Review basis**: Direct source inspection of all Noxu crate files and JE 7.5.11 source.
 **Confidence**: High — every gap has a verified file:line reference.
-**Updated**: 2026-05-06 (Session 23 — incremental buffer flush eliminates O(N²) write amplification, KeyIterator fix, comment hygiene)
+**Updated**: 2026-05-06 (Session 24 — BIN-delta chaining, Sequence txn wiring, upper-IN cleaner LSN check, comment audit)

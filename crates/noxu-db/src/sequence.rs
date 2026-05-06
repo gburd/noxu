@@ -240,10 +240,10 @@ impl<'db> Sequence<'db> {
     ///
     /// `delta` must be > 0 and must fit within the configured range.
     ///
-    /// The `txn` parameter is accepted for API compatibility but is currently
-    /// unused (sequence writes are always auto-committed in this
-    /// implementation).
-    pub fn get(&self, _txn: Option<&Transaction>, delta: i32) -> Result<i64> {
+    /// The `txn` parameter, if provided, is used for the cache-refill database
+    /// write, making it participate in the caller's transaction.
+    /// Port of JE `Sequence.get(Transaction txn, int delta)`.
+    pub fn get(&self, txn: Option<&Transaction>, delta: i32) -> Result<i64> {
         if delta <= 0 {
             return Err(NoxuError::IllegalArgument(
                 "Sequence delta must be greater than zero".into(),
@@ -416,7 +416,7 @@ impl<'db> Sequence<'db> {
             let encoded = Self::encode_record(&rec);
             let key_entry = DatabaseEntry::from_bytes(&self.key);
             let data_entry = DatabaseEntry::from_bytes(&encoded);
-            self.db.put(None, &key_entry, &data_entry)?;
+            self.db.put(txn, &key_entry, &data_entry)?;
 
             // Update the local cache window using batch_start (pre-advance).
             // cache_value = batch_start (first value to hand out)
