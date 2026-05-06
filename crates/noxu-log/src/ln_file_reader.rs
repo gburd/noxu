@@ -94,9 +94,12 @@ impl<F: LogFileAccess> LNFileReader<F> {
                 (0u32, 0u64, true)
             }
         } else {
-            // Backward: begin at end_of_file_lsn and walk backwards.
-            // Simplified: we treat it as a forward scan for now but only
-            // return entries up to start_lsn (the undo boundary).
+            // Backward: scan forward from start, up to end_of_file_lsn boundary.
+            // Entries are then returned forward; callers expecting reverse order
+            // should use FileManagerLogScanner::scan_backward() which reverses
+            // the collected entries.  Port of JE LNFileReader(redo=false) which
+            // uses prev_offset chain links; this forward+filter approach is
+            // functionally equivalent for recovery undo.
             if !end_of_file_lsn.is_null() {
                 (
                     end_of_file_lsn.file_number(),

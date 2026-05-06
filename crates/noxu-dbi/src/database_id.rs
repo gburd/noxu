@@ -24,9 +24,10 @@ impl DatabaseId {
         self.0
     }
 
-    /// Returns the serialized size using packed long encoding.
+    /// Returns the serialized size.
     ///
-    /// Simplified to always return 8 bytes.
+    /// Always 8 bytes (i64 big-endian). JE uses variable-length packed
+    /// encoding; Noxu uses fixed-size i64 for simplicity and consistency.
     pub fn log_size(&self) -> usize {
         8
     }

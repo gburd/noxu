@@ -45,7 +45,7 @@
 //! ## Off-Heap Cache
 //!
 //! When configured, the off-heap cache extends the main cache into native
-//! memory, avoiding Java GC pressure. Currently this is a stub implementation.
+//! memory, avoiding Java GC pressure. Noxu uses a `Mutex<HashMap<u64, Vec<u8>>>` — no GC pressure to avoid.
 
 pub mod arbiter;
 pub mod cache_mode;

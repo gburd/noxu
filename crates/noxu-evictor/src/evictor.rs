@@ -1045,7 +1045,10 @@ fn default_node_info(_node_id: u64) -> Option<Box<dyn NodeEvictionInfo>> {
     Some(Box::new(DefaultNodeInfo))
 }
 
-/// Returns a placeholder size (1 KiB) for every node id.
+/// Returns a conservative 1 KiB estimate for every node id.
+///
+/// Used only in unit tests or when no tree is wired; real eviction
+/// uses `real_node_size()` which traverses the live tree.
 fn default_node_size(_node_id: u64) -> u64 {
     1024
 }

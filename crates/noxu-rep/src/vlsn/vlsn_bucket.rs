@@ -373,7 +373,8 @@ mod tests {
         bucket.put(1, 0, 100);
         bucket.put(3, 1, 200); // Different file number.
         bucket.put(5, 0, 300);
-        // All entries are accepted (simplified vs JE which constrains to one file).
+        // Noxu accepts entries from multiple files in one bucket; JE constrains
+        // each bucket to a single file number for cleaner GC accounting.
         assert_eq!(bucket.get_lsn(1), Some((0, 100)));
         assert_eq!(bucket.get_lsn(3), Some((1, 200)));
         assert_eq!(bucket.get_lsn(5), Some((0, 300)));
