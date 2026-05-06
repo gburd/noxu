@@ -3,11 +3,12 @@
 //! Port of `com.sleepycat.je.txn.TxnManager`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use noxu_sync::RwLock;
 
+use crate::group_commit::GroupCommit;
 use crate::LockManager;
 use crate::txn::Txn;
 
@@ -21,6 +22,14 @@ pub struct TxnManager {
     next_txn_id: AtomicI64,
     /// Lock manager shared by all transactions.
     lock_manager: Arc<LockManager>,
+    /// Optional group-commit handler (Master or Replica).
+    ///
+    /// `None` in non-replicated environments — fsyncs go directly through
+    /// `FSyncManager`.  When set, committing transactions call
+    /// `group_commit.buffer_commit()` after writing their WAL entry.
+    ///
+    /// Port of `TxnManager.groupCommit: AtomicReference<GroupCommit>` (NoSQL fork).
+    group_commit: StdRwLock<Option<Arc<dyn GroupCommit>>>,
     /// Statistics.
     n_begins: AtomicU64,
     n_commits: AtomicU64,
@@ -34,6 +43,7 @@ impl TxnManager {
             all_txns: RwLock::new(HashMap::new()),
             next_txn_id: AtomicI64::new(1),
             lock_manager,
+            group_commit: StdRwLock::new(None),
             n_begins: AtomicU64::new(0),
             n_commits: AtomicU64::new(0),
             n_aborts: AtomicU64::new(0),
@@ -78,6 +88,48 @@ impl TxnManager {
     /// Returns a reference to the lock manager.
     pub fn lock_manager(&self) -> &Arc<LockManager> {
         &self.lock_manager
+    }
+
+    // ========================================================================
+    // GroupCommit  —  NoSQL JE fork
+    // ========================================================================
+
+    /// Returns the current group-commit handler, if any.
+    ///
+    /// Port of `TxnManager.getGroupCommit()` (NoSQL fork).
+    pub fn get_group_commit(&self) -> Option<Arc<dyn GroupCommit>> {
+        self.group_commit.read().unwrap().clone()
+    }
+
+    /// Installs the group-commit handler for the **Master** role.
+    ///
+    /// Called when this node transitions to Master in a replicated
+    /// environment.  Creates a [`crate::group_commit::GroupCommitMaster`]
+    /// with default configuration and stores it.
+    ///
+    /// Port of `TxnManager.setupGroupCommitMaster()` (NoSQL fork).
+    pub fn setup_group_commit_master(&self) {
+        use crate::group_commit::GroupCommitMaster;
+        let gc = Arc::new(GroupCommitMaster::default());
+        *self.group_commit.write().unwrap() = Some(gc);
+    }
+
+    /// Installs the group-commit handler for the **Replica** role.
+    ///
+    /// Called when this node is operating as a Replica.
+    ///
+    /// Port of `TxnManager.setupGroupCommitReplica(Replay)` (NoSQL fork).
+    pub fn setup_group_commit_replica(&self) {
+        use crate::group_commit::GroupCommitReplica;
+        let gc = Arc::new(GroupCommitReplica::default());
+        *self.group_commit.write().unwrap() = Some(gc);
+    }
+
+    /// Clears the group-commit handler.
+    ///
+    /// Called on role transitions or shutdown.
+    pub fn clear_group_commit(&self) {
+        *self.group_commit.write().unwrap() = None;
     }
 }
 
