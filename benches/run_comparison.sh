@@ -66,7 +66,8 @@ if [[ $SKIP_NOXU -eq 0 ]]; then
     echo "════════════════════════════════════════════════════════"
     cargo build --release --package noxu-workload-bench 2>&1 \
         | grep -E "^(Compiling|Finished|error)" || true
-    ./target/release/noxu-workload-bench 2>&1 | tee "$RESULTS/noxu_stdout.txt"
+    NOXU_MAX_SCALE="${MAX_SCALE:-0}" \
+        ./target/release/noxu-workload-bench 2>&1 | tee "$RESULTS/noxu_stdout.txt"
     echo ""
 fi
 
@@ -294,7 +295,7 @@ lines.append("  CPU ms        — wall-clock CPU (user+sys) consumed by the work
 lines.append("  B/op          — on-disk bytes per logical operation (storage overhead)")
 lines.append("  GC%           — fraction of JE wall time lost to GC pauses")
 lines.append("  GCn           — GC collection count during JE workload")
-lines.append("  Fsync         — fdatasync calls during workload (Noxu: group commit; JE: per-commit)")
+lines.append("  Fsync         — fdatasync calls during workload (both: CommitSync / auto-commit path; Noxu also coalesces concurrent commits via group commit)")
 lines.append("")
 lines.append("Known Noxu 1.0 gaps vs JE (affect benchmark fairness):")
 lines.append("  • LockManager does not block threads — concurrent workload overhead understated")

@@ -132,7 +132,15 @@ fn print_progress(r: &WorkloadResult) {
 
 fn main() {
     // Five scales: 1K, 10K, 100K, 500K, 1M
-    let scales: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000];
+    // NOXU_MAX_SCALE env var limits the run (e.g. NOXU_MAX_SCALE=10000).
+    let max_scale: usize = std::env::var("NOXU_MAX_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(usize::MAX);
+    let all_scales: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000];
+    let scales: Vec<usize> = all_scales.iter().copied().filter(|&s| s <= max_scale).collect();
+    let scales: &[usize] = &scales;
 
     // W10 concurrent configurations: (label, reader_threads, writer_threads)
     let concurrent_configs: &[(&str, usize, usize)] = &[
