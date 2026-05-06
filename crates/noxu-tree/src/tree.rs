@@ -26,6 +26,7 @@ use crate::key::{create_key_prefix, get_key_prefix_length};
 use crate::search_result::SearchResult;
 use noxu_latch::{LatchContext, SharedLatch};
 use noxu_util::{Lsn, NULL_LSN};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 // Level and flag constants re-exported here for tree-internal use.
@@ -63,18 +64,25 @@ pub struct Tree {
     max_entries_per_node: usize,
 
     /// Root of the tree. None if tree is empty.
-    /// In a full implementation, this would be a ChildReference wrapper.
-    root: Option<Arc<RwLock<TreeNode>>>,
+    ///
+    /// Wrapped in `RwLock` so that `insert`, `delete`, and other mutating
+    /// operations can take `&self` (interior mutability), enabling concurrent
+    /// access to different BIN nodes without requiring a global `&mut Tree`
+    /// borrow.  The root pointer itself is only written during root splits
+    /// and initial creation; all other access is read-only.
+    ///
+    /// Port of JE `Tree.root` protected by the root latch.
+    root: RwLock<Option<Arc<RwLock<TreeNode>>>>,
 
     /// Latch protecting the root reference itself.
     /// Must be held when changing the root pointer.
     root_latch: SharedLatch,
 
     /// Statistics: number of times the root has been split.
-    root_splits: u64,
+    root_splits: AtomicU64,
 
     /// Statistics: number of latch upgrades from shared to exclusive.
-    relatches_required: u64,
+    relatches_required: AtomicU64,
 
     /// Optional custom key comparator for sorted-duplicate databases.
     ///
@@ -1125,10 +1133,10 @@ impl Tree {
         Tree {
             database_id,
             max_entries_per_node,
-            root: None,
+            root: RwLock::new(None),
             root_latch: SharedLatch::new(LatchContext::new("TreeRoot"), false),
-            root_splits: 0,
-            relatches_required: 0,
+            root_splits: AtomicU64::new(0),
+            relatches_required: AtomicU64::new(0),
             key_comparator: None,
         }
     }
@@ -1147,10 +1155,10 @@ impl Tree {
         Tree {
             database_id,
             max_entries_per_node,
-            root: None,
+            root: RwLock::new(None),
             root_latch: SharedLatch::new(LatchContext::new("TreeRoot"), false),
-            root_splits: 0,
-            relatches_required: 0,
+            root_splits: AtomicU64::new(0),
+            relatches_required: AtomicU64::new(0),
             key_comparator: Some(comparator),
         }
     }
@@ -1166,19 +1174,22 @@ impl Tree {
 
     /// Returns true if the tree has no root (is empty).
     pub fn is_empty(&self) -> bool {
-        self.root.is_none()
+        self.root.read().unwrap().is_none()
     }
 
     /// Sets the root of the tree.
     ///
     /// Must hold root_latch exclusively before calling.
-    pub fn set_root(&mut self, node: TreeNode) {
-        self.root = Some(Arc::new(RwLock::new(node)));
+    pub fn set_root(&self, node: TreeNode) {
+        *self.root.write().unwrap() = Some(Arc::new(RwLock::new(node)));
     }
 
-    /// Returns a reference to the root, if any.
-    pub fn get_root(&self) -> &Option<Arc<RwLock<TreeNode>>> {
-        &self.root
+    /// Returns the root Arc, if any.
+    ///
+    /// Returns a cloned `Arc` rather than a reference so the caller does not
+    /// hold the inner `RwLock` guard.
+    pub fn get_root(&self) -> Option<Arc<RwLock<TreeNode>>> {
+        self.root.read().unwrap().clone()
     }
 
     /// Returns the database ID.
@@ -1215,13 +1226,13 @@ impl Tree {
     /// Returns a SearchResult indicating where the key is or should be.
     /// Returns None if tree is empty.
     pub fn search(&self, key: &[u8]) -> Option<SearchResult> {
-        let root = self.root.as_ref()?;
+        let root = self.get_root()?;
 
         // Walk down the tree with latch-coupling until we reach a BIN.
         // We clone Arc pointers instead of holding read guards across iterations
         // to avoid holding multiple locks simultaneously (approximating JE's
         // latch-coupling: acquire child, release parent).
-        let mut current = root.clone();
+        let mut current = root;
 
         loop {
             // Acquire this node's read lock ONCE — perform both the is_bin
@@ -1339,8 +1350,7 @@ impl Tree {
         &self,
         key: &[u8],
     ) -> Option<(Vec<u8>, Vec<u8>)> {
-        let root = self.root.as_ref()?;
-        let mut current = root.clone();
+        let mut current = self.get_root()?;
 
         loop {
             let guard = current.read().ok()?;
@@ -1408,12 +1418,12 @@ impl Tree {
     ///
     /// Returns Ok(true) if this was a new insert, Ok(false) if it was an update.
     pub fn insert(
-        &mut self,
+        &self,
         key: Vec<u8>,
         data: Vec<u8>,
         lsn: Lsn,
     ) -> Result<bool, TreeError> {
-        if self.root.is_none() {
+        if self.root.read().unwrap().is_none() {
             // Port of JE Tree.insert() first-key path:
             // Create the initial BIN, then a level-2 upper IN as root, and
             // make the upper IN point to the BIN (mirroring JE's rootIN with
@@ -1454,7 +1464,7 @@ impl Tree {
                 g.set_parent(Some(Arc::downgrade(&root_arc)));
             }
 
-            self.root = Some(root_arc);
+            *self.root.write().unwrap() = Some(root_arc);
             return Ok(true);
         }
 
@@ -1465,7 +1475,7 @@ impl Tree {
 
         // Recursively insert, splitting children proactively as we descend
         // (JE's forceSplit / searchSplitsAllowed pattern).
-        let root_arc = self.root.as_ref().unwrap().clone();
+        let root_arc = self.get_root().unwrap();
         let result = Self::insert_recursive(
             &root_arc,
             key,
@@ -1489,9 +1499,9 @@ impl Tree {
     /// 4. Call split_node on oldRoot, passing newRoot as parent.
     /// 5. Replace tree root with newRoot.
     /// ```
-    fn split_root_if_needed(&mut self, lsn: Lsn) -> Result<(), TreeError> {
+    fn split_root_if_needed(&self, lsn: Lsn) -> Result<(), TreeError> {
         let needs_split = {
-            let root_arc = self.root.as_ref().unwrap();
+            let root_arc = self.root.read().unwrap().clone().unwrap();
             let guard =
                 root_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
             guard.get_n_entries() >= self.max_entries_per_node
@@ -1502,7 +1512,7 @@ impl Tree {
         }
 
         // Create a fresh new root one level above the current root.
-        let old_root_arc = self.root.take().unwrap();
+        let old_root_arc = self.root.write().unwrap().take().unwrap();
         let old_root_level = {
             let g =
                 old_root_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
@@ -1540,8 +1550,8 @@ impl Tree {
             lsn,
         )?;
 
-        self.root = Some(new_root_arc);
-        self.root_splits += 1;
+        *self.root.write().unwrap() = Some(new_root_arc);
+        self.root_splits.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1851,8 +1861,7 @@ impl Tree {
     /// Port of `Tree.getFirstNode()`. Descends to the leftmost BIN by
     /// always following the first child slot at each upper IN level.
     pub fn get_first_node(&self) -> Option<SearchResult> {
-        let root = self.root.as_ref()?;
-        let mut current = root.clone();
+        let mut current = self.get_root()?;
 
         loop {
             let (is_bin, n_entries, first_child) = {
@@ -1888,8 +1897,7 @@ impl Tree {
     /// Port of `Tree.getLastNode()`. Descends to the rightmost BIN by
     /// always following the last child slot at each upper IN level.
     pub fn get_last_node(&self) -> Option<SearchResult> {
-        let root = self.root.as_ref()?;
-        let mut current = root.clone();
+        let mut current = self.get_root()?;
 
         loop {
             let (is_bin, n_entries, last_child) = {
@@ -1926,12 +1934,12 @@ impl Tree {
 
     /// Returns the number of root splits that have occurred.
     pub fn get_root_splits(&self) -> u64 {
-        self.root_splits
+        self.root_splits.load(Ordering::Relaxed)
     }
 
     /// Returns the number of relatches required.
     pub fn get_relatches_required(&self) -> u64 {
-        self.relatches_required
+        self.relatches_required.load(Ordering::Relaxed)
     }
 
     /// Delete a key from the tree.
@@ -1944,9 +1952,9 @@ impl Tree {
     /// In-memory removal only — WAL logging for deletes is handled by the
     /// cursor layer (`cursor_impl.rs::log_ln_write`) before this is called,
     /// matching JE's separation between LN logging and tree mutation.
-    pub fn delete(&mut self, key: &[u8]) -> bool {
-        let root = match self.root.as_ref() {
-            Some(r) => r.clone(),
+    pub fn delete(&self, key: &[u8]) -> bool {
+        let root = match self.get_root() {
+            Some(r) => r,
             None => return false,
         };
 
@@ -2052,9 +2060,9 @@ impl Tree {
     ///
     /// This implementation performs a single post-order walk so that each
     /// level is compressed after all its children have been compressed.
-    pub fn compress(&mut self) {
-        let root = match self.root.as_ref() {
-            Some(r) => r.clone(),
+    pub fn compress(&self) {
+        let root = match self.get_root() {
+            Some(r) => r,
             None => return,
         };
         Self::compress_node(&root, self.max_entries_per_node);
@@ -2332,7 +2340,7 @@ impl Tree {
     /// `true` if compression made progress (slots were removed or the BIN was
     /// pruned), `false` if the BIN was skipped (delta, no cursors issue, etc.).
     pub fn compress_bin(
-        &mut self,
+        &self,
         bin_arc: &Arc<RwLock<TreeNode>>,
     ) -> bool {
         // ---- Step 1: collect metadata without holding the write lock ----
@@ -2431,7 +2439,7 @@ impl Tree {
     /// `true` if compression was triggered (regardless of whether any slots
     /// were actually removed), `false` if the BIN does not need compression.
     pub fn maybe_compress_bin_and_parent(
-        &mut self,
+        &self,
         bin_arc: &Arc<RwLock<TreeNode>>,
     ) -> bool {
         // Check whether the BIN has any deleted slots worth compressing.
@@ -2513,7 +2521,7 @@ impl Tree {
     /// Returns a `SearchResult` if the key is (or should be) in the tree,
     /// `None` if the tree is empty.
     pub fn search_with_coupling(&self, key: &[u8]) -> Option<SearchResult> {
-        let root = self.root.as_ref()?;
+        let root = self.get_root()?;
         let mut current = root.clone();
         let mut parent: Option<Arc<RwLock<TreeNode>>> = None;
         let mut child_index_in_parent: usize = 0;
@@ -2670,8 +2678,8 @@ impl Tree {
     /// 3. When found, descend to the leftmost BIN of that sibling subtree.
     /// 4. If no such parent exists, return `None` (no next BIN).
     pub fn get_next_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
-        let root = self.root.as_ref()?;
-        Self::get_adjacent_bin(root, current_key, true)
+        let root = self.get_root()?;
+        Self::get_adjacent_bin(&root, current_key, true)
     }
 
     /// Return the entries of the BIN immediately to the left of the BIN
@@ -2679,8 +2687,8 @@ impl Tree {
     ///
     /// Port of `Tree.getPrevBin()` → `Tree.getNextIN(forward=false)` from JE.
     pub fn get_prev_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
-        let root = self.root.as_ref()?;
-        Self::get_adjacent_bin(root, current_key, false)
+        let root = self.get_root()?;
+        Self::get_adjacent_bin(&root, current_key, false)
     }
 
     /// Core implementation shared by `get_next_bin` and `get_prev_bin`.
@@ -2863,8 +2871,8 @@ impl Tree {
     /// recursive DFS and counts INs, BINs, entries, and tree height.
     pub fn collect_stats(&self) -> TreeStats {
         let mut stats = TreeStats::default();
-        if let Some(root) = &self.root {
-            Self::collect_stats_recursive(root, &mut stats, 0);
+        if let Some(root) = self.get_root() {
+            Self::collect_stats_recursive(&root, &mut stats, 0);
         }
         stats
     }
@@ -2918,8 +2926,8 @@ impl Tree {
     /// IN list accumulated during normal operation.
     pub fn collect_dirty_bins(&self, db_id: u64) -> Vec<(u64, Arc<RwLock<TreeNode>>)> {
         let mut result = Vec::new();
-        if let Some(root) = &self.root {
-            Self::collect_dirty_bins_recursive(root, db_id, &mut result);
+        if let Some(root) = self.get_root() {
+            Self::collect_dirty_bins_recursive(&root, db_id, &mut result);
         }
         result
     }
@@ -2958,8 +2966,8 @@ impl Tree {
     /// slots.  Each returned `Arc` can be passed directly to `compress_bin()`.
     pub fn collect_bins_with_known_deleted(&self) -> Vec<Arc<RwLock<TreeNode>>> {
         let mut result = Vec::new();
-        if let Some(root) = &self.root {
-            Self::collect_bins_with_known_deleted_recursive(root, &mut result);
+        if let Some(root) = self.get_root() {
+            Self::collect_bins_with_known_deleted_recursive(&root, &mut result);
         }
         result
     }
@@ -3002,8 +3010,8 @@ impl Tree {
         _db_id: u64,
     ) -> Vec<(i32, Arc<RwLock<TreeNode>>)> {
         let mut result: Vec<(i32, Arc<RwLock<TreeNode>>)> = Vec::new();
-        if let Some(root) = &self.root {
-            Self::collect_dirty_upper_ins_recursive(root, 0, &mut result);
+        if let Some(root) = self.get_root() {
+            Self::collect_dirty_upper_ins_recursive(&root, 0, &mut result);
         }
         result.sort_by_key(|(level, _)| *level);
         result
@@ -3048,14 +3056,14 @@ impl Tree {
     ///
     /// Port of `Tree.isRootResident()` from JE.
     pub fn is_root_resident(&self) -> bool {
-        self.root.is_some()
+        self.root.read().unwrap().is_some()
     }
 
     /// Returns the root node `Arc` if present, or `None`.
     ///
     /// Port of `Tree.getResidentRootIN()` from JE.
     pub fn get_resident_root_in(&self) -> Option<Arc<RwLock<TreeNode>>> {
-        self.root.clone()
+        self.root.read().unwrap().clone()
     }
 
     /// Returns the BIN that should contain a slot for `key` (the "parent" of
@@ -3068,8 +3076,7 @@ impl Tree {
         &self,
         key: &[u8],
     ) -> Option<Arc<RwLock<TreeNode>>> {
-        let root = self.root.as_ref()?;
-        let mut current = root.clone();
+        let mut current = self.get_root()?;
 
         loop {
             // Single-pass latch-coupling: check is_bin AND capture child Arc
@@ -3144,8 +3151,8 @@ impl Tree {
     /// Bottom variants) is included in the result.
     pub fn rebuild_in_list(&self) -> Vec<Arc<RwLock<TreeNode>>> {
         let mut result = Vec::new();
-        if let Some(root) = &self.root {
-            Self::rebuild_in_list_recursive(root, &mut result);
+        if let Some(root) = self.get_root() {
+            Self::rebuild_in_list_recursive(&root, &mut result);
         }
         result
     }
@@ -3188,9 +3195,9 @@ impl Tree {
     ///
     /// Returns `true` if no inconsistencies are detected, `false` otherwise.
     pub fn validate_in_list(&self) -> bool {
-        match &self.root {
+        match self.get_root() {
             None => true, // empty tree is always valid
-            Some(root) => Self::validate_node(root),
+            Some(root) => Self::validate_node(&root),
         }
     }
 
@@ -3238,8 +3245,8 @@ impl Tree {
         &self,
         child_node_id: u64,
     ) -> Option<(Arc<RwLock<TreeNode>>, usize)> {
-        let root = self.root.as_ref()?;
-        Self::find_parent_of_node_id(root, child_node_id)
+        let root = self.get_root()?;
+        Self::find_parent_of_node_id(&root, child_node_id)
     }
 
     /// Recursive DFS helper for `get_parent_in_for_child_in`.
@@ -3351,7 +3358,7 @@ mod tests {
 
     #[test]
     fn test_insert_single() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let key = b"testkey".to_vec();
         let data = b"testdata".to_vec();
         let lsn = Lsn::new(1, 100);
@@ -3371,7 +3378,7 @@ mod tests {
 
     #[test]
     fn test_insert_multiple() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
 
         let keys = vec![
             b"apple".to_vec(),
@@ -3397,7 +3404,7 @@ mod tests {
 
     #[test]
     fn test_insert_duplicate_key() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let key = b"duplicate".to_vec();
         let data1 = b"first".to_vec();
         let data2 = b"second".to_vec();
@@ -3426,7 +3433,7 @@ mod tests {
 
     #[test]
     fn test_first_and_last_node() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
 
         // Empty tree
         assert!(tree.get_first_node().is_none());
@@ -3535,7 +3542,7 @@ mod tests {
     fn test_insert_until_full() {
         // With splits implemented, inserting beyond max_entries_per_node must
         // succeed (the tree splits proactively rather than returning an error).
-        let mut tree = Tree::new(1, 3); // Small max to exercise splits
+        let tree = Tree::new(1, 3); // Small max to exercise splits
 
         // Insert up to max
         for i in 0..3 {
@@ -3562,7 +3569,7 @@ mod tests {
 
     #[test]
     fn test_delete_existing_key() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let key = b"remove_me".to_vec();
         tree.insert(key.clone(), b"val".to_vec(), Lsn::new(1, 10)).unwrap();
         assert!(tree.delete(&key));
@@ -3574,7 +3581,7 @@ mod tests {
 
     #[test]
     fn test_delete_nonexistent_key() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"a".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
 
         assert!(!tree.delete(b"zzz"));
@@ -3582,13 +3589,13 @@ mod tests {
 
     #[test]
     fn test_delete_empty_tree() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         assert!(!tree.delete(b"nothing"));
     }
 
     #[test]
     fn test_delete_all_entries_makes_bin_empty() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"x".to_vec(), b"1".to_vec(), Lsn::new(1, 1)).unwrap();
         tree.insert(b"y".to_vec(), b"2".to_vec(), Lsn::new(1, 2)).unwrap();
 
@@ -3603,7 +3610,7 @@ mod tests {
 
     #[test]
     fn test_set_root_and_get_root() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         assert!(tree.get_root().is_none());
 
         let bin = TreeNode::Bottom(BinStub {
@@ -3638,7 +3645,7 @@ mod tests {
     ///     root IN to split, creating a level-3 root.
     #[test]
     fn test_insert_forces_root_split() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         // 17 inserts with fanout 4 forces the root IN to split.
         for i in 0u32..20 {
@@ -3669,7 +3676,7 @@ mod tests {
     /// Inserting 1000 keys in sorted order and verifying all are searchable.
     #[test]
     fn test_insert_many_keys() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let n = 1000u32;
 
         for i in 0..n {
@@ -3696,7 +3703,7 @@ mod tests {
     /// are searchable.
     #[test]
     fn test_insert_random_keys() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let n = 500u32;
 
         // Insert in reverse order as a simple non-sorted sequence.
@@ -3725,7 +3732,7 @@ mod tests {
     #[test]
     fn test_split_preserves_all_keys() {
         // Tiny fanout to maximise split frequency.
-        let mut tree = Tree::new(1, 3);
+        let tree = Tree::new(1, 3);
         let n = 60u32;
 
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -3753,7 +3760,7 @@ mod tests {
     /// The tree level (depth) must grow as keys are inserted and splits occur.
     #[test]
     fn test_tree_height_grows() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         // With fanout 4, one level-2 root IN can hold 4 children.  After enough
         // inserts the root itself will split and a level-3 node will appear.
@@ -3823,7 +3830,7 @@ mod tests {
     /// Port of JE: Tree.insertLN() calls bin.setDirty(true) after each insert.
     #[test]
     fn test_insert_marks_bin_dirty() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"key1".to_vec(), b"val1".to_vec(), Lsn::new(1, 1))
             .unwrap();
 
@@ -3844,7 +3851,7 @@ mod tests {
     /// Updating an existing key keeps the BIN dirty.
     #[test]
     fn test_update_keeps_bin_dirty() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"k".to_vec(), b"v1".to_vec(), Lsn::new(1, 1)).unwrap();
         // second insert is an update
         tree.insert(b"k".to_vec(), b"v2".to_vec(), Lsn::new(1, 2)).unwrap();
@@ -3864,7 +3871,7 @@ mod tests {
     /// After deleting a key the BIN must be dirty.
     #[test]
     fn test_delete_marks_bin_dirty() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"del".to_vec(), b"val".to_vec(), Lsn::new(1, 1)).unwrap();
 
         // Manually clear dirty flag to verify delete re-sets it.
@@ -3897,7 +3904,7 @@ mod tests {
     /// BIN's parent pointer must point to the root IN.
     #[test]
     fn test_bin_parent_pointer_set_on_initial_insert() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"k".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
 
         let root_arc = tree.get_root().as_ref().unwrap().clone();
@@ -4176,7 +4183,7 @@ mod tests {
     /// collect_stats() on a single-entry tree: 1 IN + 1 BIN, height 2.
     #[test]
     fn test_collect_stats_single_insert() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"k".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
         let stats = tree.collect_stats();
         assert_eq!(stats.n_bins, 1, "must have 1 BIN");
@@ -4188,7 +4195,7 @@ mod tests {
     /// collect_stats() with many inserts: entry count matches insert count.
     #[test]
     fn test_collect_stats_many_inserts() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let n = 50u32;
         for i in 0..n {
             let key = format!("sk{:04}", i).into_bytes();
@@ -4223,7 +4230,7 @@ mod tests {
     /// preemptive splitting strategy determines the exact split points.
     #[test]
     fn test_compress_merges_underfull_bins() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
 
         // Insert 64 sorted keys to build a multi-BIN tree.
         let n = 64u32;
@@ -4278,7 +4285,7 @@ mod tests {
         // will have occurred yet, and the BINs will all be reasonably full.
         // We can't prevent splits entirely (preemptive), but we can verify that
         // compress() never loses entries.
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let n = 32u32;
         for i in 0..n {
             let key = format!("fn{:04}", i).into_bytes();
@@ -4309,14 +4316,14 @@ mod tests {
     /// compress() on an empty tree must not panic.
     #[test]
     fn test_compress_empty_tree() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         tree.compress(); // must not panic
     }
 
     /// After deleting all entries, compress() reduces BINs to 1.
     #[test]
     fn test_compress_removes_empty_bin_from_parent() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         // Insert enough keys to generate multiple BINs.
         let n = 16u32;
         for i in 0..n {
@@ -4479,7 +4486,7 @@ mod tests {
     /// search_with_coupling finds the same key as search().
     #[test]
     fn test_search_with_coupling_finds_existing_key() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         for i in 0u32..20 {
             let key = format!("c{:04}", i).into_bytes();
             tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -4498,7 +4505,7 @@ mod tests {
     /// search_with_coupling returns false for a key not in the tree.
     #[test]
     fn test_search_with_coupling_missing_key() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         tree.insert(b"hello".to_vec(), b"v".to_vec(), Lsn::new(1, 1))
             .unwrap();
 
@@ -4697,7 +4704,7 @@ mod tests {
     /// Port of JE Tree.getNextBin() / getNextIN(forward=true).
     #[test]
     fn test_get_next_bin_basic() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         // Insert 8 sorted keys — creates multiple BINs.
         for i in 0u32..8 {
@@ -4730,7 +4737,7 @@ mod tests {
     /// get_next_bin returns None for a key in the rightmost BIN.
     #[test]
     fn test_get_next_bin_at_rightmost_returns_none() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..8 {
             let key = format!("r{:04}", i).into_bytes();
             tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -4748,7 +4755,7 @@ mod tests {
     /// Port of JE Tree.getPrevBin() / getNextIN(forward=false).
     #[test]
     fn test_get_prev_bin_basic() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..8 {
             let key = format!("p{:04}", i).into_bytes();
             tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -4772,7 +4779,7 @@ mod tests {
     /// get_prev_bin returns None for a key in the leftmost BIN.
     #[test]
     fn test_get_prev_bin_at_leftmost_returns_none() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..8 {
             let key = format!("q{:04}", i).into_bytes();
             tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -4789,7 +4796,7 @@ mod tests {
     /// BIN boundary.
     #[test]
     fn test_next_prev_bin_are_symmetric() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..8 {
             let key = format!("s{:04}", i).into_bytes();
             tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -4924,7 +4931,7 @@ mod tests {
     /// Tree insert/search works correctly when BINs accumulate a key prefix.
     #[test]
     fn test_tree_insert_search_with_prefix_compression() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let n = 200u32;
 
         // All keys share a long common prefix — good for prefix compression.
@@ -4949,7 +4956,7 @@ mod tests {
     #[test]
     fn test_prefix_preserved_across_bin_split() {
         // Small fanout to force splits quickly.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         for i in 0u32..20 {
             let key = format!("pfx:key:{:04}", i).into_bytes();
@@ -5003,7 +5010,7 @@ mod tests {
     #[test]
     fn test_get_next_bin_three_level_tree() {
         // With fanout 4, inserting 20 keys forces a root split → 3 levels.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..20 {
             let key = format!("t{:04}", i).into_bytes();
             tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -5036,7 +5043,7 @@ mod tests {
     /// with varying lengths and verify each is findable immediately after insert.
     #[test]
     fn test_je_simple_tree_creation() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
 
         let keys: &[&[u8]] = &[b"aaaaa", b"aaaab", b"aaaa", b"aaa"];
         for (i, &k) in keys.iter().enumerate() {
@@ -5060,7 +5067,7 @@ mod tests {
     /// odd remain.
     #[test]
     fn test_je_insert_then_delete_then_search() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let n = 20usize;
 
         let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("key{:04}", i).into_bytes()).collect();
@@ -5103,7 +5110,7 @@ mod tests {
     #[test]
     fn test_je_range_scan_sorted_ascending() {
         let n = 40usize;
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         // Insert in reverse order to stress the B-tree.
         for i in (0..n).rev() {
@@ -5156,7 +5163,7 @@ mod tests {
     #[test]
     fn test_je_ascending_insert_balance() {
         let n = 128usize;
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
 
         for i in 0..n {
             let key = format!("asc{:06}", i).into_bytes();
@@ -5186,7 +5193,7 @@ mod tests {
     #[test]
     fn test_je_descending_insert_balance() {
         let n = 128usize;
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
 
         for i in (0..n).rev() {
             let key = format!("dsc{:06}", i).into_bytes();
@@ -5214,7 +5221,7 @@ mod tests {
     /// fanout no key is lost.
     #[test]
     fn test_je_split_no_key_lost() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         let n = 20usize;
 
         for i in 0..n {
@@ -5237,7 +5244,7 @@ mod tests {
     #[test]
     fn test_je_split_produces_two_halves() {
         // fanout=4: fill one BIN then overflow it to force a split.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         let n = 5usize; // one more than fanout → forces at least one split
 
         for i in 0..n {
@@ -5267,7 +5274,7 @@ mod tests {
     #[test]
     fn test_je_root_split_creates_new_root() {
         // fanout=4, 20 keys: forces multiple root splits.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         for i in 0u32..20 {
             let key = format!("rs{:04}", i).into_bytes();
@@ -5346,8 +5353,8 @@ mod tests {
             g.set_parent(Some(Arc::downgrade(&root_arc)));
         }
 
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc);
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when slots were removed");
@@ -5387,7 +5394,7 @@ mod tests {
                 cursor_count: 0,
         })));
 
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let result = tree.compress_bin(&bin_arc);
         assert!(!result, "compress_bin must return false when no slots were removed");
     }
@@ -5415,7 +5422,7 @@ mod tests {
                 cursor_count: 0,
         })));
 
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let result = tree.compress_bin(&bin_arc);
         assert!(!result, "compress_bin must not compress a BIN-delta");
 
@@ -5468,8 +5475,8 @@ mod tests {
             g.set_parent(Some(Arc::downgrade(&root_arc)));
         }
 
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc);
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when pruning");
@@ -5505,7 +5512,7 @@ mod tests {
                 cursor_count: 0,
         })));
 
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let result = tree.maybe_compress_bin_and_parent(&bin_arc);
         assert!(!result, "maybe_compress must return false when no deleted slots exist");
     }
@@ -5535,7 +5542,7 @@ mod tests {
                 cursor_count: 0,
         })));
 
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         let result = tree.maybe_compress_bin_and_parent(&bin_arc);
         assert!(result, "maybe_compress must return true when deleted slots were removed");
 
@@ -5617,8 +5624,8 @@ mod tests {
         bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
         sibling_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
 
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc.clone());
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc.clone());
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when a deleted slot was removed");
@@ -5656,7 +5663,7 @@ mod tests {
     fn test_incompressor_empty_bin_pruned_from_parent() {
         // Use a small node size so that a modest number of inserts produces
         // multiple BINs that can be pruned after all-delete.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         // Insert enough keys to create at least 2 BINs.
         for i in 0u32..12 {
@@ -5719,7 +5726,7 @@ mod tests {
                 cursor_count: 0,
         })));
 
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         // maybe_compress must return false without touching the BIN.
         assert!(!tree.maybe_compress_bin_and_parent(&bin_arc),
             "maybe_compress must return false for BIN-deltas");
@@ -5759,7 +5766,7 @@ mod tests {
                 cursor_count: 0,
         })));
 
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         assert!(!tree.maybe_compress_bin_and_parent(&bin_arc),
             "maybe_compress must return false when no deleted slots exist");
 
@@ -5815,8 +5822,8 @@ mod tests {
             parent: None,
         })));
         bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc);
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when one slot was removed");
@@ -5853,7 +5860,7 @@ mod tests {
 
         // Build a two-BIN tree with a small max_entries so inserts split.
         // We use max_entries=4 to match JE's NODE_MAX=4 from EmptyBINTest.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
 
         // Insert keys 0..7 (byte values).
         for i in 0u8..8 {
@@ -5897,7 +5904,7 @@ mod tests {
 
         // Build a tree with enough keys to guarantee at least 3 BINs.
         // We use a very small max_entries (4) to force splits quickly.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u8..12 {
             tree.insert(vec![i], vec![i + 10], lsn).expect("insert must succeed");
         }
@@ -5980,8 +5987,8 @@ mod tests {
         bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
         sibling_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
 
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc.clone());
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc.clone());
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when one slot was removed");
@@ -6051,8 +6058,8 @@ mod tests {
         })));
         bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
 
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc);
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true");
@@ -6313,7 +6320,7 @@ mod tests {
 
     #[test]
     fn test_collect_dirty_bins_returns_dirty_bins_only() {
-        let mut tree = Tree::new(1, 256);
+        let tree = Tree::new(1, 256);
         tree.insert(b"k1".to_vec(), b"v1".to_vec(), Lsn::new(1, 1)).unwrap();
         tree.insert(b"k2".to_vec(), b"v2".to_vec(), Lsn::new(1, 2)).unwrap();
         let dirty = tree.collect_dirty_bins(1);
@@ -6367,7 +6374,7 @@ mod tests {
 
     #[test]
     fn test_is_root_resident_after_insert() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"k".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
         assert!(tree.is_root_resident(), "root must be resident after insert");
     }
@@ -6382,21 +6389,21 @@ mod tests {
 
     #[test]
     fn test_get_resident_root_in_single_entry() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"hello".to_vec(), b"world".to_vec(), Lsn::new(1, 1))
             .unwrap();
         let root = tree.get_resident_root_in();
         assert!(root.is_some(), "root must be Some after insert");
-        let root_arc = tree.get_root().as_ref().unwrap();
+        let root_arc = tree.get_root().unwrap();
         assert!(
-            Arc::ptr_eq(root_arc, &root.unwrap()),
+            Arc::ptr_eq(&root_arc, &root.unwrap()),
             "get_resident_root_in must return the same Arc as get_root"
         );
     }
 
     #[test]
     fn test_get_resident_root_in_multi_entry() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..20 {
             let k = format!("rr{:04}", i).into_bytes();
             tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -6414,7 +6421,7 @@ mod tests {
 
     #[test]
     fn test_get_parent_bin_for_child_ln_single_entry() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"alpha".to_vec(), b"val".to_vec(), Lsn::new(1, 1))
             .unwrap();
         let bin = tree.get_parent_bin_for_child_ln(b"alpha");
@@ -6427,7 +6434,7 @@ mod tests {
 
     #[test]
     fn test_get_parent_bin_for_child_ln_multi_key() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         let keys: &[&[u8]] = &[b"aa", b"bb", b"cc", b"dd", b"ee"];
         for &k in keys {
             tree.insert(k.to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
@@ -6449,7 +6456,7 @@ mod tests {
 
     #[test]
     fn test_find_bin_for_insert_returns_bin() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"existing".to_vec(), b"data".to_vec(), Lsn::new(1, 1))
             .unwrap();
         let bin = tree.find_bin_for_insert(b"newkey");
@@ -6459,7 +6466,7 @@ mod tests {
 
     #[test]
     fn test_find_bin_for_insert_same_as_parent_bin() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"foo".to_vec(), b"bar".to_vec(), Lsn::new(1, 1))
             .unwrap();
         let a = tree.get_parent_bin_for_child_ln(b"foo").unwrap();
@@ -6480,7 +6487,7 @@ mod tests {
 
     #[test]
     fn test_search_splits_allowed_finds_existing_key() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         for i in 0u32..10 {
             let k = format!("sa{:04}", i).into_bytes();
             tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -6497,7 +6504,7 @@ mod tests {
 
     #[test]
     fn test_search_splits_allowed_missing_key() {
-        let mut tree = Tree::new(1, 8);
+        let tree = Tree::new(1, 8);
         tree.insert(b"present".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
         let sr = tree.search_splits_allowed(b"absent");
         assert!(
@@ -6516,7 +6523,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_in_list_single_entry() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"one".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
         let list = tree.rebuild_in_list();
         // Expect root IN + BIN = 2 nodes.
@@ -6529,7 +6536,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_in_list_multi_entry() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..20 {
             let k = format!("ri{:04}", i).into_bytes();
             tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -6553,14 +6560,14 @@ mod tests {
 
     #[test]
     fn test_validate_in_list_single_entry() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"v".to_vec(), b"data".to_vec(), Lsn::new(1, 1)).unwrap();
         assert!(tree.validate_in_list(), "single-entry tree must be valid");
     }
 
     #[test]
     fn test_validate_in_list_multi_entry() {
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..20 {
             let k = format!("vl{:04}", i).into_bytes();
             tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();
@@ -6579,8 +6586,8 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        let mut tree = Tree::new(1, 128);
-        tree.root = Some(root_arc);
+        let tree = Tree::new(1, 128);
+        *tree.root.write().unwrap() = Some(root_arc);
         assert!(
             !tree.validate_in_list(),
             "a tree with an empty Internal node must fail validation"
@@ -6599,7 +6606,7 @@ mod tests {
     fn test_get_parent_in_for_child_in_single_entry() {
         // A single-insert tree has: root IN → BIN.
         // The root IN is the parent of the BIN.
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"p".to_vec(), b"v".to_vec(), Lsn::new(1, 1)).unwrap();
 
         let root_arc = tree.get_root().as_ref().unwrap().clone();
@@ -6627,7 +6634,7 @@ mod tests {
 
     #[test]
     fn test_get_parent_in_for_child_in_not_found() {
-        let mut tree = Tree::new(1, 128);
+        let tree = Tree::new(1, 128);
         tree.insert(b"x".to_vec(), b"y".to_vec(), Lsn::new(1, 1)).unwrap();
         assert!(tree.get_parent_in_for_child_in(u64::MAX).is_none());
     }
@@ -6635,7 +6642,7 @@ mod tests {
     #[test]
     fn test_get_parent_in_for_child_in_multi_level() {
         // Build a tree with at least 3 levels so we test the recursive descent.
-        let mut tree = Tree::new(1, 4);
+        let tree = Tree::new(1, 4);
         for i in 0u32..20 {
             let k = format!("ml{:04}", i).into_bytes();
             tree.insert(k, vec![i as u8], Lsn::new(1, i)).unwrap();

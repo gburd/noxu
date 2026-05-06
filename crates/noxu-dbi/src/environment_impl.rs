@@ -439,8 +439,8 @@ impl EnvironmentImpl {
                     let db_list: Vec<Arc<RwLock<DatabaseImpl>>> =
                         db_map_for_compressor.read().values().cloned().collect();
                     for db_arc in db_list {
-                        let mut db = db_arc.write();
-                        if let Some(tree) = db.get_real_tree_mut() {
+                        let db = db_arc.read();
+                        if let Some(tree) = db.get_real_tree() {
                             let bins = tree.collect_bins_with_known_deleted();
                             for bin_arc in bins {
                                 tree.compress_bin(&bin_arc);

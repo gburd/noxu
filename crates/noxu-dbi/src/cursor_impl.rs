@@ -459,10 +459,9 @@ impl CursorImpl {
     /// Port of the data-read path in `CursorImpl.lockAndGetCurrent()`.
     fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<Vec<u8>> {
         use noxu_tree::tree::TreeNode;
-        let root = tree.get_root();
-        let root = root.as_ref()?;
+        let root = tree.get_root()?;
         // Descend to the BIN that should contain `key` (not always the leftmost).
-        let bin_arc = Self::find_bin_for_key(root.clone(), key)?;
+        let bin_arc = Self::find_bin_for_key(root, key)?;
         let guard = bin_arc.read().ok()?;
         match &*guard {
             TreeNode::Bottom(bin) => {
@@ -484,10 +483,9 @@ impl CursorImpl {
     /// compares >= the given search key.
     fn find_range_entry(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         use noxu_tree::tree::TreeNode;
-        let root = tree.get_root();
-        let root = root.as_ref()?;
+        let root = tree.get_root()?;
         // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-        let bin_arc = Self::find_bin_for_key(root.clone(), key)?;
+        let bin_arc = Self::find_bin_for_key(root, key)?;
         let guard = bin_arc.read().ok()?;
         match &*guard {
             TreeNode::Bottom(bin) => {
@@ -588,9 +586,8 @@ impl CursorImpl {
                     None
                 } else {
                     use noxu_tree::tree::TreeNode;
-                    let root = tree.get_root();
-                    root.as_ref().and_then(|r| {
-                        let bin_arc = Self::descend_to_bin(r.clone())?;
+                    tree.get_root().and_then(|r| {
+                        let bin_arc = Self::descend_to_bin(r)?;
                         let g = bin_arc.read().ok()?;
                         match &*g {
                             TreeNode::Bottom(bin) => {
@@ -650,9 +647,8 @@ impl CursorImpl {
                     None
                 } else {
                     use noxu_tree::tree::TreeNode;
-                    let root = tree.get_root();
-                    root.as_ref().and_then(|r| {
-                        let bin_arc = Self::descend_to_last_bin(r.clone())?;
+                    tree.get_root().and_then(|r| {
+                        let bin_arc = Self::descend_to_last_bin(r)?;
                         let g = bin_arc.read().ok()?;
                         match &*g {
                             TreeNode::Bottom(bin) => {
@@ -775,11 +771,11 @@ impl CursorImpl {
                     None
                 } else {
                     use noxu_tree::tree::TreeNode;
-                    let root = tree.get_root();
-                    root.as_ref().and_then(|r| {
-                        let current_key_slice = self.current_key.as_deref()?;
+                    let current_key_slice_opt = self.current_key.as_deref().map(|s| s.to_vec());
+                    tree.get_root().and_then(|r| {
+                        let current_key_slice = current_key_slice_opt.as_deref()?;
                         let bin_arc =
-                            Self::find_bin_for_key(r.clone(), current_key_slice)?;
+                            Self::find_bin_for_key(r, current_key_slice)?;
                         let g = bin_arc.read().ok()?;
                         match &*g {
                             TreeNode::Bottom(bin) => {
@@ -931,11 +927,10 @@ impl CursorImpl {
                                 None
                             } else {
                                 use noxu_tree::tree::TreeNode;
-                                let root = tree.get_root();
-                                root.as_ref().and_then(|r| {
+                                tree.get_root().and_then(|r| {
                                     // Use the current raw_key to find the BIN.
                                     let bin_arc =
-                                        Self::find_bin_for_key(r.clone(), &raw_key)?;
+                                        Self::find_bin_for_key(r, &raw_key)?;
                                     let g = bin_arc.read().ok()?;
                                     match &*g {
                                         TreeNode::Bottom(bin) => {
@@ -1117,8 +1112,8 @@ impl CursorImpl {
                     .ok_or(DbiError::CursorNotInitialized)?;
                 let new_lsn =
                     self.log_ln_write(&current_key, Some(data), self.locker_id)?;
-                let mut db = self.db_impl.write();
-                if let Some(tree) = db.get_real_tree_mut() {
+                let db = self.db_impl.read();
+                if let Some(tree) = db.get_real_tree() {
                     let _ = tree.insert(current_key, data.to_vec(), new_lsn);
                 }
                 self.current_data = Some(data.to_vec());
@@ -1141,8 +1136,8 @@ impl CursorImpl {
                 }
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
                     }
                 }
@@ -1172,8 +1167,8 @@ impl CursorImpl {
                 }
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
                     }
                 }
@@ -1187,8 +1182,8 @@ impl CursorImpl {
             PutMode::Overwrite => {
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
                     }
                 }
@@ -1236,8 +1231,8 @@ impl CursorImpl {
                 let new_lsn =
                     self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         let _ = tree.insert(two_part_key.clone(), vec![], new_lsn);
                     }
                 }
@@ -1260,8 +1255,8 @@ impl CursorImpl {
                 // Delete the old two-part key.
                 self.log_ln_write(&old_key, None, self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         tree.delete(&old_key);
                     }
                 }
@@ -1269,8 +1264,8 @@ impl CursorImpl {
                 let new_lsn =
                     self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         let _ = tree.insert(two_part_key.clone(), vec![], new_lsn);
                     }
                 }
@@ -1284,8 +1279,8 @@ impl CursorImpl {
                 let new_lsn =
                     self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
                 {
-                    let mut db = self.db_impl.write();
-                    if let Some(tree) = db.get_real_tree_mut() {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
                         let _ = tree.insert(two_part_key.clone(), vec![], new_lsn);
                     }
                 }
@@ -1378,8 +1373,8 @@ impl CursorImpl {
         // In both cases current_key is the correct tree-delete key.
         if let Some(tree_key) = self.current_key.clone() {
             self.log_ln_write(&tree_key, None, self.locker_id)?;
-            let mut db = self.db_impl.write();
-            if let Some(tree) = db.get_real_tree_mut() {
+            let db = self.db_impl.read();
+            if let Some(tree) = db.get_real_tree() {
                 tree.delete(&tree_key);
             }
         }
