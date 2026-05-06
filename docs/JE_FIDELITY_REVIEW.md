@@ -1,6 +1,6 @@
 # Noxu DB — JE Fidelity Review
 
-**Last Updated**: 2026-05-06 (Session 24 — BIN-delta chaining, Sequence txn, upper-IN cleaner, comment audit)
+**Last Updated**: 2026-05-06 (Session 25 — NoSQL fork public interfaces and background daemons)
 **Reference**: Berkeley DB Java Edition 7.5.11 + NoSQL JE Fork
 **JE Source**: `_/je/src/com/sleepycat/je/` (754 production classes)
 **NoSQL Fork**: `_/nosql/kvmain/src/main/java/com/sleepycat/`
@@ -420,6 +420,20 @@ The replication crate provides a production-quality structural framework: `Repli
 - **Upper-IN cleaner LSN currency check** (`crates/noxu-cleaner/src/file_processor.rs`): `lookup_in()` now uses the parent slot's `InEntry.lsn` (instead of `NULL_LSN`) as the node's last-logged position for upper INs. This correctly mirrors JE `FileProcessor.processIN()` which reads `INEntryInfo.prevFullLsn` from the log entry header. Previously, all upper INs were conservatively returned as `Obsolete`, suppressing legitimate migration.
 - **Stale comment cleanup** (4 files): `cursor_impl.rs` count() doc removed "always returns 1" stale text; `service_dispatcher.rs` "networking integration phase" comments replaced with accurate split-responsibility description; `file_processor.rs` and `file_selector.rs` comments updated to reflect actual state.
 
+### Session 25 (this session)
+- **ByteComparator** (`crates/noxu-db/src/byte_comparator.rs`): Added `ByteComparator` trait with offset+length signature matching JE exactly, plus `DefaultByteComparator` and `compare_unsigned()`. Port of `com.sleepycat.je.ByteComparator` (NoSQL fork GC optimization — avoids per-comparison byte array allocation). Re-exported from `noxu-db` crate root.
+- **ScanFilter + ScanResult** (`crates/noxu-db/src/scan_filter.rs`): Added `ScanResult` enum (Include/Exclude/IncludeStop/ExcludeStop) with `get_include()`/`get_stop()` methods, and `ScanFilter` trait. Port of `com.sleepycat.je.ScanFilter` (NoSQL fork sequential scan filter/early-stop public API).
+- **ExtinctionFilter + ExtinctionStatus** (`crates/noxu-db/src/extinction_filter.rs`): Added `ExtinctionStatus` enum (Extinct/NotExtinct/MaybeExtinct) and `ExtinctionFilter` trait. Port of `com.sleepycat.je.ExtinctionFilter` (NoSQL fork Record Extinction public interface).
+- **GroupCommit trait + Master/Replica** (`crates/noxu-txn/src/group_commit.rs`): Added `GroupCommit` trait (`is_enabled()`, `buffer_commit()`, `shutdown()`), `GroupCommitMaster` (time+size threshold above FSyncManager, constants `DEFAULT_MAX_GROUP_COMMIT=20`, `DEFAULT_GROUP_COMMIT_INTERVAL_MS=20`), and `GroupCommitReplica`. Full algorithm documented in comments for future wiring to `LogManager::flush_sync()`. Port of `com.sleepycat.je.txn.GroupCommit*` (NoSQL fork replication fsync batching).
+- **TxnManager group_commit field** (`crates/noxu-txn/src/txn_manager.rs`): Added `group_commit: RwLock<Option<Arc<dyn GroupCommit>>>` with `get_group_commit()`, `setup_group_commit_master()`, `setup_group_commit_replica()`, `clear_group_commit()`. Port of `TxnManager.groupCommit: AtomicReference<GroupCommit>` enabling master/replica role transitions at runtime.
+- **Per-slot BIN modification/creation times** (`crates/noxu-tree/src/bin.rs`): Added `modification_times: Vec<u64>` and `creation_times: Vec<u64>` fields to `Bin`, grow-on-demand via `set_modification_time(idx, ms)` / `set_creation_time(idx, ms)`. Both arrays cleared on `mutate_to_bin_delta()` and entry-removed on `delete_entry()`. Port of `BIN.modificationTimes` / `BIN.creationTimes` `INLongRep` arrays (NoSQL fork per-slot timestamp tracking for TTL analytics).
+- **VerifyCheckpointInterval background thread** (`crates/noxu-recovery/src/recovery_manager.rs`): `recover_all()` now spawns `"noxu-verify-checkpoint-interval"` thread before `run_analysis()`, verifying log file checksums in the range `[first_active_lsn.file_number()..checkpoint_end_lsn.file_number())`. Thread is joined before the redo phase begins. Port of `RecoveryManager.VerifyCheckpointInterval` inner class (NoSQL fork concurrent log verification).
+- **DataEraser daemon** (`crates/noxu-cleaner/src/data_eraser.rs`): Added `DataEraser` background daemon accepting `EraseRequest {file_number, file_offset, byte_count}` via a queue; worker thread (`"noxu-data-eraser"`) physically overwrites obsolete data with zeros via `pwrite64`. Lifecycle: `start()`, `enqueue_erase()`, `shutdown()`; `pending_count()` and `is_active()` observability. Port of `com.sleepycat.je.cleaner.DataEraser` (NoSQL fork Data Erasure feature, original: 3,530-line Java class).
+- **ExtinctionScanner daemon** (`crates/noxu-cleaner/src/extinction_scanner.rs`): Added `ExtinctionScanner` background daemon accepting `ExtinctionTask {db_name, start_key, end_key, dups}` via a queue; worker thread (`"noxu-extinction-scanner"`) walks B-tree asynchronously removing extinct records. Tracks `n_lns_extinct: AtomicU64`. Port of `com.sleepycat.je.cleaner.ExtinctionScanner` (NoSQL fork Record Extinction, original: 2,283-line Java class).
+- **BackupManager daemon** (`crates/noxu-dbi/src/backup_manager.rs`): Added `BackupManager` background daemon copying closed `.ndb` log files to `BackupDestination` path; tracks `n_files_copied` and `last_backup_ms`. Lifecycle: `start(destination)`, `shutdown()`. Port of `com.sleepycat.je.dbi.BackupManager` (NoSQL fork Auto-Backup feature, original: 2,503-line Java class).
+- **EnvironmentImpl daemon wiring** (`crates/noxu-dbi/src/environment_impl.rs`): Added `data_eraser`, `extinction_scanner`, `backup_manager` fields (all `Mutex<T>`), initialized in constructor, shut down in `close()` and `Drop`. Added public methods: `discard_extinct_records(db_name, start_key, end_key)`, `enqueue_erase(EraseRequest)`, `is_record_extinction_active()`, `n_lns_extinct()`. Port of `EnvironmentImpl` NoSQL daemon lifecycle management.
+
+
 ---
 
 ## Performance Analysis: Noxu vs JE Write Gap
@@ -482,4 +496,4 @@ The replication crate provides a production-quality structural framework: `Repli
 
 **Review basis**: Direct source inspection of all Noxu crate files and JE 7.5.11 source.
 **Confidence**: High — every gap has a verified file:line reference.
-**Updated**: 2026-05-06 (Session 24 — BIN-delta chaining, Sequence txn wiring, upper-IN cleaner LSN check, comment audit)
+**Updated**: 2026-05-06 (Session 25 — NoSQL fork ByteComparator, ScanFilter, ExtinctionFilter, GroupCommit, per-slot BIN times, VerifyCheckpointInterval, DataEraser, ExtinctionScanner, BackupManager)
