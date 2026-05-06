@@ -425,25 +425,16 @@ impl<K: PrimaryKey> Iterator for KeyIterator<'_, K> {
 
         match self.cursor.get(&mut key_entry, &mut data_entry, get_type, None) {
             Ok(OperationStatus::Success) => {
-                // The cursor returns key data; for noxu-db's HashMap-based cursor,
-                // the key is not written back to key_entry. We need to extract the
-                // key from data_entry in a different way. However, in this
-                // implementation, the cursor doesn't expose the current key bytes
-                // through key_entry. We work around this by deserializing from
-                // the data entry, which contains the full entity including the key.
-                //
-                // For the key iterator to work properly, we'd need cursor support
-                // for returning the key. For now, we extract from data_entry
-                // indirectly  -  but since we can't deserialize without a serializer,
-                // we rely on the cursor's internal key tracking.
-                //
-                // Workaround: The noxu-db cursor doesn't write back the key to
-                // key_entry, so we cannot extract the key from it. This is a
-                // limitation of the current noxu-db cursor implementation.
-                // For now, we return NotFound to indicate iteration is done.
-                // A full implementation would require cursor key output support.
-                self.done = true;
-                None
+                // The cursor writes the current key into key_entry (Cursor::get()
+                // calls key.set_data(&k) on success — port of JE Cursor.get()
+                // which sets key_entry as an output parameter for all positioning ops).
+                match key_entry.get_data() {
+                    Some(key_bytes) => Some(K::from_bytes(key_bytes)),
+                    None => {
+                        self.done = true;
+                        None
+                    }
+                }
             }
             Ok(_) => {
                 self.done = true;
@@ -880,10 +871,15 @@ mod tests {
             index.put(&ser, &test_user(i)).unwrap();
         }
 
+        // Drain all three keys.
         let mut iter = index.keys().unwrap();
-        // Drain whatever comes out.
-        let _ = iter.next();
-        // After done is set, all subsequent calls hit the early return.
+        let k1 = iter.next();
+        let k2 = iter.next();
+        let k3 = iter.next();
+        assert!(k1.is_some(), "expected first key");
+        assert!(k2.is_some(), "expected second key");
+        assert!(k3.is_some(), "expected third key");
+        // After exhausting the iterator, done=true so subsequent calls return None.
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
     }

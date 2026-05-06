@@ -28,9 +28,8 @@ use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
 
 /// The internal representation of an environment.
 ///
-/// Owns all subsystems: log, tree, txn, lock, evictor, cleaner, etc.
-/// This is a simplified initial implementation that wires together
-/// the key components built in phases 0-3.
+/// Owns all subsystems: log manager, B-tree, transaction manager,
+/// lock manager, evictor, cleaner, checkpointer, and INCompressor daemon.
 ///
 /// Port of `com.sleepycat.je.dbi.EnvironmentImpl`.
 pub struct EnvironmentImpl {
@@ -233,16 +232,12 @@ impl EnvironmentImpl {
             // that `open_database()` can transplant it into the new
             // `DatabaseImpl` instead of starting from an empty tree.
             //
-            // Multi-database recovery: the `redo_ln` in RecoveryManager
-            // already gates each LN replay on `tree.get_database_id() ==
-            // rec.db_id`, so only LNs for db_id=1 flow into `recovery_tree`.
-            // Future work: maintain a HashMap<u64, Tree> inside recovery and
-            // return the full map so all databases are reconstructed.
-            //
-            // Port of: RecoveryManager.recover() called from
-            //          EnvironmentImpl constructor in JE, followed by
-            //          RecoveryManager.recoverDatabases() which hands the
-            //          recovered DbTree to each DatabaseImpl.
+            // Multi-database recovery: recover_all() builds a HashMap<db_id, Tree>
+            // and routes each LN/BIN entry to the correct database's tree.
+            // Port of JE's RecoveryManager.recoverInternal() which populates
+            // DbTree.dbIdToDb (a Map<DatabaseId, DatabaseImpl>) during the analysis
+            // phase, then RecoveryManager.recoverDatabases() hands the recovered
+            // DbTree to each DatabaseImpl.
             let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
             let mut rmgr = RecoveryManager::new();
             // Multi-DB recovery: discover every db_id in the log and build

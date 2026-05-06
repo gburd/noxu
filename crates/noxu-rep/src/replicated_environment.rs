@@ -471,9 +471,10 @@ impl ReplicatedEnvironment {
             ));
         }
 
-        // Register the VLSN in the index (with placeholder positions for now).
-        // In a full implementation, the entry would be written to the local
-        // log and the actual file position would be used.
+        // Register the VLSN in the index.
+        // Log position is 0/0 here because the replication feeder path
+        // (G19 — deferred) is not yet wired to the live log; the VLSN
+        // index still tracks membership for election/ack purposes.
         self.vlsn_index.register(vlsn, 0, 0);
 
         log::trace!(

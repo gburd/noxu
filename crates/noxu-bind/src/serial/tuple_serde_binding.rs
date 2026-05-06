@@ -138,7 +138,7 @@ where
 /// This avoids requiring closure-based extraction by working directly with
 /// tuples.
 ///
-/// Port of `com.sleepycat.bind.serial.TupleSerialBinding` (simplified form).
+/// Port of `com.sleepycat.bind.serial.TupleSerialBinding`.
 pub struct TupleSerdeKeyDataBinding<K, V> {
     _phantom: PhantomData<(K, V)>,
 }
