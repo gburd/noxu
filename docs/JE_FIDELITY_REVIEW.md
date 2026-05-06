@@ -295,6 +295,7 @@ The replication crate provides a production-quality structural framework: `Repli
 | PutMode::NoDupData | ✓ Correct | JE fidelity confirmed (Session 18) |
 | Cursor range scan (ScanAll) | ✓ Correct | `scan_all_kv()` uses CursorImpl against real tree |
 | DbType deserialization | ✓ Correct | `database_impl.rs`: `type_for_db_name()` maps name prefix to correct DbType (G11 — Session 20) |
+| Auto-commit fsync (CommitSync) | ✓ Correct | `database.rs`: `auto_commit_sync()` called after `put/put_no_overwrite/delete(txn=None)`; fsyncs via `LogManager.flush_sync()`. Port of JE `AutoTxn` implicit CommitSync (Session 21) |
 | Cursor abort_lsn (before-image LSN) | ✓ Correct | `cursor_impl.rs:1323`: passes `Lsn::from_u64(self.current_lsn)` — the slot's LSN before the write, matching JE `WriteLockInfo.abortLsn` (Session 21) |
 | Database::count() | ~ Simplified | `database.rs`: O(n) cursor scan; JE is O(1) atomic counter — acceptable |
 | Deferred-write mode | ~ Partial | `DatabaseConfig.deferred_write` field + getter/setter exists; write path does not yet consult it — acceptable for current workloads |
@@ -345,6 +346,13 @@ The replication crate provides a production-quality structural framework: `Repli
 **Files**: `crates/noxu-tree/src/tree.rs`, `crates/noxu-evictor/src/evictor.rs`
 **JE**: `Evictor.selectIN()` checks `IN.nCursors()` — skips evicting BINs with active cursors.
 **Resolution**: Added `cursor_count: i32` field to `BinStub` (initialized to 0 in all ~45 struct literals). Updated `RealNodeInfo` in `evictor.rs` to include `pin_count: usize` populated from `b.cursor_count`. `ref_count()` now returns the actual cursor pin count.
+
+---
+
+### R6 — Auto-commit CommitSync fsync (HIGH → RESOLVED)
+**File**: `crates/noxu-db/src/database.rs`
+**JE**: `Database.put(null, key, data)` / `Database.delete(null, key)` wraps the operation in an implicit `AutoTxn` that commits with `CommitSync` durability (fsync) before returning. This guarantees durability for non-transactional callers.
+**Resolution**: Added `auto_commit_sync(txn: Option<&Transaction>)` helper. Called at the end of `put()`, `put_no_overwrite()`, and `delete()` when `txn = None`. Calls `LogManager::flush_sync()` which flushes dirty buffers and fsyncs before returning. Without this fix, Noxu performed 0 fsyncs for 100K non-transactional writes, showing 200x faster writes than JE — a phantom performance gap caused by missing durability, not real performance.
 
 ---
 

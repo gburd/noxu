@@ -82,6 +82,24 @@ impl Database {
         }
     }
 
+    /// Auto-commit flush: when `txn` is `None` (auto-commit mode), flush and
+    /// fsync the log before returning to the caller.
+    ///
+    /// Port of JE `Database.put/delete` auto-commit path: a non-transactional
+    /// mutation is wrapped in an implicit `AutoTxn` that commits with
+    /// `CommitSync` durability (fsync) before the method returns, giving the
+    /// same durability guarantee as an explicit committed transaction.
+    fn auto_commit_sync(&self, txn: Option<&Transaction>) -> Result<()> {
+        if txn.is_some() {
+            return Ok(()); // explicit txn handles its own commit/fsync
+        }
+        if let Some(lm) = self.env_impl.lock().get_log_manager() {
+            lm.flush_sync()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Creates a new database handle.
     ///
     /// Internal constructor called by Environment.
@@ -161,7 +179,7 @@ impl Database {
     /// Returns an error if the database is closed or read-only
     pub fn put(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         key: &DatabaseEntry,
         data: &DatabaseEntry,
     ) -> Result<OperationStatus> {
@@ -175,6 +193,9 @@ impl Database {
         cursor
             .put(key_bytes, data_bytes, PutMode::Overwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+
+        // Auto-commit: fsync before returning (port of JE AutoTxn CommitSync).
+        self.auto_commit_sync(txn)?;
 
         Ok(OperationStatus::Success)
     }
@@ -195,7 +216,7 @@ impl Database {
     /// Returns an error if the database is closed or read-only
     pub fn put_no_overwrite(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         key: &DatabaseEntry,
         data: &DatabaseEntry,
     ) -> Result<OperationStatus> {
@@ -206,13 +227,16 @@ impl Database {
         let data_bytes = data.get_data().unwrap_or(&[]);
 
         let mut cursor = self.make_cursor();
-        match cursor
+        let status = match cursor
             .put(key_bytes, data_bytes, PutMode::NoOverwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
-            noxu_dbi::OperationStatus::KeyExist => Ok(OperationStatus::KeyExists),
-            _ => Ok(OperationStatus::Success),
-        }
+            noxu_dbi::OperationStatus::KeyExist => OperationStatus::KeyExists,
+            _ => OperationStatus::Success,
+        };
+        // Auto-commit: fsync before returning (port of JE AutoTxn CommitSync).
+        self.auto_commit_sync(txn)?;
+        Ok(status)
     }
 
     /// Deletes a record by key.
@@ -230,7 +254,7 @@ impl Database {
     /// Returns an error if the database is closed or read-only
     pub fn delete(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         key: &DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
@@ -243,7 +267,7 @@ impl Database {
 
         let mut cursor = self.make_cursor();
         // First search to position the cursor
-        match cursor
+        let status = match cursor
             .search(key_bytes, None, SearchMode::Set)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
@@ -251,10 +275,13 @@ impl Database {
                 cursor
                     .delete()
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-                Ok(OperationStatus::Success)
+                OperationStatus::Success
             }
-            _ => Ok(OperationStatus::NotFound),
-        }
+            _ => OperationStatus::NotFound,
+        };
+        // Auto-commit: fsync before returning (port of JE AutoTxn CommitSync).
+        self.auto_commit_sync(txn)?;
+        Ok(status)
     }
 
     /// Opens a cursor for iterating over database records.
