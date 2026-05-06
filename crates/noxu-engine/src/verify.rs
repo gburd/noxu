@@ -288,7 +288,7 @@ pub fn verify_tree(
     };
 
     let mut records: u64 = 0;
-    verify_node(root, None, db_name, config, &mut result, &mut records);
+    verify_node(&root, None, db_name, config, &mut result, &mut records);
     result.records_verified = records;
     result.databases_verified = 1;
     result

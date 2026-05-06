@@ -222,7 +222,7 @@ impl TreeLookup for RealTreeLookup {
         };
 
         let outcome = {
-            let mut tree = match self.tree.write() {
+            let tree = match self.tree.read() {
                 Ok(g) => g,
                 Err(_) => {
                     let _ = self.lock_manager.release(lock_lsn, locker_id);
@@ -358,7 +358,7 @@ impl TreeLookup for RealTreeLookup {
 
         // No parent found — check if the node is the tree root.
         // Clone the Arc so we can drop the tree_guard before taking a write lock.
-        let root_arc_opt = tree_guard.get_root().clone();
+        let root_arc_opt = tree_guard.get_root();
         drop(tree_guard);
         if let Some(root) = root_arc_opt {
             let root_node_id = match root.read() {
@@ -397,20 +397,20 @@ impl RealTreeLookup {
     /// Helper: returns the current LSN of the slot for `key` in the tree,
     /// or `None` if the key is not present.
     pub(crate) fn get_slot_lsn_from_root(
-        root: &Option<std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>>,
+        root: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>>,
         key: &[u8],
     ) -> Option<Lsn> {
-        let arc = root.as_ref()?;
-        Self::find_bin_entry_lsn(arc, key)
+        let arc = root?;
+        Self::find_bin_entry_lsn(&arc, key)
     }
 
     /// Helper: returns a copy of the data stored in the slot for `key`.
     pub(crate) fn get_slot_data_from_root(
-        root: &Option<std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>>,
+        root: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>>,
         key: &[u8],
     ) -> Option<Vec<u8>> {
-        let arc = root.as_ref()?;
-        Self::find_bin_entry_data(arc, key)
+        let arc = root?;
+        Self::find_bin_entry_data(&arc, key)
     }
 
     /// Recursive descent to find the LSN of the BIN slot for `key`.
@@ -621,7 +621,7 @@ impl TreeLookup for SharedTreeLookup {
                 .unwrap_or_default()
         };
 
-        let result = self.tree.write().map(|mut t| {
+        let result = self.tree.read().map(|t| {
             t.insert(key.to_vec(), data, new_lsn)
         });
 

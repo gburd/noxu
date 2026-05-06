@@ -884,8 +884,8 @@ impl NodeEvictionInfo for RealNodeInfo {
 /// the tree read lock so the evictor does not hold the tree lock across
 /// the full eviction decision.
 fn real_node_info(tree: &Tree, node_id: u64) -> Option<Box<dyn NodeEvictionInfo>> {
-    let root_arc = tree.get_root().as_ref()?;
-    find_node_info_recursive(root_arc, node_id)
+    let root_arc = tree.get_root()?;
+    find_node_info_recursive(&root_arc, node_id)
 }
 
 fn find_node_info_recursive(
@@ -928,11 +928,11 @@ fn find_node_info_recursive(
 ///
 /// Port of JE `IN.getBudgetedMemorySize()`.
 fn real_node_size(tree: &Tree, node_id: u64) -> u64 {
-    let root_arc = match tree.get_root().as_ref() {
+    let root_arc = match tree.get_root() {
         Some(r) => r,
         None => return 1024,
     };
-    find_node_size_recursive(root_arc, node_id).unwrap_or(1024)
+    find_node_size_recursive(&root_arc, node_id).unwrap_or(1024)
 }
 
 fn find_node_size_recursive(
@@ -979,8 +979,8 @@ fn find_node_size_recursive(
 /// Used by `flush_dirty_node_to_log` so we can write-lock just the node
 /// (not the entire tree) during WAL serialisation.
 fn find_node_arc(tree: &Tree, node_id: u64) -> Option<Arc<RwLock<TreeNode>>> {
-    let root_arc = tree.get_root().as_ref()?;
-    find_node_arc_recursive(root_arc, node_id)
+    let root_arc = tree.get_root()?;
+    find_node_arc_recursive(&root_arc, node_id)
 }
 
 fn find_node_arc_recursive(
