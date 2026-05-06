@@ -1395,15 +1395,14 @@ impl CursorImpl {
 
     /// Counts the number of duplicates at the current key position.
     ///
-    /// In a full implementation with duplicate support, this would
-    /// traverse all records with the same key and count them.
+    /// For sorted-dup databases, traverses all records sharing the same
+    /// primary key. For non-dup databases, returns 1 if positioned.
     ///
-    /// For now, always returns 1 since we don't have full duplicate
-    /// support implemented.
+    /// Port of `CursorImpl.count()` from JE 7.5.
     ///
     /// # Returns
     ///
-    /// The count of duplicate records (currently always 1).
+    /// The count of duplicate records at the current key.
     ///
     /// # Errors
     ///
