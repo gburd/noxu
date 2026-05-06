@@ -32,8 +32,6 @@ pub enum BinDeltaLogEntryError {
 /// - `prev_delta_lsn`: LSN of the previous delta (NULL_LSN if prev was full)
 /// - `delta_data`: Serialized BIN delta data (only modified slots)
 ///
-/// NOTE: Since tree types (BIN) aren't implemented yet, we use Vec<u8>
-/// as placeholder for serialized delta data.
 #[derive(Debug, Clone)]
 pub struct BinDeltaLogEntry {
     /// Database ID.

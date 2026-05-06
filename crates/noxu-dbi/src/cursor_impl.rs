@@ -1309,6 +1309,13 @@ impl CursorImpl {
         data: Option<&[u8]>,
         txn_id: i64,
     ) -> Result<Lsn, DbiError> {
+        // Deferred-write databases skip WAL logging entirely.
+        // Data is flushed to disk only at eviction or checkpoint.
+        // Port of JE `CursorImpl.java` deferred-write check before logManager.log().
+        if self.db_impl.read().is_deferred_write() {
+            return Ok(noxu_util::NULL_LSN);
+        }
+
         let lm = match &self.log_manager {
             Some(lm) => lm,
             None => return Ok(noxu_util::NULL_LSN),

@@ -490,7 +490,7 @@ impl RealTreeLookup {
 /// Thread-safe `TreeLookup` implementation backed by a shared `noxu_tree::Tree`.
 ///
 /// Used by `Cleaner::process_single_file()` when wired to a real environment
-/// via `Cleaner::with_file_manager_and_tree()`.
+/// via `Cleaner::with_file_manager_tree_and_lock_manager()`.
 ///
 /// The `log_manager` obtains a fresh LSN when re-logging a migrated LN —
 /// port of JE's `targetLn.log(...)`.
@@ -510,23 +510,23 @@ pub struct SharedTreeLookup {
 }
 
 impl SharedTreeLookup {
-    /// Creates a new `SharedTreeLookup`.
+    /// Creates a new `SharedTreeLookup` with a private `LockManager`.
     ///
-    /// Allocates a fresh `LockManager` internally.  Once `environment_impl.rs`
-    /// is updated (see `CLUSTER-C-WIRING` comment in `cleaner.rs`), callers
-    /// should prefer `with_lock_manager` to pass the environment's LockManager.
+    /// Used in tests or contexts where no shared environment LockManager is
+    /// available.  Production code should use `with_lock_manager` to pass the
+    /// environment's shared LockManager for correct deadlock detection.
     pub fn new(
         tree: Arc<RwLock<noxu_tree::Tree>>,
         log_manager: Arc<LogManager>,
     ) -> Self {
-        // CLUSTER-C-WIRING: see cleaner.rs for wiring note.
         let lock_manager = Arc::new(LockManager::new());
         Self { tree, log_manager, lock_manager }
     }
 
     /// Creates a new `SharedTreeLookup` with a wired `LockManager`.
     ///
-    /// Preferred once `environment_impl.rs` supplies the env's LockManager.
+    /// Pass the environment's shared `LockManager` so that cleaner lock
+    /// operations participate in the same lock table as user transactions.
     pub fn with_lock_manager(
         tree: Arc<RwLock<noxu_tree::Tree>>,
         log_manager: Arc<LogManager>,
