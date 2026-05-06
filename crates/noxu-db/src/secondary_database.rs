@@ -326,8 +326,8 @@ impl SecondaryDatabase {
             // Single-key creator path.
             let old_sec_key = old_data.and_then(|od| {
                 let mut sk = DatabaseEntry::new();
-                // The inner.* borrow requires a temporary Database borrow, but
-                // we only have &self here.  Use a placeholder.
+                // The inner.* borrow requires a temporary Database borrow.
+                // We use &self.inner directly, which satisfies the lifetime.
                 if creator.create_secondary_key(&self.inner, pri_key, od, &mut sk) {
                     Some(sk)
                 } else {

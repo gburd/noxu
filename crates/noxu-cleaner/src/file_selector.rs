@@ -6,7 +6,7 @@
 //! The cost/benefit file scoring algorithm is ported from
 //! `UtilizationCalculator.getBestFile()` in JE.  JE selects files using
 //! average utilization: the file whose `(minUtil + maxUtil) / 2` is lowest
-//! is the best candidate.  For our simplified model (no TTL/expiration):
+//! is the best candidate.  Without TTL/expiration (not implemented):
 //!
 //!   obsolete_bytes = summary.get_obsolete_size()
 //!   minUtil = 100 * (total - obsolete) / total   (active fraction)

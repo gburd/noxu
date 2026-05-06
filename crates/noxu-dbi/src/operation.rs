@@ -11,7 +11,7 @@ pub enum Operation {
     Put,
     /// Put only if key doesn't exist.
     NoOverwrite,
-    /// Placeholder operation.
+    /// No-op / filler operation (port of JE `Operation.PLACEHOLDER`).
     Placeholder,
 }
 

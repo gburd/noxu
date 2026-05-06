@@ -1002,7 +1002,7 @@ impl TreeNode {
 
     /// Estimates the serialized byte size of this node for log/checkpoint use.
     ///
-    /// Port of JE `IN.getLogSize()` (simplified Rust-native format).
+    /// Port of JE `IN.getLogSize()` — Noxu-native serialization format.
     ///
     /// Format (big-endian):
     /// - node_id     : 8 bytes
@@ -1033,8 +1033,8 @@ impl TreeNode {
 
     /// Serializes this node to bytes for log writing.
     ///
-    /// Port of JE `IN.writeToLog(ByteBuffer logBuffer)` (simplified
-    /// Rust-native format matching `log_size()`).
+    /// Port of JE `IN.writeToLog(ByteBuffer logBuffer)` — Noxu-native
+    /// format matching `log_size()`.
     pub fn write_to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.log_size());
         match self {
@@ -1537,7 +1537,10 @@ impl Tree {
 
     /// Splits the child at `child_index` in `parent`.
     ///
-    /// Port of `IN.splitInternal()` from JE (simplified, no logging):
+    /// Port of `IN.splitInternal()` from JE.
+    ///
+    /// Note: does not emit a split log entry; split nodes are marked dirty
+    /// and flushed at the next checkpoint (flush_dirty_bins/upper_ins).
     ///
     /// ```text
     /// 1. splitIndex = child.nEntries / 2
@@ -1925,8 +1928,11 @@ impl Tree {
     /// Traverses the tree to find the BIN that should contain the key, then
     /// removes the entry. Returns true if the key was found and removed.
     ///
-    /// Port of the delete path in `Tree` from JE (simplified: no latch
-    /// coupling or log entry emission; purely in-memory removal).
+    /// Port of the delete path in `Tree` from JE.
+    ///
+    /// In-memory removal only — WAL logging for deletes is handled by the
+    /// cursor layer (`cursor_impl.rs::log_ln_write`) before this is called,
+    /// matching JE's separation between LN logging and tree mutation.
     pub fn delete(&mut self, key: &[u8]) -> bool {
         let root = match self.root.as_ref() {
             Some(r) => r.clone(),

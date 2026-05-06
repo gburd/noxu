@@ -107,8 +107,10 @@ impl VlsnRange {
     /// Otherwise, first is updated if the new VLSN is smaller, and last
     /// is updated if the new VLSN is larger.
     ///
-    /// Port of `VLSNRange.getUpdateForNewMapping()` (simplified without
-    /// entry type tracking).
+    /// Port of `VLSNRange.getUpdateForNewMapping()`.
+    ///
+    /// Note: does not track per-entry-type commit/barrier VLSNs (those are
+    /// managed by `VlsnIndex` at a higher level).
     pub fn extend(&mut self, vlsn: u64) {
         assert!(vlsn > 0, "Cannot extend with NULL_VLSN (0)");
         if self.first == 0 || vlsn < self.first {
