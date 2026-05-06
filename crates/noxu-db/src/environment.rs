@@ -243,6 +243,7 @@ impl Environment {
         dbi_config.set_read_only(config.read_only);
         dbi_config.set_temporary(config.temporary);
         dbi_config.set_transactional(config.transactional);
+        dbi_config.deferred_write = config.deferred_write;
         if config.node_max_entries > 0 {
             dbi_config.set_node_max_entries(config.node_max_entries as i32);
         }

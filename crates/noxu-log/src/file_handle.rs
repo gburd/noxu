@@ -9,8 +9,15 @@ use crate::error::{LogError, Result};
 use noxu_latch::{ExclusiveLatch, ExclusiveLatchGuard};
 use noxu_sync::Mutex;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+
+// Positional I/O: maps to pread64 / pwrite64 on Linux (single syscall, no
+// seek needed).  Port of Java's FileChannel.read(buf, position) /
+// FileChannel.write(buf, position) which the JVM lowers to pread64/pwrite64.
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as PosFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as PosFileExt;
 
 /// A file handle with latch protection for thread-safe I/O.
 ///
@@ -112,52 +119,59 @@ impl<'a> FileHandleGuard<'a> {
     /// # Returns
     ///
     /// Number of bytes read.
+    /// Reads data from the file at the given offset.
+    ///
+    /// Uses `pread64` (one syscall) instead of `lseek + read` (two syscalls).
+    /// Port of Java `FileChannel.read(ByteBuffer, position)` which the JVM
+    /// lowers to `pread64` on Linux.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut file_guard = self.handle.file.lock();
-        let file = file_guard.as_mut().ok_or_else(|| {
+        let file_guard = self.handle.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
-        file.seek(SeekFrom::Start(offset))?;
-        Ok(file.read(buf)?)
+        Ok(PosFileExt::read_at(file, buf, offset)?)
     }
 
     /// Reads exactly `buf.len()` bytes from the file at the given offset.
     ///
+    /// Uses `pread64` in a retry loop (port of Java `FileChannel.read` loop).
     /// Returns an error if fewer bytes are available.
     pub fn read_exact_at(
         &mut self,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<()> {
-        let mut file_guard = self.handle.file.lock();
-        let file = file_guard.as_mut().ok_or_else(|| {
+        let file_guard = self.handle.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(buf)?;
+        PosFileExt::read_exact_at(file, buf, offset)?;
         Ok(())
     }
 
     /// Writes data to the file at the given offset.
     ///
+    /// Uses `pwrite64` (one syscall) instead of `lseek + write` (two syscalls).
+    /// Port of JE `FileChannel.write(ByteBuffer, position)` which the JVM
+    /// lowers to `pwrite64` on Linux.  This eliminates half the syscalls on
+    /// the hot write path and removes the need to serialise seek+write under
+    /// the guard (pwrite64 is inherently positional and thread-safe).
+    ///
     /// # Arguments
     ///
-    /// * `offset` - File offset to write to
+    /// * `offset` - File offset to write to (passed directly to pwrite64)
     /// * `buf` - Data to write
     ///
     /// # Returns
     ///
-    /// Number of bytes written.
+    /// Number of bytes written (always `buf.len()` on success).
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
-        let mut file_guard = self.handle.file.lock();
-        let file = file_guard.as_mut().ok_or_else(|| {
+        let file_guard = self.handle.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
-        file.seek(SeekFrom::Start(offset))?;
-        Ok(file.write(buf)?)
+        PosFileExt::write_all_at(file, buf, offset)?;
+        Ok(buf.len())
     }
 
     /// Syncs all file data and metadata to disk (fsync).
@@ -166,11 +180,10 @@ impl<'a> FileHandleGuard<'a> {
     /// typically for file-header writes.  For log-data writes prefer
     /// `sync_data()` which is faster.
     pub fn sync(&mut self) -> Result<()> {
-        let mut file_guard = self.handle.file.lock();
-        let file = file_guard.as_mut().ok_or_else(|| {
+        let file_guard = self.handle.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
         file.sync_all()?;
         Ok(())
     }
@@ -183,11 +196,10 @@ impl<'a> FileHandleGuard<'a> {
     ///
     /// Port of `FileManager.syncLogEnd()` / `FileChannel.force(false)`.
     pub fn sync_data(&mut self) -> Result<()> {
-        let mut file_guard = self.handle.file.lock();
-        let file = file_guard.as_mut().ok_or_else(|| {
+        let file_guard = self.handle.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
         file.sync_data()?;
         Ok(())
     }
@@ -203,17 +215,15 @@ impl<'a> FileHandleGuard<'a> {
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
         Ok(file.metadata()?.len())
     }
 
     /// Truncates the file to the given length.
     pub fn truncate(&mut self, len: u64) -> Result<()> {
-        let mut file_guard = self.handle.file.lock();
-        let file = file_guard.as_mut().ok_or_else(|| {
+        let file_guard = self.handle.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-
         file.set_len(len)?;
         Ok(())
     }

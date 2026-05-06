@@ -30,8 +30,6 @@ pub enum InLogEntryError {
 /// - `prev_delta_lsn`: LSN of the previous delta version (NULL_LSN if prev was full)
 /// - `node_data`: Serialized IN/BIN data
 ///
-/// NOTE: Since tree types (IN, BIN) aren't implemented yet, we use Vec<u8>
-/// as placeholder for serialized node data.
 #[derive(Debug, Clone)]
 pub struct InLogEntry {
     /// Database ID.

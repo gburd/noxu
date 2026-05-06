@@ -156,7 +156,17 @@ impl Database {
                 let (_, value) = cursor
                     .get_current()
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-                data.set_data(&value);
+                // Partial get: return only the requested slice.
+                // Port of JE DatabaseEntry partial-read logic.
+                if data.is_partial() {
+                    let off = data.get_partial_offset();
+                    let len = data.get_partial_length();
+                    let end = (off + len).min(value.len());
+                    let slice = if off < value.len() { &value[off..end] } else { &[] };
+                    data.set_data(slice);
+                } else {
+                    data.set_data(&value);
+                }
                 Ok(OperationStatus::Success)
             }
             _ => Ok(OperationStatus::NotFound),
@@ -187,7 +197,41 @@ impl Database {
         self.check_writable()?;
 
         let key_bytes = key.get_data().unwrap_or(&[]);
-        let data_bytes = data.get_data().unwrap_or(&[]);
+
+        // Partial put: read-modify-write using the partial offset/length.
+        // Port of JE LN.combinePuts() — existing bytes outside [offset..offset+length]
+        // are preserved; only the specified range is replaced with new data.
+        let write_bytes: Vec<u8>;
+        let data_bytes: &[u8] = if data.is_partial() {
+            let new_bytes = data.get_data().unwrap_or(&[]);
+            let off = data.get_partial_offset();
+            let len = data.get_partial_length();
+            // Fetch the existing record to splice into.
+            let existing = {
+                let mut tmp_entry = DatabaseEntry::new();
+                let mut tmp_cursor = self.make_cursor();
+                match tmp_cursor.search(key_bytes, None, noxu_dbi::SearchMode::Set)
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                {
+                    noxu_dbi::OperationStatus::Success => {
+                        let (_, v) = tmp_cursor.get_current()
+                            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                        tmp_entry.set_data(&v);
+                        tmp_entry.get_data().unwrap_or(&[]).to_vec()
+                    }
+                    _ => vec![0u8; off + len],
+                }
+            };
+            let total_len = (off + len).max(existing.len());
+            let mut patched = existing;
+            patched.resize(total_len, 0);
+            let copy_len = new_bytes.len().min(len);
+            patched[off..off + copy_len].copy_from_slice(&new_bytes[..copy_len]);
+            write_bytes = patched;
+            &write_bytes
+        } else {
+            data.get_data().unwrap_or(&[])
+        };
 
         let mut cursor = self.make_cursor();
         cursor

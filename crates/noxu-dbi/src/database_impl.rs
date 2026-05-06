@@ -56,6 +56,12 @@ pub struct DatabaseImpl {
     /// write; otherwise always `Some`.  Populated either from recovery via
     /// `set_recovered_tree()` or lazily on first write.
     real_tree: Option<Tree>,
+    /// Whether writes are deferred (not WAL-logged immediately).
+    ///
+    /// Port of `DatabaseImpl.isDeferredWriteMode()` in JE.
+    /// When true, `log_ln_write()` skips WAL logging and returns NULL_LSN;
+    /// data is flushed to disk only at eviction or checkpoint.
+    deferred_write: bool,
     /// Key comparator (None = default byte comparison).
     bt_comparator:
         Option<Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>>,
@@ -137,6 +143,7 @@ impl DatabaseImpl {
             reference_count: AtomicI64::new(0),
             tree: Some(DatabaseTree::new()),
             real_tree: Some(real_tree),
+            deferred_write: config.deferred_write,
             bt_comparator: None,
             dup_comparator: None,
         }
@@ -151,6 +158,13 @@ impl DatabaseImpl {
     }
     pub fn get_db_type(&self) -> DbType {
         self.db_type
+    }
+
+    /// Returns true if this database uses deferred write mode.
+    ///
+    /// Port of `DatabaseImpl.isDeferredWriteMode()` in JE.
+    pub fn is_deferred_write(&self) -> bool {
+        self.deferred_write
     }
 
     // Flag methods
@@ -327,6 +341,7 @@ impl DatabaseImpl {
             reference_count: AtomicI64::new(0),
             tree: Some(tree),
             real_tree: Some(real_tree),
+            deferred_write: false, // not persisted in log record; set after open if needed
             bt_comparator: None,
             dup_comparator: None,
         })
