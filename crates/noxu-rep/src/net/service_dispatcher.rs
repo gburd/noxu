@@ -47,11 +47,9 @@ pub trait ServiceHandler: Send + Sync {
 
 /// Dispatches incoming connections to registered service handlers.
 ///
-/// Port of JE's `ServiceDispatcher`. In JE this class owns the server
-/// socket, accepts connections, reads a service name from each new
-/// connection, and dispatches to the corresponding registered handler.
-/// Our implementation provides the handler registry and dispatch logic;
-/// the accept loop is deferred to the networking integration phase.
+/// Port of JE's `ServiceDispatcher`. Provides the handler registry and
+/// dispatch logic. The accept loop lives in [`TcpServiceDispatcher`], which
+/// mirrors JE's ownership of the server socket.
 pub struct ServiceDispatcher {
     /// Map from service name to handler.
     services: Mutex<HashMap<String, Arc<dyn ServiceHandler>>>,
@@ -102,9 +100,9 @@ impl ServiceDispatcher {
 
     /// Start the dispatcher.
     ///
-    /// In JE this opens the server socket and begins accepting connections.
-    /// Here we simply mark the dispatcher as running; real socket acceptance
-    /// will be added in the networking integration phase.
+    /// Marks this base dispatcher as running. [`TcpServiceDispatcher::start()`]
+    /// extends this by spawning the TCP accept loop, mirroring JE's split
+    /// between `ServiceDispatcher` (registry) and `TcpChannel` (transport).
     pub fn start(&self) {
         self.running.store(true, Ordering::SeqCst);
     }

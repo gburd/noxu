@@ -6,11 +6,14 @@
 //! The cost/benefit file scoring algorithm is ported from
 //! `UtilizationCalculator.getBestFile()` in JE.  JE selects files using
 //! average utilization: the file whose `(minUtil + maxUtil) / 2` is lowest
-//! is the best candidate.  Without TTL/expiration (not implemented):
+//! is the best candidate.  TTL-expired records are tracked per-entry
+//! (BinEntry.expiration_time) but FileSummary does not yet aggregate expired
+//! bytes separately, so minUtil == maxUtil in this implementation.  In JE,
+//! expired bytes contribute to a wider min/max spread:
 //!
 //!   obsolete_bytes = summary.get_obsolete_size()
 //!   minUtil = 100 * (total - obsolete) / total   (active fraction)
-//!   maxUtil = minUtil  (no expiration contribution)
+//!   maxUtil = minUtil  (no separate expired-size contribution yet)
 //!   avgUtil = minUtil
 //!
 //! So the file with the **lowest utilization** (= highest obsolete fraction)
@@ -213,7 +216,7 @@ impl FileSelector {
 
         // Step 2 — find the file with lowest average utilization.
         // Port of JE: pick the file where (thisMinUtil + thisMaxUtil) / 2 is
-        // minimised.  Without expiration, minUtil == maxUtil == avgUtil, so we
+        // minimised.  Since expired bytes are not yet tracked in FileSummary,
         // simply rank by utilization() ascending.
         let mut best_file: Option<u32> = None;
         let mut best_avg_util: i32 = 101; // higher than any valid utilization
@@ -236,7 +239,7 @@ impl FileSelector {
 
             // Calculate average utilization (0–100 integer percent).
             // Port of JE: FileSummary.utilization(maxObsoleteSize, totalSize)
-            // Without expiration: minUtil == maxUtil == utilization().
+            // No separate expired-size in FileSummary: minUtil == maxUtil.
             let avg_util = Self::utilization_pct(summary);
 
             // Apply the utilization threshold filter.

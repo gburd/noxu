@@ -640,12 +640,12 @@ impl Checkpointer {
                 let entry = BinDeltaLogEntry::new(
                     self.db_id,
                     b.last_full_lsn,
-                    NULL_LSN, // prev_delta_lsn — we don't chain deltas yet
+                    b.last_delta_lsn, // prev_delta_lsn — port of JE BIN.lastDeltaVersion
                     delta_bytes,
                 );
                 let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
                 entry.write_to_log(&mut buf);
-                lm.log(
+                let delta_logged_lsn = lm.log(
                     LogEntryType::BINDelta,
                     &buf,
                     Provisional::No,
@@ -655,6 +655,7 @@ impl Checkpointer {
                 .map_err(|e| {
                     RecoveryError::CheckpointError(format!("BINDelta WAL write failed: {e}"))
                 })?;
+                b.last_delta_lsn = delta_logged_lsn; // advance chain for next delta
                 b.clear_dirty_after_delta_log();
                 result.delta_ins_flushed += 1;
             } else {
@@ -679,6 +680,7 @@ impl Checkpointer {
                     .map_err(|e| {
                         RecoveryError::CheckpointError(format!("BIN WAL write failed: {e}"))
                     })?;
+                b.last_delta_lsn = NULL_LSN; // full BIN resets delta chain
                 b.clear_dirty_after_full_log(logged_lsn);
                 result.full_bins_flushed += 1;
             }
@@ -1116,6 +1118,7 @@ mod tests {
             dirty: false,
             is_delta: false,
             last_full_lsn: noxu_util::NULL_LSN,
+            last_delta_lsn: noxu_util::NULL_LSN,
             generation: 0,
             parent: None,
             expiration_in_hours: false,
