@@ -149,8 +149,6 @@ impl LnFlags {
 /// - `expiration`: Expiration time of the record
 /// - `vlsn`: VLSN assigned to this log entry (for replication)
 ///
-/// NOTE: Since tree types (LN, BIN) aren't implemented yet, we use Vec<u8>
-/// as placeholder for serialized node data.
 #[derive(Debug, Clone)]
 pub struct LnLogEntry {
     /// Database ID.
