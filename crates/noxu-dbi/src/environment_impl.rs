@@ -146,6 +146,35 @@ pub struct EnvironmentImpl {
     ///
     /// Port of `EnvironmentImpl.inCompressor` / `INCompressor.run()` in JE.
     in_compressor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+
+    // =========================================================================
+    // NoSQL JE fork: additional background services
+    // =========================================================================
+
+    /// Background data-erasure daemon.
+    ///
+    /// Physically overwrites obsolete user data on disk so that sensitive
+    /// data is unrecoverable.  Started lazily when the first erasure request
+    /// is enqueued.
+    ///
+    /// Port of `EnvironmentImpl.dataEraser` (NoSQL fork).
+    data_eraser: Mutex<noxu_cleaner::DataEraser>,
+
+    /// Background record-extinction scanner.
+    ///
+    /// Asynchronously removes extinct records from the B-tree after a
+    /// `discard_extinct_records()` call commits.
+    ///
+    /// Port of `EnvironmentImpl.extinctionScanner` (NoSQL fork).
+    extinction_scanner: Mutex<noxu_cleaner::ExtinctionScanner>,
+
+    /// Automatic backup manager.
+    ///
+    /// Copies closed log files to a configured archive destination on a
+    /// cron-style schedule.
+    ///
+    /// Port of `EnvironmentImpl.backupManager` (NoSQL fork).
+    backup_manager: Mutex<crate::backup_manager::BackupManager>,
 }
 
 impl EnvironmentImpl {
@@ -450,6 +479,9 @@ impl EnvironmentImpl {
             checkpoint_interval_ms,
             in_compressor_shutdown,
             in_compressor_handle: Mutex::new(Some(in_compressor_handle)),
+            data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
+            extinction_scanner: Mutex::new(noxu_cleaner::ExtinctionScanner::new()),
+            backup_manager: Mutex::new(crate::backup_manager::BackupManager::new()),
         };
 
         // Mark as open
@@ -815,8 +847,61 @@ impl EnvironmentImpl {
             let _ = lm.flush_sync();
         }
 
+        // Shut down the NoSQL background services.
+        self.extinction_scanner.lock().unwrap().shutdown();
+        self.data_eraser.lock().unwrap().shutdown();
+        self.backup_manager.lock().unwrap().shutdown();
+
         *state = EnvState::Closed;
         Ok(())
+    }
+
+    // =========================================================================
+    // NoSQL JE fork: Record Extinction, Data Erasure, Auto-Backup
+    // =========================================================================
+
+    /// Schedules asynchronous removal of extinct records.
+    ///
+    /// Records in the specified key range are permanently removed from the
+    /// B-tree without per-record delete log entries. The caller must ensure
+    /// that the records will never be accessed again (see `ExtinctionFilter`).
+    ///
+    /// Port of `Environment.discardExtinctRecords(Transaction, DatabaseImpl,
+    ///   DatabaseEntry startKey, DatabaseEntry endKey, ScanFilter)` (NoSQL fork).
+    pub fn discard_extinct_records(
+        &self,
+        db_name: &str,
+        start_key: Vec<u8>,
+        end_key: Option<Vec<u8>>,
+    ) -> u64 {
+        let task = noxu_cleaner::ExtinctionTask {
+            db_name: db_name.to_string(),
+            start_key,
+            end_key,
+            dups: false,
+        };
+        self.extinction_scanner.lock().unwrap().discard_extinct_records(task)
+    }
+
+    /// Returns `true` if an extinction scan is in progress.
+    ///
+    /// Port of `Environment.isRecordExtinctionActive()` (NoSQL fork).
+    pub fn is_record_extinction_active(&self) -> bool {
+        self.extinction_scanner.lock().unwrap().is_active()
+    }
+
+    /// Returns the total number of LN records discarded by extinction scans.
+    ///
+    /// Port of `EnvironmentStats.getNLNsExtinct()` (NoSQL fork).
+    pub fn n_lns_extinct(&self) -> u64 {
+        self.extinction_scanner.lock().unwrap().n_lns_extinct()
+    }
+
+    /// Enqueues a disk region for physical data erasure.
+    ///
+    /// Port of `DataEraser.eraseData(long, long, int)` (NoSQL fork).
+    pub fn enqueue_erase(&self, request: noxu_cleaner::EraseRequest) {
+        self.data_eraser.lock().unwrap().enqueue_erase(request);
     }
 }
 
@@ -842,6 +927,11 @@ impl Drop for EnvironmentImpl {
         if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
+
+        // Shut down the NoSQL background services.
+        self.extinction_scanner.lock().unwrap().shutdown();
+        self.data_eraser.lock().unwrap().shutdown();
+        self.backup_manager.lock().unwrap().shutdown();
     }
 }
 
