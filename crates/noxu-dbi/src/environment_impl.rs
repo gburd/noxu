@@ -54,7 +54,7 @@ pub struct EnvironmentImpl {
     txn_manager: TxnManager,
 
     /// All open databases, keyed by DatabaseId.
-    db_map: RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>,
+    db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>>,
     /// Name -> DatabaseId mapping.
     name_map: RwLock<HashMap<String, DatabaseId>>,
 
@@ -130,6 +130,23 @@ pub struct EnvironmentImpl {
     /// Default: 30,000 ms (30 seconds).  Passed to the checkpointer thread
     /// at environment creation time.
     checkpoint_interval_ms: u64,
+
+    /// INCompressor daemon shutdown flag.
+    ///
+    /// Shared with the `in_compressor_handle` thread so that `close()` can
+    /// signal the thread to exit.
+    ///
+    /// Port of `INCompressor.shutdown()` in JE.
+    in_compressor_shutdown: Arc<AtomicBool>,
+
+    /// Background INCompressor daemon thread handle.
+    ///
+    /// The INCompressor processes BINs that have known-deleted slots,
+    /// compressing them and pruning empty subtrees.  Mirrors the daemon
+    /// pattern used by the evictor and checkpointer.
+    ///
+    /// Port of `EnvironmentImpl.inCompressor` / `INCompressor.run()` in JE.
+    in_compressor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl EnvironmentImpl {
@@ -367,6 +384,49 @@ impl EnvironmentImpl {
                 .expect("failed to spawn noxu-checkpointer thread")
         });
 
+        // Shared db_map Arc — also given to the INCompressor daemon so it can
+        // iterate open databases without holding a reference to `self`.
+        let db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Start the background INCompressor daemon thread.
+        //
+        // The daemon wakes every 100 ms, iterates all open databases, and for
+        // each calls `Tree::collect_bins_with_known_deleted()` to find BINs that
+        // still hold zombie deleted slots (e.g. from log replay).  Each such BIN
+        // is passed to `Tree::compress_bin()` to remove the defunct entries and,
+        // if the BIN becomes empty, prune it from the tree.
+        //
+        // Port of `INCompressor.run()` / `INCompressor.doCompress()` from JE.
+        let in_compressor_shutdown = Arc::new(AtomicBool::new(false));
+        let in_compressor_shutdown_clone = Arc::clone(&in_compressor_shutdown);
+        let db_map_for_compressor = Arc::clone(&db_map);
+        let in_compressor_handle = std::thread::Builder::new()
+            .name("noxu-in-compressor".to_string())
+            .spawn(move || {
+                while !in_compressor_shutdown_clone.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if in_compressor_shutdown_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Iterate all open databases and compress any BINs that
+                    // have known-deleted slots.  Port of JE:
+                    //   INCompressor.processQueue() → compressBin(bin)
+                    let db_list: Vec<Arc<RwLock<DatabaseImpl>>> =
+                        db_map_for_compressor.read().values().cloned().collect();
+                    for db_arc in db_list {
+                        let mut db = db_arc.write();
+                        if let Some(tree) = db.get_real_tree_mut() {
+                            let bins = tree.collect_bins_with_known_deleted();
+                            for bin_arc in bins {
+                                tree.compress_bin(&bin_arc);
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn noxu-in-compressor thread");
+
         let env = EnvironmentImpl {
             env_home,
             state: RwLock::new(EnvState::Init),
@@ -376,7 +436,7 @@ impl EnvironmentImpl {
             next_db_id: AtomicI64::new(1),
             lock_manager,
             txn_manager,
-            db_map: RwLock::new(HashMap::new()),
+            db_map,
             name_map: RwLock::new(HashMap::new()),
             is_invalid: AtomicBool::new(false),
             invalid_reason: RwLock::new(None),
@@ -393,6 +453,8 @@ impl EnvironmentImpl {
             checkpointer,
             checkpointer_handle: Mutex::new(checkpointer_thread),
             checkpoint_interval_ms,
+            in_compressor_shutdown,
+            in_compressor_handle: Mutex::new(Some(in_compressor_handle)),
         };
 
         // Mark as open
@@ -738,6 +800,12 @@ impl EnvironmentImpl {
             let _ = handle.join();
         }
 
+        // Signal the INCompressor daemon to stop and wait for it to exit.
+        self.in_compressor_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
         // Final (forced) checkpoint before WAL sync so recovery can restart
         // from the checkpoint rather than replaying the full log.
         // Port of JE `EnvironmentImpl.close()` calling
@@ -771,6 +839,12 @@ impl Drop for EnvironmentImpl {
             ckpt.request_shutdown();
         }
         if let Some(handle) = self.checkpointer_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // Shut down the INCompressor daemon thread.
+        self.in_compressor_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
     }

@@ -178,9 +178,10 @@ impl FileSelector {
     ///   select the best file (used in testing).
     ///
     /// # Returns
-    /// `Some((file_number, required_util))` where `required_util` is always
-    /// `None` (two-pass cleaning is not implemented here), or `None` if no
-    /// file qualifies.
+    /// `Some((file_number, required_util))` where `required_util` is the
+    /// utilization target from the two-pass cleaning logic (non-None when
+    /// `self.force_cleaning` is set after a first pass didn't meet the
+    /// target), or `None` if no file qualifies.
     pub fn select_file_for_cleaning_with_profile(
         &mut self,
         file_summaries: &BTreeMap<u32, FileSummary>,

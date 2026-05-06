@@ -1320,8 +1320,8 @@ impl CursorImpl {
         let entry = LnLogEntry::new(
             db_id,
             txn_id_opt,
-            noxu_util::NULL_LSN,   // abort_lsn (not yet tracked per-txn)
-            false,                 // abort_known_deleted
+            Lsn::from_u64(self.current_lsn), // abort_lsn: before-image LSN (current slot LSN before this write)
+            false,                            // abort_known_deleted
             None,                  // abort_key
             None,                  // abort_data
             NULL_VLSN,             // abort_vlsn

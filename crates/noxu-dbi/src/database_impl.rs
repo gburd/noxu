@@ -47,13 +47,14 @@ pub struct DatabaseImpl {
     max_tree_entries_per_node: i32,
     /// Number of open database handles (user handles referencing this db).
     reference_count: AtomicI64,
-    /// The B-tree for this database.
-    /// Using a simplified stub since we don't have real Tree integration yet.
+    /// Persistent B-tree root metadata (root LSN, serialized with the database
+    /// record in the ID database).  Populated from the log during recovery.
     tree: Option<DatabaseTree>,
-    /// The real B+tree used for in-memory operations (search, insert, iterate).
+    /// The in-memory B+tree backing cursor traversal (search, insert, delete).
     ///
-    /// This is the `noxu_tree::Tree` that backs cursor traversal.
-    /// Created lazily when the database is first written to.
+    /// `None` only for read-only or freshly created databases before the first
+    /// write; otherwise always `Some`.  Populated either from recovery via
+    /// `set_recovered_tree()` or lazily on first write.
     real_tree: Option<Tree>,
     /// Key comparator (None = default byte comparison).
     bt_comparator:
@@ -63,8 +64,13 @@ pub struct DatabaseImpl {
         Option<Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>>,
 }
 
-/// A simplified tree placeholder for the database.
-/// In the full implementation, this would be `noxu_tree::Tree`.
+/// Persistent B-tree root metadata stored alongside the database record.
+///
+/// Holds the root LSN so that recovery can locate the tree root on disk.
+/// The live in-memory tree is `DatabaseImpl::real_tree`.
+///
+/// Port of `DatabaseImpl.tree` (the persistent `Tree` object stored as part
+/// of the database record) in JE.
 #[derive(Debug)]
 pub struct DatabaseTree {
     /// Root LSN of the tree.

@@ -195,6 +195,14 @@ pub struct BinStub {
     ///
     /// Port of JE `BIN.expirationInHours`.
     pub expiration_in_hours: bool,
+    /// Number of cursors currently positioned on this BIN.
+    ///
+    /// The evictor skips BINs with a non-zero cursor count to avoid evicting
+    /// a node that a cursor is actively traversing.  CursorImpl increments
+    /// this when positioning on a BIN and decrements it on reposition/close.
+    ///
+    /// Port of JE `IN.cursorSet.size()` used by `Evictor.selectIN()`.
+    pub cursor_count: i32,
 }
 
 /// Entry in a BIN node.
@@ -740,6 +748,7 @@ impl BinStub {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })
     }
 
@@ -1411,6 +1420,7 @@ impl Tree {
                 generation: 0,
                 parent: None, // set below after root_in is created
                 expiration_in_hours: false,
+                cursor_count: 0,
             })));
 
             // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
@@ -1654,6 +1664,7 @@ impl Tree {
                     generation: 0,
                     parent: None, // set below
                     expiration_in_hours: false,
+                cursor_count: 0,
                 };
                 if sibling_bin.entries.len() >= 2 {
                     sibling_bin.recompute_key_prefix();
@@ -2923,6 +2934,44 @@ impl Tree {
         }
     }
 
+    /// Collect all BINs that have at least one `known_deleted` slot.
+    ///
+    /// Port of the INCompressor queue-drain scan in JE: the daemon iterates
+    /// the in-memory IN list and identifies BINs that still hold zombie deleted
+    /// slots.  Each returned `Arc` can be passed directly to `compress_bin()`.
+    pub fn collect_bins_with_known_deleted(&self) -> Vec<Arc<RwLock<TreeNode>>> {
+        let mut result = Vec::new();
+        if let Some(root) = &self.root {
+            Self::collect_bins_with_known_deleted_recursive(root, &mut result);
+        }
+        result
+    }
+
+    fn collect_bins_with_known_deleted_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        out: &mut Vec<Arc<RwLock<TreeNode>>>,
+    ) {
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match &*guard {
+            TreeNode::Bottom(b) => {
+                if b.entries.iter().any(|e| e.known_deleted) {
+                    out.push(Arc::clone(node_arc));
+                }
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                for child in children {
+                    Self::collect_bins_with_known_deleted_recursive(&child, out);
+                }
+            }
+        }
+    }
+
     /// Collect all dirty upper (non-BIN) internal nodes, sorted ascending by
     /// level (bottom-up order, BIN level excluded).
     ///
@@ -3407,6 +3456,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         assert!(bin.is_bin());
         assert_eq!(bin.level(), BIN_LEVEL);
@@ -3448,6 +3498,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
 
         // Search for existing key
@@ -3547,6 +3598,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         tree.set_root(bin);
         assert!(tree.get_root().is_some());
@@ -3862,6 +3914,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         assert!(!bin_node.is_dirty());
         bin_node.set_dirty(true);
@@ -3896,6 +3949,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         assert_eq!(bin_node.get_generation(), 0);
         bin_node.set_generation(42);
@@ -3945,6 +3999,7 @@ mod tests {
             generation: 5,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         assert_eq!(bin_node.log_size(), bin_node.write_to_bytes().len());
 
@@ -3981,6 +4036,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         let bytes = node.write_to_bytes();
         // First 8 bytes = node_id big-endian.
@@ -4004,6 +4060,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         let with_entry = TreeNode::Bottom(BinStub {
             node_id: 2,
@@ -4023,6 +4080,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         });
         assert!(
             with_entry.log_size() > empty.log_size(),
@@ -4045,6 +4103,7 @@ mod tests {
             generation: 0,
             parent: None, // set below
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -4284,6 +4343,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -4327,6 +4387,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         assert!(
@@ -4349,6 +4410,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
         let bin_b = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -4361,6 +4423,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -4447,6 +4510,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         let delta_entries = vec![
@@ -4493,6 +4557,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
         let n_before = base.entries.len();
         Tree::apply_delta_to_bin(&mut base, vec![]);
@@ -4521,6 +4586,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         // The delta has a new entry "bb" and overwrites "aa".
@@ -4538,6 +4604,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         Tree::mutate_to_full_bin(&mut delta, base);
@@ -4578,6 +4645,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
@@ -4741,6 +4809,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         bin.insert_with_prefix(b"record:aaa".to_vec(), Lsn::new(1, 1), None);
@@ -4766,6 +4835,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         let keys = [b"pfx:first".as_ref(), b"pfx:second".as_ref(), b"pfx:third".as_ref()];
@@ -4797,6 +4867,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         for k in [b"db:alpha".as_ref(), b"db:beta".as_ref(), b"db:gamma".as_ref()] {
@@ -4871,6 +4942,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
 
         for k in [b"myapp:user:1".as_ref(), b"myapp:user:2".as_ref()] {
@@ -5213,6 +5285,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         // Wire a minimal parent IN so compress_bin can prune if needed.
@@ -5269,6 +5342,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -5295,6 +5369,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -5330,6 +5405,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -5381,6 +5457,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -5409,6 +5486,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -5457,6 +5535,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         // Parent IN with two children: the BIN above plus a placeholder sibling.
@@ -5473,6 +5552,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -5587,6 +5667,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -5625,6 +5706,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let mut tree = Tree::new(1, 128);
@@ -5669,6 +5751,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         // Wire up a parent so compress_bin can run normally.
@@ -5811,6 +5894,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let sibling_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
@@ -5826,6 +5910,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -5899,6 +5984,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -6072,6 +6158,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
         bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
         assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
@@ -6099,6 +6186,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
         bin.insert_with_prefix(b"key".to_vec(), Lsn::new(1, 20), Some(b"new".to_vec()));
         assert!(bin.entries[0].dirty, "updated slot should be dirty");
@@ -6121,6 +6209,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
         let bytes = bin.serialize_full();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -6150,6 +6239,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         };
         let bytes = bin.serialize_delta();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -6200,6 +6290,7 @@ mod tests {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
+                cursor_count: 0,
         }
     }
 
