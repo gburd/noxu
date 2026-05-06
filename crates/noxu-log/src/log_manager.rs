@@ -329,22 +329,34 @@ impl LogManager {
     ///
     /// Each dirty buffer is written to the file indicated by its first LSN,
     /// matching JE's `LogBufferPool.writeDirty()` -> `FileManager.writeLogBuffer()`.
+    ///
+    /// Only the **unflushed** portion of each buffer (`data[flushed_len..]`) is
+    /// written, matching JE's `LogBuffer.lastFlushedPosition` watermark.  This
+    /// eliminates the O(N²) I/O pattern where every commit rewrote the entire
+    /// buffer from the start.
     fn flush_dirty_buffers(&self) -> Result<()> {
         let pool = self.buffer_pool.lock();
         let buffers = pool.get_all_buffers();
         drop(pool);
 
         for buf_arc in buffers {
-            let buf = buf_arc.lock();
+            let mut buf = buf_arc.lock();
             buf.wait_for_zero_and_latch();
 
             let first_lsn = buf.get_first_lsn();
             if !first_lsn.is_null() {
-                let data = buf.get_data().to_vec();
-                let offset = first_lsn.file_offset() as u64;
-                buf.release();
-                drop(buf);
-                self.file_manager.write_buffer(&data, offset)?;
+                let unflushed = buf.get_unflushed_data();
+                if !unflushed.is_empty() {
+                    let data = unflushed.to_vec();
+                    let offset = buf.flushed_file_offset();
+                    buf.mark_flushed();
+                    buf.release();
+                    drop(buf);
+                    self.file_manager.write_buffer(&data, offset)?;
+                } else {
+                    buf.release();
+                    drop(buf);
+                }
             } else {
                 buf.release();
                 drop(buf);
