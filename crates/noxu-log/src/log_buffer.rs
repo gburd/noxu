@@ -56,6 +56,14 @@ pub struct LogBuffer {
 
     /// Buffer may be rewritten because an IOException previously occurred.
     rewrite_allowed: bool,
+
+    /// Number of bytes already written to disk from this buffer.
+    ///
+    /// Port of JE `LogBuffer.lastFlushedPosition`: only `data[flushed_len..]`
+    /// needs to be written on the next flush.  Advancing this watermark after
+    /// each write prevents successive commits from rewriting previously
+    /// persisted bytes (eliminating the O(N²) I/O pattern).
+    flushed_len: usize,
 }
 
 impl LogBuffer {
@@ -70,6 +78,7 @@ impl LogBuffer {
             latch_held: AtomicBool::new(false),
             write_pin_count: AtomicI32::new(0),
             rewrite_allowed: false,
+            flushed_len: 0,
         }
     }
 
@@ -87,6 +96,7 @@ impl LogBuffer {
             latch_held: AtomicBool::new(false),
             write_pin_count: AtomicI32::new(0),
             rewrite_allowed: false,
+            flushed_len: 0,
         }
     }
 
@@ -100,7 +110,32 @@ impl LogBuffer {
         self.last_lsn = NULL_LSN;
         self.rewrite_allowed = false;
         self.write_pin_count.store(0, Ordering::Relaxed);
+        self.flushed_len = 0;
         self.release();
+    }
+
+    /// Returns the data that has not yet been flushed to disk.
+    ///
+    /// Port of JE `LogBuffer` dirty-range tracking.  The caller should write
+    /// this slice to disk at `flushed_file_offset()` and then call
+    /// `mark_flushed()` to advance the watermark.
+    pub fn get_unflushed_data(&self) -> &[u8] {
+        &self.data[self.flushed_len..]
+    }
+
+    /// Returns the file offset at which `get_unflushed_data()` should be written.
+    ///
+    /// Equals `first_lsn.file_offset() + flushed_len`.
+    pub fn flushed_file_offset(&self) -> u64 {
+        self.first_lsn.file_offset() as u64 + self.flushed_len as u64
+    }
+
+    /// Advances the flush watermark to the current buffer length.
+    ///
+    /// Must be called after a successful `write_buffer()` for the unflushed
+    /// slice so that the next flush only writes new data.
+    pub fn mark_flushed(&mut self) {
+        self.flushed_len = self.data.len();
     }
 
     /// Returns the first LSN held in this buffer.
