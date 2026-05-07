@@ -7,7 +7,12 @@
 //! The [`ReplicaReceiver`] provides the active I/O loop that reads framed
 //! entries from the feeder channel, passes them to a [`LogWriter`], and sends
 //! acks back.
+//!
+//! [`EnvironmentLogWriter`] is the live implementation of [`LogWriter`] that
+//! writes replicated entries into the local `LogManager` and updates the
+//! VLSN index. Port of `com.sleepycat.je.rep.impl.node.Replica.ReplayThread`.
 
+use noxu_log::{LogEntryType, Provisional};
 use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +42,97 @@ pub trait LogWriter: Send {
         entry_type: u8,
         payload: &[u8],
     ) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// EnvironmentLogWriter
+// ---------------------------------------------------------------------------
+
+/// `LogWriter` implementation backed by the live `LogManager`.
+///
+/// Each `write_entry` call:
+///   1. Resolves the `entry_type` byte to a `LogEntryType`.
+///   2. Writes the payload to the local log via `LogManager::log()`.
+///   3. Registers the returned LSN in the provided `vlsn_index` so that
+///      the VLSN→LSN mapping is kept up-to-date on the replica.
+///
+/// Port of `com.sleepycat.je.rep.impl.node.Replica.ReplayThread`.
+pub struct EnvironmentLogWriter {
+    /// Shared log manager for appending replicated entries.
+    log_manager: Arc<noxu_log::LogManager>,
+    /// VLSN index: maps VLSN → (file_number, file_offset) on this replica.
+    vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+}
+
+impl EnvironmentLogWriter {
+    /// Create a new `EnvironmentLogWriter`.
+    ///
+    /// # Arguments
+    /// * `log_manager` — The live `LogManager` for this replica environment.
+    /// * `vlsn_index`  — The VLSN index to update after each written entry.
+    pub fn new(
+        log_manager: Arc<noxu_log::LogManager>,
+        vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+    ) -> Self {
+        Self { log_manager, vlsn_index }
+    }
+}
+
+impl LogWriter for EnvironmentLogWriter {
+    /// Write one replicated entry to the local log.
+    ///
+    /// Resolves `entry_type` → `LogEntryType`, appends the payload to the
+    /// WAL, and records the assigned LSN in the VLSN index.  Returns an
+    /// error if the entry type is unknown or the write fails.
+    fn write_entry(
+        &mut self,
+        vlsn: u64,
+        entry_type: u8,
+        payload: &[u8],
+    ) -> crate::error::Result<()> {
+        // Resolve the wire entry-type byte to the typed enum.
+        let log_entry_type =
+            LogEntryType::from_type_num(entry_type).ok_or_else(|| {
+                crate::error::RepError::ProtocolError(format!(
+                    "replica: unknown entry_type byte {}",
+                    entry_type
+                ))
+            })?;
+
+        // Write to the local WAL.  Replicated entries are non-provisional and
+        // do not require an immediate fsync on every entry (the master already
+        // fsynced before sending).
+        let lsn = self
+            .log_manager
+            .log(log_entry_type, payload, Provisional::No, false, false)
+            .map_err(|e| {
+                crate::error::RepError::DatabaseError(format!(
+                    "replica log write failed: {}",
+                    e
+                ))
+            })?;
+
+        // Register VLSN → LSN in the replica's VLSN index so that
+        // FeederRunner/ack tracking can correlate positions.
+        // vlsn=0 is reserved as NULL_VLSN; skip it.
+        if vlsn > 0 {
+            self.vlsn_index.put(
+                vlsn,
+                lsn.file_number(),
+                lsn.file_offset(),
+            );
+        }
+
+        log::trace!(
+            "replica: wrote entry vlsn={} type={} lsn=({},{})",
+            vlsn,
+            log_entry_type,
+            lsn.file_number(),
+            lsn.file_offset(),
+        );
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

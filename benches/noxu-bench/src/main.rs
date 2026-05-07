@@ -260,8 +260,18 @@ fn main() {
         }
 
         // W09: transactional multi-op (3 gets + 2 puts per txn)
-        // Cap at 10K: each commit triggers a full tree scan, giving O(n²) total
-        // cost; beyond 10K the runtime becomes prohibitive.
+        //
+        // Capped at 10_000: the workload issues get(key i) then put(key i) inside
+        // the same transaction.  get() acquires a READ lock on the record's LSN;
+        // put() then needs a WRITE lock on the same LSN.  Without READ->WRITE lock
+        // upgrade support in LockManager, the manager sees a conflict with its own
+        // locker and deadlocks, hanging indefinitely at any scale.
+        //
+        // Root cause: missing lock escalation (READ->WRITE upgrade).
+        // Dependency: task #131 "Txn fidelity: lock escalation (READ->WRITE
+        //   upgrade) + GroupCommit time+size wiring".
+        //
+        // Once #131 lands, remove the `.min(10_000)` cap and use the full `n`.
         {
             let w09_n = n.min(10_000);
             let dir = TempDir::new().unwrap();
@@ -331,8 +341,10 @@ fn main() {
 
         // W11: recovery/startup time
         // Pre-populate outside the timer; time only the re-open.
-        // Noxu does not call RecoveryManager on open (known gap); JE runs
-        // full 3-phase recovery — so this workload makes the gap visible.
+        // Both Noxu and JE run full 3-phase recovery (analysis + redo + undo)
+        // on Environment::open().  Any speedup vs JE reflects lower per-entry
+        // log-replay overhead in Rust (no JVM startup, no classloading, no
+        // JIT warmup) and not a missing recovery step.
         {
             let dir = TempDir::new().unwrap();
             {

@@ -5,7 +5,7 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use noxu_tree::{KeyComparatorFn, Tree};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use crate::dup_key_data;
 
@@ -62,6 +62,15 @@ pub struct DatabaseImpl {
     /// When true, `log_ln_write()` skips WAL logging and returns NULL_LSN;
     /// data is flushed to disk only at eviction or checkpoint.
     deferred_write: bool,
+    /// Per-database entry count.
+    ///
+    /// Incremented on every new insert, decremented on every delete.
+    /// Shared (Arc) so that CursorImpl can update it without holding the
+    /// `DatabaseImpl` write lock — reads and writes are both O(1) atomics.
+    ///
+    /// Port of JE `DatabaseImpl.count` (AtomicLong, updated in
+    /// `BIN.insertEntry` / `BIN.deleteEntry`).
+    entry_count: Arc<AtomicU64>,
     /// Key comparator (None = default byte comparison).
     bt_comparator:
         Option<Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>>,
@@ -146,6 +155,7 @@ impl DatabaseImpl {
             deferred_write: config.deferred_write,
             bt_comparator: None,
             dup_comparator: None,
+            entry_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -215,6 +225,36 @@ impl DatabaseImpl {
     }
     pub fn reference_count(&self) -> i64 {
         self.reference_count.load(Ordering::Relaxed)
+    }
+
+    // Entry count (O(1) atomic counter)
+    /// Returns the current entry count.
+    ///
+    /// Port of `DatabaseImpl.count()` in JE — reads an AtomicLong.
+    pub fn entry_count(&self) -> u64 {
+        self.entry_count.load(Ordering::Relaxed)
+    }
+
+    /// Increments the entry count by 1 (on new insert).
+    pub fn increment_entry_count(&self) {
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrements the entry count by 1 (on delete), saturating at zero.
+    pub fn decrement_entry_count(&self) {
+        // Use a compare-and-swap loop to avoid underflow.
+        loop {
+            let cur = self.entry_count.load(Ordering::Relaxed);
+            if cur == 0 {
+                break;
+            }
+            if self.entry_count
+                .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     // Tree access (stub for LSN tracking)
@@ -344,6 +384,7 @@ impl DatabaseImpl {
             deferred_write: false, // not persisted in log record; set after open if needed
             bt_comparator: None,
             dup_comparator: None,
+            entry_count: Arc::new(AtomicU64::new(0)),
         })
     }
 }

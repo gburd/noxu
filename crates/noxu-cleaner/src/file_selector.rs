@@ -5,19 +5,23 @@
 //!
 //! The cost/benefit file scoring algorithm is ported from
 //! `UtilizationCalculator.getBestFile()` in JE.  JE selects files using
-//! average utilization: the file whose `(minUtil + maxUtil) / 2` is lowest
-//! is the best candidate.  TTL-expired records are tracked per-entry
-//! (BinEntry.expiration_time) but FileSummary does not yet aggregate expired
-//! bytes separately, so minUtil == maxUtil in this implementation.  In JE,
-//! expired bytes contribute to a wider min/max spread:
+//! TTL-adjusted utilization: the file whose adjusted utilization is lowest
+//! is the best candidate.  Expired records do not need to be migrated during
+//! cleaning — they can be dropped outright — so a file with a high expired
+//! fraction is cheaper to clean than its raw utilization suggests.
 //!
-//!   obsolete_bytes = summary.get_obsolete_size()
-//!   minUtil = 100 * (total - obsolete) / total   (active fraction)
-//!   maxUtil = minUtil  (no separate expired-size contribution yet)
-//!   avgUtil = minUtil
+//! Adjusted utilization formula (port of JE `UtilizationCalculator`):
 //!
-//! So the file with the **lowest utilization** (= highest obsolete fraction)
-//! is chosen, subject to:
+//!   obsolete_bytes  = summary.get_obsolete_size()
+//!   expired_bytes   = summary.obsolete_expired_size   (subset of obsolete)
+//!   active_bytes    = total - obsolete
+//!   adjusted_active = active_bytes - expired_bytes
+//!   adjustedUtil    = adjusted_active / total          (0–100 integer %)
+//!
+//! When `obsolete_expired_size == 0` (no TTL data), adjusted_util == raw_util.
+//!
+//! The file with the **lowest adjusted utilization** (= highest effective
+//! obsolete fraction) is chosen, subject to:
 //!   - `file_number <= last_file_to_clean` (age filter, JE: `fileNum <= lastFileToClean`)
 //!   - file not already in-progress (being cleaned)
 //!   - file not in the `to_be_cleaned` queue already
@@ -214,10 +218,11 @@ impl FileSelector {
         // Collect all in-progress file numbers (not eligible for re-selection).
         let in_progress: HashSet<u32> = self.file_info.keys().copied().collect();
 
-        // Step 2 — find the file with lowest average utilization.
-        // Port of JE: pick the file where (thisMinUtil + thisMaxUtil) / 2 is
-        // minimised.  Since expired bytes are not yet tracked in FileSummary,
-        // simply rank by utilization() ascending.
+        // Step 2 — find the file with lowest TTL-adjusted utilization.
+        // Port of JE `UtilizationCalculator.getBestFile()`: rank by
+        // adjusted_utilization_pct() which subtracts expired bytes from the
+        // "active bytes to migrate" numerator.  When no TTL data is present
+        // (obsolete_expired_size == 0) this equals raw utilization_pct().
         let mut best_file: Option<u32> = None;
         let mut best_avg_util: i32 = 101; // higher than any valid utilization
 
@@ -237,10 +242,10 @@ impl FileSelector {
                 continue;
             }
 
-            // Calculate average utilization (0–100 integer percent).
-            // Port of JE: FileSummary.utilization(maxObsoleteSize, totalSize)
-            // No separate expired-size in FileSummary: minUtil == maxUtil.
-            let avg_util = Self::utilization_pct(summary);
+            // TTL-adjusted utilization (0–100 integer percent).
+            // Port of JE UtilizationCalculator: expired records need not be
+            // migrated, so they reduce the effective "live bytes" to write.
+            let avg_util = Self::adjusted_utilization_pct(summary);
 
             // Apply the utilization threshold filter.
             // During a second pass (`self.force_cleaning`), override the caller's
@@ -275,18 +280,38 @@ impl FileSelector {
         Some((file_num, None))
     }
 
-    /// Returns the utilization of a file as an integer percentage 0–100.
+    /// Returns the raw (non-TTL-adjusted) utilization as an integer percentage 0–100.
     ///
     /// Port of `FileSummary.utilization(obsoleteSize, totalSize)` in JE.
     /// A file at 100% utilization has no obsolete bytes; 0% means all bytes
     /// are obsolete.
-    fn utilization_pct(summary: &FileSummary) -> i32 {
+    pub fn utilization_pct(summary: &FileSummary) -> i32 {
         if summary.total_size <= 0 {
             return 0;
         }
         let active = summary.get_active_size();
         // Clamp to [0, 100].
         ((active as i64 * 100) / summary.total_size as i64).clamp(0, 100) as i32
+    }
+
+    /// Returns the TTL-adjusted utilization as an integer percentage 0–100.
+    ///
+    /// Expired LNs tracked in `FileSummary::obsolete_expired_size` do not
+    /// need to be migrated during cleaning.  This method subtracts their
+    /// byte size from the "active bytes" numerator so files with many expired
+    /// records are scored as cheaper to clean.
+    ///
+    /// Port of JE `UtilizationCalculator.getBestFile()` TTL-adjustment:
+    ///   adjusted_active = active_bytes - expired_bytes
+    ///   adjusted_util   = adjusted_active / total_bytes  (clamped 0–100)
+    ///
+    /// When `obsolete_expired_size == 0` this is identical to `utilization_pct`.
+    pub fn adjusted_utilization_pct(summary: &FileSummary) -> i32 {
+        if summary.total_size <= 0 {
+            return 0;
+        }
+        let adjusted = summary.get_adjusted_active_size();
+        ((adjusted as i64 * 100) / summary.total_size as i64).clamp(0, 100) as i32
     }
 
     /// Adds a file to the cleaning queue.
@@ -933,5 +958,106 @@ mod tests {
         };
         // No obsolete
         assert_eq!(FileSelector::utilization_pct(&summary), 100);
+    }
+
+    // ── TTL-adjusted utilization tests ───────────────────────────────────────
+
+    /// A file with 30% live data but 200 bytes of expired records has an
+    /// adjusted_util lower than its raw_util — it is cheaper to clean.
+    #[test]
+    fn test_adjusted_utilization_lower_than_raw_when_expired() {
+        // total=1000, obsolete_ln=700 (raw active=300), expired subset=200
+        // raw_util      = 300/1000 = 30%
+        // adjusted_util = (300-200)/1000 = 10%
+        let summary = FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 7,
+            obsolete_ln_size: 700,
+            obsolete_ln_size_counted: 7,
+            obsolete_expired_lns: 2,
+            obsolete_expired_size: 200,
+            ..Default::default()
+        };
+        let raw = FileSelector::utilization_pct(&summary);
+        let adj = FileSelector::adjusted_utilization_pct(&summary);
+        assert_eq!(raw, 30, "raw utilization should be 30%");
+        assert_eq!(adj, 10, "adjusted utilization should be 10%");
+        assert!(adj < raw, "adjusted must be lower than raw when expired > 0");
+    }
+
+    /// When no expired records exist, adjusted_util equals raw_util.
+    #[test]
+    fn test_adjusted_utilization_equals_raw_when_no_expired() {
+        let summary = FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 5,
+            obsolete_ln_size: 500,
+            obsolete_ln_size_counted: 5,
+            obsolete_expired_lns: 0,
+            obsolete_expired_size: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            FileSelector::utilization_pct(&summary),
+            FileSelector::adjusted_utilization_pct(&summary),
+            "no expired records: adjusted == raw"
+        );
+    }
+
+    /// FileSelector prefers the file with expired records over one with equal
+    /// raw utilization but no expired records, because the expired file is
+    /// cheaper to clean.
+    #[test]
+    fn test_select_prefers_file_with_expired_records() {
+        // File 1: 30% raw util, 200/300 active bytes are expired → adj = 10%
+        // File 2: 30% raw util, no expired records → adj = 30%
+        // File 3: newest — skipped by age filter (min_age=1)
+        let mut map = BTreeMap::new();
+        map.insert(1u32, FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 7,
+            obsolete_ln_size: 700,
+            obsolete_ln_size_counted: 7,
+            obsolete_expired_lns: 2,
+            obsolete_expired_size: 200,
+            ..Default::default()
+        });
+        map.insert(2u32, FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 7,
+            obsolete_ln_size: 700,
+            obsolete_ln_size_counted: 7,
+            obsolete_expired_lns: 0,
+            obsolete_expired_size: 0,
+            ..Default::default()
+        });
+        map.insert(3u32, FileSummary {
+            total_count: 1,
+            total_size: 100,
+            total_ln_count: 1,
+            total_ln_size: 100,
+            ..Default::default()
+        });
+
+        let mut selector = FileSelector::new();
+        // threshold 50% → both files qualify (both adj < 50%); file 1 wins (10% < 30%)
+        let result = selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
+        assert_eq!(
+            result.map(|(f, _)| f),
+            Some(1),
+            "file with expired records (adj=10%) should be preferred over adj=30%"
+        );
     }
 }

@@ -153,7 +153,7 @@ impl LogManager {
     /// - `flush_required` : If true, flush all dirty buffers after logging.
     /// - `fsync_required` : If true, also fsync after flushing.
     /// - `old_lsn`        : Previous LSN for this slot, if any (used for
-    ///                      utilization tracking).
+    ///   utilization tracking).
     ///
     /// # Returns
     /// The LSN assigned to this log entry.
@@ -297,15 +297,15 @@ impl LogManager {
             // serialLogWork() tracker calls.
             if let Some(obs) = &self.write_observer {
                 // Mark old version obsolete (JE: countObsoleteNode).
-                if let Some(old) = old_lsn {
-                    if !old.is_null() {
-                        obs.count_obsolete(
-                            old.file_number(),
-                            old.file_offset(),
-                            0, // size unknown at this point
-                            entry_type.is_ln_type(),
-                        );
-                    }
+                if let Some(old) = old_lsn
+                    && !old.is_null()
+                {
+                    obs.count_obsolete(
+                        old.file_number(),
+                        old.file_offset(),
+                        0, // size unknown at this point
+                        entry_type.is_ln_type(),
+                    );
                 }
                 // Count the new entry (JE: countNewLogEntry).
                 obs.count_new_entry(

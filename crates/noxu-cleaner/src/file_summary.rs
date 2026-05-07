@@ -30,6 +30,19 @@ pub struct FileSummary {
     pub obsolete_ln_size: i32,
     /// Number of obsolete LNs with size counted.
     pub obsolete_ln_size_counted: i32,
+    /// Number of TTL-expired LN log entries (subset of obsolete_ln_count).
+    ///
+    /// Port of JE `FileSummary` expired-LN tracking used by `UtilizationCalculator`
+    /// to give additional weight to files with many expired records.  Expired LNs
+    /// do not need to be migrated during cleaning — they can be dropped outright —
+    /// so a file with a high expired fraction is cheaper to clean than its raw
+    /// utilization suggests.
+    pub obsolete_expired_lns: i32,
+    /// Byte size of TTL-expired LN log entries (subset of obsolete_ln_size).
+    ///
+    /// Used together with `obsolete_expired_lns` to compute the adjusted
+    /// utilization in `FileSelector::adjusted_utilization_pct()`.
+    pub obsolete_expired_size: i32,
 }
 
 impl FileSummary {
@@ -59,6 +72,8 @@ impl FileSummary {
         self.obsolete_ln_count = 0;
         self.obsolete_ln_size = 0;
         self.obsolete_ln_size_counted = 0;
+        self.obsolete_expired_lns = 0;
+        self.obsolete_expired_size = 0;
     }
 
     /// Adds the totals of the given summary object to the totals of this object.
@@ -76,6 +91,8 @@ impl FileSummary {
         self.obsolete_ln_count += other.obsolete_ln_count;
         self.obsolete_ln_size += other.obsolete_ln_size;
         self.obsolete_ln_size_counted += other.obsolete_ln_size_counted;
+        self.obsolete_expired_lns += other.obsolete_expired_lns;
+        self.obsolete_expired_size += other.obsolete_expired_size;
     }
 
     /// Returns the average size for LNs with sizes not counted, or NaN if there are no such LNs.
@@ -209,6 +226,39 @@ impl FileSummary {
         active_size / self.total_size as f64
     }
 
+    /// Returns the TTL-adjusted active byte size.
+    ///
+    /// Expired LNs do not need to be migrated during cleaning — they are simply
+    /// dropped.  From a cost/benefit perspective the "live data to migrate" is
+    /// `active_size - expired_bytes`, which is what the cleaner actually has to
+    /// write to the new file.
+    ///
+    /// Port of JE `UtilizationCalculator` expired-size adjustment:
+    ///   adjustedActive = active_size - obsolete_expired_size
+    pub fn get_adjusted_active_size(&self) -> i32 {
+        let active = self.get_active_size();
+        // Expired bytes that are also in the active set reduce migration cost.
+        // Cap at zero so we never return a negative value.
+        let expired = self.obsolete_expired_size.min(active);
+        active - expired
+    }
+
+    /// Returns the TTL-adjusted utilization (0.0-1.0).
+    ///
+    /// Files with a high proportion of expired records are cheaper to clean
+    /// because expired LNs are dropped rather than migrated.  Using the
+    /// adjusted utilization causes the `FileSelector` to prefer such files.
+    ///
+    /// Port of JE `UtilizationCalculator.getBestFile()` adjusted-utilization
+    /// formula: `(active_bytes - expired_bytes) / total_bytes`.
+    pub fn get_adjusted_utilization(&self) -> f64 {
+        if self.total_size == 0 {
+            return 0.0;
+        }
+        let adjusted = self.get_adjusted_active_size() as f64;
+        (adjusted / self.total_size as f64).clamp(0.0, 1.0)
+    }
+
     /// Returns the total number of entries counted. This value is guaranteed to increase whenever
     /// the tracking information about a file changes. It is used as a key discriminator for
     /// FileSummaryLN records.
@@ -264,6 +314,7 @@ mod tests {
             obsolete_ln_count: 2,
             obsolete_ln_size: 200,
             obsolete_ln_size_counted: 2,
+            ..Default::default()
         };
 
         summary.reset();
@@ -285,6 +336,7 @@ mod tests {
             obsolete_ln_count: 2,
             obsolete_ln_size: 200,
             obsolete_ln_size_counted: 2,
+            ..Default::default()
         };
 
         let summary2 = FileSummary {
@@ -299,6 +351,7 @@ mod tests {
             obsolete_ln_count: 1,
             obsolete_ln_size: 100,
             obsolete_ln_size_counted: 1,
+            ..Default::default()
         };
 
         summary1.add(&summary2);

@@ -543,8 +543,24 @@ impl Bin {
         if plen > 0
             && (full_key.len() < plen || &full_key[..plen] != self.key_prefix.as_slice())
         {
+            // Key does not share the stored prefix — use allocation-free
+            // two-part comparison: compare (prefix ++ suffix) against full_key
+            // by chaining the prefix slice and suffix slice comparisons.
+            let prefix = self.key_prefix.as_slice();
             let pos = self.inner.keys.partition_point(|s| {
-                self.decompress_key(s).as_slice() < full_key
+                // Compare prefix portion first, then suffix if prefix matches.
+                let pfx_cmp = prefix.cmp(&full_key[..prefix.len().min(full_key.len())]);
+                if pfx_cmp != std::cmp::Ordering::Equal {
+                    return pfx_cmp == std::cmp::Ordering::Less;
+                }
+                // Prefixes agree up to min(plen, full_key.len()):
+                // the full entry key is prefix ++ s; the comparison continuation
+                // is full_key[plen..] vs s.
+                if full_key.len() <= plen {
+                    // full_key exhausted before or at prefix boundary: prefix ++ s > full_key
+                    return false;
+                }
+                s.as_slice() < &full_key[plen..]
             });
             return (pos, false);
         }
