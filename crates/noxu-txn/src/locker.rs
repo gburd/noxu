@@ -4,6 +4,11 @@
 
 use crate::{LockResult, LockType, TxnError};
 
+/// Null transaction ID — used by non-transactional lockers (BasicLocker, etc.).
+///
+/// Port of `TxnManager.NULL_TXN_ID = -1` in JE.
+pub const NULL_TXN_ID: i64 = -1;
+
 /// A Locker is JE's route to locking and transactional support.
 ///
 /// This trait is the abstract base for BasicLocker, ThreadLocker, HandleLocker,
@@ -91,6 +96,115 @@ pub trait Locker: Send + Sync {
     /// Default is false. Can be set via isolation level configuration.
     fn is_read_uncommitted_default(&self) -> bool {
         false
+    }
+
+    /// Returns true if this locker shares locks with the locker identified by
+    /// `other_id`.
+    ///
+    /// JE: `Locker.sharesLocksWith(other)` — ThreadLockers on the same thread
+    /// return true, allowing multiple cursors on the same thread to operate
+    /// without lock conflicts.  HandleLocker returns true when configured with
+    /// a buddy locker.  Default: false.
+    ///
+    /// Used by `LockImpl::try_lock()` to skip conflict detection between
+    /// lockers that are known to cooperate.
+    fn shares_locks_with(&self, other_id: i64) -> bool {
+        let _ = other_id;
+        false
+    }
+
+    /// Returns true if locking is required for this locker's current context.
+    ///
+    /// JE: `BasicLocker.lockingRequired` — set to `!cursor.isInternalDbCursor()`
+    /// by `registerCursor()`.  When false, `DummyLockManager` grants locks
+    /// without consulting the underlying lock table.
+    ///
+    /// Default: true.  Override in BasicLocker (and its subclasses) to respect
+    /// the internal-DB-cursor optimization.
+    fn locking_required(&self) -> bool {
+        true
+    }
+
+    /// Returns the transaction-level timeout in milliseconds.
+    ///
+    /// A value of 0 means no transaction timeout (only lock timeout applies).
+    ///
+    /// JE: `Locker.txnTimeoutMillis`.  Default: 0.
+    fn txn_timeout_ms(&self) -> u64 {
+        0
+    }
+
+    /// Returns true if the transaction-level timeout has expired.
+    ///
+    /// JE: `Locker.isTimedOut()`.  Default: false (no timeout set).
+    fn is_timed_out(&self) -> bool {
+        false
+    }
+
+    /// Called by the lock manager when an LN is moved to a new LSN without
+    /// first acquiring a write lock (e.g. during eviction or cleaning).
+    ///
+    /// Every locker holding `old_lsn` must acquire a lock on `new_lsn` so that
+    /// the undo chain remains intact.
+    ///
+    /// JE: `Locker.lockAfterLsnChange(oldLsn, newLsn, dbImpl)`.
+    /// Default: no-op.
+    fn lock_after_lsn_change(
+        &mut self,
+        _old_lsn: u64,
+        _new_lsn: u64,
+    ) -> Result<(), TxnError> {
+        Ok(())
+    }
+
+    /// Called at the end of a non-transactional operation to release locks.
+    ///
+    /// JE: `Locker.operationEnd()` — for BasicLocker this releases all locks
+    /// and closes the locker; for Txn this is a no-op.
+    /// Default: no-op.
+    fn operation_end(&mut self) -> Result<(), TxnError> {
+        Ok(())
+    }
+
+    /// Releases all non-transactional locks held by this locker.
+    ///
+    /// JE: `Locker.releaseNonTxnLocks()` — called during non-txn operation
+    /// cleanup to release any read locks acquired during a cursor scan.
+    /// Default: no-op.
+    fn release_non_txn_locks(&mut self) -> Result<(), TxnError> {
+        Ok(())
+    }
+
+    /// Called after a non-transactional operation ends, releasing locks and
+    /// closing the locker.
+    ///
+    /// JE: `Locker.nonTxnOperationEnd()` — differs from `operationEnd()` in
+    /// that it also closes the locker.
+    /// Default: delegates to `operation_end()`.
+    fn non_txn_operation_end(&mut self) -> Result<(), TxnError> {
+        self.operation_end()
+    }
+
+    /// Returns true if this locker uses serializable (repeatable-read) isolation.
+    ///
+    /// JE: `Locker.isSerializableIsolation()`.  Default: false.
+    fn is_serializable_isolation(&self) -> bool {
+        false
+    }
+
+    /// Returns true if this locker uses read-committed isolation.
+    ///
+    /// JE: `Locker.isReadCommittedIsolation()`.  Default: false.
+    fn is_read_committed_isolation(&self) -> bool {
+        false
+    }
+
+    /// Returns the transaction ID if this locker is or owns a Txn, else None.
+    ///
+    /// JE: `Locker.getTxnLocker()` — returns `this` for Txn, null for others.
+    /// Default: None.
+    fn get_txn_locker_id(&self) -> Option<i64> {
+        None
     }
 
     /// Marks this locker as closed. After close, no operations should occur.

@@ -90,14 +90,18 @@ impl HandleLocker {
             None
         };
 
-        HandleLocker {
+        let locker = HandleLocker {
             id,
             lock_manager,
             locked_lsns: HashSet::new(),
             lock_timeout_ms: 5000,
             is_open: true,
             share_with_txn_id: share_with,
+        };
+        if let Some(bid) = share_with {
+            locker.register_buddy_sharing(bid);
         }
+        locker
     }
 
     /// Release all locks held by this locker.
@@ -114,17 +118,30 @@ impl HandleLocker {
         self.lock_timeout_ms = timeout_ms;
     }
 
+    /// Registers sharing with a buddy locker in the LockManager sharing registry.
+    ///
+    /// Called internally by `with_buddy()` so that `LockImpl::try_lock()` can
+    /// bypass conflict detection between this HandleLocker and its buddy txn.
+    fn register_buddy_sharing(&self, buddy_id: i64) {
+        self.lock_manager.register_locker_sharing(self.id, buddy_id);
+    }
+}
+
+impl Locker for HandleLocker {
     /// Returns true if this locker shares locks with the given locker.
-    pub fn shares_locks_with(&self, other_locker_id: i64) -> bool {
+    ///
+    /// HandleLocker shares with its buddy transaction (if any), allowing the
+    /// database-open locker and the handle locker to co-own NameLN locks.
+    ///
+    /// Port of `HandleLocker.sharesLocksWith(other)` in JE.
+    fn shares_locks_with(&self, other_locker_id: i64) -> bool {
         if let Some(buddy_id) = self.share_with_txn_id {
             buddy_id == other_locker_id
         } else {
             false
         }
     }
-}
 
-impl Locker for HandleLocker {
     fn id(&self) -> i64 {
         self.id
     }

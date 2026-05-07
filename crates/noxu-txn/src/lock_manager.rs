@@ -7,7 +7,7 @@
 //! to allow concurrent lock operations on different LSNs.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use noxu_sync::{Condvar, Mutex};
@@ -66,6 +66,18 @@ pub struct LockManager {
     ///
     /// Port of `LockManager.lockTimeout` in JE.
     lock_timeout_ms: AtomicU64,
+
+    /// Locker sharing registry: maps locker_id → share_group_id.
+    ///
+    /// ThreadLockers register their thread_id (as i64) as the group_id.
+    /// HandleLockers with a buddy register the buddy's ID as the group_id.
+    /// Two lockers are in the same sharing group iff they map to the same
+    /// group_id, and thus bypass lock-conflict detection (JE
+    /// `Locker.sharesLocksWith(other)`).
+    ///
+    /// Port of `LockManager.threadLockers` (thread-locker map) in JE, extended
+    /// to support HandleLocker buddy sharing.
+    share_registry: RwLock<HashMap<i64, i64>>,
 }
 
 /// Internal statistics tracking.
@@ -102,6 +114,7 @@ impl LockManager {
                 lock_waits: AtomicU64::new(0),
             },
             lock_timeout_ms: AtomicU64::new(timeout_ms),
+            share_registry: RwLock::new(HashMap::new()),
         }
     }
 
@@ -516,6 +529,221 @@ impl LockManager {
         }
         total
     }
+
+    // ========================================================================
+    // Lock-sharing registry — JE `LockManager.threadLockers` analogue
+    // ========================================================================
+
+    /// Registers a locker in the sharing registry with the given group ID.
+    ///
+    /// All lockers sharing the same `group_id` bypass conflict detection with
+    /// each other (JE `Locker.sharesLocksWith(other)`).
+    ///
+    /// Called by `ThreadLocker::new()` (group = thread_id) and by
+    /// `HandleLocker::with_buddy()` (group = buddy_locker_id).
+    ///
+    /// Port of `LockManager.registerThreadLocker()`.
+    pub fn register_locker_sharing(&self, locker_id: i64, group_id: i64) {
+        self.share_registry
+            .write()
+            .unwrap()
+            .insert(locker_id, group_id);
+    }
+
+    /// Removes a locker from the sharing registry.
+    ///
+    /// Called by `ThreadLocker::drop()` and `HandleLocker::drop()`.
+    ///
+    /// Port of `LockManager.unregisterThreadLocker()`.
+    pub fn unregister_locker_sharing(&self, locker_id: i64) {
+        self.share_registry.write().unwrap().remove(&locker_id);
+    }
+
+    /// Returns true if `a` and `b` are in the same lock-sharing group.
+    ///
+    /// Used by `ThreadLocker::shares_locks_with()` and
+    /// `HandleLocker::shares_locks_with()`.
+    pub fn same_share_group(&self, a: i64, b: i64) -> bool {
+        let registry = self.share_registry.read().unwrap();
+        match (registry.get(&a), registry.get(&b)) {
+            (Some(ga), Some(gb)) => ga == gb,
+            _ => false,
+        }
+    }
+
+    /// Like `lock_with_timeout()` but also performs a `sharesLocksWith` check
+    /// for every conflict that would otherwise block.
+    ///
+    /// JE: `LockManager.lock()` / `LockImpl.tryLock()` — skips conflict
+    /// detection when both lockers are in the same sharing group.
+    ///
+    /// This method is used by the locker implementations when they call the
+    /// lock manager; the plain `lock()` / `lock_with_timeout()` path uses the
+    /// registry automatically.
+    pub fn lock_with_sharing(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        lock_type: LockType,
+        non_blocking: bool,
+        jump_ahead_of_waiters: bool,
+    ) -> Result<LockGrantType, TxnError> {
+        self.lock_with_sharing_and_timeout(
+            lsn,
+            locker_id,
+            lock_type,
+            non_blocking,
+            jump_ahead_of_waiters,
+            self.lock_timeout_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Full `lock_with_sharing` with explicit timeout.
+    pub fn lock_with_sharing_and_timeout(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        lock_type: LockType,
+        non_blocking: bool,
+        jump_ahead_of_waiters: bool,
+        timeout_ms: u64,
+    ) -> Result<LockGrantType, TxnError> {
+        if lock_type == LockType::None {
+            return Ok(LockGrantType::NoneNeeded);
+        }
+        if lock_type == LockType::Restart {
+            return Err(TxnError::RangeRestart);
+        }
+
+        self.stats.lock_requests.fetch_add(1, Ordering::Relaxed);
+        let table_idx = self.get_table_index(lsn);
+
+        // Snapshot the sharing registry before entering the lock-table critical
+        // section.  This avoids capturing `self` in the closure below while
+        // also holding a mutable borrow of `self.lock_tables[table_idx]`.
+        let requester_group: Option<i64> = {
+            let reg = self.share_registry.read().unwrap();
+            reg.get(&locker_id).copied()
+        };
+        // Clone a per-call snapshot so the closure is 'static w.r.t. self.
+        let registry_snapshot: std::collections::HashMap<i64, i64> = {
+            self.share_registry.read().unwrap().clone()
+        };
+        let shares = move |owner_id: i64| -> bool {
+            if let Some(req_group) = requester_group {
+                registry_snapshot.get(&owner_id).copied() == Some(req_group)
+            } else {
+                false
+            }
+        };
+
+        // Phase 1: attempt under shard mutex.
+        let (initial_grant, owner_ids, notify_pair) = {
+            let mut table = self.lock_tables[table_idx].lock();
+            let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
+
+            let result = lock.lock_with_sharing(
+                lock_type,
+                locker_id,
+                non_blocking,
+                jump_ahead_of_waiters,
+                &shares,
+            );
+
+            if result.success {
+                return Ok(result.lock_grant);
+            }
+            if result.lock_grant == LockGrantType::Denied {
+                return Err(TxnError::LockNotAvailable { lsn });
+            }
+
+            self.stats.lock_waits.fetch_add(1, Ordering::Relaxed);
+            let owner_ids = lock.get_owner_ids();
+            let pair: WaiterNotify = Arc::new((Mutex::new(false), Condvar::new()));
+            lock.set_waiter_notify(locker_id, pair.clone());
+            (result.lock_grant, owner_ids, pair)
+        };
+
+        // Phase 2: deadlock check.
+        if let Some(deadlock_err) = self.check_deadlock_for_waiter(
+            lsn, locker_id, lock_type, &owner_ids,
+        ) {
+            let mut table = self.lock_tables[table_idx].lock();
+            if let Some(lock) = table.get_mut(&lsn) {
+                lock.flush_waiter(locker_id);
+                if lock.n_owners() == 0 && lock.n_waiters() == 0 {
+                    table.remove(&lsn);
+                }
+            }
+            return Err(deadlock_err);
+        }
+
+        // Phase 3: condvar wait (identical to lock_with_timeout).
+        let start = std::time::Instant::now();
+        let (mutex, condvar) = &*notify_pair;
+        let mut granted_guard = mutex.lock();
+
+        loop {
+            if *granted_guard {
+                break;
+            }
+            let remaining_ms = if timeout_ms == 0 {
+                0
+            } else {
+                let elapsed = start.elapsed().as_millis() as u64;
+                if elapsed >= timeout_ms {
+                    drop(granted_guard);
+                    let mut table = self.lock_tables[table_idx].lock();
+                    if let Some(lock) = table.get_mut(&lsn) {
+                        lock.flush_waiter(locker_id);
+                        if lock.n_owners() == 0 && lock.n_waiters() == 0 {
+                            table.remove(&lsn);
+                        }
+                    }
+                    return Err(TxnError::LockTimeout {
+                        timeout_ms,
+                        lsn,
+                        owner: format!("owners of LSN {}", lsn),
+                        requested_type: lock_type,
+                        requester: locker_id.to_string(),
+                    });
+                }
+                timeout_ms - elapsed
+            };
+            let slice_ms = if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
+            let timed_out = condvar.wait_for(
+                &mut granted_guard,
+                Duration::from_millis(slice_ms),
+            );
+            if timed_out.timed_out() {
+                if let Some(dl_err) = self.check_deadlock_for_waiter(
+                    lsn, locker_id, lock_type, &owner_ids,
+                ) {
+                    drop(granted_guard);
+                    let mut table = self.lock_tables[table_idx].lock();
+                    if let Some(lock) = table.get_mut(&lsn) {
+                        lock.flush_waiter(locker_id);
+                        if lock.n_owners() == 0 && lock.n_waiters() == 0 {
+                            table.remove(&lsn);
+                        }
+                    }
+                    return Err(dl_err);
+                }
+            }
+        }
+
+        drop(granted_guard);
+
+        let grant = match initial_grant {
+            LockGrantType::WaitNew => LockGrantType::New,
+            LockGrantType::WaitPromotion => LockGrantType::Promotion,
+            LockGrantType::WaitRestart => LockGrantType::New,
+            other => other,
+        };
+        Ok(grant)
+    }
+
+    // ========================================================================
 
     /// Returns the lock table index for a given LSN.
     ///
