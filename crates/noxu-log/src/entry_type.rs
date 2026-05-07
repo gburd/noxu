@@ -232,6 +232,28 @@ impl LogEntryType {
         )
     }
 
+    /// Returns true if this is an LN type (any leaf node, user or internal).
+    ///
+    /// Port of `LogEntryType.isLNType()` in JE.
+    pub fn is_ln_type(self) -> bool {
+        matches!(
+            self,
+            LogEntryType::InsertLN
+                | LogEntryType::UpdateLN
+                | LogEntryType::DeleteLN
+                | LogEntryType::InsertLNTxn
+                | LogEntryType::UpdateLNTxn
+                | LogEntryType::DeleteLNTxn
+                | LogEntryType::MapLN
+                | LogEntryType::NameLN
+                | LogEntryType::NameLNTxn
+                | LogEntryType::FileSummaryLN
+                | LogEntryType::OldLN
+                | LogEntryType::DelDupLN
+                | LogEntryType::DupCountLN
+        )
+    }
+
     /// Returns true if this is an internal node type (IN levels).
     pub fn is_in_type(self) -> bool {
         matches!(

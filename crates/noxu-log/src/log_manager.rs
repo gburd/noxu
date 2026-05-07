@@ -40,6 +40,7 @@ use crate::file_manager::FileManager;
 use crate::fsync_manager::FsyncManager;
 use crate::log_buffer_pool::LogBufferPool;
 use crate::provisional::Provisional;
+use crate::write_observer::LogWriteObserver;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_sync::Mutex;
 use std::sync::Arc;
@@ -75,6 +76,15 @@ pub struct LogManager {
     /// Initialised with threshold=0, interval=0 (group commit disabled),
     /// matching JE's default configuration.
     fsync_manager: FsyncManager,
+
+    /// Optional utilization tracking observer.
+    ///
+    /// When set, called under the LWL for every log entry written:
+    ///   - `count_new_entry()` for the freshly assigned LSN
+    ///   - `count_obsolete()` when replacing a previous version
+    ///
+    /// Port of `LogManager.serialLogWork()` tracker calls in JE.
+    write_observer: Option<Arc<dyn LogWriteObserver>>,
 }
 
 impl LogManager {
@@ -105,7 +115,58 @@ impl LogManager {
             // matching JE's LOG_GROUP_COMMIT_THRESHOLD / LOG_GROUP_COMMIT_INTERVAL
             // defaults of 0.
             fsync_manager: FsyncManager::new(0, 0),
+            write_observer: None,
         }
+    }
+
+    /// Installs the utilization tracking observer.
+    ///
+    /// Called by `EnvironmentImpl::open()` after creating the `LogManager` and
+    /// `UtilizationTracker`.  The observer is called under the LWL on every
+    /// log write so that utilization accounting is always consistent with the
+    /// on-disk log.
+    ///
+    /// Port of `LogManager` receiving `envImpl.getUtilizationTracker()` in JE.
+    pub fn set_write_observer(&mut self, observer: Arc<dyn LogWriteObserver>) {
+        self.write_observer = Some(observer);
+    }
+
+    /// Logs a raw entry to the WAL, optionally marking an old LSN obsolete.
+    ///
+    /// This is the main write path.  The caller must have already serialised
+    /// the entry payload; this method builds the full on-disk record:
+    ///
+    /// ```text
+    /// [checksum: u32 LE] [entry_type: u8] [flags: u8]
+    /// [prev_offset: u32 LE] [item_size: u32 LE]
+    /// [vlsn?: i64 LE]   <- only when provisional == Replicated
+    /// [payload bytes]
+    /// ```
+    ///
+    /// When `old_lsn` is `Some`, the observer is notified that the previous
+    /// version at that LSN is now obsolete (JE: `countObsoleteNode`).
+    ///
+    /// # Parameters
+    /// - `entry_type`     : Log entry type.
+    /// - `payload`        : Serialised payload bytes (excludes header).
+    /// - `provisional`    : Provisional status flag.
+    /// - `flush_required` : If true, flush all dirty buffers after logging.
+    /// - `fsync_required` : If true, also fsync after flushing.
+    /// - `old_lsn`        : Previous LSN for this slot, if any (used for
+    ///                      utilization tracking).
+    ///
+    /// # Returns
+    /// The LSN assigned to this log entry.
+    pub fn log_with_old_lsn(
+        &self,
+        entry_type: LogEntryType,
+        payload: &[u8],
+        provisional: Provisional,
+        flush_required: bool,
+        fsync_required: bool,
+        old_lsn: Option<Lsn>,
+    ) -> Result<Lsn> {
+        self.log_internal(entry_type, payload, provisional, flush_required, fsync_required, old_lsn)
     }
 
     /// Logs a raw entry (header + payload already serialised) to the WAL.
@@ -136,6 +197,18 @@ impl LogManager {
         provisional: Provisional,
         flush_required: bool,
         fsync_required: bool,
+    ) -> Result<Lsn> {
+        self.log_internal(entry_type, payload, provisional, flush_required, fsync_required, None)
+    }
+
+    fn log_internal(
+        &self,
+        entry_type: LogEntryType,
+        payload: &[u8],
+        provisional: Provisional,
+        flush_required: bool,
+        fsync_required: bool,
+        old_lsn: Option<Lsn>,
     ) -> Result<Lsn> {
         // Build the header bytes + payload into one contiguous buffer so we
         // can compute the checksum in one pass (matching JE's approach).
@@ -219,6 +292,30 @@ impl LogManager {
                 current_lsn.file_offset() + entry_size as u32,
             );
             self.file_manager.set_last_position(new_next, current_lsn);
+
+            // Utilization tracking — called under the LWL, matching JE's
+            // serialLogWork() tracker calls.
+            if let Some(obs) = &self.write_observer {
+                // Mark old version obsolete (JE: countObsoleteNode).
+                if let Some(old) = old_lsn {
+                    if !old.is_null() {
+                        obs.count_obsolete(
+                            old.file_number(),
+                            old.file_offset(),
+                            0, // size unknown at this point
+                            entry_type.is_ln_type(),
+                        );
+                    }
+                }
+                // Count the new entry (JE: countNewLogEntry).
+                obs.count_new_entry(
+                    current_lsn.file_number(),
+                    current_lsn.file_offset(),
+                    entry_size as u32,
+                    entry_type.is_ln_type(),
+                    entry_type.is_in_type(),
+                );
+            }
 
             // Obtain a write buffer that can hold entry_size bytes.
             let buffer_arc = {

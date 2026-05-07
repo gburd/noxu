@@ -1562,7 +1562,15 @@ impl CursorImpl {
             LogEntryType::DeleteLN
         };
 
-        lm.log(entry_type, &buf, Provisional::No, false, false)
+        // Pass the previous slot LSN as old_lsn so the UtilizationTracker
+        // marks the previous version obsolete (JE: countObsoleteNode with oldLsn).
+        let old_lsn_opt = if self.current_lsn != noxu_util::NULL_LSN.as_u64() {
+            Some(Lsn::from_u64(self.current_lsn))
+        } else {
+            None
+        };
+
+        lm.log_with_old_lsn(entry_type, &buf, Provisional::No, false, false, old_lsn_opt)
             .map_err(DbiError::from)
     }
 
