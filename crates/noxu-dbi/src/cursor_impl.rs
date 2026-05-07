@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
 #[cfg(any(test, feature = "testing"))]
 use std::cell::Cell;
 
@@ -31,6 +32,7 @@ use noxu_log::{
     entry::LnLogEntry,
 };
 use noxu_tree::{BinEntry, Tree};
+use noxu_txn::{LockManager, LockType, Locker, Txn};
 
 use crate::dup_key_data;
 use noxu_util::{Lsn, vlsn::NULL_VLSN};
@@ -149,6 +151,25 @@ pub struct CursorImpl {
     /// Write-ahead log manager for recording data operations.
     /// None for read-only cursors or cursors created outside a real env.
     log_manager: Option<Arc<LogManager>>,
+    /// Lock manager for per-record read/write locking.
+    /// None for cursors created outside a real env (e.g., unit tests).
+    ///
+    /// Port of JE `CursorImpl.locker` — the locker calls `locker.lock(lsn,
+    /// LockType.READ, ...)` via `lockLN()` before returning each record.
+    lock_manager: Option<Arc<LockManager>>,
+
+    /// Optional explicit transaction backing this cursor.
+    ///
+    /// When `Some`, write operations acquire locks via the `Txn` and record
+    /// `WriteLockInfo` (abort before-images) so the transaction can undo each
+    /// modification on abort.
+    ///
+    /// When `None` (auto-commit), write locks are acquired directly from
+    /// `lock_manager` using the cursor's own `id` as the locker and released
+    /// immediately after the write is logged (auto-commit semantics).
+    ///
+    /// Port of `CursorImpl.locker` (Txn subtype) in JE.
+    txn_ref: Option<Arc<Mutex<Txn>>>,
 }
 
 impl CursorImpl {
@@ -173,6 +194,8 @@ impl CursorImpl {
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
             log_manager: None,
+            lock_manager: None,
+            txn_ref: None,
         }
     }
 
@@ -195,7 +218,122 @@ impl CursorImpl {
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
             log_manager: Some(log_manager),
+            lock_manager: None,
+            txn_ref: None,
         }
+    }
+
+    /// Wires a lock manager for per-record locking.
+    ///
+    /// Port of JE `CursorImpl` receiving a `Locker` from
+    /// `DatabaseImpl.openCursor()`.  Returns `self` for builder-style chaining.
+    pub fn with_lock_manager(mut self, lock_manager: Arc<LockManager>) -> Self {
+        self.lock_manager = Some(lock_manager);
+        self
+    }
+
+    /// Wires an explicit transaction for write-lock tracking.
+    ///
+    /// When set, write operations (`put`, `delete`) acquire WRITE locks via
+    /// the `Txn` and record abort before-images in `WriteLockInfo`, enabling
+    /// transaction rollback.
+    ///
+    /// Port of `CursorImpl` being constructed with a `Txn` locker in JE.
+    /// Returns `self` for builder-style chaining.
+    pub fn with_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
+        self.txn_ref = Some(txn);
+        self
+    }
+
+    /// Gets the before-image (old_data, old_lsn) for `key` from the tree.
+    ///
+    /// Returns `(None, NULL_LSN)` if the key does not exist (new insert).
+    fn get_slot_before_image(&self, key: &[u8]) -> (Option<Vec<u8>>, u64) {
+        let db = self.db_impl.read();
+        if let Some(tree) = db.get_real_tree() {
+            match Self::get_data_from_tree(tree, key) {
+                Some((data, lsn)) => (Some(data), lsn),
+                None => (None, noxu_util::NULL_LSN.as_u64()),
+            }
+        } else {
+            (None, noxu_util::NULL_LSN.as_u64())
+        }
+    }
+
+    /// Acquires a WRITE lock on `old_lsn` before writing to the log.
+    ///
+    /// For txn-backed cursors, calls `Txn::lock()` (lock persists until commit/abort).
+    /// For auto-commit cursors (lock_manager only), uses cursor `id` as locker.
+    /// A NULL_LSN (new insert with no prior version) does not need a pre-log lock.
+    ///
+    /// Port of `CursorImpl.lockLNDeletedVersion()` in JE.
+    fn lock_write_before_log(&self, old_lsn: u64) -> Result<(), DbiError> {
+        if old_lsn == noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+        if let Some(txn) = &self.txn_ref {
+            txn.lock().unwrap()
+                .lock(old_lsn, LockType::Write, false)
+                .map_err(DbiError::TxnError)?;
+        } else if let Some(lm) = &self.lock_manager {
+            lm.lock(old_lsn, self.id, LockType::Write, false, false)
+                .map_err(DbiError::TxnError)?;
+        }
+        Ok(())
+    }
+
+    /// Moves the write lock to `new_lsn` and records abort before-image info.
+    ///
+    /// For txn-backed cursors:
+    ///   - If `old_lsn` is valid: moves lock via `Txn::move_write_lock_to_new_lsn()`.
+    ///   - Otherwise (new insert): acquires a new write lock on `new_lsn`.
+    ///   - Records abort info so the txn can undo on abort.
+    ///   - Notes the log entry on the txn for TxnCommit/Abort chaining.
+    ///
+    /// For auto-commit cursors:
+    ///   - Acquires write lock on `new_lsn`, releases both old and new locks
+    ///     immediately (auto-commit releases after the write is logged).
+    ///
+    /// Port of `CursorImpl.afterLog()` / `Txn.moveWriteLockToNewLsn()` in JE.
+    fn finalize_write_lock(
+        &self,
+        old_lsn: u64,
+        new_lsn: Lsn,
+        abort_key: Option<Vec<u8>>,
+        abort_data: Option<Vec<u8>>,
+    ) -> Result<(), DbiError> {
+        let new_lsn_u64 = new_lsn.as_u64();
+        // Deferred-write or no log manager: no LSN assigned, nothing to lock.
+        if new_lsn_u64 == noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+
+        if let Some(txn) = &self.txn_ref {
+            let db_id = self.db_impl.read().get_id().id() as u64;
+            let mut guard = txn.lock().unwrap();
+            if old_lsn != noxu_util::NULL_LSN.as_u64() {
+                // Move the existing write lock from old slot to new slot.
+                guard.move_write_lock_to_new_lsn(old_lsn, new_lsn_u64);
+            } else {
+                // New insert: no old lock to move — acquire a fresh write lock.
+                guard.lock(new_lsn_u64, LockType::Write, false)
+                    .map_err(DbiError::TxnError)?;
+            }
+            let abort_known_deleted = old_lsn == noxu_util::NULL_LSN.as_u64();
+            guard.set_write_lock_abort_info(
+                new_lsn_u64, old_lsn, abort_key, abort_data, abort_known_deleted, db_id,
+            );
+            guard.note_log_entry(new_lsn_u64);
+        } else if let Some(lm) = &self.lock_manager {
+            // Auto-commit: acquire write lock, then release immediately.
+            lm.lock(new_lsn_u64, self.id, LockType::Write, false, false)
+                .map_err(DbiError::TxnError)?;
+            if old_lsn != noxu_util::NULL_LSN.as_u64() {
+                let _ = lm.release(old_lsn, self.id);
+            }
+            let _ = lm.release(new_lsn_u64, self.id);
+        }
+        Ok(())
     }
 
     /// Returns true if the underlying database uses sorted duplicates.
@@ -324,7 +462,7 @@ impl CursorImpl {
         match search_mode {
             SearchMode::Set | SearchMode::Both => {
                 if found {
-                    let data_from_tree: Option<Vec<u8>> = {
+                    let result: Option<(Vec<u8>, u64)> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
                             Self::get_data_from_tree(tree, key)
@@ -332,9 +470,14 @@ impl CursorImpl {
                             None
                         }
                     };
+                    let (slot_data, slot_lsn) = match result {
+                        Some((d, l)) => (Some(d), l),
+                        None => (data.map(|d| d.to_vec()), noxu_util::NULL_LSN.as_u64()),
+                    };
+                    self.lock_ln(slot_lsn)?;
                     self.current_key = Some(key.to_vec());
-                    self.current_data = data_from_tree.or_else(|| data.map(|d| d.to_vec()));
-                    self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                    self.current_data = slot_data;
+                    self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
                     Ok(OperationStatus::Success)
@@ -344,7 +487,7 @@ impl CursorImpl {
             }
             SearchMode::SetRange | SearchMode::BothRange => {
                 if found {
-                    let data_from_tree: Option<Vec<u8>> = {
+                    let result: Option<(Vec<u8>, u64)> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
                             Self::get_data_from_tree(tree, key)
@@ -352,14 +495,19 @@ impl CursorImpl {
                             None
                         }
                     };
+                    let (slot_data, slot_lsn) = match result {
+                        Some((d, l)) => (Some(d), l),
+                        None => (data.map(|d| d.to_vec()), noxu_util::NULL_LSN.as_u64()),
+                    };
+                    self.lock_ln(slot_lsn)?;
                     self.current_key = Some(key.to_vec());
-                    self.current_data = data_from_tree.or_else(|| data.map(|d| d.to_vec()));
-                    self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                    self.current_data = slot_data;
+                    self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
                     Ok(OperationStatus::Success)
                 } else {
-                    let next_entry: Option<(Vec<u8>, Vec<u8>)> = {
+                    let next_entry: Option<(Vec<u8>, Vec<u8>, u64)> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
                             Self::find_range_entry(tree, key)
@@ -368,10 +516,11 @@ impl CursorImpl {
                         }
                     };
                     match next_entry {
-                        Some((k, v)) => {
+                        Some((k, v, lsn)) => {
+                            self.lock_ln(lsn)?;
                             self.current_key = Some(k);
                             self.current_data = Some(v);
-                            self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                            self.current_lsn = lsn;
                             self.current_index = 0;
                             self.state = CursorState::Initialized;
                             Ok(OperationStatus::Success)
@@ -410,7 +559,7 @@ impl CursorImpl {
             }
         };
 
-        let entry: Option<(Vec<u8>, Vec<u8>)> = {
+        let entry: Option<(Vec<u8>, Vec<u8>, u64)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 tree.first_entry_at_or_after(&search_two_part_key)
@@ -420,7 +569,7 @@ impl CursorImpl {
         };
 
         match entry {
-            Some((raw_key, _)) => {
+            Some((raw_key, _, slot_lsn)) => {
                 // raw_key is the two-part key found; check that the primary
                 // key part matches what was requested (for Set and Both).
                 let matches = match search_mode {
@@ -439,10 +588,11 @@ impl CursorImpl {
                     }
                 };
                 if matches {
+                    self.lock_ln(slot_lsn)?;
                     // Store the raw two-part key; get_current() will decode it.
                     self.current_key = Some(raw_key);
                     self.current_data = None; // decoded lazily in get_current()
-                    self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                    self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
                     Ok(OperationStatus::Success)
@@ -454,10 +604,43 @@ impl CursorImpl {
         }
     }
 
+    /// Acquires a read lock on a log record by LSN.
+    ///
+    /// Port of JE `CursorImpl.lockLN(LockType.READ)`.  When no lock manager
+    /// is wired (read-only cursors / unit tests) this is a no-op.
+    ///
+    /// For txn-backed cursors the lock is tracked in the `Txn` and held until
+    /// commit/abort.  For auto-commit cursors the lock is acquired (to wait
+    /// for any current exclusive writer to finish) and then released
+    /// immediately — mirroring JE's `AutoTxn` single-operation semantics.
+    ///
+    /// Returns an error only when the lock would deadlock or the locker is
+    /// invalid; `NULL_LSN` records are skipped (lock-free slots).
+    fn lock_ln(&self, lsn: u64) -> Result<(), DbiError> {
+        if lsn == noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+        if let Some(txn) = &self.txn_ref {
+            // Txn-backed cursor: track read lock in Txn (released at commit/abort).
+            txn.lock().unwrap()
+                .lock(lsn, LockType::Read, false)
+                .map_err(DbiError::TxnError)?;
+        } else if let Some(lm) = &self.lock_manager {
+            // Auto-commit: wait for any current writer, then release immediately.
+            // Use self.id (unique per cursor) so different cursors are independent lockers.
+            lm.lock(lsn, self.id, LockType::Read, false, false)
+                .map_err(DbiError::TxnError)?;
+            lm.release(lsn, self.id).map_err(DbiError::TxnError)?;
+        }
+        Ok(())
+    }
+
     /// Fetches the data associated with `key` from a tree (BIN-level lookup).
     ///
+    /// Returns `(data, slot_lsn)` so the caller can acquire a read lock.
+    ///
     /// Port of the data-read path in `CursorImpl.lockAndGetCurrent()`.
-    fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<Vec<u8>> {
+    fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
         let root = tree.get_root()?;
         // Descend to the BIN that should contain `key` (not always the leftmost).
@@ -466,12 +649,18 @@ impl CursorImpl {
         match &*guard {
             TreeNode::Bottom(bin) => {
                 // BIN entries store compressed (suffix) keys under the BIN's
-                // key_prefix. Compare against the suffix, not the full key.
+                // key_prefix. If the key doesn't start with the prefix,
+                // it is not in this BIN — return None rather than panicking.
+                if !bin.key_prefix.is_empty()
+                    && !key.starts_with(bin.key_prefix.as_slice())
+                {
+                    return None;
+                }
                 let suffix = bin.compress_key(key);
                 bin.entries
                     .iter()
                     .find(|e| e.key.as_slice() == suffix.as_slice())
-                    .and_then(|e| e.data.clone())
+                    .map(|e| (e.data.clone().unwrap_or_default(), e.lsn.as_u64()))
             }
             _ => None,
         }
@@ -479,9 +668,11 @@ impl CursorImpl {
 
     /// Finds the first entry in the tree whose key >= `key`.
     ///
+    /// Returns `(key, data, slot_lsn)` so the caller can acquire a read lock.
+    ///
     /// Port of `Tree.searchRange()` — returns the first key in the BIN that
     /// compares >= the given search key.
-    fn find_range_entry(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn find_range_entry(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
         let root = tree.get_root()?;
         // Use find_bin_for_key so range searches also work for non-leftmost BINs.
@@ -498,7 +689,7 @@ impl CursorImpl {
                     .find(|(_, e)| e.key.as_slice() >= suffix.as_slice())
                     .and_then(|(i, e)| {
                         bin.get_full_key(i)
-                            .map(|fk| (fk, e.data.clone().unwrap_or_default()))
+                            .map(|fk| (fk, e.data.clone().unwrap_or_default(), e.lsn.as_u64()))
                     })
             }
             _ => None,
@@ -579,7 +770,7 @@ impl CursorImpl {
     pub fn get_first(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        let entry: Option<(Vec<u8>, Vec<u8>, i32)> = {
+        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -601,6 +792,7 @@ impl CursorImpl {
                                         bin.get_full_key(0).unwrap_or_default(),
                                         bin.entries[0].data.clone().unwrap_or_default(),
                                         0i32,
+                                        bin.entries[0].lsn.as_u64(),
                                     ))
                                 }
                             }
@@ -614,10 +806,11 @@ impl CursorImpl {
         };
 
         match entry {
-            Some((key, data, idx)) => {
+            Some((key, data, idx, lsn)) => {
+                self.lock_ln(lsn)?;
                 self.current_key = Some(key);
                 self.current_data = Some(data);
-                self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
@@ -640,7 +833,7 @@ impl CursorImpl {
     pub fn get_last(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        let entry: Option<(Vec<u8>, Vec<u8>, i32)> = {
+        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -663,6 +856,7 @@ impl CursorImpl {
                                         bin.get_full_key(last_idx).unwrap_or_default(),
                                         bin.entries[last_idx].data.clone().unwrap_or_default(),
                                         last_idx as i32,
+                                        bin.entries[last_idx].lsn.as_u64(),
                                     ))
                                 }
                             }
@@ -676,10 +870,11 @@ impl CursorImpl {
         };
 
         match entry {
-            Some((key, data, idx)) => {
+            Some((key, data, idx, lsn)) => {
+                self.lock_ln(lsn)?;
                 self.current_key = Some(key);
                 self.current_data = Some(data);
-                self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
@@ -764,7 +959,7 @@ impl CursorImpl {
             self.current_index - 1
         };
 
-        let entry: Option<(Vec<u8>, Vec<u8>, i32)> = {
+        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -789,6 +984,7 @@ impl CursorImpl {
                                         bin.get_full_key(idx).unwrap_or_default(),
                                         bin.entries[idx].data.clone().unwrap_or_default(),
                                         next_index,
+                                        bin.entries[idx].lsn.as_u64(),
                                     ))
                                 }
                             }
@@ -801,18 +997,19 @@ impl CursorImpl {
             }
         };
 
-        if let Some((key, data, idx)) = entry {
+        if let Some((key, data, idx, lsn)) = entry {
             // For dup-mode traversal modes, filter by primary key.
             if is_dup {
                 let s = self.apply_dup_filter(
-                    key, data, idx, mode, current_primary_key.as_deref(),
+                    key, data, idx, lsn, mode, current_primary_key.as_deref(),
                     forward,
                 )?;
                 return Ok(s);
             }
+            self.lock_ln(lsn)?;
             self.current_key = Some(key);
             self.current_data = Some(data);
-            self.current_lsn = noxu_util::NULL_LSN.as_u64();
+            self.current_lsn = lsn;
             self.current_index = idx;
             return Ok(OperationStatus::Success);
         }
@@ -838,24 +1035,25 @@ impl CursorImpl {
 
         match adjacent_entries {
             Some(entries) if !entries.is_empty() => {
-                let (raw_key, raw_data, idx) = if forward {
+                let (raw_key, raw_data, idx, lsn) = if forward {
                     let e = entries.into_iter().next().unwrap();
-                    (e.key, e.data.unwrap_or_default(), 0i32)
+                    (e.key, e.data.unwrap_or_default(), 0i32, e.lsn.as_u64())
                 } else {
                     let last_idx = (entries.len() - 1) as i32;
                     let e = entries.into_iter().last().unwrap();
-                    (e.key, e.data.unwrap_or_default(), last_idx)
+                    (e.key, e.data.unwrap_or_default(), last_idx, e.lsn.as_u64())
                 };
                 if is_dup {
                     let s = self.apply_dup_filter(
-                        raw_key, raw_data, idx, mode,
+                        raw_key, raw_data, idx, lsn, mode,
                         current_primary_key.as_deref(), forward,
                     )?;
                     return Ok(s);
                 }
+                self.lock_ln(lsn)?;
                 self.current_key = Some(raw_key);
                 self.current_data = Some(raw_data);
-                self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                self.current_lsn = lsn;
                 self.current_index = idx;
                 Ok(OperationStatus::Success)
             }
@@ -877,6 +1075,7 @@ impl CursorImpl {
         mut raw_key: Vec<u8>,
         mut raw_data: Vec<u8>,
         mut idx: i32,
+        mut lsn: u64,
         mode: GetMode,
         prev_primary_key: Option<&[u8]>,
         forward: bool,
@@ -891,9 +1090,10 @@ impl CursorImpl {
                         _ => false,
                     };
                     if same {
+                        self.lock_ln(lsn)?;
                         self.current_key = Some(raw_key);
                         self.current_data = Some(raw_data);
-                        self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                        self.current_lsn = lsn;
                         self.current_index = idx;
                         return Ok(OperationStatus::Success);
                     } else {
@@ -907,9 +1107,10 @@ impl CursorImpl {
                         _ => false,
                     };
                     if !same {
+                        self.lock_ln(lsn)?;
                         self.current_key = Some(raw_key);
                         self.current_data = Some(raw_data);
-                        self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                        self.current_lsn = lsn;
                         self.current_index = idx;
                         return Ok(OperationStatus::Success);
                     }
@@ -948,6 +1149,7 @@ impl CursorImpl {
                                                         .clone()
                                                         .unwrap_or_default(),
                                                     idx,
+                                                    bin.entries[i].lsn.as_u64(),
                                                 ))
                                             }
                                         }
@@ -960,10 +1162,11 @@ impl CursorImpl {
                         }
                     };
                     match next {
-                        Some((k, d, i)) => {
+                        Some((k, d, i, l)) => {
                             raw_key = k;
                             raw_data = d;
                             idx = i;
+                            lsn = l;
                             // Loop continues.
                         }
                         None => {
@@ -983,19 +1186,20 @@ impl CursorImpl {
                             };
                             match adj {
                                 Some(entries) if !entries.is_empty() => {
-                                    let (k, d, i) = if forward {
+                                    let (k, d, i, l) = if forward {
                                         let e =
                                             entries.into_iter().next().unwrap();
-                                        (e.key, e.data.unwrap_or_default(), 0i32)
+                                        (e.key, e.data.unwrap_or_default(), 0i32, e.lsn.as_u64())
                                     } else {
                                         let li = (entries.len() - 1) as i32;
                                         let e =
                                             entries.into_iter().last().unwrap();
-                                        (e.key, e.data.unwrap_or_default(), li)
+                                        (e.key, e.data.unwrap_or_default(), li, e.lsn.as_u64())
                                     };
                                     raw_key = k;
                                     raw_data = d;
                                     idx = i;
+                                    lsn = l;
                                     // Loop continues.
                                 }
                                 _ => return Ok(OperationStatus::NotFound),
@@ -1005,9 +1209,10 @@ impl CursorImpl {
                 }
                 // Next / Prev: accept any entry.
                 GetMode::Next | GetMode::Prev => {
+                    self.lock_ln(lsn)?;
                     self.current_key = Some(raw_key);
                     self.current_data = Some(raw_data);
-                    self.current_lsn = noxu_util::NULL_LSN.as_u64();
+                    self.current_lsn = lsn;
                     self.current_index = idx;
                     return Ok(OperationStatus::Success);
                 }
@@ -1110,8 +1315,11 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
+                let (old_data, old_lsn) = self.get_slot_before_image(&current_key);
+                self.lock_write_before_log(old_lsn)?;
                 let new_lsn =
                     self.log_ln_write(&current_key, Some(data), self.locker_id)?;
+                self.finalize_write_lock(old_lsn, new_lsn, Some(current_key.clone()), old_data)?;
                 let db = self.db_impl.read();
                 if let Some(tree) = db.get_real_tree() {
                     let _ = tree.insert(current_key, data.to_vec(), new_lsn);
@@ -1134,7 +1342,11 @@ impl CursorImpl {
                 if key_exists {
                     return Ok(OperationStatus::KeyExist);
                 }
+                // New insert: old_lsn is NULL (abort_known_deleted=true).
+                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                self.lock_write_before_log(old_lsn)?;
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
+                self.finalize_write_lock(old_lsn, new_lsn, Some(key.to_vec()), old_data)?;
                 {
                     let db = self.db_impl.read();
                     if let Some(tree) = db.get_real_tree() {
@@ -1165,7 +1377,10 @@ impl CursorImpl {
                 if key_exists {
                     return Ok(OperationStatus::KeyExist);
                 }
+                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                self.lock_write_before_log(old_lsn)?;
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
+                self.finalize_write_lock(old_lsn, new_lsn, Some(key.to_vec()), old_data)?;
                 {
                     let db = self.db_impl.read();
                     if let Some(tree) = db.get_real_tree() {
@@ -1180,7 +1395,10 @@ impl CursorImpl {
                 Ok(OperationStatus::Success)
             }
             PutMode::Overwrite => {
+                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                self.lock_write_before_log(old_lsn)?;
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
+                self.finalize_write_lock(old_lsn, new_lsn, Some(key.to_vec()), old_data)?;
                 {
                     let db = self.db_impl.read();
                     if let Some(tree) = db.get_real_tree() {
@@ -1372,7 +1590,10 @@ impl CursorImpl {
         // stored in the tree.  For non-dup databases it is the plain key.
         // In both cases current_key is the correct tree-delete key.
         if let Some(tree_key) = self.current_key.clone() {
-            self.log_ln_write(&tree_key, None, self.locker_id)?;
+            let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
+            self.lock_write_before_log(old_lsn)?;
+            let del_lsn = self.log_ln_write(&tree_key, None, self.locker_id)?;
+            self.finalize_write_lock(old_lsn, del_lsn, Some(tree_key.clone()), old_data)?;
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 tree.delete(&tree_key);
@@ -1428,7 +1649,7 @@ impl CursorImpl {
                 // Use first_entry_at_or_after to position, then count via
                 // get_next_bin until primary key changes.
                 let mut current_raw = match tree.first_entry_at_or_after(&lb) {
-                    Some((k, _)) => k,
+                    Some((k, _, _)) => k,
                     None => return Ok(0),
                 };
                 loop {
@@ -1487,6 +1708,9 @@ impl CursorImpl {
             ),
             None => CursorImpl::new(self.db_impl.clone(), self.locker_id),
         };
+        if let Some(lm) = &self.lock_manager {
+            new_cursor.lock_manager = Some(lm.clone());
+        }
 
         if same_position && self.state == CursorState::Initialized {
             new_cursor.current_key = self.current_key.clone();
