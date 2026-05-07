@@ -6,6 +6,7 @@ use crate::durability::{Durability, SyncPolicy};
 use crate::error::{NoxuError, Result};
 use crate::transaction_config::TransactionConfig;
 use noxu_log::LogManager;
+use noxu_txn::Txn;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -64,6 +65,15 @@ pub struct Transaction {
     txn_timeout_ms: Mutex<u64>,
     /// Write-ahead log manager (None when created outside of an Environment).
     log_manager: Option<Arc<LogManager>>,
+    /// Internal transaction for lock management and write-set tracking.
+    ///
+    /// When `Some`, write operations on cursors acquire per-record write locks
+    /// via this `Txn` and record abort before-images.  On `abort()`, this `Txn`
+    /// releases all locks and collects `UndoRecord`s.
+    ///
+    /// Port of the relationship between `Transaction` (public) and `Txn` (internal)
+    /// in JE: `Transaction.txnImpl` field.
+    inner_txn: Option<Arc<Mutex<Txn>>>,
 }
 
 impl Transaction {
@@ -82,6 +92,7 @@ impl Transaction {
             lock_timeout_ms: Mutex::new(0),
             txn_timeout_ms: Mutex::new(0),
             log_manager: None,
+            inner_txn: None,
         }
     }
 
@@ -103,7 +114,25 @@ impl Transaction {
             lock_timeout_ms: Mutex::new(0),
             txn_timeout_ms: Mutex::new(0),
             log_manager: Some(log_manager),
+            inner_txn: None,
         }
+    }
+
+    /// Sets the inner `Txn` for lock management and write-set tracking.
+    ///
+    /// Called by `Environment::begin_transaction()` to wire the transaction to
+    /// the environment's `TxnManager` / `LockManager`.
+    pub fn with_inner_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
+        self.inner_txn = Some(txn);
+        self
+    }
+
+    /// Returns a clone of the `Arc<Mutex<Txn>>` inner transaction, if any.
+    ///
+    /// Used by `Database::make_cursor_for_txn()` to wire the cursor to the
+    /// same `Txn` so that write operations lock via the transaction.
+    pub fn get_inner_txn(&self) -> Option<Arc<Mutex<Txn>>> {
+        self.inner_txn.clone()
     }
 
     /// Commit the transaction.
@@ -141,6 +170,12 @@ impl Transaction {
                 self.write_txn_end(lm, true, fsync, flush)?;
             }
 
+        // Release per-record locks held by the inner Txn.
+        // The inner Txn has no log_manager so it won't write duplicate WAL records.
+        if let Some(inner) = &self.inner_txn {
+            let _ = inner.lock().unwrap().commit();
+        }
+
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Committed;
         Ok(())
@@ -175,6 +210,12 @@ impl Transaction {
             && let Some(lm) = &self.log_manager {
                 self.write_txn_end(lm, false, false, false)?;
             }
+
+        // Release per-record locks held by the inner Txn and collect undo records.
+        // The inner Txn has no log_manager so it won't write duplicate WAL records.
+        if let Some(inner) = &self.inner_txn {
+            let _ = inner.lock().unwrap().abort();
+        }
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Aborted;

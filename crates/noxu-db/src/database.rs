@@ -72,13 +72,35 @@ pub enum DbState {
 }
 
 impl Database {
-    /// Creates a CursorImpl, wired to the WAL when the environment has one.
+    /// Creates a CursorImpl, wired to the WAL and lock manager when the
+    /// environment has them.
     fn make_cursor(&self) -> CursorImpl {
-        match self.env_impl.lock().get_log_manager() {
+        let env = self.env_impl.lock();
+        let lock_manager = Arc::clone(env.get_lock_manager());
+        match env.get_log_manager() {
             Some(lm) => {
                 CursorImpl::with_log_manager(Arc::clone(&self.db_impl), 0, lm)
+                    .with_lock_manager(lock_manager)
             }
-            None => CursorImpl::new(Arc::clone(&self.db_impl), 0),
+            None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
+                .with_lock_manager(lock_manager),
+        }
+    }
+
+    /// Creates a CursorImpl wired to the given transaction for write-lock tracking.
+    ///
+    /// Behaves like `make_cursor()` but additionally calls `.with_txn()` so
+    /// that write operations acquire locks via the transaction's `Txn` and
+    /// record abort before-images in `WriteLockInfo`.
+    ///
+    /// Port of `DatabaseImpl.openCursor(txn, config)` in JE which passes the
+    /// transaction's `Locker` to the new `CursorImpl`.
+    fn make_cursor_for_txn(&self, txn: &Transaction) -> CursorImpl {
+        let cursor = self.make_cursor();
+        if let Some(inner) = txn.get_inner_txn() {
+            cursor.with_txn(inner)
+        } else {
+            cursor
         }
     }
 
@@ -233,7 +255,10 @@ impl Database {
             data.get_data().unwrap_or(&[])
         };
 
-        let mut cursor = self.make_cursor();
+        let mut cursor = match txn {
+            Some(t) => self.make_cursor_for_txn(t),
+            None => self.make_cursor(),
+        };
         cursor
             .put(key_bytes, data_bytes, PutMode::Overwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
@@ -270,7 +295,10 @@ impl Database {
         let key_bytes = key.get_data().unwrap_or(&[]);
         let data_bytes = data.get_data().unwrap_or(&[]);
 
-        let mut cursor = self.make_cursor();
+        let mut cursor = match txn {
+            Some(t) => self.make_cursor_for_txn(t),
+            None => self.make_cursor(),
+        };
         let status = match cursor
             .put(key_bytes, data_bytes, PutMode::NoOverwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
@@ -309,7 +337,10 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
-        let mut cursor = self.make_cursor();
+        let mut cursor = match txn {
+            Some(t) => self.make_cursor_for_txn(t),
+            None => self.make_cursor(),
+        };
         // First search to position the cursor
         let status = match cursor
             .search(key_bytes, None, SearchMode::Set)

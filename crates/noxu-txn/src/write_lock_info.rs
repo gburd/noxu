@@ -39,6 +39,12 @@ pub struct WriteLockInfo {
     /// Per JE: "True if this locker has never had this LSN locked, is false otherwise.
     /// This is used to determine if the locker must add undo information for a write lock."
     pub never_locked: bool,
+
+    /// Database ID of the database that was modified.
+    ///
+    /// Stored so that `Txn::abort()` can route each `UndoRecord` to the
+    /// correct database's B-tree.
+    pub database_id: u64,
 }
 
 impl WriteLockInfo {
@@ -54,6 +60,7 @@ impl WriteLockInfo {
             abort_expiration: 0,
             abort_expiration_in_hours: false,
             never_locked: true,
+            database_id: 0,
         }
     }
 
@@ -70,6 +77,7 @@ impl WriteLockInfo {
         self.abort_expiration = from.abort_expiration;
         self.abort_expiration_in_hours = from.abort_expiration_in_hours;
         self.never_locked = from.never_locked;
+        self.database_id = from.database_id;
     }
 
     /// Sets the abort information from a log entry.

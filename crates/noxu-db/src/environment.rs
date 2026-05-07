@@ -425,10 +425,22 @@ impl Environment {
         drop(active_txns);
 
         // Wire the transaction to the WAL so commit/abort write log entries.
-        let txn = if let Some(lm) = self.env_impl.lock().get_log_manager() {
+        // Also create an inner Txn for per-record lock management.
+        let env_guard = self.env_impl.lock();
+        let inner_txn = env_guard.begin_txn()
+            .map(|t| Arc::new(std::sync::Mutex::new(t)))
+            .ok();
+        let txn = if let Some(lm) = env_guard.get_log_manager() {
             Transaction::with_log_manager(txn_id, txn_config, lm)
         } else {
             Transaction::new(txn_id, txn_config)
+        };
+        drop(env_guard);
+
+        let txn = if let Some(it) = inner_txn {
+            txn.with_inner_txn(it)
+        } else {
+            txn
         };
 
         Ok(txn)
