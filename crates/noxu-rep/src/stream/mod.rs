@@ -9,6 +9,9 @@ pub mod feeder;
 pub mod output_thread;
 pub mod replica_stream;
 
-pub use feeder::{Feeder, FeederRunner, FeederState, LogScanner};
+pub use feeder::{EnvironmentLogScanner, Feeder, FeederRunner, FeederState, LogScanner};
 pub use output_thread::OutputQueue;
-pub use replica_stream::{LogWriter, ReplicaReceiver, ReplicaStream, ReplicaStreamState};
+pub use replica_stream::{
+    EnvironmentLogWriter, LogWriter, ReplicaReceiver, ReplicaStream,
+    ReplicaStreamState,
+};

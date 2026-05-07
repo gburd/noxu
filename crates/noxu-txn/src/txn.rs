@@ -10,6 +10,7 @@ use std::time::Instant;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_util::lsn::{Lsn, NULL_LSN};
 
+use crate::group_commit::GroupCommit;
 use crate::txn_abort::TxnAbort;
 use crate::txn_commit::TxnCommit;
 use crate::txn_state::TxnState;
@@ -170,6 +171,13 @@ pub struct Txn {
     /// Port of `Txn.postLogCommitHook()` in JE.
     post_commit_hook: Option<Box<dyn Fn(Lsn) + Send + Sync>>,
 
+    /// Optional group-commit handler (Master or Replica).
+    ///
+    /// When `Some` and enabled, `commit()` calls `buffer_commit()` after
+    /// writing the TxnCommit WAL entry to decide whether to fsync or defer.
+    ///
+    /// Port of the `GroupCommit.bufferCommit()` call site in `Txn.commit()`.
+    group_commit: Option<Arc<dyn GroupCommit>>,
 }
 
 impl Txn {
@@ -201,7 +209,28 @@ impl Txn {
             abort_lsn: NULL_LSN.as_u64(),
             pre_commit_hook: None,
             post_commit_hook: None,
+            group_commit: None,
         }
+    }
+
+    /// Attaches a group-commit handler to this transaction.
+    ///
+    /// When set, `commit()` calls `buffer_commit()` after writing the
+    /// TxnCommit WAL entry:
+    /// - if `buffer_commit()` returns `true` (batched): skip the fsync.
+    /// - if `buffer_commit()` returns `false` (flush now): call `flush_sync()`.
+    ///
+    /// Port of the `TxnManager.groupCommit` wiring in JE's `Txn.commit()`.
+    pub fn with_group_commit(mut self, gc: Arc<dyn GroupCommit>) -> Self {
+        self.group_commit = Some(gc);
+        self
+    }
+
+    /// Sets the group-commit handler on an existing transaction.
+    ///
+    /// Same semantics as `with_group_commit()` but works on `&mut self`.
+    pub fn set_group_commit(&mut self, gc: Arc<dyn GroupCommit>) {
+        self.group_commit = Some(gc);
     }
 
     /// Creates a new transaction wired to a LogManager.
@@ -250,24 +279,63 @@ impl Txn {
         for lsn in self.read_locks.drain().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
-        let fsync = matches!(durability, Durability::CommitSync);
+        let want_sync = matches!(durability, Durability::CommitSync);
         let assigned_lsn = if self.has_logged_entries() {
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
             }
-            let commit =
-                TxnCommit::new(self.id, self.last_lsn, 0, 0);
+            let commit = TxnCommit::new(self.id, self.last_lsn, 0, 0);
             let mut payload = Vec::with_capacity(commit.log_size());
             commit.write_to_log(&mut payload);
-            let lsn = self.log_entry(LogEntryType::TxnCommit, &payload, fsync)?;
+
+            // Write the TxnCommit WAL entry. The fsync is always deferred
+            // here so that group commit can decide whether to coalesce it.
+            // JE: Txn.commit() writes the entry then calls flushTo(commitLsn)
+            // separately, which is how GroupCommit intercepts the fsync.
+            let commit_lsn = self.log_entry(LogEntryType::TxnCommit, &payload, false)?;
+
             if let Some(ref hook) = self.post_commit_hook {
-                hook(lsn);
+                hook(commit_lsn);
             }
-            lsn
+
+            // Step: decide whether to fsync now or defer via GroupCommit.
+            //
+            // JE (NoSQL fork): after writing the WAL entry, Txn.commit()
+            // calls GroupCommit.bufferCommit(nowNs, txn, commitVLSN).
+            // - returns true  → commit is batched; skip fsync (another
+            //                   commit will flush for us).
+            // - returns false → flush now (timeout or buffer limit reached).
+            //
+            // Without GroupCommit: fsync according to the durability policy.
+            if want_sync {
+                let should_skip_fsync = match &self.group_commit {
+                    Some(gc) if gc.is_enabled() => {
+                        // Use the txn id as a proxy for commit VLSN in
+                        // non-replicated environments (matches JE's single-node
+                        // path where VLSN is not assigned for local txns).
+                        gc.buffer_commit(self.id)
+                    }
+                    _ => false,
+                };
+                if !should_skip_fsync && let Some(ref lm) = self.log_manager {
+                    lm.flush_sync()
+                        .map_err(TxnError::LogError)?;
+                }
+            } else if matches!(durability, Durability::CommitWriteNoSync)
+                && let Some(ref lm) = self.log_manager
+            {
+                lm.flush_no_sync()
+                    .map_err(TxnError::LogError)?;
+            }
+            // CommitNoSync: neither flush nor fsync.
+
+            commit_lsn
         } else {
             NULL_LSN
         };
         self.commit_lsn = assigned_lsn.as_u64();
+        // JE: release write locks AFTER the log flush (so lock holders are
+        // not visible to readers until the commit is durable).
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
@@ -495,20 +563,36 @@ impl Txn {
                 TxnCommit::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
             let mut payload = Vec::with_capacity(commit.log_size());
             commit.write_to_log(&mut payload);
-            let lsn = self.log_entry(LogEntryType::TxnCommit, &payload, true /* fsync */)?;
+
+            // Write the TxnCommit entry without fsync; we decide below
+            // whether to fsync based on the GroupCommit handler.
+            let commit_lsn = self.log_entry(LogEntryType::TxnCommit, &payload, false /* fsync deferred */)?;
 
             // Post-commit hook (JE: postLogCommitHook).
             if let Some(ref hook) = self.post_commit_hook {
-                hook(lsn);
+                hook(commit_lsn);
             }
-            lsn
+
+            // Decide whether to fsync now or defer to GroupCommit.
+            // commit() defaults to CommitSync (JE default durability).
+            let should_skip_fsync = match &self.group_commit {
+                Some(gc) if gc.is_enabled() => gc.buffer_commit(self.id),
+                _ => false,
+            };
+            if !should_skip_fsync && let Some(ref lm) = self.log_manager {
+                lm.flush_sync()
+                    .map_err(TxnError::LogError)?;
+            }
+
+            commit_lsn
         } else {
             NULL_LSN
         };
 
         self.commit_lsn = assigned_lsn.as_u64();
 
-        // Step 4: release write locks.
+        // Step 4: release write locks AFTER the log flush (JE: clearLocks
+        // is called after logManager.flushTo(commitLsn)).
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }

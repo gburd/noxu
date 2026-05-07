@@ -401,6 +401,39 @@ public class JeBenchmark {
         int[] scales = new int[scaleCount];
         System.arraycopy(allScales, 0, scales, 0, scaleCount);
 
+        // -------------------------------------------------------------------------
+        // JVM warmup phase — run each workload at scale=1000 without recording
+        // results.  This ensures the JIT has compiled all hot paths (Tree traversal,
+        // lock acquisition, I/O helpers) before any timed measurement begins.
+        // Without this the 1K-scale results are dominated by interpreter overhead
+        // and show an artificial 20-30× gap vs Noxu.
+        // -------------------------------------------------------------------------
+        System.out.println("[warmup] Starting JVM warmup (scale=1000)...");
+        {
+            final int WN = 1_000;
+            // w01
+            { File d = makeTempDir("wu01"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); seqWrite(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w02
+            { File d = makeTempDir("wu02"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); randWrite(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w03
+            { File d = makeTempDir("wu03"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); seqRead(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w04
+            { File d = makeTempDir("wu04"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); randRead(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w05
+            { File d = makeTempDir("wu05"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); rangeScan(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w06
+            { File d = makeTempDir("wu06"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); writeHeavy(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w07
+            { File d = makeTempDir("wu07"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); readHeavy(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w08
+            { File d = makeTempDir("wu08"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); deleteInsert(db, WN); db.close(); e.close(); deleteDir(d); }
+            // w09
+            { File d = makeTempDir("wu09"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); final Environment fe = e; txnMulti(fe, db, WN); db.close(); e.close(); deleteDir(d); }
+            // w10 (one concurrent config)
+            { File d = makeTempDir("wu10"); Environment e = EnvHelper.openEnv(d); Database db = EnvHelper.openDb(e); EnvHelper.populate(db, WN); concurrent(db, WN, 4, 4); db.close(); e.close(); deleteDir(d); }
+        }
+        System.out.println("[warmup] complete");
+
         // W10 concurrent configurations: {readerThreads, writerThreads}
         // label → {readers, writers}
         int[][] concurrentConfigs = {

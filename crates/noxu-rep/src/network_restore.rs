@@ -6,11 +6,19 @@
 //! discovers an `InsufficientLogException`  -  its local log files are too
 //! old for the feeder to supply a contiguous stream.
 
-use std::time::Duration;
+use std::io::{Read as IoRead, Write as IoWrite};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use noxu_sync::Mutex;
 
 use crate::error::{RepError, Result};
+
+/// Magic bytes sent at the start of every restore-request frame.
+///
+/// 4-byte little-endian value: `0x4E52_5354` ('N','R','S','T').
+const RESTORE_MAGIC: u32 = 0x4E52_5354;
 
 /// Configuration for a network restore operation.
 ///
@@ -65,6 +73,10 @@ pub struct NetworkRestore {
     state: Mutex<RestoreState>,
     /// Progress tracking.
     progress: Mutex<RestoreProgress>,
+    /// Local directory where restored log files are written.
+    ///
+    /// If `None`, files are written to the process's current directory.
+    local_log_dir: Option<PathBuf>,
 }
 
 impl NetworkRestore {
@@ -79,7 +91,16 @@ impl NetworkRestore {
                 files_transferred: 0,
                 elapsed: Duration::ZERO,
             }),
+            local_log_dir: None,
         }
+    }
+
+    /// Set the local directory where restored `.ndb` files will be written.
+    ///
+    /// If not set, the current working directory is used.
+    pub fn with_local_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.local_log_dir = Some(dir.into());
+        self
     }
 
     /// Get the current restore state.
@@ -95,6 +116,184 @@ impl NetworkRestore {
     /// Get the restore configuration.
     pub fn get_config(&self) -> &NetworkRestoreConfig {
         &self.config
+    }
+
+    /// Execute a full network restore: connect to the source node, transfer
+    /// all `.ndb` log files, and write them to the local log directory.
+    ///
+    /// # Wire protocol (simple restore protocol)
+    ///
+    /// ```text
+    /// Client → Server: [magic: u32 LE]            (4 bytes)  "NRST"
+    /// Server → Client: [file_count: u32 LE]        (4 bytes)
+    /// For each file:
+    ///   Server → Client: [name_len: u16 LE]        (2 bytes)
+    ///                    [name: UTF-8 bytes]        (name_len bytes)
+    ///                    [file_size: u64 LE]        (8 bytes)
+    ///                    [data: file_size bytes]
+    /// ```
+    ///
+    /// Port of `com.sleepycat.je.rep.NetworkRestore.execute()`.
+    pub fn execute(&self) -> Result<()> {
+        // Validate state: must be NotStarted.
+        {
+            let state = self.state.lock();
+            if *state != RestoreState::NotStarted {
+                return Err(RepError::NetworkRestoreError(format!(
+                    "execute called in wrong state: {:?}",
+                    *state
+                )));
+            }
+        }
+
+        // Transition to InProgress.
+        self.start()?;
+
+        let started_at = Instant::now();
+        let addr = format!(
+            "{}:{}",
+            self.config.source_host, self.config.source_port
+        );
+
+        // Connect to the source node.
+        let mut stream = TcpStream::connect(&addr).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "cannot connect to source {}: {}",
+                addr, e
+            ))
+        })?;
+
+        // Set a generous read timeout so we don't hang forever on a dead peer.
+        let _ = stream
+            .set_read_timeout(Some(Duration::from_secs(120)));
+
+        // Send the restore-request magic.
+        stream
+            .write_all(&RESTORE_MAGIC.to_le_bytes())
+            .map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "sending restore magic: {}",
+                    e
+                ))
+            })?;
+
+        // Read the file count.
+        let mut count_buf = [0u8; 4];
+        stream.read_exact(&mut count_buf).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "reading file count: {}",
+                e
+            ))
+        })?;
+        let file_count = u32::from_le_bytes(count_buf);
+
+        let log_dir = self.local_log_dir.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+
+        let mut total_bytes: u64 = 0;
+        let mut files_done: u32 = 0;
+
+        for _ in 0..file_count {
+            // Read filename length + name.
+            let mut name_len_buf = [0u8; 2];
+            stream.read_exact(&mut name_len_buf).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading filename length: {}",
+                    e
+                ))
+            })?;
+            let name_len = u16::from_le_bytes(name_len_buf) as usize;
+
+            let mut name_buf = vec![0u8; name_len];
+            stream.read_exact(&mut name_buf).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading filename: {}",
+                    e
+                ))
+            })?;
+            let filename =
+                String::from_utf8(name_buf).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "non-UTF8 filename: {}",
+                        e
+                    ))
+                })?;
+
+            // Read file size.
+            let mut size_buf = [0u8; 8];
+            stream.read_exact(&mut size_buf).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading file size for '{}': {}",
+                    filename, e
+                ))
+            })?;
+            let file_size = u64::from_le_bytes(size_buf);
+
+            // Determine destination path.
+            // If `retain_log_files` is set and the file already exists,
+            // rename the existing file before writing the new one.
+            let dest_path = log_dir.join(&filename);
+            if self.config.retain_log_files && dest_path.exists() {
+                let backup = log_dir.join(format!("{}.bak", filename));
+                let _ = std::fs::rename(&dest_path, &backup);
+            }
+
+            // Stream file bytes directly to disk in 64 KiB chunks.
+            let mut out = std::fs::File::create(&dest_path).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "creating '{}': {}",
+                    dest_path.display(),
+                    e
+                ))
+            })?;
+
+            let mut remaining = file_size;
+            let mut chunk = vec![0u8; 65536];
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(chunk.len());
+                stream
+                    .read_exact(&mut chunk[..to_read])
+                    .map_err(|e| {
+                        RepError::NetworkRestoreError(format!(
+                            "reading data for '{}': {}",
+                            filename, e
+                        ))
+                    })?;
+                out.write_all(&chunk[..to_read]).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "writing '{}': {}",
+                        dest_path.display(),
+                        e
+                    ))
+                })?;
+                remaining -= to_read as u64;
+                total_bytes += to_read as u64;
+            }
+
+            files_done += 1;
+            self.update_progress(total_bytes, files_done);
+            self.update_elapsed(started_at.elapsed());
+
+            log::debug!(
+                "NetworkRestore: received '{}' ({} bytes)",
+                filename,
+                file_size
+            );
+        }
+
+        self.update_elapsed(started_at.elapsed());
+        self.complete()?;
+
+        log::info!(
+            "NetworkRestore from {}: {} file(s), {} bytes transferred in {:?}",
+            addr,
+            files_done,
+            total_bytes,
+            started_at.elapsed(),
+        );
+
+        Ok(())
     }
 
     /// Start the network restore.

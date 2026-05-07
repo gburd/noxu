@@ -12,6 +12,7 @@ noxu-log = { workspace = true }
 noxu-txn = { workspace = true }
 noxu-tree = { workspace = true }
 noxu-sync = { workspace = true }
+noxu-dbi = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 

@@ -283,10 +283,16 @@ impl CursorImpl {
     /// writes go directly to the BIN immediately.  Read-committed isolation
     /// is enforced by the lock manager — concurrent readers block on the
     /// WRITE lock held by this cursor's txn until it commits or aborts.
+    ///
+    /// When the tree reports a **new** insert (`is_new == true`), increments
+    /// the per-database entry count (port of JE `BIN.insertEntry` counter).
     fn apply_tree_insert(&self, key: Vec<u8>, data: Vec<u8>, new_lsn: Lsn) {
         let db = self.db_impl.read();
-        if let Some(tree) = db.get_real_tree() {
-            let _ = tree.insert(key, data, new_lsn);
+        if let Some(tree) = db.get_real_tree()
+            && let Ok(is_new) = tree.insert(key, data, new_lsn)
+            && is_new
+        {
+            db.increment_entry_count();
         }
     }
 
@@ -296,10 +302,16 @@ impl CursorImpl {
     /// the deletion is applied to the BIN immediately.  Concurrent readers
     /// that try to acquire a READ lock on the deleted slot's LSN block until
     /// the writer's WRITE lock is released (commit or abort).
+    ///
+    /// When the tree confirms the key was actually removed (`deleted == true`),
+    /// decrements the per-database entry count (port of JE `BIN.deleteEntry`
+    /// counter).
     fn apply_tree_delete(&self, key: Vec<u8>, _del_lsn: Lsn) {
         let db = self.db_impl.read();
-        if let Some(tree) = db.get_real_tree() {
-            tree.delete(&key);
+        if let Some(tree) = db.get_real_tree()
+            && tree.delete(&key)
+        {
+            db.decrement_entry_count();
         }
     }
 
