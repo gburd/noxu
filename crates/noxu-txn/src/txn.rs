@@ -170,20 +170,6 @@ pub struct Txn {
     /// Port of `Txn.postLogCommitHook()` in JE.
     post_commit_hook: Option<Box<dyn Fn(Lsn) + Send + Sync>>,
 
-    /// Pending write buffer: maps (db_id, key) -> (data or None=delete, new_lsn).
-    ///
-    /// Writes in an explicit transaction are buffered here and NOT applied to
-    /// the in-memory B-tree until `commit()`.  On `abort()`, the buffer is
-    /// discarded without touching the tree, providing read-committed isolation.
-    ///
-    /// Port of JE's per-LN `pendingTxn` tag that prevents uncommitted data
-    /// from being visible to auto-commit readers.
-    pub pending_writes: HashMap<(i64, Vec<u8>), (Option<Vec<u8>>, u64)>,
-
-    /// Deferred tree-write closures registered by cursor `put()` / `delete()`
-    /// for txn-backed operations.  Executed during `commit()` to apply the
-    /// buffered writes to the in-memory tree.
-    commit_apply_hooks: Vec<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Txn {
@@ -215,8 +201,6 @@ impl Txn {
             abort_lsn: NULL_LSN.as_u64(),
             pre_commit_hook: None,
             post_commit_hook: None,
-            pending_writes: HashMap::new(),
-            commit_apply_hooks: Vec::new(),
         }
     }
 
@@ -284,10 +268,6 @@ impl Txn {
             NULL_LSN
         };
         self.commit_lsn = assigned_lsn.as_u64();
-        for hook in self.commit_apply_hooks.drain(..) {
-            hook();
-        }
-        self.pending_writes.clear();
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
@@ -316,40 +296,6 @@ impl Txn {
         F: Fn(Lsn) + Send + Sync + 'static,
     {
         self.post_commit_hook = Some(Box::new(hook));
-    }
-
-    /// Registers a deferred tree write for a txn-backed cursor operation.
-    ///
-    /// Instead of writing to the B-tree immediately (which would make the
-    /// data visible to other readers before commit), the cursor registers a
-    /// `hook` closure that applies the write at commit time.  The
-    /// `pending_writes` map is updated so that reads within this same txn can
-    /// see their own writes via `get_pending_write()`.
-    ///
-    /// Port of JE's `pendingTxn` per-LN tagging that prevents uncommitted LNs
-    /// from being returned to readers using read-committed semantics.
-    pub fn add_pending_write(
-        &mut self,
-        db_id: i64,
-        key: Vec<u8>,
-        data: Option<Vec<u8>>,
-        lsn: u64,
-        hook: Box<dyn Fn() + Send + Sync>,
-    ) {
-        self.pending_writes.insert((db_id, key), (data, lsn));
-        self.commit_apply_hooks.push(hook);
-    }
-
-    /// Returns the pending data for `(db_id, key)` if this txn has a buffered
-    /// write for that record, or `None` if no pending write exists.
-    ///
-    /// The returned tuple is `(Option<data>, lsn)` where `None` data means
-    /// the record is pending-deleted.
-    ///
-    /// Used by reads within the same transaction to implement "read your own
-    /// writes" semantics.
-    pub fn get_pending_write(&self, db_id: i64, key: &[u8]) -> Option<&(Option<Vec<u8>>, u64)> {
-        self.pending_writes.get(&(db_id, key.to_vec()))
     }
 
     /// Returns the current transaction state.
@@ -562,14 +508,6 @@ impl Txn {
 
         self.commit_lsn = assigned_lsn.as_u64();
 
-        // Step 3b: apply deferred tree writes (uncommitted data was buffered
-        // to prevent visibility before commit; apply now while write locks are
-        // still held so concurrent readers see a consistent snapshot).
-        for hook in self.commit_apply_hooks.drain(..) {
-            hook();
-        }
-        self.pending_writes.clear();
-
         // Step 4: release write locks.
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
@@ -635,21 +573,18 @@ impl Txn {
 
         self.abort_lsn = assigned_lsn.as_u64();
 
-        // Step 3: discard pending tree writes.
+        // Step 3: collect undo records from WriteLockInfo for tree undo.
         //
-        // With the write-buffering approach, uncommitted writes are stored in
-        // `pending_writes` / `commit_apply_hooks` and are NOT yet in the tree.
-        // Discarding them here achieves correct abort semantics without any
-        // tree undo.
-        self.commit_apply_hooks.clear();
-        self.pending_writes.clear();
-
-        // Step 3b: collect legacy undo records from WriteLockInfo for callers
-        // that bypass the pending-write buffer (e.g. recovery / migration paths).
+        // JE: `Txn.undoLNs()` walks the write-lock chain and calls
+        // `DatabaseImpl.abort(undoLsn, locker)` for each LN.  In Noxu, the
+        // caller (`Transaction::abort()`) is responsible for applying the undo
+        // to the B-tree after draining `take_undo_records()`.
         //
-        // The undo_records vector is available via `take_undo_records()`.
+        // Port of `Txn.undoLNs()` in JE — collects before-image records from
+        // each `WriteLockInfo` entry, including new inserts where
+        // `abort_known_deleted=true` and `abort_lsn == NULL_LSN`.
         for (lsn, wli) in &self.write_locks {
-            if wli.abort_lsn != NULL_LSN.as_u64() {
+            if wli.abort_known_deleted || wli.abort_lsn != NULL_LSN.as_u64() {
                 let record = UndoRecord {
                     current_lsn: *lsn,
                     abort_lsn: wli.abort_lsn,

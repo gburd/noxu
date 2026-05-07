@@ -1,17 +1,25 @@
 //! Concurrency and isolation correctness tests.
 //!
 //! These tests verify that the lock manager, transaction layer, and B-tree
-//! behave correctly under concurrent access:
+//! behave correctly under concurrent access.
 //!
+//! Isolation model: Noxu uses JE's lock-based read-committed isolation.
+//! Writes go directly to the BIN immediately (no buffering); concurrent
+//! readers block on write-locked records via `lock_ln()` until the writer
+//! commits or aborts.  This is NOT MVCC — readers do not see an old snapshot.
+//!
+//! Tested properties:
 //! - Multiple concurrent readers do not block each other.
-//! - Uncommitted writes are not visible to other transactions.
+//! - While a writer holds a write lock, a concurrent reader blocks and sees
+//!   the committed value once the writer commits.
+//! - Aborting a transaction rolls back its writes (before-images restored).
 //! - All writes in a transaction appear atomically after commit.
 //! - Concurrent non-conflicting writes to different keys proceed in parallel.
-//! - Write-write conflicts on the same key are properly serialised.
 //! - Concurrent reads while a writer is active do not corrupt state.
 
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus};
 use tempfile::TempDir;
@@ -83,44 +91,68 @@ fn test_concurrent_reads_do_not_block() {
 // Isolation: uncommitted writes are not visible
 // ============================================================================
 
-/// A write in an open transaction must NOT be visible to another concurrent
-/// transaction until the writer commits.
+/// A writer's uncommitted write blocks a concurrent reader until commit.
 ///
-/// JE: read-committed isolation — readers see only committed versions.
+/// JE isolation model: writes go directly to the BIN immediately; the writer
+/// holds a WRITE lock on the new LSN.  A concurrent null-txn reader calls
+/// `lock_ln()` which acquires a READ lock — this BLOCKS while the WRITE lock
+/// is held.  After the writer commits the WRITE lock is released and the
+/// reader unblocks, seeing the committed value.
+///
+/// This is read-committed via blocking (not MVCC): readers never see an old
+/// snapshot; they either block or see the committed value.
+///
+/// Port of JE's lock-based read-committed isolation test pattern.
 #[test]
-fn test_uncommitted_write_not_visible() {
+fn test_uncommitted_write_blocks_reader_until_commit() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_env_and_db(&dir);
+    let env = Arc::new(env);
+    let db = Arc::new(db);
 
-    let key = DatabaseEntry::from_bytes(b"key1");
-    let val_initial = DatabaseEntry::from_bytes(b"initial");
-    let val_new = DatabaseEntry::from_bytes(b"new");
+    let key_bytes = b"key1";
 
-    // Write and commit the initial value.
-    db.put(None, &key, &val_initial).unwrap();
+    // Pre-populate with "initial" (committed).
+    db.put(None, &DatabaseEntry::from_bytes(key_bytes), &DatabaseEntry::from_bytes(b"initial")).unwrap();
 
-    // Begin a writer transaction, write but do NOT commit yet.
-    let writer_txn = env.begin_transaction(None, None).unwrap();
-    db.put(Some(&writer_txn), &key, &val_new).unwrap();
+    // Barrier: writer signals when it holds the write lock.
+    let barrier = Arc::new(Barrier::new(2));
 
-    // A separate reader (no transaction = auto-commit) reads the key.
-    // It should see the committed initial value, NOT the uncommitted new value.
-    // Note: auto-commit read uses None txn — reads from the committed tree state.
+    let db_w = Arc::clone(&db);
+    let env_w = Arc::clone(&env);
+    let b_w = Arc::clone(&barrier);
+
+    let writer_handle = thread::spawn(move || {
+        let txn = env_w.begin_transaction(None, None).unwrap();
+        db_w.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(key_bytes),
+            &DatabaseEntry::from_bytes(b"new"),
+        ).unwrap();
+        // Notify the reader that we hold the write lock.
+        b_w.wait();
+        // Hold the lock for long enough that the reader definitely blocks.
+        thread::sleep(Duration::from_millis(80));
+        txn.commit().unwrap();
+    });
+
+    // Wait for the writer to hold the write lock, then read.
+    // `lock_ln()` will try to acquire a READ lock — it will block until the
+    // writer commits (~80 ms later) and then return the committed value "new".
+    barrier.wait();
+    let start = std::time::Instant::now();
     let mut out = DatabaseEntry::new();
-    let status = db.get(None, &key, &mut out).unwrap();
+    let status = db.get(None, &DatabaseEntry::from_bytes(key_bytes), &mut out).unwrap();
+    let elapsed = start.elapsed();
+
+    writer_handle.join().unwrap();
+
+    // The reader unblocked after the writer committed — sees the committed value.
     assert_eq!(status, OperationStatus::Success);
-    assert_eq!(
-        out.data(),
-        b"initial",
-        "uncommitted write leaked to reader"
-    );
-
-    // After commit, the reader sees the new value.
-    writer_txn.commit().unwrap();
-
-    let mut out2 = DatabaseEntry::new();
-    db.get(None, &key, &mut out2).unwrap();
-    assert_eq!(out2.data(), b"new");
+    assert_eq!(out.data(), b"new", "reader should see committed value after writer commits");
+    // The reader should have blocked for a meaningful amount of time (the
+    // writer held the lock for ~80 ms; allow generous margin for slow CI).
+    assert!(elapsed.as_millis() >= 10, "reader should have blocked on the write lock");
 }
 
 /// Aborting a transaction must roll back all its writes.

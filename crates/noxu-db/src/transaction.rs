@@ -5,7 +5,9 @@
 use crate::durability::{Durability, SyncPolicy};
 use crate::error::{NoxuError, Result};
 use crate::transaction_config::TransactionConfig;
+use noxu_dbi::{DatabaseId, EnvironmentImpl};
 use noxu_log::LogManager;
+use noxu_sync::Mutex as SyncMutex;
 use noxu_txn::Txn;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -74,6 +76,14 @@ pub struct Transaction {
     /// Port of the relationship between `Transaction` (public) and `Txn` (internal)
     /// in JE: `Transaction.txnImpl` field.
     inner_txn: Option<Arc<Mutex<Txn>>>,
+    /// Reference to the owning `EnvironmentImpl`.
+    ///
+    /// Used by `abort()` to look up each modified database by ID and apply
+    /// undo records to the B-tree.
+    ///
+    /// Port of `Txn.envImpl` in JE, which is used by `Txn.undoLNs()` to call
+    /// `EnvironmentImpl.getDatabase(dbId).abort(undoLsn, locker)`.
+    env_impl: Option<Arc<SyncMutex<EnvironmentImpl>>>,
 }
 
 impl Transaction {
@@ -93,6 +103,7 @@ impl Transaction {
             txn_timeout_ms: Mutex::new(0),
             log_manager: None,
             inner_txn: None,
+            env_impl: None,
         }
     }
 
@@ -115,7 +126,19 @@ impl Transaction {
             txn_timeout_ms: Mutex::new(0),
             log_manager: Some(log_manager),
             inner_txn: None,
+            env_impl: None,
         }
+    }
+
+    /// Wires the `EnvironmentImpl` so that `abort()` can apply undo records.
+    ///
+    /// Called by `Environment::begin_transaction()` after constructing the
+    /// `Transaction`.
+    ///
+    /// Port of `Txn.envImpl` wiring in JE's `Txn` constructor.
+    pub fn with_env_impl(mut self, env_impl: Arc<SyncMutex<EnvironmentImpl>>) -> Self {
+        self.env_impl = Some(env_impl);
+        self
     }
 
     /// Sets the inner `Txn` for lock management and write-set tracking.
@@ -211,10 +234,39 @@ impl Transaction {
                 self.write_txn_end(lm, false, false, false)?;
             }
 
-        // Release per-record locks held by the inner Txn and collect undo records.
-        // The inner Txn has no log_manager so it won't write duplicate WAL records.
+        // Release per-record locks held by the inner Txn, collect undo records,
+        // and apply them to the B-tree to restore the before-images.
+        //
+        // Port of `Txn.undoLNs()` in JE: after writing TxnAbort, JE walks the
+        // write-lock chain and calls `DatabaseImpl.abort(undoLsn, locker)` for
+        // each modified LN.  In Noxu, `Txn::abort()` collects `UndoRecord`s
+        // from the `WriteLockInfo` map; we apply them here using `env_impl`.
         if let Some(inner) = &self.inner_txn {
             let _ = inner.lock().unwrap().abort();
+            let undo_records = inner.lock().unwrap().take_undo_records();
+            if let Some(env) = &self.env_impl {
+                let env_guard = env.lock();
+                for undo in undo_records {
+                    // Each UndoRecord must carry the key; skip if missing.
+                    let Some(abort_key) = undo.abort_key else { continue };
+                    let db_id = DatabaseId::new(undo.database_id as i64);
+                    let Some(db_arc) = env_guard.get_database_by_id(db_id) else {
+                        continue;
+                    };
+                    let db_guard = db_arc.read();
+                    if let Some(tree) = db_guard.get_real_tree() {
+                        if undo.abort_known_deleted {
+                            // This txn inserted a new record; abort = delete it.
+                            tree.delete(&abort_key);
+                        } else if let Some(abort_data) = undo.abort_data {
+                            // This txn updated an existing record; restore
+                            // the before-image at the before-image LSN.
+                            let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
+                            let _ = tree.insert(abort_key, abort_data, lsn);
+                        }
+                    }
+                }
+            }
         }
 
         let mut state = self.state.lock().unwrap();
