@@ -117,6 +117,20 @@ pub struct Txn {
     /// Whether this txn can preempt other lockers' locks.
     importunate: bool,
 
+    /// Serializable (repeatable-read) isolation level.
+    ///
+    /// When true, read locks are retained through commit/abort.
+    ///
+    /// JE: `Txn.serializableIsolation`.
+    serializable_isolation: bool,
+
+    /// Read-committed isolation level.
+    ///
+    /// When true, read locks are released as soon as the cursor moves.
+    ///
+    /// JE: `Txn.readCommittedIsolation`.
+    read_committed_isolation: bool,
+
     /// Undo records collected during `abort()`.
     ///
     /// Populated by `abort()` from the `WriteLockInfo` of each write lock.
@@ -178,6 +192,8 @@ impl Txn {
             txn_start: Instant::now(),
             read_uncommitted_default: false,
             importunate: false,
+            serializable_isolation: false,
+            read_committed_isolation: false,
             undo_records: Vec::new(),
             log_manager: None,
             commit_lsn: NULL_LSN.as_u64(),
@@ -316,6 +332,41 @@ impl Txn {
     /// Sets whether this transaction is importunate.
     pub fn set_importunate(&mut self, v: bool) {
         self.importunate = v;
+    }
+
+    /// Configures serializable (repeatable-read) isolation.
+    ///
+    /// When true, read locks are held until commit/abort.
+    ///
+    /// JE: `Txn.setSerializableIsolation(boolean)`.
+    pub fn set_serializable_isolation(&mut self, v: bool) {
+        self.serializable_isolation = v;
+    }
+
+    /// Configures read-committed isolation.
+    ///
+    /// When true, read locks are released as the cursor advances.
+    ///
+    /// JE: `Txn.setReadCommittedIsolation(boolean)`.
+    pub fn set_read_committed_isolation(&mut self, v: bool) {
+        self.read_committed_isolation = v;
+    }
+
+    /// Sets the transaction-level timeout in milliseconds.
+    ///
+    /// A non-zero value causes `is_timed_out()` to return `true` after that
+    /// many milliseconds, even if individual lock requests haven't timed out.
+    ///
+    /// JE: `Locker.setTxnTimeout(millis)`.
+    pub fn set_txn_timeout(&mut self, timeout_ms: u64) {
+        self.txn_timeout_ms = timeout_ms;
+    }
+
+    /// Returns the first LSN written by this transaction.
+    ///
+    /// JE: `Txn.getFirstActiveLsn()`.
+    pub fn first_active_lsn(&self) -> u64 {
+        self.first_lsn
     }
 
     /// Returns true if any log entries have been written for this transaction.
@@ -756,6 +807,65 @@ impl Locker for Txn {
 
     fn is_read_uncommitted_default(&self) -> bool {
         self.read_uncommitted_default
+    }
+
+    /// Returns the transaction-level timeout.
+    fn txn_timeout_ms(&self) -> u64 {
+        self.txn_timeout_ms
+    }
+
+    /// Returns true if the transaction-level timeout has expired.
+    ///
+    /// JE: `Locker.isTimedOut()` — checks `txnTimeoutMillis` vs elapsed time.
+    fn is_timed_out(&self) -> bool {
+        if self.txn_timeout_ms == 0 {
+            false
+        } else {
+            self.txn_start.elapsed().as_millis() as u64 >= self.txn_timeout_ms
+        }
+    }
+
+    fn is_serializable_isolation(&self) -> bool {
+        self.serializable_isolation
+    }
+
+    fn is_read_committed_isolation(&self) -> bool {
+        self.read_committed_isolation
+    }
+
+    /// Returns the ID of this Txn (since Txn IS the transactional locker).
+    ///
+    /// JE: `Txn.getTxnLocker()` returns `this`.
+    fn get_txn_locker_id(&self) -> Option<i64> {
+        Some(self.id)
+    }
+
+    fn retains_locks_on_commit(&self) -> bool {
+        self.serializable_isolation
+    }
+
+    /// Re-acquires a lock on `new_lsn` when an LN is moved without prior
+    /// write-lock acquisition (eviction / cleaning path).
+    ///
+    /// JE: `Locker.lockAfterLsnChange(oldLsn, newLsn, dbImpl)` — every locker
+    /// holding `old_lsn` must acquire the new LSN.
+    fn lock_after_lsn_change(
+        &mut self,
+        old_lsn: u64,
+        new_lsn: u64,
+    ) -> Result<(), TxnError> {
+        // If we hold a write lock on old_lsn, migrate it to new_lsn.
+        if let Some(wli) = self.write_locks.remove(&old_lsn) {
+            let _ = self.lock_manager.release(old_lsn, self.id);
+            let _ = self.lock_manager.lock(new_lsn, self.id, LockType::Write, false, false);
+            self.write_locks.insert(new_lsn, wli);
+        } else if self.read_locks.remove(&old_lsn) {
+            // Migrate read lock.
+            let _ = self.lock_manager.release(old_lsn, self.id);
+            let _ = self.lock_manager.lock(new_lsn, self.id, LockType::Read, false, false);
+            self.read_locks.insert(new_lsn);
+        }
+        Ok(())
     }
 
     fn close(&mut self) {

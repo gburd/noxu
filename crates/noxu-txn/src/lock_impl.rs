@@ -553,6 +553,83 @@ impl LockImpl {
         }
     }
 
+    /// Like `lock()` but uses a sharing predicate to skip conflict detection
+    /// between cooperating lockers.
+    ///
+    /// JE: `LockImpl.tryLock()` — when `!locker.sharesLocksWith(ownerLocker)`
+    /// evaluates to false (they *do* share), the conflict matrix is skipped.
+    /// This allows multiple ThreadLockers on the same thread to co-own a lock
+    /// without conflicts.
+    ///
+    /// `shares_fn(owner_id)` should return `true` if the requesting locker
+    /// (`locker_id`) shares locks with `owner_id`.
+    pub fn lock_with_sharing(
+        &mut self,
+        request_type: LockType,
+        locker_id: i64,
+        non_blocking: bool,
+        jump_ahead_of_waiters: bool,
+        shares_fn: &dyn Fn(i64) -> bool,
+    ) -> LockAttemptResult {
+        let new_lock = LockInfo::new(locker_id, request_type);
+        let mut grant = self.try_lock_with_sharing(
+            new_lock.clone(),
+            jump_ahead_of_waiters || self.n_waiters() == 0,
+            shares_fn,
+        );
+
+        if grant == LockGrantType::WaitNew
+            || grant == LockGrantType::WaitPromotion
+            || grant == LockGrantType::WaitRestart
+        {
+            if request_type.causes_restart()
+                && grant != LockGrantType::WaitRestart
+            {
+                let mut waiter_idx = 0;
+                loop {
+                    let waiter = if waiter_idx == 0 {
+                        self.first_waiter.as_ref()
+                    } else if let Some(ref list) = self.waiter_list {
+                        list.get(waiter_idx - 1)
+                    } else {
+                        None
+                    };
+                    match waiter {
+                        Some(w) => {
+                            if w.lock_type != LockType::Restart
+                                && locker_id != w.locker_id
+                            {
+                                let conflict = w.lock_type.get_conflict(request_type);
+                                if conflict == LockConflict::Restart {
+                                    grant = LockGrantType::WaitRestart;
+                                    break;
+                                }
+                            }
+                            waiter_idx += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            if non_blocking {
+                grant = LockGrantType::Denied;
+            } else {
+                if grant == LockGrantType::WaitPromotion {
+                    self.add_waiter_to_head_of_list(new_lock);
+                } else {
+                    let mut waiter = new_lock;
+                    if grant == LockGrantType::WaitRestart {
+                        waiter.lock_type = LockType::Restart;
+                    }
+                    self.add_waiter_to_end_of_list(waiter);
+                }
+            }
+        }
+
+        LockAttemptResult::new(grant)
+    }
+
     /// Called from lock() to try locking a new request, and from release() to
     /// try locking a waiting request.
     ///
@@ -570,6 +647,23 @@ impl LockImpl {
         &mut self,
         new_lock: LockInfo,
         first_waiter_in_line: bool,
+    ) -> LockGrantType {
+        self.try_lock_with_sharing(new_lock, first_waiter_in_line, &|_| false)
+    }
+
+    /// Inner `try_lock` with a sharing predicate.
+    ///
+    /// JE: `LockImpl.tryLock(LockInfo newLock, boolean firstWaiterInLine)` —
+    /// when `locker.sharesLocksWith(ownerLocker)` is true, the conflict matrix
+    /// is skipped and the lock is co-granted.  This allows multiple
+    /// ThreadLockers on the same thread to share a lock without deadlock.
+    ///
+    /// Port of `com.sleepycat.je.txn.LockImpl.tryLock()`.
+    fn try_lock_with_sharing(
+        &mut self,
+        new_lock: LockInfo,
+        first_waiter_in_line: bool,
+        shares_fn: &dyn Fn(i64) -> bool,
     ) -> LockGrantType {
         // If no one owns this right now, just grab it.
         if self.n_owners() == 0 {
@@ -635,15 +729,25 @@ impl LockImpl {
                             return LockGrantType::Existing;
                         }
                     } else {
-                        // Requestor does not hold this lock: check for conflicts.
-                        let conflict = owner_type.get_conflict(request_type);
-                        if conflict == LockConflict::Restart {
-                            return LockGrantType::WaitRestart;
+                        // Requestor does not hold this lock.
+                        //
+                        // JE: skip conflict detection when the requesting and
+                        // owning lockers share locks (e.g. two ThreadLockers on
+                        // the same thread).  `shares_fn(owner_locker)` returns
+                        // true iff they are in the same sharing group.
+                        if shares_fn(owner_locker) {
+                            // They share — act as if this owner does not exist
+                            // for conflict purposes.
                         } else {
-                            if conflict == LockConflict::Block {
-                                owner_conflicts = true;
+                            let conflict = owner_type.get_conflict(request_type);
+                            if conflict == LockConflict::Restart {
+                                return LockGrantType::WaitRestart;
+                            } else {
+                                if conflict == LockConflict::Block {
+                                    owner_conflicts = true;
+                                }
+                                owner_exists = true;
                             }
-                            owner_exists = true;
                         }
                     }
 

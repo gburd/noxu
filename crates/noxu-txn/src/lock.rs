@@ -76,6 +76,56 @@ impl Lock {
         }
     }
 
+    /// Like `lock()` but uses a sharing predicate to bypass conflict detection
+    /// between co-operating lockers (e.g. ThreadLockers on the same thread).
+    ///
+    /// `shares_fn(owner_id)` returns true if the requesting locker shares locks
+    /// with `owner_id`.
+    ///
+    /// Port of `LockImpl.tryLock()` sharing path in JE.
+    pub fn lock_with_sharing(
+        &mut self,
+        request_type: LockType,
+        locker_id: i64,
+        non_blocking: bool,
+        jump_ahead_of_waiters: bool,
+        shares_fn: &dyn Fn(i64) -> bool,
+    ) -> LockAttemptResult {
+        match self {
+            Lock::Thin(thin) => {
+                match thin.lock(
+                    request_type,
+                    locker_id,
+                    non_blocking,
+                    jump_ahead_of_waiters,
+                ) {
+                    Ok(result) => result,
+                    Err(mutation) => {
+                        // Mutate to full and use the sharing variant.
+                        let mut full =
+                            LockImpl::from_first_owner(mutation.existing_owner);
+                        let result = full.lock_with_sharing(
+                            request_type,
+                            locker_id,
+                            non_blocking,
+                            jump_ahead_of_waiters,
+                            shares_fn,
+                        );
+                        *self = Lock::Full(full);
+                        result
+                    }
+                }
+            }
+            Lock::Full(full) => full.lock_with_sharing(
+                request_type,
+                locker_id,
+                non_blocking,
+                jump_ahead_of_waiters,
+                shares_fn,
+            ),
+        }
+    }
+
     /// Releases a lock held by the given locker.
     /// Returns the set of locker IDs that should be notified (woken up).
     /// Returns None if the locker wasn't an owner.

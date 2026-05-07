@@ -36,6 +36,15 @@ pub struct BasicLocker {
 
     /// Whether this locker is open.
     is_open: bool,
+
+    /// Whether locking is required for the current cursor context.
+    ///
+    /// Set by `register_cursor()` based on `cursor.isInternalDbCursor()`.
+    /// When false, the DummyLockManager grants locks without consulting
+    /// the underlying lock table.
+    ///
+    /// Port of `BasicLocker.lockingRequired` in JE.
+    locking_required: bool,
 }
 
 impl BasicLocker {
@@ -52,6 +61,7 @@ impl BasicLocker {
             lock_timeout_ms: 5000, // Default 5 second timeout
             default_no_wait: false,
             is_open: true,
+            locking_required: true,
         }
     }
 
@@ -68,6 +78,7 @@ impl BasicLocker {
             lock_timeout_ms: timeout_ms,
             default_no_wait: false,
             is_open: true,
+            locking_required: true,
         }
     }
 
@@ -80,7 +91,19 @@ impl BasicLocker {
             lock_timeout_ms: 5000,
             default_no_wait: true,
             is_open: true,
+            locking_required: true,
         }
+    }
+
+    /// Called by cursor open/init to configure whether locking is required.
+    ///
+    /// JE: `BasicLocker.registerCursor(cursor)` — sets `lockingRequired =
+    /// !cursor.isInternalDbCursor()`.  Internal-DB cursors (e.g. the utilization
+    /// DB cursor) bypass the lock table entirely.
+    ///
+    /// Port of `BasicLocker.registerCursor()` in JE.
+    pub fn register_cursor(&mut self, is_internal_db_cursor: bool) {
+        self.locking_required = !is_internal_db_cursor;
     }
 
     /// Release all locks held by this locker.
@@ -162,6 +185,24 @@ impl Locker for BasicLocker {
 
     fn default_no_wait(&self) -> bool {
         self.default_no_wait
+    }
+
+    fn locking_required(&self) -> bool {
+        self.locking_required
+    }
+
+    fn operation_end(&mut self) -> Result<(), TxnError> {
+        self.release_all_locks()?;
+        self.close();
+        Ok(())
+    }
+
+    fn release_non_txn_locks(&mut self) -> Result<(), TxnError> {
+        self.release_all_locks()
+    }
+
+    fn non_txn_operation_end(&mut self) -> Result<(), TxnError> {
+        self.operation_end()
     }
 
     fn close(&mut self) {

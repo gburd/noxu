@@ -2,157 +2,174 @@
 //!
 //! Port of `com.sleepycat.je.txn.DummyLockManager` (273 lines).
 
-use crate::{LockGrantType, LockStats, LockType, TxnError};
+use std::sync::Arc;
+
+use crate::{LockGrantType, LockManager, LockStats, LockType, TxnError};
 
 /// A no-op lock manager that always grants locks immediately.
 ///
-/// Used when locking is disabled (e.g., for read-only environments or
-/// when the application manages its own concurrency control).
+/// Used when locking is disabled (`isNoLocking()` is true in JE).  When a
+/// locker requires locking (i.e. it is an internal-DB cursor), requests are
+/// forwarded to the `superior_lock_manager` instead of being no-op'd.
 ///
-/// All operations succeed immediately without any actual locking or
-/// conflict detection.
+/// JE: `DummyLockManager` wraps the real `SyncedLockManager` as its
+/// `superiorLockManager`.  `attemptLock()` delegates to the real LM when
+/// `locker.lockingRequired()` is true; otherwise returns `NEW` immediately.
 ///
 /// Port of `com.sleepycat.je.txn.DummyLockManager`.
-pub struct DummyLockManager;
+pub struct DummyLockManager {
+    /// The real lock manager, used when `locking_required` is true.
+    ///
+    /// JE: `DummyLockManager.superiorLockManager`.
+    superior: Arc<LockManager>,
+}
 
 impl DummyLockManager {
-    /// Creates a new DummyLockManager.
-    pub fn new() -> Self {
-        DummyLockManager
+    /// Creates a new DummyLockManager backed by the given real lock manager.
+    ///
+    /// Port of `DummyLockManager(EnvironmentImpl envImpl, LockManager superiorLockManager)`.
+    pub fn new(superior: Arc<LockManager>) -> Self {
+        DummyLockManager { superior }
     }
 
-    /// Always grants locks immediately without checking for conflicts.
+    /// Returns the underlying real lock manager.
+    pub fn superior_lock_manager(&self) -> &Arc<LockManager> {
+        &self.superior
+    }
+
+    /// Attempts a lock, delegating to the superior LM when `locking_required`.
     ///
-    /// # Arguments
+    /// JE: `DummyLockManager.attemptLock(lsn, locker, type, ...)`:
+    ///   - if `locker.lockingRequired()` → delegate to `superiorLockManager.lock()`
+    ///   - else → return `LockGrantType::NEW` immediately.
     ///
-    /// * `_lsn` - The LSN to lock (ignored)
-    /// * `_locker_id` - The ID of the requesting locker (ignored)
-    /// * `lock_type` - The type of lock requested (only used to check for None)
-    /// * `_non_blocking` - Ignored (no blocking occurs)
-    /// * `_jump_ahead_of_waiters` - Ignored (no waiters exist)
+    /// The `locking_required` parameter mirrors `locker.lockingRequired()` in JE.
     ///
-    /// # Returns
-    ///
-    /// Always returns Ok(LockGrantType::New) or Ok(LockGrantType::NoneNeeded).
-    ///
-    /// Port of `DummyLockManager.lock()`.
+    /// Port of `DummyLockManager.attemptLock()`.
     pub fn lock(
         &self,
-        _lsn: u64,
-        _locker_id: i64,
+        lsn: u64,
+        locker_id: i64,
         lock_type: LockType,
-        _non_blocking: bool,
-        _jump_ahead_of_waiters: bool,
+        non_blocking: bool,
+        jump_ahead_of_waiters: bool,
+        locking_required: bool,
     ) -> Result<LockGrantType, TxnError> {
-        // Handle special lock types.
         if lock_type == LockType::None {
             return Ok(LockGrantType::NoneNeeded);
         }
-
         if lock_type == LockType::Restart {
             return Err(TxnError::RangeRestart);
         }
 
-        // All other lock requests succeed immediately.
-        Ok(LockGrantType::New)
+        if locking_required {
+            // Delegate to the real lock manager for internal-DB cursors.
+            self.superior.lock(lsn, locker_id, lock_type, non_blocking, jump_ahead_of_waiters)
+        } else {
+            Ok(LockGrantType::New)
+        }
     }
 
-    /// No-op release.
+    /// Releases a lock, delegating to superior LM when `locking_required`.
     ///
-    /// # Returns
-    ///
-    /// Always returns Ok(()).
-    ///
-    /// Port of `DummyLockManager.release()`.
-    pub fn release(&self, _lsn: u64, _locker_id: i64) -> Result<(), TxnError> {
-        Ok(())
+    /// Port of `DummyLockManager.releaseAndFindNotifyTargets()` — unconditional
+    /// delegation in JE for release.
+    pub fn release(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        locking_required: bool,
+    ) -> Result<(), TxnError> {
+        if locking_required {
+            self.superior.release(lsn, locker_id)
+        } else {
+            Ok(())
+        }
     }
 
-    /// No-op demote.
-    ///
-    /// # Returns
-    ///
-    /// Always returns Ok(()).
+    /// Demotes a write lock to read, delegating when `locking_required`.
     ///
     /// Port of `DummyLockManager.demote()`.
-    pub fn demote(&self, _lsn: u64, _locker_id: i64) -> Result<(), TxnError> {
-        Ok(())
+    pub fn demote(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        locking_required: bool,
+    ) -> Result<(), TxnError> {
+        if locking_required {
+            self.superior.demote(lsn, locker_id)
+        } else {
+            Ok(())
+        }
     }
 
-    /// No-op steal lock.
-    ///
-    /// # Returns
-    ///
-    /// Always returns Ok(()).
+    /// Steals a lock, delegating when `locking_required`.
     ///
     /// Port of `DummyLockManager.stealLock()`.
     pub fn steal_lock(
         &self,
-        _lsn: u64,
-        _locker_id: i64,
+        lsn: u64,
+        locker_id: i64,
+        locking_required: bool,
     ) -> Result<(), TxnError> {
-        Ok(())
+        if locking_required {
+            self.superior.steal_lock(lsn, locker_id)
+        } else {
+            Ok(())
+        }
     }
 
-    /// Always returns false since no locks are actually held.
-    ///
-    /// # Returns
-    ///
-    /// Always returns false.
+    /// Returns write-lock ownership, delegating when `locking_required`.
     ///
     /// Port of `DummyLockManager.isOwnedWriteLock()`.
-    pub fn is_owned_write_lock(&self, _lsn: u64, _locker_id: i64) -> bool {
-        false
+    pub fn is_owned_write_lock(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        locking_required: bool,
+    ) -> bool {
+        if locking_required {
+            self.superior.is_owned_write_lock(lsn, locker_id)
+        } else {
+            false
+        }
     }
 
-    /// Always returns None since no locks are actually held.
-    ///
-    /// # Returns
-    ///
-    /// Always returns None.
+    /// Returns owned lock type, delegating when `locking_required`.
     ///
     /// Port of `DummyLockManager.getOwnedLockType()`.
     pub fn get_owned_lock_type(
         &self,
-        _lsn: u64,
-        _locker_id: i64,
+        lsn: u64,
+        locker_id: i64,
+        locking_required: bool,
     ) -> Option<LockType> {
-        None
+        if locking_required {
+            self.superior.get_owned_lock_type(lsn, locker_id)
+        } else {
+            None
+        }
     }
 
-    /// Returns zero for both owners and waiters.
-    ///
-    /// # Returns
-    ///
-    /// Always returns (0, 0).
-    pub fn get_lock_info(&self, _lsn: u64) -> (usize, usize) {
-        (0, 0)
+    /// Returns lock info from superior when `locking_required`, else (0,0).
+    pub fn get_lock_info(&self, lsn: u64, locking_required: bool) -> (usize, usize) {
+        if locking_required {
+            self.superior.get_lock_info(lsn)
+        } else {
+            (0, 0)
+        }
     }
 
-    /// Returns empty statistics.
-    ///
-    /// # Returns
-    ///
-    /// LockStats with all counters set to zero.
+    /// Returns stats from the superior lock manager.
     ///
     /// Port of `DummyLockManager.getStats()`.
     pub fn get_stats(&self) -> LockStats {
-        LockStats::new()
+        self.superior.get_stats()
     }
 
-    /// Always returns zero since no locks are tracked.
-    ///
-    /// # Returns
-    ///
-    /// Always returns 0.
+    /// Returns the total number of locks in the superior lock manager.
     pub fn n_total_locks(&self) -> usize {
-        0
-    }
-}
-
-impl Default for DummyLockManager {
-    fn default() -> Self {
-        Self::new()
+        self.superior.n_total_locks()
     }
 }
 
@@ -160,156 +177,142 @@ impl Default for DummyLockManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_all_locks_granted() {
-        let dlm = DummyLockManager::new();
+    fn make_dlm() -> DummyLockManager {
+        let lm = Arc::new(LockManager::new());
+        DummyLockManager::new(lm)
+    }
 
-        // All lock types succeed (except None and Restart).
+    #[test]
+    fn test_all_locks_granted_no_locking_required() {
+        let dlm = make_dlm();
+        // locking_required=false: all types return New immediately.
         assert_eq!(
-            dlm.lock(100, 1, LockType::Read, false, false).unwrap(),
+            dlm.lock(100, 1, LockType::Read, false, false, false).unwrap(),
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 2, LockType::Write, false, false).unwrap(),
+            dlm.lock(100, 2, LockType::Write, false, false, false).unwrap(),
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 3, LockType::RangeRead, false, false).unwrap(),
+            dlm.lock(100, 3, LockType::RangeRead, false, false, false).unwrap(),
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 4, LockType::RangeWrite, false, false).unwrap(),
+            dlm.lock(100, 4, LockType::RangeWrite, false, false, false).unwrap(),
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 5, LockType::RangeInsert, false, false).unwrap(),
+            dlm.lock(100, 5, LockType::RangeInsert, false, false, false).unwrap(),
             LockGrantType::New
         );
     }
 
     #[test]
-    fn test_no_conflicts() {
-        let dlm = DummyLockManager::new();
-
-        // Multiple lockers can "hold" the same lock simultaneously.
+    fn test_no_conflicts_when_not_locking_required() {
+        let dlm = make_dlm();
+        // Multiple lockers, no locking_required — all granted without conflict.
         assert_eq!(
-            dlm.lock(100, 1, LockType::Write, false, false).unwrap(),
+            dlm.lock(100, 1, LockType::Write, false, false, false).unwrap(),
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 2, LockType::Write, false, false).unwrap(),
+            dlm.lock(100, 2, LockType::Write, false, false, false).unwrap(),
             LockGrantType::New
         );
+    }
 
-        // No conflicts detected.
+    #[test]
+    fn test_delegates_to_superior_when_locking_required() {
+        let dlm = make_dlm();
+        // locking_required=true: delegates to real LM, which detects conflicts.
+        assert_eq!(
+            dlm.lock(100, 1, LockType::Write, false, false, true).unwrap(),
+            LockGrantType::New
+        );
+        // Second writer should be blocked (non-blocking → LockNotAvailable).
+        let result = dlm.lock(100, 2, LockType::Write, true, false, true);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_lock_type_none() {
-        let dlm = DummyLockManager::new();
-
-        let result = dlm.lock(100, 1, LockType::None, false, false);
+        let dlm = make_dlm();
+        let result = dlm.lock(100, 1, LockType::None, false, false, false);
         assert_eq!(result.unwrap(), LockGrantType::NoneNeeded);
     }
 
     #[test]
     fn test_lock_type_restart() {
-        let dlm = DummyLockManager::new();
-
-        let result = dlm.lock(100, 1, LockType::Restart, false, false);
+        let dlm = make_dlm();
+        let result = dlm.lock(100, 1, LockType::Restart, false, false, false);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TxnError::RangeRestart));
     }
 
     #[test]
-    fn test_release() {
-        let dlm = DummyLockManager::new();
-
-        // Lock and release always succeed.
-        dlm.lock(100, 1, LockType::Write, false, false).unwrap();
-        assert!(dlm.release(100, 1).is_ok());
-
-        // Can release non-existent lock (no-op).
-        assert!(dlm.release(200, 2).is_ok());
+    fn test_release_no_locking() {
+        let dlm = make_dlm();
+        dlm.lock(100, 1, LockType::Write, false, false, false).unwrap();
+        assert!(dlm.release(100, 1, false).is_ok());
+        assert!(dlm.release(200, 2, false).is_ok());
     }
 
     #[test]
-    fn test_demote() {
-        let dlm = DummyLockManager::new();
-
-        // Demote always succeeds (even if no lock exists).
-        assert!(dlm.demote(100, 1).is_ok());
+    fn test_demote_no_locking() {
+        let dlm = make_dlm();
+        assert!(dlm.demote(100, 1, false).is_ok());
     }
 
     #[test]
-    fn test_steal_lock() {
-        let dlm = DummyLockManager::new();
-
-        // Steal always succeeds (even if no lock exists).
-        assert!(dlm.steal_lock(100, 1).is_ok());
+    fn test_steal_lock_no_locking() {
+        let dlm = make_dlm();
+        assert!(dlm.steal_lock(100, 1, false).is_ok());
     }
 
     #[test]
-    fn test_is_owned_write_lock() {
-        let dlm = DummyLockManager::new();
-
-        // Always returns false (no locks tracked).
-        dlm.lock(100, 1, LockType::Write, false, false).unwrap();
-        assert!(!dlm.is_owned_write_lock(100, 1));
+    fn test_is_owned_write_lock_no_locking() {
+        let dlm = make_dlm();
+        dlm.lock(100, 1, LockType::Write, false, false, false).unwrap();
+        // locking_required=false: no tracking, always false.
+        assert!(!dlm.is_owned_write_lock(100, 1, false));
     }
 
     #[test]
-    fn test_get_owned_lock_type() {
-        let dlm = DummyLockManager::new();
-
-        // Always returns None (no locks tracked).
-        dlm.lock(100, 1, LockType::Read, false, false).unwrap();
-        assert_eq!(dlm.get_owned_lock_type(100, 1), None);
+    fn test_get_owned_lock_type_no_locking() {
+        let dlm = make_dlm();
+        dlm.lock(100, 1, LockType::Read, false, false, false).unwrap();
+        assert_eq!(dlm.get_owned_lock_type(100, 1, false), None);
     }
 
     #[test]
-    fn test_get_lock_info() {
-        let dlm = DummyLockManager::new();
-
-        // Always returns (0, 0).
-        dlm.lock(100, 1, LockType::Write, false, false).unwrap();
-        assert_eq!(dlm.get_lock_info(100), (0, 0));
+    fn test_get_lock_info_no_locking() {
+        let dlm = make_dlm();
+        dlm.lock(100, 1, LockType::Write, false, false, false).unwrap();
+        assert_eq!(dlm.get_lock_info(100, false), (0, 0));
     }
 
     #[test]
     fn test_get_stats() {
-        let dlm = DummyLockManager::new();
-
-        // Perform some operations.
-        dlm.lock(100, 1, LockType::Write, false, false).unwrap();
-        dlm.lock(200, 2, LockType::Read, false, false).unwrap();
-        dlm.release(100, 1).unwrap();
-
-        // Stats are always zero.
+        let dlm = make_dlm();
+        // Stats come from the superior LM.
         let stats = dlm.get_stats();
         assert_eq!(stats.lock_requests, 0);
-        assert_eq!(stats.lock_waits, 0);
-        assert_eq!(stats.n_owners, 0);
-        assert_eq!(stats.n_waiters, 0);
-    }
-
-    #[test]
-    fn test_n_total_locks() {
-        let dlm = DummyLockManager::new();
-
-        // Always returns 0.
-        dlm.lock(100, 1, LockType::Write, false, false).unwrap();
-        assert_eq!(dlm.n_total_locks(), 0);
     }
 
     #[test]
     fn test_non_blocking_mode() {
-        let dlm = DummyLockManager::new();
-
-        // Non-blocking mode works the same (always grants).
+        let dlm = make_dlm();
         assert_eq!(
-            dlm.lock(100, 1, LockType::Write, true, false).unwrap(),
+            dlm.lock(100, 1, LockType::Write, true, false, false).unwrap(),
             LockGrantType::New
         );
+    }
+
+    #[test]
+    fn test_superior_lock_manager() {
+        let lm = Arc::new(LockManager::new());
+        let dlm = DummyLockManager::new(lm.clone());
+        assert!(Arc::ptr_eq(dlm.superior_lock_manager(), &lm));
     }
 }
