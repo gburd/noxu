@@ -49,6 +49,7 @@ pub mod log_buffer_pool;
 pub mod log_file_reader;
 pub mod log_flusher;
 pub mod log_manager;
+pub mod write_observer;
 
 // File readers
 pub mod checkpoint_file_reader;
@@ -74,3 +75,4 @@ pub use log_file_reader::LogFileReader;
 pub use log_manager::LogManager;
 pub use loggable::Loggable;
 pub use provisional::Provisional;
+pub use write_observer::LogWriteObserver;
