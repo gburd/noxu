@@ -261,19 +261,11 @@ fn main() {
 
         // W09: transactional multi-op (3 gets + 2 puts per txn)
         //
-        // Capped at 10_000: the workload issues get(key i) then put(key i) inside
-        // the same transaction.  get() acquires a READ lock on the record's LSN;
-        // put() then needs a WRITE lock on the same LSN.  Without READ->WRITE lock
-        // upgrade support in LockManager, the manager sees a conflict with its own
-        // locker and deadlocks, hanging indefinitely at any scale.
-        //
-        // Root cause: missing lock escalation (READ->WRITE upgrade).
-        // Dependency: task #131 "Txn fidelity: lock escalation (READ->WRITE
-        //   upgrade) + GroupCommit time+size wiring".
-        //
-        // Once #131 lands, remove the `.min(10_000)` cap and use the full `n`.
+        // get(key i) + put(key i) in the same transaction triggers the READ→WRITE
+        // lock upgrade path (LockUpgrade::WritePromote).  ThinLockImpl handles
+        // this correctly: the upgrade is granted immediately as LockGrantType::Promotion.
         {
-            let w09_n = n.min(10_000);
+            let w09_n = n;
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, w09_n);
@@ -294,6 +286,9 @@ fn main() {
             let dir = TempDir::new().unwrap();
             let (env, db) = open_db(dir.path());
             populate(&db, ops_n);
+
+            // Capture fsync baseline AFTER populate so we measure only workload fsyncs.
+            let fsync0 = env.stat_fsync_count();
 
             let db_arc = Arc::new(db);
             let cpu0 = cpu_time_ms();
@@ -330,7 +325,7 @@ fn main() {
                 disk_bytes_per_op: if total_ops > 0 {
                     (disk_kb * 1024) as f64 / total_ops as f64
                 } else { 0.0 },
-                fsync_count: env.stat_fsync_count(),
+                fsync_count: env.stat_fsync_count().saturating_sub(fsync0),
             };
             print_progress(&r);
             results.push(r);
