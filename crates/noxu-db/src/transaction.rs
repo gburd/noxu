@@ -257,10 +257,15 @@ impl Transaction {
                     if let Some(tree) = db_guard.get_real_tree() {
                         if undo.abort_known_deleted {
                             // This txn inserted a new record; abort = delete it.
-                            tree.delete(&abort_key);
+                            // Decrement the entry count to undo the insert.
+                            if tree.delete(&abort_key) {
+                                db_guard.decrement_entry_count();
+                            }
                         } else if let Some(abort_data) = undo.abort_data {
                             // This txn updated an existing record; restore
                             // the before-image at the before-image LSN.
+                            // This is an update (not a new insert), so the
+                            // entry count does not change.
                             let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
                             let _ = tree.insert(abort_key, abort_data, lsn);
                         }

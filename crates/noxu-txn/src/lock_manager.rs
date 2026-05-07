@@ -715,20 +715,19 @@ impl LockManager {
                 &mut granted_guard,
                 Duration::from_millis(slice_ms),
             );
-            if timed_out.timed_out() {
-                if let Some(dl_err) = self.check_deadlock_for_waiter(
+            if timed_out.timed_out()
+                && let Some(dl_err) = self.check_deadlock_for_waiter(
                     lsn, locker_id, lock_type, &owner_ids,
                 ) {
-                    drop(granted_guard);
-                    let mut table = self.lock_tables[table_idx].lock();
-                    if let Some(lock) = table.get_mut(&lsn) {
-                        lock.flush_waiter(locker_id);
-                        if lock.n_owners() == 0 && lock.n_waiters() == 0 {
-                            table.remove(&lsn);
-                        }
+                drop(granted_guard);
+                let mut table = self.lock_tables[table_idx].lock();
+                if let Some(lock) = table.get_mut(&lsn) {
+                    lock.flush_waiter(locker_id);
+                    if lock.n_owners() == 0 && lock.n_waiters() == 0 {
+                        table.remove(&lsn);
                     }
-                    return Err(dl_err);
                 }
+                return Err(dl_err);
             }
         }
 

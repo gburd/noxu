@@ -446,36 +446,17 @@ impl Database {
 
     /// Returns an approximate count of records in the database.
     ///
-    /// Port of `Database.count()`.
+    /// Port of `Database.count()` — reads the per-database `AtomicU64` entry
+    /// counter, giving O(1) performance identical to JE's implementation.
+    ///
+    /// The counter is incremented on every new insert and decremented on every
+    /// delete (including transaction aborts that undo inserts).
     ///
     /// # Errors
     /// Returns an error if the database is closed
     pub fn count(&self) -> Result<u64> {
         self.check_open()?;
-
-        // Count by scanning via cursor: get_first then next until exhausted.
-        // This is O(n) but correct for the current tree implementation.
-        let mut cursor = CursorImpl::new(Arc::clone(&self.db_impl), 0);
-        let first_status = cursor
-            .get_first()
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-
-        if first_status != noxu_dbi::OperationStatus::Success {
-            return Ok(0);
-        }
-
-        let mut count = 1u64;
-        loop {
-            let status = cursor
-                .retrieve_next(GetMode::Next)
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-            if status != noxu_dbi::OperationStatus::Success {
-                break;
-            }
-            count += 1;
-        }
-
-        Ok(count)
+        Ok(self.db_impl.read().entry_count())
     }
 
     /// Returns all records as `(key_bytes, data_bytes)` pairs in key order.
@@ -1058,26 +1039,42 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Covers the map_err closure on `cursor.get_first()` inside `count()`.
+    /// count() uses the O(1) AtomicU64 counter; cursor-fail hooks do not affect it.
+    /// Verify the counter is correct across insert/update/delete.
     #[test]
-    fn test_count_get_first_map_err_via_hook() {
+    fn test_count_atomic_counter_insert_update_delete() {
         let (_tmp, _env, db) = temp_env_and_db();
-        noxu_dbi::set_cursor_fail_after(1);
-        let result = db.count();
-        noxu_dbi::clear_cursor_fail_flag();
-        assert!(result.is_err());
+
+        // Empty database starts at 0.
+        assert_eq!(db.count().unwrap(), 0);
+
+        // Insert three distinct keys.
+        db.put(None, &DatabaseEntry::from_bytes(b"a"), &DatabaseEntry::from_bytes(b"1")).unwrap();
+        db.put(None, &DatabaseEntry::from_bytes(b"b"), &DatabaseEntry::from_bytes(b"2")).unwrap();
+        db.put(None, &DatabaseEntry::from_bytes(b"c"), &DatabaseEntry::from_bytes(b"3")).unwrap();
+        assert_eq!(db.count().unwrap(), 3);
+
+        // Overwrite an existing key — count must NOT change.
+        db.put(None, &DatabaseEntry::from_bytes(b"a"), &DatabaseEntry::from_bytes(b"updated")).unwrap();
+        assert_eq!(db.count().unwrap(), 3);
+
+        // Delete one key — count decrements.
+        db.delete(None, &DatabaseEntry::from_bytes(b"b")).unwrap();
+        assert_eq!(db.count().unwrap(), 2);
     }
 
-    /// Covers the map_err closure on `cursor.retrieve_next(...)` inside `count()`.
+    /// count() is O(1): verify it still works even when the cursor fail-hook
+    /// is active (the hook only affects cursor operations, not the atomic read).
     #[test]
-    fn test_count_retrieve_next_map_err_via_hook() {
+    fn test_count_unaffected_by_cursor_fail_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
         db.put(None, &DatabaseEntry::from_bytes(b"k"), &DatabaseEntry::from_bytes(b"v")).unwrap();
-        // fail on the 2nd check_state (retrieve_next, after get_first succeeds).
-        noxu_dbi::set_cursor_fail_after(2);
+        noxu_dbi::set_cursor_fail_after(1);
+        // count() must succeed (no cursor used).
         let result = db.count();
         noxu_dbi::clear_cursor_fail_flag();
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
     }
 
     /// Covers the map_err closure on `cursor.get_first()` inside `scan_all_kv()`.

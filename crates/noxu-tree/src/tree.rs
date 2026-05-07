@@ -533,21 +533,29 @@ impl BinStub {
         full_key: &[u8],
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> (usize, bool) {
-        match self.entries.binary_search_by(|e| {
-            let entry_full = if self.key_prefix.is_empty() {
-                e.key.as_slice().to_vec()
-            } else {
-                let mut fk = Vec::with_capacity(
-                    self.key_prefix.len() + e.key.len(),
-                );
-                fk.extend_from_slice(&self.key_prefix);
+        // Hot path: avoid per-comparison Vec<u8> allocation.
+        // When key_prefix is empty the stored suffix IS the full key, so we
+        // pass the suffix slice directly.  When prefix is non-empty we build a
+        // temporary concatenation only once per comparison using a small
+        // stack-local Vec that is dropped immediately after the call — this
+        // still allocates but is limited to O(key_len) bytes per call and
+        // avoids retaining any heap state between comparisons.
+        if self.key_prefix.is_empty() {
+            match self.entries.binary_search_by(|e| cmp(e.key.as_slice(), full_key)) {
+                Ok(idx) => (idx, true),
+                Err(idx) => (idx, false),
+            }
+        } else {
+            let prefix = self.key_prefix.as_slice();
+            match self.entries.binary_search_by(|e| {
+                let mut fk = Vec::with_capacity(prefix.len() + e.key.len());
+                fk.extend_from_slice(prefix);
                 fk.extend_from_slice(&e.key);
-                fk
-            };
-            cmp(&entry_full, full_key)
-        }) {
-            Ok(idx) => (idx, true),
-            Err(idx) => (idx, false),
+                cmp(&fk, full_key)
+            }) {
+                Ok(idx) => (idx, true),
+                Err(idx) => (idx, false),
+            }
         }
     }
 
@@ -567,40 +575,49 @@ impl BinStub {
         data: Option<Vec<u8>>,
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> (usize, bool) {
-        match self.entries.binary_search_by(|e| {
-            let entry_full = if self.key_prefix.is_empty() {
-                e.key.as_slice().to_vec()
-            } else {
-                let mut fk = Vec::with_capacity(
-                    self.key_prefix.len() + e.key.len(),
-                );
-                fk.extend_from_slice(&self.key_prefix);
-                fk.extend_from_slice(&e.key);
-                fk
-            };
-            cmp(&entry_full, &full_key)
-        }) {
-            Ok(idx) => {
-                // Key exists — update in place.
-                self.entries[idx].lsn = lsn;
-                self.entries[idx].data = data;
-                self.entries[idx].dirty = true;
-                (idx, false)
+        if self.key_prefix.is_empty() {
+            match self.entries.binary_search_by(|e| cmp(e.key.as_slice(), &full_key)) {
+                Ok(idx) => {
+                    self.entries[idx].lsn = lsn;
+                    self.entries[idx].data = data;
+                    self.entries[idx].dirty = true;
+                    (idx, false)
+                }
+                Err(idx) => {
+                    self.entries.insert(idx, BinEntry { key: full_key, lsn, data, known_deleted: false, dirty: true, expiration_time: 0 });
+                    (idx, true)
+                }
             }
-            Err(idx) => {
-                // New key — insert at sorted position (no prefix compression).
-                self.entries.insert(
-                    idx,
-                    BinEntry {
-                        key: full_key,
-                        lsn,
-                        data,
-                        known_deleted: false,
-                        dirty: true,
-                        expiration_time: 0,
-                    },
-                );
-                (idx, true)
+        } else {
+            let prefix = self.key_prefix.clone();
+            match self.entries.binary_search_by(|e| {
+                let mut fk = Vec::with_capacity(prefix.len() + e.key.len());
+                fk.extend_from_slice(&prefix);
+                fk.extend_from_slice(&e.key);
+                cmp(&fk, &full_key)
+            }) {
+                Ok(idx) => {
+                    // Key exists — update in place.
+                    self.entries[idx].lsn = lsn;
+                    self.entries[idx].data = data;
+                    self.entries[idx].dirty = true;
+                    (idx, false)
+                }
+                Err(idx) => {
+                    // New key — insert at sorted position (no prefix compression).
+                    self.entries.insert(
+                        idx,
+                        BinEntry {
+                            key: full_key,
+                            lsn,
+                            data,
+                            known_deleted: false,
+                            dirty: true,
+                            expiration_time: 0,
+                        },
+                    );
+                    (idx, true)
+                }
             }
         }
     }
@@ -613,19 +630,18 @@ impl BinStub {
         full_key: &[u8],
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> bool {
-        match self.entries.binary_search_by(|e| {
-            let entry_full = if self.key_prefix.is_empty() {
-                e.key.as_slice().to_vec()
-            } else {
-                let mut fk = Vec::with_capacity(
-                    self.key_prefix.len() + e.key.len(),
-                );
-                fk.extend_from_slice(&self.key_prefix);
+        let result = if self.key_prefix.is_empty() {
+            self.entries.binary_search_by(|e| cmp(e.key.as_slice(), full_key))
+        } else {
+            let prefix = self.key_prefix.clone();
+            self.entries.binary_search_by(|e| {
+                let mut fk = Vec::with_capacity(prefix.len() + e.key.len());
+                fk.extend_from_slice(&prefix);
                 fk.extend_from_slice(&e.key);
-                fk
-            };
-            cmp(&entry_full, full_key)
-        }) {
+                cmp(&fk, full_key)
+            })
+        };
+        match result {
             Ok(idx) => {
                 self.entries.remove(idx);
                 self.dirty = true;
@@ -764,11 +780,16 @@ impl BinStub {
                 expiration_time: 0,
             });
         }
-        Some(BinStub {
+        // Keys stored in the serialized format are full (uncompressed) keys.
+        // Re-establish the key prefix after loading so that memory use and
+        // search performance match an in-memory BIN.
+        // Port of JE `IN.readFromLog()` → key prefix is part of the wire
+        // format in JE; in Noxu we store full keys and recompute on load.
+        let mut bin = BinStub {
             node_id,
             level: BIN_LEVEL,
             entries,
-            key_prefix: Vec::new(), // no prefix compression in serialized form
+            key_prefix: Vec::new(),
             dirty: false,
             is_delta: false,
             last_full_lsn: NULL_LSN, // caller sets this to the logged LSN
@@ -776,8 +797,14 @@ impl BinStub {
             generation: 0,
             parent: None,
             expiration_in_hours: true,
-                cursor_count: 0,
-        })
+            cursor_count: 0,
+        };
+        // Recompute key prefix from the full keys just loaded.
+        // Port of JE `IN.recalcKeyPrefix()` called after materializing from log.
+        if bin.entries.len() >= 2 {
+            bin.recompute_key_prefix();
+        }
+        Some(bin)
     }
 
     /// Deserialise a BIN delta from the bytes produced by `serialize_delta()`.
@@ -1520,11 +1547,9 @@ impl Tree {
         // Update the memory counter for new inserts.
         // Port of JE IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
         // LN_OVERHEAD = 48 bytes (approximate fixed overhead per entry).
-        if result {
-            if let Some(counter) = &self.memory_counter {
-                let delta = (key_len + data_len + 48) as i64;
-                counter.fetch_add(delta, Ordering::Relaxed);
-            }
+        if result && let Some(counter) = &self.memory_counter {
+            let delta = (key_len + data_len + 48) as i64;
+            counter.fetch_add(delta, Ordering::Relaxed);
         }
 
         Ok(result)
@@ -2004,11 +2029,9 @@ impl Tree {
 
         // Update the memory counter when an entry is removed.
         // Port of JE IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
-        if deleted {
-            if let Some(counter) = &self.memory_counter {
-                let delta = (key.len() + 48) as i64;
-                counter.fetch_sub(delta, Ordering::Relaxed);
-            }
+        if deleted && let Some(counter) = &self.memory_counter {
+            let delta = (key.len() + 48) as i64;
+            counter.fetch_sub(delta, Ordering::Relaxed);
         }
 
         deleted
@@ -2711,6 +2734,94 @@ impl Tree {
         Self::apply_delta_to_bin(&mut base, delta_full_entries);
         delta.entries = base.entries;
         delta.key_prefix = base.key_prefix;
+        delta.is_delta = false;
+        delta.dirty = true;
+    }
+
+    /// Reconstitute a BIN-delta into a full BIN by reading the base from log.
+    ///
+    /// Port of `BIN.mutateToFullBIN(boolean leaveFreeSlot)` from JE — the
+    /// single-argument overload that calls `fetchFullBIN(databaseImpl)` to
+    /// read the last full BIN from the log manager automatically.
+    ///
+    /// Algorithm:
+    /// 1. If `delta.last_full_lsn == NULL_LSN`, the BIN was never written as a
+    ///    full entry; there is no base to merge so the delta IS the full BIN.
+    ///    Clear `is_delta` and return.
+    /// 2. Read the full-BIN log entry at `delta.last_full_lsn` using
+    ///    `log_manager.read_entry(lsn)`.
+    /// 3. Deserialize the payload with `BinStub::deserialize_full()`.
+    /// 4. Delegate to `Self::mutate_to_full_bin(delta, base)` to merge and
+    ///    replace `delta`'s contents.
+    ///
+    /// On any read / parse failure the function falls back to clearing the
+    /// `is_delta` flag without merging, so the caller always gets a non-delta
+    /// BIN (possibly missing some old slots).  This mirrors JE's
+    /// `EnvironmentFailureException` path but gracefully degrades instead of
+    /// panicking.
+    ///
+    /// Port of JE `BIN.fetchFullBIN(dbImpl)` + `BIN.mutateToFullBIN(boolean)`.
+    pub fn mutate_to_full_bin_from_log(
+        delta: &mut BinStub,
+        log_manager: &noxu_log::LogManager,
+    ) {
+        if !delta.is_delta {
+            // Already a full BIN; nothing to do.
+            return;
+        }
+
+        if delta.last_full_lsn == NULL_LSN {
+            // BIN has never been logged as a full entry — the in-memory delta
+            // is effectively the full state.  Port of JE's assertion that
+            // isBINDelta() implies lastFullLsn != NULL_LSN during normal
+            // operation; during recovery this path is harmless.
+            delta.is_delta = false;
+            return;
+        }
+
+        // Read the full-BIN log entry at last_full_lsn.
+        // Port of JE `envImpl.getLogManager().getEntryHandleFileNotFound(lsn)`.
+        match log_manager.read_entry(delta.last_full_lsn) {
+            Ok((entry_type, payload)) => {
+                use noxu_log::LogEntryType;
+                if entry_type == LogEntryType::BIN {
+                    if let Some(mut base) = BinStub::deserialize_full(&payload) {
+                        // Set the base's last_full_lsn so it is preserved
+                        // into the merged result.  Port of JE
+                        // `fullBIN.setLastFullLsn(getLastFullLsn())` in
+                        // `BIN.reconstituteBIN()`.
+                        base.last_full_lsn = delta.last_full_lsn;
+                        Self::mutate_to_full_bin(delta, base);
+                        return;
+                    }
+                    // Deserialization failed — fall through to graceful degradation.
+                    log::warn!(
+                        "mutate_to_full_bin_from_log: failed to deserialize \
+                         full BIN at LSN {:?}; keeping delta as-is",
+                        delta.last_full_lsn
+                    );
+                } else {
+                    log::warn!(
+                        "mutate_to_full_bin_from_log: expected BIN entry at \
+                         LSN {:?}, got {:?}",
+                        delta.last_full_lsn,
+                        entry_type
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "mutate_to_full_bin_from_log: failed to read log at \
+                     LSN {:?}: {}",
+                    delta.last_full_lsn,
+                    e
+                );
+            }
+        }
+
+        // Graceful degradation: promote the delta to a "full" BIN without
+        // the base slots.  The BIN will be re-logged as a full BIN at the
+        // next checkpoint.
         delta.is_delta = false;
         delta.dirty = true;
     }
@@ -4746,6 +4857,337 @@ mod tests {
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
         assert!(Tree::bin_is_delta(&bin));
+    }
+
+    // ========================================================================
+    // Tests: mutate_to_full_bin_from_log
+    // ========================================================================
+
+    /// mutate_to_full_bin_from_log is a no-op when the BIN is already full.
+    #[test]
+    fn test_mutate_to_full_bin_from_log_already_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = std::sync::Arc::new(
+            noxu_log::FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = noxu_log::LogManager::new(fm, 3, 1024 * 1024, 4096);
+
+        let mut bin = BinStub {
+            node_id: 1,
+            level: BIN_LEVEL,
+            entries: vec![BinEntry {
+                key: b"key1".to_vec(),
+                lsn: Lsn::new(1, 10),
+                data: Some(b"v1".to_vec()),
+                known_deleted: false,
+                dirty: false,
+                expiration_time: 0,
+            }],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false, // already a full BIN
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+
+        Tree::mutate_to_full_bin_from_log(&mut bin, &lm);
+
+        // No-op: is_delta was already false, entries unchanged.
+        assert!(!bin.is_delta);
+        assert_eq!(bin.entries.len(), 1);
+    }
+
+    /// mutate_to_full_bin_from_log with NULL_LSN promotes delta without base.
+    ///
+    /// When last_full_lsn is NULL_LSN the BIN has never been written as a full
+    /// entry.  The function must clear is_delta and leave the delta entries
+    /// as-is (they are the authoritative full state).
+    #[test]
+    fn test_mutate_to_full_bin_from_log_null_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = std::sync::Arc::new(
+            noxu_log::FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = noxu_log::LogManager::new(fm, 3, 1024 * 1024, 4096);
+
+        let mut delta = BinStub {
+            node_id: 2,
+            level: BIN_LEVEL,
+            entries: vec![BinEntry {
+                key: b"a".to_vec(),
+                lsn: Lsn::new(1, 5),
+                data: Some(b"delta_a".to_vec()),
+                known_deleted: false,
+                dirty: true,
+                expiration_time: 0,
+            }],
+            key_prefix: Vec::new(),
+            dirty: true,
+            is_delta: true,
+            last_full_lsn: NULL_LSN, // no full BIN ever written
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+
+        Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
+
+        // is_delta must be cleared; the single delta entry is kept as-is.
+        assert!(!delta.is_delta, "is_delta must be false after null-lsn promotion");
+        assert_eq!(delta.entries.len(), 1);
+        assert_eq!(delta.entries[0].data.as_deref(), Some(b"delta_a" as &[u8]));
+    }
+
+    /// mutate_to_full_bin_from_log reads full BIN from log and merges delta.
+    ///
+    /// Round-trip: serialize a full BIN, write it to a LogManager, record the
+    /// LSN, then call mutate_to_full_bin_from_log on a delta referencing that
+    /// LSN.  The result must contain base-only and delta-only entries with the
+    /// delta winning on conflicts.
+    #[test]
+    fn test_mutate_to_full_bin_from_log_reads_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = std::sync::Arc::new(
+            noxu_log::FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = noxu_log::LogManager::new(fm, 3, 1024 * 1024, 4096);
+
+        // Build and serialize the full BIN that will be written to the log.
+        let full_bin = BinStub {
+            node_id: 42,
+            level: BIN_LEVEL,
+            entries: vec![
+                BinEntry {
+                    key: b"base_only".to_vec(),
+                    lsn: Lsn::new(1, 1),
+                    data: Some(b"base_val".to_vec()),
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    key: b"shared_key".to_vec(),
+                    lsn: Lsn::new(1, 2),
+                    data: Some(b"base_shared".to_vec()),
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+            ],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+
+        let payload = full_bin.serialize_full();
+        let full_lsn = lm
+            .log(
+                noxu_log::LogEntryType::BIN,
+                &payload,
+                noxu_log::Provisional::No,
+                true,
+                false,
+            )
+            .expect("write full BIN to log");
+        lm.flush_no_sync().expect("flush log");
+
+        // Build a delta BIN referencing the full BIN via last_full_lsn.
+        let mut delta = BinStub {
+            node_id: 42,
+            level: BIN_LEVEL,
+            entries: vec![
+                // Overwrites "shared_key" from the base.
+                BinEntry {
+                    key: b"shared_key".to_vec(),
+                    lsn: Lsn::new(1, 20),
+                    data: Some(b"delta_shared".to_vec()),
+                    known_deleted: false,
+                    dirty: true,
+                    expiration_time: 0,
+                },
+                // New key only in the delta.
+                BinEntry {
+                    key: b"delta_only".to_vec(),
+                    lsn: Lsn::new(1, 30),
+                    data: Some(b"delta_val".to_vec()),
+                    known_deleted: false,
+                    dirty: true,
+                    expiration_time: 0,
+                },
+            ],
+            key_prefix: Vec::new(),
+            dirty: true,
+            is_delta: true,
+            last_full_lsn: full_lsn,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+
+        Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
+
+        assert!(!delta.is_delta, "is_delta must be false after log-based mutation");
+        assert!(delta.dirty, "must be dirty after mutation");
+
+        // All three distinct keys must be present.
+        let find = |k: &[u8]| -> Option<Vec<u8>> {
+            delta
+                .entries
+                .iter()
+                .find(|e| delta.decompress_key(&e.key) == k)
+                .and_then(|e| e.data.clone())
+        };
+
+        assert_eq!(
+            find(b"base_only"),
+            Some(b"base_val".to_vec()),
+            "base-only key must be present"
+        );
+        assert_eq!(
+            find(b"shared_key"),
+            Some(b"delta_shared".to_vec()),
+            "delta must win on shared_key"
+        );
+        assert_eq!(
+            find(b"delta_only"),
+            Some(b"delta_val".to_vec()),
+            "delta-only key must be present"
+        );
+        assert_eq!(delta.entries.len(), 3, "must have exactly 3 entries");
+
+        // Entries must be in sorted order (by full key).
+        let full_keys: Vec<Vec<u8>> = (0..delta.entries.len())
+            .map(|i| delta.get_full_key(i).unwrap())
+            .collect();
+        let mut sorted_keys = full_keys.clone();
+        sorted_keys.sort();
+        assert_eq!(full_keys, sorted_keys, "entries must be in sorted order");
+    }
+
+    // ========================================================================
+    // Tests: deserialize_full key prefix recomputation
+    // ========================================================================
+
+    /// deserialize_full recomputes key prefix from loaded full keys.
+    ///
+    /// Port of JE IN.recalcKeyPrefix() called after materializing from log:
+    /// a BIN loaded from the log should have prefix compression applied so
+    /// that search performance matches an in-memory BIN.
+    #[test]
+    fn test_deserialize_full_recomputes_key_prefix() {
+        // Build a BIN with a known common prefix and serialize it.
+        let mut source = BinStub {
+            node_id: 99,
+            level: BIN_LEVEL,
+            entries: vec![
+                BinEntry {
+                    key: b"pfx:alpha".to_vec(),
+                    lsn: Lsn::new(1, 1),
+                    data: None,
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    key: b"pfx:beta".to_vec(),
+                    lsn: Lsn::new(1, 2),
+                    data: None,
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    key: b"pfx:gamma".to_vec(),
+                    lsn: Lsn::new(1, 3),
+                    data: None,
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+            ],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+        source.recompute_key_prefix();
+        // Verify the source has the expected prefix before serializing.
+        assert_eq!(source.key_prefix, b"pfx:");
+
+        let payload = source.serialize_full();
+
+        // Deserialize and verify prefix is re-established.
+        let loaded = BinStub::deserialize_full(&payload)
+            .expect("deserialization must succeed");
+
+        assert_eq!(
+            loaded.key_prefix,
+            b"pfx:",
+            "key prefix must be recomputed after deserialize_full"
+        );
+
+        // All full keys must be reconstructable.
+        for i in 0..loaded.entries.len() {
+            let fk = loaded.get_full_key(i).unwrap();
+            assert!(fk.starts_with(b"pfx:"), "full key {i} must start with prefix");
+        }
+    }
+
+    /// deserialize_full with a single entry leaves key_prefix empty.
+    ///
+    /// A BIN with fewer than 2 entries cannot have a meaningful common prefix.
+    #[test]
+    fn test_deserialize_full_single_entry_no_prefix() {
+        let source = BinStub {
+            node_id: 7,
+            level: BIN_LEVEL,
+            entries: vec![BinEntry {
+                key: b"solo".to_vec(),
+                lsn: Lsn::new(1, 1),
+                data: None,
+                known_deleted: false,
+                dirty: false,
+                expiration_time: 0,
+            }],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+
+        let payload = source.serialize_full();
+        let loaded =
+            BinStub::deserialize_full(&payload).expect("deserialization must succeed");
+
+        assert!(
+            loaded.key_prefix.is_empty(),
+            "single-entry BIN must have empty prefix"
+        );
+        assert_eq!(loaded.get_full_key(0).unwrap(), b"solo");
     }
 
     // ========================================================================

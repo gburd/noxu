@@ -7,8 +7,17 @@
 //! The [`FeederRunner`] provides the active I/O loop that scans the log
 //! forward from a given VLSN, frames each entry, and sends it to the replica
 //! via a [`Channel`]. Acks are received on the same channel.
+//!
+//! [`EnvironmentLogScanner`] is the live implementation of [`LogScanner`]
+//! backed by the real `LogManager` + `FileManager`. Port of
+//! `com.sleepycat.je.rep.impl.node.Feeder.MasterFeederSource`.
 
+use noxu_dbi::EnvironmentImpl;
+use noxu_log::file_manager::FileManager;
+use noxu_log::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
+use noxu_log::file_header::FILE_HEADER_SIZE;
 use noxu_sync::Mutex;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +39,223 @@ pub trait LogScanner: Send {
     /// no new entry is available at this moment.
     fn next_entry(&mut self, from_vlsn: u64)
         -> Option<(u64, u8, Vec<u8>)>;
+}
+
+// ---------------------------------------------------------------------------
+// EnvironmentLogScanner
+// ---------------------------------------------------------------------------
+
+/// `LogScanner` implementation backed by the live `EnvironmentImpl`.
+///
+/// Scans the log forward from an LSN cursor, returning entries that carry a
+/// VLSN >= `from_vlsn`. On each call to `next_entry` the scanner advances
+/// its internal file/offset position one entry at a time; when it reaches
+/// the current end of the log it returns `None` (the `FeederRunner` will
+/// call again after a brief poll interval).
+///
+/// Port of `com.sleepycat.je.rep.impl.node.Feeder.MasterFeederSource`.
+pub struct EnvironmentLogScanner {
+    /// The log `FileManager` used for raw byte-level reads.
+    file_manager: Arc<FileManager>,
+    /// Current scan position: next file number and byte offset to read.
+    cursor_file: u32,
+    cursor_offset: u64,
+    /// Highest VLSN returned so far (to avoid duplicates on re-entrant calls).
+    last_returned_vlsn: u64,
+}
+
+impl EnvironmentLogScanner {
+    /// Create a scanner that starts at `start_lsn`.
+    ///
+    /// If `start_lsn` is `NULL_LSN` the scanner begins at the very first log
+    /// entry (file 0, offset = FILE_HEADER_SIZE).
+    ///
+    /// Obtain the `FileManager` from `EnvironmentImpl::get_log_manager()` →
+    /// `LogManager` is not directly accessible, but `EnvironmentImpl` exposes
+    /// a `get_log_manager()` returning `Option<Arc<LogManager>>`.  For the
+    /// scanner we need the `FileManager` underneath it; the simplest approach
+    /// is to construct the scanner directly from a `FileManager` Arc.
+    pub fn new(
+        env: &EnvironmentImpl,
+        start_lsn: Option<Lsn>,
+    ) -> Option<Self> {
+        // We need the FileManager to do raw byte reads.  It is not directly
+        // exposed on EnvironmentImpl, so we access it via the LogManager.
+        // LogManager::file_manager is private, so we carry it separately.
+        // For now, use the env_home path to construct a read-only FileManager.
+        //
+        // Port of MasterFeederSource: the master feeder reads the log files
+        // directly, starting at the replica's current VLSN position.
+        let env_home = env.get_env_home().to_path_buf();
+        let fm = Arc::new(
+            FileManager::new(&env_home, true, 256 * 1024 * 1024, 32).ok()?,
+        );
+
+        let (cursor_file, cursor_offset) = match start_lsn {
+            Some(lsn) if lsn != NULL_LSN => {
+                (lsn.file_number(), lsn.file_offset() as u64)
+            }
+            _ => {
+                // Start from file 0, first entry offset.
+                (0, FILE_HEADER_SIZE as u64)
+            }
+        };
+
+        Some(Self {
+            file_manager: fm,
+            cursor_file,
+            cursor_offset,
+            last_returned_vlsn: 0,
+        })
+    }
+
+    /// Read the raw header+payload at `(file_num, offset)`.
+    ///
+    /// Returns `(entry_size_bytes, vlsn_opt, entry_type_byte, payload)` or
+    /// `None` if the bytes don't form a valid entry (zero fill, truncation).
+    fn read_raw_entry(
+        &self,
+        file_num: u32,
+        offset: u64,
+    ) -> Option<(usize, Option<u64>, u8, Vec<u8>)> {
+        let mut hdr = [0u8; MIN_HEADER_SIZE];
+        let n = self
+            .file_manager
+            .read_from_file(file_num, offset, &mut hdr)
+            .ok()?;
+        if n < MIN_HEADER_SIZE {
+            return None;
+        }
+        // Zero-fill region past last written entry.
+        if hdr[4] == 0 {
+            return None;
+        }
+
+        let entry_type_byte = hdr[4];
+        let flags = hdr[5];
+        let item_size =
+            u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;
+
+        let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
+        let header_size =
+            if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
+
+        // Sanity cap: 64 MiB.
+        if item_size > 64 * 1024 * 1024 {
+            return None;
+        }
+
+        let entry_size = header_size + item_size;
+        let mut full = vec![0u8; entry_size];
+        let n = self
+            .file_manager
+            .read_from_file(file_num, offset, &mut full)
+            .ok()?;
+        if n < entry_size {
+            return None;
+        }
+
+        // Extract VLSN from the header extension if present (8-byte LE i64).
+        let vlsn_opt = if vlsn_present && full.len() >= MAX_HEADER_SIZE {
+            let raw = i64::from_le_bytes(
+                full[MIN_HEADER_SIZE..MAX_HEADER_SIZE].try_into().ok()?,
+            );
+            if raw > 0 { Some(raw as u64) } else { None }
+        } else {
+            None
+        };
+
+        let payload = full[header_size..].to_vec();
+        Some((entry_size, vlsn_opt, entry_type_byte, payload))
+    }
+}
+
+impl LogScanner for EnvironmentLogScanner {
+    /// Return the next entry with VLSN >= `from_vlsn`, advancing the cursor.
+    ///
+    /// Scans forward one entry at a time.  Returns `None` when the cursor
+    /// reaches the end of the currently-written log.  The feeder will sleep
+    /// briefly and call again.
+    fn next_entry(
+        &mut self,
+        from_vlsn: u64,
+    ) -> Option<(u64, u8, Vec<u8>)> {
+        // Collect file numbers once per call; cheap (directory listing).
+        let file_nums = self.file_manager.list_file_numbers().ok()?;
+        if file_nums.is_empty() {
+            return None;
+        }
+
+        loop {
+            // Skip files before the current cursor file.
+            if !file_nums.contains(&self.cursor_file) {
+                // Advance to the next known file.
+                let next = file_nums
+                    .iter()
+                    .find(|&&n| n > self.cursor_file)
+                    .copied();
+                match next {
+                    Some(n) => {
+                        self.cursor_file = n;
+                        self.cursor_offset = FILE_HEADER_SIZE as u64;
+                    }
+                    None => return None, // No more files.
+                }
+            }
+
+            let file_len = self
+                .file_manager
+                .get_file_length(self.cursor_file)
+                .ok()?;
+
+            if self.cursor_offset >= file_len {
+                // End of current file: move to next file.
+                let next = file_nums
+                    .iter()
+                    .find(|&&n| n > self.cursor_file)
+                    .copied();
+                match next {
+                    Some(n) => {
+                        self.cursor_file = n;
+                        self.cursor_offset = FILE_HEADER_SIZE as u64;
+                        continue;
+                    }
+                    None => return None, // End of log.
+                }
+            }
+
+            match self.read_raw_entry(self.cursor_file, self.cursor_offset) {
+                None => {
+                    // End of written data in this file; move to next.
+                    let next = file_nums
+                        .iter()
+                        .find(|&&n| n > self.cursor_file)
+                        .copied();
+                    match next {
+                        Some(n) => {
+                            self.cursor_file = n;
+                            self.cursor_offset = FILE_HEADER_SIZE as u64;
+                            continue;
+                        }
+                        None => return None,
+                    }
+                }
+                Some((entry_size, vlsn_opt, entry_type_byte, payload)) => {
+                    self.cursor_offset += entry_size as u64;
+
+                    if let Some(vlsn) = vlsn_opt
+                        && vlsn >= from_vlsn
+                        && vlsn > self.last_returned_vlsn
+                    {
+                        self.last_returned_vlsn = vlsn;
+                        return Some((vlsn, entry_type_byte, payload));
+                    }
+                    // Entry has no VLSN, vlsn < from_vlsn, or already
+                    // returned: keep scanning.
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

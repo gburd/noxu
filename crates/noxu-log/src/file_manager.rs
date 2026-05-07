@@ -10,10 +10,11 @@ use crate::file_handle::FileHandle;
 use crate::file_header::{FILE_HEADER_SIZE, FileHeader, LOG_VERSION};
 use noxu_latch::ExclusiveLatch;
 use noxu_util::lsn::Lsn;
-use noxu_sync::RwLock;
+use noxu_sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -54,57 +55,14 @@ fn parse_file_number(filename: &str) -> Option<u32> {
     u32::from_str_radix(stem, 16).ok()
 }
 
-/// File handle cache with LRU eviction.
-struct FileCache {
-    /// Map of file number to file handle.
-    handles: HashMap<u32, Arc<FileHandle>>,
-    /// Maximum number of cached handles.
-    max_size: usize,
-    /// LRU queue (file numbers in order of recent use).
-    lru: Vec<u32>,
-}
-
-impl FileCache {
-    fn new(max_size: usize) -> Self {
-        FileCache { handles: HashMap::new(), max_size, lru: Vec::new() }
-    }
-
-    /// Gets a handle from the cache, updating LRU.
-    fn get(&mut self, file_num: u32) -> Option<Arc<FileHandle>> {
-        if let Some(handle) = self.handles.get(&file_num) {
-            // Move to end of LRU (most recently used)
-            self.lru.retain(|&n| n != file_num);
-            self.lru.push(file_num);
-            Some(handle.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Inserts a handle into the cache, evicting LRU if necessary.
-    fn insert(&mut self, file_num: u32, handle: Arc<FileHandle>) {
-        // Evict LRU if at capacity
-        while self.handles.len() >= self.max_size && !self.lru.is_empty() {
-            let lru_file = self.lru.remove(0);
-            self.handles.remove(&lru_file);
-        }
-
-        self.handles.insert(file_num, handle);
-        self.lru.push(file_num);
-    }
-
-    /// Removes a handle from the cache.
-    fn remove(&mut self, file_num: u32) -> Option<Arc<FileHandle>> {
-        self.lru.retain(|&n| n != file_num);
-        self.handles.remove(&file_num)
-    }
-
-    /// Clears all handles from the cache.
-    fn clear(&mut self) {
-        self.handles.clear();
-        self.lru.clear();
-    }
-}
+/// LRU cache of open file handles.
+///
+/// Port of `com.sleepycat.je.log.FileHandleCache`.  The key is the log file
+/// number; values are `Arc`-wrapped so callers may hold a reference after the
+/// cache evicts the entry (matching JE's `FileHandle` reference-counting
+/// pattern).  Capacity is configurable (JE default: `ENV_RUN_CLEANER_THREADS
+/// + 2`; Noxu default: 10).
+type FileHandleCache = lru::LruCache<u32, Arc<FileHandle>>;
 
 /// Manages log files in the environment directory.
 pub struct FileManager {
@@ -114,8 +72,11 @@ pub struct FileManager {
     read_only: bool,
     /// Maximum size of a single log file (bytes).
     max_file_size: u64,
-    /// Cache of open file handles.
-    file_cache: RwLock<FileCache>,
+    /// LRU cache of open file handles (port of JE `FileHandleCache`).
+    ///
+    /// Protected by `noxu_sync::Mutex` because `lru::LruCache::get()` mutates
+    /// the eviction order, so a shared read lock would not be safe.
+    file_cache: Mutex<FileHandleCache>,
     /// Current file number being written to.
     current_file_num: AtomicU32,
     /// Next available LSN for writing.
@@ -167,11 +128,13 @@ impl FileManager {
             )));
         }
 
+        let capacity = NonZeroUsize::new(cache_size.max(1))
+            .expect("cache_size.max(1) is always >= 1");
         let manager = FileManager {
             env_dir,
             read_only,
             max_file_size,
-            file_cache: RwLock::new(FileCache::new(cache_size)),
+            file_cache: Mutex::new(lru::LruCache::new(capacity)),
             current_file_num: AtomicU32::new(0),
             next_available_lsn: AtomicU64::new(
                 Lsn::new(0, first_log_entry_offset()).as_u64(),
@@ -307,18 +270,22 @@ impl FileManager {
 
     /// Gets a file handle for the given file number.
     ///
-    /// The handle is cached and may be shared across multiple readers.
-    /// Returns a latched handle that must be released after use.
+    /// Checks the LRU cache first (port of JE `FileHandleCache.get()`).
+    /// On a cache miss the file is opened, its header validated, and the
+    /// resulting `Arc<FileHandle>` is inserted — with automatic LRU eviction
+    /// when the cache is at capacity.  Because `lru::LruCache::get()` mutates
+    /// the eviction order, the entire lookup+insert is done under a single
+    /// `Mutex` lock, eliminating any TOCTOU race between a cache miss and the
+    /// subsequent insert.
     pub fn get_file_handle(&self, file_num: u32) -> Result<Arc<FileHandle>> {
-        // Fast path: check cache without write lock
-        {
-            let mut cache = self.file_cache.write();
-            if let Some(handle) = cache.get(file_num) {
-                return Ok(handle);
-            }
+        let mut cache = self.file_cache.lock();
+
+        // Fast path: cache hit — LruCache::get() promotes the entry to MRU.
+        if let Some(handle) = cache.get(&file_num) {
+            return Ok(handle.clone());
         }
 
-        // Slow path: open the file and add to cache
+        // Slow path: open the file, validate its header, and insert into cache.
         let path = self.file_path(file_num);
         if !path.exists() {
             return Err(LogError::FileNotFound(format!(
@@ -329,23 +296,24 @@ impl FileManager {
 
         let mut handle = FileHandle::new(file_num);
 
-        // Open the file
+        // Open the file.
         let file = if self.read_only {
             File::open(&path)?
         } else {
             OpenOptions::new().read(true).write(true).open(&path)?
         };
 
-        // Read and validate the header
+        // Read and validate the header.
         let log_version = self.read_and_validate_header(&file, file_num)?;
 
-        // Initialize the handle
+        // Initialize the handle.
         handle.init(file, log_version);
 
         let handle = Arc::new(handle);
 
-        // Add to cache
-        self.file_cache.write().insert(file_num, handle.clone());
+        // Insert into the LRU cache (evicts the least-recently-used entry when
+        // the cache is at capacity, mirroring JE's FileHandleCache eviction).
+        cache.put(file_num, handle.clone());
 
         Ok(handle)
     }
@@ -452,8 +420,8 @@ impl FileManager {
 
         let handle = Arc::new(handle);
 
-        // Add to cache
-        self.file_cache.write().insert(file_num, handle.clone());
+        // Insert into the LRU cache.
+        self.file_cache.lock().put(file_num, handle.clone());
 
         Ok(handle)
     }
@@ -468,8 +436,8 @@ impl FileManager {
             ));
         }
 
-        // Remove from cache
-        self.file_cache.write().remove(file_num);
+        // Remove from cache.
+        self.file_cache.lock().pop(&file_num);
 
         // Delete the file
         let path = self.file_path(file_num);
@@ -482,7 +450,7 @@ impl FileManager {
 
     /// Clears the file handle cache.
     pub fn clear_cache(&self) {
-        self.file_cache.write().clear();
+        self.file_cache.lock().clear();
     }
 
     /// Writes `data` to the current log file at the given file offset.

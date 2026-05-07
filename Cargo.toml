@@ -128,7 +128,7 @@ codegen-units = 1
 
 [profile.release]
 debug = "line-tables-only"
-codegen-units = 4
+codegen-units = 1
 lto = "thin"
 
 [profile.fuzzing]

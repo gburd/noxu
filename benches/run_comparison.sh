@@ -147,6 +147,7 @@ if [[ $SKIP_JE -eq 0 ]]; then
 
     java \
         -server \
+        -XX:+TieredCompilation \
         "${GC_FLAGS[@]}" \
         "$GC_LOG" \
         ${JE_MAX_SCALE_FLAG} \
