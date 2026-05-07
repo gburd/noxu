@@ -628,6 +628,20 @@ impl EnvironmentImpl {
         Ok(db)
     }
 
+    /// Returns the `Arc<RwLock<DatabaseImpl>>` for `db_id`, or `None` if not found.
+    ///
+    /// Used by `Transaction::abort()` to look up each modified database for
+    /// undo application.
+    ///
+    /// Port of `EnvironmentImpl.getDatabase(DatabaseId)` in JE, called from
+    /// `Txn.undoLNs()`.
+    pub fn get_database_by_id(
+        &self,
+        db_id: DatabaseId,
+    ) -> Option<Arc<RwLock<DatabaseImpl>>> {
+        self.db_map.read().get(&db_id).cloned()
+    }
+
     /// Closes a database handle.
     pub fn close_database(&self, db_id: DatabaseId) -> Result<(), DbiError> {
         if let Some(db) = self.db_map.read().get(&db_id) {
