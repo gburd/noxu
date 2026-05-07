@@ -1,6 +1,6 @@
 # Noxu DB — JE Fidelity Review
 
-**Last Updated**: 2026-05-07 (Session 29 — 100% structural fidelity achieved)
+**Last Updated**: 2026-05-07 (Session 30 — benchmark refresh, w09 100K fix, fsync measurement fix)
 **Reference**: Berkeley DB Java Edition 7.5.11 + NoSQL JE Fork
 **JE Source**: `_/je/src/com/sleepycat/je/` (754 production classes)
 **NoSQL Fork**: `_/nosql/kvmain/src/main/java/com/sleepycat/`
@@ -132,6 +132,24 @@ Port of JE `BIN.evictLN()` / `BIN.evictLNs()`.
 **Severity**: LOW — client-side `NetworkRestore::execute()` is complete.
 
 The `TcpServiceDispatcher` does not yet dispatch a "restore request" from a requesting node to serve `.ndb` files over the wire. This is a minor wiring task deferred to cluster bring-up testing.
+
+---
+
+## Session 30: Benchmark Refresh + Bug Fixes (2026-05-07)
+
+### S30-1 — w10_conc fsync measurement bug (FIXED)
+**File**: `benches/noxu-bench/src/main.rs`
+The w10_conc benchmark was using cumulative `env.stat_fsync_count()` without a baseline subtraction, causing `populate()` phase fsyncs to be included in the workload measurement. This made concurrent write workloads appear to have 2× the expected fsyncs. Fixed by capturing `fsync0 = env.stat_fsync_count()` after `populate()` and computing `env.stat_fsync_count().saturating_sub(fsync0)` as the workload fsync count. Pattern now consistent with `run_timed()` used for other workloads.
+
+### S30-2 — w09 100K cap removed (FIXED)
+**File**: `benches/noxu-bench/src/main.rs`
+Removed stale `.min(10_000)` cap on w09_txn_multi workload. The cap was added before lock upgrade (READ→WRITE via `LockUpgrade::WritePromote`) was implemented. Session 26 implemented the upgrade path in `ThinLockImpl::lock()` and `LockImpl::lock_with_sharing()`. Session 30 confirmed: w09 at 100K completes at **6,656 ops/s** (23% faster than JE) with no hang.
+
+### S30-3 — w11 recovery benchmark re-evaluated
+**Finding**: JE recovery at 100K is **5.7× faster** (59ms) than Noxu (385ms) when JVM is properly warmed up. Previous "Noxu 3-5× faster" claim from S23 was measured without JVM warmup and at smaller scales where JVM startup dominated. With the S29 warmup pass, JE's JIT-compiled log scanning consistently outperforms Noxu's Rust recovery at 100K scale. Both engines perform full 3-phase recovery.
+
+### S30-4 — FSyncManager coalescing analysis
+**Finding**: Noxu's FSyncManager is correctly implemented and wired (grpc_threshold=0 matches JE's default). On tmpfs (used by the benchmark's TempDir), `fdatasync` completes near-instantly, so there is no coalescing window. JE achieves coalescing on tmpfs (100K writes → 52K fsyncs) due to its internal write-batching: multiple committed transactions share one fsync via `LogManager.flushAndSync()` before the fsync manager even runs. On real persistent storage, Noxu's FSyncManager would coalesce similarly.
 
 ---
 
@@ -517,34 +535,40 @@ Added warmup pass (all workloads at scale=1000, results discarded) before measur
 | w01 seq write/1t (100K) | 1,437 | 1,349 | Noxu ~7% faster — consistent at scale |
 | w02 rand write/1t (100K) | 1,445 | 1,344 | Noxu ~8% faster |
 | w03 seq read/1t (1K) | 1,038,000 | 40,976 | Noxu **25×** faster (no JVM warmup) |
-| w03 seq read/1t (100K) | 599,152 | 495,019 | Noxu 21% faster at scale |
-| w04 rand read/1t (100K) | 343,673 | 410,272 | JE 19% faster (JIT advantage for cache-miss path) |
-| w05 range scan/1t (100K) | 982,412 | 1,273,034 | JE 30% faster (cursor advance JIT optimization) |
-| w06 write-heavy/1t (100K) | 1,615 | 1,507 | Noxu 7% faster |
-| w07 read-heavy/1t (100K) | 14,004 | 13,365 | ~equal |
-| w08 delete+insert/1t (100K) | 1,450 | 1,400 | ~equal |
-| w09 txn_multi/1t (10K) | 7,490 | 6,292 | Noxu 19% faster |
-| w10_conc_0r4w/4t (100K) | 1,476 | 2,661 | JE 1.8× faster — concurrent write advantage (LM known gap) |
-| w10_conc_4r4w/8t (100K) | 2,833 | 5,442 | JE 1.9× faster — mixed concurrent |
-| w10_conc_8r8w/16t (100K) | 3,098 | 10,317 | JE 3.3× faster — high-thread concurrent writes |
-| w11 recovery/1t (1K) | 10 | 32 | Noxu 3× faster recovery |
-| w11 recovery/1t (100K) | 3 | 14 | Noxu 4.7× faster recovery |
+**Session 30 benchmark data (2026-05-07 — post-JVM-warmup, EpsilonGC, 100K scale):**
 
-**Session 23 incremental flush fix**: The O(N²) buffer-rewrite bug was the dominant write penalty. After the fix, single-threaded write throughput at 1K scale jumped from ~880 to **1,529 ops/s** (74% improvement) and at 10K from ~577 to **1,324 ops/s** (130% improvement). Noxu now equals or exceeds JE for single-threaded writes at all tested scales.
+| Workload | Noxu ops/s | JE ops/s | JE/Noxu | Notes |
+|---|---|---|---|---|
+| w01 seq_write/1t (100K) | 1,033 | 1,324 | 1.28 | JE 28% faster — log batch coalescing |
+| w02 rand_write/1t (100K) | 1,089 | 1,097 | 1.01 | Equal |
+| w03 seq_read/1t (100K) | 378,773 | 468,486 | 1.24 | JE 24% faster — JIT cursor advance |
+| w04 rand_read/1t (100K) | 286,185 | 260,112 | 0.91 | Noxu 10% faster |
+| w05 range_scan/1t (100K) | 876,605 | 1,325,084 | 1.51 | JE 51% faster — JIT scan loop |
+| w06 write-heavy/1t (100K) | 1,209 | 1,263 | 1.04 | Equal |
+| w07 read-heavy/1t (100K) | 10,934 | 11,023 | 1.01 | Equal |
+| w08 delete+insert/1t (100K) | 1,223 | 1,100 | 0.90 | Noxu 11% faster |
+| w09 txn_multi/1t (100K) | **6,656** | 5,406 | **0.81** | **Noxu 23% faster — lock upgrade fix** |
+| w10_conc_0r4w/4t (100K) | 1,796 | 2,163 | 1.20 | JE 20% faster — fsync coalescing |
+| w10_conc_4r4w/8t (100K) | 3,282 | 4,276 | 1.30 | JE 30% faster — mixed concurrent |
+| w10_conc_8r8w/16t (100K) | 3,280 | 8,390 | 2.56 | JE 2.6× faster — high-thread concurrent |
+| w11 recovery/1t (100K) | 3 | 17 | 5.68 | JE 5.7× faster — JIT log scan |
+| Storage (B/op, 100K) | **107** | **154** | — | Noxu 30% more storage-efficient |
 
-**Session 21 write fix context**: Before Session 21's R6 fix (auto-commit CommitSync), Noxu showed 0 fsyncs and 468K ops/s — a phantom 200x advantage from missing durability. After the fix both engines do 1 fsync per auto-commit write; parity confirmed.
+**Write throughput**: JE up to 28% faster at sequential write due to batching log writes before fsync. On tmpfs (used by bench tmpdir), fdatasync is near-instant, so Noxu's FSyncManager cannot coalesce. On real persistent storage, Noxu's FSyncManager would coalesce and the gap would close.
 
-**Read/scan performance**: At 1K–10K scale Noxu is 5–25× faster for reads (no JVM warmup). At 100K scale the JIT closes the gap; JE is 19–30% faster for pure read/scan workloads due to JIT-optimized inner loop cursor code.
+**Read/scan performance**: At 1K–10K scale Noxu is 5–25× faster (no JVM warmup). At 100K with JVM warmup, JE leads by ~24–51% for pure scan workloads due to JIT-optimized cursor advance code.
 
-**Concurrent workloads (Session 23 data — STALE for S28+)**: The Session 23 numbers for w10_conc workloads were measured before Session 28's lock-blocking fix. Session 28 made Noxu's LockManager properly block readers on write-locked records (JE-faithful isolation). A fresh benchmark run is needed to measure the real post-S28 concurrent performance. The concurrent gap may be smaller or larger than reported. Run `bash benches/run_comparison.sh --max-scale=100000` to refresh.
+**Concurrent workloads**: Session 30 data replaces the stale S23 numbers. Both fsync counts and throughput are now correctly measured. JE achieves fsync coalescing (100K writes → 52K fsyncs for 4-writers), Noxu does 1:1 on tmpfs.
 
-**w11 recovery**: Noxu's 3-5× recovery speedup is legitimate — both engines perform full 3-phase recovery (analysis → redo → undo). Noxu is faster due to no JVM startup overhead, no classloading, and compiled log-scan loop vs interpreted Java at small scale. At 100K the gap narrows to ~4.7× because JE's JIT is fully warmed up.
+**w09 txn_multi (100K)**: **Noxu 23% faster than JE** — the get()+put() lock upgrade (WritePromote) was fully implemented and the 100K cap was removed in Session 30.
 
-**Memory efficiency**: Noxu uses 107 bytes/op on disk vs JE's 154–170 bytes/op — Noxu is ~30% more storage-efficient due to the compact `.ndb` format vs JE's `.jdb` format with Java object overhead.
+**w11 recovery (100K)**: JE is **5.7× faster** (59ms vs 385ms). Previous "Noxu faster" claim was pre-JVM-warmup. With proper warmup, JE's JIT-compiled log scanning loop significantly outperforms Noxu's Rust recovery at scale. Both engines perform full 3-phase recovery (analysis → redo → undo).
+
+**Memory efficiency**: Noxu uses 107 bytes/op on disk vs JE's 154–170 bytes/op — Noxu is **30% more storage-efficient** due to the compact `.ndb` format vs JE's `.jdb` format with Java object serialization overhead.
 
 ---
 
 **Review basis**: Direct source inspection of all Noxu crate files and JE 7.5.11 source.
 **Confidence**: High — every gap has a verified file:line reference.
-**Updated**: 2026-05-07 (Session 29 — 100% structural fidelity; G19 replication wired, mutateToFullBIN, TTL cleaner, count O(1), GroupCommit wiring, file handle LRU, key prefix deserialization fix, JVM warmup)
+**Updated**: 2026-05-07 (Session 30 — benchmark refresh with JVM warmup; w09 100K lock-upgrade fix; w10_conc fsync measurement fix; w11 recovery corrected — JE faster post-warmup; storage 107 B/op Noxu vs 154 B/op JE confirmed)
 **Test count**: 4,356 passing, 0 failures, 0 clippy warnings.
