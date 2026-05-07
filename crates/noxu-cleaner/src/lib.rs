@@ -22,6 +22,7 @@ pub mod packed_offsets;
 pub mod tracked_file_summary;
 pub mod utilization_profile;
 pub mod utilization_tracker;
+pub mod utilization_tracker_observer;
 
 // Re-exports
 pub use cleaner::{CleanResult, Cleaner};
@@ -45,5 +46,6 @@ pub use packed_offsets::PackedOffsets;
 pub use tracked_file_summary::TrackedFileSummary;
 pub use utilization_profile::UtilizationProfile;
 pub use utilization_tracker::UtilizationTracker;
+pub use utilization_tracker_observer::UtilizationTrackerObserver;
 pub use data_eraser::{DataEraser, EraseRequest};
 pub use extinction_scanner::{ExtinctionScanner, ExtinctionTask};

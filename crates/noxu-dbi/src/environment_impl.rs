@@ -16,12 +16,13 @@ use crate::{
     DatabaseConfig, DatabaseId, DbType, DbiError, EnvState,
     EnvironmentFailureReason, NodeSequence,
 };
-use noxu_cleaner::Cleaner;
+use noxu_cleaner::{Cleaner, UtilizationTracker, UtilizationTrackerObserver};
 use noxu_evictor::{Arbiter, Evictor, EvictionSource};
 use noxu_log::{
     FileManager, LogManager, LogEntryType, Provisional,
     entry::TxnEndEntry,
 };
+use noxu_sync::Mutex as NoxuMutex;
 use noxu_recovery::RecoveryManager;
 use noxu_txn::{LockManager, Txn, TxnManager};
 use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
@@ -175,6 +176,17 @@ pub struct EnvironmentImpl {
     ///
     /// Port of `EnvironmentImpl.backupManager` (NoSQL fork).
     backup_manager: Mutex<crate::backup_manager::BackupManager>,
+
+    /// Per-file utilization tracker shared between the LogManager write path
+    /// and the Cleaner.
+    ///
+    /// The `LogManager` holds a `LogWriteObserver` that calls into this tracker
+    /// under the LWL for every log write.  The Cleaner reads the accumulated
+    /// counts when choosing which files to clean.
+    ///
+    /// Port of `EnvironmentImpl.utilizationTracker` / `getUtilizationTracker()`
+    /// in JE.
+    utilization_tracker: Option<Arc<NoxuMutex<UtilizationTracker>>>,
 }
 
 impl EnvironmentImpl {
@@ -233,7 +245,7 @@ impl EnvironmentImpl {
 
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
-        let log_manager = if !read_only {
+        let log_manager_and_tracker = if !read_only {
             let fm = Arc::new(
                 FileManager::new(
                     &env_home,
@@ -296,10 +308,27 @@ impl EnvironmentImpl {
                 recovered.insert(db_id, tree);
             }
 
-            Some(Arc::new(LogManager::new(fm, 3, 1024 * 1024, 65536)))
+            let mut lm = LogManager::new(fm, 3, 1024 * 1024, 65536);
+
+            // Wire the UtilizationTracker into the LogManager write path.
+            // The observer is called under the LWL for every log write so
+            // that utilization statistics are always consistent with the
+            // on-disk log.
+            // Port of JE: LogManager.logItem() calls envImpl.getUtilizationTracker()
+            // and passes it to serialLogWork().
+            let util_tracker = Arc::new(NoxuMutex::new(UtilizationTracker::new(true)));
+            let observer = Arc::new(UtilizationTrackerObserver::new(Arc::clone(&util_tracker)));
+            lm.set_write_observer(observer);
+
+            Some((Arc::new(lm), util_tracker))
         } else {
             None
         };
+        let (log_manager, utilization_tracker): (Option<Arc<LogManager>>, Option<Arc<NoxuMutex<UtilizationTracker>>>) =
+            match log_manager_and_tracker {
+                Some((lm, ut)) => (Some(lm), Some(ut)),
+                None => (None, None),
+            };
 
         // Primary shared tree (db_id=1) used for LN migration by the cleaner
         // and as the backing store for the checkpointer.
@@ -312,13 +341,20 @@ impl EnvironmentImpl {
         //
         // Port of JE EnvironmentImpl.dbMapTree / getDbTree() used by the
         // FileProcessor (cleaner) to look up live BINs during LN migration.
+        // Shared memory counter for evictor/MemoryBudget feedback.
+        // Linked to the primary tree and to the Arbiter so that BIN entry
+        // insertions/deletions are visible to the evictor.
+        // Port of JE: IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
+        let cache_usage = Arc::new(AtomicI64::new(0));
+
+        let mut primary_tree_inner = noxu_tree::Tree::new(1, 256);
+        primary_tree_inner.set_memory_counter(Arc::clone(&cache_usage));
         let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
-            Arc::new(std::sync::RwLock::new(noxu_tree::Tree::new(1, 256)));
+            Arc::new(std::sync::RwLock::new(primary_tree_inner));
 
         // Build the evictor with a 64 MiB default budget.  A shared
         // AtomicI64 is used as the live cache-usage counter; the budget can
         // be reconfigured at runtime via Arbiter::set_max_memory().
-        let cache_usage = Arc::new(AtomicI64::new(0));
         let arbiter = Arbiter::new(
             64 * 1024 * 1024, // 64 MiB default max
             Arc::clone(&cache_usage),
@@ -482,6 +518,7 @@ impl EnvironmentImpl {
             data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
             extinction_scanner: Mutex::new(noxu_cleaner::ExtinctionScanner::new()),
             backup_manager: Mutex::new(crate::backup_manager::BackupManager::new()),
+            utilization_tracker,
         };
 
         // Mark as open
@@ -686,6 +723,13 @@ impl EnvironmentImpl {
     /// Returns a reference to the txn manager.
     pub fn get_txn_manager(&self) -> &TxnManager {
         &self.txn_manager
+    }
+
+    /// Returns the utilization tracker shared with the LogManager observer.
+    ///
+    /// Port of `EnvironmentImpl.getUtilizationTracker()` in JE.
+    pub fn get_utilization_tracker(&self) -> Option<&Arc<NoxuMutex<UtilizationTracker>>> {
+        self.utilization_tracker.as_ref()
     }
 
     /// Returns a reference to the node sequence generator.

@@ -26,7 +26,7 @@ use crate::key::{create_key_prefix, get_key_prefix_length};
 use crate::search_result::SearchResult;
 use noxu_latch::{LatchContext, SharedLatch};
 use noxu_util::{Lsn, NULL_LSN};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 // Level and flag constants re-exported here for tree-internal use.
@@ -93,6 +93,17 @@ pub struct Tree {
     /// Port of JE's `btreeComparator` / `dupComparator` stored on the
     /// database and consulted at every `IN.findEntry()` call.
     pub key_comparator: Option<KeyComparatorFn>,
+
+    /// Shared memory counter for the evictor / MemoryBudget.
+    ///
+    /// Updated on every BIN entry insert (+key+data+overhead) and delete
+    /// (-key+overhead) so the evictor sees real cache pressure.
+    ///
+    /// Port of the `env.getMemoryBudget().updateTreeMemoryUsage(delta)` call
+    /// in JE's `IN.updateMemorySize()`.  In Noxu the counter is an
+    /// `Arc<AtomicI64>` shared with the `Arbiter` (and later `MemoryBudget`)
+    /// to avoid a circular crate dependency (`noxu-tree` → `noxu-dbi`).
+    pub memory_counter: Option<Arc<AtomicI64>>,
 }
 
 /// A node in the tree.
@@ -1138,7 +1149,16 @@ impl Tree {
             root_splits: AtomicU64::new(0),
             relatches_required: AtomicU64::new(0),
             key_comparator: None,
+            memory_counter: None,
         }
+    }
+
+    /// Installs a shared memory counter for evictor / MemoryBudget feedback.
+    ///
+    /// Port of `IN.updateMemorySize()` → `env.getMemoryBudget().updateTreeMemoryUsage(delta)`
+    /// in JE.  The counter is updated on every BIN entry insert/delete.
+    pub fn set_memory_counter(&mut self, counter: Arc<AtomicI64>) {
+        self.memory_counter = Some(counter);
     }
 
     /// Creates a new empty tree with a custom key comparator.
@@ -1160,6 +1180,7 @@ impl Tree {
             root_splits: AtomicU64::new(0),
             relatches_required: AtomicU64::new(0),
             key_comparator: Some(comparator),
+            memory_counter: None,
         }
     }
 
@@ -1424,6 +1445,10 @@ impl Tree {
         data: Vec<u8>,
         lsn: Lsn,
     ) -> Result<bool, TreeError> {
+        // Save sizes before potentially moving key/data — needed for memory tracking.
+        let key_len = key.len();
+        let data_len = data.len();
+
         if self.root.read().unwrap().is_none() {
             // Port of JE Tree.insert() first-key path:
             // Create the initial BIN, then a level-2 upper IN as root, and
@@ -1466,6 +1491,12 @@ impl Tree {
             }
 
             *self.root.write().unwrap() = Some(root_arc);
+
+            // Count the first entry.
+            if let Some(counter) = &self.memory_counter {
+                let delta = (key_len + data_len + 48) as i64;
+                counter.fetch_add(delta, Ordering::Relaxed);
+            }
             return Ok(true);
         }
 
@@ -1485,6 +1516,16 @@ impl Tree {
             self.max_entries_per_node,
             self.key_comparator.as_ref(),
         )?;
+
+        // Update the memory counter for new inserts.
+        // Port of JE IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
+        // LN_OVERHEAD = 48 bytes (approximate fixed overhead per entry).
+        if result {
+            if let Some(counter) = &self.memory_counter {
+                let delta = (key_len + data_len + 48) as i64;
+                counter.fetch_add(delta, Ordering::Relaxed);
+            }
+        }
 
         Ok(result)
     }
@@ -1959,7 +2000,18 @@ impl Tree {
             None => return false,
         };
 
-        Self::delete_recursive(&root, key, self.key_comparator.as_ref())
+        let deleted = Self::delete_recursive(&root, key, self.key_comparator.as_ref());
+
+        // Update the memory counter when an entry is removed.
+        // Port of JE IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
+        if deleted {
+            if let Some(counter) = &self.memory_counter {
+                let delta = (key.len() + 48) as i64;
+                counter.fetch_sub(delta, Ordering::Relaxed);
+            }
+        }
+
+        deleted
     }
 
     /// Recursive helper for `delete`: descend to the BIN that holds `key`
