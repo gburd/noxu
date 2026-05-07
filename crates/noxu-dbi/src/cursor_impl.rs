@@ -260,6 +260,89 @@ impl CursorImpl {
         }
     }
 
+    /// Returns the database ID for this cursor's database.
+    fn get_db_id(&self) -> i64 {
+        self.db_impl.read().get_id().as_i64()
+    }
+
+    /// Returns true if `key` is visible in this cursor's transactional view.
+    ///
+    /// Checks the txn's pending write buffer first (read-your-own-writes),
+    /// then falls back to the committed tree.  Auto-commit cursors check
+    /// the tree only.
+    fn key_exists_in_view(&self, key: &[u8]) -> bool {
+        if let Some(txn_arc) = &self.txn_ref {
+            let db_id = self.get_db_id();
+            let txn = txn_arc.lock().unwrap();
+            if let Some((data, _)) = txn.get_pending_write(db_id, key) {
+                return data.is_some();
+            }
+        }
+        let db = self.db_impl.read();
+        if let Some(tree) = db.get_real_tree() {
+            tree.search(key).map(|sr| sr.exact_parent_found).unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// Applies a tree insert immediately (auto-commit) or buffers until commit
+    /// (txn-backed), providing read-committed isolation.
+    ///
+    /// Port of JE's `pendingTxn` per-slot tagging on the BIN.
+    fn apply_tree_insert(&self, key: Vec<u8>, data: Vec<u8>, new_lsn: Lsn) {
+        if let Some(txn_arc) = &self.txn_ref {
+            let db_id = self.get_db_id();
+            let db_clone = Arc::clone(&self.db_impl);
+            let key_hook = key.clone();
+            let data_hook = data.clone();
+            txn_arc.lock().unwrap().add_pending_write(
+                db_id,
+                key,
+                Some(data),
+                new_lsn.as_u64(),
+                Box::new(move || {
+                    let db = db_clone.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        let _ = tree.insert(key_hook.clone(), data_hook.clone(), new_lsn);
+                    }
+                }),
+            );
+        } else {
+            let db = self.db_impl.read();
+            if let Some(tree) = db.get_real_tree() {
+                let _ = tree.insert(key, data, new_lsn);
+            }
+        }
+    }
+
+    /// Applies a tree delete immediately (auto-commit) or buffers until commit
+    /// (txn-backed).
+    fn apply_tree_delete(&self, key: Vec<u8>, del_lsn: Lsn) {
+        if let Some(txn_arc) = &self.txn_ref {
+            let db_id = self.get_db_id();
+            let db_clone = Arc::clone(&self.db_impl);
+            let key_hook = key.clone();
+            txn_arc.lock().unwrap().add_pending_write(
+                db_id,
+                key,
+                None,
+                del_lsn.as_u64(),
+                Box::new(move || {
+                    let db = db_clone.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        tree.delete(&key_hook);
+                    }
+                }),
+            );
+        } else {
+            let db = self.db_impl.read();
+            if let Some(tree) = db.get_real_tree() {
+                tree.delete(&key);
+            }
+        }
+    }
+
     /// Acquires a WRITE lock on `old_lsn` before writing to the log.
     ///
     /// For txn-backed cursors, calls `Txn::lock()` (lock persists until commit/abort).
@@ -1320,26 +1403,13 @@ impl CursorImpl {
                 let new_lsn =
                     self.log_ln_write(&current_key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(old_lsn, new_lsn, Some(current_key.clone()), old_data)?;
-                let db = self.db_impl.read();
-                if let Some(tree) = db.get_real_tree() {
-                    let _ = tree.insert(current_key, data.to_vec(), new_lsn);
-                }
+                self.apply_tree_insert(current_key, data.to_vec(), new_lsn);
                 self.current_data = Some(data.to_vec());
                 self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
             }
             PutMode::NoOverwrite => {
-                let key_exists = {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        tree.search(key)
-                            .map(|sr| sr.exact_parent_found)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                };
-                if key_exists {
+                if self.key_exists_in_view(key) {
                     return Ok(OperationStatus::KeyExist);
                 }
                 // New insert: old_lsn is NULL (abort_known_deleted=true).
@@ -1347,12 +1417,7 @@ impl CursorImpl {
                 self.lock_write_before_log(old_lsn)?;
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(old_lsn, new_lsn, Some(key.to_vec()), old_data)?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
-                    }
-                }
+                self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(data.to_vec());
                 self.current_lsn = new_lsn.as_u64();
@@ -1364,29 +1429,14 @@ impl CursorImpl {
             // returns KeyExist if the key already exists, otherwise inserts.
             // Port of JE `Cursor.putNoDupData()` non-dup branch.
             PutMode::NoDupData => {
-                let key_exists = {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        tree.search(key)
-                            .map(|sr| sr.exact_parent_found)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                };
-                if key_exists {
+                if self.key_exists_in_view(key) {
                     return Ok(OperationStatus::KeyExist);
                 }
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
                 self.lock_write_before_log(old_lsn)?;
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(old_lsn, new_lsn, Some(key.to_vec()), old_data)?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
-                    }
-                }
+                self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(data.to_vec());
                 self.current_lsn = new_lsn.as_u64();
@@ -1399,12 +1449,7 @@ impl CursorImpl {
                 self.lock_write_before_log(old_lsn)?;
                 let new_lsn = self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(old_lsn, new_lsn, Some(key.to_vec()), old_data)?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ = tree.insert(key.to_vec(), data.to_vec(), new_lsn);
-                    }
-                }
+                self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(data.to_vec());
                 self.current_lsn = new_lsn.as_u64();
@@ -1602,10 +1647,7 @@ impl CursorImpl {
             self.lock_write_before_log(old_lsn)?;
             let del_lsn = self.log_ln_write(&tree_key, None, self.locker_id)?;
             self.finalize_write_lock(old_lsn, del_lsn, Some(tree_key.clone()), old_data)?;
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                tree.delete(&tree_key);
-            }
+            self.apply_tree_delete(tree_key, del_lsn);
         }
 
         self.current_key = None;
