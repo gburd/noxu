@@ -260,24 +260,15 @@ impl CursorImpl {
         }
     }
 
-    /// Returns the database ID for this cursor's database.
-    fn get_db_id(&self) -> i64 {
-        self.db_impl.read().get_id().as_i64()
-    }
-
-    /// Returns true if `key` is visible in this cursor's transactional view.
+    /// Returns true if `key` exists in the committed tree.
     ///
-    /// Checks the txn's pending write buffer first (read-your-own-writes),
-    /// then falls back to the committed tree.  Auto-commit cursors check
-    /// the tree only.
+    /// Port of JE `CursorImpl.isPresent()` / lock-check path: with lock-based
+    /// isolation, writes go directly to the BIN, so the tree reflects the
+    /// current committed-or-locked state.  Callers that need to check
+    /// existence before a `NoOverwrite`/`NoDupData` insert consult the tree
+    /// directly; if a concurrent writer holds a WRITE lock the subsequent
+    /// `lock_ln()` call will block until that writer commits or aborts.
     fn key_exists_in_view(&self, key: &[u8]) -> bool {
-        if let Some(txn_arc) = &self.txn_ref {
-            let db_id = self.get_db_id();
-            let txn = txn_arc.lock().unwrap();
-            if let Some((data, _)) = txn.get_pending_write(db_id, key) {
-                return data.is_some();
-            }
-        }
         let db = self.db_impl.read();
         if let Some(tree) = db.get_real_tree() {
             tree.search(key).map(|sr| sr.exact_parent_found).unwrap_or(false)
@@ -286,60 +277,29 @@ impl CursorImpl {
         }
     }
 
-    /// Applies a tree insert immediately (auto-commit) or buffers until commit
-    /// (txn-backed), providing read-committed isolation.
+    /// Inserts or updates `key`/`data` at `new_lsn` in the B-tree.
     ///
-    /// Port of JE's `pendingTxn` per-slot tagging on the BIN.
+    /// Port of JE `CursorImpl.insertRecordInternal()` / `bin.updateEntry()`:
+    /// writes go directly to the BIN immediately.  Read-committed isolation
+    /// is enforced by the lock manager — concurrent readers block on the
+    /// WRITE lock held by this cursor's txn until it commits or aborts.
     fn apply_tree_insert(&self, key: Vec<u8>, data: Vec<u8>, new_lsn: Lsn) {
-        if let Some(txn_arc) = &self.txn_ref {
-            let db_id = self.get_db_id();
-            let db_clone = Arc::clone(&self.db_impl);
-            let key_hook = key.clone();
-            let data_hook = data.clone();
-            txn_arc.lock().unwrap().add_pending_write(
-                db_id,
-                key,
-                Some(data),
-                new_lsn.as_u64(),
-                Box::new(move || {
-                    let db = db_clone.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ = tree.insert(key_hook.clone(), data_hook.clone(), new_lsn);
-                    }
-                }),
-            );
-        } else {
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                let _ = tree.insert(key, data, new_lsn);
-            }
+        let db = self.db_impl.read();
+        if let Some(tree) = db.get_real_tree() {
+            let _ = tree.insert(key, data, new_lsn);
         }
     }
 
-    /// Applies a tree delete immediately (auto-commit) or buffers until commit
-    /// (txn-backed).
-    fn apply_tree_delete(&self, key: Vec<u8>, del_lsn: Lsn) {
-        if let Some(txn_arc) = &self.txn_ref {
-            let db_id = self.get_db_id();
-            let db_clone = Arc::clone(&self.db_impl);
-            let key_hook = key.clone();
-            txn_arc.lock().unwrap().add_pending_write(
-                db_id,
-                key,
-                None,
-                del_lsn.as_u64(),
-                Box::new(move || {
-                    let db = db_clone.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        tree.delete(&key_hook);
-                    }
-                }),
-            );
-        } else {
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                tree.delete(&key);
-            }
+    /// Deletes `key` from the B-tree.
+    ///
+    /// Port of JE `CursorImpl.deleteCurrentRecord()` / `bin.deleteEntry()`:
+    /// the deletion is applied to the BIN immediately.  Concurrent readers
+    /// that try to acquire a READ lock on the deleted slot's LSN block until
+    /// the writer's WRITE lock is released (commit or abort).
+    fn apply_tree_delete(&self, key: Vec<u8>, _del_lsn: Lsn) {
+        let db = self.db_impl.read();
+        if let Some(tree) = db.get_real_tree() {
+            tree.delete(&key);
         }
     }
 

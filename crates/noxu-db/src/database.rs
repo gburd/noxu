@@ -158,7 +158,7 @@ impl Database {
     /// Returns an error if the database is closed
     pub fn get(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         key: &DatabaseEntry,
         data: &mut DatabaseEntry,
     ) -> Result<OperationStatus> {
@@ -169,7 +169,10 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
-        let mut cursor = CursorImpl::new(Arc::clone(&self.db_impl), 0);
+        let mut cursor = match txn {
+            Some(t) => self.make_cursor_for_txn(t),
+            None => self.make_cursor(),
+        };
         match cursor
             .search(key_bytes, None, SearchMode::Set)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?

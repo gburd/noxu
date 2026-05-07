@@ -443,6 +443,10 @@ impl Environment {
             txn
         };
 
+        // Wire env_impl so Transaction::abort() can apply undo records.
+        // Port of Txn.envImpl assignment in JE's Txn constructor.
+        let txn = txn.with_env_impl(Arc::clone(&self.env_impl));
+
         Ok(txn)
     }
 
