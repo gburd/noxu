@@ -28,7 +28,10 @@ pub struct ThreadLocker {
     /// Shared lock manager.
     lock_manager: Arc<LockManager>,
 
-    /// Thread ID that created this locker.
+    /// Thread ID that created this locker (hashed for stable u64 representation).
+    ///
+    /// All ThreadLockers on the same thread share the same `thread_id` and
+    /// therefore share locks with each other.
     thread_id: u64,
 
     /// Set of LSNs currently locked by this locker.
@@ -47,14 +50,20 @@ pub struct ThreadLocker {
 impl ThreadLocker {
     /// Creates a new ThreadLocker for the current thread.
     ///
+    /// Registers this locker's thread ID in the LockManager's sharing registry
+    /// so that `LockImpl::try_lock()` can bypass conflict detection for co-owning
+    /// ThreadLockers on the same thread.
+    ///
     /// # Arguments
     /// * `id` - Unique locker ID
     /// * `lock_manager` - Shared lock manager
     pub fn new(id: i64, lock_manager: Arc<LockManager>) -> Self {
+        let tid = get_thread_id();
+        lock_manager.register_locker_sharing(id, tid as i64);
         ThreadLocker {
             id,
             lock_manager,
-            thread_id: get_thread_id(),
+            thread_id: tid,
             locked_lsns: HashSet::new(),
             lock_timeout_ms: 5000, // Default 5 second timeout
             default_no_wait: false,
@@ -68,10 +77,12 @@ impl ThreadLocker {
         lock_manager: Arc<LockManager>,
         timeout_ms: u64,
     ) -> Self {
+        let tid = get_thread_id();
+        lock_manager.register_locker_sharing(id, tid as i64);
         ThreadLocker {
             id,
             lock_manager,
-            thread_id: get_thread_id(),
+            thread_id: tid,
             locked_lsns: HashSet::new(),
             lock_timeout_ms: timeout_ms,
             default_no_wait: false,
@@ -173,6 +184,15 @@ impl Locker for ThreadLocker {
         self.default_no_wait
     }
 
+    /// Returns true if the other locker was created on the same thread.
+    ///
+    /// JE: `ThreadLocker.sharesLocksWith(other)` — both lockers must be
+    /// ThreadLockers **and** have the same originating thread for sharing.
+    /// We check via the LockManager's sharing registry (locker_id → thread_id).
+    fn shares_locks_with(&self, other_id: i64) -> bool {
+        self.lock_manager.same_share_group(self.id, other_id)
+    }
+
     fn close(&mut self) {
         self.is_open = false;
         let _ = self.release_all_locks();
@@ -185,8 +205,10 @@ impl Locker for ThreadLocker {
 
 impl Drop for ThreadLocker {
     fn drop(&mut self) {
-        // Ensure locks are released when locker is dropped
+        // Ensure locks are released when locker is dropped.
         let _ = self.release_all_locks();
+        // Deregister from the sharing registry.
+        self.lock_manager.unregister_locker_sharing(self.id);
     }
 }
 

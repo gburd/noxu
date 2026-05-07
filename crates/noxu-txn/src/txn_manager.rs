@@ -7,21 +7,43 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use noxu_sync::RwLock;
+use noxu_util::lsn::NULL_LSN;
 
 use crate::group_commit::GroupCommit;
 use crate::LockManager;
 use crate::txn::Txn;
+
+/// Null transaction ID for non-transactional lockers.
+///
+/// Port of `TxnManager.NULL_TXN_ID = -1` in JE.
+pub const NULL_TXN_ID: i64 = -1;
 
 /// Manages all active transactions.
 ///
 /// Port of `com.sleepycat.je.txn.TxnManager`.
 pub struct TxnManager {
     /// All active transactions, keyed by txn ID.
-    all_txns: RwLock<HashMap<i64, ()>>, // Just track IDs for now
-    /// Next transaction ID generator.
+    ///
+    /// Value is the `first_logged_lsn` for that transaction (used by
+    /// `get_first_active_lsn()`).  Starts as `NULL_LSN` until the txn writes
+    /// its first log entry.
+    ///
+    /// Port of `TxnManager.allTxns: Map<Txn, Long>` in JE.
+    all_txns: RwLock<HashMap<i64, u64>>,
+
+    /// Next local transaction ID generator (positive, incrementing).
+    ///
+    /// JE: `TxnManager.lastUsedLocalTxnId`.
     next_txn_id: AtomicI64,
+
+    /// Last committed transaction ID, used by recovery to restore the counter.
+    ///
+    /// JE: `TxnManager.setLastTxnId()` / `getLastLocalTxnId()`.
+    last_local_txn_id: AtomicI64,
+
     /// Lock manager shared by all transactions.
     lock_manager: Arc<LockManager>,
+
     /// Optional group-commit handler (Master or Replica).
     ///
     /// `None` in non-replicated environments — fsyncs go directly through
@@ -30,10 +52,16 @@ pub struct TxnManager {
     ///
     /// Port of `TxnManager.groupCommit: AtomicReference<GroupCommit>` (NoSQL fork).
     group_commit: StdRwLock<Option<Arc<dyn GroupCommit>>>,
+
     /// Statistics.
     n_begins: AtomicU64,
     n_commits: AtomicU64,
     n_aborts: AtomicU64,
+
+    /// Number of active serializable (repeatable-read) transactions.
+    ///
+    /// JE: `TxnManager.nActiveSerializable`.
+    n_active_serializable: AtomicU64,
 }
 
 impl TxnManager {
@@ -42,19 +70,23 @@ impl TxnManager {
         TxnManager {
             all_txns: RwLock::new(HashMap::new()),
             next_txn_id: AtomicI64::new(1),
+            last_local_txn_id: AtomicI64::new(0),
             lock_manager,
             group_commit: StdRwLock::new(None),
             n_begins: AtomicU64::new(0),
             n_commits: AtomicU64::new(0),
             n_aborts: AtomicU64::new(0),
+            n_active_serializable: AtomicU64::new(0),
         }
     }
 
     /// Begins a new transaction.
     pub fn begin_txn(&self) -> Txn {
         let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        self.last_local_txn_id.store(id, Ordering::Relaxed);
         self.n_begins.fetch_add(1, Ordering::Relaxed);
-        self.all_txns.write().insert(id, ());
+        // Register with NULL_LSN initially; updated when first log entry written.
+        self.all_txns.write().insert(id, NULL_LSN.as_u64());
         Txn::new(id, self.lock_manager.clone())
     }
 
@@ -70,9 +102,86 @@ impl TxnManager {
         self.n_aborts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Updates the first-logged LSN for an active transaction.
+    ///
+    /// Called by `Txn` when it writes its first log entry.  This allows
+    /// `get_first_active_lsn()` to return the correct lower bound for
+    /// checkpointing.
+    ///
+    /// Port of `TxnManager.updateFirstActiveLsn()` (implicit in JE via Txn field access).
+    pub fn update_first_lsn(&self, txn_id: i64, first_lsn: u64) {
+        let mut guard = self.all_txns.write();
+        if let Some(entry) = guard.get_mut(&txn_id) {
+            // Only update to an earlier LSN (preserve the first-ever entry).
+            if *entry == NULL_LSN.as_u64() || first_lsn < *entry {
+                *entry = first_lsn;
+            }
+        }
+    }
+
+    /// Returns the earliest first-logged LSN across all active transactions.
+    ///
+    /// The checkpointer uses this to determine the oldest LSN that must be
+    /// preserved in the log (the checkpoint interval lower bound).
+    ///
+    /// JE: `TxnManager.getFirstActiveLsn()` — acquires `allTxnsLatch` and
+    /// iterates all active Txns to find the minimum `firstLoggedLsn`.
+    ///
+    /// Port of `TxnManager.getFirstActiveLsn()`.
+    pub fn get_first_active_lsn(&self) -> u64 {
+        let guard = self.all_txns.read();
+        let mut min_lsn = u64::MAX;
+        for &lsn in guard.values() {
+            if lsn != NULL_LSN.as_u64() && lsn < min_lsn {
+                min_lsn = lsn;
+            }
+        }
+        if min_lsn == u64::MAX {
+            NULL_LSN.as_u64()
+        } else {
+            min_lsn
+        }
+    }
+
+    /// Sets the last local txn ID — called during recovery to restore the counter.
+    ///
+    /// JE: `TxnManager.setLastTxnId(id)`.
+    pub fn set_last_txn_id(&self, id: i64) {
+        // Ensure next_txn_id is always > id.
+        let next = id + 1;
+        self.next_txn_id.store(next, Ordering::Relaxed);
+        self.last_local_txn_id.store(id, Ordering::Relaxed);
+    }
+
+    /// Returns the last locally generated transaction ID.
+    ///
+    /// JE: `TxnManager.getLastLocalTxnId()` — used by HA to determine the
+    /// highest local txn ID seen.
+    pub fn get_last_local_txn_id(&self) -> i64 {
+        self.last_local_txn_id.load(Ordering::Relaxed)
+    }
+
     /// Returns the number of currently active transactions.
     pub fn n_active_txns(&self) -> usize {
         self.all_txns.read().len()
+    }
+
+    /// Returns true if any serializable transactions are active.
+    ///
+    /// JE: `TxnManager.areOtherSerializableTransactionsActive()` — used by
+    /// the evictor to decide whether to skip speculative eviction.
+    pub fn are_other_serializable_transactions_active(&self) -> bool {
+        self.n_active_serializable.load(Ordering::Relaxed) > 0
+    }
+
+    /// Called by a Txn when it starts with serializable isolation.
+    pub fn register_serializable(&self) {
+        self.n_active_serializable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Called by a Txn when a serializable transaction commits or aborts.
+    pub fn unregister_serializable(&self) {
+        self.n_active_serializable.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Returns transaction statistics.

@@ -100,4 +100,7 @@ pub mod group_commit;
 pub use group_commit::{GroupCommit, GroupCommitMaster, GroupCommitReplica};
 
 mod txn_manager;
-pub use txn_manager::{TxnManager, TxnStats};
+pub use txn_manager::{TxnManager, TxnStats, NULL_TXN_ID};
+
+mod txn_chain;
+pub use txn_chain::{CompareSlot, RevertInfo, TxnChain};
