@@ -38,6 +38,10 @@ pub struct UndoRecord {
     pub abort_data: Option<Vec<u8>>,
     /// Key of the abort version (only set when key updates are allowed).
     pub abort_key: Option<Vec<u8>>,
+    /// ID of the database that was modified.
+    ///
+    /// Used by the engine layer to route undo to the correct database's tree.
+    pub database_id: u64,
 }
 
 /// Durability policy for transaction commit.
@@ -540,6 +544,7 @@ impl Txn {
                     abort_known_deleted: wli.abort_known_deleted,
                     abort_data: wli.abort_data.clone(),
                     abort_key: wli.abort_key.clone(),
+                    database_id: wli.database_id,
                 };
                 self.undo_records.push(record);
             }
@@ -608,6 +613,50 @@ impl Txn {
         }
 
         Ok(())
+    }
+
+    /// Moves the write lock from `old_lsn` to `new_lsn`.
+    ///
+    /// Called after logging a new LN entry for an existing record:
+    /// 1. Removes the `WriteLockInfo` from `write_locks[old_lsn]`.
+    /// 2. Releases the old LSN lock at the `LockManager` level.
+    /// 3. Acquires a write lock on `new_lsn` at the `LockManager` level.
+    /// 4. Moves the `WriteLockInfo` into `write_locks[new_lsn]`.
+    ///
+    /// Port of `Txn.moveWriteLockToNewLsn(oldLsn, newLsn)` in JE.
+    pub fn move_write_lock_to_new_lsn(&mut self, old_lsn: u64, new_lsn: u64) {
+        if let Some(wli) = self.write_locks.remove(&old_lsn) {
+            let _ = self.lock_manager.release(old_lsn, self.id);
+            let _ = self.lock_manager.lock(new_lsn, self.id, LockType::Write, false, false);
+            self.write_locks.insert(new_lsn, wli);
+        }
+    }
+
+    /// Records abort (before-image) information for a write lock.
+    ///
+    /// Must be called after acquiring the write lock on `lsn` (via `lock()` or
+    /// `move_write_lock_to_new_lsn()`).  Only sets the abort information the
+    /// first time (`never_locked == true`); subsequent calls are no-ops so that
+    /// the original before-image is preserved across multiple writes to the
+    /// same record within one transaction.
+    ///
+    /// Port of `Txn.setWriteLockAbortLsn()` / `WriteLockInfo.setAbortInfo()` in JE.
+    pub fn set_write_lock_abort_info(
+        &mut self,
+        lsn: u64,
+        abort_lsn: u64,
+        abort_key: Option<Vec<u8>>,
+        abort_data: Option<Vec<u8>>,
+        abort_known_deleted: bool,
+        database_id: u64,
+    ) {
+        if let Some(wli) = self.write_locks.get_mut(&lsn)
+            && wli.never_locked
+        {
+            wli.set_abort_info(abort_lsn, abort_key, abort_data, -1, 0, abort_known_deleted, 0, false);
+            wli.never_locked = false;
+            wli.database_id = database_id;
+        }
     }
 
     /// Returns the number of read locks held.

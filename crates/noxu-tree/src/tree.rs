@@ -1349,7 +1349,7 @@ impl Tree {
     pub fn first_entry_at_or_after(
         &self,
         key: &[u8],
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+    ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
         let mut current = self.get_root()?;
 
         loop {
@@ -1371,7 +1371,8 @@ impl Tree {
                                 .data
                                 .clone()
                                 .unwrap_or_default();
-                            Some((full_key, data))
+                            let lsn = bin.entries[idx].lsn.as_u64();
+                            Some((full_key, data, lsn))
                         } else {
                             None
                         }
