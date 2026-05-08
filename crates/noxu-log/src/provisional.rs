@@ -1,6 +1,5 @@
 //! Provisional log entry specification.
 //!
-//! Port of `com.sleepycat.je.log.Provisional`.
 //!
 //! Specifies whether to log an entry provisionally.
 //!

@@ -1,6 +1,5 @@
 //! Storage size estimation utilities.
 //!
-//! Port of `com.sleepycat.je.tree.StorageSize` from JE.
 //!
 //! Provides constants and utilities for estimating the disk storage size
 //! of records and tree nodes. These estimates help applications understand
@@ -86,7 +85,7 @@ where
 /// Determines if a record should be embedded in the BIN based on size.
 ///
 /// Small records are more efficient when embedded directly in the BIN,
-/// avoiding a separate log entry fetch. JE uses a threshold around 16 bytes.
+/// avoiding a separate log entry fetch. uses a threshold around 16 bytes.
 ///
 /// # Arguments
 /// * `data_size` - Size of the data in bytes
@@ -94,7 +93,7 @@ where
 /// # Returns
 /// True if the record should be embedded
 pub fn should_embed_ln(data_size: usize) -> bool {
-    // Embed if data size is small (threshold of 16 bytes, matching JE behavior)
+    // Embed if data size is small (threshold of 16 bytes, matching behavior)
     data_size <= 16
 }
 

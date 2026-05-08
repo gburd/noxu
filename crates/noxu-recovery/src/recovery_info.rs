@@ -1,6 +1,5 @@
 //! Recovery processing information.
 //!
-//! Port of `com.sleepycat.je.recovery.RecoveryInfo`.
 
 use crate::checkpoint_end::CheckpointEnd;
 use noxu_util::{Lsn, NULL_LSN};
@@ -13,7 +12,7 @@ use std::fmt;
 /// locations, transaction state, and the last allocated IDs for various
 /// database objects.
 ///
-/// Port of `com.sleepycat.je.recovery.RecoveryInfo`.
+/// 
 #[derive(Debug, Clone)]
 pub struct RecoveryInfo {
     /// Location of last entry processed during recovery.

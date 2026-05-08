@@ -1,7 +1,7 @@
 //! Paxos-based master election protocol.
 //!
-//! Port of `com.sleepycat.je.rep.elections.Proposer` (phase 1 + 2) and
-//! `com.sleepycat.je.rep.elections.Acceptor`.
+//! Phase 1 + 2 — and
+//! Rep.elections.Acceptor`.
 //!
 //! ## Protocol overview
 //!
@@ -21,7 +21,7 @@
 //! The winner is determined by [`Proposal`] ordering (highest VLSN, then
 //! priority, then term, then node name). The proposer collects the best
 //! proposal seen in Phase 1 promises and proposes that value in Phase 2,
-//! matching JE's approach.
+//! matching approach.
 //!
 //! ## Acceptor
 //!
@@ -64,7 +64,7 @@ pub type NodeId = u32;
 /// `Some(node_id)` of the elected master (may be a different node if a better
 /// candidate was discovered in Phase 1), or `None` if quorum was not reached.
 ///
-/// Port of `Proposer::issueProposal` in JE.
+/// 
 pub fn run_election(
     node_id: NodeId,
     node_name: &str,
@@ -147,7 +147,7 @@ pub fn run_election(
     // -------------------------------------------------------------------------
     // Phase 2: Accept
     // -------------------------------------------------------------------------
-    // We propose the best value seen (JE's "Value" mechanism).
+    // We propose the best value seen ("Value" mechanism).
     let winner_name = best_proposal.node_name;
     let accept_msg = ProtocolMessage::ElectionResult {
         master: winner_name.clone(),
@@ -194,7 +194,7 @@ pub fn run_election(
 /// Run the acceptor side of the Paxos protocol on the given channel.
 ///
 /// Handles one complete election exchange (Phase 1 + Phase 2) for a single
-/// proposer connection, following JE's `Acceptor` class logic:
+/// proposer connection, following `Acceptor` class logic:
 ///
 /// **Phase 1**: Receive `ElectionProposal` from proposer.
 ///   - If the incoming proposal number >= any previously promised proposal:
@@ -211,7 +211,7 @@ pub fn run_election(
 /// Returns `Ok(Some(master_name))` when the acceptor grants phase 2,
 /// `Ok(None)` on rejection or timeout, `Err` on protocol errors.
 ///
-/// Port of `Acceptor::run()` / `Acceptor::process(Propose)` in JE.
+/// / `Acceptor::process(Propose)`.
 pub fn run_acceptor(
     channel: &dyn Channel,
     node_name: &str,
@@ -238,7 +238,7 @@ pub fn run_acceptor(
             priority: _priority,
             term,
         } => {
-            // JE acceptor: reject only if a higher-numbered proposal was
+            // acceptor: reject only if a higher-numbered proposal was
             // already promised. Accept/promise the first proposal regardless
             // of the proposer's VLSN — the VLSN comparison happens at the
             // proposer level when it collects suggestions.
@@ -249,7 +249,7 @@ pub fn run_acceptor(
                 promised_term = Some(term);
                 // Send Promise: return our own proposal as the suggestion
                 // value so the proposer can pick the best candidate.
-                // This is equivalent to JE's SuggestionGenerator returning
+                // This is equivalent to SuggestionGenerator returning
                 // the local node's VLSN in the Promise response.
                 send_message(
                     channel,
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_acceptor_returns_own_suggestion_for_better_candidate() {
-        // JE acceptors always promise the first proposal, but return their
+        // acceptors always promise the first proposal, but return their
         // own VLSN as a suggestion. When the acceptor has a higher VLSN, the
         // proposer should pick the acceptor as the better candidate.
         let pair = LocalChannelPair::new();

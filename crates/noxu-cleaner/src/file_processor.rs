@@ -1,6 +1,6 @@
 //! Log file processing for cleaning.
 //!
-//! Port of `FileProcessor.java` - reads all entries in a log file and determines
+//! reads all entries in a log file and determines
 //! whether each entry is obsolete or active. Active LNs are migrated immediately,
 //! active INs are marked dirty for the next checkpoint.
 
@@ -27,7 +27,7 @@ const PROCESS_PENDING_EVERY_N_LNS: usize = 100;
 /// Result of looking up an LN's parent BIN slot in the tree.
 ///
 /// Ported from `TreeLocation` / the result returned by
-/// `Tree.getParentBINForChildLN()` in JE.
+/// `Tree.getParentBINForChildLN()`.
 #[derive(Debug)]
 pub enum BinLookupResult {
     /// No parent BIN found for the key — the LN has been deleted from the
@@ -52,7 +52,7 @@ pub enum BinLookupResult {
 #[derive(Debug, PartialEq, Eq)]
 pub enum MigrationOutcome {
     /// The LN was migrated — it was re-logged and the BIN slot was updated to
-    /// the new LSN.  Corresponds to `nLNsMigratedThisRun++` in JE.
+    /// the new LSN.  Corresponds to `nLNsMigratedThisRun++`.
     Migrated,
 
     /// The LN slot was locked by another transaction; the LN was added to the
@@ -68,7 +68,7 @@ pub enum MigrationOutcome {
 /// A monotonically increasing counter used to generate unique ephemeral
 /// locker IDs for non-transactional cleaner locks.
 ///
-/// JE uses `BasicLocker.createBasicLocker(envImpl)` which allocates from
+/// uses `BasicLocker.createBasicLocker(envImpl)` which allocates from
 /// the environment's locker-ID generator.  We approximate that with a
 /// process-local atomic so cleaner locks never collide with each other
 /// or with transaction IDs (transaction IDs come from a different counter
@@ -77,7 +77,7 @@ pub enum MigrationOutcome {
 static CLEANER_LOCKER_NEXT: AtomicI64 = AtomicI64::new(-1);
 
 /// Allocates a fresh ephemeral locker ID for a single non-blocking lock
-/// attempt.  Port of `BasicLocker.createBasicLocker(envImpl)`.
+/// attempt.
 fn next_cleaner_locker_id() -> i64 {
     CLEANER_LOCKER_NEXT.fetch_sub(1, Ordering::Relaxed)
 }
@@ -85,19 +85,19 @@ fn next_cleaner_locker_id() -> i64 {
 /// Real `TreeLookup` implementation backed by a shared `noxu_tree::Tree`.
 ///
 /// This wires the cleaner's `FileProcessor` to the actual B-tree.  The
-/// implementation follows JE's `FileProcessor.processLN` /
+/// implementation follows `FileProcessor.processLN` /
 /// `FileProcessor.processFoundLN` faithfully:
 ///
 /// * `lookup_parent_bin` — searches the tree for the BIN that holds `key`
 ///   and returns the slot's current LSN so the caller can decide whether
 ///   migration is needed.
 /// * `migrate_ln_slot` — acquires a non-blocking read lock on `tree_lsn`
-///   (port of JE's `locker.nonBlockingLock`), re-checks the slot LSN,
+///   , re-checks the slot LSN,
 ///   re-inserts at a new LSN, and releases the lock.  Returns `Locked` if
 ///   the lock is denied so the entry can be added to the pending queue.
 /// * `lookup_in` — finds the tree node by `node_id`, compares
 ///   `BinStub.last_full_lsn` with `log_lsn`, and marks the node dirty so
-///   the next checkpoint re-logs it.  Port of JE `findINInTree()` +
+///   the next checkpoint re-logs it. +
 ///   `processIN()`.
 ///
 /// # M-5 fix
@@ -121,7 +121,7 @@ impl RealTreeLookup {
 impl TreeLookup for RealTreeLookup {
     /// Search the tree for `key` and return the slot's current LSN.
     ///
-    /// Port of `Tree.getParentBINForChildLN()` in JE.
+    /// 
     fn lookup_parent_bin(
         &self,
         _db_id: i64,
@@ -147,10 +147,10 @@ impl TreeLookup for RealTreeLookup {
 
     /// Attempt to migrate a single LN slot.
     ///
-    /// Port of `FileProcessor.processFoundLN()` — H-4 fix: now acquires a
+    /// H-4 fix: now acquires a
     /// non-blocking read lock on `tree_lsn` before migrating.
     ///
-    /// JE algorithm:
+    /// algorithm:
     /// 1. `locker = BasicLocker.createBasicLocker(envImpl)` — ephemeral locker.
     /// 2. `locker.nonBlockingLock(treeLsn, READ)` — if DENIED, return Locked.
     /// 3. Re-check `treeLsn == logLsn`; if differ, return Obsolete (Dead).
@@ -164,7 +164,7 @@ impl TreeLookup for RealTreeLookup {
         tree_lsn: Lsn,
     ) -> MigrationOutcome {
         // H-4: attempt a non-blocking read lock on tree_lsn.
-        // Port of JE: `locker.nonBlockingLock(treeLsn, LockType.READ, ...)`.
+        // `locker.nonBlockingLock(treeLsn, LockType.READ, ...)`.
         let locker_id = next_cleaner_locker_id();
         let lock_lsn = tree_lsn.as_u64();
         match self.lock_manager.lock(
@@ -175,7 +175,7 @@ impl TreeLookup for RealTreeLookup {
             false, // jump_ahead_of_waiters
         ) {
             Err(TxnError::LockNotAvailable { .. }) => {
-                // JE: "LN is currently locked by another Locker" → pending.
+                // "LN is currently locked by another Locker" → pending.
                 return MigrationOutcome::Locked;
             }
             Err(_) => {
@@ -186,7 +186,7 @@ impl TreeLookup for RealTreeLookup {
         }
 
         // Re-check the slot LSN after acquiring the lock (post-lock check).
-        // JE: `if (treeLsn != logLsn) { nLNsDeadThisRun++; return null; }`
+        // `if (treeLsn != logLsn) { nLNsDeadThisRun++; return null; }`
         let current_lsn = {
             let tree = match self.tree.read() {
                 Ok(g) => g,
@@ -209,7 +209,7 @@ impl TreeLookup for RealTreeLookup {
         }
 
         // Retrieve current data then re-insert at a new LSN.
-        // Port of JE: `targetLn.log(...) -> logItem; bin.updateEntry(logItem.lsn)`.
+        // `targetLn.log(...) -> logItem; bin.updateEntry(logItem.lsn)`.
         let data = {
             let tree = match self.tree.read() {
                 Ok(g) => g,
@@ -235,7 +235,7 @@ impl TreeLookup for RealTreeLookup {
             }
         };
 
-        // H-4: release lock — port of JE `locker.operationEnd()`.
+        // H-4: release lock.
         let _ = self.lock_manager.release(lock_lsn, locker_id);
         outcome
     }
@@ -243,9 +243,9 @@ impl TreeLookup for RealTreeLookup {
     /// Look up an IN node by `node_id` and mark it dirty if its on-disk LSN
     /// matches `log_lsn`.
     ///
-    /// Port of `FileProcessor.findINInTree()` + `processIN()` — H-3 fix.
+    /// + `processIN()` — H-3 fix.
     ///
-    /// JE algorithm:
+    /// algorithm:
     /// 1. Find the IN in the in-memory tree by node ID.
     /// 2. Retrieve the full-version LSN stored in the node
     ///    (`BinStub.last_full_lsn` / `InNodeStub` LSN via parent slot).
@@ -285,8 +285,8 @@ impl TreeLookup for RealTreeLookup {
             let slot_lsn = match &*parent_guard {
                 TreeNode::Internal(n) => {
                     // The parent slot's LSN tracks the last logged position
-                    // for the child — used directly for upper INs (port of
-                    // JE INEntryInfo.prevFullLsn read from the log entry).
+                    // for the child — used directly for upper INs
+                    // INEntryInfo.prevFullLsn read from the log entry).
                     n.entries.get(slot_idx).map(|e| e.lsn)
                 }
                 _ => None,
@@ -325,9 +325,8 @@ impl TreeLookup for RealTreeLookup {
                     // use NULL_LSN to indicate "use parent slot LSN".
                     TreeNode::Internal(_) => {
                         // For upper INs, the parent slot LSN (InEntry.lsn) is
-                        // the last logged position for this node.  Port of JE:
-                        // FileProcessor uses INEntryInfo.prevFullLsn from the
-                        // log entry header to determine currency.
+                        // the last logged position for this node. The slot LSN
+                        // from the log entry header determines currency.
                         match slot_lsn {
                             Some(lsn) => lsn,
                             None => return InLookupResult::Obsolete,
@@ -348,7 +347,7 @@ impl TreeLookup for RealTreeLookup {
             }
 
             // Step 4 — tree_lsn == log_lsn: mark dirty.
-            // Port of JE: `inInTree.setDirty(true); inInTree.setProhibitNextDelta(true)`.
+            // `inInTree.setDirty(true); inInTree.setProhibitNextDelta(true)`.
             drop(tree_guard);
             if let Ok(mut child_write) = child_arc.write() {
                 child_write.set_dirty(true);
@@ -488,10 +487,10 @@ impl RealTreeLookup {
 /// via `Cleaner::with_file_manager_tree_and_lock_manager()`.
 ///
 /// The `log_manager` obtains a fresh LSN when re-logging a migrated LN —
-/// port of JE's `targetLn.log(...)`.
+///.
 ///
 /// The `lock_manager` is used by `migrate_ln_slot` to acquire a non-blocking
-/// read lock before migrating — port of JE's `locker.nonBlockingLock(...)`.
+/// read lock before migrating.
 ///
 /// # H-4 fix
 /// Non-blocking read lock is now acquired before re-logging.
@@ -534,7 +533,7 @@ impl SharedTreeLookup {
 impl TreeLookup for SharedTreeLookup {
     /// Look up the parent BIN slot for `key` in the shared tree.
     ///
-    /// Port of `Tree.getParentBINForChildLN()` in JE.
+    /// 
     fn lookup_parent_bin(
         &self,
         _db_id: i64,
@@ -563,7 +562,7 @@ impl TreeLookup for SharedTreeLookup {
 
     /// Attempt to migrate a single LN slot with a non-blocking read lock.
     ///
-    /// Port of `FileProcessor.processFoundLN()` — H-4 fix.
+    /// H-4 fix.
     fn migrate_ln_slot(
         &self,
         _db_id: i64,
@@ -625,7 +624,7 @@ impl TreeLookup for SharedTreeLookup {
             t.insert(key.to_vec(), data, new_lsn)
         });
 
-        // H-4: release lock — port of JE `locker.operationEnd()`.
+        // H-4: release lock.
         let _ = self.lock_manager.release(lock_lsn, locker_id);
 
         match result {
@@ -654,12 +653,12 @@ impl TreeLookup for SharedTreeLookup {
 /// implementation, making the migration logic independently testable and
 /// allowing the integration to be wired in once the tree crate is complete.
 ///
-/// Each method corresponds to a specific tree operation performed by JE's
+/// Each method corresponds to a specific tree operation performed by the
 /// `FileProcessor.processLN` / `FileProcessor.processFoundLN`.
 pub trait TreeLookup {
     /// Looks up the parent BIN slot for an LN identified by `key` and `db_id`.
     ///
-    /// Corresponds to `Tree.getParentBINForChildLN()` in JE.
+    /// Corresponds to `Tree.getParentBINForChildLN()`.
     ///
     /// The implementation should latch the BIN and return the slot LSN.
     /// Latching is released by the implementation before returning — this
@@ -677,11 +676,11 @@ pub trait TreeLookup {
     /// Called after `lookup_parent_bin` returns `BinLookupResult::Found`.
     ///
     /// The implementation must:
-    /// 1. Acquire a non-blocking read lock on `tree_lsn` (JE: `locker.nonBlockingLock`).
+    /// 1. Acquire a non-blocking read lock on `tree_lsn` (the: `locker.nonBlockingLock`).
     /// 2. If the lock is denied, return `MigrationOutcome::Locked`.
     /// 3. Re-check `tree_lsn == log_lsn` after acquiring the lock; if they
     ///    differ, return `MigrationOutcome::Obsolete`.
-    /// 4. Re-log the LN (JE: `targetLn.log(...)`), update the BIN slot LSN,
+    /// 4. Re-log the LN (the: `targetLn.log(...)`), update the BIN slot LSN,
     ///    and return `MigrationOutcome::Migrated`.
     ///
     /// Corresponds to the locking + `targetLn.log()` + `bin.updateEntry()`
@@ -697,7 +696,7 @@ pub trait TreeLookup {
     /// Looks up an IN in the tree and checks whether the log entry is still
     /// the current version.
     ///
-    /// Corresponds to `FileProcessor.findINInTree()` in JE.
+    /// Corresponds to `FileProcessor.findINInTree()`.
     ///
     /// Returns `InLookupResult::Found` if the IN is still current (its LSN in
     /// the tree matches `log_lsn`), and the implementation has marked it dirty.
@@ -715,20 +714,19 @@ pub trait TreeLookup {
 
 /// Result of looking up an IN in the tree during cleaning.
 ///
-/// Returned by [`TreeLookup::lookup_in`].  Port of the result produced by
-/// `FileProcessor.findINInTree()` in JE.
+/// Returned by [`TreeLookup::lookup_in`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum InLookupResult {
     /// The IN is still the current version in the tree.  The implementation
     /// has already marked it dirty so the next checkpoint will re-log it.
     ///
-    /// Corresponds to `nINsMigratedThisRun++` in JE.
+    /// Corresponds to `nINsMigratedThisRun++`.
     Found,
 
     /// The IN is no longer current — either it has been replaced by a newer
     /// version or it was never resident (deferred-write NULL_LSN).
     ///
-    /// Corresponds to `nINsDeadThisRun++` in JE.
+    /// Corresponds to `nINsDeadThisRun++`.
     Obsolete,
 }
 
@@ -736,7 +734,7 @@ pub enum InLookupResult {
 
 /// The type of a log entry, as seen by the cleaner's file-processing loop.
 ///
-/// JE's `CleanerFileReader` has `.isLN()`, `.isIN()`, `.isBINDelta()`, etc.
+/// `CleanerFileReader` has `.isLN()`, `.isIN()`, `.isBINDelta()`, etc.
 /// predicates.  We model the classification with this enum so that the
 /// `process_file()` loop can dispatch without a real file reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,7 +796,7 @@ pub struct LogEntry {
 
 /// A cache of [`LnInfo`] entries keyed by their LSN file offset.
 ///
-/// Port of the inner `LookAheadCache` class from `FileProcessor.java`.
+/// Inner `LookAheadCache` class from `FileProcessor.java`.
 ///
 /// The cleaner reads LN log entries sequentially and accumulates them in
 /// this sorted map. When the cache is full (exceeds `max_mem` bytes) the
@@ -810,7 +808,7 @@ pub struct LookAheadCache {
     /// Sorted map: LSN file offset → LN info.
     ///
     /// BTreeMap keeps offsets in ascending order so `first_key_value` gives
-    /// the lowest-offset (oldest) entry — exactly what JE's TreeMap gave.
+    /// the lowest-offset (oldest) entry — exactly what TreeMap gave.
     map: BTreeMap<u32, LnInfo>,
 
     /// Memory currently occupied by the cache entries.
@@ -825,9 +823,9 @@ impl LookAheadCache {
     ///
     /// Pass `max_mem = 0` (or any value ≤ `TREEMAP_OVERHEAD`) to disable the
     /// look-ahead optimisation; the cache will be "full" as soon as the first
-    /// entry is added, mirroring JE's `countOnly` mode.
+    /// entry is added, mirroring `countOnly` mode.
     pub fn new(max_mem: usize) -> Self {
-        // JE seeds usedMem with TREEMAP_OVERHEAD; mirror that here.
+        // seeds usedMem with TREEMAP_OVERHEAD; mirror that here.
         const TREEMAP_OVERHEAD: usize = 64;
         Self { map: BTreeMap::new(), used_mem: TREEMAP_OVERHEAD, max_mem }
     }
@@ -845,7 +843,7 @@ impl LookAheadCache {
 
     /// Adds an entry to the cache.
     ///
-    /// Port of `LookAheadCache.add(Long lsnOffset, LNInfo info)`.
+    /// 
     pub fn add(&mut self, lsn_offset: u32, info: LnInfo) {
         const TREEMAP_ENTRY_OVERHEAD: usize = 48;
         self.used_mem += info.memory_size() + TREEMAP_ENTRY_OVERHEAD;
@@ -855,7 +853,7 @@ impl LookAheadCache {
     /// Returns the smallest LSN offset currently in the cache, or `None` if
     /// the cache is empty.
     ///
-    /// Port of `LookAheadCache.nextOffset()`.
+    /// 
     pub fn next_offset(&self) -> Option<u32> {
         self.map.keys().next().copied()
     }
@@ -864,7 +862,7 @@ impl LookAheadCache {
     ///
     /// Returns `None` if the offset is not present.
     ///
-    /// Port of `LookAheadCache.remove(Long offset)`.
+    /// 
     pub fn remove(&mut self, offset: u32) -> Option<LnInfo> {
         if let Some(info) = self.map.remove(&offset) {
             const TREEMAP_ENTRY_OVERHEAD: usize = 48;
@@ -886,7 +884,7 @@ impl LookAheadCache {
 
 /// Outcome of processing a single LN entry during file cleaning.
 ///
-/// Mirrors the per-entry status variables in JE's `processFoundLN`.
+/// Mirrors the per-entry status variables in the equivalent `processFoundLN`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateLnResult {
     /// The LN was no longer reachable in the tree — it has been deleted or
@@ -910,7 +908,7 @@ pub enum MigrateLnResult {
 /// obsolete or active. Active LNs are migrated (re-logged). Active INs
 /// are marked dirty for the next checkpoint.
 ///
-/// Port of `FileProcessor.java`.
+/// 
 pub struct FileProcessor {
     /// Reference to cleaner statistics.
     stats: Arc<CleanerStats>,
@@ -996,7 +994,7 @@ impl FileProcessor {
 
     /// Main entry point — processes a single log file for cleaning.
     ///
-    /// Port of `FileProcessor.processFile()` in JE, adapted to accept a
+    /// In JE, adapted to accept a
     /// pre-decoded entry slice so the loop is testable without I/O.
     ///
     /// # Arguments
@@ -1012,7 +1010,7 @@ impl FileProcessor {
     /// `Ok(FileProcessResult)` with counters for each entry category.
     /// `completed = false` when the shutdown flag is set mid-file.
     ///
-    /// # JE correspondence
+    /// # correspondence
     /// ```text
     /// processFile():
     ///   while reader.readNextEntry():
@@ -1037,13 +1035,13 @@ impl FileProcessor {
 
         let mut result = FileProcessResult::new();
 
-        // Look-ahead cache for LN entries.  JE uses a memory budget; we use
+        // Look-ahead cache for LN entries.  uses a memory budget; we use
         // a large fixed budget that keeps all entries in the cache until it
         // is explicitly flushed.  The cache is flushed when full or at the
-        // end of the file — matching JE's behaviour.
+        // end of the file — matching behaviour.
         //
         // Budget: TREEMAP_OVERHEAD (64) + 1 so the empty cache is never full.
-        // Any positive max_mem larger than 64 works; 4 MiB mirrors JE default.
+        // Any positive max_mem larger than 64 works; 4 MiB mirrors default.
         let mut look_ahead_cache = LookAheadCache::new(4 * 1024 * 1024);
 
         let mut n_processed_lns: usize = 0;
@@ -1051,7 +1049,7 @@ impl FileProcessor {
         for entry in entries {
             result.entries_read += 1;
 
-            // Step 1 — check shutdown periodically (JE: envImpl.isClosing()).
+            // Step 1 — check shutdown periodically (the: envImpl.isClosing()).
             if self.shutdown.load(Ordering::Relaxed) {
                 result.completed = false;
                 return Ok(result);
@@ -1069,7 +1067,7 @@ impl FileProcessor {
                     expiration_time,
                     entry_size,
                 } => {
-                    // JE: deleted LNs (log version > 2) are immediately obsolete.
+                    // Deleted LNs (log version > 2) are immediately obsolete.
                     if *deleted {
                         result.lns_obsolete += 1;
                         self.stats.lns_obsolete.fetch_add(1, Ordering::Relaxed);
@@ -1087,12 +1085,12 @@ impl FileProcessor {
                     );
                     look_ahead_cache.add(file_offset, info);
 
-                    // Process the cache when full (JE: lookAheadCache.isFull()).
+                    // Process the cache when full (the: lookAheadCache.isFull()).
                     if look_ahead_cache.is_full() {
                         self.process_ln(file_number, &mut look_ahead_cache, tree, &mut result);
                     }
 
-                    // Periodically drain pending LNs (JE: cleaner.processPending()).
+                    // Periodically drain pending LNs (the: cleaner.processPending()).
                     n_processed_lns += 1;
                     if n_processed_lns.is_multiple_of(self.process_pending_interval) {
                         // In the future: call cleaner.process_pending() here.
@@ -1113,24 +1111,24 @@ impl FileProcessor {
                 }
 
                 // ── BIN-delta entry ────────────────────────────────────────
-                // JE: `FileProcessor.processBINDelta()` — mark parent BIN dirty
+                // `FileProcessor.processBINDelta()` — mark parent BIN dirty
                 // so the next checkpoint re-logs the full node.
                 LogEntryType::BinDelta { db_id, node_id } => {
                     self.process_bin_delta(*db_id, *node_id, lsn, tree, &mut result);
                 }
 
                 // ── Other / unknown entries ────────────────────────────────
-                // JE: "Consider all entries we do not process as obsolete."
+                // "Consider all entries we do not process as obsolete."
                 LogEntryType::Other => {
                     // Counted as obsolete but no migration needed.
                     // We don't have a separate other_obsolete counter so we
-                    // leave it unreported (matches JE's silent skip).
+                    // leave it unreported (silent skip).
                 }
             }
         }
 
         // Drain any remaining LN entries from the look-ahead cache.
-        // JE: "Process remaining queued LNs."
+        // "Process remaining queued LNs."
         while !look_ahead_cache.is_empty() {
             if self.shutdown.load(Ordering::Relaxed) {
                 result.completed = false;
@@ -1171,7 +1169,7 @@ impl FileProcessor {
     /// Processes a batch of LN entries from the look-ahead cache against the
     /// tree, performing migration for active entries.
     ///
-    /// Port of `FileProcessor.processLN()`.
+    /// 
     ///
     /// The algorithm (faithful to JE):
     /// 1. Dequeue the lowest-offset LN from `cache`.
@@ -1251,7 +1249,7 @@ impl FileProcessor {
 
     /// Processes an LN that was found in the tree.
     ///
-    /// Port of `FileProcessor.processFoundLN()`.
+    /// 
     ///
     /// Decision tree (faithful to JE):
     ///
@@ -1275,7 +1273,7 @@ impl FileProcessor {
         tree_lsn: Lsn,
         tree: &T,
     ) -> MigrateLnResult {
-        // Case 4 (JE comment): NULL_LSN in tree means the record was written
+        // Case 4 (comment): NULL_LSN in tree means the record was written
         // for a deferred-write DB but has never been flushed; the log entry is
         // therefore obsolete.
         if tree_lsn == noxu_util::NULL_LSN {
@@ -1307,13 +1305,13 @@ impl FileProcessor {
 
     /// Processes an IN log entry.
     ///
-    /// Port of `FileProcessor.processIN()` in JE.
+    /// 
     ///
     /// If the IN is still the current version in the tree, marks it dirty so
     /// the next checkpoint will re-log it (making the cleaned file's copy
     /// obsolete).  If the IN is no longer current, counts it as dead.
     ///
-    /// # JE correspondence
+    /// # correspondence
     /// ```text
     /// processIN(inClone, db, logLsn):
     ///   nINsCleanedThisRun++
@@ -1334,15 +1332,15 @@ impl FileProcessor {
         tree: &T,
         result: &mut FileProcessResult,
     ) {
-        // JE: nINsCleanedThisRun++
+        // NINsCleanedThisRun++
         result.ins_cleaned += 1;
         self.stats.ins_cleaned.fetch_add(1, Ordering::Relaxed);
 
-        // JE: findINInTree → if null then dead, else dirty it.
+        // FindINInTree → if null then dead, else dirty it.
         match tree.lookup_in(db_id, node_id, log_lsn) {
             InLookupResult::Found => {
                 // The tree implementation has already called set_dirty(true)
-                // and set_prohibit_next_delta(true) (JE lines 1678-1681).
+                // and set_prohibit_next_delta(true) (lines 1678-1681).
                 result.ins_migrated += 1;
                 self.stats.ins_migrated.fetch_add(1, Ordering::Relaxed);
             }
@@ -1355,7 +1353,7 @@ impl FileProcessor {
 
     /// Processes a BIN-delta entry.
     ///
-    /// Port of `FileProcessor.processBINDelta()` in JE.
+    /// 
     ///
     /// Marks the parent BIN dirty by delegating to `process_in()`.  This
     /// causes the next checkpoint to re-log the full BIN, making the
@@ -1374,7 +1372,7 @@ impl FileProcessor {
         // compare its LSN, and mark it dirty so the next checkpoint re-logs
         // the full BIN — this supersedes the old delta.
         //
-        // Port of JE `FileProcessor.processBINDelta()` which calls
+        // `FileProcessor.processBINDelta()` which calls
         // `findINInTree()` and `IN.setDirty(true)` on the found node.
         self.process_in(db_id, node_id, log_lsn, tree, result);
         // Move the in_* counters over to bin_delta_* since this is a delta.
@@ -1860,7 +1858,7 @@ mod tests {
 
     #[test]
     fn test_look_ahead_cache_next_offset_is_smallest() {
-        // JE's LookAheadCache.nextOffset() returns the first key of a TreeMap,
+        // LookAheadCache.nextOffset() returns the first key of a TreeMap,
         // which is the smallest key.  BTreeMap gives the same guarantee.
         let mut cache = LookAheadCache::new(65536);
         cache.add(3000, make_ln_info(1, 3000, 1));
@@ -1919,7 +1917,7 @@ mod tests {
 
     // ── process_found_ln tests ────────────────────────────────────────────────
 
-    /// JE case 1: tree_lsn == log_lsn → migration path.
+    /// case 1: tree_lsn == log_lsn → migration path.
     #[test]
     fn test_process_found_ln_migrates_when_lsns_match() {
         let proc = make_processor();
@@ -1934,7 +1932,7 @@ mod tests {
         assert_eq!(result, MigrateLnResult::Migrated);
     }
 
-    /// JE case 2/3: tree_lsn != log_lsn → obsolete.
+    /// case 2/3: tree_lsn != log_lsn → obsolete.
     #[test]
     fn test_process_found_ln_dead_when_lsns_differ() {
         let proc = make_processor();
@@ -1949,7 +1947,7 @@ mod tests {
         assert_eq!(result, MigrateLnResult::Dead);
     }
 
-    /// JE case 4: NULL_LSN in tree → obsolete (deferred-write DB).
+    /// case 4: NULL_LSN in tree → obsolete (deferred-write DB).
     #[test]
     fn test_process_found_ln_dead_when_tree_lsn_is_null() {
         let proc = make_processor();
@@ -2056,7 +2054,7 @@ mod tests {
 
     /// process_ln always dequeues the lowest-offset entry first (FIFO on LSN).
     ///
-    /// JE's processLN calls `lookAheadCache.nextOffset()` (= TreeMap.firstKey(),
+    /// processLN calls `lookAheadCache.nextOffset()` (= TreeMap.firstKey(),
     /// smallest key).  Verify the Rust port does the same.
     #[test]
     fn test_process_ln_dequeues_lowest_offset_first() {
@@ -2161,7 +2159,7 @@ mod tests {
 
     #[test]
     fn test_null_lsn_in_tree_is_dead() {
-        // Port of JE's case 4 comment: deferred-write DB, never-written slot.
+        // Deferred-write DB, never-written slot.
         let proc = make_processor();
         let file_num = 1u32;
         let log_lsn = Lsn::new(file_num, 100);
@@ -2169,7 +2167,7 @@ mod tests {
 
         let result = proc.process_found_ln(&info, log_lsn, noxu_util::NULL_LSN, &NullLsnTree);
         assert_eq!(result, MigrateLnResult::Dead,
-            "NULL_LSN in tree slot must yield Dead (case 4 in JE's processFoundLN)");
+            "NULL_LSN in tree slot must yield Dead (case 4 in the equivalent processFoundLN)");
     }
 
     #[test]

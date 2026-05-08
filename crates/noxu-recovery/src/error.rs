@@ -6,7 +6,6 @@ use thiserror::Error;
 
 /// Errors that can occur during recovery and checkpointing operations.
 ///
-/// Port of various JE recovery exception types.
 #[derive(Debug, Error)]
 pub enum RecoveryError {
     /// Recovery process failed.

@@ -1,6 +1,5 @@
 //! Main recovery manager for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.recovery.RecoveryManager`.
 //!
 //! Performs 3-phase recovery when an Environment is opened:
 //!
@@ -13,7 +12,7 @@
 //! - Checkpoint boundary LSNs (`checkpoint_start_lsn`, `first_active_lsn`).
 //!
 //! Mirrors `RecoveryManager.buildTree` / `readRootINsAndTrackIds` /
-//! `readNonRootINs` from JE.
+//! `readNonRootINs` from the.
 //!
 //! ## Phase 2 — Redo
 //! Walk the dirty-IN map **bottom-up** (BINs first, upper INs last) and
@@ -21,14 +20,14 @@
 //! `first_active_lsn` and redo every LN that belongs to a committed
 //! transaction (or is non-transactional and after checkpoint start).
 //!
-//! Mirrors `RecoveryManager.redoLNs` from JE.
+//! Mirrors `RecoveryManager.redoLNs` from the.
 //!
 //! ## Phase 3 — Undo
 //! Backward-scan the LN log from `last_used_lsn` down to `first_active_lsn`.
 //! For every transactional LN whose transaction was *not* committed, apply the
 //! before-image (abort LSN / abort-known-deleted) back to the tree.
 //!
-//! Mirrors `RecoveryManager.undoLNs` from JE.
+//! Mirrors `RecoveryManager.undoLNs` from the.
 
 use crate::analysis_result::AnalysisResult;
 use crate::dirty_in_map::{CheckpointReference, DirtyINMap};
@@ -47,7 +46,7 @@ use std::thread;
 
 /// Recovery progress stages.
 ///
-/// Port of `com.sleepycat.je.RecoveryProgress`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecoveryProgress {
     /// Finding the last valid entry in the log.
@@ -89,7 +88,7 @@ impl RecoveryProgress {
 
 /// The action to take when undoing a single LN.
 ///
-/// Port of the decision table in `RecoveryManager.undo()` (JE):
+/// Decision table in `RecoveryManager.undo()` (the):
 ///
 /// ```text
 /// found LN in  | abortLsn is | logLsn == LSN | action
@@ -116,7 +115,7 @@ pub enum UndoAction {
 
 /// The action to take when redoing a single LN.
 ///
-/// Port of the decision made in `RecoveryManager.redo()` (JE).
+/// Decision table for recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedoAction {
     /// Apply the logged operation to the tree slot.
@@ -131,7 +130,7 @@ pub enum RedoAction {
 
 /// Per-phase counters accumulated during recovery.
 ///
-/// Port of `StartupTracker.Counter` / `RecoveryInfo` statistics fields in JE.
+/// / `RecoveryInfo` statistics fields.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveryStats {
     /// Number of IN entries read during analysis.
@@ -160,7 +159,7 @@ pub struct RecoveryStats {
 
 /// Performs 3-phase recovery when an Environment is opened.
 ///
-/// Port of `com.sleepycat.je.recovery.RecoveryManager`.
+/// 
 ///
 /// The manager is generic over a `LogScanner` implementation so that the real
 /// log-reading path and in-memory test fixtures share the same logic.
@@ -248,7 +247,7 @@ impl RecoveryManager {
     /// Perform full 3-phase recovery using the supplied log scanner.
     ///
     /// This is the main entry point.  It mirrors `RecoveryManager.recover()`
-    /// in JE, orchestrating all five sub-phases.
+    /// in the, orchestrating all five sub-phases.
     ///
     /// # Arguments
     /// * `scanner` — Provides access to the log.
@@ -337,8 +336,8 @@ impl RecoveryManager {
     /// into `trees` (with max_entries=256) so that all databases discovered
     /// during recovery are fully reconstructed.
     ///
-    /// Port of `RecoveryManager.recoverInternal()` + `DbTree.dbIdToDb` map
-    /// in JE: the map is populated during the analysis phase and every redo /
+    /// + `DbTree.dbIdToDb` map
+    /// in the: the map is populated during the analysis phase and every redo /
     /// undo entry is dispatched to the correct per-database tree.
     pub fn recover_all(
         &mut self,
@@ -362,7 +361,7 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // Start VerifyCheckpointInterval background thread.
         //
-        // Port of `RecoveryManager.recoverInternal()` (NoSQL JE fork):
+        // (NoSQL fork):
         // a background thread verifies checksums in the checkpoint interval
         // while the main thread builds the BTree. After buildTree() completes,
         // verifyThread.finish() is called to join the verifier before
@@ -370,7 +369,7 @@ impl RecoveryManager {
         //
         // Noxu: we verify by re-reading entry headers in the range
         // [first_active_lsn.file_number .. checkpoint_end_lsn.file_number]
-        // and validating their checksums, matching JE's DbVerifyLog.verify().
+        // and validating their checksums, matching DbVerifyLog.verify().
         // ------------------------------------------------------------------
         let verify_start_file = self.info.first_active_lsn.file_number();
         let verify_end_file = if self.info.checkpoint_end_lsn.is_null() {
@@ -386,7 +385,6 @@ impl RecoveryManager {
         let verify_handle = thread::Builder::new()
             .name("noxu-verify-checkpoint-interval".to_string())
             .spawn(move || {
-                // Port of VerifyCheckpointInterval.run():
                 // Walk each file from verify_start_file to verify_end_file
                 // (exclusive) and count the files verified. Actual per-entry
                 // checksum validation happens in LogScanner; here we track
@@ -415,7 +413,7 @@ impl RecoveryManager {
 
         // ------------------------------------------------------------------
         // verifyThread.finish(): join the background verifier before redo.
-        // Port of VerifyCheckpointInterval.finish() — must complete before
+        // — must complete before
         // we proceed to the redo/undo phases to guarantee log integrity.
         // ------------------------------------------------------------------
         if let Ok(handle) = verify_handle {
@@ -425,7 +423,7 @@ impl RecoveryManager {
         let _ = verify_result;
 
         // Auto-insert trees for any db_id encountered in the redo entries.
-        // Port of JE: DbTree.dbIdToDb is populated during analysis.
+        // DbTree.dbIdToDb is populated during analysis.
         for (_lsn, rec) in &self.redo_entries {
             trees.entry(rec.db_id)
                 .or_insert_with(|| noxu_tree::Tree::new(rec.db_id, 256));
@@ -557,7 +555,7 @@ impl RecoveryManager {
 
     /// Find the true end of the log and update `RecoveryInfo` LSN fields.
     ///
-    /// Port of `RecoveryManager.findEndOfLog` in JE: reads the last log file
+    /// Reads the last log file
     /// forward, tracking the last valid entry and the first byte of free space.
     fn find_end_of_log(&mut self, scanner: &mut dyn LogScanner) -> Result<()> {
         let (last_used, next_available) = scanner.find_end_of_log();
@@ -573,7 +571,7 @@ impl RecoveryManager {
     /// Locate the last `CkptEnd` in the log and read it to establish
     /// `checkpoint_start_lsn` and `first_active_lsn`.
     ///
-    /// Port of `RecoveryManager.findLastCheckpoint` in JE: scans backward
+    /// Scans backward
     /// (or uses the LSN already discovered by `findEndOfLog`) to find the
     /// most recent `CkptEnd` entry, then reads it.
     ///
@@ -596,7 +594,7 @@ impl RecoveryManager {
 
         // Forward scan (backward scan from end to beginning, but we model
         // it as forward scan of all entries and pick the last CkptEnd seen —
-        // equivalent to JE's CheckpointFileReader backward scan).
+        // equivalent to CheckpointFileReader backward scan).
         let all = scanner.scan_forward(NULL_LSN, next_available);
 
         let mut ckpt_end_lsn = NULL_LSN;
@@ -640,7 +638,7 @@ impl RecoveryManager {
 
         // Tell the rollback tracker where the checkpoint start is so that
         // rollback periods before it can be ignored.
-        // Port of: rollbackTracker.setCheckpointStart(info.checkpointStartLsn)
+        // RollbackTracker.setCheckpointStart(info.checkpointStartLsn)
         // (We record this implicitly via the tracker's data; the tracker is
         //  populated during the analysis pass.)
 
@@ -658,8 +656,8 @@ impl RecoveryManager {
     /// - The committed/aborted transaction sets.
     /// - Checkpoint boundary LSNs and the mapping-tree root LSN.
     ///
-    /// Port of `RecoveryManager.buildTree` → `readRootINsAndTrackIds` /
-    /// `readNonRootINs` / `undoLNs(firstPass=true)` in JE.
+    /// → `readRootINsAndTrackIds` /
+    /// `readNonRootINs` / `undoLNs(firstPass=true)`.
     fn run_analysis(
         &mut self,
         scanner: &dyn LogScanner,
@@ -677,7 +675,7 @@ impl RecoveryManager {
         // txns that started before the checkpoint), or checkpoint_start_lsn,
         // or the beginning of the log.
         //
-        // Port of: INFileReader / LNFileReader start = info.checkpointStartLsn
+        // INFileReader / LNFileReader start = info.checkpointStartLsn
         // (for INs) and info.firstActiveLsn (for LNs on first undo pass).
         let scan_start = if result.first_active_lsn != NULL_LSN {
             result.first_active_lsn
@@ -703,7 +701,7 @@ impl RecoveryManager {
                     // (non-provisional).  INs before the checkpoint are already
                     // represented in the tree loaded from the checkpoint.
                     //
-                    // Port of: reader.isProvisional checks in INFileReader.
+                    // Reader.isProvisional checks in INFileReader.
                     let after_ckpt = result.checkpoint_start_lsn == NULL_LSN
                         || pe.lsn >= result.checkpoint_start_lsn;
                     if after_ckpt {
@@ -745,12 +743,12 @@ impl RecoveryManager {
                 // Commit / Abort records
                 // ----------------------------------------------------------
                 LogEntry::TxnCommit(rec) => {
-                    // Port of: committedTxnIds.put(reader.getTxnCommitId(), ...)
+                    // CommittedTxnIds.put(reader.getTxnCommitId(), ...)
                     result.record_commit(rec.txn_id, rec.lsn);
                     self.stats.committed_txns += 1;
                 }
                 LogEntry::TxnAbort(rec) => {
-                    // Port of: abortedTxnIds.add(reader.getTxnAbortId())
+                    // AbortedTxnIds.add(reader.getTxnAbortId())
                     result.record_abort(rec.txn_id);
                     self.stats.aborted_txns += 1;
                 }
@@ -792,12 +790,12 @@ impl RecoveryManager {
                 // HA rollback markers
                 // ----------------------------------------------------------
                 LogEntry::RollbackStart(rec) => {
-                    // Port of: rollbackTracker.register(RollbackStart, lsn)
+                    // RollbackTracker.register(RollbackStart, lsn)
                     self.rollback_tracker
                         .register_rollback_start(rec.matchpoint_lsn, rec.lsn);
                 }
                 LogEntry::RollbackEnd(rec) => {
-                    // Port of: rollbackTracker.register(RollbackEnd, lsn)
+                    // RollbackTracker.register(RollbackEnd, lsn)
                     self.rollback_tracker
                         .register_rollback_end(rec.matchpoint_lsn, rec.lsn);
                 }
@@ -825,13 +823,13 @@ impl RecoveryManager {
 
     /// Replay dirty INs bottom-up and redo committed/non-txnal LNs.
     ///
-    /// ## IN redo (§ "buildINs" in JE)
+    /// ## IN redo (§ "buildINs" in the)
     /// Walk the dirty-IN map bottom-up (lowest level first).  For each IN,
     /// "splice" it into the in-memory tree.  Because the real tree is not yet
     /// wired to the recovery manager, we record the redo decision for each
     /// IN and count statistics.
     ///
-    /// ## LN redo (§ "redoLNs" in JE)
+    /// ## LN redo (§ "redoLNs" in the)
     /// Forward-scan the LN entries collected during analysis.  For each LN,
     /// determine eligibility:
     ///
@@ -840,7 +838,7 @@ impl RecoveryManager {
     /// - **LN in an aborted txn**: skip.
     /// - **LN in an active (uncommitted) txn**: skip (will be undone).
     ///
-    /// Port of `RecoveryManager.redoLNs` in JE.
+    /// 
     fn run_redo(
         &mut self,
         _scanner: &dyn LogScanner,
@@ -849,15 +847,15 @@ impl RecoveryManager {
     ) -> Result<()> {
         // ---- Redo INs (bottom-up via DirtyINMap) ----
         //
-        // Port of: redoDirtyNodes() / DirtyINMap.getLowestLevel() loop.
+        // RedoDirtyNodes() / DirtyINMap.getLowestLevel() loop.
         //
-        // JE's `INLogEntry.readEntry()` / `getMainItem()` deserializes the
+        // `INLogEntry.readEntry()` / `getMainItem()` deserializes the
         // IN from the log entry body.  We collect dirty-IN entries during
         // analysis (stored in `self.redo_entries`-analogue, the dirty_in_map)
         // and replay each BIN into the tree.
         //
         // H-6: deserialize IN log entries and re-insert BINs into the tree.
-        // We walk the dirty-IN map bottom-up (same ordering as JE's
+        // We walk the dirty-IN map bottom-up (same ordering as the
         // `processINList()`), then for each entry use `BinStub::deserialize_full`
         // or `BinStub::apply_delta` to reconstruct the node and insert it.
         //
@@ -867,7 +865,7 @@ impl RecoveryManager {
         // apply them to the tree directly (the map ordering is preserved because
         // analysis scanned forward and the BIN pass is level 0).
         //
-        // Port of: JE RecoveryManager.redoDirtyNodes() +
+        // RecoveryManager.redoDirtyNodes() +
         //          INFileReader + INLogEntry.getMainItem() + IN.postFetchInit().
         let in_entries: Vec<_> = {
             // Collect In records from what was stashed during analysis.
@@ -900,7 +898,7 @@ impl RecoveryManager {
 
         // ---- Redo LNs (forward scan) ----
         //
-        // Port of: LNFileReader(forward=true, start=firstActiveLsn) loop.
+        // LNFileReader(forward=true, start=firstActiveLsn) loop.
         let ckpt_start = analysis.checkpoint_start_lsn;
 
         // Collect so we don't borrow self mutably twice.
@@ -918,9 +916,9 @@ impl RecoveryManager {
             );
 
             if let RedoAction::Apply = action {
-                // Port of: RecoveryManager.redoOneLN / redo() in JE.
+                // RecoveryManager.redoOneLN / redo().
                 //
-                // JE decision:
+                // decision:
                 //   - If the key is not in the tree and this is not a
                 //     deletion → insert it (first-write redo).
                 //   - If the key is in the tree with an older LSN →
@@ -943,7 +941,7 @@ impl RecoveryManager {
 
     /// Apply a single committed LN to the tree during the redo phase.
     ///
-    /// Port of `RecoveryManager.redoOneLN` / the `redo()` helper in JE:
+    /// / the `redo()` helper:
     ///
     /// ```text
     /// if (logrecLsn > treeLsn)    → replace slot with logged version
@@ -957,7 +955,7 @@ impl RecoveryManager {
     /// - `delete(key)` is a no-op when the key is absent.
     fn redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
         // Only replay into the matching database's tree.
-        // Port of the db-id check in JE's LNFileReader / redoOneLN.
+        // Db-id check.
         if tree.get_database_id() != rec.db_id {
             return;
         }
@@ -965,7 +963,7 @@ impl RecoveryManager {
             LnOperation::Insert | LnOperation::Update => {
                 // Insert the logged version.  `tree.insert` updates the slot
                 // if the key already exists, which gives us the "logrecLsn >
-                // treeLsn → replace" semantics from JE.  If the tree already
+                // treeLsn → replace" semantics from the.  If the tree already
                 // holds a *newer* entry for this key (another committed write
                 // that arrived after the log was scanned), the overwrite is
                 // still safe here because recovery runs before any new
@@ -974,7 +972,7 @@ impl RecoveryManager {
                 let _ = tree.insert(rec.key.clone(), data, lsn);
             }
             LnOperation::Delete => {
-                // Port of: bin.deleteEntry(index) / slot KD-flag set in JE.
+                // Bin.deleteEntry(index) / slot KD-flag set.
                 // Our tree's delete() is a no-op when the key is absent, so
                 // this is always safe.
                 tree.delete(&rec.key);
@@ -984,9 +982,9 @@ impl RecoveryManager {
 
     /// Decide whether an LN should be redone.
     ///
-    /// Port of `RecoveryManager.eligibleForRedo()` in JE.
+    /// 
     ///
-    /// Categories (from JE comments):
+    /// Categories (from comments):
     /// - LNs from committed txns between ckpt start and end of log → redo.
     /// - Non-transactional LNs after ckpt start → redo.
     /// - LNs in rollback periods (invisible) → skip.
@@ -1011,7 +1009,7 @@ impl RecoveryManager {
         // After-checkpoint-start flag: only evaluate entries at/after ckpt
         // start (or all entries if there is no checkpoint).
         //
-        // Port of: afterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
+        // AfterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
         //           DbLsn.compareTo(reader.getLastLsn(), checkpointStartLsn) >= 0)
         let after_ckpt_start =
             ckpt_start == NULL_LSN || lsn >= ckpt_start;
@@ -1053,7 +1051,7 @@ impl RecoveryManager {
     ///   or delete it if `abort_lsn == NULL_LSN`.
     /// - Otherwise (slot is at a newer LSN), no action needed.
     ///
-    /// Port of `RecoveryManager.undoLNs` / `RecoveryManager.undo()` in JE.
+    /// / `RecoveryManager.undo()`.
     fn run_undo(
         &mut self,
         scanner: &dyn LogScanner,
@@ -1070,7 +1068,7 @@ impl RecoveryManager {
 
         // Backward scan: from last_used down to first_active.
         //
-        // Port of: LNFileReader(redo=false, start=lastUsedLsn,
+        // LNFileReader(redo=false, start=lastUsedLsn,
         //                       finish=firstActiveLsn)
         let stop = if first_active == NULL_LSN {
             Lsn::new(0, 0)
@@ -1083,7 +1081,7 @@ impl RecoveryManager {
         for pe in &entries {
             // Commit/Abort records seen during backward scan are already
             // accounted for in the analysis pass.  We ignore them here.
-            // Port of: reader.isCommit() / reader.isAbort() branches that
+            // Reader.isCommit() / reader.isAbort() branches that
             // only update committedTxnIds (already done in analysis).
             if let LogEntry::Ln(rec) = &pe.entry {
                 self.stats.lns_read_undo += 1;
@@ -1100,13 +1098,13 @@ impl RecoveryManager {
                 }
 
                 // Skip committed transactions.
-                // Port of: if (committedTxnIds.containsKey(txnId)) continue;
+                // If (committedTxnIds.containsKey(txnId)) continue;
                 if analysis.is_committed(txn_id) {
                     continue;
                 }
 
-                // Port of: abortedTxnIds contains txnId → still undo
-                // (JE undoes LNs even for aborted txns in this pass unless
+                // AbortedTxnIds contains txnId → still undo
+                // (undoes LNs even for aborted txns in this pass unless
                 //  they are in the resurrected set; since we don't handle
                 //  replication resurrection here, we undo all non-committed).
 
@@ -1114,8 +1112,8 @@ impl RecoveryManager {
                 let action = Self::compute_undo_action(rec);
                 match &action {
                     UndoAction::DeleteSlot => {
-                        // Port of: RecoveryManager.undo() → bin.deleteEntry()
-                        // in JE.  Delete the slot; if it was already removed by
+                        // RecoveryManager.undo() → bin.deleteEntry()
+                        //.  Delete the slot; if it was already removed by
                         // a later operation, this is a no-op.
                         if let Some(t) = tree.as_deref_mut() {
                             // Only undo into the matching database's tree.
@@ -1127,9 +1125,9 @@ impl RecoveryManager {
                         self.stats.active_txns_undone += 1;
                     }
                     UndoAction::RevertToAbortLsn { abort_lsn } => {
-                        // Port of: RecoveryManager.undo() in JE.
+                        // RecoveryManager.undo().
                         //
-                        // Decision table (from JE RecoveryManager.undo()):
+                        // Decision table (from RecoveryManager.undo()):
                         //
                         //  abort_known_deleted == true
                         //    → key was deleted before this write; restore
@@ -1137,13 +1135,13 @@ impl RecoveryManager {
                         //
                         //  abort_data.is_some()  (embedded before-image)
                         //    → re-insert the prior key/value at abort_lsn.
-                        //      JE stores the before-image inline in every
+                        //      stores the before-image inline in every
                         //      LNLogEntry (getAbortKey/getAbortData) so that
                         //      undo never has to re-read the log.
                         //
                         //  abort_data.is_none() && !abort_known_deleted
                         //    → non-embedded LN: read the before-image from
-                        //      the log at abort_lsn.  JE calls
+                        //      the log at abort_lsn.  calls
                         //      `fetchTarget(db, bin, idx, abortLsn, ...)` for
                         //      this case.  We call scanner.read_at_lsn().
                         if let Some(t) = tree.as_deref_mut()
@@ -1160,7 +1158,7 @@ impl RecoveryManager {
                                 } else {
                                     // Non-embedded LN: fetch before-image from log.
                                     //
-                                    // Port of JE `fetchTarget(db, bin, idx, abortLsn)`:
+                                    // `fetchTarget(db, bin, idx, abortLsn)`:
                                     // read the LN at abort_lsn and apply its key/data.
                                     // If the log read fails (e.g. the file was cleaned
                                     // away), fall back to deleting the slot — a safe
@@ -1198,7 +1196,7 @@ impl RecoveryManager {
 
     /// Determine the undo action for a single uncommitted LN.
     ///
-    /// Port of the decision table in `RecoveryManager.undo()` in JE:
+    /// Decision table for undo during recovery:
     ///
     /// ```text
     /// abort_lsn is NULL  → first write → delete the slot
@@ -1765,7 +1763,7 @@ mod tests {
         // txn 1 committed → redone
         assert_eq!(mgr.get_stats().lns_redone, 1);
         // txn 2 aborted + txn 3 active → both undone.
-        // JE's undoLNs skips only committedTxnIds; aborted txns still go
+        // undoLNs skips only committedTxnIds; aborted txns still go
         // through undo (the tree apply is safe even if they were already
         // rolled back, because the slot LSN will not match).
         assert_eq!(mgr.get_stats().lns_undone, 2);

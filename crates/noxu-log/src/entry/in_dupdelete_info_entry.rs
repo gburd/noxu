@@ -1,6 +1,5 @@
 //! INDupDeleteInfo log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.INDupDeleteInfo`.
 //!
 //! Written when a duplicate-tree IN node is deleted during tree compression.
 //! Same fields as INDeleteInfo but applies to the duplicate sub-tree. Used

@@ -4,7 +4,7 @@
 //! specific primitive type, using the sortable encoding from `TupleOutput`
 //! and `TupleInput`.
 //!
-//! Port of the various `*Binding` classes in `com.sleepycat.bind.tuple`.
+//! Primitive type bindings for key encoding.
 
 use noxu_db::DatabaseEntry;
 
@@ -68,7 +68,7 @@ impl_primitive_binding!(
     ///
     /// Encodes as a single byte: 1 for true, 0 for false.
     ///
-    /// Port of `com.sleepycat.bind.tuple.BooleanBinding`.
+    /// 
     BoolBinding, bool,
     write: write_bool,
     read: read_bool
@@ -79,7 +79,7 @@ impl_primitive_binding!(
     ///
     /// Stored as a single raw byte.
     ///
-    /// Port of unsigned byte binding.
+    /// Unsigned byte binding.
     ByteBinding, u8,
     write: write_u8,
     read: read_u8
@@ -90,7 +90,7 @@ impl_primitive_binding!(
     ///
     /// Uses big-endian encoding with sign bit flipped for sortable ordering.
     ///
-    /// Port of `com.sleepycat.bind.tuple.ShortBinding`.
+    /// 
     ShortBinding, i16,
     write: write_i16,
     read: read_i16
@@ -101,7 +101,7 @@ impl_primitive_binding!(
     ///
     /// Uses big-endian encoding with sign bit flipped for sortable ordering.
     ///
-    /// Port of `com.sleepycat.bind.tuple.IntegerBinding`.
+    /// 
     IntBinding, i32,
     write: write_i32,
     read: read_i32
@@ -112,7 +112,7 @@ impl_primitive_binding!(
     ///
     /// Uses big-endian encoding with sign bit flipped for sortable ordering.
     ///
-    /// Port of `com.sleepycat.bind.tuple.LongBinding`.
+    /// 
     LongBinding, i64,
     write: write_i64,
     read: read_i64
@@ -125,7 +125,7 @@ impl_primitive_binding!(
     /// sort in the same order as the float values. Use `SortedFloatBinding` for
     /// sortable keys.
     ///
-    /// Port of `com.sleepycat.bind.tuple.FloatBinding`.
+    /// 
     FloatBinding, f32,
     write: write_float,
     read: read_float
@@ -138,7 +138,7 @@ impl_primitive_binding!(
     /// sort in the same order as the double values. Use `SortedDoubleBinding` for
     /// sortable keys.
     ///
-    /// Port of `com.sleepycat.bind.tuple.DoubleBinding`.
+    /// 
     DoubleBinding, f64,
     write: write_double,
     read: read_double
@@ -150,7 +150,7 @@ impl_primitive_binding!(
     /// Uses sign-bit manipulation so the byte representation sorts in the
     /// same order as the float values.
     ///
-    /// Port of `com.sleepycat.bind.tuple.SortedFloatBinding`.
+    /// 
     SortedFloatBinding, f32,
     write: write_sorted_float,
     read: read_sorted_float
@@ -162,7 +162,7 @@ impl_primitive_binding!(
     /// Uses sign-bit manipulation so the byte representation sorts in the
     /// same order as the double values.
     ///
-    /// Port of `com.sleepycat.bind.tuple.SortedDoubleBinding`.
+    /// 
     SortedDoubleBinding, f64,
     write: write_sorted_double,
     read: read_sorted_double
@@ -174,7 +174,7 @@ impl_primitive_binding!(
     /// Values in [-119, 119] are stored in a single byte. Larger values use
     /// 2-5 bytes. This encoding is compact but NOT sortable.
     ///
-    /// Port of `com.sleepycat.bind.tuple.PackedIntegerBinding`.
+    /// 
     PackedIntBinding, i32,
     write: write_packed_int,
     read: read_packed_int
@@ -186,7 +186,7 @@ impl_primitive_binding!(
     /// Values in [-119, 119] are stored in a single byte. Larger values use
     /// 2-9 bytes. This encoding is compact but NOT sortable.
     ///
-    /// Port of `com.sleepycat.bind.tuple.PackedLongBinding`.
+    /// 
     PackedLongBinding, i64,
     write: write_packed_long,
     read: read_packed_long
@@ -201,7 +201,7 @@ impl_primitive_binding!(
     /// sort in the same order as the integer values, making this suitable for
     /// database keys when compactness is also desired.
     ///
-    /// Port of `com.sleepycat.bind.tuple.SortedPackedIntegerBinding`.
+    /// 
     SortedPackedIntBinding, i32,
     write: write_sorted_packed_int,
     read: read_sorted_packed_int
@@ -216,7 +216,7 @@ impl_primitive_binding!(
     /// sort in the same order as the integer values, making this suitable for
     /// database keys when compactness is also desired.
     ///
-    /// Port of `com.sleepycat.bind.tuple.SortedPackedLongBinding`.
+    /// 
     SortedPackedLongBinding, i64,
     write: write_sorted_packed_long,
     read: read_sorted_packed_long
@@ -233,7 +233,7 @@ impl_primitive_binding!(
     /// Java `char` covers the full [0, 65535] range including surrogate halves
     /// which are not valid Unicode scalar values in Rust.
     ///
-    /// Port of `com.sleepycat.bind.tuple.CharacterBinding`.
+    /// 
     CharBinding, u16,
     write: write_char,
     read: read_char
@@ -247,7 +247,7 @@ impl_primitive_binding!(
 ///
 /// Strings are stored as their UTF-8 bytes followed by a null terminator byte.
 ///
-/// Port of `com.sleepycat.bind.tuple.StringBinding`.
+/// 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StringBinding;
 
@@ -1264,7 +1264,7 @@ mod tests {
 
     /// TupleBindingTest: PackedIntBinding 1234 encodes correctly.
     ///
-    /// JE's `PackedIntegerBinding.intToEntry(1234)` produces 5 bytes because JE uses
+    /// `PackedIntegerBinding.intToEntry(1234)` produces 5 bytes because uses
     /// an unsigned packed format that always uses fixed-width headers. Our Rust port
     /// uses a signed variable-length format where 1234 = 119 + 1115, which fits in
     /// 2 value bytes → 3 bytes total (1 header + 2 value). We test our actual encoding.
@@ -1282,7 +1282,7 @@ mod tests {
 
     /// TupleBindingTest: PackedLongBinding 1234 encodes correctly.
     ///
-    /// JE's `PackedLongBinding.longToEntry(1234)` produces 9 bytes (fixed-width unsigned
+    /// `PackedLongBinding.longToEntry(1234)` produces 9 bytes (fixed-width unsigned
     /// format). Our Rust port uses a signed variable-length format: 1234 - 119 = 1115,
     /// fits in 2 bytes → 3 bytes total (1 header + 2 value).
     #[test]
@@ -1298,7 +1298,7 @@ mod tests {
 
     /// TupleBindingTest: SortedPackedIntBinding 1234 encodes correctly.
     ///
-    /// JE produces 5 bytes for 1234 in SortedPackedIntegerBinding. Our Rust implementation
+    /// produces 5 bytes for 1234 in SortedPackedIntegerBinding. Our Rust implementation
     /// encodes 1234 in the sorted packed format: it is above the 1-byte threshold (120),
     /// so it uses a 2-byte encoding (1 header + 1 value byte for values up to 0xFF+121=376),
     /// except 1234 = 0xFF + 122 + remainder, needing 3 bytes (header + 2 value bytes).

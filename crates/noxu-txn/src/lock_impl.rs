@@ -1,6 +1,5 @@
 //! Full lock implementation with support for multiple owners and waiters.
 //!
-//! Port of `com.sleepycat.je.txn.LockImpl`.
 
 use crate::{
     LockAttemptResult, LockConflict, LockGrantType, LockInfo, LockType,
@@ -23,7 +22,7 @@ use crate::{
 /// firstWaiter are used for the first owner or waiter of the lock, and the
 /// corresponding collection is instantiated and used only if more owners arrive.
 ///
-/// Port of `com.sleepycat.je.txn.LockImpl`.
+/// 
 #[derive(Debug)]
 pub struct LockImpl {
     /// First owner (optimization for single-owner case).
@@ -69,7 +68,7 @@ impl LockImpl {
 
     /// Attempts to acquire the lock and returns the LockAttemptResult.
     ///
-    /// Algorithm (from JE):
+    /// Algorithm (from the):
     /// 1. Check if locker already owns this lock -> check upgrade
     /// 2. If not owner, check for conflicts with all owners
     /// 3. If no conflict and no waiters -> grant NEW
@@ -170,7 +169,7 @@ impl LockImpl {
     /// Moves the next eligible waiter(s) from the waiter list to the owner set.
     /// For each newly-granted waiter that has a notify pair attached, this method
     /// sets the "granted" flag and signals the condvar so the blocked thread wakes
-    /// up.  This mirrors JE's `LockManager.release()` -> `notifyAll()` flow.
+    /// up.  This mirrors `LockManager.release()` -> `notifyAll()` flow.
     ///
     /// Returns the locker IDs of all waiters that were promoted to owners, or
     /// `None` if the given locker was not an owner.
@@ -186,7 +185,7 @@ impl LockImpl {
         // Move the next set of waiters to the owners set. Iterate through the
         // firstWaiter field, then the waiterList.
         //
-        // JE (LockImpl.release): "Move the next set of waiters to the owners
+        // (LockImpl.release): "Move the next set of waiters to the owners
         // set.  Iterate through the firstWaiter field, then the waiterList."
         //
         // NOTE: first_waiter may be None even when waiter_list has entries
@@ -257,7 +256,7 @@ impl LockImpl {
                         }
                         notify_set.push(waiter_locker);
 
-                        // Wake the waiting thread.  JE calls notifyAll() on
+                        // Wake the waiting thread.  calls notifyAll() on
                         // the locker object here; we signal the per-waiter
                         // condvar instead.
                         if let Some(pair) = notify_pair {
@@ -556,7 +555,7 @@ impl LockImpl {
     /// Like `lock()` but uses a sharing predicate to skip conflict detection
     /// between cooperating lockers.
     ///
-    /// JE: `LockImpl.tryLock()` — when `!locker.sharesLocksWith(ownerLocker)`
+    /// When `!locker.sharesLocksWith(ownerLocker)`
     /// evaluates to false (they *do* share), the conflict matrix is skipped.
     /// This allows multiple ThreadLockers on the same thread to co-own a lock
     /// without conflicts.
@@ -653,12 +652,12 @@ impl LockImpl {
 
     /// Inner `try_lock` with a sharing predicate.
     ///
-    /// JE: `LockImpl.tryLock(LockInfo newLock, boolean firstWaiterInLine)` —
+    /// `LockImpl.tryLock(LockInfo newLock, boolean firstWaiterInLine)` —
     /// when `locker.sharesLocksWith(ownerLocker)` is true, the conflict matrix
     /// is skipped and the lock is co-granted.  This allows multiple
     /// ThreadLockers on the same thread to share a lock without deadlock.
     ///
-    /// Port of `com.sleepycat.je.txn.LockImpl.tryLock()`.
+    /// 
     fn try_lock_with_sharing(
         &mut self,
         new_lock: LockInfo,
@@ -731,7 +730,7 @@ impl LockImpl {
                     } else {
                         // Requestor does not hold this lock.
                         //
-                        // JE: skip conflict detection when the requesting and
+                        // Skip conflict detection when the requesting and
                         // owning lockers share locks (e.g. two ThreadLockers on
                         // the same thread).  `shares_fn(owner_locker)` returns
                         // true iff they are in the same sharing group.
@@ -1084,7 +1083,7 @@ mod tests {
     // Ported from LockTest.java — testLockConflicts
     // -----------------------------------------------------------------------
 
-    /// Port of LockTest.testLockConflicts: read lock granted NEW the first time,
+    /// Read lock granted new the first time,
     /// EXISTING on a second request by the same locker.
     #[test]
     fn test_je_read_new_then_existing() {
@@ -1098,7 +1097,7 @@ mod tests {
         assert_eq!(lock.n_waiters(), 0);
     }
 
-    /// Port of LockTest.testLockConflicts: two readers co-own, then both try
+    /// Two readers co-own, then both try
     /// write upgrades — each gets WAIT_PROMOTION.
     #[test]
     fn test_je_two_readers_then_write_promotion_waits() {
@@ -1115,7 +1114,7 @@ mod tests {
         assert_eq!(lock.n_waiters(), 2);
     }
 
-    /// Port of LockTest.testLockConflicts: releasing one of two readers with
+    /// Releasing one of two readers with
     /// a pending write-promotion promotes the remaining reader to write owner.
     #[test]
     fn test_je_release_reader_promotes_writer() {
@@ -1146,7 +1145,7 @@ mod tests {
         assert_eq!(lock.n_waiters(), 0);
     }
 
-    /// Port of LockTest.testLockConflicts: holding WRITE and requesting READ
+    /// Holding write and requesting read
     /// for the same locker returns EXISTING (write subsumes read).
     #[test]
     fn test_je_write_then_read_existing() {
@@ -1158,7 +1157,7 @@ mod tests {
         lock.release(1);
     }
 
-    /// Port of LockTest.testLockConflicts: READ then WRITE by same locker (no
+    /// Read then write by same locker (no
     /// other owners) yields PROMOTION.
     #[test]
     fn test_je_read_then_write_promotion() {
@@ -1170,7 +1169,7 @@ mod tests {
         lock.release(1);
     }
 
-    /// Port of LockTest.testLockConflicts: non-blocking write request while a
+    /// Non-blocking write request while a
     /// read lock is held by another locker → DENIED, no waiter added.
     #[test]
     fn test_je_nonblocking_write_denied() {
@@ -1183,7 +1182,7 @@ mod tests {
         lock.release(1);
     }
 
-    /// Port of LockTest.testLockConflicts: two WRITE requests from the same
+    /// Two write requests from the same
     /// locker → second is EXISTING.
     #[test]
     fn test_je_double_write_existing() {
@@ -1195,7 +1194,7 @@ mod tests {
         lock.release(1);
     }
 
-    /// Port of LockTest.testLockConflicts: a read lock followed by a blocking
+    /// A read lock followed by a blocking
     /// write request from another locker → WAIT_NEW; a subsequent read from a
     /// third locker must also wait (WAIT_NEW) because a write waiter exists.
     #[test]
@@ -1215,7 +1214,7 @@ mod tests {
         lock.release(3);
     }
 
-    /// Port of LockTest.testLockConflicts: non-blocking write denied but
+    /// Non-blocking write denied but
     /// non-blocking read succeeds when only a read lock is held.
     #[test]
     fn test_je_nonblocking_read_granted_with_reader() {
@@ -1233,7 +1232,7 @@ mod tests {
         lock.release(3);
     }
 
-    /// Port of LockTest.testLockConflicts: three concurrent readers all succeed.
+    /// Three concurrent readers all succeed.
     #[test]
     fn test_je_three_concurrent_readers() {
         let mut lock = LockImpl::new();
@@ -1251,7 +1250,7 @@ mod tests {
     // Ported from LockTest.java — testOwners
     // -----------------------------------------------------------------------
 
-    /// Port of LockTest.testOwners: no write owner until a WRITE lock is held.
+    /// No write owner until a write lock is held.
     #[test]
     fn test_je_no_write_owner_with_only_reads() {
         let mut lock = LockImpl::new();
@@ -1267,7 +1266,7 @@ mod tests {
         lock.release(3);
     }
 
-    /// Port of LockTest.testOwners: owner list tracks additions and removals.
+    /// Owner list tracks additions and removals.
     #[test]
     fn test_je_owner_set_add_remove() {
         let mut lock = LockImpl::new();
@@ -1298,7 +1297,7 @@ mod tests {
     // Ported from LockTest.java — testPromotion
     // -----------------------------------------------------------------------
 
-    /// Port of LockTest.testPromotion: releasing the single writer promotes
+    /// Releasing the single writer promotes
     /// ALL waiting readers to owners simultaneously.
     #[test]
     fn test_je_release_writer_promotes_all_readers() {
@@ -1329,7 +1328,7 @@ mod tests {
     // Ported from LockTest.java — testWaiters
     // -----------------------------------------------------------------------
 
-    /// Port of LockTest.testWaiters: flush_waiter removes from waiter list
+    /// Flush_waiter removes from waiter list
     /// without affecting owners.
     #[test]
     fn test_je_flush_waiter_removes_entry() {
@@ -1346,7 +1345,7 @@ mod tests {
         assert!(!lock.is_waiter(4));
     }
 
-    /// Port of LockTest.testWaiters: a WAIT_PROMOTION waiter is inserted at
+    /// A wait_promotion waiter is inserted at
     /// the head of the waiter list (promotion takes priority).
     #[test]
     fn test_je_promotion_waiter_at_head() {
@@ -1360,7 +1359,7 @@ mod tests {
 
         let waiters = lock.get_waiters_clone();
         // The first waiter in line must be the WAIT_PROMOTION (txn1), not the
-        // WAIT_NEW (txn3), because JE moves promotions to the head.
+        // WAIT_NEW (txn3), because moves promotions to the head.
         assert_eq!(waiters[0].locker_id, 1);
         assert_eq!(waiters[0].lock_type, LockType::Write);
     }
@@ -1369,7 +1368,7 @@ mod tests {
     // Ported from LockTest.java — testRangeConflicts (spot-checks)
     // -----------------------------------------------------------------------
 
-    /// Port of LockTest.testRangeConflicts: RANGE_INSERT held → RANGE_READ
+    /// Range_insert held → range_read
     /// requested → WAIT_RESTART (not NEW or WAIT_NEW).
     #[test]
     fn test_je_range_insert_conflicts_range_read() {
@@ -1381,7 +1380,7 @@ mod tests {
         lock.release(2);
     }
 
-    /// Port of LockTest.testRangeConflicts: RANGE_INSERT held → RANGE_INSERT
+    /// Range_insert held → range_insert
     /// requested by another locker → NEW (compatible).
     #[test]
     fn test_je_range_insert_compatible_with_range_insert() {
@@ -1393,7 +1392,7 @@ mod tests {
         lock.release(2);
     }
 
-    /// Port of LockTest.testRangeConflicts: RANGE_READ held → RANGE_WRITE
+    /// Range_read held → range_write
     /// request → WAIT_NEW (conflict).
     #[test]
     fn test_je_range_read_vs_range_write_conflict() {
@@ -1409,7 +1408,7 @@ mod tests {
     // Ported from LockTest.java — testRangeInsertWaiterConflict
     // -----------------------------------------------------------------------
 
-    /// Port of LockTest.testRangeInsertWaiterConflict: when a RANGE_INSERT
+    /// When a range_insert
     /// is already waiting, a subsequent RANGE_READ request sees WAIT_RESTART
     /// (the waiter list is examined for restart conflicts).
     #[test]

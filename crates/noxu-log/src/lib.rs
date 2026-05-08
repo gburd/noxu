@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Log-structured storage engine for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.log` - handles sequential logging/writing,
+//! handles sequential logging/writing,
 //! random reading/fetching, and sequential reading of the write-ahead log.
 //!
 //! # Architecture

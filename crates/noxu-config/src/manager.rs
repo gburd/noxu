@@ -1,7 +1,5 @@
 //! Configuration manager.
 //!
-//! Port of `com.sleepycat.je.config.DbConfigManager`.
-//!
 //! Manages the active configuration for an environment, supporting parameter
 //! lookup, default values, and runtime mutation of mutable parameters.
 
@@ -13,7 +11,7 @@ use std::collections::HashMap;
 /// Holds overridden parameter values and falls back to defaults for
 /// parameters that have not been explicitly set.
 ///
-/// Port of `com.sleepycat.je.config.DbConfigManager`.
+/// Configuration manager for a database environment.
 pub struct ConfigManager {
     /// Map from parameter name to overridden value.
     overrides: HashMap<String, ParamValue>,
@@ -270,7 +268,7 @@ mod tests {
     #[test]
     fn test_long_out_of_range_min() {
         let mut mgr = ConfigManager::new();
-        // MAX_DISK min is 0 (je.maxMemory has no minimum in JE)
+        // MAX_DISK min is 0 (je.maxMemory has no minimum)
         let result = mgr.set("je.maxDisk", ParamValue::Long(-1), false);
         assert!(matches!(result, Err(ConfigError::OutOfRange { .. })));
     }
@@ -311,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_all_params_count() {
-        // We should have at least 130 params now (JE has ~176 total)
+        // We should have at least 130 params now
         let count = params::all_params().len();
         assert!(count >= 130, "expected at least 130 params, got {}", count);
     }

@@ -1,16 +1,16 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Latching primitives for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.latch` - provides exclusive and shared/exclusive
-//! latches used for B-tree node concurrency control.
+//! Latching primitives — exclusive and shared/exclusive latches used for
+//! B-tree node concurrency control.
 //!
 //! Latches are expected to be held for short, defined periods of time. No
 //! deadlock detection is provided; it is the caller's responsibility to
 //! sequence latch acquisition in an ordered fashion to avoid deadlocks.
 //!
-//! Key differences from JE's Java implementation:
-//! - Uses `noxu_sync` for the underlying lock primitives (faster than std)
-//! - Reentrancy prevention is enforced (matching JE behavior)
+//! Key properties:
+//! - Uses `noxu_sync` for the underlying lock primitives
+//! - Reentrancy prevention is enforced (panics on reentrant acquire)
 //! - Thread ownership tracking is always available via noxu_sync
 
 mod exclusive;
@@ -27,9 +27,8 @@ pub const DEFAULT_LATCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Context information about a latch, used for debugging and diagnostics.
 ///
-/// Port of `com.sleepycat.je.latch.LatchContext`. In JE this is an interface
-/// implemented by IN to reduce per-latch memory overhead. In Rust we store
-/// the name directly since the overhead is minimal.
+/// Stores the latch name and acquisition timeout directly.
+/// In B-tree nodes the name identifies which node the latch protects.
 #[derive(Debug, Clone)]
 pub struct LatchContext {
     /// Name of this latch for debugging.

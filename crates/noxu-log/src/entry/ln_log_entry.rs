@@ -1,6 +1,5 @@
 //! LN (Leaf Node) log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.LNLogEntry`.
 //!
 //! LNLogEntry is the most common log entry type - it represents a write
 //! operation (insert, update, or delete) on a data record. Each LNLogEntry
@@ -334,7 +333,7 @@ impl LnLogEntry {
     /// Reads an entry from a buffer.
     ///
     /// `is_transactional` must match the log entry type used when the entry was
-    /// written (e.g. `InsertLNTxn` → true, `InsertLN` → false).  JE stores
+    /// written (e.g. `InsertLNTxn` → true, `InsertLN` → false).  stores
     /// this information in the outer `LogEntryType` byte, not in the LN payload
     /// flags, so callers must pass it explicitly.
     pub fn read_from_log(

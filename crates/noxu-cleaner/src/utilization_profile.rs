@@ -1,6 +1,6 @@
 //! Persistent utilization data.
 //!
-//! Port of `com.sleepycat.je.cleaner.UtilizationProfile` - stores persistent file summaries
+//! stores persistent file summaries
 //! and provides methods for selecting files to clean based on utilization.
 
 use crate::file_summary::FileSummary;
@@ -71,9 +71,9 @@ impl UtilizationProfile {
     ///
     /// Returns (file_number, utilization) or None if no file qualifies.
     ///
-    /// # JE cost/benefit analysis (Cleaner.java:1200-1400)
+    /// # cost/benefit analysis (Cleaner.java:1200-1400)
     ///
-    /// JE selects files using a cost/benefit score:
+    /// selects files using a cost/benefit score:
     ///
     ///   benefit = obsolete_bytes  (more bytes freed = better)
     ///   cost    = active_bytes    (live bytes needing migration = more work)
@@ -82,7 +82,7 @@ impl UtilizationProfile {
     /// Files are ranked by descending score so that the file with the best
     /// ratio of obsolete data to migration work is cleaned first.
     ///
-    /// Port of `UtilizationCalculator.getBestFile()` in JE.
+    /// 
     pub fn get_best_file_for_cleaning(
         &self,
         min_utilization: f64,

@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Log file garbage collection for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.cleaner` - tracks per-file space utilization
+//! tracks per-file space utilization
 //! and reclaims space from deleted/obsolete records.
 
 pub mod cleaner;

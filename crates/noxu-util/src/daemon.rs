@@ -1,7 +1,7 @@
 //! Daemon thread abstraction.
 //!
-//! Port of the daemon thread pattern used throughout JE for background tasks
-//! (Cleaner, Checkpointer, Evictor, INCompressor, etc.).
+//! Daemon thread abstraction for background tasks such as Cleaner,
+//! Checkpointer, Evictor, and INCompressor.
 //!
 //! Provides a controlled lifecycle for background threads with graceful
 //! shutdown and configurable wake intervals.

@@ -1,6 +1,5 @@
 //! Internal environment implementation.
 //!
-//! Port of `com.sleepycat.je.dbi.EnvironmentImpl`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +31,7 @@ use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
 /// Owns all subsystems: log manager, B-tree, transaction manager,
 /// lock manager, evictor, cleaner, checkpointer, and INCompressor daemon.
 ///
-/// Port of `com.sleepycat.je.dbi.EnvironmentImpl`.
+/// 
 pub struct EnvironmentImpl {
     /// Path to the environment home directory.
     env_home: PathBuf,
@@ -87,7 +86,7 @@ pub struct EnvironmentImpl {
     /// `set_recovered_tree()` instead of starting with an empty tree —
     /// giving crash-restart durability for in-memory state.
     ///
-    /// Port of JE `RecoveryManager.getDbIdToDbMap()` /
+    /// `RecoveryManager.getDbIdToDbMap()` /
     /// `EnvironmentImpl.setupDbEnvironment()` tree population.
     recovered_trees: Mutex<HashMap<u64, noxu_tree::Tree>>,
 
@@ -99,7 +98,7 @@ pub struct EnvironmentImpl {
     /// `run_cleaner()` is called, live LN entries are migrated via
     /// `SharedTreeLookup`.
     ///
-    /// Port of the `env.getDbTree()` access pattern in JE's FileProcessor.
+    /// Database tree access for file processing.
     primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>>,
 
     /// The log-file garbage collector.
@@ -108,7 +107,7 @@ pub struct EnvironmentImpl {
     /// `Cleaner::with_file_manager_and_tree()`.  For read-only environments
     /// `cleaner` is `None`.
     ///
-    /// Port of `EnvironmentImpl.cleaner` in JE.
+    /// 
     cleaner: Option<Cleaner>,
 
     /// The checkpoint daemon.
@@ -116,7 +115,7 @@ pub struct EnvironmentImpl {
     /// Created for writable environments; wired to the LogManager and the
     /// primary tree so that `do_checkpoint()` flushes dirty BINs to the log.
     ///
-    /// Port of `EnvironmentImpl.checkpointer` in JE.
+    /// 
     checkpointer: Option<Arc<noxu_recovery::checkpointer::Checkpointer>>,
 
     /// Background checkpointer daemon thread handle.
@@ -136,7 +135,7 @@ pub struct EnvironmentImpl {
     /// Shared with the `in_compressor_handle` thread so that `close()` can
     /// signal the thread to exit.
     ///
-    /// Port of `INCompressor.shutdown()` in JE.
+    /// 
     in_compressor_shutdown: Arc<AtomicBool>,
 
     /// Background INCompressor daemon thread handle.
@@ -145,11 +144,11 @@ pub struct EnvironmentImpl {
     /// compressing them and pruning empty subtrees.  Mirrors the daemon
     /// pattern used by the evictor and checkpointer.
     ///
-    /// Port of `EnvironmentImpl.inCompressor` / `INCompressor.run()` in JE.
+    /// / `INCompressor.run()`.
     in_compressor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 
     // =========================================================================
-    // NoSQL JE fork: additional background services
+    // NoSQL fork: additional background services
     // =========================================================================
 
     /// Background data-erasure daemon.
@@ -158,7 +157,7 @@ pub struct EnvironmentImpl {
     /// data is unrecoverable.  Started lazily when the first erasure request
     /// is enqueued.
     ///
-    /// Port of `EnvironmentImpl.dataEraser` (NoSQL fork).
+    /// (NoSQL fork).
     data_eraser: Mutex<noxu_cleaner::DataEraser>,
 
     /// Background record-extinction scanner.
@@ -166,7 +165,7 @@ pub struct EnvironmentImpl {
     /// Asynchronously removes extinct records from the B-tree after a
     /// `discard_extinct_records()` call commits.
     ///
-    /// Port of `EnvironmentImpl.extinctionScanner` (NoSQL fork).
+    /// (NoSQL fork).
     extinction_scanner: Mutex<noxu_cleaner::ExtinctionScanner>,
 
     /// Automatic backup manager.
@@ -174,7 +173,7 @@ pub struct EnvironmentImpl {
     /// Copies closed log files to a configured archive destination on a
     /// cron-style schedule.
     ///
-    /// Port of `EnvironmentImpl.backupManager` (NoSQL fork).
+    /// (NoSQL fork).
     backup_manager: Mutex<crate::backup_manager::BackupManager>,
 
     /// Per-file utilization tracker shared between the LogManager write path
@@ -184,8 +183,8 @@ pub struct EnvironmentImpl {
     /// under the LWL for every log write.  The Cleaner reads the accumulated
     /// counts when choosing which files to clean.
     ///
-    /// Port of `EnvironmentImpl.utilizationTracker` / `getUtilizationTracker()`
-    /// in JE.
+    /// / `getUtilizationTracker()`
+    ///.
     utilization_tracker: Option<Arc<NoxuMutex<UtilizationTracker>>>,
 }
 
@@ -275,16 +274,15 @@ impl EnvironmentImpl {
             //
             // Multi-database recovery: recover_all() builds a HashMap<db_id, Tree>
             // and routes each LN/BIN entry to the correct database's tree.
-            // Port of JE's RecoveryManager.recoverInternal() which populates
+            // Which populates
             // DbTree.dbIdToDb (a Map<DatabaseId, DatabaseImpl>) during the analysis
             // phase, then RecoveryManager.recoverDatabases() hands the recovered
             // DbTree to each DatabaseImpl.
             let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
             let mut rmgr = RecoveryManager::new();
             // Multi-DB recovery: discover every db_id in the log and build
-            // a Tree for each one.  Port of JE's RecoveryManager.recoverInternal()
-            // which populates DbTree.dbIdToDb (a Map<DatabaseId, DatabaseImpl>)
-            // during the analysis phase and routes each LN/BIN to the correct DB.
+            // a Tree for each one. During the analysis phase, each LN/BIN is
+            // routed to the correct database by its db_id.
             //
             // We seed the map with db_id=1 (the primary user database) and let
             // recover_all() auto-insert entries for any other db_ids it discovers.
@@ -302,7 +300,7 @@ impl EnvironmentImpl {
 
             // Install all recovered trees keyed by db_id so that
             // open_database() can transplant each into the matching DatabaseImpl.
-            // Port of JE's per-database tree population from
+            // Per-database tree population from
             // RecoveryManager.getDbIdToDbMap().
             for (db_id, tree) in recovery_trees {
                 recovered.insert(db_id, tree);
@@ -314,7 +312,7 @@ impl EnvironmentImpl {
             // The observer is called under the LWL for every log write so
             // that utilization statistics are always consistent with the
             // on-disk log.
-            // Port of JE: LogManager.logItem() calls envImpl.getUtilizationTracker()
+            // LogManager.logItem() calls envImpl.getUtilizationTracker()
             // and passes it to serialLogWork().
             let util_tracker = Arc::new(NoxuMutex::new(UtilizationTracker::new(true)));
             let observer = Arc::new(UtilizationTrackerObserver::new(Arc::clone(&util_tracker)));
@@ -339,12 +337,12 @@ impl EnvironmentImpl {
         // starts empty but is kept in sync by subsequent writes through
         // the cursor layer.
         //
-        // Port of JE EnvironmentImpl.dbMapTree / getDbTree() used by the
+        // EnvironmentImpl.dbMapTree / getDbTree() used by the
         // FileProcessor (cleaner) to look up live BINs during LN migration.
         // Shared memory counter for evictor/MemoryBudget feedback.
         // Linked to the primary tree and to the Arbiter so that BIN entry
         // insertions/deletions are visible to the evictor.
-        // Port of JE: IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
+        // IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
         let cache_usage = Arc::new(AtomicI64::new(0));
 
         let mut primary_tree_inner = noxu_tree::Tree::new(1, 256);
@@ -380,14 +378,13 @@ impl EnvironmentImpl {
         // Build the cleaner wired to the FileManager, primary tree, and
         // LogManager for writable environments.  Read-only envs get None.
         //
-        // Port of the Cleaner initialisation in JE's EnvironmentImpl
+        // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
         let cleaner = log_manager.as_ref().map(|lm| {
             let fm = Arc::clone(lm.file_manager());
             // Pass the environment's shared LockManager so that cleaner-held
             // locks contend with user transactions for correct deadlock
-            // detection.  Port of JE: Cleaner uses
-            // env.getTxnManager().getLockManager().
+            // detection. The cleaner uses the environment's shared lock manager.
             Cleaner::with_file_manager_tree_and_lock_manager(
                 50,                      // min_utilization (50 %)
                 2,                       // min_file_count
@@ -403,8 +400,8 @@ impl EnvironmentImpl {
         // tree, for writable environments.  The db_id=1 convention matches
         // the default single database used by the primary tree.
         //
-        // Port of `EnvironmentImpl` constructor calling
-        // `Checkpointer(env, DbEnvPool.CHECKPOINT_TIMEOUT_MS)` in JE.
+        // Constructor calling
+        // `Checkpointer(env, DbEnvPool.CHECKPOINT_TIMEOUT_MS)`.
         let checkpointer = log_manager.as_ref().map(|lm| {
             use noxu_recovery::checkpointer::{Checkpointer, CheckpointConfig};
             Arc::new(
@@ -420,7 +417,7 @@ impl EnvironmentImpl {
         // Checkpointer and loops with `thread::sleep(interval)` until the
         // shutdown flag is set.
         //
-        // Port of `Checkpointer.java` `run()` → periodic checkpoint loop.
+        // `run()` → periodic checkpoint loop.
         let checkpointer_thread = checkpointer.as_ref().map(|ckpt| {
             let ckpt_clone = Arc::clone(ckpt);
             let interval =
@@ -457,7 +454,6 @@ impl EnvironmentImpl {
         // is passed to `Tree::compress_bin()` to remove the defunct entries and,
         // if the BIN becomes empty, prune it from the tree.
         //
-        // Port of `INCompressor.run()` / `INCompressor.doCompress()` from JE.
         let in_compressor_shutdown = Arc::new(AtomicBool::new(false));
         let in_compressor_shutdown_clone = Arc::clone(&in_compressor_shutdown);
         let db_map_for_compressor = Arc::clone(&db_map);
@@ -470,8 +466,7 @@ impl EnvironmentImpl {
                         break;
                     }
                     // Iterate all open databases and compress any BINs that
-                    // have known-deleted slots.  Port of JE:
-                    //   INCompressor.processQueue() → compressBin(bin)
+                    // have known-deleted slots (INCompressor.processQueue path).
                     let db_list: Vec<Arc<RwLock<DatabaseImpl>>> =
                         db_map_for_compressor.read().values().cloned().collect();
                     for db_arc in db_list {
@@ -633,7 +628,7 @@ impl EnvironmentImpl {
     /// Used by `Transaction::abort()` to look up each modified database for
     /// undo application.
     ///
-    /// Port of `EnvironmentImpl.getDatabase(DatabaseId)` in JE, called from
+    /// In JE, called from
     /// `Txn.undoLNs()`.
     pub fn get_database_by_id(
         &self,
@@ -655,7 +650,7 @@ impl EnvironmentImpl {
 
     /// Removes (deletes) a database by name.
     ///
-    /// Port of `EnvironmentImpl.dbRemove()`: returns an error if any open
+    /// Returns an error if any open
     /// handles exist for the database (reference_count > 0).
     pub fn remove_database(&self, name: &str) -> Result<(), DbiError> {
         self.check_open()?;
@@ -667,7 +662,7 @@ impl EnvironmentImpl {
             .copied()
             .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
 
-        // JE: "must not have any open Database handles" — enforce here.
+        // "must not have any open Database handles" — enforce here.
         if let Some(db) = self.db_map.read().get(&db_id)
             && db.read().reference_count() > 0 {
                 return Err(DbiError::DatabaseInUse(name.to_string()));
@@ -684,7 +679,7 @@ impl EnvironmentImpl {
 
     /// Renames a database.
     ///
-    /// Port of `EnvironmentImpl.dbRename()`: returns an error if any open
+    /// Returns an error if any open
     /// handles exist for the database (reference_count > 0).
     pub fn rename_database(
         &self,
@@ -698,7 +693,7 @@ impl EnvironmentImpl {
                 DbiError::DatabaseNotFound(old_name.to_string())
             })?;
 
-        // JE: "must not have any open Database handles" — enforce here.
+        // "must not have any open Database handles" — enforce here.
         if let Some(db) = self.db_map.read().get(&db_id)
             && db.read().reference_count() > 0 {
                 return Err(DbiError::DatabaseInUse(old_name.to_string()));
@@ -741,7 +736,7 @@ impl EnvironmentImpl {
 
     /// Returns the utilization tracker shared with the LogManager observer.
     ///
-    /// Port of `EnvironmentImpl.getUtilizationTracker()` in JE.
+    /// 
     pub fn get_utilization_tracker(&self) -> Option<&Arc<NoxuMutex<UtilizationTracker>>> {
         self.utilization_tracker.as_ref()
     }
@@ -779,7 +774,7 @@ impl EnvironmentImpl {
     /// Returns `Ok(CleanResult)` on success or `Err(String)` if the cleaner
     /// is already running, is shut down, or this is a read-only environment.
     ///
-    /// Port of `EnvironmentImpl.invokeEvictor()` / `Cleaner.doClean()` in JE.
+    /// / `Cleaner.doClean()`.
     pub fn run_cleaner(
         &self,
         n_files: u32,
@@ -803,7 +798,7 @@ impl EnvironmentImpl {
     /// - `SyncPolicy::WriteNoSync` → flush to OS buffers, no fsync
     /// - `SyncPolicy::NoSync`      → write to log buffer only, no flush
     ///
-    /// Port of `Txn.commit()` → `LogManager.flushTo()` → `FileManager.syncLogEnd()`.
+    /// → `LogManager.flushTo()` → `FileManager.syncLogEnd()`.
     pub fn log_txn_commit(
         &self,
         txn_id: i64,
@@ -831,7 +826,7 @@ impl EnvironmentImpl {
 
     /// Writes a TxnAbort entry to the WAL (no fsync needed on abort).
     ///
-    /// Port of `Txn.abort()` → log abort entry.
+    /// → log abort entry.
     pub fn log_txn_abort(&self, txn_id: i64) -> Result<(), DbiError> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
@@ -893,7 +888,7 @@ impl EnvironmentImpl {
 
         // Final (forced) checkpoint before WAL sync so recovery can restart
         // from the checkpoint rather than replaying the full log.
-        // Port of JE `EnvironmentImpl.close()` calling
+        // `EnvironmentImpl.close()` calling
         // `checkpointer.doCheckpoint(CheckpointConfig.FORCE)`.
         if let Some(ckpt) = &self.checkpointer {
             let _ = ckpt.do_checkpoint("close");
@@ -915,7 +910,7 @@ impl EnvironmentImpl {
     }
 
     // =========================================================================
-    // NoSQL JE fork: Record Extinction, Data Erasure, Auto-Backup
+    // NoSQL fork: Record Extinction, Data Erasure, Auto-Backup
     // =========================================================================
 
     /// Schedules asynchronous removal of extinct records.
@@ -924,7 +919,7 @@ impl EnvironmentImpl {
     /// B-tree without per-record delete log entries. The caller must ensure
     /// that the records will never be accessed again (see `ExtinctionFilter`).
     ///
-    /// Port of `Environment.discardExtinctRecords(Transaction, DatabaseImpl,
+    /// `Environment.discardExtinctRecords(Transaction, DatabaseImpl,
     ///   DatabaseEntry startKey, DatabaseEntry endKey, ScanFilter)` (NoSQL fork).
     pub fn discard_extinct_records(
         &self,
@@ -943,21 +938,21 @@ impl EnvironmentImpl {
 
     /// Returns `true` if an extinction scan is in progress.
     ///
-    /// Port of `Environment.isRecordExtinctionActive()` (NoSQL fork).
+    /// (NoSQL fork).
     pub fn is_record_extinction_active(&self) -> bool {
         self.extinction_scanner.lock().unwrap().is_active()
     }
 
     /// Returns the total number of LN records discarded by extinction scans.
     ///
-    /// Port of `EnvironmentStats.getNLNsExtinct()` (NoSQL fork).
+    /// (NoSQL fork).
     pub fn n_lns_extinct(&self) -> u64 {
         self.extinction_scanner.lock().unwrap().n_lns_extinct()
     }
 
     /// Enqueues a disk region for physical data erasure.
     ///
-    /// Port of `DataEraser.eraseData(long, long, int)` (NoSQL fork).
+    /// (NoSQL fork).
     pub fn enqueue_erase(&self, request: noxu_cleaner::EraseRequest) {
         self.data_eraser.lock().unwrap().enqueue_erase(request);
     }

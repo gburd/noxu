@@ -1,6 +1,6 @@
 //! Replication subscription for receiving replicated entries from a feeder.
 //!
-//! Port of `com.sleepycat.je.rep.subscription.Subscription`. JE's
+//! The
 //! Subscription connects to a feeder node and receives a stream of
 //! replicated log entries starting from a given VLSN. This is used by
 //! subscribers that want to consume the replication stream without being
@@ -15,7 +15,7 @@ use crate::error::{RepError, Result};
 
 /// Configuration for a replication subscription.
 ///
-/// Corresponds to JE's `SubscriptionConfig`. Specifies the subscriber
+/// Specifies the subscriber
 /// identity, the replication group to subscribe to, the feeder to connect
 /// to, and the starting VLSN.
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ pub struct SubscriptionConfig {
     pub group_name: String,
     /// Hostname of the feeder to connect to.
     pub feeder_host: String,
-    /// Port of the feeder to connect to.
+    /// Feeder to connect to.
     pub feeder_port: u16,
     /// VLSN to start streaming from.
     pub start_vlsn: u64,
@@ -34,7 +34,7 @@ pub struct SubscriptionConfig {
 
 /// Callback for receiving replicated entries.
 ///
-/// Corresponds to JE's `SubscriptionCallback`. Implementations process
+/// Implementations process
 /// each replicated entry as it arrives, handle errors, and are notified
 /// when the subscriber catches up to the master's current position.
 pub trait SubscriptionCallback: Send + Sync {
@@ -72,7 +72,7 @@ pub enum SubscriptionState {
 
 /// A subscription to a replication stream.
 ///
-/// Port of JE's `Subscription`. Manages the lifecycle of subscribing to
+/// Manages the lifecycle of subscribing to
 /// a feeder's replication stream: connecting, receiving entries, tracking
 /// progress, and shutting down.
 pub struct Subscription {
@@ -88,7 +88,7 @@ pub struct Subscription {
     shutdown: AtomicBool,
     /// The live TCP connection to the feeder node.
     ///
-    /// Port of JE's `SubscriptionThread` which calls
+    /// Which calls
     /// `RepUtils.openSocket(feederAddr)` to connect to the feeder. Set to
     /// `Some` after a successful `start()` call.
     connection: Mutex<Option<TcpStream>>,
@@ -130,7 +130,7 @@ impl Subscription {
 
     /// Start the subscription by connecting to the feeder.
     ///
-    /// Port of JE's `Subscription.start()` which calls
+    /// Which calls
     /// `SubscriptionThread.start()`, which in turn invokes
     /// `RepUtils.openSocket(feederAddr)` to establish a TCP connection to the
     /// feeder node.
@@ -144,7 +144,7 @@ impl Subscription {
                 *state = SubscriptionState::Connecting;
 
                 // Resolve the feeder address and open a TCP connection.
-                // JE equivalent: RepUtils.openSocket(InetSocketAddress(host, port))
+                // equivalent: RepUtils.openSocket(InetSocketAddress(host, port))
                 let addr_str = format!(
                     "{}:{}",
                     self.config.feeder_host, self.config.feeder_port
@@ -213,7 +213,7 @@ impl Subscription {
     /// Shutdown the subscription.
     ///
     /// Closes the TCP connection to the feeder (if open) and marks the
-    /// subscription as shut down. Port of JE's `Subscription.shutdown()`
+    /// subscription as shut down.
     /// which stops the `SubscriptionThread` and closes the feeder socket.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);

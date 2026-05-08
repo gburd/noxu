@@ -1,45 +1,44 @@
 //! Filter interface for sequential database scans.
 //!
-//! Port of `com.sleepycat.je.ScanFilter` from the Oracle NoSQL JE fork.
 
 /// Result returned by [`ScanFilter::check_key`] to control scan inclusion
 /// and termination.
 ///
-/// Port of `com.sleepycat.je.ScanFilter.ScanResult`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanResult {
     /// Include the key and continue scanning.
     ///
-    /// Port of `ScanResult.INCLUDE`.
+    /// 
     Include,
 
     /// Exclude the key but continue scanning.
     ///
-    /// Port of `ScanResult.EXCLUDE`.
+    /// 
     Exclude,
 
     /// Include the key and stop scanning.
     ///
-    /// Port of `ScanResult.INCLUDE_STOP`.
+    /// 
     IncludeStop,
 
     /// Exclude the key and stop scanning.
     ///
-    /// Port of `ScanResult.EXCLUDE_STOP`.
+    /// 
     ExcludeStop,
 }
 
 impl ScanResult {
     /// Returns `true` for [`ScanResult::Include`] and [`ScanResult::IncludeStop`].
     ///
-    /// Port of `ScanResult.getInclude()`.
+    /// 
     pub fn get_include(self) -> bool {
         matches!(self, ScanResult::Include | ScanResult::IncludeStop)
     }
 
     /// Returns `true` for [`ScanResult::IncludeStop`] and [`ScanResult::ExcludeStop`].
     ///
-    /// Port of `ScanResult.getStop()`.
+    /// 
     pub fn get_stop(self) -> bool {
         matches!(self, ScanResult::IncludeStop | ScanResult::ExcludeStop)
     }
@@ -47,7 +46,7 @@ impl ScanResult {
 
 /// Interface for filtering and optionally stopping a sequential scan.
 ///
-/// Port of `com.sleepycat.je.ScanFilter`.
+/// 
 ///
 /// Passed to scan operations (e.g. `Database::scan_with_filter`) to control
 /// which records are returned and whether the scan continues.
@@ -76,7 +75,7 @@ pub trait ScanFilter: Send + Sync {
     /// Called for each key to determine whether it should be included and
     /// whether the scan should continue.
     ///
-    /// Port of `ScanFilter.checkKey(byte[] key)`.
+    /// 
     fn check_key(&self, key: &[u8]) -> ScanResult;
 }
 

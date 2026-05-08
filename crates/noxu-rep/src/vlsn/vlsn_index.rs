@@ -1,6 +1,6 @@
 //! VLSN index.
 //!
-//! Port of `com.sleepycat.je.rep.vlsn.VLSNIndex`. Maps VLSNs to log
+//! Maps VLSNs to log
 //! positions (LSNs), organized as a list of `VlsnBucket`s. Each bucket
 //! covers a contiguous range of VLSNs with sparse stride-based mappings.
 //!
@@ -19,7 +19,7 @@ use super::vlsn_range::VlsnRange;
 /// VLSN-to-LSN mappings. New buckets are created automatically when a
 /// VLSN falls outside the range of the current (last) bucket.
 ///
-/// Port of `com.sleepycat.je.rep.vlsn.VLSNIndex`.
+/// 
 pub struct VlsnIndex {
     /// The overall range of VLSNs tracked by this index.
     range: RwLock<VlsnRange>,
@@ -51,7 +51,7 @@ impl VlsnIndex {
     /// a new bucket is created. The global range is extended to include
     /// the new VLSN.
     ///
-    /// Port of `VLSNIndex.put()` / `VLSNTracker.track()`.
+    /// / `VLSNTracker.track()`.
     pub fn put(&self, vlsn: u64, file_number: u32, file_offset: u32) {
         assert!(vlsn > 0, "Cannot register NULL_VLSN (0)");
 
@@ -96,7 +96,7 @@ impl VlsnIndex {
     /// then delegates to the bucket's lookup. Returns `None` if the VLSN
     /// is not tracked.
     ///
-    /// Port of `VLSNIndex.getLTELsn()` / `VLSNIndex.getLsn()`.
+    /// / `VLSNIndex.getLsn()`.
     pub fn get_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
         if vlsn == 0 {
             return None;
@@ -127,7 +127,7 @@ impl VlsnIndex {
     /// Removes all buckets whose first VLSN is greater than the truncation
     /// point, and truncates the range accordingly.
     ///
-    /// Port of `VLSNIndex.truncateFromTail()`.
+    /// 
     pub fn truncate_after(&self, vlsn: u64) {
         let mut buckets = self.buckets.write();
         let mut range = self.range.write();
@@ -342,7 +342,6 @@ mod tests {
             .collect()
     }
 
-    /// Port of VLSNIndexTest.testNonFlushedGets / doGets(false).
     ///
     /// Populate a VlsnIndex with 25 consecutive entries (file=33, offset=100)
     /// and verify:
@@ -391,7 +390,7 @@ mod tests {
         assert_eq!(index.get_lsn(6), Some((file_num, 4 * offset)));
     }
 
-    /// Port of VLSNIndexTest — verify that VLSNs outside the tracked range
+    /// Verify that VLSNs outside the tracked range
     /// return None.
     #[test]
     fn je_test_out_of_range_returns_none() {
@@ -406,7 +405,7 @@ mod tests {
         assert_eq!(index.get_lsn(100), None);
     }
 
-    /// Port of VLSNIndexTest.testOutOfOrderPuts — mappings inserted in
+    /// Mappings inserted in
     /// non-sequential order; range and lookup must still be correct.
     #[test]
     fn je_test_out_of_order_puts() {
@@ -431,7 +430,7 @@ mod tests {
         }
     }
 
-    /// Port of VLSNIndexTest.truncateFromTail — verifies the range
+    /// Verifies the range
     /// is correctly shortened after truncation.
     ///
     /// In the Rust model, `truncate_after(v)` removes buckets whose
@@ -470,7 +469,7 @@ mod tests {
         assert!(index.get_range().is_empty());
     }
 
-    /// Port of VLSNIndexTest — when multiple distinct buckets exist (achieved
+    /// When multiple distinct buckets exist (achieved
     /// here by constructing VlsnBucket objects directly and verifying the
     /// truncation invariant at the index level).
     ///
@@ -517,7 +516,7 @@ mod tests {
         assert_eq!(index.get_lsn(0), None);
     }
 
-    /// Port of VLSNIndexTest — after truncation, the last committed
+    /// After truncation, the last committed
     /// and synced VLSNs tracked in the range are clamped to the new end.
     #[test]
     fn je_test_truncate_clamps_range_metadata() {
@@ -540,7 +539,7 @@ mod tests {
         assert!(range.get_sync_vlsn() <= 12, "sync vlsn must be clamped");
     }
 
-    /// Port of VLSNIndexTest.checkBoundaryVLSN — verify that for every
+    /// Verify that for every
     /// vlsn in the range there is always a bucket whose first vlsn <=
     /// the query vlsn (LTE bucket exists).
     #[test]
@@ -564,7 +563,7 @@ mod tests {
         }
     }
 
-    /// Port of VLSNIndexTest.testNonContiguousBucketSmallHoles —
+    /// VLSNIndexTest.testNonContiguousBucketSmallHoles —
     /// inserts with small gaps (holes at vlsn 12 and 24) and verifies
     /// the index still returns valid (non-None) lsns for all non-hole vlsns.
     #[test]
@@ -609,7 +608,7 @@ mod tests {
         }
     }
 
-    /// Port of VLSNIndexTest.testNonContiguousBucketLargeHoles —
+    /// VLSNIndexTest.testNonContiguousBucketLargeHoles —
     /// inserts with three-vlsn gaps and verifies index integrity.
     #[test]
     fn je_test_non_contiguous_large_holes() {
@@ -642,7 +641,7 @@ mod tests {
         }
     }
 
-    /// Port of VLSNIndexTest — range first/last track the actual vlsn
+    /// Range first/last track the actual vlsn
     /// extremes even when insertions arrive out of order.
     #[test]
     fn je_test_range_tracks_extremes() {
@@ -657,7 +656,7 @@ mod tests {
         assert_eq!(range.get_last(), 10);
     }
 
-    /// Port of VLSNIndexTest — the index correctly handles a single vlsn
+    /// The index correctly handles a single vlsn
     /// (degenerate range).
     #[test]
     fn je_test_single_entry_range() {
@@ -670,7 +669,7 @@ mod tests {
         assert_eq!(index.get_lsn(42), Some((1, 420)));
     }
 
-    /// Port of VLSNIndexTest.testSR20726GTESearch — after flushing (which in
+    /// After flushing (which in
     /// the Rust model is a no-op but we can simulate with additional inserts),
     /// GTE bucket lookups still return the correct first/last vlsn.
     ///
@@ -715,7 +714,7 @@ mod tests {
         assert_eq!(range.get_last(), 30);
     }
 
-    /// Port of VLSNIndexTest — truncation to zero makes the range empty
+    /// Truncation to zero makes the range empty
     /// and all subsequent lookups return None.
     #[test]
     fn je_test_truncate_to_empty() {
@@ -771,7 +770,7 @@ mod tests {
         );
     }
 
-    /// Port of VLSNIndexTest — verify that inserting the same vlsn twice
+    /// Verify that inserting the same vlsn twice
     /// (idempotent re-registration) does not corrupt the range or lookups.
     #[test]
     fn je_test_duplicate_vlsn_insert() {

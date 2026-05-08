@@ -1,6 +1,5 @@
 //! Key comparison and prefix utilities.
 //!
-//! Port of `com.sleepycat.je.tree.Key` from JE.
 //!
 //! Provides utilities for comparing keys and computing key prefixes for
 //! key compression in the B-tree.

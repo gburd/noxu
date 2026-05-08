@@ -1,13 +1,13 @@
 //! VLSN range tracking.
 //!
-//! Port of `com.sleepycat.je.rep.vlsn.VLSNRange`. Tracks the range of
+//! Tracks the range of
 //! VLSNs available on this node, including the first and last VLSN in the
 //! contiguous range, as well as the last committed and last synced VLSNs.
 
 /// Tracks the range of VLSNs available on this node.
 ///
 /// All range values must be viewed together to ensure a consistent set of
-/// values. A VLSN value of 0 is treated as NULL/empty (equivalent to JE's
+/// values. A VLSN value of 0 is treated as NULL/empty (equivalent to the
 /// `VLSN.NULL_VLSN`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VlsnRange {
@@ -16,10 +16,10 @@ pub struct VlsnRange {
     /// Last available VLSN (inclusive). 0 means empty.
     last: u64,
     /// Last committed VLSN (last sync matchpoint).
-    /// Port of JE's `lastSync` field.
+    /// Field.
     commit_vlsn: u64,
     /// Last synced-to-disk VLSN (last transaction end).
-    /// Port of JE's `lastTxnEnd` field.
+    /// Field.
     sync_vlsn: u64,
 }
 
@@ -84,7 +84,7 @@ impl VlsnRange {
 
     /// Return true if this VLSN is within the range described by this struct.
     ///
-    /// Port of `VLSNRange.contains()`.
+    /// 
     pub fn contains(&self, vlsn: u64) -> bool {
         if self.first == 0 {
             return false;
@@ -107,7 +107,7 @@ impl VlsnRange {
     /// Otherwise, first is updated if the new VLSN is smaller, and last
     /// is updated if the new VLSN is larger.
     ///
-    /// Port of `VLSNRange.getUpdateForNewMapping()`.
+    /// 
     ///
     /// Note: does not track per-entry-type commit/barrier VLSNs (those are
     /// managed by `VlsnIndex` at a higher level).
@@ -147,7 +147,7 @@ impl VlsnRange {
     /// before the first VLSN, the range becomes empty. The commit and sync
     /// VLSNs are clamped to the new last VLSN.
     ///
-    /// Port of `VLSNRange.shortenFromEnd()`.
+    /// 
     pub fn truncate_after(&mut self, vlsn: u64) {
         if vlsn == 0 || (self.first > 0 && vlsn < self.first) {
             // Truncation point is before the range start; empty the range.
@@ -177,7 +177,7 @@ impl VlsnRange {
     /// sync VLSNs are set to the maximum of the two ranges. NULL (0) values
     /// are handled: a non-null value always takes precedence over null.
     ///
-    /// Port of `VLSNRange.merge()` and `VLSNRange.getUpdate()`.
+    /// And `VLSNRange.getUpdate()`.
     pub fn merge(&mut self, other: &VlsnRange) {
         // Merge first: take the smaller non-zero value.
         self.first = match (self.first, other.first) {

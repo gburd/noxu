@@ -1,7 +1,6 @@
 //! Transaction commit and abort log entries.
 //!
-//! Port of `com.sleepycat.je.log.entry.CommitLogEntry` and `AbortLogEntry`,
-//! along with `com.sleepycat.je.txn.TxnCommit` and `TxnAbort`.
+//! along with .txn.TxnCommit` and `TxnAbort`.
 //!
 //! These entries mark the end of a transaction (either commit or abort).
 

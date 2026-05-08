@@ -1,12 +1,10 @@
 //! Error types for the persistence layer.
 //!
-//! Port of error handling from `com.sleepycat.persist`.
 
 use thiserror::Error;
 
 /// Errors that can occur in the persistence layer.
 ///
-/// Port of exception types from `com.sleepycat.persist`.
 #[derive(Debug, Error)]
 pub enum PersistError {
     /// An error from the underlying database layer.

@@ -1,6 +1,5 @@
 //! Secondary cursor for iterating a secondary (index) database.
 //!
-//! Port of `com.sleepycat.je.SecondaryCursor`.
 //!
 //! A SecondaryCursor iterates secondary index entries and transparently
 //! fetches the corresponding primary data.  The cursor iterates over
@@ -21,7 +20,7 @@ use crate::secondary_database::SecondaryDatabase;
 
 /// A cursor that iterates a secondary index database.
 ///
-/// Port of `com.sleepycat.je.SecondaryCursor`.
+/// 
 ///
 /// Each iteration step returns three values:
 /// * `key`   — the secondary key (the index key).
@@ -83,7 +82,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Deletes the primary record at the current cursor position.
     ///
-    /// Port of `SecondaryCursor.delete()`.
+    /// 
     ///
     /// Reads the primary key from the current secondary record, then calls
     /// `Database::delete` on the primary database.  The secondary index
@@ -134,7 +133,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Returns the current key/primary-key/primary-data triple.
     ///
-    /// Port of `SecondaryCursor.getCurrent`.
+    /// 
     pub fn get_current(
         &mut self,
         key: &mut DatabaseEntry,
@@ -146,7 +145,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the first record and returns the triple.
     ///
-    /// Port of `SecondaryCursor.getFirst`.
+    /// 
     pub fn get_first(
         &mut self,
         key: &mut DatabaseEntry,
@@ -158,7 +157,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the last record and returns the triple.
     ///
-    /// Port of `SecondaryCursor.getLast`.
+    /// 
     pub fn get_last(
         &mut self,
         key: &mut DatabaseEntry,
@@ -170,7 +169,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the next record and returns the triple.
     ///
-    /// Port of `SecondaryCursor.getNext`.
+    /// 
     pub fn get_next(
         &mut self,
         key: &mut DatabaseEntry,
@@ -182,7 +181,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the previous record and returns the triple.
     ///
-    /// Port of `SecondaryCursor.getPrev`.
+    /// 
     pub fn get_prev(
         &mut self,
         key: &mut DatabaseEntry,
@@ -194,7 +193,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Searches for the given secondary key (exact match).
     ///
-    /// Port of `SecondaryCursor.getSearchKey`.
+    /// 
     ///
     /// # Arguments
     /// * `search_key` - The secondary key to search for (input).
@@ -236,7 +235,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Searches for the first secondary key >= `search_key`.
     ///
-    /// Port of `SecondaryCursor.getSearchKeyRange`.
+    /// 
     pub fn get_search_key_range(
         &mut self,
         search_key: &mut DatabaseEntry,
@@ -312,7 +311,7 @@ impl<'a> SecondaryCursor<'a> {
 
         // `key` is an output parameter: Cursor::get writes back the current
         // secondary key for all get modes (navigation and search).
-        // Port of JE: `key` is always an output DatabaseEntry for all cursor ops.
+        // `key` is always an output DatabaseEntry for all cursor ops.
 
         // Step 2: the "data" from the inner cursor IS the primary key.
         let pri_key_bytes = pri_key_bytes_entry.get_data().unwrap_or(&[]).to_vec();
@@ -325,7 +324,7 @@ impl<'a> SecondaryCursor<'a> {
 
         if pri_status != OperationStatus::Success {
             // Secondary refers to a missing primary — integrity issue.
-            // In JE this causes the cursor to skip the record (in
+            // In this causes the cursor to skip the record (in
             // READ_UNCOMMITTED mode) or throws an exception.  We return
             // SecondaryIntegrityException to match the non-transactional path.
             return Err(NoxuError::SecondaryIntegrityException(format!(

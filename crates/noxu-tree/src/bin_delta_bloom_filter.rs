@@ -1,6 +1,5 @@
 //! Bloom filter for BIN-delta key membership testing.
 //!
-//! Port of `com.sleepycat.je.tree.BINDeltaBloomFilter` from JE.
 //!
 //! A Bloom filter implementation, highly specialized for use in BIN deltas.
 //! Both space and computation times are minimized, with a potential small

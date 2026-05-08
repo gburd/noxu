@@ -1,6 +1,5 @@
 //! Log item structure for write operations.
 //!
-//! Port of `com.sleepycat.je.log.LogItem`.
 //!
 //! A LogItem holds the results of logging an entry: the assigned LSN,
 //! the serialized bytes, and the header. Used primarily by replication

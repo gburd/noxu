@@ -1,13 +1,12 @@
 //! Database configuration.
 //!
-//! Port of `com.sleepycat.je.DatabaseConfig`.
 
 /// Configuration for opening a database.
 ///
 /// Specifies the configuration parameters used to open a database within
 /// an environment. Use the builder pattern to configure individual parameters.
 ///
-/// Port of `com.sleepycat.je.DatabaseConfig`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseConfig {
     /// Allow creation of a new database if it doesn't exist.

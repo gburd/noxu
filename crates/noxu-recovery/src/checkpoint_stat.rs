@@ -1,6 +1,5 @@
 //! Checkpoint statistics.
 //!
-//! Port of `com.sleepycat.je.recovery.CheckpointStatDefinition`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Tracks various metrics about checkpoint execution including the number of
 /// checkpoints performed, nodes flushed, and timing information.
 ///
-/// Port of `com.sleepycat.je.recovery.CheckpointStatDefinition`.
+/// 
 #[derive(Debug)]
 pub struct CheckpointStats {
     /// Total number of checkpoints performed.

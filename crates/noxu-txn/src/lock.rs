@@ -82,7 +82,6 @@ impl Lock {
     /// `shares_fn(owner_id)` returns true if the requesting locker shares locks
     /// with `owner_id`.
     ///
-    /// Port of `LockImpl.tryLock()` sharing path in JE.
     pub fn lock_with_sharing(
         &mut self,
         request_type: LockType,

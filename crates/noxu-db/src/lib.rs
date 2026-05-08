@@ -1,11 +1,11 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Noxu DB - An embedded transactional database engine.
 //!
-//! Port of Berkeley DB Java Edition's public API: Environment, Database,
+//! Public API : Environment, Database,
 //! Cursor, Transaction, DatabaseEntry, SecondaryDatabase, Sequence, etc.
 //!
-//! This crate provides the public API for Noxu DB, a Rust port of Berkeley DB
-//! Java Edition. It is designed to be familiar to BDB JE users while being
+//! This crate provides the public API for Noxu DB.
+//! Java Edition. It is designed to be familiar to BDB users while being
 //! idiomatic Rust.
 //!
 //! # Example

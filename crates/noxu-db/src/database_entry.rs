@@ -1,6 +1,5 @@
 //! Database entry for keys and data.
 //!
-//! Port of `com.sleepycat.je.DatabaseEntry`.
 
 /// Encodes database key and data items as byte arrays.
 ///
@@ -8,7 +7,7 @@
 /// Key and data byte arrays may refer to arrays of zero length up to
 /// arrays of essentially unlimited length.
 ///
-/// Port of `com.sleepycat.je.DatabaseEntry`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseEntry {
     /// The data bytes.

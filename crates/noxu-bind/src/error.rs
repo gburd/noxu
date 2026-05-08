@@ -1,6 +1,5 @@
 //! Error types for the noxu-bind crate.
 //!
-//! Port of error conditions from `com.sleepycat.bind`.
 
 use thiserror::Error;
 

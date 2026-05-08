@@ -1,6 +1,5 @@
 //! The main replicated environment API.
 //!
-//! Port of `com.sleepycat.je.rep.ReplicatedEnvironment`.
 //!
 //! A replicated database environment that is a node in a replication group.
 //! This is the entry point for replication. It wraps a standard Environment
@@ -54,15 +53,15 @@ const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A replicated database environment.
 ///
-/// Port of `com.sleepycat.je.rep.ReplicatedEnvironment`.
+/// 
 ///
 /// This is the entry point for replication. It wraps a standard Environment
 /// and adds replication capabilities including master election, replica
 /// streaming, and commit acknowledgments.
 ///
-/// Berkeley DB JE High Availability (JE HA) is a replicated, embedded database
+/// High Availability (HA) provides a replicated, embedded database
 /// management system which provides fast, reliable, and scalable data
-/// management. JE HA enables replication of an environment across a Replication
+/// management. HA enables replication of an environment across a Replication
 /// Group. A `ReplicatedEnvironment` is a single node in the replication group.
 ///
 /// `ReplicatedEnvironment` wraps a standard `Environment`. All database
@@ -117,7 +116,7 @@ pub struct ReplicatedEnvironment {
     /// TCP service dispatcher — listens on the replication port and routes
     /// incoming connections to the appropriate service handler (feeder, etc.).
     ///
-    /// Port of JE's `ServiceDispatcher`. Started in `new()` when a listen
+    /// Started in `new()` when a listen
     /// address is available. `None` only when the bind address cannot be
     /// resolved (e.g. in unit tests that use port 0 but want lazy init).
     tcp_dispatcher: Option<TcpServiceDispatcher>,
@@ -131,7 +130,7 @@ pub struct ReplicatedEnvironment {
     /// `EnvironmentLogScanner`, and `become_replica` spawns a
     /// `ReplicaReceiver` thread using `EnvironmentLogWriter`.
     ///
-    /// Port of `RepImpl.repNode` in JE HA.
+    /// In HA.
     env_impl: StdMutex<Option<Arc<EnvironmentImpl>>>,
 
     /// Background I/O thread handles spawned during state transitions.
@@ -148,7 +147,7 @@ pub struct ReplicatedEnvironment {
 impl ReplicatedEnvironment {
     /// Create a new replicated environment.
     ///
-    /// Port of `ReplicatedEnvironment(File, ReplicationConfig, EnvironmentConfig)`.
+    /// 
     ///
     /// Creates a replicated environment handle and starts participating in the
     /// replication group. The node's state is determined when it joins the
@@ -171,7 +170,7 @@ impl ReplicatedEnvironment {
 
         // Start the TCP service dispatcher.
         //
-        // JE equivalent: `RepImpl.open()` calls `serviceDispatcher.start()`
+        // equivalent: `RepImpl.open()` calls `serviceDispatcher.start()`
         // which binds a ServerSocketChannel on the configured port and begins
         // accepting connections. We do the same here using the node_host and
         // node_port from RepConfig.
@@ -256,15 +255,15 @@ impl ReplicatedEnvironment {
     /// After this call, state transitions (`become_master`, `become_replica`)
     /// will spawn real feeder/receiver I/O threads backed by the live log.
     ///
-    /// Port of the wiring done by `RepImpl` when it holds a reference to
-    /// `EnvironmentImpl` via `RepImpl.repNode.envImpl` in JE HA.
+    /// Environment reference wiring.
+    /// `EnvironmentImpl` via `RepImpl.repNode.envImpl` in HA.
     pub fn with_environment(&self, env: Arc<EnvironmentImpl>) {
         *self.env_impl.lock().unwrap() = Some(env);
     }
 
     /// Get the current node state.
     ///
-    /// Port of `ReplicatedEnvironment.getState()`.
+    /// 
     ///
     /// Returns the current state of the node associated with this replication
     /// environment. If the caller's intent is to track the state of the node,
@@ -295,7 +294,7 @@ impl ReplicatedEnvironment {
 
     /// Get the node name.
     ///
-    /// Port of `ReplicatedEnvironment.getNodeName()`.
+    /// 
     ///
     /// Returns the unique name used to identify this replicated environment.
     pub fn get_node_name(&self) -> &str {
@@ -320,7 +319,7 @@ impl ReplicatedEnvironment {
 
     /// Get the replication group info.
     ///
-    /// Port of `ReplicatedEnvironment.getGroup()`.
+    /// 
     ///
     /// Returns a description of the replication group as known by this node.
     /// The replicated group metadata is stored in a replicated database and
@@ -333,7 +332,7 @@ impl ReplicatedEnvironment {
 
     /// Get the replication configuration.
     ///
-    /// Port of `ReplicatedEnvironment.getRepConfig()`.
+    /// 
     ///
     /// Returns the replication configuration that has been used to create this
     /// environment.
@@ -357,7 +356,7 @@ impl ReplicatedEnvironment {
 
     /// Get replication statistics.
     ///
-    /// Port of `ReplicatedEnvironment.getRepStats(StatsConfig)`.
+    /// 
     ///
     /// Returns statistics associated with this environment.
     pub fn get_stats(&self) -> &RepStats {
@@ -399,7 +398,7 @@ impl ReplicatedEnvironment {
     /// a `FeederRunner` + `EnvironmentLogScanner` background thread is spawned
     /// for each currently-registered replica (feeder entries in `feeders`).
     ///
-    /// Port of `RepNode.masterTransition()` in JE HA.
+    /// In HA.
     pub fn become_master(&self, term: u64) -> Result<()> {
         if self.is_shutdown() {
             return Err(RepError::StateError(
@@ -416,7 +415,7 @@ impl ReplicatedEnvironment {
 
         // --- G19: spawn FeederRunner threads for each known replica --------
         //
-        // Port of `RepNode.masterTransition()` → `Feeder.runFeedingLoop()`.
+        // → `Feeder.runFeedingLoop()`.
         // Each active feeder in the feeders list gets a dedicated thread that
         // runs `FeederRunner::run()` backed by `EnvironmentLogScanner`.
         if let Some(env) = self.env_impl.lock().unwrap().clone() {
@@ -506,7 +505,7 @@ impl ReplicatedEnvironment {
     /// entries can be written to the local log.  The actual network connection
     /// is established by the `TcpServiceDispatcher`; this method logs intent.
     ///
-    /// Port of `RepNode.replicaTransition()` in JE HA.
+    /// In HA.
     pub fn become_replica(&self, master_name: &str) -> Result<()> {
         if self.is_shutdown() {
             return Err(RepError::StateError(
@@ -527,7 +526,7 @@ impl ReplicatedEnvironment {
 
         // --- G19: prepare EnvironmentLogWriter for incoming replication ----
         //
-        // Port of `RepNode.replicaTransition()` → `Replica.run()`.
+        // → `Replica.run()`.
         // When a `Channel` to the master is available (provided by the TCP
         // dispatcher after handshake), the caller constructs a
         // `ReplicaReceiver` and passes an `EnvironmentLogWriter`.  Here we
@@ -606,7 +605,7 @@ impl ReplicatedEnvironment {
 
     /// Initiate a master transfer to the target node.
     ///
-    /// Port of `ReplicatedEnvironment.transferMaster(Set, int, TimeUnit)`.
+    /// 
     ///
     /// Transfers the current master state from this node to one of the
     /// electable replicas. The replica that is actually chosen to be the new
@@ -687,7 +686,7 @@ impl ReplicatedEnvironment {
 
     /// Set the state change listener.
     ///
-    /// Port of `ReplicatedEnvironment.setStateChangeListener(StateChangeListener)`.
+    /// 
     ///
     /// Sets the listener used to receive asynchronous replication node state
     /// change events. Note that there is one listener per replication node,
@@ -716,7 +715,7 @@ impl ReplicatedEnvironment {
 
     /// Close the replicated environment.
     ///
-    /// Port of `ReplicatedEnvironment.close()`.
+    /// 
     ///
     /// Closes this handle and releases any resources. When closed, daemon
     /// threads are stopped, even if they are performing work. The node ceases
@@ -747,7 +746,7 @@ impl ReplicatedEnvironment {
         }
 
         // Signal and join all I/O threads spawned by become_master /
-        // become_replica.  Port of RepNode shutdown in JE HA.
+        // become_replica.
         self.io_shutdown.store(true, Ordering::SeqCst);
         {
             let mut threads = self.io_threads.lock().unwrap();
@@ -756,7 +755,7 @@ impl ReplicatedEnvironment {
             }
         }
 
-        // Stop the TCP service dispatcher (JE: serviceDispatcher.shutdown()).
+        // Stop the TCP service dispatcher (the: serviceDispatcher.shutdown()).
         if let Some(ref dispatcher) = self.tcp_dispatcher {
             dispatcher.stop();
             log::debug!(
@@ -777,7 +776,7 @@ impl ReplicatedEnvironment {
     /// Close this handle and shut down the Replication Group by forcing all
     /// active Replicas to exit.
     ///
-    /// Port of `ReplicatedEnvironment.shutdownGroup(long, TimeUnit)`.
+    /// 
     ///
     /// This method must be invoked on the node that's currently the Master
     /// after all other outstanding handles have been closed. The Master waits

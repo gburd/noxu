@@ -1,6 +1,5 @@
 //! Memory-optimized lock for the common case of a single owner with no waiters.
 //!
-//! Port of `com.sleepycat.je.txn.ThinLockImpl`.
 
 use crate::{LockAttemptResult, LockGrantType, LockInfo, LockType};
 
@@ -9,7 +8,7 @@ use crate::{LockAttemptResult, LockGrantType, LockInfo, LockType};
 /// When contention occurs (multiple owners or waiters needed), this lock
 /// "mutates" into a full LockImpl by returning a MutateToFull signal.
 ///
-/// Port of `com.sleepycat.je.txn.ThinLockImpl`.
+/// 
 #[derive(Debug)]
 pub struct ThinLockImpl {
     /// The single lock owner info, or None if unlocked.

@@ -1,6 +1,5 @@
 //! Filter interface for identifying extinct records.
 //!
-//! Port of `com.sleepycat.je.ExtinctionFilter` from the Oracle NoSQL JE fork.
 //!
 //! # Record Extinction
 //!
@@ -12,38 +11,37 @@
 //!
 //! **Semantics**: Once records are marked extinct via
 //! `discard_extinct_records`, the application must not read or write them
-//! again. JE does not guarantee transactional semantics for extinct records.
+//! again. does not guarantee transactional semantics for extinct records.
 //!
-//! Port of `com.sleepycat.je.ExtinctionFilter` and
-//! `com.sleepycat.je.ExtinctionFilter.ExtinctionStatus` (NoSQL JE 18.1+).
+//! ExtinctionFilter.ExtinctionStatus` (NoSQL 18.1+).
 
 /// Classification returned by [`ExtinctionFilter::get_extinction_status`].
 ///
-/// Port of `com.sleepycat.je.ExtinctionFilter.ExtinctionStatus`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtinctionStatus {
     /// The record is extinct: it was specified in a previous
     /// `discard_extinct_records` call and will never be accessed again.
     ///
-    /// Port of `ExtinctionStatus.EXTINCT`.
+    /// 
     Extinct,
 
     /// The record is not extinct: it has not been specified for extinction.
     ///
-    /// Port of `ExtinctionStatus.NOT_EXTINCT`.
+    /// 
     NotExtinct,
 
     /// The record may or may not be extinct. The application temporarily
     /// cannot determine extinction status (e.g. during startup before
     /// metadata is loaded). The cleaner will fall back to a BTree lookup.
     ///
-    /// Port of `ExtinctionStatus.MAYBE_EXTINCT`.
+    /// 
     MaybeExtinct,
 }
 
 /// Callback for classifying records as extinct.
 ///
-/// Port of `com.sleepycat.je.ExtinctionFilter`.
+/// 
 ///
 /// Implement this trait and register it with `EnvironmentConfig` before
 /// calling [`crate::Environment::discard_extinct_records`].
@@ -60,12 +58,12 @@ pub trait ExtinctionFilter: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `db_name` — name of the JE database containing the record.
+    /// * `db_name` — name of the database containing the record.
     /// * `dups` — whether the database uses duplicate keys (secondary DB).
     /// * `key` — the primary key of the record. When `dups` is true this is
     ///   the record's data field, treated as a primary key.
     ///
-    /// Port of `ExtinctionFilter.getExtinctionStatus(String, boolean, byte[])`.
+    /// 
     fn get_extinction_status(
         &self,
         db_name: &str,

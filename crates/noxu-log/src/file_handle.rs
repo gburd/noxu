@@ -1,6 +1,5 @@
 //! File handle with latch protection.
 //!
-//! Port of `com.sleepycat.je.log.FileHandle`.
 //!
 //! A FileHandle wraps a file descriptor with a latch to ensure exclusive
 //! access during I/O operations.
@@ -12,8 +11,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 // Positional I/O: maps to pread64 / pwrite64 on Linux (single syscall, no
-// seek needed).  Port of Java's FileChannel.read(buf, position) /
-// FileChannel.write(buf, position) which the JVM lowers to pread64/pwrite64.
+// seek needed).
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as PosFileExt;
 #[cfg(windows)]
@@ -122,7 +120,7 @@ impl<'a> FileHandleGuard<'a> {
     /// Reads data from the file at the given offset.
     ///
     /// Uses `pread64` (one syscall) instead of `lseek + read` (two syscalls).
-    /// Port of Java `FileChannel.read(ByteBuffer, position)` which the JVM
+    /// The JVM
     /// lowers to `pread64` on Linux.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let file_guard = self.handle.file.lock();
@@ -134,7 +132,7 @@ impl<'a> FileHandleGuard<'a> {
 
     /// Reads exactly `buf.len()` bytes from the file at the given offset.
     ///
-    /// Uses `pread64` in a retry loop (port of Java `FileChannel.read` loop).
+    /// Uses `pread64` in a retry loop.
     /// Returns an error if fewer bytes are available.
     pub fn read_exact_at(
         &mut self,
@@ -152,7 +150,7 @@ impl<'a> FileHandleGuard<'a> {
     /// Writes data to the file at the given offset.
     ///
     /// Uses `pwrite64` (one syscall) instead of `lseek + write` (two syscalls).
-    /// Port of JE `FileChannel.write(ByteBuffer, position)` which the JVM
+    /// `FileChannel.write(ByteBuffer, position)` which the JVM
     /// lowers to `pwrite64` on Linux.  This eliminates half the syscalls on
     /// the hot write path and removes the need to serialise seek+write under
     /// the guard (pwrite64 is inherently positional and thread-safe).
@@ -191,10 +189,10 @@ impl<'a> FileHandleGuard<'a> {
     /// Syncs only the file data to disk (fdatasync).
     ///
     /// Faster than `sync()` because it does not flush file metadata (mtime
-    /// etc.).  JE uses `FileChannel.force(false)` (= fdatasync) for all
+    /// etc.).  uses `FileChannel.force(false)` (= fdatasync) for all
     /// log-data writes and `force(true)` (= fsync) only for file-header writes.
     ///
-    /// Port of `FileManager.syncLogEnd()` / `FileChannel.force(false)`.
+    /// / `FileChannel.force(false)`.
     pub fn sync_data(&mut self) -> Result<()> {
         let file_guard = self.handle.file.lock();
         let file = file_guard.as_ref().ok_or_else(|| {

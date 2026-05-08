@@ -1,6 +1,5 @@
 //! Transaction handle for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.Transaction`.
 
 use crate::durability::{Durability, SyncPolicy};
 use crate::error::{NoxuError, Result};
@@ -27,7 +26,7 @@ pub enum TransactionState {
 
 /// A transaction handle.
 ///
-/// Port of `com.sleepycat.je.Transaction`.
+/// 
 ///
 /// Transaction handles are used to protect database operations.
 /// A single Transaction may be used for operations on multiple databases
@@ -73,15 +72,15 @@ pub struct Transaction {
     /// via this `Txn` and record abort before-images.  On `abort()`, this `Txn`
     /// releases all locks and collects `UndoRecord`s.
     ///
-    /// Port of the relationship between `Transaction` (public) and `Txn` (internal)
-    /// in JE: `Transaction.txnImpl` field.
+    /// Relationship between `Transaction` (public) and `Txn` (internal)
+    /// in the: `Transaction.txnImpl` field.
     inner_txn: Option<Arc<Mutex<Txn>>>,
     /// Reference to the owning `EnvironmentImpl`.
     ///
     /// Used by `abort()` to look up each modified database by ID and apply
     /// undo records to the B-tree.
     ///
-    /// Port of `Txn.envImpl` in JE, which is used by `Txn.undoLNs()` to call
+    /// In JE, which is used by `Txn.undoLNs()` to call
     /// `EnvironmentImpl.getDatabase(dbId).abort(undoLsn, locker)`.
     env_impl: Option<Arc<SyncMutex<EnvironmentImpl>>>,
 }
@@ -135,7 +134,7 @@ impl Transaction {
     /// Called by `Environment::begin_transaction()` after constructing the
     /// `Transaction`.
     ///
-    /// Port of `Txn.envImpl` wiring in JE's `Txn` constructor.
+    /// Wiring in the equivalent `Txn` constructor.
     pub fn with_env_impl(mut self, env_impl: Arc<SyncMutex<EnvironmentImpl>>) -> Self {
         self.env_impl = Some(env_impl);
         self
@@ -237,7 +236,7 @@ impl Transaction {
         // Release per-record locks held by the inner Txn, collect undo records,
         // and apply them to the B-tree to restore the before-images.
         //
-        // Port of `Txn.undoLNs()` in JE: after writing TxnAbort, JE walks the
+        // After writing TxnAbort, walks the
         // write-lock chain and calls `DatabaseImpl.abort(undoLsn, locker)` for
         // each modified LN.  In Noxu, `Txn::abort()` collects `UndoRecord`s
         // from the `WriteLockInfo` map; we apply them here using `env_impl`.

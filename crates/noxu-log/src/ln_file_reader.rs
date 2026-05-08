@@ -1,6 +1,5 @@
 //! LN file reader for recovery.
 //!
-//! Port of `com.sleepycat.je.log.LNFileReader`.
 //!
 //! Scans log files for Leaf Node (LN) entries during recovery.  During the
 //! **redo** phase the reader scans forward; during the **undo** phase it scans
@@ -32,7 +31,7 @@ enum CurrentEntry {
 
 /// Scans log files for Leaf Node (LN) entries during recovery.
 ///
-/// Port of `com.sleepycat.je.log.LNFileReader`.
+/// 
 ///
 /// The reader maintains a set of *target* `LogEntryType` values registered via
 /// [`add_target_type`].  Each call to [`read_next_entry`] advances to the next
@@ -97,9 +96,9 @@ impl<F: LogFileAccess> LNFileReader<F> {
             // Backward: scan forward from start, up to end_of_file_lsn boundary.
             // Entries are then returned forward; callers expecting reverse order
             // should use FileManagerLogScanner::scan_backward() which reverses
-            // the collected entries.  Port of JE LNFileReader(redo=false) which
-            // uses prev_offset chain links; this forward+filter approach is
-            // functionally equivalent for recovery undo.
+            // the collected entries. This forward+filter approach is
+            // functionally equivalent to following prev_offset chain links
+            // for recovery undo.
             if !end_of_file_lsn.is_null() {
                 (
                     end_of_file_lsn.file_number(),
@@ -136,7 +135,7 @@ impl<F: LogFileAccess> LNFileReader<F> {
 
     /// Register a log entry type that this reader should return.
     ///
-    /// Port of `LNFileReader.addTargetType()`.
+    /// 
     pub fn add_target_type(&mut self, entry_type: LogEntryType) {
         self.target_types.insert(entry_type);
     }
@@ -146,7 +145,7 @@ impl<F: LogFileAccess> LNFileReader<F> {
     /// Returns `Ok(true)` when an entry was found and parsed; `Ok(false)` at
     /// end of log.
     ///
-    /// Port of `FileReader.readNextEntry()` + `LNFileReader.isTargetEntry()` +
+    /// + `LNFileReader.isTargetEntry()` +
     /// `LNFileReader.processEntry()`.
     pub fn read_next_entry(&mut self) -> Result<bool> {
         if self.eof {

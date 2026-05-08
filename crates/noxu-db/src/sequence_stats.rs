@@ -1,10 +1,9 @@
 //! Sequence statistics.
 //!
-//! Port of `com.sleepycat.je.SequenceStats`.
 
 /// Statistics for a `Sequence` handle.
 ///
-/// Port of `com.sleepycat.je.SequenceStats`.
+/// 
 #[derive(Debug, Clone)]
 pub struct SequenceStats {
     /// Total number of successful `get` calls on this handle.

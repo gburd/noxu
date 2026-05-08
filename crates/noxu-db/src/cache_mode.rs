@@ -1,6 +1,5 @@
 //! Cache modes for database operations.
 //!
-//! Port of `com.sleepycat.je.CacheMode`.
 
 /// Cache mode for database operations.
 ///
@@ -8,7 +7,7 @@
 /// Allows applications to optimize caching behavior based on
 /// access patterns.
 ///
-/// Port of `com.sleepycat.je.CacheMode`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {
     /// Use the default caching behavior.

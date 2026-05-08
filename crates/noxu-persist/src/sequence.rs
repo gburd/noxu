@@ -1,7 +1,6 @@
 //! Auto-incrementing sequences for entity ID generation.
 //!
-//! Port of `com.sleepycat.persist.EntityStore.getSequence()` and
-//! `com.sleepycat.je.Sequence`. Provides atomic sequence generation
+//! Sequence`. Provides atomic sequence generation
 //! backed by a database record.
 
 use crate::error::Result;
@@ -15,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// the underlying database. The `cache_size` controls how many values
 /// are pre-allocated in memory before a database write is required.
 ///
-/// Port of `com.sleepycat.je.Sequence`.
+/// 
 ///
 /// # Example
 ///

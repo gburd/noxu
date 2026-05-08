@@ -1,8 +1,7 @@
 //! UncachedLN  -  LN variant that avoids data copy when not cached.
 //!
-//! Port of NoSQL's `com.sleepycat.je.tree.UncachedLN`.
 //!
-//! This is one of the 10 NoSQL JE enhancements. An UncachedLN is used
+//! This is one of the 10 NoSQL enhancements. An UncachedLN is used
 //! when the LN data is not needed in cache  -  the data is read directly
 //! from the log without copying into the BIN cache. This optimization
 //! reduces memory usage for workloads where data is read once and

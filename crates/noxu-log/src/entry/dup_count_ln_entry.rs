@@ -1,6 +1,5 @@
 //! DupCountLN log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.DupCountLNLogEntry`.
 //!
 //! Contains a duplicate count value stored in old-format duplicate databases.
 //! The count tracks the total number of duplicate records for a given key.

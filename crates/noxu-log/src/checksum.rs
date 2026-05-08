@@ -1,6 +1,5 @@
 //! Checksum validation utilities.
 //!
-//! Port of `com.sleepycat.je.log.ChecksumValidator`.
 //!
 //! Uses CRC32 (via crc32fast) for log entry checksum validation.
 

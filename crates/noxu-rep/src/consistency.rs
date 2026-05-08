@@ -1,8 +1,7 @@
 //! Consistency policies for replica reads.
 //!
-//! Port of `com.sleepycat.je.rep.NoConsistencyRequiredPolicy`,
-//! `com.sleepycat.je.rep.TimeConsistencyPolicy`, and
-//! `com.sleepycat.je.rep.CommitPointConsistencyPolicy`.
+//! Rep.TimeConsistencyPolicy`, and
+//! Rep.CommitPointConsistencyPolicy`.
 
 use std::time::Duration;
 
@@ -11,19 +10,19 @@ use crate::error::{RepError, Result};
 /// A consistency policy that determines what state a replica must be in
 /// before a read operation can proceed.
 ///
-/// Port of the consistency policy hierarchy in `com.sleepycat.je.rep`.
+/// Consistency policy hierarchy for replication.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ConsistencyPolicy {
     /// No consistency requirement -- read from any state.
     ///
-    /// Port of `com.sleepycat.je.rep.NoConsistencyRequiredPolicy`.
+    /// 
     #[default]
     NoConsistency,
 
     /// Time-based consistency: the replica must be within `max_lag` of
     /// the master's commit point.
     ///
-    /// Port of `com.sleepycat.je.rep.TimeConsistencyPolicy`.
+    /// 
     TimeConsistency {
         /// Maximum permissible lag behind the master.
         max_lag: Duration,
@@ -34,7 +33,7 @@ pub enum ConsistencyPolicy {
     /// Commit-point consistency: the replica must have applied up to
     /// a specific VLSN before the read can proceed.
     ///
-    /// Port of `com.sleepycat.je.rep.CommitPointConsistencyPolicy`.
+    /// 
     CommitPointConsistency {
         /// The VLSN sequence that must be applied on the replica.
         vlsn: i64,

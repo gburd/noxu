@@ -1,6 +1,5 @@
 //! Sorted map view of a database.
 //!
-//! Port of `com.sleepycat.collections.StoredSortedMap`.
 
 use crate::error::Result;
 use crate::stored_iterator::{
@@ -11,7 +10,7 @@ use noxu_db::Database;
 
 /// A sorted map view of a database.
 ///
-/// Port of `com.sleepycat.collections.StoredSortedMap`.
+/// 
 ///
 /// Provides all the operations of `StoredMap` plus sorted-map operations
 /// like `first_key()`, `last_key()`, and range iteration. Keys are

@@ -1,6 +1,5 @@
 //! Key set view of a database.
 //!
-//! Port of `com.sleepycat.collections.StoredKeySet`.
 
 use crate::error::Result;
 use crate::stored_iterator::StoredKeyIterator;
@@ -10,7 +9,7 @@ use std::sync::Mutex;
 
 /// A set view of database keys.
 ///
-/// Port of `com.sleepycat.collections.StoredKeySet`.
+/// 
 ///
 /// Provides a set interface over the keys of a Noxu DB database.
 /// Keys are returned in sorted byte order.

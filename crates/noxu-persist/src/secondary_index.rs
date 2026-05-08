@@ -1,15 +1,14 @@
 //! Secondary index for typed entity access by a non-primary key.
 //!
-//! Port of `com.sleepycat.persist.SecondaryIndex`.
 //!
 //! A `SecondaryIndex<SK, PK, E>` maps a secondary key (SK) extracted from an
 //! entity (E) back to its primary key (PK), and then looks up the entity in
-//! the `PrimaryIndex`.  This mirrors JE's `SecondaryDatabase → PrimaryDatabase`
+//! the `PrimaryIndex`.  This mirrors `SecondaryDatabase → PrimaryDatabase`
 //! join.
 //!
 //! # Design
 //!
-//! In BDB JE the secondary database is a first-class on-disk store that is
+//! In BDB the secondary database is a first-class on-disk store that is
 //! automatically kept in sync with the primary database through the
 //! `SecondaryDatabase` association.  In this Rust port the persistence layer
 //! sits on top of `noxu-db`'s in-memory `HashMap` store, so we replicate the
@@ -24,9 +23,9 @@
 //!   `PrimaryIndex` automatically keeps all registered secondary indexes
 //!   consistent.
 //!
-//! # JE Fidelity
+//! # Fidelity
 //!
-//! | JE method | Rust method |
+//! | method | Rust method |
 //! |---|---|
 //! | `get(SK)` | `get(&sk)` |
 //! | `contains(SK)` | `contains(&sk)` |
@@ -149,7 +148,7 @@ impl<SK: Ord + Clone, PK: Ord + Clone> SecondaryMap<SK, PK> {
 
 /// Typed secondary index that maps a secondary key `SK` to entities `E`.
 ///
-/// Port of `com.sleepycat.persist.SecondaryIndex<SK, PK, E>`.
+/// 
 ///
 /// # Type Parameters
 ///
@@ -205,7 +204,7 @@ where
     /// The key-extractor closure: `entity → Option<SK>`.
     ///
     /// Returns `None` for entities where the secondary key is absent (nullable
-    /// keys, equivalent to JE's null secondary key which is simply omitted).
+    /// keys, equivalent to null secondary key which is simply omitted).
     extractor: Arc<dyn Fn(&E) -> Option<SK> + Send + Sync>,
 }
 
@@ -230,10 +229,10 @@ where
     /// Returns the first entity whose secondary key equals `sk`, or `None`.
     ///
     /// When multiple primary keys map to the same secondary key (MANY_TO_ONE)
-    /// the entity with the smallest primary key is returned, matching BDB JE's
+    /// the entity with the smallest primary key is returned, matching BDB the
     /// `SecondaryDatabase.get` behaviour (returns the first duplicate).
     ///
-    /// Port of `SecondaryIndex.get(SK)`.
+    /// 
     pub fn get<S: EntitySerializer<E>>(
         &self,
         serializer: &S,
@@ -247,7 +246,7 @@ where
         };
         // Drop the lock before doing the (potentially slow) primary lookup.
         drop(guard);
-        // Return the first matching entity (smallest PK), mirroring JE.
+        // Return the first matching entity (smallest PK), mirroring the.
         for pk in &pks {
             if let Some(entity) = primary.get(serializer, pk)? {
                 return Ok(Some(entity));
@@ -258,7 +257,7 @@ where
 
     /// Returns `true` if at least one entity has the given secondary key.
     ///
-    /// Port of `SecondaryIndex.contains(SK)` (via `EntityIndex.contains`).
+    /// (via `EntityIndex.contains`).
     pub fn contains(&self, sk: &SK) -> bool {
         self.shared.lock().unwrap().contains(sk)
     }
@@ -267,7 +266,7 @@ where
     ///
     /// Returns `true` if at least one entity was deleted.
     ///
-    /// Port of `SecondaryIndex.delete(SK)` – in JE this deletes via the
+    /// – in this deletes via the
     /// secondary database which cascades a delete to the primary.
     pub fn delete<S: EntitySerializer<E>>(
         &self,
@@ -286,7 +285,7 @@ where
         for pk in &pks {
             // Use delete_with_entity so that ALL registered secondary indexes
             // (not just this one) are notified of the deletion via their
-            // maintainer callbacks.  This mirrors JE's SecondaryDatabase
+            // maintainer callbacks.  This mirrors SecondaryDatabase
             // cascade behaviour.
             if primary.delete_with_entity(serializer, pk)? {
                 deleted = true;
@@ -302,7 +301,7 @@ where
     /// Returns an iterator over all `(secondary_key, entity)` pairs in
     /// secondary key order.
     ///
-    /// Port of `SecondaryIndex.entities()` / `EntityCursor`.
+    /// / `EntityCursor`.
     pub fn iter<'a, S: EntitySerializer<E>>(
         &'a self,
         serializer: &'a S,
@@ -324,7 +323,7 @@ where
     /// Returns an iterator over `(secondary_key, entity)` pairs where
     /// `secondary_key >= from_sk`, in secondary key order.
     ///
-    /// Port of range-scan via `EntityIndex.entities(SK, boolean)`.
+    /// Range-scan via the entity index.
     pub fn iter_from<'a, S: EntitySerializer<E>>(
         &'a self,
         serializer: &'a S,
@@ -350,7 +349,7 @@ where
     /// Returns an iterator over only the secondary key → primary key mappings,
     /// without fetching the full entities.
     ///
-    /// Port of `SecondaryIndex.keysIndex()`.
+    /// 
     pub fn keys_index(&self) -> Vec<(SK, PK)> {
         let guard = self.shared.lock().unwrap();
         guard.iter().map(|(sk, pk)| (sk.clone(), pk.clone())).collect()
@@ -358,7 +357,7 @@ where
 
     /// Returns all primary keys that map to `sk` (sub-index).
     ///
-    /// Port of `SecondaryIndex.subIndex(SK)`.
+    /// 
     pub fn sub_index(&self, sk: &SK) -> Vec<PK> {
         let guard = self.shared.lock().unwrap();
         guard.get_pks(sk).map(|s| s.iter().cloned().collect()).unwrap_or_default()
@@ -373,7 +372,7 @@ where
 ///
 /// Yields `(SK, E)` tuples in secondary key order.  Missing primary records
 /// (which can occur if the primary was deleted without the secondary being
-/// properly maintained) are silently skipped, matching BDB JE behaviour.
+/// properly maintained) are silently skipped, matching BDB behaviour.
 pub struct SecondaryIterator<'a, SK, PK, E, S>
 where
     PK: PrimaryKey + Ord + Send + Sync + 'static,
@@ -598,7 +597,7 @@ mod tests {
     // Tests
     // -----------------------------------------------------------------------
 
-    /// Basic get via secondary key – mirrors JE SecondaryIndex.get(SK).
+    /// Basic get via secondary key – mirrors SecondaryIndex.get(SK).
     #[test]
     fn test_secondary_get_found() {
         let (_td, _env, db) = setup();

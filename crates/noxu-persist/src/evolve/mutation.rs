@@ -1,6 +1,5 @@
 //! Base mutation type for schema evolution.
 //!
-//! Port of `com.sleepycat.persist.evolve.Mutation`.
 
 /// A key identifying a mutation target: (class_name, class_version,
 /// field_name).
@@ -8,7 +7,7 @@
 /// `field_name` is `None` when the mutation targets the class itself rather
 /// than a specific field.
 ///
-/// Port of `com.sleepycat.persist.evolve.Mutation`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MutationKey {
     /// The fully-qualified class (entity) name.

@@ -1,7 +1,6 @@
 //! Background scanner for asynchronous record extinction.
 //!
-//! Port of `com.sleepycat.je.cleaner.ExtinctionScanner` from the Oracle NoSQL
-//! JE fork.
+//! fork.
 //!
 //! # Record Extinction
 //!
@@ -14,7 +13,6 @@
 //! 2. Remove extinct records from BINs without writing per-record deletes.
 //! 3. Log the cleaner utilization update so disk space is reclaimed over time.
 //!
-//! Port of `com.sleepycat.je.cleaner.ExtinctionScanner`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +24,6 @@ pub const DEFAULT_SCANNER_INTERVAL_MS: u64 = 100;
 
 /// A pending extinction task: specifies a key range in a database.
 ///
-/// Port of JE's `ExtinctionScanner.ExtinctionTask`.
 #[derive(Debug, Clone)]
 pub struct ExtinctionTask {
     /// Name of the database containing the extinct records.
@@ -42,7 +39,7 @@ pub struct ExtinctionTask {
 /// Background scanner that asynchronously removes extinct records from the
 /// B-tree and updates the utilization profile.
 ///
-/// Port of `com.sleepycat.je.cleaner.ExtinctionScanner`.
+/// 
 pub struct ExtinctionScanner {
     /// Pending extinction tasks queued by `discard_extinct_records`.
     task_queue: Arc<Mutex<Vec<ExtinctionTask>>>,
@@ -59,7 +56,7 @@ pub struct ExtinctionScanner {
 impl ExtinctionScanner {
     /// Creates a new `ExtinctionScanner`.
     ///
-    /// Port of `ExtinctionScanner(EnvironmentImpl envImpl)`.
+    /// 
     pub fn new() -> Self {
         ExtinctionScanner {
             task_queue: Arc::new(Mutex::new(Vec::new())),
@@ -72,7 +69,7 @@ impl ExtinctionScanner {
 
     /// Starts the background scanner thread.
     ///
-    /// Port of `StoppableThread.start()`.
+    /// 
     pub fn start(&mut self) {
         let queue = Arc::clone(&self.task_queue);
         let shutdown = Arc::clone(&self.shutdown);
@@ -88,7 +85,6 @@ impl ExtinctionScanner {
                     };
 
                     for _task in tasks {
-                        // Port of ExtinctionScanner.scan(task):
                         //   1. Open a read cursor on task.db_name.
                         //   2. Position at task.start_key.
                         //   3. For each record up to task.end_key:
@@ -117,27 +113,27 @@ impl ExtinctionScanner {
     ///
     /// Called by `Environment::discard_extinct_records()`.
     ///
-    /// Port of `ExtinctionScanner.discardExtinctRecords(Txn, DatabaseImpl,
+    /// `ExtinctionScanner.discardExtinctRecords(Txn, DatabaseImpl,
     ///   DatabaseEntry startKey, DatabaseEntry endKey, ScanFilter filter)`.
     pub fn discard_extinct_records(&self, task: ExtinctionTask) -> u64 {
         if self.active {
             self.task_queue.lock().unwrap().push(task);
         }
         // Returns a task ID for progress tracking.
-        // Port of JE's return value: the ID of the queued scan.
+        // Returns the ID of the queued scan.
         self.n_lns_extinct.load(Ordering::Relaxed)
     }
 
     /// Returns the number of LNs discarded so far.
     ///
-    /// Port of JE `EnvironmentStats.getNLNsExtinct()`.
+    /// `EnvironmentStats.getNLNsExtinct()`.
     pub fn n_lns_extinct(&self) -> u64 {
         self.n_lns_extinct.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if there are pending extinction tasks.
     ///
-    /// Port of `Environment.isRecordExtinctionActive()`.
+    /// 
     pub fn is_active(&self) -> bool {
         self.active && !self.task_queue.lock().unwrap().is_empty()
     }

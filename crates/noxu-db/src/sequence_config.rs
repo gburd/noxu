@@ -1,15 +1,14 @@
 //! Sequence configuration.
 //!
-//! Port of `com.sleepycat.je.SequenceConfig`.
 
 /// Specifies the attributes of a sequence.
 ///
-/// Port of `com.sleepycat.je.SequenceConfig`.
+/// 
 #[derive(Debug, Clone)]
 pub struct SequenceConfig {
     /// Number of elements cached in the sequence handle (default 20).
     ///
-    /// JE default is 0 but the task specifies 20 as the noxu default for
+    /// default is 0 but the task specifies 20 as the noxu default for
     /// pre-fetching.  A value of 0 disables caching (every get hits the DB).
     pub cache_size: i32,
 

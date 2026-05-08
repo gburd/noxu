@@ -1,8 +1,7 @@
 //! Off-heap cache support.
 //!
-//! Port of `com.sleepycat.je.evictor.OffHeapCache`.
 //!
-//! JE's OffHeapCache stores evicted BIN bytes in a `ConcurrentHashMap<Long, byte[]>`
+//! OffHeapCache stores evicted BIN bytes in a `ConcurrentHashMap<Long, byte[]>`
 //! keyed by node ID.  Rust has no GC pressure to avoid, so we use a simple
 //! `Mutex<HashMap<u64, Vec<u8>>>` as the equivalent.  The allocator abstraction
 //! from the Java version is not needed here.
@@ -17,11 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// rather than being discarded.  This allows a larger effective cache because
 /// the data can be reloaded without disk I/O on the next access.
 ///
-/// JE equivalent: `ConcurrentHashMap<Long nodeId, byte[] serializedBytes>` +
+/// equivalent: `ConcurrentHashMap<Long nodeId, byte[] serializedBytes>` +
 /// `OffHeapAllocator`.  In Rust we use a `Mutex<HashMap>` (no GC pressure to
 /// avoid, so a plain heap `Vec<u8>` per node is fine).
 ///
-/// Port of `com.sleepycat.je.evictor.OffHeapCache`.
+/// 
 #[derive(Debug)]
 pub struct OffHeapCache {
     /// Whether off-heap cache is enabled.
@@ -32,11 +31,11 @@ pub struct OffHeapCache {
     max_bytes: u64,
 
     /// Serialised bytes keyed by node_id.
-    /// Port of JE's `ConcurrentHashMap<Long, byte[]> inMemIds`.
+    /// In-memory node ID set.
     store: Mutex<HashMap<u64, Vec<u8>>>,
 
     /// Running total of bytes currently stored off-heap.
-    /// Port of JE's `memoryUsed` / `allocator.totalBytes()`.
+    /// Tracks total allocated bytes.
     used_bytes: AtomicU64,
 }
 
@@ -87,7 +86,7 @@ impl OffHeapCache {
     /// `max_bytes`.  If a node with the same ID was already present its old
     /// bytes are replaced (usage is adjusted accordingly).
     ///
-    /// Port of JE `OffHeapCache.storeEvictedBIN` / the underlying allocator
+    /// `OffHeapCache.storeEvictedBIN` / the underlying allocator
     /// `storeIN` pattern — key = nodeId, value = serialised bytes.
     pub fn store_node(&self, node_id: u64, data: Vec<u8>) -> bool {
         if !self.enabled {
@@ -120,7 +119,7 @@ impl OffHeapCache {
     /// Returns a clone of the stored bytes, leaving the entry in place (the
     /// node will be promoted back to the main cache by the caller).
     ///
-    /// Port of JE `OffHeapCache.getBINBytes`.
+    /// `OffHeapCache.getBINBytes`.
     pub fn load_node(&self, node_id: u64) -> Option<Vec<u8>> {
         if !self.enabled {
             return None;
@@ -134,7 +133,7 @@ impl OffHeapCache {
     ///
     /// Returns `true` if the node was present and removed, `false` otherwise.
     ///
-    /// Port of JE `OffHeapCache.removeINFromMain` (the part that frees the
+    /// `OffHeapCache.removeINFromMain` (the part that frees the
     /// off-heap allocation for the BIN itself).
     pub fn remove_node(&self, node_id: u64) -> bool {
         if !self.enabled {
@@ -160,7 +159,7 @@ impl OffHeapCache {
 
     /// Clear all entries from the off-heap cache.
     ///
-    /// Port of JE `OffHeapCache.clearCache`.
+    /// `OffHeapCache.clearCache`.
     pub fn clear(&self) {
         if let Ok(mut guard) = self.store.lock() {
             guard.clear();
@@ -196,7 +195,7 @@ impl OffHeapCache {
             usage,
             num_bins,
             // LN off-heap is not supported; only BIN pages are cached off-heap.
-            // Port of JE OffHeapCache which stores both BIN pages and LN values;
+            // OffHeapCache which stores both BIN pages and LN values;
             // Noxu stores LNs inline in BIN slots (embedded_ln=true) instead.
             num_lns: 0,
         }

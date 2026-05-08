@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Database internals for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.dbi` - internal implementations including
+//! internal implementations including
 //! EnvironmentImpl, DatabaseImpl, CursorImpl, DbTree, MemoryBudget, INList.
 
 pub mod backup_manager;

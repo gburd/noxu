@@ -1,6 +1,5 @@
 //! Replication group management.
 //!
-//! Port of `com.sleepycat.je.rep.ReplicationGroup`.
 
 use std::collections::HashMap;
 

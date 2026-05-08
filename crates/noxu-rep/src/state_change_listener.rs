@@ -1,13 +1,12 @@
 //! State change notification for replication nodes.
 //!
-//! Port of `com.sleepycat.je.rep.StateChangeListener` and
-//! `com.sleepycat.je.rep.StateChangeEvent`.
+//! Rep.StateChangeEvent`.
 
 use crate::node_state::NodeState;
 
 /// Callback for replication state change events.
 ///
-/// Port of `com.sleepycat.je.rep.StateChangeListener`.
+/// 
 ///
 /// An asynchronous mechanism for tracking the state of the replicated
 /// environment and choosing how to route database operations. State determines
@@ -34,7 +33,7 @@ pub trait StateChangeListener: Send + Sync {
 
 /// Describes a state change event.
 ///
-/// Port of `com.sleepycat.je.rep.StateChangeEvent`.
+/// 
 ///
 /// Communicates the state change at a node to the StateChangeListener.
 /// There is a distinct instance of this event representing each state

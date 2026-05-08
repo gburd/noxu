@@ -1,6 +1,6 @@
 //! OldLN log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.LNLogEntry` (old format).
+//! Old format — .
 //!
 //! Represents a legacy LN log entry format that does not carry abort fields.
 //! Used during recovery of logs written by older versions of the database.

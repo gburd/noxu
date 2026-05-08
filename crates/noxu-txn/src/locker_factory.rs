@@ -1,6 +1,5 @@
 //! Factory for creating lockers.
 //!
-//! Port of `com.sleepycat.je.txn.LockerFactory`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -17,7 +16,7 @@ use crate::thread_locker::ThreadLocker;
 /// based on the requested configuration. Each factory is associated with
 /// a single LockManager instance.
 ///
-/// Port of `com.sleepycat.je.txn.LockerFactory`.
+/// 
 pub struct LockerFactory {
     /// Atomic counter for generating unique locker IDs.
     next_id: AtomicI64,

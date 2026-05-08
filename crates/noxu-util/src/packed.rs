@@ -1,8 +1,5 @@
 //! Packed integer encoding utilities.
 //!
-//! Port of `com.sleepycat.util.PackedInteger` and sorted number encoding
-//! from `com.sleepycat.bind.tuple`.
-//!
 //! Provides variable-length encoding for integers that is compact for small
 //! values and preserves sort order when used as keys.
 //!
@@ -30,7 +27,6 @@
 //! - Positive (value > 120): first byte = 0xF7 + N; value bytes store (value - 121)
 //! - Negative (value < -119): first byte = 0x08 - N; value bytes store (value + 119)
 //!
-//! This is a faithful port of the JE PackedInteger class.
 
 use std::io::{self, Read, Write};
 
@@ -526,7 +522,7 @@ mod tests {
         }
     }
 
-    // Port of JE's testIntRange for boundary values
+    // Boundary value tests for packed i32 encoding
     #[test]
     fn test_packed_i32_boundary_values() {
         let v119 = 119i32;
@@ -761,9 +757,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE PackedIntegerTest.testIntRange / testLongRange
-    //
-    // For each size tier, verify:
+    // Per-tier range tests: for each size tier, verify:
     //   1. write_packed produces exactly `expected_bytes` bytes for every value
     //      in the range.
     //   2. packed_i32_size / packed_i64_size returns `expected_bytes`.
@@ -833,7 +827,7 @@ mod tests {
         }
     }
 
-    // JE constants
+    // Encoding boundary constants
     const V119: i64 = 119;
     const MAX_1: i64 = 0xFF;
     const MAX_2: i64 = 0xFFFF;
@@ -843,7 +837,7 @@ mod tests {
     const MAX_6: i64 = 0xFFFF_FFFF_FFFF;
     const MAX_7: i64 = 0xFF_FFFF_FFFF_FFFF;
 
-    // --- i32 range tests (ported from JE testIntRange) ---
+    // --- i32 range tests ---
 
     #[test]
     fn test_je_int_range_tier1() {
@@ -932,7 +926,7 @@ mod tests {
         check_i32_range(i32::MAX - 99, i32::MAX, 5);
     }
 
-    // --- i64 range tests (ported from JE testLongRange) ---
+    // --- i64 range tests ---
 
     #[test]
     fn test_je_long_range_tier1() {
@@ -1076,19 +1070,17 @@ mod tests {
 
     #[test]
     fn test_je_long_range_tier9_max() {
-        // JE uses Long.MAX_VALUE - 1 as the upper bound (exclusive of MAX)
+        // Use MAX - 1 as the upper bound of the sample range (exclusive of MAX itself)
         check_i64_range(i64::MAX - 99, i64::MAX - 1, 9);
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE testSortOrder: sorted-encoded bytes must compare in the
-    // same order as the integer values (the crucial correctness invariant).
+    // Sort-order correctness: sorted-encoded bytes must compare in the same
+    // order as the integer values (the crucial correctness invariant).
     //
     // NOTE: The *packed* format (write_packed_i32/i64) uses little-endian
     // encoding and does NOT preserve byte-wise sort order.  Only the *sorted*
-    // format (write_sorted_i32/i64) is sort-order preserving.  JE's
-    // testSortOrder exercises the sorted format, so we do the same here with
-    // a broader set of boundary values than the existing sorted ordering tests.
+    // format (write_sorted_i32/i64) is sort-order preserving.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1173,9 +1165,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE testIntArray: array encode/decode round-trip
-    // Encode multiple values sequentially into a buffer, then decode them
-    // back in order and verify each value.
+    // Array encode/decode round-trip: encode multiple values sequentially
+    // into a buffer, then decode them back in order and verify each value.
     // -----------------------------------------------------------------------
 
     #[test]

@@ -1,6 +1,6 @@
 //! Network restore for copying database files from another node.
 //!
-//! Port of `com.sleepycat.je.rep.NetworkRestore`. JE's NetworkRestore
+//! NetworkRestore
 //! copies log files from a network peer to restore a node that has fallen
 //! too far behind the replication stream. This is used when a replica
 //! discovers an `InsufficientLogException`  -  its local log files are too
@@ -22,7 +22,7 @@ const RESTORE_MAGIC: u32 = 0x4E52_5354;
 
 /// Configuration for a network restore operation.
 ///
-/// Corresponds to JE's `NetworkRestoreConfig`. Specifies the source node
+/// Specifies the source node
 /// to copy from and whether existing log files should be retained.
 #[derive(Debug, Clone)]
 pub struct NetworkRestoreConfig {
@@ -30,7 +30,7 @@ pub struct NetworkRestoreConfig {
     pub source_node: String,
     /// Hostname of the source node.
     pub source_host: String,
-    /// Port of the source node.
+    /// Source node.
     pub source_port: u16,
     /// Whether to retain existing log files (rename rather than delete).
     pub retain_log_files: bool,
@@ -64,7 +64,7 @@ pub struct RestoreProgress {
 
 /// A network restore operation that copies database files from a peer node.
 ///
-/// Port of JE's `NetworkRestore`. Manages the lifecycle of a restore:
+/// Manages the lifecycle of a restore:
 /// starting the transfer, tracking progress, and completing or failing.
 pub struct NetworkRestore {
     /// Configuration for this restore.
@@ -133,7 +133,7 @@ impl NetworkRestore {
     ///                    [data: file_size bytes]
     /// ```
     ///
-    /// Port of `com.sleepycat.je.rep.NetworkRestore.execute()`.
+    /// 
     pub fn execute(&self) -> Result<()> {
         // Validate state: must be NotStarted.
         {

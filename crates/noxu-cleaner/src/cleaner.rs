@@ -1,6 +1,6 @@
 //! Main cleaner daemon for log garbage collection.
 //!
-//! Port of `Cleaner.java` - responsible for garbage collecting the JE log by
+//! responsible for garbage collecting the log by
 //! selecting least utilized files, processing them, and deleting cleaned files.
 
 use crate::FileSelector;
@@ -18,7 +18,7 @@ use noxu_sync::Mutex;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// The Cleaner is responsible for garbage collecting the JE log.
+/// The Cleaner is responsible for garbage collecting the log.
 ///
 /// It selects the least utilized log file for cleaning (FileSelector),
 /// reads through the log file (FileProcessor) and determines whether
@@ -78,7 +78,7 @@ pub struct Cleaner {
     /// so that live LN entries are migrated (their BIN slot LSNs are updated).
     /// When `None`, migration is skipped (the no-op path used by unit tests).
     ///
-    /// Port of the `env.getDbTree()` access pattern in JE's `FileProcessor`.
+    /// `env.getDbTree()` access pattern in the equivalent `FileProcessor`.
     tree: Option<Arc<RwLock<noxu_tree::Tree>>>,
 
     /// Optional LogManager used by `SharedTreeLookup::migrate_ln_slot` to
@@ -92,7 +92,7 @@ pub struct Cleaner {
     /// detection.  When `None`, `SharedTreeLookup::new` allocates a private
     /// manager (safe but no cross-component deadlock detection).
     ///
-    /// Port of `JE Cleaner` using `env.getTxnManager().getLockManager()`.
+    /// Using `env.getTxnManager().getLockManager()`.
     lock_manager: Option<Arc<noxu_txn::LockManager>>,
 }
 
@@ -180,7 +180,7 @@ impl Cleaner {
     /// `SharedTreeLookup` so that live LN entries are re-logged and their
     /// BIN slot LSNs are updated.
     ///
-    /// Port of the tree-access wiring in JE's `FileProcessor.processFile()`.
+    /// Tree-access wiring for file processing.
     ///
     /// Note: allocates a private `LockManager` (no lock-table sharing with
     /// transactions).  Use `with_file_manager_tree_and_lock_manager` to pass
@@ -218,7 +218,7 @@ impl Cleaner {
     /// environment's `LockManager` ensures that locks held by the cleaner
     /// contend with user transactions, enabling correct deadlock detection.
     ///
-    /// Port of JE: `Cleaner` obtains the lock manager via
+    /// Cleaner obtains the lock manager via
     /// `env.getTxnManager().getLockManager()`.
     pub fn with_file_manager_tree_and_lock_manager(
         min_utilization: u32,
@@ -373,8 +373,8 @@ impl Cleaner {
         ) {
             let entries = self.decode_ln_entries_from_file(fm, file_number);
             // Use the environment's shared LockManager when available so that
-            // cleaner-held locks contend with user transactions (JE fidelity).
-            // Port of JE: Cleaner uses env.getTxnManager().getLockManager().
+            // cleaner-held locks contend with user transactions (fidelity).
+            // Cleaner uses env.getTxnManager().getLockManager().
             let tree_lookup = if let Some(ref shared_lm) = self.lock_manager {
                 SharedTreeLookup::with_lock_manager(
                     Arc::clone(tree),
@@ -404,13 +404,13 @@ impl Cleaner {
     /// Scans the file sequentially, reading each entry header and payload.
     /// For LN-family entries (type bytes 4–9) the payload is parsed using
     /// `LnLogEntry::read_from_log` to extract the real record key.  This
-    /// mirrors the way JE's `CleanerFileReader` extracts keys from log entries
+    /// mirrors the way `CleanerFileReader` extracts keys from log entries
     /// before passing them to `FileProcessor.processFile()`.
     ///
     /// IN, BIN-delta, and all other entry types are represented as
     /// `LogEntryType::Other` (they will be skipped by the migration loop).
     ///
-    /// Port of `CleanerFileReader.readNextEntry()` in JE.
+    /// 
     fn decode_ln_entries_from_file(
         &self,
         fm: &Arc<FileManager>,
@@ -454,7 +454,7 @@ impl Cleaner {
             // Build a LogEntry for LN-family types only; everything else
             // is emitted as LogEntryType::Other so the processor skips it.
             // For LN entries, read the payload and deserialise the real key.
-            // Port of JE CleanerFileReader reading actual record keys via
+            // CleanerFileReader reading actual record keys via
             // LN payload deserialization.
             let log_entry_type = match entry_type_byte {
                 // InsertLN=4, UpdateLN=6 (non-transactional) — active entries
@@ -1386,7 +1386,7 @@ mod tests {
     /// `process_single_file` completes successfully when a tree is wired in,
     /// even if the tree is empty (all entries will be counted as dead).
     ///
-    /// Port of JE's FileProcessor.processFile — the no-live-entries path where
+    /// The no-live-entries path where
     /// every LN decoded from the file is absent from the tree.
     #[test]
     fn test_process_single_file_with_tree_empty_tree() {
@@ -1420,7 +1420,7 @@ mod tests {
     /// `process_single_file` with a tree-wired cleaner: live LN entries
     /// whose keys match entries in the tree are migrated.
     ///
-    /// This is the core migration path ported from JE's
+    /// Core migration path for log file cleaning.
     /// `FileProcessor.processFoundLN()`.  We insert a key into the tree at
     /// the LSN that would be produced by a synthetic LN entry in the log, then
     /// verify the cleaner reports a migration.

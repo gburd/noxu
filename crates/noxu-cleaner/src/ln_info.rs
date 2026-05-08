@@ -1,6 +1,6 @@
 //! LN information for cleaning operations.
 //!
-//! Port of `LNInfo.java` - holds information about an LN entry found during
+//! holds information about an LN entry found during
 //! file processing, used for pending LNs and look-ahead caches.
 
 use noxu_util::Lsn;

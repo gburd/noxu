@@ -2,7 +2,6 @@
 //!
 //! This module provides the types required to configure how the DPL handles
 //! incompatible changes to entity class definitions over time.  It is a port
-//! of the `com.sleepycat.persist.evolve` Java package from Berkeley DB JE.
 //!
 //! # Overview
 //!

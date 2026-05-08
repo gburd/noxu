@@ -1,10 +1,9 @@
 //! Operation result status.
 //!
-//! Port of `com.sleepycat.je.OperationStatus`.
 
 /// Status returned by cursor and database operations.
 ///
-/// Port of `com.sleepycat.je.OperationStatus`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStatus {
     /// Operation succeeded.

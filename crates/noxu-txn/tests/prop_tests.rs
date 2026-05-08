@@ -20,7 +20,7 @@ fn lock_type_strategy() -> impl Strategy<Value = LockType> {
 // 1. Lock conflict matrix symmetry for compatible types
 //    For the 5 main lock types, conflict(a, b) and conflict(b, a) should
 //    share the same "blocking" quality when the matrix is symmetric.
-//    Note: The JE conflict matrix is NOT fully symmetric (RangeInsert row
+//    Note: The conflict matrix is NOT fully symmetric (RangeInsert row
 //    differs from the RangeInsert column), so we test a weaker property:
 //    Allow is symmetric among Read/Write/RangeRead/RangeWrite.
 // ============================================================================

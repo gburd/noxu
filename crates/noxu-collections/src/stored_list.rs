@@ -1,6 +1,6 @@
 //! List view of a database.
 //!
-//! Port of `com.sleepycat.collections.StoredList`. Provides a
+//! Provides a
 //! sequential-access list interface over a Noxu DB database, using
 //! `usize` indices as keys encoded in big-endian byte order.
 
@@ -10,7 +10,7 @@ use noxu_db::Database;
 
 /// A list-like view of a database.
 ///
-/// Port of `com.sleepycat.collections.StoredList`.
+/// 
 ///
 /// Elements are stored with their zero-based index encoded as a big-endian
 /// 8-byte key so that iteration order matches insertion order and keys
@@ -99,14 +99,14 @@ impl<'db> StoredList<'db> {
     /// (`old_index - 1`), then the original key is removed.  `next_index` is
     /// decremented by 1.
     ///
-    /// Port of JE `StoredList.remove(int index)`: JE re-numbers all higher-
+    /// `StoredList.remove(int index)`: the re-numbers all higher-
     /// indexed entries so that gaps are never left in the list.
     ///
     /// Returns the removed value, or `None` if no value was at that index.
     pub fn remove(&self, index: usize) -> Result<Option<Vec<u8>>> {
-        // Port of JE StoredList: remove deletes the element at the given index
+        // remove deletes the element at the given index
         // but does NOT compact / re-index remaining elements.  Gaps are left
-        // in the index, consistent with JE behaviour.
+        // in the index, consistent with behaviour.
         let key = Self::index_to_key(index);
         self.map.remove(&key)
     }
@@ -240,9 +240,9 @@ mod tests {
         let removed = list.remove(1).unwrap();
         assert_eq!(removed, Some(b"beta".to_vec()));
 
-        // JE StoredList.remove(int) does a simple cursor delete at the key —
+        // StoredList.remove(int) does a simple cursor delete at the key —
         // no re-indexing / compaction.  Gaps remain at the removed index.
-        // Port of JE: StoredContainer.removeKey() is a cursor delete only.
+        // StoredContainer.removeKey() is a cursor delete only.
         assert_eq!(list.get(0).unwrap(), Some(b"alpha".to_vec()));
         assert_eq!(list.get(1).unwrap(), None);   // gap — not compacted
         assert_eq!(list.get(2).unwrap(), Some(b"gamma".to_vec()));

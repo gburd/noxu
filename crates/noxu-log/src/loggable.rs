@@ -1,6 +1,5 @@
 //! Loggable trait for log entry serialization.
 //!
-//! Port of `com.sleepycat.je.log.Loggable`, `VersionedWriteLoggable`, and
 //! `BasicVersionedWriteLoggable`.
 //!
 //! Classes that implement Loggable know how to serialize and deserialize
@@ -45,7 +44,7 @@ pub trait Loggable: Sized {
 
 /// Extension of Loggable that supports writing in multiple log versions.
 ///
-/// Port of `com.sleepycat.je.log.VersionedWriteLoggable`.
+/// 
 ///
 /// Types that implement this trait can serialize themselves in earlier log
 /// formats to support replication during upgrades where the master has been
@@ -104,7 +103,7 @@ pub trait VersionedWriteLoggable: Loggable {
 /// Basic implementation of VersionedWriteLoggable that writes in a single
 /// format by default.
 ///
-/// Port of `com.sleepycat.je.log.BasicVersionedWriteLoggable`.
+/// 
 ///
 /// Types can implement this trait to get default single-format behavior,
 /// then override specific methods to support multiple versions.

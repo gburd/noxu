@@ -1,6 +1,5 @@
 //! OldBINDelta log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.OldBINDeltaLogEntry`.
 //!
 //! Represents an old-format BIN delta log entry used during recovery of logs
 //! written by earlier versions. Contains raw serialized delta data along with

@@ -1,12 +1,11 @@
 //! Error types for Noxu DB.
 //!
-//! Port of exception types from `com.sleepycat.je` package.
 
 use thiserror::Error;
 
 /// Errors that can occur when using Noxu DB.
 ///
-/// Port of Berkeley DB Java Edition exception hierarchy.
+/// The database engine exception hierarchy.
 #[derive(Debug, Error)]
 pub enum NoxuError {
     /// A fatal condition has occurred that will cause the environment to close.

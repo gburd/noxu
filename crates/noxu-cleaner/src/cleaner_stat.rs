@@ -1,6 +1,6 @@
 //! Cleaner statistics tracking.
 //!
-//! Port of `CleanerStatDefinition.java` - comprehensive statistics for the cleaner
+//! comprehensive statistics for the cleaner
 //! daemon, including runs, migrations, deletions, and disk usage metrics.
 
 use std::sync::atomic::{AtomicU64, Ordering};

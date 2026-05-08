@@ -1,6 +1,5 @@
 //! Transaction and locking error types.
 //!
-//! Port of various exception types from `com.sleepycat.je.txn`.
 
 use thiserror::Error;
 
@@ -16,7 +15,7 @@ pub enum TxnError {
 
     /// Lock timeout occurred while waiting for a lock.
     ///
-    /// Port of `com.sleepycat.je.LockTimeoutException`.
+    /// 
     #[error(
         "lock timeout after {timeout_ms}ms on LSN {lsn}: held by {owner}, requested {requested_type:?} by locker {requester}"
     )]
@@ -35,7 +34,7 @@ pub enum TxnError {
 
     /// Transaction timeout occurred.
     ///
-    /// Port of `com.sleepycat.je.TransactionTimeoutException`.
+    /// 
     #[error("transaction timeout after {timeout_ms}ms for txn {txn_id}")]
     TransactionTimeout {
         /// Timeout duration in milliseconds.
@@ -46,7 +45,7 @@ pub enum TxnError {
 
     /// Deadlock detected during lock acquisition.
     ///
-    /// Port of `com.sleepycat.je.DeadlockException`.
+    /// 
     #[error("deadlock detected: {0}")]
     Deadlock(String),
 
@@ -68,7 +67,7 @@ pub enum TxnError {
 
     /// Range restart required due to range lock conflict.
     ///
-    /// Port of `com.sleepycat.je.RangeRestartException`.
+    /// 
     #[error("range restart required")]
     RangeRestart,
 

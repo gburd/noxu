@@ -1,12 +1,10 @@
 //! Error types for the collections crate.
 //!
-//! Port of exception types from `com.sleepycat.collections`.
 
 use thiserror::Error;
 
 /// Errors that can occur when using collection views.
 ///
-/// Port of exceptions from `com.sleepycat.collections`.
 #[derive(Debug, Error)]
 pub enum CollectionError {
     /// An underlying database error occurred.

@@ -1,6 +1,5 @@
 //! Deadlock detection using waits-for graph analysis.
 //!
-//! Port of deadlock detection logic from `com.sleepycat.je.txn.LockManager`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,7 +25,6 @@ use std::collections::{HashMap, HashSet};
 /// When T3 requests lock A, the detector finds:
 /// T3 -> T1 -> T2 -> T3 (cycle detected!)
 ///
-/// Port of deadlock detection logic from `com.sleepycat.je.txn.LockManager`.
 pub struct DeadlockDetector;
 
 impl DeadlockDetector {
@@ -88,7 +86,7 @@ impl DeadlockDetector {
 
     /// Selects the deadlock victim from a cycle.
     ///
-    /// JE's algorithm (ported from `LockManager.java selectVictim()`):
+    /// algorithm:
     ///
     /// 1. Select the locker with the **fewest locks held**.  A transaction
     ///    with fewer locks has done less work, so aborting it wastes less.
@@ -97,7 +95,7 @@ impl DeadlockDetector {
     ///    created = youngest.  Aborting the youngest preserves the most
     ///    accumulated work in the system.
     ///
-    /// Port of `LockManager.selectVictim()` in JE:
+    /// `LockManager.selectVictim()`:
     /// `victim = locker with min(n_owners), ties broken by max(locker_id)`.
     ///
     /// # Arguments

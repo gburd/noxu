@@ -10,10 +10,8 @@
 //! `futex_wait` to avoid syscall overhead under low contention.
 //!
 //! Additional fields:
-//!   `waiters: AtomicUsize` — count of threads blocked in futex_wait,
-//!     matching JE's `LatchImpl.getNWaiters()` / `ReentrantLock.getQueueLength()`.
-//!   `owner: AtomicU64`  — hash of the owning thread's ID,
-//!     matching JE's `LatchImpl.getOwner()`.
+//!   `waiters: AtomicUsize` — count of threads blocked in futex_wait.
+//!   `owner: AtomicU64`  — hash of the owning thread's ID.
 
 use crate::futex::{futex_wait, futex_wake};
 use lock_api;
@@ -219,16 +217,12 @@ impl NoxuRawMutex {
     }
 
     /// Returns the number of threads currently waiting to acquire this mutex.
-    ///
-    /// Matches JE's `LatchImpl.getNWaiters()` / `ReentrantLock.getQueueLength()`.
     #[inline]
     pub fn get_n_waiters(&self) -> usize {
         self.waiters.load(Ordering::Relaxed)
     }
 
     /// Returns the thread-ID hash of the current owner, or 0 if unlocked.
-    ///
-    /// Matches JE's `LatchImpl.getOwner()`.
     #[inline]
     pub fn get_owner(&self) -> u64 {
         self.owner.load(Ordering::Relaxed)

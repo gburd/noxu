@@ -1,6 +1,5 @@
 //! RollbackStart log entry.
 //!
-//! Port of `com.sleepycat.je.txn.RollbackStart`.
 //!
 //! Written at the start of a replay (HA) rollback to mark the beginning of
 //! the recovery period. Contains the LSN of the start of the transaction being

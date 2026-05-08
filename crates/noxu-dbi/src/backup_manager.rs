@@ -1,6 +1,5 @@
 //! Automatic backup manager.
 //!
-//! Port of `com.sleepycat.je.dbi.BackupManager` from the Oracle NoSQL JE fork.
 //!
 //! # Overview
 //!
@@ -9,7 +8,7 @@
 //! a replica filesystem). It runs according to a cron-style schedule and uses
 //! a snapshot manifest to determine which files are new since the last backup.
 //!
-//! ## Algorithm (mirrors JE's BackupManager)
+//! ## Algorithm (mirrors BackupManager)
 //!
 //! 1. On wakeup, read the current log file list via `FileManager`.
 //! 2. Compare against the last `SnapshotManifest` to find new/changed files.
@@ -17,7 +16,6 @@
 //! 4. Write a new manifest recording the set of files included in this backup.
 //! 5. Sleep until the next scheduled wakeup.
 //!
-//! Port of `com.sleepycat.je.dbi.BackupManager`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +28,7 @@ pub const DEFAULT_BACKUP_INTERVAL_SEC: u64 = 60;
 
 /// Destination for backup file copies.
 ///
-/// Port of `com.sleepycat.je.BackupArchiveLocation` / `BackupFileLocation`.
+/// / `BackupFileLocation`.
 #[derive(Debug, Clone)]
 pub struct BackupDestination {
     /// Local path to the backup directory.
@@ -39,7 +37,7 @@ pub struct BackupDestination {
 
 /// Manages automatic periodic backup of closed log files.
 ///
-/// Port of `com.sleepycat.je.dbi.BackupManager`.
+/// 
 pub struct BackupManager {
     /// Whether the backup manager is currently running.
     active: bool,
@@ -56,7 +54,7 @@ pub struct BackupManager {
 impl BackupManager {
     /// Creates a new (stopped) BackupManager.
     ///
-    /// Port of `BackupManager(EnvironmentImpl envImpl)`.
+    /// 
     pub fn new() -> Self {
         BackupManager {
             active: false,
@@ -69,7 +67,7 @@ impl BackupManager {
 
     /// Starts the background backup thread.
     ///
-    /// Port of `StoppableThread.start()`.
+    /// 
     pub fn start(&mut self, _destination: BackupDestination) {
         let shutdown = Arc::clone(&self.shutdown);
 
@@ -77,7 +75,6 @@ impl BackupManager {
             .name("noxu-backup-manager".to_string())
             .spawn(move || {
                 while !shutdown.load(Ordering::Relaxed) {
-                    // Port of BackupManager.run():
                     //   1. Obtain a list of closed log files from FileManager.
                     //   2. Determine new files since last SnapshotManifest.
                     //   3. Copy new files to destination.path using BackupFileCopy.
@@ -99,28 +96,28 @@ impl BackupManager {
 
     /// Returns whether the backup manager is running.
     ///
-    /// Port of `BackupManager.isRunning()`.
+    /// 
     pub fn is_running(&self) -> bool {
         self.active
     }
 
     /// Returns the number of files copied in the last run.
     ///
-    /// Port of `BackupManager` stat: `BACKUP_COPY_FILES_COUNT`.
+    /// Stat: `BACKUP_COPY_FILES_COUNT`.
     pub fn n_files_copied(&self) -> u32 {
         self.n_files_copied
     }
 
     /// Returns the elapsed time of the last backup run in milliseconds.
     ///
-    /// Port of `BackupManager` stat: `BACKUP_COPY_FILES_MS`.
+    /// Stat: `BACKUP_COPY_FILES_MS`.
     pub fn last_backup_ms(&self) -> u64 {
         self.last_backup_ms
     }
 
     /// Shuts down the background thread.
     ///
-    /// Port of `StoppableThread.shutdownThread()`.
+    /// 
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {

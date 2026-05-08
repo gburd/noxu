@@ -1,6 +1,6 @@
 //! Per-database-per-file utilization counters.
 //!
-//! Port of `com.sleepycat.je.cleaner.DbFileSummary` - the DatabaseImpl stores a
+//! the DatabaseImpl stores a
 //! persistent map of file number to DbFileSummary.
 
 /// Per-database-per-file utilization counters.

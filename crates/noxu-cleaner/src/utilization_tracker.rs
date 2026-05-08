@@ -1,6 +1,6 @@
 //! In-memory utilization tracking.
 //!
-//! Port of `com.sleepycat.je.cleaner.BaseUtilizationTracker` and `UtilizationTracker` -
+//! Base and per-file utilization tracking for log space accounting.
 //! tracks per-file utilization changes in memory between checkpoints.
 
 use crate::tracked_file_summary::TrackedFileSummary;

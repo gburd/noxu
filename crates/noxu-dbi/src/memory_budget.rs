@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// Centralizes all memory calculations. Objects that need memory
 /// should get settings from this class.
 ///
-/// Port of `com.sleepycat.je.dbi.MemoryBudget`.
+/// 
 pub struct MemoryBudget {
     /// Maximum cache size in bytes.
     max_memory: i64,
@@ -19,7 +19,7 @@ pub struct MemoryBudget {
     log_buffer_budget: i64,
 }
 
-/// Estimated object overheads in bytes (Rust equivalents of JE constants).
+/// Estimated object overheads in bytes (Rust equivalents of constants).
 /// These are approximate sizes used for memory accounting.
 pub struct MemoryOverhead;
 
@@ -49,7 +49,7 @@ impl MemoryOverhead {
 impl MemoryBudget {
     /// Creates a new MemoryBudget with the given max cache size.
     pub fn new(max_memory: i64) -> Self {
-        // Reserve 7% for log buffers (matching JE default)
+        // Reserve 7% for log buffers (matching default)
         let log_buffer_budget = max_memory * 7 / 100;
 
         MemoryBudget {

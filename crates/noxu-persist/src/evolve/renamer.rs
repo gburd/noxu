@@ -1,6 +1,5 @@
 //! Renamer mutation for schema evolution.
 //!
-//! Port of `com.sleepycat.persist.evolve.Renamer`.
 
 use super::mutation::MutationKey;
 
@@ -22,7 +21,7 @@ use super::mutation::MutationKey;
 /// let field_renamer = Renamer::for_field("my.package.Human", 0, "name", "fullName");
 /// ```
 ///
-/// Port of `com.sleepycat.persist.evolve.Renamer`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Renamer {
     key: MutationKey,
@@ -32,7 +31,7 @@ pub struct Renamer {
 impl Renamer {
     /// Creates a mutation for renaming the class itself.
     ///
-    /// Port of `Renamer(String fromClass, int fromVersion, String toClass)`.
+    /// 
     ///
     /// # Arguments
     /// * `from_class` - Fully-qualified name of the class being renamed.
@@ -51,7 +50,7 @@ impl Renamer {
 
     /// Creates a mutation for renaming a field within a class.
     ///
-    /// Port of `Renamer(String declaringClass, int declaringClassVersion,
+    /// `Renamer(String declaringClass, int declaringClassVersion,
     ///                   String fromField, String toField)`.
     ///
     /// # Arguments
@@ -78,7 +77,7 @@ impl Renamer {
 
     /// Returns the new class or field name.
     ///
-    /// Port of `Renamer.getNewName()`.
+    /// 
     pub fn new_name(&self) -> &str {
         &self.new_name
     }

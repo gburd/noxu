@@ -1,10 +1,9 @@
 //! Database configuration.
 //!
-//! Port of `com.sleepycat.je.DatabaseConfig`.
 
 /// Configuration for a database.
 ///
-/// Port of `com.sleepycat.je.DatabaseConfig`.
+/// 
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     /// Allow database creation if it doesn't exist.
@@ -23,7 +22,7 @@ pub struct DatabaseConfig {
     pub node_max_entries: i32,
     /// Deferred write: skip WAL logging; flush only at eviction/checkpoint.
     ///
-    /// Port of `DatabaseConfig.setDeferredWrite(true)` in JE.
+    /// 
     pub deferred_write: bool,
 }
 

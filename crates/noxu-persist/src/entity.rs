@@ -1,7 +1,6 @@
 //! Entity and key traits for the persistence layer.
 //!
-//! Port of `@Entity`, `@PrimaryKey`, and `@Persistent` annotations from
-//! `com.sleepycat.persist.model`. In Rust, these are expressed as traits
+//! Model`. In Rust, these are expressed as traits
 //! that users implement for their types. Derive macros can be added later
 //! in a separate proc-macro crate.
 
@@ -9,11 +8,11 @@ use crate::error::{PersistError, Result};
 
 /// Trait for types that can be stored as entities in the persistence layer.
 ///
-/// This is the Rust equivalent of JE's `@Entity` annotation. Types implementing
+/// This is the Rust equivalent of `@Entity` annotation. Types implementing
 /// this trait can be stored in and retrieved from an `EntityStore` via a
 /// `PrimaryIndex`.
 ///
-/// Port of `com.sleepycat.persist.model.Entity`.
+/// 
 ///
 /// # Example
 ///
@@ -52,11 +51,11 @@ pub trait Entity: Sized {
 
 /// Trait for types that can serve as primary keys.
 ///
-/// This is the Rust equivalent of JE's `@PrimaryKey` annotation. Primary key
+/// This is the Rust equivalent of `@PrimaryKey` annotation. Primary key
 /// types must be serializable to and from bytes, and must support equality
 /// comparison and hashing for use in indexes.
 ///
-/// Port of `com.sleepycat.persist.model.PrimaryKey`.
+/// 
 pub trait PrimaryKey: Clone + Eq + std::hash::Hash {
     /// Encodes this key to a byte vector.
     fn to_bytes(&self) -> Vec<u8>;

@@ -1,6 +1,5 @@
 //! Replication node types.
 //!
-//! Port of `com.sleepycat.je.rep.NodeType`.
 
 /// The type of a node within a replication group.
 ///

@@ -1,6 +1,5 @@
 //! Tracking information for cleaner and log management.
 //!
-//! Port of `com.sleepycat.je.tree.TrackingInfo` from JE.
 
 use noxu_util::Lsn;
 

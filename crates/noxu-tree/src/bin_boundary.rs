@@ -1,6 +1,5 @@
 //! BIN boundary key tracking.
 //!
-//! Port of `com.sleepycat.je.tree.BINBoundary` from JE.
 //!
 //! Identifies a BIN boundary by tracking the key(s) that define the boundary
 //! between adjacent BINs in the tree.

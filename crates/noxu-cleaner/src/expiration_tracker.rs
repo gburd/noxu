@@ -1,6 +1,6 @@
 //! TTL expiration tracking for log files.
 //!
-//! Port of `ExpirationTracker.java` - tracks expired bytes in time windows
+//! tracks expired bytes in time windows
 //! (histogram) for each log file, used to calculate expired data during cleaning.
 
 use std::collections::HashMap;

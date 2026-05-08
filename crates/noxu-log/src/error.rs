@@ -1,6 +1,5 @@
 //! Error types for the log layer.
 //!
-//! Port of error handling from `com.sleepycat.je.log` and related packages.
 
 use std::io;
 use thiserror::Error;

@@ -1,6 +1,5 @@
 //! Log entry types and traits.
 //!
-//! Port of `com.sleepycat.je.log.entry` package.
 //!
 //! Each log entry in the WAL consists of a header (managed by the log manager)
 //! followed by entry-specific data. This module defines the types for various

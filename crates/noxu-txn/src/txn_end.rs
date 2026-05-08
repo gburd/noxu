@@ -1,13 +1,12 @@
 //! Base type for transaction end log entries (commit/abort).
 //!
-//! Port of `com.sleepycat.je.txn.TxnEnd`.
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io;
 
 /// Base type for transaction end log entries (commit/abort).
 ///
-/// Port of `com.sleepycat.je.txn.TxnEnd`.
+/// 
 #[derive(Debug, Clone)]
 pub struct TxnEnd {
     /// Transaction ID.

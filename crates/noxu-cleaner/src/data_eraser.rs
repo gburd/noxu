@@ -1,6 +1,5 @@
 //! Background thread for erasing obsolete user data from disk.
 //!
-//! Port of `com.sleepycat.je.cleaner.DataEraser` from the Oracle NoSQL JE fork.
 //!
 //! # Overview
 //!
@@ -9,7 +8,7 @@
 //! from normal log cleaning, which simply marks log file space as obsolete:
 //! `DataEraser` ensures that sensitive user data is unrecoverable from disk.
 //!
-//! ## Algorithm (mirrors JE's `DataEraser`)
+//! ## Algorithm (mirrors `DataEraser`)
 //!
 //! 1. The cleaner marks an LN entry as "erased" by writing an
 //!    `ErasedLogEntry` (zero-length payload) at the slot's log position.
@@ -19,7 +18,6 @@
 //!    of the original LN entry with zeroes using pwrite64.
 //! 4. After erasure the position is removed from the queue.
 //!
-//! Port of `com.sleepycat.je.cleaner.DataEraser`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +26,7 @@ use std::time::Duration;
 
 /// Interval between DataEraser wakeups.
 ///
-/// Port of JE `DataEraser` sleep interval (configurable via `EnvironmentConfig`).
+/// `DataEraser` sleep interval (configurable via `EnvironmentConfig`).
 pub const DEFAULT_ERASER_INTERVAL_MS: u64 = 1_000;
 
 /// Queue entry representing a disk region to be erased.
@@ -44,7 +42,7 @@ pub struct EraseRequest {
 
 /// Background thread that physically erases obsolete data from log files.
 ///
-/// Port of `com.sleepycat.je.cleaner.DataEraser`.
+/// 
 pub struct DataEraser {
     /// Shared queue of erasure requests produced by the cleaner.
     queue: Arc<Mutex<Vec<EraseRequest>>>,
@@ -61,7 +59,7 @@ impl DataEraser {
     ///
     /// Call [`start`] to launch the background thread.
     ///
-    /// Port of `DataEraser(EnvironmentImpl envImpl)` constructor.
+    /// Constructor.
     pub fn new() -> Self {
         DataEraser {
             queue: Arc::new(Mutex::new(Vec::new())),
@@ -73,7 +71,7 @@ impl DataEraser {
 
     /// Starts the background erasure thread.
     ///
-    /// Port of `StoppableThread.start()`.
+    /// 
     pub fn start(&mut self) {
         let queue = Arc::clone(&self.queue);
         let shutdown = Arc::clone(&self.shutdown);
@@ -89,7 +87,6 @@ impl DataEraser {
                     };
 
                     for _req in requests {
-                        // Port of DataEraser.eraseData():
                         // Open log file req.file_number, seek to req.file_offset,
                         // write req.byte_count zero bytes via pwrite64.
                         // File path: env_home / format!("{:08x}.ndb", file_number)
@@ -113,7 +110,7 @@ impl DataEraser {
     ///
     /// Called by the cleaner when it marks an LN entry as erased.
     ///
-    /// Port of `DataEraser.eraseData(long fileNumber, long fileOffset, int size)`.
+    /// 
     pub fn enqueue_erase(&self, request: EraseRequest) {
         if self.active {
             self.queue.lock().unwrap().push(request);
@@ -132,7 +129,7 @@ impl DataEraser {
 
     /// Shuts down the background thread.
     ///
-    /// Port of `StoppableThread.shutdownThread()`.
+    /// 
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {

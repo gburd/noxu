@@ -1,6 +1,5 @@
 //! Background daemon for periodic log flushing.
 //!
-//! Port of `com.sleepycat.je.log.LogFlusher`.
 //!
 //! Flushes the log buffers (and write queue) periodically to disk and to the
 //! file system, as specified by configuration parameters.
@@ -13,7 +12,7 @@ use std::time::Duration;
 
 /// Background daemon that periodically flushes log buffers.
 ///
-/// Port of `com.sleepycat.je.log.LogFlusher`.
+/// 
 pub struct LogFlusher {
     /// The flush daemon thread (with fsync).
     flush_sync_daemon: Option<DaemonThread>,

@@ -1,4 +1,4 @@
-//! Port of JE CollectionTest, ForeignKeyTest, NullValueTest, and TestSR15721.
+//! CollectionTest, ForeignKeyTest, NullValueTest, and TestSR15721.
 //!
 //! Reference:
 //!   _/je/test/com/sleepycat/collections/test/CollectionTest.java

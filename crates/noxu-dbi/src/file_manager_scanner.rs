@@ -4,7 +4,7 @@
 //! that `RecoveryManager::recover()` can be called during `Environment::open()`
 //! on an existing database directory.
 //!
-//! Port of `LastFileReader` / `INFileReader` / `LNFileReader` usage in
+//! Log file scanning utilities.
 //! `RecoveryManager.recover()`.
 
 use std::sync::Arc;
@@ -439,7 +439,7 @@ impl LogScanner for FileManagerLogScanner {
     /// Used during the undo phase to fetch the before-image of a
     /// disk-resident LN at its `abort_lsn`.
     ///
-    /// Port of `RecoveryManager.undo()` → `fetchTarget(...)` in JE.
+    /// → `fetchTarget(...)`.
     fn read_at_lsn(&self, target_lsn: Lsn) -> Option<LogEntry> {
         if target_lsn == NULL_LSN {
             return None;

@@ -1,6 +1,5 @@
 //! NameLN log entry for database operations.
 //!
-//! Port of `com.sleepycat.je.log.entry.NameLNLogEntry`.
 //!
 //! NameLNLogEntry extends the regular LNLogEntry with additional information
 //! about database operations (create, remove, truncate, rename, update config).
@@ -39,7 +38,7 @@ pub enum NameLnLogEntryError {
 ///
 /// The `replicated_create_config` field carries a length-prefixed byte
 /// serialization of the database configuration (4-byte big-endian length
-/// prefix + raw bytes), mirroring JE's `NameLNLogEntry.writeEntry()` /
+/// prefix + raw bytes), mirroring `NameLNLogEntry.writeEntry()` /
 /// `readEntry()` which writes `replicatedCreateConfig` via
 /// `LogUtils.writeByteArray`.  Callers pass a pre-serialized `DatabaseConfig`
 /// byte representation.

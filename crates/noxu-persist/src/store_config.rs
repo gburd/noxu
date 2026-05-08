@@ -1,6 +1,5 @@
 //! Entity store configuration.
 //!
-//! Port of `com.sleepycat.persist.StoreConfig`.
 
 /// Configuration for an `EntityStore`.
 ///
@@ -8,7 +7,7 @@
 /// creation of new databases and whether the store operates in read-only
 /// or transactional mode.
 ///
-/// Port of `com.sleepycat.persist.StoreConfig`.
+/// 
 ///
 /// # Example
 ///

@@ -1,6 +1,5 @@
 //! Tree search result structure.
 //!
-//! Port of `com.sleepycat.je.tree.SearchResult` from JE.
 //!
 //! Returned by tree search operations to indicate the result of a search
 //! and the location where a key was found (or should be inserted).

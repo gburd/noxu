@@ -1,6 +1,5 @@
 //! FileSummaryLN  -  Leaf Node for per-file utilization tracking.
 //!
-//! Port of `com.sleepycat.je.tree.FileSummaryLN`.
 //!
 //! A FileSummaryLN stores utilization information for a single log file.
 //! This data is used by the cleaner to determine which log files have
