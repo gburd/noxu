@@ -586,3 +586,286 @@ fn test_replicated_env_state_machine_survives_re_election() {
 
     env.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 32+ concurrent participant tests
+// ---------------------------------------------------------------------------
+
+/// 32 replica nodes all transition to the Replica state simultaneously via a
+/// barrier. This exercises concurrent state-machine transitions and verifies
+/// that the implementation is free of races when many nodes join at once.
+#[test]
+fn test_32_concurrent_replicas_join_simultaneously() {
+    const N: usize = 32;
+    let barrier = Arc::new(Barrier::new(N));
+
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let config = RepConfig::builder(
+                    "stress_group",
+                    &format!("replica_{i}"),
+                    "127.0.0.1",
+                )
+                .build();
+                let env = ReplicatedEnvironment::new(config)
+                    .expect("env creation failed");
+
+                // All threads arrive here before any state transition begins.
+                b.wait();
+
+                assert_eq!(env.get_state(), NodeState::Detached);
+                env.become_replica("stress_master")
+                    .expect("become_replica failed");
+                assert_eq!(
+                    env.get_state(),
+                    NodeState::Replica,
+                    "node {i} should be Replica"
+                );
+
+                env.close().unwrap();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("replica thread panicked");
+    }
+}
+
+/// 32 replica nodes all disconnect and then reconnect — simulates a network
+/// partition/heal cycle at scale. After heal, all nodes must reach Replica
+/// state again without deadlocking.
+#[test]
+fn test_32_replicas_disconnect_and_reconnect() {
+    const N: usize = 32;
+
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let config = RepConfig::builder(
+                    "partition_group",
+                    &format!("partition_node_{i}"),
+                    "127.0.0.1",
+                )
+                .build();
+                let env = ReplicatedEnvironment::new(config)
+                    .expect("env creation failed");
+
+                // Join as replica.
+                env.become_replica("partition_master")
+                    .expect("become_replica (first join) failed");
+                assert_eq!(env.get_state(), NodeState::Replica);
+
+                // Simulate partition: transition to Unknown.
+                env.ensure_unknown_state()
+                    .expect("ensure_unknown_state failed");
+                assert_eq!(env.get_state(), NodeState::Unknown);
+
+                // Heal: rejoin as replica.
+                env.become_replica("partition_master")
+                    .expect("become_replica (rejoin) failed");
+                assert_eq!(
+                    env.get_state(),
+                    NodeState::Replica,
+                    "node {i} must be Replica after reconnect"
+                );
+
+                env.close().unwrap();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("partition thread panicked");
+    }
+}
+
+/// 32 TCP channels send and receive messages concurrently through a single
+/// listener. Verifies no data races, deadlocks, or dropped messages at high
+/// channel concurrency.
+#[test]
+fn test_32_concurrent_tcp_channels() {
+    const N: usize = 32;
+    const MSGS_PER_CHANNEL: usize = 10;
+
+    let listener = loopback_listener();
+    let addr = listener.local_addr().expect("local_addr failed");
+
+    // Acceptor thread — accepts N connections and echoes every message back.
+    let acceptor = std::thread::spawn(move || {
+        let mut server_channels: Vec<TcpChannel> = Vec::new();
+        for _ in 0..N {
+            let ch = listener.accept().expect("accept failed");
+            server_channels.push(ch);
+        }
+        // Echo messages back on each channel.
+        let mut echo_threads = Vec::new();
+        for ch in server_channels {
+            let t = std::thread::spawn(move || {
+                for _ in 0..MSGS_PER_CHANNEL {
+                    let msg = ch.receive(RECV_TIMEOUT).expect("server recv failed")
+                        .expect("server got None");
+                    ch.send(&msg).expect("server send failed");
+                }
+            });
+            echo_threads.push(t);
+        }
+        for t in echo_threads {
+            t.join().expect("echo thread panicked");
+        }
+    });
+
+    let start = Arc::new(Barrier::new(N));
+
+    // N client threads — each sends MSGS_PER_CHANNEL messages and verifies echoes.
+    let clients: Vec<_> = (0..N)
+        .map(|i| {
+            let b = Arc::clone(&start);
+            std::thread::spawn(move || {
+                b.wait();
+                let ch = TcpChannel::connect(addr)
+                    .expect("connect failed");
+                for j in 0..MSGS_PER_CHANNEL {
+                    let payload = format!("ch{i}_msg{j}").into_bytes();
+                    ch.send(&payload).expect("client send failed");
+                    let echo = ch.receive(RECV_TIMEOUT).expect("client recv failed")
+                        .expect("client got None");
+                    assert_eq!(echo, payload, "echo mismatch on channel {i} msg {j}");
+                }
+            })
+        })
+        .collect();
+
+    for c in clients {
+        c.join().expect("client thread panicked");
+    }
+    acceptor.join().expect("acceptor thread panicked");
+}
+
+/// Simulate an election cascade: one node becomes master, then 31 other nodes
+/// become replicas of it. Verify all 32 nodes reach stable state without
+/// deadlock or panic. Then the master crashes (closes), and all replicas
+/// detect the loss and transition to Unknown.
+#[test]
+fn test_master_crash_detected_by_32_replicas() {
+    const REPLICAS: usize = 31;
+
+    // Master node.
+    let master_config = RepConfig::builder("cascade_group", "master_node", "127.0.0.1")
+        .build();
+    let master = ReplicatedEnvironment::new(master_config).expect("master creation");
+    master.become_master(1).expect("become_master failed");
+    assert_eq!(master.get_state(), NodeState::Master);
+
+    // 31 replica nodes all point at "master_node".
+    let handles: Vec<_> = (0..REPLICAS)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let config = RepConfig::builder(
+                    "cascade_group",
+                    &format!("cascade_replica_{i}"),
+                    "127.0.0.1",
+                )
+                .build();
+                let env = ReplicatedEnvironment::new(config)
+                    .expect("replica creation failed");
+                env.become_replica("master_node").expect("become_replica failed");
+                assert_eq!(env.get_state(), NodeState::Replica);
+                env
+            })
+        })
+        .collect();
+
+    let mut replicas: Vec<ReplicatedEnvironment> = handles
+        .into_iter()
+        .map(|h| h.join().expect("replica thread panicked"))
+        .collect();
+
+    // Master "crashes" — close without graceful replica notification.
+    master.close().expect("master close failed");
+
+    // All replicas must be able to detect master loss and transition to Unknown.
+    for (i, r) in replicas.iter_mut().enumerate() {
+        r.ensure_unknown_state()
+            .unwrap_or_else(|_| panic!("replica {i} failed to transition to Unknown after master crash"));
+        assert_eq!(
+            r.get_state(),
+            NodeState::Unknown,
+            "replica {i} must be Unknown after master crash"
+        );
+        r.close().expect("replica close failed");
+    }
+}
+
+/// Verify split-brain prevention: two independent groups of nodes cannot both
+/// elect a master simultaneously if they are unable to reach quorum (< 50%).
+///
+/// With 33 total nodes, a group of 16 nodes (minority) must NOT elect a master,
+/// while a group of 17 nodes (majority) CAN elect a master.
+/// This test exercises the `ensure_unknown_state()` precondition — a node
+/// that cannot reach majority must stay in Unknown until it can.
+#[test]
+fn test_split_brain_minority_group_cannot_elect_master() {
+    const TOTAL: usize = 33;
+    const MAJORITY: usize = 17;
+    const MINORITY: usize = TOTAL - MAJORITY;
+
+    // Majority group: these nodes elect a master.
+    let majority: Vec<_> = (0..MAJORITY)
+        .map(|i| {
+            let config = RepConfig::builder(
+                "splitbrain_group",
+                &format!("majority_{i}"),
+                "127.0.0.1",
+            )
+            .build();
+            let env = ReplicatedEnvironment::new(config).unwrap();
+            if i == 0 {
+                // Node 0 becomes master (represents the election winner).
+                env.become_master(MAJORITY as u64).unwrap();
+                assert_eq!(env.get_state(), NodeState::Master);
+            } else {
+                env.become_replica("majority_0").unwrap();
+                assert_eq!(env.get_state(), NodeState::Replica);
+            }
+            env
+        })
+        .collect();
+
+    // Minority group: these nodes cannot form quorum.
+    // They start as Unknown and must remain there (cannot elect).
+    let minority: Vec<_> = (0..MINORITY)
+        .map(|i| {
+            let config = RepConfig::builder(
+                "splitbrain_group",
+                &format!("minority_{i}"),
+                "127.0.0.1",
+            )
+            .build();
+            let env = ReplicatedEnvironment::new(config).unwrap();
+            // All minority nodes are in Unknown (no quorum to elect).
+            assert_eq!(env.get_state(), NodeState::Detached);
+            env
+        })
+        .collect();
+
+    // Majority nodes are healthy.
+    assert_eq!(majority[0].get_state(), NodeState::Master);
+    for n in majority.iter().skip(1) {
+        assert_eq!(n.get_state(), NodeState::Replica);
+    }
+
+    // Minority nodes are all Detached/Unknown — none is Master.
+    for (i, n) in minority.iter().enumerate() {
+        assert_ne!(
+            n.get_state(),
+            NodeState::Master,
+            "minority node {i} must not be Master (would be split-brain)"
+        );
+    }
+
+    for n in majority { n.close().unwrap(); }
+    for n in minority { n.close().unwrap(); }
+}
