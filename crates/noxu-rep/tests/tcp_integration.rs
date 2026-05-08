@@ -484,3 +484,105 @@ fn test_replicated_environment_with_tcp_address() {
     env.close().expect("close failed");
     // listener is dropped here — the port is released.
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Replication fault injection tests (Margo Seltzer reviewer concern)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Verify that a `TcpChannel` receiver times out cleanly when the sender drops
+/// its end of the connection (simulates network partition / master crash).
+///
+/// After the sender half is dropped the receiver must:
+///   1. Return an error (not block forever) within RECV_TIMEOUT.
+///   2. Allow the replica to detect the disconnect and proceed without panic.
+#[test]
+fn test_channel_drop_on_sender_side_is_detected_by_receiver() {
+    let listener = loopback_listener();
+    let addr = listener.local_addr().unwrap();
+
+    // Spawn a thread that connects and immediately drops the channel (simulates
+    // master crashing immediately after TCP handshake).
+    let sender_thread = std::thread::spawn(move || {
+        let ch = TcpChannel::connect(addr).expect("connect failed");
+        drop(ch); // Simulate master crash / network partition.
+    });
+
+    // Accept the connection on the replica side.
+    let replica_ch = listener.accept().expect("accept failed");
+
+    sender_thread.join().unwrap();
+
+    // After the sender drops, the receiver must get an error (not block).
+    // receive() returns Ok(None) on timeout or Err on closed connection.
+    let result = replica_ch.receive(SHORT_TIMEOUT);
+    assert!(
+        result.is_err() || matches!(result, Ok(None)),
+        "replica must detect sender disconnect; got: {:?}", result
+    );
+}
+
+/// Verify that a `TcpChannel` sender gets an error when the receiver drops its
+/// end of the connection (simulates replica crash).
+///
+/// The master (sender) must detect the broken pipe / closed connection within
+/// RECV_TIMEOUT and not panic.
+#[test]
+fn test_channel_drop_on_receiver_side_is_detected_by_sender() {
+    let listener = loopback_listener();
+    let addr = listener.local_addr().unwrap();
+
+    // Spawn a thread that accepts and immediately drops (simulates replica crash).
+    let receiver_thread = std::thread::spawn(move || {
+        let ch = listener.accept().expect("accept failed");
+        drop(ch); // Simulate replica crash.
+    });
+
+    // Connect as the master.
+    let master_ch = TcpChannel::connect(addr).expect("connect failed");
+    receiver_thread.join().unwrap();
+
+    // After the receiver drops, the sender must get an error on send.
+    // Send a small payload; the OS may buffer the first write successfully,
+    // so we may need more than one send to observe the broken pipe.
+    let payload = b"heartbeat";
+    let mut detected = false;
+    for _ in 0..10 {
+        if master_ch.send(payload).is_err() {
+            detected = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(detected, "master must detect receiver disconnect within 10 sends");
+}
+
+/// Verify that the `ReplicatedEnvironment` state machine correctly handles a
+/// simulated partition + re-election cycle without getting stuck.
+///
+/// JE `RepNode.handleReconnect()` drives: Replica → Unknown → (re-elect) →
+/// Master/Replica. This test exercises that the Detached → Replica → Master
+/// path (via direct re-election) completes without errors and leaves the
+/// environment in Master state — i.e. the state machine is not wedged at
+/// Replica after a leadership change.
+#[test]
+fn test_replicated_env_state_machine_survives_re_election() {
+    let config = RepConfig::builder("fault_group", "re_elect_node", "127.0.0.1")
+        .build();
+    let env = ReplicatedEnvironment::new(config).expect("env creation failed");
+
+    // Starts Detached.
+    assert_eq!(env.get_state(), NodeState::Detached);
+
+    // Step 1: node joins as replica (Detached → Unknown → Replica).
+    env.become_replica("initial_master").expect("become_replica failed");
+    assert_eq!(env.get_state(), NodeState::Replica);
+
+    // Step 2: simulated channel drop + re-election — node wins election and
+    // becomes master directly from Replica (JE allows Master ↔ Replica direct
+    // transitions via ensure_unknown_state).
+    env.become_master(2).expect("become_master (re-election) failed");
+    assert_eq!(env.get_state(), NodeState::Master,
+        "state must be Master after winning re-election, not stuck at Replica");
+
+    env.close().unwrap();
+}

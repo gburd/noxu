@@ -1245,6 +1245,39 @@ impl Tree {
         self.database_id
     }
 
+    /// Count the total number of live (non-deleted) entries across all BINs.
+    ///
+    /// Used by `DatabaseImpl::set_recovered_tree()` to initialise the
+    /// per-database `entry_count` AtomicU64 after recovery replays the log.
+    pub fn count_entries(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(root) = self.get_root() {
+            Self::count_entries_recursive(&root, &mut total);
+        }
+        total
+    }
+
+    fn count_entries_recursive(node_arc: &Arc<RwLock<TreeNode>>, total: &mut u64) {
+        let guard = match node_arc.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match &*guard {
+            TreeNode::Bottom(b) => {
+                // Count only live (non-known_deleted) entries.
+                *total += b.entries.iter().filter(|e| !e.known_deleted).count() as u64;
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                for child in children {
+                    Self::count_entries_recursive(&child, total);
+                }
+            }
+        }
+    }
+
     /// Release a parent node latch after capturing the child Arc pointer.
     ///
     /// Implements JE's hand-over-hand (latch-coupling) protocol:
@@ -6591,7 +6624,7 @@ mod tests {
 
         // Pre-populate with 50 entries so the tree has multiple BINs.
         {
-            let mut t = tree.write().unwrap();
+            let t = tree.write().unwrap();
             for i in 0u32..50 {
                 let key = format!("{:08}", i).into_bytes();
                 t.insert(key, vec![i as u8], noxu_util::NULL_LSN).unwrap();
@@ -6627,7 +6660,7 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier_clone.wait();
-                let mut t = tree_clone.write().unwrap();
+                let t = tree_clone.write().unwrap();
                 for i in 50u32..100 {
                     let key = format!("{:08}", i).into_bytes();
                     t.insert(key, vec![i as u8], noxu_util::NULL_LSN).unwrap();
@@ -6662,7 +6695,7 @@ mod tests {
 
         let tree = Arc::new(std::sync::RwLock::new(Tree::new(1, 4)));
         {
-            let mut t = tree.write().unwrap();
+            let t = tree.write().unwrap();
             for i in 0u32..100 {
                 let key = format!("{:08}", i).into_bytes();
                 t.insert(key, vec![i as u8], noxu_util::NULL_LSN).unwrap();

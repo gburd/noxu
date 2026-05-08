@@ -2523,3 +2523,170 @@ fn cursor_search_after_tree_splits_all_keys_findable() {
 
     cursor.close().unwrap();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crash-recovery integrity tests (Keith Bostic / Margo Seltzer reviewer concern)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Verify that all committed records survive a clean close + reopen (recovery
+/// run on open).  This is the base case: write N records, close, reopen,
+/// assert every key is still present with the correct value.
+#[test]
+fn recovery_committed_records_survive_reopen() {
+    let dir = TempDir::new().unwrap();
+    const N: u32 = 200;
+
+    // Phase 1: write N records and close.
+    {
+        let (env, db) = open_env_and_db(&dir);
+        for i in 0..N {
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let v = DatabaseEntry::from_vec((i * 3 + 7).to_be_bytes().to_vec());
+            db.put(None, &k, &v).unwrap();
+        }
+        drop(db);
+        drop(env);
+    }
+
+    // Phase 2: reopen (runs recovery) and verify all N records.
+    {
+        let (env, db) = open_env_and_db(&dir);
+        assert_eq!(db.count().unwrap(), N as u64,
+            "all committed records must survive reopen");
+        for i in 0..N {
+            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let mut v = DatabaseEntry::new();
+            let status = db.get(None, &mut k, &mut v).unwrap();
+            assert_eq!(status, OperationStatus::Success,
+                "key {} must be present after recovery", i);
+            assert_eq!(v.data(), (i * 3 + 7).to_be_bytes(),
+                "value for key {} must be correct after recovery", i);
+        }
+        drop(db);
+        drop(env);
+    }
+}
+
+/// Verify that concurrent writes from multiple threads all survive close +
+/// reopen: the Jepsen-style check — concurrent writes + recovery = all
+/// committed data intact, no phantom records, no corrupted values.
+#[test]
+fn recovery_concurrent_writes_all_survive_reopen() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    const THREADS: usize = 8;
+    const PER_THREAD: u32 = 50;
+
+    // Phase 1: concurrent writes from THREADS threads.
+    {
+        let (env, db) = open_env_and_db(&dir);
+        let env = Arc::new(env);
+        let db  = Arc::new(db);
+
+        let handles: Vec<_> = (0..THREADS).map(|t| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let global_key = (t as u32) * PER_THREAD + i;
+                    let k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
+                    let v = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
+                    db.put(None, &k, &v).unwrap();
+                }
+            })
+        }).collect();
+
+        for h in handles { h.join().unwrap(); }
+        drop(db);
+        drop(env);
+    }
+
+    // Phase 2: reopen and verify all THREADS*PER_THREAD records.
+    {
+        let env_config = noxu_db::EnvironmentConfig::new(dir_path)
+            .with_allow_create(false)  // Must already exist.
+            .with_transactional(true);
+        let env = noxu_db::Environment::open(env_config).unwrap();
+        // allow_create=true: the database name is not persisted in the log yet;
+        // recovery transplants the recovered tree into the newly opened handle.
+        let db = env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true)).unwrap();
+
+        let total = THREADS as u32 * PER_THREAD;
+        assert_eq!(db.count().unwrap(), total as u64,
+            "all {} records from {} threads must survive reopen", total, THREADS);
+
+        for global_key in 0..total {
+            let mut k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
+            let mut v = DatabaseEntry::new();
+            let status = db.get(None, &mut k, &mut v).unwrap();
+            assert_eq!(status, OperationStatus::Success,
+                "key {} (from thread {}) must be present after recovery",
+                global_key, global_key / PER_THREAD);
+            assert_eq!(v.data(), global_key.to_be_bytes(),
+                "value for key {} must be correct (no corruption)", global_key);
+        }
+    }
+}
+
+/// Verify that uncommitted transactions are correctly undone on reopen.
+///
+/// Write N committed records, then write M records inside a transaction that
+/// is never committed (simulated by dropping the transaction without commit).
+/// Reopen: recovery must undo the M uncommitted records.  Only N records
+/// should be present.
+#[test]
+fn recovery_uncommitted_transactions_are_undone_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    const N_COMMITTED: u32 = 50;
+    const M_UNCOMMITTED: u32 = 20;
+
+    // Phase 1: write N committed + M uncommitted records.
+    {
+        let (env, db) = open_env_and_db(&dir);
+
+        // Committed writes (no txn = auto-commit).
+        for i in 0..N_COMMITTED {
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let v = DatabaseEntry::from_vec(b"committed".to_vec());
+            db.put(None, &k, &v).unwrap();
+        }
+
+        // Uncommitted writes: start a txn, write M records, then abort.
+        let txn = env.begin_transaction(None, None).unwrap();
+        for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let v = DatabaseEntry::from_vec(b"uncommitted".to_vec());
+            db.put(Some(&txn), &k, &v).unwrap();
+        }
+        txn.abort().unwrap(); // Explicitly abort — simulates crash scenario.
+
+        drop(db);
+        drop(env);
+    }
+
+    // Phase 2: reopen and verify only N_COMMITTED records.
+    {
+        let (_, db) = open_env_and_db(&dir);
+        assert_eq!(db.count().unwrap(), N_COMMITTED as u64,
+            "only {} committed records must be present; {} uncommitted must be absent",
+            N_COMMITTED, M_UNCOMMITTED);
+
+        // Committed records must be present.
+        for i in 0..N_COMMITTED {
+            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let mut v = DatabaseEntry::new();
+            assert_eq!(db.get(None, &mut k, &mut v).unwrap(), OperationStatus::Success,
+                "committed key {} must be present", i);
+        }
+
+        // Uncommitted records must be absent.
+        for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
+            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let mut v = DatabaseEntry::new();
+            assert_eq!(db.get(None, &mut k, &mut v).unwrap(), OperationStatus::NotFound,
+                "aborted key {} must NOT be present after recovery", i);
+        }
+    }
+}

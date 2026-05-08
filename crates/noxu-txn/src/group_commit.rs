@@ -25,7 +25,7 @@
 //! In non-replicated environments `TxnManager.group_commit` is `None` and
 //! transactions use the base `FSyncManager` path directly.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Maximum number of transactions to batch before forcing an fsync.
 ///
@@ -74,14 +74,27 @@ pub trait GroupCommit: Send + Sync {
 /// transactions are queued) before issuing a single fsync. After the fsync the
 /// queued transactions are acknowledged.
 ///
+/// ## Threshold semantics
+///
+/// `buffer_commit()` returns `false` (caller must fsync) every `max_count`
+/// calls — the count-based threshold.  The caller (`Txn::commit_with_durability`)
+/// treats a `false` return as a signal to call `LogManager::flush_sync()`,
+/// which then handles the time-based coalescing via `FSyncManager`.  This
+/// correctly separates concerns: GroupCommit enforces the batch-size policy;
+/// FSyncManager enforces the time-window and leader/waiter coalescing.
+///
 /// Port of `com.sleepycat.je.txn.GroupCommitMaster`.
 pub struct GroupCommitMaster {
     /// Whether group commit is currently active.
     enabled: AtomicBool,
     /// Maximum transactions per batch before forcing an fsync.
     max_count: usize,
-    /// Time window for batching in milliseconds.
+    /// Time window for batching in milliseconds (passed to FSyncManager).
     interval_ms: u64,
+    /// Running count of buffered commits since the last threshold flush.
+    pending_count: AtomicUsize,
+    /// Number of times the count threshold has fired (observable in tests).
+    flush_count: AtomicUsize,
 }
 
 impl GroupCommitMaster {
@@ -97,9 +110,22 @@ impl GroupCommitMaster {
             enabled: AtomicBool::new(max_count > 0),
             max_count,
             interval_ms,
+            pending_count: AtomicUsize::new(0),
+            flush_count: AtomicUsize::new(0),
         }
     }
 
+    /// Returns the batch window in milliseconds.
+    pub fn interval_ms(&self) -> u64 {
+        self.interval_ms
+    }
+
+    /// Returns the number of times the count threshold has fired.
+    ///
+    /// Used in tests to verify durability threshold enforcement.
+    pub fn flush_count(&self) -> usize {
+        self.flush_count.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for GroupCommitMaster {
@@ -113,23 +139,28 @@ impl GroupCommit for GroupCommitMaster {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// Buffer a commit and enforce the count-based threshold.
+    ///
+    /// Returns `false` (caller must fsync) on every `max_count`th call.
+    /// Returns `true` (commit is buffered, skip fsync) otherwise.
+    ///
+    /// Port of `GroupCommitMaster.bufferCommit()` count-threshold path.
+    /// The time-window threshold is handled by `FSyncManager` when the
+    /// caller proceeds to `LogManager::flush_sync()` on a `false` return.
     fn buffer_commit(&self, _commit_vlsn: i64) -> bool {
-        // Implementation delegates to the FSyncManager's group-commit path
-        // (base JE leader/waiter pattern) with the additional time+size
-        // threshold layered on top.
-        //
-        // Full port of GroupCommitMaster.bufferCommit():
-        //   1. Check canSkip() — if highestVLSNFsynced >= commitVLSN, ack and return.
-        //   2. If no fsync in progress, add txn to pendingBuffer.
-        //   3. If became leader: sleep groupCommitIntervalMs, then flushPendingAcks.
-        //   4. If not leader but buffer >= maxGroupCommit: force fsync via CAS.
-        //   5. Otherwise wait for in-progress fsync to complete.
-        //
-        // The actual fsync is issued via LogManager.flushSync() held in
-        // EnvironmentImpl. In the current single-node configuration the
-        // FSyncManager (noxu-log) handles leader/waiter coalescing and this
-        // method adds the time+size threshold layer.
-        true
+        if !self.enabled.load(Ordering::Relaxed) {
+            return false; // Disabled: caller must always fsync.
+        }
+        // Increment and check threshold.  fetch_add returns the value BEFORE
+        // the increment, so we compare against max_count - 1.
+        let prev = self.pending_count.fetch_add(1, Ordering::AcqRel);
+        if prev + 1 >= self.max_count {
+            // Threshold reached: reset counter and signal caller to fsync.
+            self.pending_count.store(0, Ordering::Release);
+            self.flush_count.fetch_add(1, Ordering::Relaxed);
+            return false; // Caller must call flush_sync().
+        }
+        true // Buffered: caller skips fsync.
     }
 
     fn shutdown(&self) {
@@ -207,9 +238,44 @@ mod tests {
     }
 
     #[test]
-    fn test_master_buffer_commit() {
-        let gc = GroupCommitMaster::default();
-        assert!(gc.buffer_commit(42));
+    fn test_master_buffer_commit_first_is_buffered() {
+        // First commit in a fresh batch is buffered (threshold not yet reached).
+        let gc = GroupCommitMaster::new(3, 20);
+        assert!(gc.buffer_commit(1), "first commit should be buffered");
+        assert_eq!(gc.flush_count(), 0);
+    }
+
+    #[test]
+    fn test_master_threshold_fires_at_max_count() {
+        // With max_count=3: commits 1 and 2 are buffered; commit 3 fires fsync.
+        let gc = GroupCommitMaster::new(3, 20);
+        assert!(gc.buffer_commit(1),  "commit 1 should be buffered");
+        assert!(gc.buffer_commit(2),  "commit 2 should be buffered");
+        assert!(!gc.buffer_commit(3), "commit 3 must trigger flush (threshold)");
+        assert_eq!(gc.flush_count(), 1, "exactly one flush should have fired");
+    }
+
+    #[test]
+    fn test_master_threshold_resets_after_flush() {
+        // After threshold fires, the counter resets and the cycle repeats.
+        let gc = GroupCommitMaster::new(3, 20);
+        assert!(gc.buffer_commit(1));
+        assert!(gc.buffer_commit(2));
+        assert!(!gc.buffer_commit(3)); // flush #1
+        // Next batch:
+        assert!(gc.buffer_commit(4));
+        assert!(gc.buffer_commit(5));
+        assert!(!gc.buffer_commit(6)); // flush #2
+        assert_eq!(gc.flush_count(), 2);
+    }
+
+    #[test]
+    fn test_master_disabled_always_flushes() {
+        // When max_count=0, group commit is disabled: every commit requires fsync.
+        let gc = GroupCommitMaster::new(0, 20);
+        assert!(!gc.is_enabled());
+        assert!(!gc.buffer_commit(1), "disabled GC must return false (always flush)");
+        assert!(!gc.buffer_commit(2));
     }
 
     #[test]
@@ -217,6 +283,14 @@ mod tests {
         let gc = GroupCommitMaster::default();
         gc.shutdown();
         assert!(!gc.is_enabled());
+        // After shutdown, buffer_commit must return false (always flush).
+        assert!(!gc.buffer_commit(99), "post-shutdown must return false");
+    }
+
+    #[test]
+    fn test_master_interval_ms_accessible() {
+        let gc = GroupCommitMaster::new(10, 50);
+        assert_eq!(gc.interval_ms(), 50);
     }
 
     #[test]
