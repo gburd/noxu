@@ -86,6 +86,59 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // ordered_commits: T1 commits 25 keys (0..25); T2 writes 25 keys
+        // (100..125) but never commits — the parent kills after t2_started.
+        //
+        // After recovery:
+        //   - T1 keys 0..25 must be present (committed before kill).
+        //   - T2 keys 100..125 must be absent (never committed).
+        //
+        // Probes commit ordering: the committed T1 state survives even though
+        // an uncommitted T2 was in-flight at crash time.
+        "ordered_commits" => {
+            // T1: committed.
+            let txn = env.begin_transaction(None, None).expect("begin T1");
+            for i in 0u32..25 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"t1");
+                db.put(Some(&txn), &key, &val).expect("put T1");
+            }
+            txn.commit().expect("commit T1");
+            flag(&dir, "t1_done");
+
+            // T2: uncommitted — parent kills us here.
+            let txn = env.begin_transaction(None, None).expect("begin T2");
+            for i in 100u32..125 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"t2");
+                db.put(Some(&txn), &key, &val).expect("put T2");
+            }
+            flag(&dir, "t2_started");
+            drop(txn); // suppress "unused" lint — never committed
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // clean_then_dirty: write 25 committed records, signal readiness,
+        // then wait — used to test clean-close vs SIGKILL parity.
+        // The parent can either let this exit cleanly (graceful) or SIGKILL it.
+        "clean_then_dirty" => {
+            for i in 0u32..25 {
+                let txn = env.begin_transaction(None, None).expect("begin txn");
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"parity");
+                db.put(Some(&txn), &key, &val).expect("put");
+                txn.commit().expect("commit");
+            }
+            flag(&dir, "writes_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

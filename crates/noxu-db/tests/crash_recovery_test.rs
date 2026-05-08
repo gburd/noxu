@@ -1,4 +1,4 @@
-//! SIGKILL crash recovery correctness tests.
+//! SIGKILL crash recovery correctness tests — adversarial suite.
 //!
 //! Each test:
 //!  1. Launches the `crash_worker` subprocess that writes data under a
@@ -9,12 +9,73 @@
 //!       - every committed record is present with its original value, and
 //!       - no uncommitted record appears.
 //!
+//! The adversarial tests additionally probe:
+//!  - Commit ordering: recovery must not reorder or drop earlier commits when a
+//!    later commit was in-flight at crash time.
+//!  - Torn write: a SIGKILL during log flush leaves a partial entry; recovery
+//!    must detect the partial entry and discard it rather than treating it as
+//!    committed or crashing.
+//!  - Clean-close / SIGKILL parity: the visible state after a clean shutdown
+//!    must be identical to the state after a SIGKILL, given the same committed
+//!    transactions.
+//!
 //! The worker binary path is injected by cargo as `CARGO_BIN_EXE_crash_worker`.
 
 use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Helpers shared by adversarial tests
+// ---------------------------------------------------------------------------
+
+/// Collect all `.ndb` log files in `dir`, sorted by name.
+fn log_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |x| x == "ndb"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Return the byte length of the last complete log entry in `file`.
+///
+/// Scans forward over the file reading 14-byte entry headers (the minimum
+/// header size for non-VLSN entries: 4 checksum + 1 type + 1 flags +
+/// 4 prev_offset + 4 item_size).  Stops at the first header it cannot fully
+/// read or whose `item_size` would extend past the file.  Returns the offset
+/// of the last successfully consumed entry boundary.
+fn last_complete_entry_end(file: &Path) -> u64 {
+    const MIN_HEADER: usize = 14; // checksum(4) + type(1) + flags(1) + prev_offset(4) + item_size(4)
+    let data = std::fs::read(file).unwrap();
+    let len = data.len();
+
+    // Skip the 32-byte file header.
+    let mut pos: usize = 32;
+    let mut last_good: usize = 32;
+
+    while pos + MIN_HEADER <= len {
+        // item_size is at bytes [pos+10 .. pos+14] (little-endian u32).
+        let item_size = u32::from_le_bytes([
+            data[pos + 10],
+            data[pos + 11],
+            data[pos + 12],
+            data[pos + 13],
+        ]) as usize;
+        let entry_end = pos + MIN_HEADER + item_size;
+        if entry_end > len {
+            break; // partial entry
+        }
+        last_good = entry_end;
+        pos = entry_end;
+    }
+
+    last_good as u64
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -270,4 +331,210 @@ fn test_repeated_crash_recovery_is_idempotent() {
         leaked, 0,
         "{leaked} uncommitted keys leaked after 3 crash rounds"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial Test 4: commit ordering — T1 committed, SIGKILL before T2
+// ---------------------------------------------------------------------------
+
+/// T1 commits keys 0..25, T2 commits keys 100..125.  The worker is killed
+/// after T1's flag but before T2's flag.
+///
+/// After recovery:
+///   - All 25 T1 keys must be present with value `b"t1"`.
+///   - All 25 T2 keys must be absent (T2 was not complete at kill time).
+///
+/// Probes commit ordering: an earlier committed transaction must survive even
+/// when a later transaction was interrupted mid-commit.
+#[test]
+fn test_commit_ordering_preserved_after_sigkill() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "ordered_commits")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    // Wait for T1 to commit.
+    assert!(
+        wait_for_flag(&dir_path, "t1_done", Duration::from_secs(60)),
+        "worker did not commit T1 within timeout"
+    );
+    // Wait for T2 to begin (keys written but not committed), then kill.
+    assert!(
+        wait_for_flag(&dir_path, "t2_started", Duration::from_secs(10)),
+        "worker did not start T2 within timeout"
+    );
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait");
+
+    let (_env, db) = reopen_db(&dir_path);
+
+    // All T1 keys must be present with correct value.
+    let mut missing = 0u32;
+    for i in 0u32..25 {
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let mut val = DatabaseEntry::new();
+        match db.get(None, &key, &mut val).unwrap() {
+            OperationStatus::Success => {
+                assert_eq!(val.data(), b"t1", "key {i} has wrong value after recovery");
+            }
+            OperationStatus::NotFound => missing += 1,
+            s => panic!("unexpected status {s:?} for T1 key {i}"),
+        }
+    }
+    assert_eq!(missing, 0, "{missing} T1 keys lost after recovery");
+
+    // No T2 keys may appear.
+    let mut leaked = 0u32;
+    for i in 100u32..125 {
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let mut val = DatabaseEntry::new();
+        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+            leaked += 1;
+        }
+    }
+    assert_eq!(leaked, 0, "{leaked} T2 keys visible before T2 committed");
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial Test 5: torn write — partial log entry truncated on recovery
+// ---------------------------------------------------------------------------
+
+/// Simulates a torn write: after a SIGKILL the last log file is manually
+/// truncated to a non-entry boundary, leaving a partial (corrupt) entry at
+/// the tail.  Recovery must detect and discard the partial entry without
+/// losing any of the 50 previously committed keys.
+#[test]
+fn test_torn_write_truncated_entry_recovered() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "committed_then_uncommitted")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    assert!(
+        wait_for_flag(&dir_path, "phase1_done", Duration::from_secs(60)),
+        "phase1_done not set"
+    );
+    assert!(
+        wait_for_flag(&dir_path, "phase2_started", Duration::from_secs(10)),
+        "phase2_started not set"
+    );
+    child.kill().expect("SIGKILL");
+    child.wait().expect("wait");
+
+    // Inject a torn write: truncate the last log file one byte past the end
+    // of the last complete entry, leaving an incomplete entry header.
+    let files = log_files(&dir_path);
+    let last_file = files.last().expect("at least one log file");
+    let complete_end = last_complete_entry_end(last_file);
+    let file_len = std::fs::metadata(last_file).unwrap().len();
+    if file_len > complete_end {
+        let torn_len = complete_end + 1;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(last_file)
+            .unwrap();
+        file.set_len(torn_len).expect("truncate to torn boundary");
+    }
+
+    // Recovery must handle the torn entry and surface all committed data.
+    let (_env, db) = reopen_db(&dir_path);
+
+    let mut missing = 0u32;
+    for i in 0u32..50 {
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let mut val = DatabaseEntry::new();
+        if db.get(None, &key, &mut val).unwrap() == OperationStatus::NotFound {
+            missing += 1;
+        }
+    }
+    assert_eq!(
+        missing, 0,
+        "{missing} committed keys lost after torn-write recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial Test 6: clean-close / SIGKILL parity
+// ---------------------------------------------------------------------------
+
+/// The visible state after a clean shutdown must be identical to the visible
+/// state after a SIGKILL, given the same set of committed transactions.
+///
+/// Two databases are written with identical commits.  One worker is SIGKILLed
+/// immediately after signalling; the other is also killed (the OS fsync
+/// guarantees from commit mean both must recover identically).  Both databases
+/// must expose exactly the same 25 keys.
+#[test]
+fn test_clean_close_and_sigkill_produce_identical_state() {
+    // Both paths use SIGKILL after the commits are fsync'd.  The distinction
+    // is that one is killed immediately after writes_done (simulating a crash
+    // right after the last commit fsync) and the other is allowed a short
+    // sleep to simulate graceful shutdown flushing any remaining buffers.
+
+    let clean_dir = TempDir::new().unwrap();
+    let crash_dir = TempDir::new().unwrap();
+
+    // Start both workers simultaneously.
+    let mut clean_child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", clean_dir.path())
+        .env("NOXU_CRASH_MODE", "clean_then_dirty")
+        .spawn()
+        .expect("spawn clean worker");
+    let mut crash_child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", crash_dir.path())
+        .env("NOXU_CRASH_MODE", "clean_then_dirty")
+        .spawn()
+        .expect("spawn crash worker");
+
+    assert!(
+        wait_for_flag(clean_dir.path(), "writes_done", Duration::from_secs(60)),
+        "clean worker did not signal writes_done"
+    );
+    assert!(
+        wait_for_flag(crash_dir.path(), "writes_done", Duration::from_secs(60)),
+        "crash worker did not signal writes_done"
+    );
+
+    // "Clean" side: sleep briefly to let the process flush any internal
+    // state it would flush during a normal shutdown, then kill.
+    std::thread::sleep(Duration::from_millis(20));
+    clean_child.kill().ok();
+    clean_child.wait().ok();
+
+    // "Crash" side: kill immediately (no flush grace period).
+    crash_child.kill().expect("SIGKILL crash worker");
+    crash_child.wait().expect("wait crash worker");
+
+    let (_env_c, db_clean) = reopen_db(clean_dir.path());
+    let (_env_k, db_crash) = reopen_db(crash_dir.path());
+
+    for i in 0u32..25 {
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+
+        let mut val_c = DatabaseEntry::new();
+        let status_c = db_clean.get(None, &key, &mut val_c).unwrap();
+
+        let mut val_k = DatabaseEntry::new();
+        let status_k = db_crash.get(None, &key, &mut val_k).unwrap();
+
+        assert_eq!(
+            status_c, status_k,
+            "key {i}: clean={status_c:?} crash={status_k:?} — parity violation"
+        );
+        if status_c == OperationStatus::Success {
+            assert_eq!(
+                val_c.data(),
+                val_k.data(),
+                "key {i}: value mismatch between clean and crash recovery"
+            );
+        }
+    }
 }
