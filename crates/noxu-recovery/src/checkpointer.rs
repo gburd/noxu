@@ -1152,6 +1152,57 @@ mod tests {
         assert!(checkpointer.persist_file_summaries().is_ok());
     }
 
+    /// `persist_file_summaries` with a wired UtilizationTracker actually writes
+    /// a `FileSummaryLN` entry to the WAL.
+    ///
+    /// Wires a real LogManager + UtilizationTracker, calls
+    /// `persist_file_summaries()`, then scans the log file with
+    /// `LogFileReader` to verify at least one `FileSummaryLN` entry was
+    /// written.
+    #[test]
+    fn test_persist_file_summaries_writes_file_summary_ln_to_log() {
+        use noxu_cleaner::UtilizationTracker;
+        use noxu_log::{FileManager, LogFileReader, LogEntryType};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Populate the tracker with a non-empty file summary so something is
+        // written when persist_file_summaries() is called.
+        let mut tracker = UtilizationTracker::new(true);
+        tracker.count_new_log_entry(0, 128, true, false);
+        tracker.track_obsolete(0, 64, 64, true);
+        let tracker_arc =
+            Arc::new(std::sync::Mutex::new(tracker));
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_utilization_tracker(Arc::clone(&tracker_arc));
+
+        checkpointer.persist_file_summaries().unwrap();
+
+        // Flush to disk so the reader can see the bytes.
+        lm.flush_sync().unwrap();
+
+        // Scan all log entries in file 0 and look for FileSummaryLN.
+        let mut reader = LogFileReader::open(Arc::clone(&fm), 0).unwrap();
+        let mut found = false;
+        while let Some((_lsn, entry_type, _payload)) = reader.read_next() {
+            if entry_type == LogEntryType::FileSummaryLN {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "expected a FileSummaryLN entry in the log after persist_file_summaries()"
+        );
+    }
+
     /// Checkpoint with a real tree flushes dirty BINs — step 4.
     ///
     /// Inserts a few keys (marking BIN slots dirty), then runs a checkpoint
