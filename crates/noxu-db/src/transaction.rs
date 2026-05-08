@@ -233,20 +233,23 @@ impl Transaction {
                 self.write_txn_end(lm, false, false, false)?;
             }
 
-        // Release per-record locks held by the inner Txn, collect undo records,
-        // and apply them to the B-tree to restore the before-images.
-        //
-        // After writing TxnAbort, walks the
-        // write-lock chain and calls `DatabaseImpl.abort(undoLsn, locker)` for
-        // each modified LN.  In Noxu, `Txn::abort()` collects `UndoRecord`s
-        // from the `WriteLockInfo` map; we apply them here using `env_impl`.
+        // Apply undo records to the B-tree to restore before-images, then
+        // release write locks.  The two steps must happen in this order: while
+        // write locks are still held, no reader can observe the in-flight value;
+        // once release_all_locks() is called, blocked readers unblock and must
+        // already see the restored before-image.
         if let Some(inner) = &self.inner_txn {
-            let _ = inner.lock().unwrap().abort();
-            let undo_records = inner.lock().unwrap().take_undo_records();
+            // Phase 1: collect undo records without releasing write locks.
+            let undo_records = inner
+                .lock()
+                .unwrap()
+                .abort_collect_undo()
+                .unwrap_or_default();
+
+            // Phase 2: apply undo to the B-tree (write locks still held).
             if let Some(env) = &self.env_impl {
                 let env_guard = env.lock();
                 for undo in undo_records {
-                    // Each UndoRecord must carry the key; skip if missing.
                     let Some(abort_key) = undo.abort_key else { continue };
                     let db_id = DatabaseId::new(undo.database_id as i64);
                     let Some(db_arc) = env_guard.get_database_by_id(db_id) else {
@@ -255,22 +258,20 @@ impl Transaction {
                     let db_guard = db_arc.read();
                     if let Some(tree) = db_guard.get_real_tree() {
                         if undo.abort_known_deleted {
-                            // This txn inserted a new record; abort = delete it.
-                            // Decrement the entry count to undo the insert.
                             if tree.delete(&abort_key) {
                                 db_guard.decrement_entry_count();
                             }
                         } else if let Some(abort_data) = undo.abort_data {
-                            // This txn updated an existing record; restore
-                            // the before-image at the before-image LSN.
-                            // This is an update (not a new insert), so the
-                            // entry count does not change.
                             let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
                             let _ = tree.insert(abort_key, abort_data, lsn);
                         }
                     }
                 }
             }
+
+            // Phase 3: release write locks — blocked readers now unblock and
+            // see the restored before-image.
+            inner.lock().unwrap().release_all_locks();
         }
 
         let mut state = self.state.lock().unwrap();
