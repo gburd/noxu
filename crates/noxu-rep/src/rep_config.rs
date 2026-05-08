@@ -1,6 +1,7 @@
 //! Replication configuration.
 //!
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::commit_durability::CommitDurability;
@@ -48,6 +49,12 @@ pub struct RepConfig {
     pub consistency_policy: ConsistencyPolicy,
     /// Default commit durability for replicated transactions.
     pub commit_durability: CommitDurability,
+    /// Path to the local environment home directory (`.ndb` files).
+    ///
+    /// When set, `ReplicatedEnvironment` registers a `NetworkRestoreServer`
+    /// on the service dispatcher so that other nodes can restore from this
+    /// node via the `"RESTORE"` service.
+    pub env_home: Option<PathBuf>,
 }
 
 impl RepConfig {
@@ -70,6 +77,7 @@ impl RepConfig {
             feeder_timeout: DEFAULT_FEEDER_TIMEOUT,
             consistency_policy: ConsistencyPolicy::default(),
             commit_durability: CommitDurability::default(),
+            env_home: None,
         }
     }
 
@@ -94,6 +102,7 @@ pub struct RepConfigBuilder {
     feeder_timeout: Duration,
     consistency_policy: ConsistencyPolicy,
     commit_durability: CommitDurability,
+    env_home: Option<PathBuf>,
 }
 
 impl RepConfigBuilder {
@@ -157,6 +166,12 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Sets the environment home directory (serves `.ndb` files for network restore).
+    pub fn env_home(mut self, path: impl Into<PathBuf>) -> Self {
+        self.env_home = Some(path.into());
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -172,6 +187,7 @@ impl RepConfigBuilder {
             feeder_timeout: self.feeder_timeout,
             consistency_policy: self.consistency_policy,
             commit_durability: self.commit_durability,
+            env_home: self.env_home,
         }
     }
 }
