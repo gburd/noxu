@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Serialization bindings for Noxu DB.
 //!
-//! Port of `com.sleepycat.bind`  -  bindings between database entries
+//! bindings between database entries
 //! and Rust types, including tuple and byte encoding.
 //!
 //! # Overview
@@ -41,4 +41,4 @@ pub use tuple::primitive_bindings::{
     SortedDoubleBinding, SortedFloatBinding, SortedPackedIntBinding,
     SortedPackedLongBinding, StringBinding,
 };
-pub use tuple::{TupleBinding, TupleInput, TupleOutput};
+pub use tuple::{SortKey, TupleBinding, TupleInput, TupleOutput};
