@@ -1,6 +1,5 @@
 //! Environment handle.
 //!
-//! Port of `com.sleepycat.je.Environment`.
 
 use crate::database::Database;
 use crate::database_config::DatabaseConfig;
@@ -17,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A database environment.
 ///
-/// Port of `com.sleepycat.je.Environment`.
+/// 
 ///
 /// An Environment provides support for caching, locking, logging, and
 /// transactions. It is the top-level handle through which databases are
@@ -76,7 +75,7 @@ struct TransactionState {
 impl Environment {
     /// Opens or creates a database environment.
     ///
-    /// Port of `Environment(File, EnvironmentConfig)` constructor.
+    /// Constructor.
     ///
     /// # Arguments
     /// * `config` - The environment configuration
@@ -134,7 +133,7 @@ impl Environment {
                 .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))?;
 
         // Thread the configured lock timeout from EnvironmentConfig into the
-        // LockManager.  JE does this in EnvironmentImpl constructor; we do it
+        // LockManager.  does this in EnvironmentImpl constructor; we do it
         // here because EnvironmentConfig lives in noxu-db, not noxu-dbi.
         env_impl.get_lock_manager().set_lock_timeout(config.lock_timeout_ms);
 
@@ -151,7 +150,7 @@ impl Environment {
 
     /// Closes the environment handle.
     ///
-    /// Port of `Environment.close()`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if:
@@ -195,7 +194,7 @@ impl Environment {
 
     /// Opens or creates a database.
     ///
-    /// Port of `Environment.openDatabase(Transaction, String, DatabaseConfig)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -287,7 +286,7 @@ impl Environment {
 
     /// Removes a database.
     ///
-    /// Port of `Environment.removeDatabase(Transaction, String)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -327,7 +326,7 @@ impl Environment {
 
     /// Renames a database.
     ///
-    /// Port of `Environment.renameDatabase(Transaction, String, String)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -383,7 +382,7 @@ impl Environment {
 
     /// Begins a new transaction.
     ///
-    /// Port of `Environment.beginTransaction(Transaction, TransactionConfig)`.
+    /// 
     ///
     /// # Arguments
     /// * `parent` - Optional parent transaction (currently ignored)
@@ -427,8 +426,17 @@ impl Environment {
         // Wire the transaction to the WAL so commit/abort write log entries.
         // Also create an inner Txn for per-record lock management.
         let env_guard = self.env_impl.lock();
+        let is_read_committed = txn_config.read_committed;
         let inner_txn = env_guard.begin_txn()
-            .map(|t| Arc::new(std::sync::Mutex::new(t)))
+            .map(|mut t| {
+                // Propagate the isolation level from TransactionConfig into the
+                // inner Txn so that lock_ln() can release read locks immediately
+                // for read-committed transactions.
+                if is_read_committed {
+                    t.set_read_committed_isolation(true);
+                }
+                Arc::new(std::sync::Mutex::new(t))
+            })
             .ok();
         let txn = if let Some(lm) = env_guard.get_log_manager() {
             Transaction::with_log_manager(txn_id, txn_config, lm)
@@ -444,7 +452,7 @@ impl Environment {
         };
 
         // Wire env_impl so Transaction::abort() can apply undo records.
-        // Port of Txn.envImpl assignment in JE's Txn constructor.
+        // Txn environment reference during construction.
         let txn = txn.with_env_impl(Arc::clone(&self.env_impl));
 
         Ok(txn)
@@ -452,7 +460,7 @@ impl Environment {
 
     /// Returns a list of database names.
     ///
-    /// Port of `Environment.getDatabaseNames()`.
+    /// 
     ///
     /// # Returns
     /// A vector of database names
@@ -467,42 +475,42 @@ impl Environment {
 
     /// Returns the home directory path.
     ///
-    /// Port of `Environment.getHome()`.
+    /// 
     pub fn get_home(&self) -> &Path {
         &self.home
     }
 
     /// Returns the environment configuration.
     ///
-    /// Port of `Environment.getConfig()`.
+    /// 
     pub fn get_config(&self) -> &EnvironmentConfig {
         &self.config
     }
 
     /// Returns whether the environment handle is valid.
     ///
-    /// Port of `Environment.isValid()`.
+    /// 
     pub fn is_valid(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }
 
     /// Returns whether the environment is transactional.
     ///
-    /// Port of `EnvironmentConfig.getTransactional()` via environment.
+    /// Via environment.
     pub fn is_transactional(&self) -> bool {
         self.config.transactional
     }
 
     /// Returns whether the environment is read-only.
     ///
-    /// Port of `EnvironmentConfig.getReadOnly()` via environment.
+    /// Via environment.
     pub fn is_read_only(&self) -> bool {
         self.config.read_only
     }
 
     /// Returns the total number of fdatasync calls performed by the log manager.
     ///
-    /// Port of JE's `EnvironmentStats.getNFSyncs()`.  Useful for benchmarking
+    /// Useful for benchmarking
     /// and for verifying that group commit is working (fewer fsyncs than commits).
     /// Returns 0 if the environment is non-transactional (no log manager).
     pub fn stat_fsync_count(&self) -> u64 {

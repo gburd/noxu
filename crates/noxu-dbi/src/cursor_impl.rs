@@ -1,8 +1,7 @@
 //! Internal cursor implementation.
 //!
-//! Port of `com.sleepycat.je.dbi.CursorImpl`.
 //!
-//! The core traversal logic mirrors JE's `CursorImpl.getNext()` (line 2546):
+//! The core traversal logic mirrors `CursorImpl.getNext()` (line 2546):
 //!
 //! ```text
 //! while (bin != null) {
@@ -117,16 +116,16 @@ fn tick_fail() -> bool {
 /// This implementation wires cursor traversal to `noxu_tree::Tree`:
 ///
 /// * `get_first` / `get_last` — use `Tree::get_first_node()` /
-///   `Tree::get_last_node()` (port of `CursorImpl.positionFirstOrLast`).
+///   `Tree::get_last_node()`.
 /// * `retrieve_next` — increments `current_index` within the BIN and, when
 ///   the BIN is exhausted, calls `Tree::get_next_bin()` /
-///   `Tree::get_prev_bin()` to cross BIN boundaries (port of
+///   `Tree::get_prev_bin()` to cross BIN boundaries
 ///   `CursorImpl.getNext()`).
 /// * `search` — uses `Tree::search()` to locate the exact key.
 /// * `put` / `delete` — mutate the tree in-place using `Tree::insert()` /
 ///   `Tree::delete()`.
 ///
-/// Port of `com.sleepycat.je.dbi.CursorImpl` (4096 lines in JE 7.5.11).
+/// (4096 lines in 7.5.11).
 pub struct CursorImpl {
     /// Unique cursor ID (for debugging and hashCode).
     id: i64,
@@ -145,7 +144,7 @@ pub struct CursorImpl {
     current_lsn: u64,
     /// Current position: the BIN index (slot in the current BIN).
     ///
-    /// In JE this is `CursorImpl.index`. -1 means "before first entry".
+    /// In this is `CursorImpl.index`. -1 means "before first entry".
     current_index: i32,
 
     /// Write-ahead log manager for recording data operations.
@@ -154,7 +153,7 @@ pub struct CursorImpl {
     /// Lock manager for per-record read/write locking.
     /// None for cursors created outside a real env (e.g., unit tests).
     ///
-    /// Port of JE `CursorImpl.locker` — the locker calls `locker.lock(lsn,
+    /// `CursorImpl.locker` — the locker calls `locker.lock(lsn,
     /// LockType.READ, ...)` via `lockLN()` before returning each record.
     lock_manager: Option<Arc<LockManager>>,
 
@@ -168,7 +167,7 @@ pub struct CursorImpl {
     /// `lock_manager` using the cursor's own `id` as the locker and released
     /// immediately after the write is logged (auto-commit semantics).
     ///
-    /// Port of `CursorImpl.locker` (Txn subtype) in JE.
+    /// (Txn subtype).
     txn_ref: Option<Arc<Mutex<Txn>>>,
 }
 
@@ -225,7 +224,7 @@ impl CursorImpl {
 
     /// Wires a lock manager for per-record locking.
     ///
-    /// Port of JE `CursorImpl` receiving a `Locker` from
+    /// `CursorImpl` receiving a `Locker` from
     /// `DatabaseImpl.openCursor()`.  Returns `self` for builder-style chaining.
     pub fn with_lock_manager(mut self, lock_manager: Arc<LockManager>) -> Self {
         self.lock_manager = Some(lock_manager);
@@ -238,7 +237,7 @@ impl CursorImpl {
     /// the `Txn` and record abort before-images in `WriteLockInfo`, enabling
     /// transaction rollback.
     ///
-    /// Port of `CursorImpl` being constructed with a `Txn` locker in JE.
+    /// Being constructed with a `Txn` locker.
     /// Returns `self` for builder-style chaining.
     pub fn with_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
         self.txn_ref = Some(txn);
@@ -262,7 +261,7 @@ impl CursorImpl {
 
     /// Returns true if `key` exists in the committed tree.
     ///
-    /// Port of JE `CursorImpl.isPresent()` / lock-check path: with lock-based
+    /// `CursorImpl.isPresent()` / lock-check path: with lock-based
     /// isolation, writes go directly to the BIN, so the tree reflects the
     /// current committed-or-locked state.  Callers that need to check
     /// existence before a `NoOverwrite`/`NoDupData` insert consult the tree
@@ -279,13 +278,13 @@ impl CursorImpl {
 
     /// Inserts or updates `key`/`data` at `new_lsn` in the B-tree.
     ///
-    /// Port of JE `CursorImpl.insertRecordInternal()` / `bin.updateEntry()`:
+    /// `CursorImpl.insertRecordInternal()` / `bin.updateEntry()`:
     /// writes go directly to the BIN immediately.  Read-committed isolation
     /// is enforced by the lock manager — concurrent readers block on the
     /// WRITE lock held by this cursor's txn until it commits or aborts.
     ///
     /// When the tree reports a **new** insert (`is_new == true`), increments
-    /// the per-database entry count (port of JE `BIN.insertEntry` counter).
+    /// the per-database entry count.
     fn apply_tree_insert(&self, key: Vec<u8>, data: Vec<u8>, new_lsn: Lsn) {
         let db = self.db_impl.read();
         if let Some(tree) = db.get_real_tree()
@@ -298,13 +297,13 @@ impl CursorImpl {
 
     /// Deletes `key` from the B-tree.
     ///
-    /// Port of JE `CursorImpl.deleteCurrentRecord()` / `bin.deleteEntry()`:
+    /// `CursorImpl.deleteCurrentRecord()` / `bin.deleteEntry()`:
     /// the deletion is applied to the BIN immediately.  Concurrent readers
     /// that try to acquire a READ lock on the deleted slot's LSN block until
     /// the writer's WRITE lock is released (commit or abort).
     ///
     /// When the tree confirms the key was actually removed (`deleted == true`),
-    /// decrements the per-database entry count (port of JE `BIN.deleteEntry`
+    /// decrements the per-database entry count (.
     /// counter).
     fn apply_tree_delete(&self, key: Vec<u8>, _del_lsn: Lsn) {
         let db = self.db_impl.read();
@@ -321,7 +320,7 @@ impl CursorImpl {
     /// For auto-commit cursors (lock_manager only), uses cursor `id` as locker.
     /// A NULL_LSN (new insert with no prior version) does not need a pre-log lock.
     ///
-    /// Port of `CursorImpl.lockLNDeletedVersion()` in JE.
+    /// 
     fn lock_write_before_log(&self, old_lsn: u64) -> Result<(), DbiError> {
         if old_lsn == noxu_util::NULL_LSN.as_u64() {
             return Ok(());
@@ -349,7 +348,7 @@ impl CursorImpl {
     ///   - Acquires write lock on `new_lsn`, releases both old and new locks
     ///     immediately (auto-commit releases after the write is logged).
     ///
-    /// Port of `CursorImpl.afterLog()` / `Txn.moveWriteLockToNewLsn()` in JE.
+    /// / `Txn.moveWriteLockToNewLsn()`.
     fn finalize_write_lock(
         &self,
         old_lsn: u64,
@@ -469,7 +468,7 @@ impl CursorImpl {
 
     /// Positions the cursor at a specific key.
     ///
-    /// Port of `CursorImpl.searchExact()` / `CursorImpl.searchRange()` from JE.
+    /// / `CursorImpl.searchRange()`.
     ///
     /// Uses `Tree::search(key)` to locate the BIN slot for the key:
     ///
@@ -594,7 +593,7 @@ impl CursorImpl {
     /// appropriate two-part search key and delegates to the tree's
     /// comparator-aware range finder.
     ///
-    /// Port of `CursorImpl.searchExact()` dup path from JE 7.5.
+    /// Dup path from 7.5.
     fn search_dup(
         &mut self,
         key: &[u8],
@@ -661,13 +660,13 @@ impl CursorImpl {
 
     /// Acquires a read lock on a log record by LSN.
     ///
-    /// Port of JE `CursorImpl.lockLN(LockType.READ)`.  When no lock manager
+    /// `CursorImpl.lockLN(LockType.READ)`.  When no lock manager
     /// is wired (read-only cursors / unit tests) this is a no-op.
     ///
     /// For txn-backed cursors the lock is tracked in the `Txn` and held until
     /// commit/abort.  For auto-commit cursors the lock is acquired (to wait
     /// for any current exclusive writer to finish) and then released
-    /// immediately — mirroring JE's `AutoTxn` single-operation semantics.
+    /// immediately — mirroring `AutoTxn` single-operation semantics.
     ///
     /// Returns an error only when the lock would deadlock or the locker is
     /// invalid; `NULL_LSN` records are skipped (lock-free slots).
@@ -676,10 +675,16 @@ impl CursorImpl {
             return Ok(());
         }
         if let Some(txn) = &self.txn_ref {
-            // Txn-backed cursor: track read lock in Txn (released at commit/abort).
-            txn.lock().unwrap()
-                .lock(lsn, LockType::Read, false)
+            let mut guard = txn.lock().unwrap();
+            guard.lock(lsn, LockType::Read, false)
                 .map_err(DbiError::TxnError)?;
+            // Read-committed: release the read lock immediately after each
+            // operation so concurrent writers are not blocked for the txn
+            // duration.  Under serializable isolation the lock is held until
+            // commit/abort (tracked in Txn.read_locks).
+            if guard.is_read_committed_isolation() {
+                guard.release_lock(lsn).map_err(DbiError::TxnError)?;
+            }
         } else if let Some(lm) = &self.lock_manager {
             // Auto-commit: wait for any current writer, then release immediately.
             // Use self.id (unique per cursor) so different cursors are independent lockers.
@@ -694,7 +699,7 @@ impl CursorImpl {
     ///
     /// Returns `(data, slot_lsn)` so the caller can acquire a read lock.
     ///
-    /// Port of the data-read path in `CursorImpl.lockAndGetCurrent()`.
+    /// Data-read path in `CursorImpl.lockAndGetCurrent()`.
     fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
         let root = tree.get_root()?;
@@ -725,7 +730,7 @@ impl CursorImpl {
     ///
     /// Returns `(key, data, slot_lsn)` so the caller can acquire a read lock.
     ///
-    /// Port of `Tree.searchRange()` — returns the first key in the BIN that
+    /// returns the first key in the BIN that
     /// compares >= the given search key.
     fn find_range_entry(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
@@ -813,7 +818,7 @@ impl CursorImpl {
 
     /// Positions the cursor at the first (smallest) record in the database.
     ///
-    /// Port of `CursorImpl.positionFirstOrLast(true)` from JE (line 1754).
+    /// .
     ///
     /// Uses `Tree::get_first_node()` to descend to the leftmost BIN, then
     /// positions the cursor at slot 0.
@@ -838,8 +843,7 @@ impl CursorImpl {
                         match &*g {
                             TreeNode::Bottom(bin) => {
                                 // Use get_full_key so prefix-compressed keys
-                                // are correctly reconstructed.  Port of JE
-                                // IN.getKey(int idx).
+                                // are correctly reconstructed via get_full_key().
                                 if bin.entries.is_empty() {
                                     None
                                 } else {
@@ -876,7 +880,7 @@ impl CursorImpl {
 
     /// Positions the cursor at the last (largest) record in the database.
     ///
-    /// Port of `CursorImpl.positionFirstOrLast(false)` from JE (line 1757).
+    /// .
     ///
     /// Uses `Tree::get_last_node()` to descend to the rightmost BIN, then
     /// positions the cursor at the last slot.
@@ -968,12 +972,12 @@ impl CursorImpl {
 
     /// Moves the cursor to the next/previous record.
     ///
-    /// Port of `CursorImpl.getNext()` from JE (line 2546).
+    /// .
     ///
     /// Advances `current_index` within the current BIN.  When the BIN is
     /// exhausted (forward: `index >= nEntries`; backward: `index < 0`) the
     /// cursor moves to the adjacent BIN via `Tree::get_next_bin()` /
-    /// `Tree::get_prev_bin()`, mirroring JE's call to
+    /// `Tree::get_prev_bin()`, mirroring call to
     /// `tree.getNextBin(anchorBIN)` / `tree.getPrevBin(anchorBIN)`.
     ///
     /// The GetMode parameter controls direction and duplicate handling:
@@ -1328,14 +1332,14 @@ impl CursorImpl {
 
     /// Inserts or updates a record at the cursor position.
     ///
-    /// Port of the write path in `CursorImpl.put()` from JE:
+    /// Write path:
     ///
     /// 1. Checks state and, for `Current` mode, that the cursor is initialized.
     /// 2. For `NoOverwrite`: searches the tree; returns `KeyExist` if found.
     /// 3. Calls `Tree::insert(key, data, lsn)` to insert/update in the BIN.
     /// 4. Updates the cursor position to the newly written record.
     ///
-    /// Note: locking (step 2 in JE) and WAL logging (step 3 in JE) are not
+    /// Note: locking (step 2 in the) and WAL logging (step 3 in the) are not
     /// yet wired here — they require LogManager integration (P0 gap).
     ///
     /// # Arguments
@@ -1358,7 +1362,7 @@ impl CursorImpl {
 
         // For sorted-dup databases: encode (key, data) as a two-part composite
         // key.  The tree stores `combine(key, data)` with no slot data.
-        // Port of `CursorImpl.putInternal()` dup path in JE 7.5.
+        // Dup path in 7.5.
         if self.is_sorted_dup() {
             return self.put_dup(key, data, put_mode);
         }
@@ -1399,7 +1403,7 @@ impl CursorImpl {
             }
             // NoDupData on a non-dup database behaves like NoOverwrite:
             // returns KeyExist if the key already exists, otherwise inserts.
-            // Port of JE `Cursor.putNoDupData()` non-dup branch.
+            // `Cursor.putNoDupData()` non-dup branch.
             PutMode::NoDupData => {
                 if self.key_exists_in_view(key) {
                     return Ok(OperationStatus::KeyExist);
@@ -1438,7 +1442,7 @@ impl CursorImpl {
     /// tree with empty slot data.  The tree's custom comparator ensures
     /// correct ordering.
     ///
-    /// Port of `CursorImpl.putInternal()` dup path from JE 7.5.
+    /// Dup path from 7.5.
     fn put_dup(
         &mut self,
         key: &[u8],
@@ -1541,7 +1545,7 @@ impl CursorImpl {
     ) -> Result<Lsn, DbiError> {
         // Deferred-write databases skip WAL logging entirely.
         // Data is flushed to disk only at eviction or checkpoint.
-        // Port of JE `CursorImpl.java` deferred-write check before logManager.log().
+        // `CursorImpl.java` deferred-write check before logManager.log().
         if self.db_impl.read().is_deferred_write() {
             return Ok(noxu_util::NULL_LSN);
         }
@@ -1580,7 +1584,7 @@ impl CursorImpl {
         };
 
         // Pass the previous slot LSN as old_lsn so the UtilizationTracker
-        // marks the previous version obsolete (JE: countObsoleteNode with oldLsn).
+        // marks the previous version obsolete (the: countObsoleteNode with oldLsn).
         let old_lsn_opt = if self.current_lsn != noxu_util::NULL_LSN.as_u64() {
             Some(Lsn::from_u64(self.current_lsn))
         } else {
@@ -1593,12 +1597,12 @@ impl CursorImpl {
 
     /// Deletes the record at the cursor position.
     ///
-    /// Port of the delete path in `CursorImpl.delete()` from JE:
+    /// Delete path:
     ///
     /// 1. Checks that the cursor is initialized.
     /// 2. Writes a DeleteLN log entry to the WAL (if log manager is present).
     /// 3. Calls `Tree::delete(key)` to remove the entry from the BIN.
-    /// 4. Resets cursor to NotInitialized (matching JE behaviour).
+    /// 4. Resets cursor to NotInitialized (matching behaviour).
     ///
     /// # Returns
     ///
@@ -1636,7 +1640,7 @@ impl CursorImpl {
     /// For sorted-dup databases, traverses all records sharing the same
     /// primary key. For non-dup databases, returns 1 if positioned.
     ///
-    /// Port of `CursorImpl.count()` from JE 7.5.
+    /// 7.5.
     ///
     /// # Returns
     ///
@@ -1652,7 +1656,7 @@ impl CursorImpl {
         // For sorted-dup databases, count all entries sharing the same primary
         // key as the current position.
         //
-        // Port of `CursorImpl.count()` from JE 7.5: position at the lower
+        // From 7.5: position at the lower
         // bound of the current primary key and iterate until the primary key
         // changes.
         if self.is_sorted_dup() {
@@ -2102,7 +2106,7 @@ mod tests {
 
     /// get_first on an empty database returns NotFound.
     ///
-    /// Port of JE CursorImplTest: positionFirstOrLast on an empty tree.
+    /// positionFirstOrLast on an empty tree.
     #[test]
     fn test_get_first_empty_tree() {
         let db = create_test_database();
@@ -2154,7 +2158,6 @@ mod tests {
 
     /// retrieve_next(Next) advances forward through the BIN.
     ///
-    /// Port of JE CursorImplTest.testGetNext().
     #[test]
     fn test_retrieve_next_forward() {
         let db = create_test_database();
@@ -2181,7 +2184,6 @@ mod tests {
 
     /// retrieve_next(Prev) traverses backward through the BIN.
     ///
-    /// Port of JE CursorImplTest.testGetPrev().
     #[test]
     fn test_retrieve_next_backward() {
         let db = create_test_database();
@@ -2224,7 +2226,7 @@ mod tests {
 
     /// retrieve_next from NotInitialized state returns NotFound (not an error).
     ///
-    /// Port of JE: getNext asserts mustBeInitialized; we convert this to
+    /// The: getNext asserts mustBeInitialized; we convert this to
     /// NotFound per Rust convention.
     #[test]
     fn test_retrieve_next_from_not_initialized_returns_not_found() {
@@ -2313,7 +2315,7 @@ mod tests {
 
     /// Basic put + get_current round-trip for sorted-dup database.
     ///
-    /// Port of JE `DupKeyDataTest.testCombineSplit()`.
+    /// `DupKeyDataTest.testCombineSplit()`.
     #[test]
     fn test_dup_put_and_get_current() {
         let db = create_dup_database();
@@ -2329,7 +2331,7 @@ mod tests {
 
     /// Multiple data values for the same primary key.
     ///
-    /// Port of JE `SortedDuplicatesTest.testMultipleDups()`.
+    /// `SortedDuplicatesTest.testMultipleDups()`.
     #[test]
     fn test_dup_multiple_data_per_key() {
         let db = create_dup_database();
@@ -2350,7 +2352,7 @@ mod tests {
 
     /// search Both: positions at the exact (key, data) pair.
     ///
-    /// Port of JE `CursorImpl.searchBothExact()` dup path.
+    /// `CursorImpl.searchBothExact()` dup path.
     #[test]
     fn test_dup_search_both_exact() {
         let db = create_dup_database();
@@ -2385,7 +2387,7 @@ mod tests {
 
     /// NoDupData returns KeyExist when exact (key, data) already stored.
     ///
-    /// Port of JE `SortedDuplicatesTest.testNoDupData()`.
+    /// `SortedDuplicatesTest.testNoDupData()`.
     #[test]
     fn test_dup_no_dup_data_returns_key_exist() {
         let db = create_dup_database();
@@ -2411,7 +2413,7 @@ mod tests {
 
     /// NextDup traversal visits all dups of the current primary key.
     ///
-    /// Port of JE `CursorImpl.getNext(GetMode.NEXT_DUP)` path.
+    /// `CursorImpl.getNext(GetMode.NEXT_DUP)` path.
     #[test]
     fn test_dup_next_dup_traversal() {
         let db = create_dup_database();
@@ -2446,7 +2448,7 @@ mod tests {
 
     /// NextNoDup skips all dups of the current primary key.
     ///
-    /// Port of JE `CursorImpl.getNext(GetMode.NEXT_NO_DUP)`.
+    /// `CursorImpl.getNext(GetMode.NEXT_NO_DUP)`.
     #[test]
     fn test_dup_next_no_dup_skips_dups() {
         let db = create_dup_database();
@@ -2471,7 +2473,7 @@ mod tests {
 
     /// Dup delete removes only the specific (key, data) pair.
     ///
-    /// Port of JE `SortedDuplicatesTest.testDeleteDup()`.
+    /// `SortedDuplicatesTest.testDeleteDup()`.
     #[test]
     fn test_dup_delete_specific_pair() {
         let db = create_dup_database();
@@ -2502,7 +2504,7 @@ mod tests {
 
     /// Dup prefix-ambiguity ordering is correct.
     ///
-    /// Port of `DupKeyDataTest.testCmpCorrectnessPrefixAmbiguity()`.
+    /// 
     /// Key "a" data "bc" must sort before key "ab" data "c".
     #[test]
     fn test_dup_ordering_prefix_ambiguity() {
@@ -2537,7 +2539,7 @@ mod tests {
     /// fill multiple BINs.  The cursor must cross every BIN boundary without
     /// losing any entry.
     ///
-    /// Port of JE CursorImplTest multi-BIN scan: insert N records, open
+    /// CursorImplTest multi-BIN scan: insert N records, open
     /// cursor at first, call getNext() until NotFound, assert count == N and
     /// keys are in ascending order.
     #[test]
