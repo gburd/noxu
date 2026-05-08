@@ -268,6 +268,26 @@ pub trait LogScanner {
     /// `fetchTarget(db, bin, idx, abortLsn, ...)` to read the before-image
     /// directly from the log when it is not embedded in the LN log entry.
     fn read_at_lsn(&self, lsn: Lsn) -> Option<LogEntry>;
+
+    /// Scan **forward** from `start_lsn` to `end_lsn`, invoking `cb` for each
+    /// entry without collecting into an intermediate `Vec`.
+    ///
+    /// The default implementation calls `scan_forward()` and iterates the
+    /// returned `Vec`.  Override this method in the real file-backed scanner
+    /// to process entries inline (streaming), eliminating the O(N) allocation
+    /// and improving cache locality during the analysis phase.
+    ///
+    /// LNFileReader / INFileReader read loop.
+    fn scan_forward_fn(
+        &self,
+        start_lsn: Lsn,
+        end_lsn: Lsn,
+        cb: &mut dyn FnMut(PositionedEntry),
+    ) {
+        for pe in self.scan_forward(start_lsn, end_lsn) {
+            cb(pe);
+        }
+    }
 }
 
 /// An in-memory `LogScanner` backed by a `Vec<PositionedEntry>`.

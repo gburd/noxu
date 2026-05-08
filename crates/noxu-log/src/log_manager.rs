@@ -47,14 +47,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The central coordinator for log operations.
 ///
-/// 
+///
 pub struct LogManager {
     /// Pool of log buffers for staging writes before they reach the file.
     buffer_pool: Arc<Mutex<LogBufferPool>>,
 
     /// Serializes all log writes so entries appear in LSN order.
     /// calls this the "Log Write Latch" (LWL).
+    ///
+    /// Held only long enough to assign the LSN and copy bytes into the write
+    /// buffer (both are pure in-memory operations).  All disk I/O happens
+    /// under `write_io_latch`, outside the LWL.
     log_write_latch: Mutex<()>,
+
+    /// Serializes the pwrite64 + fdatasync pair outside the LWL.
+    ///
+    /// Two-latch coalescing design:
+    ///   1. Under LWL: assign LSN, copy entry to write buffer, advance
+    ///      watermarks (`collect_dirty_buffers`).  The LWL is released as
+    ///      soon as the in-memory snapshot is complete — no disk I/O.
+    ///   2. Under write_io_latch: write pending bytes with pwrite64, then
+    ///      fdatasync via `FsyncManager`.  Concurrent writers that finish
+    ///      their LWL phase while this I/O is in flight accumulate more data
+    ///      in the write buffer; the next holder of `write_io_latch` may find
+    ///      all buffers already marked flushed (nothing to write) and only
+    ///      pays for a single coalesced fsync.
+    write_io_latch: Mutex<()>,
 
     /// Last flushed LSN (updated when buffers are written to disk).
     last_flush_lsn: AtomicU64,
@@ -71,7 +89,7 @@ pub struct LogManager {
 
     /// Coalesces concurrent fsync requests (group commit).
     ///
-    /// 
+    ///
     /// Initialised with threshold=0, interval=0 (group commit disabled),
     /// matching default configuration.
     fsync_manager: FsyncManager,
@@ -104,6 +122,7 @@ impl LogManager {
         LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
             log_write_latch: Mutex::new(()),
+            write_io_latch: Mutex::new(()),
             last_flush_lsn: AtomicU64::new(NULL_LSN.as_u64()),
             n_repeat_fault_reads: AtomicU64::new(0),
             n_temp_buffer_writes: AtomicU64::new(0),
@@ -387,25 +406,52 @@ impl LogManager {
     }
 
     /// → `FSyncManager.fsync()`.
+    ///
+    /// Three-phase write coalescing:
+    ///
+    /// Phase 1 — under LWL (fast, in-memory only): snapshot each dirty
+    ///   buffer's pending bytes and advance the flush watermark via
+    ///   `collect_dirty_buffers()`.  The LWL is released immediately after
+    ///   snapshotting — no disk I/O holds it.  Concurrent committers can now
+    ///   fill write buffers while this caller waits for `write_io_latch`.
+    ///
+    /// Phase 2 — under write_io_latch (slow, disk I/O): write each snapshot
+    ///   to disk via pwrite64, then fdatasync via `FsyncManager`.  The
+    ///   `write_io_latch` ensures that a caller cannot return to its caller
+    ///   (signalling durability) before the pwrite64 completes, which would
+    ///   allow a concurrent reader to see data that is not yet on disk.
+    ///
+    /// Coalescing benefit: multiple concurrent committers complete Phase 1
+    ///   (fast) while one caller holds `write_io_latch`.  The next holder of
+    ///   `write_io_latch` may find all buffers already marked flushed (nothing
+    ///   to write) and only pays for a single coalesced fsync via
+    ///   `FsyncManager`.
     pub fn flush_sync(&self) -> Result<Lsn> {
-        // Phase 1: flush dirty buffers under the LWL, then release it.
-        let eol = {
+        // Phase 1: snapshot dirty buffer data (in-memory only, under LWL).
+        let (eol, pending_writes) = {
             let _lwl = self.log_write_latch.lock();
-            self.flush_dirty_buffers()?;
-            self.file_manager.get_next_available_lsn()
+            let pending = self.collect_dirty_buffers();
+            let eol = self.file_manager.get_next_available_lsn();
+            (eol, pending)
         };
-        // LWL released here — other threads can now enter flush_sync()
-        // concurrently, enabling group-commit coalescing in phase 2.
+        // LWL released — concurrent committers can now accumulate more data
+        // in write buffers while we wait for the I/O latch below.
 
-        // Phase 2: fdatasync outside the LWL via FSyncManager.
-        // The closure converts NoxuLogError -> io::Error (FsyncManager uses
-        // std::io); the outer ? converts io::Error back to NoxuLogError.
-        let fm = &self.file_manager;
-        self.fsync_manager.fsync(|| {
-            fm.sync_log_end().map_err(|e| {
-                std::io::Error::other(e.to_string())
-            })
-        })?;
+        // Phase 2: pwrite64 + fsync under the I/O latch (outside LWL).
+        // The latch ensures pwrite64 completes before we return, so readers
+        // that observe the committed LSN always find the data on disk.
+        {
+            let _io = self.write_io_latch.lock();
+            for (data, offset) in pending_writes {
+                self.file_manager.write_buffer(&data, offset)?;
+            }
+            let fm = &self.file_manager;
+            self.fsync_manager.fsync(|| {
+                fm.sync_log_end().map_err(|e| {
+                    std::io::Error::other(e.to_string())
+                })
+            })?;
+        }
 
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Relaxed);
         Ok(eol)
@@ -413,26 +459,39 @@ impl LogManager {
 
     /// Flushes all dirty write buffers to disk without an fsync.
     pub fn flush_no_sync(&self) -> Result<Lsn> {
-        let _lwl = self.log_write_latch.lock();
-        self.flush_dirty_buffers()?;
-        let eol = self.file_manager.get_next_available_lsn();
+        let (eol, pending_writes) = {
+            let _lwl = self.log_write_latch.lock();
+            let pending = self.collect_dirty_buffers();
+            let eol = self.file_manager.get_next_available_lsn();
+            (eol, pending)
+        };
+        {
+            let _io = self.write_io_latch.lock();
+            for (data, offset) in pending_writes {
+                self.file_manager.write_buffer(&data, offset)?;
+            }
+        }
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Relaxed);
         Ok(eol)
     }
 
-    /// Drains the write-buffer pool to disk.
+    /// Collects each dirty write buffer's pending bytes under the caller's LWL.
     ///
-    /// Each dirty buffer is written to the file indicated by its first LSN,
-    /// matching `LogBufferPool.writeDirty()` -> `FileManager.writeLogBuffer()`.
+    /// For each dirty buffer:
+    ///   1. Latches the buffer (waits for any in-progress writer to finish).
+    ///   2. Snapshots the unflushed byte slice and the current file offset.
+    ///   3. Calls `mark_flushed()` so the watermark advances immediately.
+    ///   4. Releases the buffer latch.
     ///
-    /// Only the **unflushed** portion of each buffer (`data[flushed_len..]`) is
-    /// written, matching `LogBuffer.lastFlushedPosition` watermark.  This
-    /// eliminates the O(N²) I/O pattern where every commit rewrote the entire
-    /// buffer from the start.
-    fn flush_dirty_buffers(&self) -> Result<()> {
+    /// Returns a `Vec<(data, file_offset)>` that the caller writes to disk
+    /// **outside** the LWL.  This decouples the slow pwrite64 syscall from the
+    /// serialised LSN-assignment critical section.
+    fn collect_dirty_buffers(&self) -> Vec<(Vec<u8>, u64)> {
         let pool = self.buffer_pool.lock();
         let buffers = pool.get_all_buffers();
         drop(pool);
+
+        let mut pending: Vec<(Vec<u8>, u64)> = Vec::new();
 
         for buf_arc in buffers {
             let mut buf = buf_arc.lock();
@@ -444,21 +503,21 @@ impl LogManager {
                 if !unflushed.is_empty() {
                     let data = unflushed.to_vec();
                     let offset = buf.flushed_file_offset();
+                    // Advance the watermark now (under the buffer latch) so a
+                    // subsequent collect_dirty_buffers() call sees this range as
+                    // already flushed and does not re-collect it.
                     buf.mark_flushed();
                     buf.release();
                     drop(buf);
-                    self.file_manager.write_buffer(&data, offset)?;
-                } else {
-                    buf.release();
-                    drop(buf);
+                    pending.push((data, offset));
+                    continue;
                 }
-            } else {
-                buf.release();
-                drop(buf);
             }
+            buf.release();
+            drop(buf);
         }
 
-        Ok(())
+        pending
     }
 
     /// Reads a single log entry from the given LSN.

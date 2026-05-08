@@ -69,6 +69,17 @@ pub struct AnalysisResult {
     /// In `RecoveryManager.java`.
     pub aborted_txns: HashSet<u64>,
 
+    /// Transaction IDs seen in the recovery interval that have neither
+    /// committed nor aborted — i.e., active at crash time, must be undone.
+    ///
+    /// Populated when an LN with a `txn_id` is seen; the ID is removed when
+    /// `record_commit` or `record_abort` is called.  When empty after the full
+    /// analysis pass, Phase 3 (undo) can be skipped entirely (clean shutdown).
+    ///
+    /// Mirrors the implicit set derived from `undoTxnIds` in
+    /// `RecoveryManager.java`.
+    pub active_txn_ids: HashSet<u64>,
+
     /// Maximum node ID seen in the recovery interval.
     pub max_node_id: u64,
 
@@ -101,6 +112,7 @@ impl AnalysisResult {
             dirty_ins: HashMap::new(),
             committed_txns: HashMap::new(),
             aborted_txns: HashSet::new(),
+            active_txn_ids: HashSet::new(),
             max_node_id: 0,
             max_db_id: 0,
             max_txn_id: 0,
@@ -142,6 +154,7 @@ impl AnalysisResult {
             self.max_txn_id = txn_id;
         }
         self.committed_txns.insert(txn_id, commit_lsn);
+        self.active_txn_ids.remove(&txn_id);
     }
 
     /// Record an aborted transaction.
@@ -150,6 +163,24 @@ impl AnalysisResult {
             self.max_txn_id = txn_id;
         }
         self.aborted_txns.insert(txn_id);
+        self.active_txn_ids.remove(&txn_id);
+    }
+
+    /// Record a transactional LN seen during analysis (txn neither committed
+    /// nor aborted yet).
+    pub fn record_active_txn(&mut self, txn_id: u64) {
+        if txn_id > self.max_txn_id {
+            self.max_txn_id = txn_id;
+        }
+        self.active_txn_ids.insert(txn_id);
+    }
+
+    /// Returns `true` if any transactions were active at crash time.
+    ///
+    /// When `false`, the undo phase (Phase 3) can be skipped entirely —
+    /// all transactions committed or aborted cleanly before shutdown.
+    pub fn has_active_txns(&self) -> bool {
+        !self.active_txn_ids.is_empty()
     }
 
     /// Returns `true` if `txn_id` committed in the recovery interval.
@@ -304,6 +335,55 @@ mod tests {
         ar.record_commit(5, lsn(0, 10));
         ar.record_abort(3);
         assert_eq!(ar.max_txn_id, 5);
+    }
+
+    #[test]
+    fn test_has_active_txns_empty_by_default() {
+        let ar = AnalysisResult::new();
+        assert!(!ar.has_active_txns());
+    }
+
+    #[test]
+    fn test_record_active_txn_appears_in_active_set() {
+        let mut ar = AnalysisResult::new();
+        ar.record_active_txn(7);
+        assert!(ar.has_active_txns());
+        assert!(ar.active_txn_ids.contains(&7));
+    }
+
+    #[test]
+    fn test_record_commit_removes_from_active() {
+        let mut ar = AnalysisResult::new();
+        ar.record_active_txn(7);
+        ar.record_commit(7, lsn(0, 100));
+        assert!(!ar.has_active_txns());
+    }
+
+    #[test]
+    fn test_record_abort_removes_from_active() {
+        let mut ar = AnalysisResult::new();
+        ar.record_active_txn(9);
+        ar.record_abort(9);
+        assert!(!ar.has_active_txns());
+    }
+
+    #[test]
+    fn test_partially_committed_txns_leaves_active() {
+        let mut ar = AnalysisResult::new();
+        ar.record_active_txn(1);
+        ar.record_active_txn(2);
+        ar.record_commit(1, lsn(0, 100));
+        // txn 2 still active
+        assert!(ar.has_active_txns());
+        assert!(ar.active_txn_ids.contains(&2));
+        assert!(!ar.active_txn_ids.contains(&1));
+    }
+
+    #[test]
+    fn test_max_txn_id_from_record_active_txn() {
+        let mut ar = AnalysisResult::new();
+        ar.record_active_txn(42);
+        assert_eq!(ar.max_txn_id, 42);
     }
 
     #[test]
