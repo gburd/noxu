@@ -42,66 +42,6 @@ impl FileManagerLogScanner {
         Self { file_manager }
     }
 
-    // ------------------------------------------------------------------
-    // Internal: raw byte scanning
-    // ------------------------------------------------------------------
-
-    /// Parse a raw log entry at the given file/offset position.
-    ///
-    /// Returns `(entry_size, LogEntry)` on success, or `None` if the bytes
-    /// don't form a valid entry (e.g. zero-filled region past the last write).
-    fn read_raw_entry(
-        &self,
-        file_num: u32,
-        offset: u64,
-    ) -> Option<(usize, Option<LogEntry>)> {
-        // Read the minimum header.
-        let mut hdr = [0u8; MIN_HEADER_SIZE];
-        let n = self
-            .file_manager
-            .read_from_file(file_num, offset, &mut hdr)
-            .ok()?;
-        if n < MIN_HEADER_SIZE {
-            return None;
-        }
-
-        // Zero-filled region past the last written byte — stop scanning.
-        if hdr[4] == 0 {
-            return None;
-        }
-
-        let entry_type_num = hdr[4];
-        let flags = hdr[5];
-        let item_size =
-            u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;
-
-        // Sanity-check item_size before allocating.
-        if item_size > MAX_SANE_ITEM_SIZE {
-            return None;
-        }
-
-        let vlsn_present =
-            (flags & 0x08) != 0 || (flags & 0x20) != 0; // VLSN_PRESENT | REPLICATED
-        let header_size =
-            if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
-        let entry_size = header_size + item_size;
-
-        // Read the full entry (header + payload).
-        let mut full_buf = vec![0u8; entry_size];
-        let n = self
-            .file_manager
-            .read_from_file(file_num, offset, &mut full_buf)
-            .ok()?;
-        if n < entry_size {
-            return None; // Truncated write at end of log.
-        }
-
-        let payload = &full_buf[header_size..];
-        let log_entry = Self::parse_payload(entry_type_num, payload);
-
-        Some((entry_size, log_entry))
-    }
-
     /// Convert a raw (entry_type_num, payload) pair to a `LogEntry`.
     ///
     /// Returns `None` for entry types recovery does not need to process
@@ -233,8 +173,55 @@ impl FileManagerLogScanner {
         }
     }
 
+    /// Parse a log entry from an in-memory file slice at `offset`.
+    ///
+    /// Returns `(entry_size, Option<LogEntry>)` or `None` if the bytes are
+    /// zero-filled (past the last write) or truncated.
+    fn parse_entry_from_slice(
+        data: &[u8],
+        offset: usize,
+    ) -> Option<(usize, Option<LogEntry>)> {
+        if offset + MIN_HEADER_SIZE > data.len() {
+            return None;
+        }
+        let hdr = &data[offset..offset + MIN_HEADER_SIZE];
+
+        // Zero-filled region past the last written byte.
+        if hdr[4] == 0 {
+            return None;
+        }
+
+        let entry_type_num = hdr[4];
+        let flags = hdr[5];
+        let item_size =
+            u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;
+
+        if item_size > MAX_SANE_ITEM_SIZE {
+            return None;
+        }
+
+        let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
+        let header_size =
+            if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
+        let entry_size = header_size + item_size;
+
+        if offset + entry_size > data.len() {
+            return None; // Truncated write at end of log.
+        }
+
+        let payload = &data[offset + header_size..offset + entry_size];
+        let log_entry = Self::parse_payload(entry_type_num, payload);
+
+        Some((entry_size, log_entry))
+    }
+
     /// Scan forward through all log files collecting `PositionedEntry` items
     /// whose LSN falls in `[start_lsn, end_lsn)`.
+    ///
+    /// Each file is read into memory with a single `pread64` call before any
+    /// entry parsing — eliminating 2 syscalls per entry (one for the header,
+    /// one for the full entry) down to 1 syscall per file.  For a 100K-record
+    /// log (~17 MB on one file) this reduces syscall count from ~200K to 1.
     ///
     /// `NULL_LSN` for `start_lsn` means "from the beginning of the first file".
     /// `NULL_LSN` for `end_lsn`   means "to the end of the log".
@@ -260,24 +247,38 @@ impl FileManagerLogScanner {
         };
 
         for &file_num in file_nums.iter().filter(|&&n| n >= start_file) {
-            // Determine where in this file to start reading.
-            let file_start_offset: u64 =
-                if start_lsn != NULL_LSN && file_num == start_lsn.file_number()
-                {
-                    start_lsn.file_offset() as u64
-                } else {
-                    FILE_HEADER_SIZE as u64
-                };
-
-            // Determine the file length.
             let file_len = match self.file_manager.get_file_length(file_num) {
                 Ok(len) => len,
                 Err(_) => continue,
             };
+            if file_len == 0 {
+                continue;
+            }
+
+            // Read the entire file into memory in one syscall, then parse
+            // entries from the in-memory slice — no per-entry allocation for
+            // raw bytes.
+            let mut file_data = vec![0u8; file_len as usize];
+            match self.file_manager.read_from_file(file_num, 0, &mut file_data) {
+                Ok(n) if n < file_len as usize => file_data.truncate(n),
+                Err(_) => continue,
+                Ok(_) => {}
+            }
+
+            // Determine where in this file to start parsing.
+            // Always start at FILE_HEADER_SIZE minimum: a start offset of 0
+            // would land inside the file header and break parsing.
+            let file_start_offset: usize =
+                if start_lsn != NULL_LSN && file_num == start_lsn.file_number()
+                {
+                    (start_lsn.file_offset() as usize).max(FILE_HEADER_SIZE)
+                } else {
+                    FILE_HEADER_SIZE
+                };
 
             let mut offset = file_start_offset;
 
-            while offset < file_len {
+            while offset < file_data.len() {
                 // Enforce end_lsn upper bound.
                 if end_lsn != NULL_LSN {
                     let cur_lsn = Lsn::new(file_num, offset as u32);
@@ -286,13 +287,12 @@ impl FileManagerLogScanner {
                     }
                 }
 
-                match self.read_raw_entry(file_num, offset) {
-                    None => break, // End of written data in this file.
+                match Self::parse_entry_from_slice(&file_data, offset) {
+                    None => break, // Zero-filled or truncated — end of data.
                     Some((entry_size, parsed)) => {
                         let entry_lsn = Lsn::new(file_num, offset as u32);
 
                         if let Some(mut log_entry) = parsed {
-                            // Patch the LSN into records that carry it.
                             match &mut log_entry {
                                 LogEntry::TxnCommit(r) => {
                                     r.lsn = entry_lsn;
@@ -302,13 +302,12 @@ impl FileManagerLogScanner {
                                 }
                                 _ => {}
                             }
-
                             results.push(PositionedEntry::new(
                                 entry_lsn, log_entry,
                             ));
                         }
 
-                        offset += entry_size as u64;
+                        offset += entry_size;
                     }
                 }
             }
@@ -350,30 +349,41 @@ impl LogScanner for FileManagerLogScanner {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
+            if file_len == 0 {
+                continue;
+            }
 
-            let mut offset = FILE_HEADER_SIZE as u64;
-            let mut last_valid_offset: Option<u64> = None;
+            // Read the whole file once; parse entries from the in-memory buf.
+            let mut file_data = vec![0u8; file_len as usize];
+            match self.file_manager.read_from_file(file_num, 0, &mut file_data) {
+                Ok(n) if n < file_len as usize => file_data.truncate(n),
+                Err(_) => continue,
+                Ok(_) => {}
+            }
+
+            let mut offset = FILE_HEADER_SIZE;
+            let mut last_valid_offset: Option<usize> = None;
             let mut last_entry_size = 0usize;
 
-            while offset < file_len {
-                match self.read_raw_entry(file_num, offset) {
+            while offset < file_data.len() {
+                match Self::parse_entry_from_slice(&file_data, offset) {
                     None => break,
                     Some((entry_size, _)) => {
                         last_valid_offset = Some(offset);
                         last_entry_size = entry_size;
-                        offset += entry_size as u64;
+                        offset += entry_size;
                     }
                 }
             }
 
             if let Some(valid_offset) = last_valid_offset {
-                let end_offset = valid_offset + last_entry_size as u64;
+                let end_offset = valid_offset + last_entry_size;
                 last_used_lsn = Lsn::new(file_num, valid_offset as u32);
 
                 // next_available is the byte immediately after the last entry.
                 // If we're at the end of this file, the next write goes to
                 // the start of the next file.
-                next_available_lsn = if end_offset >= file_len
+                next_available_lsn = if end_offset >= file_data.len()
                     && file_nums.last().copied() != Some(file_num)
                 {
                     let next_file = file_num + 1;
@@ -409,16 +419,17 @@ impl LogScanner for FileManagerLogScanner {
         start_lsn: Lsn,
         stop_lsn: Lsn,
     ) -> Vec<PositionedEntry> {
-        // Collect forward then reverse; this matches the InMemoryLogScanner
-        // contract (entries in descending LSN order).
+        // scan_files_forward returns entries in ascending LSN order (files in
+        // numeric order, offsets in forward order within each file).  Reversing
+        // the resulting Vec is O(N) vs the previous sort_by() which was
+        // O(N log N).
         let mut entries = self.scan_files_forward(stop_lsn, NULL_LSN);
 
-        // Keep only entries at or below start_lsn.
         if start_lsn != NULL_LSN {
             entries.retain(|e| e.lsn <= start_lsn);
         }
 
-        entries.sort_by(|a, b| b.lsn.cmp(&a.lsn));
+        entries.reverse();
         entries
     }
 

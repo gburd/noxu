@@ -280,6 +280,10 @@ impl DatabaseImpl {
     /// Called by `EnvironmentImpl::open_database()` when a matching
     /// `recovered_trees` entry exists (Approach B of P1b wiring).
     pub fn set_recovered_tree(&mut self, tree: Tree) {
+        // Synchronise the in-memory entry_count counter from the recovered
+        // tree so that Database::count() returns the correct value after reopen.
+        let count = tree.count_entries();
+        self.entry_count.store(count, std::sync::atomic::Ordering::Relaxed);
         self.real_tree = Some(tree);
     }
 
