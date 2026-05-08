@@ -1,37 +1,15 @@
-//! Composite binding combining tuple-encoded keys with serde-serialized data.
+//! Composite binding combining sort-preserving tuple-encoded keys with
+//! serde-serialized data.
 //!
-//! Port of `com.sleepycat.bind.serial.TupleSerialBinding`  -  an entity binding
-//! where the key is encoded using tuple format (compact, sortable binary) and
-//! the data is serialized using serde via [`super::simple_serial`].
+//! Keys are encoded using the `SortKey` trait, which produces a fixed-width
+//! big-endian representation for integers (with sign-bit flipping for signed
+//! types) and null-escaped, null-terminated sequences for strings and byte
+//! slices. This encoding is sort-preserving: lexicographic byte comparison of
+//! encoded keys matches the natural `Ord` ordering of the original values.
 //!
-//! ## Required dependencies (to be added to Cargo.toml)
-//!
-//! ```toml
-//! serde = { version = "1", features = ["derive"] }
-//! ```
-//!
-//! ## ⚠ KEY SORT ORDER WARNING ⚠
-//!
-//! JE's `TupleSerialBinding` uses a **sort-preserving** tuple encoding for keys
-//! so that byte-wise B-tree comparison produces the same order as comparing the
-//! original values.  This implementation uses **serde binary encoding** (via
-//! `postcard`) which is **not sort-preserving** for most types:
-//!
-//! - `u64` keys: postcard uses variable-length encoding (integers like 1, 2, 10
-//!   are NOT serialized as big-endian fixed-width bytes).  Byte-wise order does
-//!   NOT match numeric order for all values.
-//! - `String` keys: postcard prefixes with a variable-length length; keys of
-//!   different lengths are not correctly sorted by byte comparison.
-//! - `struct` keys: field ordering and encoding are serde-format-specific.
-//!
-//! **If you need sorted key ranges** (range scans, `get_next`, `get_prev`,
-//! `StoredSortedMap` key ordering), you MUST supply a custom comparator via
-//! `DatabaseConfig::bt_comparator` that deserializes and compares the key type
-//! natively.  Failure to do so will produce **silently incorrect** sort order.
-//!
-//! Types that ARE safely sort-preserving with serde/postcard:
-//! - `Vec<u8>` / `[u8; N]` — raw bytes are compared as-is, which matches
-//!   lexicographic byte order by definition.
+//! Data (the non-key payload) is serialized using serde via the compact
+//! binary encoding from [`super::simple_serial`]. Data encoding does not need
+//! to be sort-preserving because the B-tree only compares keys.
 
 use std::marker::PhantomData;
 
@@ -43,22 +21,19 @@ use noxu_db::DatabaseEntry;
 use crate::Result;
 use crate::entry_binding::{EntityBinding, EntryBinding};
 use crate::serial::serde_binding::SerdeBinding;
+use crate::tuple::sort_key::SortKey;
+use crate::tuple::{TupleInput, TupleOutput};
 
-/// Entity binding that uses serde-binary encoding for keys and data.
+/// Entity binding that uses sort-preserving tuple encoding for keys and serde
+/// binary encoding for data.
 ///
-/// Port of JE's `TupleSerialBinding`.  JE uses a dedicated sort-preserving
-/// tuple format for keys so that byte-wise comparison of serialized keys
-/// produces the same order as comparing the original values.  This
-/// implementation uses the compact serde binary format from [`SerdeBinding`]
-/// for both key and data, which is correct for equality comparisons but does
-/// not preserve sort order for lexicographic key comparisons.  Applications
-/// requiring sorted key ranges should supply a custom key comparator via
-/// `DatabaseConfig::bt_comparator` that deserializes and compares the key type.
+/// The key type `K` must implement `SortKey`, which guarantees that the
+/// byte-wise order of encoded keys matches the `Ord` order of the original
+/// values. This makes range scans, `get_next`, `get_prev`, and sorted map
+/// operations correct without requiring a custom comparator.
 ///
-/// The entity type `E` is split into a key part `K` and a data part `V` via
+/// The entity type `V` is split into a key `K` and a data payload `V` via
 /// user-provided extraction functions.
-///
-/// Port of `com.sleepycat.bind.serial.TupleSerialBinding`.
 ///
 /// # Examples
 ///
@@ -90,12 +65,12 @@ pub struct TupleSerdeBinding<K, V> {
 
 impl<K, V> TupleSerdeBinding<K, V>
 where
-    K: Serialize + DeserializeOwned,
+    K: SortKey,
     V: Serialize + DeserializeOwned,
 {
     /// Creates a new composite binding with the given key extractor and entity creator.
     ///
-    /// - `key_extractor`: extracts the key from an entity value.
+    /// - `key_extractor`: extracts the sort key from an entity value.
     /// - `entity_creator`: reconstructs the entity from key and data.
     pub fn new<FKey, FCreate>(
         key_extractor: FKey,
@@ -124,7 +99,7 @@ impl<K, V> std::fmt::Debug for TupleSerdeBinding<K, V> {
 
 impl<K, V> EntityBinding<V> for TupleSerdeBinding<K, V>
 where
-    K: Serialize + DeserializeOwned,
+    K: SortKey,
     V: Serialize + DeserializeOwned,
 {
     fn entry_to_object(
@@ -132,17 +107,19 @@ where
         key: &DatabaseEntry,
         data: &DatabaseEntry,
     ) -> Result<V> {
-        let key_binding = SerdeBinding::<K>::new();
+        let mut inp = TupleInput::new(key.data());
+        let k = K::decode_sort_key(&mut inp)?;
         let data_binding = SerdeBinding::<V>::new();
-        let k = key_binding.entry_to_object(key)?;
         let v = data_binding.entry_to_object(data)?;
         Ok((self.entity_creator)(k, v))
     }
 
     fn object_to_key(&self, object: &V, key: &mut DatabaseEntry) -> Result<()> {
-        let key_binding = SerdeBinding::<K>::new();
+        let mut out = TupleOutput::new();
         let k = (self.key_extractor)(object);
-        key_binding.object_to_entry(&k, key)
+        k.encode_sort_key(&mut out);
+        key.set_data_vec(out.into_vec());
+        Ok(())
     }
 
     fn object_to_data(
@@ -160,8 +137,6 @@ where
 ///
 /// This avoids requiring closure-based extraction by working directly with
 /// tuples.
-///
-/// Port of `com.sleepycat.bind.serial.TupleSerialBinding`.
 pub struct TupleSerdeKeyDataBinding<K, V> {
     _phantom: PhantomData<(K, V)>,
 }
@@ -196,7 +171,7 @@ impl<K, V> std::fmt::Debug for TupleSerdeKeyDataBinding<K, V> {
 
 impl<K, V> EntityBinding<(K, V)> for TupleSerdeKeyDataBinding<K, V>
 where
-    K: Serialize + DeserializeOwned + Clone,
+    K: SortKey + Clone,
     V: Serialize + DeserializeOwned + Clone,
 {
     fn entry_to_object(
@@ -204,9 +179,9 @@ where
         key: &DatabaseEntry,
         data: &DatabaseEntry,
     ) -> Result<(K, V)> {
-        let key_binding = SerdeBinding::<K>::new();
+        let mut inp = TupleInput::new(key.data());
+        let k = K::decode_sort_key(&mut inp)?;
         let data_binding = SerdeBinding::<V>::new();
-        let k = key_binding.entry_to_object(key)?;
         let v = data_binding.entry_to_object(data)?;
         Ok((k, v))
     }
@@ -216,8 +191,10 @@ where
         object: &(K, V),
         key: &mut DatabaseEntry,
     ) -> Result<()> {
-        let key_binding = SerdeBinding::<K>::new();
-        key_binding.object_to_entry(&object.0, key)
+        let mut out = TupleOutput::new();
+        object.0.encode_sort_key(&mut out);
+        key.set_data_vec(out.into_vec());
+        Ok(())
     }
 
     fn object_to_data(
@@ -281,9 +258,103 @@ mod tests {
         let mut key_entry = DatabaseEntry::new();
         binding.object_to_key(&emp, &mut key_entry).unwrap();
 
-        let key_binding = SerdeBinding::<u64>::new();
-        let key: u64 = key_binding.entry_to_object(&key_entry).unwrap();
+        // Decode using TupleInput (sort-preserving big-endian encoding).
+        let mut inp = TupleInput::new(key_entry.data());
+        let key: u64 = u64::decode_sort_key(&mut inp).unwrap();
         assert_eq!(key, 99);
+    }
+
+    /// Verify that encoded u64 keys are exactly 8 bytes (fixed-width big-endian).
+    #[test]
+    fn test_u64_key_is_8_bytes_fixed_width() {
+        let binding = TupleSerdeBinding::<u64, Employee>::new(
+            |emp| emp.id,
+            |_key, data| data,
+        );
+        for id in [0u64, 1, 2, 10, 100, u64::MAX] {
+            let emp = Employee { id, name: String::new(), department: String::new() };
+            let mut key_entry = DatabaseEntry::new();
+            binding.object_to_key(&emp, &mut key_entry).unwrap();
+            assert_eq!(key_entry.data().len(), 8, "u64 key must be 8 bytes (id={})", id);
+        }
+    }
+
+    /// The primary correctness guarantee: lexicographic byte order of encoded
+    /// u64 keys matches numeric order.
+    #[test]
+    fn test_u64_key_sort_order_preserved() {
+        let binding = TupleSerdeBinding::<u64, Employee>::new(
+            |emp| emp.id,
+            |_key, data| data,
+        );
+
+        let key_bytes = |id: u64| {
+            let emp = Employee { id, name: String::new(), department: String::new() };
+            let mut key_entry = DatabaseEntry::new();
+            binding.object_to_key(&emp, &mut key_entry).unwrap();
+            key_entry.get_data().unwrap().to_vec()
+        };
+
+        let b0  = key_bytes(0);
+        let b1  = key_bytes(1);
+        let b2  = key_bytes(2);
+        let b10 = key_bytes(10);
+        let bmax = key_bytes(u64::MAX);
+
+        assert!(b0 < b1,  "0 < 1");
+        assert!(b1 < b2,  "1 < 2");
+        assert!(b2 < b10, "2 < 10");
+        assert!(b10 < bmax, "10 < MAX");
+    }
+
+    /// i64 keys should sort with negatives before zero before positives.
+    #[test]
+    fn test_i64_key_sort_order_preserved() {
+        let binding = TupleSerdeBinding::<i64, Employee>::new(
+            |emp| emp.id as i64,
+            |_key, data| data,
+        );
+
+        let key_bytes = |id: i64| {
+            let emp = Employee {
+                id: id as u64,
+                name: String::new(),
+                department: String::new(),
+            };
+            let mut key_entry = DatabaseEntry::new();
+            binding.object_to_key(&emp, &mut key_entry).unwrap();
+            key_entry.get_data().unwrap().to_vec()
+        };
+
+        let vals = [i64::MIN, -1000i64, -1, 0, 1, 1000, i64::MAX];
+        for w in vals.windows(2) {
+            assert!(
+                key_bytes(w[0]) < key_bytes(w[1]),
+                "i64 sort order: {} should be < {}",
+                w[0], w[1]
+            );
+        }
+    }
+
+    /// String keys sort lexicographically.
+    #[test]
+    fn test_string_key_sort_order_preserved() {
+        let binding = TupleSerdeBinding::<String, Employee>::new(
+            |emp| emp.name.clone(),
+            |_key, data| data,
+        );
+
+        let key_bytes = |name: &str| {
+            let emp = Employee { id: 0, name: name.to_string(), department: String::new() };
+            let mut key_entry = DatabaseEntry::new();
+            binding.object_to_key(&emp, &mut key_entry).unwrap();
+            key_entry.get_data().unwrap().to_vec()
+        };
+
+        assert!(key_bytes("a") < key_bytes("b"));
+        assert!(key_bytes("abc") < key_bytes("abd"));
+        assert!(key_bytes("a") < key_bytes("aa"));
+        assert!(key_bytes("") < key_bytes("a"));
     }
 
     #[test]
@@ -299,6 +370,25 @@ mod tests {
 
         let decoded = binding.entry_to_object(&key_entry, &data_entry).unwrap();
         assert_eq!(decoded, entity);
+    }
+
+    /// u32 keys in TupleSerdeKeyDataBinding sort correctly.
+    #[test]
+    fn test_key_data_binding_u32_sort_order() {
+        let binding = TupleSerdeKeyDataBinding::<u32, String>::new();
+
+        let key_bytes = |k: u32| {
+            let entity = (k, String::new());
+            let mut key_entry = DatabaseEntry::new();
+            binding.object_to_key(&entity, &mut key_entry).unwrap();
+            key_entry.get_data().unwrap().to_vec()
+        };
+
+        let vals = [0u32, 1, 2, 10, 100, 1000, u32::MAX];
+        for w in vals.windows(2) {
+            assert!(key_bytes(w[0]) < key_bytes(w[1]),
+                "{} should sort before {}", w[0], w[1]);
+        }
     }
 
     #[test]
@@ -390,72 +480,11 @@ mod tests {
         assert_eq!(decoded, entity);
     }
 
-    /// Demonstrates that serde/postcard encoding of integer keys is NOT
-    /// sort-preserving.  This test intentionally asserts the CURRENT
-    /// (non-sorted) behaviour so that any future change to a sort-preserving
-    /// encoding will be caught.
-    ///
-    /// JE uses a dedicated tuple encoding where u64 keys are serialised as
-    /// 8-byte big-endian so that byte-wise comparison equals numeric comparison.
-    /// Postcard uses variable-length encoding; 1, 2, and 10 all encode as
-    /// different byte lengths and their lexicographic byte order does not match
-    /// numeric order in general.
-    ///
-    /// **If you need sorted integer key ranges, supply a custom comparator.**
-    #[test]
-    fn test_sort_order_not_preserved_for_integer_keys() {
-        let binding = TupleSerdeBinding::<u64, Employee>::new(
-            |emp| emp.id,
-            |_key, data| data,
-        );
-
-        // Serialise three keys: 1, 2, 10.
-        let key_bytes = |id: u64| {
-            let emp = Employee { id, name: String::new(), department: String::new() };
-            let mut key_entry = DatabaseEntry::new();
-            binding.object_to_key(&emp, &mut key_entry).unwrap();
-            key_entry.get_data().unwrap().to_vec()
-        };
-
-        let b1  = key_bytes(1);
-        let b2  = key_bytes(2);
-        let b10 = key_bytes(10);
-
-        // With sort-preserving big-endian fixed-width encoding, byte order
-        // would be b1 < b2 < b10.  With postcard variable-length encoding
-        // this is NOT guaranteed for all values.
-        //
-        // This assertion documents the current behaviour.  If postcard ever
-        // changes encoding so that b1 < b2 < b10 holds lexicographically,
-        // update this comment to say sort order IS preserved.
-        let sort_preserving =
-            b1.as_slice() < b2.as_slice() && b2.as_slice() < b10.as_slice();
-
-        if !sort_preserving {
-            // Current behaviour: not sort-preserving.  This is expected and
-            // documented.  Applications needing sorted ranges must supply a
-            // custom comparator.
-        }
-        // The test passes regardless — it exists to document and track the
-        // behaviour, not to enforce a specific outcome.
-        let _ = sort_preserving;
-
-        // What IS guaranteed: round-trip equality is always correct.
-        let key_binding = crate::serial::serde_binding::SerdeBinding::<u64>::new();
-        let mut e1 = DatabaseEntry::new();
-        let emp1 = Employee { id: 42, name: "x".into(), department: "y".into() };
-        binding.object_to_key(&emp1, &mut e1).unwrap();
-        let decoded: u64 = key_binding.entry_to_object(&e1).unwrap();
-        assert_eq!(decoded, 42, "round-trip must always be correct");
-    }
-
     #[test]
     fn test_entity_creator_transforms() {
-        // Test that entity_creator can transform the reconstructed entity
         let binding = TupleSerdeBinding::<u64, Employee>::new(
             |emp| emp.id,
             |key, mut data| {
-                // Override the id from the key (simulating key->entity injection)
                 data.id = key;
                 data
             },
@@ -475,5 +504,17 @@ mod tests {
         let decoded = binding.entry_to_object(&key_entry, &data_entry).unwrap();
         assert_eq!(decoded.id, 42);
         assert_eq!(decoded.name, "Test");
+    }
+
+    /// Verify that u32 key bytes are exactly 4 bytes fixed-width big-endian.
+    #[test]
+    fn test_u32_key_is_4_bytes_fixed_width() {
+        let binding = TupleSerdeKeyDataBinding::<u32, String>::new();
+        for k in [0u32, 1, 255, 256, u32::MAX] {
+            let entity = (k, String::new());
+            let mut key_entry = DatabaseEntry::new();
+            binding.object_to_key(&entity, &mut key_entry).unwrap();
+            assert_eq!(key_entry.data().len(), 4, "u32 key must be 4 bytes (k={})", k);
+        }
     }
 }
