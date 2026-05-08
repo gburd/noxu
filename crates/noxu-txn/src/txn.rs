@@ -669,7 +669,67 @@ impl Txn {
         }
 
         // Step 4: release all write locks then read locks.
-        // ClearWriteLocks + clearReadLocks after undo.
+        self.release_all_locks();
+
+        Ok(assigned_lsn)
+    }
+
+    /// Performs steps 1-3 of abort (state transition, log, undo collection)
+    /// WITHOUT releasing write locks.
+    ///
+    /// Used by the higher-level `Transaction::abort()` so it can apply tree
+    /// undo while write locks are still held, then call `release_all_locks()`
+    /// after the before-images are restored.  Readers blocked on a write lock
+    /// will not unblock until `release_all_locks()` is called, so they always
+    /// observe the restored before-image rather than the in-flight value.
+    pub fn abort_collect_undo(&mut self) -> Result<Vec<UndoRecord>, TxnError> {
+        if self.state == TxnState::Aborted {
+            return Ok(std::mem::take(&mut self.undo_records));
+        }
+        if self.state == TxnState::Committed {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "COMMITTED".into(),
+            });
+        }
+
+        self.state = TxnState::Aborted;
+
+        let assigned_lsn = if self.has_logged_entries() {
+            let abort =
+                TxnAbort::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
+            let mut payload = Vec::with_capacity(abort.log_size());
+            abort.write_to_log(&mut payload);
+            self.log_entry(LogEntryType::TxnAbort, &payload, false /* fsync */)?
+        } else {
+            NULL_LSN
+        };
+
+        self.abort_lsn = assigned_lsn.as_u64();
+
+        let mut records = Vec::new();
+        for (lsn, wli) in &self.write_locks {
+            if wli.abort_known_deleted || wli.abort_lsn != NULL_LSN.as_u64() {
+                records.push(UndoRecord {
+                    current_lsn: *lsn,
+                    abort_lsn: wli.abort_lsn,
+                    abort_known_deleted: wli.abort_known_deleted,
+                    abort_data: wli.abort_data.clone(),
+                    abort_key: wli.abort_key.clone(),
+                    database_id: wli.database_id,
+                });
+            }
+        }
+        // Also store in self.undo_records so take_undo_records() still works.
+        self.undo_records.extend(records.iter().cloned());
+        Ok(records)
+    }
+
+    /// Releases all write locks then read locks held by this transaction.
+    ///
+    /// Called by `abort()` and by the higher-level `Transaction::abort()` after
+    /// tree undo has been applied.
+    pub fn release_all_locks(&mut self) {
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
@@ -678,8 +738,6 @@ impl Txn {
         for lsn in self.read_locks.drain().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
-
-        Ok(assigned_lsn)
     }
 
     /// Returns (and clears) the list of undo records produced by `abort()`.

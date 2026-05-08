@@ -537,9 +537,19 @@ impl CursorImpl {
                         Some((d, l)) => (Some(d), l),
                         None => (data.map(|d| d.to_vec()), noxu_util::NULL_LSN.as_u64()),
                     };
+                    // lock_ln may block if a writer holds the write lock.  After
+                    // it returns, the writer has committed or aborted — re-read
+                    // the BIN to get the now-committed value rather than the
+                    // stale snapshot captured before the block.
                     self.lock_ln(slot_lsn)?;
+                    let committed_data = {
+                        let db = self.db_impl.read();
+                        db.get_real_tree()
+                            .and_then(|tree| Self::get_data_from_tree(tree, key))
+                            .map(|(d, _)| d)
+                    };
                     self.current_key = Some(key.to_vec());
-                    self.current_data = slot_data;
+                    self.current_data = committed_data.map(Some).unwrap_or(slot_data);
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
@@ -573,8 +583,14 @@ impl CursorImpl {
                         None => (data.map(|d| d.to_vec()), noxu_util::NULL_LSN.as_u64()),
                     };
                     self.lock_ln(slot_lsn)?;
+                    let committed_data = {
+                        let db = self.db_impl.read();
+                        db.get_real_tree()
+                            .and_then(|tree| Self::get_data_from_tree(tree, key))
+                            .map(|(d, _)| d)
+                    };
                     self.current_key = Some(key.to_vec());
-                    self.current_data = slot_data;
+                    self.current_data = committed_data.map(Some).unwrap_or(slot_data);
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
