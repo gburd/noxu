@@ -2703,6 +2703,32 @@ impl Tree {
     // BIN-Delta reconstitution
     // ========================================================================
 
+    /// Increments the cursor-pin count on a BIN node.
+    ///
+    /// Called by `CursorImpl` when it positions on (or enters) a BIN.
+    /// The evictor will not select a BIN with `cursor_count > 0` for eviction
+    /// (`RealNodeInfo.pin_count`), matching `BIN.incrementCursorCount()`.
+    pub fn pin_bin(bin_arc: &Arc<RwLock<TreeNode>>) {
+        if let Ok(mut guard) = bin_arc.write() {
+            if let TreeNode::Bottom(ref mut stub) = *guard {
+                stub.cursor_count += 1;
+            }
+        }
+    }
+
+    /// Decrements the cursor-pin count on a BIN node.
+    ///
+    /// Called by `CursorImpl` when it moves away from or closes on a BIN.
+    /// Uses `saturating_sub` to guard against an accidental double-unpin.
+    /// Matching `BIN.decrementCursorCount()`.
+    pub fn unpin_bin(bin_arc: &Arc<RwLock<TreeNode>>) {
+        if let Ok(mut guard) = bin_arc.write() {
+            if let TreeNode::Bottom(ref mut stub) = *guard {
+                stub.cursor_count = stub.cursor_count.saturating_sub(1);
+            }
+        }
+    }
+
     /// Returns `true` if the given `BinStub` is a BIN-delta (not a full BIN).
     ///
     /// `IN.isBINDelta()`.

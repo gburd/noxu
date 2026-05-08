@@ -147,6 +147,13 @@ pub struct CursorImpl {
     /// In this is `CursorImpl.index`. -1 means "before first entry".
     current_index: i32,
 
+    /// The BIN Arc the cursor is currently pinned to, if any.
+    ///
+    /// Increments `BinStub.cursor_count` via `Tree::pin_bin()` so the
+    /// evictor skips this BIN while the cursor is positioned on it.
+    /// Cleared (and unpinned) when the cursor is closed or moves to a new BIN.
+    current_bin_arc: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>,
+
     /// Write-ahead log manager for recording data operations.
     /// None for read-only cursors or cursors created outside a real env.
     log_manager: Option<Arc<LogManager>>,
@@ -192,6 +199,7 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            current_bin_arc: None,
             log_manager: None,
             lock_manager: None,
             txn_ref: None,
@@ -216,6 +224,7 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            current_bin_arc: None,
             log_manager: Some(log_manager),
             lock_manager: None,
             txn_ref: None,
@@ -534,6 +543,16 @@ impl CursorImpl {
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
+                    // Pin the BIN the cursor is now positioned on.
+                    let bin_arc = {
+                        let db = self.db_impl.read();
+                        db.get_real_tree().and_then(|tree| {
+                            tree.get_root().and_then(|r| {
+                                Self::find_bin_for_key(r, key)
+                            })
+                        })
+                    };
+                    self.update_bin_pin(bin_arc);
                     Ok(OperationStatus::Success)
                 } else {
                     Ok(OperationStatus::NotFound)
@@ -559,6 +578,16 @@ impl CursorImpl {
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
+                    // Pin the BIN the cursor is now positioned on.
+                    let bin_arc = {
+                        let db = self.db_impl.read();
+                        db.get_real_tree().and_then(|tree| {
+                            tree.get_root().and_then(|r| {
+                                Self::find_bin_for_key(r, key)
+                            })
+                        })
+                    };
+                    self.update_bin_pin(bin_arc);
                     Ok(OperationStatus::Success)
                 } else {
                     let next_entry: Option<(Vec<u8>, Vec<u8>, u64)> = {
@@ -572,11 +601,21 @@ impl CursorImpl {
                     match next_entry {
                         Some((k, v, lsn)) => {
                             self.lock_ln(lsn)?;
+                            // Pin the BIN for the range-found key.
+                            let bin_arc = {
+                                let db = self.db_impl.read();
+                                db.get_real_tree().and_then(|tree| {
+                                    tree.get_root().and_then(|r| {
+                                        Self::find_bin_for_key(r, &k)
+                                    })
+                                })
+                            };
                             self.current_key = Some(k);
                             self.current_data = Some(v);
                             self.current_lsn = lsn;
                             self.current_index = 0;
                             self.state = CursorState::Initialized;
+                            self.update_bin_pin(bin_arc);
                             Ok(OperationStatus::Success)
                         }
                         None => Ok(OperationStatus::NotFound),
@@ -1110,10 +1149,21 @@ impl CursorImpl {
                     return Ok(s);
                 }
                 self.lock_ln(lsn)?;
+                // Crossed into a new BIN — update the cursor pin.
+                let new_key_ref = raw_key.clone();
+                let bin_arc = {
+                    let db = self.db_impl.read();
+                    db.get_real_tree().and_then(|tree| {
+                        tree.get_root().and_then(|r| {
+                            Self::find_bin_for_key(r, &new_key_ref)
+                        })
+                    })
+                };
                 self.current_key = Some(raw_key);
                 self.current_data = Some(raw_data);
                 self.current_lsn = lsn;
                 self.current_index = idx;
+                self.update_bin_pin(bin_arc);
                 Ok(OperationStatus::Success)
             }
             _ => Ok(OperationStatus::NotFound),
@@ -1756,20 +1806,48 @@ impl CursorImpl {
     /// will return `CursorClosed` errors.
     ///
     /// Closing a cursor multiple times is safe and has no effect after the
+    /// Updates the cursor's BIN pin when moving to a new BIN.
+    ///
+    /// Decrements  on the old BIN (if any) and increments it
+    /// on  (if ).  No-op when the cursor stays on the same BIN
+    /// (pointer equality checked via ).
+    ///
+    /// Matching  /
+    ///  calls in cursor positioning.
+    fn update_bin_pin(
+        &mut self,
+        new_bin: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>,
+    ) {
+        // Same BIN — nothing to do.
+        match (&self.current_bin_arc, &new_bin) {
+            (Some(old), Some(new)) if std::sync::Arc::ptr_eq(old, new) => {
+                return;
+            }
+            _ => {}
+        }
+        // Unpin old BIN.
+        if let Some(old_arc) = self.current_bin_arc.take() {
+            noxu_tree::Tree::unpin_bin(&old_arc);
+        }
+        // Pin new BIN.
+        if let Some(ref new_arc) = new_bin {
+            noxu_tree::Tree::pin_bin(new_arc);
+        }
+        self.current_bin_arc = new_bin;
+    }
+
     /// first close.
     ///
     /// # Returns
     ///
-    /// `Ok(())` always (never fails).
+    ///  always (never fails).
     pub fn close(&mut self) -> Result<(), DbiError> {
         if self.state == CursorState::Closed {
             return Ok(());
         }
 
-        // In a full implementation, would:
-        // 1. Release BIN latch if held
-        // 2. Release cursor-level locks
-        // 3. Unregister from DatabaseImpl's cursor tracking
+        // Release BIN pin — prevents evictor from seeing a stale cursor_count.
+        self.update_bin_pin(None);
 
         self.current_key = None;
         self.current_data = None;
