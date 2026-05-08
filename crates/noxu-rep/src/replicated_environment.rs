@@ -371,7 +371,7 @@ impl ReplicatedEnvironment {
     /// Ensure the node state machine is in Unknown state, transitioning
     /// from Detached if necessary. This is needed because the state machine
     /// only allows Detached -> Unknown -> Master/Replica.
-    fn ensure_unknown_state(&self) -> Result<()> {
+    pub fn ensure_unknown_state(&self) -> Result<()> {
         let current = self.node_state.get_state();
         match current {
             NodeState::Unknown => Ok(()),
@@ -379,9 +379,12 @@ impl ReplicatedEnvironment {
                 self.node_state.transition_to(NodeState::Unknown)?;
                 Ok(())
             }
-            // Master and Replica can transition directly to each other
-            // per the state machine rules.
-            NodeState::Master | NodeState::Replica => Ok(()),
+            // Master and Replica must transition through Unknown before
+            // joining a new group or reconnecting.
+            NodeState::Master | NodeState::Replica => {
+                self.node_state.transition_to(NodeState::Unknown)?;
+                Ok(())
+            }
             NodeState::Shutdown => {
                 Err(RepError::StateError("Node is shut down".to_string()))
             }
