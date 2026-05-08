@@ -488,6 +488,10 @@ impl RecoveryManager {
         if last_used == NULL_LSN {
             return Ok(());
         }
+        // Fast path: no uncommitted transactions → skip entire backward scan.
+        if !analysis.has_active_txns() {
+            return Ok(());
+        }
         let stop = if first_active == NULL_LSN {
             Lsn::new(0, 0)
         } else {
@@ -729,10 +733,9 @@ impl RecoveryManager {
                         // during the redo/undo passes.
                         self.redo_entries.push((pe.lsn, rec.clone()));
 
-                        // Track txn IDs seen so undo can identify active txns.
-                        if txn_id > result.max_txn_id {
-                            result.max_txn_id = txn_id;
-                        }
+                        // Track this txn as active until we see its commit/abort.
+                        // record_active_txn() also updates max_txn_id.
+                        result.record_active_txn(txn_id);
                     } else {
                         // Non-transactional LN: always redo after checkpoint.
                         self.redo_entries.push((pe.lsn, rec.clone()));
@@ -1063,6 +1066,12 @@ impl RecoveryManager {
 
         // Guard: nothing to undo if log is empty.
         if last_used == NULL_LSN {
+            return Ok(());
+        }
+
+        // Fast path: no uncommitted transactions → skip entire backward scan.
+        // This is the common case after a clean shutdown.
+        if !analysis.has_active_txns() {
             return Ok(());
         }
 
@@ -2169,6 +2178,33 @@ mod tests {
         let found = tree.search(b"epsilon").map(|r| r.exact_parent_found).unwrap_or(false);
         assert!(!found, "committed delete must remove the key from the tree");
         assert_eq!(mgr.get_stats().lns_redone, 1);
+    }
+
+    /// All transactions committed → undo pass is skipped (lns_read_undo == 0).
+    #[test]
+    fn test_undo_skipped_when_all_txns_committed() {
+        let mut scanner = InMemoryLogScanner::new();
+        // Three transactions, all committed.
+        for txn_id in 1u64..=3 {
+            scanner.push(
+                lsn(0, txn_id as u32 * 10),
+                LogEntry::Ln(make_insert(1, Some(txn_id), b"k", NULL_LSN)),
+            );
+            scanner.push(
+                lsn(0, txn_id as u32 * 10 + 5),
+                LogEntry::TxnCommit(TxnCommitRecord {
+                    txn_id,
+                    lsn: lsn(0, txn_id as u32 * 10 + 5),
+                }),
+            );
+        }
+
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, None, false).unwrap();
+
+        // All 3 redone, zero scanned for undo (fast path).
+        assert_eq!(mgr.get_stats().lns_redone, 3);
+        assert_eq!(mgr.get_stats().lns_read_undo, 0, "undo pass must be skipped when no active txns");
     }
 
     /// Multiple keys: committed inserts visible, uncommitted insert absent.
