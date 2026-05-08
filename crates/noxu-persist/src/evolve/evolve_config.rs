@@ -1,6 +1,5 @@
 //! Configuration for eager schema evolution.
 //!
-//! Port of `com.sleepycat.persist.evolve.EvolveConfig`.
 
 use std::collections::HashSet;
 
@@ -8,7 +7,7 @@ use std::collections::HashSet;
 ///
 /// Return `true` to continue evolution; `false` to stop early.
 ///
-/// Port of `com.sleepycat.persist.evolve.EvolveListener`.
+/// 
 pub trait EvolveListener: Send + Sync {
     /// Called each time an entity is processed during eager evolution.
     ///
@@ -42,7 +41,7 @@ pub trait EvolveListener: Send + Sync {
 ///     .with_class_to_evolve("my.package.Person");
 /// ```
 ///
-/// Port of `com.sleepycat.persist.evolve.EvolveConfig`.
+/// 
 ///
 /// [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 /// [`add_class_to_evolve`]: EvolveConfig::add_class_to_evolve
@@ -57,7 +56,7 @@ pub struct EvolveConfig {
 impl EvolveConfig {
     /// Creates an evolve configuration with default properties.
     ///
-    /// Port of `EvolveConfig()`.
+    /// 
     pub fn new() -> Self {
         Self { classes_to_evolve: HashSet::new(), listener: None }
     }
@@ -67,7 +66,7 @@ impl EvolveConfig {
     /// If no classes are added, all indexes that require evolution will be
     /// converted.
     ///
-    /// Port of `EvolveConfig.addClassToEvolve(String)`.
+    /// 
     pub fn add_class_to_evolve(&mut self, entity_class: impl Into<String>) -> &mut Self {
         self.classes_to_evolve.insert(entity_class.into());
         self
@@ -85,7 +84,7 @@ impl EvolveConfig {
     ///
     /// An empty set means "evolve all classes".
     ///
-    /// Port of `EvolveConfig.getClassesToEvolve()`.
+    /// 
     pub fn classes_to_evolve(&self) -> &HashSet<String> {
         &self.classes_to_evolve
     }
@@ -100,7 +99,7 @@ impl EvolveConfig {
 
     /// Sets a progress listener that is notified each time an entity is read.
     ///
-    /// Port of `EvolveConfig.setEvolveListener(EvolveListener)`.
+    /// 
     pub fn set_listener(&mut self, listener: impl EvolveListener + 'static) -> &mut Self {
         self.listener = Some(Box::new(listener));
         self
@@ -116,7 +115,7 @@ impl EvolveConfig {
 
     /// Returns the progress listener, if one was set.
     ///
-    /// Port of `EvolveConfig.getEvolveListener()`.
+    /// 
     pub fn listener(&self) -> Option<&dyn EvolveListener> {
         self.listener.as_deref()
     }

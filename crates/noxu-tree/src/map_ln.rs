@@ -1,6 +1,5 @@
 //! MapLN  -  Leaf Node that maps database IDs to database metadata.
 //!
-//! Port of `com.sleepycat.je.tree.MapLN`.
 //!
 //! A MapLN stores the configuration and state for a database. MapLNs live
 //! in the database mapping tree (DbTree) and map database IDs to their

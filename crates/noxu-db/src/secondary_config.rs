@@ -1,6 +1,5 @@
 //! Secondary database configuration.
 //!
-//! Port of `com.sleepycat.je.SecondaryConfig`.
 
 use crate::database::Database;
 use crate::database_config::DatabaseConfig;
@@ -8,7 +7,7 @@ use crate::database_entry::DatabaseEntry;
 
 /// Callback trait for creating a single secondary key from a primary record.
 ///
-/// Port of `com.sleepycat.je.SecondaryKeyCreator`.
+/// 
 ///
 /// Implement this trait to extract one secondary key per primary record.
 /// The implementation must be thread-safe because it is called from multiple
@@ -36,7 +35,7 @@ pub trait SecondaryKeyCreator: Send + Sync {
 
 /// Callback trait for creating multiple secondary keys from a primary record.
 ///
-/// Port of `com.sleepycat.je.SecondaryMultiKeyCreator`.
+/// 
 ///
 /// Implement this trait to extract zero or more secondary keys per primary
 /// record. The implementation must be thread-safe because it is called from
@@ -60,7 +59,7 @@ pub trait SecondaryMultiKeyCreator: Send + Sync {
 
 /// Action taken when a record in a foreign key database is deleted.
 ///
-/// Port of `com.sleepycat.je.ForeignKeyDeleteAction`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForeignKeyDeleteAction {
     /// Abort the operation if a secondary record refers to the deleted foreign key.
@@ -79,7 +78,7 @@ pub enum ForeignKeyDeleteAction {
 
 /// Callback trait for nullifying a single foreign key reference in primary data.
 ///
-/// Port of `com.sleepycat.je.ForeignKeyNullifier`.
+/// 
 pub trait ForeignKeyNullifier: Send + Sync {
     /// Called when a referenced foreign key record is deleted.
     ///
@@ -97,7 +96,7 @@ pub trait ForeignKeyNullifier: Send + Sync {
 
 /// Callback trait for nullifying multi-valued foreign key references.
 ///
-/// Port of `com.sleepycat.je.ForeignMultiKeyNullifier`.
+/// 
 pub trait ForeignMultiKeyNullifier: Send + Sync {
     /// Called when a referenced foreign key record is deleted.
     ///
@@ -117,7 +116,7 @@ pub trait ForeignMultiKeyNullifier: Send + Sync {
 
 /// Configuration for a secondary database.
 ///
-/// Port of `com.sleepycat.je.SecondaryConfig`.
+/// 
 ///
 /// SecondaryConfig extends DatabaseConfig with additional fields required to
 /// open a secondary (index) database:
@@ -231,7 +230,7 @@ impl SecondaryConfig {
     }
 
     // ------------------------------------------------------------------
-    // Builder-style setters (mirrors JE's setXxx() returning &self)
+    // Builder-style setters (mirrors setXxx() returning &self)
     // ------------------------------------------------------------------
 
     /// Sets whether a new secondary database may be created.
@@ -251,7 +250,7 @@ impl SecondaryConfig {
 
     /// Sets whether automatic population of the secondary is allowed on open.
     ///
-    /// Port of `SecondaryConfig.setAllowPopulate`.
+    /// 
     pub fn with_allow_populate(mut self, allow_populate: bool) -> Self {
         self.allow_populate = allow_populate;
         self
@@ -262,7 +261,7 @@ impl SecondaryConfig {
     /// Either `key_creator` or `multi_key_creator` must be set (not both),
     /// unless the primary database is read-only.
     ///
-    /// Port of `SecondaryConfig.setKeyCreator`.
+    /// 
     pub fn with_key_creator(mut self, key_creator: Box<dyn SecondaryKeyCreator>) -> Self {
         self.key_creator = Some(key_creator);
         self
@@ -270,7 +269,7 @@ impl SecondaryConfig {
 
     /// Sets the multi-key creator callback.
     ///
-    /// Port of `SecondaryConfig.setMultiKeyCreator`.
+    /// 
     pub fn with_multi_key_creator(
         mut self,
         multi_key_creator: Box<dyn SecondaryMultiKeyCreator>,
@@ -281,7 +280,7 @@ impl SecondaryConfig {
 
     /// Sets whether the secondary key is immutable.
     ///
-    /// Port of `SecondaryConfig.setImmutableSecondaryKey`.
+    /// 
     pub fn with_immutable_secondary_key(mut self, immutable: bool) -> Self {
         self.immutable_secondary_key = immutable;
         self
@@ -289,7 +288,7 @@ impl SecondaryConfig {
 
     /// Sets whether to derive the secondary key from the primary key only.
     ///
-    /// Port of `SecondaryConfig.setExtractFromPrimaryKeyOnly`.
+    /// 
     pub fn with_extract_from_primary_key_only(mut self, extract_only: bool) -> Self {
         self.extract_from_primary_key_only = extract_only;
         self
@@ -301,7 +300,7 @@ impl SecondaryConfig {
     /// The pointer must remain valid for the lifetime of this config and the
     /// secondary database that uses it.
     ///
-    /// Port of `SecondaryConfig.setForeignKeyDatabase`.
+    /// 
     pub fn with_foreign_key_database(mut self, db: &Database) -> Self {
         self.foreign_key_database = Some(db as *const Database);
         self
@@ -309,7 +308,7 @@ impl SecondaryConfig {
 
     /// Sets the action to take when a referenced foreign key is deleted.
     ///
-    /// Port of `SecondaryConfig.setForeignKeyDeleteAction`.
+    /// 
     pub fn with_foreign_key_delete_action(mut self, action: ForeignKeyDeleteAction) -> Self {
         self.foreign_key_delete_action = action;
         self
@@ -317,7 +316,7 @@ impl SecondaryConfig {
 
     /// Sets the foreign key nullifier (single-value variant).
     ///
-    /// Port of `SecondaryConfig.setForeignKeyNullifier`.
+    /// 
     pub fn with_foreign_key_nullifier(
         mut self,
         nullifier: Box<dyn ForeignKeyNullifier>,
@@ -328,7 +327,7 @@ impl SecondaryConfig {
 
     /// Sets the foreign key nullifier (multi-value variant).
     ///
-    /// Port of `SecondaryConfig.setForeignMultiKeyNullifier`.
+    /// 
     pub fn with_foreign_multi_key_nullifier(
         mut self,
         nullifier: Box<dyn ForeignMultiKeyNullifier>,
@@ -345,7 +344,7 @@ impl SecondaryConfig {
     ///
     /// Returns an error description if the configuration is invalid.
     ///
-    /// Port of the constructor validation in `SecondaryDatabase`.
+    /// Constructor validation in `SecondaryDatabase`.
     pub(crate) fn validate(&self, primary_read_only: bool) -> Result<(), String> {
         if self.key_creator.is_some() && self.multi_key_creator.is_some() {
             return Err(
@@ -387,7 +386,7 @@ impl SecondaryConfig {
 
     /// Returns whether an update to the primary may change the secondary key.
     ///
-    /// Port of `SecondaryDatabase.updateMayChangeSecondary`.
+    /// 
     pub(crate) fn update_may_change_secondary(&self) -> bool {
         !self.immutable_secondary_key && !self.extract_from_primary_key_only
     }

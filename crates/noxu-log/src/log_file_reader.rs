@@ -1,6 +1,6 @@
 //! Sequential log file reader.
 //!
-//! Port of the core read-loop from `com.sleepycat.je.log.FileReader`.
+//! Core read-loop for log file reading.
 //!
 //! `LogFileReader` opens a single `.ndb` log file and reads entries one by
 //! one in forward order.  Unlike the generic `FileReader<F>` (which uses a
@@ -21,7 +21,7 @@
 //!
 //! CRC32 is computed over bytes `[CHECKSUM_BYTES..header_size+item_size]`.
 //!
-//! # JE equivalents
+//! # equivalents
 //!
 //! - `FileReader.readNextEntry()` -> `LogFileReader::read_next()`
 //! - Checksum validation via `ChecksumValidator`
@@ -49,7 +49,7 @@ pub struct LogFileReader {
     file_num: u32,
 
     /// Current byte offset within the file.  Starts at `FILE_HEADER_SIZE`
-    /// (i.e. just after the file header), exactly as JE does.
+    /// (i.e. just after the file header), exactly as does.
     current_offset: u64,
 
     /// Length of the file as determined at open time.
@@ -63,7 +63,7 @@ impl LogFileReader {
     /// Opens the log file `file_num` for sequential reading.
     ///
     /// The reader starts immediately after the file header
-    /// (`FILE_HEADER_SIZE` bytes in), matching JE's positioning.
+    /// (`FILE_HEADER_SIZE` bytes in), matching positioning.
     ///
     /// # Errors
     /// Returns an error if the file does not exist or cannot be read.
@@ -92,13 +92,13 @@ impl LogFileReader {
 
     /// Reads the next log entry from the file.
     ///
-    /// Port of the core loop inside `FileReader.readNextEntry()`.
+    /// Core loop inside `FileReader.readNextEntry()`.
     ///
     /// - If a complete, valid entry is found, returns
     ///   `Some((lsn, entry_type, payload))`.
     /// - If the end of the file is reached, returns `None`.
     /// - If the entry header or checksum is invalid (truncated write at end
-    ///   of log), logs a warning and returns `None` - this matches JE's
+    ///   of log), logs a warning and returns `None` - this matches the
     ///   behaviour in `LastFileReader` where bad-CRC entries are treated as
     ///   the log boundary rather than a hard error.
     pub fn read_next(
@@ -148,7 +148,7 @@ impl LogFileReader {
             Some(t) => t,
             None => {
                 // Unknown type - could be garbage at end of a partial write.
-                // Treat as end-of-log (matches JE's approach).
+                // Treat as end-of-log (approach).
                 log::warn!(
                     "LogFileReader: unknown entry type {} at file {:08x} \
                      offset {:#x}; treating as end of log",
@@ -206,7 +206,7 @@ impl LogFileReader {
         }
 
         // Step 5: Validate the CRC32 checksum.
-        // JE: ChecksumValidator covers bytes [CHECKSUM_BYTES..entry_size].
+        // ChecksumValidator covers bytes [CHECKSUM_BYTES..entry_size].
         let computed_crc = ChecksumValidator::compute_range(
             &full_buf,
             CHECKSUM_BYTES,
@@ -214,7 +214,7 @@ impl LogFileReader {
         );
 
         if computed_crc != stored_checksum {
-            // Bad checksum - partial/corrupt write.  JE's LastFileReader
+            // Bad checksum - partial/corrupt write.  LastFileReader
             // treats this as end-of-log rather than a hard error.
             log::warn!(
                 "LogFileReader: checksum mismatch at file {:08x} offset \

@@ -1,6 +1,5 @@
 //! Last file reader for finding the true end of the log.
 //!
-//! Port of `com.sleepycat.je.log.LastFileReader`.
 //!
 //! Traverses the last log file backward to find the true end of the log,
 //! handling partial writes at the end of the file. Used during recovery.

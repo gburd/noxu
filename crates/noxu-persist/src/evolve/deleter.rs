@@ -1,6 +1,5 @@
 //! Deleter mutation for schema evolution.
 //!
-//! Port of `com.sleepycat.persist.evolve.Deleter`.
 
 use super::mutation::MutationKey;
 
@@ -22,7 +21,7 @@ use super::mutation::MutationKey;
 /// let field_deleter = Deleter::for_field("my.package.Person", 0, "favoriteColors");
 /// ```
 ///
-/// Port of `com.sleepycat.persist.evolve.Deleter`.
+/// 
 ///
 /// [`Converter`]: super::converter::Converter
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +32,7 @@ pub struct Deleter {
 impl Deleter {
     /// Creates a mutation for deleting an entire entity class.
     ///
-    /// Port of `Deleter(String className, int classVersion)`.
+    /// 
     ///
     /// # Arguments
     /// * `class_name` - Fully-qualified name of the class to delete.
@@ -44,7 +43,7 @@ impl Deleter {
 
     /// Creates a mutation for deleting a field from all instances of a class.
     ///
-    /// Port of `Deleter(String declaringClass, int declaringClassVersion,
+    /// `Deleter(String declaringClass, int declaringClassVersion,
     ///                   String fieldName)`.
     ///
     /// # Arguments

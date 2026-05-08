@@ -1,6 +1,5 @@
 //! Log entry header.
 //!
-//! Port of `com.sleepycat.je.log.LogEntryHeader`.
 //!
 //! A LogEntryHeader embodies the header information at the beginning of each
 //! log entry. The header contains: checksum, entry type, flags, previous

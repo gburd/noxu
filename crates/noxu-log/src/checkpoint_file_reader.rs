@@ -1,6 +1,5 @@
 //! Checkpoint file reader for recovery.
 //!
-//! Port of `com.sleepycat.je.log.CheckpointFileReader`.
 //!
 //! Scans backward from the end of log looking for checkpoint entries.
 //! Used during recovery to find the last checkpoint.

@@ -1,6 +1,5 @@
 //! Internal database implementation.
 //!
-//! Port of `com.sleepycat.je.dbi.DatabaseImpl`.
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use noxu_tree::{KeyComparatorFn, Tree};
@@ -29,7 +28,7 @@ const PREFIXING_ENABLED: u8 = 0x10;
 
 /// The underlying object for a given database.
 ///
-/// Port of `com.sleepycat.je.dbi.DatabaseImpl`.
+/// 
 pub struct DatabaseImpl {
     /// Unique database ID.
     id: DatabaseId,
@@ -58,7 +57,7 @@ pub struct DatabaseImpl {
     real_tree: Option<Tree>,
     /// Whether writes are deferred (not WAL-logged immediately).
     ///
-    /// Port of `DatabaseImpl.isDeferredWriteMode()` in JE.
+    /// 
     /// When true, `log_ln_write()` skips WAL logging and returns NULL_LSN;
     /// data is flushed to disk only at eviction or checkpoint.
     deferred_write: bool,
@@ -68,7 +67,7 @@ pub struct DatabaseImpl {
     /// Shared (Arc) so that CursorImpl can update it without holding the
     /// `DatabaseImpl` write lock — reads and writes are both O(1) atomics.
     ///
-    /// Port of JE `DatabaseImpl.count` (AtomicLong, updated in
+    /// `DatabaseImpl.count` (AtomicLong, updated in
     /// `BIN.insertEntry` / `BIN.deleteEntry`).
     entry_count: Arc<AtomicU64>,
     /// Key comparator (None = default byte comparison).
@@ -84,8 +83,8 @@ pub struct DatabaseImpl {
 /// Holds the root LSN so that recovery can locate the tree root on disk.
 /// The live in-memory tree is `DatabaseImpl::real_tree`.
 ///
-/// Port of `DatabaseImpl.tree` (the persistent `Tree` object stored as part
-/// of the database record) in JE.
+/// (the persistent `Tree` object stored as part
+/// of the database record).
 #[derive(Debug)]
 pub struct DatabaseTree {
     /// Root LSN of the tree.
@@ -172,7 +171,7 @@ impl DatabaseImpl {
 
     /// Returns true if this database uses deferred write mode.
     ///
-    /// Port of `DatabaseImpl.isDeferredWriteMode()` in JE.
+    /// 
     pub fn is_deferred_write(&self) -> bool {
         self.deferred_write
     }
@@ -230,7 +229,7 @@ impl DatabaseImpl {
     // Entry count (O(1) atomic counter)
     /// Returns the current entry count.
     ///
-    /// Port of `DatabaseImpl.count()` in JE — reads an AtomicLong.
+    /// In — reads an AtomicLong.
     pub fn entry_count(&self) -> u64 {
         self.entry_count.load(Ordering::Relaxed)
     }
@@ -333,7 +332,7 @@ impl DatabaseImpl {
     }
 
     pub fn read_from_log(buf: &[u8]) -> std::io::Result<Self> {
-        // Helper: port of JE DatabaseImpl.typeForDbName()
+        // Helper:
         fn type_for_db_name(name: &str) -> DbType {
             match name {
                 "_jeIdMap" | "_noxuIdMap" => DbType::Id,

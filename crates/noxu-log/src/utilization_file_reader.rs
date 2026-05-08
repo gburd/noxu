@@ -1,6 +1,5 @@
 //! Utilization file reader for tracking log file space usage.
 //!
-//! Port of `com.sleepycat.je.log.UtilizationFileReader`.
 //!
 //! Scans the entire log (or a range of it) and builds a per-file
 //! `FileSummary` that separately counts LN and IN entries as total vs.
@@ -9,7 +8,7 @@
 //! file number.
 //!
 //! Because noxu-log does not depend on noxu-cleaner, this module provides its
-//! own minimal `FileSummary` type that mirrors the fields required by JE's
+//! own minimal `FileSummary` type that mirrors the fields required by the
 //! `UtilizationFileReader`.  Callers that need the full noxu-cleaner
 //! `FileSummary` can copy the fields across.
 
@@ -25,7 +24,6 @@ const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;
 
 /// Minimal per-file utilization summary produced by `UtilizationFileReader`.
 ///
-/// Fields mirror `com.sleepycat.je.cleaner.FileSummary`.
 #[derive(Debug, Clone, Default)]
 pub struct FileSummary {
     /// Total number of log entries counted for this file.
@@ -63,7 +61,7 @@ impl FileSummary {
 
 /// Scans the log and builds a per-file utilization map.
 ///
-/// Port of `com.sleepycat.je.log.UtilizationFileReader`.
+/// 
 ///
 /// The simplest way to use this reader:
 ///
@@ -137,7 +135,7 @@ impl<F: LogFileAccess> UtilizationFileReader<F> {
     ///
     /// Returns `Ok(true)` while entries remain; `Ok(false)` at end of log.
     ///
-    /// Port of `UtilizationFileReader.processEntry()` — every non-header
+    /// every non-header
     /// entry is counted; invisible entries are skipped.
     pub fn read_next_entry(&mut self) -> Result<bool> {
         if self.eof {

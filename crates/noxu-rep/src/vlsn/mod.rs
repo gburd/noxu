@@ -1,6 +1,6 @@
 //! VLSN tracking subsystem.
 //!
-//! Port of `com.sleepycat.je.rep.vlsn`  -  tracks the mapping from VLSNs
+//! tracks the mapping from VLSNs
 //! (Virtual Log Sequence Numbers) to LSNs (Log Sequence Numbers) and
 //! maintains the range of VLSNs available on this node.
 

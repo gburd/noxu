@@ -1,6 +1,5 @@
 //! BIN Delta log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.BINDeltaLogEntry`.
 //!
 //! BINDeltaLogEntry represents a partial BIN (Bottom Internal Node) that
 //! contains only the slots that have changed since the last full BIN or

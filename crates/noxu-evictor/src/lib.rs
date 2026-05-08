@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Cache eviction for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.evictor` - manages eviction of B-tree nodes
+//! manages eviction of B-tree nodes
 //! from the main cache and off-heap cache when they overflow.
 //!
 //! ## Overview

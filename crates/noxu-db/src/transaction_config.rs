@@ -1,6 +1,5 @@
 //! Transaction configuration.
 //!
-//! Port of `com.sleepycat.je.TransactionConfig`.
 
 use crate::durability::Durability;
 
@@ -8,7 +7,7 @@ use crate::durability::Durability;
 ///
 /// Specifies the configuration parameters used when beginning a transaction.
 ///
-/// Port of `com.sleepycat.je.TransactionConfig`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionConfig {
     /// Durability for this transaction.

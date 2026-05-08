@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Iterator-based collection views for Noxu DB.
 //!
-//! Port of `com.sleepycat.collections`  -  provides standard Rust Iterator
+//! provides standard Rust Iterator
 //! and collection-style access to databases.
 //!
 //! This crate provides map, set, and iterator views over Noxu DB databases,

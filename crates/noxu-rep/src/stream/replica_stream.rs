@@ -1,6 +1,6 @@
 //! Replica stream  -  replica-side replication receiver.
 //!
-//! Port of `com.sleepycat.je.rep.impl.node.Replica`. Tracks the state of
+//! Tracks the state of
 //! receiving replication data from the master, including pending entries,
 //! applied/received VLSNs, and the master's latest known VLSN.
 //!
@@ -10,7 +10,7 @@
 //!
 //! [`EnvironmentLogWriter`] is the live implementation of [`LogWriter`] that
 //! writes replicated entries into the local `LogManager` and updates the
-//! VLSN index. Port of `com.sleepycat.je.rep.impl.node.Replica.ReplayThread`.
+//! VLSN index.
 
 use noxu_log::{LogEntryType, Provisional};
 use noxu_sync::Mutex;
@@ -26,7 +26,7 @@ use crate::net::channel::Channel;
 
 /// Sink for replicated log entries.
 ///
-/// Corresponds to JE's replay thread accepting log records and writing them
+/// Corresponds to replay thread accepting log records and writing them
 /// to the local environment. The replica calls `write_entry` for every entry
 /// received from the master.
 pub trait LogWriter: Send {
@@ -56,7 +56,7 @@ pub trait LogWriter: Send {
 ///   3. Registers the returned LSN in the provided `vlsn_index` so that
 ///      the VLSN→LSN mapping is kept up-to-date on the replica.
 ///
-/// Port of `com.sleepycat.je.rep.impl.node.Replica.ReplayThread`.
+/// 
 pub struct EnvironmentLogWriter {
     /// Shared log manager for appending replicated entries.
     log_manager: Arc<noxu_log::LogManager>,
@@ -152,7 +152,7 @@ const FRAME_HEADER_LEN: usize = 8 + 1 + 4;
 ///   4. Sends an 8-byte LE VLSN ack back to the master.
 ///   5. Returns when the channel is closed or an I/O error occurs.
 ///
-/// Port of the read thread + `ReplayThread` in JE's `Replica`.
+/// Read thread and replay thread in the replica.
 pub struct ReplicaReceiver {
     /// Channel to the master feeder.
     channel: Arc<dyn Channel>,
@@ -236,7 +236,7 @@ impl ReplicaReceiver {
 
 /// The state of the replica's replication stream.
 ///
-/// Port of the replica state machine from JE's `Replica` class.
+/// Replica state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaStreamState {
     /// Not connected to any master.
@@ -257,7 +257,7 @@ pub enum ReplicaStreamState {
 /// in a pending queue, and tracks which VLSNs have been received vs.
 /// applied to the local database.
 ///
-/// Port of `com.sleepycat.je.rep.impl.node.Replica`.
+/// 
 pub struct ReplicaStream {
     /// Name of the master we are connected to.
     master_name: Mutex<Option<String>>,

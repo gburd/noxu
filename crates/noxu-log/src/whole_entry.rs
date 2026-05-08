@@ -1,6 +1,5 @@
 //! Whole entry structure for read operations.
 //!
-//! Port of `com.sleepycat.je.log.WholeEntry`.
 //!
 //! This struct packages the log entry header and the log entry contents
 //! together for components that need information from both parts.

@@ -1,6 +1,6 @@
 //! Election state machine.
 //!
-//! Port of `com.sleepycat.je.rep.elections.Elections`  -  orchestrates a single
+//! orchestrates a single
 //! election round: proposing candidacy, collecting votes, evaluating competing
 //! proposals, checking quorum, and recording the outcome.
 //!

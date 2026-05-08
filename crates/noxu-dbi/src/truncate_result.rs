@@ -1,6 +1,6 @@
 /// Result of a database truncate operation.
 ///
-/// Port of `com.sleepycat.je.dbi.TruncateResult`.
+/// 
 #[derive(Debug, Clone)]
 pub struct TruncateResult {
     /// The new (empty) database.

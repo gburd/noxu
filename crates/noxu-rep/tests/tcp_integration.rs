@@ -559,7 +559,7 @@ fn test_channel_drop_on_receiver_side_is_detected_by_sender() {
 /// Verify that the `ReplicatedEnvironment` state machine correctly handles a
 /// simulated partition + re-election cycle without getting stuck.
 ///
-/// JE `RepNode.handleReconnect()` drives: Replica → Unknown → (re-elect) →
+/// Drives: Replica → Unknown → (re-elect) →
 /// Master/Replica. This test exercises that the Detached → Replica → Master
 /// path (via direct re-election) completes without errors and leaves the
 /// environment in Master state — i.e. the state machine is not wedged at
@@ -578,7 +578,7 @@ fn test_replicated_env_state_machine_survives_re_election() {
     assert_eq!(env.get_state(), NodeState::Replica);
 
     // Step 2: simulated channel drop + re-election — node wins election and
-    // becomes master directly from Replica (JE allows Master ↔ Replica direct
+    // becomes master directly from Replica (allows Master ↔ Replica direct
     // transitions via ensure_unknown_state).
     env.become_master(2).expect("become_master (re-election) failed");
     assert_eq!(env.get_state(), NodeState::Master,

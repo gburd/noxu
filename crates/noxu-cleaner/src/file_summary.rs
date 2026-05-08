@@ -1,6 +1,6 @@
 //! Per-file utilization counters.
 //!
-//! Port of `com.sleepycat.je.cleaner.FileSummary` - tracks the total and obsolete
+//! tracks the total and obsolete
 //! counts and sizes for log entries in a single log file.
 
 /// Per-file utilization counters.
@@ -32,7 +32,7 @@ pub struct FileSummary {
     pub obsolete_ln_size_counted: i32,
     /// Number of TTL-expired LN log entries (subset of obsolete_ln_count).
     ///
-    /// Port of JE `FileSummary` expired-LN tracking used by `UtilizationCalculator`
+    /// `FileSummary` expired-LN tracking used by `UtilizationCalculator`
     /// to give additional weight to files with many expired records.  Expired LNs
     /// do not need to be migrated during cleaning — they can be dropped outright —
     /// so a file with a high expired fraction is cheaper to clean than its raw
@@ -233,7 +233,7 @@ impl FileSummary {
     /// `active_size - expired_bytes`, which is what the cleaner actually has to
     /// write to the new file.
     ///
-    /// Port of JE `UtilizationCalculator` expired-size adjustment:
+    /// `UtilizationCalculator` expired-size adjustment:
     ///   adjustedActive = active_size - obsolete_expired_size
     pub fn get_adjusted_active_size(&self) -> i32 {
         let active = self.get_active_size();
@@ -249,7 +249,7 @@ impl FileSummary {
     /// because expired LNs are dropped rather than migrated.  Using the
     /// adjusted utilization causes the `FileSelector` to prefer such files.
     ///
-    /// Port of JE `UtilizationCalculator.getBestFile()` adjusted-utilization
+    /// `UtilizationCalculator.getBestFile()` adjusted-utilization
     /// formula: `(active_bytes - expired_bytes) / total_bytes`.
     pub fn get_adjusted_utilization(&self) -> f64 {
         if self.total_size == 0 {

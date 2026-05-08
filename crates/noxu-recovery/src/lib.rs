@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Checkpoint-based crash recovery for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.recovery` - performs recovery during Environment
+//! performs recovery during Environment
 //! open and periodic checkpointing to bound recovery time.
 
 pub mod analysis_result;

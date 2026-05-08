@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Derive-macro-based entity persistence for Noxu DB.
 //!
-//! Port of `com.sleepycat.persist` (Direct Persistence Layer) - provides
+//! Direct Persistence Layer — provides
 //! trait-based entity-to-database mapping. Users implement `Entity`,
 //! `PrimaryKey`, and `EntitySerializer` traits for their types. Derive
 //! macros can be added later in a separate proc-macro crate.
@@ -10,8 +10,8 @@
 //!
 //! The persistence layer provides typed access to database records through:
 //!
-//! - **`Entity`** - Trait marking a type as storable (port of `@Entity` annotation)
-//! - **`PrimaryKey`** - Trait for primary key types (port of `@PrimaryKey` annotation)
+//! - **`Entity`** - Trait marking a type as storable
+//! - **`PrimaryKey`** - Trait for primary key types
 //! - **`EntitySerializer`** - Trait for custom serialization strategies
 //! - **`PrimaryIndex`** - Typed CRUD operations on entities by primary key
 //! - **`EntityStore`** - Manages databases for entity types

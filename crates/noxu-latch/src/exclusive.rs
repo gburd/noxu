@@ -1,11 +1,8 @@
 //! Exclusive (mutex-like) latch.
 //!
-//! Port of `com.sleepycat.je.latch.LatchImpl`.
-//!
 //! Provides exclusive latching implemented with `noxu_sync::Mutex`.
 //! Reentrancy is prevented: attempting to acquire a latch already held by
-//! the current thread will panic (matching JE's behavior of detecting
-//! accidental reentrant calls).
+//! the current thread will panic, detecting accidental reentrant calls.
 
 use crate::LatchContext;
 use noxu_sync::Mutex;
@@ -18,8 +15,6 @@ use std::thread;
 /// This latch provides exclusive/write access only. It prevents reentrant
 /// acquisition by the same thread, which increases reliability by detecting
 /// accidental reentrant calls.
-///
-/// Port of `com.sleepycat.je.latch.LatchImpl`.
 pub struct ExclusiveLatch {
     context: LatchContext,
     inner: Mutex<()>,
@@ -47,8 +42,7 @@ impl ExclusiveLatch {
     /// # Panics
     ///
     /// Panics if the latch is already held by the calling thread (reentrancy
-    /// detected), or if the acquisition times out.  Reentrancy detection
-    /// matches JE's behavior of throwing EnvironmentFailureException.
+    /// detected), or if the acquisition times out.
     pub fn acquire(&self) -> ExclusiveLatchGuard<'_> {
         let current = thread_id();
         if self.owner.load(Ordering::Relaxed) == current {
@@ -113,7 +107,7 @@ impl ExclusiveLatch {
     /// Releases the latch if held by the current thread.
     /// Does nothing if not held by the current thread.
     ///
-    /// This is the equivalent of JE's `releaseIfOwner()`.
+    /// Equivalent of `release_if_owner()` — releases only if held by this thread.
     pub fn release_if_owner(&self) {
         if self.is_owner() {
             self.owner.store(0, Ordering::Relaxed);
@@ -317,8 +311,7 @@ mod tests {
     // Ported from LatchTest.java — exclusive latch invariants
     // -----------------------------------------------------------------------
 
-    /// Port of LatchTest.testAcquireAndReacquire: acquiring an already-held
-    /// exclusive latch must panic (reentrancy detection).
+    /// Acquiring an already-held exclusive latch must panic (reentrancy detection).
     #[test]
     fn test_je_acquire_reacquire_panics() {
         let result = std::panic::catch_unwind(|| {
@@ -330,8 +323,7 @@ mod tests {
         assert!(result.is_err(), "reentrant acquire should panic");
     }
 
-    /// Port of LatchTest.testAcquireAndReacquire: releasing a latch that is
-    /// not held must panic.
+    /// Releasing a latch that is not held must panic.
     #[test]
     fn test_je_release_not_held_panics() {
         // release_if_owner on a latch not held should be a no-op (not panic).
@@ -345,8 +337,7 @@ mod tests {
         assert!(!latch.is_locked());
     }
 
-    /// Port of LatchTest.testAcquireNoWait: try_acquire returns None when held
-    /// by another thread, and Some when available.
+    /// `try_acquire` returns None when held by another thread, and Some when available.
     #[test]
     fn test_je_try_acquire_no_wait() {
         let latch = Arc::new(ExclusiveLatch::named("je-no-wait"));
@@ -390,8 +381,8 @@ mod tests {
         assert!(!latch.is_locked());
     }
 
-    /// Port of LatchTest.testWait: thread 2 blocks on acquire while thread 1
-    /// holds; after thread 1 releases, thread 2 is granted.
+    /// A second thread blocks on `acquire` while the first holds it;
+    /// after the first releases, the second is granted.
     #[test]
     fn test_je_wait_blocks_until_released() {
         let latch = Arc::new(ExclusiveLatch::named("je-wait"));
@@ -419,8 +410,7 @@ mod tests {
         assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// Port of LatchTest.testMultipleWaiters: N threads wait sequentially;
-    /// each is granted after the previous releases.
+    /// N threads wait sequentially; each is granted after the previous releases.
     #[test]
     fn test_je_multiple_waiters_sequential_grant() {
         use std::sync::atomic::{AtomicUsize, Ordering};

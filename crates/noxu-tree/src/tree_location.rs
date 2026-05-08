@@ -1,6 +1,5 @@
 //! Recovery cursor-like position tracker.
 //!
-//! Port of `com.sleepycat.je.tree.TreeLocation` from JE.
 //!
 //! Tracks a location in a tree during recovery operations. This is similar
 //! to a cursor but is used specifically for recovery processing.

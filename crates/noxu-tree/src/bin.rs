@@ -1,8 +1,7 @@
 //! BIN (Bottom Internal Node) implementation.
 //!
-//! Port of `com.sleepycat.je.tree.BIN` from JE.
 //!
-//! A BIN is the leaf-level internal node in the JE B+tree. BINs contain
+//! A BIN is the leaf-level internal node in the B+tree. BINs contain
 //! references to LN (Leaf Node) data records. BINs support BIN-deltas
 //! for efficient logging of partially-modified nodes.
 //!
@@ -61,21 +60,21 @@ pub struct InNode {
     is_delta: bool,
     /// Node-level dirty flag.
     ///
-    /// Port of JE `IN.dirty` (IN_DIRTY_BIT in `flags`).
+    /// `IN.dirty` (IN_DIRTY_BIT in `flags`).
     dirty: bool,
     /// When true, the next checkpoint must write a full BIN rather than a delta.
     ///
-    /// Set when a dirty slot is compressed away — JE sets this in
+    /// Set when a dirty slot is compressed away — sets this in
     /// `BIN.compress()` to prevent a subsequent delta from omitting the
-    /// compressed slot.  Port of JE `BIN.prohibitNextDelta`.
+    /// compressed slot.
     prohibit_next_delta: bool,
     /// Persistent node ID assigned at creation.
     ///
-    /// Port of JE `IN.nodeId` (allocated from `NodeSequence`).
+    /// `IN.nodeId` (allocated from `NodeSequence`).
     node_id: u64,
 }
 
-/// Monotonic counter for BIN node IDs (mirrors JE's NodeSequence).
+/// Monotonic counter for BIN node IDs (mirrors NodeSequence).
 static NEXT_BIN_NODE_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -246,35 +245,35 @@ impl InNode {
 
     /// Returns the node-level dirty flag.
     ///
-    /// Port of JE `IN.isDirty()`.
+    /// `IN.isDirty()`.
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
     /// Sets or clears the node-level dirty flag.
     ///
-    /// Port of JE `IN.setDirty(boolean)`.
+    /// `IN.setDirty(boolean)`.
     pub fn set_dirty(&mut self, dirty: bool) {
         self.dirty = dirty;
     }
 
     /// Returns true if the next checkpoint must write a full BIN (not a delta).
     ///
-    /// Port of JE `BIN.getProhibitNextDelta()`.
+    /// `BIN.getProhibitNextDelta()`.
     pub fn get_prohibit_next_delta(&self) -> bool {
         self.prohibit_next_delta
     }
 
     /// Sets or clears the prohibit-next-delta flag.
     ///
-    /// Port of JE `BIN.setProhibitNextDelta(boolean)`.
+    /// `BIN.setProhibitNextDelta(boolean)`.
     pub fn set_prohibit_next_delta(&mut self, val: bool) {
         self.prohibit_next_delta = val;
     }
 
     /// Returns the persistent node ID.
     ///
-    /// Port of JE `Node.getNodeId()`.
+    /// `Node.getNodeId()`.
     pub fn node_id(&self) -> i64 {
         self.node_id as i64
     }
@@ -308,7 +307,7 @@ impl InNode {
     pub fn release_latch(&self) {}
 }
 
-/// A Bottom Internal Node in the JE B+tree.
+/// A Bottom Internal Node in the B+tree.
 ///
 /// BINs are always at level 1 (MAIN_LEVEL | 1 = BIN_LEVEL).
 /// They reference LN data records in their slots.
@@ -319,18 +318,18 @@ impl InNode {
 /// each key — the bytes after stripping the common leading prefix.  The full
 /// key is reconstructed by prepending `key_prefix` to the stored suffix via
 /// `get_full_key()`.  The prefix is recomputed via `recompute_key_prefix()`
-/// after bulk inserts and splits, mirroring JE's `IN.keyPrefix` pattern.
+/// after bulk inserts and splits, mirroring `IN.keyPrefix` pattern.
 ///
-/// Port of `com.sleepycat.je.tree.BIN` from JE.
+/// .
 #[derive(Debug)]
 pub struct Bin {
-    /// The underlying IN (composition  -  BIN extends IN in JE).
+    /// The underlying IN (composition  -  BIN extends IN in the).
     /// `inner.keys` stores *suffixes* when `key_prefix` is non-empty.
     pub(crate) inner: InNode,
 
     /// Common prefix shared by every key in this BIN.
     /// Empty means prefix compression is not active.
-    /// Port of JE `IN.keyPrefix`.
+    /// `IN.keyPrefix`.
     pub(crate) key_prefix: Vec<u8>,
 
     /// LSN of the last full BIN that was logged (for BIN-delta reconstruction).
@@ -338,7 +337,7 @@ pub struct Bin {
 
     /// Set of cursor IDs currently positioned on this BIN.
     ///
-    /// JE uses a `TinyHashSet<CursorImpl>` pointer set; we track cursor IDs
+    /// uses a `TinyHashSet<CursorImpl>` pointer set; we track cursor IDs
     /// (u64) as a lightweight substitute until the full cursor integration is
     /// wired.  None means the set is empty.
     cursor_set: Option<HashSet<u64>>,
@@ -363,8 +362,8 @@ pub struct Bin {
     /// Only populated for slots with embedded LN data. A value of 0 means
     /// no modification time is recorded for that slot.
     ///
-    /// Port of JE `BIN.modificationTimes` (`INLongRep` array, NoSQL fork).
-    /// JE's `INLongRep` uses variable-length encoding with a delta base to
+    /// `BIN.modificationTimes` (`INLongRep` array, NoSQL fork).
+    /// `INLongRep` uses variable-length encoding with a delta base to
     /// pack times compactly; Noxu stores absolute millis in a plain Vec for
     /// simplicity while preserving the same per-slot semantics.
     pub(crate) modification_times: Vec<u64>,
@@ -374,7 +373,7 @@ pub struct Bin {
     /// Only populated for slots with embedded LN data. A value of 0 means
     /// no creation time is recorded for that slot.
     ///
-    /// Port of JE `BIN.creationTimes` (`INLongRep` array, NoSQL fork).
+    /// `BIN.creationTimes` (`INLongRep` array, NoSQL fork).
     pub(crate) creation_times: Vec<u64>,
 }
 
@@ -402,19 +401,19 @@ impl Bin {
     }
 
     // ========================================================================
-    // Key prefix compression  —  port of JE IN.keyPrefix / recalcKeyPrefix
+    // Key prefix compression
     // ========================================================================
 
     /// Returns the current key prefix (may be empty).
     ///
-    /// Port of JE `IN.getKeyPrefix()`.
+    /// `IN.getKeyPrefix()`.
     pub fn get_key_prefix(&self) -> &[u8] {
         &self.key_prefix
     }
 
     /// Returns true when prefix compression is active.
     ///
-    /// Port of JE `IN.hasKeyPrefix()`.
+    /// `IN.hasKeyPrefix()`.
     pub fn has_key_prefix(&self) -> bool {
         !self.key_prefix.is_empty()
     }
@@ -423,7 +422,7 @@ impl Bin {
     ///
     /// Returns `None` if `index` is out of range.
     ///
-    /// Port of JE `IN.getKey(int idx)`.
+    /// `IN.getKey(int idx)`.
     pub fn get_full_key(&self, index: usize) -> Option<Vec<u8>> {
         let suffix = self.inner.get_key(index)?;
         if self.key_prefix.is_empty() {
@@ -452,7 +451,7 @@ impl Bin {
 
     /// Strip the current prefix from a full key to obtain the suffix to store.
     ///
-    /// Port of JE `IN.computeKeySuffix(prefix, key)`.
+    /// `IN.computeKeySuffix(prefix, key)`.
     fn compress_key(&self, full_key: &[u8]) -> Vec<u8> {
         let plen = self.key_prefix.len();
         if plen == 0 {
@@ -468,7 +467,7 @@ impl Bin {
     /// Returns an empty `Vec` when fewer than 2 entries exist or keys share no
     /// common prefix.
     ///
-    /// Port of JE `IN.computeKeyPrefix(int excludeIdx)`.
+    /// `IN.computeKeyPrefix(int excludeIdx)`.
     pub fn compute_key_prefix(&self, exclude_idx: Option<usize>) -> Vec<u8> {
         let n = self.inner.get_n_entries();
         if n < 2 {
@@ -512,7 +511,7 @@ impl Bin {
     ///
     /// Call after bulk inserts, splits, or merges.
     ///
-    /// Port of JE `IN.recalcKeyPrefix()` → `IN.recalcSuffixes(newPrefix, …)`.
+    /// `IN.recalcKeyPrefix()` → `IN.recalcSuffixes(newPrefix, …)`.
     pub fn recompute_key_prefix(&mut self) {
         let new_prefix = self.compute_key_prefix(None);
         self.apply_new_prefix(new_prefix);
@@ -521,7 +520,7 @@ impl Bin {
     /// Apply `new_prefix`, re-encoding all suffixes from the old prefix into
     /// the new one.
     ///
-    /// Port of JE `IN.recalcSuffixes(newPrefix, null, null, -1)`.
+    /// `IN.recalcSuffixes(newPrefix, null, null, -1)`.
     fn apply_new_prefix(&mut self, new_prefix: Vec<u8>) {
         let n = self.inner.get_n_entries();
         let full_keys: Vec<Vec<u8>> =
@@ -607,7 +606,7 @@ impl Bin {
     /// allocated (prefix prepended to the stored suffix).  When there is no
     /// prefix the suffix byte-slice is returned as-is inside a `Vec`.
     ///
-    /// Port of JE `IN.getKey(int idx)`.
+    /// `IN.getKey(int idx)`.
     #[inline]
     pub fn get_key(&self, index: usize) -> Option<Vec<u8>> {
         self.get_full_key(index)
@@ -636,7 +635,7 @@ impl Bin {
     /// Index into the slot array. If the EXACT_MATCH flag (bit 16) is set,
     /// an exact match was found. Otherwise returns the insertion point.
     ///
-    /// Port of JE `IN.findEntry(key, indicateIfDuplicate, exact)`.
+    /// `IN.findEntry(key, indicateIfDuplicate, exact)`.
     pub fn find_entry(&self, key: &[u8], _indicator: bool, exact: bool) -> i32 {
         let (idx, found) = self.find_entry_compressed(key);
         if found {
@@ -652,7 +651,7 @@ impl Bin {
 
     /// Returns the set of cursor IDs currently positioned on this BIN.
     ///
-    /// Port of `BIN.getCursorSet()`.
+    /// 
     pub fn get_cursor_set(&self) -> std::collections::BTreeSet<u64> {
         match &self.cursor_set {
             None => std::collections::BTreeSet::new(),
@@ -662,7 +661,7 @@ impl Bin {
 
     /// Registers a cursor (by ID) with this BIN.
     ///
-    /// Port of `BIN.addCursor()`.
+    /// 
     pub fn add_cursor(&mut self, cursor_id: u64) {
         self.cursor_set
             .get_or_insert_with(HashSet::new)
@@ -671,7 +670,7 @@ impl Bin {
 
     /// Unregisters a cursor (by ID) from this BIN.
     ///
-    /// Port of `BIN.removeCursor()`.
+    /// 
     pub fn remove_cursor(&mut self, cursor_id: u64) {
         if let Some(set) = self.cursor_set.as_mut() {
             set.remove(&cursor_id);
@@ -683,7 +682,7 @@ impl Bin {
 
     /// Returns the number of cursors currently positioned on this BIN.
     ///
-    /// Port of `BIN.nCursors()`.
+    /// 
     #[inline]
     pub fn n_cursors(&self) -> usize {
         self.cursor_set.as_ref().map_or(0, |s| s.len())
@@ -691,7 +690,7 @@ impl Bin {
 
     /// Returns true if any cursors are currently positioned on this BIN.
     ///
-    /// Port of `BIN.nCursors() > 0`.
+    /// 
     #[inline]
     pub fn has_cursors(&self) -> bool {
         self.n_cursors() > 0
@@ -863,7 +862,7 @@ impl Bin {
     /// - After the insert, if a prefix was not yet established and there are
     ///   now ≥ 2 entries, the prefix is computed and all suffixes re-encoded.
     ///
-    /// Port of JE `IN.setKey` / BIN insert path including
+    /// `IN.setKey` / BIN insert path including
     /// `IN.recalcSuffixes`.
     ///
     /// # Arguments
@@ -894,7 +893,7 @@ impl Bin {
 
         if plen > 0 && new_len < plen {
             // New key shrinks the prefix — recompute considering the incoming
-            // key.  Port of JE IN.setKey: compute new prefix then recalcSuffixes.
+            // key: recompute prefix then recalculate suffixes.
             let mut candidate = self.compute_key_prefix(None);
             if !candidate.is_empty() {
                 let cl = get_key_prefix_length(&candidate, &key);
@@ -957,13 +956,13 @@ impl Bin {
     }
 
     // ========================================================================
-    // Per-slot modification / creation time  —  NoSQL JE fork
+    // Per-slot modification / creation time  —  NoSQL fork
     // ========================================================================
 
     /// Returns the last-modification time for slot `index` in milliseconds
     /// since the Unix epoch, or `0` if not set.
     ///
-    /// Port of JE `BIN.getModificationTime(int idx)` (NoSQL fork).
+    /// `BIN.getModificationTime(int idx)` (NoSQL fork).
     pub fn get_modification_time(&self, index: usize) -> u64 {
         self.modification_times.get(index).copied().unwrap_or(0)
     }
@@ -971,7 +970,7 @@ impl Bin {
     /// Sets the last-modification time for slot `index` in milliseconds
     /// since the Unix epoch.
     ///
-    /// Port of JE `BIN.setModificationTime(int idx, long time)` (NoSQL fork).
+    /// `BIN.setModificationTime(int idx, long time)` (NoSQL fork).
     pub fn set_modification_time(&mut self, index: usize, time_ms: u64) {
         while self.modification_times.len() <= index {
             self.modification_times.push(0);
@@ -982,7 +981,7 @@ impl Bin {
     /// Returns the creation time for slot `index` in milliseconds since the
     /// Unix epoch, or `0` if not set.
     ///
-    /// Port of JE `BIN.getCreationTime(int idx)` (NoSQL fork).
+    /// `BIN.getCreationTime(int idx)` (NoSQL fork).
     pub fn get_creation_time(&self, index: usize) -> u64 {
         self.creation_times.get(index).copied().unwrap_or(0)
     }
@@ -990,7 +989,7 @@ impl Bin {
     /// Sets the creation time for slot `index` in milliseconds since the
     /// Unix epoch.
     ///
-    /// Port of JE `BIN.setCreationTime(int idx, long time)` (NoSQL fork).
+    /// `BIN.setCreationTime(int idx, long time)` (NoSQL fork).
     pub fn set_creation_time(&mut self, index: usize, time_ms: u64) {
         while self.creation_times.len() <= index {
             self.creation_times.push(0);
@@ -1024,7 +1023,7 @@ impl Bin {
 
     /// Returns true if the slot is known-deleted or pending-deleted.
     ///
-    /// Port of `BIN.isDeleted()`.
+    /// 
     #[inline]
     pub fn is_deleted(&self, index: usize) -> bool {
         self.inner.is_entry_known_deleted(index) || self.inner.is_entry_pending_deleted(index)
@@ -1033,7 +1032,7 @@ impl Bin {
     /// Returns true if the slot is defunct (deleted or TTL-expired).
     ///
     /// A slot is defunct when it is known-deleted/pending-deleted OR when its
-    /// TTL expiration time has passed.  Port of `BIN.isDefunct()` from JE.
+    /// TTL expiration time has passed. from the.
     #[inline]
     pub fn is_defunct(&self, index: usize) -> bool {
         if self.is_deleted(index) {
@@ -1050,7 +1049,7 @@ impl Bin {
 
     /// Returns true if the slot is defunct, optionally treating tombstones as defunct.
     ///
-    /// Port of `BIN.isDefunct(idx, excludeTombstones)`.
+    /// 
     #[inline]
     pub fn is_defunct_with_tombstones(&self, index: usize, exclude_tombstones: bool) -> bool {
         self.is_defunct(index) || (exclude_tombstones && self.is_tombstone(index))
@@ -1058,7 +1057,7 @@ impl Bin {
 
     /// Returns true if the slot has the tombstone flag set.
     ///
-    /// Port of `IN.isTombstone()`.
+    /// 
     #[inline]
     pub fn is_tombstone(&self, index: usize) -> bool {
         self.inner.is_tombstone(index)
@@ -1066,7 +1065,7 @@ impl Bin {
 
     /// Sets or clears the tombstone flag for the slot at `index`.
     ///
-    /// Port of `IN.setTombstone()`.
+    /// 
     #[inline]
     pub fn set_tombstone(&mut self, index: usize, tombstone: bool) {
         self.inner.set_tombstone(index, tombstone);
@@ -1074,7 +1073,7 @@ impl Bin {
 
     /// Sets the known-deleted flag on the slot (also clears pending-deleted).
     ///
-    /// Port of `IN.setKnownDeleted()`.
+    /// 
     #[inline]
     pub fn set_known_deleted(&mut self, index: usize) {
         self.inner.set_known_deleted(index);
@@ -1082,7 +1081,7 @@ impl Bin {
 
     /// Clears the known-deleted flag on the slot.
     ///
-    /// Port of `IN.clearKnownDeleted()`.
+    /// 
     #[inline]
     pub fn clear_known_deleted(&mut self, index: usize) {
         self.inner.clear_known_deleted(index);
@@ -1090,7 +1089,7 @@ impl Bin {
 
     /// Sets the pending-deleted flag on the slot.
     ///
-    /// Port of `IN.setPendingDeleted()`.
+    /// 
     #[inline]
     pub fn set_pending_deleted(&mut self, index: usize) {
         self.inner.set_pending_deleted(index);
@@ -1098,7 +1097,7 @@ impl Bin {
 
     /// Clears the pending-deleted flag on the slot.
     ///
-    /// Port of `IN.clearPendingDeleted()`.
+    /// 
     #[inline]
     pub fn clear_pending_deleted(&mut self, index: usize) {
         self.inner.clear_pending_deleted(index);
@@ -1110,7 +1109,7 @@ impl Bin {
 
     /// Returns true if the BIN has any deleted slots that could be compressed.
     ///
-    /// Port of `BIN.shouldCompressObsoleteKeys()`.
+    /// 
     pub fn should_compress_obsolete_keys(&self) -> bool {
         if self.is_bin_delta() || self.get_n_entries() == 0 {
             return false;
@@ -1122,12 +1121,12 @@ impl Bin {
     ///
     /// If `compress_dirty_slots` is false, dirty slots are left in place even
     /// when deleted.  The BIN is NOT marked dirty when non-dirty slots are
-    /// removed — this matches JE's design to allow delta logging after
+    /// removed — this design to allow delta logging after
     /// compression of clean slots.
     ///
     /// Returns `true` always (locking checks are no-ops in this implementation).
     ///
-    /// Port of `BIN.compress()`.
+    /// 
     pub fn compress(&mut self, compress_dirty_slots: bool) -> bool {
         assert!(!self.is_bin_delta(), "compress called on BIN-delta");
         assert!(self.n_cursors() == 0, "compress called with active cursors");
@@ -1170,7 +1169,7 @@ impl Bin {
     ///
     /// Returns the total bytes freed (estimated as key-len + data-len per slot).
     ///
-    /// Port of `BIN.evictLNs()` in JE.
+    /// 
     pub fn evict_lns(
         &mut self,
         log_manager: Option<&noxu_log::LogManager>,
@@ -1197,7 +1196,7 @@ impl Bin {
     ///
     /// Returns an estimate of the bytes freed (key-len + data-len).
     ///
-    /// Port of `BIN.evictLN(int index)` in JE.
+    /// 
     pub fn evict_ln(
         &mut self,
         index: usize,
@@ -1271,7 +1270,7 @@ impl Bin {
     ///
     /// A BIN is not evictable when it has active cursors.
     ///
-    /// Port of `BIN.isEvictable()`.
+    /// 
     #[inline]
     pub fn is_evictable(&self) -> bool {
         !self.has_cursors()
@@ -1281,7 +1280,7 @@ impl Bin {
     ///
     /// All slots must be known-deleted and there must be no active cursors.
     ///
-    /// Port of `BIN.isValidForDelete()`.
+    /// 
     pub fn is_valid_for_delete(&self) -> bool {
         if self.is_bin_delta() || self.has_cursors() {
             return false;
@@ -1295,7 +1294,7 @@ impl Bin {
 
     /// Returns true if this full BIN can be mutated to a BIN-delta.
     ///
-    /// Port of `BIN.canMutateToBINDelta()`.
+    /// 
     pub fn can_mutate_to_bin_delta(&self) -> bool {
         if self.is_bin_delta() || self.inner.get_prohibit_next_delta() {
             return false;
@@ -1312,7 +1311,7 @@ impl Bin {
     ///
     /// Returns the approximate number of bytes freed.
     ///
-    /// Port of `BIN.mutateToBINDelta()`.
+    /// 
     pub fn mutate_to_bin_delta(&mut self) -> usize {
         assert!(self.can_mutate_to_bin_delta(), "cannot mutate to BIN-delta");
 
@@ -1372,7 +1371,7 @@ impl Bin {
     /// `full_bin` must be the full BIN matching `self.last_full_version`.
     /// After the call `self` is a full BIN.
     ///
-    /// Port of `BIN.mutateToFullBIN(BIN fullBIN, boolean leaveFreeSlot)`.
+    /// 
     pub fn mutate_to_full_bin(&mut self, full_bin: &mut Bin, leave_free_slot: bool) {
         assert!(self.is_bin_delta(), "mutate_to_full_bin called on non-delta");
 
@@ -1409,7 +1408,7 @@ impl Bin {
     ///
     /// Updates the slot if the key already exists; otherwise inserts a new slot.
     ///
-    /// Port of `IN.applyDelta(...)`.
+    /// 
     pub fn apply_delta_slot(
         &mut self,
         key: Vec<u8>,
@@ -1434,7 +1433,7 @@ impl Bin {
     /// Skips if the slot is dirty and a delta should be logged, to avoid
     /// blocking a future delta write.
     ///
-    /// Port of `BIN.queueSlotDeletion()`.
+    /// 
     pub fn queue_slot_deletion(&self, index: usize) {
         if self.inner.is_entry_dirty(index) && self.should_log_delta() {
             return;
@@ -1667,7 +1666,7 @@ mod tests {
 
     // ========================================================================
     // Key prefix compression tests
-    // Port of JE IN key-prefix compression unit tests.
+    // IN key-prefix compression unit tests.
     // ========================================================================
 
     /// Inserting keys with a common prefix causes the BIN to automatically
@@ -2713,12 +2712,11 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests ported from JE BinDeltaTest.java and KeyPrefixTest.java
     // ========================================================================
 
-    /// Port of BinDeltaTest — mutate_to_bin_delta sets IS_DELTA flag.
+    /// Mutate_to_bin_delta sets IS_DELTA flag.
     ///
-    /// JE: `BIN.log(delta=true)` produces a BIN-delta; the in-memory BIN is
+    /// `BIN.log(delta=true)` produces a BIN-delta; the in-memory BIN is
     /// still a full BIN but the delta flag is set.  In our model
     /// `mutate_to_bin_delta()` converts the in-memory representation.
     #[test]
@@ -2741,9 +2739,9 @@ mod tests {
         assert_eq!(bin.get_n_entries(), 1);
     }
 
-    /// Port of BinDeltaTest — `apply_delta_slot` updates an existing key LSN.
+    /// `apply_delta_slot` updates an existing key LSN.
     ///
-    /// JE: applying a delta writes the new child LSN into the slot whose key
+    /// Applying a delta writes the new child LSN into the slot whose key
     /// matches the delta entry key.
     #[test]
     fn test_je_apply_delta_slot_updates_existing_key_lsn() {
@@ -2763,9 +2761,9 @@ mod tests {
             "apply_delta_slot must update the LSN of the matched key");
     }
 
-    /// Port of BinDeltaTest — full round-trip: mutate → reconstruct.
+    /// Full round-trip: mutate → reconstruct.
     ///
-    /// JE `logAndCheck`: after logging a delta and reconstituting via
+    /// `logAndCheck`: after logging a delta and reconstituting via
     /// `reconstituteBIN` the entry count and all LSNs must match the
     /// original in-memory full BIN.
     ///
@@ -2840,9 +2838,9 @@ mod tests {
         }
     }
 
-    /// Port of KeyPrefixTest.testKeyPrefixer — `create_key_prefix` semantics.
+    /// `create_key_prefix` semantics.
     ///
-    /// JE `Key.createKeyPrefix`:
+    /// `Key.createKeyPrefix`:
     ///   makePrefix("aaaa","aaab") = "aaa"
     ///   makePrefix("abaa","aaab") = "a"
     ///   makePrefix("baaa","aaab") = null
@@ -2859,9 +2857,8 @@ mod tests {
         assert_eq!(create_key_prefix(b"aaa",  b"aaab"), Some(b"aaa".to_vec()));
     }
 
-    /// Port of KeyPrefixTest.testKeyPrefixSubsetting.
     ///
-    /// JE: "keyPrefixSubsetTest" — given an existing prefix and a new key,
+    /// "keyPrefixSubsetTest" — given an existing prefix and a new key,
     /// check whether the existing prefix is a prefix of the new key.
     ///
     ///   ("aaa",  "aaa")  → true   (identical)
@@ -2887,10 +2884,10 @@ mod tests {
         assert!(!is_prefix_of(Some(b"baa"), b"aa"),  "different first byte");
     }
 
-    /// Port of KeyPrefixTest — inserting a key that breaks the existing prefix
+    /// Inserting a key that breaks the existing prefix
     /// clears / shortens the prefix and all keys remain decompressible.
     ///
-    /// JE: when a new key reduces the common prefix length, the BIN recomputes
+    /// When a new key reduces the common prefix length, the BIN recomputes
     /// suffixes so `getKey(i)` still returns the full key.
     #[test]
     fn test_je_prefix_cleared_when_key_breaks_it() {
@@ -2922,9 +2919,9 @@ mod tests {
         }
     }
 
-    /// Port of KeyPrefixTest — compress_key / decompress_key are inverse ops.
+    /// Compress_key / decompress_key are inverse ops.
     ///
-    /// JE: the suffix stored for each key must round-trip back to the full key
+    /// The suffix stored for each key must round-trip back to the full key
     /// via `getKey(i)` (decompress).
     #[test]
     fn test_je_compress_decompress_are_inverse() {
@@ -2945,7 +2942,7 @@ mod tests {
         }
     }
 
-    /// Port of KeyPrefixTest — after a split, each half has its own correct
+    /// After a split, each half has its own correct
     /// key prefix.
     ///
     /// We simulate a split by building two separate BINs from the halves of a
@@ -2983,12 +2980,12 @@ mod tests {
         }
     }
 
-    /// Port of KeyPrefixTest — after recompute_key_prefix, N keys with a
+    /// After recompute_key_prefix, N keys with a
     /// common prefix all decompress to their original full keys.
     #[test]
     fn test_je_recompute_prefix_preserves_all_keys() {
         let mut bin = Bin::new(1, 32);
-        // Keys from the JE test's "BIN5" group.
+        // Keys from the test's "BIN5" group.
         let keys: &[&[u8]] = &[b"aat", b"aau", b"aav", b"aaz"];
         for &k in keys {
             bin.insert_entry(k.to_vec(), Lsn::from_u64(1), 0, None).unwrap();
@@ -3008,7 +3005,6 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests ported from JE BINDeltaOperationTest.java
     // ========================================================================
     //
     // BINDeltaOperationTest tests the detailed slot-level semantics of BIN
@@ -3016,10 +3012,10 @@ mod tests {
     // mutate_to_full_bin.  These tests exercise the invariants at the Bin
     // struct level (without a full tree + environment setup).
 
-    /// Port of BINDeltaOperationTest — `mutate_to_bin_delta` retains only
+    /// `mutate_to_bin_delta` retains only
     /// dirty slots, marks the BIN as a delta, and frees approximate memory.
     ///
-    /// JE: after `BIN.mutateToBINDelta()` the BIN has `IS_DELTA` set and
+    /// After `BIN.mutateToBINDelta()` the BIN has `IS_DELTA` set and
     /// holds only the entries that were dirty at the time of mutation.
     #[test]
     fn test_bindelta_mutate_only_dirty_slots_retained() {
@@ -3059,10 +3055,10 @@ mod tests {
         }
     }
 
-    /// Port of BINDeltaOperationTest — `apply_delta_slot` updates the LSN
+    /// `apply_delta_slot` updates the LSN
     /// and state of an existing slot, leaving all other slots unchanged.
     ///
-    /// JE: `IN.applyDelta` writes the delta entry's child LSN into the
+    /// `IN.applyDelta` writes the delta entry's child LSN into the
     /// matching slot when an exact-match key is found.
     #[test]
     fn test_bindelta_apply_delta_slot_updates_lsn_and_state() {
@@ -3103,10 +3099,10 @@ mod tests {
         assert_eq!(bin.get_n_entries(), 4, "no new slots may be added");
     }
 
-    /// Port of BINDeltaOperationTest — `mutate_to_full_bin` merges delta
+    /// `mutate_to_full_bin` merges delta
     /// entries into the base full BIN and the result is no longer a delta.
     ///
-    /// JE: `BIN.mutateToFullBIN(fullBIN, leaveFreeSlot)` applies every
+    /// `BIN.mutateToFullBIN(fullBIN, leaveFreeSlot)` applies every
     /// delta slot onto `fullBIN` (updating existing keys or inserting new
     /// ones) then swaps the contents so `self` becomes the full BIN.
     #[test]
@@ -3160,11 +3156,11 @@ mod tests {
         }
     }
 
-    /// Port of BINDeltaOperationTest — full round-trip:
+    /// Full round-trip:
     /// full BIN → mutate_to_bin_delta → mutate_to_full_bin → full BIN
     /// must restore all original entries with the correct updated LSNs.
     ///
-    /// JE `testEviction`: after mutating to delta and then reconstituting,
+    /// `testEviction`: after mutating to delta and then reconstituting,
     /// the in-memory BIN must have the same entry count as the original.
     #[test]
     fn test_bindelta_full_roundtrip_restores_all_slots() {
@@ -3234,7 +3230,7 @@ mod tests {
         }
     }
 
-    /// Port of BINDeltaOperationTest — `apply_delta_slot` with a key that is
+    /// `apply_delta_slot` with a key that is
     /// not in the base BIN inserts a new slot (the "insert new key" branch of
     /// `IN.applyDelta`).
     #[test]
@@ -3254,11 +3250,11 @@ mod tests {
         assert_eq!(bin.get_lsn((idx & 0xFFFF) as usize), Lsn::from_u64(2));
     }
 
-    /// Port of BINDeltaOperationTest — searching a BIN-delta for a key that
+    /// Searching a BIN-delta for a key that
     /// is in the delta returns an exact match; searching for a key that is
     /// NOT in the delta does not return an exact match.
     ///
-    /// JE: a cursor performing a search on an in-memory BIN-delta can resolve
+    /// A cursor performing a search on an in-memory BIN-delta can resolve
     /// the key directly if it appears in the delta's slots, without needing to
     /// reconstruct the full BIN.
     #[test]
@@ -3297,7 +3293,7 @@ mod tests {
             "key [20] (not in delta) must not be found by exact search");
     }
 
-    /// Port of BINDeltaOperationTest — `mutate_to_bin_delta` sets the bloom
+    /// `mutate_to_bin_delta` sets the bloom
     /// filter to a non-None value when the delta is non-empty, and clears it
     /// when re-assigning to None.
     #[test]

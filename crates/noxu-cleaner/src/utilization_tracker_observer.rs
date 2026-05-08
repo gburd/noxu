@@ -4,8 +4,8 @@
 //! `noxu_log::LogWriteObserver` trait so that the `LogManager` can notify
 //! it (under the LWL) for every log write.
 //!
-//! Port of `UtilizationTracker.countNewLogEntry` /
-//! `countObsoleteNode` calls made from `LogManager.serialLogWork()` in JE.
+//! Utilization tracking hooks invoked from the log write path.
+//! `countObsoleteNode` calls made from `LogManager.serialLogWork()`.
 
 use std::sync::Arc;
 

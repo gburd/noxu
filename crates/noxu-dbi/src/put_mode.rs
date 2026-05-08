@@ -1,10 +1,9 @@
 //! Cursor put modes.
 //!
-//! Port of `com.sleepycat.je.dbi.PutMode`.
 
 /// Distinguishes cursor put operations.
 ///
-/// Port of `com.sleepycat.je.dbi.PutMode`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutMode {
     /// Replace data at current position.

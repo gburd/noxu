@@ -1,8 +1,7 @@
 //! Database iterators for collection views.
 //!
-//! Port of `com.sleepycat.collections.StoredIterator`.
 //!
-//! Provides iterators over database records. Unlike the JE StoredIterator
+//! Provides iterators over database records. Unlike the StoredIterator
 //! which wraps a live cursor, these iterators work from a snapshot of
 //! sorted keys and fetch values on demand from the database.
 
@@ -11,7 +10,7 @@ use noxu_db::{Database, DatabaseEntry, OperationStatus};
 
 /// Iterator over database records yielding (key, value) pairs.
 ///
-/// Port of `com.sleepycat.collections.StoredIterator`.
+/// 
 ///
 /// This iterator yields key-value pairs as `(Vec<u8>, Vec<u8>)`. Records
 /// are returned in sorted key order. The iterator takes a snapshot of keys

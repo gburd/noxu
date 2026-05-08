@@ -1,6 +1,5 @@
 //! Replication statistics.
 //!
-//! Port of `com.sleepycat.je.rep.ReplicatedEnvironmentStats`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

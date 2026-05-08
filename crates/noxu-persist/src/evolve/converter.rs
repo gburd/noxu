@@ -1,17 +1,16 @@
 //! Converter mutation for schema evolution.
 //!
-//! Port of `com.sleepycat.persist.evolve.Converter` and
-//! `com.sleepycat.persist.evolve.Conversion`.
+//! Evolve.Conversion`.
 
 use super::mutation::MutationKey;
 
 /// A conversion function that transforms the raw bytes of an old entity or
 /// field value into bytes compatible with the current schema.
 ///
-/// In JE this is the `Conversion` interface.  In Rust we use a trait object
+/// In this is the `Conversion` interface.  In Rust we use a trait object
 /// (`Box<dyn ConversionFn>`) so the closure can be stored.
 ///
-/// Port of `com.sleepycat.persist.evolve.Conversion`.
+/// 
 pub trait ConversionFn: Send + Sync {
     /// Converts old raw bytes to new raw bytes.
     ///
@@ -49,7 +48,7 @@ where
 /// );
 /// ```
 ///
-/// Port of `com.sleepycat.persist.evolve.Converter`.
+/// 
 pub struct Converter {
     key: MutationKey,
     conversion: Box<dyn ConversionFn>,
@@ -59,7 +58,7 @@ impl Converter {
     /// Creates a mutation for converting all instances of the given class
     /// version to the current version.
     ///
-    /// Port of `Converter(String className, int classVersion, Conversion conversion)`.
+    /// 
     pub fn for_class<F>(
         class_name: impl Into<String>,
         class_version: u32,
@@ -77,7 +76,7 @@ impl Converter {
     /// Creates a mutation for converting all values of the given field in the
     /// given class version.
     ///
-    /// Port of `Converter(String declaringClassName, int declaringClassVersion,
+    /// `Converter(String declaringClassName, int declaringClassVersion,
     ///                     String fieldName, Conversion conversion)`.
     pub fn for_field<F>(
         class_name: impl Into<String>,
@@ -118,7 +117,7 @@ impl Converter {
     ///
     /// Returns `None` if the record should be deleted.
     ///
-    /// Port of `Conversion.convert(EntityInput, int, EntityInput)` (simplified
+    /// (simplified
     /// to raw byte slice interface for Rust).
     pub fn convert(&self, old_bytes: &[u8]) -> Option<Vec<u8>> {
         self.conversion.convert(old_bytes)

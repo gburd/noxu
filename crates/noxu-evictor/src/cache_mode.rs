@@ -1,6 +1,5 @@
 //! Cache mode configuration for controlling per-operation caching behavior.
 //!
-//! Port of `com.sleepycat.je.CacheMode`.
 
 /// Modes that can be specified for control over caching of records in the
 /// in-memory cache.
@@ -9,7 +8,7 @@
 /// the record is subsequently retained in the in-memory cache, relative to
 /// other records in the cache.
 ///
-/// Port of `com.sleepycat.je.CacheMode`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {
     /// The record's hotness is changed to "most recently used" by the operation.

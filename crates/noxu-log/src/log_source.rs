@@ -1,6 +1,6 @@
 //! Abstraction for reading log data.
 //!
-//! Port of `com.sleepycat.je.log.LogSource`, `FileSource`, and `FileHandleSource`.
+//! Log source abstractions for reading log data.
 //!
 //! LogSource provides an abstraction for reading data from different sources
 //! (files, buffers, etc.) in a uniform way.

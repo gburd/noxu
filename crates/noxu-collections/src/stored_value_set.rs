@@ -1,6 +1,5 @@
 //! Value set view of a database.
 //!
-//! Port of `com.sleepycat.collections.StoredValueSet`.
 
 use crate::error::Result;
 use crate::stored_iterator::StoredValueIterator;
@@ -10,7 +9,7 @@ use std::sync::Mutex;
 
 /// A collection view of database values.
 ///
-/// Port of `com.sleepycat.collections.StoredValueSet`.
+/// 
 ///
 /// Provides a collection interface over the values stored in a Noxu DB
 /// database. Values are yielded in key-sorted order during iteration.

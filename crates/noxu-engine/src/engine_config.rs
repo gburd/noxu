@@ -440,8 +440,8 @@ impl Default for EngineConfig {
             read_only: false,
             cache_size: 64 * 1024 * 1024, // 64 MB
             lock_table_count: 16,
-            lock_timeout_ms: 500,  // 500 ms — matches JE default
-            txn_timeout_ms: 0,     // 0 = no timeout — matches JE default
+            lock_timeout_ms: 500,  // 500 ms — matches default
+            txn_timeout_ms: 0,     // 0 = no timeout — matches default
             evictor_enabled: true,
             cleaner_enabled: true,
             checkpointer_enabled: true,

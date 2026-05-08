@@ -1,6 +1,5 @@
 //! Durability and sync policies for transactions.
 //!
-//! Port of `com.sleepycat.je.Durability`.
 
 /// Sync policy for local commit synchronization.
 ///
@@ -53,7 +52,7 @@ pub enum ReplicaAckPolicy {
 /// - Replica sync policy: how replica nodes synchronize
 /// - Replica acknowledgment policy: how many replicas must acknowledge
 ///
-/// Port of `com.sleepycat.je.Durability`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Durability {
     /// Sync policy for the local (master) node.

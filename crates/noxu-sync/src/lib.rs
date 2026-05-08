@@ -5,13 +5,13 @@
 //!
 //! ## Extra capabilities vs parking_lot
 //!
-//! | Method | Matches JE |
-//! |--------|-----------|
-//! | `Mutex::get_n_waiters()` | `LatchImpl.getNWaiters()` |
-//! | `Mutex::get_owner()` | `LatchImpl.getOwner()` (thread ID hash) |
-//! | `RwLock::get_n_waiters()` | `SharedLatchImpl.getNWaiters()` |
-//! | `RwLock::is_locked_exclusive()` | `SharedLatchImpl.isWriteLockedByCurrentThread()` |
-//! | `RwLock::reader_count()` | `SharedLatchImpl.getReadHoldCount()` (global) |
+//! | Method | Description |
+//! |--------|-------------|
+//! | `Mutex::get_n_waiters()` | Count of threads blocked waiting for the mutex |
+//! | `Mutex::get_owner()` | Thread ID hash of the current owner |
+//! | `RwLock::get_n_waiters()` | Count of threads blocked waiting for the rwlock |
+//! | `RwLock::is_locked_exclusive()` | Returns true when a write lock is held |
+//! | `RwLock::reader_count()` | Number of active shared-lock holders (global) |
 //!
 //! ## Drop-in compatibility
 //!
@@ -71,8 +71,7 @@ pub type RwLockWriteGuard<'a, T> = lock_api::RwLockWriteGuard<'a, NoxuRawRwLock,
 /// Reader-writer lock backed by a futex.
 ///
 /// Drop-in replacement for `parking_lot::RwLock<T>`.
-/// Non-fair: new readers are not blocked by waiting writers, matching
-/// `SharedLatchImpl(fair=false)` in JE.
+/// Non-fair: new readers are not blocked by waiting writers.
 ///
 /// Additional methods beyond parking_lot:
 ///   - `is_locked_exclusive()` — true when a write lock is held
@@ -133,8 +132,6 @@ impl<T> RwLock<T> {
     }
 
     /// Returns `true` if the write (exclusive) lock is currently held.
-    ///
-    /// Matches JE's `SharedLatchImpl.isWriteLockedByCurrentThread()`.
     #[inline]
     pub fn is_locked_exclusive(&self) -> bool {
         // SAFETY: raw() is safe to call; we only read atomic state.
@@ -142,8 +139,6 @@ impl<T> RwLock<T> {
     }
 
     /// Returns the total number of threads waiting to acquire this lock.
-    ///
-    /// Matches JE's `SharedLatchImpl.getNWaiters()`.
     #[inline]
     pub fn get_n_waiters(&self) -> usize {
         unsafe { self.0.raw().get_n_waiters() }

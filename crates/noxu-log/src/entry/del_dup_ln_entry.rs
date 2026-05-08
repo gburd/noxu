@@ -1,6 +1,5 @@
 //! DelDupLN log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.DelDupLNLogEntry`.
 //!
 //! A deletion record for a sorted-duplicate LN. Contains both the primary key
 //! and the duplicate key (data key) so that the correct slot in the duplicate

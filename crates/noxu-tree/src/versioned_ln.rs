@@ -1,6 +1,5 @@
 //! Versioned LN  -  LN that preserves VLSN information.
 //!
-//! Port of `com.sleepycat.je.tree.VersionedLN`.
 //!
 //! In JE, VersionedLN is a subclass of LN that preserves VLSN information
 //! for replication purposes. In Noxu DB, all LNs can hold VLSNs, so this

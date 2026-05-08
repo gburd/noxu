@@ -1,13 +1,12 @@
 //! Lock grant result type.
 //!
-//! Port of `com.sleepycat.je.txn.LockGrantType`.
 
 /// Result of a lock attempt.
 ///
 /// Indicates whether a lock was granted immediately, must wait, was promoted,
 /// or denied for non-blocking requests.
 ///
-/// Port of `com.sleepycat.je.txn.LockGrantType`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockGrantType {
     /// New lock granted immediately.

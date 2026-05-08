@@ -1,6 +1,6 @@
 //! Log Sequence Number (LSN) utilities.
 //!
-//! Port of `com.sleepycat.je.utilint.DbLsn`.
+//! Log Sequence Number (LSN) — a u64 combining file number and byte offset.
 //!
 //! An LSN is a u64 comprised of a file number (upper 32 bits) and offset
 //! within that file (lower 32 bits) which references a unique record in
@@ -138,8 +138,7 @@ impl Lsn {
 
 impl Ord for Lsn {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // NULL_LSN is not valid for comparison -- matches JE's behavior of
-        // throwing EnvironmentFailureException when either operand is NULL_LSN.
+        // NULL_LSN is not valid for comparison — comparing against NULL_LSN panics.
         assert!(
             !self.is_null(),
             "Lsn::cmp: self is NULL_LSN -- invalid comparison"
@@ -270,7 +269,6 @@ mod tests {
         assert_eq!(c.no_cleaning_distance(d, 10_000_000), 20_000_300);
     }
 
-    // Port of JE's testNoCleaningDistance
     #[test]
     fn test_no_cleaning_distance_je_port() {
         let a = Lsn::new(1, 10);
@@ -322,8 +320,7 @@ mod tests {
         assert!(Lsn::from_u64(u64::MAX).is_null());
     }
 
-    // Port of JE's testDbLsn: verify file_number and file_offset roundtrip
-    // for large values including 0xFFFFFFFF
+    // Verify file_number and file_offset roundtrip for large values including 0xFFFFFFFF.
     #[test]
     fn test_je_large_values() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
@@ -334,7 +331,7 @@ mod tests {
         }
     }
 
-    // Port of JE's testComparableInequalityFileNumber
+    // Verify that higher file number produces a greater LSN.
     #[test]
     fn test_comparable_inequality_file_number() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
@@ -346,7 +343,7 @@ mod tests {
         }
     }
 
-    // Port of JE's testComparableInequalityFileOffset
+    // Verify that higher file offset produces a greater LSN within the same file.
     #[test]
     fn test_comparable_inequality_file_offset() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
@@ -376,12 +373,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE DbLsnTest.testDbLsn (testMakeEntry)
-    //
     // Verify NULL_LSN sentinel, and that Lsn::new(file, offset) stores and
-    // returns both components correctly for every value in the JE test set.
-    // The JE test uses values[] = {0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF,
-    // 0xFFFFFFFFL}; the last entry (0xFFFFFFFF for both file and offset)
+    // returns both components correctly.
+    // Test values: {0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF, 0xFFFFFFFFL};
+    // the last entry (0xFFFFFFFF for both file and offset)
     // produces NULL_LSN (u64::MAX) and is tested separately.
     // -----------------------------------------------------------------------
 
@@ -396,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_make_entry_roundtrip() {
-        // JE values (excluding 0xFFFFFFFF which creates NULL_LSN)
+        // Test values (excluding 0xFFFFFFFF which creates NULL_LSN)
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFF_FFFF];
         for &v in values {
             let lsn = Lsn::new(v, v);
@@ -422,10 +417,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE DbLsnTest.testCompareLsns
-    //
-    // compare(NULL, NULL), compare(LSN, NULL), compare(NULL, LSN) all panic
-    // (JE throws EnvironmentFailureException; Rust asserts).
+    // compare(NULL, NULL), compare(LSN, NULL), compare(NULL, LSN) all panic.
     // compare(smaller, larger) and same-file different-offset comparisons.
     // -----------------------------------------------------------------------
 
@@ -468,8 +460,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE DbLsnTest.testMaxFileOffset
-    //
     // The maximum valid file offset is u32::MAX - 1 (0xFFFFFFFE); offset
     // 0xFFFFFFFF is reserved (together with file 0xFFFFFFFF) for NULL_LSN.
     // -----------------------------------------------------------------------
@@ -491,8 +481,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE DbLsnTest.testOverflow
-    //
     // Large file numbers must not corrupt the offset bits, and large offsets
     // must not corrupt the file number bits.
     // -----------------------------------------------------------------------
@@ -533,8 +521,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Port of JE testComparableEquality
-    //
     // Two LSNs constructed with the same file/offset must compare equal.
     // -----------------------------------------------------------------------
 

@@ -1,6 +1,5 @@
 //! Write operation options.
 //!
-//! Port of `com.sleepycat.je.WriteOptions`.
 
 use crate::cache_mode::CacheMode;
 
@@ -9,7 +8,7 @@ use crate::cache_mode::CacheMode;
 /// Specifies optional parameters that control write behavior, including
 /// caching and time-to-live (TTL) expiration.
 ///
-/// Port of `com.sleepycat.je.WriteOptions`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOptions {
     /// Cache mode for the write operation.

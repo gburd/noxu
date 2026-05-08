@@ -1,6 +1,5 @@
 //! Database type enumeration.
 //!
-//! Port of internal database type tracking from JE.
 
 use std::fmt;
 

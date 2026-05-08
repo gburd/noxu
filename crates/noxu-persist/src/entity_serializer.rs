@@ -4,7 +4,6 @@
 //! byte representations. This is separate from the `Entity` trait to allow
 //! different serialization formats to be plugged in.
 //!
-//! Port of serialization aspects of `com.sleepycat.persist.impl`.
 
 use crate::entity::Entity;
 use crate::error::Result;
@@ -16,7 +15,7 @@ use crate::error::Result;
 /// serializer might use a compact binary format while another might use
 /// a human-readable format.
 ///
-/// Port of serialization aspects of `com.sleepycat.persist.impl.PersistCatalog`.
+/// Entity serialization and catalog.
 ///
 /// # Example
 ///

@@ -1,12 +1,11 @@
 //! Manager for coalescing fsync operations (group commit).
 //!
-//! Port of `com.sleepycat.je.log.FSyncManager`.
 //!
 //! The FSyncManager ensures that only one file fsync is issued at a time for
 //! performance optimization.  The goal is to reduce the number of fsyncs
 //! issued by the system by having one fsync serve a batch of threads.
 //!
-//! # Algorithm (mirrors JE's leader/waiter pattern)
+//! # Algorithm (mirrors leader/waiter pattern)
 //!
 //! When a thread enters `fsync()` it finds one of two situations:
 //!
@@ -34,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// One cohort of threads waiting for a common fsync.
 ///
-/// Port of `FSyncManager.FSyncGroup`.  Each instance lives behind an `Arc` so
+/// Each instance lives behind an `Arc` so
 /// that threads that joined a group keep a reference even after the leader has
 /// swapped in a fresh `FSyncGroup` for the next cohort.
 struct FSyncGroup {
@@ -53,7 +52,7 @@ struct FsyncGroupInner {
 
 /// Return value from `FSyncGroup::wait_for_event`.
 ///
-/// Port of `FSyncGroup.DO_TIMEOUT_FSYNC / DO_LEADER_FSYNC / NO_FSYNC_NEEDED`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitStatus {
     /// The fsync was completed on this thread's behalf; nothing to do.
@@ -78,7 +77,7 @@ impl FSyncGroup {
 
     /// Block until work is done, this thread becomes leader, or we time out.
     ///
-    /// Port of `FSyncGroup.waitForEvent()`.
+    /// 
     fn wait_for_event(&self, timeout: Duration) -> WaitStatus {
         let mut inner = self.inner.lock().unwrap();
 
@@ -117,7 +116,7 @@ impl FSyncGroup {
         }
     }
 
-    /// Wake all waiters with success.  Port of `FSyncGroup.wakeupAll()`.
+    /// Wake all waiters with success.
     fn wakeup_all(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.work_done = true;
@@ -136,7 +135,7 @@ impl FSyncGroup {
     }
 
     /// Wake a single waiter to become the next leader.
-    /// Port of `FSyncGroup.wakeupOne()`.
+    /// 
     fn wakeup_one(&self) {
         self.condvar.notify_one();
     }
@@ -151,7 +150,7 @@ impl FSyncGroup {
 
 /// Mutable state guarded by `FsyncManager::state_mutex`.
 ///
-/// Mirrors the fields that JE protects with `mgrMutex`.
+/// Mirrors the fields that protects with `mgrMutex`.
 struct FsyncState {
     /// True while a leader thread is performing (or about to perform) an fsync.
     work_in_progress: bool,
@@ -167,17 +166,17 @@ struct FsyncState {
 
 /// Coalesces fsync requests so that one system call serves many threads.
 ///
-/// Port of `com.sleepycat.je.log.FSyncManager`.
+/// 
 ///
 /// # Configuration
 ///
 /// * `grpc_threshold` — minimum number of waiters before the leader executes
-///   the fsync.  `0` disables group-commit waiting (JE default).
+///   the fsync.  `0` disables group-commit waiting (default).
 /// * `grpc_interval_ms` — maximum milliseconds the leader waits for more
-///   waiters.  `0` disables group-commit waiting (JE default).
+///   waiters.  `0` disables group-commit waiting (default).
 ///
 /// Group-commit waiting is only active when **both** values are non-zero,
-/// matching JE's `grpWaitOn` flag.
+/// matching `grpWaitOn` flag.
 pub struct FsyncManager {
     /// Min waiters before the leader fsyncs (0 = disabled).
     grpc_threshold: usize,
@@ -186,14 +185,14 @@ pub struct FsyncManager {
     /// Whether group-commit waiting is active (`grpcInterval != 0 && grpcThreshold != 0`).
     grp_wait_on: bool,
     /// Timeout for waiting threads before they do their own fsync.
-    /// (JE: `LOG_FSYNC_TIMEOUT`, default 500 ms.)
+    /// (the: `LOG_FSYNC_TIMEOUT`, default 500 ms.)
     fsync_timeout: Duration,
     /// Mutex protecting `FsyncState`.  Also used by `leader_condvar`.
     state: Mutex<FsyncState>,
     /// Condvar used by the leader to wait for more members (grpc wait).
     /// Paired with `state` mutex so the lock can be released during the wait.
     leader_condvar: Condvar,
-    /// Total number of fdatasync/fsync calls performed (port of JE nFSyncs stat).
+    /// Total number of fdatasync/fsync calls performed.
     n_fsyncs: AtomicU64,
 }
 
@@ -209,7 +208,7 @@ impl FsyncManager {
             grpc_threshold,
             grpc_interval_ms,
             grp_wait_on,
-            // JE default timeout: 500 ms.
+            // default timeout: 500 ms.
             fsync_timeout: Duration::from_millis(500),
             state: Mutex::new(FsyncState {
                 work_in_progress: false,
@@ -224,7 +223,7 @@ impl FsyncManager {
 
     /// Request an fsync, coalescing with concurrent callers.
     ///
-    /// Port of `FSyncManager.flushAndSync(boolean fsyncRequired)`.
+    /// 
     ///
     /// The caller supplies `do_fsync`, a closure that performs the actual
     /// fsync.  This method guarantees that when it returns `Ok(())`, at least
@@ -290,7 +289,7 @@ impl FsyncManager {
                     if state.work_in_progress {
                         // Another thread started a new fsync while we were being
                         // woken up — do our own fsync as a safety measure.
-                        // (JE comment: "Ensure that an fsync is done before returning")
+                        // (comment: "Ensure that an fsync is done before returning")
                         do_work = true;
                     } else {
                         is_leader = true;
@@ -327,7 +326,7 @@ impl FsyncManager {
                     Err(e) => in_prog.wakeup_all_with_error(e.to_string()),
                 }
                 // Wake one member of the next cohort to become the new leader,
-                // then clear work_in_progress — matching JE's ordering.
+                // then clear work_in_progress — matching ordering.
                 let mut state = self.state.lock().unwrap();
                 state.next_fsync_waiters.wakeup_one();
                 state.work_in_progress = false;
@@ -341,7 +340,7 @@ impl FsyncManager {
 
     /// Returns the total number of fdatasync calls performed.
     ///
-    /// Port of JE's `nFSyncs` stat (see `LogStatDefinition.N_FSYNCS`).
+    /// Stat (see `LogStatDefinition.N_FSYNCS`).
     pub fn fsync_count(&self) -> u64 {
         self.n_fsyncs.load(Ordering::Relaxed)
     }
@@ -349,7 +348,7 @@ impl FsyncManager {
     /// Perform the group-commit wait: release the state lock and wait up to
     /// `grpc_interval_ms` for `grpc_threshold` waiters to accumulate.
     ///
-    /// Mirrors the `if (grpWaitOn)` block inside `flushAndSync()` in JE:
+    /// Mirrors the `if (grpWaitOn)` block inside `flushAndSync()`:
     /// ```java
     /// if (numNextWaiters < grpcThreshold) {
     ///     interval = System.nanoTime() - startNextWait;

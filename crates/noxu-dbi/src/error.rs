@@ -1,6 +1,5 @@
 //! Error types for the DBI layer.
 //!
-//! Port of error handling from `com.sleepycat.je.dbi`.
 
 use thiserror::Error;
 
@@ -21,7 +20,7 @@ pub enum DbiError {
 
     /// Database cannot be deleted or renamed while handles are open.
     ///
-    /// Port of `com.sleepycat.je.DatabaseException` thrown when
+    /// Thrown when
     /// `EnvironmentImpl.dbRemove()`/`dbRename()` detect open handles.
     #[error("database is in use (open handles exist): {0}")]
     DatabaseInUse(String),

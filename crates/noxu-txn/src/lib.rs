@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Transaction management and locking for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.txn` - transaction management and
+//! transaction management and
 //! record-level locking with deadlock detection.
 //!
 //! ## Phase 3: Lock Type System Foundation (Implemented)

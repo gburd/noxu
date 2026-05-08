@@ -1,6 +1,6 @@
 //! Serde-based entry binding for Noxu DB.
 //!
-//! Port of `com.sleepycat.bind.serial.SerialBinding` adapted for Rust's serde
+//! Adapted for Rust's serde
 //! framework. Instead of Java serialization, this uses a compact binary format
 //! implemented in [`super::simple_serial`].
 //!
@@ -26,7 +26,7 @@ use crate::serial::simple_serial;
 /// Any type implementing `Serialize + DeserializeOwned` can be stored in and
 /// retrieved from database entries using this binding.
 ///
-/// Port of `com.sleepycat.bind.serial.SerialBinding` adapted for serde.
+/// Adapted for serde.
 ///
 /// # Examples
 ///

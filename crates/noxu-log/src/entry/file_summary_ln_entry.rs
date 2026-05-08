@@ -1,6 +1,5 @@
 //! FileSummaryLN log entry.
 //!
-//! Port of `com.sleepycat.je.cleaner.FileSummaryLN`.
 //!
 //! Records per-file utilization statistics used by the cleaner to determine
 //! which log files are candidates for cleaning. Written periodically by the

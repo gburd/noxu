@@ -1,6 +1,5 @@
 //! File manager for log files.
 //!
-//! Port of `com.sleepycat.je.log.FileManager`.
 //!
 //! The FileManager presents the abstraction of one contiguous log file,
 //! managing the actual on-disk log files, file handles, and LSN allocation.
@@ -57,10 +56,10 @@ fn parse_file_number(filename: &str) -> Option<u32> {
 
 /// LRU cache of open file handles.
 ///
-/// Port of `com.sleepycat.je.log.FileHandleCache`.  The key is the log file
+/// The key is the log file
 /// number; values are `Arc`-wrapped so callers may hold a reference after the
-/// cache evicts the entry (matching JE's `FileHandle` reference-counting
-/// pattern).  Capacity is configurable (JE default: `ENV_RUN_CLEANER_THREADS
+/// cache evicts the entry (matching `FileHandle` reference-counting
+/// pattern).  Capacity is configurable (default: `ENV_RUN_CLEANER_THREADS
 /// + 2`; Noxu default: 10).
 type FileHandleCache = lru::LruCache<u32, Arc<FileHandle>>;
 
@@ -72,7 +71,7 @@ pub struct FileManager {
     read_only: bool,
     /// Maximum size of a single log file (bytes).
     max_file_size: u64,
-    /// LRU cache of open file handles (port of JE `FileHandleCache`).
+    /// LRU cache of open file handles.
     ///
     /// Protected by `noxu_sync::Mutex` because `lru::LruCache::get()` mutates
     /// the eviction order, so a shared read lock would not be safe.
@@ -270,7 +269,7 @@ impl FileManager {
 
     /// Gets a file handle for the given file number.
     ///
-    /// Checks the LRU cache first (port of JE `FileHandleCache.get()`).
+    /// Checks the LRU cache first`).
     /// On a cache miss the file is opened, its header validated, and the
     /// resulting `Arc<FileHandle>` is inserted — with automatic LRU eviction
     /// when the cache is at capacity.  Because `lru::LruCache::get()` mutates
@@ -312,7 +311,7 @@ impl FileManager {
         let handle = Arc::new(handle);
 
         // Insert into the LRU cache (evicts the least-recently-used entry when
-        // the cache is at capacity, mirroring JE's FileHandleCache eviction).
+        // the cache is at capacity, mirroring FileHandleCache eviction).
         cache.put(file_num, handle.clone());
 
         Ok(handle)
@@ -455,10 +454,9 @@ impl FileManager {
 
     /// Writes `data` to the current log file at the given file offset.
     ///
-    /// This is the Rust port of `FileManager.writeLogBuffer()` /
     /// `writeToFile()`.  The caller must supply the exact file-level byte
     /// offset at which `data` should be written (i.e. `firstLsn.fileOffset`
-    /// in JE terms).  After a successful write the method checks whether the
+    /// in terms).  After a successful write the method checks whether the
     /// file has grown past `max_file_size`; if so it calls `flip_file()` and
     /// returns the new file number, otherwise it returns the current one.
     ///
@@ -517,7 +515,7 @@ impl FileManager {
 
     /// Reads bytes from a log file at a given offset.
     ///
-    /// Port of `FileManager.readFromFileInternal()`.
+    /// 
     ///
     /// # Arguments
     /// * `file_num` - The log file number to read from.
@@ -553,7 +551,7 @@ impl FileManager {
 
     /// Fsyncs the current log file to stable storage.
     ///
-    /// Port of `FileManager.syncLogEnd()`.
+    /// 
     pub fn sync_log_end(&self) -> Result<()> {
         if self.read_only {
             return Ok(());
@@ -570,7 +568,7 @@ impl FileManager {
         let handle = self.get_file_handle(file_num)?;
         let mut guard = handle.acquire();
         // Use fdatasync (sync_data) — only log data must be durable here,
-        // not file metadata.  JE uses FileChannel.force(false) for this.
+        // not file metadata.  uses FileChannel.force(false) for this.
         guard.sync_data()?;
         Ok(())
     }

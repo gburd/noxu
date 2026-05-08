@@ -1,6 +1,6 @@
 //! Environment verification utilities.
 //!
-//! Port of `com.sleepycat.je.util.DbVerify` and related verification functionality.
+//! Related verification functionality.
 
 use noxu_tree::tree::{BinStub, InNodeStub, TreeNode};
 use noxu_tree::Tree;
@@ -250,8 +250,6 @@ impl Default for VerifyConfig {
 
 // ============================================================================
 // Tree structural verification helpers
-// Port of com.sleepycat.je.cleaner.VerifyUtils.verifyBtree() and
-// com.sleepycat.je.util.DbVerify
 // ============================================================================
 
 /// Verifies the structural integrity of a B-tree.
@@ -260,13 +258,13 @@ impl Default for VerifyConfig {
 ///
 /// 1. Each upper IN's children are accessible (non-null child references).
 /// 2. For each IN, every child's leftmost key is >= the parent key entry that
-///    routes to it (key-range containment — port of JE `VerifyUtils`).
+///    routes to it (key-range containment).
 /// 3. Each BIN entry that is not known-deleted has a valid (non-NULL) LSN.
 ///
 /// Returns a `VerifyResult` with any anomalies found and the count of records
 /// verified.
 ///
-/// Port of `com.sleepycat.je.cleaner.VerifyUtils.verifyBtree()`.
+/// 
 pub fn verify_tree(
     tree: &Tree,
     db_name: &str,
@@ -326,7 +324,7 @@ fn verify_node(
 
 /// Verifies an upper internal node (IN).
 ///
-/// Port of JE `VerifyUtils.verifyIN()`: checks that each child's first key is
+/// `VerifyUtils.verifyIN()`: checks that each child's first key is
 /// within the key range implied by the parent entry.
 fn verify_internal_node(
     in_node: &InNodeStub,
@@ -363,7 +361,7 @@ fn verify_internal_node(
 
         // The key carried in slot 0 of an IN is the virtual -infinity key;
         // entries at i > 0 carry the first key of that child's subtree.
-        // Port of JE IN slot-0 special case.
+        // IN slot-0 special case.
         let expected_parent_key: Option<&[u8]> = if i == 0 {
             None
         } else {
@@ -387,7 +385,7 @@ fn verify_internal_node(
 
 /// Verifies a BIN stub (leaf-level node).
 ///
-/// Port of JE `VerifyUtils.verifyBIN()`: checks that non-deleted slots carry
+/// `VerifyUtils.verifyBIN()`: checks that non-deleted slots carry
 /// valid (non-NULL) LSNs, and that the BIN's first key is >= the routing key
 /// passed from the parent.
 fn verify_bin_stub(
@@ -447,7 +445,7 @@ fn verify_bin_stub(
 /// live tree reference and therefore validates only configuration-level
 /// invariants; call `verify_tree()` directly to walk a B-tree.
 ///
-/// Port of `com.sleepycat.je.util.DbVerify.verify()`.
+/// 
 ///
 /// # Arguments
 ///
@@ -480,7 +478,7 @@ pub fn verify_environment(config: &VerifyConfig) -> VerifyResult {
 /// perform full structural verification (key-range checks, LSN validity).
 /// This entry point validates database-level metadata without a tree handle.
 ///
-/// Port of `com.sleepycat.je.util.DbVerify.verify(String dbName)`.
+/// 
 ///
 /// # Arguments
 ///

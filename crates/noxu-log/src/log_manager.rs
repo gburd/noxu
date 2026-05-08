@@ -1,13 +1,12 @@
 //! Central coordinator for log reading and writing.
 //!
-//! Port of `com.sleepycat.je.log.LogManager`.
 //!
-//! The LogManager supports reading and writing to the JE log. The writing of
+//! The LogManager supports reading and writing to the log. The writing of
 //! data to the log is serialized via the logWriteMutex. Typically space is
 //! allocated under the LWL. The client computes the checksum and copies the
 //! data into the log buffer (not holding the LWL).
 //!
-//! # Write path (JE serialLogWork -> Rust LogManager::log)
+//! # Write path (serialLogWork -> Rust LogManager::log)
 //!
 //! 1. Under the LWL, determine whether the current file would overflow if we
 //!    appended `entry_size` bytes; if so, flip to a new file.
@@ -22,7 +21,7 @@
 //! 7. Advance next_available_lsn / last_used_lsn in the FileManager.
 //! 8. Return the assigned LSN.
 //!
-//! # Read path (JE getLogEntryFromLogSource -> Rust LogManager::read_entry)
+//! # Read path (getLogEntryFromLogSource -> Rust LogManager::read_entry)
 //!
 //! 1. Check whether the LSN is still in a write buffer (hot read).
 //! 2. If not, open the log file indicated by lsn.file_number().
@@ -48,13 +47,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The central coordinator for log operations.
 ///
-/// Port of `com.sleepycat.je.log.LogManager`.
+/// 
 pub struct LogManager {
     /// Pool of log buffers for staging writes before they reach the file.
     buffer_pool: Arc<Mutex<LogBufferPool>>,
 
     /// Serializes all log writes so entries appear in LSN order.
-    /// JE calls this the "Log Write Latch" (LWL).
+    /// calls this the "Log Write Latch" (LWL).
     log_write_latch: Mutex<()>,
 
     /// Last flushed LSN (updated when buffers are written to disk).
@@ -72,9 +71,9 @@ pub struct LogManager {
 
     /// Coalesces concurrent fsync requests (group commit).
     ///
-    /// Port of `com.sleepycat.je.log.FSyncManager`.
+    /// 
     /// Initialised with threshold=0, interval=0 (group commit disabled),
-    /// matching JE's default configuration.
+    /// matching default configuration.
     fsync_manager: FsyncManager,
 
     /// Optional utilization tracking observer.
@@ -83,7 +82,6 @@ pub struct LogManager {
     ///   - `count_new_entry()` for the freshly assigned LSN
     ///   - `count_obsolete()` when replacing a previous version
     ///
-    /// Port of `LogManager.serialLogWork()` tracker calls in JE.
     write_observer: Option<Arc<dyn LogWriteObserver>>,
 }
 
@@ -112,7 +110,7 @@ impl LogManager {
             read_buffer_size,
             file_manager,
             // Group commit disabled by default (threshold=0, interval=0),
-            // matching JE's LOG_GROUP_COMMIT_THRESHOLD / LOG_GROUP_COMMIT_INTERVAL
+            // matching LOG_GROUP_COMMIT_THRESHOLD / LOG_GROUP_COMMIT_INTERVAL
             // defaults of 0.
             fsync_manager: FsyncManager::new(0, 0),
             write_observer: None,
@@ -126,7 +124,7 @@ impl LogManager {
     /// log write so that utilization accounting is always consistent with the
     /// on-disk log.
     ///
-    /// Port of `LogManager` receiving `envImpl.getUtilizationTracker()` in JE.
+    /// Receiving `envImpl.getUtilizationTracker()`.
     pub fn set_write_observer(&mut self, observer: Arc<dyn LogWriteObserver>) {
         self.write_observer = Some(observer);
     }
@@ -144,7 +142,7 @@ impl LogManager {
     /// ```
     ///
     /// When `old_lsn` is `Some`, the observer is notified that the previous
-    /// version at that LSN is now obsolete (JE: `countObsoleteNode`).
+    /// version at that LSN is now obsolete (the: `countObsoleteNode`).
     ///
     /// # Parameters
     /// - `entry_type`     : Log entry type.
@@ -211,7 +209,7 @@ impl LogManager {
         old_lsn: Option<Lsn>,
     ) -> Result<Lsn> {
         // Build the header bytes + payload into one contiguous buffer so we
-        // can compute the checksum in one pass (matching JE's approach).
+        // can compute the checksum in one pass (matching approach).
         let item_size = payload.len() as u32;
         let header_size = MIN_HEADER_SIZE; // no VLSN for non-replicated entries
 
@@ -235,12 +233,12 @@ impl LogManager {
         entry_buf[header_size..].copy_from_slice(payload);
 
         // Acquire the LWL - all LSN assignment and file position advancement
-        // happens under this latch, matching JE's serialLog/serialLogWork.
+        // happens under this latch, matching serialLog/serialLogWork.
         let lsn = {
             let _lwl = self.log_write_latch.lock();
 
             // Determine whether a file flip is needed before assigning the LSN.
-            // JE: shouldFlipFile -> calculateNextLsn -> advanceLsn
+            // ShouldFlipFile -> calculateNextLsn -> advanceLsn
             let next_lsn = self.file_manager.get_next_available_lsn();
             let current_file = next_lsn.file_number();
 
@@ -260,7 +258,7 @@ impl LogManager {
             };
 
             // prev_offset: offset of the last used LSN in the same file, or 0
-            // when this is the first entry in the file (JE: advanceLsn).
+            // when this is the first entry in the file (the: advanceLsn).
             let last_used = self.file_manager.get_last_used_lsn();
             let prev_offset: u32 = if last_used.is_null()
                 || last_used.file_number() != file_num
@@ -275,7 +273,7 @@ impl LogManager {
             entry_buf[6..10].copy_from_slice(&prev_offset.to_le_bytes());
 
             // Compute CRC32 over bytes [CHECKSUM_BYTES..entry_size].
-            // JE skips the first 4 bytes (the checksum field itself) when
+            // skips the first 4 bytes (the checksum field itself) when
             // computing the checksum.
             let crc = ChecksumValidator::compute_range(
                 &entry_buf,
@@ -293,10 +291,10 @@ impl LogManager {
             );
             self.file_manager.set_last_position(new_next, current_lsn);
 
-            // Utilization tracking — called under the LWL, matching JE's
+            // Utilization tracking — called under the LWL, matching the
             // serialLogWork() tracker calls.
             if let Some(obs) = &self.write_observer {
-                // Mark old version obsolete (JE: countObsoleteNode).
+                // Mark old version obsolete (the: countObsoleteNode).
                 if let Some(old) = old_lsn
                     && !old.is_null()
                 {
@@ -307,7 +305,7 @@ impl LogManager {
                         entry_type.is_ln_type(),
                     );
                 }
-                // Count the new entry (JE: countNewLogEntry).
+                // Count the new entry (the: countNewLogEntry).
                 obs.count_new_entry(
                     current_lsn.file_number(),
                     current_lsn.file_offset(),
@@ -339,7 +337,7 @@ impl LogManager {
                 }
                 None => {
                     // Entry is too large for any pool buffer - write directly
-                    // to the file, as JE does in serialLogWork.
+                    // to the file, as does in serialLogWork.
                     buffer.release();
                     drop(buffer);
 
@@ -368,7 +366,7 @@ impl LogManager {
 
     /// Flushes all dirty write buffers to disk and performs an fdatasync.
     ///
-    /// This is the durable commit path.  The implementation mirrors JE's
+    /// This is the durable commit path.  The implementation mirrors the
     /// group-commit pattern (`FSyncManager`):
     ///
     /// 1. Acquire the LWL, drain all dirty write buffers to disk, then
@@ -378,17 +376,17 @@ impl LogManager {
     /// 2. Call `fsync_manager.fsync()` **outside** the LWL.  Concurrent
     ///    callers elect one leader; the leader does a single fdatasync and
     ///    all waiters return together.  This turns N per-commit fsyncs into
-    ///    ≈1 fsync for a burst of N concurrent commits (identical to JE's
+    ///    ≈1 fsync for a burst of N concurrent commits (identical to the
     ///    `FSyncManager.fsync()` flow).
     ///
     /// Returns the total number of fdatasync calls performed by this log manager.
     ///
-    /// Port of JE's `nFSyncs` stat in `EnvironmentStats`.
+    /// Stat in `EnvironmentStats`.
     pub fn fsync_count(&self) -> u64 {
         self.fsync_manager.fsync_count()
     }
 
-    /// Port of `LogManager.logForceFlush()` → `FSyncManager.fsync()` in JE.
+    /// → `FSyncManager.fsync()`.
     pub fn flush_sync(&self) -> Result<Lsn> {
         // Phase 1: flush dirty buffers under the LWL, then release it.
         let eol = {
@@ -425,10 +423,10 @@ impl LogManager {
     /// Drains the write-buffer pool to disk.
     ///
     /// Each dirty buffer is written to the file indicated by its first LSN,
-    /// matching JE's `LogBufferPool.writeDirty()` -> `FileManager.writeLogBuffer()`.
+    /// matching `LogBufferPool.writeDirty()` -> `FileManager.writeLogBuffer()`.
     ///
     /// Only the **unflushed** portion of each buffer (`data[flushed_len..]`) is
-    /// written, matching JE's `LogBuffer.lastFlushedPosition` watermark.  This
+    /// written, matching `LogBuffer.lastFlushedPosition` watermark.  This
     /// eliminates the O(N²) I/O pattern where every commit rewrote the entire
     /// buffer from the start.
     fn flush_dirty_buffers(&self) -> Result<()> {
@@ -465,7 +463,7 @@ impl LogManager {
 
     /// Reads a single log entry from the given LSN.
     ///
-    /// Port of `LogManager.getLogEntryFromLogSource()`.
+    /// 
     ///
     /// Procedure:
     /// 1. Check the write-buffer pool first (hot path).
@@ -534,7 +532,7 @@ impl LogManager {
 
     /// Reads a log entry from disk at the given LSN.
     ///
-    /// Port of the disk-read branch of `LogManager.getLogEntryFromLogSource()`.
+    /// Disk-read branch of `LogManager.getLogEntryFromLogSource()`.
     ///
     /// Format on disk (little-endian):
     /// ```text
@@ -613,7 +611,7 @@ impl LogManager {
         }
 
         // Step 5: Validate CRC32.
-        // JE computes the checksum over everything after the checksum field:
+        // computes the checksum over everything after the checksum field:
         // bytes [CHECKSUM_BYTES..entry_size].
         let computed_crc = ChecksumValidator::compute_range(
             &full_buf,

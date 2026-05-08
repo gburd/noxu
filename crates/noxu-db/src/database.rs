@@ -1,6 +1,5 @@
 //! Database handle.
 //!
-//! Port of `com.sleepycat.je.Database`.
 
 use crate::cursor::Cursor;
 use crate::cursor_config::CursorConfig;
@@ -18,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A database handle.
 ///
-/// Port of `com.sleepycat.je.Database`.
+/// 
 ///
 /// Database handles provide methods for inserting, retrieving, and
 /// deleting records. A database belongs to a single environment.
@@ -59,7 +58,7 @@ pub struct Database {
 
 /// State of a database handle.
 ///
-/// Port of `Database.DbState`.
+/// 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbState {
@@ -93,7 +92,7 @@ impl Database {
     /// that write operations acquire locks via the transaction's `Txn` and
     /// record abort before-images in `WriteLockInfo`.
     ///
-    /// Port of `DatabaseImpl.openCursor(txn, config)` in JE which passes the
+    /// In which passes the
     /// transaction's `Locker` to the new `CursorImpl`.
     fn make_cursor_for_txn(&self, txn: &Transaction) -> CursorImpl {
         let cursor = self.make_cursor();
@@ -107,7 +106,7 @@ impl Database {
     /// Auto-commit flush: when `txn` is `None` (auto-commit mode), flush and
     /// fsync the log before returning to the caller.
     ///
-    /// Port of JE `Database.put/delete` auto-commit path: a non-transactional
+    /// `Database.put/delete` auto-commit path: a non-transactional
     /// mutation is wrapped in an implicit `AutoTxn` that commits with
     /// `CommitSync` durability (fsync) before the method returns, giving the
     /// same durability guarantee as an explicit committed transaction.
@@ -144,7 +143,7 @@ impl Database {
 
     /// Retrieves a record by key.
     ///
-    /// Port of `Database.get(Transaction, DatabaseEntry, DatabaseEntry, LockMode)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -182,7 +181,7 @@ impl Database {
                     .get_current()
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
                 // Partial get: return only the requested slice.
-                // Port of JE DatabaseEntry partial-read logic.
+                // DatabaseEntry partial-read logic.
                 if data.is_partial() {
                     let off = data.get_partial_offset();
                     let len = data.get_partial_length();
@@ -200,7 +199,7 @@ impl Database {
 
     /// Inserts or updates a record.
     ///
-    /// Port of `Database.put(Transaction, DatabaseEntry, DatabaseEntry)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -224,7 +223,7 @@ impl Database {
         let key_bytes = key.get_data().unwrap_or(&[]);
 
         // Partial put: read-modify-write using the partial offset/length.
-        // Port of JE LN.combinePuts() — existing bytes outside [offset..offset+length]
+        // LN.combinePuts() — existing bytes outside [offset..offset+length]
         // are preserved; only the specified range is replaced with new data.
         let write_bytes: Vec<u8>;
         let data_bytes: &[u8] = if data.is_partial() {
@@ -266,7 +265,7 @@ impl Database {
             .put(key_bytes, data_bytes, PutMode::Overwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
 
-        // Auto-commit: fsync before returning (port of JE AutoTxn CommitSync).
+        // Auto-commit: fsync before returning.
         self.auto_commit_sync(txn)?;
 
         Ok(OperationStatus::Success)
@@ -274,7 +273,7 @@ impl Database {
 
     /// Inserts a record, failing if the key already exists.
     ///
-    /// Port of `Database.putNoOverwrite(Transaction, DatabaseEntry, DatabaseEntry)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -309,14 +308,14 @@ impl Database {
             noxu_dbi::OperationStatus::KeyExist => OperationStatus::KeyExists,
             _ => OperationStatus::Success,
         };
-        // Auto-commit: fsync before returning (port of JE AutoTxn CommitSync).
+        // Auto-commit: fsync before returning.
         self.auto_commit_sync(txn)?;
         Ok(status)
     }
 
     /// Deletes a record by key.
     ///
-    /// Port of `Database.delete(Transaction, DatabaseEntry)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -357,14 +356,14 @@ impl Database {
             }
             _ => OperationStatus::NotFound,
         };
-        // Auto-commit: fsync before returning (port of JE AutoTxn CommitSync).
+        // Auto-commit: fsync before returning.
         self.auto_commit_sync(txn)?;
         Ok(status)
     }
 
     /// Opens a cursor for iterating over database records.
     ///
-    /// Port of `Database.openCursor(Transaction, CursorConfig)`.
+    /// 
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -396,7 +395,7 @@ impl Database {
 
     /// Opens (and optionally creates) a sequence backed by this database.
     ///
-    /// Port of `Database.openSequence(Transaction, DatabaseEntry, SequenceConfig)`.
+    /// 
     ///
     /// # Arguments
     /// * `key`    - The database key under which the sequence record is stored.
@@ -416,7 +415,7 @@ impl Database {
 
     /// Closes the database handle.
     ///
-    /// Port of `Database.close()`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the database is already closed
@@ -432,22 +431,22 @@ impl Database {
 
     /// Returns the database name.
     ///
-    /// Port of `Database.getDatabaseName()`.
+    /// 
     pub fn get_database_name(&self) -> &str {
         &self.name
     }
 
     /// Returns the database configuration.
     ///
-    /// Port of `Database.getConfig()`.
+    /// 
     pub fn get_config(&self) -> &DatabaseConfig {
         &self.config
     }
 
     /// Returns an approximate count of records in the database.
     ///
-    /// Port of `Database.count()` — reads the per-database `AtomicU64` entry
-    /// counter, giving O(1) performance identical to JE's implementation.
+    /// reads the per-database `AtomicU64` entry
+    /// counter, giving O(1) performance analogous to an O(1) counter.
     ///
     /// The counter is incremented on every new insert and decremented on every
     /// delete (including transaction aborts that undo inserts).
@@ -500,7 +499,7 @@ impl Database {
 
     /// Returns whether the database handle is valid.
     ///
-    /// Port of `Database.isValid()`.
+    /// 
     pub fn is_valid(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }

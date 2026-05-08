@@ -1,13 +1,12 @@
 //! Statistics for eager schema evolution.
 //!
-//! Port of `com.sleepycat.persist.evolve.EvolveStats`.
 
 /// Statistics accumulated during eager entity evolution.
 ///
 /// Returned from [`EntityStore::evolve`] and also passed to progress
 /// listeners during evolution.
 ///
-/// Port of `com.sleepycat.persist.evolve.EvolveStats`.
+/// 
 ///
 /// [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,7 +25,7 @@ impl EvolveStats {
 
     /// Accumulates counts from processing one batch/class.
     ///
-    /// Port of `EvolveStats.add(int nRead, int nConverted)`.
+    /// 
     pub fn add(&mut self, n_read: u64, n_converted: u64) {
         self.n_read += n_read;
         self.n_converted += n_converted;
@@ -34,7 +33,7 @@ impl EvolveStats {
 
     /// Returns the total number of entities read during eager evolution.
     ///
-    /// Port of `EvolveStats.getNRead()`.
+    /// 
     pub fn n_read(&self) -> u64 {
         self.n_read
     }
@@ -42,7 +41,7 @@ impl EvolveStats {
     /// Returns the total number of entities converted (written) during eager
     /// evolution.
     ///
-    /// Port of `EvolveStats.getNConverted()`.
+    /// 
     pub fn n_converted(&self) -> u64 {
         self.n_converted
     }

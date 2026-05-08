@@ -1,6 +1,5 @@
 //! Entity store for managing databases of typed entities.
 //!
-//! Port of `com.sleepycat.persist.EntityStore`.
 
 use std::collections::HashMap;
 
@@ -22,7 +21,7 @@ use crate::store_config::StoreConfig;
 /// Each entity type gets its own database, named using the store name as a
 /// prefix and the entity name as a suffix.
 ///
-/// Port of `com.sleepycat.persist.EntityStore`.
+/// 
 ///
 /// # Example
 ///
@@ -50,7 +49,7 @@ impl<'env> EntityStore<'env> {
     /// names are prefixed with the store name to avoid collisions between
     /// multiple stores in the same environment.
     ///
-    /// Port of `EntityStore(Environment, String, StoreConfig)` constructor.
+    /// Constructor.
     ///
     /// # Arguments
     /// * `env` - The environment in which to open the store
@@ -74,7 +73,7 @@ impl<'env> EntityStore<'env> {
     /// in the store configuration, it will be created. The database name is
     /// formed as `"{store_name}_{entity_name}"`.
     ///
-    /// Port of `EntityStore.getPrimaryIndex(Class<PK>, Class<E>)`.
+    /// 
     ///
     /// # Type Parameters
     /// * `K` - The primary key type
@@ -119,7 +118,7 @@ impl<'env> EntityStore<'env> {
     /// type and must pass the resulting `PrimaryIndex` here so the secondary
     /// index registration can be deposited into it.
     ///
-    /// Port of `EntityStore.getSecondaryIndex(PrimaryIndex, Class<SK>, String)`.
+    /// 
     ///
     /// # Type Parameters
     /// * `SK` - The secondary key type
@@ -147,14 +146,14 @@ impl<'env> EntityStore<'env> {
 
     /// Returns the store name.
     ///
-    /// Port of `EntityStore.getStoreName()`.
+    /// 
     pub fn get_store_name(&self) -> &str {
         &self.config.store_name
     }
 
     /// Returns the store configuration.
     ///
-    /// Port of `EntityStore.getConfig()`.
+    /// 
     pub fn get_config(&self) -> &StoreConfig {
         &self.config
     }
@@ -191,7 +190,7 @@ impl<'env> EntityStore<'env> {
     /// The method returns cumulative [`EvolveStats`] describing how many
     /// records were read and how many were re-written.
     ///
-    /// Port of `EntityStore.evolve(EvolveConfig)`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the store is not open or if any database operation
@@ -240,7 +239,7 @@ impl<'env> EntityStore<'env> {
 
     /// Closes the entity store and all of its databases.
     ///
-    /// Port of `EntityStore.close()`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the store is already closed or if any database

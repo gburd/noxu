@@ -1,6 +1,5 @@
 //! File header entry for log files.
 //!
-//! Port of `com.sleepycat.je.log.FileHeader` and `com.sleepycat.je.log.entry.FileHeaderEntry`.
 //!
 //! Each log file begins with a FileHeader that identifies the file number,
 //! log version, and the LSN of the last entry in the previous file.

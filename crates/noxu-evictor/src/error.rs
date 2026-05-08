@@ -1,12 +1,10 @@
 //! Error types for the evictor.
 //!
-//! Port of error handling from `com.sleepycat.je.evictor`.
 
 use thiserror::Error;
 
 /// Errors that can occur during eviction operations.
 ///
-/// Port of exception handling from JE's evictor package.
 #[derive(Debug, Error)]
 pub enum EvictorError {
     /// Eviction operation failed.

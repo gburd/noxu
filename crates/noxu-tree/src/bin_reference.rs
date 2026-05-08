@@ -1,6 +1,5 @@
 //! BIN reference for the INCompressor.
 //!
-//! Port of `com.sleepycat.je.tree.BINReference` from JE.
 //!
 //! Identifies a BIN and a set of deleted keys for the INCompressor daemon.
 //! The INCompressor processes these references to remove empty slots and

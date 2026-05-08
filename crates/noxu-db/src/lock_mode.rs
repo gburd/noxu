@@ -1,13 +1,12 @@
 //! Lock modes for read operations.
 //!
-//! Port of `com.sleepycat.je.LockMode`.
 
 /// Lock mode for read operations.
 ///
 /// Specifies the locking behavior for a read operation. Controls isolation
 /// level and whether locks are acquired.
 ///
-/// Port of `com.sleepycat.je.LockMode`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LockMode {
     /// Use the default isolation level for the cursor or transaction.

@@ -1,6 +1,5 @@
 //! Result of a Locker.lock() call.
 //!
-//! Port of `com.sleepycat.je.txn.LockResult`.
 
 use crate::{LockGrantType, WriteLockInfo};
 
@@ -8,7 +7,7 @@ use crate::{LockGrantType, WriteLockInfo};
 ///
 /// Encapsulates the grant type and optional write lock info (for write locks).
 ///
-/// Port of `com.sleepycat.je.txn.LockResult`.
+/// 
 #[derive(Debug)]
 pub struct LockResult {
     /// The type of lock grant that occurred.
@@ -34,7 +33,7 @@ impl LockResult {
 
     /// Sets the abort info in the write lock info, if present.
     ///
-    /// Port of `LockResult.setAbortInfo()`.
+    /// 
     pub fn set_abort_info(
         &mut self,
         abort_lsn: u64,
@@ -62,7 +61,7 @@ impl LockResult {
 
     /// Copies write lock info from another WriteLockInfo.
     ///
-    /// Port of `LockResult.copyWriteLockInfo()`.
+    /// 
     pub fn copy_write_lock_info(&mut self, from: &WriteLockInfo) {
         if let Some(ref mut info) = self.write_lock_info {
             info.copy_all_info(from);
@@ -76,7 +75,7 @@ impl LockResult {
 
     /// Returns true if the lock was granted (NEW, PROMOTION, or EXISTING).
     ///
-    /// Port of `LockResult.isLockGranted()`.
+    /// 
     pub fn is_granted(&self) -> bool {
         matches!(
             self.grant,

@@ -1,6 +1,5 @@
 //! Primary index for typed entity access.
 //!
-//! Port of `com.sleepycat.persist.PrimaryIndex`.
 
 use std::marker::PhantomData;
 
@@ -21,7 +20,7 @@ use crate::secondary_index::{
 /// method call rather than stored in the index, allowing different
 /// serialization strategies to be used with the same index.
 ///
-/// Port of `com.sleepycat.persist.PrimaryIndex`.
+/// 
 ///
 /// # Type Parameters
 ///
@@ -33,7 +32,7 @@ pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     ///
     /// Each secondary index deposits a `SecondaryRegistration` here. On every
     /// `put` / `delete_with_entity` every maintainer is notified so the
-    /// secondary maps stay in sync with the primary store — mirroring BDB JE's
+    /// secondary maps stay in sync with the primary store — mirroring BDB the
     /// `SecondaryDatabase` auto-maintenance.
     secondaries: Vec<Box<dyn SecondaryIndexMaintainer<K, E> + Send + Sync>>,
     _phantom: PhantomData<(K, E)>,
@@ -59,7 +58,7 @@ where
     /// `PrimaryIndex`: every `put` and `delete_with_entity` updates the
     /// secondary map.
     ///
-    /// Port of `EntityStore.getSecondaryIndex(PrimaryIndex, Class<SK>, String)`.
+    /// 
     ///
     /// # Example
     ///
@@ -108,7 +107,7 @@ where
     ///
     /// Returns `None` if no entity with the given key exists.
     ///
-    /// Port of `PrimaryIndex.get(PK)`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the database operation fails or deserialization fails.
@@ -145,7 +144,7 @@ where
     ///
     /// All registered secondary indexes are updated automatically.
     ///
-    /// Port of `PrimaryIndex.put(E)`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
@@ -155,7 +154,7 @@ where
         entity: &E,
     ) -> Result<()> {
         // Fetch the existing entity so secondary maintainers can remove the
-        // stale secondary key mapping (mirrors JE's old-value callback).
+        // stale secondary key mapping (mirrors old-value callback).
         let old_entity = self.get(serializer, entity.primary_key())?;
 
         let key_bytes = entity.primary_key().to_bytes();
@@ -178,7 +177,7 @@ where
     /// Returns `true` if the entity was inserted, `false` if the key already
     /// exists. Secondary indexes are updated on successful insert.
     ///
-    /// Port of `PrimaryIndex.putNoOverwrite(E)`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
@@ -214,7 +213,7 @@ where
     /// no entity is fetched. Use [`delete_with_entity`] when secondary index
     /// maintenance is required.
     ///
-    /// Port of `PrimaryIndex.delete(PK)`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
@@ -258,7 +257,7 @@ where
 
     /// Checks whether an entity with the given primary key exists.
     ///
-    /// Port of `PrimaryIndex.contains(PK)`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
@@ -271,7 +270,7 @@ where
 
     /// Returns an approximate count of entities in the index.
     ///
-    /// Port of `PrimaryIndex.count()`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
@@ -285,7 +284,7 @@ where
 
     /// Returns an iterator over all entities in key order.
     ///
-    /// Port of `PrimaryIndex.entities()`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
@@ -305,7 +304,7 @@ where
 
     /// Returns an iterator over all primary keys in key order.
     ///
-    /// Port of `PrimaryIndex.keys()`.
+    /// 
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
@@ -331,7 +330,7 @@ where
 
 /// Iterator over entities using a database cursor.
 ///
-/// Port of `com.sleepycat.persist.EntityCursor`.
+/// 
 pub struct EntityIterator<'a, K, E, S> {
     cursor: noxu_db::Cursor,
     serializer: &'a S,
@@ -397,7 +396,6 @@ impl<K, E, S> Drop for EntityIterator<'_, K, E, S> {
 
 /// Iterator over primary keys using a database cursor.
 ///
-/// Port of key iteration from `com.sleepycat.persist.EntityCursor`.
 pub struct KeyIterator<'a, K> {
     cursor: noxu_db::Cursor,
     started: bool,
@@ -426,7 +424,7 @@ impl<K: PrimaryKey> Iterator for KeyIterator<'_, K> {
         match self.cursor.get(&mut key_entry, &mut data_entry, get_type, None) {
             Ok(OperationStatus::Success) => {
                 // The cursor writes the current key into key_entry (Cursor::get()
-                // calls key.set_data(&k) on success — port of JE Cursor.get()
+                // calls key.set_data(&k) on success.
                 // which sets key_entry as an output parameter for all positioning ops).
                 match key_entry.get_data() {
                     Some(key_bytes) => Some(K::from_bytes(key_bytes)),

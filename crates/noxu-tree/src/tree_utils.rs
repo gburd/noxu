@@ -1,6 +1,5 @@
 //! Small utility functions for tree operations.
 //!
-//! Port of `com.sleepycat.je.tree.TreeUtils` from JE.
 
 /// Creates an indentation string of N spaces.
 ///

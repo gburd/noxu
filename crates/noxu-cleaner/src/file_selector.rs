@@ -1,16 +1,16 @@
 //! File selection for cleaning.
 //!
-//! Port of `com.sleepycat.je.cleaner.FileSelector` - keeps track of the status of files
+//! keeps track of the status of files
 //! for which cleaning is in progress.
 //!
-//! The cost/benefit file scoring algorithm is ported from
-//! `UtilizationCalculator.getBestFile()` in JE.  JE selects files using
+//! Cost/benefit file scoring algorithm for log cleaning.
+//! `UtilizationCalculator.getBestFile()`.  selects files using
 //! TTL-adjusted utilization: the file whose adjusted utilization is lowest
 //! is the best candidate.  Expired records do not need to be migrated during
 //! cleaning — they can be dropped outright — so a file with a high expired
 //! fraction is cheaper to clean than its raw utilization suggests.
 //!
-//! Adjusted utilization formula (port of JE `UtilizationCalculator`):
+//! Adjusted utilization formula:
 //!
 //!   obsolete_bytes  = summary.get_obsolete_size()
 //!   expired_bytes   = summary.obsolete_expired_size   (subset of obsolete)
@@ -22,7 +22,7 @@
 //!
 //! The file with the **lowest adjusted utilization** (= highest effective
 //! obsolete fraction) is chosen, subject to:
-//!   - `file_number <= last_file_to_clean` (age filter, JE: `fileNum <= lastFileToClean`)
+//!   - `file_number <= last_file_to_clean` (age filter, the: `fileNum <= lastFileToClean`)
 //!   - file not already in-progress (being cleaned)
 //!   - file not in the `to_be_cleaned` queue already
 //!
@@ -82,12 +82,12 @@ pub struct FileSelector {
     /// raises this threshold and sets `force_cleaning=true` to force a second pass
     /// targeting lower-utilization files.
     ///
-    /// Port of `FileSelector.requiredUtil` in JE.
+    /// 
     required_util: Option<i32>,
     /// Two-pass cleaning: if true, bypass normal utilization threshold and
     /// always select the best candidate file.
     ///
-    /// Port of `FileSelector.forceCleaning` in JE.
+    /// 
     force_cleaning: bool,
 }
 
@@ -112,7 +112,7 @@ impl FileSelector {
     /// above `target_util`, raises `required_util` by the gap and enables
     /// `force_cleaning` for the next pass.
     ///
-    /// Port of `FileSelector.checkForRequiredUtilization()` in JE.
+    /// 
     pub fn check_for_required_util(&mut self, actual_util: i32, target_util: i32) {
         if actual_util > target_util {
             // Raise the threshold by the shortfall, capped at 100.
@@ -128,7 +128,7 @@ impl FileSelector {
 
     /// Returns the current required utilization threshold (`None` if none set).
     ///
-    /// Port of `FileSelector.getRequiredUtil()` in JE.
+    /// 
     pub fn required_util(&self) -> Option<i32> {
         self.required_util
     }
@@ -153,11 +153,11 @@ impl FileSelector {
         None
     }
 
-    /// Selects the best file for cleaning using JE's cost/benefit scoring.
+    /// Selects the best file for cleaning using cost/benefit scoring.
     ///
-    /// This is a port of the file-selection logic inside
+    /// File-selection logic.
     /// `UtilizationCalculator.getBestFile()` and `FileSelector.selectFileForCleaning()`
-    /// in JE.
+    ///.
     ///
     /// Algorithm:
     /// 1. If there is already a file queued in `to_be_cleaned`, return it
@@ -176,11 +176,11 @@ impl FileSelector {
     /// # Arguments
     /// * `file_summaries` — sorted (BTreeMap) map of file_number → summary.
     ///   Must be sorted by file number so the last key gives the newest file
-    ///   (JE: `fileSummaryMap.lastKey()`).
+    ///   (the: `fileSummaryMap.lastKey()`).
     /// * `min_utilization_pct` — 0–100 integer threshold; files whose utilization
     ///   is at or above this are not cleaned unless `force_cleaning`.
     /// * `min_age` — minimum age (distance in file numbers from the newest file)
-    ///   before a file may be cleaned. JE default is 2.
+    ///   before a file may be cleaned. default is 2.
     /// * `force_cleaning` — if true, bypass the utilization threshold and always
     ///   select the best file (used in testing).
     ///
@@ -207,7 +207,7 @@ impl FileSelector {
         }
 
         // The newest (highest-numbered) file is the "first active" file.
-        // JE: firstActiveFile = fileSummaryMap.lastKey()
+        // FirstActiveFile = fileSummaryMap.lastKey()
         let newest_file = *file_summaries.keys().next_back()?;
 
         // lastFileToClean = firstActiveFile - minAge
@@ -219,7 +219,7 @@ impl FileSelector {
         let in_progress: HashSet<u32> = self.file_info.keys().copied().collect();
 
         // Step 2 — find the file with lowest TTL-adjusted utilization.
-        // Port of JE `UtilizationCalculator.getBestFile()`: rank by
+        // `UtilizationCalculator.getBestFile()`: rank by
         // adjusted_utilization_pct() which subtracts expired bytes from the
         // "active bytes to migrate" numerator.  When no TTL data is present
         // (obsolete_expired_size == 0) this equals raw utilization_pct().
@@ -232,7 +232,7 @@ impl FileSelector {
                 continue;
             }
 
-            // Skip files that are too young (JE: fileNum > lastFileToClean).
+            // Skip files that are too young (the: fileNum > lastFileToClean).
             if file_num > last_file_to_clean {
                 continue;
             }
@@ -243,14 +243,14 @@ impl FileSelector {
             }
 
             // TTL-adjusted utilization (0–100 integer percent).
-            // Port of JE UtilizationCalculator: expired records need not be
+            // expired records need not be
             // migrated, so they reduce the effective "live bytes" to write.
             let avg_util = Self::adjusted_utilization_pct(summary);
 
             // Apply the utilization threshold filter.
             // During a second pass (`self.force_cleaning`), override the caller's
             // threshold with `self.required_util` if it is stricter (lower).
-            // Port of JE: FileSelector picks files below requiredUtil when
+            // FileSelector picks files below requiredUtil when
             // forceCleaning is active.
             let effective_threshold = if self.force_cleaning {
                 self.required_util.unwrap_or(min_utilization_pct as i32)
@@ -282,7 +282,7 @@ impl FileSelector {
 
     /// Returns the raw (non-TTL-adjusted) utilization as an integer percentage 0–100.
     ///
-    /// Port of `FileSummary.utilization(obsoleteSize, totalSize)` in JE.
+    /// 
     /// A file at 100% utilization has no obsolete bytes; 0% means all bytes
     /// are obsolete.
     pub fn utilization_pct(summary: &FileSummary) -> i32 {
@@ -301,7 +301,7 @@ impl FileSelector {
     /// byte size from the "active bytes" numerator so files with many expired
     /// records are scored as cheaper to clean.
     ///
-    /// Port of JE `UtilizationCalculator.getBestFile()` TTL-adjustment:
+    /// `UtilizationCalculator.getBestFile()` TTL-adjustment:
     ///   adjusted_active = active_bytes - expired_bytes
     ///   adjusted_util   = adjusted_active / total_bytes  (clamped 0–100)
     ///

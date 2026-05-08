@@ -1,12 +1,11 @@
 //! Cursor configuration.
 //!
-//! Port of `com.sleepycat.je.CursorConfig`.
 
 /// Configuration for opening a cursor.
 ///
 /// Specifies the configuration parameters used to open a cursor on a database.
 ///
-/// Port of `com.sleepycat.je.CursorConfig`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorConfig {
     /// Use read-committed isolation.

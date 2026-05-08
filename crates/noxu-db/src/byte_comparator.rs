@@ -1,10 +1,9 @@
 //! Byte-slice comparator interface for zero-allocation key comparisons.
 //!
-//! Port of `com.sleepycat.je.ByteComparator` from the Oracle NoSQL JE fork.
 //!
 //! In Java, a `Comparator<byte[]>` requires allocating a new byte array for
 //! every comparison. `ByteComparator` avoids this by accepting offset + length
-//! parameters into an existing array, matching how JE's BIN slot keys are
+//! parameters into an existing array, matching how BIN slot keys are
 //! stored.  In Rust the equivalent GC cost does not arise, but the interface
 //! is preserved for structural fidelity.
 
@@ -12,7 +11,7 @@ use std::cmp::Ordering;
 
 /// Key and duplicate-data comparator that avoids unnecessary allocations.
 ///
-/// Port of `com.sleepycat.je.ByteComparator`.
+/// 
 ///
 /// Implement this trait instead of a simple `Fn(&[u8], &[u8]) -> Ordering`
 /// when the comparator needs to operate on sub-ranges of larger buffers
@@ -22,7 +21,7 @@ use std::cmp::Ordering;
 /// # Default implementation
 ///
 /// [`ByteComparator::DEFAULT`] provides unsigned lexicographic comparison,
-/// equivalent to `Key::compareUnsignedBytes` in JE.
+/// equivalent to `Key::compareUnsignedBytes`.
 ///
 /// # Example
 ///
@@ -61,7 +60,7 @@ pub trait ByteComparator: Send + Sync {
 
 /// Default unsigned-lexicographic byte comparator.
 ///
-/// Port of `ByteComparator.DEFAULT = Key::compareUnsignedBytes`.
+/// 
 pub struct DefaultByteComparator;
 
 impl ByteComparator for DefaultByteComparator {
@@ -82,7 +81,7 @@ impl ByteComparator for DefaultByteComparator {
 
 /// Convenience function: compare full byte slices using unsigned-byte order.
 ///
-/// Port of `Key.compareUnsignedBytes(byte[] key1, byte[] key2)`.
+/// 
 pub fn compare_unsigned(key1: &[u8], key2: &[u8]) -> Ordering {
     key1.cmp(key2)
 }

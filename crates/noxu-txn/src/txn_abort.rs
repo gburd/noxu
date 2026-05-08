@@ -1,13 +1,12 @@
 //! TxnAbort log entry.
 //!
-//! Port of `com.sleepycat.je.txn.TxnAbort`.
 
 use crate::txn_end::TxnEnd;
 use std::io;
 
 /// A TxnAbort is logged when a transaction aborts.
 ///
-/// Port of `com.sleepycat.je.txn.TxnAbort`.
+/// 
 #[derive(Debug, Clone)]
 pub struct TxnAbort {
     pub end: TxnEnd,

@@ -1,6 +1,5 @@
 //! Transaction implementation.
 //!
-//! Port of `com.sleepycat.je.txn.Txn`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,10 +20,10 @@ use crate::{
 /// A single undo record produced when a transaction aborts.
 ///
 /// Corresponds to the information extracted from `WriteLockInfo` during
-/// `Txn.undo()` in JE. The engine/recovery layer uses these records to restore
+/// `Txn.undo()`. The engine/recovery layer uses these records to restore
 /// the before-image of each modified record.
 ///
-/// Port of the per-entry information used in `RecoveryManager.abortUndo`.
+/// Per-entry undo information.
 #[derive(Debug, Clone)]
 pub struct UndoRecord {
     /// LSN of the log entry that must be marked obsolete (the current version).
@@ -35,7 +34,7 @@ pub struct UndoRecord {
     /// did not exist before this transaction).
     pub abort_known_deleted: bool,
     /// Embedded data of the abort version, when the LN data is stored directly
-    /// in the BIN slot (JE "embedded LN" / BIN-delta path).
+    /// in the BIN slot ("embedded LN" / BIN-delta path).
     pub abort_data: Option<Vec<u8>>,
     /// Key of the abort version (only set when key updates are allowed).
     pub abort_key: Option<Vec<u8>>,
@@ -49,22 +48,21 @@ pub struct UndoRecord {
 ///
 /// Controls whether the log is flushed/fsynced on commit.
 ///
-/// Port of `com.sleepycat.je.Durability` SyncPolicy in JE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
     /// Flush and fsync before returning from commit.  Guarantees data is on
     /// durable storage.  This is the default.
     ///
-    /// Port of `Durability.SyncPolicy.SYNC`.
+    /// 
     CommitSync,
     /// Flush write buffers (OS page cache) but do not fsync.  Data survives
     /// process crash but not OS/power failure.
     ///
-    /// Port of `Durability.SyncPolicy.WRITE_NO_SYNC`.
+    /// 
     CommitWriteNoSync,
     /// Do not flush or fsync.  Fastest; data may be lost on crash.
     ///
-    /// Port of `Durability.SyncPolicy.NO_SYNC`.
+    /// 
     CommitNoSync,
 }
 
@@ -78,7 +76,7 @@ const IMPORTUNATE: u8 = 8;
 /// This class must support multi-threaded use. A single Txn can be used
 /// by multiple threads via cursor operations.
 ///
-/// Port of `com.sleepycat.je.txn.Txn`.
+/// 
 pub struct Txn {
     /// Transaction ID.
     id: i64,
@@ -90,7 +88,7 @@ pub struct Txn {
     txn_flags: u8,
 
     /// Set of LSNs holding read locks.
-    /// In JE this is a TinyHashSet for memory efficiency.
+    /// In this is a TinyHashSet for memory efficiency.
     read_locks: HashSet<u64>,
     /// Map of LSN -> WriteLockInfo for write locks.
     /// The write lock info is needed for undo operations on abort.
@@ -122,14 +120,12 @@ pub struct Txn {
     ///
     /// When true, read locks are retained through commit/abort.
     ///
-    /// JE: `Txn.serializableIsolation`.
     serializable_isolation: bool,
 
     /// Read-committed isolation level.
     ///
     /// When true, read locks are released as soon as the cursor moves.
     ///
-    /// JE: `Txn.readCommittedIsolation`.
     read_committed_isolation: bool,
 
     /// Undo records collected during `abort()`.
@@ -161,14 +157,14 @@ pub struct Txn {
     /// Used by replication (`MasterTxn`) to pre-register the commit in VLSN
     /// tracking before it becomes durable.
     ///
-    /// Port of `Txn.preLogCommitHook()` in JE.
+    /// 
     pre_commit_hook: Option<Box<dyn Fn() + Send + Sync>>,
 
     /// Hook called immediately after the TxnCommit log entry is written.
     ///
     /// Used by replication to queue the commit LSN for ACK tracking.
     ///
-    /// Port of `Txn.postLogCommitHook()` in JE.
+    /// 
     post_commit_hook: Option<Box<dyn Fn(Lsn) + Send + Sync>>,
 
     /// Optional group-commit handler (Master or Replica).
@@ -176,7 +172,7 @@ pub struct Txn {
     /// When `Some` and enabled, `commit()` calls `buffer_commit()` after
     /// writing the TxnCommit WAL entry to decide whether to fsync or defer.
     ///
-    /// Port of the `GroupCommit.bufferCommit()` call site in `Txn.commit()`.
+    /// Commit()`.
     group_commit: Option<Arc<dyn GroupCommit>>,
 }
 
@@ -220,7 +216,7 @@ impl Txn {
     /// - if `buffer_commit()` returns `true` (batched): skip the fsync.
     /// - if `buffer_commit()` returns `false` (flush now): call `flush_sync()`.
     ///
-    /// Port of the `TxnManager.groupCommit` wiring in JE's `Txn.commit()`.
+    /// `TxnManager.groupCommit` wiring in the equivalent `Txn.commit()`.
     pub fn with_group_commit(mut self, gc: Arc<dyn GroupCommit>) -> Self {
         self.group_commit = Some(gc);
         self
@@ -239,7 +235,7 @@ impl Txn {
     /// and `abort()` writes a `TxnAbort` record to `log_manager`, making the
     /// transaction durable.
     ///
-    /// Port of the pattern in JE where `Txn` holds a reference to
+    /// `Txn` holds a reference to
     /// `EnvironmentImpl` (which owns the `LogManager`).
     pub fn with_log_manager(
         id: i64,
@@ -263,7 +259,7 @@ impl Txn {
 
     /// Commits with an explicit durability policy.
     ///
-    /// Port of `Txn.commit(Durability)` in JE.
+    /// 
     ///
     /// - `CommitSync` (default): flush and fsync before returning.
     /// - `CommitWriteNoSync`: write to OS page cache but don't fsync.
@@ -290,7 +286,7 @@ impl Txn {
 
             // Write the TxnCommit WAL entry. The fsync is always deferred
             // here so that group commit can decide whether to coalesce it.
-            // JE: Txn.commit() writes the entry then calls flushTo(commitLsn)
+            // Txn.commit() writes the entry then calls flushTo(commitLsn)
             // separately, which is how GroupCommit intercepts the fsync.
             let commit_lsn = self.log_entry(LogEntryType::TxnCommit, &payload, false)?;
 
@@ -300,7 +296,7 @@ impl Txn {
 
             // Step: decide whether to fsync now or defer via GroupCommit.
             //
-            // JE (NoSQL fork): after writing the WAL entry, Txn.commit()
+            // (NoSQL fork): after writing the WAL entry, Txn.commit()
             // calls GroupCommit.bufferCommit(nowNs, txn, commitVLSN).
             // - returns true  → commit is batched; skip fsync (another
             //                   commit will flush for us).
@@ -311,7 +307,7 @@ impl Txn {
                 let should_skip_fsync = match &self.group_commit {
                     Some(gc) if gc.is_enabled() => {
                         // Use the txn id as a proxy for commit VLSN in
-                        // non-replicated environments (matches JE's single-node
+                        // non-replicated environments (single-node
                         // path where VLSN is not assigned for local txns).
                         gc.buffer_commit(self.id)
                     }
@@ -334,7 +330,7 @@ impl Txn {
             NULL_LSN
         };
         self.commit_lsn = assigned_lsn.as_u64();
-        // JE: release write locks AFTER the log flush (so lock holders are
+        // Release write locks AFTER the log flush (so lock holders are
         // not visible to readers until the commit is durable).
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
@@ -346,7 +342,6 @@ impl Txn {
 
     /// Sets the pre-commit hook called before writing the TxnCommit log entry.
     ///
-    /// Port of `Txn.preLogCommitHook()` hook registration in JE.
     pub fn set_pre_commit_hook<F>(&mut self, hook: F)
     where
         F: Fn() + Send + Sync + 'static,
@@ -358,7 +353,6 @@ impl Txn {
     ///
     /// The hook receives the LSN of the committed TxnCommit record.
     ///
-    /// Port of `Txn.postLogCommitHook()` hook registration in JE.
     pub fn set_post_commit_hook<F>(&mut self, hook: F)
     where
         F: Fn(Lsn) + Send + Sync + 'static,
@@ -376,7 +370,7 @@ impl Txn {
     /// After this call the transaction can only be aborted; any further
     /// operation attempt except abort() will return an error.
     ///
-    /// Port of `Txn.setOnlyAbortable()`.
+    /// 
     pub fn set_only_abortable(&mut self) {
         if self.state == TxnState::Open {
             self.state = TxnState::MustAbort;
@@ -388,7 +382,7 @@ impl Txn {
     /// Used by deadlock victim selection: transactions holding fewer locks are
     /// preferred as victims (lighter transactions are cheaper to abort).
     ///
-    /// Port of the lock-count approach in JE's deadlock victim selection.
+    /// Lock-count approach.
     pub fn n_locks(&self) -> usize {
         self.read_locks.len() + self.write_locks.len()
     }
@@ -407,7 +401,6 @@ impl Txn {
     ///
     /// When true, read locks are held until commit/abort.
     ///
-    /// JE: `Txn.setSerializableIsolation(boolean)`.
     pub fn set_serializable_isolation(&mut self, v: bool) {
         self.serializable_isolation = v;
     }
@@ -416,7 +409,6 @@ impl Txn {
     ///
     /// When true, read locks are released as the cursor advances.
     ///
-    /// JE: `Txn.setReadCommittedIsolation(boolean)`.
     pub fn set_read_committed_isolation(&mut self, v: bool) {
         self.read_committed_isolation = v;
     }
@@ -426,21 +418,19 @@ impl Txn {
     /// A non-zero value causes `is_timed_out()` to return `true` after that
     /// many milliseconds, even if individual lock requests haven't timed out.
     ///
-    /// JE: `Locker.setTxnTimeout(millis)`.
     pub fn set_txn_timeout(&mut self, timeout_ms: u64) {
         self.txn_timeout_ms = timeout_ms;
     }
 
     /// Returns the first LSN written by this transaction.
     ///
-    /// JE: `Txn.getFirstActiveLsn()`.
     pub fn first_active_lsn(&self) -> u64 {
         self.first_lsn
     }
 
     /// Returns true if any log entries have been written for this transaction.
     ///
-    /// Port of `Txn.updateLoggedForTxn()` — only transactions that have
+    /// only transactions that have
     /// written log entries need a TxnCommit / TxnAbort log record.
     pub fn has_logged_entries(&self) -> bool {
         self.last_lsn != NULL_LSN.as_u64()
@@ -448,7 +438,7 @@ impl Txn {
 
     /// Records a new log entry written by this transaction.
     ///
-    /// JE maintains `lastLoggedLsn` (chain of undo log entries) and
+    /// maintains `lastLoggedLsn` (chain of undo log entries) and
     /// `firstLoggedLsn` (checkpointing). We update both here.
     pub fn note_log_entry(&mut self, lsn: u64) {
         if self.first_lsn == NULL_LSN.as_u64() {
@@ -472,8 +462,8 @@ impl Txn {
     /// Returns the assigned LSN, or `NULL_LSN` when no log manager is
     /// configured (read-only test contexts).
     ///
-    /// Port of the `logManager.log(params)` call inside `logCommitEntry` /
-    /// `abortInternal` in JE's `Txn.java`.
+    /// `logManager.log(params)` call inside `logCommitEntry` /
+    /// `abortInternal` in the equivalent `Txn.java`.
     fn log_entry(
         &self,
         entry_type: LogEntryType,
@@ -483,7 +473,7 @@ impl Txn {
         match &self.log_manager {
             None => Ok(NULL_LSN),
             Some(lm) => {
-                // JE: Provisional.NO for commit/abort records (they are
+                // Provisional.NO for commit/abort records (they are
                 // never provisional — they mark the end of a transaction).
                 // fsync behaviour follows the durability SyncPolicy:
                 //   SYNC            -> flush_required=true, fsync_required=true
@@ -505,21 +495,20 @@ impl Txn {
 
     /// Returns true if there are open cursors on this transaction.
     ///
-    /// Port of `Txn.checkCursorsForClose()`.
+    /// 
     pub fn has_open_cursors(&self) -> bool {
         self.cursor_count.load(Ordering::Relaxed) > 0
     }
 
     /// Commits the transaction.
     ///
-    /// Port of `Txn.commit(Durability)` from JE (steps 1-5):
     ///
     /// 1. Check state and that there are no open cursors.
-    /// 2. Release all read locks (JE: `clearReadLocks`).
+    /// 2. Release all read locks (the: `clearReadLocks`).
     /// 3. If this txn has written log entries, serialise a `TxnCommit` record
     ///    and write it to the `LogManager` via `log()`.  The assigned LSN is
     ///    stored in `self.commit_lsn` and returned to the caller.
-    ///    Per JE: "If nothing was written to log for this txn, no need to log
+    ///    Per the: "If nothing was written to log for this txn, no need to log
     ///    a commit." (Txn.commit lines 764-785)
     /// 4. Release all write locks.
     /// 5. Set state to `Committed`.
@@ -540,21 +529,20 @@ impl Txn {
             });
         }
 
-        // Step 2: release read locks first (JE: clearReadLocks).
+        // Step 2: release read locks first (the: clearReadLocks).
         for lsn in self.read_locks.drain().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
 
         // Step 3: log TxnCommit if this txn made any writes.
         //
-        // Per JE: "If nothing was written to log for this txn, no need to
+        // Per the: "If nothing was written to log for this txn, no need to
         // log a commit." (Txn.commit lines 764-785)
         //
-        // JE logCommitEntry() calls preLogCommitHook() before and
+        // logCommitEntry() calls preLogCommitHook() before and
         // postLogCommitHook() after writing the TxnCommit entry.
-        // Port of `Txn.logCommitEntry()` in JE.
         let assigned_lsn = if self.has_logged_entries() {
-            // Pre-commit hook (JE: preLogCommitHook).
+            // Pre-commit hook (the: preLogCommitHook).
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
             }
@@ -568,13 +556,13 @@ impl Txn {
             // whether to fsync based on the GroupCommit handler.
             let commit_lsn = self.log_entry(LogEntryType::TxnCommit, &payload, false /* fsync deferred */)?;
 
-            // Post-commit hook (JE: postLogCommitHook).
+            // Post-commit hook (the: postLogCommitHook).
             if let Some(ref hook) = self.post_commit_hook {
                 hook(commit_lsn);
             }
 
             // Decide whether to fsync now or defer to GroupCommit.
-            // commit() defaults to CommitSync (JE default durability).
+            // commit() defaults to CommitSync (default durability).
             let should_skip_fsync = match &self.group_commit {
                 Some(gc) if gc.is_enabled() => gc.buffer_commit(self.id),
                 _ => false,
@@ -591,7 +579,7 @@ impl Txn {
 
         self.commit_lsn = assigned_lsn.as_u64();
 
-        // Step 4: release write locks AFTER the log flush (JE: clearLocks
+        // Step 4: release write locks AFTER the log flush (the: clearLocks
         // is called after logManager.flushTo(commitLsn)).
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
@@ -605,10 +593,9 @@ impl Txn {
 
     /// Aborts the transaction.
     ///
-    /// Port of `Txn.abortInternal(boolean)` from JE (steps 1-4):
     ///
     /// 1. Set state to ABORTED immediately (blocks other threads from seeing
-    ///    a partially-undone transaction — see JE comment at line 1192).
+    ///    a partially-undone transaction — see comment at line 1192).
     /// 2. If this txn wrote log entries, serialise a `TxnAbort` record and
     ///    write it to the `LogManager`.  The abort LSN is stored in
     ///    `self.abort_lsn` and returned to the caller.
@@ -634,17 +621,17 @@ impl Txn {
         }
 
         // Step 1: set ABORTED state before undo so other threads see this
-        // txn as finished.  Per JE line 1192: "State is set to ABORTED before
+        // txn as finished.  Per line 1192: "State is set to ABORTED before
         // undo, so that other threads cannot access this txn in the middle of
         // undo."
         self.state = TxnState::Aborted;
 
         // Step 2: log TxnAbort if this txn wrote any log entries.
         //
-        // JE abortInternal() calls logManager.logForceFlush(abortEntry,
+        // abortInternal() calls logManager.logForceFlush(abortEntry,
         // fsyncRequired, repContext) when forceFlush is true (i.e. durability
         // SyncPolicy.SYNC), or logManager.log() otherwise.  We write with
-        // fsync=false (NO_SYNC default for aborts) to match JE's default.
+        // fsync=false (NO_SYNC default for aborts) to match default.
         let assigned_lsn = if self.has_logged_entries() {
             let abort =
                 TxnAbort::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
@@ -659,12 +646,12 @@ impl Txn {
 
         // Step 3: collect undo records from WriteLockInfo for tree undo.
         //
-        // JE: `Txn.undoLNs()` walks the write-lock chain and calls
+        // `Txn.undoLNs()` walks the write-lock chain and calls
         // `DatabaseImpl.abort(undoLsn, locker)` for each LN.  In Noxu, the
         // caller (`Transaction::abort()`) is responsible for applying the undo
         // to the B-tree after draining `take_undo_records()`.
         //
-        // Port of `Txn.undoLNs()` in JE — collects before-image records from
+        // Collects before-image records from
         // each `WriteLockInfo` entry, including new inserts where
         // `abort_known_deleted=true` and `abort_lsn == NULL_LSN`.
         for (lsn, wli) in &self.write_locks {
@@ -682,7 +669,7 @@ impl Txn {
         }
 
         // Step 4: release all write locks then read locks.
-        // JE: clearWriteLocks + clearReadLocks after undo.
+        // ClearWriteLocks + clearReadLocks after undo.
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             let _ = self.lock_manager.release(lsn, self.id);
         }
@@ -725,7 +712,6 @@ impl Txn {
 
     /// Downgrades a write lock to a read lock.
     ///
-    /// Port of `Txn.demoteLock()` from JE (read-committed cursor path):
     /// 1. Calls `LockManager.demote()` to downgrade the lock at the table level.
     /// 2. Moves the LSN from `write_locks` to `read_locks` in this txn.
     ///
@@ -754,7 +740,7 @@ impl Txn {
     /// 3. Acquires a write lock on `new_lsn` at the `LockManager` level.
     /// 4. Moves the `WriteLockInfo` into `write_locks[new_lsn]`.
     ///
-    /// Port of `Txn.moveWriteLockToNewLsn(oldLsn, newLsn)` in JE.
+    /// 
     pub fn move_write_lock_to_new_lsn(&mut self, old_lsn: u64, new_lsn: u64) {
         if let Some(wli) = self.write_locks.remove(&old_lsn) {
             let _ = self.lock_manager.release(old_lsn, self.id);
@@ -771,7 +757,7 @@ impl Txn {
     /// the original before-image is preserved across multiple writes to the
     /// same record within one transaction.
     ///
-    /// Port of `Txn.setWriteLockAbortLsn()` / `WriteLockInfo.setAbortInfo()` in JE.
+    /// / `WriteLockInfo.setAbortInfo()`.
     pub fn set_write_lock_abort_info(
         &mut self,
         lsn: u64,
@@ -838,9 +824,9 @@ impl Locker for Txn {
         )?;
 
         // Track the lock.
-        // JE: when a write lock is acquired (new or via promotion), the LSN
+        // When a write lock is acquired (new or via promotion), the LSN
         // must be removed from read_locks if it was there, because a write lock
-        // supersedes the read lock.  This mirrors JE's LockManager.lock()
+        // supersedes the read lock.  This mirrors LockManager.lock()
         // behaviour where PROMOTION moves the entry from the read set to the
         // write set.
         let wli = if lock_type.is_write_lock() {
@@ -896,7 +882,7 @@ impl Locker for Txn {
 
     /// Returns true if the transaction-level timeout has expired.
     ///
-    /// JE: `Locker.isTimedOut()` — checks `txnTimeoutMillis` vs elapsed time.
+    /// Checks `txnTimeoutMillis` vs elapsed time.
     fn is_timed_out(&self) -> bool {
         if self.txn_timeout_ms == 0 {
             false
@@ -915,7 +901,7 @@ impl Locker for Txn {
 
     /// Returns the ID of this Txn (since Txn IS the transactional locker).
     ///
-    /// JE: `Txn.getTxnLocker()` returns `this`.
+    /// `Txn.getTxnLocker()` returns `this`.
     fn get_txn_locker_id(&self) -> Option<i64> {
         Some(self.id)
     }
@@ -927,7 +913,7 @@ impl Locker for Txn {
     /// Re-acquires a lock on `new_lsn` when an LN is moved without prior
     /// write-lock acquisition (eviction / cleaning path).
     ///
-    /// JE: `Locker.lockAfterLsnChange(oldLsn, newLsn, dbImpl)` — every locker
+    /// Every locker
     /// holding `old_lsn` must acquire the new LSN.
     fn lock_after_lsn_change(
         &mut self,
@@ -1440,7 +1426,7 @@ mod tests {
     // Ported from TxnTest.java — testBasicLocking
     // -----------------------------------------------------------------------
 
-    /// Port of TxnTest.testBasicLocking: acquire a read lock, verify it is
+    /// Acquire a read lock, verify it is
     /// held, release it, and verify the count returns to zero.
     #[test]
     fn test_je_basic_read_lock_release() {
@@ -1455,7 +1441,7 @@ mod tests {
         assert_eq!(txn.n_read_locks(), 0);
     }
 
-    /// Port of TxnTest.testBasicLocking: acquire a read lock then promote to
+    /// Acquire a read lock then promote to
     /// write (PROMOTION grant), then demote back to read.
     #[test]
     fn test_je_promote_and_demote() {
@@ -1478,7 +1464,7 @@ mod tests {
         assert_eq!(txn.n_write_locks(), 0);
     }
 
-    /// Port of TxnTest.testBasicLocking: EXISTING grant when requesting a lock
+    /// Existing grant when requesting a lock
     /// that is already held at the same or stronger level.
     #[test]
     fn test_je_existing_lock_grant() {
@@ -1495,7 +1481,7 @@ mod tests {
     // Ported from TxnTest.java — testCommit (lock-focused part)
     // -----------------------------------------------------------------------
 
-    /// Port of TxnTest.testCommit: commit releases all locks held by the txn.
+    /// Commit releases all locks held by the txn.
     #[test]
     fn test_je_commit_releases_all_locks() {
         let mut txn = create_test_txn();
@@ -1524,7 +1510,7 @@ mod tests {
     // Ported from TxnTest.java — txn state transitions
     // -----------------------------------------------------------------------
 
-    /// Port of TxnTest: begin → commit creates/destroys txn state correctly.
+    /// Begin → commit creates/destroys txn state correctly.
     #[test]
     fn test_je_begin_commit_state() {
         let mut txn = create_test_txn();
@@ -1536,7 +1522,7 @@ mod tests {
         assert_eq!(txn.get_state(), TxnState::Committed);
     }
 
-    /// Port of TxnTest: begin → abort destroys txn state and releases locks.
+    /// Begin → abort destroys txn state and releases locks.
     #[test]
     fn test_je_begin_abort_releases_locks() {
         let mut txn = create_test_txn();
@@ -1557,7 +1543,7 @@ mod tests {
     // acquire what was held
     // -----------------------------------------------------------------------
 
-    /// Port of TxnTest: after txn1 aborts, txn2 can immediately acquire the
+    /// After txn1 aborts, txn2 can immediately acquire the
     /// same lock that txn1 held.
     #[test]
     fn test_je_abort_releases_lock_for_other_txn() {
@@ -1582,7 +1568,7 @@ mod tests {
     // Ported from TxnTest — nested/shared lock manager (two txns, one manager)
     // -----------------------------------------------------------------------
 
-    /// Port of TxnTest: two independent txns sharing the same LockManager can
+    /// Two independent txns sharing the same lockmanager can
     /// hold compatible locks concurrently.
     #[test]
     fn test_je_two_txns_shared_read_locks() {
@@ -1601,7 +1587,7 @@ mod tests {
         txn2.commit().unwrap();
     }
 
-    /// Port of TxnTest: a write lock held by txn1 prevents txn2 from
+    /// A write lock held by txn1 prevents txn2 from
     /// immediately acquiring a write lock on the same LSN (non-blocking).
     #[test]
     fn test_je_write_blocks_other_write_nonblocking() {
@@ -1624,7 +1610,7 @@ mod tests {
         txn2.abort().unwrap();
     }
 
-    /// Port of TxnTest: n_locks() returns the total read + write lock count.
+    /// N_locks() returns the total read + write lock count.
     #[test]
     fn test_je_n_locks_totals() {
         let mut txn = create_test_txn();

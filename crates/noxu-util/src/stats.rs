@@ -1,7 +1,6 @@
 //! Statistics framework.
 //!
-//! Port of `com.sleepycat.je.utilint.StatDefinition`, `StatGroup`, and
-//! related stat classes.
+//! Statistics framework: `StatDefinition`, `StatGroup`, and related types.
 //!
 //! Provides a framework for defining, collecting, and reporting statistics
 //! across all database subsystems.

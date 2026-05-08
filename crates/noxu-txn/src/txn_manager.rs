@@ -1,6 +1,5 @@
 //! Transaction manager.
 //!
-//! Port of `com.sleepycat.je.txn.TxnManager`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -15,12 +14,12 @@ use crate::txn::Txn;
 
 /// Null transaction ID for non-transactional lockers.
 ///
-/// Port of `TxnManager.NULL_TXN_ID = -1` in JE.
+/// 
 pub const NULL_TXN_ID: i64 = -1;
 
 /// Manages all active transactions.
 ///
-/// Port of `com.sleepycat.je.txn.TxnManager`.
+/// 
 pub struct TxnManager {
     /// All active transactions, keyed by txn ID.
     ///
@@ -28,17 +27,16 @@ pub struct TxnManager {
     /// `get_first_active_lsn()`).  Starts as `NULL_LSN` until the txn writes
     /// its first log entry.
     ///
-    /// Port of `TxnManager.allTxns: Map<Txn, Long>` in JE.
+    /// 
     all_txns: RwLock<HashMap<i64, u64>>,
 
     /// Next local transaction ID generator (positive, incrementing).
     ///
-    /// JE: `TxnManager.lastUsedLocalTxnId`.
     next_txn_id: AtomicI64,
 
     /// Last committed transaction ID, used by recovery to restore the counter.
     ///
-    /// JE: `TxnManager.setLastTxnId()` / `getLastLocalTxnId()`.
+    /// `TxnManager.setLastTxnId()` / `getLastLocalTxnId()`.
     last_local_txn_id: AtomicI64,
 
     /// Lock manager shared by all transactions.
@@ -50,7 +48,7 @@ pub struct TxnManager {
     /// `FSyncManager`.  When set, committing transactions call
     /// `group_commit.buffer_commit()` after writing their WAL entry.
     ///
-    /// Port of `TxnManager.groupCommit: AtomicReference<GroupCommit>` (NoSQL fork).
+    /// (NoSQL fork).
     group_commit: StdRwLock<Option<Arc<dyn GroupCommit>>>,
 
     /// Statistics.
@@ -60,7 +58,6 @@ pub struct TxnManager {
 
     /// Number of active serializable (repeatable-read) transactions.
     ///
-    /// JE: `TxnManager.nActiveSerializable`.
     n_active_serializable: AtomicU64,
 }
 
@@ -108,7 +105,7 @@ impl TxnManager {
     /// `get_first_active_lsn()` to return the correct lower bound for
     /// checkpointing.
     ///
-    /// Port of `TxnManager.updateFirstActiveLsn()` (implicit in JE via Txn field access).
+    /// (implicit in via Txn field access).
     pub fn update_first_lsn(&self, txn_id: i64, first_lsn: u64) {
         let mut guard = self.all_txns.write();
         if let Some(entry) = guard.get_mut(&txn_id) {
@@ -124,10 +121,10 @@ impl TxnManager {
     /// The checkpointer uses this to determine the oldest LSN that must be
     /// preserved in the log (the checkpoint interval lower bound).
     ///
-    /// JE: `TxnManager.getFirstActiveLsn()` — acquires `allTxnsLatch` and
+    /// Acquires `allTxnsLatch` and
     /// iterates all active Txns to find the minimum `firstLoggedLsn`.
     ///
-    /// Port of `TxnManager.getFirstActiveLsn()`.
+    /// 
     pub fn get_first_active_lsn(&self) -> u64 {
         let guard = self.all_txns.read();
         let mut min_lsn = u64::MAX;
@@ -145,7 +142,6 @@ impl TxnManager {
 
     /// Sets the last local txn ID — called during recovery to restore the counter.
     ///
-    /// JE: `TxnManager.setLastTxnId(id)`.
     pub fn set_last_txn_id(&self, id: i64) {
         // Ensure next_txn_id is always > id.
         let next = id + 1;
@@ -155,7 +151,7 @@ impl TxnManager {
 
     /// Returns the last locally generated transaction ID.
     ///
-    /// JE: `TxnManager.getLastLocalTxnId()` — used by HA to determine the
+    /// Used by HA to determine the
     /// highest local txn ID seen.
     pub fn get_last_local_txn_id(&self) -> i64 {
         self.last_local_txn_id.load(Ordering::Relaxed)
@@ -168,7 +164,7 @@ impl TxnManager {
 
     /// Returns true if any serializable transactions are active.
     ///
-    /// JE: `TxnManager.areOtherSerializableTransactionsActive()` — used by
+    /// Used by
     /// the evictor to decide whether to skip speculative eviction.
     pub fn are_other_serializable_transactions_active(&self) -> bool {
         self.n_active_serializable.load(Ordering::Relaxed) > 0
@@ -200,12 +196,12 @@ impl TxnManager {
     }
 
     // ========================================================================
-    // GroupCommit  —  NoSQL JE fork
+    // GroupCommit  —  NoSQL fork
     // ========================================================================
 
     /// Returns the current group-commit handler, if any.
     ///
-    /// Port of `TxnManager.getGroupCommit()` (NoSQL fork).
+    /// (NoSQL fork).
     pub fn get_group_commit(&self) -> Option<Arc<dyn GroupCommit>> {
         self.group_commit.read().unwrap().clone()
     }
@@ -216,7 +212,7 @@ impl TxnManager {
     /// environment.  Creates a [`crate::group_commit::GroupCommitMaster`]
     /// with default configuration and stores it.
     ///
-    /// Port of `TxnManager.setupGroupCommitMaster()` (NoSQL fork).
+    /// (NoSQL fork).
     pub fn setup_group_commit_master(&self) {
         use crate::group_commit::GroupCommitMaster;
         let gc = Arc::new(GroupCommitMaster::default());
@@ -227,7 +223,7 @@ impl TxnManager {
     ///
     /// Called when this node is operating as a Replica.
     ///
-    /// Port of `TxnManager.setupGroupCommitReplica(Replay)` (NoSQL fork).
+    /// (NoSQL fork).
     pub fn setup_group_commit_replica(&self) {
         use crate::group_commit::GroupCommitReplica;
         let gc = Arc::new(GroupCommitReplica::default());

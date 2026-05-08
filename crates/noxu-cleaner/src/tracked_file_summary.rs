@@ -1,6 +1,6 @@
 //! Delta file summary info for a tracked file.
 //!
-//! Port of `com.sleepycat.je.cleaner.TrackedFileSummary` - tracked files are managed
+//! tracked files are managed
 //! by the UtilizationTracker.
 
 use crate::file_summary::FileSummary;

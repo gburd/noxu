@@ -1,6 +1,5 @@
 //! Collection of schema-evolution mutations.
 //!
-//! Port of `com.sleepycat.persist.evolve.Mutations`.
 
 use std::collections::HashMap;
 
@@ -27,7 +26,7 @@ use super::renamer::Renamer;
 /// assert!(!m.is_empty());
 /// ```
 ///
-/// Port of `com.sleepycat.persist.evolve.Mutations`.
+/// 
 ///
 /// [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 #[derive(Debug, Default)]
@@ -40,7 +39,7 @@ pub struct Mutations {
 impl Mutations {
     /// Creates an empty set of mutations.
     ///
-    /// Port of `Mutations()` constructor.
+    /// Constructor.
     pub fn new() -> Self {
         Self {
             renamers: HashMap::new(),
@@ -51,7 +50,7 @@ impl Mutations {
 
     /// Returns `true` if no mutations are present.
     ///
-    /// Port of `Mutations.isEmpty()`.
+    /// 
     pub fn is_empty(&self) -> bool {
         self.renamers.is_empty() && self.deleters.is_empty() && self.converters.is_empty()
     }
@@ -62,7 +61,7 @@ impl Mutations {
 
     /// Adds a renamer mutation.
     ///
-    /// Port of `Mutations.addRenamer(Renamer)`.
+    /// 
     pub fn add_renamer(&mut self, renamer: Renamer) {
         self.renamers.insert(renamer.key().clone(), renamer);
     }
@@ -71,7 +70,7 @@ impl Mutations {
     ///
     /// Pass `field_name = None` to look up a class renamer.
     ///
-    /// Port of `Mutations.getRenamer(String, int, String)`.
+    /// 
     pub fn get_renamer(
         &self,
         class_name: &str,
@@ -84,7 +83,7 @@ impl Mutations {
 
     /// Returns an iterator over all renamer mutations.
     ///
-    /// Port of `Mutations.getRenamers()`.
+    /// 
     pub fn renamers(&self) -> impl Iterator<Item = &Renamer> {
         self.renamers.values()
     }
@@ -95,7 +94,7 @@ impl Mutations {
 
     /// Adds a deleter mutation.
     ///
-    /// Port of `Mutations.addDeleter(Deleter)`.
+    /// 
     pub fn add_deleter(&mut self, deleter: Deleter) {
         self.deleters.insert(deleter.key().clone(), deleter);
     }
@@ -104,7 +103,7 @@ impl Mutations {
     ///
     /// Pass `field_name = None` to look up a class deleter.
     ///
-    /// Port of `Mutations.getDeleter(String, int, String)`.
+    /// 
     pub fn get_deleter(
         &self,
         class_name: &str,
@@ -117,7 +116,7 @@ impl Mutations {
 
     /// Returns an iterator over all deleter mutations.
     ///
-    /// Port of `Mutations.getDeleters()`.
+    /// 
     pub fn deleters(&self) -> impl Iterator<Item = &Deleter> {
         self.deleters.values()
     }
@@ -128,7 +127,7 @@ impl Mutations {
 
     /// Adds a converter mutation.
     ///
-    /// Port of `Mutations.addConverter(Converter)`.
+    /// 
     pub fn add_converter(&mut self, converter: Converter) {
         self.converters.insert(converter.key().clone(), converter);
     }
@@ -137,7 +136,7 @@ impl Mutations {
     ///
     /// Pass `field_name = None` to look up a class converter.
     ///
-    /// Port of `Mutations.getConverter(String, int, String)`.
+    /// 
     pub fn get_converter(
         &self,
         class_name: &str,
@@ -150,7 +149,7 @@ impl Mutations {
 
     /// Returns an iterator over all converter mutations.
     ///
-    /// Port of `Mutations.getConverters()`.
+    /// 
     pub fn converters(&self) -> impl Iterator<Item = &Converter> {
         self.converters.values()
     }
@@ -162,7 +161,7 @@ impl Mutations {
     /// Returns all mutations (renamer, deleter, or converter) that apply to
     /// the given class at the given version.
     ///
-    /// This is a convenience method not present in JE.  It collects all
+    /// This is a convenience method not present.  It collects all
     /// class-level and field-level mutations for a class name + version pair,
     /// which is useful during eager evolution.
     pub fn get_mutations_for_class(

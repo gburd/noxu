@@ -1,6 +1,5 @@
 //! Empty log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.EmptyLogEntry`.
 //!
 //! Used for log entry types that need no additional data beyond the entry
 //! type itself, such as checkpoint start/end markers.

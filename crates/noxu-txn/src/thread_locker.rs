@@ -1,6 +1,5 @@
 //! ThreadLocker - per-thread locker.
 //!
-//! Port of `com.sleepycat.je.txn.ThreadLocker`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use crate::{LockResult, LockType, TxnError};
 /// This is used for auto-commit operations where a transaction context
 /// is not explicitly provided.
 ///
-/// Port of `com.sleepycat.je.txn.ThreadLocker`.
+/// 
 pub struct ThreadLocker {
     /// Unique locker ID.
     id: i64,
@@ -186,7 +185,7 @@ impl Locker for ThreadLocker {
 
     /// Returns true if the other locker was created on the same thread.
     ///
-    /// JE: `ThreadLocker.sharesLocksWith(other)` — both lockers must be
+    /// Both lockers must be
     /// ThreadLockers **and** have the same originating thread for sharing.
     /// We check via the LockManager's sharing registry (locker_id → thread_id).
     fn shares_locks_with(&self, other_id: i64) -> bool {

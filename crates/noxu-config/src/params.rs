@@ -1,7 +1,5 @@
 //! Environment configuration parameter definitions.
 //!
-//! Port of `com.sleepycat.je.config.EnvironmentParams`.
-//!
 //! This module defines all known configuration parameters with their types,
 //! defaults, ranges, and mutability. Parameters are organized by subsystem.
 
@@ -14,11 +12,11 @@ use std::time::Duration;
 // Memory parameters
 // =========================================================================
 
-/// Maximum number of bytes used for the JE cache.
+/// Maximum number of bytes used for the in-memory cache.
 /// A value of 0 means use MAX_MEMORY_PERCENT instead.
 pub static MAX_MEMORY: ConfigParam = ConfigParam::long_param(
     "je.maxMemory",
-    None,    // min (null in JE)
+    None,    // min
     None,    // max
     0,       // default: use percent
     true,    // mutable
@@ -150,7 +148,7 @@ pub static ENV_FAIR_LATCHES: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// Not used as of JE 6.0. Left in place to avoid errors from config settings.
+/// No longer used. Left in place to avoid errors from existing config settings.
 pub static ENV_SHARED_LATCHES: ConfigParam = ConfigParam::bool_param(
     "je.env.sharedLatches",
     true,  // default
@@ -158,7 +156,7 @@ pub static ENV_SHARED_LATCHES: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// If true, configure the JE logging framework on environment open.
+/// If true, configure the logging framework on environment open.
 pub static ENV_SETUP_LOGGER: ConfigParam = ConfigParam::bool_param(
     "je.env.setupLogger",
     false, // default
@@ -1021,7 +1019,7 @@ pub static OFFHEAP_KEEP_ALIVE: ConfigParam = ConfigParam {
 };
 
 /// Number of LRU lists used by the off-heap evictor (for concurrency).
-/// Note: JE reuses the same property name as EVICTOR_N_LRU_LISTS.
+/// Note: reuses the same property name as EVICTOR_N_LRU_LISTS.
 pub static OFFHEAP_N_LRU_LISTS: ConfigParam = ConfigParam::int_param(
     "je.evictor.nLRULists",
     Some(1),  // min
@@ -1039,7 +1037,7 @@ pub static OFFHEAP_N_LRU_LISTS: ConfigParam = ConfigParam::int_param(
 pub static CHECKPOINTER_BYTES_INTERVAL: ConfigParam = ConfigParam::long_param(
     "je.checkpointer.bytesInterval",
     Some(0),    // min
-    None,       // max (Long.MAX_VALUE in JE)
+    None,       // max (Long.MAX_VALUE)
     20_000_000, // default: 20 MB
     false,      // mutable
     false,      // forReplication
@@ -1133,7 +1131,7 @@ pub static CLEANER_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
     Some(0), // min
     None,    // max
     3,       // default
-    true,    // mutable (JE has mutable=true)
+    true,    // mutable
     false,   // forReplication
 );
 
@@ -1251,7 +1249,7 @@ pub static CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE: ConfigParam = ConfigParam::int_
     false,    // forReplication
 );
 
-/// If true, discard potentially invalid cleaner detail info from old JE versions.
+/// If true, discard potentially invalid cleaner detail info from old log formats.
 pub static CLEANER_RMW_FIX: ConfigParam = ConfigParam::bool_param(
     "je.cleaner.rmwFix",
     true,  // default
@@ -1352,7 +1350,7 @@ pub static LOCK_DEADLOCK_DETECT_DELAY: ConfigParam = ConfigParam {
     for_replication: false,
 };
 
-/// If true, throw pre-JE-4.0-style lock exceptions (LockException, etc.).
+/// If true, throw legacy-style lock exceptions (LockException, etc.).
 pub static LOCK_OLD_LOCK_EXCEPTIONS: ConfigParam = ConfigParam::bool_param(
     "je.lock.oldLockExceptions",
     false, // default
@@ -1483,7 +1481,7 @@ pub static JE_LOGGING_DBLOG: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// Log level for JE's console (stdout) logging handler.
+/// Log level for the console (stdout) logging handler.
 pub static JE_CONSOLE_LEVEL: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
     name: "je.consoleHandler.level",
     param_type: crate::param::ParamType::String,
@@ -1494,7 +1492,7 @@ pub static JE_CONSOLE_LEVEL: LazyLock<ConfigParam> = LazyLock::new(|| ConfigPara
     for_replication: false,
 });
 
-/// Log level for JE's file logging handler.
+/// Log level for the file logging handler.
 pub static JE_FILE_LEVEL: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
     name: "je.fileHandler.level",
     param_type: crate::param::ParamType::String,
@@ -1510,8 +1508,8 @@ pub static JE_FILE_LEVEL: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
 // Retained to avoid errors when old je.properties files are used.
 // =========================================================================
 
-/// @deprecated in JE 6.3. Adjustments are no longer needed because LN log
-/// sizes have been stored in the Btree since JE 6.0.
+/// Deprecated. Adjustments are no longer needed because LN log
+/// sizes are stored in the B-tree.
 pub static CLEANER_ADJUST_UTILIZATION: ConfigParam = ConfigParam::bool_param(
     "je.cleaner.adjustUtilization",
     false, // default
@@ -1544,7 +1542,7 @@ pub static COMPRESSOR_PURGE_ROOT: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// @deprecated as of JE 4.1. Replaced by EVICTOR_EVICT_BYTES.
+/// Deprecated. Replaced by EVICTOR_EVICT_BYTES.
 pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
     "je.evictor.nodesPerScan",
     Some(1),    // min
@@ -1554,7 +1552,7 @@ pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
     false,      // forReplication
 );
 
-/// @deprecated as of JE 4.1. Use evictor thread pool instead.
+/// Deprecated. Use the evictor thread pool instead.
 pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
     "je.evictor.deadlockRetry",
     Some(0), // min
@@ -1564,7 +1562,7 @@ pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
     false,   // forReplication
 );
 
-/// @deprecated as of JE 6.0.
+/// Deprecated.
 pub static EVICTOR_LRU_ONLY: ConfigParam = ConfigParam::bool_param(
     "je.evictor.lruOnly",
     true,  // default
@@ -1605,7 +1603,7 @@ pub static RESERVED_DISK: ConfigParam = ConfigParam::long_param(
     false,   // forReplication
 );
 
-/// If true, JE operates in test mode — behavior may be modified from normal operation.
+/// If true, operates in test mode — behavior may be modified from normal operation.
 pub static TEST_MODE: ConfigParam = ConfigParam::bool_param(
     "je.testMode",
     false, // default
@@ -1838,7 +1836,7 @@ mod tests {
     use std::time::Duration;
 
     // -----------------------------------------------------------------------
-    // Verify that param name strings exactly match JE.
+    // Verify that param name strings are correct.
     // These are regression tests — if a name is wrong, lookups in
     // je.properties files will silently fail.
     // -----------------------------------------------------------------------
@@ -1853,7 +1851,7 @@ mod tests {
         assert_eq!(FREE_DISK.name, "je.freeDisk");
         assert_eq!(MAX_OFF_HEAP_MEMORY.name, "je.maxOffHeapMemory");
 
-        // HALT: JE uses "je.haltOnCommitAfterChecksumException" (no "env.")
+        // HALT: uses "je.haltOnCommitAfterChecksumException" (no "env." prefix)
         assert_eq!(
             HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION.name,
             "je.haltOnCommitAfterChecksumException"
@@ -1865,14 +1863,14 @@ mod tests {
         assert_eq!(LOG_MEM_ONLY.name, "je.log.memOnly");
         assert_eq!(LOG_CHECKSUM_READ.name, "je.log.checksumRead");
 
-        // Stats: JE uses dot-separated sub-keys
+        // Stats: uses dot-separated sub-keys
         assert_eq!(STATS_COLLECT.name, "je.stats.collect");
         assert_eq!(STATS_FILE_ROW_COUNT.name, "je.stats.file.row.count");
         assert_eq!(STATS_MAX_FILES.name, "je.stats.max.files");
         assert_eq!(STATS_COLLECT_INTERVAL.name, "je.stats.collect.interval");
         assert_eq!(STATS_FILE_DIRECTORY.name, "je.stats.file.directory");
 
-        // Startup threshold: JE uses "je.env.startupThreshold" (not "Dump")
+        // Startup threshold: name is "je.env.startupThreshold" (not "Dump")
         assert_eq!(STARTUP_DUMP_THRESHOLD.name, "je.env.startupThreshold");
 
         // Evictor
@@ -1881,7 +1879,7 @@ mod tests {
         assert_eq!(EVICTOR_EVICT_BYTES.name, "je.evictor.evictBytes");
         assert_eq!(EVICTOR_N_LRU_LISTS.name, "je.evictor.nLRULists");
 
-        // Off-heap: JE reuses "je.evictor.nLRULists" for OFFHEAP_N_LRU_LISTS too
+        // Off-heap: reuses "je.evictor.nLRULists" for OFFHEAP_N_LRU_LISTS too
         assert_eq!(OFFHEAP_N_LRU_LISTS.name, "je.evictor.nLRULists");
 
         // Cleaner
@@ -1915,7 +1913,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Verify default values match JE EnvironmentParams.java
+    // Verify default values are correct
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2031,7 +2029,7 @@ mod tests {
         assert_eq!(STATS_FILE_ROW_COUNT.default, ParamValue::Int(1440));
         assert_eq!(STATS_MAX_FILES.default, ParamValue::Int(10));
 
-        // Startup threshold (JE: "je.env.startupThreshold", default 5 min)
+        // Startup threshold ("je.env.startupThreshold", default 5 min)
         assert_eq!(
             STARTUP_DUMP_THRESHOLD.default,
             ParamValue::Duration(Duration::from_secs(5 * 60))
@@ -2059,7 +2057,7 @@ mod tests {
         }
         for (name, count) in &seen {
             // The only known intentional duplicate is "je.evictor.nLRULists"
-            // (shared by EVICTOR_N_LRU_LISTS and OFFHEAP_N_LRU_LISTS per JE).
+            // (shared by EVICTOR_N_LRU_LISTS and OFFHEAP_N_LRU_LISTS).
             if *name == "je.evictor.nLRULists" {
                 assert_eq!(
                     *count, 2,

@@ -1,6 +1,5 @@
 //! Log scanning abstraction for recovery.
 //!
-//! Port of the log reader types used in `RecoveryManager.java`:
 //! `INFileReader`, `LNFileReader`, `LastFileReader`, `CheckpointFileReader`.
 //!
 //! Provides a `LogEntry` enum covering all entry types that recovery needs to
@@ -11,7 +10,7 @@ use noxu_util::{Lsn, NULL_LSN};
 
 /// Operation type carried by a transactional LN.
 ///
-/// Port of the LN subtype discrimination done in JE's `LNFileReader`.
+/// LN subtype discrimination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LnOperation {
     Insert,
@@ -26,7 +25,7 @@ pub enum LnOperation {
 /// - what key/value were written
 /// - the abort LSN and abort-known-deleted flag (before-image info)
 ///
-/// Port of the data extracted from `LNLogEntry<?>` in `LNFileReader`.
+/// Data extracted from log entries.
 #[derive(Debug, Clone)]
 pub struct LnRecord {
     /// Database ID that owns this LN.
@@ -45,12 +44,12 @@ pub struct LnRecord {
     pub abort_known_deleted: bool,
     /// Key of the before-image (None when same as `key`).
     ///
-    /// Port of `LNLogEntry.getAbortKey()` in JE — populated when an embedded
+    /// In — populated when an embedded
     /// before-image has a different key (key-updating operations).
     pub abort_key: Option<Vec<u8>>,
     /// Data of the before-image (embedded in the log entry itself).
     ///
-    /// Port of `LNLogEntry.getAbortData()` in JE — populated for all embedded
+    /// In — populated for all embedded
     /// LNs in the NoSQL fork so that undo does NOT need to re-read the log.
     /// `None` for non-embedded LNs (rare in modern JE) and for first writes
     /// where the before-image is "deleted" (use `abort_known_deleted` instead).
@@ -90,7 +89,7 @@ impl LnRecord {
 
 /// An internal-node (IN/BIN) record as seen during recovery.
 ///
-/// Port of the data extracted from `INFileReader` in JE.
+/// Data extracted from log entries.
 #[derive(Debug, Clone)]
 pub struct InRecord {
     /// Database ID that owns this IN.
@@ -107,8 +106,8 @@ pub struct InRecord {
     /// `BinStub::serialize_delta()`.  Present when the log scanner can parse
     /// the payload; `None` for scanner stubs that don't carry node data.
     ///
-    /// Port of `INLogEntry.getMainItem()` / `BINDeltaLogEntry.getMainItem()`
-    /// in JE — the deserialized IN/BIN object available after `readEntry()`.
+    /// / `BINDeltaLogEntry.getMainItem()`
+    /// in — the deserialized IN/BIN object available after `readEntry()`.
     pub node_data: Option<Vec<u8>>,
 }
 
@@ -226,7 +225,7 @@ impl PositionedEntry {
 
 /// Abstract log scanner used by the 3-phase recovery.
 ///
-/// Mirrors the contract of JE's `LastFileReader`, `INFileReader`, and
+/// Mirrors the contract of `LastFileReader`, `INFileReader`, and
 /// `LNFileReader` behind a single trait so that both the real log path and
 /// in-memory test fixtures can satisfy it.
 ///
@@ -237,13 +236,13 @@ pub trait LogScanner {
     /// Return the LSN of the first valid entry and the next-available (EOF)
     /// LSN found by scanning the last log file.
     ///
-    /// Port of `RecoveryManager.findEndOfLog` / `LastFileReader`.
+    /// / `LastFileReader`.
     fn find_end_of_log(&mut self) -> (Lsn, Lsn);
 
     /// Scan **forward** from `start_lsn` up to (but not including)
     /// `end_lsn`, yielding every entry.
     ///
-    /// Port of the forward-reading `INFileReader` and `LNFileReader` paths.
+    /// Forward-reading log scan path.
     fn scan_forward(
         &self,
         start_lsn: Lsn,
@@ -253,7 +252,7 @@ pub trait LogScanner {
     /// Scan **backward** from `start_lsn` down to `stop_lsn` (inclusive),
     /// yielding every entry in reverse LSN order.
     ///
-    /// Port of the backward-reading `LNFileReader` path used by `undoLNs`.
+    /// Backward-reading log scan path for undo.
     fn scan_backward(
         &self,
         start_lsn: Lsn,
@@ -265,7 +264,7 @@ pub trait LogScanner {
     /// Returns `None` if the entry is not found.  Used during the undo phase
     /// to fetch the before-image of a disk-resident LN at its `abort_lsn`.
     ///
-    /// Port of `RecoveryManager.undo()` in JE which calls
+    /// In which calls
     /// `fetchTarget(db, bin, idx, abortLsn, ...)` to read the before-image
     /// directly from the log when it is not embedded in the LN log entry.
     fn read_at_lsn(&self, lsn: Lsn) -> Option<LogEntry>;

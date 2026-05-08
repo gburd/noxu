@@ -1,10 +1,9 @@
 //! Transaction state enum.
 //!
-//! Port of `com.sleepycat.je.Transaction.State`.
 
 /// Transaction states.
 ///
-/// Port of `com.sleepycat.je.Transaction.State`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
     /// Transaction is active and accepting operations.

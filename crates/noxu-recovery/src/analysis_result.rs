@@ -49,24 +49,24 @@ pub struct DirtyInEntry {
 
 /// Results produced by Phase 1 (analysis).
 ///
-/// Port of the data structures populated by `RecoveryManager.buildTree` and
-/// the `undoLNs`/`redoLNs` preparation in JE's `RecoveryManager.java`.
+/// Data structures populated by `RecoveryManager.buildTree` and
+/// the `undoLNs`/`redoLNs` preparation in the equivalent `RecoveryManager.java`.
 #[derive(Debug)]
 pub struct AnalysisResult {
     /// Dirty INs that must be replayed during redo, keyed by `(db_id, node_id)`.
     ///
-    /// We keep only the *latest* logged entry per node (same as JE: a later
+    /// We keep only the *latest* logged entry per node (same as the: a later
     /// checkpoint flush of the same IN supersedes an earlier one).
     pub dirty_ins: HashMap<DirtyInKey, DirtyInEntry>,
 
     /// Committed transaction IDs → LSN of the commit record.
     ///
-    /// Port of `committedTxnIds` in `RecoveryManager.java`.
+    /// In `RecoveryManager.java`.
     pub committed_txns: HashMap<u64, Lsn>,
 
     /// Aborted transaction IDs.
     ///
-    /// Port of `abortedTxnIds` in `RecoveryManager.java`.
+    /// In `RecoveryManager.java`.
     pub aborted_txns: HashSet<u64>,
 
     /// Maximum node ID seen in the recovery interval.
@@ -114,7 +114,7 @@ impl AnalysisResult {
     /// Record a dirty IN seen at `lsn`.
     ///
     /// If the same `(db_id, node_id)` was already seen at an earlier LSN,
-    /// the newer entry replaces it (matches JE's behaviour: the last logged
+    /// the newer entry replaces it (behaviour: the last logged
     /// version is the one to replay).
     pub fn record_dirty_in(&mut self, record: InRecord, lsn: Lsn) {
         let key = DirtyInKey::new(record.db_id, record.node_id);
@@ -186,8 +186,8 @@ impl AnalysisResult {
     /// Consume the dirty IN map, returning all entries grouped by tree level
     /// in ascending order (bottom-up = BINs first).
     ///
-    /// Port of the bottom-up level iteration in `DirtyINMap` used by
-    /// `redoDirtyNodes` in JE.
+    /// Bottom-up level iteration.
+    /// `redoDirtyNodes`.
     pub fn take_dirty_ins_by_level(
         &mut self,
     ) -> Vec<(i32, Vec<DirtyInEntry>)> {

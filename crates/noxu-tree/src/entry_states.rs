@@ -1,6 +1,5 @@
 //! Slot state bit flags for BIN entries.
 //!
-//! Port of `com.sleepycat.je.tree.EntryStates` from JE.
 //!
 //! Each slot in a BIN (Bottom Internal Node) has associated state flags
 //! that track metadata about the entry (deleted, dirty, embedded, etc.).
@@ -26,15 +25,15 @@ pub const EMBEDDED_LN_BIT: u8 = 0x10;
 pub const NO_DATA_LN_BIT: u8 = 0x20;
 
 /// Update key when logged bit - transient flag to update key on next log.
-/// Port of `EntryStates.UPDATE_KEY_WHEN_LOGGED`.
+/// 
 pub const UPDATE_KEY_WHEN_LOGGED: u8 = 0x40;
 
 /// Tombstone bit - slot is a blind-deletion tombstone.
-/// Port of `EntryStates.TOMBSTONE_BIT`.
+/// 
 pub const TOMBSTONE_BIT: u8 = 0x80;
 
 /// Mask for transient state bits (not logged to disk).
-/// Port of `EntryStates.TRANSIENT_BITS`.
+/// 
 /// Bit 0x04 (MIGRATE_BIT) is always transient; UPDATE_KEY_WHEN_LOGGED is also transient.
 pub const TRANSIENT_BITS: u8 = MIGRATE_BIT | UPDATE_KEY_WHEN_LOGGED;
 
@@ -173,7 +172,7 @@ impl SlotState {
 
     /// Returns true if the update-key-when-logged (transient) bit is set.
     ///
-    /// Port of `EntryStates.UPDATE_KEY_WHEN_LOGGED`.
+    /// 
     #[inline]
     pub fn is_update_key_when_logged(self) -> bool {
         (self.0 & UPDATE_KEY_WHEN_LOGGED) != 0
@@ -194,7 +193,7 @@ impl SlotState {
     /// Returns true if the tombstone bit is set.
     ///
     /// A tombstone slot is a blind-deletion marker (NoSQL extension).
-    /// Port of `EntryStates.TOMBSTONE_BIT`.
+    /// 
     #[inline]
     pub fn is_tombstone(self) -> bool {
         (self.0 & TOMBSTONE_BIT) != 0
@@ -215,7 +214,7 @@ impl SlotState {
     /// Clears all transient bits (not persisted to disk).
     ///
     /// Transient bits are: MIGRATE_BIT (0x04), UPDATE_KEY_WHEN_LOGGED (0x40).
-    /// Port of `EntryStates.CLEAR_TRANSIENT_BITS`.
+    /// 
     #[inline]
     pub fn clear_transient_bits(&mut self) {
         self.0 &= !TRANSIENT_BITS;

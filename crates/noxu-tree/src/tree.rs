@@ -1,8 +1,7 @@
 //! B+tree implementation.
 //!
-//! Port of `com.sleepycat.je.tree.Tree`.
 //!
-//! Tree implements the JE B+tree. It provides search, insert, and delete
+//! Tree implements the B+tree. It provides search, insert, and delete
 //! operations on the tree structure. The tree uses latch-coupling for
 //! concurrent access: when traversing down the tree, the parent latch
 //! is released after the child latch is acquired.
@@ -46,13 +45,13 @@ pub const INSERT_SUCCESS: i32 = 1 << 17;
 /// comparators to each.  For normal databases this field is `None` and
 /// lexicographic byte comparison is used.
 ///
-/// Port of JE `DatabaseImpl.btreeComparator` / `DatabaseImpl.dupComparator`.
+/// `DatabaseImpl.btreeComparator` / `DatabaseImpl.dupComparator`.
 pub type KeyComparatorFn =
     Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
 
 /// The B+tree.
 ///
-/// Port of `com.sleepycat.je.tree.Tree`.
+/// 
 ///
 /// This is the main tree structure that manages the B+tree nodes and
 /// provides operations for search, insert, delete, and tree maintenance.
@@ -71,7 +70,7 @@ pub struct Tree {
     /// borrow.  The root pointer itself is only written during root splits
     /// and initial creation; all other access is read-only.
     ///
-    /// Port of JE `Tree.root` protected by the root latch.
+    /// `Tree.root` protected by the root latch.
     root: RwLock<Option<Arc<RwLock<TreeNode>>>>,
 
     /// Latch protecting the root reference itself.
@@ -90,7 +89,7 @@ pub struct Tree {
     /// and BIN entry search/insert/delete) use this comparator instead of
     /// lexicographic byte comparison.
     ///
-    /// Port of JE's `btreeComparator` / `dupComparator` stored on the
+    /// / `dupComparator` stored on the
     /// database and consulted at every `IN.findEntry()` call.
     pub key_comparator: Option<KeyComparatorFn>,
 
@@ -99,8 +98,8 @@ pub struct Tree {
     /// Updated on every BIN entry insert (+key+data+overhead) and delete
     /// (-key+overhead) so the evictor sees real cache pressure.
     ///
-    /// Port of the `env.getMemoryBudget().updateTreeMemoryUsage(delta)` call
-    /// in JE's `IN.updateMemorySize()`.  In Noxu the counter is an
+    /// `env.getMemoryBudget().updateTreeMemoryUsage(delta)` call
+    /// in the equivalent `IN.updateMemorySize()`.  In Noxu the counter is an
     /// `Arc<AtomicI64>` shared with the `Arbiter` (and later `MemoryBudget`)
     /// to avoid a circular crate dependency (`noxu-tree` → `noxu-dbi`).
     pub memory_counter: Option<Arc<AtomicI64>>,
@@ -123,7 +122,7 @@ pub enum TreeNode {
 
 /// Lightweight upper-IN representation used by the tree traversal layer.
 ///
-/// Port of JE `IN`: carries the dirty flag (IN_DIRTY_BIT), the LRU
+/// `IN`: carries the dirty flag (IN_DIRTY_BIT), the LRU
 /// generation counter, and a weak back-pointer to the parent so that
 /// dirty state can be propagated upward.
 #[derive(Debug)]
@@ -135,14 +134,14 @@ pub struct InNodeStub {
     /// Child entries (key, lsn, optional child).
     pub entries: Vec<InEntry>,
     /// Dirty flag — set whenever this node is modified.
-    /// Port of JE `IN.dirty` (IN_DIRTY_BIT).
+    /// `IN.dirty` (IN_DIRTY_BIT).
     pub dirty: bool,
     /// LRU generation counter for the evictor.
-    /// Port of JE `IN.generation`.
+    /// `IN.generation`.
     pub generation: u64,
     /// Weak back-pointer to parent IN.
     /// Enables dirty-propagation and latch-coupling validation.
-    /// Port of JE `IN.parent` reference used during splits and logging.
+    /// `IN.parent` reference used during splits and logging.
     pub parent: Option<Weak<RwLock<TreeNode>>>,
 }
 
@@ -159,12 +158,12 @@ pub struct InEntry {
 
 /// Lightweight BIN representation used by the tree traversal layer.
 ///
-/// Port of JE `BIN` (which extends `IN`): carries the dirty flag, LRU
+/// `BIN` (which extends `IN`): carries the dirty flag, LRU
 /// generation counter, and a weak back-pointer to the parent IN.
 ///
 /// # Key Prefix Compression
 ///
-/// BINs support key prefix compression (port of JE `IN.keyPrefix`).  When
+/// BINs support key prefix compression.  When
 /// `key_prefix` is non-empty the `key` field of every `BinEntry` stores only
 /// the *suffix* — the bytes after stripping the common leading bytes.  The
 /// full key is reconstructed by prepending `key_prefix` to the stored suffix.
@@ -180,18 +179,18 @@ pub struct BinStub {
     pub level: i32,
     /// Entries.  When `key_prefix` is non-empty the `key` field in each entry
     /// is the *suffix* of the full key (leading `key_prefix` bytes stripped).
-    /// Port of JE `IN.entryKeys` (suffix-only storage when prefixing is on).
+    /// `IN.entryKeys` (suffix-only storage when prefixing is on).
     pub entries: Vec<BinEntry>,
     /// Common prefix shared by every key in this BIN.
     /// Empty slice means no prefix compression is active.
-    /// Port of JE `IN.keyPrefix`.
+    /// `IN.keyPrefix`.
     pub key_prefix: Vec<u8>,
     /// Dirty flag — set whenever this BIN is modified.
-    /// Port of JE `IN.dirty` (IN_DIRTY_BIT).
+    /// `IN.dirty` (IN_DIRTY_BIT).
     pub dirty: bool,
     /// BIN-delta flag — true when this BIN contains only dirty (delta) slots
     /// rather than a complete set of entries.
-    /// Port of JE `IN.IN_DELTA_BIT` (the IN_DELTA_BIT flag inside `flags`).
+    /// `IN.IN_DELTA_BIT` (the IN_DELTA_BIT flag inside `flags`).
     pub is_delta: bool,
     /// LSN at which this BIN was last logged as a full (non-delta) BIN.
     ///
@@ -199,7 +198,7 @@ pub struct BinStub {
     /// and to compare against `prev_delta_lsn` when deciding whether to write
     /// a delta or a full BIN.
     ///
-    /// Port of JE `BIN.lastFullLsn`.
+    /// `BIN.lastFullLsn`.
     pub last_full_lsn: Lsn,
     /// LSN at which this BIN was last logged as a BIN-delta.
     ///
@@ -207,10 +206,10 @@ pub struct BinStub {
     /// cleaner's utilization tracker can mark the superseded delta obsolete.
     /// Reset to `NULL_LSN` whenever a full BIN is written.
     ///
-    /// Port of JE `BIN.lastDeltaVersion` / `BIN.getLastDeltaLsn()`.
+    /// `BIN.lastDeltaVersion` / `BIN.getLastDeltaLsn()`.
     pub last_delta_lsn: Lsn,
     /// LRU generation counter for the evictor.
-    /// Port of JE `IN.generation`.
+    /// `IN.generation`.
     pub generation: u64,
     /// Weak back-pointer to parent IN.
     /// Enables dirty-propagation and latch-coupling validation.
@@ -218,9 +217,9 @@ pub struct BinStub {
     /// If true, `BinEntry.expiration_time` values in this BIN are packed hours
     /// since epoch; if false, they are packed seconds since epoch.
     ///
-    /// Default: `true` (hours, matching JE's TTL resolution).
+    /// Default: `true` (hours, matching TTL resolution).
     ///
-    /// Port of JE `BIN.expirationInHours`.
+    /// `BIN.expirationInHours`.
     pub expiration_in_hours: bool,
     /// Number of cursors currently positioned on this BIN.
     ///
@@ -228,7 +227,7 @@ pub struct BinStub {
     /// a node that a cursor is actively traversing.  CursorImpl increments
     /// this when positioning on a BIN and decrements it on reposition/close.
     ///
-    /// Port of JE `IN.cursorSet.size()` used by `Evictor.selectIN()`.
+    /// `IN.cursorSet.size()` used by `Evictor.selectIN()`.
     pub cursor_count: i32,
 }
 
@@ -242,13 +241,13 @@ pub struct BinEntry {
     pub lsn: Lsn,
     /// Optional embedded data (for small records) or cached LN.
     pub data: Option<Vec<u8>>,
-    /// True when this slot has been marked known-deleted (analogous to JE's
+    /// True when this slot has been marked known-deleted (analogous to the
     /// KNOWN_DELETED_BIT in `IN.entryStates`).  The slot is eligible for
     /// removal by `compress_bin()`.
     pub known_deleted: bool,
     /// True when this slot has been modified since the last full BIN log write.
     ///
-    /// Port of JE `IN.entryStates[i] & IN_DIRTY_BIT`.  Used by the checkpoint
+    /// `IN.entryStates[i] & IN_DIRTY_BIT`.  Used by the checkpoint
     /// path to decide whether to write a BIN-delta (few dirty slots) or a
     /// full BIN (many dirty slots).
     pub dirty: bool,
@@ -257,20 +256,20 @@ pub struct BinEntry {
     /// When the owning `BinStub.expiration_in_hours` is true, this value is
     /// hours since Unix epoch; otherwise it is seconds since Unix epoch.
     ///
-    /// Port of JE `IN.entryExpiration`.
+    /// `IN.entryExpiration`.
     pub expiration_time: u32,
 }
 
 impl BinStub {
     // ========================================================================
     // Key prefix compression helpers
-    // Port of JE IN.computeKeyPrefix / IN.recalcSuffixes / IN.getKey
+    // IN.computeKeyPrefix / IN.recalcSuffixes / IN.getKey
     // ========================================================================
 
     /// Reconstruct the full key for slot `idx` by prepending the BIN's
     /// current prefix to the stored suffix.
     ///
-    /// Port of JE `IN.getKey(int idx)`.
+    /// `IN.getKey(int idx)`.
     pub fn get_full_key(&self, idx: usize) -> Option<Vec<u8>> {
         let suffix = self.entries.get(idx)?.key.as_slice();
         if self.key_prefix.is_empty() {
@@ -285,7 +284,7 @@ impl BinStub {
 
     /// Decompress a stored suffix back to a full key.
     ///
-    /// Port of JE `IN.getKey` used from outside: prepend `key_prefix` to
+    /// `IN.getKey` used from outside: prepend `key_prefix` to
     /// `suffix`.  If `key_prefix` is empty the suffix *is* the full key.
     pub fn decompress_key(&self, suffix: &[u8]) -> Vec<u8> {
         if self.key_prefix.is_empty() {
@@ -300,7 +299,7 @@ impl BinStub {
 
     /// Strip the current prefix from a full key to obtain the stored suffix.
     ///
-    /// Port of JE `IN.computeKeySuffix(byte[] prefix, byte[] key)`.
+    /// `IN.computeKeySuffix(byte[] prefix, byte[] key)`.
     ///
     /// # Panics
     /// Panics (debug only) if `full_key` does not start with `key_prefix`.
@@ -324,7 +323,7 @@ impl BinStub {
     /// Returns an empty `Vec` if the BIN has fewer than 2 entries or if the
     /// keys share no common leading bytes.
     ///
-    /// Port of JE `IN.computeKeyPrefix(int excludeIdx)`.
+    /// `IN.computeKeyPrefix(int excludeIdx)`.
     pub fn compute_key_prefix(&self, exclude_idx: Option<usize>) -> Vec<u8> {
         // Need at least 2 entries to find a common prefix.
         let n = self.entries.len();
@@ -346,7 +345,7 @@ impl BinStub {
         let mut prefix_len = seed_full.len();
 
         // Compare every other non-excluded entry against the running prefix.
-        // Port of JE: iterate all entries (byteOrdered disabled in JE too).
+        // Iterate all entries (byteOrdered disabled in too).
         for i in (first_idx + 1)..n {
             if let Some(ex) = exclude_idx
                 && i == ex
@@ -373,7 +372,7 @@ impl BinStub {
     ///
     /// Call this after bulk inserts, splits, or merges.
     ///
-    /// Port of JE `IN.recalcKeyPrefix()` → `IN.recalcSuffixes(newPrefix, …)`.
+    /// `IN.recalcKeyPrefix()` → `IN.recalcSuffixes(newPrefix, …)`.
     pub fn recompute_key_prefix(&mut self) {
         let new_prefix = self.compute_key_prefix(None);
         self.apply_new_prefix(new_prefix);
@@ -382,7 +381,7 @@ impl BinStub {
     /// Apply `new_prefix` as the BIN's key prefix, re-encoding all stored
     /// suffixes from the old prefix into the new one.
     ///
-    /// This is the Rust port of JE `IN.recalcSuffixes(newPrefix, null, null, -1)`.
+    /// This is the Rust.
     fn apply_new_prefix(&mut self, new_prefix: Vec<u8>) {
         // Reconstruct all full keys (using old prefix), then re-encode with
         // the new prefix.
@@ -407,7 +406,7 @@ impl BinStub {
     /// - `idx` is the slot index (or insertion point when `exact == false`).
     /// - `exact` is `true` when an exact match was found.
     ///
-    /// Port of JE `IN.findEntry(key, indicateIfDuplicate, exact)`.
+    /// `IN.findEntry(key, indicateIfDuplicate, exact)`.
     pub fn find_entry_compressed(&self, full_key: &[u8]) -> (usize, bool) {
         let plen = self.key_prefix.len();
         // Check that the key shares the current prefix; if not it cannot be
@@ -436,7 +435,7 @@ impl BinStub {
     ///
     /// Returns `(slot_index, is_new_insert)`.
     ///
-    /// Port of JE `IN.setKey` / BIN insert path.
+    /// `IN.setKey` / BIN insert path.
     pub fn insert_with_prefix(
         &mut self,
         full_key: Vec<u8>,
@@ -453,7 +452,7 @@ impl BinStub {
 
         // If the new key shrinks the prefix we must re-encode everything first.
         if plen > 0 && new_len < plen {
-            // Port of JE: compute new prefix considering the incoming key and
+            // Compute new prefix considering the incoming key and
             // all existing full keys.  We pass `None` for exclude_idx because
             // the slot for this key does not yet exist.
             let mut candidate = self.compute_key_prefix(None);
@@ -492,14 +491,14 @@ impl BinStub {
                 self.entries[idx].lsn = lsn;
                 self.entries[idx].data = data;
                 // Mark slot dirty: this slot changed since the last full BIN log.
-                // Port of JE `IN.setDirtyEntry(idx)`.
+                // `IN.setDirtyEntry(idx)`.
                 self.entries[idx].dirty = true;
                 (idx, false)
             }
             Err(idx) => {
                 // New key — insert in sorted position.
                 // New slots start dirty: they have never been logged in any BIN.
-                // Port of JE `IN.setDirtyEntry(idx)` called after `insertEntry`.
+                // `IN.setDirtyEntry(idx)` called after `insertEntry`.
                 self.entries.insert(idx, BinEntry { key: suffix, lsn, data, known_deleted: false, dirty: true, expiration_time: 0 });
                 // After insertion, if there is no prefix yet, try to establish one.
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
@@ -512,7 +511,7 @@ impl BinStub {
 
     /// Returns the number of slots that are marked dirty.
     ///
-    /// Port of JE `BIN.getNumDirtyEntries()`.
+    /// `BIN.getNumDirtyEntries()`.
     pub fn dirty_count(&self) -> usize {
         self.entries.iter().filter(|e| e.dirty).count()
     }
@@ -527,7 +526,7 @@ impl BinStub {
     ///
     /// Returns `(idx, exact)`.  Does NOT do prefix compression.
     ///
-    /// Port of JE `IN.findEntry` with btreeComparator active.
+    /// `IN.findEntry` with btreeComparator active.
     pub fn find_entry_cmp(
         &self,
         full_key: &[u8],
@@ -567,7 +566,6 @@ impl BinStub {
     ///
     /// Returns `(slot_index, is_new_insert)`.
     ///
-    /// Port of JE BIN insert path with btreeComparator active.
     pub fn insert_cmp(
         &mut self,
         full_key: Vec<u8>,
@@ -658,7 +656,7 @@ impl BinStub {
     ///
     /// Prepended by: node_id(u64BE) | num_entries(u32BE).
     ///
-    /// Port of JE `BIN.writeToLog()` (non-delta path).
+    /// `BIN.writeToLog()` (non-delta path).
     pub fn serialize_full(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.node_id.to_be_bytes());
@@ -688,7 +686,7 @@ impl BinStub {
     ///
     /// Prepended by: node_id(u64BE) | num_dirty(u32BE).
     ///
-    /// Port of JE `BIN.writeToLog()` (delta path).
+    /// `BIN.writeToLog()` (delta path).
     pub fn serialize_delta(&self) -> Vec<u8> {
         let dirty: Vec<usize> =
             (0..self.entries.len()).filter(|&i| self.entries[i].dirty).collect();
@@ -720,7 +718,7 @@ impl BinStub {
     /// clean (they are already on disk at `last_full_lsn`).  Returns `None`
     /// if the byte slice is malformed.
     ///
-    /// Port of JE `INLogEntry.readEntry()` / `IN.readFromLog()` (non-delta).
+    /// `INLogEntry.readEntry()` / `IN.readFromLog()` (non-delta).
     pub fn deserialize_full(bytes: &[u8]) -> Option<BinStub> {
         if bytes.len() < 12 {
             return None;
@@ -783,8 +781,8 @@ impl BinStub {
         // Keys stored in the serialized format are full (uncompressed) keys.
         // Re-establish the key prefix after loading so that memory use and
         // search performance match an in-memory BIN.
-        // Port of JE `IN.readFromLog()` → key prefix is part of the wire
-        // format in JE; in Noxu we store full keys and recompute on load.
+        // `IN.readFromLog()` → key prefix is part of the wire
+        // format in the; in Noxu we store full keys and recompute on load.
         let mut bin = BinStub {
             node_id,
             level: BIN_LEVEL,
@@ -800,7 +798,7 @@ impl BinStub {
             cursor_count: 0,
         };
         // Recompute key prefix from the full keys just loaded.
-        // Port of JE `IN.recalcKeyPrefix()` called after materializing from log.
+        // `IN.recalcKeyPrefix()` called after materializing from log.
         if bin.entries.len() >= 2 {
             bin.recompute_key_prefix();
         }
@@ -815,7 +813,7 @@ impl BinStub {
     ///
     /// Returns `None` if `delta_bytes` is malformed.
     ///
-    /// Port of JE `BINDeltaLogEntry.readEntry()` / `BIN.reconstituteBIN()`.
+    /// `BINDeltaLogEntry.readEntry()` / `BIN.reconstituteBIN()`.
     pub fn apply_delta(base: &mut BinStub, delta_bytes: &[u8]) -> Option<()> {
         if delta_bytes.len() < 12 {
             return None;
@@ -898,7 +896,7 @@ impl BinStub {
     /// this BIN was last fully logged.
     ///
     /// Called by the checkpoint path after a successful full-BIN log write.
-    /// Port of JE `BIN.afterLog()` / `BIN.setLastFullLsn()`.
+    /// `BIN.afterLog()` / `BIN.setLastFullLsn()`.
     pub fn clear_dirty_after_full_log(&mut self, logged_at: Lsn) {
         for e in &mut self.entries {
             e.dirty = false;
@@ -911,7 +909,7 @@ impl BinStub {
     ///
     /// `last_full_lsn` is NOT updated — the full LSN only changes after a
     /// full BIN write.
-    /// Port of JE `BIN.afterLog()` (delta path).
+    /// `BIN.afterLog()` (delta path).
     pub fn clear_dirty_after_delta_log(&mut self) {
         for e in &mut self.entries {
             e.dirty = false;
@@ -938,7 +936,7 @@ impl TreeNode {
     ///
     /// For BIN nodes the search is prefix-aware: if the BIN has a key prefix,
     /// `key` (a full, uncompressed key) is compared against stored suffixes
-    /// after stripping the prefix.  This is the port of JE
+    /// after stripping the prefix.
     /// `IN.findEntry(key, indicateIfDuplicate, exact)`.
     ///
     /// Returns index with EXACT_MATCH flag set if exact match found.
@@ -984,12 +982,12 @@ impl TreeNode {
     }
 
     // ========================================================================
-    // Dirty flag — port of JE IN.getDirty() / IN.setDirty(boolean)
+    // Dirty flag
     // ========================================================================
 
     /// Returns true if this node has been modified since last checkpoint.
     ///
-    /// Port of JE `IN.getDirty()`.
+    /// `IN.getDirty()`.
     pub fn is_dirty(&self) -> bool {
         match self {
             TreeNode::Internal(n) => n.dirty,
@@ -999,7 +997,7 @@ impl TreeNode {
 
     /// Sets or clears the dirty flag on this node.
     ///
-    /// Port of JE `IN.setDirty(boolean dirty)`.
+    /// `IN.setDirty(boolean dirty)`.
     pub fn set_dirty(&mut self, dirty: bool) {
         match self {
             TreeNode::Internal(n) => n.dirty = dirty,
@@ -1008,12 +1006,12 @@ impl TreeNode {
     }
 
     // ========================================================================
-    // LRU generation — port of JE IN.getGeneration() / IN.setGeneration(long)
+    // LRU generation
     // ========================================================================
 
     /// Returns the LRU generation counter.
     ///
-    /// Port of JE `IN.getGeneration()`.
+    /// `IN.getGeneration()`.
     pub fn get_generation(&self) -> u64 {
         match self {
             TreeNode::Internal(n) => n.generation,
@@ -1023,7 +1021,7 @@ impl TreeNode {
 
     /// Sets the LRU generation counter.
     ///
-    /// Port of JE `IN.setGeneration(long gen)`.
+    /// `IN.setGeneration(long gen)`.
     pub fn set_generation(&mut self, r#gen: u64) {
         match self {
             TreeNode::Internal(n) => n.generation = r#gen,
@@ -1052,12 +1050,12 @@ impl TreeNode {
     }
 
     // ========================================================================
-    // Log serialization — port of JE IN.getLogSize() / IN.writeToLog()
+    // Log serialization
     // ========================================================================
 
     /// Estimates the serialized byte size of this node for log/checkpoint use.
     ///
-    /// Port of JE `IN.getLogSize()` — Noxu-native serialization format.
+    /// `IN.getLogSize()` — Noxu-native serialization format.
     ///
     /// Format (big-endian):
     /// - node_id     : 8 bytes
@@ -1088,7 +1086,7 @@ impl TreeNode {
 
     /// Serializes this node to bytes for log writing.
     ///
-    /// Port of JE `IN.writeToLog(ByteBuffer logBuffer)` — Noxu-native
+    /// `IN.writeToLog(ByteBuffer logBuffer)` — Noxu-native
     /// format matching `log_size()`.
     pub fn write_to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.log_size());
@@ -1166,7 +1164,7 @@ impl SplitEntries {
 impl Tree {
     /// Creates a new empty tree.
     ///
-    /// Port of `Tree` constructor.
+    /// Constructor.
     pub fn new(database_id: u64, max_entries_per_node: usize) -> Self {
         Tree {
             database_id,
@@ -1182,8 +1180,8 @@ impl Tree {
 
     /// Installs a shared memory counter for evictor / MemoryBudget feedback.
     ///
-    /// Port of `IN.updateMemorySize()` → `env.getMemoryBudget().updateTreeMemoryUsage(delta)`
-    /// in JE.  The counter is updated on every BIN entry insert/delete.
+    /// → `env.getMemoryBudget().updateTreeMemoryUsage(delta)`
+    ///.  The counter is updated on every BIN entry insert/delete.
     pub fn set_memory_counter(&mut self, counter: Arc<AtomicI64>) {
         self.memory_counter = Some(counter);
     }
@@ -1193,7 +1191,7 @@ impl Tree {
     /// Used for sorted-duplicate databases where keys are two-part
     /// composite keys that require a custom ordering function.
     ///
-    /// Port of `Tree` constructor with `btreeComparator` parameter.
+    /// Constructor with `btreeComparator` parameter.
     pub fn new_with_comparator(
         database_id: u64,
         max_entries_per_node: usize,
@@ -1280,17 +1278,17 @@ impl Tree {
 
     /// Release a parent node latch after capturing the child Arc pointer.
     ///
-    /// Implements JE's hand-over-hand (latch-coupling) protocol:
+    /// Implements hand-over-hand (latch-coupling) protocol:
     /// acquire the child Arc while holding the parent latch, then call this
     /// to release the parent before descending.
     ///
-    /// Port of JE `IN.releaseLatch()` / the explicit release in
+    /// `IN.releaseLatch()` / the explicit release in
     /// `Tree.searchSubTree()`.
     #[inline]
     fn latch_coupling_release<G>(_guard: G) {
         // Moving `_guard` into this function drops it, releasing the lock.
         // Named helper rather than bare `drop()` to make the coupling
-        // semantics explicit and match JE's IN.releaseLatch() call sites.
+        // semantics explicit and match IN.releaseLatch() call sites.
     }
 
     /// Search for a BIN that should contain the given key.
@@ -1298,7 +1296,7 @@ impl Tree {
     /// This is the core tree traversal operation. It walks from root to BIN
     /// using latch-coupling (acquire child latch, then release parent latch).
     ///
-    /// Port of `Tree.search()` from JE. Descends the tree until a BIN is
+    /// . Descends the tree until a BIN is
     /// reached, following the child pointer at the slot whose key is the
     /// largest key <= the search key (the "LTE" rule).  Slot 0 in every upper
     /// IN carries a virtual key (-infinity) so any search key routes through
@@ -1311,7 +1309,7 @@ impl Tree {
 
         // Walk down the tree with latch-coupling until we reach a BIN.
         // We clone Arc pointers instead of holding read guards across iterations
-        // to avoid holding multiple locks simultaneously (approximating JE's
+        // to avoid holding multiple locks simultaneously (approximating the
         // latch-coupling: acquire child, release parent).
         let mut current = root;
 
@@ -1357,7 +1355,7 @@ impl Tree {
                         (exact, index & 0xFFFF)
                     }
                 };
-                // Port of JE CursorImpl.isProbablyExpired(): if an exact match
+                // CursorImpl.isProbablyExpired(): if an exact match
                 // was found, check whether the entry's TTL has already elapsed.
                 // If it has, treat the slot as not found so callers skip it.
                 let found = if found {
@@ -1383,7 +1381,7 @@ impl Tree {
 
             // Upper IN: find the child slot with the largest key <= search
             // key, and capture the child Arc WHILE HOLDING the guard.
-            // Port of JE: index = parent.findEntry(key, false, false)
+            // Index = parent.findEntry(key, false, false)
             // Slot 0 has a virtual key that compares as -infinity.
             let next_arc = match &*guard {
                 TreeNode::Internal(n) => {
@@ -1410,7 +1408,6 @@ impl Tree {
                 TreeNode::Bottom(_) => unreachable!("is_bin() returned false above"),
             };
             // Release parent latch now that child Arc has been captured.
-            // Port of JE IN.releaseLatch() in Tree.searchSubTree().
             Self::latch_coupling_release(guard);
 
             current = next_arc;
@@ -1426,7 +1423,7 @@ impl Tree {
     /// Used by sorted-duplicate cursor `search(Set)` to position at the first
     /// (key, data) pair whose two-part key >= `lower_bound(primary_key)`.
     ///
-    /// Port of `CursorImpl.searchExact(POSITION_FIRST_DUP)` → BIN scan path.
+    /// → BIN scan path.
     pub fn first_entry_at_or_after(
         &self,
         key: &[u8],
@@ -1485,7 +1482,7 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Release parent latch — port of JE IN.releaseLatch().
+            // Release parent latch.
             Self::latch_coupling_release(guard);
             current = next_arc;
         }
@@ -1493,8 +1490,8 @@ impl Tree {
 
     /// Insert a key/data pair into the tree.
     ///
-    /// Port of `Tree.insert()` from JE. Handles the root-is-null case by
-    /// creating a two-level tree (upper IN + BIN) per JE's initialisation path,
+    /// . Handles the root-is-null case by
+    /// creating a two-level tree (upper IN + BIN) per initialisation path,
     /// then delegates to `insert_recursive` which performs preemptive splitting
     /// as it descends.
     ///
@@ -1510,9 +1507,9 @@ impl Tree {
         let data_len = data.len();
 
         if self.root.read().unwrap().is_none() {
-            // Port of JE Tree.insert() first-key path:
+            // Tree.insert() first-key path:
             // Create the initial BIN, then a level-2 upper IN as root, and
-            // make the upper IN point to the BIN (mirroring JE's rootIN with
+            // make the upper IN point to the BIN (mirroring rootIN with
             // a single BIN child at slot 0).
             let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
                 node_id: generate_node_id(),
@@ -1561,12 +1558,12 @@ impl Tree {
         }
 
         // Check whether the root itself needs to be split before descending.
-        // Port of JE Tree.searchSplitsAllowed(): if rootIN.needsSplitting()
+        // Tree.searchSplitsAllowed(): if rootIN.needsSplitting()
         // call splitRoot first.
         self.split_root_if_needed(lsn)?;
 
         // Recursively insert, splitting children proactively as we descend
-        // (JE's forceSplit / searchSplitsAllowed pattern).
+        // (forceSplit / searchSplitsAllowed pattern).
         let root_arc = self.get_root().unwrap();
         let result = Self::insert_recursive(
             &root_arc,
@@ -1578,7 +1575,7 @@ impl Tree {
         )?;
 
         // Update the memory counter for new inserts.
-        // Port of JE IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
+        // IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
         // LN_OVERHEAD = 48 bytes (approximate fixed overhead per entry).
         if result && let Some(counter) = &self.memory_counter {
             let delta = (key_len + data_len + 48) as i64;
@@ -1590,7 +1587,6 @@ impl Tree {
 
     /// Splits the root node if it is full (needsSplitting).
     ///
-    /// Port of `Tree.splitRoot()` from JE:
     ///
     /// ```text
     /// 1. Save oldRoot (the current root IN or BIN).
@@ -1620,7 +1616,7 @@ impl Tree {
         };
 
         // newRoot = new IN(level = oldRoot.level + 1) with slot 0 = oldRoot.
-        // The key at slot 0 is the virtual key (empty slice) following JE's
+        // The key at slot 0 is the virtual key (empty slice) following the
         // convention that entry-zero in an upper IN compares as -infinity.
         let new_root_arc = Arc::new(RwLock::new(TreeNode::Internal(
             InNodeStub {
@@ -1657,7 +1653,7 @@ impl Tree {
 
     /// Splits the child at `child_index` in `parent`.
     ///
-    /// Port of `IN.splitInternal()` from JE.
+    /// .
     ///
     /// Note: does not emit a split log entry; split nodes are marked dirty
     /// and flushed at the next checkpoint (flush_dirty_bins/upper_ins).
@@ -1696,7 +1692,7 @@ impl Tree {
         // Gather all entries from the child plus split metadata.
         // For BIN nodes we decompress every key to full form so that each
         // split half can independently establish its own optimal prefix.
-        // Port of JE: split decompresses before dividing, then calls
+        // Split decompresses before dividing, then calls
         // recalcKeyPrefix on each half independently.
         let (child_level, all_entries, bin_old_prefix) = {
             let child_guard =
@@ -1751,7 +1747,7 @@ impl Tree {
                     // Reset prefix; entries are full keys.
                     b.key_prefix = Vec::new();
                     b.entries = le.clone();
-                    // Port of JE: recompute prefix on each half after split.
+                    // Recompute prefix on each half after split.
                     if b.entries.len() >= 2 {
                         b.recompute_key_prefix();
                     }
@@ -1775,7 +1771,7 @@ impl Tree {
             }
             SplitEntries::Bottom(re) => {
                 // Entries are full keys; build BinStub with no prefix then
-                // recompute.  Port of JE: newSibling.recalcKeyPrefix().
+                // recompute key prefix for the new sibling.
                 let mut sibling_bin = BinStub {
                     node_id: generate_node_id(),
                     level: child_level,
@@ -1803,7 +1799,7 @@ impl Tree {
         }
 
         // Insert the new sibling into the parent after child_index.
-        // Port of JE: parent.insertEntry(newSibling, newIdKey, newSiblingLsn)
+        // Parent.insertEntry(newSibling, newIdKey, newSiblingLsn)
         // Also wire the sibling's parent pointer and mark the parent dirty.
         {
             let mut parent_guard =
@@ -1836,7 +1832,7 @@ impl Tree {
 
     /// Recursive insert with preemptive splitting.
     ///
-    /// Port of JE's top-down traversal in `Tree.forceSplit` +
+    /// Top-down traversal in `Tree.forceSplit` +
     /// `Tree.searchSplitsAllowed`:
     ///
     /// 1. At an upper IN: find which child slot covers `key`, split the child
@@ -1844,7 +1840,7 @@ impl Tree {
     ///    key into the parent), then recurse into the appropriate child.
     /// 2. At a BIN: insert the key/data directly.
     ///
-    /// This implements the "preemptive splitting" strategy from JE: we split
+    /// This implements the "preemptive splitting" strategy from the: we split
     /// children on the way down so we never need to walk back up.
     fn insert_recursive(
         node_arc: &Arc<RwLock<TreeNode>>,
@@ -1862,7 +1858,7 @@ impl Tree {
 
         if is_bin {
             // BIN: insert the key using prefix-aware insertion.
-            // Port of JE Tree.insertLN(): after modifying a BIN, call
+            // Tree.insertLN(): after modifying a BIN, call
             // bin.setDirty(true) so the checkpointer logs it.
             let mut guard =
                 node_arc.write().map_err(|_| TreeError::NodeNotEmpty)?;
@@ -1890,7 +1886,7 @@ impl Tree {
             }
         } else {
             // Upper IN: find the child slot that covers key.
-            // Port of JE: index = parent.findEntry(key, false, false)
+            // Index = parent.findEntry(key, false, false)
             // Entry zero in an upper IN has a virtual key (-infinity), so
             // any real key is routed to at least slot 0.
             let (child_index, child_arc) = {
@@ -1930,7 +1926,7 @@ impl Tree {
             };
 
             // Proactively split the child if it is full.
-            // Port of JE: if (child.needsSplitting()) child.split(parent, ...)
+            // If (child.needsSplitting()) child.split(parent, ...)
             let child_full = {
                 let g =
                     child_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
@@ -1958,7 +1954,7 @@ impl Tree {
 
     /// Get the first (leftmost) BIN in the tree.
     ///
-    /// Port of `Tree.getFirstNode()`. Descends to the leftmost BIN by
+    /// Descends to the leftmost BIN by
     /// always following the first child slot at each upper IN level.
     pub fn get_first_node(&self) -> Option<SearchResult> {
         let mut current = self.get_root()?;
@@ -1994,7 +1990,7 @@ impl Tree {
 
     /// Get the last (rightmost) BIN in the tree.
     ///
-    /// Port of `Tree.getLastNode()`. Descends to the rightmost BIN by
+    /// Descends to the rightmost BIN by
     /// always following the last child slot at each upper IN level.
     pub fn get_last_node(&self) -> Option<SearchResult> {
         let mut current = self.get_root()?;
@@ -2047,11 +2043,11 @@ impl Tree {
     /// Traverses the tree to find the BIN that should contain the key, then
     /// removes the entry. Returns true if the key was found and removed.
     ///
-    /// Port of the delete path in `Tree` from JE.
+    /// Delete path in `Tree` from the.
     ///
     /// In-memory removal only — WAL logging for deletes is handled by the
     /// cursor layer (`cursor_impl.rs::log_ln_write`) before this is called,
-    /// matching JE's separation between LN logging and tree mutation.
+    /// matching separation between LN logging and tree mutation.
     pub fn delete(&self, key: &[u8]) -> bool {
         let root = match self.get_root() {
             Some(r) => r,
@@ -2061,7 +2057,7 @@ impl Tree {
         let deleted = Self::delete_recursive(&root, key, self.key_comparator.as_ref());
 
         // Update the memory counter when an entry is removed.
-        // Port of JE IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
+        // IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
         if deleted && let Some(counter) = &self.memory_counter {
             let delta = (key.len() + 48) as i64;
             counter.fetch_sub(delta, Ordering::Relaxed);
@@ -2152,14 +2148,14 @@ impl Tree {
     }
 
     // ========================================================================
-    // B-tree Merge / Compress  (port of Tree.compress / IN.compress)
+    // B-tree Merge / Compress
     // ========================================================================
 
     /// Merge under-full sibling BIN pairs and remove empty subtrees.
     ///
-    /// Port of JE `INCompressor` / `Tree.compressInternal()` logic.
+    /// `INCompressor` / `Tree.compressInternal()` logic.
     ///
-    /// JE merges two adjacent siblings when their combined entry count is
+    /// merges two adjacent siblings when their combined entry count is
     /// ≤ `max_entries_per_node` (the merge threshold equal to the node
     /// capacity).  The left sibling's entries are prepended into the right
     /// sibling; the parent key slot pointing at the left sibling is then
@@ -2255,7 +2251,7 @@ impl Tree {
                     }
                 };
 
-                // JE merge condition: combined count fits within one node.
+                // merge condition: combined count fits within one node.
                 if left_n + right_n > max_entries {
                     i += 1;
                     continue;
@@ -2273,7 +2269,7 @@ impl Tree {
                     // BIN merge: decompress left entries to full keys, then
                     // prepend into right BIN (also decompressed), and finally
                     // recompute the merged BIN's prefix.
-                    // Port of JE compress: merge left into right, then
+                    // merge left into right, then
                     // recalcKeyPrefix on the merged node.
                     let left_full_entries: Vec<BinEntry> = {
                         match left_arc.read() {
@@ -2375,7 +2371,7 @@ impl Tree {
                     }
                 }
 
-                // Port of JE: remove the right sibling's parent slot and update
+                // Remove the right sibling's parent slot and update
                 // the left slot to point at the merged right child.
                 //
                 // We keep the LEFT slot's key (which is the correct minimum for
@@ -2422,23 +2418,22 @@ impl Tree {
     }
 
     // ========================================================================
-    // BIN slot compression  (port of JE INCompressor.compressBin /
-    //                         INCompressor.lazyCompress)
+    // BIN slot compression
     // ========================================================================
 
     /// Compress deleted slots from a BIN node, then prune it from its parent
     /// IN when it becomes empty.
     ///
-    /// Port of `INCompressor.compressBin()` from JE (the in-place slot-removal
+    /// (the in-place slot-removal
     /// path, NOT the sibling-merge path handled by `compress()`).
     ///
-    /// # Algorithm (faithful port of JE lines 439-496)
+    /// # Algorithm
     ///
     /// 1. If the BIN is a delta, skip — deltas cannot be compressed.
     /// 2. Remove all slots where `entry.known_deleted` is true.  This mirrors
-    ///    JE's `bin.compress(!bin.shouldLogDelta(), localTracker)`.
+    ///    `bin.compress(!bin.shouldLogDelta(), localTracker)`.
     /// 3. If the BIN is now empty, remove it from its parent IN.  This mirrors
-    ///    JE's `pruneBIN(db, binRef, idKey)` → `tree.delete(idKey)`.
+    ///    `pruneBIN(db, binRef, idKey)` → `tree.delete(idKey)`.
     ///
     /// # Arguments
     ///
@@ -2458,7 +2453,7 @@ impl Tree {
                 Ok(g) => match &*g {
                     TreeNode::Bottom(b) => {
                         // Identifier key = first full key in the BIN
-                        // (JE: bin.getIdentifierKey()).
+                        // (the: bin.getIdentifierKey()).
                         let id_key = b.get_full_key(0);
                         (b.is_delta, b.entries.len(), id_key)
                     }
@@ -2468,12 +2463,12 @@ impl Tree {
             }
         };
 
-        // JE: if (bin.isBINDelta()) return; — deltas cannot be compressed.
+        // If (bin.isBINDelta()) return; — deltas cannot be compressed.
         if is_delta {
             return false;
         }
 
-        // ---- Step 2: remove known-deleted slots (port of bin.compress()) ----
+        // ---- Step 2: remove known-deleted slots) ----
         // We compress dirty slots too (compress_dirty_slots = true) because
         // we are not writing a BIN-delta here.
         let removed_any = {
@@ -2481,7 +2476,7 @@ impl Tree {
                 Ok(mut g) => match &mut *g {
                     TreeNode::Bottom(b) => {
                         let before = b.entries.len();
-                        // Port of JE BIN.compress(): walk backwards to remove
+                        // BIN.compress(): walk backwards to remove
                         // deleted slots without index confusion.
                         let mut j = b.entries.len();
                         while j > 0 {
@@ -2493,7 +2488,7 @@ impl Tree {
                         }
                         // Recompute prefix after slot removal, since the
                         // remaining keys may share a longer common prefix.
-                        // Port of JE: after compress(), call recalcKeyPrefix().
+                        // After compress(), call recalcKeyPrefix().
                         if b.entries.len() >= 2 {
                             b.recompute_key_prefix();
                         } else if b.entries.len() < 2 {
@@ -2508,7 +2503,7 @@ impl Tree {
         };
 
         // ---- Step 3: prune empty BIN from parent ----
-        // JE: if (empty) pruneBIN(db, binRef, idKey)  → tree.delete(idKey).
+        // If (empty) pruneBIN(db, binRef, idKey)  → tree.delete(idKey).
         // We only prune when the BIN is actually empty after compression.
         let now_empty = {
             bin_arc.read().ok().map(|g| g.get_n_entries() == 0).unwrap_or(false)
@@ -2516,7 +2511,7 @@ impl Tree {
 
         if now_empty {
             if let Some(key) = id_key {
-                // JE pruneBIN calls tree.delete(idKey) to remove the empty
+                // pruneBIN calls tree.delete(idKey) to remove the empty
                 // BIN's parent IN slot.  We call our own delete() which walks
                 // the tree by key and removes the entry from the parent IN.
                 //
@@ -2535,10 +2530,9 @@ impl Tree {
     /// Check whether a BIN node is a candidate for slot compression and,
     /// if so, trigger `compress_bin`.
     ///
-    /// Port of `INCompressor.lazyCompress(IN in, boolean compressDirtySlots)`
-    /// from JE (the opportunistic / lazy compression path).
+    /// from (the opportunistic / lazy compression path).
     ///
-    /// # Algorithm (faithful port of JE lines 572-608)
+    /// # Algorithm
     ///
     /// 1. Skip the BIN if it is a delta or has no defunct (known-deleted) slots.
     /// 2. If compression succeeds and the BIN becomes empty, it is pruned.
@@ -2552,17 +2546,17 @@ impl Tree {
         bin_arc: &Arc<RwLock<TreeNode>>,
     ) -> bool {
         // Check whether the BIN has any deleted slots worth compressing.
-        // JE lazyCompress: skip deltas and BINs with no defunct slots.
+        // lazyCompress: skip deltas and BINs with no defunct slots.
         let should_compress = {
             match bin_arc.read() {
                 Ok(g) => match &*g {
                     TreeNode::Bottom(b) => {
-                        // Skip deltas (JE: !in.isBIN() || in.isBINDelta()).
+                        // Skip deltas (the: !in.isBIN() || in.isBINDelta()).
                         if b.is_delta {
                             false
                         } else {
                             // Check for any known-deleted slot
-                            // (JE: for (int i=0; i < bin.getNEntries(); i++) {
+                            // (the: for (int i=0; i < bin.getNEntries(); i++) {
                             //        if (bin.isDefunct(i)) { ... break; }
                             //      }).
                             b.entries.iter().any(|e| e.known_deleted)
@@ -2582,13 +2576,13 @@ impl Tree {
     }
 
     // ========================================================================
-    // Latch-coupling validation  (port of JE searchSplitsAllowed)
+    // Latch-coupling validation
     // ========================================================================
 
     /// Validate that `parent.entries[child_index].child` still points at
     /// `child_arc` after acquiring the child's latch.
     ///
-    /// Port of the re-latch validation step inside JE's
+    /// Re-latch validation step inside the
     /// `Tree.searchSplitsAllowed`: after a concurrent split the parent
     /// slot that previously held the child may have changed.  Callers that
     /// plan to mutate the child must verify the parent-child link is still
@@ -2619,7 +2613,7 @@ impl Tree {
     /// Search for the BIN that should contain `key`, with latch-coupling
     /// validation at every level of descent.
     ///
-    /// Port of `Tree.searchSplitsAllowed()` from JE.
+    /// .
     ///
     /// The difference from `search()` is that after obtaining the child
     /// arc we call `validate_parent_child` to confirm the parent still
@@ -2686,7 +2680,7 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Release parent latch — port of JE IN.releaseLatch().
+            // Release parent latch.
             Self::latch_coupling_release(guard);
 
             // Validate parent → current link before descending.
@@ -2706,19 +2700,18 @@ impl Tree {
     }
 
     // ========================================================================
-    // BIN-Delta reconstitution  (port of BIN.mutateToFullBIN / applyDelta)
+    // BIN-Delta reconstitution
     // ========================================================================
 
     /// Returns `true` if the given `BinStub` is a BIN-delta (not a full BIN).
     ///
-    /// Port of JE `IN.isBINDelta()`.
+    /// `IN.isBINDelta()`.
     pub fn bin_is_delta(bin: &BinStub) -> bool {
         bin.is_delta
     }
 
     /// Merge delta entries into a full BIN's entry list.
     ///
-    /// Port of `BIN.applyDelta()` from JE:
     /// - For each delta entry: if a matching key already exists in `bin`,
     ///   replace it (delta is authoritative).
     /// - Otherwise insert the delta entry in sorted position.
@@ -2728,7 +2721,7 @@ impl Tree {
     /// recomputed so the final state is consistent.
     ///
     /// All delta entries are considered to be the most-recently-dirtied
-    /// state, exactly as in JE where delta slots supersede full-BIN slots.
+    /// state, exactly as in where delta slots supersede full-BIN slots.
     pub fn apply_delta_to_bin(bin: &mut BinStub, delta_entries: Vec<BinEntry>) {
         for delta in delta_entries {
             // `delta.key` is a full (uncompressed) key here.
@@ -2739,8 +2732,7 @@ impl Tree {
 
     /// Reconstitute a BIN-delta into a full BIN.
     ///
-    /// Port of `BIN.mutateToFullBIN(BIN fullBIN, boolean leaveFreeSlot)`
-    /// from JE:
+    /// from the:
     ///
     /// 1. Extract the delta entries from `self` (this BIN-delta), decompressing
     ///    them to full keys.
@@ -2763,7 +2755,7 @@ impl Tree {
                 expiration_time: delta.entries[i].expiration_time,
             })
             .collect();
-        // Port of JE reconstituteBIN + resetContent + setBINDelta(false).
+        // reconstituteBIN + resetContent + setBINDelta(false).
         Self::apply_delta_to_bin(&mut base, delta_full_entries);
         delta.entries = base.entries;
         delta.key_prefix = base.key_prefix;
@@ -2773,7 +2765,7 @@ impl Tree {
 
     /// Reconstitute a BIN-delta into a full BIN by reading the base from log.
     ///
-    /// Port of `BIN.mutateToFullBIN(boolean leaveFreeSlot)` from JE — the
+    /// — the
     /// single-argument overload that calls `fetchFullBIN(databaseImpl)` to
     /// read the last full BIN from the log manager automatically.
     ///
@@ -2789,11 +2781,11 @@ impl Tree {
     ///
     /// On any read / parse failure the function falls back to clearing the
     /// `is_delta` flag without merging, so the caller always gets a non-delta
-    /// BIN (possibly missing some old slots).  This mirrors JE's
+    /// BIN (possibly missing some old slots).  This mirrors the
     /// `EnvironmentFailureException` path but gracefully degrades instead of
     /// panicking.
     ///
-    /// Port of JE `BIN.fetchFullBIN(dbImpl)` + `BIN.mutateToFullBIN(boolean)`.
+    /// `BIN.fetchFullBIN(dbImpl)` + `BIN.mutateToFullBIN(boolean)`.
     pub fn mutate_to_full_bin_from_log(
         delta: &mut BinStub,
         log_manager: &noxu_log::LogManager,
@@ -2805,24 +2797,21 @@ impl Tree {
 
         if delta.last_full_lsn == NULL_LSN {
             // BIN has never been logged as a full entry — the in-memory delta
-            // is effectively the full state.  Port of JE's assertion that
-            // isBINDelta() implies lastFullLsn != NULL_LSN during normal
-            // operation; during recovery this path is harmless.
+            // is effectively the full state. During recovery this path is
+            // harmless.
             delta.is_delta = false;
             return;
         }
 
         // Read the full-BIN log entry at last_full_lsn.
-        // Port of JE `envImpl.getLogManager().getEntryHandleFileNotFound(lsn)`.
+        // `envImpl.getLogManager().getEntryHandleFileNotFound(lsn)`.
         match log_manager.read_entry(delta.last_full_lsn) {
             Ok((entry_type, payload)) => {
                 use noxu_log::LogEntryType;
                 if entry_type == LogEntryType::BIN {
                     if let Some(mut base) = BinStub::deserialize_full(&payload) {
                         // Set the base's last_full_lsn so it is preserved
-                        // into the merged result.  Port of JE
-                        // `fullBIN.setLastFullLsn(getLastFullLsn())` in
-                        // `BIN.reconstituteBIN()`.
+                        // into the merged result.
                         base.last_full_lsn = delta.last_full_lsn;
                         Self::mutate_to_full_bin(delta, base);
                         return;
@@ -2860,15 +2849,15 @@ impl Tree {
     }
 
     // ========================================================================
-    // getNextBin / getPrevBin  (port of Tree.getNextIN / Tree.getPrevIN)
+    // getNextBin / getPrevBin
     // ========================================================================
 
     /// Return the entries of the BIN immediately to the right of the BIN
     /// that contains (or would contain) `current_key`.
     ///
-    /// Port of `Tree.getNextBin()` → `Tree.getNextIN(forward=true)` from JE.
+    /// → `Tree.getNextIN(forward=true)`.
     ///
-    /// Algorithm (faithful port of JE getNextIN):
+    /// # Algorithm
     /// 1. Build a root-to-BIN path for `current_key`.
     /// 2. Walk the path back up looking for a parent that has a slot to the
     ///    right of the slot we descended through.
@@ -2882,7 +2871,7 @@ impl Tree {
     /// Return the entries of the BIN immediately to the left of the BIN
     /// that contains (or would contain) `current_key`.
     ///
-    /// Port of `Tree.getPrevBin()` → `Tree.getNextIN(forward=false)` from JE.
+    /// → `Tree.getNextIN(forward=false)`.
     pub fn get_prev_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
         let root = self.get_root()?;
         Self::get_adjacent_bin(&root, current_key, false)
@@ -2937,7 +2926,7 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Release parent latch — port of JE IN.releaseLatch().
+            // Release parent latch.
             Self::latch_coupling_release(guard);
 
             path.push((current.clone(), slot_idx));
@@ -2945,7 +2934,7 @@ impl Tree {
         }
 
         // Ascend the path looking for a level with a sibling slot.
-        // Port of JE getNextIN's "ascend while at edge" loop.
+        // getNextIN's "ascend while at edge" loop.
         while let Some((parent_arc, taken_idx)) = path.pop() {
             let n_entries = {
                 parent_arc.read().ok()?.get_n_entries()
@@ -2987,7 +2976,7 @@ impl Tree {
     /// Descend to the leftmost BIN (`forward = true`) or rightmost BIN
     /// (`forward = false`) in the sub-tree rooted at `node_arc`.
     ///
-    /// Port of JE `Tree.searchSubTree(SearchType.LEFT / RIGHT, targetLevel)`.
+    /// `Tree.searchSubTree(SearchType.LEFT / RIGHT, targetLevel)`.
     fn descend_to_edge_bin(
         node_arc: &Arc<RwLock<TreeNode>>,
         forward: bool,
@@ -3034,7 +3023,7 @@ impl Tree {
                 }
                 _ => return None,
             };
-            // Release parent latch — port of JE IN.releaseLatch().
+            // Release parent latch.
             Self::latch_coupling_release(guard);
 
             current = next;
@@ -3043,12 +3032,12 @@ impl Tree {
 }
 
 // ============================================================================
-// Tree statistics — port of JE TreeWalkerStatsAccumulator
+// Tree statistics
 // ============================================================================
 
 /// Statistics collected by a full tree walk.
 ///
-/// Port of JE `TreeWalkerStatsAccumulator`.
+/// `TreeWalkerStatsAccumulator`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TreeStats {
     /// Number of BINs (bottom internal nodes).
@@ -3064,7 +3053,7 @@ pub struct TreeStats {
 impl Tree {
     /// Walks the entire tree and collects structural statistics.
     ///
-    /// Port of JE `TreeWalkerStatsAccumulator` pattern — performs a simple
+    /// `TreeWalkerStatsAccumulator` pattern — performs a simple
     /// recursive DFS and counts INs, BINs, entries, and tree height.
     pub fn collect_stats(&self) -> TreeStats {
         let mut stats = TreeStats::default();
@@ -3119,7 +3108,7 @@ impl Tree {
     /// BIN-delta threshold — whether to write a full `BIN` entry or a
     /// `BINDelta` entry.
     ///
-    /// Port of JE `Checkpointer.processINList()` which iterates the dirty
+    /// `Checkpointer.processINList()` which iterates the dirty
     /// IN list accumulated during normal operation.
     pub fn collect_dirty_bins(&self, db_id: u64) -> Vec<(u64, Arc<RwLock<TreeNode>>)> {
         let mut result = Vec::new();
@@ -3158,7 +3147,7 @@ impl Tree {
 
     /// Collect all BINs that have at least one `known_deleted` slot.
     ///
-    /// Port of the INCompressor queue-drain scan in JE: the daemon iterates
+    /// INCompressor queue-drain scan in the: the daemon iterates
     /// the in-memory IN list and identifies BINs that still hold zombie deleted
     /// slots.  Each returned `Arc` can be passed directly to `compress_bin()`.
     pub fn collect_bins_with_known_deleted(&self) -> Vec<Arc<RwLock<TreeNode>>> {
@@ -3197,8 +3186,8 @@ impl Tree {
     /// Collect all dirty upper (non-BIN) internal nodes, sorted ascending by
     /// level (bottom-up order, BIN level excluded).
     ///
-    /// Port of the upper-IN traversal in `Checkpointer.processINList()` from
-    /// JE — visits all `TreeNode::Internal` nodes whose `dirty` flag is set
+    /// Upper-IN traversal in `Checkpointer.processINList()` from
+    /// — visits all `TreeNode::Internal` nodes whose `dirty` flag is set
     /// and returns them together with their level, sorted lowest-level-first
     /// so the checkpointer can log them bottom-up.  The root is always the
     /// last entry (highest level), which must be logged `Provisional::No`.
@@ -3246,19 +3235,19 @@ impl Tree {
     }
 
     // ========================================================================
-    // JE Tree.java ports: 8 additional tree methods (Task #82)
+    // Tree.java ports: 8 additional tree methods (Task #82)
     // ========================================================================
 
     /// Returns `true` if the root node is currently loaded in memory.
     ///
-    /// Port of `Tree.isRootResident()` from JE.
+    /// .
     pub fn is_root_resident(&self) -> bool {
         self.root.read().unwrap().is_some()
     }
 
     /// Returns the root node `Arc` if present, or `None`.
     ///
-    /// Port of `Tree.getResidentRootIN()` from JE.
+    /// .
     pub fn get_resident_root_in(&self) -> Option<Arc<RwLock<TreeNode>>> {
         self.root.read().unwrap().clone()
     }
@@ -3266,7 +3255,7 @@ impl Tree {
     /// Returns the BIN that should contain a slot for `key` (the "parent" of
     /// LN slots).
     ///
-    /// Port of `Tree.getParentBINForChildLN()` from JE.  Descends the tree
+    /// .  Descends the tree
     /// exactly like `search()` and returns the leaf-level BIN arc, or `None`
     /// if the tree is empty.
     pub fn get_parent_bin_for_child_ln(
@@ -3308,7 +3297,7 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!("is_bin() returned false above"),
             };
-            // Release parent latch — port of JE IN.releaseLatch().
+            // Release parent latch.
             Self::latch_coupling_release(guard);
             current = next_arc;
         }
@@ -3316,9 +3305,9 @@ impl Tree {
 
     /// Returns the BIN where `key` should be inserted.
     ///
-    /// Port of `Tree.findBinForInsert()` from JE.  Semantically identical to
+    /// .  Semantically identical to
     /// `get_parent_bin_for_child_ln` — expressed as a separate method to match
-    /// JE's API surface.
+    /// API surface.
     pub fn find_bin_for_insert(
         &self,
         key: &[u8],
@@ -3328,7 +3317,7 @@ impl Tree {
 
     /// Search for a BIN, allowing splits during descent (preemptive splitting).
     ///
-    /// Port of `Tree.searchSplitsAllowed()` from JE.  This thin wrapper
+    /// .  This thin wrapper
     /// delegates to `search()` and returns the result wrapped in `Some`.
     /// The full split-allowed descent is performed by `insert()` internally;
     /// this method exposes the same result type for callers that only need to
@@ -3342,7 +3331,7 @@ impl Tree {
     /// Traverses the entire tree and returns every IN and BIN node as a flat
     /// list.
     ///
-    /// Port of `Tree.rebuildINList()` from JE.  Used by recovery to rebuild
+    /// .  Used by recovery to rebuild
     /// the in-memory IN list after log replay.  The walk is a BFS from the
     /// root; every `Arc<RwLock<TreeNode>>` encountered (both Internal and
     /// Bottom variants) is included in the result.
@@ -3381,7 +3370,7 @@ impl Tree {
 
     /// Validates internal tree consistency.
     ///
-    /// Port of `Tree.validateINList()` from JE.  Primarily a debug/test tool.
+    /// .  Primarily a debug/test tool.
     ///
     /// Rules checked:
     /// - An empty tree (no root) is trivially valid → returns `true`.
@@ -3432,7 +3421,7 @@ impl Tree {
     /// Traverses the tree to find the parent IN that contains `child_node_id`
     /// as one of its child slots.
     ///
-    /// Port of `Tree.getParentINForChildIN()` from JE.  Used by the cleaner
+    /// .  Used by the cleaner
     /// migration path to re-insert migrated INs after eviction/fetch.
     ///
     /// Returns `(parent_arc, slot_index)` where `slot_index` is the position
@@ -3506,11 +3495,11 @@ impl Tree {
 
     /// Propagates the dirty flag upward from `node_arc` to the root.
     ///
-    /// Port of JE's implicit dirty propagation: after modifying any node,
+    /// Implicit dirty propagation: after modifying any node,
     /// all ancestors on the path to the root must also be marked dirty so
     /// the checkpointer logs them.
     ///
-    /// In JE this happens through `IN.setDirty(true)` calls at each level
+    /// In this happens through `IN.setDirty(true)` calls at each level
     /// during split/insert callbacks.  Here we walk the weak parent chain.
     pub fn propagate_dirty_to_root(node_arc: &Arc<RwLock<TreeNode>>) {
         let parent_weak = {
@@ -3832,7 +3821,7 @@ mod tests {
     // Split / multi-level insert tests  (new)
     // ========================================================================
 
-    /// Port of JE SplitTest: inserting enough keys to fill the root IN causes
+    /// inserting enough keys to fill the root IN causes
     /// the root IN itself to split, resulting in a tree with 3 or more levels.
     ///
     /// With max_entries_per_node = 4:
@@ -3925,7 +3914,6 @@ mod tests {
 
     /// After any number of splits, every key inserted must still be findable.
     ///
-    /// Port of JE SplitTest.testSplitPreservesAllEntries.
     #[test]
     fn test_split_preserves_all_keys() {
         // Tiny fanout to maximise split frequency.
@@ -4024,7 +4012,7 @@ mod tests {
 
     /// After inserting into a tree, the BIN (and root IN) must be dirty.
     ///
-    /// Port of JE: Tree.insertLN() calls bin.setDirty(true) after each insert.
+    /// The: Tree.insertLN() calls bin.setDirty(true) after each insert.
     #[test]
     fn test_insert_marks_bin_dirty() {
         let tree = Tree::new(1, 128);
@@ -4727,7 +4715,7 @@ mod tests {
 
     /// apply_delta_to_bin replaces existing entries and inserts new ones.
     ///
-    /// Port of JE BIN.applyDelta(): delta entries are authoritative and
+    /// BIN.applyDelta(): delta entries are authoritative and
     /// supersede full-BIN entries at the same key.
     #[test]
     fn test_apply_delta_to_bin_updates_and_inserts() {
@@ -4804,7 +4792,7 @@ mod tests {
 
     /// mutate_to_full_bin reconstitutes a full BIN from a delta + base.
     ///
-    /// Port of JE BIN.mutateToFullBIN(BIN fullBIN): after mutation the
+    /// BIN.mutateToFullBIN(BIN fullBIN): after mutation the
     /// `is_delta` flag must be cleared and the entries must contain both
     /// base and delta data.
     #[test]
@@ -5117,7 +5105,7 @@ mod tests {
 
     /// deserialize_full recomputes key prefix from loaded full keys.
     ///
-    /// Port of JE IN.recalcKeyPrefix() called after materializing from log:
+    /// IN.recalcKeyPrefix() called after materializing from log:
     /// a BIN loaded from the log should have prefix compression applied so
     /// that search performance matches an in-memory BIN.
     #[test]
@@ -5229,7 +5217,7 @@ mod tests {
 
     /// get_next_bin returns the entries of the next BIN to the right.
     ///
-    /// Port of JE Tree.getNextBin() / getNextIN(forward=true).
+    /// Tree.getNextBin() / getNextIN(forward=true).
     #[test]
     fn test_get_next_bin_basic() {
         let tree = Tree::new(1, 4);
@@ -5280,7 +5268,7 @@ mod tests {
 
     /// get_prev_bin returns the entries of the next BIN to the left.
     ///
-    /// Port of JE Tree.getPrevBin() / getNextIN(forward=false).
+    /// Tree.getPrevBin() / getNextIN(forward=false).
     #[test]
     fn test_get_prev_bin_basic() {
         let tree = Tree::new(1, 4);
@@ -5362,7 +5350,7 @@ mod tests {
 
     // ========================================================================
     // Key prefix compression tests for BinStub / Tree
-    // Port of JE IN key-prefix tests (KeyPrefixTest / TreeTest).
+    // IN key-prefix tests (KeyPrefixTest / TreeTest).
     // ========================================================================
 
     /// Inserting keys with a common prefix causes the BIN to establish that
@@ -5564,10 +5552,9 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests ported from JE TreeTest.java and SplitTest.java
     // ========================================================================
 
-    /// Port of JE TreeTest.testSimpleTreeCreation: insert a small set of keys
+    /// insert a small set of keys
     /// with varying lengths and verify each is findable immediately after insert.
     #[test]
     fn test_je_simple_tree_creation() {
@@ -5590,7 +5577,7 @@ mod tests {
         }
     }
 
-    /// Port of JE TreeTest.testMultipleInsertRetrieve: insert N keys, verify
+    /// insert N keys, verify
     /// all are found; delete the even-indexed keys, verify even are gone and
     /// odd remain.
     #[test]
@@ -5632,7 +5619,7 @@ mod tests {
         }
     }
 
-    /// Port of JE TreeTest.testCountAndValidateKeys: insert N keys in reverse
+    /// insert N keys in reverse
     /// order, then verify every key is directly findable and the keys are in
     /// sorted ascending order (B-tree ordering invariant).
     #[test]
@@ -5685,7 +5672,7 @@ mod tests {
         }
     }
 
-    /// Port of JE TreeTest.testAscendingInsertBalance: insert N keys in
+    /// insert N keys in
     /// ascending order and verify the tree height stays bounded (≤ 10 levels)
     /// and all keys are findable.
     #[test]
@@ -5715,7 +5702,7 @@ mod tests {
         }
     }
 
-    /// Port of JE TreeTest.testDescendingInsertBalance: insert N keys in
+    /// insert N keys in
     /// descending order and verify the tree height stays bounded (≤ 10 levels)
     /// and all keys are findable.
     #[test]
@@ -5745,7 +5732,7 @@ mod tests {
         }
     }
 
-    /// Port of JE SplitTest invariant: after many splits induced by a small
+    /// SplitTest invariant: after many splits induced by a small
     /// fanout no key is lost.
     #[test]
     fn test_je_split_no_key_lost() {
@@ -5767,7 +5754,7 @@ mod tests {
         }
     }
 
-    /// Port of JE SplitTest invariant: after a BIN split both halves exist and
+    /// SplitTest invariant: after a BIN split both halves exist and
     /// all original keys are findable.
     #[test]
     fn test_je_split_produces_two_halves() {
@@ -5797,7 +5784,7 @@ mod tests {
         }
     }
 
-    /// Port of JE SplitTest invariant: root splits are tracked and the tree
+    /// SplitTest invariant: root splits are tracked and the tree
     /// grows in height as keys accumulate.
     #[test]
     fn test_je_root_split_creates_new_root() {
@@ -5834,12 +5821,12 @@ mod tests {
 
     // ========================================================================
     // Tests: compress_bin / maybe_compress_bin_and_parent
-    // Port of JE INCompressor.compressBin / lazyCompress tests
+    // INCompressor.compressBin / lazyCompress tests
     // ========================================================================
 
     /// compress_bin removes known-deleted slots from a BIN.
     ///
-    /// Port of INCompressor.compressBin(): after compression, slots with
+    /// INCompressor.compressBin(): after compression, slots with
     /// `known_deleted = true` must be gone and the BIN must be dirty.
     #[test]
     fn test_compress_bin_removes_deleted_slots() {
@@ -5900,7 +5887,7 @@ mod tests {
 
     /// compress_bin on a BIN with no deleted slots returns false.
     ///
-    /// Port of INCompressor: if no slots were removed, compression made no
+    /// INCompressor: if no slots were removed, compression made no
     /// progress and returns false.
     #[test]
     fn test_compress_bin_no_deleted_slots_returns_false() {
@@ -5929,7 +5916,7 @@ mod tests {
 
     /// compress_bin on a BIN-delta is a no-op.
     ///
-    /// Port of INCompressor.compressBin(): "if (bin.isBINDelta()) return".
+    /// INCompressor.compressBin(): "if (bin.isBINDelta()) return".
     #[test]
     fn test_compress_bin_skips_delta() {
         let lsn = Lsn::new(1, 1);
@@ -5964,7 +5951,7 @@ mod tests {
 
     /// compress_bin prunes an empty BIN from the tree.
     ///
-    /// Port of INCompressor.pruneBIN(): when all slots are deleted and
+    /// INCompressor.pruneBIN(): when all slots are deleted and
     /// compression empties the BIN, it must be removed from the parent IN.
     #[test]
     fn test_compress_bin_prunes_empty_bin() {
@@ -6019,7 +6006,7 @@ mod tests {
 
     /// maybe_compress_bin_and_parent returns false when no deleted slots exist.
     ///
-    /// Port of INCompressor.lazyCompress(): skip BINs with no defunct slots.
+    /// INCompressor.lazyCompress(): skip BINs with no defunct slots.
     #[test]
     fn test_maybe_compress_skips_clean_bin() {
         let lsn = Lsn::new(1, 1);
@@ -6047,7 +6034,7 @@ mod tests {
 
     /// maybe_compress_bin_and_parent triggers compression when deleted slots exist.
     ///
-    /// Port of INCompressor.lazyCompress(): when defunct slots are found,
+    /// INCompressor.lazyCompress(): when defunct slots are found,
     /// call bin.compress() to remove them.
     #[test]
     fn test_maybe_compress_triggers_when_deleted_slots_exist() {
@@ -6086,12 +6073,10 @@ mod tests {
 
     // ========================================================================
     // Tests: INCompressorTest / EmptyBINTest ports
-    // Port of:
     //   INCompressorTest (compress_bin semantics, prefix recompute, live-slot preservation)
     //   EmptyBINTest     (empty-BIN scan, all-deleted compress, search returns NotFound)
     // ========================================================================
 
-    /// Port of INCompressorTest.testDeleteNonTransactional (core compression path).
     ///
     /// Insert two live keys and one deleted key into a BIN wired into a tree.
     /// After compress_bin the deleted slot must be gone; the live slots remain.
@@ -6180,12 +6165,11 @@ mod tests {
         }
     }
 
-    /// Port of INCompressorTest.testRemoveEmptyBIN.
     ///
     /// After all slots in a BIN are deleted and compress() is called, the
     /// empty BIN must be removed from its parent IN (pruneBIN path).
     ///
-    /// Port of INCompressorTest — uses tree.compress() which correctly invokes
+    /// Uses tree.compress() which correctly invokes
     /// the pruneBIN / merge logic that removes empty BINs from the parent IN.
     #[test]
     fn test_incompressor_empty_bin_pruned_from_parent() {
@@ -6230,9 +6214,9 @@ mod tests {
         }
     }
 
-    /// Port of INCompressorTest — BIN-delta is skipped by maybe_compress.
+    /// BIN-delta is skipped by maybe_compress.
     ///
-    /// JE: INCompressor.lazyCompress() short-circuits for BIN-deltas:
+    /// INCompressor.lazyCompress() short-circuits for BIN-deltas:
     /// "if (in.isBINDelta()) return false".
     #[test]
     fn test_incompressor_maybe_compress_skips_bin_delta() {
@@ -6270,9 +6254,9 @@ mod tests {
         }
     }
 
-    /// Port of INCompressorTest — clean BIN (no deleted slots) is not compressed.
+    /// Clean BIN (no deleted slots) is not compressed.
     ///
-    /// JE: INCompressor.lazyCompress() skips BINs that have no defunct slots.
+    /// INCompressor.lazyCompress() skips BINs that have no defunct slots.
     #[test]
     fn test_incompressor_clean_bin_not_compressed() {
         let lsn = Lsn::new(1, 1);
@@ -6306,13 +6290,13 @@ mod tests {
         }
     }
 
-    /// Port of INCompressorTest — prefix is recomputed after compression.
+    /// Prefix is recomputed after compression.
     ///
     /// When keys share a common prefix (e.g. "pfx:a", "pfx:b", "pfx:c") and
     /// one is deleted, after compress_bin the remaining keys must share the
     /// correct (potentially longer) prefix.
     ///
-    /// JE: after BIN.compress() the BIN calls recalcKeyPrefix() so the
+    /// After BIN.compress() the BIN calls recalcKeyPrefix() so the
     /// shorter remaining key set may expose a longer common prefix.
     #[test]
     fn test_incompressor_prefix_recomputed_after_compress() {
@@ -6376,7 +6360,7 @@ mod tests {
         }
     }
 
-    /// Port of EmptyBINTest — after all entries are deleted and the BIN is
+    /// After all entries are deleted and the BIN is
     /// compressed to empty, a subsequent search for any of those keys must
     /// return not-found.
     ///
@@ -6387,7 +6371,7 @@ mod tests {
         let lsn = Lsn::new(1, 1);
 
         // Build a two-BIN tree with a small max_entries so inserts split.
-        // We use max_entries=4 to match JE's NODE_MAX=4 from EmptyBINTest.
+        // We use max_entries=4 to match NODE_MAX=4 from EmptyBINTest.
         let tree = Tree::new(1, 4);
 
         // Insert keys 0..7 (byte values).
@@ -6419,7 +6403,7 @@ mod tests {
         }
     }
 
-    /// Port of EmptyBINTest.testScanForward — scan all values in a tree that
+    /// Scan all values in a tree that
     /// has an empty BIN in the middle (created by deleting all entries in one
     /// BIN and then calling compress_bin).
     ///
@@ -6454,7 +6438,7 @@ mod tests {
         }
     }
 
-    /// Port of INCompressorTest.testNodeNotEmpty — after a BIN is emptied by
+    /// After a bin is emptied by
     /// compression and its queue entry is on the compressor queue, re-inserting
     /// a key into that BIN prevents the prune.
     ///
@@ -6543,10 +6527,10 @@ mod tests {
         }
     }
 
-    /// Port of INCompressorTest — compressing a BIN with a mix of known-deleted
+    /// Compressing a BIN with a mix of known-deleted
     /// and pending-deleted slots removes both kinds.
     ///
-    /// JE: BIN.isDefunct(i) returns true for both KNOWN_DELETED and
+    /// BIN.isDefunct(i) returns true for both KNOWN_DELETED and
     /// PENDING_DELETED.  compress_bin must remove all defunct slots.
     #[test]
     fn test_incompressor_known_and_pending_deleted_removed() {

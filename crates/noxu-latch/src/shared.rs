@@ -1,14 +1,11 @@
 //! Shared/exclusive (reader-writer) latch.
 //!
-//! Port of `com.sleepycat.je.latch.SharedLatchImpl`.
-//!
 //! Extends the latch concept to provide reader-writer access. Multiple threads
 //! can hold the latch in shared mode simultaneously, but exclusive mode
 //! requires sole access.
 //!
-//! This may also operate in exclusive-only mode (matching JE's behavior where
-//! BIN latches are exclusive-only but use the SharedLatch interface). In
-//! exclusive-only mode, `acquire_shared()` behaves like `acquire_exclusive()`.
+//! This may also operate in exclusive-only mode where `acquire_shared()`
+//! behaves like `acquire_exclusive()`. BIN latches use this mode.
 
 use crate::LatchContext;
 use noxu_sync::RwLock;
@@ -39,11 +36,8 @@ fn read_hold_count() -> u32 {
 /// A shared/exclusive (reader-writer) latch.
 ///
 /// When `exclusive_only` is true, this behaves identically to an
-/// ExclusiveLatch (shared acquisition degrades to exclusive). This matches
-/// JE's pattern where BIN latches are exclusive-only but use the SharedLatch
-/// interface for polymorphism with IN latches.
-///
-/// Port of `com.sleepycat.je.latch.SharedLatchImpl`.
+/// ExclusiveLatch (shared acquisition degrades to exclusive). BIN latches
+/// use this mode for polymorphism with IN latches.
 pub struct SharedLatch {
     context: LatchContext,
     exclusive_only: bool,
@@ -92,8 +86,7 @@ impl SharedLatch {
 
         // Detect read-to-write upgrade: this thread already holds a read guard
         // and attempting to acquire write would deadlock with noxu_sync's
-        // non-reentrant RwLock (matches JE's EnvironmentFailureException check
-        // on getReadHoldCount() > 0).
+        // non-reentrant RwLock; attempting the upgrade would deadlock.
         if read_hold_count() > 0 {
             panic!(
                 "Deadlock: thread holds read lock and requested write lock on latch {}",
@@ -145,10 +138,9 @@ impl SharedLatch {
         if self.exclusive_only {
             SharedLatchGuard::Write(self.acquire_exclusive())
         } else {
-            // Detect reentrant shared acquisition on the same thread. This
-            // matches JE's SharedLatchImpl behavior: a thread must not acquire
-            // the latch in shared mode more than once (reentrancy is forbidden
-            // to prevent subtle ordering bugs).
+            // Detect reentrant shared acquisition on the same thread.
+            // A thread must not acquire the latch in shared mode more than once
+            // (reentrancy is forbidden to prevent subtle ordering bugs).
             if read_hold_count() > 0 {
                 panic!(
                     "Latch already held in shared mode: {} (thread {:?})",
@@ -290,8 +282,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "Deadlock")]
     fn test_read_to_write_upgrade_panics() {
-        // Acquiring a read guard then trying to upgrade to write must panic,
-        // matching JE's EnvironmentFailureException on getReadHoldCount() > 0.
+        // Acquiring a read guard then trying to upgrade to write must panic
+        // because re-entrancy is forbidden.
         let latch = SharedLatch::named("test-upgrade", false);
         let _rguard = latch.acquire_shared();
         // This thread now holds a read guard -- exclusive acquire must panic.
@@ -442,8 +434,7 @@ mod tests {
     // Ported from LatchTest.java — shared/exclusive latch invariants
     // -----------------------------------------------------------------------
 
-    /// Port of LatchTest.testAcquireAndReacquireShared: re-acquiring a shared
-    /// latch on the same thread should panic (reentrancy prevention).
+    /// Re-acquiring a shared latch on the same thread should panic (reentrancy prevention).
     #[test]
     fn test_je_shared_reacquire_panics() {
         let result = std::panic::catch_unwind(|| {
@@ -455,8 +446,7 @@ mod tests {
         assert!(result.is_err(), "reentrant shared acquire should panic");
     }
 
-    /// Port of LatchTest.testAcquireAndReacquireShared: acquiring exclusively
-    /// after a shared guard is held on the same thread must panic (would deadlock).
+    /// Acquiring exclusively after a shared guard is held on the same thread must panic (would deadlock).
     #[test]
     fn test_je_read_to_write_upgrade_panics() {
         let result = std::panic::catch_unwind(|| {
@@ -467,8 +457,7 @@ mod tests {
         assert!(result.is_err(), "read-to-write upgrade should panic");
     }
 
-    /// Port of LatchTest.testAcquireAndReacquireShared: releasing a latch that
-    /// is not held (release_if_owner style) should be safe on exclusive path.
+    /// Releasing a latch that is not held (release_if_owner style) should be safe on exclusive path.
     #[test]
     fn test_je_shared_release_not_held_exclusive_path() {
         let latch = SharedLatch::named("je-not-held", false);
@@ -476,8 +465,7 @@ mod tests {
         assert!(!latch.is_exclusive_owner());
     }
 
-    /// Port of LatchTest: multiple threads can hold shared guards simultaneously
-    /// while no exclusive holder is present.
+    /// Multiple threads can hold shared guards simultaneously while no exclusive holder is present.
     #[test]
     fn test_je_multiple_readers_concurrent() {
         let latch = Arc::new(SharedLatch::named("je-multi-read", false));
@@ -515,8 +503,7 @@ mod tests {
         }
     }
 
-    /// Port of LatchTest: exclusive blocks shared; after exclusive releases
-    /// shared can be acquired.
+    /// Exclusive mode blocks shared; after exclusive releases shared can be acquired.
     #[test]
     fn test_je_exclusive_blocks_then_shared_granted() {
         let latch = Arc::new(SharedLatch::named("je-excl-blocks-shared", false));
@@ -542,8 +529,7 @@ mod tests {
         assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// Port of LatchTest: try_acquire_exclusive (non-blocking) returns None
-    /// while an exclusive holder is present.
+    /// `try_acquire_exclusive` (non-blocking) returns None while an exclusive holder is present.
     #[test]
     fn test_je_try_acquire_exclusive_no_wait() {
         let latch = Arc::new(SharedLatch::named("je-try-excl", false));
@@ -569,8 +555,8 @@ mod tests {
         drop(r2);
     }
 
-    /// Port of LatchTest: exclusive latch in exclusive-only mode behaves like
-    /// a plain exclusive latch (shared acquisition acts as exclusive).
+    /// In exclusive-only mode the latch behaves like a plain exclusive latch
+    /// (shared acquisition acts as exclusive).
     #[test]
     fn test_je_exclusive_only_mode_serializes() {
         use std::sync::atomic::{AtomicUsize, Ordering};

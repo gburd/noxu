@@ -1,6 +1,5 @@
 //! Checkpoint daemon for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.recovery.Checkpointer`.
 //!
 //! The Checkpointer flushes dirty IN nodes from the tree to the log in
 //! bottom-up order. This bounds recovery time and ensures durability.
@@ -23,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Configuration for checkpoint behavior.
 ///
-/// Port of `com.sleepycat.je.CheckpointConfig`.
+/// 
 ///
 /// Controls when and how checkpoints are performed.
 #[derive(Debug, Clone)]
@@ -110,7 +109,7 @@ impl CheckpointResult {
 
 /// The Checkpointer flushes dirty IN nodes to the log.
 ///
-/// Port of `com.sleepycat.je.recovery.Checkpointer`.
+/// 
 ///
 /// Checkpoint flushes must be done in ascending order from the bottom
 /// of the tree up. This ensures that recovery can reconstruct the tree
@@ -129,7 +128,7 @@ impl CheckpointResult {
 ///
 /// This implementation flushes dirty BINs via `flush_dirty_bins_internal()`,
 /// which writes full BIN or BINDelta log entries depending on the dirty-slot
-/// fraction (JE TREE_BIN_DELTA = 25%). Upper INs (level ≥ 2) are flushed
+/// fraction (TREE_BIN_DELTA = 25%). Upper INs (level ≥ 2) are flushed
 /// by `flush_upper_ins_internal()` after the BIN pass, bottom-up, using
 /// `Provisional::Yes` for intermediate levels and `Provisional::No` for
 /// the root. File utilization summaries are persisted via
@@ -170,7 +169,7 @@ pub struct Checkpointer {
     /// Incremented by `wakeup_after_write()`. When this exceeds
     /// `checkpoint_bytes_interval` a checkpoint is triggered immediately.
     ///
-    /// Port of `Checkpointer.nFullINFlushThisRun` write-byte accumulation in JE.
+    /// Write-byte accumulation.
     bytes_since_checkpoint: AtomicU64,
     /// Bytes-written threshold that triggers an immediate checkpoint.
     ///
@@ -179,7 +178,7 @@ pub struct Checkpointer {
     /// Optional utilization tracker for persisting file summaries.
     ///
     /// When set, `persist_file_summaries()` iterates tracked summaries and
-    /// writes `FileSummaryLN` WAL entries — port of JE `Checkpointer.flushUtilizationDb()`.
+    /// writes `FileSummaryLN` WAL entries.
     utilization_tracker: Option<Arc<std::sync::Mutex<UtilizationTracker>>>,
 }
 
@@ -211,7 +210,7 @@ impl Checkpointer {
 
     /// Set the bytes-written threshold that triggers an immediate checkpoint.
     ///
-    /// Port of `EnvironmentParams.CHECKPOINTER_BYTES_INTERVAL` in JE.
+    /// 
     pub fn with_bytes_interval(mut self, bytes: u64) -> Self {
         self.checkpoint_bytes_interval = bytes;
         self
@@ -229,7 +228,7 @@ impl Checkpointer {
     /// Attach a Tree so that `do_checkpoint` flushes dirty BINs in step 4.
     ///
     /// `db_id` is the database ID passed to `Tree::collect_dirty_bins()`.
-    /// Port of JE `Checkpointer` receiving the environment's tree reference.
+    /// `Checkpointer` receiving the environment's tree reference.
     pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
         self.tree = Some(tree);
         self.db_id = db_id;
@@ -239,7 +238,7 @@ impl Checkpointer {
     /// Attach a UtilizationTracker so that `persist_file_summaries()` writes
     /// real `FileSummaryLN` WAL entries during each checkpoint.
     ///
-    /// Port of JE `Checkpointer` receiving the environment's utilization tracker.
+    /// `Checkpointer` receiving the environment's utilization tracker.
     pub fn with_utilization_tracker(
         mut self,
         tracker: Arc<std::sync::Mutex<UtilizationTracker>>,
@@ -256,7 +255,7 @@ impl Checkpointer {
     /// `checkpoint_bytes_interval` the counter is reset and
     /// `do_checkpoint("wakeup")` is invoked synchronously.
     ///
-    /// Port of `Checkpointer.wakeupAfterWrite()` in JE.
+    /// 
     pub fn wakeup_after_write(&self, bytes: u64) {
         if self.checkpoint_bytes_interval == 0 {
             return;
@@ -278,7 +277,7 @@ impl Checkpointer {
     /// been checkpointed would be lost on eviction because it has no on-disk
     /// representation yet.
     ///
-    /// Port of `Checkpointer.coordinateEvictionWithCheckpoint()` in JE.
+    /// 
     pub fn is_checkpointed(node: &RwLock<TreeNode>) -> bool {
         let guard = match node.read() {
             Ok(g) => g,
@@ -297,7 +296,7 @@ impl Checkpointer {
     /// Writes a `FileSummaryLN` log entry for each tracked file summary so
     /// that utilization data survives a restart.
     ///
-    /// Port of `Checkpointer.flushUtilizationDb()` in JE.
+    /// 
     ///
     /// Requires both a `LogManager` (via `with_log_manager`) and a
     /// `UtilizationTracker` (via `with_utilization_tracker`) to be wired.
@@ -410,10 +409,10 @@ impl Checkpointer {
 
         // Step 4a: Flush dirty BINs.
         //
-        // For each dirty BIN in the tree decide — using JE's TREE_BIN_DELTA
+        // For each dirty BIN in the tree decide — using TREE_BIN_DELTA
         // threshold of 25 % — whether to write a BINDelta or a full BIN.
         //
-        // Port of JE `Checkpointer.processINList()` + `logIN()` (BIN path).
+        // `Checkpointer.processINList()` + `logIN()` (BIN path).
         let mut flush_result = self.flush_dirty_bins_internal()?;
 
         // Step 4b: Flush dirty upper INs (level ≥ 2) bottom-up.
@@ -423,7 +422,7 @@ impl Checkpointer {
         // Intermediate levels use Provisional::Yes (subsumed by root);
         // the root level uses Provisional::No (anchors the checkpoint).
         //
-        // Port of JE `Checkpointer.processINList()` upper-IN loop +
+        // `Checkpointer.processINList()` upper-IN loop +
         // `Checkpointer.logIN()` for non-BIN nodes.
         let upper_result = self.flush_upper_ins_internal()?;
         flush_result.full_ins_flushed += upper_result.full_ins_flushed;
@@ -564,14 +563,14 @@ impl Checkpointer {
     /// returning only success/failure.  Use this from external callers (e.g.
     /// daemon threads) that do not need per-BIN counts.
     ///
-    /// Port of JE `Checkpointer.doCheckpoint()` partial flush path.
+    /// `Checkpointer.doCheckpoint()` partial flush path.
     pub fn flush_dirty_bins(&self) -> Result<()> {
         self.flush_dirty_bins_internal().map(|_| ())
     }
 
     /// Internal flush all dirty BINs to the log.
     ///
-    /// For each dirty BIN the JE TREE_BIN_DELTA threshold (25 %) decides:
+    /// For each dirty BIN the TREE_BIN_DELTA threshold (25 %) decides:
     /// - dirty_count / total ≤ 0.25 → write `BINDelta` entry (delta path)
     /// - otherwise                  → write full `BIN` entry (full path)
     ///
@@ -581,7 +580,7 @@ impl Checkpointer {
     /// Also calls `persist_file_summaries()` to ensure utilization data is
     /// durable.
     ///
-    /// Port of JE `Checkpointer.processINList()` + `Checkpointer.logIN()`.
+    /// `Checkpointer.processINList()` + `Checkpointer.logIN()`.
     fn flush_dirty_bins_internal(&self) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
@@ -607,7 +606,7 @@ impl Checkpointer {
             tree_guard.collect_dirty_bins(self.db_id)
         };
 
-        // JE TREE_BIN_DELTA: if dirty fraction ≤ 25 % write a delta.
+        // TREE_BIN_DELTA: if dirty fraction ≤ 25 % write a delta.
         const TREE_BIN_DELTA: f64 = 0.25;
 
         for (_db_id, bin_arc) in dirty_bins {
@@ -640,7 +639,7 @@ impl Checkpointer {
                 let entry = BinDeltaLogEntry::new(
                     self.db_id,
                     b.last_full_lsn,
-                    b.last_delta_lsn, // prev_delta_lsn — port of JE BIN.lastDeltaVersion
+                    b.last_delta_lsn, // prev_delta_lsn
                     delta_bytes,
                 );
                 let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
@@ -701,7 +700,7 @@ impl Checkpointer {
     ///
     /// After a successful write the IN's dirty flag is cleared.
     ///
-    /// Port of JE `Checkpointer.processINList()` upper-IN pass +
+    /// `Checkpointer.processINList()` upper-IN pass +
     /// `Checkpointer.logIN()` for `TreeNode::Internal` nodes.
     fn flush_upper_ins_internal(&self) -> Result<FlushResult> {
         let mut result = FlushResult::default();

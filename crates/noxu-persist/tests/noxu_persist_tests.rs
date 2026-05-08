@@ -1,4 +1,4 @@
-//! Port of JE persist layer tests.
+//! Integration tests for the persistence layer.
 //!
 //! Covers the key invariants from:
 //!   - `OperationTest.java`  — EntityStore open/close, put/get/delete, count,
@@ -133,7 +133,7 @@ fn test_entity_store_open_close() {
 }
 
 /// Closing a store a second time must return an error.
-/// Mirrors JE behavior: calling `EntityStore.close()` twice throws.
+/// Mirrors behavior: calling `EntityStore.close()` twice throws.
 #[test]
 fn test_close_twice_returns_error() {
     let td = TempDir::new().unwrap();
@@ -299,7 +299,7 @@ fn test_contains() {
 }
 
 /// Operations on a closed store return an error.
-/// Mirrors JE `DatabaseException` on closed-store access.
+/// Raised on closed-store access.
 #[test]
 fn test_get_primary_index_on_closed_store_fails() {
     let td = TempDir::new().unwrap();
@@ -944,7 +944,7 @@ fn test_converter_mutation_transforms_records_and_stats() {
 
     assert_eq!(stats.n_read(), N as u64);
     assert_eq!(stats.n_converted(), N as u64);
-    // JE invariant: n_converted >= n_read (always true for eager evolve).
+    // invariant: n_converted >= n_read (always true for eager evolve).
     assert!(stats.n_converted() >= stats.n_read());
 }
 
@@ -1017,7 +1017,7 @@ fn test_evolve_config_class_filter() {
 }
 
 /// `evolve()` on a closed store must return an error.
-/// Mirrors JE: calling evolve on a closed EntityStore throws DatabaseException.
+/// Calling evolve on a closed EntityStore throws DatabaseException.
 #[test]
 fn test_evolve_on_closed_store_returns_error() {
     let td = TempDir::new().unwrap();
@@ -1033,7 +1033,7 @@ fn test_evolve_on_closed_store_returns_error() {
     assert!(store.evolve(&mutations, &evolve_cfg).is_err());
 }
 
-/// `EvolveStats` accumulation mirrors JE's `getNRead`/`getNConverted`.
+/// `EvolveStats` accumulation mirrors `getNRead`/`getNConverted`.
 /// Direct unit test of the stats type used by the listener callback.
 #[test]
 fn test_evolve_stats_accumulation() {
@@ -1051,7 +1051,7 @@ fn test_evolve_stats_accumulation() {
     assert_eq!(stats.n_read(), 8);
     assert_eq!(stats.n_converted(), 7);
 
-    // n_converted <= n_read is the general JE invariant (when some
+    // n_converted <= n_read is the general invariant (when some
     // records are already up to date they are read but not re-written).
     assert!(stats.n_converted() <= stats.n_read());
 }

@@ -5,15 +5,13 @@
 //!   bit  30:   WRITE_LOCKED  (exclusive writer holds the lock)
 //!   bit  31:   WRITE_WAITING (reserved, not currently used — non-fair mode)
 //!
-//! Non-fair design: new readers are not blocked by pending writers, matching
-//! `SharedLatchImpl(fair=false)` in JE. This maximises read throughput.
+//! Non-fair design: new readers are not blocked by pending writers, which
+//! maximises read throughput.
 //!
 //! Additional fields:
 //!   `read_waiters`  — readers blocked waiting for a write to finish
 //!   `write_waiters` — writers blocked waiting for all readers/writers to finish
 //!   `exclusive_owner` — thread ID hash of the write-lock owner
-//!
-//! All of the above match JE's `SharedLatchImpl` diagnostics interface.
 
 use crate::futex::{futex_wait, futex_wake};
 use lock_api;
@@ -289,16 +287,12 @@ impl NoxuRawRwLock {
     }
 
     /// Returns `true` if the write lock is currently held.
-    ///
-    /// Matches JE's `SharedLatchImpl.isOwner()` / `isWriteLockedByCurrentThread()`.
     #[inline]
     pub fn is_write_locked(&self) -> bool {
         self.state.load(Ordering::Relaxed) & WRITE_LOCKED != 0
     }
 
     /// Returns the total number of threads waiting to acquire this lock.
-    ///
-    /// Matches JE's `SharedLatchImpl.getNWaiters()`.
     #[inline]
     pub fn get_n_waiters(&self) -> usize {
         self.read_waiters.load(Ordering::Relaxed)

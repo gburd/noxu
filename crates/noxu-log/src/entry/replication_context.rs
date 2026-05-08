@@ -1,6 +1,5 @@
 //! Replication context.
 //!
-//! Port of `com.sleepycat.je.log.ReplicationContext`.
 //!
 //! Provides context about high-level operations so the logging level can
 //! determine which replication-related actions are required for a given

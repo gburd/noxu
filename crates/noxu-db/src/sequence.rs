@@ -1,13 +1,12 @@
 //! Sequence handle.
 //!
-//! Port of `com.sleepycat.je.Sequence`.
 //!
 //! A `Sequence` is an auto-incrementing (or decrementing) counter backed by
 //! a single key-value record in a `Database`.  The persistent record stores
 //! the *next* batch boundary so that multiple handles can share the same
 //! database key without requiring coordination on every call.
 //!
-//! ## Record format (ported exactly from JE)
+//! ## Record format (ported exactly from the)
 //!
 //! ```text
 //! byte 0   : version (always 1)
@@ -20,7 +19,7 @@
 //! bytes 18+: stored_value (big-endian i64, 8 bytes)
 //! ```
 //!
-//! Total: 26 bytes.  JE uses packed-long encoding; we use fixed big-endian
+//! Total: 26 bytes.  uses packed-long encoding; we use fixed big-endian
 //! i64 for simplicity (compatible with the noxu-persist pattern).
 
 use crate::database::Database;
@@ -72,7 +71,7 @@ struct CacheState {
 
 /// A handle for manipulating a sequence record stored in a `Database`.
 ///
-/// Port of `com.sleepycat.je.Sequence`.
+/// 
 ///
 /// Multiple threads may share a single `Sequence` handle safely; all cache
 /// manipulation is protected by an internal `Mutex`.  For higher throughput
@@ -236,13 +235,13 @@ impl<'db> Sequence<'db> {
     /// Returns the next available element in the sequence and advances by
     /// `delta`.
     ///
-    /// Port of `Sequence.get(Transaction, int)`.
+    /// 
     ///
     /// `delta` must be > 0 and must fit within the configured range.
     ///
     /// The `txn` parameter, if provided, is used for the cache-refill database
     /// write, making it participate in the caller's transaction.
-    /// Port of JE `Sequence.get(Transaction txn, int delta)`.
+    /// `Sequence.get(Transaction txn, int delta)`.
     pub fn get(&self, txn: Option<&Transaction>, delta: i32) -> Result<i64> {
         if delta <= 0 {
             return Err(NoxuError::IllegalArgument(
@@ -252,7 +251,7 @@ impl<'db> Sequence<'db> {
 
         let mut state = self.state.lock().unwrap();
 
-        // JE: "if (rangeMin > rangeMax - delta)" — use saturating to avoid
+        // "if (rangeMin > rangeMax - delta)" — use saturating to avoid
         // overflow when range_max is near i64::MIN.
         if state.range_min > state.range_max.saturating_sub(delta as i64) {
             return Err(NoxuError::IllegalArgument(
@@ -364,7 +363,7 @@ impl<'db> Sequence<'db> {
                         full_avail.min(adjust)
                     } else {
                         // Range exhausted and wrap not allowed — error now,
-                        // matching JE SequenceImpl which throws immediately.
+                        // matching SequenceImpl which throws immediately.
                         return Err(NoxuError::OperationNotAllowed(format!(
                             "Sequence overflow at {}",
                             state.stored_value
@@ -450,7 +449,7 @@ impl<'db> Sequence<'db> {
 
     /// Returns a snapshot of statistics for this handle.
     ///
-    /// Port of `Sequence.getStats(StatsConfig)`.
+    /// 
     pub fn get_stats(&self) -> SequenceStats {
         let state = self.state.lock().unwrap();
         SequenceStats {
@@ -470,7 +469,7 @@ impl<'db> Sequence<'db> {
     /// After calling this method the handle must not be used again.  Unused
     /// cached values are discarded.
     ///
-    /// Port of `Sequence.close()`.
+    /// 
     pub fn close(&self) -> Result<()> {
         // Nothing to flush; the DB record already holds the batch boundary.
         Ok(())
@@ -481,7 +480,7 @@ impl<'db> Sequence<'db> {
     /// Initialise `(cache_value, cache_last)` from a just-read record so that
     /// the cache appears empty and the first `get` call triggers a refill.
     ///
-    /// JE does: `cacheLast = increment ? (storedValue - 1) : (storedValue + 1)`
+    /// does: `cacheLast = increment ? (storedValue - 1) : (storedValue + 1)`
     fn init_cache(rec: &PersistedSeq, _cache_size: i32) -> (i64, i64) {
         let cache_value = rec.stored_value;
         // cache_last is set so the cache appears empty on first get:

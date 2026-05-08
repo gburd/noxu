@@ -1,6 +1,5 @@
 //! Lock manager for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.txn.LockManager` (2228 lines).
 //!
 //! The LockManager is the central authority for all lock operations in the
 //! system. It manages N sharded lock tables, each protected by its own mutex,
@@ -19,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Number of lock table shards.
 ///
 /// Multiple lock tables reduce contention by allowing concurrent operations
-/// on locks in different tables.  JE defaults to 1, but we use 16 for better
+/// on locks in different tables.  defaults to 1, but we use 16 for better
 /// concurrency on multi-core systems.
 const N_LOCK_TABLES: usize = 16;
 
@@ -47,9 +46,9 @@ const N_LOCK_TABLES: usize = 16;
 /// 5. On timeout removes itself from the waiter list and returns
 ///    `TxnError::LockTimeout`.
 ///
-/// This mirrors the flow in `LockManager.lock()` / `waitForLock()` in JE.
+/// This mirrors the flow in `LockManager.lock()` / `waitForLock()`.
 ///
-/// Port of `com.sleepycat.je.txn.LockManager`.
+/// 
 pub struct LockManager {
     /// Sharded lock tables, keyed by LSN.
     lock_tables: Vec<Mutex<HashMap<u64, Lock>>>,
@@ -59,12 +58,11 @@ pub struct LockManager {
 
     /// Default lock-wait timeout in milliseconds.
     ///
-    /// 0 means wait forever (JE `EnvironmentConfig.setLockTimeout(0)`).
-    /// Corresponds to `EnvironmentConfig.lock_timeout_ms`.
+    /// 0 means wait forever (`EnvironmentConfig.setLockTimeout(0)`).
     /// Configured at open time from `EnvironmentConfig`; can be overridden
     /// per-call via `lock_with_timeout()`.
     ///
-    /// Port of `LockManager.lockTimeout` in JE.
+    /// 
     lock_timeout_ms: AtomicU64,
 
     /// Locker sharing registry: maps locker_id → share_group_id.
@@ -75,7 +73,7 @@ pub struct LockManager {
     /// group_id, and thus bypass lock-conflict detection (JE
     /// `Locker.sharesLocksWith(other)`).
     ///
-    /// Port of `LockManager.threadLockers` (thread-locker map) in JE, extended
+    /// (thread-locker map), extended
     /// to support HandleLocker buddy sharing.
     share_registry: RwLock<HashMap<i64, i64>>,
 }
@@ -91,14 +89,14 @@ struct LockManagerStats {
 
 impl LockManager {
     /// Creates a new LockManager with N_LOCK_TABLES shards and the default
-    /// lock timeout of 500 ms (matching JE's default).
+    /// lock timeout of 500 ms (matching default).
     pub fn new() -> Self {
         Self::with_lock_timeout(500)
     }
 
     /// Creates a new LockManager with a specific default lock timeout.
     ///
-    /// `timeout_ms == 0` means wait forever (JE `setLockTimeout(0, MILLISECONDS)`).
+    /// `timeout_ms == 0` means wait forever (`setLockTimeout(0, MILLISECONDS)`).
     ///
     /// Call this from `EnvironmentImpl` after reading `EnvironmentConfig.lock_timeout_ms`.
     pub fn with_lock_timeout(timeout_ms: u64) -> Self {
@@ -121,7 +119,7 @@ impl LockManager {
     /// Updates the default lock timeout.
     ///
     /// Thread-safe; takes effect for subsequent `lock()` calls.
-    /// Port of `LockManager.setLockTimeout()` in JE.
+    /// 
     pub fn set_lock_timeout(&self, timeout_ms: u64) {
         self.lock_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
@@ -156,7 +154,7 @@ impl LockManager {
     /// - `TxnError::LockTimeout` if the timeout expired while waiting
     /// - `TxnError::Deadlock` if a wait-for cycle is detected before waiting
     ///
-    /// Port of `LockManager.lock()`.
+    /// 
     pub fn lock(
         &self,
         lsn: u64,
@@ -178,7 +176,7 @@ impl LockManager {
     /// Like `lock()` but the caller supplies the timeout in milliseconds.
     /// `timeout_ms == 0` means wait forever.
     ///
-    /// Port of `LockManager.lock(lsn, locker, type, timeout, ...)`.
+    /// 
     pub fn lock_with_timeout(
         &self,
         lsn: u64,
@@ -205,7 +203,7 @@ impl LockManager {
 
         // --- Phase 1: attempt to acquire the lock under the shard mutex. ---
         //
-        // JE: "Attempt to lock without any initial wait."
+        // "Attempt to lock without any initial wait."
         let (initial_grant, owner_ids, notify_pair) = {
             let mut table = self.lock_tables[table_idx].lock();
             let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
@@ -230,7 +228,7 @@ impl LockManager {
             // We must wait.  Collect owner IDs for deadlock detection and
             // attach a per-waiter notify pair to our waiter entry.
             //
-            // JE: "locker.setWaitingFor(lsn, type)" then deadlock detect then
+            // "locker.setWaitingFor(lsn, type)" then deadlock detect then
             //     "locker.wait(timeout)".
             self.stats.lock_waits.fetch_add(1, Ordering::Relaxed);
 
@@ -248,7 +246,7 @@ impl LockManager {
 
         // --- Phase 2: deadlock detection before sleeping. ---
         //
-        // JE: runs DeadlockChecker after setWaitingFor.  If the current
+        // Runs DeadlockChecker after setWaitingFor.  If the current
         // locker is selected as the victim, throw DeadlockException.
         //
         // We build a lightweight waits-for snapshot from the current lock
@@ -276,7 +274,7 @@ impl LockManager {
 
         // --- Phase 3: wait on the condvar. ---
         //
-        // JE: "locker.wait(timeRemaining)" in a loop, checking ownership on
+        // "locker.wait(timeRemaining)" in a loop, checking ownership on
         //     each wakeup.  We also re-run deadlock detection on each
         //     iteration so that cycles formed after we enter the wait path
         //     are caught.
@@ -320,7 +318,7 @@ impl LockManager {
 
             // Use a short slice (up to 50 ms) so we can re-check for
             // deadlocks that may form after we entered the wait path.
-            // JE uses a "deadlock detection delay" for the same purpose.
+            // uses a "deadlock detection delay" for the same purpose.
             let slice_ms = if remaining_ms == 0 {
                 50
             } else {
@@ -412,7 +410,7 @@ impl LockManager {
     /// Promotes compatible waiters to owners, signals their condvars so they
     /// wake up, and removes the lock entry when it becomes empty.
     ///
-    /// Port of `LockManager.release()`.
+    /// 
     pub fn release(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
@@ -434,7 +432,7 @@ impl LockManager {
 
     /// Downgrades a write lock to a read lock.
     ///
-    /// Port of `LockManager.demote()`.
+    /// 
     pub fn demote(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
@@ -451,7 +449,7 @@ impl LockManager {
     /// Used by the HA replayer to forcibly acquire locks, removing all other
     /// preemptable owners.
     ///
-    /// Port of `LockManager.stealLock()`.
+    /// 
     pub fn steal_lock(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
@@ -464,7 +462,7 @@ impl LockManager {
 
     /// Returns true if the given locker owns a write lock on the LSN.
     ///
-    /// Port of `LockManager.isOwnedWriteLock()`.
+    /// 
     pub fn is_owned_write_lock(&self, lsn: u64, locker_id: i64) -> bool {
         let table_idx = self.get_table_index(lsn);
         let table = self.lock_tables[table_idx].lock();
@@ -478,7 +476,7 @@ impl LockManager {
 
     /// Returns the lock type owned by the locker, or None.
     ///
-    /// Port of `LockManager.getOwnedLockType()`.
+    /// 
     pub fn get_owned_lock_type(
         &self,
         lsn: u64,
@@ -508,7 +506,7 @@ impl LockManager {
 
     /// Returns current lock statistics.
     ///
-    /// Port of `LockManager.getStats()`.
+    /// 
     pub fn get_stats(&self) -> LockStats {
         LockStats {
             lock_requests: self.stats.lock_requests.load(Ordering::Relaxed),
@@ -531,18 +529,18 @@ impl LockManager {
     }
 
     // ========================================================================
-    // Lock-sharing registry — JE `LockManager.threadLockers` analogue
+    // Lock-sharing registry — `LockManager.threadLockers` analogue
     // ========================================================================
 
     /// Registers a locker in the sharing registry with the given group ID.
     ///
     /// All lockers sharing the same `group_id` bypass conflict detection with
-    /// each other (JE `Locker.sharesLocksWith(other)`).
+    /// each other (`Locker.sharesLocksWith(other)`).
     ///
     /// Called by `ThreadLocker::new()` (group = thread_id) and by
     /// `HandleLocker::with_buddy()` (group = buddy_locker_id).
     ///
-    /// Port of `LockManager.registerThreadLocker()`.
+    /// 
     pub fn register_locker_sharing(&self, locker_id: i64, group_id: i64) {
         self.share_registry
             .write()
@@ -554,7 +552,7 @@ impl LockManager {
     ///
     /// Called by `ThreadLocker::drop()` and `HandleLocker::drop()`.
     ///
-    /// Port of `LockManager.unregisterThreadLocker()`.
+    /// 
     pub fn unregister_locker_sharing(&self, locker_id: i64) {
         self.share_registry.write().unwrap().remove(&locker_id);
     }
@@ -574,7 +572,7 @@ impl LockManager {
     /// Like `lock_with_timeout()` but also performs a `sharesLocksWith` check
     /// for every conflict that would otherwise block.
     ///
-    /// JE: `LockManager.lock()` / `LockImpl.tryLock()` — skips conflict
+    /// `LockManager.lock()` / `LockImpl.tryLock()` — skips conflict
     /// detection when both lockers are in the same sharing group.
     ///
     /// This method is used by the locker implementations when they call the
@@ -746,9 +744,8 @@ impl LockManager {
 
     /// Returns the lock table index for a given LSN.
     ///
-    /// JE: `((int) lsn & 0x7fffffff) % nLockTables`.
     ///
-    /// Port of `LockManager.getLockTableIndex()`.
+    /// 
     fn get_table_index(&self, lsn: u64) -> usize {
         ((lsn as usize) & 0x7fff_ffff) % N_LOCK_TABLES
     }
@@ -759,7 +756,7 @@ impl LockManager {
     /// Returns `Some(TxnError::Deadlock)` if the cycle is detected and this
     /// locker is the chosen victim, `None` otherwise.
     ///
-    /// The victim-selection strategy mirrors JE: among all lockers in the
+    /// The victim-selection strategy mirrors the: among all lockers in the
     /// cycle, the one with the fewest locks held is chosen.  Since we do not
     /// have per-locker lock counts here, we use the locker ID to break ties
     /// deterministically (smaller ID = victim, consistent with
@@ -1032,7 +1029,7 @@ mod tests {
     /// Thread A holds a write lock; thread B blocks on it.  When A releases,
     /// B should be granted the lock.
     ///
-    /// Port of JE waitForLock / notifyAll flow.
+    /// Waitforlock / notifyall flow.
     #[test]
     fn test_blocking_lock_granted_on_release() {
         let lm = Arc::new(LockManager::new());
@@ -1158,7 +1155,7 @@ mod tests {
 
     /// One write lock released; multiple waiting readers must all be granted.
     ///
-    /// JE grants all compatible waiters at once in LockImpl.release().
+    /// grants all compatible waiters at once in LockImpl.release().
     #[test]
     fn test_multiple_readers_unblocked() {
         let lm = Arc::new(LockManager::new());
@@ -1223,7 +1220,7 @@ mod tests {
     // Ported from LockManagerTest.java — testNegatives
     // -----------------------------------------------------------------------
 
-    /// Port of LockManagerTest.testNegatives: query methods return false before
+    /// Query methods return false before
     /// a lock is acquired, and the lock entry is cleaned up after release.
     #[test]
     fn test_je_negatives_query_before_lock() {
@@ -1270,7 +1267,7 @@ mod tests {
         assert_eq!(lm.get_owned_lock_type(lsn, 1), None);
     }
 
-    /// Port of LockManagerTest.testNegatives: holding WRITE then requesting
+    /// Holding write then requesting
     /// READ for the same locker succeeds (WRITE subsumes READ).
     #[test]
     fn test_je_write_then_read_same_locker_ok() {
@@ -1290,12 +1287,12 @@ mod tests {
     // Ported from LockManagerTest.java — testSR15926LargeNodeIds
     // -----------------------------------------------------------------------
 
-    /// Port of LockManagerTest.testSR15926LargeNodeIds: LSN values with the
+    /// Lsn values with the
     /// sign bit set (> 0x80000000) must hash to a non-negative table index.
     #[test]
     fn test_je_large_lsn_no_negative_index() {
         let lm = LockManager::new();
-        // 0x80000000 is the value from the original JE bug report.
+        // 0x80000000 is the value from the original bug report.
         let large_lsn: u64 = 0x80000000u64;
         let result = lm.lock(large_lsn, 1, LockType::Write, false, false);
         assert!(result.is_ok(), "large LSN should not cause a panic or error");
@@ -1326,7 +1323,7 @@ mod tests {
     // Ported from LockManagerTest.java — testMultipleReaders
     // -----------------------------------------------------------------------
 
-    /// Port of LockManagerTest.testMultipleReaders: three concurrent threads
+    /// Three concurrent threads
     /// can all hold read locks simultaneously.
     #[test]
     fn test_je_multiple_readers_concurrent() {
@@ -1368,7 +1365,7 @@ mod tests {
     // Ported from LockManagerTest.java — testNonBlockingLock1 / 2
     // -----------------------------------------------------------------------
 
-    /// Port of LockManagerTest.testNonBlockingLock1: a read lock is held;
+    /// A read lock is held;
     /// a non-blocking write request is denied; after release the write succeeds.
     #[test]
     fn test_je_nonblocking_write_denied_then_granted() {
@@ -1403,7 +1400,7 @@ mod tests {
         lm.release(LSN, 2).unwrap();
     }
 
-    /// Port of LockManagerTest.testNonBlockingLock2: a write lock is held;
+    /// A write lock is held;
     /// a non-blocking read request is denied; after release the read succeeds.
     #[test]
     fn test_je_nonblocking_read_denied_then_granted() {
@@ -1435,7 +1432,7 @@ mod tests {
     // Ported from LockManagerTest.java — testMultipleReadersSingleWrite1
     // -----------------------------------------------------------------------
 
-    /// Port of LockManagerTest.testMultipleReadersSingleWrite1: two readers
+    /// Two readers
     /// hold a lock; a writer blocks; when both readers release the writer is
     /// granted.
     #[test]
@@ -1487,7 +1484,7 @@ mod tests {
     // Ported from DeadlockTest.java — testDeadlockBetweenTwoLockers
     // -----------------------------------------------------------------------
 
-    /// Port of DeadlockTest.testDeadlockBetweenTwoLockers: classic 2-locker
+    /// Classic 2-locker
     /// deadlock.  Locker 1 holds L1 and waits for L2; locker 2 holds L2 and
     /// waits for L1.  At least one must receive a Deadlock error.
     #[test]
@@ -1526,7 +1523,7 @@ mod tests {
     // Ported from DeadlockTest.java — testDeadlockAmongThreeLockers
     // -----------------------------------------------------------------------
 
-    /// Port of DeadlockTest.testDeadlockAmongThreeLockers: 3-locker cycle.
+    /// 3-locker cycle.
     /// Locker1 → L2, Locker2 → L3, Locker3 → L1.  At least one deadlock.
     #[test]
     fn test_je_deadlock_three_lockers_cycle() {
@@ -1573,7 +1570,7 @@ mod tests {
     // Ported from DeadlockTest.java — testThrowCorrectException
     // -----------------------------------------------------------------------
 
-    /// Port of DeadlockTest.testThrowCorrectException: a single waiter with
+    /// A single waiter with
     /// no cycle should time out with LockTimeout (not Deadlock).
     #[test]
     fn test_je_no_cycle_gives_timeout_not_deadlock() {
@@ -1621,7 +1618,7 @@ mod tests {
     // Ported from LockManagerTest.java — testUpgradeLock
     // -----------------------------------------------------------------------
 
-    /// Port of LockManagerTest.testUpgradeLock: a promotion waiter (locker
+    /// A promotion waiter (locker
     /// that already holds a read lock) is placed ahead of new write waiters
     /// so it gets the write lock before them.
     #[test]

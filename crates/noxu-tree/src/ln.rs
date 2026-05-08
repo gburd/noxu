@@ -1,8 +1,7 @@
 //! Leaf Node (LN) implementation.
 //!
-//! Port of `com.sleepycat.je.tree.LN`.
 //!
-//! An LN represents a Leaf Node in the JE tree. LNs hold the actual
+//! An LN represents a Leaf Node in the tree. LNs hold the actual
 //! data records (key-value pairs). The key is stored in the parent BIN
 //! slot; the LN holds the data (value).
 
@@ -14,7 +13,7 @@ const CLEAR_DIRTY_BIT: u32 = !DIRTY_BIT;
 /// Fetched-cold flag  -  set when LN was fetched but should be evicted soon.
 const FETCHED_COLD_BIT: u32 = 0x40000000;
 
-/// A Leaf Node in the JE B+tree.
+/// A Leaf Node in the B+tree.
 ///
 /// Holds the data (value) for a record. The key is stored in the parent
 /// BIN slot, not in the LN itself.

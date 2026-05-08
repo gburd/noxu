@@ -1,6 +1,6 @@
 //! Acknowledgment tracking for replication commits.
 //!
-//! Port of commit ack tracking from `com.sleepycat.je.rep.impl.node.RepNode`.
+//! Commit acknowledgment tracking for replication.
 //! Tracks transaction commit acknowledgments from replicas to determine when
 //! a transaction's durability requirements have been satisfied.
 

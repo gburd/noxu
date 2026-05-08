@@ -1,6 +1,5 @@
 //! Base node types and identifiers for the B-tree.
 //!
-//! Port of `com.sleepycat.je.tree.Node` from JE.
 //!
 //! In JE, Node is an abstract base class. In Rust, we use an enum for the
 //! closed set of node types, plus utilities for node ID generation.

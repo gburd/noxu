@@ -1,6 +1,5 @@
 //! Matchpoint log entry.
 //!
-//! Port of `com.sleepycat.je.rep.impl.node.Matchpoint`.
 //!
 //! Written by the HA (High Availability) layer as a named synchronization
 //! point in the replication stream. Carries both a physical LSN and a virtual

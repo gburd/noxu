@@ -1,10 +1,9 @@
 //! Cursor get modes.
 //!
-//! Port of `com.sleepycat.je.dbi.GetMode`.
 
 /// Distinguishes which variety of get operation a cursor should use.
 ///
-/// Port of `com.sleepycat.je.dbi.GetMode`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GetMode {
     /// Get the next key/data pair.

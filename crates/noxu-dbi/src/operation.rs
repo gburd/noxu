@@ -1,17 +1,16 @@
 //! Replication operation types.
 //!
-//! Port of `com.sleepycat.je.dbi.Operation`.
 
 /// Types of operations for replication.
 ///
-/// Port of `com.sleepycat.je.dbi.Operation`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     /// Standard put operation.
     Put,
     /// Put only if key doesn't exist.
     NoOverwrite,
-    /// No-op / filler operation (port of JE `Operation.PLACEHOLDER`).
+    /// No-op / filler operation.
     Placeholder,
 }
 

@@ -1,6 +1,5 @@
 //! Key filtering for entity iteration.
 //!
-//! Port of key selection/filtering concepts from `com.sleepycat.persist`.
 //! Provides traits and implementations for filtering entities by their
 //! primary key during iteration.
 
@@ -12,7 +11,7 @@ use crate::entity::PrimaryKey;
 /// entities based on their primary key. This avoids deserializing
 /// entity data for records that will be skipped.
 ///
-/// Port of key-range filtering from `com.sleepycat.persist.EntityCursor`.
+/// Key-range filtering for entity cursors.
 pub trait KeySelector<K: PrimaryKey> {
     /// Returns `true` if the entity with this key should be included.
     fn select(&self, key: &K) -> bool;

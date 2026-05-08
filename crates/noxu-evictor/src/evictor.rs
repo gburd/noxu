@@ -1,6 +1,5 @@
 //! Main evictor implementation.
 //!
-//! Port of `com.sleepycat.je.evictor.Evictor`.
 
 // ---------------------------------------------------------------------------
 // CLUSTER-B-WIRING: environment_impl.rs must call the following after
@@ -37,7 +36,7 @@ use std::sync::{Arc, RwLock};
 /// Different eviction sources have different priorities and behaviors.
 /// Statistics are tracked separately for each source.
 ///
-/// Port of `com.sleepycat.je.evictor.Evictor.EvictionSource`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionSource {
     /// Eviction triggered by background daemon threads (evictor pool threads).
@@ -96,7 +95,7 @@ impl EvictResult {
 /// a short-lived implementation of this trait so the evictor can apply its
 /// decision tree without creating a circular-dependency between crates.
 ///
-/// Mirrors the per-node state that JE's `processTarget()` inspects before
+/// Mirrors the per-node state that `processTarget()` inspects before
 /// taking action on an eviction target:
 /// - `isPinned()` / cursor-count → `ref_count`
 /// - `getDirty()` → `is_dirty`
@@ -128,9 +127,9 @@ pub trait NodeEvictionInfo {
 
 /// Decision made by the evictor's decision tree for a single target node.
 ///
-/// Mirrors the outcomes enumerated in JE's `processTarget()` Javadoc:
+/// Mirrors the outcomes enumerated in the equivalent `processTarget()` Javadoc:
 ///
-/// | JE name              | Rust variant      | Meaning |
+/// | name              | Rust variant      | Meaning |
 /// |----------------------|-------------------|---------|
 /// | SKIP                 | `Skip`            | Leave node alone; another thread already acted on it |
 /// | PUT_BACK             | `PutBack`         | Return node to the LRU it came from unchanged |
@@ -170,10 +169,10 @@ pub enum EvictionDecision {
 // Decision tree helper
 // ---------------------------------------------------------------------------
 
-/// Apply JE's `processTarget()` decision tree to a node described by
+/// Apply `processTarget()` decision tree to a node described by
 /// `info`, and return the appropriate `EvictionDecision`.
 ///
-/// # Decision tree (mirrors JE `processTarget()`)
+/// # Decision tree (mirrors `processTarget()`)
 ///
 /// 1. `!is_resident` → `Skip`  (evicted by another thread)
 /// 2. `ref_count > 0` → `PutBack`  (pinned / active cursors)
@@ -230,7 +229,7 @@ pub fn decide_eviction(
 /// - Application threads (critical eviction)
 /// - Manual eviction requests
 ///
-/// Port of `com.sleepycat.je.evictor.Evictor`.
+/// 
 pub struct Evictor {
     /// Arbiter for determining when eviction is needed.
     arbiter: Arbiter,
@@ -252,23 +251,23 @@ pub struct Evictor {
 
     /// Cumulative count of nodes evicted from the priority-1 LRU list.
     ///
-    /// JE uses an array of pri1 LRU lists and round-robins across them using
+    /// uses an array of pri1 LRU lists and round-robins across them using
     /// this index.  Since Noxu uses a single combined LRU list per priority,
     /// this counter is used as a monotonic eviction counter for pri1 nodes,
-    /// matching JE's `next_pri1_index` semantics.
+    /// matching `next_pri1_index` semantics.
     ///
-    /// Port of `Evictor.nextPri1Index` in JE.
+    /// 
     next_pri1_index: AtomicU64,
 
     /// Cumulative count of nodes evicted from the priority-2 LRU list.
     ///
-    /// Port of `Evictor.nextPri2Index` in JE.
+    /// 
     next_pri2_index: AtomicU64,
 
     /// Optional LogManager for flushing dirty nodes to the WAL before
     /// eviction.  Wired by `with_log_manager()`.
     ///
-    /// Port of JE `Evictor.envImpl.getLogManager()` reference used inside
+    /// `Evictor.envImpl.getLogManager()` reference used inside
     /// `evict()` when `target.getDirty()` is true.
     log_manager: Option<Arc<LogManager>>,
 
@@ -276,7 +275,7 @@ pub struct Evictor {
     /// node-size callbacks (`do_evict`) and for dirty-write-before-eviction.
     /// Wired by `with_tree()`.
     ///
-    /// Port of JE's per-IN `target.getDatabase().getTree()` lookup.
+    /// Per-IN lookup.
     tree: Option<Arc<RwLock<Tree>>>,
 
     /// Database ID associated with `tree`.  Required to identify which BINs
@@ -320,7 +319,7 @@ impl Evictor {
     ///
     /// Mirrors the same pattern used by `Checkpointer::with_log_manager`.
     ///
-    /// Port of JE `Evictor.envImpl.getLogManager()` used inside `evict()`.
+    /// `Evictor.envImpl.getLogManager()` used inside `evict()`.
     pub fn with_log_manager(mut self, lm: Arc<LogManager>) -> Self {
         self.log_manager = Some(lm);
         self
@@ -331,7 +330,7 @@ impl Evictor {
     ///
     /// Mirrors the same pattern used by `Checkpointer::with_tree`.
     ///
-    /// Port of JE's per-IN `target.getDatabase().getTree()` lookup.
+    /// Per-IN lookup.
     pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
         self.tree = Some(tree);
         self.db_id = db_id;
@@ -344,7 +343,7 @@ impl Evictor {
 
     /// Execute one eviction batch.
     ///
-    /// Mirrors JE's `evictBatch()`:
+    /// Mirrors `evictBatch()`:
     ///
     /// 1. Drain priority-1 LRU up to `max_batch_size` nodes.
     /// 2. For each node, call `decide_eviction()` via the supplied callback.
@@ -374,7 +373,7 @@ impl Evictor {
         let mut nodes_processed = 0usize;
 
         // Phase 1: drain pri1 LRU, then switch to pri2 if still needed.
-        // JE initialises maxNodesScanned to the current pri1 size and
+        // initialises maxNodesScanned to the current pri1 size and
         // transitions to pri2 when that many nodes have been scanned.
         let mut in_pri1 = true;
         let pri1_quota = self.lru.len();
@@ -472,7 +471,7 @@ impl Evictor {
                 }
 
                 EvictionDecision::MoveDirtyToPri2 => {
-                    // JE calls pri2AddFront (cold end) so the checkpointer
+                    // calls pri2AddFront (cold end) so the checkpointer
                     // encounters dirty nodes quickly.
                     self.lru.pri2_add_front(node_id);
                     self.stats.increment(&self.stats.nodes_moved_to_pri2_lru);
@@ -482,7 +481,7 @@ impl Evictor {
                     // C-3 fix: If the node is dirty, flush it to the WAL
                     // before removing it from memory.
                     //
-                    // Port of JE `Evictor.evict()`:
+                    // `Evictor.evict()`:
                     //   if (target.getDirty() && !storedOffHeap) {
                     //       loggedLsn = target.log(...);
                     //   }
@@ -565,7 +564,7 @@ impl Evictor {
 
     /// Write a dirty node to the WAL before evicting it (C-3 fix).
     ///
-    /// JE `Evictor.evict()`:
+    /// `Evictor.evict()`:
     /// ```java
     /// if (target.getDirty() && !storedOffHeap) {
     ///     loggedLsn = target.log(allowBinDeltas, provisional, bgIO, parent);
@@ -635,7 +634,7 @@ impl Evictor {
             false, // fsync_required — fsync at next checkpoint/commit boundary
         ) {
             // Clear dirty flags and update last_full_lsn.
-            // Port of JE: parent.detachNode(index, updateLsn=true, loggedLsn)
+            // Parent.detachNode(index, updateLsn=true, loggedLsn)
             bin.clear_dirty_after_full_log(logged_lsn);
             self.stats.increment(&self.stats.dirty_nodes_evicted);
         }
@@ -802,7 +801,7 @@ impl Evictor {
 
     /// Returns the cumulative count of nodes evicted from the priority-1 LRU.
     ///
-    /// Port of `Evictor.nextPri1Index` in JE (used for round-robin selection
+    /// Used for round-robin selection
     /// across multiple pri1 LRU lists; here counts total pri1 evictions).
     pub fn pri1_eviction_count(&self) -> u64 {
         self.next_pri1_index.load(Ordering::Relaxed)
@@ -810,7 +809,7 @@ impl Evictor {
 
     /// Returns the cumulative count of nodes evicted from the priority-2 LRU.
     ///
-    /// Port of `Evictor.nextPri2Index` in JE.
+    /// 
     pub fn pri2_eviction_count(&self) -> u64 {
         self.next_pri2_index.load(Ordering::Relaxed)
     }
@@ -862,12 +861,12 @@ impl std::fmt::Debug for Evictor {
 
 /// Snapshot of a node's eviction-relevant metadata.
 ///
-/// Port of JE `IN.getDirty()` / `IN.getBudgetedMemorySize()` / `IN.isBIN()`.
+/// `IN.getDirty()` / `IN.getBudgetedMemorySize()` / `IN.isBIN()`.
 struct RealNodeInfo {
     dirty: bool,
     is_bin: bool,
     /// Number of cursors currently positioned on this node.
-    /// Port of JE `IN.cursorSet.size()` used by `Evictor.selectIN()`.
+    /// `IN.cursorSet.size()` used by `Evictor.selectIN()`.
     pin_count: usize,
 }
 
@@ -880,7 +879,7 @@ impl NodeEvictionInfo for RealNodeInfo {
 
 /// Walk the tree to find a node by ID and return a `RealNodeInfo` snapshot.
 ///
-/// Port of JE `selectIN()` / `processTarget()` — we read node metadata under
+/// `selectIN()` / `processTarget()` — we read node metadata under
 /// the tree read lock so the evictor does not hold the tree lock across
 /// the full eviction decision.
 fn real_node_info(tree: &Tree, node_id: u64) -> Option<Box<dyn NodeEvictionInfo>> {
@@ -926,7 +925,7 @@ fn find_node_info_recursive(
 
 /// Compute the actual heap size of a node by its ID.
 ///
-/// Port of JE `IN.getBudgetedMemorySize()`.
+/// `IN.getBudgetedMemorySize()`.
 fn real_node_size(tree: &Tree, node_id: u64) -> u64 {
     let root_arc = match tree.get_root() {
         Some(r) => r,

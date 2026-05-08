@@ -1,6 +1,5 @@
 //! Checkpoint end log entry.
 //!
-//! Port of `com.sleepycat.je.recovery.CheckpointEnd`.
 
 use crate::error::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -15,7 +14,7 @@ use std::time::SystemTime;
 /// critical tree nodes and transaction state, as well as the last allocated IDs
 /// for various database objects.
 ///
-/// Port of `com.sleepycat.je.recovery.CheckpointEnd`.
+/// 
 #[derive(Debug, Clone)]
 pub struct CheckpointEnd {
     /// Checkpoint ID - matches the corresponding CheckpointStart.

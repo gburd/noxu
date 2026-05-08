@@ -1,6 +1,5 @@
 //! Result of a lock attempt on a Lock object.
 //!
-//! Port of `com.sleepycat.je.txn.LockAttemptResult`.
 
 use crate::LockGrantType;
 
@@ -9,7 +8,7 @@ use crate::LockGrantType;
 /// This is a simple tuple returned by the low-level Lock.lock() method
 /// to indicate whether the lock attempt succeeded and what grant type resulted.
 ///
-/// Port of `com.sleepycat.je.txn.LockAttemptResult`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockAttemptResult {
     /// Whether the lock attempt succeeded.

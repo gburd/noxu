@@ -1,6 +1,5 @@
 //! Search file reader for finding specific entry types.
 //!
-//! Port of `com.sleepycat.je.log.SearchFileReader`.
 //!
 //! Reads forward through the log looking for entries of a specific type.
 
