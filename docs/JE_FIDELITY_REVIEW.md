@@ -135,6 +135,65 @@ The `TcpServiceDispatcher` does not yet dispatch a "restore request" from a requ
 
 ---
 
+## Session 31: Expert Reviewer Concerns Addressed (2026-05-07)
+
+**Commit**: `30af0b7`  **Tests**: 4,359 passing (+3 from S30) | **Clippy**: zero warnings
+
+### S31-1 — Recovery correctness bug (FIXED — root cause of w11 discrepancy)
+**File**: `crates/noxu-dbi/src/file_manager_scanner.rs`
+**Bug**: `scan_files_forward(Lsn::new(0,0), ...)` computed `file_start_offset = 0`, landing inside the file header. The `parse_entry_from_slice` guard saw `entry_type=0` at offset 0, broke immediately, and returned an empty entry list — meaning recovery replayed **zero records** on reopen (all `redo_entries` empty).
+**Fix**: `(start_lsn.file_offset() as usize).max(FILE_HEADER_SIZE)` ensures parsing never starts before the first valid log entry.
+**Secondary fix**: `Tree::count_entries()` added; `DatabaseImpl::set_recovered_tree()` now initialises `entry_count` from the recovered tree so `db.count()` returns the correct value after reopen.
+**Significance**: All three crash-recovery integrity tests now pass (see S31-4). The w11 recovery benchmark will show higher latency in the next run (because recovery now does real work) but will be correct.
+
+### S31-2 — GroupCommit count-based threshold (Charlie Lamb concern — RESOLVED)
+**File**: `crates/noxu-txn/src/group_commit.rs`
+`GroupCommitMaster::buffer_commit()` was a near-no-op returning `true` unconditionally. Now enforces `max_count` threshold via `AtomicUsize pending_count` and `flush_count`: returns `false` (caller must fsync) on every `max_count`-th call; `flush_count()` is observable in tests. Added 6 unit tests covering threshold firing, reset after flush, disabled-always-flushes, and shutdown paths.
+
+### S31-3 — TupleSerdeBinding sort-order warning (Linda Lee concern — RESOLVED)
+**File**: `crates/noxu-bind/src/serial/tuple_serde_binding.rs`
+Added module-level `⚠ KEY SORT ORDER WARNING ⚠` block documenting that postcard variable-length encoding does NOT preserve lexicographic sort order for integers or strings. Safe types (byte arrays, booleans) documented. Custom comparator requirement stated. Demonstrating test `test_sort_order_not_preserved_for_integer_keys` added. Per project decision: sort-preserving encoding is an accepted deviation (see Known Limitations).
+
+### S31-4 — Crash-recovery integrity tests (Keith Bostic / Margo Seltzer concern — RESOLVED)
+**File**: `crates/noxu-db/tests/integration_test.rs`
+Three new tests added:
+- `recovery_committed_records_survive_reopen` — 200 auto-commit records, close, reopen, verify all 200 present with correct values
+- `recovery_concurrent_writes_all_survive_reopen` — 8 threads × 50 records, close, reopen, verify all 400 correct (Jepsen-style)
+- `recovery_uncommitted_transactions_are_undone_on_reopen` — 50 committed + 20 aborted, verify only 50 present after recovery
+
+### S31-5 — Replication fault injection tests (Margo Seltzer concern — RESOLVED)
+**File**: `crates/noxu-rep/tests/tcp_integration.rs`
+Three new fault injection tests added:
+- `test_channel_drop_on_sender_side_is_detected_by_receiver` — sender drops TCP channel; receiver gets error (not block)
+- `test_channel_drop_on_receiver_side_is_detected_by_sender` — receiver drops; sender detects broken pipe within 10 sends
+- `test_replicated_env_state_machine_survives_re_election` — Detached → Replica → Master (re-election) without wedging
+
+### S31-6 — Real-storage benchmark option (Charlie Lamb concern — RESOLVED)
+**Files**: `benches/noxu-bench/src/main.rs`, `benches/run_comparison.sh`
+`NOXU_BENCH_DIR` env var added: when set, benchmark workloads use the specified directory (real NVMe/SSD) instead of `TempDir` (tmpfs). `--bench-dir DIR` flag added to `run_comparison.sh`. With real storage, `fdatasync` has observable latency, enabling FSyncManager coalescing to show its effect. ShenandoahGC strategy added for JE (IU mode, 4GB fixed heap) — avoids EpsilonGC OOM at 100K scale.
+
+### S31-7 — ShenandoahGC JE benchmark results (2026-05-07, scale 1K/10K/100K)
+
+Clean full-scale run with ShenandoahGC (no OOM, GC overhead ≤ 9.4%):
+
+| Workload | Noxu ops/s | JE ops/s | JE/Noxu | Notes |
+|---|---|---|---|---|
+| w01 seq_write/1t (100K) | 1,033 | 1,446 | 1.40 | JE 40% faster — log-write batching |
+| w02 rand_write/1t (100K) | 1,089 | 1,465 | 1.34 | JE 34% faster |
+| w03 seq_read/1t (100K) | 378,773 | 465,052 | 1.23 | JE 23% faster — JIT scan loop |
+| w04 rand_read/1t (100K) | 286,185 | 376,362 | 1.32 | JE 32% faster |
+| w05 range_scan/1t (100K) | 876,605 | 1,133,597 | 1.29 | JE 29% faster |
+| w06 write-heavy/1t (100K) | 1,209 | 1,624 | 1.34 | JE 34% faster |
+| w09 txn_multi/1t (100K) | **6,656** | 6,922 | 1.04 | **~equal** — Noxu lock upgrade works |
+| w10_conc_8r8w/16t (100K) | 3,280 | 10,814 | 3.30 | JE 3.3× — fsync coalescing + JIT |
+| w11_recovery/1t (100K) | 3\* | 14 | 4.83 | JE 4.8× — \*Noxu was buggy (S31-1) |
+| **Storage** | **107 B/op** | **154 B/op** | **0.69** | **Noxu 31% more efficient** |
+
+\*After S31-1 fix, w11 Noxu will be slower (correct work) but recovery is now functionally correct.
+ShenandoahGC showed 0–26ms GC overhead vs EpsilonGC (OOM at 100K). Results are clean and comparable.
+
+---
+
 ## Session 30: Benchmark Refresh + Bug Fixes (2026-05-07)
 
 ### S30-1 — w10_conc fsync measurement bug (FIXED)
