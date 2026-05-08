@@ -1,6 +1,5 @@
 //! Dirty IN tracking for checkpoint.
 //!
-//! Port of `com.sleepycat.je.recovery.DirtyINMap`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -46,7 +45,7 @@ impl CheckpointReference {
 /// Organizes dirty INs by level for bottom-up flushing (BINs first, then
 /// upper INs). Separates normal INs from BIN-deltas within each level.
 ///
-/// Port of `com.sleepycat.je.recovery.DirtyINMap`.
+/// 
 pub struct DirtyINMap {
     /// Map of level -> (normal_refs, delta_refs).
     /// BTreeMap ensures levels are processed in order (bottom-up).

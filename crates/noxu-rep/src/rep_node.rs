@@ -1,6 +1,5 @@
 //! Replication node information.
 //!
-//! Port of `com.sleepycat.je.rep.ReplicationNode`.
 
 use crate::node_type::NodeType;
 

@@ -8,7 +8,7 @@ use noxu_sync::RwLock;
 /// Tracks all cached tree nodes (INs, BINs) for the evictor.
 /// Uses a concurrent set for thread-safe access.
 ///
-/// Port of `com.sleepycat.je.dbi.INList`.
+/// 
 pub struct INList {
     /// Set of node IDs currently in the cache.
     /// In a full implementation, this would hold actual IN references.

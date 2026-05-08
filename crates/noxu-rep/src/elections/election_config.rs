@@ -1,6 +1,6 @@
 //! Election configuration.
 //!
-//! Port of `com.sleepycat.je.rep.elections.ElectionsConfig`  -  tunables that
+//! tunables that
 //! govern how elections are conducted: timeouts, retry limits, node priority,
 //! and designated-primary behaviour.
 

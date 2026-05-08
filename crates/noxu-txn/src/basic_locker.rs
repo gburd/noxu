@@ -1,6 +1,5 @@
 //! BasicLocker - non-transactional locker.
 //!
-//! Port of `com.sleepycat.je.txn.BasicLocker`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use crate::{LockResult, LockType, TxnError};
 /// BasicLocker is used for non-transactional database operations where
 /// locks only need to be held for the duration of a single API call.
 ///
-/// Port of `com.sleepycat.je.txn.BasicLocker`.
+/// 
 pub struct BasicLocker {
     /// Unique locker ID.
     id: i64,
@@ -43,7 +42,7 @@ pub struct BasicLocker {
     /// When false, the DummyLockManager grants locks without consulting
     /// the underlying lock table.
     ///
-    /// Port of `BasicLocker.lockingRequired` in JE.
+    /// 
     locking_required: bool,
 }
 
@@ -97,11 +96,11 @@ impl BasicLocker {
 
     /// Called by cursor open/init to configure whether locking is required.
     ///
-    /// JE: `BasicLocker.registerCursor(cursor)` — sets `lockingRequired =
+    /// Sets `lockingRequired =
     /// !cursor.isInternalDbCursor()`.  Internal-DB cursors (e.g. the utilization
     /// DB cursor) bypass the lock table entirely.
     ///
-    /// Port of `BasicLocker.registerCursor()` in JE.
+    /// 
     pub fn register_cursor(&mut self, is_internal_db_cursor: bool) {
         self.locking_required = !is_internal_db_cursor;
     }

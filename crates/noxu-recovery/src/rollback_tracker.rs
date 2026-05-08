@@ -1,6 +1,5 @@
 //! Rollback period tracking for HA replica syncup.
 //!
-//! Port of `com.sleepycat.je.recovery.RollbackTracker`.
 //!
 //! Detects rollback periods in the log that are the result of HA replica syncups.
 //! These rollback periods affect how LNs should be processed at recovery. Rollbacks
@@ -61,7 +60,7 @@ impl RollbackPeriod {
 
 /// Tracks rollback periods detected during recovery.
 ///
-/// Port of `com.sleepycat.je.recovery.RollbackTracker`.
+/// 
 ///
 /// Rollback periods affect how LNs are processed during recovery.
 /// A rollback returns an LN to its previous version (which differs from
@@ -194,7 +193,7 @@ impl RollbackTracker {
     /// Called by `RecoveryManager::run_analysis()` when it encounters a
     /// `RollbackStart` log entry.
     ///
-    /// Port of `RollbackTracker.register(RollbackStart, lsn)` in JE.
+    /// 
     pub fn record_rollback_start(
         &mut self,
         lsn: Lsn,
@@ -209,7 +208,7 @@ impl RollbackTracker {
     /// Called by `RecoveryManager::run_analysis()` when it encounters a
     /// `RollbackEnd` log entry.
     ///
-    /// Port of `RollbackTracker.register(RollbackEnd, lsn)` in JE.
+    /// 
     pub fn record_rollback_end(
         &mut self,
         lsn: Lsn,
@@ -235,7 +234,7 @@ impl RollbackTracker {
 
     /// Returns true if any rollback periods were found during analysis.
     ///
-    /// Port of `RollbackTracker.isActive()` in JE.
+    /// 
     pub fn is_active(&self) -> bool {
         !self.rollback_periods.is_empty() || !self.pending_rollback_starts.is_empty()
     }
@@ -251,7 +250,7 @@ impl RollbackTracker {
     /// rollback periods, or `None` if there are none.
     ///
     /// Used during recovery to know how far back in the log to replay.
-    /// Port of `RollbackTracker.getEarliestRollbackStart()` in JE.
+    /// 
     pub fn earliest_rollback_start(&self) -> Option<Lsn> {
         self.rollback_periods
             .iter()
@@ -268,7 +267,7 @@ impl Default for RollbackTracker {
 
 /// Scanner that efficiently checks whether an LSN is within a rollback period.
 ///
-/// Port of the Scanner inner classes in `RollbackTracker.java`.
+/// Scanner types for rollback tracking.
 ///
 /// The scanner maintains a cursor position as it processes LSNs in backward
 /// order during recovery. This avoids repeatedly searching the entire list

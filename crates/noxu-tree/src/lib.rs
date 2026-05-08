@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! B-tree implementation for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.tree`  -  the main in-memory cache containing
+//! the main in-memory cache containing
 //! persistent B-tree nodes (IN, BIN, LN) and access methods.
 //!
 //! # Module Structure

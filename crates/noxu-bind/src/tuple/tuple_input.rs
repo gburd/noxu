@@ -1,17 +1,16 @@
 //! TupleInput: reads primitive types from a byte buffer using sortable encodings.
 //!
-//! Port of `com.sleepycat.bind.tuple.TupleInput`.
 
 use crate::error::{BindError, Result};
 
 /// A reader for tuple-encoded byte data.
 ///
 /// Reads primitive values from a byte buffer using the same encoding formats
-/// as JE's `TupleInput`. Signed integers use big-endian with the sign bit
+/// as `TupleInput`. Signed integers use big-endian with the sign bit
 /// flipped for sortable ordering. Floats use IEEE 754 with bit manipulation
 /// for sortable ordering.
 ///
-/// Port of `com.sleepycat.bind.tuple.TupleInput`.
+/// 
 #[derive(Debug, Clone)]
 pub struct TupleInput {
     buf: Vec<u8>,
@@ -212,7 +211,7 @@ impl TupleInput {
     /// This is an unsorted variable-length encoding where values in [-119, 119]
     /// are stored in a single byte. Larger values use 2-5 bytes.
     ///
-    /// Port of `PackedInteger.readInt()`.
+    /// 
     ///
     /// Reads values written by `TupleOutput::write_packed_int`.
     pub fn read_packed_int(&mut self) -> Result<i32> {
@@ -249,7 +248,7 @@ impl TupleInput {
     /// This is an unsorted variable-length encoding where values in [-119, 119]
     /// are stored in a single byte. Larger values use 2-9 bytes.
     ///
-    /// Port of `PackedInteger.readLong()`.
+    /// 
     ///
     /// Reads values written by `TupleOutput::write_packed_long`.
     pub fn read_packed_long(&mut self) -> Result<i64> {
@@ -303,7 +302,7 @@ impl TupleInput {
     /// Positive multi-byte: first byte `> 0xF7`, meaning `(b1 - 0xF7)` big-endian
     /// value bytes follow; value = `raw + 121`.
     ///
-    /// Port of `PackedInteger.readSortedInt()`.
+    /// 
     pub fn read_sorted_packed_int(&mut self) -> Result<i32> {
         let b1 = self.read_fast()?;
         if b1 < 0x08 {
@@ -333,7 +332,7 @@ impl TupleInput {
     /// Uses the same header-byte scheme as `read_sorted_packed_int`, extended
     /// to up to 8 value bytes.
     ///
-    /// Port of `PackedInteger.readSortedLong()`.
+    /// 
     pub fn read_sorted_packed_long(&mut self) -> Result<i64> {
         let b1 = self.read_fast()?;
         if b1 < 0x08 {
@@ -1070,7 +1069,7 @@ mod tests {
     }
 
     /// TupleFormatTest: null string then int interleaved.
-    /// JE TupleFormatTest.testNullString writes null then int and back.
+    /// TupleFormatTest.testNullString writes null then int and back.
     /// In Rust we model "null string" as Option<String>, but the tuple
     /// format doesn't have a built-in null. We test the Rust equivalent:
     /// an empty string followed by an i32, verifying the i32 is readable.
@@ -1139,7 +1138,7 @@ mod tests {
     /// TupleBindingTest: i32 edge values MIN, MAX, and all wrapping boundary arithmetic.
     #[test]
     fn test_i32_wrapping_values() {
-        // JE TupleFormatTest.testInt exercises values like MAX+1 which wrap.
+        // TupleFormatTest.testInt exercises values like MAX+1 which wrap.
         // i32::MAX+1 wraps to i32::MIN in two's complement.
         let cases: &[(i32, i32)] = &[
             (i32::MAX.wrapping_add(1), i32::MIN), // wraps

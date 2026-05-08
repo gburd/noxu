@@ -1,6 +1,5 @@
 //! Log statistics definitions.
 //!
-//! Port of `com.sleepycat.je.log.LogStatDefinition`.
 //!
 //! Defines stat definitions for the log subsystem using the noxu-util
 //! stats framework.

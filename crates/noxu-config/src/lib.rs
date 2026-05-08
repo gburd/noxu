@@ -1,12 +1,11 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Configuration parameter system for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.config` - defines all configuration parameters,
+//! Configuration parameter system — defines all configuration parameters,
 //! their types, defaults, ranges, and validation logic.
 //!
-//! JE has ~400 configuration parameters. This module ports the configuration
-//! infrastructure and the initial set of core parameters. Parameters will be
-//! added incrementally as each subsystem is ported.
+//! Approximately 400 configuration parameters are defined here covering
+//! environment, logging, locking, replication, and background daemon tuning.
 
 pub mod manager;
 pub mod param;

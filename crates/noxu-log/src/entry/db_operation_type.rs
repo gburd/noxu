@@ -1,6 +1,5 @@
 //! Database operation type enum.
 //!
-//! Port of `com.sleepycat.je.log.entry.DbOperationType`.
 //!
 //! Identifies the type of database operation (create, remove, truncate, rename,
 //! update config) that caused a NameLN to be logged. Used for replication.

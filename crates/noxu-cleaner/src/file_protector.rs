@@ -1,6 +1,6 @@
 //! File protection from deletion during processing.
 //!
-//! Port of `FileProtector.java` - protects log files from deletion while they
+//! protects log files from deletion while they
 //! are being read or processed by various subsystems (backup, replication, etc.).
 
 use noxu_sync::Mutex;

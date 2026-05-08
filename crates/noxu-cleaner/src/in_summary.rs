@@ -1,6 +1,6 @@
 //! Per-IN utilization summary.
 //!
-//! Port of `com.sleepycat.je.cleaner.INSummary` - used to trace the relative numbers
+//! used to trace the relative numbers
 //! of full INs and BIN-deltas that are obsolete vs active.
 
 /// Per-IN utilization summary.

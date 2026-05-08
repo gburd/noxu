@@ -1,6 +1,6 @@
 //! Node state machine for replication nodes.
 //!
-//! Port of `com.sleepycat.je.rep.impl.node.NodeState`  -  encapsulates the
+//! encapsulates the
 //! current replicator state and the ability to validate state transitions.
 
 use noxu_sync::RwLock;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 /// The possible states of a replication node.
 ///
-/// Port of `com.sleepycat.je.rep.ReplicatedEnvironment.State`.
+/// 
 ///
 /// These states determine which operations are permitted on the node. For
 /// example, only the Master node can execute write operations.
@@ -119,7 +119,7 @@ impl fmt::Display for NodeState {
 
 /// Manages state transitions for a replication node.
 ///
-/// Port of `com.sleepycat.je.rep.impl.node.NodeState`  -  encapsulates the
+/// encapsulates the
 /// current replicator state, validates transitions, and tracks timing.
 ///
 /// All methods are thread-safe. The state machine enforces that only valid

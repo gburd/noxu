@@ -1,6 +1,5 @@
 //! Trace log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.TraceLogEntry` and `com.sleepycat.je.log.Trace`.
 //!
 //! Used for logging critical event tracing messages into the log files.
 //! Only critical messages that should always be included should use this.

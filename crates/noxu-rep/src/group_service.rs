@@ -1,6 +1,6 @@
 //! Group membership service for replication.
 //!
-//! Port of `com.sleepycat.je.rep.impl.GroupService`  -  manages the replication
+//! manages the replication
 //! group membership, tracking which nodes are in the group, their types, and
 //! their activity status.
 
@@ -12,7 +12,7 @@ use crate::node_type::NodeType;
 
 /// Manages the replication group membership.
 ///
-/// Port of `com.sleepycat.je.rep.impl.GroupService`.
+/// 
 ///
 /// The group service tracks all nodes that are members of a replication group,
 /// including their type (electable, monitor, secondary), network address, and
@@ -191,7 +191,7 @@ impl GroupService {
     ///
     /// The quorum is the simple majority: `(electable_count / 2) + 1`.
     /// This counts all electable nodes regardless of active status, matching
-    /// JE's `RepGroupImpl.getElectableGroupSize()` behavior.
+    /// `RepGroupImpl.getElectableGroupSize()` behavior.
     pub fn quorum_size(&self) -> u32 {
         let count = self.electable_count() as u32;
         if count == 0 {

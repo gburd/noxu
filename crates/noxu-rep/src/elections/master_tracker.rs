@@ -1,6 +1,6 @@
 //! Master tracking.
 //!
-//! Port of `com.sleepycat.je.rep.elections.MasterTracker`  -  maintains
+//! maintains
 //! knowledge of the current master and its liveness based on heartbeats.
 //!
 //! The tracker is consulted by replicas to determine:

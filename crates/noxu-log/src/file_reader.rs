@@ -1,6 +1,5 @@
 //! Base file reader for sequential log scanning.
 //!
-//! Port of `com.sleepycat.je.log.FileReader`.
 //!
 //! A FileReader traverses the log files, reading chunks at a time. It provides
 //! an iterator-like interface via its `read_next_entry()` method. Concrete

@@ -1,6 +1,5 @@
 //! Core binding traits for converting between database entries and Rust types.
 //!
-//! Port of `com.sleepycat.bind.EntryBinding` and `com.sleepycat.bind.EntityBinding`.
 
 use noxu_db::DatabaseEntry;
 
@@ -8,11 +7,11 @@ use crate::error::Result;
 
 /// Converts between a `DatabaseEntry` and a Rust type.
 ///
-/// This is the fundamental binding trait, analogous to JE's `EntryBinding<T>`.
+/// This is the fundamental binding trait, analogous to `EntryBinding<T>`.
 /// Implementations define how to serialize an object into a database entry
 /// and how to deserialize it back.
 ///
-/// Port of `com.sleepycat.bind.EntryBinding<T>`.
+/// 
 pub trait EntryBinding<T> {
     /// Converts a `DatabaseEntry` to an object.
     ///
@@ -38,7 +37,7 @@ pub trait EntryBinding<T> {
 /// This trait is used for entity bindings where the key and data are stored
 /// separately but represent a single logical entity.
 ///
-/// Port of `com.sleepycat.bind.EntityBinding<E>`.
+/// 
 pub trait EntityBinding<E> {
     /// Converts key and data entries to an entity object.
     ///

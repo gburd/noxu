@@ -1,6 +1,5 @@
 //! Lock conflict result type.
 //!
-//! Port of `com.sleepycat.je.txn.LockConflict`.
 
 /// Result of checking whether two lock types conflict.
 ///
@@ -15,7 +14,7 @@ pub enum LockConflict {
     /// Lock is blocked, requester must wait for the holder to release.
     Block,
 
-    /// Lock causes a restart (RangeRestartException in JE).
+    /// Lock causes a restart (RangeRestartException in the).
     ///
     /// This occurs when a RANGE_INSERT lock is held and a range lock is requested,
     /// indicating that a phantom insert may have occurred within the range being read.

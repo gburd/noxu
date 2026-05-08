@@ -1,10 +1,9 @@
 //! Environment state.
 //!
-//! Port of `com.sleepycat.je.dbi.DbEnvState`.
 
 /// States of the environment lifecycle.
 ///
-/// Port of `com.sleepycat.je.dbi.DbEnvState`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvState {
     /// Environment is being initialized.

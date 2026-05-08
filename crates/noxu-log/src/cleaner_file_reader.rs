@@ -1,6 +1,5 @@
 //! Cleaner file reader for log file garbage collection.
 //!
-//! Port of `com.sleepycat.je.log.CleanerFileReader`.
 //!
 //! Scans a single log file and classifies each entry into one of the
 //! following categories (mirroring the Java constants):
@@ -45,7 +44,7 @@ enum CurrentEntry {
 
 /// Scans a log file and classifies entries for the cleaner.
 ///
-/// Port of `com.sleepycat.je.log.CleanerFileReader`.
+/// 
 ///
 /// Unlike recovery-oriented readers, this reader processes **every** entry
 /// (not just a target set) so that the full file utilization can be measured.
@@ -111,7 +110,7 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
     ///
     /// Returns `Ok(true)` when an entry was read; `Ok(false)` at end of file.
     ///
-    /// Port of `CleanerFileReader.processEntry()` — every entry is "processed"
+    /// every entry is "processed"
     /// (there is no `isTargetEntry` filter here).
     pub fn read_next_entry(&mut self) -> Result<bool> {
         if self.eof {
@@ -306,7 +305,7 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
 
 /// Returns `true` if the given `LogEntryType` is an LN-family type.
 ///
-/// This mirrors `LogEntryType.isLNType()` in JE.
+/// This mirrors `LogEntryType.isLNType()`.
 fn is_ln_type(t: LogEntryType) -> bool {
     matches!(
         t,

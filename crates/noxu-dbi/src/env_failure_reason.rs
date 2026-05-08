@@ -1,10 +1,9 @@
 //! Environment failure reasons.
 //!
-//! Port of `com.sleepycat.je.dbi.EnvironmentFailureReason`.
 
 /// Reasons why an environment might fail and become invalid.
 ///
-/// Port of `com.sleepycat.je.dbi.EnvironmentFailureReason`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvironmentFailureReason {
     /// Environment is locked by another process.

@@ -1,6 +1,6 @@
 //! Network transport layer for Noxu DB replication.
 //!
-//! Port of `com.sleepycat.je.rep.net`  -  provides abstract channel traits,
+//! provides abstract channel traits,
 //! service dispatching, and typed message channels for replication
 //! communication.
 

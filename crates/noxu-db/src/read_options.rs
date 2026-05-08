@@ -1,6 +1,5 @@
 //! Read operation options.
 //!
-//! Port of `com.sleepycat.je.ReadOptions`.
 
 use crate::cache_mode::CacheMode;
 use crate::lock_mode::LockMode;
@@ -10,7 +9,7 @@ use crate::lock_mode::LockMode;
 /// Specifies optional parameters that control read behavior, including
 /// locking and caching.
 ///
-/// Port of `com.sleepycat.je.ReadOptions`.
+/// 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOptions {
     /// Lock mode for the read operation.

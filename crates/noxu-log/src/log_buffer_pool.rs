@@ -1,6 +1,5 @@
 //! Pool of log buffers for managing write buffering.
 //!
-//! Port of `com.sleepycat.je.log.LogBufferPool`.
 //!
 //! LogBufferPool manages a circular pool of LogBuffers. The currentWriteBuffer
 //! is the buffer that is currently used to add data. When the buffer is full,
@@ -23,7 +22,7 @@ use std::sync::Arc;
 
 /// Manages a circular pool of LogBuffers.
 ///
-/// Port of `com.sleepycat.je.log.LogBufferPool`.
+/// 
 pub struct LogBufferPool {
     /// The pool of buffers (typically 3 buffers).
     buffers: Vec<Arc<Mutex<LogBuffer>>>,
@@ -221,7 +220,7 @@ impl LogBufferPool {
     ///
     /// Iterates the dirty buffer chain and flushes each buffer to the
     /// FileManager write queue.
-    /// Port of `LogBufferPool.writeLogBuffers()` from JE.
+    /// .
     fn write_dirty(&mut self, _flush_write_queue: bool) {
         let _guard = self.buffer_pool_latch.acquire();
 
@@ -289,7 +288,7 @@ impl LogBufferPool {
     /// Returns a snapshot of all buffer arcs in the pool.
     ///
     /// Used by `LogManager::flush_dirty_buffers()` to drain all buffers to
-    /// disk, matching JE's `LogBufferPool.writeDirty()` traversal.
+    /// disk, matching `LogBufferPool.writeDirty()` traversal.
     pub fn get_all_buffers(&self) -> Vec<Arc<Mutex<LogBuffer>>> {
         self.buffers.clone()
     }

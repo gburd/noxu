@@ -620,7 +620,7 @@ fn cursor_impl_search_modes_all_succeed() {
 // ============================================================================
 // 5b. CursorImpl traversal — get_first, get_last, retrieve_next
 //
-// These tests mirror JE's CursorImplTest for the basic traversal path:
+// These tests mirror CursorImplTest for the basic traversal path:
 //   positionFirstOrLast / getNext / getPrev.
 // ============================================================================
 
@@ -644,7 +644,7 @@ fn cursor_get_last_empty_returns_not_found() {
 
 /// `get_first` positions the cursor at the smallest key.
 ///
-/// Port of JE CursorImplTest: after inserting multiple keys, getFirst()
+/// CursorImplTest: after inserting multiple keys, getFirst()
 /// must land on the smallest one.
 #[test]
 fn cursor_get_first_positions_at_smallest_key() {
@@ -667,7 +667,7 @@ fn cursor_get_first_positions_at_smallest_key() {
 
 /// `get_last` positions the cursor at the largest key.
 ///
-/// Port of JE CursorImplTest: after inserting multiple keys, getLast()
+/// CursorImplTest: after inserting multiple keys, getLast()
 /// must land on the largest one.
 #[test]
 fn cursor_get_last_positions_at_largest_key() {
@@ -690,7 +690,7 @@ fn cursor_get_last_positions_at_largest_key() {
 /// `get_first` + sequential `retrieve_next` (GetMode::Next) iterates in
 /// sorted order.
 ///
-/// Port of JE CursorImplTest scan: get first, then repeatedly getNext until
+/// CursorImplTest scan: get first, then repeatedly getNext until
 /// NotFound.
 #[test]
 fn cursor_iterate_forward_with_get_first_and_retrieve_next() {
@@ -727,7 +727,7 @@ fn cursor_iterate_forward_with_get_first_and_retrieve_next() {
 /// `get_last` + sequential `retrieve_next` (GetMode::Prev) iterates in
 /// reverse sorted order.
 ///
-/// Port of JE CursorImplTest reverse scan.
+/// CursorImplTest reverse scan.
 #[test]
 fn cursor_iterate_backward_with_get_last_and_retrieve_next_prev() {
     let db = make_cursor_db();
@@ -762,7 +762,7 @@ fn cursor_iterate_backward_with_get_last_and_retrieve_next_prev() {
 
 /// `retrieve_next` from an uninitialized cursor returns NotFound.
 ///
-/// Port of JE: CursorImpl.getNext() asserts mustBeInitialized.
+/// : CursorImpl.getNext() asserts mustBeInitialized.
 #[test]
 fn cursor_retrieve_next_uninitialized_returns_not_found() {
     let db = make_cursor_db();
@@ -803,7 +803,7 @@ fn cursor_single_element_get_last_then_prev_is_not_found() {
 
 /// Range search (SetRange) positions at first key >= search key.
 ///
-/// Port of JE CursorImpl.searchRange(): with keys "apple", "banana", "cherry",
+/// CursorImpl.searchRange(): with keys "apple", "banana", "cherry",
 /// searching for "b" should position at "banana".
 #[test]
 fn cursor_search_range_positions_at_first_ge_key() {

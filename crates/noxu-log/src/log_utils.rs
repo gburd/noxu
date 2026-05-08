@@ -1,6 +1,5 @@
 //! Utility functions for marshalling data to/from the log.
 //!
-//! Port of `com.sleepycat.je.log.LogUtils`.
 //!
 //! Provides helpers for reading and writing common data types in the log
 //! format using little-endian byte order.
@@ -355,7 +354,7 @@ mod tests {
     #[test]
     fn test_packed_i32_size_tiers() {
         // Each size tier boundary: 1, 2, 3, 4, 5 bytes.
-        // noxu_util::packed uses the same encoding as JE:
+        // noxu_util::packed uses the same encoding as the:
         //   1 byte : -119..=119
         //   2 bytes: +/-120..
         //   3 bytes: ...

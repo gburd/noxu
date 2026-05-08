@@ -1,7 +1,7 @@
 //! Abstract network channel trait, in-memory implementation, and TCP
 //! implementation.
 //!
-//! Port of `com.sleepycat.je.rep.net.DataChannel`. JE's DataChannel extends
+//! DataChannel extends
 //! Java NIO's ByteChannel/GatheringByteChannel/ScatteringByteChannel
 //! interfaces backed by a SocketChannel. This Rust port provides an abstract
 //! `Channel` trait for bidirectional communication, a `LocalChannelPair`
@@ -10,7 +10,7 @@
 //!
 //! ## Wire framing
 //!
-//! JE uses NIO ByteBuffers with explicit message boundaries managed at the
+//! uses NIO ByteBuffers with explicit message boundaries managed at the
 //! protocol layer. Our `TcpChannel` uses a simple length-prefix framing:
 //! `[payload_len: u32 LE][payload bytes]`. This is consistent with the
 //! `ProtocolMessage` encoding used everywhere else in noxu-rep.
@@ -28,7 +28,7 @@ use crate::error::{RepError, Result};
 
 /// Trait for bidirectional communication channels.
 ///
-/// Corresponds to JE's `DataChannel` interface which wraps a SocketChannel
+/// Corresponds to `DataChannel` interface which wraps a SocketChannel
 /// providing ByteChannel read/write semantics. In our Rust port we use a
 /// message-oriented API (send/receive of byte vectors) rather than stream
 /// oriented I/O, which simplifies protocol message framing.
@@ -200,9 +200,9 @@ impl Default for LocalChannelPair {
 ///
 /// Wire framing: every message is prefixed with a 4-byte little-endian length
 /// so the receiver knows exactly how many bytes to read. This mirrors the
-/// explicit message-length negotiation in JE's `DataChannel` / protocol layer.
+/// explicit message-length negotiation in the equivalent `DataChannel` / protocol layer.
 ///
-/// Corresponds to JE's `SocketChannel`-backed `DataChannel`.
+/// Corresponds to `SocketChannel`-backed `DataChannel`.
 pub struct TcpChannel {
     /// The underlying TCP stream, shared between sender and receiver sides.
     /// `noxu_sync::Mutex` is used rather than `std::sync::Mutex` for
@@ -327,7 +327,7 @@ impl Channel for TcpChannel {
 /// Listens for incoming TCP connections and wraps each accepted socket in a
 /// `TcpChannel`.
 ///
-/// Corresponds to the server-socket accept loop inside JE's
+/// Corresponds to the server-socket accept loop inside the
 /// `ServiceDispatcher`.
 pub struct TcpChannelListener {
     listener: TcpListener,

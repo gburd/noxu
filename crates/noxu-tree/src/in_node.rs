@@ -1,6 +1,6 @@
 //! Internal Node (IN) implementation for Noxu DB B-tree.
 //!
-//! Port of `com.sleepycat.je.tree.IN` - the core B-tree node structure.
+//! the core B-tree node structure.
 //!
 //! INs hold references to child INs or (for BINs) to LNs/embedded data.
 //! Slot data is stored in parallel arrays for memory compactness.
@@ -42,7 +42,7 @@ pub const EXACT_MATCH: i32 = 1 << 16;
 pub const INSERT_SUCCESS: i32 = 1 << 17;
 
 /// IN flag bits (transient, not persisted).
-/// Port of the `IN_*_BIT` constants in `com.sleepycat.je.tree.IN`.
+/// Entry state flag constants.
 const IN_DIRTY_BIT: u32 = 0x1;
 const IN_RECALC_TOGGLE_BIT: u32 = 0x2;
 const IN_IS_ROOT_BIT: u32 = 0x4;
@@ -63,7 +63,7 @@ const IN_SUBTREE_SLOTS_REFLECT_LEAST_VALUE: u32 = 0x400;
 
 /// Entry state flags (persistent).
 ///
-/// Port of `com.sleepycat.je.tree.EntryStates`.
+/// 
 /// These constants mirror `crate::entry_states` but are kept here for
 /// in-module use so that methods inside `InNode` can reference them without
 /// a long path.
@@ -81,16 +81,16 @@ pub mod entry_states {
     pub const TOMBSTONE_BIT: u8 = 0x80;
 
     /// Bits that are transient (cleared before persisting to disk).
-    /// Port of `EntryStates.TRANSIENT_BITS`.
+    /// 
     pub const TRANSIENT_BITS: u8 = MIGRATE_BIT | UPDATE_KEY_WHEN_LOGGED;
 }
 
 /// Default maximum entries per IN.
 pub const DEFAULT_MAX_ENTRIES: usize = 128;
 
-/// An Internal Node in the JE B+tree.
+/// An Internal Node in the B+tree.
 ///
-/// Port of `com.sleepycat.je.tree.IN`.
+/// 
 ///
 /// INs hold references to child INs or (for BINs) to LNs/embedded data.
 /// Slot data is stored in parallel arrays for memory compactness.
@@ -340,7 +340,7 @@ impl InNode {
 
     /// Returns true if this node is in the priority-2 LRU list.
     ///
-    /// Port of `IN.isInPri2LRU()`.
+    /// 
     #[inline]
     pub fn is_in_pri2_lru(&self) -> bool {
         (self.flags & IN_PRI2_LRU_BIT) != 0
@@ -348,7 +348,7 @@ impl InNode {
 
     /// Sets or clears the priority-2 LRU flag.
     ///
-    /// Port of `IN.setInPri2LRU()`.
+    /// 
     #[inline]
     pub fn set_in_pri2_lru(&mut self, value: bool) {
         if value {
@@ -361,7 +361,7 @@ impl InNode {
     /// Returns true if this node was fetched with CacheMode::Unchanged and
     /// has not been accessed with any other mode since.
     ///
-    /// Port of `IN.getFetchedCold()`.
+    /// 
     #[inline]
     pub fn get_fetched_cold(&self) -> bool {
         (self.flags & IN_FETCHED_COLD_BIT) != 0
@@ -369,7 +369,7 @@ impl InNode {
 
     /// Sets or clears the fetched-cold flag.
     ///
-    /// Port of `IN.setFetchedCold()`.
+    /// 
     #[inline]
     pub fn set_fetched_cold(&mut self, val: bool) {
         if val {
@@ -382,7 +382,7 @@ impl InNode {
     /// Returns true if the next log write of this BIN must be a full BIN
     /// (not a delta).
     ///
-    /// Port of `IN.getProhibitNextDelta()`.
+    /// 
     #[inline]
     pub fn get_prohibit_next_delta(&self) -> bool {
         (self.flags & IN_PROHIBIT_NEXT_DELTA_BIT) != 0
@@ -394,7 +394,7 @@ impl InNode {
     /// to be a full BIN. This is set (a) when deleting a slot and (b) when
     /// the cleaner marks a BIN dirty for migration.
     ///
-    /// Port of `IN.setProhibitNextDelta()`.
+    /// 
     #[inline]
     pub fn set_prohibit_next_delta(&mut self, val: bool) {
         if !self.is_bin() {
@@ -409,7 +409,7 @@ impl InNode {
 
     /// Returns true if expiration values for this BIN are in hours.
     ///
-    /// Port of `IN.isExpirationInHours()`.
+    /// 
     #[inline]
     pub fn is_expiration_in_hours(&self) -> bool {
         (self.flags & IN_EXPIRATION_IN_HOURS) != 0
@@ -428,7 +428,7 @@ impl InNode {
     /// Returns true if this node is registered on the INList (resident in
     /// the cache).
     ///
-    /// Port of `IN.getInListResident()`.
+    /// 
     #[inline]
     pub fn get_in_list_resident(&self) -> bool {
         self.in_list_resident
@@ -436,7 +436,7 @@ impl InNode {
 
     /// Sets whether this node is registered on the INList.
     ///
-    /// Port of `IN.setInListResident()`.
+    /// 
     #[inline]
     pub fn set_in_list_resident(&mut self, resident: bool) {
         self.in_list_resident = resident;
@@ -670,7 +670,7 @@ impl InNode {
     /// Sets the known-deleted (KD) flag on the slot at `index`.
     ///
     /// Also clears the pending-deleted flag and marks the slot dirty, exactly
-    /// as in JE `IN.setKnownDeleted`.
+    /// as in `IN.setKnownDeleted`.
     pub fn set_known_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::KNOWN_DELETED_BIT;
@@ -681,7 +681,7 @@ impl InNode {
 
     /// Clears the known-deleted flag on the slot at `index` and marks it dirty.
     ///
-    /// Port of `IN.clearKnownDeleted`.
+    /// 
     pub fn clear_known_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::KNOWN_DELETED_BIT;
@@ -691,7 +691,7 @@ impl InNode {
 
     /// Sets the pending-deleted flag on the slot at `index` and marks dirty.
     ///
-    /// Port of `IN.setPendingDeleted`.
+    /// 
     pub fn set_pending_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::PENDING_DELETED_BIT;
@@ -701,7 +701,7 @@ impl InNode {
 
     /// Clears the pending-deleted flag on the slot at `index` and marks dirty.
     ///
-    /// Port of `IN.clearPendingDeleted`.
+    /// 
     pub fn clear_pending_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::PENDING_DELETED_BIT;
@@ -711,7 +711,7 @@ impl InNode {
 
     /// Sets the embedded LN bit on the entry at the given index and marks dirty.
     ///
-    /// Port of `IN.setEmbeddedLN`.
+    /// 
     pub fn set_embedded_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::EMBEDDED_LN_BIT;
@@ -721,7 +721,7 @@ impl InNode {
 
     /// Clears the embedded LN bit on the entry at the given index and marks dirty.
     ///
-    /// Port of `IN.clearEmbeddedLN`.
+    /// 
     pub fn clear_embedded_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::EMBEDDED_LN_BIT;
@@ -731,7 +731,7 @@ impl InNode {
 
     /// Sets the no-data-LN bit on the entry at the given index and marks dirty.
     ///
-    /// Port of `IN.setNoDataLN`.
+    /// 
     pub fn set_no_data_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::NO_DATA_LN_BIT;
@@ -741,7 +741,7 @@ impl InNode {
 
     /// Clears the no-data-LN bit on the entry at the given index and marks dirty.
     ///
-    /// Port of `IN.clearNoDataLN`.
+    /// 
     pub fn clear_no_data_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::NO_DATA_LN_BIT;
@@ -763,7 +763,7 @@ impl InNode {
 
     /// Returns true if the slot has a tombstone flag set.
     ///
-    /// Port of `IN.isTombstone()`.
+    /// 
     #[inline]
     pub fn is_tombstone(&self, index: usize) -> bool {
         debug_assert!(index < self.n_entries);
@@ -773,7 +773,7 @@ impl InNode {
     /// Sets or clears the tombstone flag for the slot at `index`.
     ///
     /// Also marks the slot and node dirty.
-    /// Port of `IN.setTombstone()`.
+    /// 
     pub fn set_tombstone(&mut self, index: usize, tombstone: bool) {
         debug_assert!(index < self.n_entries);
         if tombstone {
@@ -787,7 +787,7 @@ impl InNode {
 
     /// Returns true if the slot has the update-key-when-logged transient flag.
     ///
-    /// Port of `IN.isUpdateKeyWhenLogged()`.
+    /// 
     #[inline]
     pub fn is_update_key_when_logged(&self, index: usize) -> bool {
         debug_assert!(index < self.n_entries);
@@ -797,7 +797,7 @@ impl InNode {
     /// Sets the update-key-when-logged flag on the slot at `index`.
     ///
     /// This transient flag tells the logger to re-encode the key when writing.
-    /// Port of `IN.setUpdateKeyWhenLogged()`.
+    /// 
     pub fn set_update_key_when_logged(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::UPDATE_KEY_WHEN_LOGGED;
@@ -807,7 +807,7 @@ impl InNode {
     ///
     /// Returns `false` if the data is zero-length even though EMBEDDED_LN_BIT
     /// is set (NO_DATA_LN_BIT is set in that case).
-    /// Port of `IN.haveEmbeddedData()`.
+    /// 
     #[inline]
     pub fn have_embedded_data(&self, index: usize) -> bool {
         self.is_entry_embedded_ln(index) && !self.is_entry_no_data_ln(index)
@@ -815,7 +815,7 @@ impl InNode {
 
     /// Returns the number of slots with the EMBEDDED_LN_BIT set.
     ///
-    /// Port of `IN.getNumEmbeddedLNs()`.
+    /// 
     pub fn get_num_embedded_lns(&self) -> usize {
         (0..self.n_entries)
             .filter(|&i| self.is_entry_embedded_ln(i))
@@ -828,14 +828,14 @@ impl InNode {
 
     /// Increments the pin count, preventing this node from being evicted.
     ///
-    /// Port of `IN.pin()`.
+    /// 
     pub fn pin(&mut self) {
         self.pin_count += 1;
     }
 
     /// Decrements the pin count.
     ///
-    /// Port of `IN.unpin()`.
+    /// 
     ///
     /// # Panics
     ///
@@ -847,7 +847,7 @@ impl InNode {
 
     /// Returns true if this node is pinned (pin_count > 0).
     ///
-    /// Port of `IN.isPinned()`.
+    /// 
     #[inline]
     pub fn is_pinned(&self) -> bool {
         self.pin_count > 0
@@ -858,7 +858,7 @@ impl InNode {
     /// An upper-IN is always evictable (the evictor decides whether to do so).
     /// BINs override this logic in `Bin::is_evictable`.
     ///
-    /// Port of `IN.isEvictable()`.
+    /// 
     #[inline]
     pub fn is_evictable(&self) -> bool {
         // Upper INs are always considered evictable at the IN level.
@@ -872,7 +872,7 @@ impl InNode {
 
     /// Returns the cached in-memory size of this node (bytes).
     ///
-    /// Port of `IN.getInMemorySize()`.
+    /// 
     #[inline]
     pub fn get_in_memory_size(&self) -> usize {
         self.in_memory_size
@@ -887,7 +887,7 @@ impl InNode {
     /// Returns the memory size that has been reported to the budget.
     ///
     /// This is the cached size minus the accumulated (un-reported) delta.
-    /// Port of `IN.getBudgetedMemorySize()`.
+    /// 
     #[inline]
     pub fn get_budgeted_memory_size(&self) -> i64 {
         self.in_memory_size as i64 - self.accumulated_delta
@@ -896,7 +896,7 @@ impl InNode {
     /// Resets the accumulated delta and returns the total memory size.
     ///
     /// Called during a checkpoint to flush pending memory-budget updates.
-    /// Port of `IN.resetAndGetMemorySize()`.
+    /// 
     pub fn reset_and_get_memory_size(&mut self) -> usize {
         self.accumulated_delta = 0;
         self.in_memory_size
@@ -914,7 +914,7 @@ impl InNode {
     /// For upper INs: true when the node has at most one valid entry (which
     /// should be handled by the caller before deletion).
     ///
-    /// Port of `IN.isValidForDelete()` / `BIN.isValidForDelete()`.
+    /// / `BIN.isValidForDelete()`.
     pub fn is_valid_for_delete(&self) -> bool {
         if self.is_bin_delta() {
             return false;
@@ -930,7 +930,7 @@ impl InNode {
     /// For a BIN this always returns true (BINs have no sub-tree to validate).
     /// For upper INs we conservatively check the slot count.
     ///
-    /// Port of `IN.validateSubtreeBeforeDelete()`.
+    /// 
     pub fn validate_subtree_before_delete(&self, index: usize) -> bool {
         if index >= self.n_entries {
             // No entry here — trivially deletable.
@@ -953,7 +953,7 @@ impl InNode {
     /// 2. The key might already be present in the full BIN (blind insertions
     ///    skip the check, so they never need to mutate just for that reason).
     ///
-    /// Port of `IN.insertMustMutateToFullBIN()`.
+    /// 
     pub fn insert_must_mutate_to_full_bin(
         &self,
         key: &[u8],
@@ -1064,7 +1064,7 @@ impl InNode {
 
     /// Compares two keys using unsigned byte comparison.
     ///
-    /// This is the default key comparison used by JE.
+    /// This is the default key comparison used by the.
     fn compare_keys(key1: &[u8], key2: &[u8]) -> CmpOrdering {
         let min_len = key1.len().min(key2.len());
 
@@ -1183,7 +1183,7 @@ impl InNode {
 
     /// Updates only the LSN at the given slot index.
     ///
-    /// Port of `IN.updateLsn()`.
+    /// 
     ///
     /// # Panics
     ///
@@ -1227,7 +1227,7 @@ impl InNode {
     /// approximate: it counts the parallel slot arrays plus the key bytes held
     /// in each occupied slot.
     ///
-    /// Port of `IN.getInMemorySize()`.
+    /// 
     pub fn get_memory_size(&self) -> usize {
         // Fixed-size fields: node_id (8), flags (4), last_full_lsn (8),
         // last_delta_lsn (8), level (4), n_entries (8), max_entries (8),
@@ -2082,7 +2082,7 @@ mod tests {
     #[test]
     fn test_upper_in_entry_zero_virtual_key() {
         // Upper IN: the key at slot 0 is treated as -infinity (virtual).
-        // Per JE IN.java: when middle==0 and entry_zero_special_compare is
+        // Per IN.java: when middle==0 and entry_zero_special_compare is
         // true, the comparison is set to cmp=1 (search key > virtual key),
         // so the loop always moves right past slot 0.
         //
@@ -2202,12 +2202,10 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests ported from JE INTest.java
     // ========================================================================
 
-    /// Port of INTest.testFindEntry (empty-node path).
     ///
-    /// JE: on an empty IN every `findEntry` variant returns -1.
+    /// On an empty IN every `findEntry` variant returns -1.
     #[test]
     fn test_je_find_entry_empty_in_returns_minus_one() {
         let node = InNode::new(1, BIN_LEVEL, 6);
@@ -2226,9 +2224,8 @@ mod tests {
         assert_eq!(node.find_entry(&max_key,  true,  true),  -1);
     }
 
-    /// Port of INTest.testFindEntry (after sequential inserts).
     ///
-    /// JE inserts keys of the form [0x01, i, 0x10] for i in 0..capacity.
+    /// inserts keys of the form [0x01, i, 0x10] for i in 0..capacity.
     /// After each insert:
     ///  - zero_key (all 0x00) routes to slot 0 (LTE inexact)
     ///  - max_key  (all 0xFF) routes to the last inserted slot (LTE inexact)
@@ -2253,7 +2250,7 @@ mod tests {
             assert_eq!((flags & !INSERT_SUCCESS) as u8, i, "slot index must equal i");
 
             // zero_key is below all inserted keys → -1 (no slot at or below it).
-            // JE semantics: inexact returns the largest slot index whose key ≤
+            // semantics: inexact returns the largest slot index whose key ≤
             // search key, or -1 if the search key is less than slot[0].
             assert_eq!(node.find_entry(&zero_key, false, false), -1);
             // max_key is above all inserted keys → last slot (LTE inexact).
@@ -2288,9 +2285,9 @@ mod tests {
         }
     }
 
-    /// Port of INTest.testFindEntry — unsigned comparison of 0xFF bytes.
+    /// Unsigned comparison of 0xff bytes.
     ///
-    /// JE's comment: "Use FF since that sets the sign bit negative on a byte.
+    /// comment: "Use FF since that sets the sign bit negative on a byte.
     /// This checks the Key.compareTo routine for proper unsigned comparisons."
     ///
     /// In the Rust port this is just `u8::cmp` which is already unsigned, but
@@ -2314,9 +2311,9 @@ mod tests {
         assert_eq!(node.get_key(1), &[0xFFu8; 3]);
     }
 
-    /// Port of INTest.testDeleteEntry — fill then empty a BIN.
+    /// Fill then empty a bin.
     ///
-    /// JE: fill IN to capacity with random keys, then delete them one by one
+    /// Fill IN to capacity with random keys, then delete them one by one
     /// until only the first entry remains, then delete that too.
     /// We use deterministic keys for reproducibility.
     #[test]
@@ -2356,9 +2353,9 @@ mod tests {
         assert!(!node.delete_entry(0));
     }
 
-    /// Port of INTest — level constants.
+    /// Level constants.
     ///
-    /// JE: BINs are at level `MAIN_LEVEL | 1`; upper INs are at
+    /// BINs are at level `MAIN_LEVEL | 1`; upper INs are at
     /// `MAIN_LEVEL | 2` and above; dbmap INs live in `DBMAP_LEVEL` space.
     #[test]
     fn test_je_level_constants() {
@@ -2379,9 +2376,9 @@ mod tests {
         assert!(dbmap.is_dbmap_level(), "DBMAP_LEVEL node must be is_dbmap_level()");
     }
 
-    /// Port of INTest — virtual slot-0 key in an upper IN.
+    /// Virtual slot-0 key in an upper IN.
     ///
-    /// JE: "The 0'th entry's key is treated specially in an upper IN. It
+    /// "The 0'th entry's key is treated specially in an upper IN. It
     /// always compares lower than any other key (virtual key behavior)."
     ///
     /// When indicate_if_duplicate=false and exact=false, the virtual path is
@@ -2428,9 +2425,9 @@ mod tests {
             "indicate_dup: EXACT_MATCH must be set for 'bbb'");
     }
 
-    /// Port of INTest.testInsertEntry — node-full error.
+    /// Node-full error.
     ///
-    /// JE: inserting into a full IN raises EnvironmentFailureException.
+    /// Inserting into a full IN raises EnvironmentFailureException.
     /// Rust: `insert_entry` returns `Err(InError::NodeFull)`.
     #[test]
     fn test_je_insert_entry_node_full_returns_error() {

@@ -1,6 +1,6 @@
 //! Database naming strategy for entity stores.
 //!
-//! Port of `com.sleepycat.persist.DatabaseNamer`. Provides a trait and
+//! Provides a trait and
 //! default implementation for generating database names from entity and
 //! store names.
 
@@ -10,7 +10,7 @@
 /// The `DatabaseNamer` controls the naming convention used to map entity
 /// types and key names to underlying database names.
 ///
-/// Port of `com.sleepycat.persist.DatabaseNamer`.
+/// 
 pub trait DatabaseNamer {
     /// Generate a database name for a primary index.
     ///
@@ -39,11 +39,11 @@ pub trait DatabaseNamer {
     fn sequence_db_name(&self, store_name: &str) -> String;
 }
 
-/// Default database namer using the JE convention: `"persist#StoreName#EntityName"`.
+/// Default database namer using the convention: `"persist#StoreName#EntityName"`.
 ///
-/// This matches the naming convention used by JE's `EntityStore`.
+/// This matches the naming convention used by `EntityStore`.
 ///
-/// Port of the default naming logic in `com.sleepycat.persist.impl.Store`.
+/// Default database naming logic.
 ///
 /// # Examples
 ///

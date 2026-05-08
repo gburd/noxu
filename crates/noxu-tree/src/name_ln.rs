@@ -1,6 +1,5 @@
 //! NameLN  -  Leaf Node that maps database names to database IDs.
 //!
-//! Port of `com.sleepycat.je.tree.NameLN`.
 //!
 //! A NameLN stores the mapping from a database name to its database ID.
 //! NameLNs live in the naming tree, where keys are database names and

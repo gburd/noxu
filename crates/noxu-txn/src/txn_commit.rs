@@ -1,13 +1,12 @@
 //! TxnCommit log entry.
 //!
-//! Port of `com.sleepycat.je.txn.TxnCommit`.
 
 use crate::txn_end::TxnEnd;
 use std::io;
 
 /// A TxnCommit is logged when a transaction commits.
 ///
-/// Port of `com.sleepycat.je.txn.TxnCommit`.
+/// 
 #[derive(Debug, Clone)]
 pub struct TxnCommit {
     pub end: TxnEnd,

@@ -1,6 +1,5 @@
 //! Partial transaction rollback for replication sync-up.
 //!
-//! Port of `com.sleepycat.je.txn.TxnChain`.
 
 use std::collections::HashMap;
 
@@ -11,7 +10,6 @@ use noxu_util::lsn::NULL_LSN;
 /// During partial rollback, multiple writes to the same record within a
 /// transaction need to be collapsed to just the latest revert state.
 ///
-/// JE: `TxnChain.CompareSlot`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompareSlot {
     /// Node ID of the BIN containing this slot.
@@ -30,7 +28,6 @@ impl CompareSlot {
 ///
 /// Records the state that a record should be reverted to during partial rollback.
 ///
-/// JE: `TxnChain.RevertInfo`.
 #[derive(Debug, Clone)]
 pub struct RevertInfo {
     /// The LSN to revert to (the before-image LSN).
@@ -86,9 +83,9 @@ impl RevertInfo {
 ///    before-image needed for partial rollback.
 /// 5. Stop when the chain LSN <= `rollback_point`.
 ///
-/// JE: `TxnChain` — used by `MasterTxn.rollbackOperations()` in HA.
+/// Used by `MasterTxn.rollbackOperations()` in HA.
 ///
-/// Port of `com.sleepycat.je.txn.TxnChain`.
+/// 
 #[derive(Debug)]
 pub struct TxnChain {
     /// Ordered list of revert entries (in log-chain traversal order, newest first).
@@ -118,7 +115,7 @@ impl TxnChain {
 
     /// Adds a revert entry for a BIN slot, if not already recorded.
     ///
-    /// JE: On each log entry in the chain, if the slot hasn't been seen yet,
+    /// On each log entry in the chain, if the slot hasn't been seen yet,
     /// record the `RevertInfo` (the before-image).  If it has been seen, the
     /// earlier (older) write is ignored because the later write's before-image
     /// is what partial rollback needs.

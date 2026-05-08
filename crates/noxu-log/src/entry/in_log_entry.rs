@@ -1,6 +1,5 @@
 //! IN (Internal Node) log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.INLogEntry`.
 //!
 //! INLogEntry represents a B-tree internal node being written to the log.
 //! This includes both upper internal nodes (UINs) and bottom internal nodes

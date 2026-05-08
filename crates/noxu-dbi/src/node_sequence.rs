@@ -1,13 +1,12 @@
 //! Node ID and transient LSN generation.
 //!
-//! Port of `com.sleepycat.je.dbi.NodeSequence`.
 
 use noxu_util::Lsn;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Generates unique node IDs and transient LSNs.
 ///
-/// Port of `com.sleepycat.je.dbi.NodeSequence`.
+/// 
 pub struct NodeSequence {
     last_local_node_id: AtomicI64,
     last_replicated_node_id: AtomicI64,

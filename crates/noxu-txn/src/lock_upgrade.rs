@@ -1,6 +1,5 @@
 //! Lock upgrade result type.
 //!
-//! Port of `com.sleepycat.je.txn.LockUpgrade`.
 
 use crate::LockType;
 

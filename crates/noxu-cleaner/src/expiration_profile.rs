@@ -1,6 +1,5 @@
 //! TTL-aware expiration profile for log file utilization.
 //!
-//! Port of `com.sleepycat.je.cleaner.ExpirationProfile`.
 
 use std::collections::BTreeMap;
 

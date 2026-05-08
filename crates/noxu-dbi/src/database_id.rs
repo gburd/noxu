@@ -1,10 +1,9 @@
 //! Database identifier.
 //!
-//! Port of `com.sleepycat.je.dbi.DatabaseId`.
 
 /// Unique identifier for a database.
 ///
-/// Port of `com.sleepycat.je.dbi.DatabaseId`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatabaseId(i64);
 
@@ -26,7 +25,7 @@ impl DatabaseId {
 
     /// Returns the serialized size.
     ///
-    /// Always 8 bytes (i64 big-endian). JE uses variable-length packed
+    /// Always 8 bytes (i64 big-endian). uses variable-length packed
     /// encoding; Noxu uses fixed-size i64 for simplicity and consistency.
     pub fn log_size(&self) -> usize {
         8

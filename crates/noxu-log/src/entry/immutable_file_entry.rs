@@ -1,6 +1,5 @@
 //! ImmutableFile marker log entry.
 //!
-//! Port of `com.sleepycat.je.log.ImmutableFile`.
 //!
 //! Marks a log file as immutable — no further writes will be appended to it.
 //! Written when a log file is closed and transitioned to read-only status.

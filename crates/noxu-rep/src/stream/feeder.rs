@@ -1,6 +1,6 @@
 //! Feeder  -  master-side replication sender.
 //!
-//! Port of `com.sleepycat.je.rep.impl.node.Feeder`. Tracks the state of
+//! Tracks the state of
 //! feeding replication data to a single replica, including the current
 //! VLSN position, acknowledged VLSN, output queue, and heartbeat tracking.
 //!
@@ -9,8 +9,8 @@
 //! via a [`Channel`]. Acks are received on the same channel.
 //!
 //! [`EnvironmentLogScanner`] is the live implementation of [`LogScanner`]
-//! backed by the real `LogManager` + `FileManager`. Port of
-//! `com.sleepycat.je.rep.impl.node.Feeder.MasterFeederSource`.
+//! backed by the real `LogManager` + `FileManager`.
+//! Rep.impl.node.Feeder.MasterFeederSource`.
 
 use noxu_dbi::EnvironmentImpl;
 use noxu_log::file_manager::FileManager;
@@ -30,7 +30,7 @@ use crate::net::channel::Channel;
 
 /// An iterator over log entries starting from a given VLSN.
 ///
-/// Corresponds to JE's `FeederSource` / `MasterFeederSource`. The scanner
+/// Corresponds to `FeederSource` / `MasterFeederSource`. The scanner
 /// returns `(vlsn, entry_type, payload)` tuples in VLSN order. Returning
 /// `None` signals that there are no more entries *yet*; the caller will call
 /// `next_entry` again after a short wait.
@@ -53,7 +53,7 @@ pub trait LogScanner: Send {
 /// the current end of the log it returns `None` (the `FeederRunner` will
 /// call again after a brief poll interval).
 ///
-/// Port of `com.sleepycat.je.rep.impl.node.Feeder.MasterFeederSource`.
+/// 
 pub struct EnvironmentLogScanner {
     /// The log `FileManager` used for raw byte-level reads.
     file_manager: Arc<FileManager>,
@@ -84,7 +84,7 @@ impl EnvironmentLogScanner {
         // LogManager::file_manager is private, so we carry it separately.
         // For now, use the env_home path to construct a read-only FileManager.
         //
-        // Port of MasterFeederSource: the master feeder reads the log files
+        // The master feeder reads the log files
         // directly, starting at the replica's current VLSN position.
         let env_home = env.get_env_home().to_path_buf();
         let fm = Arc::new(
@@ -277,7 +277,7 @@ const FRAME_HEADER_LEN: usize = 8 + 1 + 4;
 ///   3. Reads ack messages back from the replica and advances `acked_vlsn`.
 ///   4. Returns when the channel is closed or an I/O error occurs.
 ///
-/// Port of the output + input thread pair inside JE's `Feeder`.
+/// Output and input thread pair inside the feeder.
 pub struct FeederRunner {
     /// Channel to the replica.
     channel: Arc<dyn Channel>,
@@ -382,7 +382,7 @@ impl FeederRunner {
 
 /// The state of a feeder connection to a replica.
 ///
-/// Port of the feeder state machine from JE's `Feeder` class.
+/// Feeder state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeederState {
     /// Not connected to any replica.
@@ -401,7 +401,7 @@ pub enum FeederState {
 /// maintains a queue of outbound messages and tracks which VLSNs have been
 /// sent vs. acknowledged.
 ///
-/// Port of `com.sleepycat.je.rep.impl.node.Feeder`.
+/// 
 pub struct Feeder {
     /// Name of the replica this feeder is serving.
     replica_name: String,

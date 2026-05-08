@@ -1,6 +1,5 @@
 //! LRU list tracking for eviction candidates.
 //!
-//! Port of the LRU list implementation from `com.sleepycat.je.evictor.Evictor`.
 
 use noxu_sync::Mutex;
 use std::collections::HashMap;
@@ -31,7 +30,7 @@ struct Node {
 ///
 /// Convention: front = cold end (LRU, evicted first); back = hot end (MRU).
 ///
-/// Port of the LRU list data structures from JE's Evictor.
+/// The LRU list data structures from Evictor.
 #[derive(Debug)]
 struct LruListImpl {
     /// Slab of nodes; None means the slot is free.
@@ -213,13 +212,13 @@ impl LruListImpl {
 
 /// A two-priority LRU list system.
 ///
-/// JE uses two LRU lists:
+/// uses two LRU lists:
 /// - Priority 1 (mixed): contains clean and dirty nodes when no off-heap cache
 /// - Priority 2 (dirty): contains dirty nodes that should be evicted last
 ///
 /// This structure manages both lists.
 ///
-/// Port of JE's dual LRU list system.
+/// Dual LRU list system.
 #[derive(Debug)]
 pub struct LruList {
     /// Priority-1 LRU list (mixed or normal).

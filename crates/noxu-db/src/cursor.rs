@@ -1,6 +1,5 @@
 //! Cursor handle for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.Cursor`.
 
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
@@ -23,7 +22,7 @@ pub enum CursorState {
 
 /// A database cursor for iterating over records.
 ///
-/// Port of `com.sleepycat.je.Cursor`.
+/// 
 ///
 /// Cursors are used for operating on collections of records,
 /// for iterating over a database, and for saving handles to individual
@@ -121,7 +120,7 @@ impl Cursor {
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?,
             Get::Next => {
                 if self.state == CursorState::NotInitialized {
-                    // JE: Next from uninitialized positions at the first record.
+                    // Next from uninitialized positions at the first record.
                     self.inner
                         .get_first()
                         .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
@@ -133,7 +132,7 @@ impl Cursor {
             }
             Get::Prev => {
                 if self.state == CursorState::NotInitialized {
-                    // JE: Prev from uninitialized positions at the last record.
+                    // Prev from uninitialized positions at the last record.
                     self.inner
                         .get_last()
                         .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
@@ -215,7 +214,7 @@ impl Cursor {
             // NoDupData inserts only if the exact (key, data) pair does not
             // already exist.  For sorted-dup databases this checks the full
             // two-part composite key; for non-dup databases it behaves
-            // identically to NoOverwrite.  Port of JE `Cursor.putNoDupData()`.
+            // identically to NoOverwrite.
             Put::NoDupData => PutMode::NoDupData,
             Put::Current => {
                 self.check_initialized()?;
@@ -798,7 +797,7 @@ mod tests {
 
     /// Put::NoDupData on a non-dup database inserts when the key is new.
     ///
-    /// Port of JE `Cursor.putNoDupData()`: for a non-dup database NoDupData
+    /// `Cursor.putNoDupData()`: for a non-dup database NoDupData
     /// behaves like NoOverwrite (returns KeyExists if the key is already
     /// present, Success otherwise).
     #[test]

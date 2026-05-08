@@ -11,10 +11,9 @@
 //! The custom comparator `cmp_two_part_keys` must be used for BIN searches:
 //! it splits both keys and compares the primary part first, then the data part.
 //!
-//! Port of `com.sleepycat.je.dbi.DupKeyData`.
 
 /// Returns the number of bytes needed to encode `value` (non-negative) in
-/// reverse-packed format.  Mirrors JE `PackedInteger.getWriteIntLength(value)`.
+/// reverse-packed format.  Mirrors `PackedInteger.getWriteIntLength(value)`.
 fn packed_int_len(value: usize) -> usize {
     if value <= 119 {
         1
@@ -32,7 +31,7 @@ fn packed_int_len(value: usize) -> usize {
 /// Appends a reverse-packed non-negative integer to `buf` starting at
 /// `start_off`.  Layout: big-endian value bytes then a marker byte.
 ///
-/// Port of `PackedInteger.writeReverseInt`.
+/// 
 fn write_packed_int_at(buf: &mut Vec<u8>, start_off: usize, value: usize) {
     let len = packed_int_len(value);
     if buf.len() < start_off + len {
@@ -76,7 +75,7 @@ fn write_packed_int_at(buf: &mut Vec<u8>, start_off: usize, value: usize) {
 /// Returns `(key_size, packed_len_bytes)` where `packed_len_bytes` is the
 /// number of bytes consumed by the encoding at the end of `buf`.
 ///
-/// Port of `PackedInteger.readReverseInt`.
+/// 
 fn read_packed_int_from_end(buf: &[u8]) -> Option<(usize, usize)> {
     if buf.is_empty() {
         return None;
@@ -112,7 +111,7 @@ fn read_packed_int_from_end(buf: &[u8]) -> Option<(usize, usize)> {
 ///
 /// Format: `[key_bytes][data_bytes][packed_key_len]`
 ///
-/// Port of `DupKeyData.combine(paramKey, paramData)`.
+/// 
 pub fn combine(key: &[u8], data: &[u8]) -> Vec<u8> {
     let size_len = packed_int_len(key.len());
     let total = key.len() + data.len() + size_len;
@@ -128,7 +127,7 @@ pub fn combine(key: &[u8], data: &[u8]) -> Vec<u8> {
 ///
 /// Returns `None` if the buffer is malformed.
 ///
-/// Port of `DupKeyData.split(twoPartKey, paramKey, paramData)`.
+/// 
 pub fn split(two_part_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let (key_size, size_len) = read_packed_int_from_end(two_part_key)?;
     let data_end = two_part_key.len().checked_sub(size_len)?;
@@ -169,7 +168,7 @@ pub fn matches_key(two_part_key: &[u8], primary_key: &[u8]) -> bool {
 /// 1. Extract and compare primary-key parts.
 /// 2. If equal, compare data parts.
 ///
-/// Port of `DupKeyData.compare(k1, k2, dupComparator, dbImpl)`.
+/// 
 pub fn cmp_two_part_keys<K, D>(
     a: &[u8],
     b: &[u8],

@@ -1,6 +1,5 @@
 //! No-op lock manager for non-locking mode.
 //!
-//! Port of `com.sleepycat.je.txn.DummyLockManager` (273 lines).
 
 use std::sync::Arc;
 
@@ -8,26 +7,25 @@ use crate::{LockGrantType, LockManager, LockStats, LockType, TxnError};
 
 /// A no-op lock manager that always grants locks immediately.
 ///
-/// Used when locking is disabled (`isNoLocking()` is true in JE).  When a
+/// Used when locking is disabled (`isNoLocking()` is true in the).  When a
 /// locker requires locking (i.e. it is an internal-DB cursor), requests are
 /// forwarded to the `superior_lock_manager` instead of being no-op'd.
 ///
-/// JE: `DummyLockManager` wraps the real `SyncedLockManager` as its
+/// `DummyLockManager` wraps the real `SyncedLockManager` as its
 /// `superiorLockManager`.  `attemptLock()` delegates to the real LM when
 /// `locker.lockingRequired()` is true; otherwise returns `NEW` immediately.
 ///
-/// Port of `com.sleepycat.je.txn.DummyLockManager`.
+/// 
 pub struct DummyLockManager {
     /// The real lock manager, used when `locking_required` is true.
     ///
-    /// JE: `DummyLockManager.superiorLockManager`.
     superior: Arc<LockManager>,
 }
 
 impl DummyLockManager {
     /// Creates a new DummyLockManager backed by the given real lock manager.
     ///
-    /// Port of `DummyLockManager(EnvironmentImpl envImpl, LockManager superiorLockManager)`.
+    /// 
     pub fn new(superior: Arc<LockManager>) -> Self {
         DummyLockManager { superior }
     }
@@ -39,13 +37,13 @@ impl DummyLockManager {
 
     /// Attempts a lock, delegating to the superior LM when `locking_required`.
     ///
-    /// JE: `DummyLockManager.attemptLock(lsn, locker, type, ...)`:
+    /// `DummyLockManager.attemptLock(lsn, locker, type, ...)`:
     ///   - if `locker.lockingRequired()` → delegate to `superiorLockManager.lock()`
     ///   - else → return `LockGrantType::NEW` immediately.
     ///
-    /// The `locking_required` parameter mirrors `locker.lockingRequired()` in JE.
+    /// The `locking_required` parameter mirrors `locker.lockingRequired()`.
     ///
-    /// Port of `DummyLockManager.attemptLock()`.
+    /// 
     pub fn lock(
         &self,
         lsn: u64,
@@ -72,8 +70,8 @@ impl DummyLockManager {
 
     /// Releases a lock, delegating to superior LM when `locking_required`.
     ///
-    /// Port of `DummyLockManager.releaseAndFindNotifyTargets()` — unconditional
-    /// delegation in JE for release.
+    /// unconditional
+    /// delegation in for release.
     pub fn release(
         &self,
         lsn: u64,
@@ -89,7 +87,7 @@ impl DummyLockManager {
 
     /// Demotes a write lock to read, delegating when `locking_required`.
     ///
-    /// Port of `DummyLockManager.demote()`.
+    /// 
     pub fn demote(
         &self,
         lsn: u64,
@@ -105,7 +103,7 @@ impl DummyLockManager {
 
     /// Steals a lock, delegating when `locking_required`.
     ///
-    /// Port of `DummyLockManager.stealLock()`.
+    /// 
     pub fn steal_lock(
         &self,
         lsn: u64,
@@ -121,7 +119,7 @@ impl DummyLockManager {
 
     /// Returns write-lock ownership, delegating when `locking_required`.
     ///
-    /// Port of `DummyLockManager.isOwnedWriteLock()`.
+    /// 
     pub fn is_owned_write_lock(
         &self,
         lsn: u64,
@@ -137,7 +135,7 @@ impl DummyLockManager {
 
     /// Returns owned lock type, delegating when `locking_required`.
     ///
-    /// Port of `DummyLockManager.getOwnedLockType()`.
+    /// 
     pub fn get_owned_lock_type(
         &self,
         lsn: u64,
@@ -162,7 +160,7 @@ impl DummyLockManager {
 
     /// Returns stats from the superior lock manager.
     ///
-    /// Port of `DummyLockManager.getStats()`.
+    /// 
     pub fn get_stats(&self) -> LockStats {
         self.superior.get_stats()
     }

@@ -1,12 +1,10 @@
 //! Lock statistics definitions.
 //!
-//! Port of `com.sleepycat.je.txn.LockStatDefinition`.
 
 /// Lock statistics counters.
 ///
 /// Tracks lock manager performance and usage metrics.
 ///
-/// Port of `com.sleepycat.je.txn.LockStatDefinition` and `com.sleepycat.je.LockStats`.
 #[derive(Debug, Default, Clone)]
 pub struct LockStats {
     /// Total number of lock requests.

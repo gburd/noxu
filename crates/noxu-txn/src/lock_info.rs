@@ -1,6 +1,5 @@
 //! Information about a lock holder or waiter.
 //!
-//! Port of `com.sleepycat.je.txn.LockInfo`.
 
 use std::sync::Arc;
 
@@ -22,7 +21,7 @@ pub type WaiterNotify = Arc<(Mutex<bool>, Condvar)>;
 /// For waiters, `notify` carries the condvar pair used to wake the blocked thread
 /// once the lock is granted.
 ///
-/// Port of `com.sleepycat.je.txn.LockInfo`.
+/// 
 #[derive(Debug, Clone)]
 pub struct LockInfo {
     /// The ID of the locker holding/waiting for this lock.

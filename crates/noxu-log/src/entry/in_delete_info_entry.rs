@@ -1,6 +1,5 @@
 //! INDeleteInfo log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.INDeleteInfo`.
 //!
 //! Written when an IN node is deleted during tree compression. Contains the
 //! node ID, idKey of the deleted node, and the database ID. Used during

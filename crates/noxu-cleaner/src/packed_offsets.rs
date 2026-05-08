@@ -1,6 +1,6 @@
 //! Packed offset list for efficient storage of obsolete log entry offsets.
 //!
-//! Port of `com.sleepycat.je.cleaner.PackedOffsets` - stores a sorted list of LSN offsets
+//! stores a sorted list of LSN offsets
 //! in a packed representation. Each stored value is the difference between two consecutive
 //! offsets, encoded as a variable-length integer.
 

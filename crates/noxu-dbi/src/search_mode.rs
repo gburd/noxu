@@ -1,10 +1,9 @@
 //! Cursor search modes.
 //!
-//! Port of `com.sleepycat.je.dbi.SearchMode`.
 
 /// Distinguishes cursor search operations.
 ///
-/// Port of `com.sleepycat.je.dbi.SearchMode`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     /// Search for an exact key match.

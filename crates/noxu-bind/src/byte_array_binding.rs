@@ -1,6 +1,5 @@
 //! Raw byte array binding.
 //!
-//! Port of `com.sleepycat.bind.ByteArrayBinding`.
 
 use noxu_db::DatabaseEntry;
 
@@ -11,7 +10,7 @@ use crate::error::Result;
 ///
 /// This binding stores and retrieves byte arrays without any transformation.
 ///
-/// Port of `com.sleepycat.bind.ByteArrayBinding`.
+/// 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ByteArrayBinding;
 

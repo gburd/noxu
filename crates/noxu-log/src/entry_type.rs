@@ -1,6 +1,5 @@
 //! Log entry type definitions.
 //!
-//! Port of `com.sleepycat.je.log.LogEntryType`.
 //!
 //! LogEntryType is an enumeration of all log entry types. Each type has
 //! associated metadata: type number, version, transactional/replication flags,
@@ -234,7 +233,7 @@ impl LogEntryType {
 
     /// Returns true if this is an LN type (any leaf node, user or internal).
     ///
-    /// Port of `LogEntryType.isLNType()` in JE.
+    /// 
     pub fn is_ln_type(self) -> bool {
         matches!(
             self,

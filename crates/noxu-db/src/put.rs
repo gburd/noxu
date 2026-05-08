@@ -1,12 +1,12 @@
 //! Put operation types.
 //!
-//! Port of put operation types from `com.sleepycat.je`.
+//! Put operation mode enum.
 
 /// Type of put operation for cursors and databases.
 ///
 /// Specifies how to insert or update records.
 ///
-/// Port of put operation types from Berkeley DB Java Edition.
+/// Put operation mode enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Put {
     /// Insert if the key doesn't exist, else return error.

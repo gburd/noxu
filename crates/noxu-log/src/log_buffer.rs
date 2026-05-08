@@ -1,6 +1,6 @@
 //! Log buffer for staging writes before flushing to disk.
 //!
-//! Port of `com.sleepycat.je.log.LogBuffer` and `LogBufferSegment`.
+//! `LogBufferSegment`.
 //!
 //! LogBuffers hold outgoing, newly written log entries. Space is allocated
 //! via the `allocate()` method that returns a `LogBufferSegment`. The
@@ -28,9 +28,9 @@ use std::time::Duration;
 
 /// A write buffer backed by `BytesMut`.
 ///
-/// Port of `com.sleepycat.je.log.LogBuffer`.
+/// 
 ///
-/// Uses a RawMutex with manual lock/unlock to match JE's explicit
+/// Uses a RawMutex with manual lock/unlock to match explicit
 /// latch_for_write/release pattern (not RAII).
 pub struct LogBuffer {
     /// The actual buffer storage.
@@ -59,7 +59,7 @@ pub struct LogBuffer {
 
     /// Number of bytes already written to disk from this buffer.
     ///
-    /// Port of JE `LogBuffer.lastFlushedPosition`: only `data[flushed_len..]`
+    /// `LogBuffer.lastFlushedPosition`: only `data[flushed_len..]`
     /// needs to be written on the next flush.  Advancing this watermark after
     /// each write prevents successive commits from rewriting previously
     /// persisted bytes (eliminating the O(N²) I/O pattern).
@@ -116,7 +116,7 @@ impl LogBuffer {
 
     /// Returns the data that has not yet been flushed to disk.
     ///
-    /// Port of JE `LogBuffer` dirty-range tracking.  The caller should write
+    /// `LogBuffer` dirty-range tracking.  The caller should write
     /// this slice to disk at `flushed_file_offset()` and then call
     /// `mark_flushed()` to advance the watermark.
     pub fn get_unflushed_data(&self) -> &[u8] {
@@ -321,7 +321,7 @@ impl LogBuffer {
 
 /// A segment allocated within a LogBuffer for writing.
 ///
-/// Port of `com.sleepycat.je.log.LogBufferSegment`.
+/// 
 ///
 /// Holds a raw pointer into the LogBuffer's data region. The LogBuffer's
 /// latch and pin count protocol ensures the pointer remains valid for the

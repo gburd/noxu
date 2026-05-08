@@ -1,6 +1,5 @@
 //! Secondary database handle.
 //!
-//! Port of `com.sleepycat.je.SecondaryDatabase`.
 //!
 //! A secondary database is an index over a primary database.  Records are
 //! automatically maintained when the primary is written.  Reads via a
@@ -32,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A secondary (index) database handle.
 ///
-/// Port of `com.sleepycat.je.SecondaryDatabase`.
+/// 
 ///
 /// Secondary databases are always associated with a primary database.
 /// Key characteristics:
@@ -72,7 +71,7 @@ pub struct SecondaryDatabase {
 impl SecondaryDatabase {
     /// Opens or creates a secondary database associated with `primary`.
     ///
-    /// Port of `Environment.openSecondaryDatabase`.
+    /// 
     ///
     /// # Arguments
     /// * `primary` - The primary database handle, shared via `Arc<Mutex<_>>`.
@@ -119,7 +118,7 @@ impl SecondaryDatabase {
 
     /// Returns the secondary configuration.
     ///
-    /// Port of `SecondaryDatabase.getConfig`.
+    /// 
     pub fn get_config(&self) -> &SecondaryConfig {
         &self.config
     }
@@ -131,14 +130,14 @@ impl SecondaryDatabase {
 
     /// Closes the secondary database handle.
     ///
-    /// Port of `SecondaryDatabase.close`.
+    /// 
     pub fn close(&self) -> Result<()> {
         self.inner.close()
     }
 
     /// Retrieves a primary record by secondary key.
     ///
-    /// Port of `SecondaryDatabase.get(txn, key, pKey, data, lockMode)`.
+    /// 
     ///
     /// Looks up `key` in the secondary index, obtains the primary key stored
     /// there, then fetches the corresponding record from the primary database.
@@ -190,7 +189,7 @@ impl SecondaryDatabase {
 
     /// Deletes all primary records whose secondary key equals `key`.
     ///
-    /// Port of `SecondaryDatabase.delete(txn, key)`.
+    /// 
     ///
     /// All duplicate secondary index entries with the given secondary key are
     /// found and their corresponding primary records deleted.  Each primary
@@ -230,7 +229,7 @@ impl SecondaryDatabase {
 
             // 1. Remove all secondary entries for this primary record first.
             //    This includes the current secondary key entry we found.
-            //    Port of JE: updateSecondaryOnDelete calls updateSecondary.
+            //    UpdateSecondaryOnDelete calls updateSecondary.
             let old_data = data.clone();
             self.delete_all_for_primary(&pri_key_entry, Some(&old_data))?;
 
@@ -256,7 +255,7 @@ impl SecondaryDatabase {
 
     /// Opens a cursor on the secondary database.
     ///
-    /// Port of `SecondaryDatabase.openCursor`.
+    /// 
     ///
     /// # Returns
     /// A `SecondaryCursor` that iterates secondary index entries and returns
@@ -273,21 +272,21 @@ impl SecondaryDatabase {
 
     /// Starts incremental population mode.
     ///
-    /// Port of `SecondaryDatabase.startIncrementalPopulation`.
+    /// 
     pub fn start_incremental_population(&self) {
         self.is_fully_populated.store(false, Ordering::Release);
     }
 
     /// Ends incremental population mode.
     ///
-    /// Port of `SecondaryDatabase.endIncrementalPopulation`.
+    /// 
     pub fn end_incremental_population(&self) {
         self.is_fully_populated.store(true, Ordering::Release);
     }
 
     /// Returns whether incremental population is currently enabled.
     ///
-    /// Port of `SecondaryDatabase.isIncrementalPopulationEnabled`.
+    /// 
     pub fn is_incremental_population_enabled(&self) -> bool {
         !self.is_fully_populated.load(Ordering::Acquire)
     }
@@ -298,7 +297,7 @@ impl SecondaryDatabase {
 
     /// Updates the secondary index when a primary record is inserted or updated.
     ///
-    /// Port of `SecondaryDatabase.updateSecondary`.
+    /// 
     ///
     /// Called from `Database::put_and_update_secondaries` (see database.rs
     /// integration layer) and from application code that manages secondary
@@ -480,7 +479,7 @@ impl SecondaryDatabase {
 
     /// Populates the secondary index from the primary if the secondary is empty.
     ///
-    /// Port of the population logic in `SecondaryDatabase.init`.
+    /// Population logic in `SecondaryDatabase.init`.
     fn populate_if_empty(&self) -> Result<()> {
         // Check if the secondary is empty.
         let sec_count = self.inner.count()?;

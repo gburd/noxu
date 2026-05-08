@@ -1,6 +1,5 @@
 //! Error types for the noxu-tree crate.
 //!
-//! Port of various exception types from `com.sleepycat.je.tree`.
 
 use thiserror::Error;
 
@@ -9,19 +8,19 @@ use thiserror::Error;
 pub enum TreeError {
     /// Attempted to delete/remove a non-empty node.
     ///
-    /// Port of `NodeNotEmptyException` from JE.
+    /// .
     #[error("Node is not empty and cannot be deleted")]
     NodeNotEmpty,
 
     /// Attempted to remove a node that still has cursors positioned on it.
     ///
-    /// Port of `CursorsExistException` from JE.
+    /// .
     #[error("Cursors exist on node and it cannot be removed")]
     CursorsExist,
 
     /// Attempted an operation that requires a node split.
     ///
-    /// Port of `SplitRequiredException` from JE.
+    /// .
     #[error("Node split is required")]
     SplitRequired,
 

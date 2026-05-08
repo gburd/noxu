@@ -42,7 +42,7 @@ fn make_managers_small_file(
 
 /// Write one entry, read it back by LSN, verify the payload matches.
 ///
-/// JE equivalent: LogManager.logItem() -> LogManager.getLogEntry().
+/// equivalent: LogManager.logItem() -> LogManager.getLogEntry().
 #[test]
 fn test_write_and_read_entry() {
     let dir = TempDir::new().unwrap();
@@ -66,7 +66,7 @@ fn test_write_and_read_entry() {
 
 /// Write entries until the file flips, verify a second .ndb file is created.
 ///
-/// JE equivalent: FileManager.shouldFlipFile() -> flipFile().
+/// equivalent: FileManager.shouldFlipFile() -> flipFile().
 #[test]
 fn test_file_flip() {
     let dir = TempDir::new().unwrap();
@@ -98,7 +98,7 @@ fn test_file_flip() {
 /// Corrupt a byte in the log file and verify that `LogFileReader::read_next_strict`
 /// returns a checksum error.
 ///
-/// JE equivalent: ChecksumValidator mismatch -> ChecksumException.
+/// equivalent: ChecksumValidator mismatch -> ChecksumException.
 ///
 /// NOTE: We use `LogFileReader::read_next_strict` (which always reads from
 /// disk) rather than `LogManager::read_entry` (which checks the write-buffer
@@ -164,7 +164,7 @@ fn test_crc_validation_on_read() {
 
 /// Write 10 entries, then use LogFileReader to read all 10 in forward order.
 ///
-/// JE equivalent: FileReader.readNextEntry() loop.
+/// equivalent: FileReader.readNextEntry() loop.
 #[test]
 fn test_sequential_read() {
     let dir = TempDir::new().unwrap();
@@ -211,7 +211,7 @@ fn test_sequential_read() {
 /// After sync(), data must be readable even if the process were to restart
 /// (simulated by clearing the file cache and reading from disk directly).
 ///
-/// JE equivalent: FileManager.syncLogEnd() guarantees durability.
+/// equivalent: FileManager.syncLogEnd() guarantees durability.
 #[test]
 fn test_sync_flushes_to_disk() {
     let dir = TempDir::new().unwrap();

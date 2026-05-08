@@ -1,6 +1,6 @@
 //! Master transfer support.
 //!
-//! Port of `com.sleepycat.je.rep.MasterTransferConfig`  -  allows transferring
+//! allows transferring
 //! master status from the current master to a designated target node.
 
 use noxu_sync::Mutex;

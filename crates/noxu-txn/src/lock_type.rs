@@ -1,6 +1,5 @@
 //! Lock type definitions and conflict/upgrade matrices.
 //!
-//! Port of `com.sleepycat.je.txn.LockType`.
 
 use crate::{LockConflict, LockUpgrade};
 
@@ -9,7 +8,7 @@ use crate::{LockConflict, LockUpgrade};
 /// Noxu DB uses hierarchical locking with five primary lock types.
 /// The conflict and upgrade matrices define how locks interact.
 ///
-/// Port of `com.sleepycat.je.txn.LockType`.
+/// 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockType {
     /// Basic read lock on a record.
@@ -51,7 +50,7 @@ pub enum LockType {
 impl LockType {
     /// Returns true if this is a write lock that modifies data.
     ///
-    /// Note: Per JE implementation, RangeInsert is NOT considered a write lock
+    /// Note: Per implementation, RangeInsert is NOT considered a write lock
     /// for the purposes of transaction commit/abort. Only Write and RangeWrite
     /// require undo information.
     #[inline]
@@ -69,7 +68,7 @@ impl LockType {
 
     /// Returns the conflict status between a held lock and a requested lock.
     ///
-    /// This implements the 5x5 conflict matrix from JE:
+    /// This implements the 5x5 conflict matrix from the:
     /// ```text
     ///              READ    WRITE   RANGE_R  RANGE_W  RANGE_I
     /// READ        ALLOW   BLOCK   ALLOW    BLOCK    ALLOW
@@ -125,7 +124,7 @@ impl LockType {
 
     /// Returns the upgrade result when a locker holds this lock and requests another.
     ///
-    /// This implements the 5x5 upgrade matrix from JE:
+    /// This implements the 5x5 upgrade matrix from the:
     /// ```text
     ///              READ           WRITE              RANGE_R            RANGE_W              RANGE_I
     /// READ        EXISTING       WRITE_PROMOTE      RANGE_READ_IMMED   RANGE_WRITE_PROMOTE  ILLEGAL

@@ -1,6 +1,5 @@
 //! Reference from parent to child in the B-tree.
 //!
-//! Port of `com.sleepycat.je.tree.ChildReference` from JE.
 //!
 //! A ChildReference contains the key, LSN, and state for a reference from
 //! a parent IN to a child node. This is primarily used for the tree root.
@@ -12,7 +11,7 @@ use noxu_util::Lsn;
 ///
 /// Contains a key, LSN (on-disk location), and state byte for tracking
 /// deletion and dirty status. This structure is used primarily for the
-/// tree root reference, though in JE it's also used within IN slot arrays.
+/// tree root reference, though in it's also used within IN slot arrays.
 ///
 /// In the Noxu DB Rust port, individual IN/BIN slot storage is separate from
 /// ChildReference, but the concepts are similar.

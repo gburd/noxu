@@ -1,8 +1,7 @@
 //! Group commit interface and implementations.
 //!
-//! Port of `com.sleepycat.je.txn.GroupCommit`,
-//! `com.sleepycat.je.txn.GroupCommitMaster`, and
-//! `com.sleepycat.je.txn.GroupCommitReplica` from the Oracle NoSQL JE fork.
+//! Txn.GroupCommitMaster`, and
+//! Txn.GroupCommitReplica` from the Oracle NoSQL fork.
 //!
 //! # Overview
 //!
@@ -29,22 +28,22 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Maximum number of transactions to batch before forcing an fsync.
 ///
-/// Port of `RepParams.MASTER_MAX_GROUP_COMMIT` (default 20).
+/// Default: 20.
 pub const DEFAULT_MAX_GROUP_COMMIT: usize = 20;
 
 /// Time window for batching transactions before forcing an fsync, in
 /// milliseconds.
 ///
-/// Port of `RepParams.MASTER_GROUP_COMMIT_INTERVAL` (default 20 ms).
+/// Default: 20 ms.
 pub const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 20;
 
 /// Shared group-commit abstraction used by [`crate::TxnManager`].
 ///
-/// Port of `com.sleepycat.je.txn.GroupCommit`.
+/// 
 pub trait GroupCommit: Send + Sync {
     /// Returns `true` if group commit is currently enabled.
     ///
-    /// Port of `GroupCommit.isEnabled()`.
+    /// 
     fn is_enabled(&self) -> bool;
 
     /// Called by each committing transaction to buffer itself and potentially
@@ -56,12 +55,12 @@ pub trait GroupCommit: Send + Sync {
     /// concurrent fsync) before returning; `false` if fsync was skipped
     /// (e.g. `CommitNoSync` durability).
     ///
-    /// Port of `GroupCommit.bufferCommit(long nowNs, Txn, long commitVLSN)`.
+    /// 
     fn buffer_commit(&self, commit_vlsn: i64) -> bool;
 
     /// Shuts down the group-commit background machinery.
     ///
-    /// Port of `GroupCommit.shutdown()` (implied by `StoppableThread`).
+    /// (implied by `StoppableThread`).
     fn shutdown(&self);
 }
 
@@ -83,7 +82,7 @@ pub trait GroupCommit: Send + Sync {
 /// correctly separates concerns: GroupCommit enforces the batch-size policy;
 /// FSyncManager enforces the time-window and leader/waiter coalescing.
 ///
-/// Port of `com.sleepycat.je.txn.GroupCommitMaster`.
+/// 
 pub struct GroupCommitMaster {
     /// Whether group commit is currently active.
     enabled: AtomicBool,
@@ -102,8 +101,8 @@ impl GroupCommitMaster {
     ///
     /// # Arguments
     ///
-    /// * `max_count` — maximum batch size (port of `MASTER_MAX_GROUP_COMMIT`).
-    /// * `interval_ms` — batch window in milliseconds (port of
+    /// * `max_count` — maximum batch size.
+    /// * `interval_ms` — batch window in milliseconds
     ///   `MASTER_GROUP_COMMIT_INTERVAL`).
     pub fn new(max_count: usize, interval_ms: u64) -> Self {
         GroupCommitMaster {
@@ -144,7 +143,7 @@ impl GroupCommit for GroupCommitMaster {
     /// Returns `false` (caller must fsync) on every `max_count`th call.
     /// Returns `true` (commit is buffered, skip fsync) otherwise.
     ///
-    /// Port of `GroupCommitMaster.bufferCommit()` count-threshold path.
+    /// Count-threshold path.
     /// The time-window threshold is handled by `FSyncManager` when the
     /// caller proceeds to `LogManager::flush_sync()` on a `false` return.
     fn buffer_commit(&self, _commit_vlsn: i64) -> bool {
@@ -175,7 +174,7 @@ impl GroupCommit for GroupCommitMaster {
 /// Batches acknowledgements during log replay, sending an ACK to the feeder
 /// once a batch of committed transactions has been applied and durably written.
 ///
-/// Port of `com.sleepycat.je.txn.GroupCommitReplica`.
+/// 
 pub struct GroupCommitReplica {
     enabled: AtomicBool,
     interval_ms: u64,
@@ -209,7 +208,6 @@ impl GroupCommit for GroupCommitReplica {
         // back. The actual durability is ensured by the fsync that precedes the
         // ACK.
         //
-        // Port of GroupCommitReplica.bufferCommit():
         //   1. Add VLSN to the pending ACK queue.
         //   2. If a leader exists, piggyback; otherwise become leader and wait
         //      groupCommitIntervalMs before ACKing the batch.

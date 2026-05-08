@@ -1,7 +1,6 @@
 //! Election proposal.
 //!
-//! Port of `com.sleepycat.je.rep.elections.Proposer.Proposal` and
-//! `com.sleepycat.je.rep.elections.TimebasedProposalGenerator`  -  represents a
+//! Rep.elections.TimebasedProposalGenerator`  -  represents a
 //! candidate's bid to become master and defines the total ordering used to
 //! decide which candidate wins.
 //!

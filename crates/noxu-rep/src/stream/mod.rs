@@ -1,7 +1,6 @@
 //! Replication stream subsystem.
 //!
-//! Port of feeder and replica stream components from
-//! `com.sleepycat.je.rep.impl.node`. The feeder runs on the master side
+//! Rep.impl.node`. The feeder runs on the master side
 //! and sends replication data to replicas. The replica stream runs on the
 //! replica side and receives data from the master.
 

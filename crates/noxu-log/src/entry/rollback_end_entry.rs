@@ -1,6 +1,5 @@
 //! RollbackEnd log entry.
 //!
-//! Port of `com.sleepycat.je.txn.RollbackEnd`.
 //!
 //! Written at the end of an HA rollback. Contains a back-pointer to the
 //! matching RollbackStart entry so recovery can bracket the rollback period.

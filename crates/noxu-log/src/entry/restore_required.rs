@@ -1,6 +1,5 @@
 //! RestoreRequired log entry.
 //!
-//! Port of `com.sleepycat.je.log.entry.RestoreRequired`.
 //!
 //! Indicates that the environment's log files are not recoverable and that
 //! some curative action is required before the environment can be opened.

@@ -1,6 +1,5 @@
 //! Arbiter for determining when eviction is needed.
 //!
-//! Port of `com.sleepycat.je.evictor.Arbiter`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -14,7 +13,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// - Eviction threshold (evict_bytes)
 /// - Critical eviction threshold
 ///
-/// Port of `com.sleepycat.je.evictor.Arbiter`.
+/// 
 #[derive(Debug)]
 pub struct Arbiter {
     /// Maximum memory budget in bytes.

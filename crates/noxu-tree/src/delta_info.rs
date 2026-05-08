@@ -1,6 +1,5 @@
 //! BIN delta slot information.
 //!
-//! Port of `com.sleepycat.je.tree.DeltaInfo` from JE.
 //!
 //! Holds the delta information for one BIN entry in a partial BIN log entry.
 //! BIN deltas are logged instead of full BINs when only a few slots have changed,

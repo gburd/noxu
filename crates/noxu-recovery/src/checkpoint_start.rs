@@ -1,6 +1,5 @@
 //! Checkpoint start log entry.
 //!
-//! Port of `com.sleepycat.je.recovery.CheckpointStart`.
 
 use crate::error::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -13,7 +12,7 @@ use std::time::SystemTime;
 /// the time when the checkpoint started, and information about who invoked it
 /// (e.g., recovery, daemon, API call, cleaner).
 ///
-/// Port of `com.sleepycat.je.recovery.CheckpointStart`.
+/// 
 #[derive(Debug, Clone)]
 pub struct CheckpointStart {
     /// Checkpoint ID - unique identifier for this checkpoint.

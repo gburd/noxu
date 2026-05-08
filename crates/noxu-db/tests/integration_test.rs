@@ -275,7 +275,7 @@ fn test_get_database_names() {
     assert_eq!(names.len(), 2);
 }
 
-// ─── DatabaseEntry correctness tests (ported from DatabaseEntryTest.java) ────
+// ─── DatabaseEntry correctness tests ────
 
 /// DatabaseEntry::new() has no data; get_data() returns None and size is 0.
 /// Mirrors the null-entry branch of testBasic().
@@ -385,7 +385,7 @@ fn dbentry_partial_flag_round_trip() {
     assert!(!entry.is_partial());
 }
 
-// ─── Cursor correctness tests (ported from CursorTest.java) ──────────────────
+// ─── Cursor correctness tests ──────────────────
 
 /// Get::First returns the smallest key in the database.
 /// Mirrors the getFirst() assertion in insertMultiDb().
@@ -605,7 +605,7 @@ fn cursor_delete_removes_record_next_skips_it() {
     assert_eq!(del_status, noxu_db::OperationStatus::Success);
 
     // The cursor is no longer initialized; a Get::Next should move to "C".
-    // (In JE after delete the cursor sits on a deleted slot and Next skips it.)
+    // (In after delete the cursor sits on a deleted slot and Next skips it.)
     // Here we re-position at "A" and advance past where "B" was.
     let mut key2 = noxu_db::DatabaseEntry::new();
     let mut data2 = noxu_db::DatabaseEntry::new();
@@ -715,7 +715,7 @@ fn cursor_get_current_after_search() {
 }
 
 /// Get::Next from an uninitialized cursor positions at the first record.
-/// Mirrors JE Cursor contract: Next from uninitialized == First.
+/// Mirrors Cursor contract: Next from uninitialized == First.
 #[test]
 fn cursor_next_from_uninitialized_is_first() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -736,7 +736,7 @@ fn cursor_next_from_uninitialized_is_first() {
 }
 
 /// Get::Prev from an uninitialized cursor positions at the last record.
-/// Mirrors JE Cursor contract: Prev from uninitialized == Last.
+/// Mirrors Cursor contract: Prev from uninitialized == Last.
 #[test]
 fn cursor_prev_from_uninitialized_is_last() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -756,7 +756,7 @@ fn cursor_prev_from_uninitialized_is_last() {
     cursor.close().unwrap();
 }
 
-// ─── Database correctness tests (ported from DatabaseTest.java) ───────────────
+// ─── Database correctness tests ───────────────
 
 /// delete() on a missing key returns NotFound.
 /// Mirrors testDeleteNonDup(): second delete of same key returns NOTFOUND.
@@ -1013,7 +1013,7 @@ fn db_large_record_set_sorted_iteration() {
     cursor.close().unwrap();
 }
 
-// ─── Sequence tests (ported from SequenceTest.java) ──────────────────────────
+// ─── Sequence tests ──────────────────────────
 
 /// Helper: open an environment and a plain database for sequence tests.
 fn open_seq_env_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
@@ -1555,7 +1555,7 @@ fn seq_extreme_range_i64_max() {
     seq.close().unwrap();
 }
 
-// ─── Secondary database tests (ported from SecondaryTest.java) ───────────────
+// ─── Secondary database tests ───────────────
 
 use noxu_db::{
     SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator, SecondaryMultiKeyCreator,
@@ -2091,7 +2091,7 @@ fn sec_auto_populate_on_open() {
 
 /// NUM_RECS put/get round trip through secondary matching SecondaryTest.testGet()
 /// structure: 5 records with sec_key = pri_key + KEY_OFFSET encoded as big-endian u32.
-/// This is the closest Rust port of the JE testGet() integer-based pattern.
+/// Integer-based pattern.
 #[test]
 fn sec_num_recs_put_get_round_trip() {
     const NUM_RECS: u32 = 5;
@@ -2104,7 +2104,7 @@ fn sec_num_recs_put_get_round_trip() {
     let env = noxu_db::Environment::open(env_config).unwrap();
 
     // Use a key creator that extracts bytes [4..8] of data as the secondary key
-    // (the second u32 field, simulating the JE "value = i, sec_key = i+100" pattern).
+    // (the second u32 field, simulating the "value = i, sec_key = i+100" pattern).
     struct SecondU32Creator;
     impl SecondaryKeyCreator for SecondU32Creator {
         fn create_secondary_key(
@@ -2245,12 +2245,11 @@ fn sec_num_recs_put_get_round_trip() {
     cursor.close().unwrap();
 }
 
-// ─── Cursor search tests (ported from DbCursorSearchTest.java) ────────────────
+// ─── Cursor search tests ────────────────
 //
 // DbCursorSearchTest verifies GetSearchKey / GetSearchKeyRange behaviour across
-// single- and multi-BIN trees (JE uses N_KEYS = 50 to force at least one split).
+// single- and multi-BIN trees (uses N_KEYS = 50 to force at least one split).
 
-/// Port of DbCursorSearchTest.testSimpleSearchKey.
 ///
 /// Put a small number of string key-value pairs then verify that Get::Search
 /// finds each one and the returned data matches the stored value.
@@ -2284,7 +2283,6 @@ fn cursor_search_simple_exact_match() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest.testSimpleDeleteAndSearchKey.
 ///
 /// Put records, search for each one successfully, delete via cursor, then
 /// verify that a subsequent Get::Search returns NotFound.
@@ -2328,7 +2326,6 @@ fn cursor_search_after_delete_returns_not_found() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest.testLargeSearchKey.
 ///
 /// Insert enough records to force at least one BIN split (N_KEYS = 50) then
 /// verify that Get::Search finds every key.
@@ -2364,7 +2361,6 @@ fn cursor_search_large_tree_exact_match() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest.testLargeDeleteAndSearchKey.
 ///
 /// Insert many records (forcing splits), search for each one, delete it, then
 /// verify subsequent searches return NotFound.
@@ -2406,10 +2402,10 @@ fn cursor_search_large_tree_delete_and_search() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest — Get::SearchGte finds the first key >= the
+/// Get::SearchGte finds the first key >= the
 /// search key in a multi-BIN tree.
 ///
-/// JE: `cursor.getSearchKeyRange` sets key to the found key (which may be >=
+/// Sets key to the found key (which may be >=
 /// the search key) and returns SUCCESS, or NOTFOUND if all keys are < query.
 #[test]
 fn cursor_search_range_finds_first_gte_key() {
@@ -2450,7 +2446,7 @@ fn cursor_search_range_finds_first_gte_key() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest — Get::Search on an empty database returns NotFound.
+/// Get::Search on an empty database returns NotFound.
 #[test]
 fn cursor_search_empty_database_returns_not_found() {
     let dir = TempDir::new().unwrap();
@@ -2467,7 +2463,7 @@ fn cursor_search_empty_database_returns_not_found() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest — Get::SearchGte on an empty database returns NotFound.
+/// Get::SearchGte on an empty database returns NotFound.
 #[test]
 fn cursor_search_range_empty_database_returns_not_found() {
     let dir = TempDir::new().unwrap();
@@ -2484,10 +2480,10 @@ fn cursor_search_range_empty_database_returns_not_found() {
     cursor.close().unwrap();
 }
 
-/// Port of DbCursorSearchTest — after tree splits, Get::Search still works
+/// After tree splits, Get::Search still works
 /// for all inserted keys.
 ///
-/// JE: forces splits by inserting N = 80 records; after splits every key must
+/// : forces splits by inserting N = 80 records; after splits every key must
 /// still be findable, exercising the multi-BIN tree traversal path.
 #[test]
 fn cursor_search_after_tree_splits_all_keys_findable() {

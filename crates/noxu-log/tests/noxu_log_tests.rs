@@ -1,6 +1,6 @@
-//! Ports of JE log subsystem tests to noxu-log.
+//! Ports of log subsystem tests to noxu-log.
 //!
-//! Covers correctness properties from the following JE test files:
+//! Covers correctness properties from the following test files:
 //!
 //! - `LogEntryTest.java` — entry type lookup and type_num round-trips
 //! - `LoggableTest.java` — write_to_log/read_from_log round-trips; log_size() matches actual bytes
@@ -65,7 +65,6 @@ fn make_managers_small_file(
 // LogEntryTest — entry type catalog
 // ============================================================================
 
-/// Port of `LogEntryTest.testEquality`.
 ///
 /// Every defined LogEntryType must have a stable type_num, and
 /// from_type_num(type_num) must recover the original variant.
@@ -96,7 +95,7 @@ fn test_entry_type_num_roundtrip() {
     assert!(found > 10, "Expected at least 10 log entry types; found {}", found);
 }
 
-/// Port of `LogEntryTest.testEquality` — spot-check key types.
+/// Spot-check key types.
 #[test]
 fn test_entry_type_spot_checks() {
     // File metadata
@@ -120,7 +119,7 @@ fn test_entry_type_spot_checks() {
     assert_eq!(LogEntryType::Trace.type_num(), 60);
 }
 
-/// Port of `LogEntryTest.testEquality` — findType returns correct variant.
+/// FindType returns correct variant.
 #[test]
 fn test_entry_type_find_type() {
     let in_type = LogEntryType::from_type_num(LogEntryType::IN.type_num());
@@ -135,7 +134,7 @@ fn test_entry_type_find_type() {
     assert_eq!(LogEntryType::from_type_num(0), None);
 }
 
-/// Port of `LogEntryTest` — flags (transactional, replication, sync point).
+/// Flags (transactional, replication, sync point).
 #[test]
 fn test_entry_type_flags() {
     // Transactional
@@ -178,7 +177,7 @@ fn test_entry_type_flags() {
 //   3. The re-read object also reports the same log_size().
 // ============================================================================
 
-/// Port of `LoggableTest.testEntryData` — TraceLogEntry round-trip.
+/// TraceLogEntry round-trip.
 #[test]
 fn test_loggable_trace_log_entry_roundtrip() {
     let owned: Vec<String> = vec![
@@ -213,7 +212,7 @@ fn test_loggable_trace_log_entry_roundtrip() {
     }
 }
 
-/// Port of `LoggableTest.testEntryData` — FileHeader round-trip.
+/// FileHeader round-trip.
 #[test]
 fn test_loggable_file_header_roundtrip() {
     let cases = [
@@ -244,7 +243,7 @@ fn test_loggable_file_header_roundtrip() {
     }
 }
 
-/// Port of `LoggableTest.testEntryData` — FileHeaderEntry round-trip.
+/// FileHeaderEntry round-trip.
 #[test]
 fn test_loggable_file_header_entry_roundtrip() {
     let entry = FileHeaderEntry::new(7, Lsn::new(2, 128), 1);
@@ -260,7 +259,7 @@ fn test_loggable_file_header_entry_roundtrip() {
     assert_eq!(entry.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — EmptyLogEntry round-trip.
+/// EmptyLogEntry round-trip.
 ///
 /// Used for CkptStart, CkptEnd.
 #[test]
@@ -281,7 +280,7 @@ fn test_loggable_empty_log_entry_roundtrip() {
     assert_eq!(EmptyLogEntry::log_size(), EmptyLogEntry::log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — TxnEndEntry (commit) round-trip.
+/// TxnEndEntry (commit) round-trip.
 #[test]
 fn test_loggable_txn_commit_roundtrip() {
     let orig = TxnEndEntry::new_commit(
@@ -309,7 +308,7 @@ fn test_loggable_txn_commit_roundtrip() {
     assert_eq!(orig.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — TxnEndEntry (abort) round-trip.
+/// TxnEndEntry (abort) round-trip.
 #[test]
 fn test_loggable_txn_abort_roundtrip() {
     let orig = TxnEndEntry::new_abort(
@@ -332,7 +331,7 @@ fn test_loggable_txn_abort_roundtrip() {
     assert_eq!(orig.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — InLogEntry round-trip.
+/// InLogEntry round-trip.
 #[test]
 fn test_loggable_in_log_entry_roundtrip() {
     let node_data: Vec<u8> = (0u8..=15).collect();
@@ -357,7 +356,7 @@ fn test_loggable_in_log_entry_roundtrip() {
     assert_eq!(orig.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — InLogEntry with various data sizes.
+/// InLogEntry with various data sizes.
 #[test]
 fn test_loggable_in_log_entry_various_sizes() {
     for size in [0usize, 1, 64, 256, 1024] {
@@ -381,7 +380,7 @@ fn test_loggable_in_log_entry_various_sizes() {
     }
 }
 
-/// Port of `LoggableTest.testEntryData` — LnLogEntry round-trip.
+/// LnLogEntry round-trip.
 #[test]
 fn test_loggable_ln_log_entry_roundtrip() {
     let data = b"abcdef";
@@ -416,7 +415,7 @@ fn test_loggable_ln_log_entry_roundtrip() {
     assert_eq!(orig.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — LnLogEntry with empty data (delete).
+/// LnLogEntry with empty data (delete).
 #[test]
 fn test_loggable_ln_log_entry_delete_roundtrip() {
     let orig = LnLogEntry::new(
@@ -447,7 +446,7 @@ fn test_loggable_ln_log_entry_delete_roundtrip() {
     assert_eq!(orig.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — RestoreRequired round-trip.
+/// RestoreRequired round-trip.
 #[test]
 fn test_loggable_restore_required_roundtrip() {
     let mut props = HashMap::new();
@@ -481,7 +480,7 @@ fn test_loggable_restore_required_roundtrip() {
     assert_eq!(orig.log_size(), decoded.log_size());
 }
 
-/// Port of `LoggableTest.testEntryData` — RestoreRequired with all failure types.
+/// RestoreRequired with all failure types.
 #[test]
 fn test_loggable_restore_required_all_failure_types() {
     for failure_type in [
@@ -501,7 +500,7 @@ fn test_loggable_restore_required_all_failure_types() {
     }
 }
 
-/// Port of `LoggableTest` — FailureType string round-trip.
+/// FailureType string round-trip.
 #[test]
 fn test_failure_type_parse_roundtrip() {
     for ft in [
@@ -521,10 +520,10 @@ fn test_failure_type_parse_roundtrip() {
 // ============================================================================
 // LogEntryHeader — serialization round-trips
 //
-// Port of LoggableTest invariants applied to the header struct.
+// LoggableTest invariants applied to the header struct.
 // ============================================================================
 
-/// Port of `LoggableTest.writeAndRead` applied to LogEntryHeader (no VLSN).
+/// Applied to LogEntryHeader (no VLSN).
 #[test]
 fn test_header_loggable_no_vlsn_roundtrip() {
     let provisionals = [
@@ -562,7 +561,7 @@ fn test_header_loggable_no_vlsn_roundtrip() {
     }
 }
 
-/// Port of `LoggableTest.writeAndRead` applied to LogEntryHeader (with VLSN).
+/// Applied to LogEntryHeader (with VLSN).
 #[test]
 fn test_header_loggable_with_vlsn_roundtrip() {
     let vlsn = Some(Vlsn::new(99));
@@ -590,7 +589,7 @@ fn test_header_loggable_with_vlsn_roundtrip() {
     assert_eq!(header.size(), decoded.size());
 }
 
-/// Port of `LoggableTest` — invisible flag survives round-trip.
+/// Invisible flag survives round-trip.
 #[test]
 fn test_header_invisible_flag_roundtrip() {
     let mut header =
@@ -606,7 +605,7 @@ fn test_header_invisible_flag_roundtrip() {
     assert_eq!(header.size(), decoded.size());
 }
 
-/// Port of `LoggableTest` — post-marshalling fields survive read-back.
+/// Post-marshalling fields survive read-back.
 #[test]
 fn test_header_post_marshalling_roundtrip() {
     let mut header =
@@ -634,7 +633,7 @@ fn test_header_post_marshalling_roundtrip() {
 use noxu_log::fsync_manager::FsyncManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Port of `FSyncManagerTest.testBasic` — multiple threads requesting fsync
+/// Multiple threads requesting fsync
 /// should result in fewer actual fsyncs than threads (coalescing).
 #[test]
 fn test_fsync_manager_grouping_reduces_fsyncs() {
@@ -678,7 +677,7 @@ fn test_fsync_manager_grouping_reduces_fsyncs() {
     );
 }
 
-/// Port of `FSyncManagerTest` — single-thread fsync: closure called once.
+/// Single-thread fsync: closure called once.
 #[test]
 fn test_fsync_manager_flush_only_no_fsync() {
     let manager = FsyncManager::new(0, 0);
@@ -695,7 +694,7 @@ fn test_fsync_manager_flush_only_no_fsync() {
     assert_eq!(call_count.load(Ordering::SeqCst), 1, "closure must be called once");
 }
 
-/// Port of `FSyncManagerTest` — waiter is notified after leader completes.
+/// Waiter is notified after leader completes.
 #[test]
 fn test_fsync_manager_waiter_notified() {
     use std::sync::Barrier;
@@ -738,7 +737,7 @@ fn test_fsync_manager_waiter_notified() {
     );
 }
 
-/// Port of `FSyncManagerTest` — error propagates to caller.
+/// Error propagates to caller.
 #[test]
 fn test_fsync_manager_flush_error_propagates() {
     let manager = FsyncManager::new(0, 0);
@@ -750,7 +749,7 @@ fn test_fsync_manager_flush_error_propagates() {
     assert!(result.is_err(), "error must be propagated to caller");
 }
 
-/// Port of `FSyncManagerTest` — consecutive single-threaded calls each run the closure.
+/// Consecutive single-threaded calls each run the closure.
 #[test]
 fn test_fsync_manager_sequential_calls_each_flush() {
     let manager = FsyncManager::new(0, 0);
@@ -777,7 +776,7 @@ fn test_fsync_manager_sequential_calls_each_flush() {
 // LogManagerTest — write, flush, read, checksum
 // ============================================================================
 
-/// Port of `LogManagerTest.testBasicInMemory` / `testBasicOnDisk`.
+/// / `testBasicOnDisk`.
 ///
 /// Write several entries, flush, read them all back out of order and verify
 /// the payloads match.
@@ -832,7 +831,7 @@ fn test_log_manager_write_and_read_multiple_entries() {
     assert_eq!(p3, payloads[3]);
 }
 
-/// Port of `LogManagerTest` — returned LSNs are in strictly ascending order
+/// Returned LSNs are in strictly ascending order
 /// within the same file.
 #[test]
 fn test_log_manager_lsns_are_ascending() {
@@ -869,7 +868,7 @@ fn test_log_manager_lsns_are_ascending() {
     }
 }
 
-/// Port of `LogManagerTest.testEntryChecksum` — corrupting any byte in the
+/// Corrupting any byte in the
 /// on-disk entry must cause a checksum error when reading back from disk.
 #[test]
 fn test_log_manager_bad_checksum_detected() {
@@ -919,7 +918,7 @@ fn test_log_manager_bad_checksum_detected() {
     }
 }
 
-/// Port of `LogManagerTest.testEntryChecksum` — unmodified entry validates cleanly.
+/// Unmodified entry validates cleanly.
 #[test]
 fn test_log_manager_valid_checksum_reads_ok() {
     let dir = TempDir::new().unwrap();
@@ -944,7 +943,7 @@ fn test_log_manager_valid_checksum_reads_ok() {
     assert_eq!(read_payload.as_slice(), payload);
 }
 
-/// Port of `LogManagerTest` — entry type is preserved through the write/read cycle.
+/// Entry type is preserved through the write/read cycle.
 #[test]
 fn test_log_manager_entry_type_preserved() {
     let dir = TempDir::new().unwrap();
@@ -978,7 +977,7 @@ fn test_log_manager_entry_type_preserved() {
     }
 }
 
-/// Port of `LogManagerTest` — adjacent entries are offset by exactly
+/// Adjacent entries are offset by exactly
 /// (header_size + payload_size) within the same file.
 #[test]
 fn test_log_manager_lsn_stride() {
@@ -1006,7 +1005,7 @@ fn test_log_manager_lsn_stride() {
     // (If a file flip occurred, the stride check does not apply.)
 }
 
-/// Port of `LogManagerTest` — get_end_of_log advances after each write.
+/// Get_end_of_log advances after each write.
 #[test]
 fn test_log_manager_end_of_log_advances() {
     let dir = TempDir::new().unwrap();
@@ -1033,7 +1032,7 @@ fn test_log_manager_end_of_log_advances() {
     }
 }
 
-/// Port of `LogManagerTest` — flush_sync makes data readable from disk
+/// Flush_sync makes data readable from disk
 /// even after clearing the buffer pool.
 #[test]
 fn test_log_manager_flush_sync_durability() {
@@ -1059,10 +1058,10 @@ fn test_log_manager_flush_sync_durability() {
 }
 
 // ============================================================================
-// Checksum — unit tests ported from LogManagerTest.testEntryChecksum
+// Checksum
 // ============================================================================
 
-/// Port of `LogManagerTest.testEntryChecksum` — checksum covers bytes
+/// Checksum covers bytes
 /// [CHECKSUM_BYTES..entry_size], i.e. the first 4 bytes are the stored
 /// checksum itself and are excluded from the computation.
 #[test]
@@ -1101,7 +1100,7 @@ fn test_checksum_skips_first_four_bytes() {
     );
 }
 
-/// Port of `LogManagerTest.testEntryChecksum` — modifying any individual bit
+/// Modifying any individual bit
 /// of a committed entry invalidates the checksum.
 #[test]
 fn test_checksum_any_bit_flip_detected() {
@@ -1157,7 +1156,7 @@ fn test_checksum_any_bit_flip_detected() {
 // LastFileReaderTest / FileReaderTest — forward scan and end-of-log detection
 // ============================================================================
 
-/// Port of `FileReaderTest.testEmptyExtraFile` and
+/// And
 /// `LastFileReaderTest.testLastFileEmpty`.
 ///
 /// The LogFileReader must handle being given an empty file (zero length or
@@ -1191,7 +1190,7 @@ fn test_log_file_reader_empty_file_no_entries() {
     );
 }
 
-/// Port of `FileReaderTest.testNonDefaultParams` / `LastFileReaderTest.testBasic`.
+/// / `LastFileReaderTest.testBasic`.
 ///
 /// Write N entries, open a fresh reader, read them all forward — count must
 /// match exactly.
@@ -1234,7 +1233,7 @@ fn test_log_file_reader_sequential_forward_scan() {
     assert_eq!(count, n_entries, "reader must return all {} entries", n_entries);
 }
 
-/// Port of `LastFileReaderTest.testSmallBuffers` / `testMedBuffers`.
+/// / `testMedBuffers`.
 ///
 /// Read back all entries with small read buffers to exercise buffering code.
 #[test]
@@ -1286,7 +1285,7 @@ fn test_log_file_reader_small_payloads_all_readable() {
     }
 }
 
-/// Port of `LastFileReaderTest.testJunk` — trailing junk bytes at the end of
+/// Trailing junk bytes at the end of
 /// a file do not corrupt valid entries that precede them.
 ///
 /// The reader must stop at the first bad (corrupt) entry and return all
@@ -1332,7 +1331,7 @@ fn test_log_file_reader_junk_at_end_of_file() {
     assert_eq!(count, n_valid, "all valid entries must be returned");
 }
 
-/// Port of `FileReaderTest` — reader correctly handles files spanning
+/// Reader correctly handles files spanning
 /// multiple log files (file flip).
 ///
 /// Uses a 4 KB payload with a 10 KB max file size — the same ratio used by
@@ -1393,7 +1392,7 @@ fn test_log_file_reader_multi_file_scan() {
 // entry types and verify that only the expected types appear.
 // ============================================================================
 
-/// Port of `INFileReaderTest.testNoFile` — no crash when scanning an empty file.
+/// No crash when scanning an empty file.
 #[test]
 fn test_log_file_reader_empty_returns_no_entries() {
     let dir = TempDir::new().unwrap();
@@ -1413,7 +1412,7 @@ fn test_log_file_reader_empty_returns_no_entries() {
     assert_eq!(count, 1);
 }
 
-/// Port of `INFileReaderTest.testBasic` / `LNFileReaderTest.testBasicRedo`.
+/// / `LNFileReaderTest.testBasicRedo`.
 ///
 /// Write a mix of IN, BIN and Trace entries; scan and count only IN/BIN types.
 #[test]
@@ -1479,7 +1478,7 @@ fn test_log_file_reader_filter_by_entry_type() {
     assert_eq!(bin_count, n_per_type, "BIN count mismatch");
 }
 
-/// Port of `LNFileReaderTest.testEmpty` — reader on a freshly-written file
+/// Reader on a freshly-written file
 /// with only one entry of a specific type.
 #[test]
 fn test_log_file_reader_single_entry_type_filtering() {
@@ -1526,7 +1525,7 @@ fn test_log_file_reader_single_entry_type_filtering() {
     assert_eq!(count, n, "must read all {} InsertLNTxn entries", n);
 }
 
-/// Port of `INFileReaderTest.testMiddleStart` — the reader can start from a
+/// The reader can start from a
 /// given LSN (mid-file).
 ///
 /// We verify this by writing 10 entries, then scanning and verifying we can
@@ -1558,7 +1557,7 @@ fn test_log_manager_random_access_mid_file() {
     }
 }
 
-/// Port of `LNFileReaderTest.testBasicUndo` — entries are accessible in
+/// Entries are accessible in
 /// reverse (random-access) order.
 #[test]
 fn test_log_manager_read_entries_in_reverse_order() {
@@ -1591,7 +1590,7 @@ fn test_log_manager_read_entries_in_reverse_order() {
 // Provisional flag — LogManager round-trip
 // ============================================================================
 
-/// Port of `LogManagerTest` — provisional status is encoded in the flags byte
+/// Provisional status is encoded in the flags byte
 /// and preserved through write/read.
 #[test]
 fn test_log_manager_provisional_flag_preserved() {

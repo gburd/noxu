@@ -297,11 +297,11 @@ fn select_victim_fewest_locks() {
 #[test]
 fn select_victim_tie_break_by_larger_id() {
     // Cycle: [10, 20] both hold 2 locks.
-    // JE tie-break: youngest transaction = LARGEST locker ID wins.
+    // tie-break: youngest transaction = LARGEST locker ID wins.
     // Locker IDs are assigned sequentially; the highest ID is the most
     // recently created ("youngest") transaction.  Aborting the youngest
     // wastes the least accumulated work in the system.
-    // Port of JE `LockManager.selectVictim()`.
+    // `LockManager.selectVictim()`.
     let cycle = vec![10i64, 20, 10];
     let mut lock_counts = HashMap::new();
     lock_counts.insert(10, 2usize);

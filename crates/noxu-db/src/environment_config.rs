@@ -1,6 +1,5 @@
 //! Environment configuration.
 //!
-//! Port of `com.sleepycat.je.EnvironmentConfig`.
 
 use crate::durability::Durability;
 use std::path::PathBuf;
@@ -10,7 +9,7 @@ use std::path::PathBuf;
 /// Specifies the configuration parameters used to open an environment.
 /// Use the builder pattern to configure individual parameters.
 ///
-/// Port of `com.sleepycat.je.EnvironmentConfig`.
+/// 
 #[derive(Debug, Clone)]
 pub struct EnvironmentConfig {
     /// Home directory for the environment.

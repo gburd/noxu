@@ -3,7 +3,7 @@
 //! These tests verify that the lock manager, transaction layer, and B-tree
 //! behave correctly under concurrent access.
 //!
-//! Isolation model: Noxu uses JE's lock-based read-committed isolation.
+//! Isolation model: Noxu uses lock-based read-committed isolation.
 //! Writes go directly to the BIN immediately (no buffering); concurrent
 //! readers block on write-locked records via `lock_ln()` until the writer
 //! commits or aborts.  This is NOT MVCC — readers do not see an old snapshot.
@@ -42,7 +42,7 @@ fn open_env_and_db(
 
 /// Multiple threads reading the same keys concurrently must all succeed.
 ///
-/// Port of JE's read-sharing: multiple SharedLock holders are granted
+///  read-sharing: multiple SharedLock holders are granted
 /// simultaneously (READERS_LOCK type) — none should block the others.
 #[test]
 fn test_concurrent_reads_do_not_block() {
@@ -93,7 +93,7 @@ fn test_concurrent_reads_do_not_block() {
 
 /// A writer's uncommitted write blocks a concurrent reader until commit.
 ///
-/// JE isolation model: writes go directly to the BIN immediately; the writer
+/// isolation model: writes go directly to the BIN immediately; the writer
 /// holds a WRITE lock on the new LSN.  A concurrent null-txn reader calls
 /// `lock_ln()` which acquires a READ lock — this BLOCKS while the WRITE lock
 /// is held.  After the writer commits the WRITE lock is released and the
@@ -102,7 +102,7 @@ fn test_concurrent_reads_do_not_block() {
 /// This is read-committed via blocking (not MVCC): readers never see an old
 /// snapshot; they either block or see the committed value.
 ///
-/// Port of JE's lock-based read-committed isolation test pattern.
+///  lock-based read-committed isolation test pattern.
 #[test]
 fn test_uncommitted_write_blocks_reader_until_commit() {
     let dir = TempDir::new().unwrap();

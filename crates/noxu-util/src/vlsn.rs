@@ -1,6 +1,6 @@
 //! Version Log Sequence Number (VLSN).
 //!
-//! Port of `com.sleepycat.je.utilint.VLSN`.
+//! Version Log Sequence Number (VLSN).
 //!
 //! A VLSN identifies a replicated log entry by a monotonically increasing
 //! sequence number. Used by the replication subsystem to track replication
@@ -57,7 +57,6 @@ impl Vlsn {
 
     /// Returns true if the given raw sequence value represents a null VLSN.
     ///
-    /// Port of `VLSN.isNull(long sequence)`.
     #[inline]
     pub fn is_null_seq(seq: i64) -> bool {
         seq == NULL_VLSN_SEQUENCE
@@ -104,15 +103,11 @@ impl Vlsn {
     }
 
     /// Writes this VLSN to the log as a little-endian i64 (8 bytes).
-    ///
-    /// Port of `VLSN.writeToLog(ByteBuffer)`.
     pub fn write_to_log(self, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&self.sequence.to_le_bytes())
     }
 
     /// Reads a VLSN from the log (little-endian i64, 8 bytes).
-    ///
-    /// Port of `VLSN.readFromLog(ByteBuffer, int)`.
     pub fn read_from_log(r: &mut impl Read) -> io::Result<Vlsn> {
         let mut buf = [0u8; 8];
         r.read_exact(&mut buf)?;

@@ -1,6 +1,6 @@
 //! VLSN-to-LSN mapping bucket.
 //!
-//! Port of `com.sleepycat.je.rep.vlsn.VLSNBucket`. A bucket maps a
+//! A bucket maps a
 //! contiguous range of VLSNs to their log positions (LSNs). As a tradeoff
 //! between space and time, a bucket only stores a sparse set of mappings
 //! at stride intervals. The caller must use a log reader to scan for any
@@ -16,7 +16,7 @@
 /// first_vlsn=9, the bucket stores offsets for VLSNs 9, 13, 17, ... The last
 /// VLSN mapping is always stored regardless of stride alignment.
 ///
-/// Port of `com.sleepycat.je.rep.vlsn.VLSNBucket`.
+/// 
 #[derive(Debug, Clone)]
 pub struct VlsnBucket {
     /// First VLSN covered by this bucket. 0 means uninitialized.
@@ -95,7 +95,7 @@ impl VlsnBucket {
     /// If the VLSN is on a stride boundary, it is stored in the offsets
     /// array. The last VLSN/LSN pair is always tracked regardless of stride.
     ///
-    /// Port of `VLSNBucket.put()`.
+    /// 
     pub fn put(
         &mut self,
         vlsn: u64,
@@ -142,7 +142,7 @@ impl VlsnBucket {
     /// Returns `None` if the VLSN is not owned by this bucket or no
     /// mapping can be found.
     ///
-    /// Port of `VLSNBucket.getLTELsn()` and `VLSNBucket.getLsn()`.
+    /// And `VLSNBucket.getLsn()`.
     pub fn get_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
         if !self.owns(vlsn) {
             return None;
@@ -184,7 +184,7 @@ impl VlsnBucket {
     /// Check if this bucket owns the given VLSN (i.e., the VLSN falls
     /// within [first_vlsn, last_vlsn]).
     ///
-    /// Port of `VLSNBucket.owns()`.
+    /// 
     pub fn owns(&self, vlsn: u64) -> bool {
         if vlsn == 0 || self.first_vlsn == 0 {
             return false;
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_out_of_order_puts() {
-        // Simulate out-of-order insertion (as described in JE's VLSNBucket).
+        // Simulate out-of-order insertion (as described in the equivalent VLSNBucket).
         let mut bucket = VlsnBucket::new(10, 3);
         // Insert VLSN 16 first (skipping 10 and 13).
         assert!(bucket.put(16, 1, 300));
@@ -373,7 +373,7 @@ mod tests {
         bucket.put(1, 0, 100);
         bucket.put(3, 1, 200); // Different file number.
         bucket.put(5, 0, 300);
-        // Noxu accepts entries from multiple files in one bucket; JE constrains
+        // Noxu accepts entries from multiple files in one bucket; constrains
         // each bucket to a single file number for cleaner GC accounting.
         assert_eq!(bucket.get_lsn(1), Some((0, 100)));
         assert_eq!(bucket.get_lsn(3), Some((1, 200)));
@@ -390,7 +390,6 @@ mod tests {
         (1u64..=6).map(|i| (i, 3u32, i as u32 * 10)).collect()
     }
 
-    /// Port of VLSNBucketTest.testBasic (in-order inserts, stride=3).
     ///
     /// The Rust bucket has no hard maxMappings cap. The key invariants
     /// ported here are:
@@ -477,7 +476,7 @@ mod tests {
         assert_eq!(bucket.get_lsn(vals[5].0), Some((vals[5].1, vals[5].2)));
     }
 
-    /// Port of VLSNBucketTest.testOutOfOrderPuts — vlsns inserted in
+    /// Vlsns inserted in
     /// non-monotonic order; ownership and LTE lookup must still be correct.
     #[test]
     fn je_test_out_of_order_puts() {
@@ -512,7 +511,7 @@ mod tests {
         check_access(&bucket, stride as u64, &vals);
     }
 
-    /// Port of VLSNBucketTest.testGetNonNullWithHoles — bucket with holes
+    /// Bucket with holes
     /// (out-of-order puts that leave unpopulated stride slots), checking
     /// that LTE and GTE semantics work correctly around holes.
     #[test]
@@ -534,7 +533,7 @@ mod tests {
         assert_eq!(bucket.get_lsn(6), Some((0, 60)));
     }
 
-    /// Port of VLSNBucketTest.testRemoveFromTail — after truncation the
+    /// After truncation the
     /// VLSNs at or beyond the truncation point must no longer be owned.
     /// We simulate this by verifying ownership after truncating the bucket
     /// range through the index (VlsnIndex::truncate_after).
@@ -554,7 +553,7 @@ mod tests {
         assert!(!bucket.owns(20));
     }
 
-    /// Port of VLSNBucketTest.testTruncateAfterFileOffset — verifies that
+    /// Verifies that
     /// the last tracked vlsn after insert is correct, including when the
     /// last insert is not on a stride boundary.
     #[test]
@@ -585,7 +584,7 @@ mod tests {
         assert_eq!(bucket.get_lsn(28), Some((0, 40)));
     }
 
-    /// Port of VLSNBucketTest — first_vlsn is always returned exactly.
+    /// First_vlsn is always returned exactly.
     #[test]
     fn je_test_first_vlsn_exact_lookup() {
         let mut bucket = VlsnBucket::new(1, 3);

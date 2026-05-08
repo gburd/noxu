@@ -1,6 +1,5 @@
 //! Replication error types.
 //!
-//! Port of exception types from `com.sleepycat.je.rep`.
 
 use thiserror::Error;
 
@@ -9,7 +8,7 @@ use thiserror::Error;
 pub enum RepError {
     /// The node is not the master. Thrown when a write operation is attempted
     /// on a replica node.
-    /// Port of `com.sleepycat.je.rep.ReplicaWriteException`.
+    /// 
     #[error("node is not master: current master is {master:?}")]
     NotMaster {
         /// The name of the current master, if known.
@@ -22,22 +21,22 @@ pub enum RepError {
     NotReplica,
 
     /// The replication group does not exist.
-    /// Port of `com.sleepycat.je.rep.UnknownMasterException` (group aspect).
+    /// (group aspect).
     #[error("replication group does not exist: {0}")]
     GroupNotFound(String),
 
     /// A node was not found in the replication group.
-    /// Port of `com.sleepycat.je.rep.MemberNotFoundException`.
+    /// 
     #[error("node {0} not found in group")]
     NodeNotFound(String),
 
     /// An election failed to produce a master.
-    /// Port of `com.sleepycat.je.rep.UnknownMasterException`.
+    /// 
     #[error("election failed: {0}")]
     ElectionFailed(String),
 
     /// Insufficient replica acknowledgments for a commit.
-    /// Port of `com.sleepycat.je.rep.InsufficientAcksException`.
+    /// 
     #[error("insufficient acks: needed {needed}, got {received}")]
     InsufficientAcks {
         /// Number of acks required by the durability policy.
@@ -47,7 +46,7 @@ pub enum RepError {
     },
 
     /// A replica consistency policy timed out.
-    /// Port of `com.sleepycat.je.rep.ReplicaConsistencyException`.
+    /// 
     #[error("replica consistency timeout after {0:?}")]
     ConsistencyTimeout(std::time::Duration),
 
@@ -61,7 +60,7 @@ pub enum RepError {
     },
 
     /// A hard rollback is required on the replica.
-    /// Port of `com.sleepycat.je.rep.RollbackException`.
+    /// 
     #[error("rollback required: from VLSN {from} to {to}")]
     RollbackRequired {
         /// The VLSN sequence to roll back from.

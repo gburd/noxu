@@ -1,6 +1,5 @@
 //! IN file reader for recovery.
 //!
-//! Port of `com.sleepycat.je.log.INFileReader`.
 //!
 //! Scans log files for Internal Node (IN, BIN, BINDelta) entries during
 //! recovery's **IN rebuild** pass.  Optionally tracks the maximum node ID,
@@ -42,7 +41,7 @@ impl CurrentEntry {
 
 /// Scans log files for IN/BIN/BINDelta entries during recovery.
 ///
-/// Port of `com.sleepycat.je.log.INFileReader`.
+/// 
 ///
 /// ## Usage
 ///
@@ -123,7 +122,7 @@ impl<F: LogFileAccess> INFileReader<F> {
 
     /// Register a log entry type that this reader should return.
     ///
-    /// Port of `INFileReader.addTargetType()`.
+    /// 
     pub fn add_target_type(&mut self, entry_type: LogEntryType) {
         self.target_types.insert(entry_type);
     }
@@ -132,7 +131,7 @@ impl<F: LogFileAccess> INFileReader<F> {
     ///
     /// Returns `Ok(true)` when an entry was found; `Ok(false)` at end of log.
     ///
-    /// Port of `FileReader.readNextEntry()` + `INFileReader.isTargetEntry()` +
+    /// + `INFileReader.isTargetEntry()` +
     /// `INFileReader.processEntry()`.
     pub fn read_next_entry(&mut self) -> Result<bool> {
         if self.eof {
@@ -301,7 +300,7 @@ impl<F: LogFileAccess> INFileReader<F> {
 
     /// Update `max_node_id` and `max_db_id` from an IN/BIN/BINDelta entry.
     ///
-    /// Port of the id-tracking logic inside `INFileReader.processEntry()`.
+    /// Id-tracking logic inside `INFileReader.processEntry()`.
     fn update_max_ids(&mut self, entry_type: LogEntryType, payload: &[u8]) {
         match entry_type {
             LogEntryType::IN | LogEntryType::BIN => {

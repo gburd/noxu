@@ -1,7 +1,7 @@
 //! Election subsystem for Noxu DB replication.
 //!
-//! Port of `com.sleepycat.je.rep.elections`  -  implements the Paxos-based
-//! master election protocol used by JE's replication layer. The subsystem
+//! implements the Paxos-based
+//! master election protocol used by replication layer. The subsystem
 //! includes:
 //!
 //! - [`ElectionConfig`]  -  tunable election parameters (timeout, retries,

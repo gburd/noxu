@@ -1,6 +1,5 @@
 //! Observer trait for log write events.
 //!
-//! Port of the utilization tracking hooks in `com.sleepycat.je.log.LogManager`
 //! (`serialLogWork`). In JE, `UtilizationTracker` is fetched from `envImpl`
 //! and called under the Log Write Latch (LWL) each time an entry is written.
 //!
@@ -10,16 +9,16 @@
 
 /// Callback interface for utilization tracking on every log write.
 ///
-/// Port of the `UtilizationTracker.countNewLogEntry` /
+/// `UtilizationTracker.countNewLogEntry` /
 /// `countObsoleteNode` / `countObsoleteNodeInexact` calls made from
-/// `LogManager.serialLogWork()` in JE.
+/// `LogManager.serialLogWork()`.
 ///
 /// Implementations MUST be `Send + Sync` and MUST handle their own internal
 /// locking because these methods are called **under the LWL**.
 pub trait LogWriteObserver: Send + Sync {
     /// Called for every new log entry, with the assigned LSN.
     ///
-    /// Port of `UtilizationTracker.countNewLogEntry(currentLsn, type, size, db)`.
+    /// 
     ///
     /// # Parameters
     /// - `file_num`   : Log file number component of the assigned LSN.
@@ -38,7 +37,7 @@ pub trait LogWriteObserver: Send + Sync {
 
     /// Called when a previous version of a node is being replaced.
     ///
-    /// Port of `UtilizationTracker.countObsoleteNode(oldLsn, type, size, db)`.
+    /// 
     ///
     /// # Parameters
     /// - `file_num`   : File number of the obsolete LSN.

@@ -1,6 +1,5 @@
 //! TupleOutput: writes primitive types to a growable buffer using sortable encodings.
 //!
-//! Port of `com.sleepycat.bind.tuple.TupleOutput`.
 
 use noxu_db::DatabaseEntry;
 use noxu_util::packed::{write_sorted_i32, write_sorted_i64};
@@ -8,11 +7,11 @@ use noxu_util::packed::{write_sorted_i32, write_sorted_i64};
 /// A writer for tuple-encoded byte data.
 ///
 /// Writes primitive values to a growable byte buffer using the same encoding formats
-/// as JE's `TupleOutput`. Signed integers use big-endian with the sign bit
+/// as `TupleOutput`. Signed integers use big-endian with the sign bit
 /// flipped for sortable ordering. Floats use IEEE 754 with bit manipulation
 /// for sortable ordering.
 ///
-/// Port of `com.sleepycat.bind.tuple.TupleOutput`.
+/// 
 #[derive(Debug, Clone)]
 pub struct TupleOutput {
     buf: Vec<u8>,
@@ -213,7 +212,7 @@ impl TupleOutput {
     /// This is an unsorted encoding  -  it is compact but the byte representation
     /// does NOT sort in the same order as the integer values.
     ///
-    /// Port of `PackedInteger.writeInt()`.
+    /// 
     ///
     /// Values can be read using `TupleInput::read_packed_int`.
     pub fn write_packed_int(&mut self, value: i32) {
@@ -270,7 +269,7 @@ impl TupleOutput {
     /// This is an unsorted encoding  -  it is compact but the byte representation
     /// does NOT sort in the same order as the integer values.
     ///
-    /// Port of `PackedInteger.writeLong()`.
+    /// 
     ///
     /// Values can be read using `TupleInput::read_packed_long`.
     pub fn write_packed_long(&mut self, value: i64) {
@@ -339,7 +338,7 @@ impl TupleOutput {
         }
     }
 
-    /// Writes a null-escaped UTF-8 string using JE's null-byte escape format.
+    /// Writes a null-escaped UTF-8 string using null-byte escape format.
     ///
     /// Each 0x00 byte in the string is escaped as the two-byte sequence
     /// [0x00, 0x01], and the string is terminated with [0x00, 0x00].
@@ -380,7 +379,7 @@ impl TupleOutput {
     /// making this suitable for database keys. This is distinct from
     /// `write_packed_int`, which is compact but NOT sortable.
     ///
-    /// Port of `PackedInteger.writeSortedInt()` / `TupleOutput.writeSortedPackedInt()`.
+    /// / `TupleOutput.writeSortedPackedInt()`.
     ///
     /// Values can be read using `TupleInput::read_sorted_packed_int`.
     pub fn write_sorted_packed_int(&mut self, val: i32) {
@@ -398,7 +397,7 @@ impl TupleOutput {
     /// making this suitable for database keys. This is distinct from
     /// `write_packed_long`, which is compact but NOT sortable.
     ///
-    /// Port of `PackedInteger.writeSortedLong()` / `TupleOutput.writeSortedPackedLong()`.
+    /// / `TupleOutput.writeSortedPackedLong()`.
     ///
     /// Values can be read using `TupleInput::read_sorted_packed_long`.
     pub fn write_sorted_packed_long(&mut self, val: i64) {
@@ -411,7 +410,7 @@ impl TupleOutput {
     /// The encoding is identical to an unsigned big-endian u16: the high byte
     /// first, then the low byte. This matches Java's `DataOutputStream.writeChar`.
     ///
-    /// Port of `TupleOutput.writeChar()`.
+    /// 
     ///
     /// Values can be read using `TupleInput::read_char`.
     pub fn write_char(&mut self, val: u16) {
@@ -675,10 +674,10 @@ mod tests {
         let mut out = TupleOutput::new();
         out.write_string("abc");
         // 3 chars + 2-byte null terminator [0x00, 0x00] = 5 bytes
-        // But JE writes each char as 1 byte then a 1-byte null terminator.
+        // But writes each char as 1 byte then a 1-byte null terminator.
         // Our format writes UTF-8 bytes + [0x00, 0x00] terminator.
         // "abc" → 3 bytes + 2 bytes terminator = 5 bytes total.
-        // However JE TupleFormatTest expects 4 for "abc", because JE uses
+        // However TupleFormatTest expects 4 for "abc", because uses
         // a SINGLE null byte terminator for ASCII-range strings.
         // Our Rust implementation uses a 2-byte null terminator to allow
         // embedded nulls, so "abc" → 5 bytes.
@@ -944,7 +943,7 @@ mod tests {
     }
 
     /// TupleOrderingTest.testFloat: positive-only float ordering (unsorted write_float).
-    /// JE notes that ONLY positive floats are ordered deterministically with writeFloat.
+    /// notes that ONLY positive floats are ordered deterministically with writeFloat.
     #[test]
     fn test_ordering_float_positive_only() {
         let data: &[f32] = &[

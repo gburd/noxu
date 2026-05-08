@@ -15,7 +15,6 @@
 //!   Rep.elections`.
 //! - **VLSN Index** -- Maps version sequence numbers to log file positions.
 //! - **Feeder/Replica Stream** -- Master-to-replica log entry streaming. Port
-//!   of `com.sleepycat.je.rep.stream`.
 //! - **Network Transport** -- Pluggable channel-based communication.
 //!   Rep.net`.
 //! - **Group Service** -- Replication group membership management.

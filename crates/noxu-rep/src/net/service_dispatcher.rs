@@ -1,6 +1,6 @@
 //! Service dispatcher for routing incoming connections.
 //!
-//! Port of `com.sleepycat.je.rep.impl.ServiceDispatcher`. JE's
+//! The
 //! ServiceDispatcher listens on a server socket, accepts incoming TCP
 //! connections, reads a service name from each new connection, and routes it
 //! to the registered handler. This Rust port provides:
@@ -18,7 +18,7 @@
 //! [name_len: u32 LE][service_name: utf8 bytes]
 //! ```
 //! After sending the service name the client owns the connection and may
-//! begin the actual service protocol. This matches JE's `ServiceDispatcher`
+//! begin the actual service protocol. This `ServiceDispatcher`
 //! which reads a service name from each new socket before routing.
 
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ use crate::error::{RepError, Result};
 
 /// Callback for handling incoming connections on a named service.
 ///
-/// Corresponds to JE's `ServiceDispatcher.ServiceConnector` interface.
+/// Corresponds to `ServiceDispatcher.ServiceConnector` interface.
 /// Implementations receive an open channel and process the connection.
 pub trait ServiceHandler: Send + Sync {
     /// Handle an incoming connection on this service.
@@ -47,9 +47,9 @@ pub trait ServiceHandler: Send + Sync {
 
 /// Dispatches incoming connections to registered service handlers.
 ///
-/// Port of JE's `ServiceDispatcher`. Provides the handler registry and
+/// Provides the handler registry and
 /// dispatch logic. The accept loop lives in [`TcpServiceDispatcher`], which
-/// mirrors JE's ownership of the server socket.
+/// mirrors ownership of the server socket.
 pub struct ServiceDispatcher {
     /// Map from service name to handler.
     services: Mutex<HashMap<String, Arc<dyn ServiceHandler>>>,
@@ -101,7 +101,7 @@ impl ServiceDispatcher {
     /// Start the dispatcher.
     ///
     /// Marks this base dispatcher as running. [`TcpServiceDispatcher::start()`]
-    /// extends this by spawning the TCP accept loop, mirroring JE's split
+    /// extends this by spawning the TCP accept loop, mirroring split
     /// between `ServiceDispatcher` (registry) and `TcpChannel` (transport).
     pub fn start(&self) {
         self.running.store(true, Ordering::SeqCst);
@@ -144,7 +144,7 @@ impl Default for ServiceDispatcher {
 
 /// A TCP-backed service dispatcher with a real accept loop.
 ///
-/// Corresponds to JE's `ServiceDispatcher` which binds a server socket,
+/// Corresponds to `ServiceDispatcher` which binds a server socket,
 /// accepts connections, reads the service name, and routes to a handler.
 ///
 /// ## Usage

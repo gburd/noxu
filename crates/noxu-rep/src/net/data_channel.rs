@@ -2,7 +2,7 @@
 //!
 //! Wraps a raw `Channel` with protocol message serialization, providing
 //! send/receive of typed `ProtocolMessage` values and message counting
-//! statistics. This corresponds to the pattern in JE where protocol
+//! statistics. This corresponds to the pattern in where protocol
 //! messages are serialized/deserialized over the underlying DataChannel.
 
 use std::sync::Arc;

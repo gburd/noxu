@@ -1,6 +1,6 @@
 //! Replication protocol messages.
 //!
-//! Port of protocol messages from `com.sleepycat.je.rep.impl.node.RepNode`
+//! Replication protocol message types.
 //! and related classes. Uses a simple tag+length+value binary encoding.
 
 use crate::error::{RepError, Result};

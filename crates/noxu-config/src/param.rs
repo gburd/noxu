@@ -1,8 +1,7 @@
 //! Configuration parameter types.
 //!
-//! Port of `com.sleepycat.je.config.ConfigParam` and its typed subclasses:
-//! `BooleanConfigParam`, `IntConfigParam`, `LongConfigParam`,
-//! `DurationConfigParam`, `ShortConfigParam`.
+//! Configuration parameter types including boolean, integer, long, duration,
+//! and string variants with optional min/max bounds and mutability flags.
 
 use std::fmt;
 use std::time::Duration;
@@ -78,9 +77,9 @@ pub enum ParamType {
 
 /// Definition of a single configuration parameter.
 ///
-/// Port of `com.sleepycat.je.config.ConfigParam` and its subclasses.
+/// Definition of a single configuration parameter.
 ///
-/// Each parameter has a name (following JE's "je.xxx.yyy" naming convention),
+/// Each parameter has a name (following the "je.xxx.yyy" naming convention),
 /// a type, a default value, optional min/max bounds, and flags indicating
 /// whether it can be changed at runtime (mutable) and whether it's a
 /// replication parameter.

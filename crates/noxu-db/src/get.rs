@@ -1,12 +1,11 @@
 //! Get operation types.
 //!
-//! Port of get operation types from `com.sleepycat.je`.
 
 /// Type of get operation for cursors and databases.
 ///
 /// Specifies how to position the cursor or which record to retrieve.
 ///
-/// Port of get operation types from Berkeley DB Java Edition.
+/// Get operation types from the database engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Get {
     /// Get the record matching the key.
@@ -68,10 +67,10 @@ pub enum Get {
     /// Positions the cursor at the first record with a key greater than or
     /// equal to the search key.
     ///
-    /// Also known as `SearchRange` (JE: `Cursor.getSearchKeyRange`).
+    /// Also known as `SearchRange` (the: `Cursor.getSearchKeyRange`).
     SearchGte,
 
-    /// Alias for `SearchGte`.  Matches the JE `SEARCH_RANGE`/`getSearchKeyRange` name.
+    /// Alias for `SearchGte`.  Matches the `SEARCH_RANGE`/`getSearchKeyRange` name.
     SearchRange,
 
     /// Get the record with the largest key less than or equal to the specified key.

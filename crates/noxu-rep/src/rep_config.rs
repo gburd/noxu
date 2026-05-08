@@ -1,6 +1,5 @@
 //! Replication configuration.
 //!
-//! Port of `com.sleepycat.je.rep.ReplicationConfig`.
 
 use std::time::Duration;
 
@@ -21,7 +20,7 @@ const DEFAULT_NODE_PORT: u16 = 5001;
 
 /// Configuration for a replication node.
 ///
-/// Port of `com.sleepycat.je.rep.ReplicationConfig`. Use the builder
+/// Use the builder
 /// pattern to construct.
 #[derive(Debug, Clone)]
 pub struct RepConfig {

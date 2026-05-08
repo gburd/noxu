@@ -1,8 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Internal utilities for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.utilint` - provides fundamental types and
-//! utilities used throughout the database engine.
+//! Fundamental types and utilities used throughout the database engine.
 
 pub mod daemon;
 pub mod lsn;

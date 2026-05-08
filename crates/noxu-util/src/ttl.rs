@@ -1,6 +1,6 @@
 //! TTL (time-to-live) utility functions.
 //!
-//! Port of `com.sleepycat.je.TTL`.
+//! TTL (time-to-live) utility functions for record expiration.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
