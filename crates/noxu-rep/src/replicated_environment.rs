@@ -39,6 +39,7 @@ use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
 use crate::master_transfer::MasterTransferConfig;
 use crate::net::service_dispatcher::TcpServiceDispatcher;
+use crate::network_restore_server::{NetworkRestoreServer, RESTORE_SERVICE_NAME};
 use crate::node_state::{NodeState, NodeStateMachine};
 use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
@@ -181,6 +182,24 @@ impl ReplicatedEnvironment {
                     match TcpServiceDispatcher::new(addr) {
                         Ok(dispatcher) => match dispatcher.start() {
                             Ok(bound) => {
+                                // Register the network restore handler so any
+                                // node in the group can request a full file-set
+                                // copy from this node's environment.
+                                if let Some(ref home) = config.env_home {
+                                    let restore_server = Arc::new(
+                                        NetworkRestoreServer::new(home.clone()),
+                                    );
+                                    dispatcher.register(
+                                        RESTORE_SERVICE_NAME,
+                                        restore_server,
+                                    );
+                                    log::debug!(
+                                        "Node '{}' RESTORE service registered \
+                                         (env_home={})",
+                                        config.node_name,
+                                        home.display(),
+                                    );
+                                }
                                 log::info!(
                                     "Node '{}' TCP service dispatcher started on {}",
                                     config.node_name,
