@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Replication and high availability for Noxu DB.
 //!
-//! Port of `com.sleepycat.je.rep` -- master-replica replication with
+//! master-replica replication with
 //! automatic elections, VLSN tracking, network restore, and subscription.
 //!
 //! # Architecture
@@ -9,16 +9,15 @@
 //! The replication layer consists of:
 //!
 //! - **ReplicatedEnvironment** -- Entry point that wraps a standard Environment
-//!   and adds replication capabilities. Port of
-//!   `com.sleepycat.je.rep.ReplicatedEnvironment`.
-//! - **Elections** -- Automatic master election using majority voting. Port of
-//!   `com.sleepycat.je.rep.elections`.
+//!   and adds replication capabilities.
+//!   Rep.ReplicatedEnvironment`.
+//! - **Elections** -- Automatic master election using majority voting.
+//!   Rep.elections`.
 //! - **VLSN Index** -- Maps version sequence numbers to log file positions.
-//!   Port of `com.sleepycat.je.rep.vlsn`.
 //! - **Feeder/Replica Stream** -- Master-to-replica log entry streaming. Port
 //!   of `com.sleepycat.je.rep.stream`.
-//! - **Network Transport** -- Pluggable channel-based communication. Port of
-//!   `com.sleepycat.je.rep.net`.
+//! - **Network Transport** -- Pluggable channel-based communication.
+//!   Rep.net`.
 //! - **Group Service** -- Replication group membership management.
 //! - **Consistency Policies** -- Configurable replica consistency guarantees.
 //! - **Master Transfer** -- Controlled transfer of master role.
@@ -96,6 +95,7 @@ pub mod subscription;
 
 // Network restore
 pub mod network_restore;
+pub mod network_restore_server;
 
 // Main API
 pub mod replicated_environment;
@@ -109,6 +109,7 @@ pub use master_transfer::{
     MasterTransfer, MasterTransferConfig, TransferState,
 };
 pub use network_restore::{NetworkRestore, NetworkRestoreConfig, RestoreState};
+pub use network_restore_server::{NetworkRestoreServer, RESTORE_SERVICE_NAME};
 pub use node_state::{NodeState, NodeStateMachine};
 pub use node_type::NodeType;
 pub use rep_config::RepConfig;
