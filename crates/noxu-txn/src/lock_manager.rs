@@ -757,10 +757,9 @@ impl LockManager {
     /// locker is the chosen victim, `None` otherwise.
     ///
     /// The victim-selection strategy mirrors the: among all lockers in the
-    /// cycle, the one with the fewest locks held is chosen.  Since we do not
-    /// have per-locker lock counts here, we use the locker ID to break ties
-    /// deterministically (smaller ID = victim, consistent with
-    /// `DeadlockDetector::select_victim`).
+    /// cycle, the one with the fewest locks held is chosen.  Scans all shards
+    /// to build real per-locker lock counts so the victim selection matches
+    /// `LockManager.selectVictim()` (min n_owners, tiebreak by youngest).
     fn check_deadlock_for_waiter(
         &self,
         lsn: u64,
@@ -768,16 +767,11 @@ impl LockManager {
         lock_type: LockType,
         owner_ids: &[i64],
     ) -> Option<TxnError> {
-        let waits_for = self.build_waits_for_snapshot(lsn, locker_id);
+        let (waits_for, lock_counts) =
+            self.build_waits_for_and_lock_counts(lsn, locker_id);
         let cycle =
             DeadlockDetector::detect(locker_id, owner_ids, &waits_for)?;
 
-        // Build a uniform lock_counts map (1 per locker) — we do not have
-        // access to actual per-locker counts at this layer.
-        let mut lock_counts = HashMap::new();
-        for &id in &cycle {
-            lock_counts.insert(id, 1usize);
-        }
         let victim = DeadlockDetector::select_victim(&cycle, &lock_counts);
 
         if victim == locker_id {
@@ -791,37 +785,45 @@ impl LockManager {
         }
     }
 
-    /// Builds a lightweight waits-for snapshot for deadlock detection.
+    /// Builds both the waits-for snapshot and real per-locker lock counts in
+    /// a single pass over the shard tables.
     ///
-    /// Walks every lock in every shard (acquiring each shard mutex separately
-    /// to avoid multi-lock ordering issues) and produces:
-    ///   waits_for[locker_id] = { owner_id, ... }
-    /// for all lockers that currently have a waiter entry, plus the edge for
-    /// the calling locker itself which is about to sleep on `waiting_lsn`.
+    /// Returns `(waits_for, lock_counts)` where:
+    /// - `waits_for[locker_id]` = set of locker_ids it is waiting for
+    /// - `lock_counts[locker_id]` = number of locks the locker currently owns
+    ///
+    /// Both maps are built from the same shard scan so the data is consistent.
+    /// This is equivalent to JE's `LockManager.selectVictim()` which also
+    /// uses the actual lock count per locker (`locker.nOwners()`).
     ///
     /// The `waiting_lsn` shard has already been released before this method
-    /// is called, so we re-acquire it like any other shard here.
-    ///
-    /// The result is passed to `DeadlockDetector::detect()`.
-    fn build_waits_for_snapshot(
+    /// is called, so it is re-acquired like any other shard here.
+    fn build_waits_for_and_lock_counts(
         &self,
         waiting_lsn: u64,
         waiting_locker_id: i64,
-    ) -> HashMap<i64, HashSet<i64>> {
+    ) -> (HashMap<i64, HashSet<i64>>, HashMap<i64, usize>) {
         let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut lock_counts: HashMap<i64, usize> = HashMap::new();
 
         for table_mutex in &self.lock_tables {
             let table = table_mutex.lock();
             for (lsn, lock) in table.iter() {
-                let owner_ids: HashSet<i64> =
-                    lock.get_owner_ids().into_iter().collect();
+                let owner_ids: Vec<i64> = lock.get_owner_ids();
+
+                // Count each owner's total held locks across all LSNs.
+                for &owner_id in &owner_ids {
+                    *lock_counts.entry(owner_id).or_insert(0) += 1;
+                }
+
+                let owner_set: HashSet<i64> = owner_ids.into_iter().collect();
 
                 // Record existing waiter -> owners edges.
                 for waiter in lock.get_waiters_clone() {
                     waits_for
                         .entry(waiter.locker_id)
                         .or_default()
-                        .extend(owner_ids.iter().copied());
+                        .extend(owner_set.iter().copied());
                 }
 
                 // Record the edge for the calling locker if this is the
@@ -830,12 +832,12 @@ impl LockManager {
                     waits_for
                         .entry(waiting_locker_id)
                         .or_default()
-                        .extend(owner_ids.iter().copied());
+                        .extend(owner_set.iter().copied());
                 }
             }
         }
 
-        waits_for
+        (waits_for, lock_counts)
     }
 }
 

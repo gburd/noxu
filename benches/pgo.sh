@@ -50,7 +50,9 @@ mkdir -p "$PGO_DIR"
 # system llvm-profdata may be a different LLVM version and will reject the
 # .profraw files with a "version mismatch" error.
 RUSTC_SYSROOT="$(rustc --print sysroot)"
-RUSTLIB_BIN="$RUSTC_SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+# Detect the host target triple from rustc so this works on aarch64, riscv64, etc.
+HOST_TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')"
+RUSTLIB_BIN="$RUSTC_SYSROOT/lib/rustlib/${HOST_TRIPLE}/bin"
 if [[ -x "$RUSTLIB_BIN/llvm-profdata" ]]; then
     LLVM_PROFDATA="$RUSTLIB_BIN/llvm-profdata"
 else

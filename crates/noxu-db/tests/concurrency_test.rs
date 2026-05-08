@@ -416,3 +416,133 @@ fn test_utilization_tracker_counts_writes() {
 
     let _ = env;
 }
+
+// ============================================================================
+// Concurrent abort with overlapping key ranges (Lamb concern)
+// ============================================================================
+
+/// T1 and T2 both write the SAME key concurrently.  T2 commits first; T1
+/// then aborts.  The committed value from T2 must survive T1's abort.
+///
+/// This exercises the write-lock contention path where two transactions
+/// overlap on key space: one holds the write lock, the other waits, then
+/// the waiter aborts without ever acquiring the lock.  After both transactions
+/// resolve the surviving value must be T2's committed write, not a
+/// reversion to the pre-T1 before-image.
+#[test]
+fn test_concurrent_overlapping_writes_abort_does_not_clobber_commit() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+    let env = Arc::new(env);
+    let db = Arc::new(db);
+
+    let key = DatabaseEntry::from_bytes(b"contended_key");
+
+    // Seed: install a known base value.
+    let base = DatabaseEntry::from_bytes(b"base");
+    db.put(None, &key, &base).unwrap();
+
+    // T2: acquires write lock on the key and commits.
+    // T1: tries to write the same key with a different value, but aborts.
+    //
+    // Because Noxu uses lock-based (not MVCC) isolation, T1 must wait for T2
+    // to release the write lock before it can lock the key.  Once T2 commits,
+    // T1 can acquire the lock, does its write, then aborts — restoring to the
+    // T2-committed value (not "base").
+    let barrier = Arc::new(Barrier::new(2));
+
+    let env2 = Arc::clone(&env);
+    let db2 = Arc::clone(&db);
+    let barrier2 = Arc::clone(&barrier);
+
+    let t2 = thread::spawn(move || {
+        // T2: begin, write, signal T1, commit.
+        let txn2 = env2.begin_transaction(None, None).unwrap();
+        let k2 = DatabaseEntry::from_bytes(b"contended_key");
+        let v2 = DatabaseEntry::from_bytes(b"t2_value");
+        db2.put(Some(&txn2), &k2, &v2).unwrap();
+
+        // Both threads have their transactions open; T2 commits now.
+        barrier2.wait();
+        txn2.commit().unwrap();
+    });
+
+    // T1: begin, wait until T2 is ready, attempt write (will block on T2's
+    // write lock), then abort once T2 commits and releases the lock.
+    barrier.wait();
+    // T2 holds the write lock; T1's put will block until T2 commits.
+    let txn1 = env.begin_transaction(None, None).unwrap();
+    let k1 = DatabaseEntry::from_bytes(b"contended_key");
+    let v1 = DatabaseEntry::from_bytes(b"t1_aborted_value");
+    db.put(Some(&txn1), &k1, &v1).unwrap();
+    txn1.abort().unwrap();
+
+    t2.join().unwrap();
+
+    // After T2 committed "t2_value" and T1 aborted, the key must hold
+    // T2's committed value — the abort must not revert past T2's commit.
+    let mut out = DatabaseEntry::new();
+    let status = db.get(None, &key, &mut out).unwrap();
+    assert_eq!(status, OperationStatus::Success);
+    assert_eq!(
+        out.data(),
+        b"t2_value",
+        "T1 abort must not clobber T2's committed value"
+    );
+}
+
+/// Reader observes the correct value after a concurrent writer aborts.
+///
+/// Sequence:
+/// 1. Seed key = "initial"
+/// 2. T_writer begins, writes key = "in_flight"
+/// 3. T_reader begins, tries to read key → blocks (write-locked by T_writer)
+/// 4. T_writer aborts → write lock released, before-image restored
+/// 5. T_reader unblocks, reads → must see "initial" (the before-image)
+#[test]
+fn test_reader_sees_before_image_after_concurrent_writer_aborts() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+    let env = Arc::new(env);
+    let db = Arc::new(db);
+
+    // Seed a base value.
+    let key = DatabaseEntry::from_bytes(b"abort_race_key");
+    let initial = DatabaseEntry::from_bytes(b"initial");
+    db.put(None, &key, &initial).unwrap();
+
+    let writer_ready = Arc::new(Barrier::new(2));
+    let writer_ready2 = Arc::clone(&writer_ready);
+
+    let env_w = Arc::clone(&env);
+    let db_w = Arc::clone(&db);
+
+    let writer = thread::spawn(move || {
+        let txn = env_w.begin_transaction(None, None).unwrap();
+        let k = DatabaseEntry::from_bytes(b"abort_race_key");
+        let v = DatabaseEntry::from_bytes(b"in_flight");
+        db_w.put(Some(&txn), &k, &v).unwrap();
+
+        // Signal that the write lock is held.
+        writer_ready2.wait();
+
+        // Hold the lock briefly so the reader races to block, then abort.
+        thread::sleep(Duration::from_millis(20));
+        txn.abort().unwrap();
+    });
+
+    // Wait for the writer to hold the lock, then read.
+    writer_ready.wait();
+    // Reader should unblock once the writer aborts.
+    let mut out = DatabaseEntry::new();
+    let status = db.get(None, &key, &mut out).unwrap();
+
+    writer.join().unwrap();
+
+    assert_eq!(status, OperationStatus::Success);
+    assert_eq!(
+        out.data(),
+        b"initial",
+        "after writer aborts, reader must see the committed before-image"
+    );
+}
