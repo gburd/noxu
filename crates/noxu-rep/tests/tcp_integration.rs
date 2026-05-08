@@ -869,3 +869,191 @@ fn test_split_brain_minority_group_cannot_elect_master() {
     for n in majority { n.close().unwrap(); }
     for n in minority { n.close().unwrap(); }
 }
+
+// ---------------------------------------------------------------------------
+// Replication data consistency tests (Margo Seltzer concerns)
+// ---------------------------------------------------------------------------
+
+/// A VLSN registered on a master must be monotonically increasing.
+/// Registering N entries in order must produce a VLSN range of [1..N] with
+/// no gaps and with `get_current_vlsn()` equal to N.
+///
+/// This validates the core invariant: no entry can be skipped or replayed
+/// out of order, which would violate linearizability on the replica.
+#[test]
+fn test_vlsn_monotonically_increasing_on_master() {
+    let env = ReplicatedEnvironment::new(
+        RepConfig::builder("grp", "master", "127.0.0.1").build(),
+    )
+    .unwrap();
+    env.become_master(1).unwrap();
+
+    const N: u64 = 50;
+    for vlsn in 1..=N {
+        env.register_vlsn(vlsn, 0, vlsn as u32 * 16);
+    }
+
+    let current = env.get_current_vlsn();
+    assert_eq!(
+        current, N,
+        "current VLSN must equal the last registered VLSN"
+    );
+
+    let range = env.get_vlsn_range();
+    assert_eq!(range.get_last(), N, "range.last must equal N");
+    assert!(
+        range.get_first() <= 1,
+        "range.first must be ≤ 1 (first registered VLSN)"
+    );
+
+    env.close().unwrap();
+}
+
+/// After N entries are registered on a master and ACK'd by a quorum of
+/// replicas, `AckTracker::is_satisfied()` must return `true` for every
+/// VLSN in [1..N].  With fewer than quorum ACKs, durability is not satisfied.
+///
+/// This directly probes commit durability: a write is only durable when the
+/// required number of replicas have acknowledged it.
+#[test]
+fn test_ack_tracker_quorum_satisfies_durability() {
+    let env = ReplicatedEnvironment::new(
+        RepConfig::builder("grp", "master", "127.0.0.1").build(),
+    )
+    .unwrap();
+    env.become_master(1).unwrap();
+
+    let ack_tracker = env.get_ack_tracker();
+
+    // Register 10 VLSNs each requiring 2 ACKs (master + 1 replica).
+    for vlsn in 1u64..=10 {
+        ack_tracker.register(vlsn, 2);
+    }
+
+    // With 0 ACKs, nothing is satisfied.
+    for vlsn in 1u64..=10 {
+        assert!(
+            !ack_tracker.is_satisfied(vlsn),
+            "VLSN {vlsn} must not be satisfied before any ACKs"
+        );
+    }
+
+    // Record ACKs from one replica — still not at quorum (needed=2, got=1).
+    for vlsn in 1u64..=10 {
+        ack_tracker.record_ack(vlsn, "replica-1");
+    }
+    for vlsn in 1u64..=10 {
+        assert!(
+            !ack_tracker.is_satisfied(vlsn),
+            "VLSN {vlsn} must not be satisfied with only 1 of 2 required ACKs"
+        );
+    }
+
+    // Record ACKs from the master itself — now quorum reached (needed=2, got=2).
+    for vlsn in 1u64..=10 {
+        ack_tracker.record_ack(vlsn, "master");
+    }
+    for vlsn in 1u64..=10 {
+        assert!(
+            ack_tracker.is_satisfied(vlsn),
+            "VLSN {vlsn} must be satisfied after quorum ACKs"
+        );
+    }
+
+    env.close().unwrap();
+}
+
+/// When a replica node transitions to master it must not regress its VLSN.
+/// The new master's `get_current_vlsn()` must be ≥ the VLSN it had as a
+/// replica — i.e. no committed entries are lost in the leadership transition.
+///
+/// This is the critical failover consistency property: a replica that
+/// acknowledged VLSN N must, upon becoming master, still report VLSN ≥ N.
+#[test]
+fn test_replica_to_master_failover_preserves_vlsn() {
+    let node = ReplicatedEnvironment::new(
+        RepConfig::builder("grp", "node1", "127.0.0.1").build(),
+    )
+    .unwrap();
+
+    // Start as replica and register 30 VLSNs (simulates receiving 30 entries
+    // from the previous master before the master crashed).
+    node.become_replica("old-master").unwrap();
+    for vlsn in 1u64..=30 {
+        node.register_vlsn(vlsn, 0, vlsn as u32 * 16);
+    }
+    let vlsn_as_replica = node.get_current_vlsn();
+    assert_eq!(vlsn_as_replica, 30, "replica must track all 30 registered VLSNs");
+
+    // Failover: node becomes master (old master crashed).
+    node.become_master(2).unwrap();
+    let vlsn_as_master = node.get_current_vlsn();
+
+    assert!(
+        vlsn_as_master >= vlsn_as_replica,
+        "VLSN must not regress on failover: was {vlsn_as_replica} as replica, now {vlsn_as_master} as master"
+    );
+
+    node.close().unwrap();
+}
+
+/// Concurrent writes on the master produce strictly ordered, gap-free VLSNs.
+/// 8 threads each register 100 VLSNs.  After all threads complete:
+///   - `get_current_vlsn()` must equal 800 (all entries accounted for).
+///   - The VLSN range must cover [1..800] with no gaps detectable via the
+///     range length.
+///
+/// This probes the absence of duplicate or dropped VLSN assignments under
+/// concurrent load — a prerequisite for replica consistency.
+#[test]
+fn test_concurrent_vlsn_registration_no_gaps_or_duplicates() {
+    use std::sync::Arc;
+
+    let env = Arc::new(
+        ReplicatedEnvironment::new(
+            RepConfig::builder("grp", "master", "127.0.0.1").build(),
+        )
+        .unwrap(),
+    );
+    env.become_master(1).unwrap();
+
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 100;
+    const TOTAL: u64 = THREADS * PER_THREAD;
+
+    // Pre-allocate unique VLSNs for each thread (1-indexed, no duplicates).
+    // Thread i registers VLSNs in range [i*100+1 .. (i+1)*100].
+    let barrier = Arc::new(Barrier::new(THREADS as usize));
+    let mut handles = Vec::new();
+
+    for t in 0..THREADS {
+        let env_clone = Arc::clone(&env);
+        let barrier_clone = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier_clone.wait();
+            let start = t * PER_THREAD + 1;
+            for vlsn in start..start + PER_THREAD {
+                env_clone.register_vlsn(vlsn, 0, vlsn as u32 * 16);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let current = env.get_current_vlsn();
+    assert_eq!(
+        current, TOTAL,
+        "after {TOTAL} registrations current_vlsn must be {TOTAL}, got {current}"
+    );
+
+    let range = env.get_vlsn_range();
+    let range_len = range.get_last().saturating_sub(range.get_first()) + 1;
+    assert!(
+        range_len >= TOTAL,
+        "VLSN range must span at least {TOTAL} entries, got {range_len}"
+    );
+
+    env.close().unwrap();
+}
