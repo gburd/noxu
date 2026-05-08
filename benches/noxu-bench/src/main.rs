@@ -23,11 +23,53 @@ use metrics::{cpu_time_ms, dir_size_kb, proc_io, rss_kb};
 use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use std::fs;
 use std::io::Write as IoWrite;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 
 const VALUE: &[u8] = b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bench directory helper
+//
+// By default each workload uses a fresh TempDir (tmpfs on Linux).  Set
+// NOXU_BENCH_DIR to a path on real NVMe/SSD storage to measure FSyncManager
+// coalescing behaviour that is invisible on tmpfs (where fdatasync is instant).
+//
+// Example:
+//   NOXU_BENCH_DIR=/mnt/nvme/noxu_bench NOXU_MAX_SCALE=100000 ./noxu-workload-bench
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Holds either a managed TempDir (auto-deleted on drop) or a plain PathBuf
+/// pointing to a caller-managed real-storage directory.
+enum BenchDir {
+    Temp(TempDir),
+    Real(PathBuf),
+}
+
+impl BenchDir {
+    fn path(&self) -> &Path {
+        match self {
+            BenchDir::Temp(d) => d.path(),
+            BenchDir::Real(p) => p.as_path(),
+        }
+    }
+}
+
+/// Create a fresh benchmark directory.  Uses `NOXU_BENCH_DIR` if set;
+/// falls back to a new TempDir (tmpfs).
+fn new_bench_dir(base: &Option<PathBuf>, tag: &str, n: usize) -> BenchDir {
+    match base {
+        None => BenchDir::Temp(TempDir::new().unwrap()),
+        Some(root) => {
+            let dir = root.join(format!("{}_{}", tag, n));
+            // Remove any leftover data from a previous run.
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("failed to create bench dir");
+            BenchDir::Real(dir)
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -138,6 +180,19 @@ fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(usize::MAX);
+
+    // NOXU_BENCH_DIR: optional path to a real-storage directory.  When set,
+    // each workload writes to a subdirectory of this path instead of TempDir,
+    // enabling FSyncManager coalescing measurement on real NVMe/SSD.
+    let bench_base: Option<PathBuf> = std::env::var("NOXU_BENCH_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    if let Some(ref b) = bench_base {
+        println!("  Storage: {} (real storage)", b.display());
+    } else {
+        println!("  Storage: TempDir (tmpfs — FSyncManager coalescing window is zero)");
+    }
     let all_scales: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000];
     let scales: Vec<usize> = all_scales.iter().copied().filter(|&s| s <= max_scale).collect();
     let scales: &[usize] = &scales;
@@ -159,7 +214,7 @@ fn main() {
 
         // W01: sequential write
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_2", n);
             let (env, db) = open_db(dir.path());
             let r = run_timed("w01_seq_write", n, 1, dir.path(), Some(&env), || {
                 workloads::w01_seq_write(&db, n)
@@ -171,7 +226,7 @@ fn main() {
 
         // W02: random write
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_3", n);
             let (env, db) = open_db(dir.path());
             let r = run_timed("w02_rand_write", n, 1, dir.path(), Some(&env), || {
                 workloads::w02_rand_write(&db, n)
@@ -183,7 +238,7 @@ fn main() {
 
         // W03: sequential read (pre-populate)
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_4", n);
             let (env, db) = open_db(dir.path());
             populate(&db, n);
             let r = run_timed("w03_seq_read", n, 1, dir.path(), Some(&env), || {
@@ -196,7 +251,7 @@ fn main() {
 
         // W04: random read
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_5", n);
             let (env, db) = open_db(dir.path());
             populate(&db, n);
             let r = run_timed("w04_rand_read", n, 1, dir.path(), Some(&env), || {
@@ -209,7 +264,7 @@ fn main() {
 
         // W05: range scan
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_6", n);
             let (env, db) = open_db(dir.path());
             populate(&db, n);
             let r = run_timed("w05_range_scan", n, 1, dir.path(), Some(&env), || {
@@ -222,7 +277,7 @@ fn main() {
 
         // W06: write-heavy mixed (90% write / 10% read)
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_7", n);
             let (env, db) = open_db(dir.path());
             populate(&db, n);
             let r = run_timed("w06_write_heavy", n, 1, dir.path(), Some(&env), || {
@@ -235,7 +290,7 @@ fn main() {
 
         // W07: read-heavy mixed (90% read / 10% write)
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_8", n);
             let (env, db) = open_db(dir.path());
             populate(&db, n);
             let r = run_timed("w07_read_heavy", n, 1, dir.path(), Some(&env), || {
@@ -248,7 +303,7 @@ fn main() {
 
         // W08: delete + insert pairs
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_9", n);
             let (env, db) = open_db(dir.path());
             populate(&db, n);
             let r = run_timed("w08_delete_insert", n, 1, dir.path(), Some(&env), || {
@@ -266,7 +321,7 @@ fn main() {
         // this correctly: the upgrade is granted immediately as LockGrantType::Promotion.
         {
             let w09_n = n;
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_10", n);
             let (env, db) = open_db(dir.path());
             populate(&db, w09_n);
             let r = run_timed("w09_txn_multi", w09_n, 1, dir.path(), Some(&env), || {
@@ -283,7 +338,7 @@ fn main() {
             // Cap ops at 100K when writer threads > 4 at large scale to keep runtime sane
             let ops_n = if n > 100_000 && wthreads > 4 { 100_000 } else { n };
 
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_11", n);
             let (env, db) = open_db(dir.path());
             populate(&db, ops_n);
 
@@ -341,7 +396,7 @@ fn main() {
         // log-replay overhead in Rust (no JVM startup, no classloading, no
         // JIT warmup) and not a missing recovery step.
         {
-            let dir = TempDir::new().unwrap();
+            let dir = new_bench_dir(&bench_base, "bench_12", n);
             {
                 let (env_pre, db_pre) = open_db(dir.path());
                 populate(&db_pre, n);

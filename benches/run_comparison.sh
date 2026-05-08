@@ -37,6 +37,7 @@ SKIP_NOXU=0
 SKIP_JE=0
 GC_STRATEGY="g1"
 MAX_SCALE=0   # 0 = no limit
+BENCH_DIR=""  # "" = use tmpfs TempDir (default); set to real path for NVMe tests
 
 for arg in "$@"; do
     case $arg in
@@ -44,15 +45,18 @@ for arg in "$@"; do
         --skip-je)      SKIP_JE=1   ;;
         --gc=*)         GC_STRATEGY="${arg#--gc=}" ;;
         --max-scale=*)  MAX_SCALE="${arg#--max-scale=}" ;;
+        --bench-dir=*)  BENCH_DIR="${arg#--bench-dir=}" ;;
         --gc)           ;;   # consumed via positional; handled below
         --max-scale)    ;;   # consumed via positional; handled below
+        --bench-dir)    ;;   # consumed via positional; handled below
     esac
 done
-# Handle space-separated --gc <val> and --max-scale <val>
+# Handle space-separated --gc <val>, --max-scale <val>, --bench-dir <val>
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gc)           GC_STRATEGY="${2:-g1}"; shift 2 ;;
         --max-scale)    MAX_SCALE="${2:-0}";    shift 2 ;;
+        --bench-dir)    BENCH_DIR="${2:-}";     shift 2 ;;
         *)              shift ;;
     esac
 done
@@ -66,7 +70,11 @@ if [[ $SKIP_NOXU -eq 0 ]]; then
     echo "════════════════════════════════════════════════════════"
     cargo build --release --package noxu-workload-bench 2>&1 \
         | grep -E "^(Compiling|Finished|error)" || true
+    if [[ -n "$BENCH_DIR" ]]; then
+        echo "  Bench dir: $BENCH_DIR  (real storage — FSyncManager coalescing measurable)"
+    fi
     NOXU_MAX_SCALE="${MAX_SCALE:-0}" \
+    NOXU_BENCH_DIR="${BENCH_DIR:-}" \
         ./target/release/noxu-workload-bench 2>&1 | tee "$RESULTS/noxu_stdout.txt"
     echo ""
 fi
@@ -107,6 +115,18 @@ if [[ $SKIP_JE -eq 0 ]]; then
                 -XX:+DisableExplicitGC
             )
             GC_DESC="EpsilonGC (no-op), 8GB fixed heap — zero GC interference"
+            ;;
+        shenandoah)
+            GC_FLAGS=(
+                -XX:+UnlockExperimentalVMOptions
+                -XX:+UseShenandoahGC
+                -XX:ShenandoahGCMode=iu
+                -Xmx4g -Xms4g
+                -XX:+AlwaysPreTouch
+                -XX:+DisableExplicitGC
+                -XX:ShenandoahUncommitDelay=3600000   # don't return memory during run
+            )
+            GC_DESC="ShenandoahGC (IU mode), 4GB fixed heap — concurrent low-pause"
             ;;
         zgc)
             GC_FLAGS=(
