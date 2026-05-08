@@ -6,7 +6,11 @@
 #   bash benches/setup.sh     (installs Java, builds JE jar and fat jar)
 #
 # Usage:
-#   bash benches/run_comparison.sh [--skip-noxu] [--skip-je] [--gc g1|zgc|epsilon] [--max-scale N]
+#   bash benches/run_comparison.sh [--skip-noxu] [--skip-je] [--pgo] [--gc g1|zgc|epsilon] [--max-scale N]
+#
+# --pgo: use the PGO-optimised Noxu binary (./target/pgo/noxu-workload-bench).
+#   Build it first with:  bash benches/pgo.sh [--train-scale 10000]
+#   Falls back to a regular --release build if the PGO binary or profdata is absent.
 #
 # --max-scale N: limit JE run to scales <= N (e.g. --max-scale 100000 to skip 500K/1M,
 #   which take hours due to per-commit fsync).  Noxu always runs all 5 scales.
@@ -35,6 +39,7 @@ mkdir -p "$RESULTS" "$RESULTS/je-tmp"
 # ---------------------------------------------------------------------------
 SKIP_NOXU=0
 SKIP_JE=0
+USE_PGO=0
 GC_STRATEGY="g1"
 MAX_SCALE=0   # 0 = no limit
 BENCH_DIR=""  # "" = use tmpfs TempDir (default); set to real path for NVMe tests
@@ -43,6 +48,7 @@ for arg in "$@"; do
     case $arg in
         --skip-noxu)    SKIP_NOXU=1 ;;
         --skip-je)      SKIP_JE=1   ;;
+        --pgo)          USE_PGO=1   ;;
         --gc=*)         GC_STRATEGY="${arg#--gc=}" ;;
         --max-scale=*)  MAX_SCALE="${arg#--max-scale=}" ;;
         --bench-dir=*)  BENCH_DIR="${arg#--bench-dir=}" ;;
@@ -68,14 +74,43 @@ if [[ $SKIP_NOXU -eq 0 ]]; then
     echo "════════════════════════════════════════════════════════"
     echo "  Running Noxu workload benchmarks..."
     echo "════════════════════════════════════════════════════════"
-    cargo build --release --package noxu-workload-bench 2>&1 \
-        | grep -E "^(Compiling|Finished|error)" || true
+
+    PGO_PROFDATA="/tmp/noxu-pgo/merged.profdata"
+    PGO_BIN="./target/pgo/noxu-workload-bench"
+    NOXU_BIN=""
+
+    if [[ $USE_PGO -eq 1 ]]; then
+        if [[ -f "$PGO_PROFDATA" && -f "$PGO_BIN" ]]; then
+            echo "  Mode: PGO-optimised ($PGO_BIN)"
+            NOXU_BIN="$PGO_BIN"
+        elif [[ -f "$PGO_PROFDATA" ]]; then
+            echo "  PGO profdata found — building PGO-optimised binary..."
+            RUSTFLAGS="-Cprofile-use=$PGO_PROFDATA -Cllvm-args=-pgo-warn-missing-function" \
+                cargo build --profile pgo --package noxu-workload-bench 2>&1 \
+                | grep -E "^(Compiling|Finished|error)" || true
+            NOXU_BIN="$PGO_BIN"
+            echo "  Mode: PGO-optimised ($PGO_BIN)"
+        else
+            echo "  WARNING: --pgo requested but $PGO_PROFDATA not found." >&2
+            echo "           Run 'bash benches/pgo.sh' first to generate profile data." >&2
+            echo "           Falling back to regular --release build." >&2
+            USE_PGO=0
+        fi
+    fi
+
+    if [[ $USE_PGO -eq 0 ]]; then
+        cargo build --release --package noxu-workload-bench 2>&1 \
+            | grep -E "^(Compiling|Finished|error)" || true
+        NOXU_BIN="./target/release/noxu-workload-bench"
+        echo "  Mode: release (non-PGO)"
+    fi
+
     if [[ -n "$BENCH_DIR" ]]; then
         echo "  Bench dir: $BENCH_DIR  (real storage — FSyncManager coalescing measurable)"
     fi
     NOXU_MAX_SCALE="${MAX_SCALE:-0}" \
     NOXU_BENCH_DIR="${BENCH_DIR:-}" \
-        ./target/release/noxu-workload-bench 2>&1 | tee "$RESULTS/noxu_stdout.txt"
+        "$NOXU_BIN" 2>&1 | tee "$RESULTS/noxu_stdout.txt"
     echo ""
 fi
 

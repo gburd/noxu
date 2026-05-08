@@ -141,3 +141,22 @@ inherits = "release"
 debug = true
 lto = false
 codegen-units = 16
+
+# Profile-guided optimisation target.
+#
+# Build with `--profile pgo` only through the `benches/pgo.sh` script, which
+# handles the three-phase PGO cycle:
+#   1. Instrument: RUSTFLAGS="-Cprofile-generate=<dir>" cargo build --profile pgo
+#   2. Train:      run the benchmark at reduced scale to emit .profraw files
+#   3. Optimize:   RUSTFLAGS="-Cprofile-use=<merged.profdata>" cargo build --profile pgo
+#
+# fat LTO is used here (vs thin in release) because PGO + fat LTO yields the
+# best throughput for hot-path-heavy workloads.  codegen-units=1 is required so
+# the profile data covers the whole binary in a single LLVM IR module.
+[profile.pgo]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "symbols"
