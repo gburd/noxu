@@ -909,3 +909,54 @@ fn environment_cursor_put_get_delete() {
     cursor.close().unwrap();
     env.close().unwrap();
 }
+
+// ============================================================================
+// UtilizationTracker wiring
+// ============================================================================
+
+/// Writes through `EnvironmentImpl` update the `UtilizationTracker`.
+///
+/// Uses `CursorImpl::with_log_manager` so LN writes flow through the real
+/// `LogManager`, which notifies the `UtilizationTrackerObserver` on each
+/// `log()` call.  Verifies that after 10 puts the tracker holds at least one
+/// file summary with a non-zero `total_count`.
+#[test]
+fn utilization_tracker_is_populated_after_writes() {
+    let dir = TempDir::new().unwrap();
+    let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+
+    let lm = env
+        .get_log_manager()
+        .expect("transactional env must have a LogManager");
+
+    let mut cfg = DatabaseConfig::new();
+    cfg.set_allow_create(true);
+    let db_arc = env.open_database("util_test", &cfg).unwrap();
+
+    // Use with_log_manager so LN writes go through LogManager (and trigger
+    // the UtilizationTrackerObserver on each write).
+    let mut cursor = CursorImpl::with_log_manager(db_arc, 1, lm);
+
+    for i in 0u8..10 {
+        cursor.put(&[i], b"value", PutMode::Overwrite).unwrap();
+    }
+    cursor.close().unwrap();
+
+    // The UtilizationTracker must be populated with at least one file having
+    // a non-zero total_count.
+    let tracker_lock = env
+        .get_utilization_tracker()
+        .expect("UtilizationTracker must be wired into EnvironmentImpl");
+
+    let tracker = tracker_lock.lock();
+    let has_entries = tracker
+        .get_tracked_files()
+        .values()
+        .any(|t| t.get_summary().total_count > 0);
+
+    assert!(
+        has_entries,
+        "UtilizationTracker has no tracked entries after writes — \
+         count_new_log_entry is not being called from the write path"
+    );
+}

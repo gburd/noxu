@@ -1060,4 +1060,85 @@ mod tests {
             "file with expired records (adj=10%) should be preferred over adj=30%"
         );
     }
+
+    // ── Two-pass cleaning tests ───────────────────────────────────────────────
+
+    /// `check_for_required_util` with actual > target sets force_cleaning and
+    /// raises required_util by the shortfall, then a second profile scan
+    /// selects a file that would otherwise be above the normal threshold.
+    #[test]
+    fn test_two_pass_cleaning_triggers_second_pass() {
+        let mut selector = FileSelector::new();
+
+        // First pass: actual utilization 70%, target 50% — goal not met.
+        selector.check_for_required_util(70, 50);
+        assert!(selector.is_force_cleaning(), "force_cleaning must be set after shortfall");
+        assert!(
+            selector.required_util().is_some(),
+            "required_util must be set after shortfall"
+        );
+
+        // The new required_util should be >= actual_util (raised by the gap).
+        let req = selector.required_util().unwrap();
+        assert!(req >= 70, "required_util should be at or above actual_util");
+    }
+
+    /// After `check_for_required_util` enables force_cleaning, a file whose
+    /// utilization exceeds the normal threshold is selected in the second pass.
+    #[test]
+    fn test_two_pass_cleaning_selects_previously_excluded_file() {
+        // File 1: 75% util (above normal threshold of 50%).
+        // File 2 (newest): skipped by age filter.
+        let mut map = BTreeMap::new();
+        map.insert(1u32, FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 2,
+            obsolete_ln_size: 250,
+            obsolete_ln_size_counted: 2,
+            ..Default::default()
+        });
+        map.insert(2u32, FileSummary {
+            total_count: 1,
+            total_size: 100,
+            total_ln_count: 1,
+            total_ln_size: 100,
+            ..Default::default()
+        });
+
+        let mut selector = FileSelector::new();
+
+        // Normal first pass: file 1 at 75% util is above the 50% threshold.
+        let no_result = selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
+        assert_eq!(no_result, None, "file at 75% util should not qualify in first pass");
+
+        // First pass fell short; trigger second-pass mode.
+        selector.check_for_required_util(75, 50);
+        assert!(selector.is_force_cleaning());
+
+        // Second pass: force_cleaning active — file 1 should now be selected.
+        let result = selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
+        assert_eq!(
+            result.map(|(f, _)| f),
+            Some(1),
+            "file at 75% util should be selected during force_cleaning second pass"
+        );
+    }
+
+    /// `check_for_required_util` with actual <= target clears force_cleaning.
+    #[test]
+    fn test_two_pass_cleaning_clears_when_target_met() {
+        let mut selector = FileSelector::new();
+
+        // Trigger second-pass mode.
+        selector.check_for_required_util(70, 50);
+        assert!(selector.is_force_cleaning());
+
+        // Next pass meets the target: clear force_cleaning.
+        selector.check_for_required_util(45, 50);
+        assert!(!selector.is_force_cleaning(), "force_cleaning should clear when target is met");
+        assert_eq!(selector.required_util(), None, "required_util should be None when target is met");
+    }
 }
