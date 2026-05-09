@@ -10,7 +10,7 @@ use crate::operation_status::OperationStatus;
 use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::transaction::Transaction;
-use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode};
+use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode, ThroughputStats};
 use noxu_sync::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +54,12 @@ pub struct Database {
     env_impl: Arc<Mutex<EnvironmentImpl>>,
     /// Whether this handle is open
     open: AtomicBool,
+    /// Throughput counters for this database's operations.
+    ///
+    /// Cloned from `DatabaseImpl.throughput` at open time so that
+    /// `get()`, `put()`, `delete()` can increment stats without
+    /// locking `db_impl`.
+    throughput: Arc<ThroughputStats>,
 }
 
 /// State of a database handle.
@@ -131,6 +137,7 @@ impl Database {
         db_impl: Arc<RwLock<DatabaseImpl>>,
         env_impl: Arc<Mutex<EnvironmentImpl>>,
     ) -> Self {
+        let throughput = db_impl.read().throughput.clone();
         Database {
             name,
             id,
@@ -138,6 +145,7 @@ impl Database {
             db_impl,
             env_impl,
             open: AtomicBool::new(true),
+            throughput,
         }
     }
 
@@ -191,9 +199,13 @@ impl Database {
                 } else {
                     data.set_data(&value);
                 }
+                self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
                 Ok(OperationStatus::Success)
             }
-            _ => Ok(OperationStatus::NotFound),
+            _ => {
+                self.throughput.n_pri_search_fails.fetch_add(1, Ordering::Relaxed);
+                Ok(OperationStatus::NotFound)
+            }
         }
     }
 
@@ -268,6 +280,7 @@ impl Database {
         // Auto-commit: fsync before returning.
         self.auto_commit_sync(txn)?;
 
+        self.throughput.n_pri_updates.fetch_add(1, Ordering::Relaxed);
         Ok(OperationStatus::Success)
     }
 
@@ -310,6 +323,11 @@ impl Database {
         };
         // Auto-commit: fsync before returning.
         self.auto_commit_sync(txn)?;
+        if status == OperationStatus::Success {
+            self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.throughput.n_pri_insert_fails.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(status)
     }
 
@@ -358,6 +376,11 @@ impl Database {
         };
         // Auto-commit: fsync before returning.
         self.auto_commit_sync(txn)?;
+        if status == OperationStatus::Success {
+            self.throughput.n_pri_deletes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.throughput.n_pri_delete_fails.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(status)
     }
 

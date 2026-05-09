@@ -88,6 +88,16 @@ pub struct FileManager {
     file_latch: ExclusiveLatch,
     /// Lock file handle (for environment locking).
     lock_file: RwLock<Option<File>>,
+    /// Number of log files opened (cache miss = new file open).
+    pub n_file_opens: AtomicU64,
+    /// Number of sequential read calls.
+    pub n_sequential_reads: AtomicU64,
+    /// Total bytes read sequentially.
+    pub n_sequential_read_bytes: AtomicU64,
+    /// Number of sequential write calls.
+    pub n_sequential_writes: AtomicU64,
+    /// Total bytes written sequentially.
+    pub n_sequential_write_bytes: AtomicU64,
 }
 
 impl FileManager {
@@ -142,6 +152,11 @@ impl FileManager {
             per_file_last_lsn: RwLock::new(HashMap::new()),
             file_latch: ExclusiveLatch::named("file_manager"),
             lock_file: RwLock::new(None),
+            n_file_opens: AtomicU64::new(0),
+            n_sequential_reads: AtomicU64::new(0),
+            n_sequential_read_bytes: AtomicU64::new(0),
+            n_sequential_writes: AtomicU64::new(0),
+            n_sequential_write_bytes: AtomicU64::new(0),
         };
 
         // Lock the environment
@@ -313,6 +328,7 @@ impl FileManager {
         // Insert into the LRU cache (evicts the least-recently-used entry when
         // the cache is at capacity, mirroring FileHandleCache eviction).
         cache.put(file_num, handle.clone());
+        self.n_file_opens.fetch_add(1, Ordering::Relaxed);
 
         Ok(handle)
     }
@@ -503,6 +519,10 @@ impl FileManager {
         // file_offset+len here would set next_available_lsn backward whenever
         // an older buffer is written after a newer one (ring-wrapped pool).
 
+        // Track sequential-write stats.
+        self.n_sequential_writes.fetch_add(1, Ordering::Relaxed);
+        self.n_sequential_write_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
         // Check whether we need to flip to a new file.
         let path = self.file_path(file_num);
         let file_len = path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -534,6 +554,8 @@ impl FileManager {
         let handle = self.get_file_handle(file_num)?;
         let mut guard = handle.acquire();
         let n = guard.read_at(offset, buf)?;
+        self.n_sequential_reads.fetch_add(1, Ordering::Relaxed);
+        self.n_sequential_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 
@@ -547,6 +569,17 @@ impl FileManager {
             )));
         }
         Ok(path.metadata()?.len())
+    }
+
+    /// Returns current I/O statistics for this FileManager.
+    pub fn get_io_stats(&self) -> FileManagerIoStats {
+        FileManagerIoStats {
+            n_file_opens: self.n_file_opens.load(Ordering::Relaxed),
+            n_sequential_reads: self.n_sequential_reads.load(Ordering::Relaxed),
+            n_sequential_read_bytes: self.n_sequential_read_bytes.load(Ordering::Relaxed),
+            n_sequential_writes: self.n_sequential_writes.load(Ordering::Relaxed),
+            n_sequential_write_bytes: self.n_sequential_write_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Fsyncs the current log file to stable storage.
@@ -595,6 +628,23 @@ impl Drop for FileManager {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// Snapshot of FileManager I/O statistics.
+///
+/// Mirrors JE FILEMGR_FILE_OPENS, FILEMGR_SEQUENTIAL_READS/WRITES etc.
+#[derive(Debug, Clone, Default)]
+pub struct FileManagerIoStats {
+    /// Number of log files opened (LRU cache miss).
+    pub n_file_opens: u64,
+    /// Number of sequential read operations.
+    pub n_sequential_reads: u64,
+    /// Total bytes read sequentially.
+    pub n_sequential_read_bytes: u64,
+    /// Number of sequential write operations.
+    pub n_sequential_writes: u64,
+    /// Total bytes written sequentially.
+    pub n_sequential_write_bytes: u64,
 }
 
 #[cfg(test)]

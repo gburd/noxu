@@ -194,6 +194,8 @@ pub struct FsyncManager {
     leader_condvar: Condvar,
     /// Total number of fdatasync/fsync calls performed.
     n_fsyncs: AtomicU64,
+    /// Total number of fsync requests (before coalescing).
+    n_fsync_requests: AtomicU64,
 }
 
 impl FsyncManager {
@@ -218,6 +220,7 @@ impl FsyncManager {
             }),
             leader_condvar: Condvar::new(),
             n_fsyncs: AtomicU64::new(0),
+            n_fsync_requests: AtomicU64::new(0),
         }
     }
 
@@ -232,6 +235,7 @@ impl FsyncManager {
     where
         F: Fn() -> std::io::Result<()>,
     {
+        self.n_fsync_requests.fetch_add(1, Ordering::Relaxed);
         let mut do_work = false;
         let mut is_leader = false;
         // Group whose waiters this leader serves (set only when is_leader).
@@ -343,6 +347,11 @@ impl FsyncManager {
     /// Stat (see `LogStatDefinition.N_FSYNCS`).
     pub fn fsync_count(&self) -> u64 {
         self.n_fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Returns total number of fsync requests (before coalescing).
+    pub fn fsync_request_count(&self) -> u64 {
+        self.n_fsync_requests.load(Ordering::Relaxed)
     }
 
     /// Perform the group-commit wait: release the state lock and wait up to

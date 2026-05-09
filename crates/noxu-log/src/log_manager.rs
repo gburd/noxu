@@ -743,6 +743,7 @@ impl LogManager {
         let pool = self.buffer_pool.lock();
         let pool_stats = pool.get_stats();
 
+        let io_stats = self.file_manager.get_io_stats();
         LogManagerStats {
             end_of_log: self.get_end_of_log(),
             last_flush_lsn: self.get_last_flush_lsn(),
@@ -753,6 +754,13 @@ impl LogManager {
                 .n_temp_buffer_writes
                 .load(Ordering::Relaxed),
             buffer_pool_stats: pool_stats,
+            n_log_fsyncs: self.fsync_manager.fsync_count(),
+            n_fsync_requests: self.fsync_manager.fsync_request_count(),
+            n_file_opens: io_stats.n_file_opens,
+            n_sequential_reads: io_stats.n_sequential_reads,
+            n_sequential_read_bytes: io_stats.n_sequential_read_bytes,
+            n_sequential_writes: io_stats.n_sequential_writes,
+            n_sequential_write_bytes: io_stats.n_sequential_write_bytes,
         }
     }
 }
@@ -765,6 +773,20 @@ pub struct LogManagerStats {
     pub n_repeat_fault_reads: u64,
     pub n_temp_buffer_writes: u64,
     pub buffer_pool_stats: crate::log_buffer_pool::BufferPoolStats,
+    /// Number of fsync calls completed (after group-commit coalescing).
+    pub n_log_fsyncs: u64,
+    /// Number of fsync requests (before coalescing).
+    pub n_fsync_requests: u64,
+    /// Number of log file opens (cache miss).
+    pub n_file_opens: u64,
+    /// Number of sequential read operations.
+    pub n_sequential_reads: u64,
+    /// Total bytes read sequentially.
+    pub n_sequential_read_bytes: u64,
+    /// Number of sequential write operations.
+    pub n_sequential_writes: u64,
+    /// Total bytes written sequentially.
+    pub n_sequential_write_bytes: u64,
 }
 
 #[cfg(test)]
