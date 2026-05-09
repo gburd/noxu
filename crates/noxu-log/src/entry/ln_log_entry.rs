@@ -6,13 +6,12 @@
 //! describes a single record modification within a transaction or as a
 //! non-transactional operation.
 
-use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use noxu_util::{
     lsn::{Lsn, NULL_LSN},
     vlsn::{NULL_VLSN, Vlsn},
 };
-use std::io::{self, Cursor};
+use std::io;
 use thiserror::Error;
 
 /// Error type for LN log entry operations.
@@ -20,6 +19,114 @@ use thiserror::Error;
 pub enum LnLogEntryError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+}
+
+// ---------------------------------------------------------------------------
+// Low-level offset-based helpers — no Cursor, no intermediate allocations.
+// ---------------------------------------------------------------------------
+
+fn read_u8_at(buf: &[u8], pos: &mut usize) -> Result<u8, LnLogEntryError> {
+    if *pos >= buf.len() {
+        return Err(LnLogEntryError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read_u8",
+        )));
+    }
+    let v = buf[*pos];
+    *pos += 1;
+    Ok(v)
+}
+
+fn read_u32_be_at(buf: &[u8], pos: &mut usize) -> Result<u32, LnLogEntryError> {
+    let end = *pos + 4;
+    if end > buf.len() {
+        return Err(LnLogEntryError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read_u32",
+        )));
+    }
+    let v = u32::from_be_bytes(buf[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+fn read_i32_be_at(buf: &[u8], pos: &mut usize) -> Result<i32, LnLogEntryError> {
+    Ok(read_u32_be_at(buf, pos)? as i32)
+}
+
+fn read_u64_be_at(buf: &[u8], pos: &mut usize) -> Result<u64, LnLogEntryError> {
+    let end = *pos + 8;
+    if end > buf.len() {
+        return Err(LnLogEntryError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read_u64",
+        )));
+    }
+    let v = u64::from_be_bytes(buf[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+fn read_i64_be_at(buf: &[u8], pos: &mut usize) -> Result<i64, LnLogEntryError> {
+    Ok(read_u64_be_at(buf, pos)? as i64)
+}
+
+fn read_slice_at<'a>(
+    buf: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], LnLogEntryError> {
+    let end = *pos + len;
+    if end > buf.len() {
+        return Err(LnLogEntryError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read_slice",
+        )));
+    }
+    let slice = &buf[*pos..end];
+    *pos = end;
+    Ok(slice)
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy borrowed view
+// ---------------------------------------------------------------------------
+
+/// Borrowed view of a parsed LN log entry.
+///
+/// All variable-length fields are `&[u8]` slices pointing directly into the
+/// source buffer — no heap allocation is performed during parsing.  Callers
+/// in the hot recovery scan path can inspect the key/data and discard this
+/// struct without ever copying the bytes; callers that need ownership call
+/// `.to_owned()` on individual fields.
+///
+/// Obtain via [`LnLogEntry::parse_from_slice`].
+#[derive(Debug, Clone, Copy)]
+pub struct LnEntryRef<'a> {
+    /// Database ID.
+    pub db_id: u64,
+    /// Transaction ID (None for non-transactional).
+    pub txn_id: Option<i64>,
+    /// LSN of the abort version.
+    pub abort_lsn: Lsn,
+    /// Whether the abort version was deleted.
+    pub abort_known_deleted: bool,
+    /// Abort version key (if different from current key).
+    pub abort_key: Option<&'a [u8]>,
+    /// Abort version data (if embedded).
+    pub abort_data: Option<&'a [u8]>,
+    /// VLSN of the abort version.
+    pub abort_vlsn: Vlsn,
+    /// Expiration of abort version (0 = none).
+    pub abort_expiration: i32,
+    /// Whether the LN is embedded in the BIN after this operation.
+    pub embedded_ln: bool,
+    /// Record key — zero-copy slice into the source buffer.
+    pub key: &'a [u8],
+    /// Record data — zero-copy slice, `None` for deletions.
+    pub data: Option<&'a [u8]>,
+    /// Expiration time (0 = none).
+    pub expiration: i32,
 }
 
 /// LN log entry flags.
@@ -330,94 +437,78 @@ impl LnLogEntry {
         buf.extend_from_slice(&self.key);
     }
 
-    /// Reads an entry from a buffer.
+    /// Zero-copy parse of an LN payload.
     ///
-    /// `is_transactional` must match the log entry type used when the entry was
-    /// written (e.g. `InsertLNTxn` → true, `InsertLN` → false).  stores
-    /// this information in the outer `LogEntryType` byte, not in the LN payload
-    /// flags, so callers must pass it explicitly.
-    pub fn read_from_log(
-        buf: &[u8],
+    /// Returns an [`LnEntryRef`] whose `key` and `data` fields are `&[u8]`
+    /// slices pointing directly into `buf`.  No heap allocation is performed.
+    ///
+    /// `is_transactional` must match the log entry type (e.g. `InsertLNTxn`
+    /// → `true`, `InsertLN` → `false`); that information lives in the outer
+    /// entry-type byte, not in the LN payload flags.
+    pub fn parse_from_slice<'a>(
+        buf: &'a [u8],
         is_transactional: bool,
-    ) -> Result<Self, LnLogEntryError> {
-        let mut cursor = Cursor::new(buf);
+    ) -> Result<LnEntryRef<'a>, LnLogEntryError> {
+        let mut pos = 0usize;
 
-        // Read flags
-        let flags = LnFlags::from_bits(cursor.read_u8()?);
+        let flags = LnFlags::from_bits(read_u8_at(buf, &mut pos)?);
+        let db_id = read_u64_be_at(buf, &mut pos)?;
 
-        // Database ID
-        let db_id = cursor.read_u64::<BigEndian>()?;
-
-        // Transactional fields
         let (txn_id, abort_lsn) = if is_transactional {
             let lsn = if flags.have_abort_lsn() {
-                Lsn::from_u64(cursor.read_u64::<BigEndian>()?)
+                Lsn::from_u64(read_u64_be_at(buf, &mut pos)?)
             } else {
                 NULL_LSN
             };
-            let txn = cursor.read_i64::<BigEndian>()?;
+            let txn = read_i64_be_at(buf, &mut pos)?;
             (Some(txn), lsn)
         } else {
             (None, NULL_LSN)
         };
 
-        // Abort key
         let abort_key = if flags.have_abort_key() {
-            let len = cursor.read_u32::<BigEndian>()? as usize;
-            let mut key = vec![0u8; len];
-            io::Read::read_exact(&mut cursor, &mut key)?;
-            Some(key)
+            let len = read_u32_be_at(buf, &mut pos)? as usize;
+            Some(read_slice_at(buf, &mut pos, len)?)
         } else {
             None
         };
 
-        // Abort data
         let abort_data = if flags.have_abort_data() {
-            let len = cursor.read_u32::<BigEndian>()? as usize;
-            let mut data = vec![0u8; len];
-            io::Read::read_exact(&mut cursor, &mut data)?;
-            Some(data)
+            let len = read_u32_be_at(buf, &mut pos)? as usize;
+            Some(read_slice_at(buf, &mut pos, len)?)
         } else {
             None
         };
 
-        // Abort VLSN
         let abort_vlsn = if flags.have_abort_vlsn() {
-            Vlsn::new(cursor.read_i64::<BigEndian>()?)
+            Vlsn::new(read_i64_be_at(buf, &mut pos)?)
         } else {
             NULL_VLSN
         };
 
-        // Abort expiration
         let abort_expiration = if flags.have_abort_expiration() {
-            cursor.read_i32::<BigEndian>()?
+            read_i32_be_at(buf, &mut pos)?
         } else {
             0
         };
 
-        // Expiration
         let expiration = if flags.have_expiration() {
-            cursor.read_i32::<BigEndian>()?
+            read_i32_be_at(buf, &mut pos)?
         } else {
             0
         };
 
-        // Data
-        let data_len = cursor.read_u32::<BigEndian>()? as usize;
+        let data_len = read_u32_be_at(buf, &mut pos)? as usize;
         let data = if data_len > 0 {
-            let mut d = vec![0u8; data_len];
-            io::Read::read_exact(&mut cursor, &mut d)?;
-            Some(d)
+            Some(read_slice_at(buf, &mut pos, data_len)?)
         } else {
             None
         };
 
-        // Key
-        let key_len = cursor.read_u32::<BigEndian>()? as usize;
-        let mut key = vec![0u8; key_len];
-        io::Read::read_exact(&mut cursor, &mut key)?;
+        let key_len = read_u32_be_at(buf, &mut pos)? as usize;
+        let key = read_slice_at(buf, &mut pos, key_len)?;
 
-        Ok(Self {
+        Ok(LnEntryRef {
             db_id,
             txn_id,
             abort_lsn,
@@ -430,6 +521,35 @@ impl LnLogEntry {
             key,
             data,
             expiration,
+        })
+    }
+
+    /// Reads an entry from a buffer, returning an owned [`LnLogEntry`].
+    ///
+    /// Internally calls [`parse_from_slice`][Self::parse_from_slice] and
+    /// copies each slice field into a `Vec<u8>`.  Prefer `parse_from_slice`
+    /// in hot paths (e.g. recovery scanning) to avoid the allocations.
+    ///
+    /// `is_transactional` must match the log entry type used when the entry was
+    /// written (e.g. `InsertLNTxn` → true, `InsertLN` → false).
+    pub fn read_from_log(
+        buf: &[u8],
+        is_transactional: bool,
+    ) -> Result<Self, LnLogEntryError> {
+        let r = Self::parse_from_slice(buf, is_transactional)?;
+        Ok(Self {
+            db_id: r.db_id,
+            txn_id: r.txn_id,
+            abort_lsn: r.abort_lsn,
+            abort_known_deleted: r.abort_known_deleted,
+            abort_key: r.abort_key.map(<[u8]>::to_vec),
+            abort_data: r.abort_data.map(<[u8]>::to_vec),
+            abort_vlsn: r.abort_vlsn,
+            abort_expiration: r.abort_expiration,
+            embedded_ln: r.embedded_ln,
+            key: r.key.to_vec(),
+            data: r.data.map(<[u8]>::to_vec),
+            expiration: r.expiration,
             vlsn: NULL_VLSN, // VLSN comes from entry header, not body
         })
     }
