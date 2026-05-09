@@ -537,19 +537,23 @@ impl CursorImpl {
                         Some((d, l)) => (Some(d), l),
                         None => (data.map(|d| d.to_vec()), noxu_util::NULL_LSN.as_u64()),
                     };
-                    // lock_ln may block if a writer holds the write lock.  After
-                    // it returns, the writer has committed or aborted — re-read
-                    // the BIN to get the now-committed value rather than the
-                    // stale snapshot captured before the block.
-                    self.lock_ln(slot_lsn)?;
-                    let committed_data = {
+                    // If a writer held the write lock when we called lock_ln,
+                    // our pre-fetched slot_data is stale — re-read from the BIN
+                    // after the writer commits/aborts.  If lock_ln returned
+                    // immediately (no contention), slot_data is still valid.
+                    let contended = self.lock_ln(slot_lsn)?;
+                    let final_data = if contended {
                         let db = self.db_impl.read();
                         db.get_real_tree()
                             .and_then(|tree| Self::get_data_from_tree(tree, key))
                             .map(|(d, _)| d)
+                            .map(Some)
+                            .unwrap_or(slot_data)
+                    } else {
+                        slot_data
                     };
                     self.current_key = Some(key.to_vec());
-                    self.current_data = committed_data.map(Some).unwrap_or(slot_data);
+                    self.current_data = final_data;
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
@@ -582,15 +586,19 @@ impl CursorImpl {
                         Some((d, l)) => (Some(d), l),
                         None => (data.map(|d| d.to_vec()), noxu_util::NULL_LSN.as_u64()),
                     };
-                    self.lock_ln(slot_lsn)?;
-                    let committed_data = {
+                    let contended = self.lock_ln(slot_lsn)?;
+                    let final_data = if contended {
                         let db = self.db_impl.read();
                         db.get_real_tree()
                             .and_then(|tree| Self::get_data_from_tree(tree, key))
                             .map(|(d, _)| d)
+                            .map(Some)
+                            .unwrap_or(slot_data)
+                    } else {
+                        slot_data
                     };
                     self.current_key = Some(key.to_vec());
-                    self.current_data = committed_data.map(Some).unwrap_or(slot_data);
+                    self.current_data = final_data;
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
@@ -725,14 +733,31 @@ impl CursorImpl {
     ///
     /// Returns an error only when the lock would deadlock or the locker is
     /// invalid; `NULL_LSN` records are skipped (lock-free slots).
-    fn lock_ln(&self, lsn: u64) -> Result<(), DbiError> {
+    ///
+    /// Returns `Ok(contended)` where `contended = true` means the lock was
+    /// not immediately available — a concurrent writer held an exclusive lock
+    /// and we had to wait.  When `contended` is `true`, any data pre-fetched
+    /// before calling this method may be stale (the writer may have committed
+    /// or aborted during the wait), and the caller should re-read from the BIN.
+    /// When `contended` is `false`, the lock was granted immediately with no
+    /// intervening write, so pre-fetched data remains valid.
+    fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
         if lsn == noxu_util::NULL_LSN.as_u64() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(txn) = &self.txn_ref {
             let mut guard = txn.lock().unwrap();
-            guard.lock(lsn, LockType::Read, false)
-                .map_err(DbiError::TxnError)?;
+            // Try non-blocking first to detect write contention without waiting.
+            let contended = match guard.lock(lsn, LockType::Read, true) {
+                Ok(_) => false, // granted immediately — no concurrent writer
+                Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
+                    // A writer holds the lock; block until they commit/abort.
+                    guard.lock(lsn, LockType::Read, false)
+                        .map_err(DbiError::TxnError)?;
+                    true
+                }
+                Err(e) => return Err(DbiError::TxnError(e)),
+            };
             // Read-committed: release the read lock immediately after each
             // operation so concurrent writers are not blocked for the txn
             // duration.  Under serializable isolation the lock is held until
@@ -740,14 +765,26 @@ impl CursorImpl {
             if guard.is_read_committed_isolation() {
                 guard.release_lock(lsn).map_err(DbiError::TxnError)?;
             }
+            Ok(contended)
         } else if let Some(lm) = &self.lock_manager {
-            // Auto-commit: wait for any current writer, then release immediately.
-            // Use self.id (unique per cursor) so different cursors are independent lockers.
-            lm.lock(lsn, self.id, LockType::Read, false, false)
-                .map_err(DbiError::TxnError)?;
-            lm.release(lsn, self.id).map_err(DbiError::TxnError)?;
+            // Auto-commit: detect contention via non-blocking attempt first.
+            let contended = match lm.lock(lsn, self.id, LockType::Read, true, false) {
+                Ok(_) => {
+                    lm.release(lsn, self.id).map_err(DbiError::TxnError)?;
+                    false
+                }
+                Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
+                    lm.lock(lsn, self.id, LockType::Read, false, false)
+                        .map_err(DbiError::TxnError)?;
+                    lm.release(lsn, self.id).map_err(DbiError::TxnError)?;
+                    true
+                }
+                Err(e) => return Err(DbiError::TxnError(e)),
+            };
+            Ok(contended)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     /// Fetches the data associated with `key` from a tree (BIN-level lookup).
