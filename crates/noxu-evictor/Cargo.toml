@@ -14,6 +14,8 @@ noxu-sync = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 bytes = { workspace = true }
+memmap2 = { workspace = true }
+lru = "0.12"
 
 [lints]
 workspace = true
