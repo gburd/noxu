@@ -1,6 +1,6 @@
 # Noxu DB — JE Fidelity Review
 
-**Last Updated**: 2026-05-08 (Session 32 — 32-participant replication fault injection tests; ensure_unknown_state() correctness fix; Session 32 NVMe benchmark: Noxu leads JE at write 1K–10K, equal at 100K)
+**Last Updated**: 2026-05-09 (Session 33 — cursor re-fetch optimization, flush_sync group-commit coalescing fix, TestLocker stubs)
 **Reference**: Berkeley DB Java Edition 7.5.11 + NoSQL JE Fork
 **JE Source**: `_/je/src/com/sleepycat/je/` (754 production classes)
 **NoSQL Fork**: `_/nosql/kvmain/src/main/java/com/sleepycat/`
@@ -11,26 +11,36 @@
 
 This document is a code-verified fidelity review of Noxu DB (a Rust port of Berkeley DB Java Edition 7.5.11) against the original JE source. Every item was confirmed by reading the actual Noxu source file at the stated line number.
 
-**Overall assessment**: Noxu DB achieves 100% structural fidelity and ≥98% executable fidelity across all subsystems. Session 32 achieved 100% executable fidelity: sort-preserving keys, server-side NetworkRestore, read-committed isolation fix, and complete attribution cleanup.
+**Overall assessment**: Noxu DB achieves high fidelity to JE's core algorithms and data structures across all named subsystems. The honest breakdown across three dimensions is:
 
-**Accepted deviations**: None. All previously noted deviations have been resolved.
+- **Named-algorithm fidelity (~92%)**: Every major named algorithm from JE — latch coupling, BIN-delta migration, group commit, two-pass cleaning, priority-2 LRU eviction, lock promotion, per-txn abort LSN, pre/post commit hooks, TTL file selection — has been faithfully ported. A small number of JE operational details (adaptive cleaner throttling, off-heap upper-IN cache) remain unimplemented.
+
+- **Operational completeness (~45%)**: JE exposes 147 EnvironmentConfig parameters; Noxu implements approximately 25–30 (17–20%). JE exposes ~50 EnvironmentStats metrics; Noxu exposes 3 (fsync count, buffer pool stats, end-of-log). JE's exception hierarchy distinguishes retryable vs fatal vs replication errors with ~20 concrete exception classes; Noxu has a flat `NoxuError` / `TxnError` split without that granularity. These gaps would require significant work before Noxu could be used as a drop-in replacement for JE in a production application that consults configuration or statistics.
+
+- **Production hardening (~25%)**: Noxu has not been validated at TiB-scale data volumes or under sustained thousands-of-threads concurrent load. JE's codebase has been hardened over two decades against edge cases in OS paging, file-system behavior, GC interaction, and network partition; Noxu's equivalent experience is roughly the 4,400+ passing unit/integration tests. The concurrent-write benchmark gap (w10_conc: JE 3.0× faster at 100K scale) reflects real LM contention not yet closed. The recovery benchmark gap (w11: JE 2.7× faster) reflects JIT's advantage on tight scan loops.
+
+**Accepted deviations** (permanent, by design):
+
+1. **Log file format**: Noxu uses `.ndb` files with a Noxu-native header (magic `NOXUDB\0\0`, version 2, 32-byte header); JE uses `.jdb`. Files are not cross-readable.
+2. **Binary serialization**: Noxu uses `serde` + `bincode`/`postcard` for log entry payloads; JE uses custom Java-object serialization. The on-disk format is logically equivalent but byte-for-byte different.
+3. **TupleSerdeBinding key sort order**: `TupleSerdeBinding<K,V>` uses `SortKey` trait (sort-preserving fixed-width BE encoding). The `serde` fallback path uses variable-length encoding which is NOT sort-preserving — documented with a compile-time warning.
 
 ---
 
 ## Fidelity by Subsystem (Summary Table)
 
-| Subsystem | Structural % | Executable % | Notes |
-|-----------|-------------|--------------|-------|
-| Log format / LogManager | 100% | 100% | pwrite64/pread64, group commit, fdatasync, file handle LRU cache, write ordering mutex — all done |
-| B-tree / BIN | 100% | 99% | Latch coupling, mutateToFullBIN, key prefix compression, BIN eviction — all done |
-| Recovery (RecoveryManager) | 100% | 98% | Multi-DB recovery, before-image abort_lsn — done |
-| Checkpointer | 100% | 98% | persist_file_summaries() wired and implemented |
-| Cleaner | 100% | 98% | TTL-aware file selection, two-pass, shared LM, real keys — all done |
-| Transactions / LockManager | 100% | 99% | Lock escalation, GroupCommit wiring, commit ordering — all done |
-| Evictor | 100% | 99% | BIN eviction, priority-2 LRU round-robin, cursor ref_count wired — done |
-| Replication | 100% | 97% | EnvironmentLogScanner+LogWriter wired; NetworkRestoreServer (standalone + ServiceHandler) complete |
-| Public API (noxu-db) | 100% | 99% | count() O(1), all prior gaps resolved |
-| Collections / Bindings | 100% | 99% | SortKey trait — sort-preserving fixed-width BE encoding for all key types |
+| Subsystem | Algorithm Fidelity | Operational Coverage | Notes |
+|-----------|-------------------|---------------------|-------|
+| Log format / LogManager | 97% | 70% | Algorithms complete; EnvironmentStats (log throughput, buffer stats) sparse |
+| B-tree / BIN | 95% | 80% | Latch coupling, mutateToFullBIN, key prefix, BIN eviction done; off-heap IN cache missing |
+| Recovery (RecoveryManager) | 90% | 65% | Multi-DB recovery, abort_lsn done; 2.7× slower than JE at 100K (JIT gap) |
+| Checkpointer | 93% | 70% | persist_file_summaries() done; checkpoint interval config parameter not wired |
+| Cleaner | 85% | 60% | Two-pass, TTL, shared LM, real keys done; adaptive throttling (write-rate backoff) missing |
+| Transactions / LockManager | 92% | 65% | Lock escalation, GroupCommit, commit ordering done; 3× w10_conc gap; error hierarchy flat |
+| Evictor | 90% | 65% | BIN eviction, priority-2 LRU done; off-heap cache missing; evictor config params sparse |
+| Replication | 85% | 55% | EnvironmentLogScanner+LogWriter, NetworkRestoreServer done; not tested at production scale |
+| Public API (noxu-db) | 88% | 35% | Core CRUD+txn complete; EnvironmentConfig ~20% coverage; EnvironmentStats ~6% coverage |
+| Collections / Bindings | 92% | 75% | SortKey trait, sort-preserving encoding for all key types done |
 
 ---
 
@@ -43,8 +53,8 @@ This document is a code-verified fidelity review of Noxu DB (a Rust port of Berk
 ---
 
 ### G2 — DummyLocker stubs (HIGH → RESOLVED)
-**Files**: `crates/noxu-txn/src/locker.rs`
-**Resolution**: Replaced both `unimplemented!()` stubs in `TestLocker::lock()` (line 147) and `TestLockerWithTimeout::lock()` (line 305) with correct implementations: if `!self.locking_required()`, return immediate `LockResult { grant: LockGrantType::New, ... }`; otherwise delegate to the full lock acquisition path. Port of JE `DummyLockManager.lock()` / `BasicLocker.lock()` locking-required check.
+**Files**: `crates/noxu-txn/src/locker.rs`, `crates/noxu-txn/src/dummy_lock_manager.rs`
+**Resolution**: `DummyLockManager` now holds `superior: Arc<LockManager>` and delegates to the real LM when `locking_required=true`; returns immediate `LockResult { grant: LockGrantType::New }` otherwise. `TestLocker` and `CustomDefaultsLocker` test helpers (Session 33) replaced `unimplemented!()` stubs with `Ok(LockResult::new(LockGrantType::New, None))` — these are test-only helpers that never reach a real lock manager.
 
 ---
 
@@ -123,13 +133,53 @@ Port of JE `BIN.evictLN()` / `BIN.evictLNs()`.
 
 ---
 
-## Known Limitations (Accepted Future Work)
+## Known Limitations
 
-### Network restore server-side provider (minor, deferred)
-**File**: `crates/noxu-rep/src/net/service_dispatcher.rs`
-**Severity**: LOW — client-side `NetworkRestore::execute()` is complete.
+### 1. EnvironmentConfig coverage (~20% of JE parameters)
+**Severity**: HIGH for production use.
 
-The `TcpServiceDispatcher` does not yet dispatch a "restore request" from a requesting node to serve `.ndb` files over the wire. This is a minor wiring task deferred to cluster bring-up testing.
+JE's `EnvironmentConfig` exposes 147 tuning parameters. Noxu implements approximately 25–30: basic cache size, log file max, cleaner min utilization, lock timeout, transaction timeout, and a handful more. Missing parameters include `CLEANER_THREADS`, `CHECKPOINTER_BYTES_INTERVAL`, `LOG_BUFFER_SIZE`, `EVICTOR_NODES_PER_SCAN`, `TREE_MAX_DELTA`, `TREE_BIN_DELTA`, `LOCK_N_LOCK_TABLES`, `MAX_OFF_HEAP_MEMORY`, and ~120 others. Applications that tune JE via these parameters cannot directly translate that tuning to Noxu.
+
+### 2. EnvironmentStats coverage (~6% of JE statistics)
+**Severity**: HIGH for production operations.
+
+JE's `EnvironmentStats` exposes ~50 metrics (btree hits/misses, cleaner runs, evictor activity, lock wait times, buffer pool efficiency, replication lag). Noxu currently exposes: `stat_fsync_count()`, `get_end_of_log()`, and buffer pool stats. Operators cannot monitor Noxu the way they monitor JE — no cleaner backlog, no cache hit rate, no lock contention stats.
+
+### 3. Cleaner adaptive throttling (not implemented)
+**Severity**: MEDIUM.
+
+JE's cleaner dynamically throttles between write operations based on observed write rate (`UtilizationCalculator.calcSleepInterval()`). Under heavy write load the cleaner backs off; under light load it accelerates. Noxu's cleaner runs at a fixed interval without write-rate awareness. Under sustained heavy writes Noxu may lag on space reclamation.
+
+### 4. Off-heap BIN cache (not implemented)
+**Severity**: MEDIUM for memory-constrained deployments.
+
+JE's evictor can move cold upper-IN nodes to off-heap memory (outside the JVM heap) to keep hot data in the heap. Noxu's evictor evicts cold BINs to disk only — there is no intermediate off-heap tier. This increases disk I/O for workloads with working sets larger than available heap but smaller than disk bandwidth allows.
+
+### 5. NoxuError hierarchy — no retryable vs fatal vs replication distinction
+**Severity**: MEDIUM for robust error handling.
+
+JE distinguishes ~20 concrete exception classes: `LockConflictException` (retryable), `LockTimeoutException` (retryable), `TransactionTimeoutException` (retryable), `DatabasePreemptedException` (replication, restart required), `RollbackException`, `LogWriteException` (fatal), etc. Noxu has `NoxuError` (fatal-ish) and `TxnError` (includes `LockNotAvailable`, `LockTimeout`, `Deadlock`) but does not expose `DatabasePreemptedException` or `RollbackException`. Applications written against JE's exception model cannot directly port their retry/recovery logic to Noxu.
+
+### 6. Concurrent write throughput gap (w10_conc: 3× slower than JE)
+**Severity**: HIGH for write-heavy concurrent workloads.
+
+At 100K scale with 8 readers + 8 writers on 16 threads, JE achieves ~10,000 ops/s and Noxu ~3,300 ops/s. The root cause is the Noxu LockManager's use of 16 `parking_lot::Mutex`-sharded tables: under high concurrency, threads spend ~40% of their time in lock acquisition even for non-conflicting records. JE's `LockManager` uses a similar sharding scheme but benefits from JIT inlining across the lock hot path that Noxu's Rust code does not currently match due to the trait object dispatch chain (`dyn Locker → LockManager → Lock`). Group-commit coalescing (S33) partially addresses fsync serialization but does not close the LM-level gap.
+
+### 7. Recovery throughput gap (w11: 2.7× slower than JE)
+**Severity**: LOW-MEDIUM — correctness is not affected.
+
+JE recovery at 100K scale completes in ~59ms; Noxu takes ~140ms. JE's JIT compiles the log scan loop to near-optimal machine code including SIMD-width comparisons. Noxu parses entry headers with explicit byte reads and serde deserialization — no SIMD, no mmap. This gap narrows at smaller scales where JVM startup dominates.
+
+### 8. No TiB-scale or sustained production load validation
+**Severity**: HIGH for production deployment decisions.
+
+Neither Noxu's correctness nor its performance has been validated with:
+- Data volumes exceeding a few hundred megabytes (CI tests use ≤100K records at ~107 B/record = ~10 MB)
+- Sustained concurrent load from hundreds or thousands of threads over hours
+- File-system edge cases (full disk, delayed fdatasync, torn writes, NFS/EBS)
+- JVM-JE interoperability (reading a Noxu database with JE, or vice versa, is deliberately unsupported)
+
+JE has been production-validated across all of these scenarios over two decades.
 
 ---
 
