@@ -1,7 +1,7 @@
 # Serialization Research: Zero-Copy Log Entry Parsing
 
 **Date**: 2026-05-09
-**Status**: Research complete; primary recommendation implemented.
+**Status**: Research complete; all recommendations implemented.
 
 ---
 
@@ -232,25 +232,43 @@ For a 1 GB log with 5 M LN entries, recovery allocation count drops from
 
 ---
 
-## 5. Future Work: `bytes::Bytes` for Full Zero-Copy
+## 5. `bytes::Bytes` for Full Zero-Copy — **IMPLEMENTED** (2026-05-09)
 
-The remaining 2 allocations per LN entry (key + data) exist because `LnRecord`
-owns `Vec<u8>`.  To eliminate these:
+The remaining 2 allocations per LN entry (key + data) have been eliminated.
 
-1. Change `LnRecord.key: Vec<u8>` → `bytes::Bytes`
-2. Change `LnRecord.data: Option<Vec<u8>>` → `Option<bytes::Bytes>`
-3. Wrap the mmap region in `Bytes::from_static(unsafe {...})` or via an
-   `Arc<[u8]>` owner
-4. Slice the `Bytes` for each field: `file_bytes.slice(key_start..key_end)`
+### Changes made
 
-`Bytes::slice` is O(1) and performs no copy — it only clones the `Arc` reference
-counter.  This would reduce the hot recovery path to **0 heap allocations per LN
-entry** (only the `LnRecord` struct itself, allocated once per batch by the
-recovery manager).
+| File | Change |
+|------|--------|
+| `crates/noxu-recovery/src/log_scanner.rs` | `LnRecord.key/data/abort_key/abort_data: Vec<u8>` → `Bytes` |
+| `crates/noxu-recovery/src/recovery_manager.rs` | `tree.insert` call sites materialise `Bytes` → `Vec<u8>` via `.to_vec()` at ownership boundary |
+| `crates/noxu-dbi/src/file_manager_scanner.rs` | `load_file_bytes()` wraps mmap via `Bytes::from_owner(mmap)`; LN field slices use `payload.slice(subslice_range(raw, r.key))` — O(1) |
 
-This change requires updating `RecoveryManager` and its callers, and careful
-lifetime management around the mmap region.  It is the correct next step once
-the current 2-allocation baseline is validated in benchmarks.
+### How it works
+
+1. `load_file_bytes()` returns `Bytes::from_owner(mmap)` — the OS-managed mmap
+   pages are the backing store; no copy of the file is made.
+2. For each LN entry, `parse_from_slice` computes `&[u8]` field positions with
+   zero allocation (pointer arithmetic only).
+3. `payload.slice(subslice_range(raw, r.key))` creates a `Bytes` sub-slice in
+   O(1) — only an Arc refcount increment.
+4. `LnRecord` stores these `Bytes` slices with zero heap allocation.
+5. At the tree insertion boundary (`tree.insert` takes `Vec<u8>`), `.to_vec()`
+   is called once per field — 2 allocations for entries that are redone/undone,
+   0 for analysis-only entries.
+
+### Final allocation profile
+
+| Path | Before (post §3) | After | Change |
+|------|-----------------|-------|--------|
+| Analysis-only LN entries | 2 allocs | **0 allocs** | -100% |
+| Redo/undo LN entries | 2 allocs | 2 allocs | unchanged† |
+| Write path | 0 allocs | 0 allocs | unchanged |
+
+†The 2 allocations at redo/undo are unavoidable: the B-tree `BinEntry` must own
+its key and data bytes independent of the mmap region lifetime.  Eliminating
+these would require changing `BinEntry` to also use `Bytes` — accepted future
+work if profiling shows it matters.
 
 ---
 
