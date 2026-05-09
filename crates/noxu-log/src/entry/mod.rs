@@ -40,7 +40,7 @@ pub use immutable_file_entry::ImmutableFileEntry;
 pub use in_delete_info_entry::InDeleteInfoEntry;
 pub use in_dupdelete_info_entry::InDupDeleteInfoEntry;
 pub use in_log_entry::InLogEntry;
-pub use ln_log_entry::LnLogEntry;
+pub use ln_log_entry::{LnEntryRef, LnLogEntry};
 pub use matchpoint_entry::MatchpointEntry;
 pub use name_ln_log_entry::NameLnLogEntry;
 pub use old_bin_delta_entry::OldBinDeltaEntry;
