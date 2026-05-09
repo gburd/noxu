@@ -525,16 +525,18 @@ impl RecoveryManager {
                             } else if let Some(abort_data) = &rec.abort_data {
                                 let key = rec.abort_key
                                     .clone()
-                                    .unwrap_or_else(|| rec.key.clone());
-                                let _ = t.insert(key, abort_data.clone(), *abort_lsn);
+                                    .unwrap_or_else(|| rec.key.clone())
+                                    .to_vec();
+                                let _ = t.insert(key, abort_data.to_vec(), *abort_lsn);
                             } else {
                                 // Non-embedded: read before-image from log.
                                 let before_image = scanner.read_at_lsn(*abort_lsn);
                                 if let Some(LogEntry::Ln(before_rec)) = before_image {
                                     if let Some(before_data) = before_rec.data {
                                         let key = before_rec.abort_key
-                                            .unwrap_or(before_rec.key);
-                                        let _ = t.insert(key, before_data, *abort_lsn);
+                                            .unwrap_or(before_rec.key)
+                                            .to_vec();
+                                        let _ = t.insert(key, before_data.to_vec(), *abort_lsn);
                                     } else {
                                         t.delete(&rec.key);
                                     }
@@ -971,8 +973,9 @@ impl RecoveryManager {
                 // that arrived after the log was scanned), the overwrite is
                 // still safe here because recovery runs before any new
                 // transactions are admitted.
-                let data = rec.data.clone().unwrap_or_default();
-                let _ = tree.insert(rec.key.clone(), data, lsn);
+                // Materialise Bytes → Vec<u8> at the tree boundary.
+                let data = rec.data.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
+                let _ = tree.insert(rec.key.to_vec(), data, lsn);
             }
             LnOperation::Delete => {
                 // Bin.deleteEntry(index) / slot KD-flag set.
@@ -1162,8 +1165,9 @@ impl RecoveryManager {
                                     // Embedded before-image: re-insert prior value.
                                     let key = rec.abort_key
                                         .clone()
-                                        .unwrap_or_else(|| rec.key.clone());
-                                    let _ = t.insert(key, abort_data.clone(), *abort_lsn);
+                                        .unwrap_or_else(|| rec.key.clone())
+                                        .to_vec();
+                                    let _ = t.insert(key, abort_data.to_vec(), *abort_lsn);
                                 } else {
                                     // Non-embedded LN: fetch before-image from log.
                                     //
@@ -1177,8 +1181,9 @@ impl RecoveryManager {
                                     if let Some(LogEntry::Ln(before_rec)) = before_image {
                                         if let Some(before_data) = before_rec.data {
                                             let key = before_rec.abort_key
-                                                .unwrap_or(before_rec.key);
-                                            let _ = t.insert(key, before_data, *abort_lsn);
+                                                .unwrap_or(before_rec.key)
+                                                .to_vec();
+                                            let _ = t.insert(key, before_data.to_vec(), *abort_lsn);
                                         } else {
                                             // Before-image was itself a delete.
                                             t.delete(&rec.key);
@@ -1258,6 +1263,7 @@ impl Default for RecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use crate::dirty_in_map::CheckpointReference;
     use crate::log_scanner::{
         CkptEndRecord, CkptStartRecord, DbTreeRecord, InMemoryLogScanner,
@@ -1281,8 +1287,8 @@ mod tests {
             db_id,
             txn_id,
             LnOperation::Insert,
-            key.to_vec(),
-            Some(b"value".to_vec()),
+            Bytes::copy_from_slice(key),
+            Some(Bytes::from_static(b"value")),
             abort_lsn,
             false,
         )
@@ -1298,7 +1304,7 @@ mod tests {
             db_id,
             txn_id,
             LnOperation::Delete,
-            key.to_vec(),
+            Bytes::copy_from_slice(key),
             None,
             abort_lsn,
             true,
@@ -2030,8 +2036,8 @@ mod tests {
                 1,
                 Some(1),
                 LnOperation::Insert,
-                b"alpha".to_vec(),
-                Some(b"value_a".to_vec()),
+                Bytes::from_static(b"alpha"),
+                Some(Bytes::from_static(b"value_a")),
                 NULL_LSN,
                 false,
             )),
@@ -2061,8 +2067,8 @@ mod tests {
                 1,
                 None, // non-transactional
                 LnOperation::Insert,
-                b"beta".to_vec(),
-                Some(b"value_b".to_vec()),
+                Bytes::from_static(b"beta"),
+                Some(Bytes::from_static(b"value_b")),
                 NULL_LSN,
                 false,
             )),
@@ -2087,8 +2093,8 @@ mod tests {
                 1,
                 Some(99),
                 LnOperation::Insert,
-                b"gamma".to_vec(),
-                Some(b"value_g".to_vec()),
+                Bytes::from_static(b"gamma"),
+                Some(Bytes::from_static(b"value_g")),
                 NULL_LSN,
                 false,
             )),
@@ -2126,8 +2132,8 @@ mod tests {
                 1,
                 Some(5),
                 LnOperation::Insert,
-                b"delta".to_vec(),
-                Some(b"value_d".to_vec()),
+                Bytes::from_static(b"delta"),
+                Some(Bytes::from_static(b"value_d")),
                 NULL_LSN, // abort_lsn=NULL → first write → DeleteSlot
                 false,
             )),
@@ -2161,7 +2167,7 @@ mod tests {
                 1,
                 Some(2),
                 LnOperation::Delete,
-                b"epsilon".to_vec(),
+                Bytes::from_static(b"epsilon"),
                 None,
                 NULL_LSN,
                 true,
@@ -2216,7 +2222,7 @@ mod tests {
             lsn(0, 10),
             LogEntry::Ln(LnRecord::new(
                 1, Some(1), LnOperation::Insert,
-                b"key1".to_vec(), Some(b"v1".to_vec()), NULL_LSN, false,
+                Bytes::from_static(b"key1"), Some(Bytes::from_static(b"v1")), NULL_LSN, false,
             )),
         );
         scanner.push(
@@ -2228,7 +2234,7 @@ mod tests {
             lsn(0, 30),
             LogEntry::Ln(LnRecord::new(
                 1, Some(2), LnOperation::Insert,
-                b"key2".to_vec(), Some(b"v2".to_vec()), NULL_LSN, false,
+                Bytes::from_static(b"key2"), Some(Bytes::from_static(b"v2")), NULL_LSN, false,
             )),
         );
 
