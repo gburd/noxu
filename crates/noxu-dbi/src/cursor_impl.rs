@@ -34,6 +34,7 @@ use noxu_tree::{BinEntry, Tree};
 use noxu_txn::{LockManager, LockType, Locker, Txn};
 
 use crate::dup_key_data;
+use crate::throughput_stats::ThroughputStats;
 use noxu_util::{Lsn, vlsn::NULL_VLSN};
 use noxu_sync::RwLock;
 
@@ -176,6 +177,8 @@ pub struct CursorImpl {
     ///
     /// (Txn subtype).
     txn_ref: Option<Arc<Mutex<Txn>>>,
+    /// Throughput counters shared with all cursors on this database.
+    throughput: Arc<ThroughputStats>,
 }
 
 impl CursorImpl {
@@ -190,6 +193,7 @@ impl CursorImpl {
     /// * `db_impl` - The database implementation this cursor operates on
     /// * `locker_id` - The locker (transaction) ID for this cursor
     pub fn new(db_impl: Arc<RwLock<DatabaseImpl>>, locker_id: i64) -> Self {
+        let throughput = db_impl.read().throughput.clone();
         CursorImpl {
             id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
             db_impl,
@@ -203,6 +207,7 @@ impl CursorImpl {
             log_manager: None,
             lock_manager: None,
             txn_ref: None,
+            throughput,
         }
     }
 
@@ -215,6 +220,7 @@ impl CursorImpl {
         locker_id: i64,
         log_manager: Arc<LogManager>,
     ) -> Self {
+        let throughput = db_impl.read().throughput.clone();
         CursorImpl {
             id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
             db_impl,
@@ -228,6 +234,7 @@ impl CursorImpl {
             log_manager: Some(log_manager),
             lock_manager: None,
             txn_ref: None,
+            throughput,
         }
     }
 

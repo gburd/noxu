@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use noxu_sync::RwLock;
 
 use crate::database_impl::DatabaseImpl;
+use crate::throughput_stats::ThroughputStatsSnapshot;
 use crate::dbi_config::DbiEnvConfig;
 use crate::file_manager_scanner::FileManagerLogScanner;
 use crate::{
@@ -898,6 +899,16 @@ impl EnvironmentImpl {
     /// Returns the number of open databases.
     pub fn n_databases(&self) -> usize {
         self.db_map.read().len()
+    }
+
+    /// Aggregates throughput statistics across all open databases.
+    pub fn get_throughput_snapshot(&self) -> ThroughputStatsSnapshot {
+        let mut agg = ThroughputStatsSnapshot::default();
+        for db in self.db_map.read().values() {
+            let snap = db.read().throughput.snapshot();
+            agg.add(&snap);
+        }
+        agg
     }
 
     /// Closes the environment.

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use crate::dup_key_data;
+use crate::throughput_stats::ThroughputStats;
 
 use crate::{DatabaseConfig, DatabaseId, DbType};
 
@@ -76,6 +77,12 @@ pub struct DatabaseImpl {
     /// Duplicate comparator (None = default byte comparison).
     dup_comparator:
         Option<Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>>,
+    /// Per-database operation throughput counters.
+    ///
+    /// Shared with every CursorImpl opened on this database so that insert,
+    /// search, update, delete and position operations can be counted on the
+    /// hot path without acquiring any mutex.
+    pub throughput: Arc<ThroughputStats>,
 }
 
 /// Persistent B-tree root metadata stored alongside the database record.
@@ -155,6 +162,7 @@ impl DatabaseImpl {
             bt_comparator: None,
             dup_comparator: None,
             entry_count: Arc::new(AtomicU64::new(0)),
+            throughput: ThroughputStats::new(),
         }
     }
 
@@ -388,6 +396,7 @@ impl DatabaseImpl {
             bt_comparator: None,
             dup_comparator: None,
             entry_count: Arc::new(AtomicU64::new(0)),
+            throughput: ThroughputStats::new(),
         })
     }
 }
