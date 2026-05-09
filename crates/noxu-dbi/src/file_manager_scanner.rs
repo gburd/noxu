@@ -122,7 +122,11 @@ impl FileManagerLogScanner {
                         | LogEntryType::UpdateLNTxn
                         | LogEntryType::DeleteLNTxn
                 );
-                let e = LnLogEntry::read_from_log(payload, is_txn).ok()?;
+                // Use zero-copy parse: key/data are &[u8] slices into
+                // `payload` (which itself points into the mmap'd file buf).
+                // Only .to_vec() at the LnRecord boundary where owned bytes
+                // are required — one allocation per field instead of two.
+                let r = LnLogEntry::parse_from_slice(payload, is_txn).ok()?;
                 let op = match entry_type {
                     LogEntryType::InsertLN | LogEntryType::InsertLNTxn => {
                         LnOperation::Insert
@@ -133,16 +137,16 @@ impl FileManagerLogScanner {
                     _ => LnOperation::Delete,
                 };
                 let mut rec = LnRecord::new(
-                    e.db_id,
-                    e.txn_id.map(|id| id as u64),
+                    r.db_id,
+                    r.txn_id.map(|id| id as u64),
                     op,
-                    e.key,
-                    e.data,
-                    e.abort_lsn,
-                    e.abort_known_deleted,
+                    r.key.to_vec(),
+                    r.data.map(<[u8]>::to_vec),
+                    r.abort_lsn,
+                    r.abort_known_deleted,
                 );
-                rec.abort_key = e.abort_key;
-                rec.abort_data = e.abort_data;
+                rec.abort_key = r.abort_key.map(<[u8]>::to_vec);
+                rec.abort_data = r.abort_data.map(<[u8]>::to_vec);
                 Some(LogEntry::Ln(rec))
             }
 
