@@ -238,6 +238,7 @@ impl<T: Locker> LockerExt for T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LockGrantType;
 
     /// Test that trait methods have correct defaults.
     struct TestLocker {
@@ -256,7 +257,7 @@ mod tests {
             _lock_type: LockType,
             _non_blocking: bool,
         ) -> Result<LockResult, TxnError> {
-            unimplemented!()
+            Ok(LockResult::new(LockGrantType::New, None))
         }
 
         fn release_lock(&mut self, _lsn: u64) -> Result<(), TxnError> {
@@ -414,7 +415,7 @@ mod tests {
             _lock_type: LockType,
             _non_blocking: bool,
         ) -> Result<LockResult, TxnError> {
-            unimplemented!()
+            Ok(LockResult::new(LockGrantType::New, None))
         }
 
         fn release_lock(&mut self, _lsn: u64) -> Result<(), TxnError> {
