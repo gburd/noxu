@@ -7,10 +7,9 @@
 //! Log file scanning utilities.
 //! `RecoveryManager.recover()`.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use bytes::Bytes;
 use noxu_log::{
     FileManager,
     entry::{BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry},
@@ -28,24 +27,14 @@ use noxu_util::{Lsn, NULL_LSN};
 // Maximum plausible payload size (64 MiB) for a sanity check while scanning.
 const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;
 
-/// A file's bytes, either memory-mapped (zero-copy) or heap-owned (fallback).
+/// Compute the byte range of `child` within `parent`.
 ///
-/// Both variants deref to `&[u8]` so the parsing loop is identical either way.
-/// Recovery uses mmap by default; if mmap fails (e.g. the file is empty or the
-/// OS refuses), it falls back to a single `pread64` into a heap buffer.
-enum FileBuf {
-    Mapped(Mmap),
-    Owned(Vec<u8>),
-}
-
-impl Deref for FileBuf {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            FileBuf::Mapped(m) => m,
-            FileBuf::Owned(v) => v,
-        }
-    }
+/// Panics in debug builds if `child` is not a subslice of `parent`; in release
+/// builds the range is silently clamped (unreachable in correct code).
+#[inline]
+fn subslice_range(parent: &[u8], child: &[u8]) -> std::ops::Range<usize> {
+    let start = child.as_ptr() as usize - parent.as_ptr() as usize;
+    start..start + child.len()
 }
 
 /// `LogScanner` implementation backed by a real `FileManager`.
@@ -64,46 +53,57 @@ impl FileManagerLogScanner {
         Self { file_manager }
     }
 
-    /// Load a log file's bytes for sequential scanning.
+    /// Load a log file as a [`Bytes`] buffer for sequential scanning.
     ///
-    /// Tries `mmap` first (zero heap allocation, OS-managed read-ahead).
-    /// Falls back to a single `pread64` into a heap buffer if mmap fails.
-    fn load_file_buf(&self, file_num: u32, file_len: u64) -> Option<FileBuf> {
-        // Try mmap first.
+    /// Tries `mmap` first via [`Bytes::from_owner`] so the OS-managed pages
+    /// back the buffer without any heap copy.  Falls back to a single
+    /// `pread64` into a `Vec<u8>` — owned by the `Bytes` — if mmap fails.
+    ///
+    /// Either way, callers get a `Bytes` that can be sliced zero-copy.
+    fn load_file_bytes(&self, file_num: u32, file_len: u64) -> Option<Bytes> {
+        // Try mmap first: Bytes::from_owner stores the Mmap as the owner,
+        // keeping the pages mapped for as long as the Bytes (or any slice
+        // derived from it) is alive.
         if let Ok(mmap) = self.file_manager.mmap_file(file_num) {
-            return Some(FileBuf::Mapped(mmap));
+            return Some(Bytes::from_owner(mmap));
         }
-        // Fallback: heap buffer + pread64.
+        // Fallback: single pread64 into a heap Vec, then move into Bytes
+        // (no copy — Bytes::from(Vec<u8>) takes ownership).
         let mut buf = vec![0u8; file_len as usize];
         match self.file_manager.read_from_file(file_num, 0, &mut buf) {
             Ok(n) if n < file_len as usize => buf.truncate(n),
             Err(_) => return None,
             Ok(_) => {}
         }
-        Some(FileBuf::Owned(buf))
+        Some(Bytes::from(buf))
     }
 
-    /// Convert a raw (entry_type_num, payload) pair to a `LogEntry`.
+    /// Convert a raw (entry_type_num, payload_bytes) pair to a `LogEntry`.
+    ///
+    /// `payload` is a `Bytes` slice pointing into the file buffer.  For LN
+    /// entries the key/data fields are created as sub-slices of `payload`
+    /// via `Bytes::slice` — zero heap allocation until the bytes are
+    /// materialised into the B-tree at the redo/undo boundary.
     ///
     /// Returns `None` for entry types recovery does not need to process
     /// (FileHeader, Trace, etc.).
     fn parse_payload(
         entry_type_num: u8,
-        payload: &[u8],
+        payload: Bytes,
     ) -> Option<LogEntry> {
         let entry_type = LogEntryType::from_type_num(entry_type_num)?;
 
         match entry_type {
             // Transaction end ─────────────────────────────────────────
             LogEntryType::TxnCommit => {
-                let e = TxnEndEntry::read_from_log(payload).ok()?;
+                let e = TxnEndEntry::read_from_log(&payload).ok()?;
                 Some(LogEntry::TxnCommit(TxnCommitRecord {
                     txn_id: e.txn_id as u64,
                     lsn: NULL_LSN, // Filled in by caller with actual LSN.
                 }))
             }
             LogEntryType::TxnAbort => {
-                let e = TxnEndEntry::read_from_log(payload).ok()?;
+                let e = TxnEndEntry::read_from_log(&payload).ok()?;
                 Some(LogEntry::TxnAbort(TxnAbortRecord {
                     txn_id: e.txn_id as u64,
                 }))
@@ -122,11 +122,11 @@ impl FileManagerLogScanner {
                         | LogEntryType::UpdateLNTxn
                         | LogEntryType::DeleteLNTxn
                 );
-                // Use zero-copy parse: key/data are &[u8] slices into
-                // `payload` (which itself points into the mmap'd file buf).
-                // Only .to_vec() at the LnRecord boundary where owned bytes
-                // are required — one allocation per field instead of two.
-                let r = LnLogEntry::parse_from_slice(payload, is_txn).ok()?;
+                // Zero-copy parse: LnEntryRef borrows &[u8] slices from
+                // `payload`.  We then convert each slice to a Bytes::slice
+                // of the same underlying mmap region — no heap allocation.
+                let raw: &[u8] = &payload;
+                let r = LnLogEntry::parse_from_slice(raw, is_txn).ok()?;
                 let op = match entry_type {
                     LogEntryType::InsertLN | LogEntryType::InsertLNTxn => {
                         LnOperation::Insert
@@ -136,23 +136,25 @@ impl FileManagerLogScanner {
                     }
                     _ => LnOperation::Delete,
                 };
+                let key   = payload.slice(subslice_range(raw, r.key));
+                let data  = r.data.map(|s| payload.slice(subslice_range(raw, s)));
                 let mut rec = LnRecord::new(
                     r.db_id,
                     r.txn_id.map(|id| id as u64),
                     op,
-                    r.key.to_vec(),
-                    r.data.map(<[u8]>::to_vec),
+                    key,
+                    data,
                     r.abort_lsn,
                     r.abort_known_deleted,
                 );
-                rec.abort_key = r.abort_key.map(<[u8]>::to_vec);
-                rec.abort_data = r.abort_data.map(<[u8]>::to_vec);
+                rec.abort_key  = r.abort_key.map(|s| payload.slice(subslice_range(raw, s)));
+                rec.abort_data = r.abort_data.map(|s| payload.slice(subslice_range(raw, s)));
                 Some(LogEntry::Ln(rec))
             }
 
             // IN / BIN entries ────────────────────────────────────────
             LogEntryType::IN | LogEntryType::BIN => {
-                let e = InLogEntry::read_from_log(payload).ok()?;
+                let e = InLogEntry::read_from_log(&payload).ok()?;
                 // Extract node_id from the serialized node_data so the
                 // recovery redo pass can key on it.  The format written by
                 // BinStub::serialize_full() starts with node_id(u64BE).
@@ -171,7 +173,7 @@ impl FileManagerLogScanner {
                 }))
             }
             LogEntryType::BINDelta => {
-                let e = BinDeltaLogEntry::read_from_log(payload).ok()?;
+                let e = BinDeltaLogEntry::read_from_log(&payload).ok()?;
                 let node_id = if e.delta_data.len() >= 8 {
                     u64::from_be_bytes(e.delta_data[0..8].try_into().ok()?)
                 } else {
@@ -189,14 +191,14 @@ impl FileManagerLogScanner {
 
             // Checkpoint entries ──────────────────────────────────────
             LogEntryType::CkptStart => {
-                let e = CheckpointStart::read_from_log(payload).ok()?;
+                let e = CheckpointStart::read_from_log(&payload).ok()?;
                 Some(LogEntry::CkptStart(CkptStartRecord {
                     id: e.get_id(),
                     lsn: NULL_LSN, // Filled in by caller.
                 }))
             }
             LogEntryType::CkptEnd => {
-                let e = CheckpointEnd::read_from_log(payload).ok()?;
+                let e = CheckpointEnd::read_from_log(&payload).ok()?;
                 Some(LogEntry::CkptEnd(CkptEndRecord {
                     id: e.get_id(),
                     checkpoint_start_lsn: e.get_checkpoint_start_lsn(),
@@ -218,14 +220,18 @@ impl FileManagerLogScanner {
         }
     }
 
-    /// Parse a log entry from an in-memory file slice at `offset`.
+    /// Parse a log entry from a `Bytes` file buffer at `offset`.
+    ///
+    /// Extracts the payload as a `Bytes::slice` of `file_bytes` — zero-copy
+    /// for both the mmap and heap-owned fallback paths.
     ///
     /// Returns `(entry_size, Option<LogEntry>)` or `None` if the bytes are
     /// zero-filled (past the last write) or truncated.
-    fn parse_entry_from_slice(
-        data: &[u8],
+    fn parse_entry_from_bytes(
+        file_bytes: &Bytes,
         offset: usize,
     ) -> Option<(usize, Option<LogEntry>)> {
+        let data: &[u8] = file_bytes;
         if offset + MIN_HEADER_SIZE > data.len() {
             return None;
         }
@@ -254,7 +260,8 @@ impl FileManagerLogScanner {
             return None; // Truncated write at end of log.
         }
 
-        let payload = &data[offset + header_size..offset + entry_size];
+        // slice() is O(1): just bumps the Bytes Arc refcount.
+        let payload = file_bytes.slice(offset + header_size..offset + entry_size);
         let log_entry = Self::parse_payload(entry_type_num, payload);
 
         Some((entry_size, log_entry))
@@ -302,11 +309,10 @@ impl FileManagerLogScanner {
 
             // Prefer mmap (zero heap allocation, sequential OS read-ahead);
             // fall back to a single pread64 into a heap buffer if mmap fails.
-            let file_buf = match self.load_file_buf(file_num, file_len) {
+            let file_bytes = match self.load_file_bytes(file_num, file_len) {
                 Some(b) => b,
                 None => continue,
             };
-            let file_data: &[u8] = &file_buf;
 
             // Determine where in this file to start parsing.
             // Always start at FILE_HEADER_SIZE minimum: a start offset of 0
@@ -321,7 +327,7 @@ impl FileManagerLogScanner {
 
             let mut offset = file_start_offset;
 
-            while offset < file_data.len() {
+            while offset < file_bytes.len() {
                 // Enforce end_lsn upper bound.
                 if end_lsn != NULL_LSN {
                     let cur_lsn = Lsn::new(file_num, offset as u32);
@@ -330,7 +336,7 @@ impl FileManagerLogScanner {
                     }
                 }
 
-                match Self::parse_entry_from_slice(file_data, offset) {
+                match Self::parse_entry_from_bytes(&file_bytes, offset) {
                     None => break, // Zero-filled or truncated — end of data.
                     Some((entry_size, parsed)) => {
                         let entry_lsn = Lsn::new(file_num, offset as u32);
@@ -397,18 +403,17 @@ impl LogScanner for FileManagerLogScanner {
             }
 
             // Prefer mmap; fall back to pread64 on failure.
-            let file_buf = match self.load_file_buf(file_num, file_len) {
+            let file_bytes = match self.load_file_bytes(file_num, file_len) {
                 Some(b) => b,
                 None => continue,
             };
-            let file_data: &[u8] = &file_buf;
 
             let mut offset = FILE_HEADER_SIZE;
             let mut last_valid_offset: Option<usize> = None;
             let mut last_entry_size = 0usize;
 
-            while offset < file_data.len() {
-                match Self::parse_entry_from_slice(file_data, offset) {
+            while offset < file_bytes.len() {
+                match Self::parse_entry_from_bytes(&file_bytes, offset) {
                     None => break,
                     Some((entry_size, _)) => {
                         last_valid_offset = Some(offset);
@@ -425,7 +430,7 @@ impl LogScanner for FileManagerLogScanner {
                 // next_available is the byte immediately after the last entry.
                 // If we're at the end of this file, the next write goes to
                 // the start of the next file.
-                next_available_lsn = if end_offset >= file_data.len()
+                next_available_lsn = if end_offset >= file_bytes.len()
                     && file_nums.last().copied() != Some(file_num)
                 {
                     let next_file = file_num + 1;

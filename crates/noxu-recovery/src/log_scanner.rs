@@ -6,6 +6,7 @@
 //! process, and a `LogScanner` trait so that the real log-reading path and
 //! in-memory test fixtures share the same interface.
 
+use bytes::Bytes;
 use noxu_util::{Lsn, NULL_LSN};
 
 /// Operation type carried by a transactional LN.
@@ -25,6 +26,11 @@ pub enum LnOperation {
 /// - what key/value were written
 /// - the abort LSN and abort-known-deleted flag (before-image info)
 ///
+/// Variable-length fields use [`bytes::Bytes`] so that the file-backed scanner
+/// can store zero-copy slices of the mmap'd log region — cloning a `Bytes` is
+/// O(1) (Arc refcount bump) and no heap allocation is needed until the bytes
+/// are actually materialised into the B-tree at the redo/undo boundary.
+///
 /// Data extracted from log entries.
 #[derive(Debug, Clone)]
 pub struct LnRecord {
@@ -34,10 +40,10 @@ pub struct LnRecord {
     pub txn_id: Option<u64>,
     /// The operation type.
     pub operation: LnOperation,
-    /// The key bytes.
-    pub key: Vec<u8>,
+    /// The key bytes — zero-copy slice when built by the file-backed scanner.
+    pub key: Bytes,
     /// The value bytes, `None` for deletes.
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
     /// LSN to revert to on undo (before-image LSN, NULL_LSN = first write).
     pub abort_lsn: Lsn,
     /// Whether the slot was known-deleted before this operation.
@@ -46,14 +52,14 @@ pub struct LnRecord {
     ///
     /// In — populated when an embedded
     /// before-image has a different key (key-updating operations).
-    pub abort_key: Option<Vec<u8>>,
+    pub abort_key: Option<Bytes>,
     /// Data of the before-image (embedded in the log entry itself).
     ///
     /// In — populated for all embedded
     /// LNs in the NoSQL fork so that undo does NOT need to re-read the log.
     /// `None` for non-embedded LNs (rare in modern JE) and for first writes
     /// where the before-image is "deleted" (use `abort_known_deleted` instead).
-    pub abort_data: Option<Vec<u8>>,
+    pub abort_data: Option<Bytes>,
     /// Whether this entry has been marked invisible (rolled-back by HA).
     pub is_invisible: bool,
     /// Whether this entry belongs to a replicated transaction.
@@ -66,8 +72,8 @@ impl LnRecord {
         db_id: u64,
         txn_id: Option<u64>,
         operation: LnOperation,
-        key: Vec<u8>,
-        data: Option<Vec<u8>>,
+        key: Bytes,
+        data: Option<Bytes>,
         abort_lsn: Lsn,
         abort_known_deleted: bool,
     ) -> Self {
@@ -507,8 +513,8 @@ mod tests {
             42,
             Some(7),
             LnOperation::Insert,
-            b"key".to_vec(),
-            Some(b"val".to_vec()),
+            Bytes::from_static(b"key"),
+            Some(Bytes::from_static(b"val")),
             NULL_LSN,
             false,
         );
