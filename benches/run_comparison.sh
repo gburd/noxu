@@ -32,7 +32,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 RESULTS="$REPO_ROOT/benches/results"
-mkdir -p "$RESULTS" "$RESULTS/je-tmp"
+mkdir -p "$RESULTS"
+# JE_TMPDIR is set after argument parsing (may depend on BENCH_DIR)
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -66,6 +67,15 @@ while [[ $# -gt 0 ]]; do
         *)              shift ;;
     esac
 done
+
+# Resolve JE tmpdir: use BENCH_DIR/je-tmp when bench-dir is set (real storage),
+# otherwise use the in-tree results/je-tmp (tmpfs default).
+if [[ -n "$BENCH_DIR" ]]; then
+    JE_TMPDIR="${BENCH_DIR}/je-tmp"
+else
+    JE_TMPDIR="$RESULTS/je-tmp"
+fi
+mkdir -p "$JE_TMPDIR"
 
 # ---------------------------------------------------------------------------
 # Run Noxu benchmark
@@ -192,6 +202,9 @@ if [[ $SKIP_JE -eq 0 ]]; then
     echo "  JVM: $(java -version 2>&1 | head -1)"
     echo "  GC:  $GC_DESC"
     echo "  GC log: $RESULTS/je_gc.log"
+    if [[ -n "$BENCH_DIR" ]]; then
+        echo "  Bench dir: $JE_TMPDIR  (real storage)"
+    fi
     echo "════════════════════════════════════════════════════════"
 
     JE_MAX_SCALE_FLAG=""
@@ -206,7 +219,7 @@ if [[ $SKIP_JE -eq 0 ]]; then
         "${GC_FLAGS[@]}" \
         "$GC_LOG" \
         ${JE_MAX_SCALE_FLAG} \
-        -Djava.io.tmpdir="$RESULTS/je-tmp" \
+        -Djava.io.tmpdir="$JE_TMPDIR" \
         -jar "$JE_BENCH_JAR" \
         2>&1 | tee "$RESULTS/je_stdout.txt"
     echo ""
@@ -353,7 +366,7 @@ lines.append("  GC%           — fraction of JE wall time lost to GC pauses")
 lines.append("  GCn           — GC collection count during JE workload")
 lines.append("  Fsync         — fdatasync calls during workload (both: CommitSync / auto-commit path; Noxu also coalesces concurrent commits via group commit)")
 lines.append("")
-lines.append("Noxu vs JE analysis (Session 30 — 100% structural fidelity):")
+lines.append("Noxu vs JE analysis (Session 31 — 100% structural fidelity; bytes::Bytes zero-copy recovery):")
 lines.append("  • WRITE throughput (w01/w02): JE up to 28% faster — JE batches log writes before fsync;")
 lines.append("    Noxu serializes through log_write_latch with 1 fsync/write on tmpfs (coalesces on real storage)")
 lines.append("  • READ throughput (w03/w04): roughly equal at 100K; Noxu leads at small scales (no JVM warmup)")
