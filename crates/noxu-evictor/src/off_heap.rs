@@ -1,203 +1,313 @@
 //! Off-heap cache support.
 //!
+//! `OffHeapCache` stores serialised BIN bytes in an anonymous `mmap` region,
+//! keeping them outside the Rust allocator heap.  The OS can page out cold
+//! entries under memory pressure while the in-memory index (a `LruCache`) stays
+//! resident.  When capacity is exhausted, the least-recently-used node is
+//! evicted to make room rather than refusing the insert.
 //!
-//! OffHeapCache stores evicted BIN bytes in a `ConcurrentHashMap<Long, byte[]>`
-//! keyed by node ID.  Rust has no GC pressure to avoid, so we use a simple
-//! `Mutex<HashMap<u64, Vec<u8>>>` as the equivalent.  The allocator abstraction
-//! from the Java version is not needed here.
+//! Backing: `memmap2::MmapMut` (anonymous, no file backing) + `lru::LruCache`
+//! for O(1) LRU get/evict/peek.  A bump allocator advances through the mmap
+//! region; compaction is triggered when the free-after-bump space would be
+//! exhausted.
 
-use std::collections::HashMap;
+use lru::LruCache;
+use memmap2::MmapMut;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Off-heap cache for B-tree nodes.
-///
-/// When enabled, evicted nodes from the main (on-heap) cache are moved here
-/// rather than being discarded.  This allows a larger effective cache because
-/// the data can be reloaded without disk I/O on the next access.
-///
-/// equivalent: `ConcurrentHashMap<Long nodeId, byte[] serializedBytes>` +
-/// `OffHeapAllocator`.  In Rust we use a `Mutex<HashMap>` (no GC pressure to
-/// avoid, so a plain heap `Vec<u8>` per node is fine).
-///
-/// 
-#[derive(Debug)]
-pub struct OffHeapCache {
-    /// Whether off-heap cache is enabled.
-    enabled: bool,
+// ─── internal mmap-backed store ───────────────────────────────────────────────
 
-    /// Maximum size of off-heap cache in bytes.  When `used_bytes` would
-    /// exceed this value, `store_node` returns `false` (over budget).
-    max_bytes: u64,
-
-    /// Serialised bytes keyed by node_id.
-    /// In-memory node ID set.
-    store: Mutex<HashMap<u64, Vec<u8>>>,
-
-    /// Running total of bytes currently stored off-heap.
-    /// Tracks total allocated bytes.
-    used_bytes: AtomicU64,
+struct MmapStore {
+    /// The anonymous mmap region.
+    mmap: MmapMut,
+    /// LRU index: node_id → (offset_in_mmap, byte_len).
+    /// `get` promotes the entry to MRU; `pop_lru` evicts the LRU tail.
+    index: LruCache<u64, (usize, usize)>,
+    /// Next write position (bump allocator within mmap).
+    write_pos: usize,
+    /// Bytes from evicted/removed entries that have not been compacted.
+    fragmented: usize,
+    /// Logical capacity (== mmap.len()).
+    capacity: usize,
+    /// Cumulative count of LRU-driven evictions.
+    evictions: u64,
 }
 
-impl OffHeapCache {
-    /// Create a new off-heap cache.
-    ///
-    /// # Arguments
-    /// * `enabled`   - Whether off-heap caching is enabled
-    /// * `max_bytes` - Maximum capacity in bytes (0 = disabled regardless of `enabled`)
-    pub fn new(enabled: bool, max_bytes: u64) -> Self {
-        let actually_enabled = enabled && max_bytes > 0;
-        Self {
-            enabled: actually_enabled,
-            max_bytes,
-            store: Mutex::new(HashMap::new()),
-            used_bytes: AtomicU64::new(0),
+impl MmapStore {
+    fn new(capacity: usize) -> Option<Self> {
+        if capacity == 0 {
+            return None;
         }
+        let mmap = MmapMut::map_anon(capacity).ok()?;
+        Some(Self {
+            mmap,
+            index: LruCache::unbounded(),
+            write_pos: 0,
+            fragmented: 0,
+            capacity,
+            evictions: 0,
+        })
     }
 
-    /// Check if off-heap cache is enabled.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
+    fn live_bytes(&self) -> usize {
+        self.write_pos - self.fragmented
     }
 
-    /// Get the maximum capacity of the off-heap cache in bytes.
-    pub fn get_max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
-    /// Get the maximum size of the off-heap cache (alias kept for API compat).
-    pub fn get_max_size(&self) -> usize {
-        self.max_bytes as usize
-    }
-
-    /// Get the current usage of the off-heap cache in bytes.
-    pub fn get_usage(&self) -> usize {
-        self.used_bytes.load(Ordering::Relaxed) as usize
-    }
-
-    /// Check if the off-heap cache is over budget.
-    pub fn is_over_budget(&self) -> bool {
-        self.enabled && self.used_bytes.load(Ordering::Relaxed) > self.max_bytes
-    }
-
-    /// Store serialised node bytes in the off-heap cache.
-    ///
-    /// Returns `false` when the cache is disabled or the addition would exceed
-    /// `max_bytes`.  If a node with the same ID was already present its old
-    /// bytes are replaced (usage is adjusted accordingly).
-    ///
-    /// `OffHeapCache.storeEvictedBIN` / the underlying allocator
-    /// `storeIN` pattern — key = nodeId, value = serialised bytes.
-    pub fn store_node(&self, node_id: u64, data: Vec<u8>) -> bool {
-        if !self.enabled {
+    /// Store `data` for `node_id`, evicting LRU entries as needed.
+    /// Returns `false` only if `data.len() > capacity` (a single entry is too
+    /// large for the entire cache).
+    fn store(&mut self, node_id: u64, data: &[u8]) -> bool {
+        let len = data.len();
+        if len > self.capacity {
             return false;
         }
 
-        let new_len = data.len() as u64;
-
-        let mut guard = match self.store.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-
-        // Account for eviction of a previous entry for this node.
-        let old_len = guard.get(&node_id).map(|v| v.len() as u64).unwrap_or(0);
-
-        let current = self.used_bytes.load(Ordering::Relaxed);
-        let projected = current - old_len + new_len;
-        if projected > self.max_bytes {
-            return false; // over budget
+        // Remove any existing entry (replace semantics; count its bytes freed).
+        // `LruCache::pop` returns `Option<V>` = `Option<(usize, usize)>`.
+        if let Some((_, old_len)) = self.index.pop(&node_id) {
+            self.fragmented += old_len;
         }
 
-        guard.insert(node_id, data);
-        self.used_bytes.store(projected, Ordering::Relaxed);
+        // Evict LRU tail entries until `len` bytes fit within capacity.
+        while self.live_bytes() + len > self.capacity {
+            match self.index.pop_lru() {
+                Some((_, (_, evicted_len))) => {
+                    self.fragmented += evicted_len;
+                    self.evictions += 1;
+                }
+                // All entries evicted yet still not enough room — `len` must be
+                // larger than the entire mmap; already guarded above.
+                None => return false,
+            }
+        }
+
+        // Compact if there is not enough contiguous space at write_pos.
+        if self.write_pos + len > self.capacity {
+            self.compact();
+        }
+
+        self.mmap[self.write_pos..self.write_pos + len].copy_from_slice(data);
+        self.index.push(node_id, (self.write_pos, len));
+        self.write_pos += len;
         true
     }
 
-    /// Load serialised node bytes from the off-heap cache.
-    ///
-    /// Returns a clone of the stored bytes, leaving the entry in place (the
-    /// node will be promoted back to the main cache by the caller).
-    ///
-    /// `OffHeapCache.getBINBytes`.
-    pub fn load_node(&self, node_id: u64) -> Option<Vec<u8>> {
-        if !self.enabled {
-            return None;
-        }
-
-        let guard = self.store.lock().ok()?;
-        guard.get(&node_id).cloned()
+    /// Load bytes for `node_id` (marks it as recently used).
+    fn load(&mut self, node_id: u64) -> Option<Vec<u8>> {
+        let &(offset, len) = self.index.get(&node_id)?;
+        Some(self.mmap[offset..offset + len].to_vec())
     }
 
-    /// Remove a node from the off-heap cache and free its bytes.
-    ///
-    /// Returns `true` if the node was present and removed, `false` otherwise.
-    ///
-    /// `OffHeapCache.removeINFromMain` (the part that frees the
-    /// off-heap allocation for the BIN itself).
-    pub fn remove_node(&self, node_id: u64) -> bool {
-        if !self.enabled {
-            return false;
-        }
-
-        let mut guard = match self.store.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-
-        if let Some(old) = guard.remove(&node_id) {
-            let freed = old.len() as u64;
-            // Saturating sub — should never underflow in correct usage.
-            self.used_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(freed))
-            }).ok();
+    /// Remove a node, marking its bytes as fragmented.
+    fn remove(&mut self, node_id: u64) -> bool {
+        if let Some((_, len)) = self.index.pop(&node_id) {
+            self.fragmented += len;
             true
         } else {
             false
         }
     }
 
-    /// Clear all entries from the off-heap cache.
-    ///
-    /// `OffHeapCache.clearCache`.
-    pub fn clear(&self) {
-        if let Ok(mut guard) = self.store.lock() {
-            guard.clear();
+    /// Compact the mmap region: move all live entries to the beginning, close
+    /// gaps left by evictions/removals, rebuild the LRU index with updated
+    /// offsets.  LRU ordering is approximated by insertion-offset order
+    /// (entries at lower offsets were generally stored earlier).
+    fn compact(&mut self) {
+        // Collect live entries sorted by current physical offset (ascending).
+        let mut entries: Vec<(u64, usize, usize)> = self
+            .index
+            .iter()
+            .map(|(&id, &(off, len))| (id, off, len))
+            .collect();
+        entries.sort_by_key(|&(_, off, _)| off);
+
+        // Copy bytes to a contiguous region at the start of mmap.
+        let mut new_pos = 0usize;
+        for &(_, old_off, len) in &entries {
+            if old_off != new_pos {
+                self.mmap.copy_within(old_off..old_off + len, new_pos);
+            }
+            new_pos += len;
         }
-        self.used_bytes.store(0, Ordering::Relaxed);
+
+        // Rebuild the LRU with updated offsets (offset order ≈ insertion order).
+        let mut new_lru: LruCache<u64, (usize, usize)> = LruCache::unbounded();
+        let mut pos = 0usize;
+        for (id, _, len) in &entries {
+            new_lru.push(*id, (pos, *len));
+            pos += len;
+        }
+
+        self.index = new_lru;
+        self.write_pos = new_pos;
+        self.fragmented = 0;
     }
 
-    /// Number of nodes currently stored off-heap.
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+}
+
+// ─── public API ───────────────────────────────────────────────────────────────
+
+/// Off-heap BIN cache backed by an anonymous `mmap` region with LRU eviction.
+///
+/// Evicted BINs are serialised and placed here by the evictor.  The backing
+/// memory lives outside the Rust allocator heap, so the OS can page it out
+/// under memory pressure while the compact in-memory LRU index remains hot.
+/// When the cache is full, the least-recently-used entry is evicted to make
+/// room rather than refusing the new insert.
+///
+/// Structural equivalent: `OffHeapAllocator` + `ConcurrentHashMap<Long,
+/// byte[]>`.
+pub struct OffHeapCache {
+    enabled: bool,
+    max_bytes: u64,
+    inner: Mutex<Option<MmapStore>>,
+}
+
+impl std::fmt::Debug for OffHeapCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let usage = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.live_bytes()))
+            .unwrap_or(0);
+        f.debug_struct("OffHeapCache")
+            .field("enabled", &self.enabled)
+            .field("max_bytes", &self.max_bytes)
+            .field("used_bytes", &usage)
+            .finish()
+    }
+}
+
+impl OffHeapCache {
+    /// Create a new off-heap cache.
+    ///
+    /// `enabled && max_bytes > 0` must both be true for the cache to be
+    /// active.  If the anonymous `mmap` cannot be created, the cache is
+    /// silently disabled.
+    pub fn new(enabled: bool, max_bytes: u64) -> Self {
+        let store = if enabled && max_bytes > 0 {
+            MmapStore::new(max_bytes as usize)
+        } else {
+            None
+        };
+        let actually_enabled = store.is_some();
+        Self {
+            enabled: actually_enabled,
+            max_bytes,
+            inner: Mutex::new(store),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn get_max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn get_max_size(&self) -> usize {
+        self.max_bytes as usize
+    }
+
+    pub fn get_usage(&self) -> usize {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.live_bytes()))
+            .unwrap_or(0)
+    }
+
+    /// With LRU eviction the cache never exceeds its budget, so this always
+    /// returns `false`.
+    pub fn is_over_budget(&self) -> bool {
+        false
+    }
+
+    /// Store serialised node bytes in the off-heap cache.
+    ///
+    /// LRU entries are evicted as needed to stay within `max_bytes`.  Returns
+    /// `false` only when the cache is disabled or `data.len() > max_bytes`.
+    pub fn store_node(&self, node_id: u64, data: Vec<u8>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().map(|s| s.store(node_id, &data)))
+            .unwrap_or(false)
+    }
+
+    /// Load serialised node bytes, marking the entry as recently used.
+    ///
+    /// Returns `None` when the cache is disabled or the node is not cached.
+    pub fn load_node(&self, node_id: u64) -> Option<Vec<u8>> {
+        if !self.enabled {
+            return None;
+        }
+        self.inner.lock().ok()?.as_mut()?.load(node_id)
+    }
+
+    /// Remove a node from the cache, freeing its mmap space.
+    pub fn remove_node(&self, node_id: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().map(|s| s.remove(node_id)))
+            .unwrap_or(false)
+    }
+
+    /// Clear all entries.
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(s) = guard.as_mut() {
+                s.index = LruCache::unbounded();
+                s.write_pos = 0;
+                s.fragmented = 0;
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.store.lock().map(|g| g.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.len()))
+            .unwrap_or(0)
     }
 
-    /// True when no nodes are stored off-heap.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Number of bytes currently used by the off-heap cache.
     pub fn used_bytes(&self) -> u64 {
-        self.used_bytes.load(Ordering::Relaxed)
+        self.get_usage() as u64
     }
 
-    /// Get statistics about the off-heap cache.
     pub fn get_stats(&self) -> OffHeapStats {
-        let (num_bins, usage) = self.store
+        let (num_bins, usage, evictions) = self
+            .inner
             .lock()
-            .map(|g| (g.len(), g.values().map(|v| v.len()).sum::<usize>()))
-            .unwrap_or((0, 0));
-
+            .ok()
+            .and_then(|g| {
+                g.as_ref().map(|s| (s.len(), s.live_bytes(), s.evictions))
+            })
+            .unwrap_or((0, 0, 0));
         OffHeapStats {
             enabled: self.enabled,
             max_size: self.max_bytes as usize,
             usage,
             num_bins,
-            // LN off-heap is not supported; only BIN pages are cached off-heap.
-            // OffHeapCache which stores both BIN pages and LN values;
-            // Noxu stores LNs inline in BIN slots (embedded_ln=true) instead.
             num_lns: 0,
+            evictions,
         }
     }
 }
@@ -225,6 +335,9 @@ pub struct OffHeapStats {
 
     /// Number of LNs stored off-heap.
     pub num_lns: usize,
+
+    /// Cumulative LRU-driven evictions since the cache was created.
+    pub evictions: u64,
 }
 
 #[cfg(test)]
@@ -263,10 +376,14 @@ mod tests {
         assert!(cache.store_node(1, vec![0u8; 8]));
         assert!(!cache.is_over_budget());
 
-        // Store another 4 bytes for node 2 — would bring total to 12 > 10,
-        // so store_node must refuse.
-        assert!(!cache.store_node(2, vec![0u8; 4]));
-        assert!(!cache.is_over_budget()); // still 8 bytes
+        // Store 4 bytes for node 2: LRU evicts node 1 to make room.
+        // With LRU eviction the cache never goes over budget.
+        assert!(cache.store_node(2, vec![0u8; 4]));
+        assert!(!cache.is_over_budget());
+        // Node 1 was evicted; node 2 is present.
+        assert!(cache.load_node(1).is_none());
+        assert!(cache.load_node(2).is_some());
+        assert_eq!(cache.used_bytes(), 4);
     }
 
     #[test]
@@ -369,6 +486,7 @@ mod tests {
             usage: 512,
             num_bins: 10,
             num_lns: 100,
+            evictions: 0,
         };
 
         let stats2 = OffHeapStats {
@@ -377,6 +495,7 @@ mod tests {
             usage: 512,
             num_bins: 10,
             num_lns: 100,
+            evictions: 0,
         };
 
         assert_eq!(stats1, stats2);
@@ -390,6 +509,7 @@ mod tests {
             usage: 512,
             num_bins: 10,
             num_lns: 100,
+            evictions: 0,
         };
 
         let cloned = stats;
@@ -411,13 +531,20 @@ mod tests {
     }
 
     #[test]
-    fn test_budget_enforcement_multiple_nodes() {
-        // Budget = 20 bytes; two 8-byte nodes fit, a third does not.
+    fn test_budget_enforcement_lru_eviction() {
+        // Budget = 20 bytes: two 8-byte nodes fit (16 bytes), a third 8-byte
+        // node evicts the LRU (node 1) to stay within budget.
         let cache = OffHeapCache::new(true, 20);
         assert!(cache.store_node(1, vec![0u8; 8]));
         assert!(cache.store_node(2, vec![0u8; 8]));
-        assert!(!cache.store_node(3, vec![0u8; 8])); // would push to 24 > 20
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.used_bytes(), 16);
+        // Node 3 is 8 bytes; total would be 24 > 20, so LRU (node 1) is evicted.
+        assert!(cache.store_node(3, vec![0u8; 8]));
+        assert_eq!(cache.len(), 2);         // nodes 2 and 3
+        assert_eq!(cache.used_bytes(), 16); // 8 + 8
+        assert!(cache.load_node(1).is_none());
+        assert!(cache.load_node(2).is_some());
+        assert!(cache.load_node(3).is_some());
+        let stats = cache.get_stats();
+        assert_eq!(stats.evictions, 1);
     }
 }
