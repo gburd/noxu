@@ -5,6 +5,7 @@
 
 use crate::FileSelector;
 use crate::cleaner_stat::CleanerStats;
+use crate::throttle::CleanerThrottle;
 use crate::file_processor::{
     FileProcessResult, FileProcessor, LogEntry, LogEntryType, SharedTreeLookup,
 };
@@ -94,6 +95,12 @@ pub struct Cleaner {
     ///
     /// Using `env.getTxnManager().getLockManager()`.
     lock_manager: Option<Arc<noxu_txn::LockManager>>,
+
+    /// Adaptive throttle: tracks the log write rate and computes sleep
+    /// intervals and files-per-pass recommendations for the daemon loop.
+    ///
+    /// Mirrors JE `CleanerThrottle`.
+    pub throttle: Arc<CleanerThrottle>,
 }
 
 /// Result of a cleaning operation.
@@ -136,6 +143,7 @@ impl Cleaner {
             tree: None,
             log_manager: None,
             lock_manager: None,
+            throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
 
@@ -167,6 +175,7 @@ impl Cleaner {
             tree: None,
             log_manager: None,
             lock_manager: None,
+            throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
 
@@ -208,6 +217,7 @@ impl Cleaner {
             tree: Some(tree),
             log_manager: Some(log_manager),
             lock_manager: None,
+            throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
 
@@ -244,6 +254,7 @@ impl Cleaner {
             tree: Some(tree),
             log_manager: Some(log_manager),
             lock_manager: Some(lock_manager),
+            throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
 
@@ -1476,7 +1487,7 @@ mod tests {
         // find it and attempt migration.
         let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
         {
-            let mut t = tree.write().unwrap();
+            let t = tree.write().unwrap();
             t.insert(synthetic_key, b"value".to_vec(), entry_lsn)
                 .expect("insert should succeed");
         }

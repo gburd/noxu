@@ -6,6 +6,7 @@
 
 pub mod cleaner;
 pub mod cleaner_stat;
+pub mod throttle;
 pub mod data_eraser;
 pub mod db_file_summary;
 pub mod error;
@@ -26,6 +27,7 @@ pub mod utilization_tracker_observer;
 
 // Re-exports
 pub use cleaner::{CleanResult, Cleaner};
+pub use throttle::CleanerThrottle;
 pub use cleaner_stat::{CleanerStats, CleanerStatsSnapshot};
 pub use db_file_summary::DbFileSummary;
 pub use error::{CleanerError, Result};

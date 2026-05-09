@@ -275,6 +275,52 @@ impl Engine {
         Ok(result)
     }
 
+    /// Throttle-driven cleaning pass for use by the cleaner daemon.
+    ///
+    /// Reads the current log write-byte counter, updates the throttle, then
+    /// cleans `n_files` recommended by the throttle.
+    ///
+    /// Returns `(CleanResult, sleep_ms)` — the daemon should sleep
+    /// `sleep_ms` milliseconds before its next pass.
+    pub fn clean_adaptive(&self) -> Result<(CleanResult, u64)> {
+        if !self.is_open() {
+            return Err(EngineError::EnvironmentClosed);
+        }
+        if self.config.read_only {
+            return Err(EngineError::InvalidConfig(
+                "cannot clean read-only environment".to_string(),
+            ));
+        }
+
+        // Read current write byte count from log manager stats.
+        let bytes_written = {
+            let env_impl = self.env_impl.lock();
+            env_impl
+                .get_log_manager()
+                .map(|lm| lm.get_stats().n_sequential_write_bytes)
+                .unwrap_or(0)
+        };
+
+        // Determine if cleaning is needed (any file below min utilization).
+        let cleaning_needed = self
+            .cleaner
+            .get_file_selector()
+            .lock()
+            .has_files_to_clean();
+
+        let (sleep_ms, n_files) = self
+            .cleaner
+            .throttle
+            .update(bytes_written, cleaning_needed);
+
+        let result = self
+            .cleaner
+            .do_clean(n_files, false)
+            .map_err(EngineError::DatabaseError)?;
+
+        Ok((result, sleep_ms))
+    }
+
     /// Performs cache eviction.
     ///
     /// # Returns
