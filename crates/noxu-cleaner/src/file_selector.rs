@@ -365,6 +365,14 @@ impl FileSelector {
     }
 
     /// Returns whether a file is currently being cleaned.
+    /// Returns `true` if there are files queued for cleaning.
+    ///
+    /// Used by the adaptive throttle to determine whether to shorten the
+    /// cleaner daemon's sleep interval.
+    pub fn has_files_to_clean(&self) -> bool {
+        !self.to_be_cleaned.is_empty() || self.is_force_cleaning()
+    }
+
     pub fn is_being_cleaned(&self, file_number: u32) -> bool {
         self.being_cleaned.contains(&file_number)
     }
