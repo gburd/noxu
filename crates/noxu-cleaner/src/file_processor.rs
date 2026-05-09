@@ -2699,7 +2699,7 @@ mod tests {
 
     /// Build a Tree with one key and wrap it in RealTreeLookup.
     fn make_tree_with_key(key: &[u8], lsn: Lsn) -> noxu_tree::Tree {
-        let mut tree = noxu_tree::Tree::new(1, 128);
+        let tree = noxu_tree::Tree::new(1, 128);
         tree.insert(key.to_vec(), b"value".to_vec(), lsn)
             .expect("insert should succeed");
         tree
@@ -2852,7 +2852,7 @@ mod tests {
         let key: &[u8] = &[0x10, 0x20, 0x30];
         let lsn = Lsn::new(5, 100);
 
-        let mut tree = noxu_tree::Tree::new(1, 128);
+        let tree = noxu_tree::Tree::new(1, 128);
         tree.insert(key.to_vec(), b"data".to_vec(), lsn).unwrap();
         let lookup = RealTreeLookup::new(
             Arc::new(std::sync::RwLock::new(tree)),
