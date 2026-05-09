@@ -7,7 +7,7 @@ use crate::environment_config::EnvironmentConfig;
 use crate::error::{NoxuError, Result};
 use crate::transaction::Transaction;
 use crate::transaction_config::TransactionConfig;
-use noxu_dbi::EnvironmentImpl;
+use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
 use noxu_sync::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -128,14 +128,37 @@ impl Environment {
             let _ = std::fs::remove_file(&test_file);
         }
 
+        // Translate EnvironmentConfig into DbiEnvConfig (the noxu-dbi struct)
+        // to avoid a circular dependency between the two crates.
+        let buf_size = (config.log_total_buffer_bytes as usize)
+            .checked_div(config.log_num_buffers)
+            .unwrap_or(1024 * 1024);
+        let dbi_cfg = DbiEnvConfig {
+            read_only: config.read_only,
+            transactional: config.transactional,
+            cache_size: config.cache_size,
+            log_file_max_bytes: config.log_file_max_bytes,
+            log_num_buffers: config.log_num_buffers,
+            log_buffer_size: buf_size,
+            log_fault_read_size: config.log_fault_read_size,
+            log_group_commit_threshold: config.log_group_commit_threshold,
+            log_group_commit_interval_ms: config.log_group_commit_interval_ms,
+            run_cleaner: config.run_cleaner,
+            cleaner_min_utilization: config.cleaner_min_utilization,
+            cleaner_min_file_count: config.cleaner_min_file_count,
+            cleaner_min_age: config.cleaner_min_age,
+            run_checkpointer: config.run_checkpointer,
+            checkpointer_bytes_interval: config.checkpointer_bytes_interval,
+            checkpointer_interval_ms: 30_000, // fixed 30 s daemon interval
+            run_evictor: config.run_evictor,
+            evictor_nodes_per_scan: config.evictor_nodes_per_scan,
+            evictor_lru_only: config.evictor_lru_only,
+            lock_timeout_ms: config.lock_timeout_ms,
+            txn_timeout_ms: config.txn_timeout_ms,
+        };
         let env_impl =
-            EnvironmentImpl::new(home.clone(), config.read_only, config.transactional)
+            EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
                 .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))?;
-
-        // Thread the configured lock timeout from EnvironmentConfig into the
-        // LockManager.  does this in EnvironmentImpl constructor; we do it
-        // here because EnvironmentConfig lives in noxu-db, not noxu-dbi.
-        env_impl.get_lock_manager().set_lock_timeout(config.lock_timeout_ms);
 
         Ok(Environment {
             home,
