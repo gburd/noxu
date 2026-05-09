@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use noxu_sync::RwLock;
 
 use crate::database_impl::DatabaseImpl;
+use crate::dbi_config::DbiEnvConfig;
 use crate::file_manager_scanner::FileManagerLogScanner;
 use crate::{
     DatabaseConfig, DatabaseId, DbType, DbiError, EnvState,
@@ -214,6 +215,18 @@ impl EnvironmentImpl {
         )
     }
 
+    /// Opens an environment using a fully specified `DbiEnvConfig`.
+    ///
+    /// The caller (typically `noxu_db::Environment::open`) translates its
+    /// own `EnvironmentConfig` into this struct, which avoids a circular
+    /// dependency between `noxu-db` and `noxu-dbi`.
+    pub fn from_dbi_config(
+        env_home: impl Into<PathBuf>,
+        cfg: &DbiEnvConfig,
+    ) -> Result<Self, DbiError> {
+        Self::new_with_config_inner(env_home, cfg)
+    }
+
     /// Like `new()` but allows overriding the checkpoint interval for testing.
     pub fn new_with_config(
         env_home: impl Into<PathBuf>,
@@ -221,8 +234,24 @@ impl EnvironmentImpl {
         transactional: bool,
         checkpoint_interval_ms: u64,
     ) -> Result<Self, DbiError> {
+        Self::new_with_config_inner(env_home, &DbiEnvConfig {
+            read_only,
+            transactional,
+            checkpointer_interval_ms: checkpoint_interval_ms,
+            ..DbiEnvConfig::default()
+        })
+    }
+
+    fn new_with_config_inner(
+        env_home: impl Into<PathBuf>,
+        cfg: &DbiEnvConfig,
+    ) -> Result<Self, DbiError> {
+        let read_only = cfg.read_only;
+        let transactional = cfg.transactional;
+        let checkpoint_interval_ms = cfg.checkpointer_interval_ms;
         let env_home = env_home.into();
         let lock_manager = Arc::new(LockManager::new());
+        lock_manager.set_lock_timeout(cfg.lock_timeout_ms);
         let txn_manager = TxnManager::new(lock_manager.clone());
 
         // Ensure the environment directory exists (create if needed).
@@ -249,8 +278,8 @@ impl EnvironmentImpl {
                 FileManager::new(
                     &env_home,
                     false,
-                    64 * 1024 * 1024, // 64 MiB per log file
-                    100,              // file handle cache size
+                    cfg.log_file_max_bytes,
+                    100, // file handle cache size (fixed; not yet configurable)
                 )
                 .map_err(|e| DbiError::EnvironmentFailure {
                     reason: format!("failed to init FileManager: {e}"),
@@ -306,7 +335,16 @@ impl EnvironmentImpl {
                 recovered.insert(db_id, tree);
             }
 
-            let mut lm = LogManager::new(fm, 3, 1024 * 1024, 65536);
+            let mut lm = LogManager::new(
+                fm,
+                cfg.log_num_buffers,
+                cfg.log_buffer_size,
+                cfg.log_fault_read_size,
+            );
+            lm.set_group_commit(
+                cfg.log_group_commit_threshold,
+                cfg.log_group_commit_interval_ms,
+            );
 
             // Wire the UtilizationTracker into the LogManager write path.
             // The observer is called under the LWL for every log write so
@@ -350,16 +388,18 @@ impl EnvironmentImpl {
         let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
             Arc::new(std::sync::RwLock::new(primary_tree_inner));
 
-        // Build the evictor with a 64 MiB default budget.  A shared
-        // AtomicI64 is used as the live cache-usage counter; the budget can
-        // be reconfigured at runtime via Arbiter::set_max_memory().
+        let cache_bytes = cfg.cache_size as i64;
         let arbiter = Arbiter::new(
-            64 * 1024 * 1024, // 64 MiB default max
+            cache_bytes,
             Arc::clone(&cache_usage),
-            128 * 1024,       // 128 KiB hysteresis
-            4 * 1024 * 1024,  // 4 MiB critical threshold
+            128 * 1024_i64,   // 128 KiB hysteresis (fixed)
+            cache_bytes / 16, // critical threshold: 1/16 of cache
         );
-        let evictor = Arc::new(Evictor::new(arbiter, 100, false));
+        let evictor = Arc::new(Evictor::new(
+            arbiter,
+            cfg.evictor_nodes_per_scan,
+            cfg.evictor_lru_only,
+        ));
 
         // Start the background daemon thread.  The thread loops as long as
         // `evictor.is_shutdown()` returns false, sleeping 5 ms between
@@ -386,9 +426,9 @@ impl EnvironmentImpl {
             // locks contend with user transactions for correct deadlock
             // detection. The cleaner uses the environment's shared lock manager.
             Cleaner::with_file_manager_tree_and_lock_manager(
-                50,                      // min_utilization (50 %)
-                2,                       // min_file_count
-                0,                       // min_age (seconds)
+                cfg.cleaner_min_utilization as u32,
+                cfg.cleaner_min_file_count,
+                cfg.cleaner_min_age as u64,
                 fm,
                 Arc::clone(&primary_tree),
                 Arc::clone(lm),
@@ -405,9 +445,12 @@ impl EnvironmentImpl {
         let checkpointer = log_manager.as_ref().map(|lm| {
             use noxu_recovery::checkpointer::{Checkpointer, CheckpointConfig};
             Arc::new(
-                Checkpointer::new(CheckpointConfig::default())
-                    .with_log_manager(Arc::clone(lm))
-                    .with_tree(Arc::clone(&primary_tree), 1),
+                Checkpointer::new(
+                    CheckpointConfig::new()
+                        .bytes_interval(cfg.checkpointer_bytes_interval),
+                )
+                .with_log_manager(Arc::clone(lm))
+                .with_tree(Arc::clone(&primary_tree), 1),
             )
         });
 

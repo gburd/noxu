@@ -1,5 +1,8 @@
 //! Environment configuration.
 //!
+//! Mirrors the JE `EnvironmentConfig` / `EnvironmentMutableConfig` classes.
+//! Parameters are grouped by subsystem: log, B-tree, cleaner, checkpointer,
+//! evictor, locking, and transaction.
 
 use crate::durability::Durability;
 use std::path::PathBuf;
@@ -9,47 +12,192 @@ use std::path::PathBuf;
 /// Specifies the configuration parameters used to open an environment.
 /// Use the builder pattern to configure individual parameters.
 ///
-/// 
+/// Matches `EnvironmentConfig` from JE (147 total params in JE; this covers
+/// the ~25 most operationally significant ones).
 #[derive(Debug, Clone)]
 pub struct EnvironmentConfig {
+    // -----------------------------------------------------------------------
+    // Core
+    // -----------------------------------------------------------------------
+
     /// Home directory for the environment.
     pub home: PathBuf,
 
     /// Allow creation of a new environment if it doesn't exist.
+    /// JE: `EnvironmentConfig.setAllowCreate()`
     pub allow_create: bool,
 
     /// Open the environment for transactional use.
+    /// JE: `EnvironmentConfig.setTransactional()`
     pub transactional: bool,
 
     /// Open the environment in read-only mode.
+    /// JE: `EnvironmentConfig.setReadOnly()`
     pub read_only: bool,
 
-    /// Cache size in bytes.
-    pub cache_size: u64,
-
-    /// Lock timeout in milliseconds.
-    pub lock_timeout_ms: u64,
-
-    /// Transaction timeout in milliseconds.
-    pub txn_timeout_ms: u64,
-
-    /// Default durability for transactions.
-    pub durability: Durability,
-
     /// Shared cache across environments.
+    /// JE: `EnvironmentConfig.setSharedCache()`
     pub shared_cache: bool,
 
     /// Logging level.
     pub logging_level: Option<String>,
 
-    /// Whether to run cleaner threads.
+    // -----------------------------------------------------------------------
+    // Memory / cache
+    // -----------------------------------------------------------------------
+
+    /// Maximum number of bytes to use for the B-tree cache.
+    /// Replaces the earlier `cache_size` field.
+    /// JE: `EnvironmentConfig.setCacheSize()` / `MAX_MEMORY`
+    /// Default: 64 MiB.
+    pub cache_size: u64,
+
+    /// Cache size as a percentage of the JVM heap (0 = use `cache_size` abs value).
+    /// JE: `EnvironmentConfig.setCachePercent()` / `CACHE_PERCENT`
+    /// Default: 0 (use `cache_size`).
+    pub cache_percent: u32,
+
+    // -----------------------------------------------------------------------
+    // Log / I-O
+    // -----------------------------------------------------------------------
+
+    /// Maximum size of a single log file in bytes.
+    /// JE: `EnvironmentConfig.setConfigParam(LOG_FILE_MAX)` / default 10 MiB.
+    pub log_file_max_bytes: u64,
+
+    /// Number of write buffers in the log buffer pool.
+    /// JE: `LOG_NUM_BUFFERS` / default 3.
+    pub log_num_buffers: usize,
+
+    /// Total bytes across all log buffers (`log_num_buffers` × per-buffer size).
+    /// JE: `LOG_TOTAL_BUFFER_BYTES` / default 7 MiB (≈ 2.3 MiB each × 3).
+    pub log_total_buffer_bytes: u64,
+
+    /// Size of the fault-in read buffer for random BIN reads.
+    /// JE: `LOG_FAULT_READ_SIZE` / default 2 KiB.
+    pub log_fault_read_size: usize,
+
+    /// Group-commit waiter threshold: minimum number of concurrent commit
+    /// callers before the leader fsyncs immediately.  0 = disabled.
+    /// JE: `LOG_GROUP_COMMIT_THRESHOLD`
+    pub log_group_commit_threshold: usize,
+
+    /// Group-commit interval in milliseconds: maximum time the leader waits
+    /// for additional concurrent callers before fsyncing.  0 = disabled.
+    /// JE: `LOG_GROUP_COMMIT_INTERVAL`
+    pub log_group_commit_interval_ms: u64,
+
+    // -----------------------------------------------------------------------
+    // B-tree
+    // -----------------------------------------------------------------------
+
+    /// Maximum percentage of BIN entries that may be in a delta before a full
+    /// BIN is written (0–100).
+    /// JE: `TREE_MAX_DELTA` / default 25.
+    pub tree_max_delta: u8,
+
+    /// Whether to write BIN-delta log entries (partial BIN updates).
+    /// JE: `TREE_BIN_DELTA` / default true.
+    pub tree_bin_delta: bool,
+
+    // -----------------------------------------------------------------------
+    // Cleaner
+    // -----------------------------------------------------------------------
+
+    /// Whether to run the background cleaner daemon.
+    /// JE: `ENV_RUN_CLEANER` / default true.
     pub run_cleaner: bool,
 
-    /// Whether to run checkpointer threads.
+    /// Minimum log utilization percentage below which cleaning is triggered.
+    /// JE: `CLEANER_MIN_UTILIZATION` / default 50.
+    pub cleaner_min_utilization: u8,
+
+    /// Minimum per-file utilization percentage; files below this are always
+    /// candidates regardless of overall utilization.
+    /// JE: `CLEANER_MIN_FILE_UTILIZATION` / default 5.
+    pub cleaner_min_file_utilization: u8,
+
+    /// Number of background cleaner threads.
+    /// JE: `CLEANER_THREADS` / default 1.
+    pub cleaner_threads: u32,
+
+    /// Minimum number of log files that must exist before cleaning begins.
+    /// JE: `CLEANER_MIN_FILES_TO_CLEAN` / default 2.
+    pub cleaner_min_file_count: u32,
+
+    /// Minimum age of a log file (in checkpoints) before it becomes a
+    /// cleaning candidate.
+    /// JE: `CLEANER_MIN_AGE` / default 2.
+    pub cleaner_min_age: u32,
+
+    /// Whether TTL-based record expiration is tracked by the cleaner.
+    /// JE: `CLEANER_EXPIRATION_ENABLED` / default false.
+    pub cleaner_expiration_enabled: bool,
+
+    // -----------------------------------------------------------------------
+    // Checkpointer
+    // -----------------------------------------------------------------------
+
+    /// Whether to run the background checkpointer daemon.
+    /// JE: `ENV_RUN_CHECKPOINTER` / default true.
     pub run_checkpointer: bool,
 
-    /// Whether to run evictor threads.
+    /// Number of bytes written between automatic checkpoints.
+    /// JE: `CHECKPOINTER_BYTES_INTERVAL` / default 20 MiB.
+    pub checkpointer_bytes_interval: u64,
+
+    /// Minimum time between automatic checkpoints in seconds (0 = disabled).
+    /// JE: `CHECKPOINTER_HIGH_PRIORITY` (relates to interval) / default 0.
+    pub checkpointer_min_interval_secs: u64,
+
+    // -----------------------------------------------------------------------
+    // Evictor
+    // -----------------------------------------------------------------------
+
+    /// Whether to run the background evictor daemon.
+    /// JE: `ENV_RUN_EVICTOR` / default true.
     pub run_evictor: bool,
+
+    /// Number of tree nodes examined per evictor pass.
+    /// JE: `EVICTOR_NODES_PER_SCAN` / default 10.
+    pub evictor_nodes_per_scan: usize,
+
+    /// Whether to use LRU-only eviction (no priority-1 / priority-2 split).
+    /// JE: `EVICTOR_LRU_ONLY` / default false.
+    pub evictor_lru_only: bool,
+
+    // -----------------------------------------------------------------------
+    // Locking
+    // -----------------------------------------------------------------------
+
+    /// Lock timeout in milliseconds.
+    /// JE: `LOCK_TIMEOUT` / default 500 ms.
+    pub lock_timeout_ms: u64,
+
+    /// Number of lock table shards.  Higher values reduce contention at the
+    /// cost of slightly more memory.
+    /// JE: `LOCK_N_LOCK_TABLES` / default 1 (Noxu defaults to 16).
+    pub lock_n_lock_tables: u32,
+
+    // -----------------------------------------------------------------------
+    // Transactions
+    // -----------------------------------------------------------------------
+
+    /// Transaction timeout in milliseconds.  0 = no timeout.
+    /// JE: `TXN_TIMEOUT` / default 0.
+    pub txn_timeout_ms: u64,
+
+    /// Default durability for transactions.
+    /// JE: `TXN_DURABILITY`
+    pub durability: Durability,
+
+    /// If true, commits do not wait for the log to be written to disk.
+    /// JE: `TXN_NO_SYNC` / default false.
+    pub txn_no_sync: bool,
+
+    /// If true, commits write the log to the OS buffer but do not fdatasync.
+    /// JE: `TXN_WRITE_NO_SYNC` / default false.
+    pub txn_write_no_sync: bool,
 }
 
 impl EnvironmentConfig {
@@ -60,15 +208,45 @@ impl EnvironmentConfig {
             allow_create: false,
             transactional: false,
             read_only: false,
-            cache_size: 64 * 1024 * 1024, // 64 MB default
-            lock_timeout_ms: 500,
-            txn_timeout_ms: 0, // No timeout
-            durability: Durability::default(),
             shared_cache: false,
             logging_level: None,
+            // Memory
+            cache_size: 64 * 1024 * 1024, // 64 MiB
+            cache_percent: 0,
+            // Log
+            log_file_max_bytes: 10 * 1024 * 1024, // 10 MiB (JE default)
+            log_num_buffers: 3,
+            log_total_buffer_bytes: 7 * 1024 * 1024, // 7 MiB total (JE LOG_TOTAL_BUFFER_BYTES)
+            log_fault_read_size: 2048,
+            log_group_commit_threshold: 0,
+            log_group_commit_interval_ms: 0,
+            // B-tree
+            tree_max_delta: 25,
+            tree_bin_delta: true,
+            // Cleaner
             run_cleaner: true,
+            cleaner_min_utilization: 50,
+            cleaner_min_file_utilization: 5,
+            cleaner_threads: 1,
+            cleaner_min_file_count: 2,
+            cleaner_min_age: 2,
+            cleaner_expiration_enabled: false,
+            // Checkpointer
             run_checkpointer: true,
+            checkpointer_bytes_interval: 20_000_000, // 20 MiB
+            checkpointer_min_interval_secs: 0,
+            // Evictor
             run_evictor: true,
+            evictor_nodes_per_scan: 10,
+            evictor_lru_only: false,
+            // Locking
+            lock_timeout_ms: 500,
+            lock_n_lock_tables: 16, // Noxu default (JE default is 1)
+            // Transactions
+            txn_timeout_ms: 0,
+            durability: Durability::default(),
+            txn_no_sync: false,
+            txn_write_no_sync: false,
         }
     }
 
@@ -174,6 +352,179 @@ impl EnvironmentConfig {
     /// Builder-style method to set durability.
     pub fn with_durability(mut self, durability: Durability) -> Self {
         self.durability = durability;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // New parameter setters (Log)
+    // -----------------------------------------------------------------------
+
+    pub fn set_log_file_max_bytes(&mut self, bytes: u64) -> &mut Self {
+        self.log_file_max_bytes = bytes;
+        self
+    }
+
+    pub fn set_log_num_buffers(&mut self, n: usize) -> &mut Self {
+        self.log_num_buffers = n;
+        self
+    }
+
+    pub fn set_log_total_buffer_bytes(&mut self, bytes: u64) -> &mut Self {
+        self.log_total_buffer_bytes = bytes;
+        self
+    }
+
+    pub fn set_log_fault_read_size(&mut self, size: usize) -> &mut Self {
+        self.log_fault_read_size = size;
+        self
+    }
+
+    pub fn set_log_group_commit_threshold(&mut self, threshold: usize) -> &mut Self {
+        self.log_group_commit_threshold = threshold;
+        self
+    }
+
+    pub fn set_log_group_commit_interval_ms(&mut self, ms: u64) -> &mut Self {
+        self.log_group_commit_interval_ms = ms;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // B-tree
+    // -----------------------------------------------------------------------
+
+    pub fn set_tree_max_delta(&mut self, pct: u8) -> &mut Self {
+        self.tree_max_delta = pct;
+        self
+    }
+
+    pub fn set_tree_bin_delta(&mut self, enabled: bool) -> &mut Self {
+        self.tree_bin_delta = enabled;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleaner
+    // -----------------------------------------------------------------------
+
+    pub fn set_cleaner_min_utilization(&mut self, pct: u8) -> &mut Self {
+        self.cleaner_min_utilization = pct;
+        self
+    }
+
+    pub fn set_cleaner_min_file_utilization(&mut self, pct: u8) -> &mut Self {
+        self.cleaner_min_file_utilization = pct;
+        self
+    }
+
+    pub fn set_cleaner_threads(&mut self, n: u32) -> &mut Self {
+        self.cleaner_threads = n;
+        self
+    }
+
+    pub fn set_cleaner_min_file_count(&mut self, n: u32) -> &mut Self {
+        self.cleaner_min_file_count = n;
+        self
+    }
+
+    pub fn set_cleaner_min_age(&mut self, checkpoints: u32) -> &mut Self {
+        self.cleaner_min_age = checkpoints;
+        self
+    }
+
+    pub fn set_cleaner_expiration_enabled(&mut self, enabled: bool) -> &mut Self {
+        self.cleaner_expiration_enabled = enabled;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpointer
+    // -----------------------------------------------------------------------
+
+    pub fn set_checkpointer_bytes_interval(&mut self, bytes: u64) -> &mut Self {
+        self.checkpointer_bytes_interval = bytes;
+        self
+    }
+
+    pub fn set_checkpointer_min_interval_secs(&mut self, secs: u64) -> &mut Self {
+        self.checkpointer_min_interval_secs = secs;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Evictor
+    // -----------------------------------------------------------------------
+
+    pub fn set_evictor_nodes_per_scan(&mut self, n: usize) -> &mut Self {
+        self.evictor_nodes_per_scan = n;
+        self
+    }
+
+    pub fn set_evictor_lru_only(&mut self, lru_only: bool) -> &mut Self {
+        self.evictor_lru_only = lru_only;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Locking
+    // -----------------------------------------------------------------------
+
+    pub fn set_lock_n_lock_tables(&mut self, n: u32) -> &mut Self {
+        self.lock_n_lock_tables = n;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Transactions
+    // -----------------------------------------------------------------------
+
+    pub fn set_txn_no_sync(&mut self, no_sync: bool) -> &mut Self {
+        self.txn_no_sync = no_sync;
+        self
+    }
+
+    pub fn set_txn_write_no_sync(&mut self, write_no_sync: bool) -> &mut Self {
+        self.txn_write_no_sync = write_no_sync;
+        self
+    }
+
+    pub fn set_cache_percent(&mut self, pct: u32) -> &mut Self {
+        self.cache_percent = pct;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Builder-style equivalents (chained self)
+    // -----------------------------------------------------------------------
+
+    pub fn with_log_file_max_bytes(mut self, bytes: u64) -> Self {
+        self.log_file_max_bytes = bytes;
+        self
+    }
+
+    pub fn with_cleaner_min_utilization(mut self, pct: u8) -> Self {
+        self.cleaner_min_utilization = pct;
+        self
+    }
+
+    pub fn with_checkpointer_bytes_interval(mut self, bytes: u64) -> Self {
+        self.checkpointer_bytes_interval = bytes;
+        self
+    }
+
+    pub fn with_evictor_nodes_per_scan(mut self, n: usize) -> Self {
+        self.evictor_nodes_per_scan = n;
+        self
+    }
+
+    pub fn with_log_group_commit(mut self, threshold: usize, interval_ms: u64) -> Self {
+        self.log_group_commit_threshold = threshold;
+        self.log_group_commit_interval_ms = interval_ms;
+        self
+    }
+
+    pub fn with_txn_no_sync(mut self, no_sync: bool) -> Self {
+        self.txn_no_sync = no_sync;
         self
     }
 }
@@ -335,5 +686,141 @@ mod tests {
         assert_eq!(config.logging_level, None);
         config.set_logging_level("DEBUG".to_string());
         assert_eq!(config.logging_level, Some("DEBUG".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // New parameter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_defaults_for_new_params() {
+        let config = EnvironmentConfig::default();
+        assert_eq!(config.log_file_max_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.log_num_buffers, 3);
+        assert_eq!(config.log_total_buffer_bytes, 7 * 1024 * 1024);
+        assert_eq!(config.log_fault_read_size, 2048);
+        assert_eq!(config.log_group_commit_threshold, 0);
+        assert_eq!(config.log_group_commit_interval_ms, 0);
+        assert_eq!(config.tree_max_delta, 25);
+        assert!(config.tree_bin_delta);
+        assert!(config.run_cleaner);
+        assert_eq!(config.cleaner_min_utilization, 50);
+        assert_eq!(config.cleaner_min_file_utilization, 5);
+        assert_eq!(config.cleaner_threads, 1);
+        assert_eq!(config.cleaner_min_file_count, 2);
+        assert_eq!(config.cleaner_min_age, 2);
+        assert!(!config.cleaner_expiration_enabled);
+        assert!(config.run_checkpointer);
+        assert_eq!(config.checkpointer_bytes_interval, 20_000_000);
+        assert_eq!(config.checkpointer_min_interval_secs, 0);
+        assert!(config.run_evictor);
+        assert_eq!(config.evictor_nodes_per_scan, 10);
+        assert!(!config.evictor_lru_only);
+        assert_eq!(config.lock_n_lock_tables, 16);
+        assert!(!config.txn_no_sync);
+        assert!(!config.txn_write_no_sync);
+        assert_eq!(config.cache_percent, 0);
+    }
+
+    #[test]
+    fn test_log_file_max() {
+        let mut c = EnvironmentConfig::default();
+        c.set_log_file_max_bytes(20 * 1024 * 1024);
+        assert_eq!(c.log_file_max_bytes, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_log_buffers() {
+        let mut c = EnvironmentConfig::default();
+        c.set_log_num_buffers(5);
+        c.set_log_total_buffer_bytes(5 * 1024 * 1024);
+        assert_eq!(c.log_num_buffers, 5);
+        assert_eq!(c.log_total_buffer_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_group_commit() {
+        let c = EnvironmentConfig::default()
+            .with_log_group_commit(10, 20);
+        assert_eq!(c.log_group_commit_threshold, 10);
+        assert_eq!(c.log_group_commit_interval_ms, 20);
+    }
+
+    #[test]
+    fn test_cleaner_params() {
+        let c = EnvironmentConfig::default()
+            .with_cleaner_min_utilization(30);
+        assert_eq!(c.cleaner_min_utilization, 30);
+
+        let mut c2 = EnvironmentConfig::default();
+        c2.set_cleaner_threads(4);
+        c2.set_cleaner_min_file_count(5);
+        c2.set_cleaner_min_age(3);
+        c2.set_cleaner_expiration_enabled(true);
+        assert_eq!(c2.cleaner_threads, 4);
+        assert_eq!(c2.cleaner_min_file_count, 5);
+        assert_eq!(c2.cleaner_min_age, 3);
+        assert!(c2.cleaner_expiration_enabled);
+    }
+
+    #[test]
+    fn test_checkpointer_params() {
+        let c = EnvironmentConfig::default()
+            .with_checkpointer_bytes_interval(50_000_000);
+        assert_eq!(c.checkpointer_bytes_interval, 50_000_000);
+
+        let mut c2 = EnvironmentConfig::default();
+        c2.set_checkpointer_min_interval_secs(60);
+        assert_eq!(c2.checkpointer_min_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_evictor_params() {
+        let c = EnvironmentConfig::default()
+            .with_evictor_nodes_per_scan(50);
+        assert_eq!(c.evictor_nodes_per_scan, 50);
+
+        let mut c2 = EnvironmentConfig::default();
+        c2.set_evictor_lru_only(true);
+        assert!(c2.evictor_lru_only);
+    }
+
+    #[test]
+    fn test_lock_n_tables() {
+        let mut c = EnvironmentConfig::default();
+        c.set_lock_n_lock_tables(32);
+        assert_eq!(c.lock_n_lock_tables, 32);
+    }
+
+    #[test]
+    fn test_txn_sync_flags() {
+        let c = EnvironmentConfig::default().with_txn_no_sync(true);
+        assert!(c.txn_no_sync);
+        assert!(!c.txn_write_no_sync);
+
+        let mut c2 = EnvironmentConfig::default();
+        c2.set_txn_write_no_sync(true);
+        assert!(c2.txn_write_no_sync);
+    }
+
+    #[test]
+    fn test_builder_chain_with_new_params() {
+        let c = EnvironmentConfig::new(PathBuf::from("/data"))
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_cache_size(128 * 1024 * 1024)
+            .with_log_file_max_bytes(5 * 1024 * 1024)
+            .with_cleaner_min_utilization(40)
+            .with_checkpointer_bytes_interval(10_000_000)
+            .with_evictor_nodes_per_scan(20)
+            .with_log_group_commit(5, 10)
+            .with_txn_no_sync(false);
+        assert_eq!(c.cache_size, 128 * 1024 * 1024);
+        assert_eq!(c.log_file_max_bytes, 5 * 1024 * 1024);
+        assert_eq!(c.cleaner_min_utilization, 40);
+        assert_eq!(c.checkpointer_bytes_interval, 10_000_000);
+        assert_eq!(c.evictor_nodes_per_scan, 20);
+        assert_eq!(c.log_group_commit_threshold, 5);
+        assert_eq!(c.log_group_commit_interval_ms, 10);
     }
 }

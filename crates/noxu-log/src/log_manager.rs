@@ -136,6 +136,17 @@ impl LogManager {
         }
     }
 
+    /// Reconfigures the group-commit parameters.
+    ///
+    /// Can be called after construction (e.g. from `EnvironmentImpl::open()`
+    /// after applying `EnvironmentConfig`).
+    ///
+    /// - `threshold`   : min concurrent waiters before leader fsyncs immediately (0 = disabled)
+    /// - `interval_ms` : max ms the leader waits for more waiters (0 = disabled)
+    pub fn set_group_commit(&mut self, threshold: usize, interval_ms: u64) {
+        self.fsync_manager = FsyncManager::new(threshold, interval_ms);
+    }
+
     /// Installs the utilization tracking observer.
     ///
     /// Called by `EnvironmentImpl::open()` after creating the `LogManager` and
