@@ -5,12 +5,25 @@ use thiserror::Error;
 
 /// Errors that can occur when using Noxu DB.
 ///
-/// The database engine exception hierarchy.
+/// Mirrors JE's exception hierarchy:
+///
+/// - [`NoxuError::EnvironmentFailure`] — fatal; environment must be closed.
+/// - Operation-failure variants — environment is still valid; the operation
+///   failed.  Retryable variants are marked by [`NoxuError::is_retryable()`].
+/// - HA / replication variants ([`NoxuError::InsufficientReplicas`],
+///   [`NoxuError::ReplicaWrite`], [`NoxuError::RollbackRequired`]).
 #[derive(Debug, Error)]
 pub enum NoxuError {
+    // ── Fatal ─────────────────────────────────────────────────────────────
+
     /// A fatal condition has occurred that will cause the environment to close.
+    ///
+    /// Mirrors JE `EnvironmentFailureException`.  After this error the
+    /// environment must be closed and re-opened.
     #[error("environment failure: {0}")]
     EnvironmentFailure(String),
+
+    // ── Database / cursor lifecycle ────────────────────────────────────────
 
     /// The requested database was not found in the environment.
     #[error("database not found: {0}")]
@@ -20,30 +33,6 @@ pub enum NoxuError {
     #[error("database already exists: {0}")]
     DatabaseAlreadyExists(String),
 
-    /// A lock conflict occurred (e.g., deadlock or timeout).
-    #[error("lock conflict: {0}")]
-    LockConflict(String),
-
-    /// A deadlock was detected between two or more transactions.
-    #[error("deadlock detected")]
-    DeadlockDetected,
-
-    /// The transaction was aborted.
-    #[error("transaction aborted: {0}")]
-    TransactionAborted(String),
-
-    /// An operation was attempted on a closed cursor.
-    #[error("cursor closed")]
-    CursorClosed,
-
-    /// An illegal argument was provided to a method.
-    #[error("illegal argument: {0}")]
-    IllegalArgument(String),
-
-    /// The operation is not allowed in the current state.
-    #[error("operation not allowed: {0}")]
-    OperationNotAllowed(String),
-
     /// An operation was attempted on a closed database.
     #[error("database closed")]
     DatabaseClosed,
@@ -52,59 +41,247 @@ pub enum NoxuError {
     #[error("environment closed")]
     EnvironmentClosed,
 
-    /// An I/O error occurred.
-    #[error("io error: {0}")]
-    IoError(#[from] std::io::Error),
+    /// An operation was attempted on a closed cursor.
+    #[error("cursor closed")]
+    CursorClosed,
+
+    // ── Lock / transaction failures ────────────────────────────────────────
+
+    /// A lock conflict occurred (locker blocked and could not acquire).
+    ///
+    /// Mirrors JE `LockConflictException`.  Retryable after abort.
+    #[error("lock conflict: {0}")]
+    LockConflict(String),
+
+    /// A deadlock was detected between two or more transactions.
+    ///
+    /// Mirrors JE `DeadlockException`.  Retryable after abort.
+    #[error("deadlock detected")]
+    DeadlockDetected,
+
+    /// A lock-wait timeout expired.
+    ///
+    /// Mirrors JE `LockTimeoutException`.  Retryable after abort.
+    #[error("lock timeout after {timeout_ms}ms")]
+    LockTimeout {
+        /// How long the locker waited before giving up.
+        timeout_ms: u64,
+    },
+
+    /// A transaction-level timeout expired.
+    ///
+    /// Mirrors JE `TransactionTimeoutException`.  Retryable after abort.
+    #[error("transaction timeout after {timeout_ms}ms for txn {txn_id}")]
+    TransactionTimeout {
+        /// Transaction-level timeout in milliseconds.
+        timeout_ms: u64,
+        /// ID of the timed-out transaction.
+        txn_id: i64,
+    },
+
+    /// A lock was preempted by a higher-priority locker (HA).
+    ///
+    /// Mirrors JE `LockPreemptedException`.  The holder must release all
+    /// resources and re-read before retrying.  Retryable after abort.
+    #[error("lock preempted by higher-priority locker")]
+    LockPreempted,
+
+    /// The transaction was aborted.
+    #[error("transaction aborted: {0}")]
+    TransactionAborted(String),
+
+    // ── Constraint violations ──────────────────────────────────────────────
+
+    /// The key already exists (for `put_no_overwrite` / cursor `put_no_dup_data`).
+    #[error("key already exists")]
+    KeyExists,
+
+    /// A unique-index constraint was violated.
+    ///
+    /// Mirrors JE `UniqueConstraintException`.
+    #[error("unique constraint violated: {0}")]
+    UniqueConstraintViolation(String),
+
+    /// A secondary database integrity constraint was violated.
+    ///
+    /// Mirrors JE `SecondaryIntegrityException`.
+    #[error("secondary integrity constraint violated: {0}")]
+    SecondaryIntegrityException(String),
+
+    // ── Not-found / access control ─────────────────────────────────────────
 
     /// A key or data item was not found.
     #[error("not found")]
     NotFound,
 
-    /// The key already exists (for noOverwrite operations).
-    #[error("key already exists")]
-    KeyExists,
-
-    /// A secondary database integrity constraint was violated.
-    #[error("secondary integrity constraint violated: {0}")]
-    SecondaryIntegrityException(String),
-
-    /// A version mismatch occurred.
-    #[error("version mismatch: {0}")]
-    VersionMismatch(String),
-
-    /// The database is in read-only mode.
+    /// The database or environment is in read-only mode.
     #[error("read-only mode")]
     ReadOnly,
 
-    /// The operation timed out.
+    // ── HA / replication ───────────────────────────────────────────────────
+
+    /// A write was attempted on a replica node.
+    ///
+    /// Mirrors JE `ReplicaWriteException`.
+    #[error("write not allowed on replica")]
+    ReplicaWrite,
+
+    /// Insufficient replicas acknowledged the commit.
+    ///
+    /// Mirrors JE `InsufficientReplicasException`.
+    #[error("insufficient replicas: required {required}, available {available}")]
+    InsufficientReplicas {
+        /// Acknowledgement quorum required.
+        required: u32,
+        /// Number of replicas that responded.
+        available: u32,
+    },
+
+    /// The transaction must be rolled back due to a replication state change.
+    ///
+    /// Mirrors JE `RollbackException`.
+    #[error("rollback required: {0}")]
+    RollbackRequired(String),
+
+    // ── Log / I/O ──────────────────────────────────────────────────────────
+
+    /// A log checksum mismatch was detected (potential corruption).
+    ///
+    /// This is fatal when found during normal operation; the environment will
+    /// be invalidated.  During recovery it may be recoverable.
+    #[error("log checksum mismatch: {0}")]
+    LogChecksumMismatch(String),
+
+    /// A log file was not found.
+    ///
+    /// Mirrors JE `LogFileNotFoundException`.
+    #[error("log file not found: {0}")]
+    LogFileNotFound(String),
+
+    /// An I/O error occurred.
+    #[error("io error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    // ── General ────────────────────────────────────────────────────────────
+
+    /// The operation is not allowed in the current state.
+    ///
+    /// Mirrors JE `OperationNotAllowedException`.
+    #[error("operation not allowed: {0}")]
+    OperationNotAllowed(String),
+
+    /// An illegal argument was provided to a method.
+    ///
+    /// Mirrors JE `IllegalArgumentException` (DB flavour).
+    #[error("illegal argument: {0}")]
+    IllegalArgument(String),
+
+    /// A version mismatch occurred (e.g. on-disk format vs. code version).
+    #[error("version mismatch: {0}")]
+    VersionMismatch(String),
+
+    /// The operation timed out (non-lock, non-txn — e.g. network or sync).
     #[error("operation timed out")]
     Timeout,
 
-    /// Invalid operation.
+    /// An invalid operation was requested.
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
 }
 
 impl NoxuError {
-    /// Helper to create an EnvironmentFailure error.
+    // ── Classification helpers ─────────────────────────────────────────────
+
+    /// Returns `true` if the failed operation may be retried after aborting
+    /// the current transaction.
+    ///
+    /// Mirrors JE `OperationFailureException.isRetryable()`.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            NoxuError::LockConflict(_)
+                | NoxuError::DeadlockDetected
+                | NoxuError::LockTimeout { .. }
+                | NoxuError::TransactionTimeout { .. }
+                | NoxuError::LockPreempted
+        )
+    }
+
+    /// Returns `true` if this error is fatal to the environment.
+    ///
+    /// After a fatal error the environment must be closed and re-opened;
+    /// further operations will fail with `EnvironmentClosed`.
+    ///
+    /// Mirrors JE `EnvironmentFailureException` detection.
+    pub fn is_fatal_to_environment(&self) -> bool {
+        matches!(
+            self,
+            NoxuError::EnvironmentFailure(_) | NoxuError::LogChecksumMismatch(_)
+        )
+    }
+
+    // ── Constructor helpers ────────────────────────────────────────────────
+
+    /// Creates an `EnvironmentFailure` error.
     pub fn environment(msg: impl Into<String>) -> Self {
         NoxuError::EnvironmentFailure(msg.into())
     }
 
-    /// Helper to create an OperationNotAllowed error (for database-level errors).
+    /// Creates an `OperationNotAllowed` error.
     pub fn database(msg: impl Into<String>) -> Self {
         NoxuError::OperationNotAllowed(msg.into())
     }
 
-    /// Helper to create an IllegalArgument error.
+    /// Creates an `IllegalArgument` error.
     pub fn invalid_argument(msg: impl Into<String>) -> Self {
         NoxuError::IllegalArgument(msg.into())
     }
 }
 
+// ── Conversions from sub-crate errors ─────────────────────────────────────
+
 impl From<noxu_dbi::DbiError> for NoxuError {
     fn from(e: noxu_dbi::DbiError) -> Self {
-        NoxuError::OperationNotAllowed(e.to_string())
+        use noxu_dbi::DbiError;
+        match e {
+            DbiError::DatabaseNotFound(s) => NoxuError::DatabaseNotFound(s),
+            DbiError::DatabaseAlreadyExists(s) | DbiError::DatabaseExists(s) => {
+                NoxuError::DatabaseAlreadyExists(s)
+            }
+            DbiError::EnvironmentFailure { reason } => NoxuError::EnvironmentFailure(reason),
+            DbiError::EnvironmentNotOpen | DbiError::EnvironmentLocked(_) => {
+                NoxuError::EnvironmentClosed
+            }
+            DbiError::CursorClosed | DbiError::CursorNotInitialized => NoxuError::CursorClosed,
+            DbiError::LockConflict(s) => NoxuError::LockConflict(s),
+            DbiError::IoError(io) => NoxuError::IoError(io),
+            DbiError::TxnError(txn_err) => NoxuError::from(txn_err),
+            DbiError::LogError(log_err) => NoxuError::OperationNotAllowed(log_err.to_string()),
+            DbiError::TreeError(tree_err) => NoxuError::OperationNotAllowed(tree_err.to_string()),
+            DbiError::DatabaseInUse(s) => NoxuError::OperationNotAllowed(s),
+            DbiError::OperationFailed(s) => NoxuError::OperationNotAllowed(s),
+        }
+    }
+}
+
+impl From<noxu_txn::TxnError> for NoxuError {
+    fn from(e: noxu_txn::TxnError) -> Self {
+        use noxu_txn::TxnError;
+        match e {
+            TxnError::Deadlock(_) => NoxuError::DeadlockDetected,
+            TxnError::LockConflict(s) => NoxuError::LockConflict(s),
+            TxnError::LockTimeout { timeout_ms, .. } => NoxuError::LockTimeout { timeout_ms },
+            TxnError::TransactionTimeout { timeout_ms, txn_id } => {
+                NoxuError::TransactionTimeout { timeout_ms, txn_id }
+            }
+            TxnError::LockNotAvailable { .. } => NoxuError::LockConflict("lock not available".into()),
+            TxnError::RangeRestart => NoxuError::LockConflict("range restart".into()),
+            TxnError::InvalidTransaction { txn_id, state } => {
+                NoxuError::TransactionAborted(format!("txn {txn_id}: {state}"))
+            }
+            TxnError::StateError(s) => NoxuError::TransactionAborted(s),
+            TxnError::LogError(log_err) => NoxuError::OperationNotAllowed(log_err.to_string()),
+        }
     }
 }
 
@@ -176,10 +353,96 @@ mod tests {
 
     #[test]
     fn test_from_dbi_error() {
+        // CursorClosed now maps to NoxuError::CursorClosed (not OperationNotAllowed)
         let dbi_err = noxu_dbi::DbiError::CursorClosed;
         let err: NoxuError = NoxuError::from(dbi_err);
-        assert!(matches!(err, NoxuError::OperationNotAllowed(_)));
+        assert!(matches!(err, NoxuError::CursorClosed));
         assert!(err.to_string().contains("cursor closed"));
+
+        // DatabaseNotFound maps correctly
+        let e: NoxuError = noxu_dbi::DbiError::DatabaseNotFound("x".into()).into();
+        assert!(matches!(e, NoxuError::DatabaseNotFound(_)));
+
+        // EnvironmentFailure maps correctly
+        let e: NoxuError =
+            noxu_dbi::DbiError::EnvironmentFailure { reason: "disk".into() }.into();
+        assert!(matches!(e, NoxuError::EnvironmentFailure(_)));
+    }
+
+    #[test]
+    fn test_from_txn_error() {
+        use noxu_txn::{LockType, TxnError};
+
+        let e: NoxuError = TxnError::Deadlock("cycle".into()).into();
+        assert!(matches!(e, NoxuError::DeadlockDetected));
+
+        let e: NoxuError = TxnError::LockTimeout {
+            timeout_ms: 500,
+            lsn: 1,
+            owner: "t1".into(),
+            requested_type: LockType::Write,
+            requester: "t2".into(),
+        }
+        .into();
+        assert!(matches!(e, NoxuError::LockTimeout { timeout_ms: 500 }));
+
+        let e: NoxuError = TxnError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }.into();
+        assert!(matches!(e, NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }));
+    }
+
+    #[test]
+    fn test_is_retryable() {
+        assert!(NoxuError::DeadlockDetected.is_retryable());
+        assert!(NoxuError::LockConflict("x".into()).is_retryable());
+        assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_retryable());
+        assert!(NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }.is_retryable());
+        assert!(NoxuError::LockPreempted.is_retryable());
+
+        assert!(!NoxuError::NotFound.is_retryable());
+        assert!(!NoxuError::EnvironmentFailure("x".into()).is_retryable());
+        assert!(!NoxuError::DatabaseClosed.is_retryable());
+    }
+
+    #[test]
+    fn test_is_fatal_to_environment() {
+        assert!(NoxuError::EnvironmentFailure("x".into()).is_fatal_to_environment());
+        assert!(NoxuError::LogChecksumMismatch("bad".into()).is_fatal_to_environment());
+
+        assert!(!NoxuError::DeadlockDetected.is_fatal_to_environment());
+        assert!(!NoxuError::NotFound.is_fatal_to_environment());
+        assert!(!NoxuError::LockConflict("x".into()).is_fatal_to_environment());
+    }
+
+    #[test]
+    fn test_new_variants() {
+        let e = NoxuError::LockTimeout { timeout_ms: 250 };
+        assert!(e.to_string().contains("250ms"));
+
+        let e = NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 7 };
+        assert!(e.to_string().contains("1000ms"));
+        assert!(e.to_string().contains("7"));
+
+        let e = NoxuError::LockPreempted;
+        assert!(e.to_string().contains("preempted"));
+
+        let e = NoxuError::UniqueConstraintViolation("idx_email".into());
+        assert!(e.to_string().contains("unique constraint"));
+
+        let e = NoxuError::ReplicaWrite;
+        assert!(e.to_string().contains("replica"));
+
+        let e = NoxuError::InsufficientReplicas { required: 3, available: 1 };
+        assert!(e.to_string().contains("required 3"));
+        assert!(e.to_string().contains("available 1"));
+
+        let e = NoxuError::RollbackRequired("ha failover".into());
+        assert!(e.to_string().contains("rollback required"));
+
+        let e = NoxuError::LogChecksumMismatch("file 7".into());
+        assert!(e.to_string().contains("log checksum mismatch"));
+
+        let e = NoxuError::LogFileNotFound("00000007.ndb".into());
+        assert!(e.to_string().contains("log file not found"));
     }
 
     #[test]
