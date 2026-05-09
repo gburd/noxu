@@ -2,7 +2,10 @@
 
 use crate::daemon_manager::DaemonManager;
 use crate::engine_config::EngineConfig;
-use crate::env_stats::{EnvironmentStats, EvictorStatsSnapshot};
+use crate::env_stats::{
+    EnvironmentStats, EvictorStatsSnapshot, LockStatsSnapshot, LogStatsSnapshot,
+    TxnStatsSnapshot,
+};
 use crate::error::{EngineError, Result};
 use noxu_cleaner::{CleanResult, Cleaner};
 use noxu_dbi::EnvironmentImpl;
@@ -295,18 +298,26 @@ impl Engine {
 
         let env_impl = self.env_impl.lock();
         let n_databases = env_impl.n_databases() as u32;
+        let log_stats = env_impl.get_log_manager().map(|lm| lm.get_stats());
+        let lock_stats = env_impl.get_lock_manager().get_stats();
+        let txn_stats = env_impl.get_txn_manager().get_stats();
+        let throughput = env_impl.get_throughput_snapshot();
         drop(env_impl);
 
         EnvironmentStats {
-            evictor: EvictorStatsSnapshot::from(evictor_stats),
-            cleaner: cleaner_stats.snapshot(),
-            checkpoint: checkpoint_stats.snapshot(),
             cache_size: self.config.cache_size,
             cache_usage: self.cache_usage.load(Ordering::Relaxed) as u64,
             n_databases,
-            n_lock_tables: self.config.lock_table_count,
-            n_locks: 0,        // Would be retrieved from lock manager
-            n_transactions: 0, // Would be retrieved from txn manager
+            evictor: EvictorStatsSnapshot::from(evictor_stats),
+            log: log_stats.as_ref().map(LogStatsSnapshot::from).unwrap_or_default(),
+            lock: LockStatsSnapshot {
+                n_lock_tables: self.config.lock_table_count as u64,
+                ..LockStatsSnapshot::from(&lock_stats)
+            },
+            txn: TxnStatsSnapshot::from(&txn_stats),
+            cleaner: cleaner_stats.snapshot(),
+            checkpoint: checkpoint_stats.snapshot(),
+            throughput,
         }
     }
 
@@ -492,7 +503,7 @@ mod tests {
 
         let stats = engine.get_stats();
         assert_eq!(stats.cache_size, 10 * 1024 * 1024);
-        assert_eq!(stats.n_lock_tables, 16);
+        assert_eq!(stats.lock.n_lock_tables, 16);
     }
 
     #[test]
