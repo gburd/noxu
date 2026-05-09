@@ -7,6 +7,7 @@
 use crate::error::{LogError, Result};
 use crate::file_handle::FileHandle;
 use crate::file_header::{FILE_HEADER_SIZE, FileHeader, LOG_VERSION};
+use memmap2::Mmap;
 use noxu_latch::ExclusiveLatch;
 use noxu_util::lsn::Lsn;
 use noxu_sync::{Mutex, RwLock};
@@ -569,6 +570,36 @@ impl FileManager {
             )));
         }
         Ok(path.metadata()?.len())
+    }
+
+    /// Memory-maps a log file for read-only sequential access.
+    ///
+    /// Returns a `Mmap` covering the entire file.  The OS handles page-in
+    /// lazily with automatic sequential read-ahead, eliminating all per-entry
+    /// `pread64` syscalls during recovery scanning.
+    ///
+    /// # Safety
+    /// The caller must not hold a mutable reference into the mapped memory
+    /// while other processes write to the file.  During recovery, log files
+    /// are read-only, making this safe.
+    pub fn mmap_file(&self, file_num: u32) -> Result<Mmap> {
+        let path = self.file_path(file_num);
+        let file = File::open(&path).map_err(|e| {
+            LogError::FileNotFound(format!(
+                "Cannot open {:?} for mmap: {}",
+                path, e
+            ))
+        })?;
+        // SAFETY: We only mmap files that are complete (not the current
+        // active write file) during recovery, so the underlying bytes do
+        // not change while the mapping is alive.
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+            LogError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("mmap {:?}: {}", path, e),
+            ))
+        })?;
+        Ok(mmap)
     }
 
     /// Returns current I/O statistics for this FileManager.
