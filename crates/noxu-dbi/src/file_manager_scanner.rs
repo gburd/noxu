@@ -7,8 +7,10 @@
 //! Log file scanning utilities.
 //! `RecoveryManager.recover()`.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
+use memmap2::Mmap;
 use noxu_log::{
     FileManager,
     entry::{BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry},
@@ -26,6 +28,26 @@ use noxu_util::{Lsn, NULL_LSN};
 // Maximum plausible payload size (64 MiB) for a sanity check while scanning.
 const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;
 
+/// A file's bytes, either memory-mapped (zero-copy) or heap-owned (fallback).
+///
+/// Both variants deref to `&[u8]` so the parsing loop is identical either way.
+/// Recovery uses mmap by default; if mmap fails (e.g. the file is empty or the
+/// OS refuses), it falls back to a single `pread64` into a heap buffer.
+enum FileBuf {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Deref for FileBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileBuf::Mapped(m) => m,
+            FileBuf::Owned(v) => v,
+        }
+    }
+}
+
 /// `LogScanner` implementation backed by a real `FileManager`.
 ///
 /// Implements the three scan primitives required by `RecoveryManager`:
@@ -40,6 +62,25 @@ pub struct FileManagerLogScanner {
 impl FileManagerLogScanner {
     pub fn new(file_manager: Arc<FileManager>) -> Self {
         Self { file_manager }
+    }
+
+    /// Load a log file's bytes for sequential scanning.
+    ///
+    /// Tries `mmap` first (zero heap allocation, OS-managed read-ahead).
+    /// Falls back to a single `pread64` into a heap buffer if mmap fails.
+    fn load_file_buf(&self, file_num: u32, file_len: u64) -> Option<FileBuf> {
+        // Try mmap first.
+        if let Ok(mmap) = self.file_manager.mmap_file(file_num) {
+            return Some(FileBuf::Mapped(mmap));
+        }
+        // Fallback: heap buffer + pread64.
+        let mut buf = vec![0u8; file_len as usize];
+        match self.file_manager.read_from_file(file_num, 0, &mut buf) {
+            Ok(n) if n < file_len as usize => buf.truncate(n),
+            Err(_) => return None,
+            Ok(_) => {}
+        }
+        Some(FileBuf::Owned(buf))
     }
 
     /// Convert a raw (entry_type_num, payload) pair to a `LogEntry`.
@@ -255,15 +296,13 @@ impl FileManagerLogScanner {
                 continue;
             }
 
-            // Read the entire file into memory in one syscall, then parse
-            // entries from the in-memory slice — no per-entry allocation for
-            // raw bytes.
-            let mut file_data = vec![0u8; file_len as usize];
-            match self.file_manager.read_from_file(file_num, 0, &mut file_data) {
-                Ok(n) if n < file_len as usize => file_data.truncate(n),
-                Err(_) => continue,
-                Ok(_) => {}
-            }
+            // Prefer mmap (zero heap allocation, sequential OS read-ahead);
+            // fall back to a single pread64 into a heap buffer if mmap fails.
+            let file_buf = match self.load_file_buf(file_num, file_len) {
+                Some(b) => b,
+                None => continue,
+            };
+            let file_data: &[u8] = &file_buf;
 
             // Determine where in this file to start parsing.
             // Always start at FILE_HEADER_SIZE minimum: a start offset of 0
@@ -287,7 +326,7 @@ impl FileManagerLogScanner {
                     }
                 }
 
-                match Self::parse_entry_from_slice(&file_data, offset) {
+                match Self::parse_entry_from_slice(file_data, offset) {
                     None => break, // Zero-filled or truncated — end of data.
                     Some((entry_size, parsed)) => {
                         let entry_lsn = Lsn::new(file_num, offset as u32);
@@ -353,20 +392,19 @@ impl LogScanner for FileManagerLogScanner {
                 continue;
             }
 
-            // Read the whole file once; parse entries from the in-memory buf.
-            let mut file_data = vec![0u8; file_len as usize];
-            match self.file_manager.read_from_file(file_num, 0, &mut file_data) {
-                Ok(n) if n < file_len as usize => file_data.truncate(n),
-                Err(_) => continue,
-                Ok(_) => {}
-            }
+            // Prefer mmap; fall back to pread64 on failure.
+            let file_buf = match self.load_file_buf(file_num, file_len) {
+                Some(b) => b,
+                None => continue,
+            };
+            let file_data: &[u8] = &file_buf;
 
             let mut offset = FILE_HEADER_SIZE;
             let mut last_valid_offset: Option<usize> = None;
             let mut last_entry_size = 0usize;
 
             while offset < file_data.len() {
-                match Self::parse_entry_from_slice(&file_data, offset) {
+                match Self::parse_entry_from_slice(file_data, offset) {
                     None => break,
                     Some((entry_size, _)) => {
                         last_valid_offset = Some(offset);
