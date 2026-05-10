@@ -123,7 +123,10 @@ impl LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
             log_write_latch: Mutex::new(()),
             write_io_latch: Mutex::new(()),
-            last_flush_lsn: AtomicU64::new(NULL_LSN.as_u64()),
+            // 0 means "nothing flushed yet". NULL_LSN = u64::MAX would make
+            // flush_sync_if_needed's `already_flushed >= lsn` always true,
+            // causing all flushes to be skipped.
+            last_flush_lsn: AtomicU64::new(0),
             n_repeat_fault_reads: AtomicU64::new(0),
             n_temp_buffer_writes: AtomicU64::new(0),
             read_buffer_size,
@@ -479,8 +482,42 @@ impl LogManager {
             })
         })?;
 
-        self.last_flush_lsn.store(eol.as_u64(), Ordering::Relaxed);
+        self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
+    }
+
+    /// Port of JE `LogManager.flushTo(lsn)`:
+    /// flush and fsync only if `lsn` has not yet been flushed.
+    ///
+    /// Fast path: if `last_flush_lsn >= lsn`, return immediately — a
+    /// concurrent or preceding `flush_sync()` already covers our data.
+    /// Slow path: call the full `flush_sync()`.
+    ///
+    /// This is the key coalescing primitive for concurrent commit throughput.
+    /// Example with 8 concurrent writers:
+    ///   1. Thread A calls flush_sync() first; its LWL snapshot captures ALL
+    ///      pending writes from threads A–H; updates last_flush_lsn past all.
+    ///   2. Threads B–H call flush_sync_if_needed(their_commit_lsn) and each
+    ///      sees last_flush_lsn >= their_commit_lsn → skip fsync immediately.
+    ///   Result: 1 fdatasync for 8 commits (8:1 coalescing, no config needed).
+    pub fn flush_sync_if_needed(&self, lsn: Lsn) -> Result<Lsn> {
+        // NULL_LSN (= u64::MAX) means "no write LSN known" — always flush.
+        // last_flush_lsn is initialised to 0 ("nothing flushed") so that a
+        // fresh environment never skips the first flush.
+        if lsn != NULL_LSN {
+            let already_flushed = self.last_flush_lsn.load(Ordering::Acquire);
+            // Strict `>`: `eol` in flush_sync() is `get_next_available_lsn()`
+            // AFTER the snapshot — the next LSN to be assigned, not the last
+            // one written.  So `last_flush_lsn = X` means everything up to
+            // (not including) X was flushed.  We need `already_flushed > lsn`
+            // to guarantee `lsn` was included.  Equality means the previous
+            // flush computed its eol just before our write was allocated — our
+            // data was NOT in that flush.
+            if already_flushed > lsn.as_u64() {
+                return Ok(Lsn::from_u64(already_flushed));
+            }
+        }
+        self.flush_sync()
     }
 
     /// Flushes all dirty write buffers to disk without an fsync.
@@ -497,7 +534,7 @@ impl LogManager {
                 self.file_manager.write_buffer(&data, offset)?;
             }
         }
-        self.last_flush_lsn.store(eol.as_u64(), Ordering::Relaxed);
+        self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
     }
 
