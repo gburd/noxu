@@ -11,7 +11,9 @@ use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode, ThroughputStats};
+use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
+use noxu_txn::LockManager;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -60,6 +62,12 @@ pub struct Database {
     /// `get()`, `put()`, `delete()` can increment stats without
     /// locking `db_impl`.
     throughput: Arc<ThroughputStats>,
+    /// Cached lock manager — acquired once at open, never changes.
+    /// Eliminates per-operation `env_impl.lock()` on the hot read/write path.
+    lock_manager: Arc<LockManager>,
+    /// Cached log manager — acquired once at open, None for no-WAL envs.
+    /// Eliminates per-operation `env_impl.lock()` on the hot read/write path.
+    log_manager: Option<Arc<LogManager>>,
 }
 
 /// State of a database handle.
@@ -79,16 +87,17 @@ pub enum DbState {
 impl Database {
     /// Creates a CursorImpl, wired to the WAL and lock manager when the
     /// environment has them.
+    ///
+    /// Uses cached `lock_manager` / `log_manager` to avoid acquiring
+    /// `env_impl.lock()` on every operation.
     fn make_cursor(&self) -> CursorImpl {
-        let env = self.env_impl.lock();
-        let lock_manager = Arc::clone(env.get_lock_manager());
-        match env.get_log_manager() {
+        match &self.log_manager {
             Some(lm) => {
-                CursorImpl::with_log_manager(Arc::clone(&self.db_impl), 0, lm)
-                    .with_lock_manager(lock_manager)
+                CursorImpl::with_log_manager(Arc::clone(&self.db_impl), 0, Arc::clone(lm))
+                    .with_lock_manager(Arc::clone(&self.lock_manager))
             }
             None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
-                .with_lock_manager(lock_manager),
+                .with_lock_manager(Arc::clone(&self.lock_manager)),
         }
     }
 
@@ -120,7 +129,7 @@ impl Database {
         if txn.is_some() {
             return Ok(()); // explicit txn handles its own commit/fsync
         }
-        if let Some(lm) = self.env_impl.lock().get_log_manager() {
+        if let Some(lm) = &self.log_manager {
             lm.flush_sync()
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         }
@@ -138,6 +147,14 @@ impl Database {
         env_impl: Arc<Mutex<EnvironmentImpl>>,
     ) -> Self {
         let throughput = db_impl.read().throughput.clone();
+        // Cache the manager Arcs at construction so hot-path operations
+        // (get/put/delete) never need to re-acquire env_impl.lock().
+        let (lock_manager, log_manager) = {
+            let env = env_impl.lock();
+            let lm = Arc::clone(env.get_lock_manager());
+            let logm = env.get_log_manager();
+            (lm, logm)
+        };
         Database {
             name,
             id,
@@ -146,6 +163,8 @@ impl Database {
             env_impl,
             open: AtomicBool::new(true),
             throughput,
+            lock_manager,
+            log_manager,
         }
     }
 

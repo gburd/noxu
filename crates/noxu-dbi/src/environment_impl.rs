@@ -755,6 +755,39 @@ impl EnvironmentImpl {
         Ok(())
     }
 
+    /// Truncates a database: removes all records while keeping the database
+    /// registered and any open handles valid.
+    ///
+    /// Returns the number of records that were in the database before truncation.
+    ///
+    /// JE: `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    pub fn truncate_database(&self, name: &str) -> Result<u64, DbiError> {
+        self.check_open()?;
+
+        let db_id = self
+            .name_map
+            .read()
+            .get(name)
+            .copied()
+            .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
+
+        let count = {
+            let db_map_guard = self.db_map.read();
+            let db_arc = db_map_guard
+                .get(&db_id)
+                .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
+            let mut db_guard = db_arc.write();
+            let old_count = db_guard.entry_count();
+            // Replace the real tree with a fresh empty tree, preserving config.
+            let max_entries = db_guard.max_tree_entries_per_node() as usize;
+            let new_tree = noxu_tree::Tree::new(db_id.as_i64() as u64, max_entries);
+            db_guard.set_recovered_tree(new_tree); // resets entry_count to 0
+            old_count
+        };
+
+        Ok(count)
+    }
+
     /// Returns the list of database names.
     pub fn get_database_names(&self) -> Vec<String> {
         self.name_map.read().keys().cloned().collect()
