@@ -3212,6 +3212,59 @@ impl Tree {
     /// Collect all dirty upper (non-BIN) internal nodes, sorted ascending by
     /// level (bottom-up order, BIN level excluded).
     ///
+    /// Serialise an upper-IN node (level > 1) by node_id for off-heap storage.
+    ///
+    /// Traverses the tree to find the internal node whose  matches,
+    /// then calls  to produce a compact byte
+    /// representation.  Returns  if the node is not found or is a BIN
+    /// (BINs are not upper INs).
+    ///
+    /// JE: `OffHeapAllocator` serialises the same bytes that would be written
+    /// to the log, allowing the evictor to store upper-INs off-heap and avoid
+    /// log-file reads on the next traversal.
+    pub fn serialize_upper_in(&self, node_id: u64) -> Option<Vec<u8>> {
+        let root = self.get_root()?;
+        Self::find_and_serialize_upper_in(&root, node_id)
+    }
+
+    fn find_and_serialize_upper_in(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        target_id: u64,
+    ) -> Option<Vec<u8>> {
+        let guard = node_arc.read().ok()?;
+        match &*guard {
+            TreeNode::Bottom(_) => None, // BINs are not upper INs
+            TreeNode::Internal(n) => {
+                if n.node_id == target_id {
+                    // Serialise InNodeStub for off-heap storage.
+                    // Format: node_id(u64BE) | level(i32BE) | n_entries(u32BE)
+                    //   then per-entry: key_len(u32BE) | key | lsn(u64BE)
+                    let mut buf = Vec::new();
+                    buf.extend_from_slice(&n.node_id.to_be_bytes());
+                    buf.extend_from_slice(&n.level.to_be_bytes());
+                    buf.extend_from_slice(&(n.entries.len() as u32).to_be_bytes());
+                    for e in &n.entries {
+                        buf.extend_from_slice(&(e.key.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(&e.key);
+                        buf.extend_from_slice(&e.lsn.as_u64().to_be_bytes());
+                    }
+                    return Some(buf);
+                }
+                // Recurse into children before releasing the guard so we
+                // hold the minimum read-lock duration.
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                for child in &children {
+                    if let Some(bytes) = Self::find_and_serialize_upper_in(child, target_id) {
+                        return Some(bytes);
+                    }
+                }
+                None
+            }
+        }
+    }
+
     /// Upper-IN traversal in `Checkpointer.processINList()` from
     /// — visits all `TreeNode::Internal` nodes whose `dirty` flag is set
     /// and returns them together with their level, sorted lowest-level-first
