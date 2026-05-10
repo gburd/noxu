@@ -110,7 +110,7 @@ pub struct EnvironmentImpl {
     /// `cleaner` is `None`.
     ///
     /// 
-    cleaner: Option<Cleaner>,
+    cleaner: Option<Arc<Cleaner>>,
 
     /// The checkpoint daemon.
     ///
@@ -148,6 +148,12 @@ pub struct EnvironmentImpl {
     ///
     /// / `INCompressor.run()`.
     in_compressor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+
+    /// Cleaner daemon shutdown flag (JE CleanerDaemon).
+    cleaner_shutdown: Arc<AtomicBool>,
+
+    /// Background cleaner daemon thread handle.
+    cleaner_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 
     // =========================================================================
     // NoSQL fork: additional background services
@@ -435,7 +441,7 @@ impl EnvironmentImpl {
             // Pass the environment's shared LockManager so that cleaner-held
             // locks contend with user transactions for correct deadlock
             // detection. The cleaner uses the environment's shared lock manager.
-            Cleaner::with_file_manager_tree_and_lock_manager(
+            Arc::new(Cleaner::with_file_manager_tree_and_lock_manager(
                 cfg.cleaner_min_utilization as u32,
                 cfg.cleaner_min_file_count,
                 cfg.cleaner_min_age as u64,
@@ -443,7 +449,7 @@ impl EnvironmentImpl {
                 Arc::clone(&primary_tree),
                 Arc::clone(lm),
                 Arc::clone(&lock_manager),
-            )
+            ))
         });
 
         // Build the checkpointer, wired to the LogManager and the primary
@@ -535,6 +541,37 @@ impl EnvironmentImpl {
             })
             .expect("failed to spawn noxu-in-compressor thread");
 
+        // Start the background log-cleaner daemon thread (JE CleanerDaemon).
+        // Sleeps for throttle.current_sleep_ms() between cleaning passes so
+        // the sleep interval adapts to the current log write rate.
+        let cleaner_shutdown = Arc::new(AtomicBool::new(false));
+        let cleaner_shutdown_clone = Arc::clone(&cleaner_shutdown);
+        let cleaner_for_daemon = cleaner.as_ref().map(Arc::clone);
+        let run_cleaner_daemon = cfg.run_cleaner;
+        let cleaner_handle = std::thread::Builder::new()
+            .name("noxu-cleaner".to_string())
+            .spawn(move || {
+                if !run_cleaner_daemon {
+                    return;
+                }
+                while !cleaner_shutdown_clone.load(Ordering::Relaxed) {
+                    let sleep_ms = if let Some(ref c) = cleaner_for_daemon {
+                        let _ = c.do_clean(c.throttle.current_n_files(), false);
+                        c.throttle.current_sleep_ms()
+                    } else {
+                        5_000 // no cleaner — sleep 5 s
+                    };
+                    // Sleep in small chunks so shutdown is responsive.
+                    let chunk_ms = 100u64;
+                    let mut remaining = sleep_ms;
+                    while remaining > 0 && !cleaner_shutdown_clone.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(chunk_ms.min(remaining)));
+                        remaining = remaining.saturating_sub(chunk_ms);
+                    }
+                }
+            })
+            .expect("failed to spawn noxu-cleaner thread");
+
         let env = EnvironmentImpl {
             env_home,
             state: RwLock::new(EnvState::Init),
@@ -563,6 +600,8 @@ impl EnvironmentImpl {
             checkpoint_interval_ms,
             in_compressor_shutdown,
             in_compressor_handle: Mutex::new(Some(in_compressor_handle)),
+            cleaner_shutdown,
+            cleaner_handle: Mutex::new(Some(cleaner_handle)),
             data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
             extinction_scanner: Mutex::new(noxu_cleaner::ExtinctionScanner::new()),
             backup_manager: Mutex::new(crate::backup_manager::BackupManager::new()),
@@ -847,8 +886,8 @@ impl EnvironmentImpl {
     /// Returns a reference to the cleaner, if one was created.
     ///
     /// Returns `None` for read-only environments.
-    pub fn get_cleaner(&self) -> Option<&Cleaner> {
-        self.cleaner.as_ref()
+    pub fn get_cleaner(&self) -> Option<Arc<Cleaner>> {
+        self.cleaner.as_ref().map(Arc::clone)
     }
 
     /// Returns the checkpointer, if one was created.
@@ -989,6 +1028,12 @@ impl EnvironmentImpl {
             let _ = handle.join();
         }
 
+        // Signal the cleaner daemon to stop and wait for it to exit.
+        self.cleaner_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
         // Final (forced) checkpoint before WAL sync so recovery can restart
         // from the checkpoint rather than replaying the full log.
         // `EnvironmentImpl.close()` calling
@@ -1081,6 +1126,12 @@ impl Drop for EnvironmentImpl {
         // Shut down the INCompressor daemon thread.
         self.in_compressor_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // Shut down the cleaner daemon thread.
+        self.cleaner_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
 
