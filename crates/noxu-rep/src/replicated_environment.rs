@@ -143,6 +143,12 @@ pub struct ReplicatedEnvironment {
     /// Shutdown flag shared with I/O threads so they terminate when the
     /// environment is closed.
     io_shutdown: AtomicBool,
+
+    /// Whether the RESTORE service has been registered on the TCP dispatcher.
+    ///
+    /// When `config.env_home` is `None` at construction time, registration is
+    /// deferred until `with_environment()` provides the env home path.
+    restore_registered: AtomicBool,
 }
 
 impl ReplicatedEnvironment {
@@ -176,6 +182,8 @@ impl ReplicatedEnvironment {
         // accepting connections. We do the same here using the node_host and
         // node_port from RepConfig.
         let listen_addr_str = format!("{}:{}", config.node_host, config.node_port);
+        let mut restore_registered_init = false;
+
         let (tcp_dispatcher, bound_addr) =
             match listen_addr_str.parse::<SocketAddr>() {
                 Ok(addr) => {
@@ -186,12 +194,11 @@ impl ReplicatedEnvironment {
                                 // node in the group can request a full file-set
                                 // copy from this node's environment.
                                 if let Some(ref home) = config.env_home {
-                                    let restore_server = Arc::new(
-                                        NetworkRestoreServer::new(home.clone()),
-                                    );
+                                    let restore_server =
+                                        NetworkRestoreServer::new(home.clone());
                                     dispatcher.register(
                                         RESTORE_SERVICE_NAME,
-                                        restore_server,
+                                        Arc::new(restore_server),
                                     );
                                     log::debug!(
                                         "Node '{}' RESTORE service registered \
@@ -199,6 +206,7 @@ impl ReplicatedEnvironment {
                                         config.node_name,
                                         home.display(),
                                     );
+                                    restore_registered_init = true;
                                 }
                                 log::info!(
                                     "Node '{}' TCP service dispatcher started on {}",
@@ -255,6 +263,7 @@ impl ReplicatedEnvironment {
             env_impl: StdMutex::new(None),
             io_threads: StdMutex::new(Vec::new()),
             io_shutdown: AtomicBool::new(false),
+            restore_registered: AtomicBool::new(restore_registered_init),
         };
 
         Ok(env)
@@ -274,9 +283,33 @@ impl ReplicatedEnvironment {
     /// After this call, state transitions (`become_master`, `become_replica`)
     /// will spawn real feeder/receiver I/O threads backed by the live log.
     ///
+    /// If the RESTORE service was not registered at construction time (because
+    /// `config.env_home` was `None`), it is registered here using the
+    /// environment's actual home path.  This mirrors JE `RepNode.envSetup()`
+    /// which registers the restore handler during environment wiring.
+    ///
     /// Environment reference wiring.
     /// `EnvironmentImpl` via `RepImpl.repNode.envImpl` in HA.
     pub fn with_environment(&self, env: Arc<EnvironmentImpl>) {
+        // Register RESTORE service lazily if not already done.
+        if !self.restore_registered.load(Ordering::SeqCst) {
+            if let Some(ref dispatcher) = self.tcp_dispatcher {
+                let env_home = env.get_env_home().to_path_buf();
+                let restore_server = NetworkRestoreServer::new(env_home.clone());
+                dispatcher.register(
+                    RESTORE_SERVICE_NAME,
+                    Arc::new(restore_server),
+                );
+                self.restore_registered.store(true, Ordering::SeqCst);
+                log::debug!(
+                    "Node '{}' RESTORE service registered via with_environment \
+                     (env_home={})",
+                    self.config.node_name,
+                    env_home.display(),
+                );
+            }
+        }
+
         *self.env_impl.lock().unwrap() = Some(env);
     }
 
@@ -1276,5 +1309,56 @@ mod tests {
         // Close
         env.close().unwrap();
         assert!(env.is_shutdown());
+    }
+
+    /// Verify that `with_environment` lazily registers the RESTORE service on
+    /// the TCP dispatcher when `config.env_home` was not set at construction.
+    ///
+    /// This mirrors JE `RepNode.envSetup()` which registers the restore handler
+    /// when the environment is wired into the replicated node.
+    #[test]
+    fn test_restore_registered_lazily_via_with_environment() {
+        use noxu_dbi::EnvironmentImpl;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("temp dir");
+
+        // Build config WITHOUT env_home — dispatcher starts, but no RESTORE handler yet.
+        let config = RepConfig::builder("test_group", "node1", "127.0.0.1")
+            .node_port(0)
+            .build();
+
+        let rep_env = ReplicatedEnvironment::new(config).unwrap();
+
+        // Not yet registered.
+        assert!(!rep_env.restore_registered.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Wire in a real EnvironmentImpl so get_env_home() returns the temp dir.
+        let env_impl = Arc::new(
+            EnvironmentImpl::new(dir.path(), false, false).expect("open env"),
+        );
+        rep_env.with_environment(env_impl);
+
+        // Now the RESTORE service must be registered.
+        assert!(rep_env.restore_registered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Verify that when `config.env_home` IS set at construction, the RESTORE
+    /// service is registered immediately (not deferred).
+    #[test]
+    fn test_restore_registered_eagerly_when_env_home_in_config() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("temp dir");
+
+        let config = RepConfig::builder("test_group", "node2", "127.0.0.1")
+            .node_port(0)
+            .env_home(dir.path())
+            .build();
+
+        let rep_env = ReplicatedEnvironment::new(config).unwrap();
+
+        // Should be registered immediately (env_home was in config).
+        assert!(rep_env.restore_registered.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
