@@ -220,6 +220,38 @@ impl NoxuError {
         )
     }
 
+    // ── Classification helpers ─────────────────────────────────────────────
+
+    /// Returns `true` if this is a lock-conflict error (JE `LockConflictException`
+    /// or `DeadlockException`).  Always retryable after abort.
+    pub fn is_lock_conflict(&self) -> bool {
+        matches!(
+            self,
+            NoxuError::LockConflict(_) | NoxuError::DeadlockDetected | NoxuError::LockPreempted
+        )
+    }
+
+    /// Returns `true` if this is a lock or transaction timeout (JE
+    /// `LockTimeoutException` / `TransactionTimeoutException`).  Retryable.
+    pub fn is_lock_timeout(&self) -> bool {
+        matches!(
+            self,
+            NoxuError::LockTimeout { .. } | NoxuError::TransactionTimeout { .. }
+        )
+    }
+
+    /// Returns `true` if the named database was not found (JE
+    /// `DatabaseNotFoundException`).
+    pub fn is_database_not_found(&self) -> bool {
+        matches!(self, NoxuError::DatabaseNotFound(_))
+    }
+
+    /// Returns `true` for any `OperationFailureException`-equivalent: lock
+    /// conflicts, timeouts, deadlocks, and preemptions.
+    pub fn is_operation_failure(&self) -> bool {
+        self.is_retryable()
+    }
+
     // ── Constructor helpers ────────────────────────────────────────────────
 
     /// Creates an `EnvironmentFailure` error.
@@ -235,6 +267,21 @@ impl NoxuError {
     /// Creates an `IllegalArgument` error.
     pub fn invalid_argument(msg: impl Into<String>) -> Self {
         NoxuError::IllegalArgument(msg.into())
+    }
+
+    /// Creates a `LockConflict` error.  Mirrors JE `LockConflictException`.
+    pub fn lock_conflict(msg: impl Into<String>) -> Self {
+        NoxuError::LockConflict(msg.into())
+    }
+
+    /// Creates a `LockTimeout` error.  Mirrors JE `LockTimeoutException`.
+    pub fn lock_timeout(timeout_ms: u64) -> Self {
+        NoxuError::LockTimeout { timeout_ms }
+    }
+
+    /// Creates a `DatabaseNotFound` error.  Mirrors JE `DatabaseNotFoundException`.
+    pub fn database_not_found(name: impl Into<String>) -> Self {
+        NoxuError::DatabaseNotFound(name.into())
     }
 }
 
@@ -510,5 +557,41 @@ mod tests {
         assert!(matches!(NoxuError::environment("x"), NoxuError::EnvironmentFailure(_)));
         assert!(matches!(NoxuError::database("x"), NoxuError::OperationNotAllowed(_)));
         assert!(matches!(NoxuError::invalid_argument("x"), NoxuError::IllegalArgument(_)));
+        assert!(matches!(NoxuError::lock_conflict("x"), NoxuError::LockConflict(_)));
+        assert!(matches!(NoxuError::lock_timeout(500), NoxuError::LockTimeout { timeout_ms: 500 }));
+        assert!(matches!(NoxuError::database_not_found("db"), NoxuError::DatabaseNotFound(_)));
+    }
+
+    #[test]
+    fn test_is_lock_conflict() {
+        assert!(NoxuError::LockConflict("x".into()).is_lock_conflict());
+        assert!(NoxuError::DeadlockDetected.is_lock_conflict());
+        assert!(NoxuError::LockPreempted.is_lock_conflict());
+        assert!(!NoxuError::LockTimeout { timeout_ms: 500 }.is_lock_conflict());
+        assert!(!NoxuError::NotFound.is_lock_conflict());
+    }
+
+    #[test]
+    fn test_is_lock_timeout() {
+        assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_lock_timeout());
+        assert!(NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }.is_lock_timeout());
+        assert!(!NoxuError::LockConflict("x".into()).is_lock_timeout());
+        assert!(!NoxuError::NotFound.is_lock_timeout());
+    }
+
+    #[test]
+    fn test_is_database_not_found() {
+        assert!(NoxuError::DatabaseNotFound("mydb".into()).is_database_not_found());
+        assert!(!NoxuError::DatabaseClosed.is_database_not_found());
+        assert!(!NoxuError::NotFound.is_database_not_found());
+    }
+
+    #[test]
+    fn test_is_operation_failure() {
+        assert!(NoxuError::DeadlockDetected.is_operation_failure());
+        assert!(NoxuError::LockConflict("x".into()).is_operation_failure());
+        assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_operation_failure());
+        assert!(!NoxuError::NotFound.is_operation_failure());
+        assert!(!NoxuError::EnvironmentFailure("x".into()).is_operation_failure());
     }
 }

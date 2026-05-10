@@ -90,7 +90,7 @@ impl Default for CheckpointStats {
 ///
 /// This struct contains copies of the atomic counters for safe reading
 /// without worrying about concurrent modifications.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CheckpointStatsSnapshot {
     pub checkpoints: u64,
     pub full_in_flush: u64,

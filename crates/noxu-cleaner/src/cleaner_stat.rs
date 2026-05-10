@@ -271,7 +271,7 @@ impl Default for CleanerStats {
 /// A non-atomic snapshot of cleaner statistics.
 ///
 /// Useful for reporting and persistence without holding locks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CleanerStatsSnapshot {
     pub runs: u64,
     pub two_pass_runs: u64,

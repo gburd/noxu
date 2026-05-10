@@ -9,7 +9,7 @@ use crate::transaction::Transaction;
 use crate::transaction_config::TransactionConfig;
 use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
 use noxu_engine::EnvironmentStats;
-use noxu_engine::env_stats::{LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot};
+use noxu_engine::env_stats::{EvictorStatsSnapshot, LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot};
 use noxu_log::LogManager;
 use noxu_sync::Mutex;
 use std::collections::HashMap;
@@ -595,6 +595,15 @@ impl Environment {
         let lock = LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
         let txn = TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
         let throughput = env_impl.get_throughput_snapshot();
+        let evictor = EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
+        let cleaner = env_impl
+            .get_cleaner()
+            .map(|c| c.get_stats().snapshot())
+            .unwrap_or_default();
+        let checkpoint = env_impl
+            .get_checkpointer()
+            .map(|cp| cp.get_stats().snapshot())
+            .unwrap_or_default();
         Ok(EnvironmentStats {
             cache_size: self.config.cache_size,
             cache_usage: 0,
@@ -603,7 +612,9 @@ impl Environment {
             lock,
             txn,
             throughput,
-            ..Default::default()
+            evictor,
+            cleaner,
+            checkpoint,
         })
     }
 
