@@ -842,6 +842,13 @@ impl EnvironmentImpl {
         self.cleaner.as_ref()
     }
 
+    /// Returns the checkpointer, if one was created.
+    ///
+    /// Returns `None` for read-only environments.
+    pub fn get_checkpointer(&self) -> Option<Arc<noxu_recovery::checkpointer::Checkpointer>> {
+        self.checkpointer.as_ref().map(Arc::clone)
+    }
+
     /// Runs one pass of the log cleaner.
     ///
     /// Selects up to `n_files` least-utilized log files, processes them
