@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// Use the builder pattern to configure individual parameters.
 ///
 /// Matches `EnvironmentConfig` from JE (147 total params in JE; this covers
-/// the ~25 most operationally significant ones).
+/// the ~55 most operationally significant ones).
 #[derive(Debug, Clone)]
 pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
@@ -42,6 +42,14 @@ pub struct EnvironmentConfig {
     /// Logging level.
     pub logging_level: Option<String>,
 
+    /// Force a checkpoint after recovery completes.
+    /// JE: `ENV_RECOVERY_FORCE_CHECKPOINT` / default false.
+    pub env_recovery_force_checkpoint: bool,
+
+    /// Maximum disk space the environment may use in bytes.  0 = unlimited.
+    /// JE: `MAX_DISK` / default 0.
+    pub max_disk: u64,
+
     // -----------------------------------------------------------------------
     // Memory / cache
     // -----------------------------------------------------------------------
@@ -64,6 +72,18 @@ pub struct EnvironmentConfig {
     /// Maximum size of a single log file in bytes.
     /// JE: `EnvironmentConfig.setConfigParam(LOG_FILE_MAX)` / default 10 MiB.
     pub log_file_max_bytes: u64,
+
+    /// Number of cached open file handles (LRU eviction when full).
+    /// JE: `LOG_FILE_CACHE_SIZE` / default 100.
+    pub log_file_cache_size: usize,
+
+    /// Validate entry checksums when reading the log (read-path only).
+    /// JE: `LOG_CHECKSUM_READ` / default true.
+    pub log_checksum_read: bool,
+
+    /// Timeout for a single `fdatasync` call in milliseconds.
+    /// JE: `LOG_FSYNC_TIMEOUT` / default 500_000 ms (8.3 min).
+    pub log_fsync_timeout_ms: u64,
 
     /// Number of write buffers in the log buffer pool.
     /// JE: `LOG_NUM_BUFFERS` / default 3.
@@ -99,6 +119,14 @@ pub struct EnvironmentConfig {
     /// Whether to write BIN-delta log entries (partial BIN updates).
     /// JE: `TREE_BIN_DELTA` / default true.
     pub tree_bin_delta: bool,
+
+    /// Whether to run the background INCompressor daemon.
+    /// JE: `ENV_RUN_IN_COMPRESSOR` / default true.
+    pub run_in_compressor: bool,
+
+    /// INCompressor wakeup interval in milliseconds.
+    /// JE: `COMPRESSOR_WAKEUP_INTERVAL` / default 5000 ms.
+    pub in_compressor_wakeup_interval_ms: u64,
 
     // -----------------------------------------------------------------------
     // Cleaner
@@ -166,6 +194,14 @@ pub struct EnvironmentConfig {
     /// JE: `EVICTOR_LRU_ONLY` / default false.
     pub evictor_lru_only: bool,
 
+    /// Minimum number of background evictor threads always kept alive.
+    /// JE: `EVICTOR_CORE_THREADS` / default 1.
+    pub evictor_core_threads: usize,
+
+    /// Maximum number of background evictor threads.
+    /// JE: `EVICTOR_MAX_THREADS` / default 10.
+    pub evictor_max_threads: usize,
+
     // -----------------------------------------------------------------------
     // Locking
     // -----------------------------------------------------------------------
@@ -178,6 +214,10 @@ pub struct EnvironmentConfig {
     /// cost of slightly more memory.
     /// JE: `LOCK_N_LOCK_TABLES` / default 1 (Noxu defaults to 16).
     pub lock_n_lock_tables: u32,
+
+    /// Whether to run the deadlock detector on lock waits.
+    /// JE: `LOCK_DEADLOCK_DETECT` / default true.
+    pub lock_deadlock_detect: bool,
 
     // -----------------------------------------------------------------------
     // Transactions
@@ -198,6 +238,34 @@ pub struct EnvironmentConfig {
     /// If true, commits write the log to the OS buffer but do not fdatasync.
     /// JE: `TXN_WRITE_NO_SYNC` / default false.
     pub txn_write_no_sync: bool,
+
+    /// If true, all transactions use serializable (degree-3) isolation by default.
+    /// JE: `TXN_SERIALIZABLE_ISOLATION` / default false.
+    pub txn_serializable_isolation: bool,
+
+    // -----------------------------------------------------------------------
+    // Cleaner (extended)
+    // -----------------------------------------------------------------------
+
+    /// Bytes read per cleaner file scan pass.
+    /// JE: `CLEANER_READ_SIZE` / default 8 KiB.
+    pub cleaner_read_size: usize,
+
+    /// Number of LN records to look ahead during file cleaning.
+    /// JE: `CLEANER_LOOK_AHEAD_CACHE_SIZE` / default 32.
+    pub cleaner_look_ahead_cache_size: usize,
+
+    // -----------------------------------------------------------------------
+    // Background stats
+    // -----------------------------------------------------------------------
+
+    /// Whether to collect environment statistics in the background.
+    /// JE: `STATS_COLLECT` / default false.
+    pub stats_collect: bool,
+
+    /// Interval in seconds between background stats collection passes.
+    /// JE: `STATS_COLLECT_INTERVAL` / default 300 s.
+    pub stats_collect_interval_secs: u64,
 }
 
 impl EnvironmentConfig {
@@ -210,19 +278,27 @@ impl EnvironmentConfig {
             read_only: false,
             shared_cache: false,
             logging_level: None,
+            env_recovery_force_checkpoint: false,
+            max_disk: 0,
             // Memory
             cache_size: 64 * 1024 * 1024, // 64 MiB
             cache_percent: 0,
             // Log
             log_file_max_bytes: 10 * 1024 * 1024, // 10 MiB (JE default)
+            log_file_cache_size: 100,               // JE LOG_FILE_CACHE_SIZE default
+            log_checksum_read: true,
+            log_fsync_timeout_ms: 500_000,          // JE LOG_FSYNC_TIMEOUT default (500 s)
             log_num_buffers: 3,
-            log_total_buffer_bytes: 7 * 1024 * 1024, // 7 MiB total (JE LOG_TOTAL_BUFFER_BYTES)
+            log_total_buffer_bytes: 7 * 1024 * 1024, // 7 MiB total
             log_fault_read_size: 2048,
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
             // B-tree
             tree_max_delta: 25,
             tree_bin_delta: true,
+            // INCompressor
+            run_in_compressor: true,
+            in_compressor_wakeup_interval_ms: 5000, // JE COMPRESSOR_WAKEUP_INTERVAL default
             // Cleaner
             run_cleaner: true,
             cleaner_min_utilization: 50,
@@ -231,6 +307,8 @@ impl EnvironmentConfig {
             cleaner_min_file_count: 2,
             cleaner_min_age: 2,
             cleaner_expiration_enabled: false,
+            cleaner_read_size: 8192,                // JE CLEANER_READ_SIZE default
+            cleaner_look_ahead_cache_size: 32,      // JE CLEANER_LOOK_AHEAD_CACHE_SIZE default
             // Checkpointer
             run_checkpointer: true,
             checkpointer_bytes_interval: 20_000_000, // 20 MiB
@@ -239,14 +317,21 @@ impl EnvironmentConfig {
             run_evictor: true,
             evictor_nodes_per_scan: 10,
             evictor_lru_only: false,
+            evictor_core_threads: 1,                // JE EVICTOR_CORE_THREADS default
+            evictor_max_threads: 10,                // JE EVICTOR_MAX_THREADS default
             // Locking
             lock_timeout_ms: 500,
-            lock_n_lock_tables: 16, // Noxu default (JE default is 1)
+            lock_n_lock_tables: 16,                 // Noxu default (JE default is 1)
+            lock_deadlock_detect: true,
             // Transactions
             txn_timeout_ms: 0,
             durability: Durability::default(),
             txn_no_sync: false,
             txn_write_no_sync: false,
+            txn_serializable_isolation: false,
+            // Stats
+            stats_collect: false,
+            stats_collect_interval_secs: 300,
         }
     }
 
@@ -488,8 +573,111 @@ impl EnvironmentConfig {
         self
     }
 
+    pub fn set_txn_serializable_isolation(&mut self, serializable: bool) -> &mut Self {
+        self.txn_serializable_isolation = serializable;
+        self
+    }
+
     pub fn set_cache_percent(&mut self, pct: u32) -> &mut Self {
         self.cache_percent = pct;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Core (extended)
+    // -----------------------------------------------------------------------
+
+    pub fn set_env_recovery_force_checkpoint(&mut self, force: bool) -> &mut Self {
+        self.env_recovery_force_checkpoint = force;
+        self
+    }
+
+    pub fn set_max_disk(&mut self, bytes: u64) -> &mut Self {
+        self.max_disk = bytes;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Log (extended)
+    // -----------------------------------------------------------------------
+
+    pub fn set_log_file_cache_size(&mut self, n: usize) -> &mut Self {
+        self.log_file_cache_size = n;
+        self
+    }
+
+    pub fn set_log_checksum_read(&mut self, enabled: bool) -> &mut Self {
+        self.log_checksum_read = enabled;
+        self
+    }
+
+    pub fn set_log_fsync_timeout_ms(&mut self, ms: u64) -> &mut Self {
+        self.log_fsync_timeout_ms = ms;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // INCompressor
+    // -----------------------------------------------------------------------
+
+    pub fn set_run_in_compressor(&mut self, run: bool) -> &mut Self {
+        self.run_in_compressor = run;
+        self
+    }
+
+    pub fn set_in_compressor_wakeup_interval_ms(&mut self, ms: u64) -> &mut Self {
+        self.in_compressor_wakeup_interval_ms = ms;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleaner (extended)
+    // -----------------------------------------------------------------------
+
+    pub fn set_cleaner_read_size(&mut self, bytes: usize) -> &mut Self {
+        self.cleaner_read_size = bytes;
+        self
+    }
+
+    pub fn set_cleaner_look_ahead_cache_size(&mut self, n: usize) -> &mut Self {
+        self.cleaner_look_ahead_cache_size = n;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Evictor (extended)
+    // -----------------------------------------------------------------------
+
+    pub fn set_evictor_core_threads(&mut self, n: usize) -> &mut Self {
+        self.evictor_core_threads = n;
+        self
+    }
+
+    pub fn set_evictor_max_threads(&mut self, n: usize) -> &mut Self {
+        self.evictor_max_threads = n;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Locking (extended)
+    // -----------------------------------------------------------------------
+
+    pub fn set_lock_deadlock_detect(&mut self, enabled: bool) -> &mut Self {
+        self.lock_deadlock_detect = enabled;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Stats
+    // -----------------------------------------------------------------------
+
+    pub fn set_stats_collect(&mut self, enabled: bool) -> &mut Self {
+        self.stats_collect = enabled;
+        self
+    }
+
+    pub fn set_stats_collect_interval_secs(&mut self, secs: u64) -> &mut Self {
+        self.stats_collect_interval_secs = secs;
         self
     }
 
@@ -801,6 +989,61 @@ mod tests {
         let mut c2 = EnvironmentConfig::default();
         c2.set_txn_write_no_sync(true);
         assert!(c2.txn_write_no_sync);
+    }
+
+    #[test]
+    fn test_extended_params_defaults() {
+        let c = EnvironmentConfig::default();
+        assert!(!c.env_recovery_force_checkpoint);
+        assert_eq!(c.max_disk, 0);
+        assert_eq!(c.log_file_cache_size, 100);
+        assert!(c.log_checksum_read);
+        assert_eq!(c.log_fsync_timeout_ms, 500_000);
+        assert!(c.run_in_compressor);
+        assert_eq!(c.in_compressor_wakeup_interval_ms, 5000);
+        assert_eq!(c.cleaner_read_size, 8192);
+        assert_eq!(c.cleaner_look_ahead_cache_size, 32);
+        assert_eq!(c.evictor_core_threads, 1);
+        assert_eq!(c.evictor_max_threads, 10);
+        assert!(c.lock_deadlock_detect);
+        assert!(!c.txn_serializable_isolation);
+        assert!(!c.stats_collect);
+        assert_eq!(c.stats_collect_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_extended_params_setters() {
+        let mut c = EnvironmentConfig::default();
+        c.set_env_recovery_force_checkpoint(true);
+        c.set_max_disk(10 * 1024 * 1024 * 1024);
+        c.set_log_file_cache_size(200);
+        c.set_log_checksum_read(false);
+        c.set_log_fsync_timeout_ms(1000);
+        c.set_run_in_compressor(false);
+        c.set_in_compressor_wakeup_interval_ms(1000);
+        c.set_cleaner_read_size(16384);
+        c.set_cleaner_look_ahead_cache_size(64);
+        c.set_evictor_core_threads(2);
+        c.set_evictor_max_threads(4);
+        c.set_lock_deadlock_detect(false);
+        c.set_txn_serializable_isolation(true);
+        c.set_stats_collect(true);
+        c.set_stats_collect_interval_secs(60);
+        assert!(c.env_recovery_force_checkpoint);
+        assert_eq!(c.max_disk, 10 * 1024 * 1024 * 1024);
+        assert_eq!(c.log_file_cache_size, 200);
+        assert!(!c.log_checksum_read);
+        assert_eq!(c.log_fsync_timeout_ms, 1000);
+        assert!(!c.run_in_compressor);
+        assert_eq!(c.in_compressor_wakeup_interval_ms, 1000);
+        assert_eq!(c.cleaner_read_size, 16384);
+        assert_eq!(c.cleaner_look_ahead_cache_size, 64);
+        assert_eq!(c.evictor_core_threads, 2);
+        assert_eq!(c.evictor_max_threads, 4);
+        assert!(!c.lock_deadlock_detect);
+        assert!(c.txn_serializable_isolation);
+        assert!(c.stats_collect);
+        assert_eq!(c.stats_collect_interval_secs, 60);
     }
 
     #[test]
