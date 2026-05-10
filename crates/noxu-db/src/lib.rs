@@ -62,7 +62,7 @@ pub use database_config::DatabaseConfig;
 pub use database_entry::DatabaseEntry;
 pub use durability::{Durability, ReplicaAckPolicy, SyncPolicy};
 pub use environment::Environment;
-pub use environment_config::EnvironmentConfig;
+pub use environment_config::{EnvironmentConfig, ExceptionListenerHolder};
 pub use noxu_engine::EnvironmentStats;
 pub use error::{
     EnvironmentFailureReason, ExceptionEvent, ExceptionListener, ExceptionSource, NoxuError, Result,
