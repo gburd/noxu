@@ -280,7 +280,7 @@ impl EnvironmentImpl {
                     &env_home,
                     false,
                     cfg.log_file_max_bytes,
-                    100, // file handle cache size (fixed; not yet configurable)
+                    cfg.log_file_cache_size,
                 )
                 .map_err(|e| DbiError::EnvironmentFailure {
                     reason: format!("failed to init FileManager: {e}"),
@@ -490,22 +490,22 @@ impl EnvironmentImpl {
         let db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Start the background INCompressor daemon thread.
-        //
-        // The daemon wakes every 100 ms, iterates all open databases, and for
-        // each calls `Tree::collect_bins_with_known_deleted()` to find BINs that
-        // still hold zombie deleted slots (e.g. from log replay).  Each such BIN
-        // is passed to `Tree::compress_bin()` to remove the defunct entries and,
-        // if the BIN becomes empty, prune it from the tree.
-        //
+        // Start the background INCompressor daemon thread (JE INCompressor).
+        // Controlled by cfg.run_in_compressor; wakeup interval from
+        // cfg.in_compressor_wakeup_interval_ms (JE COMPRESSOR_WAKEUP_INTERVAL).
         let in_compressor_shutdown = Arc::new(AtomicBool::new(false));
         let in_compressor_shutdown_clone = Arc::clone(&in_compressor_shutdown);
         let db_map_for_compressor = Arc::clone(&db_map);
+        let compressor_interval_ms = cfg.in_compressor_wakeup_interval_ms;
+        let run_in_compressor = cfg.run_in_compressor;
         let in_compressor_handle = std::thread::Builder::new()
             .name("noxu-in-compressor".to_string())
             .spawn(move || {
+                if !run_in_compressor {
+                    return;
+                }
                 while !in_compressor_shutdown_clone.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(compressor_interval_ms));
                     if in_compressor_shutdown_clone.load(Ordering::Relaxed) {
                         break;
                     }
