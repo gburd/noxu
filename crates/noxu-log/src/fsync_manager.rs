@@ -256,6 +256,12 @@ impl FsyncManager {
                 if self.grp_wait_on && state.num_next_waiters == 1 {
                     state.start_next_wait = Some(Instant::now());
                 }
+                // If this new waiter pushes us to the threshold, wake the
+                // leader early so it doesn't wait the full grpc_interval_ms.
+                // Mirrors: if (numNextWaiters >= grpcThreshold) mgrMutex.notifyAll()
+                if self.grp_wait_on && state.num_next_waiters >= self.grpc_threshold {
+                    self.leader_condvar.notify_one();
+                }
             } else {
                 // Become the leader.
                 is_leader = true;
