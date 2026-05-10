@@ -56,19 +56,29 @@ impl BenchDir {
     }
 }
 
-/// Create a fresh benchmark directory.  Uses `NOXU_BENCH_DIR` if set;
-/// falls back to a new TempDir (tmpfs).
+/// Create a fresh benchmark directory.
+///
+/// Priority:
+/// 1. `NOXU_BENCH_DIR` env var (explicit override)
+/// 2. `/scratch/noxu_bench` if `/scratch` is writable (NVMe on this machine)
+/// 3. TempDir (tmpfs fallback — FSyncManager coalescing is invisible on tmpfs)
 fn new_bench_dir(base: &Option<PathBuf>, tag: &str, n: usize) -> BenchDir {
-    match base {
-        None => BenchDir::Temp(TempDir::new().unwrap()),
-        Some(root) => {
-            let dir = root.join(format!("{}_{}", tag, n));
-            // Remove any leftover data from a previous run.
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).expect("failed to create bench dir");
-            BenchDir::Real(dir)
+    let root = match base {
+        Some(r) => r.clone(),
+        None => {
+            let scratch = PathBuf::from("/scratch/noxu_bench");
+            if scratch.parent().map(|p| p.exists()).unwrap_or(false) {
+                scratch
+            } else {
+                return BenchDir::Temp(TempDir::new().unwrap());
+            }
         }
-    }
+    };
+    let dir = root.join(format!("{}_{}", tag, n));
+    // Remove any leftover data from a previous run.
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("failed to create bench dir");
+    BenchDir::Real(dir)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,18 +209,20 @@ fn main() {
         .filter(|&v| v > 0)
         .unwrap_or(usize::MAX);
 
-    // NOXU_BENCH_DIR: optional path to a real-storage directory.  When set,
-    // each workload writes to a subdirectory of this path instead of TempDir,
-    // enabling FSyncManager coalescing measurement on real NVMe/SSD.
+    // NOXU_BENCH_DIR: explicit override for benchmark storage root.
+    // Falls back to /scratch/noxu_bench (NVMe) if available, then TempDir.
     let bench_base: Option<PathBuf> = std::env::var("NOXU_BENCH_DIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    if let Some(ref b) = bench_base {
-        println!("  Storage: {} (real storage)", b.display());
+    let storage_label = if let Some(ref b) = bench_base {
+        format!("{} (NOXU_BENCH_DIR)", b.display())
+    } else if PathBuf::from("/scratch").exists() {
+        "/scratch/noxu_bench (NVMe auto-detected)".to_string()
     } else {
-        println!("  Storage: TempDir (tmpfs — FSyncManager coalescing window is zero)");
-    }
+        "TempDir (tmpfs — FSyncManager coalescing window is zero)".to_string()
+    };
+    println!("  Storage: {}", storage_label);
     let all_scales: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000];
     let scales: Vec<usize> = all_scales.iter().copied().filter(|&s| s <= max_scale).collect();
     let scales: &[usize] = &scales;
