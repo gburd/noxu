@@ -292,22 +292,22 @@ impl ReplicatedEnvironment {
     /// `EnvironmentImpl` via `RepImpl.repNode.envImpl` in HA.
     pub fn with_environment(&self, env: Arc<EnvironmentImpl>) {
         // Register RESTORE service lazily if not already done.
-        if !self.restore_registered.load(Ordering::SeqCst) {
-            if let Some(ref dispatcher) = self.tcp_dispatcher {
-                let env_home = env.get_env_home().to_path_buf();
-                let restore_server = NetworkRestoreServer::new(env_home.clone());
-                dispatcher.register(
-                    RESTORE_SERVICE_NAME,
-                    Arc::new(restore_server),
-                );
-                self.restore_registered.store(true, Ordering::SeqCst);
-                log::debug!(
-                    "Node '{}' RESTORE service registered via with_environment \
-                     (env_home={})",
-                    self.config.node_name,
-                    env_home.display(),
-                );
-            }
+        if !self.restore_registered.load(Ordering::SeqCst)
+            && let Some(ref dispatcher) = self.tcp_dispatcher
+        {
+            let env_home = env.get_env_home().to_path_buf();
+            let restore_server = NetworkRestoreServer::new(env_home.clone());
+            dispatcher.register(
+                RESTORE_SERVICE_NAME,
+                Arc::new(restore_server),
+            );
+            self.restore_registered.store(true, Ordering::SeqCst);
+            log::debug!(
+                "Node '{}' RESTORE service registered via with_environment \
+                 (env_home={})",
+                self.config.node_name,
+                env_home.display(),
+            );
         }
 
         *self.env_impl.lock().unwrap() = Some(env);

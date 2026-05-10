@@ -2709,10 +2709,10 @@ impl Tree {
     /// The evictor will not select a BIN with `cursor_count > 0` for eviction
     /// (`RealNodeInfo.pin_count`), matching `BIN.incrementCursorCount()`.
     pub fn pin_bin(bin_arc: &Arc<RwLock<TreeNode>>) {
-        if let Ok(mut guard) = bin_arc.write() {
-            if let TreeNode::Bottom(ref mut stub) = *guard {
-                stub.cursor_count += 1;
-            }
+        if let Ok(mut guard) = bin_arc.write()
+            && let TreeNode::Bottom(ref mut stub) = *guard
+        {
+            stub.cursor_count += 1;
         }
     }
 
@@ -2722,10 +2722,10 @@ impl Tree {
     /// Uses `saturating_sub` to guard against an accidental double-unpin.
     /// Matching `BIN.decrementCursorCount()`.
     pub fn unpin_bin(bin_arc: &Arc<RwLock<TreeNode>>) {
-        if let Ok(mut guard) = bin_arc.write() {
-            if let TreeNode::Bottom(ref mut stub) = *guard {
-                stub.cursor_count = stub.cursor_count.saturating_sub(1);
-            }
+        if let Ok(mut guard) = bin_arc.write()
+            && let TreeNode::Bottom(ref mut stub) = *guard
+        {
+            stub.cursor_count = stub.cursor_count.saturating_sub(1);
         }
     }
 

@@ -594,10 +594,7 @@ impl FileManager {
         // active write file) during recovery, so the underlying bytes do
         // not change while the mapping is alive.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            LogError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("mmap {:?}: {}", path, e),
-            ))
+            LogError::Io(std::io::Error::other(format!("mmap {:?}: {}", path, e)))
         })?;
         Ok(mmap)
     }

@@ -336,9 +336,8 @@ impl RecoveryManager {
     /// into `trees` (with max_entries=256) so that all databases discovered
     /// during recovery are fully reconstructed.
     ///
-    /// + `DbTree.dbIdToDb` map
-    /// in the: the map is populated during the analysis phase and every redo /
-    /// undo entry is dispatched to the correct per-database tree.
+    /// Mirrors `DbTree.dbIdToDb`: the map is populated during the analysis phase
+    /// and every redo / undo entry is dispatched to the correct per-database tree.
     pub fn recover_all(
         &mut self,
         scanner: &mut dyn LogScanner,

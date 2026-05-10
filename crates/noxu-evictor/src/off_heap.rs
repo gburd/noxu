@@ -267,12 +267,12 @@ impl OffHeapCache {
 
     /// Clear all entries.
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(s) = guard.as_mut() {
-                s.index = LruCache::unbounded();
-                s.write_pos = 0;
-                s.fragmented = 0;
-            }
+        if let Ok(mut guard) = self.inner.lock()
+            && let Some(s) = guard.as_mut()
+        {
+            s.index = LruCache::unbounded();
+            s.write_pos = 0;
+            s.fragmented = 0;
         }
     }
 
