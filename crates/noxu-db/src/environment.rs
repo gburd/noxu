@@ -10,6 +10,7 @@ use crate::transaction_config::TransactionConfig;
 use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
 use noxu_engine::EnvironmentStats;
 use noxu_engine::env_stats::{LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot};
+use noxu_log::LogManager;
 use noxu_sync::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,9 @@ pub struct Environment {
     open: AtomicBool,
     /// The real internal environment implementation (B-tree backed).
     env_impl: Arc<Mutex<EnvironmentImpl>>,
+    /// Cached log manager — acquired once at open; None for non-transactional envs.
+    /// Used by stat_fsync_count() to avoid env_impl.lock() on the stats hot path.
+    log_manager: Option<Arc<LogManager>>,
 }
 
 /// Internal database handle state.
@@ -162,6 +166,8 @@ impl Environment {
             EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
                 .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))?;
 
+        let log_manager = env_impl.get_log_manager();
+        let env_impl_arc = Arc::new(Mutex::new(env_impl));
         Ok(Environment {
             home,
             config,
@@ -169,7 +175,8 @@ impl Environment {
             active_txns: Mutex::new(HashMap::new()),
             next_txn_id: AtomicU64::new(1),
             open: AtomicBool::new(true),
-            env_impl: Arc::new(Mutex::new(env_impl)),
+            env_impl: env_impl_arc,
+            log_manager,
         })
     }
 
@@ -563,8 +570,9 @@ impl Environment {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let n_databases = env_impl.n_databases() as u32;
-        let log = env_impl
-            .get_log_manager()
+        // Use cached log_manager for the log stats to avoid double-locking.
+        let log = self.log_manager
+            .as_ref()
             .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
             .unwrap_or_default();
         let lock = LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
@@ -588,9 +596,8 @@ impl Environment {
     /// and for verifying that group commit is working (fewer fsyncs than commits).
     /// Returns 0 if the environment is non-transactional (no log manager).
     pub fn stat_fsync_count(&self) -> u64 {
-        self.env_impl
-            .lock()
-            .get_log_manager()
+        self.log_manager
+            .as_ref()
             .map(|lm| lm.fsync_count())
             .unwrap_or(0)
     }
