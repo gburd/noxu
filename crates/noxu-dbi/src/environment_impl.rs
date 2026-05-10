@@ -244,7 +244,7 @@ impl EnvironmentImpl {
         Self::new_with_config_inner(env_home, &DbiEnvConfig {
             read_only,
             transactional,
-            checkpointer_interval_ms: checkpoint_interval_ms,
+            checkpointer_wakeup_interval_ms: checkpoint_interval_ms,
             ..DbiEnvConfig::default()
         })
     }
@@ -255,7 +255,7 @@ impl EnvironmentImpl {
     ) -> Result<Self, DbiError> {
         let read_only = cfg.read_only;
         let transactional = cfg.transactional;
-        let checkpoint_interval_ms = cfg.checkpointer_interval_ms;
+        let checkpoint_interval_ms = cfg.checkpointer_wakeup_interval_ms;
         let env_home = env_home.into();
         let lock_manager = Arc::new(LockManager::new());
         lock_manager.set_lock_timeout(cfg.lock_timeout_ms);

@@ -317,7 +317,10 @@ impl Transaction {
 
         lm.log(entry_type, &buf, Provisional::No, flush, fsync)
             .map(|_| ())
-            .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))
+            .map_err(|e| NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::LogWrite,
+                e.to_string(),
+            ))
     }
 
     /// Get the transaction ID.

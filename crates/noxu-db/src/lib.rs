@@ -64,7 +64,9 @@ pub use durability::{Durability, ReplicaAckPolicy, SyncPolicy};
 pub use environment::Environment;
 pub use environment_config::EnvironmentConfig;
 pub use noxu_engine::EnvironmentStats;
-pub use error::{NoxuError, Result};
+pub use error::{
+    EnvironmentFailureReason, ExceptionEvent, ExceptionListener, ExceptionSource, NoxuError, Result,
+};
 pub use extinction_filter::{ExtinctionFilter, ExtinctionStatus};
 pub use get::Get;
 pub use lock_mode::LockMode;

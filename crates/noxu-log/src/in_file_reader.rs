@@ -131,8 +131,7 @@ impl<F: LogFileAccess> INFileReader<F> {
     ///
     /// Returns `Ok(true)` when an entry was found; `Ok(false)` at end of log.
     ///
-    /// + `INFileReader.isTargetEntry()` +
-    /// `INFileReader.processEntry()`.
+    /// See `INFileReader.isTargetEntry()` and `INFileReader.processEntry()`.
     pub fn read_next_entry(&mut self) -> Result<bool> {
         if self.eof {
             return Ok(false);
