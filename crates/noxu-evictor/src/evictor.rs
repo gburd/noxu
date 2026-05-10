@@ -27,6 +27,7 @@ use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_tree::tree::{BinEntry, BinStub, InEntry, InNodeStub, Tree, TreeNode};
 use noxu_util::NULL_LSN;
+use crate::off_heap::OffHeapCache;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -281,6 +282,14 @@ pub struct Evictor {
     /// Database ID associated with `tree`.  Required to identify which BINs
     /// belong to this database when calling `collect_dirty_bins`.
     db_id: u64,
+
+    /// Optional off-heap cache for upper-IN nodes.
+    ///
+    /// JE `OffHeapAllocator`: when an upper-IN is evicted from the main
+    /// cache it is serialised and placed here.  On the next fetch the
+    /// in-memory representation is reconstructed from off-heap bytes rather
+    /// than performing a log-file read.
+    off_heap: Option<Arc<OffHeapCache>>,
 }
 
 impl Evictor {
@@ -307,6 +316,7 @@ impl Evictor {
             log_manager: None,
             tree: None,
             db_id: 0,
+            off_heap: None,
         }
     }
 
@@ -334,6 +344,18 @@ impl Evictor {
     pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
         self.tree = Some(tree);
         self.db_id = db_id;
+        self
+    }
+
+    /// Wire an off-heap cache into the evictor.
+    ///
+    /// When wired, evicted upper-IN nodes (level > 1) are serialised and
+    /// placed in the off-heap store.  On the next tree fetch those INs are
+    /// reconstructed from off-heap bytes rather than from the log file.
+    ///
+    /// Mirrors JE `OffHeapCache` integration in `Evictor.doEvict()`.
+    pub fn with_off_heap(mut self, cache: Arc<OffHeapCache>) -> Self {
+        self.off_heap = Some(cache);
         self
     }
 
@@ -478,15 +500,29 @@ impl Evictor {
                 }
 
                 EvictionDecision::Evict => {
-                    // C-3 fix: If the node is dirty, flush it to the WAL
-                    // before removing it from memory.
+                    // JE: if (target.getDirty() && !storedOffHeap) log to WAL
+                    // then parent.detachNode(index, logged, loggedLsn).
                     //
-                    // `Evictor.evict()`:
-                    //   if (target.getDirty() && !storedOffHeap) {
-                    //       loggedLsn = target.log(...);
-                    //   }
-                    //   parent.detachNode(index, logged, loggedLsn);
-                    if info.is_dirty() {
+                    // Off-heap path: if an off-heap cache is wired and the
+                    // node is an upper IN (level > 1), serialise it into the
+                    // off-heap store.  This avoids a log-file read on the
+                    // next tree traversal that needs this IN.
+                    let mut stored_off_heap = false;
+                    if let (Some(oh), Some(tree_arc)) = (&self.off_heap, &self.tree) {
+                        if oh.is_enabled() {
+                            if let Ok(tree_guard) = tree_arc.read() {
+                                if let Some(serialized) =
+                                    tree_guard.serialize_upper_in(node_id)
+                                {
+                                    stored_off_heap = oh.store_node(node_id, serialized);
+                                }
+                            }
+                        }
+                    }
+
+                    // Only flush dirty nodes to log if NOT stored off-heap
+                    // (JE: !storedOffHeap check before logging).
+                    if info.is_dirty() && !stored_off_heap {
                         self.flush_dirty_node_to_log(node_id);
                     }
 

@@ -396,11 +396,20 @@ impl EnvironmentImpl {
             128 * 1024_i64,   // 128 KiB hysteresis (fixed)
             cache_bytes / 16, // critical threshold: 1/16 of cache
         );
-        let evictor = Arc::new(Evictor::new(
+        // Build optional off-heap cache from config (JE MAX_OFF_HEAP_MEMORY).
+        let off_heap_cache = Arc::new(
+            noxu_evictor::OffHeapCache::new(
+                cfg.max_off_heap_memory > 0,
+                cfg.max_off_heap_memory,
+            )
+        );
+
+        let evictor_builder = Evictor::new(
             arbiter,
             cfg.evictor_nodes_per_scan,
             cfg.evictor_lru_only,
-        ));
+        ).with_off_heap(Arc::clone(&off_heap_cache));
+        let evictor = Arc::new(evictor_builder);
 
         // Start the background daemon thread.  The thread loops as long as
         // `evictor.is_shutdown()` returns false, sleeping 5 ms between
