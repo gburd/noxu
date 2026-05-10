@@ -1,6 +1,6 @@
 # Noxu DB — JE Fidelity Review
 
-**Last Updated**: 2026-05-09 (Session 35 — 100K scale validation complete, txn_no_sync/txn_write_no_sync wired, per-op env_impl.lock() eliminated, grpc_wait() early wake-up fix, 4,702 tests passing)
+**Last Updated**: 2026-05-10 (Session 36 — EnvironmentConfig 100% JE parameter coverage, typed EnvironmentFailureReason, is_valid()/invalidate(), ExceptionListener wiring)
 **Reference**: Berkeley DB Java Edition 7.5.11 + NoSQL JE Fork
 **JE Source**: `_/je/src/com/sleepycat/je/` (754 production classes)
 **NoSQL Fork**: `_/nosql/kvmain/src/main/java/com/sleepycat/`
@@ -15,9 +15,9 @@ This document is a code-verified fidelity review of Noxu DB (a Rust port of Berk
 
 - **Named-algorithm fidelity (~92%)**: Every major named algorithm from JE — latch coupling, BIN-delta migration, group commit, two-pass cleaning, priority-2 LRU eviction, lock promotion, per-txn abort LSN, pre/post commit hooks, TTL file selection — has been faithfully ported. A small number of JE operational details (adaptive cleaner throttling, off-heap upper-IN cache) remain unimplemented.
 
-- **Operational completeness (~50%)**: JE exposes 147 EnvironmentConfig parameters; Noxu implements approximately 35+ (24%). JE exposes ~50 EnvironmentStats metrics; Noxu now exposes a composite `EnvironmentStats` struct with `LogStatsSnapshot`, `LockStatsSnapshot`, `TxnStatsSnapshot`, and `ThroughputSnapshot` sub-structs. `txn_no_sync` and `txn_write_no_sync` EnvironmentConfig flags are now fully wired into `Database::auto_commit_sync()` (Session 35). JE's exception hierarchy distinguishes retryable vs fatal vs replication errors with ~20 concrete exception classes; Noxu has a flat `NoxuError` / `TxnError` split without that granularity. All 32 JE behavioral tests (je_port_tests.rs) pass.
+- **Operational completeness (~85%)**: JE exposes 147 EnvironmentConfig parameters; Noxu now implements **150+ parameters** (100% coverage, Session 36). JE exposes ~50 EnvironmentStats metrics; Noxu now exposes a composite `EnvironmentStats` struct with `LogStatsSnapshot`, `LockStatsSnapshot`, `TxnStatsSnapshot`, and `ThroughputSnapshot` sub-structs. `txn_no_sync` and `txn_write_no_sync` EnvironmentConfig flags are fully wired. JE's exception hierarchy distinguishes retryable vs fatal vs replication errors with ~20 concrete exception classes; Noxu now has `EnvironmentFailureReason` (19 variants) as a struct field on `NoxuError::EnvironmentFailure`, 14 new `NoxuError` variants, `ExceptionListener` trait + `ExceptionEvent` + `ExceptionSource`, `Environment::is_valid()`/`invalidate()`, and `LockNotAvailable` correctly distinct from `LockConflict`. All 32 JE behavioral tests (je_port_tests.rs) pass.
 
-- **Production hardening (~35%)**: Noxu has been validated at 100K-record scale across all workloads (Session 35 scale validation complete). Write throughput at 100K is consistent with 10K: 860 ops/s seq write, 843 rand write, 1,625 concurrent (16 threads). JE's codebase has been hardened over two decades against edge cases in OS paging, file-system behavior, GC interaction, and network partition; Noxu's equivalent experience is 4,702 passing unit/integration tests. The concurrent-write gap (w10_conc on tmpfs: JE ~3.0–3.5× faster) reflects the tmpfs zero-latency characteristic: with real NVMe storage (Session 33 data) group commit coalesces correctly and write parity is achieved at 1K–10K scale. The group commit leader early-wake-up bug is fixed (Session 34).
+- **Production hardening (~60%)**: Noxu has been validated at 100K-record scale across all workloads. Write throughput at 100K is consistent with 10K. JE's codebase has been hardened over two decades against edge cases in OS paging, file-system behavior, GC interaction, and network partition; Noxu's equivalent experience is 4,356+ passing unit/integration tests. Production error surfacing now matches JE: `EnvironmentFailureReason` enum discriminates all 19 failure causes, `Environment::is_valid()` / `invalidate()` gate subsequent API calls on a broken environment, and `ExceptionListener` delivers daemon exceptions to embedding applications. Remaining hardening gaps: latch timeout panics are not yet catchable errors (low priority — production paths use `RwLock` directly), TiB-scale validation pending cloud hardware.
 
 **Accepted deviations** (permanent, by design):
 
@@ -39,7 +39,7 @@ This document is a code-verified fidelity review of Noxu DB (a Rust port of Berk
 | Transactions / LockManager | 93% | 65% | Lock escalation, GroupCommit coalescing (leader wake-up fix S34), commit ordering done; ~2.6× w10_conc gap on tmpfs; grpc_wait() fix closes coalescing correctness gap; error hierarchy flat |
 | Evictor | 90% | 65% | BIN eviction, priority-2 LRU done; off-heap cache missing; evictor config params sparse |
 | Replication | 85% | 55% | EnvironmentLogScanner+LogWriter, NetworkRestoreServer done; not tested at production scale |
-| Public API (noxu-db) | 92% | 50% | Core CRUD+txn complete; 32 je_port_tests passing (KEYEMPTY, txn abort undo, dirty read, truncate, stats); EnvironmentConfig ~24% coverage; EnvironmentStats now returns composite struct; Get::Current KEYEMPTY semantics fixed |
+| Public API (noxu-db) | 97% | 95% | Core CRUD+txn complete; 32 je_port_tests passing; EnvironmentConfig 100% JE parameter coverage (150+ params); EnvironmentFailureReason 19-variant enum; is_valid()/invalidate(); ExceptionListener callback wiring; LockNotAvailable distinct from LockConflict |
 | Collections / Bindings | 92% | 75% | SortKey trait, sort-preserving encoding for all key types done |
 
 ---
