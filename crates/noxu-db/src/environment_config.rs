@@ -8,7 +8,26 @@
 //! Parameters are grouped by subsystem to match the JE source layout.
 
 use crate::durability::Durability;
+use crate::error::ExceptionListener;
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Wrapper around an optional `ExceptionListener` that implements `Debug` and
+/// `Clone` so that `EnvironmentConfig` can keep those derives.
+///
+/// JE: `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
+#[derive(Clone, Default)]
+pub struct ExceptionListenerHolder(pub Option<Arc<dyn ExceptionListener>>);
+
+impl fmt::Debug for ExceptionListenerHolder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            None => f.write_str("None"),
+            Some(_) => f.write_str("Some(<ExceptionListener>)"),
+        }
+    }
+}
 
 /// Configuration for opening a Noxu DB environment.
 ///
@@ -710,6 +729,17 @@ pub struct EnvironmentConfig {
     /// startup takes longer than this.  0 = disabled.
     /// JE: `STARTUP_DUMP_THRESHOLD` / default 0.
     pub startup_dump_threshold_ms: u64,
+
+    // -----------------------------------------------------------------------
+    // Callbacks
+    // -----------------------------------------------------------------------
+
+    /// Optional callback invoked when a background daemon thread encounters
+    /// an exception.  Set this to receive notifications from the Checkpointer,
+    /// Cleaner, Evictor, INCompressor, and Verifier daemons.
+    ///
+    /// JE: `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
+    pub exception_listener: ExceptionListenerHolder,
 }
 
 impl EnvironmentConfig {
@@ -883,6 +913,7 @@ impl EnvironmentConfig {
             trace_level_evictor: None,
             trace_level_cleaner: None,
             startup_dump_threshold_ms: 0,
+            exception_listener: ExceptionListenerHolder(None),
         }
     }
 
@@ -1615,6 +1646,27 @@ impl EnvironmentConfig {
     pub fn set_startup_dump_threshold_ms(&mut self, ms: u64) -> &mut Self {
         self.startup_dump_threshold_ms = ms;
         self
+    }
+
+    // -----------------------------------------------------------------------
+    // Callback setters
+    // -----------------------------------------------------------------------
+
+    /// Registers a callback to be invoked when a background daemon thread
+    /// encounters an unhandled exception.
+    ///
+    /// JE: `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
+    pub fn set_exception_listener(
+        &mut self,
+        listener: Arc<dyn ExceptionListener>,
+    ) -> &mut Self {
+        self.exception_listener = ExceptionListenerHolder(Some(listener));
+        self
+    }
+
+    /// Returns the registered `ExceptionListener`, if any.
+    pub fn get_exception_listener(&self) -> Option<Arc<dyn ExceptionListener>> {
+        self.exception_listener.0.clone()
     }
 }
 
