@@ -11,6 +11,7 @@ use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode, ThroughputStats};
+use noxu_util::lsn::Lsn;
 use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
 use noxu_txn::LockManager;
@@ -125,11 +126,12 @@ impl Database {
     /// Auto-commit flush: when `txn` is `None` (auto-commit mode), flush and
     /// fsync the log before returning to the caller.
     ///
-    /// `Database.put/delete` auto-commit path: a non-transactional
-    /// mutation is wrapped in an implicit `AutoTxn` that commits with
-    /// `CommitSync` durability (fsync) before the method returns, giving the
-    /// same durability guarantee as an explicit committed transaction.
-    fn auto_commit_sync(&self, txn: Option<&Transaction>) -> Result<()> {
+    /// `write_lsn` is the LSN assigned to the write operation just performed.
+    /// Port of JE `LogManager.flushTo(lsn)`: if a concurrent committer already
+    /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
+    /// natural many:1 fsync coalescing under concurrent write load with no
+    /// explicit group-commit configuration required.
+    fn auto_commit_sync(&self, txn: Option<&Transaction>, write_lsn: Lsn) -> Result<()> {
         if txn.is_some() {
             return Ok(()); // explicit txn handles its own commit/fsync
         }
@@ -142,7 +144,8 @@ impl Database {
                 lm.flush_no_sync()
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
             } else {
-                lm.flush_sync()
+                // JE: flushTo(lsn) — skip if already covered by another flush.
+                lm.flush_sync_if_needed(write_lsn)
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
             }
         }
@@ -312,9 +315,10 @@ impl Database {
         cursor
             .put(key_bytes, data_bytes, PutMode::Overwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
 
-        // Auto-commit: fsync before returning.
-        self.auto_commit_sync(txn)?;
+        // Auto-commit: fsync before returning (skip if already covered).
+        self.auto_commit_sync(txn, write_lsn)?;
 
         self.throughput.n_pri_updates.fetch_add(1, Ordering::Relaxed);
         Ok(OperationStatus::Success)
@@ -357,8 +361,9 @@ impl Database {
             noxu_dbi::OperationStatus::KeyExist => OperationStatus::KeyExists,
             _ => OperationStatus::Success,
         };
-        // Auto-commit: fsync before returning.
-        self.auto_commit_sync(txn)?;
+        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
+        // Auto-commit: fsync before returning (skip if already covered).
+        self.auto_commit_sync(txn, write_lsn)?;
         if status == OperationStatus::Success {
             self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -410,8 +415,9 @@ impl Database {
             }
             _ => OperationStatus::NotFound,
         };
-        // Auto-commit: fsync before returning.
-        self.auto_commit_sync(txn)?;
+        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
+        // Auto-commit: fsync before returning (skip if already covered).
+        self.auto_commit_sync(txn, write_lsn)?;
         if status == OperationStatus::Success {
             self.throughput.n_pri_deletes.fetch_add(1, Ordering::Relaxed);
         } else {
