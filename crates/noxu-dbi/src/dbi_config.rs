@@ -72,6 +72,11 @@ pub struct DbiEnvConfig {
     pub stats_collect: bool,
     pub stats_collect_interval_secs: u64,
 
+    // Off-heap cache
+    /// Off-heap cache size in bytes.  0 = disabled.
+    /// JE: `MAX_OFF_HEAP_MEMORY` / default 0.
+    pub max_off_heap_memory: u64,
+
     // Disk limits
     pub max_disk: u64,
 }
@@ -114,6 +119,7 @@ impl Default for DbiEnvConfig {
             env_recovery_force_checkpoint: false,
             stats_collect: false,
             stats_collect_interval_secs: 300,
+            max_off_heap_memory: 0,
             max_disk: 0,
         }
     }

@@ -46,6 +46,10 @@ pub struct EnvironmentConfig {
     /// JE: `ENV_RECOVERY_FORCE_CHECKPOINT` / default false.
     pub env_recovery_force_checkpoint: bool,
 
+    /// Off-heap cache size in bytes.  0 = disabled.
+    /// JE: `MAX_OFF_HEAP_MEMORY` / default 0.
+    pub max_off_heap_memory: u64,
+
     /// Maximum disk space the environment may use in bytes.  0 = unlimited.
     /// JE: `MAX_DISK` / default 0.
     pub max_disk: u64,
@@ -279,6 +283,7 @@ impl EnvironmentConfig {
             shared_cache: false,
             logging_level: None,
             env_recovery_force_checkpoint: false,
+            max_off_heap_memory: 0,
             max_disk: 0,
             // Memory
             cache_size: 64 * 1024 * 1024, // 64 MiB

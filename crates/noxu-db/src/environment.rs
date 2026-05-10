@@ -175,6 +175,7 @@ impl Environment {
             env_recovery_force_checkpoint: config.env_recovery_force_checkpoint,
             stats_collect: config.stats_collect,
             stats_collect_interval_secs: config.stats_collect_interval_secs,
+            max_off_heap_memory: config.max_off_heap_memory,
             max_disk: config.max_disk,
         };
         let env_impl =
