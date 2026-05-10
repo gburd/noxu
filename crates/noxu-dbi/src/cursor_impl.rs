@@ -1069,6 +1069,46 @@ impl CursorImpl {
         Ok((raw_key, raw_data))
     }
 
+    /// Returns true if the slot the cursor is positioned on has been deleted
+    /// since the cursor was last positioned.
+    ///
+    /// JE: analogous to checking KNOWN_DELETED_BIT / entry removal on
+    /// Cursor.getCurrentLN() path — returns KEYEMPTY when the record is gone.
+    pub fn is_current_slot_deleted(&self) -> bool {
+        use noxu_tree::tree::TreeNode;
+        let current_key = match &self.current_key {
+            Some(k) => k,
+            None => return false,
+        };
+        let bin_arc = match &self.current_bin_arc {
+            Some(a) => a,
+            None => return false,
+        };
+        let idx = self.current_index as usize;
+        let guard = match bin_arc.read() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if let TreeNode::Bottom(bin) = &*guard {
+            if idx >= bin.entries.len() {
+                return true; // entry was removed
+            }
+            let plen = bin.key_prefix.len();
+            let expected_suffix: &[u8] = if plen == 0 || current_key.len() <= plen {
+                current_key.as_slice()
+            } else {
+                &current_key[plen..]
+            };
+            let stored = bin.entries[idx].key.as_slice();
+            if stored != expected_suffix {
+                return true; // different key at this index = deleted and shifted
+            }
+            bin.entries[idx].known_deleted
+        } else {
+            false
+        }
+    }
+
     /// Moves the cursor to the next/previous record.
     ///
     /// .

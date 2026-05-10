@@ -144,6 +144,12 @@ impl Cursor {
             }
             Get::Current => {
                 // Already checked initialized above.
+                // JE: re-check for deletion — Cursor.getCurrentLN() returns
+                // KEYEMPTY when the record at the cursor position was deleted
+                // after the cursor was positioned.
+                if self.inner.is_current_slot_deleted() {
+                    return Ok(OperationStatus::NotFound);
+                }
                 let (k, v) = self
                     .inner
                     .get_current()

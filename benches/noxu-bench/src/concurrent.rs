@@ -3,15 +3,8 @@
 //! Spawns `reader_threads` reader threads and `writer_threads` writer threads.
 //! All threads synchronise at a Barrier before starting, so that wall-clock
 //! time measures pure throughput rather than thread-startup latency.
-//!
-//! # Caveat
-//!
-//! Noxu DB's lock manager does not block threads waiting for conflicting
-//! locks — concurrent write operations proceed without actual blocking.
-//! This means the concurrent workload measures raw in-memory B-tree
-//! throughput rather than realistic lock-contended throughput.
 
-use noxu_db::{Database, DatabaseEntry};
+use noxu_db::{Database, DatabaseEntry, Environment};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Barrier};
@@ -128,4 +121,58 @@ pub fn run_concurrent(
         elapsed_ms,
         ops_per_sec,
     }
+}
+
+/// Run a transactional concurrent workload with explicit transactions.
+///
+/// Each writer wraps its put in a `begin_transaction` / `commit` pair.
+/// This exercises the full WAL commit + `flush_sync` + `FsyncManager` path.
+/// When `group_commit_threshold > 0` and `group_commit_interval_ms > 0`,
+/// concurrent commit threads coalesce fsyncs through the FSyncManager.
+pub fn run_concurrent_txn(
+    env: &Environment,
+    db: &Database,
+    writer_threads: usize,
+    ops_per_thread: usize,
+) -> ConcurrentResult {
+    use std::sync::{Arc, Barrier};
+    let barrier = Arc::new(Barrier::new(writer_threads));
+    let t0 = std::time::Instant::now();
+
+    // scoped threads borrow env and db with the lifetime of this function,
+    // avoiding 'static requirements or Arc<Environment>.
+    let total_ops: u64 = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..writer_threads)
+            .map(|writer_id| {
+                let barrier = Arc::clone(&barrier);
+                s.spawn(move || -> u64 {
+                    let value =
+                        b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+                    barrier.wait();
+                    let mut ops: u64 = 0;
+                    for i in 0..ops_per_thread {
+                        let key_idx = writer_id * ops_per_thread + i;
+                        let k = DatabaseEntry::from_vec(
+                            format!("{:010}", key_idx).into_bytes(),
+                        );
+                        let v = DatabaseEntry::from_bytes(value);
+                        let txn = env.begin_transaction(None, None).unwrap();
+                        let _ = db.put(Some(&txn), &k, &v);
+                        let _ = txn.commit();
+                        ops += 1;
+                    }
+                    ops
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+    });
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let ops_per_sec = if elapsed_ms > 0.0 {
+        total_ops as f64 / (elapsed_ms / 1000.0)
+    } else {
+        0.0
+    };
+    ConcurrentResult { total_ops, elapsed_ms, ops_per_sec }
 }

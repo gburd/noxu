@@ -8,6 +8,8 @@ use crate::error::{NoxuError, Result};
 use crate::transaction::Transaction;
 use crate::transaction_config::TransactionConfig;
 use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
+use noxu_engine::EnvironmentStats;
+use noxu_engine::env_stats::{LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot};
 use noxu_sync::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -347,9 +349,32 @@ impl Environment {
         Ok(())
     }
 
+    /// Truncates a database: removes all records while keeping the database
+    /// registered and any open handles valid.
+    ///
+    /// Returns the number of records that were in the database before truncation.
+    ///
+    /// JE: `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    pub fn truncate_database(
+        &self,
+        _txn: Option<&Transaction>,
+        name: &str,
+    ) -> Result<u64> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        env_impl.truncate_database(name).map_err(|e| {
+            match &e {
+                noxu_dbi::DbiError::DatabaseNotFound(_) => {
+                    NoxuError::DatabaseNotFound(format!("Database '{}' does not exist", name))
+                }
+                _ => NoxuError::EnvironmentFailure(e.to_string()),
+            }
+        })
+    }
+
     /// Renames a database.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -529,6 +554,32 @@ impl Environment {
     /// Via environment.
     pub fn is_read_only(&self) -> bool {
         self.config.read_only
+    }
+
+    /// Returns a snapshot of environment statistics from all subsystems.
+    ///
+    /// JE: `Environment.getStats(StatsConfig)`.
+    pub fn get_stats(&self) -> Result<EnvironmentStats> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let n_databases = env_impl.n_databases() as u32;
+        let log = env_impl
+            .get_log_manager()
+            .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
+            .unwrap_or_default();
+        let lock = LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
+        let txn = TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
+        let throughput = env_impl.get_throughput_snapshot();
+        Ok(EnvironmentStats {
+            cache_size: self.config.cache_size,
+            cache_usage: 0,
+            n_databases,
+            log,
+            lock,
+            txn,
+            throughput,
+            ..Default::default()
+        })
     }
 
     /// Returns the total number of fdatasync calls performed by the log manager.

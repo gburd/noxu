@@ -86,6 +86,24 @@ fn open_db(dir: &Path) -> (Environment, Database) {
     (env, db)
 }
 
+/// Open with group commit enabled — used for w10_txn_conc benchmarks to show
+/// FsyncManager coalescing under concurrent transactional workloads.
+///
+/// threshold=1, interval_ms=2: leader waits up to 2 ms for ≥1 other committer,
+/// then fsyncs on behalf of all accumulated waiters.  Under 8+ concurrent
+/// writers, almost every fsync serves multiple transactions.
+fn open_db_group_commit(dir: &Path) -> (Environment, Database) {
+    let cfg = EnvironmentConfig::new(dir.to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_log_group_commit(1, 2);
+    let env = Environment::open(cfg).unwrap();
+    let db = env
+        .open_database(None, "bench", &DatabaseConfig::new().with_allow_create(true))
+        .unwrap();
+    (env, db)
+}
+
 fn populate(db: &Database, n: usize) {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
@@ -387,6 +405,78 @@ fn main() {
 
             drop(db_arc);
             drop(env);
+        }
+
+        // W10_TXN: transactional concurrent writes (8 writer threads) with
+        // group commit enabled.  This is the canonical group-commit coalescing
+        // benchmark: each writer wraps its put in begin_transaction/commit,
+        // giving FsyncManager a chance to coalesce concurrent fsyncs.
+        {
+            let wthreads = 8usize;
+            let ops_n = if n > 100_000 { 100_000 } else { n };
+            let ops_per_thread = ops_n / wthreads;
+
+            // No group commit variant: each commit does its own fsync.
+            {
+                let dir = new_bench_dir(&bench_base, "bench_txn_no_gc", n);
+                let (env, db) = open_db(dir.path());
+                let fsync0 = env.stat_fsync_count();
+                let cpu0 = cpu_time_ms();
+                let io0 = proc_io();
+                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread);
+                let cpu1 = cpu_time_ms();
+                let io1 = proc_io();
+                let disk_kb = dir_size_kb(dir.path());
+                let total_ops = conc.total_ops as usize;
+                let r = WorkloadResult {
+                    workload: "w10_txn_no_gc".to_string(),
+                    scale: n, threads: wthreads,
+                    elapsed_ms: conc.elapsed_ms,
+                    ns_per_op: if total_ops > 0 { conc.elapsed_ms * 1_000_000.0 / total_ops as f64 } else { 0.0 },
+                    ops_per_sec: conc.ops_per_sec,
+                    cpu_ms: cpu1.saturating_sub(cpu0),
+                    rss_delta_kb: 0,
+                    read_kb: io1.0.saturating_sub(io0.0) / 1024,
+                    write_kb: io1.1.saturating_sub(io0.1) / 1024,
+                    disk_kb,
+                    disk_bytes_per_op: if total_ops > 0 { (disk_kb * 1024) as f64 / total_ops as f64 } else { 0.0 },
+                    fsync_count: env.stat_fsync_count().saturating_sub(fsync0),
+                };
+                print_progress(&r);
+                results.push(r);
+                drop(db); drop(env);
+            }
+
+            // Group commit variant: leader coalesces fsyncs from concurrent committers.
+            {
+                let dir = new_bench_dir(&bench_base, "bench_txn_gc", n);
+                let (env, db) = open_db_group_commit(dir.path());
+                let fsync0 = env.stat_fsync_count();
+                let cpu0 = cpu_time_ms();
+                let io0 = proc_io();
+                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread);
+                let cpu1 = cpu_time_ms();
+                let io1 = proc_io();
+                let disk_kb = dir_size_kb(dir.path());
+                let total_ops = conc.total_ops as usize;
+                let r = WorkloadResult {
+                    workload: "w10_txn_group_commit".to_string(),
+                    scale: n, threads: wthreads,
+                    elapsed_ms: conc.elapsed_ms,
+                    ns_per_op: if total_ops > 0 { conc.elapsed_ms * 1_000_000.0 / total_ops as f64 } else { 0.0 },
+                    ops_per_sec: conc.ops_per_sec,
+                    cpu_ms: cpu1.saturating_sub(cpu0),
+                    rss_delta_kb: 0,
+                    read_kb: io1.0.saturating_sub(io0.0) / 1024,
+                    write_kb: io1.1.saturating_sub(io0.1) / 1024,
+                    disk_kb,
+                    disk_bytes_per_op: if total_ops > 0 { (disk_kb * 1024) as f64 / total_ops as f64 } else { 0.0 },
+                    fsync_count: env.stat_fsync_count().saturating_sub(fsync0),
+                };
+                print_progress(&r);
+                results.push(r);
+                drop(db); drop(env);
+            }
         }
 
         // W11: recovery/startup time
