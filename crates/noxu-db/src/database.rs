@@ -68,6 +68,10 @@ pub struct Database {
     /// Cached log manager — acquired once at open, None for no-WAL envs.
     /// Eliminates per-operation `env_impl.lock()` on the hot read/write path.
     log_manager: Option<Arc<LogManager>>,
+    /// If true, auto-commit writes skip the log flush entirely (JE: TXN_NO_SYNC).
+    no_sync: bool,
+    /// If true, auto-commit writes flush to OS but skip fdatasync (JE: TXN_WRITE_NO_SYNC).
+    write_no_sync: bool,
 }
 
 /// State of a database handle.
@@ -129,9 +133,18 @@ impl Database {
         if txn.is_some() {
             return Ok(()); // explicit txn handles its own commit/fsync
         }
+        if self.no_sync {
+            return Ok(()); // JE: TXN_NO_SYNC — skip log flush entirely
+        }
         if let Some(lm) = &self.log_manager {
-            lm.flush_sync()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            if self.write_no_sync {
+                // JE: TXN_WRITE_NO_SYNC — flush to OS buffer, no fdatasync
+                lm.flush_no_sync()
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            } else {
+                lm.flush_sync()
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -145,6 +158,8 @@ impl Database {
         config: DatabaseConfig,
         db_impl: Arc<RwLock<DatabaseImpl>>,
         env_impl: Arc<Mutex<EnvironmentImpl>>,
+        no_sync: bool,
+        write_no_sync: bool,
     ) -> Self {
         let throughput = db_impl.read().throughput.clone();
         // Cache the manager Arcs at construction so hot-path operations
@@ -165,6 +180,8 @@ impl Database {
             throughput,
             lock_manager,
             log_manager,
+            no_sync,
+            write_no_sync,
         }
     }
 
