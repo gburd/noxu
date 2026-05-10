@@ -49,6 +49,12 @@ pub struct Environment {
     next_txn_id: AtomicU64,
     /// Whether the environment is open
     open: AtomicBool,
+    /// Whether the environment is valid (not invalidated by a fatal error).
+    ///
+    /// JE: `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
+    /// Set to `false` when an `EnvironmentFailure` with `invalidates_environment() == true`
+    /// is returned; all subsequent API calls check this and return `EnvironmentFailure`.
+    env_valid: AtomicBool,
     /// The real internal environment implementation (B-tree backed).
     env_impl: Arc<Mutex<EnvironmentImpl>>,
     /// Cached log manager — acquired once at open; None for non-transactional envs.
@@ -101,13 +107,13 @@ impl Environment {
         if !home.exists() {
             if config.allow_create {
                 std::fs::create_dir_all(&home).map_err(|e| {
-                    NoxuError::EnvironmentFailure(format!(
+                    NoxuError::environment(format!(
                         "Failed to create environment directory {:?}: {}",
                         home, e
                     ))
                 })?;
             } else {
-                return Err(NoxuError::EnvironmentFailure(format!(
+                return Err(NoxuError::environment(format!(
                     "Environment directory {:?} does not exist and allow_create is false",
                     home
                 )));
@@ -115,7 +121,7 @@ impl Environment {
         }
 
         if !home.is_dir() {
-            return Err(NoxuError::EnvironmentFailure(format!(
+            return Err(NoxuError::environment(format!(
                 "Environment home {:?} is not a directory",
                 home
             )));
@@ -126,7 +132,7 @@ impl Environment {
             // Test write access by creating a temp file
             let test_file = home.join(".noxu_write_test");
             std::fs::write(&test_file, b"test").map_err(|e| {
-                NoxuError::EnvironmentFailure(format!(
+                NoxuError::environment(format!(
                     "Environment directory {:?} is not writable: {}",
                     home, e
                 ))
@@ -136,51 +142,154 @@ impl Environment {
 
         // Translate EnvironmentConfig into DbiEnvConfig (the noxu-dbi struct)
         // to avoid a circular dependency between the two crates.
-        let buf_size = (config.log_total_buffer_bytes as usize)
-            .checked_div(config.log_num_buffers)
-            .unwrap_or(1024 * 1024);
+        let buf_size = if config.log_buffer_size > 0 {
+            config.log_buffer_size
+        } else {
+            (config.log_total_buffer_bytes as usize)
+                .checked_div(config.log_num_buffers)
+                .unwrap_or(1024 * 1024)
+        };
         let dbi_cfg = DbiEnvConfig {
+            // Core
             read_only: config.read_only,
             transactional: config.transactional,
+            env_is_locking: config.env_is_locking,
+            env_recovery_force_checkpoint: config.env_recovery_force_checkpoint,
+            env_recovery_force_checkpoint_field: config.env_recovery_force_checkpoint,
+            env_recovery_force_new_file: config.env_recovery_force_new_file,
+            halt_on_commit_after_checksum_exception: config
+                .halt_on_commit_after_checksum_exception,
+            env_check_leaks: config.env_check_leaks,
+            env_forced_yield: config.env_forced_yield,
+            env_fair_latches: config.env_fair_latches,
+            env_latch_timeout_ms: config.env_latch_timeout_ms,
+            env_ttl_clock_tolerance_ms: config.env_ttl_clock_tolerance_ms,
+            env_expiration_enabled: config.env_expiration_enabled,
+            env_db_eviction: config.env_db_eviction,
+            // Memory
             cache_size: config.cache_size,
+            cache_percent: config.cache_percent,
+            max_off_heap_memory: config.max_off_heap_memory,
+            max_disk: config.max_disk,
+            free_disk: config.free_disk,
+            // Log
             log_file_max_bytes: config.log_file_max_bytes,
             log_file_cache_size: config.log_file_cache_size,
             log_checksum_read: config.log_checksum_read,
+            log_verify_checksums: config.log_verify_checksums,
             log_fsync_timeout_ms: config.log_fsync_timeout_ms,
+            log_fsync_time_limit_ms: config.log_fsync_time_limit_ms,
             log_num_buffers: config.log_num_buffers,
             log_buffer_size: buf_size,
             log_fault_read_size: config.log_fault_read_size,
+            log_iterator_read_size: config.log_iterator_read_size,
+            log_iterator_max_size: config.log_iterator_max_size,
+            log_n_data_directories: config.log_n_data_directories,
+            log_mem_only: config.log_mem_only,
+            log_detect_file_delete: config.log_detect_file_delete,
+            log_detect_file_delete_interval_ms: config.log_detect_file_delete_interval_ms,
+            log_flush_sync_interval_ms: config.log_flush_sync_interval_ms,
+            log_flush_no_sync_interval_ms: config.log_flush_no_sync_interval_ms,
+            log_use_odsync: config.log_use_odsync,
+            log_use_write_queue: config.log_use_write_queue,
+            log_write_queue_size: config.log_write_queue_size,
             log_group_commit_threshold: config.log_group_commit_threshold,
             log_group_commit_interval_ms: config.log_group_commit_interval_ms,
+            // B-tree
+            node_max_entries: config.node_max_entries,
+            node_dup_tree_max_entries: config.node_dup_tree_max_entries,
+            tree_max_embedded_ln: config.tree_max_embedded_ln,
+            tree_max_delta: config.tree_max_delta,
+            tree_bin_delta: config.tree_bin_delta,
+            tree_min_memory: config.tree_min_memory,
+            tree_compact_max_key_length: config.tree_compact_max_key_length,
+            // INCompressor
             run_in_compressor: config.run_in_compressor,
             in_compressor_wakeup_interval_ms: config.in_compressor_wakeup_interval_ms,
+            compressor_deadlock_retry: config.compressor_deadlock_retry,
+            compressor_lock_timeout_ms: config.compressor_lock_timeout_ms,
+            compressor_purge_root: config.compressor_purge_root,
+            // Cleaner
             run_cleaner: config.run_cleaner,
             cleaner_min_utilization: config.cleaner_min_utilization,
+            cleaner_min_file_utilization: config.cleaner_min_file_utilization,
+            cleaner_threads: config.cleaner_threads,
             cleaner_min_file_count: config.cleaner_min_file_count,
             cleaner_min_age: config.cleaner_min_age,
+            cleaner_bytes_interval: config.cleaner_bytes_interval,
+            cleaner_wakeup_interval_ms: config.cleaner_wakeup_interval_ms,
+            cleaner_fetch_obsolete_size: config.cleaner_fetch_obsolete_size,
+            cleaner_adjust_utilization: config.cleaner_adjust_utilization,
+            cleaner_deadlock_retry: config.cleaner_deadlock_retry,
+            cleaner_lock_timeout_ms: config.cleaner_lock_timeout_ms,
+            cleaner_expunge: config.cleaner_expunge,
+            cleaner_use_deleted_dir: config.cleaner_use_deleted_dir,
+            cleaner_max_batch_files: config.cleaner_max_batch_files,
             cleaner_read_size: config.cleaner_read_size,
+            cleaner_detail_max_memory_percentage: config.cleaner_detail_max_memory_percentage,
             cleaner_look_ahead_cache_size: config.cleaner_look_ahead_cache_size,
+            cleaner_foreground_proactive_migration: config
+                .cleaner_foreground_proactive_migration,
+            cleaner_background_proactive_migration: config
+                .cleaner_background_proactive_migration,
+            cleaner_lazy_migration: config.cleaner_lazy_migration,
+            cleaner_expiration_enabled: config.cleaner_expiration_enabled,
+            // Checkpointer
             run_checkpointer: config.run_checkpointer,
             checkpointer_bytes_interval: config.checkpointer_bytes_interval,
-            checkpointer_interval_ms: 30_000, // fixed 30 s daemon interval
+            checkpointer_wakeup_interval_ms: config.checkpointer_wakeup_interval_ms,
+            checkpointer_deadlock_retry: config.checkpointer_deadlock_retry,
+            checkpointer_high_priority: config.checkpointer_high_priority,
+            // Evictor
             run_evictor: config.run_evictor,
             evictor_nodes_per_scan: config.evictor_nodes_per_scan,
+            evictor_evict_bytes: config.evictor_evict_bytes,
+            evictor_critical_percentage: config.evictor_critical_percentage,
             evictor_lru_only: config.evictor_lru_only,
+            evictor_n_lru_lists: config.evictor_n_lru_lists,
+            evictor_deadlock_retry: config.evictor_deadlock_retry,
             evictor_core_threads: config.evictor_core_threads,
             evictor_max_threads: config.evictor_max_threads,
+            evictor_keep_alive_ms: config.evictor_keep_alive_ms,
+            evictor_allow_bin_deltas: config.evictor_allow_bin_deltas,
+            // Off-heap evictor
+            run_offheap_evictor: config.run_offheap_evictor,
+            offheap_evict_bytes: config.offheap_evict_bytes,
+            offheap_n_lru_lists: config.offheap_n_lru_lists,
+            offheap_checksum: config.offheap_checksum,
+            offheap_core_threads: config.offheap_core_threads,
+            offheap_max_threads: config.offheap_max_threads,
+            offheap_keep_alive_ms: config.offheap_keep_alive_ms,
+            // Locking
             lock_timeout_ms: config.lock_timeout_ms,
             lock_deadlock_detect: config.lock_deadlock_detect,
+            lock_deadlock_detect_delay_ms: config.lock_deadlock_detect_delay_ms,
+            // Transactions
             txn_timeout_ms: config.txn_timeout_ms,
             txn_serializable_isolation: config.txn_serializable_isolation,
-            env_recovery_force_checkpoint: config.env_recovery_force_checkpoint,
+            txn_deadlock_stack_trace: config.txn_deadlock_stack_trace,
+            txn_dump_locks: config.txn_dump_locks,
+            // Verifier
+            run_verifier: config.run_verifier,
+            verify_log: config.verify_log,
+            verify_log_read_delay_ms: config.verify_log_read_delay_ms,
+            verify_btree: config.verify_btree,
+            verify_secondaries: config.verify_secondaries,
+            verify_data_records: config.verify_data_records,
+            verify_obsolete_records: config.verify_obsolete_records,
+            verify_btree_batch_size: config.verify_btree_batch_size,
+            verify_btree_batch_delay_ms: config.verify_btree_batch_delay_ms,
+            // Stats
             stats_collect: config.stats_collect,
             stats_collect_interval_secs: config.stats_collect_interval_secs,
-            max_off_heap_memory: config.max_off_heap_memory,
-            max_disk: config.max_disk,
+            // Background rate limits
+            env_background_read_limit_kb: config.env_background_read_limit_kb,
+            env_background_write_limit_kb: config.env_background_write_limit_kb,
+            env_background_sleep_interval_us: config.env_background_sleep_interval_us,
         };
         let env_impl =
             EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
-                .map_err(|e| NoxuError::EnvironmentFailure(e.to_string()))?;
+                .map_err(|e| NoxuError::environment(e.to_string()))?;
 
         let log_manager = env_impl.get_log_manager();
         let env_impl_arc = Arc::new(Mutex::new(env_impl));
@@ -191,6 +300,7 @@ impl Environment {
             active_txns: Mutex::new(HashMap::new()),
             next_txn_id: AtomicU64::new(1),
             open: AtomicBool::new(true),
+            env_valid: AtomicBool::new(true),
             env_impl: env_impl_arc,
             log_manager,
         })
@@ -306,7 +416,7 @@ impl Environment {
                             name
                         ))
                     }
-                    _ => NoxuError::EnvironmentFailure(e.to_string()),
+                    _ => NoxuError::environment(e.to_string()),
                 }
             })?
         };
@@ -365,7 +475,7 @@ impl Environment {
                             name
                         ))
                     }
-                    _ => NoxuError::EnvironmentFailure(e.to_string()),
+                    _ => NoxuError::environment(e.to_string()),
                 }
             })?;
         }
@@ -392,7 +502,7 @@ impl Environment {
                 noxu_dbi::DbiError::DatabaseNotFound(_) => {
                     NoxuError::DatabaseNotFound(format!("Database '{}' does not exist", name))
                 }
-                _ => NoxuError::EnvironmentFailure(e.to_string()),
+                _ => NoxuError::environment(e.to_string()),
             }
         })
     }
@@ -441,7 +551,7 @@ impl Environment {
                             new_name
                         ))
                     }
-                    _ => NoxuError::EnvironmentFailure(e.to_string()),
+                    _ => NoxuError::environment(e.to_string()),
                 }
             })?;
         }
@@ -560,11 +670,24 @@ impl Environment {
         &self.config
     }
 
-    /// Returns whether the environment handle is valid.
+    /// Returns `true` if the environment is open and has not been invalidated by a fatal error.
     ///
-    /// 
+    /// JE: `Environment.isValid()`.  Returns `false` after the environment is closed
+    /// or after an `EnvironmentFailure` whose `reason.invalidates_environment()` returns
+    /// `true` (e.g. `LogChecksum`, `BtreeCorruption`, `DiskLimit`).
+    /// Once invalidated the environment must be closed and re-opened.
     pub fn is_valid(&self) -> bool {
-        self.open.load(Ordering::Acquire)
+        self.open.load(Ordering::Acquire) && self.env_valid.load(Ordering::Acquire)
+    }
+
+    /// Invalidates the environment in response to a fatal error.
+    ///
+    /// Called internally when an `EnvironmentFailure` with
+    /// `reason.invalidates_environment() == true` propagates out of a
+    /// background daemon.  After invalidation `is_valid()` returns `false`
+    /// and all subsequent public API calls return `EnvironmentFailure`.
+    pub fn invalidate(&self) {
+        self.env_valid.store(false, Ordering::Release);
     }
 
     /// Returns whether the environment is transactional.
@@ -649,10 +772,15 @@ impl Environment {
         active_txns.remove(&txn_id);
     }
 
-    /// Checks if the environment is open, returns an error if not.
     fn check_open(&self) -> Result<()> {
         if !self.open.load(Ordering::Acquire) {
             return Err(NoxuError::EnvironmentClosed);
+        }
+        if !self.env_valid.load(Ordering::Acquire) {
+            return Err(NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::ForcedShutdown,
+                "environment has been invalidated due to a prior fatal error".to_string(),
+            ));
         }
         Ok(())
     }

@@ -508,16 +508,12 @@ impl Evictor {
                     // off-heap store.  This avoids a log-file read on the
                     // next tree traversal that needs this IN.
                     let mut stored_off_heap = false;
-                    if let (Some(oh), Some(tree_arc)) = (&self.off_heap, &self.tree) {
-                        if oh.is_enabled() {
-                            if let Ok(tree_guard) = tree_arc.read() {
-                                if let Some(serialized) =
-                                    tree_guard.serialize_upper_in(node_id)
-                                {
-                                    stored_off_heap = oh.store_node(node_id, serialized);
-                                }
-                            }
-                        }
+                    if let (Some(oh), Some(tree_arc)) = (&self.off_heap, &self.tree)
+                        && oh.is_enabled()
+                        && let Ok(tree_guard) = tree_arc.read()
+                        && let Some(serialized) = tree_guard.serialize_upper_in(node_id)
+                    {
+                        stored_off_heap = oh.store_node(node_id, serialized);
                     }
 
                     // Only flush dirty nodes to log if NOT stored off-heap

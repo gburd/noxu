@@ -21,7 +21,7 @@
 use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -143,7 +143,7 @@ fn main() {
     }
 }
 
-fn flag(dir: &PathBuf, name: &str) {
+fn flag(dir: &Path, name: &str) {
     fs::write(dir.join(name), b"ok")
         .unwrap_or_else(|e| panic!("write flag {name}: {e}"));
 }

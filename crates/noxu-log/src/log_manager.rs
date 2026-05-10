@@ -495,11 +495,13 @@ impl LogManager {
     ///
     /// This is the key coalescing primitive for concurrent commit throughput.
     /// Example with 8 concurrent writers:
-    ///   1. Thread A calls flush_sync() first; its LWL snapshot captures ALL
-    ///      pending writes from threads A–H; updates last_flush_lsn past all.
-    ///   2. Threads B–H call flush_sync_if_needed(their_commit_lsn) and each
-    ///      sees last_flush_lsn >= their_commit_lsn → skip fsync immediately.
-    ///   Result: 1 fdatasync for 8 commits (8:1 coalescing, no config needed).
+    ///
+    /// 1. Thread A calls flush_sync() first; its LWL snapshot captures ALL
+    ///    pending writes from threads A–H; updates last_flush_lsn past all.
+    /// 2. Threads B–H call flush_sync_if_needed(their_commit_lsn) and each
+    ///    sees last_flush_lsn >= their_commit_lsn → skip fsync immediately.
+    ///
+    /// Result: 1 fdatasync for 8 commits (8:1 coalescing, no config needed).
     pub fn flush_sync_if_needed(&self, lsn: Lsn) -> Result<Lsn> {
         // NULL_LSN (= u64::MAX) means "no write LSN known" — always flush.
         // last_flush_lsn is initialised to 0 ("nothing flushed") so that a

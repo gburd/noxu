@@ -145,8 +145,7 @@ impl<F: LogFileAccess> LNFileReader<F> {
     /// Returns `Ok(true)` when an entry was found and parsed; `Ok(false)` at
     /// end of log.
     ///
-    /// + `LNFileReader.isTargetEntry()` +
-    /// `LNFileReader.processEntry()`.
+    /// See `LNFileReader.isTargetEntry()` and `LNFileReader.processEntry()`.
     pub fn read_next_entry(&mut self) -> Result<bool> {
         if self.eof {
             return Ok(false);

@@ -57,7 +57,7 @@ pub const BYTE_ORDER_LITTLE_ENDIAN: u8 = 0x01;
 /// Version history:
 /// - 1: Original Noxu format (no magic, no byte-order marker)
 /// - 2: Added 8-byte magic, 4-byte version, 1-byte byte-order, 3-byte padding
-///      making the header self-describing and portable (32 bytes total)
+///   making the header self-describing and portable (32 bytes total)
 pub const LOG_VERSION: u32 = 2;
 
 /// Minimum supported log file format version.
