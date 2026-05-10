@@ -344,6 +344,19 @@ impl Cleaner {
         // Attempt to delete pending files
         let files_deleted = self.delete_pending_files();
 
+        // Adaptive throttle update (JE CleanerThrottle.update()).
+        // Pull current cumulative write bytes from the LogManager and pass
+        // them to the throttle so it can compute a new sleep interval for
+        // the next cleaning pass.  `cleaning_needed` is true when files were
+        // found (forcing a shorter sleep to keep up with write pressure).
+        let current_write_bytes = self
+            .log_manager
+            .as_ref()
+            .map(|lm| lm.get_stats().n_sequential_write_bytes)
+            .unwrap_or(0);
+        let cleaning_needed = files_cleaned > 0;
+        self.throttle.update(current_write_bytes, cleaning_needed);
+
         Ok(CleanResult {
             files_cleaned,
             files_deleted,
