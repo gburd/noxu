@@ -313,6 +313,8 @@ impl Environment {
             config.clone(),
             db_impl_arc,
             Arc::clone(&self.env_impl),
+            self.config.txn_no_sync,
+            self.config.txn_write_no_sync,
         ))
     }
 
