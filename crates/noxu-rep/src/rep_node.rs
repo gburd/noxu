@@ -1,6 +1,8 @@
 //! Replication node information.
 //!
 
+use std::time::Duration;
+
 use crate::node_type::NodeType;
 
 /// Information about a node in a replication group.
@@ -20,10 +22,20 @@ pub struct RepNode {
     pub port: u16,
     /// The unique numeric identifier assigned to this node by the group.
     pub node_id: u32,
+    /// Relative read throughput capacity × 100 (default 100 = 1.0).
+    ///
+    /// Used by quoracle strategy when computing load-optimal quorums.
+    pub read_capacity_pct: u32,
+    /// Relative write throughput capacity × 100 (default 100 = 1.0).
+    pub write_capacity_pct: u32,
+    /// Expected one-way latency hint in milliseconds (default 1).
+    pub latency_hint_ms: u64,
 }
 
 impl RepNode {
     /// Creates a new `RepNode` with the given parameters.
+    ///
+    /// Capacity fields default to 1.0 (100 pct) and latency to 1 ms.
     pub fn new(
         name: String,
         node_type: NodeType,
@@ -31,7 +43,48 @@ impl RepNode {
         port: u16,
         node_id: u32,
     ) -> Self {
-        Self { name, node_type, host, port, node_id }
+        Self {
+            name,
+            node_type,
+            host,
+            port,
+            node_id,
+            read_capacity_pct: 100,
+            write_capacity_pct: 100,
+            latency_hint_ms: 1,
+        }
+    }
+
+    /// Set relative read capacity (e.g. `0.5` for half-speed node).
+    ///
+    /// The value is stored as `(cap * 100) as u32`.
+    pub fn with_read_capacity(mut self, cap: f64) -> Self {
+        self.read_capacity_pct = (cap * 100.0).round() as u32;
+        self
+    }
+
+    /// Set relative write capacity.
+    pub fn with_write_capacity(mut self, cap: f64) -> Self {
+        self.write_capacity_pct = (cap * 100.0).round() as u32;
+        self
+    }
+
+    /// Set expected one-way latency hint.
+    pub fn with_latency_hint(mut self, d: Duration) -> Self {
+        self.latency_hint_ms = d.as_millis() as u64;
+        self
+    }
+
+    /// Build a `quoracle::Node<String>` from this `RepNode`, embedding
+    /// the capacity and latency hints so that quoracle's LP strategy
+    /// can factor them into load-optimal quorum selection.
+    pub fn to_quoracle_node(&self) -> quoracle::Node<String> {
+        let read_cap = self.read_capacity_pct as f64 / 100.0;
+        let write_cap = self.write_capacity_pct as f64 / 100.0;
+        let latency = Duration::from_millis(self.latency_hint_ms);
+        quoracle::Node::new(self.name.clone())
+            .with_read_write_capacity(read_cap, write_cap)
+            .with_latency(latency)
     }
 
     /// Returns the name of this node.

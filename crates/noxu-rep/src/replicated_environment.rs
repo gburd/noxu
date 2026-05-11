@@ -371,7 +371,7 @@ impl ReplicatedEnvironment {
 
     /// Get the replication group info.
     ///
-    /// 
+    ///
     ///
     /// Returns a description of the replication group as known by this node.
     /// The replicated group metadata is stored in a replicated database and
@@ -380,6 +380,77 @@ impl ReplicatedEnvironment {
     /// group to be out of date.
     pub fn get_group(&self) -> &GroupService {
         &self.group_service
+    }
+
+    /// Add a peer node to the replication group at runtime.
+    ///
+    /// The node is registered in the `GroupService` so elections and quorum
+    /// calculations immediately reflect the new membership.
+    pub fn add_peer(&self, node: crate::rep_node::RepNode) -> Result<()> {
+        use crate::group_service::NodeInfo;
+        use std::time::Instant;
+
+        let info = NodeInfo {
+            name: node.name.clone(),
+            node_type: node.node_type,
+            host: node.host.clone(),
+            port: node.port,
+            node_id: node.node_id,
+            joined_at: Instant::now(),
+            last_seen: Instant::now(),
+            is_active: true,
+            known_vlsn: 0,
+            log_range: None,
+        };
+        self.group_service.add_node(info)?;
+        log::info!(
+            "Node '{}': added peer '{}' ({}:{}) to group '{}'",
+            self.config.node_name,
+            node.name,
+            node.host,
+            node.port,
+            self.config.group_name,
+        );
+        Ok(())
+    }
+
+    /// Remove a peer node from the replication group by name.
+    ///
+    /// The node is deregistered from the `GroupService`.  Elections initiated
+    /// after this call will not include the removed node in quorum calculations.
+    pub fn remove_peer(&self, name: &str) -> Result<()> {
+        self.group_service.remove_node(name)?;
+        log::info!(
+            "Node '{}': removed peer '{}' from group '{}'",
+            self.config.node_name,
+            name,
+            self.config.group_name,
+        );
+        Ok(())
+    }
+
+    /// Returns a snapshot of the current replication group as a [`RepGroup`].
+    ///
+    /// The snapshot reflects the state at the time of the call; subsequent
+    /// `add_peer` / `remove_peer` calls are not reflected in it.
+    pub fn get_rep_group(&self) -> crate::rep_group::RepGroup {
+        use crate::rep_group::RepGroup;
+
+        let mut group = RepGroup::new(
+            self.config.group_name.clone(),
+            self.group_service.get_group_id(),
+        );
+        for info in self.group_service.get_all_nodes() {
+            let node = crate::rep_node::RepNode::new(
+                info.name.clone(),
+                info.node_type,
+                info.host.clone(),
+                info.port,
+                info.node_id,
+            );
+            group.add_node(node);
+        }
+        group
     }
 
     /// Get the replication configuration.

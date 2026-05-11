@@ -74,13 +74,16 @@ pub fn run_election(
     priority: u32,
     term: u64,
 ) -> Option<NodeId> {
-    let quorum = group.quorum_size() as usize;
-    if quorum == 0 {
+    // Flexible Paxos: Phase 1 and Phase 2 may use different quorum sizes.
+    // For SimpleMajority both equal (n/2)+1; for Flexible they differ.
+    let phase1_quorum = group.phase1_quorum();
+    let phase2_quorum = group.phase2_quorum();
+    if phase1_quorum == 0 || phase2_quorum == 0 {
         return None;
     }
 
-    // We count ourselves as one vote in both phases.
-    let self_needed = if quorum > 0 { 1 } else { 0 };
+    // We always count ourselves as one vote in both phases.
+    let self_needed = 1usize;
 
     // -------------------------------------------------------------------------
     // Phase 1: Prepare / Promise
@@ -140,7 +143,7 @@ pub fn run_election(
 
     // Count self-vote: we always vote for our own proposal in phase 1.
     let total_promises = promises.len() + self_needed;
-    if total_promises < quorum {
+    if total_promises < phase1_quorum {
         return None;
     }
 
@@ -171,7 +174,7 @@ pub fn run_election(
     // Count self-accept.
     accepts += self_needed;
 
-    if accepts >= quorum {
+    if accepts >= phase2_quorum {
         // Resolve winner name to node_id by looking up in the group.
         let winner_id = if winner_name == node_name {
             node_id

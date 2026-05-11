@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Replication and high availability for Noxu DB"
 
+[features]
+# Enable QUIC transport (requires quinn, tokio, rustls, rcgen, bytes).
+quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:bytes"]
+
 [dependencies]
 noxu-engine = { workspace = true }
 noxu-util = { workspace = true }
@@ -15,10 +19,18 @@ noxu-sync = { workspace = true }
 noxu-dbi = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+quoracle = { workspace = true }
+# Optional QUIC transport deps.
+quinn  = { workspace = true, optional = true }
+tokio  = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rcgen  = { workspace = true, optional = true }
+bytes  = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = "3"
+rand = "0.8"
 
 [lints]
 workspace = true
