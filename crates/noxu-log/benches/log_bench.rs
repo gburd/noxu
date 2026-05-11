@@ -1,5 +1,7 @@
 //! Benchmarks for noxu-log: entry header serialization, checksum, LSN, packed int.
 
+#![allow(clippy::unit_arg)]
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::io::Cursor;
 

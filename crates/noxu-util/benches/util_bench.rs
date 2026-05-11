@@ -1,5 +1,7 @@
 //! Benchmarks for noxu-util: LSN, VLSN, packed integer encoding, CRC32.
 
+#![allow(clippy::unit_arg)]
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::io::Cursor;
 

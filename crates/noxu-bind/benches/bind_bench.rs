@@ -1,5 +1,7 @@
 //! Benchmarks for noxu-bind: TupleOutput write, TupleInput read, round-trips.
 
+#![allow(clippy::approx_constant)]
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use noxu_bind::tuple::{TupleInput, TupleOutput};

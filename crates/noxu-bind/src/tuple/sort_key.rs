@@ -249,8 +249,8 @@ mod tests {
 
     #[test]
     fn test_bool_round_trip() {
-        assert_eq!(round_trip(false), false);
-        assert_eq!(round_trip(true), true);
+        assert!(!round_trip(false));
+        assert!(round_trip(true));
     }
 
     #[test]

@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env.open_database(None, "scale", &DatabaseConfig::new().with_allow_create(true))?,
     );
 
-    let records_per_thread = (args.records + args.threads as u64 - 1) / args.threads as u64;
+    let records_per_thread = args.records.div_ceil(args.threads as u64);
     let total_inserted = Arc::new(AtomicU64::new(0));
     let barrier = Arc::new(Barrier::new(args.threads + 1));
     let start = Instant::now();
@@ -187,7 +187,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db = Arc::clone(&db);
         let total_inserted = Arc::clone(&total_inserted);
         let barrier = Arc::clone(&barrier);
-        let records_per_thread = records_per_thread;
         let threads = args.threads as u64;
         writer_handles.push(std::thread::spawn(move || {
             barrier.wait();
@@ -270,10 +269,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         let cur_key = String::from_utf8_lossy(k.get_data().unwrap_or_default()).into_owned();
-        if let Some(ref p) = prev_key {
-            if cur_key < *p {
-                order_errors += 1;
-            }
+        if let Some(ref p) = prev_key && cur_key < *p {
+            order_errors += 1;
         }
         prev_key = Some(cur_key);
         count += 1;
