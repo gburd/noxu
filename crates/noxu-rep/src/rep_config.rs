@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::commit_durability::CommitDurability;
 use crate::consistency::ConsistencyPolicy;
 use crate::node_type::NodeType;
+use crate::quorum_policy::QuorumPolicy;
+use crate::rep_node::RepNode;
 
 /// Default election timeout.
 const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -18,6 +20,10 @@ const DEFAULT_REPLICA_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_FEEDER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default replication port.
 const DEFAULT_NODE_PORT: u16 = 5001;
+/// Default per-phase election message timeout.
+const DEFAULT_ELECTION_PHASE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Default phi accrual sample window size.
+const DEFAULT_PHI_WINDOW_SIZE: usize = 200;
 
 /// Configuration for a replication node.
 ///
@@ -55,6 +61,26 @@ pub struct RepConfig {
     /// on the service dispatcher so that other nodes can restore from this
     /// node via the `"RESTORE"` service.
     pub env_home: Option<PathBuf>,
+    /// Quorum policy for elections. Default: `SimpleMajority`.
+    pub quorum_policy: QuorumPolicy,
+    /// Phi accrual suspicion threshold.
+    ///
+    /// `None` (default) uses a binary heartbeat timeout.
+    /// `Some(8.0)` enables phi accrual detection with the paper's recommended
+    /// threshold (mistake rate ≈ 10⁻⁸).
+    pub phi_threshold: Option<f64>,
+    /// Sliding-window size for phi accrual inter-arrival samples.
+    ///
+    /// Default `200` is adequate for LAN; use `1000` for WAN.
+    pub phi_window_size: usize,
+    /// Fully-described peers added to the replication group at startup.
+    ///
+    /// Useful for pre-populating quoracle capacity/latency metadata beyond
+    /// what can be inferred from `helper_hosts`.
+    pub initial_peers: Vec<RepNode>,
+    /// Timeout per peer message exchange during Phase 1 and Phase 2 of an
+    /// election.  Default: 500 ms.
+    pub election_phase_timeout: Duration,
 }
 
 impl RepConfig {
@@ -78,6 +104,11 @@ impl RepConfig {
             consistency_policy: ConsistencyPolicy::default(),
             commit_durability: CommitDurability::default(),
             env_home: None,
+            quorum_policy: QuorumPolicy::SimpleMajority,
+            phi_threshold: None,
+            phi_window_size: DEFAULT_PHI_WINDOW_SIZE,
+            initial_peers: Vec::new(),
+            election_phase_timeout: DEFAULT_ELECTION_PHASE_TIMEOUT,
         }
     }
 
@@ -103,6 +134,11 @@ pub struct RepConfigBuilder {
     consistency_policy: ConsistencyPolicy,
     commit_durability: CommitDurability,
     env_home: Option<PathBuf>,
+    quorum_policy: QuorumPolicy,
+    phi_threshold: Option<f64>,
+    phi_window_size: usize,
+    initial_peers: Vec<RepNode>,
+    election_phase_timeout: Duration,
 }
 
 impl RepConfigBuilder {
@@ -172,6 +208,40 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Sets the quorum policy for elections (default: `SimpleMajority`).
+    pub fn quorum_policy(mut self, policy: QuorumPolicy) -> Self {
+        self.quorum_policy = policy;
+        self
+    }
+
+    /// Enable phi accrual failure detection with the given suspicion threshold.
+    ///
+    /// `8.0` is the paper's recommended production value (mistake rate ≈ 10⁻⁸).
+    /// Call with `None` to revert to binary heartbeat timeout detection.
+    pub fn phi_threshold(mut self, threshold: Option<f64>) -> Self {
+        self.phi_threshold = threshold;
+        self
+    }
+
+    /// Sets the phi accrual inter-arrival sample window size (default 200).
+    pub fn phi_window_size(mut self, size: usize) -> Self {
+        self.phi_window_size = size;
+        self
+    }
+
+    /// Add a fully-described initial peer to the group at startup.
+    pub fn add_initial_peer(mut self, node: RepNode) -> Self {
+        self.initial_peers.push(node);
+        self
+    }
+
+    /// Set the per-peer message timeout for Phase 1 and Phase 2 election
+    /// exchanges (default: 500 ms).
+    pub fn election_phase_timeout(mut self, timeout: Duration) -> Self {
+        self.election_phase_timeout = timeout;
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -188,6 +258,11 @@ impl RepConfigBuilder {
             consistency_policy: self.consistency_policy,
             commit_durability: self.commit_durability,
             env_home: self.env_home,
+            quorum_policy: self.quorum_policy,
+            phi_threshold: self.phi_threshold,
+            phi_window_size: self.phi_window_size,
+            initial_peers: self.initial_peers,
+            election_phase_timeout: self.election_phase_timeout,
         }
     }
 }
