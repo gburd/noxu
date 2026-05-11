@@ -68,10 +68,12 @@ impl FileHandle {
 
     /// Acquires the latch and returns a guard that provides access to the file.
     ///
-    /// The latch is automatically released when the guard is dropped.
-    pub fn acquire(&self) -> FileHandleGuard<'_> {
-        let _latch_guard = self.latch.acquire();
-        FileHandleGuard { handle: self, _latch_guard }
+    /// Returns `Ok(guard)` on success, or `Err(LogError::LatchTimeout)` if the
+    /// latch acquisition times out. The latch is released when the guard drops.
+    pub fn acquire(&self) -> Result<FileHandleGuard<'_>> {
+        let _latch_guard = self.latch.acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
+        Ok(FileHandleGuard { handle: self, _latch_guard })
     }
 
     /// Attempts to acquire the latch without blocking.
@@ -272,13 +274,13 @@ mod tests {
         handle.init(file, 1);
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             guard.write_at(0, b"test data").unwrap();
             guard.sync().unwrap();
         }
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             let mut buf = vec![0u8; 9];
             let n = guard.read_at(0, &mut buf).unwrap();
             assert_eq!(n, 9);
@@ -338,7 +340,7 @@ mod tests {
         let file = File::open(temp_file.path()).unwrap();
         let mut handle = FileHandle::new(99);
         handle.init(file, 3);
-        let guard = handle.acquire();
+        let guard = handle.acquire().expect("acquire");
         assert_eq!(guard.file_num(), 99);
         assert_eq!(guard.log_version(), 3);
     }
@@ -355,11 +357,11 @@ mod tests {
         handle.init(file, 1);
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             guard.write_at(0, b"hello").unwrap();
         }
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             let mut buf = vec![0u8; 5];
             guard.read_exact_at(0, &mut buf).unwrap();
             assert_eq!(&buf, b"hello");
@@ -378,13 +380,13 @@ mod tests {
         handle.init(file, 1);
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             assert!(guard.is_empty().unwrap());
             assert_eq!(guard.len().unwrap(), 0);
             guard.write_at(0, b"abc").unwrap();
         }
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             assert!(!guard.is_empty().unwrap());
             assert_eq!(guard.len().unwrap(), 3);
         }
@@ -402,11 +404,11 @@ mod tests {
         handle.init(file, 1);
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             guard.write_at(0, b"hello world").unwrap();
         }
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             guard.truncate(5).unwrap();
             assert_eq!(guard.len().unwrap(), 5);
         }
@@ -439,11 +441,11 @@ mod tests {
         handle.init(file, 1);
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             guard.write_at(0, b"ABCDEF").unwrap();
         }
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             let mut buf = vec![0u8; 3];
             let n = guard.read_at(2, &mut buf).unwrap();
             assert_eq!(n, 3);
@@ -463,12 +465,12 @@ mod tests {
         handle.init(file, 1);
 
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             guard.write_at(0, b"XXXXXXXX").unwrap();
             guard.write_at(2, b"AB").unwrap();
         }
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire().expect("acquire");
             let mut buf = vec![0u8; 8];
             guard.read_exact_at(0, &mut buf).unwrap();
             assert_eq!(&buf[2..4], b"AB");

@@ -4,7 +4,7 @@
 //! Reentrancy is prevented: attempting to acquire a latch already held by
 //! the current thread will panic, detecting accidental reentrant calls.
 
-use crate::LatchContext;
+use crate::{LatchContext, LatchError};
 use noxu_sync::Mutex;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,11 +39,14 @@ impl ExclusiveLatch {
 
     /// Acquires the latch for exclusive access.
     ///
+    /// Returns `Ok(guard)` on success, or `Err(LatchError::Timeout)` if the
+    /// acquisition times out.
+    ///
     /// # Panics
     ///
     /// Panics if the latch is already held by the calling thread (reentrancy
-    /// detected), or if the acquisition times out.
-    pub fn acquire(&self) -> ExclusiveLatchGuard<'_> {
+    /// detected). Reentrancy is a programming error and must not be silenced.
+    pub fn acquire(&self) -> Result<ExclusiveLatchGuard<'_>, LatchError> {
         let current = thread_id();
         if self.owner.load(Ordering::Relaxed) == current {
             panic!(
@@ -54,15 +57,15 @@ impl ExclusiveLatch {
         }
 
         let timeout = self.context.timeout;
-        let guard = self.inner.try_lock_for(timeout).unwrap_or_else(|| {
-            panic!(
+        let guard = self.inner.try_lock_for(timeout).ok_or_else(|| {
+            LatchError::Timeout(format!(
                 "Latch acquisition timed out after {}ms: {}",
                 timeout.as_millis(),
                 self.context.name
-            )
-        });
+            ))
+        })?;
         self.owner.store(current, Ordering::Relaxed);
-        ExclusiveLatchGuard { latch: self, _guard: guard }
+        Ok(ExclusiveLatchGuard { latch: self, _guard: guard })
     }
 
     /// Attempts to acquire the latch without blocking.
@@ -160,7 +163,7 @@ mod tests {
         let latch = ExclusiveLatch::named("test");
         assert!(!latch.is_locked());
         {
-            let _guard = latch.acquire();
+            let _guard = latch.acquire().expect("acquire");
             assert!(latch.is_locked());
             assert!(latch.is_owner());
         }
@@ -183,15 +186,15 @@ mod tests {
     #[should_panic(expected = "Latch already held")]
     fn test_reentrant_panics() {
         let latch = ExclusiveLatch::named("test");
-        let _guard = latch.acquire();
-        let _guard2 = latch.acquire(); // Should panic
+        let _guard = latch.acquire().expect("first acquire");
+        let _ = latch.acquire(); // Should panic before returning
     }
 
     #[test]
     fn test_release_if_owner() {
         let latch = ExclusiveLatch::named("test");
         {
-            let _guard = latch.acquire();
+            let _guard = latch.acquire().expect("acquire");
             assert!(latch.is_owner());
         }
         // After guard dropped, release_if_owner should be a no-op
@@ -200,7 +203,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "timed out")]
     fn test_acquire_timeout() {
         use std::time::Duration;
         let ctx = crate::LatchContext::with_timeout(
@@ -213,14 +215,15 @@ mod tests {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
         let handle = std::thread::spawn(move || {
-            let _g = latch2.acquire();
+            let _g = latch2.acquire().expect("acquire in spawned thread");
             barrier2.wait(); // signal: lock is held
             std::thread::sleep(Duration::from_millis(200));
         });
 
         barrier.wait(); // wait until other thread holds the lock
-        // This will try to acquire with a 50ms timeout and must panic.
-        let _g = latch.acquire();
+        // acquire() should return Err(LatchError::Timeout) instead of panicking.
+        let result = latch.acquire();
+        assert!(result.is_err(), "expected latch timeout error, got Ok");
         let _ = handle.join();
     }
 
@@ -243,7 +246,7 @@ mod tests {
     #[test]
     fn test_is_owner_only_in_owning_thread() {
         let latch = Arc::new(ExclusiveLatch::named("test-owner-thread"));
-        let _guard = latch.acquire();
+        let _guard = latch.acquire().expect("acquire");
         assert!(latch.is_owner());
 
         // Another thread should see is_owner() == false even while we hold it
@@ -270,7 +273,7 @@ mod tests {
             let violations = violations.clone();
             std::thread::spawn(move || {
                 for _ in 0..25 {
-                    let _guard = latch.acquire();
+                    let _guard = latch.acquire().expect("acquire");
                     // We should be the only thread in this section
                     let prev = concurrent.fetch_add(1, Ordering::SeqCst);
                     if prev != 0 {
@@ -316,9 +319,9 @@ mod tests {
     fn test_je_acquire_reacquire_panics() {
         let result = std::panic::catch_unwind(|| {
             let latch = ExclusiveLatch::named("je-reacquire");
-            let _g1 = latch.acquire();
+            let _g1 = latch.acquire().expect("first acquire");
             // Second acquire on same thread must panic.
-            let _g2 = latch.acquire();
+            let _ = latch.acquire();
         });
         assert!(result.is_err(), "reentrant acquire should panic");
     }
@@ -389,14 +392,14 @@ mod tests {
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Thread 1 acquires the latch.
-        let g = latch.acquire();
+        let g = latch.acquire().expect("acquire");
         assert!(latch.is_locked());
 
         let latch2 = latch.clone();
         let acquired2 = acquired.clone();
         let h = std::thread::spawn(move || {
             // This will block until thread 1 releases.
-            let _g2 = latch2.acquire();
+            let _g2 = latch2.acquire().expect("acquire in spawned thread");
             acquired2.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
@@ -419,7 +422,7 @@ mod tests {
         let order = Arc::new(AtomicUsize::new(0));
 
         // Main thread acquires.
-        let g = latch.acquire();
+        let g = latch.acquire().expect("acquire");
 
         let mut handles = Vec::new();
         for i in 0..N {
@@ -428,7 +431,7 @@ mod tests {
             let h = std::thread::spawn(move || {
                 // Stagger entry slightly so they queue up in order.
                 std::thread::sleep(std::time::Duration::from_millis(5 * (i as u64 + 1)));
-                let _g = latch2.acquire();
+                let _g = latch2.acquire().expect("acquire in spawned thread");
                 order2.fetch_add(1, Ordering::SeqCst);
             });
             handles.push(h);

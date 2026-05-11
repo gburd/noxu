@@ -7,7 +7,7 @@
 //! This may also operate in exclusive-only mode where `acquire_shared()`
 //! behaves like `acquire_exclusive()`. BIN latches use this mode.
 
-use crate::LatchContext;
+use crate::{LatchContext, LatchError};
 use noxu_sync::RwLock;
 use std::cell::Cell;
 use std::fmt;
@@ -69,12 +69,15 @@ impl SharedLatch {
 
     /// Acquires the latch for exclusive/write access.
     ///
+    /// Returns `Ok(guard)` on success, or `Err(LatchError::Timeout)` if the
+    /// acquisition times out.
+    ///
     /// # Panics
     ///
     /// Panics if the latch is already held exclusively by the calling thread,
-    /// if the calling thread holds any read guards (which would deadlock), or
-    /// if the acquisition times out.
-    pub fn acquire_exclusive(&self) -> SharedLatchWriteGuard<'_> {
+    /// or if the calling thread holds any read guards (which would deadlock).
+    /// Both are programming errors and must not be silenced.
+    pub fn acquire_exclusive(&self) -> Result<SharedLatchWriteGuard<'_>, LatchError> {
         let current = thread_id();
         if self.exclusive_owner.load(Ordering::Relaxed) == current {
             panic!(
@@ -95,15 +98,15 @@ impl SharedLatch {
         }
 
         let timeout = self.context.timeout;
-        let guard = self.inner.try_write_for(timeout).unwrap_or_else(|| {
-            panic!(
+        let guard = self.inner.try_write_for(timeout).ok_or_else(|| {
+            LatchError::Timeout(format!(
                 "Latch acquisition timed out after {}ms: {}",
                 timeout.as_millis(),
                 self.context.name
-            )
-        });
+            ))
+        })?;
         self.exclusive_owner.store(current, Ordering::Relaxed);
-        SharedLatchWriteGuard { latch: self, _guard: guard }
+        Ok(SharedLatchWriteGuard { latch: self, _guard: guard })
     }
 
     /// Attempts to acquire the latch for exclusive access without blocking.
@@ -130,13 +133,16 @@ impl SharedLatch {
     /// In exclusive-only mode, this is equivalent to `acquire_exclusive()`
     /// and returns a write guard wrapped in the enum.
     ///
+    /// Returns `Ok(guard)` on success, or `Err(LatchError::Timeout)` if the
+    /// acquisition times out.
+    ///
     /// # Panics
     ///
-    /// Panics if the latch is already held by the calling thread, or if the
-    /// acquisition times out.
-    pub fn acquire_shared(&self) -> SharedLatchGuard<'_> {
+    /// Panics if the latch is already held by the calling thread. Reentrancy
+    /// is a programming error and must not be silenced.
+    pub fn acquire_shared(&self) -> Result<SharedLatchGuard<'_>, LatchError> {
         if self.exclusive_only {
-            SharedLatchGuard::Write(self.acquire_exclusive())
+            Ok(SharedLatchGuard::Write(self.acquire_exclusive()?))
         } else {
             // Detect reentrant shared acquisition on the same thread.
             // A thread must not acquire the latch in shared mode more than once
@@ -150,16 +156,15 @@ impl SharedLatch {
             }
 
             let timeout = self.context.timeout;
-            let guard =
-                self.inner.try_read_for(timeout).unwrap_or_else(|| {
-                    panic!(
-                        "Latch acquisition timed out after {}ms: {}",
-                        timeout.as_millis(),
-                        self.context.name
-                    )
-                });
+            let guard = self.inner.try_read_for(timeout).ok_or_else(|| {
+                LatchError::Timeout(format!(
+                    "Latch acquisition timed out after {}ms: {}",
+                    timeout.as_millis(),
+                    self.context.name
+                ))
+            })?;
             increment_read_hold();
-            SharedLatchGuard::Read(SharedLatchReadGuard { _guard: guard })
+            Ok(SharedLatchGuard::Read(SharedLatchReadGuard { _guard: guard }))
         }
     }
 
@@ -233,10 +238,10 @@ mod tests {
         let latch = Arc::new(SharedLatch::named("test", false));
 
         // Multiple readers should be able to acquire simultaneously
-        let _guard1 = latch.acquire_shared();
+        let _guard1 = latch.acquire_shared().expect("acquire_shared");
         let latch2 = latch.clone();
         let handle = std::thread::spawn(move || {
-            let _guard = latch2.acquire_shared();
+            let _guard = latch2.acquire_shared().expect("acquire_shared");
             true
         });
         assert!(handle.join().unwrap());
@@ -245,7 +250,7 @@ mod tests {
     #[test]
     fn test_exclusive_blocks_shared() {
         let latch = Arc::new(SharedLatch::named("test", false));
-        let _guard = latch.acquire_exclusive();
+        let _guard = latch.acquire_exclusive().expect("acquire_exclusive");
         assert!(latch.is_exclusive_owner());
 
         // Another thread should not be able to acquire
@@ -262,7 +267,7 @@ mod tests {
         assert!(latch.is_exclusive_only());
 
         // acquire_shared should actually acquire exclusive
-        let guard = latch.acquire_shared();
+        let guard = latch.acquire_shared().expect("acquire_shared");
         match guard {
             SharedLatchGuard::Write(_) => {} // Expected
             SharedLatchGuard::Read(_) => {
@@ -275,8 +280,8 @@ mod tests {
     #[should_panic(expected = "Latch already held")]
     fn test_reentrant_exclusive_panics() {
         let latch = SharedLatch::named("test", false);
-        let _guard = latch.acquire_exclusive();
-        let _guard2 = latch.acquire_exclusive(); // Should panic
+        let _guard = latch.acquire_exclusive().expect("first acquire");
+        let _ = latch.acquire_exclusive(); // Should panic before returning
     }
 
     #[test]
@@ -285,13 +290,12 @@ mod tests {
         // Acquiring a read guard then trying to upgrade to write must panic
         // because re-entrancy is forbidden.
         let latch = SharedLatch::named("test-upgrade", false);
-        let _rguard = latch.acquire_shared();
+        let _rguard = latch.acquire_shared().expect("acquire_shared");
         // This thread now holds a read guard -- exclusive acquire must panic.
-        let _wguard = latch.acquire_exclusive();
+        let _ = latch.acquire_exclusive();
     }
 
     #[test]
-    #[should_panic(expected = "timed out")]
     fn test_exclusive_acquire_timeout() {
         use std::time::Duration;
         // Create a latch with a very short timeout so the test completes fast.
@@ -303,19 +307,19 @@ mod tests {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
         let handle = std::thread::spawn(move || {
-            let _g = latch2.acquire_exclusive();
+            let _g = latch2.acquire_exclusive().expect("acquire in spawned thread");
             barrier2.wait(); // signal: lock is held
             std::thread::sleep(Duration::from_millis(200));
         });
 
         barrier.wait(); // wait until the other thread holds the lock
-        // Now this will try to acquire with a 50ms timeout and must panic.
-        let _g = latch.acquire_exclusive();
+        // acquire_exclusive() should return Err instead of panicking.
+        let result = latch.acquire_exclusive();
+        assert!(result.is_err(), "expected latch timeout error, got Ok");
         let _ = handle.join();
     }
 
     #[test]
-    #[should_panic(expected = "timed out")]
     fn test_shared_acquire_timeout() {
         use std::time::Duration;
         let ctx = crate::LatchContext::with_timeout("test-timeout-r", Duration::from_millis(50));
@@ -325,14 +329,15 @@ mod tests {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
         let handle = std::thread::spawn(move || {
-            let _g = latch2.acquire_exclusive();
+            let _g = latch2.acquire_exclusive().expect("acquire in spawned thread");
             barrier2.wait();
             std::thread::sleep(Duration::from_millis(200));
         });
 
         barrier.wait();
-        // Shared acquire should time out while write lock is held.
-        let _g = latch.acquire_shared();
+        // acquire_shared() should return Err instead of panicking.
+        let result = latch.acquire_shared();
+        assert!(result.is_err(), "expected latch timeout error, got Ok");
         let _ = handle.join();
     }
 
@@ -345,7 +350,7 @@ mod tests {
     #[test]
     fn test_is_exclusive_owner_only_in_owning_thread() {
         let latch = Arc::new(SharedLatch::named("test-owner-thread", false));
-        let _guard = latch.acquire_exclusive();
+        let _guard = latch.acquire_exclusive().expect("acquire_exclusive");
         assert!(latch.is_exclusive_owner());
 
         let latch2 = latch.clone();
@@ -359,7 +364,7 @@ mod tests {
     fn test_exclusive_owner_cleared_after_drop() {
         let latch = SharedLatch::named("test-drop", false);
         {
-            let _guard = latch.acquire_exclusive();
+            let _guard = latch.acquire_exclusive().expect("acquire_exclusive");
             assert!(latch.is_exclusive_owner());
         }
         assert!(!latch.is_exclusive_owner());
@@ -414,7 +419,7 @@ mod tests {
             let violations = violations.clone();
             std::thread::spawn(move || {
                 for _ in 0..25 {
-                    let _guard = latch.acquire_exclusive();
+                    let _guard = latch.acquire_exclusive().expect("acquire_exclusive");
                     let prev = concurrent.fetch_add(1, Ordering::SeqCst);
                     if prev != 0 {
                         violations.fetch_add(1, Ordering::SeqCst);
@@ -439,9 +444,9 @@ mod tests {
     fn test_je_shared_reacquire_panics() {
         let result = std::panic::catch_unwind(|| {
             let latch = SharedLatch::named("je-shared-reacquire", false);
-            let _g1 = latch.acquire_shared();
+            let _g1 = latch.acquire_shared().expect("first acquire_shared");
             // Second shared acquire on same thread must panic.
-            let _g2 = latch.acquire_shared();
+            let _ = latch.acquire_shared();
         });
         assert!(result.is_err(), "reentrant shared acquire should panic");
     }
@@ -451,8 +456,8 @@ mod tests {
     fn test_je_read_to_write_upgrade_panics() {
         let result = std::panic::catch_unwind(|| {
             let latch = SharedLatch::named("je-rwupgrade", false);
-            let _rg = latch.acquire_shared(); // increments read hold count
-            let _wg = latch.acquire_exclusive(); // must panic
+            let _rg = latch.acquire_shared().expect("acquire_shared"); // increments read hold count
+            let _ = latch.acquire_exclusive(); // must panic
         });
         assert!(result.is_err(), "read-to-write upgrade should panic");
     }
@@ -476,7 +481,7 @@ mod tests {
             let latch2 = latch.clone();
             let ready2 = ready.clone();
             let h = std::thread::spawn(move || {
-                let _g = latch2.acquire_shared();
+                let _g = latch2.acquire_shared().expect("acquire_shared");
                 {
                     let (m, cv) = &*ready2;
                     let mut g = m.lock();
@@ -509,14 +514,14 @@ mod tests {
         let latch = Arc::new(SharedLatch::named("je-excl-blocks-shared", false));
 
         // Acquire exclusive.
-        let g = latch.acquire_exclusive();
+        let g = latch.acquire_exclusive().expect("acquire_exclusive");
         assert!(latch.is_exclusive_owner());
 
         let latch2 = latch.clone();
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let acquired2 = acquired.clone();
         let h = std::thread::spawn(move || {
-            let _sg = latch2.acquire_shared();
+            let _sg = latch2.acquire_shared().expect("acquire_shared");
             acquired2.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
@@ -538,7 +543,7 @@ mod tests {
         let latch2 = latch.clone();
         let barrier2 = barrier.clone();
         let h = std::thread::spawn(move || {
-            let _g = latch2.acquire_exclusive();
+            let _g = latch2.acquire_exclusive().expect("acquire_exclusive");
             barrier2.wait();
             std::thread::sleep(std::time::Duration::from_millis(100));
         });
@@ -573,7 +578,7 @@ mod tests {
                 let violations = violations.clone();
                 std::thread::spawn(move || {
                     for _ in 0..10 {
-                        let _g = latch.acquire_shared(); // exclusive in excl-only mode
+                        let _g = latch.acquire_shared().expect("acquire_shared"); // exclusive in excl-only mode
                         let prev = concurrent.fetch_add(1, Ordering::SeqCst);
                         if prev != 0 {
                             violations.fetch_add(1, Ordering::SeqCst);

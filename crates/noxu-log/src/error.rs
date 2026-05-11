@@ -61,6 +61,10 @@ pub enum NoxuLogError {
     #[error("Log corrupt: {0}")]
     LogCorrupt(String),
 
+    /// Latch acquisition timed out (maps to EnvironmentFailure/LatchTimeout).
+    #[error("Latch acquisition timed out: {0}")]
+    LatchTimeout(String),
+
     /// Internal consistency error.
     #[error("Internal error: {0}")]
     Internal(String),
