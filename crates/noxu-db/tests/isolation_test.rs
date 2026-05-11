@@ -43,11 +43,11 @@ fn put_committed(env: &noxu_db::Environment, db: &noxu_db::Database, key: &[u8],
     txn.commit().unwrap();
 }
 
-fn get_val<'a>(
+fn get_val(
     db: &noxu_db::Database,
     txn: Option<&noxu_db::Transaction>,
     key: &[u8],
-    buf: &'a mut DatabaseEntry,
+    buf: &mut DatabaseEntry,
 ) -> OperationStatus {
     let k = DatabaseEntry::from_bytes(key);
     db.get(txn, &k, buf).unwrap()
@@ -854,10 +854,8 @@ fn test_200_thread_disjoint_writers() {
             break;
         }
         let cur = String::from_utf8_lossy(k.get_data().unwrap_or_default()).into_owned();
-        if let Some(ref p) = prev {
-            if cur < *p {
-                order_errors += 1;
-            }
+        if let Some(ref p) = prev && cur < *p {
+            order_errors += 1;
         }
         prev = Some(cur);
         checked += 1;

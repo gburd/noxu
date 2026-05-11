@@ -2550,9 +2550,9 @@ fn recovery_committed_records_survive_reopen() {
         assert_eq!(db.count().unwrap(), N as u64,
             "all committed records must survive reopen");
         for i in 0..N {
-            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            let status = db.get(None, &mut k, &mut v).unwrap();
+            let status = db.get(None, &k, &mut v).unwrap();
             assert_eq!(status, OperationStatus::Success,
                 "key {} must be present after recovery", i);
             assert_eq!(v.data(), (i * 3 + 7).to_be_bytes(),
@@ -2614,9 +2614,9 @@ fn recovery_concurrent_writes_all_survive_reopen() {
             "all {} records from {} threads must survive reopen", total, THREADS);
 
         for global_key in 0..total {
-            let mut k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
+            let k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            let status = db.get(None, &mut k, &mut v).unwrap();
+            let status = db.get(None, &k, &mut v).unwrap();
             assert_eq!(status, OperationStatus::Success,
                 "key {} (from thread {}) must be present after recovery",
                 global_key, global_key / PER_THREAD);
@@ -2671,17 +2671,17 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
 
         // Committed records must be present.
         for i in 0..N_COMMITTED {
-            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            assert_eq!(db.get(None, &mut k, &mut v).unwrap(), OperationStatus::Success,
+            assert_eq!(db.get(None, &k, &mut v).unwrap(), OperationStatus::Success,
                 "committed key {} must be present", i);
         }
 
         // Uncommitted records must be absent.
         for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
-            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            assert_eq!(db.get(None, &mut k, &mut v).unwrap(), OperationStatus::NotFound,
+            assert_eq!(db.get(None, &k, &mut v).unwrap(), OperationStatus::NotFound,
                 "aborted key {} must NOT be present after recovery", i);
         }
     }
@@ -2733,18 +2733,18 @@ fn recovery_multi_db_both_databases_survive_reopen() {
         let db_beta  = env.open_database(None, "beta",  &db_cfg).unwrap();
 
         for i in 0u32..N {
-            let mut k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
 
             assert_eq!(
-                db_alpha.get(None, &mut k, &mut v).unwrap(),
+                db_alpha.get(None, &k, &mut v).unwrap(),
                 OperationStatus::Success,
                 "alpha: key {} missing after recovery", i
             );
             assert_eq!(v.data(), b"alpha", "alpha: key {} has wrong value", i);
 
             assert_eq!(
-                db_beta.get(None, &mut k, &mut v).unwrap(),
+                db_beta.get(None, &k, &mut v).unwrap(),
                 OperationStatus::Success,
                 "beta: key {} missing after recovery", i
             );

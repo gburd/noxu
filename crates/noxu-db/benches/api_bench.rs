@@ -131,14 +131,14 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
     c.bench_function("cursor_forward_scan_1000", |b| {
         b.iter(|| {
             let mut cursor = db.open_cursor(None, None).unwrap();
-            let key = DatabaseEntry::new();
+            let mut key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             let mut count = 0u32;
 
-            let mut status = cursor.get(&key, &mut data, Get::First, None).unwrap();
+            let mut status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
             while status == OperationStatus::Success {
                 count += 1;
-                status = cursor.get(&key, &mut data, Get::Next, None).unwrap();
+                status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
             }
             cursor.close().unwrap();
             black_box(count);

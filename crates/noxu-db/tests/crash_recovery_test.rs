@@ -36,7 +36,7 @@ fn log_files(dir: &Path) -> Vec<std::path::PathBuf> {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |x| x == "ndb"))
+        .filter(|p| p.extension().is_some_and(|x| x == "ndb"))
         .collect();
     files.sort();
     files
