@@ -351,7 +351,7 @@ impl LogManager {
             // Obtain a write buffer that can hold entry_size bytes.
             let buffer_arc = {
                 let mut pool = self.buffer_pool.lock();
-                pool.get_write_buffer(entry_size, flipped)
+                pool.get_write_buffer(entry_size, flipped)?
             };
             let mut buffer = buffer_arc.lock();
 
@@ -609,7 +609,7 @@ impl LogManager {
         // ------------------------------------------------------------------
         {
             let mut pool = self.buffer_pool.lock();
-            if let Some(buf_arc) = pool.get_read_buffer_by_lsn(lsn) {
+            if let Some(buf_arc) = pool.get_read_buffer_by_lsn(lsn)? {
                 let buf = buf_arc.lock();
                 // get_bytes returns a slice starting at lsn.file_offset()
                 let slice = buf.get_bytes(lsn.file_offset());

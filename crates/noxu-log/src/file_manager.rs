@@ -361,7 +361,8 @@ impl FileManager {
     ///
     /// Writes the file header with a link to the previous file.
     pub fn create_file(&self, file_num: u32) -> Result<Arc<FileHandle>> {
-        let _guard = self.file_latch.acquire();
+        let _guard = self.file_latch.acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
         self.create_file_internal(file_num)
     }
 
@@ -369,7 +370,8 @@ impl FileManager {
     ///
     /// Called when the current file reaches its maximum size.
     pub fn flip_file(&self) -> Result<u32> {
-        let _guard = self.file_latch.acquire();
+        let _guard = self.file_latch.acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         let current = self.current_file_num.load(Ordering::Acquire);
         let next = current + 1;
@@ -509,7 +511,7 @@ impl FileManager {
 
         // Write the data at the specified offset.
         {
-            let mut guard = handle.acquire();
+            let mut guard = handle.acquire()?;
             guard.write_at(file_offset, data)?;
         }
 
@@ -553,7 +555,7 @@ impl FileManager {
         buf: &mut [u8],
     ) -> Result<usize> {
         let handle = self.get_file_handle(file_num)?;
-        let mut guard = handle.acquire();
+        let mut guard = handle.acquire()?;
         let n = guard.read_at(offset, buf)?;
         self.n_sequential_reads.fetch_add(1, Ordering::Relaxed);
         self.n_sequential_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -627,7 +629,7 @@ impl FileManager {
         }
 
         let handle = self.get_file_handle(file_num)?;
-        let mut guard = handle.acquire();
+        let mut guard = handle.acquire()?;
         // Use fdatasync (sync_data) — only log data must be durable here,
         // not file metadata.  uses FileChannel.force(false) for this.
         guard.sync_data()?;

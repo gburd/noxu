@@ -1925,14 +1925,14 @@ mod tests {
 
         // Test exclusive latch (RAII guard)
         {
-            let _guard = in_node.latch().acquire_exclusive();
+            let _guard = in_node.latch().acquire_exclusive().expect("acquire_exclusive");
             // Latch is held here
         }
         // Latch is released when guard goes out of scope
 
         // For a BIN (level 1), shared and exclusive are the same (exclusive-only mode)
         {
-            let _guard = in_node.latch().acquire_shared();
+            let _guard = in_node.latch().acquire_shared().expect("acquire_shared");
             // Latch is held here (as exclusive since BINs are exclusive-only)
         }
     }

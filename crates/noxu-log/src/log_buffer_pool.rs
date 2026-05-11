@@ -14,6 +14,7 @@
 //! LogManager.logWriteLatch (aka LWL) is used to serialize access to the
 //! currentWriteBuffer, so that entries are added in write/LSN order.
 
+use crate::error::{LogError, Result};
 use crate::log_buffer::LogBuffer;
 use noxu_latch::ExclusiveLatch;
 use noxu_util::lsn::Lsn;
@@ -99,19 +100,19 @@ impl LogBufferPool {
         &mut self,
         size_needed: usize,
         flipped_file: bool,
-    ) -> Arc<Mutex<LogBuffer>> {
+    ) -> Result<Arc<Mutex<LogBuffer>>> {
         // If we've flipped to a new file or the current buffer is full, handle it
         if flipped_file {
-            self.bump_and_write_dirty(size_needed, true);
+            self.bump_and_write_dirty(size_needed, true)?;
         } else {
             let current = self.buffers[self.current_write_buffer_index].lock();
             let has_room = current.has_room(size_needed);
             drop(current);
 
             if !has_room {
-                if !self.bump_current(size_needed) {
+                if !self.bump_current(size_needed)? {
                     // Could not bump, need to write dirty buffers
-                    self.bump_and_write_dirty(size_needed, false);
+                    self.bump_and_write_dirty(size_needed, false)?;
                 } else {
                     let current =
                         self.buffers[self.current_write_buffer_index].lock();
@@ -120,13 +121,13 @@ impl LogBufferPool {
 
                     if !has_room_after_bump {
                         // Item is larger than buffer size, write dirty to prepare for direct write
-                        self.bump_and_write_dirty(size_needed, false);
+                        self.bump_and_write_dirty(size_needed, false)?;
                     }
                 }
             }
         }
 
-        Arc::clone(&self.buffers[self.current_write_buffer_index])
+        Ok(Arc::clone(&self.buffers[self.current_write_buffer_index]))
     }
 
     /// Bumps current write buffer and writes the dirty buffers.
@@ -136,19 +137,19 @@ impl LogBufferPool {
         &mut self,
         size_needed: usize,
         flush_write_queue: bool,
-    ) {
-        if !self.bump_current(size_needed) {
+    ) -> Result<()> {
+        if !self.bump_current(size_needed)? {
             // Could not bump, write dirty buffers first
-            self.write_dirty(flush_write_queue);
+            self.write_dirty(flush_write_queue)?;
 
-            if !self.bump_current(size_needed) {
+            if !self.bump_current(size_needed)? {
                 // Should not happen - after writing dirty buffers we should be able to bump
                 panic!("No free log buffers after flushing dirty buffers");
             }
         }
 
         // Write the dirty buffers
-        self.write_dirty(flush_write_queue);
+        self.write_dirty(flush_write_queue)
     }
 
     /// Moves the current write buffer to the next buffer in the pool.
@@ -157,8 +158,9 @@ impl LogBufferPool {
     ///
     /// Returns false when the buffer needs flushing but there are no free buffers.
     /// Returns true when the buffer is empty or when the buffer is non-empty and is bumped.
-    fn bump_current(&mut self, _size_needed: usize) -> bool {
-        let _guard = self.buffer_pool_latch.acquire();
+    fn bump_current(&mut self, _size_needed: usize) -> Result<bool> {
+        let _guard = self.buffer_pool_latch.acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         let current = self.buffers[self.current_write_buffer_index].lock();
         current.latch_for_write();
@@ -166,7 +168,7 @@ impl LogBufferPool {
         // Is there anything in this write buffer?
         if current.get_first_lsn().is_null() {
             current.release();
-            return true;
+            return Ok(true);
         }
 
         // Check if there is an undirty buffer to use
@@ -175,7 +177,7 @@ impl LogBufferPool {
             if next_slot == self.dirty_start as usize {
                 self.n_no_free_buffer += 1;
                 current.release();
-                return false;
+                return Ok(false);
             }
         } else {
             self.dirty_start = self.current_write_buffer_index as i32;
@@ -206,7 +208,7 @@ impl LogBufferPool {
             self.min_buffer_lsn = new_min_lsn;
         }
 
-        true
+        Ok(true)
     }
 
     /// Returns the next buffer slot number from the input buffer slot number.
@@ -221,11 +223,12 @@ impl LogBufferPool {
     /// Iterates the dirty buffer chain and flushes each buffer to the
     /// FileManager write queue.
     /// .
-    fn write_dirty(&mut self, _flush_write_queue: bool) {
-        let _guard = self.buffer_pool_latch.acquire();
+    fn write_dirty(&mut self, _flush_write_queue: bool) -> Result<()> {
+        let _guard = self.buffer_pool_latch.acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         if self.dirty_start < 0 {
-            return;
+            return Ok(());
         }
 
         let mut current_dirty = self.dirty_start as usize;
@@ -248,6 +251,7 @@ impl LogBufferPool {
 
         self.dirty_start = -1;
         self.dirty_end = -1;
+        Ok(())
     }
 
     /// Finds a buffer that contains the given LSN location.
@@ -259,30 +263,31 @@ impl LogBufferPool {
     pub fn get_read_buffer_by_lsn(
         &mut self,
         lsn: Lsn,
-    ) -> Option<Arc<Mutex<LogBuffer>>> {
+    ) -> Result<Option<Arc<Mutex<LogBuffer>>>> {
         self.n_not_resident += 1;
 
         // Avoid latching if the LSN is known not to be in the pool
         if lsn < self.min_buffer_lsn {
             self.n_cache_miss += 1;
-            return None;
+            return Ok(None);
         }
 
         // Latch and check the buffer pool
-        let _guard = self.buffer_pool_latch.acquire();
+        let _guard = self.buffer_pool_latch.acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         for buffer_arc in &self.buffers {
             let buffer = buffer_arc.lock();
             if buffer.contains_lsn(lsn) {
                 // Buffer is latched by contains_lsn if it returns true
                 drop(buffer);
-                return Some(Arc::clone(buffer_arc));
+                return Ok(Some(Arc::clone(buffer_arc)));
             }
             drop(buffer);
         }
 
         self.n_cache_miss += 1;
-        None
+        Ok(None)
     }
 
     /// Returns a snapshot of all buffer arcs in the pool.
@@ -329,7 +334,7 @@ mod tests {
     #[test]
     fn test_get_write_buffer() {
         let mut pool = LogBufferPool::new(3, 1024);
-        let buffer = pool.get_write_buffer(100, false);
+        let buffer = pool.get_write_buffer(100, false).expect("get_write_buffer");
         let buf = buffer.lock();
         assert!(buf.has_room(100));
     }
@@ -340,7 +345,7 @@ mod tests {
 
         // Fill first buffer
         {
-            let buffer = pool.get_write_buffer(50, false);
+            let buffer = pool.get_write_buffer(50, false).expect("get_write_buffer");
             let mut buf = buffer.lock();
             buf.latch_for_write();
             buf.register_lsn(Lsn::new(0, 0));
@@ -350,7 +355,7 @@ mod tests {
 
         // Request more space, should bump to next buffer
         {
-            let buffer = pool.get_write_buffer(60, false);
+            let buffer = pool.get_write_buffer(60, false).expect("get_write_buffer");
             let buf = buffer.lock();
             assert!(buf.has_room(60));
         }
@@ -382,7 +387,7 @@ mod tests {
         // searched. We force a cache miss by searching for a high LSN
         // in a pool whose buffers have no registered LSNs yet.
         let lsn = Lsn::new(99, 5000);
-        let result = pool.get_read_buffer_by_lsn(lsn);
+        let result = pool.get_read_buffer_by_lsn(lsn).expect("get_read_buffer_by_lsn");
         assert!(result.is_none());
         assert_eq!(pool.get_stats().n_cache_miss, 1);
     }
@@ -390,7 +395,7 @@ mod tests {
     #[test]
     fn test_write_buffer_has_enough_space() {
         let mut pool = LogBufferPool::new(3, 512);
-        let buf = pool.get_write_buffer(256, false);
+        let buf = pool.get_write_buffer(256, false).expect("get_write_buffer");
         let inner = buf.lock();
         assert!(inner.has_room(256));
     }
