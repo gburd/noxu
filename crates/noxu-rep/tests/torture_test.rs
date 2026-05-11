@@ -9,10 +9,10 @@
 //! - TCP/QUIC connection teardown from node crash
 //! - VLSN state persisted to disk; verified after node restart
 //! - 5-10 minute long-running driver that cycles through:
-//!     • normal operation
-//!     • lossy / high-latency chaos phases
-//!     • random node crashes with restart
-//!     • minority-partition → majority-partition heal
+//!   - normal operation
+//!   - lossy / high-latency chaos phases
+//!   - random node crashes with restart
+//!   - minority-partition → majority-partition heal
 //!
 //! ## Transport selection
 //!
@@ -61,7 +61,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
@@ -226,9 +226,10 @@ impl AnyListener {
 /// Open an **election** channel to `addr` using the given transport.
 fn connect_election(kind: TransportKind, addr: SocketAddr) -> Option<Arc<dyn Channel>> {
     match kind {
-        TransportKind::Tcp => TcpChannel::connect(addr)
-            .ok()
-            .map(|c| Arc::new(c) as Arc<dyn Channel>),
+        TransportKind::Tcp => match TcpChannel::connect(addr) {
+            Ok(c)  => Some(Arc::new(c) as Arc<dyn Channel>),
+            Err(e) => { eprintln!("[torture] TCP connect to {addr} failed: {e}"); None }
+        },
         #[cfg(feature = "quic")]
         TransportKind::Quic => QuicChannel::connect(addr, "localhost")
             .ok()
@@ -321,6 +322,9 @@ struct TcNetemGuard {
 
 impl TcNetemGuard {
     fn setup() -> Self {
+        // Clean up any leftover qdisc from a previous killed run.  The 'del'
+        // fails harmlessly when no netem qdisc is present.
+        Self::run_tc(&["qdisc", "del", "dev", "lo", "root"]);
         if Self::run_tc(&["qdisc", "add", "dev", "lo", "root", "netem",
                           "loss", "2%", "delay", "5ms", "2ms",
                           "reorder", "5%", "25%"]) {
@@ -351,17 +355,20 @@ impl TcNetemGuard {
     }
 
     fn run_tc(args: &[&str]) -> bool {
-        for prefix in &[vec![], vec!["sudo", "-n"]] {
-            let mut full: Vec<&str> = prefix.to_vec();
-            full.extend_from_slice(args);
-            if Command::new("tc").args(&full[..]).status()
-                .map(|s| s.success()).unwrap_or(false) { return true; }
-            if full[0] == "sudo" { continue; }
-            // Try with explicit sudo prefix
-            if Command::new("sudo").args(["-n", "tc"]).args(args).status()
-                .map(|s| s.success()).unwrap_or(false) { return true; }
-            break;
-        }
+        // 1. Try setuid helper (user installs this via `make tc-helper`).
+        let helper = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .map(|d| d.join("../../../scripts/tc_netem_helper"))
+            .unwrap_or_else(|| PathBuf::from("scripts/tc_netem_helper"));
+        if helper.exists() && Command::new(&helper).args(args).status()
+            .map(|s| s.success()).unwrap_or(false) { return true; }
+        // 2. Try direct tc (works if process already has CAP_NET_ADMIN).
+        if Command::new("tc").args(args).status()
+            .map(|s| s.success()).unwrap_or(false) { return true; }
+        // 3. Try passwordless sudo tc.
+        if Command::new("sudo").arg("-n").arg("tc").args(args).status()
+            .map(|s| s.success()).unwrap_or(false) { return true; }
         false
     }
 }
@@ -545,24 +552,30 @@ fn run_election_round(
         }
     }
 
-    // Spawn one acceptor thread per listener, consuming the listener.
-    let mut acceptor_threads = Vec::new();
+    // Spawn one acceptor thread per listener.
+    // Use a channel so we can wait with a timeout — QUIC accept() blocks
+    // indefinitely and h.join() would hang forever if the proposer never
+    // connects (e.g. under 80% packet loss in MinorityPartition).
+    let mut acceptor_rxs: Vec<(usize, mpsc::Receiver<noxu_rep::error::Result<Option<String>>>)> =
+        Vec::new();
     for (i, listener) in listeners {
         let name  = nodes[i].name.clone();
         let vlsn  = nodes[i].vlsn();
-        let h = std::thread::spawn(move || {
-            match listener.accept_election() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = match listener.accept_election() {
                 Some(ch) => run_acceptor(ch.as_ref(), &name, vlsn, 1, term),
                 None     => Ok(None),
-            }
+            };
+            let _ = tx.send(r);
         });
-        acceptor_threads.push((i, h));
+        acceptor_rxs.push((i, rx));
     }
 
     // Proposer connects to each acceptor's election port.
     let proposer = &nodes[proposer_idx];
     let mut peer_channels: Vec<Arc<dyn Channel>> = Vec::new();
-    let peer_node_ids: Vec<usize> = acceptor_threads.iter().map(|(i, _)| *i).collect();
+    let peer_node_ids: Vec<usize> = acceptor_rxs.iter().map(|(i, _)| *i).collect();
 
     for &ni in &peer_node_ids {
         let port = *nodes[ni].last_election_port.lock().unwrap();
@@ -572,7 +585,8 @@ fn run_election_round(
             Some(ch) => peer_channels.push(ch),
             None => {
                 eprintln!("[torture] election connect failed to node {}", nodes[ni].name);
-                for (_, h) in acceptor_threads { let _ = h.join(); }
+                // Do NOT join — acceptor threads may be blocked in QUIC accept().
+                // They'll self-terminate when the listener drops or process exits.
                 return None;
             }
         }
@@ -583,7 +597,10 @@ fn run_election_round(
         proposer.vlsn(), 1, term,
     );
 
-    for (_, h) in acceptor_threads { let _ = h.join(); }
+    // Drain acceptor results with a per-thread timeout to avoid blocking forever.
+    for (_, rx) in &acceptor_rxs {
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+    }
 
     if let Some(winner_id) = result {
         inv.record_winner(term, winner_id);
