@@ -1,9 +1,10 @@
 //! Replication group management.
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::node_type::NodeType;
+use crate::quorum_policy::QuorumPolicy;
 use crate::rep_node::RepNode;
 
 /// A replication group consisting of named nodes.
@@ -18,12 +19,37 @@ pub struct RepGroup {
     group_id: u64,
     /// Map from node name to node info.
     nodes: HashMap<String, RepNode>,
+    /// Quorum policy controlling Phase 1 / Phase 2 election sizes.
+    quorum_policy: QuorumPolicy,
 }
 
 impl RepGroup {
     /// Creates a new replication group with the given name and ID.
+    ///
+    /// Defaults to [`QuorumPolicy::SimpleMajority`].  Use
+    /// [`RepGroup::with_policy`] to specify a Flexible or Expression policy.
     pub fn new(name: String, group_id: u64) -> Self {
-        Self { name, group_id, nodes: HashMap::new() }
+        Self {
+            name,
+            group_id,
+            nodes: HashMap::new(),
+            quorum_policy: QuorumPolicy::SimpleMajority,
+        }
+    }
+
+    /// Creates a new replication group with an explicit quorum policy.
+    pub fn with_policy(name: String, group_id: u64, policy: QuorumPolicy) -> Self {
+        Self { name, group_id, nodes: HashMap::new(), quorum_policy: policy }
+    }
+
+    /// Replace the quorum policy for this group.
+    pub fn set_quorum_policy(&mut self, policy: QuorumPolicy) {
+        self.quorum_policy = policy;
+    }
+
+    /// Returns a reference to the current quorum policy.
+    pub fn quorum_policy(&self) -> &QuorumPolicy {
+        &self.quorum_policy
     }
 
     /// Returns the group name.
@@ -77,13 +103,37 @@ impl RepGroup {
             as u32
     }
 
+    /// Returns the Phase 1 (Prepare/Promise) quorum size under the current policy.
+    pub fn phase1_quorum(&self) -> usize {
+        self.quorum_policy.phase1_quorum(self.electable_count() as usize)
+    }
+
+    /// Returns the Phase 2 (Accept/Commit) quorum size under the current policy.
+    pub fn phase2_quorum(&self) -> usize {
+        self.quorum_policy.phase2_quorum(self.electable_count() as usize)
+    }
+
+    /// Returns `true` if `voters` satisfies the Phase 2 quorum requirement.
+    pub fn is_valid_phase2_quorum(&self, voters: &HashSet<&str>) -> bool {
+        self.quorum_policy
+            .is_valid_phase2_quorum(voters, self.electable_count() as usize)
+    }
+
+    /// Validate and optionally rebuild the quorum system after a membership
+    /// change.  For `SimpleMajority` and `Expression` policies this is always
+    /// valid; for `Flexible` it checks `phase1 + phase2 > n`.
+    ///
+    /// Returns `Err` if the current policy is unsafe for the new group size.
+    pub fn rebuild_quorum_system(&self) -> Result<(), String> {
+        self.quorum_policy.validate(self.electable_count() as usize)
+    }
+
     /// Returns the quorum size: a simple majority of electable nodes.
     ///
-    /// The quorum is `(electable_count / 2) + 1`. If there are no
-    /// electable nodes, the quorum size is 0.
+    /// This is a compatibility shim that returns [`phase2_quorum`](Self::phase2_quorum)
+    /// cast to `u32`.  New code should call `phase2_quorum()` directly.
     pub fn quorum_size(&self) -> u32 {
-        let count = self.electable_count();
-        if count == 0 { 0 } else { (count / 2) + 1 }
+        self.phase2_quorum() as u32
     }
 
     /// Returns `true` if the group contains a node with the given name.

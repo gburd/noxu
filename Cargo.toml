@@ -105,6 +105,15 @@ noxu-collections = { path = "crates/noxu-collections" }
 noxu-persist = { path = "crates/noxu-persist" }
 noxu-rep = { path = "crates/noxu-rep" }
 
+# Quorum system library (authored by Greg Burd — path dep from local copy)
+quoracle = { path = "crates/noxu-rep/quoracle" }
+
+# QUIC transport (optional, pulled in by noxu-rep's "quic" feature)
+quinn   = { version = "0.11" }
+tokio   = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "time"] }
+rustls  = { version = "0.23", features = ["ring"], default-features = false }
+rcgen   = { version = "0.13" }
+
 # External crates (approved core set)
 lock_api = "0.4"
 libc = "0.2"

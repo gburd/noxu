@@ -17,10 +17,12 @@ pub mod election;
 pub mod election_config;
 pub mod master_tracker;
 pub mod paxos;
+pub mod phi_detector;
 pub mod proposal;
 
 pub use election::{Election, ElectionOutcome, ElectionState};
 pub use election_config::ElectionConfig;
 pub use master_tracker::MasterTracker;
 pub use paxos::{run_acceptor, run_election, NodeId};
+pub use phi_detector::PhiAccrualDetector;
 pub use proposal::Proposal;

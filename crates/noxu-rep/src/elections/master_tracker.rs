@@ -13,10 +13,16 @@ use std::time::{Duration, Instant};
 
 use noxu_sync::RwLock;
 
+use super::phi_detector::PhiAccrualDetector;
+
 /// Tracks the current known master of the replication group.
 ///
 /// All methods are safe to call concurrently from multiple threads. Reads use
 /// a shared lock; writes use an exclusive lock.
+///
+/// When a [`PhiAccrualDetector`] is attached (via [`MasterTracker::with_phi`]),
+/// `is_master_alive` uses the continuous φ suspicion level instead of the
+/// binary heartbeat timeout.  This adapts automatically to network jitter.
 pub struct MasterTracker {
     /// Name of the current master, if known.
     current_master: RwLock<Option<String>>,
@@ -26,19 +32,32 @@ pub struct MasterTracker {
     last_heartbeat: RwLock<Option<Instant>>,
     /// Maximum time between heartbeats before the master is considered dead.
     heartbeat_timeout: Duration,
+    /// Optional phi accrual failure detector.
+    phi_detector: Option<PhiAccrualDetector>,
 }
 
 impl MasterTracker {
     /// Create a new tracker with the given heartbeat timeout.
     ///
-    /// The tracker starts with no known master.
+    /// Uses binary heartbeat timeout for liveness detection.  Call
+    /// [`with_phi`](Self::with_phi) to switch to phi accrual detection.
     pub fn new(heartbeat_timeout: Duration) -> Self {
         Self {
             current_master: RwLock::new(None),
             master_term: RwLock::new(0),
             last_heartbeat: RwLock::new(None),
             heartbeat_timeout,
+            phi_detector: None,
         }
+    }
+
+    /// Attach a phi accrual failure detector.
+    ///
+    /// When attached, [`is_master_alive`](Self::is_master_alive) returns
+    /// `phi_detector.is_available()` instead of the binary timeout check.
+    pub fn with_phi(mut self, detector: PhiAccrualDetector) -> Self {
+        self.phi_detector = Some(detector);
+        self
     }
 
     /// Set the current master and its term unconditionally.
@@ -71,10 +90,16 @@ impl MasterTracker {
     /// Record a heartbeat from the master at the current time.
     pub fn record_heartbeat(&self) {
         *self.last_heartbeat.write() = Some(Instant::now());
+        if let Some(ref phi) = self.phi_detector {
+            phi.record_heartbeat();
+        }
     }
 
-    /// Returns `true` if a master is set and its last heartbeat was within
-    /// the configured timeout.
+    /// Returns `true` if a master is set and it is still considered alive.
+    ///
+    /// When a phi detector is configured, uses the continuous suspicion level
+    /// (`phi.is_available()`).  Otherwise falls back to binary heartbeat
+    /// timeout (`elapsed < heartbeat_timeout`).
     pub fn is_master_alive(&self) -> bool {
         let master = self.current_master.read();
         if master.is_none() {
@@ -82,11 +107,22 @@ impl MasterTracker {
         }
         drop(master);
 
-        let hb = self.last_heartbeat.read();
-        match *hb {
-            Some(t) => t.elapsed() < self.heartbeat_timeout,
-            None => false,
+        match &self.phi_detector {
+            Some(phi) => phi.is_available(),
+            None => {
+                let hb = self.last_heartbeat.read();
+                match *hb {
+                    Some(t) => t.elapsed() < self.heartbeat_timeout,
+                    None => false,
+                }
+            }
         }
+    }
+
+    /// Returns the current phi suspicion value, or `None` if no phi detector
+    /// is configured.
+    pub fn phi(&self) -> Option<f64> {
+        self.phi_detector.as_ref().map(|d| d.phi())
     }
 
     /// Returns the duration since the last heartbeat, or `None` if no

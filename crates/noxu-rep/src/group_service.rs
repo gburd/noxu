@@ -6,13 +6,15 @@
 
 use noxu_sync::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::node_type::NodeType;
 
 /// Manages the replication group membership.
 ///
-/// 
+///
 ///
 /// The group service tracks all nodes that are members of a replication group,
 /// including their type (electable, monitor, secondary), network address, and
@@ -26,6 +28,15 @@ pub struct GroupService {
     nodes: RwLock<HashMap<String, NodeInfo>>,
     /// Group version, incremented on each membership change.
     version: RwLock<u64>,
+    /// Cleaner Barrier VLSN (CBVLSN) — global minimum committed VLSN across
+    /// all active replicas.
+    ///
+    /// The log cleaner must not remove log files at VLSNs ≤ CBVLSN because
+    /// one or more replicas may still need those entries. Updated whenever a
+    /// replica's `known_vlsn` is refreshed.
+    ///
+    /// Corresponds to `LocalCBVLSNUpdater` / `RepGroupImpl.getCBVLSN()` in JE HA.
+    cbvlsn: Arc<AtomicU64>,
 }
 
 /// Extended node information tracked by the group service.
@@ -50,6 +61,19 @@ pub struct NodeInfo {
     pub last_seen: Instant,
     /// Whether this node is currently active.
     pub is_active: bool,
+    /// The highest VLSN this node has committed (0 = unknown).
+    ///
+    /// Updated on every heartbeat / ack from the node. Used to compute the
+    /// CBVLSN (Cleaner Barrier VLSN) and to select peer feeders.
+    pub known_vlsn: u64,
+    /// The contiguous VLSN log range this node holds: `(first, last)`.
+    ///
+    /// A replica that holds `[first, last]` can act as a peer feeder for
+    /// any other replica that needs VLSNs within that range.  `None` means
+    /// the range is not yet known (node just joined or is restoring).
+    ///
+    /// Corresponds to `ReplicaState.getRepTxnEndVLSN()` in JE HA.
+    pub log_range: Option<(u64, u64)>,
 }
 
 impl GroupService {
@@ -60,7 +84,82 @@ impl GroupService {
             group_id: RwLock::new(0),
             nodes: RwLock::new(HashMap::new()),
             version: RwLock::new(0),
+            cbvlsn: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CBVLSN — Cleaner Barrier VLSN
+    // -----------------------------------------------------------------------
+
+    /// Return the current CBVLSN (Cleaner Barrier VLSN).
+    ///
+    /// This is the global minimum committed VLSN across all active electable
+    /// nodes. The log cleaner must retain all log files at VLSNs ≥ CBVLSN
+    /// so that lagging replicas can still catch up.
+    pub fn get_cbvlsn(&self) -> u64 {
+        self.cbvlsn.load(Ordering::Acquire)
+    }
+
+    /// Return an `Arc` to the raw CBVLSN counter.
+    ///
+    /// Useful for wiring the CBVLSN directly into the cleaner without
+    /// locking the group service.
+    pub fn cbvlsn_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.cbvlsn)
+    }
+
+    /// Update the `known_vlsn` for a node and recompute the CBVLSN.
+    ///
+    /// Call this whenever a heartbeat or ack arrives from the named node.
+    /// If the node is not found, the call is silently ignored (the node may
+    /// have been removed from the group).
+    pub fn update_node_vlsn(&self, name: &str, vlsn: u64) {
+        let mut nodes = self.nodes.write();
+        if let Some(info) = nodes.get_mut(name)
+            && vlsn > info.known_vlsn
+        {
+            info.known_vlsn = vlsn;
+        }
+        // Recompute CBVLSN = min(known_vlsn) over active electable nodes.
+        let new_cbvlsn = nodes
+            .values()
+            .filter(|n| n.is_active && n.node_type == crate::node_type::NodeType::Electable)
+            .map(|n| n.known_vlsn)
+            .min()
+            .unwrap_or(0);
+        self.cbvlsn.store(new_cbvlsn, Ordering::Release);
+    }
+
+    /// Update the VLSN log range `[first, last]` for a node.
+    ///
+    /// A node that holds a log range can serve as a peer feeder for other
+    /// replicas that need entries within that range.
+    pub fn update_node_log_range(&self, name: &str, first: u64, last: u64) {
+        let mut nodes = self.nodes.write();
+        if let Some(info) = nodes.get_mut(name) {
+            info.log_range = Some((first, last));
+        }
+    }
+
+    /// Find nodes that hold log entries covering the given VLSN.
+    ///
+    /// Returns names of all nodes (sorted by how recently they were seen)
+    /// whose `log_range` covers `vlsn`.  These nodes can act as peer feeders.
+    pub fn find_peers_with_vlsn(&self, vlsn: u64) -> Vec<String> {
+        let nodes = self.nodes.read();
+        let mut peers: Vec<(&str, Instant)> = nodes
+            .values()
+            .filter(|n| {
+                n.is_active
+                    && n.log_range
+                        .is_some_and(|(first, last)| first <= vlsn && vlsn <= last)
+            })
+            .map(|n| (n.name.as_str(), n.last_seen))
+            .collect();
+        // Sort by most-recently-seen first (freshest peer first).
+        peers.sort_by(|a, b| b.1.cmp(&a.1));
+        peers.into_iter().map(|(name, _)| name.to_string()).collect()
     }
 
     /// Get the group name.
@@ -247,6 +346,8 @@ mod tests {
             node_id: port as u32,
             joined_at: Instant::now(),
             last_seen: Instant::now(),
+            known_vlsn: 0,
+            log_range: None,
             is_active: true,
         }
     }

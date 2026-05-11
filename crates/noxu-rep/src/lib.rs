@@ -58,6 +58,7 @@ pub mod consistency;
 pub mod error;
 pub mod node_type;
 pub mod protocol;
+pub mod quorum_policy;
 pub mod rep_config;
 pub mod rep_group;
 pub mod rep_node;
@@ -103,6 +104,7 @@ pub mod state_change_listener;
 // Re-export primary types
 pub use commit_durability::{CommitDurability, ReplicaAckPolicy};
 pub use consistency::ConsistencyPolicy;
+pub use elections::phi_detector::PhiAccrualDetector;
 pub use error::{RepError, Result};
 pub use master_transfer::{
     MasterTransfer, MasterTransferConfig, TransferState,
@@ -111,6 +113,7 @@ pub use network_restore::{NetworkRestore, NetworkRestoreConfig, RestoreState};
 pub use network_restore_server::{NetworkRestoreServer, RESTORE_SERVICE_NAME};
 pub use node_state::{NodeState, NodeStateMachine};
 pub use node_type::NodeType;
+pub use quorum_policy::QuorumPolicy;
 pub use rep_config::RepConfig;
 pub use rep_group::RepGroup;
 pub use rep_node::RepNode;
@@ -119,4 +122,13 @@ pub use replicated_environment::ReplicatedEnvironment;
 pub use state_change_listener::{StateChangeEvent, StateChangeListener};
 pub use subscription::{
     Subscription, SubscriptionCallback, SubscriptionConfig, SubscriptionState,
+};
+#[cfg(feature = "quic")]
+pub use net::{
+    QuicChannel, QuicChannelListener, default_server_config, insecure_client_config,
+};
+#[cfg(feature = "quic")]
+pub use net::{
+    QuicMultiplexedChannel, QuicMultiplexedChannelListener, ReconnectToken, ReplicationChannel,
+    mux_server_config, mux_insecure_client_config,
 };
