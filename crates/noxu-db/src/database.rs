@@ -6,6 +6,7 @@ use crate::cursor_config::CursorConfig;
 use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
+use crate::database_stats::{BtreeStats, DatabaseStats};
 use crate::join_config::JoinConfig;
 use crate::join_cursor::JoinCursor;
 use crate::lock_mode::LockMode;
@@ -14,6 +15,7 @@ use crate::read_options::ReadOptions;
 use crate::secondary_cursor::SecondaryCursor;
 use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
+use crate::stats_config::StatsConfig;
 use crate::transaction::Transaction;
 use crate::write_options::WriteOptions;
 use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode, ThroughputStats};
@@ -725,6 +727,47 @@ impl Database {
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Returns B-tree statistics for this database.
+    ///
+    /// Mirrors JE's `Database.getStats(StatsConfig)`.
+    ///
+    /// When `config.fast` is `true`, only the O(1) entry-count is returned
+    /// and no tree traversal is performed.  When `fast` is `false` (default),
+    /// the full tree is walked to populate all node-count fields.
+    ///
+    /// # Errors
+    /// Returns an error if the database is closed.
+    pub fn get_stats(&self, config: Option<&StatsConfig>) -> Result<DatabaseStats> {
+        self.check_open()?;
+        let fast = config.map(|c| c.fast).unwrap_or(false);
+
+        let btree = if fast {
+            // Fast path: O(1) counter only; skip tree traversal.
+            BtreeStats {
+                leaf_node_count: self.db_impl.read().entry_count(),
+                ..Default::default()
+            }
+        } else {
+            // Full path: walk the tree.
+            let guard = self.db_impl.read();
+            match guard.collect_btree_stats() {
+                Some(ts) => BtreeStats {
+                    leaf_node_count: ts.n_entries,
+                    deleted_leaf_node_count: 0,
+                    bottom_internal_node_count: ts.n_bins,
+                    internal_node_count: ts.n_ins,
+                    main_tree_max_depth: ts.height,
+                },
+                None => BtreeStats {
+                    leaf_node_count: guard.entry_count(),
+                    ..Default::default()
+                },
+            }
+        };
+
+        Ok(DatabaseStats { btree })
     }
 
     /// Verifies the structural integrity of this database's B-tree.
