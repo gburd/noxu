@@ -281,6 +281,91 @@ impl<'a> SecondaryCursor<'a> {
     }
 
     // ------------------------------------------------------------------
+    // Join-cursor helpers (used by JoinCursor internals).
+    // ------------------------------------------------------------------
+
+    /// Returns the primary key at the current cursor position *without*
+    /// fetching primary data.  Returns `None` if the cursor is not
+    /// positioned on a record.
+    pub(crate) fn get_current_primary_key_only(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut sec_key = DatabaseEntry::new();
+        let mut pri_key_entry = DatabaseEntry::new();
+        // A "not positioned" or "not found" condition returns Ok(None) so the
+        // caller (JoinCursor) can treat it as an empty candidate set rather than
+        // propagating a spurious error.
+        let status = match self.inner.get(&mut sec_key, &mut pri_key_entry, Get::Current, None) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        if status != OperationStatus::Success {
+            return Ok(None);
+        }
+        Ok(pri_key_entry.get_data().map(|d| d.to_vec()))
+    }
+
+    /// Returns the secondary key bytes at the current cursor position.
+    /// Returns `None` if the cursor is not positioned on a record.
+    pub(crate) fn get_current_sec_key_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut sec_key = DatabaseEntry::new();
+        let mut pri_key_entry = DatabaseEntry::new();
+        let status = match self.inner.get(&mut sec_key, &mut pri_key_entry, Get::Current, None) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        if status != OperationStatus::Success {
+            return Ok(None);
+        }
+        Ok(sec_key.get_data().map(|d| d.to_vec()))
+    }
+
+    /// Returns an estimate of the number of primary keys that share the
+    /// current secondary key.  In the current one-to-one secondary model
+    /// this is always 0 or 1; with duplicate support it will reflect the
+    /// actual duplicate count.
+    pub(crate) fn count_estimate(&mut self) -> u64 {
+        match self.inner.count() {
+            Ok(n) => n,
+            Err(_) => 0,
+        }
+    }
+
+    /// Advances to the next record that has the **same** secondary key as
+    /// the current position (i.e. the next "duplicate").
+    ///
+    /// In the current one-to-one secondary model the cursor stores exactly
+    /// one primary key per secondary key, so this always returns
+    /// `NotFound`.  When full duplicate support is added this will iterate
+    /// the duplicate set.
+    pub(crate) fn get_next_dup(&mut self) -> Result<OperationStatus> {
+        let Some(current_sk) = self.get_current_sec_key_bytes()? else {
+            return Ok(OperationStatus::NotFound);
+        };
+        let mut sec_key = DatabaseEntry::new();
+        let mut pri_key_entry = DatabaseEntry::new();
+        let status = self.inner.get(&mut sec_key, &mut pri_key_entry, Get::Next, None)?;
+        if status != OperationStatus::Success {
+            return Ok(OperationStatus::NotFound);
+        }
+        let new_sk = sec_key.get_data().map(|d| d.to_vec()).unwrap_or_default();
+        if new_sk == current_sk {
+            Ok(OperationStatus::Success)
+        } else {
+            // Stepped onto a different secondary key — not a duplicate.
+            Ok(OperationStatus::NotFound)
+        }
+    }
+
+    /// Returns `true` if the primary key at the current cursor position
+    /// matches `candidate`.  Used by `JoinCursor` to probe secondary
+    /// cursors without touching the primary database.
+    pub(crate) fn has_candidate_primary_key(&mut self, candidate: &[u8]) -> Result<bool> {
+        match self.get_current_primary_key_only()? {
+            Some(pk) => Ok(pk == candidate),
+            None => Ok(false),
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 

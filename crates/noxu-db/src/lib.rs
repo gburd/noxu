@@ -36,6 +36,8 @@ pub mod environment_config;
 pub mod error;
 pub mod extinction_filter;
 pub mod get;
+pub mod join_config;
+pub mod join_cursor;
 pub mod lock_mode;
 pub mod operation_result;
 pub mod operation_status;
@@ -69,6 +71,8 @@ pub use error::{
 };
 pub use extinction_filter::{ExtinctionFilter, ExtinctionStatus};
 pub use get::Get;
+pub use join_config::JoinConfig;
+pub use join_cursor::JoinCursor;
 pub use lock_mode::LockMode;
 pub use operation_result::OperationResult;
 pub use operation_status::OperationStatus;

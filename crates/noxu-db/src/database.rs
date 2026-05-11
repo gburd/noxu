@@ -6,9 +6,12 @@ use crate::cursor_config::CursorConfig;
 use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
+use crate::join_config::JoinConfig;
+use crate::join_cursor::JoinCursor;
 use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
 use crate::read_options::ReadOptions;
+use crate::secondary_cursor::SecondaryCursor;
 use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::transaction::Transaction;
@@ -746,6 +749,35 @@ impl Database {
         self.check_open()?;
         let guard = self.db_impl.read();
         Ok(noxu_engine::verify_database_impl(&guard, config))
+    }
+
+    /// Creates a join cursor that returns records matching all secondary-key
+    /// constraints expressed by the pre-positioned `cursors`.
+    ///
+    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)` from JE.
+    ///
+    /// Each cursor in `cursors` must already be positioned at the desired
+    /// secondary key value (e.g. via `SecondaryCursor::get_search_key`).
+    /// The join algorithm iterates through all candidate primary keys from
+    /// `cursors[0]` and probes `cursors[1..n]` to confirm each candidate
+    /// also appears in their secondary keys.  Candidates that pass all
+    /// probes are returned by [`JoinCursor::get_next`].
+    ///
+    /// Unless `config.no_sort` is `true`, the cursor array is re-ordered by
+    /// ascending duplicate-count estimate before the join starts, matching
+    /// JE's optimisation for minimum candidate-set size.
+    ///
+    /// The returned `JoinCursor` owns the `cursors` for its lifetime.
+    ///
+    /// # Errors
+    /// Returns an error if this database handle is closed.
+    pub fn join<'db>(
+        &'db self,
+        cursors: Vec<SecondaryCursor<'db>>,
+        config: Option<JoinConfig>,
+    ) -> Result<JoinCursor<'db>> {
+        self.check_open()?;
+        JoinCursor::new(self, cursors, config)
     }
 
     /// Checks if the database is open, returns an error if not.
