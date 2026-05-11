@@ -1209,6 +1209,16 @@ impl Tree {
         }
     }
 
+    /// Sets the key comparator, replacing any existing one.
+    pub fn set_comparator(&mut self, comparator: KeyComparatorFn) {
+        self.key_comparator = Some(comparator);
+    }
+
+    /// Takes the key comparator out of this tree (leaving None).
+    pub fn take_comparator(&mut self) -> Option<KeyComparatorFn> {
+        self.key_comparator.take()
+    }
+
     /// Returns the key comparator if set, or performs lexicographic comparison.
     #[inline]
     fn key_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -1447,13 +1457,13 @@ impl Tree {
                         let (idx, exact) = bin.find_entry_compressed(key);
                         if exact { Some(idx) } else { None }
                     };
-                    if let Some(slot_idx) = slot {
-                        if let Some(entry) = bin.entries.get_mut(slot_idx) {
-                            entry.expiration_time = expiration_hours;
-                            bin.expiration_in_hours = true;
-                            bin.dirty = true;
-                            return true;
-                        }
+                    if let Some(slot_idx) = slot
+                        && let Some(entry) = bin.entries.get_mut(slot_idx)
+                    {
+                        entry.expiration_time = expiration_hours;
+                        bin.expiration_in_hours = true;
+                        bin.dirty = true;
+                        return true;
                     }
                 }
                 return false;
