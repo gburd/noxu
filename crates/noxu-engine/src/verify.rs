@@ -2,6 +2,7 @@
 //!
 //! Related verification functionality.
 
+use noxu_dbi::DatabaseImpl;
 use noxu_tree::tree::{BinStub, InNodeStub, TreeNode};
 use noxu_tree::Tree;
 use noxu_util::NULL_LSN;
@@ -478,7 +479,7 @@ pub fn verify_environment(config: &VerifyConfig) -> VerifyResult {
 /// perform full structural verification (key-range checks, LSN validity).
 /// This entry point validates database-level metadata without a tree handle.
 ///
-/// 
+///
 ///
 /// # Arguments
 ///
@@ -499,6 +500,40 @@ pub fn verify_database(db_name: &str, config: &VerifyConfig) -> VerifyResult {
         databases_verified: 1,
         records_verified: 0,
         passed: true,
+    }
+}
+
+/// Verify a `DatabaseImpl`'s B-tree structural integrity.
+///
+/// Calls `verify_tree()` on the underlying real B-tree when one is present.
+/// Used by `Database::verify()` in `noxu-db` to bridge the crate boundary
+/// (noxu-db does not depend directly on noxu-tree).
+///
+/// Mirrors `DatabaseImpl.verify(VerifyConfig)` in JE — calls BtreeVerifier
+/// on the tree owned by the DatabaseImpl.
+///
+/// # Arguments
+///
+/// * `db_impl` - The database implementation to verify.
+/// * `config` - Configuration controlling what to verify.
+///
+/// # Returns
+///
+/// A `VerifyResult` with structural errors and the count of records verified.
+pub fn verify_database_impl(db_impl: &DatabaseImpl, config: &VerifyConfig) -> VerifyResult {
+    let db_name = db_impl.get_name();
+    match db_impl.get_real_tree() {
+        Some(tree) => verify_tree(tree, db_name, config),
+        None => {
+            // No real B-tree attached (e.g., stub / metadata DB) — treat as empty.
+            VerifyResult {
+                errors: Vec::new(),
+                warnings: Vec::new(),
+                databases_verified: 1,
+                records_verified: 0,
+                passed: true,
+            }
+        }
     }
 }
 
