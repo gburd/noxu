@@ -25,14 +25,17 @@
 
 pub mod byte_comparator;
 pub mod cache_mode;
+pub mod checkpoint_config;
 pub mod cursor;
 pub mod cursor_config;
 pub mod database;
 pub mod database_config;
 pub mod database_entry;
+pub mod database_stats;
 pub mod durability;
 pub mod environment;
 pub mod environment_config;
+pub mod environment_mutable_config;
 pub mod error;
 pub mod extinction_filter;
 pub mod get;
@@ -50,6 +53,7 @@ pub mod secondary_database;
 pub mod sequence;
 pub mod sequence_config;
 pub mod sequence_stats;
+pub mod stats_config;
 pub mod transaction;
 pub mod transaction_config;
 pub mod write_options;
@@ -70,10 +74,14 @@ pub use error::{
     EnvironmentFailureReason, ExceptionEvent, ExceptionListener, ExceptionSource, NoxuError, Result,
 };
 pub use extinction_filter::{ExtinctionFilter, ExtinctionStatus};
+pub use checkpoint_config::CheckpointConfig;
+pub use database_stats::{BtreeStats, DatabaseStats};
+pub use environment_mutable_config::EnvironmentMutableConfig;
 pub use get::Get;
 pub use join_config::JoinConfig;
 pub use join_cursor::JoinCursor;
 pub use lock_mode::LockMode;
+pub use stats_config::StatsConfig;
 pub use operation_result::OperationResult;
 pub use operation_status::OperationStatus;
 pub use put::Put;

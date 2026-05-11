@@ -75,7 +75,7 @@ pub use uncached_ln::{make_uncached_ln, make_uncached_ln_from_bytes};
 pub use versioned_ln::make_versioned_ln;
 
 // Tree types
-pub use tree::{BinEntry, KeyComparatorFn, Tree, TreeNode, generate_node_id};
+pub use tree::{BinEntry, BinStub, InNodeStub, KeyComparatorFn, Tree, TreeNode, TreeStats, generate_node_id};
 
 // Re-export from in_node
 pub use in_node::{

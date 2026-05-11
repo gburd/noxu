@@ -103,8 +103,8 @@ impl<'a> JoinCursor<'a> {
         // In JE these are all "duplicate" records with the same secondary key.
         // In Noxu's current one-to-one secondary model there is at most one.
         let mut candidates = std::collections::VecDeque::new();
-        if !cursors.is_empty() {
-            if let Some(pk) = cursors[0].get_current_primary_key_only()? {
+        if let Some(first) = cursors.first_mut() {
+            if let Some(pk) = first.get_current_primary_key_only()? {
                 candidates.push_back(pk);
             }
             // When full duplicate support is added, call get_next_dup() here

@@ -323,10 +323,7 @@ impl<'a> SecondaryCursor<'a> {
     /// this is always 0 or 1; with duplicate support it will reflect the
     /// actual duplicate count.
     pub(crate) fn count_estimate(&mut self) -> u64 {
-        match self.inner.count() {
-            Ok(n) => n,
-            Err(_) => 0,
-        }
+        self.inner.count().unwrap_or_default()
     }
 
     /// Advances to the next record that has the **same** secondary key as

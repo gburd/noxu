@@ -905,6 +905,23 @@ impl EnvironmentImpl {
         self.checkpointer.as_ref().map(Arc::clone)
     }
 
+    /// Runs a manual checkpoint synchronously.
+    ///
+    /// Bridges `Environment::checkpoint()` in `noxu-db` without exposing
+    /// `noxu_recovery` as a direct dependency of that crate.
+    /// Returns `Ok(())` if there is no checkpointer (read-only / non-txn env).
+    pub fn run_checkpoint(&self) -> Result<(), DbiError> {
+        match &self.checkpointer {
+            None => Ok(()),
+            Some(ckpt) => ckpt
+                .do_checkpoint("manual")
+                .map(|_| ())
+                .map_err(|e| DbiError::EnvironmentFailure {
+                    reason: e.to_string(),
+                }),
+        }
+    }
+
     /// Runs one pass of the log cleaner.
     ///
     /// Selects up to `n_files` least-utilized log files, processes them
