@@ -73,6 +73,12 @@ use noxu_rep::elections::{run_acceptor, run_election};
 use noxu_rep::net::{Channel, TcpChannel, TcpChannelListener};
 use noxu_rep::stream::{FeederRunner, LogScanner};
 
+/// Maximum time to wait for any transport connect under kernel netem chaos.
+/// TCP's OS default (~2 min) and QUIC's internal retry timeout (~30 s) both
+/// make election retries unbearably slow under MinorityPartition (80% loss).
+/// 2 s is sufficient for loopback.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 // QUIC types — compiled only when the `quic` feature is enabled.
 #[cfg(feature = "quic")]
 use noxu_rep::net::{
@@ -226,18 +232,24 @@ impl AnyListener {
 /// Open an **election** channel to `addr` using the given transport.
 fn connect_election(kind: TransportKind, addr: SocketAddr) -> Option<Arc<dyn Channel>> {
     match kind {
-        TransportKind::Tcp => match TcpChannel::connect(addr) {
-            Ok(c)  => Some(Arc::new(c) as Arc<dyn Channel>),
-            Err(e) => { eprintln!("[torture] TCP connect to {addr} failed: {e}"); None }
-        },
+        TransportKind::Tcp => {
+            // Use a short timeout so election retries stay fast under kernel
+            // netem packet loss (OS default TCP timeout is ~2 min).
+            match std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(s)  => Some(Arc::new(TcpChannel::new(s)) as Arc<dyn Channel>),
+                Err(e) => { eprintln!("[torture] TCP connect to {addr} failed: {e}"); None }
+            }
+        }
         #[cfg(feature = "quic")]
-        TransportKind::Quic => QuicChannel::connect(addr, "localhost")
-            .ok()
-            .map(|c| Arc::new(c) as Arc<dyn Channel>),
+        TransportKind::Quic => quic_connect_timeout(addr, CONNECT_TIMEOUT,
+            |a| QuicChannel::connect(a, "localhost")
+                .ok()
+                .map(|c| Arc::new(c) as Arc<dyn Channel>)),
         #[cfg(feature = "quic")]
-        TransportKind::QuicMux => QuicMultiplexedChannel::connect(addr, "localhost")
-            .ok()
-            .map(|mux| Arc::new(MuxElectionChannel(Arc::new(mux))) as Arc<dyn Channel>),
+        TransportKind::QuicMux => quic_connect_timeout(addr, CONNECT_TIMEOUT,
+            |a| QuicMultiplexedChannel::connect(a, "localhost")
+                .ok()
+                .map(|mux| Arc::new(MuxElectionChannel(Arc::new(mux))) as Arc<dyn Channel>)),
         #[allow(unreachable_patterns)]
         _ => TcpChannel::connect(addr)
             .ok()
@@ -248,22 +260,37 @@ fn connect_election(kind: TransportKind, addr: SocketAddr) -> Option<Arc<dyn Cha
 /// Open a **VLSN streaming** channel to `addr` using the given transport.
 fn connect_log(kind: TransportKind, addr: SocketAddr) -> Option<Arc<dyn Channel>> {
     match kind {
-        TransportKind::Tcp => TcpChannel::connect(addr)
+        TransportKind::Tcp => std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
             .ok()
-            .map(|c| Arc::new(c) as Arc<dyn Channel>),
+            .map(|s| Arc::new(TcpChannel::new(s)) as Arc<dyn Channel>),
         #[cfg(feature = "quic")]
-        TransportKind::Quic => QuicChannel::connect(addr, "localhost")
-            .ok()
-            .map(|c| Arc::new(c) as Arc<dyn Channel>),
+        TransportKind::Quic => quic_connect_timeout(addr, CONNECT_TIMEOUT,
+            |a| QuicChannel::connect(a, "localhost")
+                .ok()
+                .map(|c| Arc::new(c) as Arc<dyn Channel>)),
         #[cfg(feature = "quic")]
-        TransportKind::QuicMux => QuicMultiplexedChannel::connect(addr, "localhost")
-            .ok()
-            .map(|mux| Arc::new(MuxLogChannel(Arc::new(mux))) as Arc<dyn Channel>),
+        TransportKind::QuicMux => quic_connect_timeout(addr, CONNECT_TIMEOUT,
+            |a| QuicMultiplexedChannel::connect(a, "localhost")
+                .ok()
+                .map(|mux| Arc::new(MuxLogChannel(Arc::new(mux))) as Arc<dyn Channel>)),
         #[allow(unreachable_patterns)]
         _ => TcpChannel::connect(addr)
             .ok()
             .map(|c| Arc::new(c) as Arc<dyn Channel>),
     }
+}
+
+/// Run a QUIC connect on a background thread and return the result within
+/// `timeout`. QUIC's internal retry can take ~30 s under high packet loss;
+/// this wrapper caps it at `CONNECT_TIMEOUT` (2 s) for loopback testing.
+#[cfg(feature = "quic")]
+fn quic_connect_timeout<F>(addr: SocketAddr, timeout: Duration, f: F) -> Option<Arc<dyn Channel>>
+where
+    F: FnOnce(SocketAddr) -> Option<Arc<dyn Channel>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(f(addr)); });
+    rx.recv_timeout(timeout).ok().flatten()
 }
 
 // ============================================================================
