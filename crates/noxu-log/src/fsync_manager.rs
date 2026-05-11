@@ -196,6 +196,12 @@ pub struct FsyncManager {
     n_fsyncs: AtomicU64,
     /// Total number of fsync requests (before coalescing).
     n_fsync_requests: AtomicU64,
+    /// Number of fsync requests that timed out (waited but leader took too long).
+    n_fsync_timeouts: AtomicU64,
+    /// Number of group-commit batches where leader served ≥1 waiter.
+    n_group_commits: AtomicU64,
+    /// Cumulative fsync duration in milliseconds.
+    fsync_time_ms: AtomicU64,
 }
 
 impl FsyncManager {
@@ -221,6 +227,9 @@ impl FsyncManager {
             leader_condvar: Condvar::new(),
             n_fsyncs: AtomicU64::new(0),
             n_fsync_requests: AtomicU64::new(0),
+            n_fsync_timeouts: AtomicU64::new(0),
+            n_group_commits: AtomicU64::new(0),
+            fsync_time_ms: AtomicU64::new(0),
         }
     }
 
@@ -319,6 +328,7 @@ impl FsyncManager {
                 WaitStatus::DoTimeoutFsync => {
                     // Timed out — do our own fsync regardless.
                     do_work = true;
+                    self.n_fsync_timeouts.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -326,7 +336,15 @@ impl FsyncManager {
         // ── Phase 3: perform the fsync ────────────────────────────────────
         if do_work {
             self.n_fsyncs.fetch_add(1, Ordering::Relaxed);
+            let fsync_start = std::time::Instant::now();
             let result = do_fsync();
+            let elapsed_ms = fsync_start.elapsed().as_millis() as u64;
+            self.fsync_time_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+            // Count as a group commit when leader has an in-progress group
+            // (meaning at least one other thread piggybacked on this fsync).
+            if is_leader && in_progress_group.is_some() {
+                self.n_group_commits.fetch_add(1, Ordering::Relaxed);
+            }
 
             if is_leader {
                 let in_prog = in_progress_group.as_ref().unwrap();
@@ -353,6 +371,21 @@ impl FsyncManager {
     /// Stat (see `LogStatDefinition.N_FSYNCS`).
     pub fn fsync_count(&self) -> u64 {
         self.n_fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Returns number of fsync requests that timed out.
+    pub fn fsync_timeout_count(&self) -> u64 {
+        self.n_fsync_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Returns number of group-commit batches where leader served ≥1 waiter.
+    pub fn group_commit_count(&self) -> u64 {
+        self.n_group_commits.load(Ordering::Relaxed)
+    }
+
+    /// Returns cumulative fsync duration in milliseconds.
+    pub fn fsync_time_ms(&self) -> u64 {
+        self.fsync_time_ms.load(Ordering::Relaxed)
     }
 
     /// Returns total number of fsync requests (before coalescing).

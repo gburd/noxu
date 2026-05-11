@@ -99,6 +99,10 @@ pub struct FileManager {
     pub n_sequential_writes: AtomicU64,
     /// Total bytes written sequentially.
     pub n_sequential_write_bytes: AtomicU64,
+    /// Number of random (point-lookup) read operations.
+    pub n_random_reads: AtomicU64,
+    /// Total bytes from random read operations.
+    pub n_random_read_bytes: AtomicU64,
 }
 
 impl FileManager {
@@ -158,6 +162,8 @@ impl FileManager {
             n_sequential_read_bytes: AtomicU64::new(0),
             n_sequential_writes: AtomicU64::new(0),
             n_sequential_write_bytes: AtomicU64::new(0),
+            n_random_reads: AtomicU64::new(0),
+            n_random_read_bytes: AtomicU64::new(0),
         };
 
         // Lock the environment
@@ -562,6 +568,24 @@ impl FileManager {
         Ok(n)
     }
 
+    /// Reads bytes from a log file at a given offset, counted as a random
+    /// (point-lookup) read rather than a sequential scan read.
+    ///
+    /// Used by `LogManager::read_at_lsn` for in-flight log reads.
+    pub fn read_from_file_random(
+        &self,
+        file_num: u32,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let handle = self.get_file_handle(file_num)?;
+        let mut guard = handle.acquire()?;
+        let n = guard.read_at(offset, buf)?;
+        self.n_random_reads.fetch_add(1, Ordering::Relaxed);
+        self.n_random_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
     /// Returns the length of a log file in bytes.
     pub fn get_file_length(&self, file_num: u32) -> Result<u64> {
         let path = self.file_path(file_num);
@@ -609,6 +633,8 @@ impl FileManager {
             n_sequential_read_bytes: self.n_sequential_read_bytes.load(Ordering::Relaxed),
             n_sequential_writes: self.n_sequential_writes.load(Ordering::Relaxed),
             n_sequential_write_bytes: self.n_sequential_write_bytes.load(Ordering::Relaxed),
+            n_random_reads: self.n_random_reads.load(Ordering::Relaxed),
+            n_random_read_bytes: self.n_random_read_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -662,12 +688,13 @@ impl Drop for FileManager {
 
 /// Snapshot of FileManager I/O statistics.
 ///
-/// Mirrors JE FILEMGR_FILE_OPENS, FILEMGR_SEQUENTIAL_READS/WRITES etc.
+/// Mirrors JE FILEMGR_FILE_OPENS, FILEMGR_SEQUENTIAL_READS/WRITES,
+/// FILEMGR_RANDOM_READS etc.
 #[derive(Debug, Clone, Default)]
 pub struct FileManagerIoStats {
     /// Number of log files opened (LRU cache miss).
     pub n_file_opens: u64,
-    /// Number of sequential read operations.
+    /// Number of sequential read operations (recovery scan).
     pub n_sequential_reads: u64,
     /// Total bytes read sequentially.
     pub n_sequential_read_bytes: u64,
@@ -675,6 +702,10 @@ pub struct FileManagerIoStats {
     pub n_sequential_writes: u64,
     /// Total bytes written sequentially.
     pub n_sequential_write_bytes: u64,
+    /// Number of random (point-lookup) read operations.
+    pub n_random_reads: u64,
+    /// Total bytes from random read operations.
+    pub n_random_read_bytes: u64,
 }
 
 #[cfg(test)]
