@@ -57,7 +57,7 @@ impl FileLogSource {
         // SAFETY: We extend the lifetime of the guard to 'static because we keep
         // the Arc<FileHandle> alive for as long as the guard exists.
         let guard = unsafe {
-            let guard = handle.acquire();
+            let guard = handle.acquire()?;
             std::mem::transmute::<FileHandleGuard<'_>, FileHandleGuard<'static>>(
                 guard,
             )

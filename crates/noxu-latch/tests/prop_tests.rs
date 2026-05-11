@@ -16,7 +16,7 @@ proptest! {
         let latch = ExclusiveLatch::named("prop-test");
         for _ in 0..iterations {
             {
-                let _guard = latch.acquire();
+                let _guard = latch.acquire().expect("acquire");
                 prop_assert!(latch.is_locked());
                 prop_assert!(latch.is_owner());
             }
@@ -54,14 +54,14 @@ proptest! {
         let latch = Arc::new(SharedLatch::named("prop-shared", false));
 
         // Acquire a shared lock from the main thread
-        let _main_guard = latch.acquire_shared();
+        let _main_guard = latch.acquire_shared().expect("acquire_shared");
 
         // Spawn additional reader threads that should all succeed
         let handles: Vec<_> = (0..num_readers)
             .map(|_| {
                 let latch = latch.clone();
                 std::thread::spawn(move || {
-                    let _guard = latch.acquire_shared();
+                    let _guard = latch.acquire_shared().expect("acquire_shared");
                     true
                 })
             })
@@ -79,7 +79,7 @@ proptest! {
         let latch = SharedLatch::named("prop-exclusive", false);
         for _ in 0..iterations {
             {
-                let _guard = latch.acquire_exclusive();
+                let _guard = latch.acquire_exclusive().expect("acquire_exclusive");
                 prop_assert!(latch.is_exclusive_owner());
             }
             prop_assert!(!latch.is_exclusive_owner());
@@ -92,7 +92,7 @@ proptest! {
         let latch = SharedLatch::named("prop-excl-only", true);
         prop_assert!(latch.is_exclusive_only());
 
-        let _guard = latch.acquire_shared();
+        let _guard = latch.acquire_shared().expect("acquire_shared");
         // In exclusive-only mode, shared acquisition becomes exclusive
         prop_assert!(latch.is_exclusive_owner());
     }
