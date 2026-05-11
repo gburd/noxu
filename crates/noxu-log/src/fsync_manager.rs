@@ -202,6 +202,8 @@ pub struct FsyncManager {
     n_group_commits: AtomicU64,
     /// Cumulative fsync duration in milliseconds.
     fsync_time_ms: AtomicU64,
+    /// Sum of all group-commit batch sizes (waiters served per fsync).
+    n_fsync_batch_size_sum: AtomicU64,
 }
 
 impl FsyncManager {
@@ -230,6 +232,7 @@ impl FsyncManager {
             n_fsync_timeouts: AtomicU64::new(0),
             n_group_commits: AtomicU64::new(0),
             fsync_time_ms: AtomicU64::new(0),
+            n_fsync_batch_size_sum: AtomicU64::new(0),
         }
     }
 
@@ -247,6 +250,7 @@ impl FsyncManager {
         self.n_fsync_requests.fetch_add(1, Ordering::Relaxed);
         let mut do_work = false;
         let mut is_leader = false;
+        let mut leader_batch_size: u64 = 0;
         // Group whose waiters this leader serves (set only when is_leader).
         let mut in_progress_group: Option<Arc<FSyncGroup>> = None;
         // Group this thread belongs to as a waiter.
@@ -282,6 +286,7 @@ impl FsyncManager {
                 }
 
                 // Capture the current waiters group; swap in a fresh one.
+                leader_batch_size = state.num_next_waiters as u64;
                 in_progress_group = Some(Arc::clone(&state.next_fsync_waiters));
                 state.next_fsync_waiters = FSyncGroup::new();
                 state.num_next_waiters = 0;
@@ -320,6 +325,7 @@ impl FsyncManager {
                         }
 
                         // The `my_group` cohort is now the in-progress group.
+                        leader_batch_size = state.num_next_waiters as u64;
                         in_progress_group = my_group.take();
                         state.next_fsync_waiters = FSyncGroup::new();
                         state.num_next_waiters = 0;
@@ -344,6 +350,7 @@ impl FsyncManager {
             // (meaning at least one other thread piggybacked on this fsync).
             if is_leader && in_progress_group.is_some() {
                 self.n_group_commits.fetch_add(1, Ordering::Relaxed);
+                self.n_fsync_batch_size_sum.fetch_add(leader_batch_size, Ordering::Relaxed);
             }
 
             if is_leader {
@@ -386,6 +393,11 @@ impl FsyncManager {
     /// Returns cumulative fsync duration in milliseconds.
     pub fn fsync_time_ms(&self) -> u64 {
         self.fsync_time_ms.load(Ordering::Relaxed)
+    }
+
+    /// Returns cumulative sum of group-commit batch sizes (total waiters served).
+    pub fn fsync_batch_size_sum(&self) -> u64 {
+        self.n_fsync_batch_size_sum.load(Ordering::Relaxed)
     }
 
     /// Returns total number of fsync requests (before coalescing).

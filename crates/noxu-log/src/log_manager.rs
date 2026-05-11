@@ -388,8 +388,14 @@ impl LogManager {
         // LWL released here.
 
         // Flush / fsync if requested, outside the LWL (matching JE).
+        // Use flush_sync_if_needed(lsn) rather than flush_sync() so that a
+        // concurrent committer whose data was already written by a racing
+        // leader thread can return immediately without competing for
+        // write_io_latch.  One thread flushes all pending writes; the others
+        // see last_flush_lsn > their_commit_lsn and skip the I/O entirely.
+        // This is the JE LogManager.flushTo(lsn) coalescing optimisation.
         if fsync_required {
-            self.flush_sync()?;
+            self.flush_sync_if_needed(lsn)?;
         } else if flush_required {
             self.flush_no_sync()?;
         }
@@ -799,6 +805,7 @@ impl LogManager {
             n_fsync_timeouts: self.fsync_manager.fsync_timeout_count(),
             n_group_commits: self.fsync_manager.group_commit_count(),
             fsync_time_ms: self.fsync_manager.fsync_time_ms(),
+            n_fsync_batch_size_sum: self.fsync_manager.fsync_batch_size_sum(),
             n_file_opens: io_stats.n_file_opens,
             n_sequential_reads: io_stats.n_sequential_reads,
             n_sequential_read_bytes: io_stats.n_sequential_read_bytes,
@@ -828,6 +835,8 @@ pub struct LogManagerStats {
     pub n_group_commits: u64,
     /// Cumulative fsync duration in milliseconds.
     pub fsync_time_ms: u64,
+    /// Sum of all group-commit batch sizes (total waiters served across all batches).
+    pub n_fsync_batch_size_sum: u64,
     /// Number of log file opens (cache miss).
     pub n_file_opens: u64,
     /// Number of sequential read operations (recovery scan).
