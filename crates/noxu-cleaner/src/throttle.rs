@@ -164,6 +164,27 @@ impl CleanerThrottle {
     pub fn write_rate_bytes_per_sec(&self) -> f64 {
         *self.write_rate_ewma.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// Returns a recommended write-path delay when the log write rate exceeds
+    /// `HIGH_WRITE_THRESHOLD_BYTES_PER_SEC`, or `None` if no throttling is
+    /// needed.
+    ///
+    /// The delay scales linearly with how far above the threshold we are,
+    /// clamped to [1 ms, 50 ms].  At 2× threshold the writer sleeps ~2 ms;
+    /// at 10× threshold it sleeps ~10 ms; above 50× it sleeps 50 ms.
+    ///
+    /// This is the write-path counterpart to the cleaner's adaptive sleep.
+    /// JE implements equivalent logic in `CleanerThrottle.getWriteDelay()`.
+    pub fn should_throttle_writer(&self) -> Option<std::time::Duration> {
+        let rate = self.write_rate_bytes_per_sec() as u64;
+        if rate <= HIGH_WRITE_THRESHOLD_BYTES_PER_SEC {
+            return None;
+        }
+        // overshoot factor (1.0 at threshold, 2.0 at 2× threshold, etc.)
+        let factor = rate / HIGH_WRITE_THRESHOLD_BYTES_PER_SEC;
+        let delay_ms = factor.clamp(1, 50);
+        Some(std::time::Duration::from_millis(delay_ms))
+    }
 }
 
 impl Default for CleanerThrottle {

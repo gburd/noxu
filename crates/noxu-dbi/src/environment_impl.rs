@@ -898,6 +898,14 @@ impl EnvironmentImpl {
         self.cleaner.as_ref().map(Arc::clone)
     }
 
+    /// Returns the `CleanerThrottle` from the active cleaner, if one exists.
+    ///
+    /// Used by the write path to apply backpressure when the log write rate
+    /// significantly exceeds the cleaner's capacity.
+    pub fn get_cleaner_throttle(&self) -> Option<Arc<noxu_cleaner::CleanerThrottle>> {
+        self.cleaner.as_ref().map(|c| Arc::clone(&c.throttle))
+    }
+
     /// Returns the checkpointer, if one was created.
     ///
     /// Returns `None` for read-only environments.

@@ -18,9 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Number of lock table shards.
 ///
 /// Multiple lock tables reduce contention by allowing concurrent operations
-/// on locks in different tables.  defaults to 1, but we use 16 for better
-/// concurrency on multi-core systems.
-const N_LOCK_TABLES: usize = 16;
+/// on locks in different tables.  64 shards provide good distribution across
+/// multi-core systems under high concurrency (16+ threads).  The hash
+/// function spreads LSNs uniformly so collision probability is low.
+const N_LOCK_TABLES: usize = 64;
 
 /// The LockManager manages all locks in the system.
 ///
@@ -76,6 +77,17 @@ pub struct LockManager {
     /// (thread-locker map), extended
     /// to support HandleLocker buddy sharing.
     share_registry: RwLock<HashMap<i64, i64>>,
+
+    /// Incremental waits-for graph for O(1) deadlock detection.
+    ///
+    /// Maps waiting_locker_id → [owner_locker_ids it is blocked by].
+    /// Inserted O(1) when a locker enters the wait path; removed when it
+    /// exits (grant, timeout, or deadlock abort).
+    ///
+    /// `check_deadlock_for_waiter` reads from this small graph instead of
+    /// rescanning all N_LOCK_TABLES shards — eliminates the O(64) full scan
+    /// that stalls all threads under high contention.
+    waiter_graph: Mutex<HashMap<i64, Vec<i64>>>,
 }
 
 /// Internal statistics tracking.
@@ -117,6 +129,7 @@ impl LockManager {
             },
             lock_timeout_ms: AtomicU64::new(timeout_ms),
             share_registry: RwLock::new(HashMap::new()),
+            waiter_graph: Mutex::new(HashMap::new()),
         }
     }
 
@@ -248,6 +261,10 @@ impl LockManager {
         };
         // Shard mutex is released here.
 
+        // Register in the incremental waits-for graph so deadlock detection
+        // can find this edge without rescanning all lock-table shards.
+        self.record_wait(locker_id, &owner_ids);
+
         // --- Phase 2: deadlock detection before sleeping. ---
         //
         // Runs DeadlockChecker after setWaitingFor.  If the current
@@ -266,6 +283,7 @@ impl LockManager {
             lsn, locker_id, lock_type, &owner_ids,
         ) {
             // We are the chosen victim.  Flush from waiter list and throw.
+            self.clear_wait(locker_id);
             let mut table = self.lock_tables[table_idx].lock();
             if let Some(lock) = table.get_mut(&lsn) {
                 lock.flush_waiter(locker_id);
@@ -302,6 +320,7 @@ impl LockManager {
                 if elapsed >= timeout_ms {
                     // Already timed out before we even slept this iteration.
                     drop(granted_guard);
+                    self.clear_wait(locker_id);
                     let mut table = self.lock_tables[table_idx].lock();
                     if let Some(lock) = table.get_mut(&lsn) {
                         lock.flush_waiter(locker_id);
@@ -353,6 +372,7 @@ impl LockManager {
                 if let Some(deadlock_err) = self.check_deadlock_for_waiter(
                     lsn, locker_id, lock_type, &cur_owner_ids,
                 ) {
+                    self.clear_wait(locker_id);
                     let mut table = self.lock_tables[table_idx].lock();
                     if let Some(lock) = table.get_mut(&lsn) {
                         lock.flush_waiter(locker_id);
@@ -375,6 +395,7 @@ impl LockManager {
                     && start.elapsed().as_millis() as u64 >= timeout_ms
                 {
                     drop(granted_guard);
+                    self.clear_wait(locker_id);
                     let mut table = self.lock_tables[table_idx].lock();
                     if let Some(lock) = table.get_mut(&lsn) {
                         lock.flush_waiter(locker_id);
@@ -397,6 +418,7 @@ impl LockManager {
         }
 
         drop(granted_guard);
+        self.clear_wait(locker_id);
 
         // Determine which grant type to report.  On wakeup the lock type we
         // actually hold is exactly what we requested (or a promotion of it).
@@ -630,13 +652,18 @@ impl LockManager {
             let reg = self.share_registry.read().unwrap();
             reg.get(&locker_id).copied()
         };
-        // Clone a per-call snapshot so the closure is 'static w.r.t. self.
-        let registry_snapshot: std::collections::HashMap<i64, i64> = {
-            self.share_registry.read().unwrap().clone()
-        };
+        // Only clone the registry when the requester is actually in a sharing
+        // group — avoids a HashMap allocation on every lock call for the common
+        // path where requester_group is None (BasicLockers, most internal ops).
+        let registry_snapshot: Option<std::collections::HashMap<i64, i64>> =
+            if requester_group.is_some() {
+                Some(self.share_registry.read().unwrap().clone())
+            } else {
+                None
+            };
         let shares = move |owner_id: i64| -> bool {
-            if let Some(req_group) = requester_group {
-                registry_snapshot.get(&owner_id).copied() == Some(req_group)
+            if let (Some(req_group), Some(reg)) = (requester_group, &registry_snapshot) {
+                reg.get(&owner_id).copied() == Some(req_group)
             } else {
                 false
             }
@@ -669,10 +696,14 @@ impl LockManager {
             (result.lock_grant, owner_ids, pair)
         };
 
+        // Register in the incremental waits-for graph (same as lock_with_timeout).
+        self.record_wait(locker_id, &owner_ids);
+
         // Phase 2: deadlock check.
         if let Some(deadlock_err) = self.check_deadlock_for_waiter(
             lsn, locker_id, lock_type, &owner_ids,
         ) {
+            self.clear_wait(locker_id);
             let mut table = self.lock_tables[table_idx].lock();
             if let Some(lock) = table.get_mut(&lsn) {
                 lock.flush_waiter(locker_id);
@@ -698,6 +729,7 @@ impl LockManager {
                 let elapsed = start.elapsed().as_millis() as u64;
                 if elapsed >= timeout_ms {
                     drop(granted_guard);
+                    self.clear_wait(locker_id);
                     let mut table = self.lock_tables[table_idx].lock();
                     if let Some(lock) = table.get_mut(&lsn) {
                         lock.flush_waiter(locker_id);
@@ -725,6 +757,7 @@ impl LockManager {
                     lsn, locker_id, lock_type, &owner_ids,
                 ) {
                 drop(granted_guard);
+                self.clear_wait(locker_id);
                 let mut table = self.lock_tables[table_idx].lock();
                 if let Some(lock) = table.get_mut(&lsn) {
                     lock.flush_waiter(locker_id);
@@ -737,6 +770,7 @@ impl LockManager {
         }
 
         drop(granted_guard);
+        self.clear_wait(locker_id);
 
         let grant = match initial_grant {
             LockGrantType::WaitNew => LockGrantType::New,
@@ -757,16 +791,31 @@ impl LockManager {
         ((lsn as usize) & 0x7fff_ffff) % N_LOCK_TABLES
     }
 
+    /// Records that `locker_id` is now waiting on `owner_ids` in the
+    /// incremental waits-for graph.  Called right after Phase 1 in both wait
+    /// paths, before the first deadlock check.
+    fn record_wait(&self, locker_id: i64, owner_ids: &[i64]) {
+        let mut graph = self.waiter_graph.lock();
+        graph.insert(locker_id, owner_ids.to_vec());
+    }
+
+    /// Removes `locker_id` from the incremental waits-for graph.  Called at
+    /// every exit point after `record_wait`: grant, timeout, and deadlock abort.
+    fn clear_wait(&self, locker_id: i64) {
+        let mut graph = self.waiter_graph.lock();
+        graph.remove(&locker_id);
+    }
+
     /// Checks whether this locker is involved in a deadlock and should be
     /// aborted as the victim.
     ///
     /// Returns `Some(TxnError::Deadlock)` if the cycle is detected and this
     /// locker is the chosen victim, `None` otherwise.
     ///
-    /// The victim-selection strategy mirrors the: among all lockers in the
-    /// cycle, the one with the fewest locks held is chosen.  Scans all shards
-    /// to build real per-locker lock counts so the victim selection matches
-    /// `LockManager.selectVictim()` (min n_owners, tiebreak by youngest).
+    /// Reads the incremental `waiter_graph` snapshot — O(n_active_waiters),
+    /// no shard re-acquisition.  Victim selection uses "youngest locker"
+    /// heuristic (highest locker_id, i.e. most recently started transaction)
+    /// since we avoid the O(N_LOCK_TABLES) scan needed for exact lock counts.
     fn check_deadlock_for_waiter(
         &self,
         lsn: u64,
@@ -774,12 +823,23 @@ impl LockManager {
         lock_type: LockType,
         owner_ids: &[i64],
     ) -> Option<TxnError> {
-        let (waits_for, lock_counts) =
-            self.build_waits_for_and_lock_counts(lsn, locker_id);
-        let cycle =
-            DeadlockDetector::detect(locker_id, owner_ids, &waits_for)?;
+        // Build the waits-for snapshot from the incremental graph.  Also
+        // ensure the current requester's edge is present (record_wait may
+        // not have been called yet on the very first check).
+        let waits_for: HashMap<i64, HashSet<i64>> = {
+            let graph = self.waiter_graph.lock();
+            let mut wf: HashMap<i64, HashSet<i64>> = graph
+                .iter()
+                .map(|(&wid, owners)| (wid, owners.iter().copied().collect()))
+                .collect();
+            wf.entry(locker_id)
+                .or_insert_with(|| owner_ids.iter().copied().collect());
+            wf
+        };
 
-        let victim = DeadlockDetector::select_victim(&cycle, &lock_counts);
+        let cycle = DeadlockDetector::detect(locker_id, owner_ids, &waits_for)?;
+        // Pass empty lock_counts: select_victim falls back to youngest (highest ID).
+        let victim = DeadlockDetector::select_victim(&cycle, &HashMap::new());
 
         if victim == locker_id {
             Some(TxnError::Deadlock(format!(
@@ -790,61 +850,6 @@ impl LockManager {
         } else {
             None
         }
-    }
-
-    /// Builds both the waits-for snapshot and real per-locker lock counts in
-    /// a single pass over the shard tables.
-    ///
-    /// Returns `(waits_for, lock_counts)` where:
-    /// - `waits_for[locker_id]` = set of locker_ids it is waiting for
-    /// - `lock_counts[locker_id]` = number of locks the locker currently owns
-    ///
-    /// Both maps are built from the same shard scan so the data is consistent.
-    /// This is equivalent to JE's `LockManager.selectVictim()` which also
-    /// uses the actual lock count per locker (`locker.nOwners()`).
-    ///
-    /// The `waiting_lsn` shard has already been released before this method
-    /// is called, so it is re-acquired like any other shard here.
-    fn build_waits_for_and_lock_counts(
-        &self,
-        waiting_lsn: u64,
-        waiting_locker_id: i64,
-    ) -> (HashMap<i64, HashSet<i64>>, HashMap<i64, usize>) {
-        let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
-        let mut lock_counts: HashMap<i64, usize> = HashMap::new();
-
-        for table_mutex in &self.lock_tables {
-            let table = table_mutex.lock();
-            for (lsn, lock) in table.iter() {
-                let owner_ids: Vec<i64> = lock.get_owner_ids();
-
-                // Count each owner's total held locks across all LSNs.
-                for &owner_id in &owner_ids {
-                    *lock_counts.entry(owner_id).or_insert(0) += 1;
-                }
-
-                let owner_set: HashSet<i64> = owner_ids.into_iter().collect();
-
-                // Record existing waiter -> owners edges.
-                for waiter in lock.get_waiters_clone() {
-                    waits_for
-                        .entry(waiter.locker_id)
-                        .or_default()
-                        .extend(owner_set.iter().copied());
-                }
-
-                // Record the edge for the calling locker if this is the
-                // lock it is about to wait on.
-                if *lsn == waiting_lsn {
-                    waits_for
-                        .entry(waiting_locker_id)
-                        .or_default()
-                        .extend(owner_set.iter().copied());
-                }
-            }
-        }
-
-        (waits_for, lock_counts)
     }
 }
 

@@ -79,6 +79,9 @@ pub struct Database {
     /// Cached log manager — acquired once at open, None for no-WAL envs.
     /// Eliminates per-operation `env_impl.lock()` on the hot read/write path.
     log_manager: Option<Arc<LogManager>>,
+    /// Cached cleaner throttle — acquired once at open, None when no cleaner.
+    /// Used by put() for write-path backpressure without locking env_impl.
+    cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
     /// If true, auto-commit writes skip the log flush entirely (JE: TXN_NO_SYNC).
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (JE: TXN_WRITE_NO_SYNC).
@@ -198,11 +201,12 @@ impl Database {
         let throughput = db_impl.read().throughput.clone();
         // Cache the manager Arcs at construction so hot-path operations
         // (get/put/delete) never need to re-acquire env_impl.lock().
-        let (lock_manager, log_manager) = {
+        let (lock_manager, log_manager, cleaner_throttle) = {
             let env = env_impl.lock();
             let lm = Arc::clone(env.get_lock_manager());
             let logm = env.get_log_manager();
-            (lm, logm)
+            let ct = env.get_cleaner_throttle();
+            (lm, logm, ct)
         };
         Database {
             name,
@@ -214,6 +218,7 @@ impl Database {
             throughput,
             lock_manager,
             log_manager,
+            cleaner_throttle,
             no_sync,
             write_no_sync,
         }
@@ -414,6 +419,19 @@ impl Database {
             .put(key_bytes, data_bytes, PutMode::Overwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
+
+        // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
+        // writes: if the log write rate exceeds the cleaner's capacity, sleep
+        // briefly so the cleaner can keep up.  Transactional paths handle this
+        // in Transaction::commit_with_durability() instead.
+        if txn.is_none()
+            && let Some(delay) = self
+                .cleaner_throttle
+                .as_ref()
+                .and_then(|t| t.should_throttle_writer())
+        {
+            std::thread::sleep(delay);
+        }
 
         // Auto-commit: fsync before returning (skip if already covered).
         self.auto_commit_sync(txn, write_lsn)?;
