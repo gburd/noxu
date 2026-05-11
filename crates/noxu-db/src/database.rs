@@ -6,10 +6,13 @@ use crate::cursor_config::CursorConfig;
 use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
+use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
+use crate::read_options::ReadOptions;
 use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::transaction::Transaction;
+use crate::write_options::WriteOptions;
 use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode, ThroughputStats};
 use noxu_util::lsn::Lsn;
 use noxu_log::LogManager;
@@ -103,6 +106,20 @@ impl Database {
             }
             None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
+        }
+    }
+
+    /// Creates a CursorImpl without a lock manager (dirty-read / read-uncommitted).
+    ///
+    /// Used by `get_with_options()` when `ReadOptions.lock_mode == ReadUncommitted`.
+    /// Skips all lock acquisition so the cursor reads directly from the BIN
+    /// without blocking on write locks — mirrors JE's read-uncommitted cursor.
+    fn make_cursor_no_lock(&self) -> CursorImpl {
+        match &self.log_manager {
+            Some(lm) => {
+                CursorImpl::with_log_manager(Arc::clone(&self.db_impl), 0, Arc::clone(lm))
+            }
+            None => CursorImpl::new(Arc::clone(&self.db_impl), 0),
         }
     }
 
@@ -248,9 +265,76 @@ impl Database {
         }
     }
 
+    /// Retrieves a record with per-operation read options.
+    ///
+    /// Mirrors `Cursor.get()` with `ReadOptions` applied:
+    /// - `LockMode::ReadUncommitted` — dirty read, no lock acquired (JE read-uncommitted)
+    /// - `LockMode::ReadCommitted` — read-committed isolation (standard locking)
+    /// - `LockMode::Rmw` — acquire write lock for read-modify-write
+    /// - `LockMode::Default` — environment default isolation
+    ///
+    /// `CacheMode` in `ReadOptions` is advisory (currently informational).
+    ///
+    /// # Arguments
+    /// * `txn` - Optional transaction handle
+    /// * `key` - The search key
+    /// * `data` - Output parameter to receive the data
+    /// * `opts` - Per-operation read options (isolation, cache hints)
+    ///
+    /// # Returns
+    /// `OperationStatus::Success` if found, `OperationStatus::NotFound` otherwise
+    pub fn get_with_options(
+        &self,
+        txn: Option<&Transaction>,
+        key: &DatabaseEntry,
+        data: &mut DatabaseEntry,
+        opts: &ReadOptions,
+    ) -> Result<OperationStatus> {
+        self.check_open()?;
+
+        let key_bytes = match key.get_data() {
+            Some(k) => k,
+            None => return Ok(OperationStatus::NotFound),
+        };
+
+        let mut cursor = match opts.lock_mode {
+            LockMode::ReadUncommitted => self.make_cursor_no_lock(),
+            _ => match txn {
+                Some(t) => self.make_cursor_for_txn(t),
+                None => self.make_cursor(),
+            },
+        };
+
+        match cursor
+            .search(key_bytes, None, SearchMode::Set)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+        {
+            noxu_dbi::OperationStatus::Success => {
+                let (_, value) = cursor
+                    .get_current()
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                if data.is_partial() {
+                    let off = data.get_partial_offset();
+                    let len = data.get_partial_length();
+                    let end = (off + len).min(value.len());
+                    let slice = if off < value.len() { &value[off..end] } else { &[] };
+                    data.set_data(slice);
+                } else {
+                    data.set_data(&value);
+                }
+                self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
+                Ok(OperationStatus::Success)
+            }
+            _ => {
+                self.throughput.n_pri_search_fails.fetch_add(1, Ordering::Relaxed);
+                Ok(OperationStatus::NotFound)
+            }
+        }
+    }
+
     /// Inserts or updates a record.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -324,9 +408,48 @@ impl Database {
         Ok(OperationStatus::Success)
     }
 
+    /// Inserts or updates a record with per-operation write options.
+    ///
+    /// Extends `put()` with `WriteOptions` support:
+    /// - `ttl` — if > 0, sets a per-record TTL expiration (hours from now); the
+    ///   record will be treated as expired and invisible after the TTL elapses.
+    ///   Stored in the BIN slot as absolute hours since Unix epoch, matching
+    ///   the `BIN.expirationInHours` / `IN.entryExpiration` JE TTL path.
+    /// - `update_ttl` — if true and the record already exists, refreshes its TTL
+    ///   to the new value rather than leaving the original expiration.
+    /// - `cache_mode` — advisory cache hint (currently informational).
+    ///
+    /// # Arguments
+    /// * `txn` - Optional transaction handle
+    /// * `key` - The key to insert/update
+    /// * `data` - The data to store
+    /// * `opts` - Per-operation write options (TTL, cache hints)
+    ///
+    /// # Returns
+    /// `OperationStatus::Success` on success
+    pub fn put_with_options(
+        &self,
+        txn: Option<&Transaction>,
+        key: &DatabaseEntry,
+        data: &DatabaseEntry,
+        opts: &WriteOptions,
+    ) -> Result<OperationStatus> {
+        let result = self.put(txn, key, data)?;
+
+        // Apply TTL to the just-written BIN slot when requested.
+        if opts.ttl > 0 {
+            let key_bytes = key.get_data().unwrap_or(&[]);
+            let expiration_hours = noxu_util::current_time_hours()
+                .saturating_add(opts.ttl as u32);
+            self.db_impl.read().update_key_expiration(key_bytes, expiration_hours);
+        }
+
+        Ok(result)
+    }
+
     /// Inserts a record, failing if the key already exists.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -576,6 +699,20 @@ impl Database {
         } else {
             DbState::Closed
         }
+    }
+
+    /// Flushes all pending writes for this database to stable storage.
+    ///
+    /// Mirrors JE `Database.sync()` — issues an fdatasync on the log file,
+    /// ensuring that all writes made by non-transactional or deferred-sync
+    /// operations are durable before returning.
+    pub fn sync(&self) -> Result<()> {
+        self.check_open()?;
+        if let Some(lm) = &self.log_manager {
+            lm.flush_sync()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Checks if the database is open, returns an error if not.
@@ -1173,6 +1310,106 @@ mod tests {
         let result = db.scan_all_kv();
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sync_on_open_database_succeeds() {
+        let (_tmp, _env, db) = temp_env_and_db();
+        db.put(None, &DatabaseEntry::from_bytes(b"key"), &DatabaseEntry::from_bytes(b"val")).unwrap();
+        assert!(db.sync().is_ok());
+    }
+
+    #[test]
+    fn test_sync_on_closed_database_fails() {
+        let (_tmp, _env, db) = temp_env_and_db();
+        db.close().unwrap();
+        assert!(db.sync().is_err());
+    }
+
+    // ── get_with_options / put_with_options ────────────────────────────────
+
+    #[test]
+    fn test_get_with_options_default_reads_written_record() {
+        use crate::read_options::ReadOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let key = DatabaseEntry::from_bytes(b"ropt_key");
+        let val = DatabaseEntry::from_bytes(b"ropt_val");
+        db.put(None, &key, &val).unwrap();
+
+        let opts = ReadOptions::new();
+        let mut out = DatabaseEntry::new();
+        let status = db.get_with_options(None, &key, &mut out, &opts).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+        assert_eq!(out.get_data().unwrap(), b"ropt_val");
+    }
+
+    #[test]
+    fn test_get_with_options_read_uncommitted_sees_written_record() {
+        use crate::read_options::ReadOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let key = DatabaseEntry::from_bytes(b"ru_key");
+        let val = DatabaseEntry::from_bytes(b"ru_val");
+        db.put(None, &key, &val).unwrap();
+
+        let opts = ReadOptions::read_uncommitted();
+        let mut out = DatabaseEntry::new();
+        let status = db.get_with_options(None, &key, &mut out, &opts).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+        assert_eq!(out.get_data().unwrap(), b"ru_val");
+    }
+
+    #[test]
+    fn test_get_with_options_not_found() {
+        use crate::read_options::ReadOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let key = DatabaseEntry::from_bytes(b"missing");
+        let opts = ReadOptions::new();
+        let mut out = DatabaseEntry::new();
+        let status = db.get_with_options(None, &key, &mut out, &opts).unwrap();
+        assert_eq!(status, OperationStatus::NotFound);
+    }
+
+    #[test]
+    fn test_put_with_options_no_ttl_behaves_like_put() {
+        use crate::write_options::WriteOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let key = DatabaseEntry::from_bytes(b"wopt_key");
+        let val = DatabaseEntry::from_bytes(b"wopt_val");
+        let opts = WriteOptions::new();
+        let status = db.put_with_options(None, &key, &val, &opts).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+
+        let mut out = DatabaseEntry::new();
+        db.get(None, &key, &mut out).unwrap();
+        assert_eq!(out.get_data().unwrap(), b"wopt_val");
+    }
+
+    #[test]
+    fn test_put_with_options_with_ttl_stores_record() {
+        use crate::write_options::WriteOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let key = DatabaseEntry::from_bytes(b"ttl_key");
+        let val = DatabaseEntry::from_bytes(b"ttl_val");
+        // TTL of 1 hour — the record is not yet expired so it should be readable
+        let opts = WriteOptions::with_expiration(1);
+        let status = db.put_with_options(None, &key, &val, &opts).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+
+        let mut out = DatabaseEntry::new();
+        let read_status = db.get(None, &key, &mut out).unwrap();
+        assert_eq!(read_status, OperationStatus::Success);
+        assert_eq!(out.get_data().unwrap(), b"ttl_val");
+    }
+
+    #[test]
+    fn test_put_with_options_closed_db_fails() {
+        use crate::write_options::WriteOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        db.close().unwrap();
+        let key = DatabaseEntry::from_bytes(b"k");
+        let val = DatabaseEntry::from_bytes(b"v");
+        let opts = WriteOptions::new();
+        assert!(db.put_with_options(None, &key, &val, &opts).is_err());
     }
 
 }

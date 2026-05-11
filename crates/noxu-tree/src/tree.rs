@@ -1414,6 +1414,85 @@ impl Tree {
         }
     }
 
+    /// Sets the expiration time (in absolute hours since Unix epoch) for an
+    /// existing key's BIN slot.
+    ///
+    /// Returns `true` if the key was found and updated, `false` otherwise.
+    ///
+    /// Used by `Database::put_with_options()` to apply per-record TTL.
+    /// `IN.entryExpiration` / `BIN.expirationInHours` path.
+    pub fn update_key_expiration(&self, key: &[u8], expiration_hours: u32) -> bool {
+        let root = match self.get_root() {
+            Some(r) => r,
+            None => return false,
+        };
+        let mut current = root;
+        loop {
+            // Detect BIN with a read lock first, then re-acquire write lock.
+            // This double-lock pattern matches `insert_recursive`.
+            let is_bin = match current.read() {
+                Ok(g) => g.is_bin(),
+                Err(_) => return false,
+            };
+            if is_bin {
+                let mut guard = match current.write() {
+                    Ok(g) => g,
+                    Err(_) => return false,
+                };
+                if let TreeNode::Bottom(bin) = &mut *guard {
+                    let slot = if let Some(cmp) = &self.key_comparator {
+                        let (idx, exact) = bin.find_entry_cmp(key, cmp.as_ref());
+                        if exact { Some(idx) } else { None }
+                    } else {
+                        let (idx, exact) = bin.find_entry_compressed(key);
+                        if exact { Some(idx) } else { None }
+                    };
+                    if let Some(slot_idx) = slot {
+                        if let Some(entry) = bin.entries.get_mut(slot_idx) {
+                            entry.expiration_time = expiration_hours;
+                            bin.expiration_in_hours = true;
+                            bin.dirty = true;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            // Upper IN: navigate to the child covering this key.
+            let next_arc = {
+                let guard = match current.read() {
+                    Ok(g) => g,
+                    Err(_) => return false,
+                };
+                match &*guard {
+                    TreeNode::Internal(n) => {
+                        if n.entries.is_empty() {
+                            return false;
+                        }
+                        let mut idx = 0usize;
+                        for (i, entry) in n.entries.iter().enumerate() {
+                            if i == 0 {
+                                idx = 0;
+                            } else if self.key_cmp(entry.key.as_slice(), key)
+                                != std::cmp::Ordering::Greater
+                            {
+                                idx = i;
+                            } else {
+                                break;
+                            }
+                        }
+                        n.entries.get(idx).and_then(|e| e.child.clone())
+                    }
+                    TreeNode::Bottom(_) => None,
+                }
+            };
+            match next_arc {
+                Some(child) => current = child,
+                None => return false,
+            }
+        }
+    }
+
     /// Returns the key and data of the first BIN entry at or after `key`.
     ///
     /// Descends with the tree's key comparator (same path as `search()`), then
