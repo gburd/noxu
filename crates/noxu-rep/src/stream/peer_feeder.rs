@@ -1,0 +1,614 @@
+//! Peer-to-peer log distribution — BDB/HA-style peer feeder.
+//!
+//! In Berkeley DB/HA each replica maintains a log range `[first_vlsn,
+//! last_vlsn]` and can act as a feeder for other replicas that need entries
+//! in that range.  This avoids routing all log-shipping traffic through the
+//! master, which would otherwise be the sole bottleneck.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Master ──► FeederRunner (master feeder) ──► Replica A
+//!                                        ──► Replica B ──► PeerFeederRunner ──► Replica C
+//! ```
+//!
+//! `PeerLogScanner` is a `LogScanner` implementation backed by an
+//! in-memory `VecDeque<(vlsn, entry_type, payload)>`.  It is populated by
+//! the local `ReplicaReceiver` as entries arrive from the master.
+//!
+//! `PeerFeederRunner` wraps a `FeederRunner` and a `PeerLogScanner`.  The
+//! `GroupService` is queried to find peers that hold the needed VLSN range,
+//! and a `FeederRunner` is spawned to stream entries to the requesting node.
+//!
+//! ## CBVLSN
+//!
+//! The Cleaner Barrier VLSN is the global minimum `known_vlsn` across all
+//! active electable replicas.  The log cleaner uses this to decide which
+//! log files it is safe to reclaim.  It is maintained by `GroupService`
+//! and updated on every heartbeat / ack.
+//!
+//! Corresponds to `FeederReplicaSyncup`, `LocalCBVLSNUpdater`, and
+//! `RepGroupImpl.getCBVLSN()` in the JE HA implementation.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use noxu_sync::Mutex;
+
+use crate::error::Result;
+use crate::net::channel::Channel;
+use crate::stream::feeder::{FeederRunner, LogScanner};
+
+// ---------------------------------------------------------------------------
+// PeerLogScanner
+// ---------------------------------------------------------------------------
+
+/// A [`LogScanner`] backed by an in-memory queue of `(vlsn, type, payload)`
+/// entries.
+///
+/// Entries are pushed by the `ReplicaReceiver` as they arrive from the
+/// master (or from another peer).  The `PeerFeederRunner` consumes entries
+/// from this queue and streams them to a downstream replica.
+///
+/// Thread safety: the queue is protected by a `Mutex` so that the receiver
+/// thread (writer) and the feeder thread (reader) can operate concurrently.
+pub struct PeerLogScanner {
+    queue: Mutex<VecDeque<(u64, u8, Vec<u8>)>>,
+    /// The VLSN range currently held in `queue`: `(first, last)`.
+    /// Updated lazily on `push`; used by `GroupService` callers to determine
+    /// whether this scanner can serve a given VLSN.
+    first_vlsn: Mutex<u64>,
+    last_vlsn: Mutex<u64>,
+}
+
+impl PeerLogScanner {
+    /// Create an empty scanner.
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            first_vlsn: Mutex::new(0),
+            last_vlsn: Mutex::new(0),
+        }
+    }
+
+    /// Push a log entry into the scanner's queue.
+    ///
+    /// Called by the `ReplicaReceiver` each time an entry is applied.
+    /// Entries must be pushed in VLSN order; out-of-order pushes update
+    /// only the bounds if the new VLSN falls within or extends the range.
+    pub fn push(&self, vlsn: u64, entry_type: u8, payload: Vec<u8>) {
+        let mut first = self.first_vlsn.lock();
+        let mut last = self.last_vlsn.lock();
+        if *first == 0 || vlsn < *first {
+            *first = vlsn;
+        }
+        if vlsn > *last {
+            *last = vlsn;
+        }
+        self.queue.lock().push_back((vlsn, entry_type, payload));
+    }
+
+    /// Return the VLSN range currently held in this scanner.
+    ///
+    /// Returns `None` if the scanner is empty (no entries pushed yet).
+    pub fn log_range(&self) -> Option<(u64, u64)> {
+        let first = *self.first_vlsn.lock();
+        let last = *self.last_vlsn.lock();
+        if first == 0 { None } else { Some((first, last)) }
+    }
+
+    /// Return the number of entries currently queued.
+    pub fn len(&self) -> usize {
+        self.queue.lock().len()
+    }
+
+    /// Returns true if no entries are queued.
+    pub fn is_empty(&self) -> bool {
+        self.queue.lock().is_empty()
+    }
+}
+
+impl Default for PeerLogScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogScanner for PeerLogScanner {
+    fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
+        let mut q = self.queue.lock();
+        // Skip entries with VLSN < from_vlsn (they were already seen by the
+        // downstream replica).
+        while let Some(&(vlsn, _, _)) = q.front() {
+            if vlsn >= from_vlsn {
+                return q.pop_front();
+            }
+            q.pop_front();
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeerFeederSource — Arc-wrapped PeerLogScanner that implements LogScanner
+// ---------------------------------------------------------------------------
+
+/// A shared, `Arc`-wrapped `PeerLogScanner` that can be passed between
+/// threads.
+///
+/// The `ReplicaReceiver` holds an `Arc<PeerFeederSource>` and calls
+/// `push()` as entries arrive. A `PeerFeederRunner` holds another clone
+/// and calls `next_entry()` to stream those entries downstream.
+pub struct PeerFeederSource(pub Arc<PeerLogScanner>);
+
+impl PeerFeederSource {
+    /// Create a new `PeerFeederSource` backed by a fresh `PeerLogScanner`.
+    pub fn new() -> Self {
+        Self(Arc::new(PeerLogScanner::new()))
+    }
+
+    /// Return a clone of the inner `Arc<PeerLogScanner>` for the receiver
+    /// thread to use when pushing entries.
+    pub fn clone_scanner(&self) -> Arc<PeerLogScanner> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Default for PeerFeederSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Adapter so `PeerFeederSource` can be used directly as a `LogScanner`.
+///
+/// We implement `LogScanner` on the *mutable reference* side: since
+/// `PeerFeederSource` is `Arc`-wrapped, we implement on a thin wrapper
+/// struct that holds an `Arc` and a local cursor.
+pub struct PeerScannerAdapter {
+    source: Arc<PeerLogScanner>,
+    cursor_vlsn: u64,
+}
+
+impl PeerScannerAdapter {
+    /// Create a new adapter starting from `start_vlsn`.
+    pub fn new(source: Arc<PeerLogScanner>, start_vlsn: u64) -> Self {
+        Self { source, cursor_vlsn: start_vlsn }
+    }
+}
+
+impl LogScanner for PeerScannerAdapter {
+    fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
+        let effective_from = self.cursor_vlsn.max(from_vlsn);
+        let entry = {
+            let mut q = self.source.queue.lock();
+            let mut result = None;
+            while let Some(&(vlsn, _, _)) = q.front() {
+                if vlsn >= effective_from {
+                    result = q.pop_front();
+                    break;
+                }
+                q.pop_front(); // discard stale entries
+            }
+            result
+        };
+        if let Some((vlsn, _, _)) = &entry {
+            self.cursor_vlsn = vlsn + 1;
+        }
+        entry
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeerFeederRunner
+// ---------------------------------------------------------------------------
+
+/// Streams log entries from a `PeerLogScanner` to a downstream replica.
+///
+/// This is a thin wrapper around `FeederRunner` that uses a
+/// `PeerScannerAdapter` as the log source instead of reading from disk.
+///
+/// Corresponds to JE's peer-to-peer feeder path in `FeederReplicaSyncup`.
+pub struct PeerFeederRunner {
+    inner: FeederRunner,
+    source: Arc<PeerLogScanner>,
+    start_vlsn: u64,
+}
+
+impl PeerFeederRunner {
+    /// Create a new peer feeder that streams entries from `source` to
+    /// `channel`, starting at `start_vlsn`.
+    pub fn new(
+        channel: Arc<dyn Channel>,
+        source: Arc<PeerLogScanner>,
+        start_vlsn: u64,
+    ) -> Self {
+        let inner = FeederRunner::new(channel, start_vlsn);
+        Self { inner, source, start_vlsn }
+    }
+
+    /// Run the peer feeder loop.
+    ///
+    /// Streams entries from the `PeerLogScanner` to the downstream replica.
+    /// Returns when the channel is closed or an I/O error occurs.
+    pub fn run(&self) -> Result<()> {
+        let mut adapter =
+            PeerScannerAdapter::new(Arc::clone(&self.source), self.start_vlsn);
+        self.inner.run(&mut adapter)
+    }
+
+    /// Return the last VLSN acknowledged by the downstream replica.
+    pub fn known_replica_vlsn(&self) -> u64 {
+        self.inner.known_replica_vlsn()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syncup helpers
+// ---------------------------------------------------------------------------
+
+/// Result of a peer syncup negotiation.
+///
+/// In JE HA, `FeederReplicaSyncup` finds the highest VLSN that is committed
+/// on BOTH the feeder and the replica (the "matchpoint").  The feeder then
+/// streams entries from matchpoint+1 onwards.
+///
+/// We model this as a simple VLSN range comparison: if the peer holds
+/// `[peer_first, peer_last]` and the replica needs `replica_needs` onwards,
+/// we can serve if `peer_first <= replica_needs <= peer_last`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncupResult {
+    /// The peer holds the needed range; stream from `start_vlsn`.
+    CanServe { start_vlsn: u64 },
+    /// The peer does not hold the needed VLSN; fall back to master or
+    /// network restore.
+    NeedsRestore,
+}
+
+/// Determine whether `peer_range` can serve a replica that needs
+/// log entries starting from `replica_needs`.
+pub fn negotiate_syncup(
+    peer_range: Option<(u64, u64)>,
+    replica_needs: u64,
+) -> SyncupResult {
+    match peer_range {
+        Some((first, last)) if first <= replica_needs && replica_needs <= last => {
+            SyncupResult::CanServe { start_vlsn: replica_needs }
+        }
+        _ => SyncupResult::NeedsRestore,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::channel::LocalChannelPair;
+    use std::time::Duration;
+
+    // -----------------------------------------------------------------------
+    // PeerLogScanner unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_scanner_push_and_log_range() {
+        let scanner = PeerLogScanner::new();
+        assert!(scanner.is_empty());
+        assert!(scanner.log_range().is_none());
+
+        scanner.push(5, 1, b"entry5".to_vec());
+        scanner.push(6, 1, b"entry6".to_vec());
+        scanner.push(10, 1, b"entry10".to_vec());
+
+        assert_eq!(scanner.len(), 3);
+        assert_eq!(scanner.log_range(), Some((5, 10)));
+    }
+
+    #[test]
+    fn test_peer_scanner_next_entry_in_order() {
+        let mut scanner = PeerLogScanner::new();
+        for vlsn in [3u64, 4, 5, 6, 7] {
+            scanner.push(vlsn, 1, vlsn.to_le_bytes().to_vec());
+        }
+
+        // Ask from_vlsn=4 — should skip 3 and return 4, 5, 6, 7.
+        let mut results = Vec::new();
+        while let Some((vlsn, _, _)) = scanner.next_entry(4) {
+            results.push(vlsn);
+        }
+        assert_eq!(results, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_peer_scanner_skips_stale_entries() {
+        let mut scanner = PeerLogScanner::new();
+        for v in [1u64, 2, 3, 10, 11] {
+            scanner.push(v, 1, vec![v as u8]);
+        }
+        // Ask from 10 — entries 1, 2, 3 are stale.
+        let entry = scanner.next_entry(10);
+        assert_eq!(entry.map(|(v, _, _)| v), Some(10));
+    }
+
+    #[test]
+    fn test_peer_scanner_empty_returns_none() {
+        let mut scanner = PeerLogScanner::new();
+        assert!(scanner.next_entry(1).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerScannerAdapter unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_scanner_adapter_cursor_advances() {
+        let source = Arc::new(PeerLogScanner::new());
+        for v in [1u64, 2, 3, 4, 5] {
+            source.push(v, 1, vec![v as u8]);
+        }
+
+        let mut adapter = PeerScannerAdapter::new(Arc::clone(&source), 1);
+        let mut seen = Vec::new();
+        while let Some((v, _, _)) = adapter.next_entry(1) {
+            seen.push(v);
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerFeederRunner integration test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_feeder_runner_streams_to_replica() {
+        let source = Arc::new(PeerLogScanner::new());
+        for v in [10u64, 11, 12, 13, 14] {
+            source.push(v, 1, format!("payload-{v}").into_bytes());
+        }
+
+        let pair = LocalChannelPair::new();
+        let sender: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let receiver: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // Receiver: collect all frames.
+        let recv_handle = {
+            let receiver = Arc::clone(&receiver);
+            std::thread::spawn(move || {
+                let mut vlsns = Vec::new();
+                // Expect 5 frames then a timeout.
+                for _ in 0..5 {
+                    let frame = receiver
+                        .receive(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap();
+                    let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+                    vlsns.push(vlsn);
+                    // Send ack.
+                    let _ = receiver.send(&vlsn.to_le_bytes());
+                }
+                vlsns
+            })
+        };
+
+        let runner = PeerFeederRunner::new(Arc::clone(&sender), Arc::clone(&source), 10);
+        let sender_clone = Arc::clone(&sender);
+        let run_handle = std::thread::spawn(move || {
+            let _ = runner.run();
+        });
+
+        // Wait for receiver to collect all 5 frames.
+        let vlsns = recv_handle.join().unwrap();
+        assert_eq!(vlsns, vec![10, 11, 12, 13, 14]);
+
+        sender_clone.close().unwrap();
+        let _ = run_handle.join();
+    }
+
+    // -----------------------------------------------------------------------
+    // negotiate_syncup tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_negotiate_syncup_can_serve() {
+        assert_eq!(
+            negotiate_syncup(Some((5, 20)), 10),
+            SyncupResult::CanServe { start_vlsn: 10 }
+        );
+        // Exact boundary.
+        assert_eq!(
+            negotiate_syncup(Some((10, 10)), 10),
+            SyncupResult::CanServe { start_vlsn: 10 }
+        );
+    }
+
+    #[test]
+    fn test_negotiate_syncup_needs_restore_too_early() {
+        // Replica needs VLSN 3 but peer only has [5, 20].
+        assert_eq!(negotiate_syncup(Some((5, 20)), 3), SyncupResult::NeedsRestore);
+    }
+
+    #[test]
+    fn test_negotiate_syncup_needs_restore_too_late() {
+        // Replica needs VLSN 25 but peer only has [5, 20].
+        assert_eq!(negotiate_syncup(Some((5, 20)), 25), SyncupResult::NeedsRestore);
+    }
+
+    #[test]
+    fn test_negotiate_syncup_no_range() {
+        // Peer has no log range (just joined or restoring).
+        assert_eq!(negotiate_syncup(None, 10), SyncupResult::NeedsRestore);
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupService CBVLSN integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_service_cbvlsn_tracks_minimum() {
+        use crate::group_service::{GroupService, NodeInfo};
+        use crate::node_type::NodeType;
+        use std::time::Instant;
+
+        let gs = GroupService::new("test_group".to_string());
+
+        // Add 3 electable nodes.
+        for (name, port) in [("n1", 5001u16), ("n2", 5002), ("n3", 5003)] {
+            gs.add_node(NodeInfo {
+                name: name.to_string(),
+                node_type: NodeType::Electable,
+                host: "localhost".to_string(),
+                port,
+                node_id: port as u32,
+                joined_at: Instant::now(),
+                last_seen: Instant::now(),
+                is_active: true,
+                known_vlsn: 0,
+                log_range: None,
+            })
+            .unwrap();
+        }
+
+        // Initially all known_vlsn = 0 → CBVLSN = 0.
+        assert_eq!(gs.get_cbvlsn(), 0);
+
+        // Update n1 and n2 but not n3 → CBVLSN = min(50, 40, 0) = 0.
+        gs.update_node_vlsn("n1", 50);
+        gs.update_node_vlsn("n2", 40);
+        assert_eq!(gs.get_cbvlsn(), 0, "n3 still at 0, CBVLSN must be 0");
+
+        // Now n3 also updates → CBVLSN = min(50, 40, 30) = 30.
+        gs.update_node_vlsn("n3", 30);
+        assert_eq!(gs.get_cbvlsn(), 30);
+
+        // n3 advances → min(50, 40, 45) = 40.
+        gs.update_node_vlsn("n3", 45);
+        assert_eq!(gs.get_cbvlsn(), 40);
+    }
+
+    #[test]
+    fn test_group_service_cbvlsn_monotone_nondecreasing() {
+        use crate::group_service::{GroupService, NodeInfo};
+        use crate::node_type::NodeType;
+        use std::time::Instant;
+
+        let gs = GroupService::new("cbvlsn_monotone".to_string());
+
+        for (name, port) in [("a", 5001u16), ("b", 5002)] {
+            gs.add_node(NodeInfo {
+                name: name.to_string(),
+                node_type: NodeType::Electable,
+                host: "localhost".to_string(),
+                port,
+                node_id: port as u32,
+                joined_at: Instant::now(),
+                last_seen: Instant::now(),
+                is_active: true,
+                known_vlsn: 0,
+                log_range: None,
+            })
+            .unwrap();
+        }
+
+        // CBVLSN must never decrease.
+        let mut prev = 0u64;
+        for (na, va, nb, vb) in [
+            ("a", 10u64, "b", 5u64),
+            ("a", 20, "b", 15),
+            ("a", 25, "b", 22),
+            ("a", 30, "b", 28),
+        ] {
+            gs.update_node_vlsn(na, va);
+            gs.update_node_vlsn(nb, vb);
+            let cbvlsn = gs.get_cbvlsn();
+            assert!(
+                cbvlsn >= prev,
+                "CBVLSN must not decrease: was {prev}, now {cbvlsn}"
+            );
+            prev = cbvlsn;
+        }
+    }
+
+    #[test]
+    fn test_group_service_find_peers_with_vlsn() {
+        use crate::group_service::{GroupService, NodeInfo};
+        use crate::node_type::NodeType;
+        use std::time::Instant;
+
+        let gs = GroupService::new("peer_select".to_string());
+
+        // Node a: holds [1, 100]
+        // Node b: holds [50, 200]
+        // Node c: no range
+        for (name, port, range) in [
+            ("a", 5001u16, Some((1u64, 100u64))),
+            ("b", 5002, Some((50, 200))),
+            ("c", 5003, None),
+        ] {
+            let mut info = NodeInfo {
+                name: name.to_string(),
+                node_type: NodeType::Electable,
+                host: "localhost".to_string(),
+                port,
+                node_id: port as u32,
+                joined_at: Instant::now(),
+                last_seen: Instant::now(),
+                is_active: true,
+                known_vlsn: 0,
+                log_range: range,
+            };
+            // Set last_seen differently so we can check sort order.
+            info.last_seen = Instant::now()
+                - std::time::Duration::from_millis(port as u64 * 10);
+            gs.add_node(info).unwrap();
+        }
+
+        // VLSN 75: only a and b hold it.
+        let peers = gs.find_peers_with_vlsn(75);
+        assert!(peers.contains(&"a".to_string()));
+        assert!(peers.contains(&"b".to_string()));
+        assert!(!peers.contains(&"c".to_string()));
+
+        // VLSN 150: only b holds it.
+        let peers = gs.find_peers_with_vlsn(150);
+        assert_eq!(peers, vec!["b".to_string()]);
+
+        // VLSN 201: nobody holds it.
+        assert!(gs.find_peers_with_vlsn(201).is_empty());
+    }
+
+    #[test]
+    fn test_group_service_update_log_range() {
+        use crate::group_service::{GroupService, NodeInfo};
+        use crate::node_type::NodeType;
+        use std::time::Instant;
+
+        let gs = GroupService::new("log_range_test".to_string());
+        gs.add_node(NodeInfo {
+            name: "r1".to_string(),
+            node_type: NodeType::Electable,
+            host: "localhost".to_string(),
+            port: 5001,
+            node_id: 1,
+            joined_at: Instant::now(),
+            last_seen: Instant::now(),
+            is_active: true,
+            known_vlsn: 0,
+            log_range: None,
+        })
+        .unwrap();
+
+        // Initially no range.
+        assert!(gs.get_node("r1").unwrap().log_range.is_none());
+
+        // Update range.
+        gs.update_node_log_range("r1", 100, 500);
+        assert_eq!(gs.get_node("r1").unwrap().log_range, Some((100, 500)));
+
+        // Extend range.
+        gs.update_node_log_range("r1", 100, 800);
+        assert_eq!(gs.get_node("r1").unwrap().log_range, Some((100, 800)));
+    }
+}
