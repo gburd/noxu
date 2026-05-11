@@ -282,6 +282,18 @@ impl DatabaseImpl {
         self.real_tree.as_mut()
     }
 
+    /// Sets the expiration time (absolute hours since Unix epoch) for the
+    /// BIN slot holding `key`.
+    ///
+    /// Returns `true` if the key was found and updated.
+    /// Delegates to `Tree::update_key_expiration()`.
+    pub fn update_key_expiration(&self, key: &[u8], expiration_hours: u32) -> bool {
+        self.real_tree
+            .as_ref()
+            .map(|t| t.update_key_expiration(key, expiration_hours))
+            .unwrap_or(false)
+    }
+
     /// Replace the real B+tree with a tree recovered from the log.
     ///
     /// Called by `EnvironmentImpl::open_database()` when a matching
