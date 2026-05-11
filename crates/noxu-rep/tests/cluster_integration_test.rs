@@ -29,6 +29,12 @@
 //! - `test_partition_and_catch_up`: replica falls behind during a simulated
 //!   partition, then catches up via sequential `apply_entry`; final VLSN on
 //!   replica matches the master and the range spans the full [1..N] window.
+//!
+//! - `test_fpaxos_5node_election_phase2_2`: Flexible Paxos with phase1=4,
+//!   phase2=2 on a 5-node group; election succeeds with 2 Phase-2 accepts.
+//!
+//! - `test_dynamic_peer_add_remove`: add_peer/remove_peer at runtime on a
+//!   ReplicatedEnvironment; get_rep_group() reflects changes immediately.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -574,4 +580,167 @@ fn test_state_change_listener_fires_on_transitions() {
     );
 
     env.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// FPaxos: 5-node cluster, phase1=4, phase2=2
+// ---------------------------------------------------------------------------
+
+/// Verify Flexible Paxos with phase1=4, phase2=2 on a 5-node cluster over
+/// real loopback TCP sockets.
+///
+/// Setup:
+///   - node1 (id=1, vlsn=200): proposer.  Highest VLSN → should win.
+///   - node2..node5: acceptors on ephemeral listeners.
+///
+/// Phase 1 requires 4 promises (proposer + ≥ 3 peers).
+/// Phase 2 requires 2 accepts (proposer + ≥ 1 peer).
+///
+/// All 4 peers participate so both phase constraints are met.
+#[test]
+fn test_fpaxos_5node_election_phase2_2() {
+    use noxu_rep::QuorumPolicy;
+
+    // Build a 5-node RepGroup with Flexible{phase1:4, phase2:2}.
+    let mut group = RepGroup::new("fpaxos_test_group".to_string(), 42);
+    for i in 1u32..=5 {
+        group.add_node(RepNode::new(
+            format!("fp_node{i}"),
+            NodeType::Electable,
+            "127.0.0.1".to_string(),
+            6600 + i as u16,
+            i,
+        ));
+    }
+    group.set_quorum_policy(QuorumPolicy::Flexible { phase1: 4, phase2: 2 });
+
+    // Verify the policy is applied correctly.
+    assert_eq!(group.phase1_quorum(), 4, "phase1 quorum must be 4");
+    assert_eq!(group.phase2_quorum(), 2, "phase2 quorum must be 2");
+
+    // Spawn 4 acceptor threads (nodes 2–5).
+    let listeners: Vec<_> = (0..4).map(|_| ephemeral_listener()).collect();
+    let addrs: Vec<_> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap())
+        .collect();
+
+    let handles: Vec<_> = listeners
+        .into_iter()
+        .enumerate()
+        .map(|(i, listener)| {
+            let node_name = format!("fp_node{}", i + 2);
+            std::thread::spawn(move || {
+                let ch = listener.accept().expect("acceptor accept");
+                run_acceptor(&ch, &node_name, 50, 1, 1)
+            })
+        })
+        .collect();
+
+    // Proposer: connect to all 4 acceptors.
+    let channels: Vec<Arc<dyn Channel>> = addrs
+        .iter()
+        .map(|&addr| Arc::new(TcpChannel::connect(addr).expect("connect")) as Arc<dyn Channel>)
+        .collect();
+
+    let winner = run_election(1, "fp_node1", &group, &channels, 200, 1, 1);
+
+    // Collect acceptor results.
+    let acceptor_results: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("acceptor thread panicked"))
+        .collect();
+
+    // Election must succeed.
+    assert!(
+        winner.is_some(),
+        "election must succeed with Flexible{{phase1:4, phase2:2}} on 5-node cluster"
+    );
+    assert_eq!(winner.unwrap(), 1, "fp_node1 (highest VLSN 200) must win");
+
+    // All acceptors must have accepted a phase-2 result.
+    for (i, result) in acceptor_results.iter().enumerate() {
+        assert!(
+            result.as_ref().is_ok_and(|r| r.is_some()),
+            "acceptor {} must have accepted the phase-2 result",
+            i + 2
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic peer management: add_peer / remove_peer
+// ---------------------------------------------------------------------------
+
+/// Verify that `add_peer` and `remove_peer` work at runtime and that
+/// `get_rep_group()` reflects changes immediately.
+#[test]
+fn test_dynamic_peer_add_remove() {
+    // Start with a single-node (self) environment.
+    let env = ReplicatedEnvironment::new(
+        RepConfig::builder("dyn_group", "dyn_node1", "127.0.0.1")
+            .node_port(0)
+            .build(),
+    )
+    .expect("env creation failed");
+
+    // Initially no peers beyond self.
+    let initial_group = env.get_rep_group();
+    let initial_count = initial_group.electable_count() as usize;
+
+    // Add node2.
+    env.add_peer(RepNode::new(
+        "dyn_node2".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        5802,
+        2,
+    ))
+    .expect("add_peer must succeed");
+
+    let group_after_add = env.get_rep_group();
+    assert_eq!(
+        group_after_add.electable_count() as usize,
+        initial_count + 1,
+        "electable count must increase by 1 after add_peer"
+    );
+    assert!(
+        group_after_add.contains_node("dyn_node2"),
+        "group must contain the newly added peer"
+    );
+
+    // Add node3.
+    env.add_peer(RepNode::new(
+        "dyn_node3".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        5803,
+        3,
+    ))
+    .expect("second add_peer must succeed");
+
+    let group_3node = env.get_rep_group();
+    assert_eq!(
+        group_3node.electable_count() as usize,
+        initial_count + 2,
+        "electable count must be initial + 2 after two add_peer calls"
+    );
+
+    // Remove node2.
+    env.remove_peer("dyn_node2").expect("remove_peer must succeed");
+
+    let group_after_remove = env.get_rep_group();
+    assert_eq!(
+        group_after_remove.electable_count() as usize,
+        initial_count + 1,
+        "electable count must decrease by 1 after remove_peer"
+    );
+    assert!(
+        !group_after_remove.contains_node("dyn_node2"),
+        "removed peer must no longer be in the group"
+    );
+    assert!(
+        group_after_remove.contains_node("dyn_node3"),
+        "remaining peer dyn_node3 must still be in the group"
+    );
 }
