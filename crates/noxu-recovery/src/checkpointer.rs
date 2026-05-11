@@ -1223,7 +1223,7 @@ mod tests {
         let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
 
         // Build a tree with dirty BINs.
-        let mut tree = Tree::new(1, 256);
+        let tree = Tree::new(1, 256);
         tree.insert(b"apple".to_vec(), b"fruit".to_vec(), Lsn::new(1, 1)).unwrap();
         tree.insert(b"banana".to_vec(), b"fruit".to_vec(), Lsn::new(1, 2)).unwrap();
         tree.insert(b"cherry".to_vec(), b"fruit".to_vec(), Lsn::new(1, 3)).unwrap();

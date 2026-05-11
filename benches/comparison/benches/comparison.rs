@@ -1,4 +1,6 @@
 //! Comparative benchmarks: Noxu DB vs LMDB (heed 0.22), sled 0.34, redb 4.
+
+#![allow(clippy::suspicious_map)]
 //!
 //! # Workloads
 //!

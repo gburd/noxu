@@ -1,5 +1,7 @@
 //! Benchmarks for noxu-recovery: checkpoint serialization, DirtyINMap, RollbackTracker.
 
+#![allow(clippy::unit_arg)]
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use noxu_recovery::{

@@ -33,14 +33,12 @@ impl SecondaryKeyCreator for DepartmentKeyCreator {
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        if let Some(bytes) = data.get_data() {
-            // Value format: "department|title"
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                if let Some(sep) = s.find('|') {
-                    result.set_data(s[..sep].as_bytes());
-                    return true;
-                }
-            }
+        if let Some(bytes) = data.get_data()
+            && let Ok(s) = std::str::from_utf8(bytes)
+            && let Some(sep) = s.find('|')
+        {
+            result.set_data(&s.as_bytes()[..sep]);
+            return true;
         }
         false
     }
