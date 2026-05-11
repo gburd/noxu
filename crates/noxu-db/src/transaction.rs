@@ -192,6 +192,20 @@ impl Transaction {
                 self.write_txn_end(lm, true, fsync, flush)?;
             }
 
+        // Apply cleaner write-path backpressure: if the log write rate exceeds
+        // the cleaner's capacity, sleep briefly to let cleaning catch up.
+        // Mirrors JE's CleanerThrottle.getWriteDelay() path in Txn.commit().
+        // Extract the throttle Arc while holding the env lock, then
+        // drop the lock BEFORE sleeping to avoid blocking other threads.
+        if !self.read_only
+            && let Some(ref env) = self.env_impl
+        {
+            let throttle = env.lock().get_cleaner_throttle();
+            if let Some(delay) = throttle.and_then(|t| t.should_throttle_writer()) {
+                std::thread::sleep(delay);
+            }
+        }
+
         // Release per-record locks held by the inner Txn.
         // The inner Txn has no log_manager so it won't write duplicate WAL records.
         if let Some(inner) = &self.inner_txn {

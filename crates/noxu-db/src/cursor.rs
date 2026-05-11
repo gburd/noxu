@@ -142,6 +142,47 @@ impl Cursor {
                         .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
                 }
             }
+            Get::NextDup => {
+                self.check_initialized()?;
+                self.inner
+                    .retrieve_next(GetMode::NextDup)
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            }
+            Get::PrevDup => {
+                self.check_initialized()?;
+                self.inner
+                    .retrieve_next(GetMode::PrevDup)
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            }
+            Get::NextNoDup => {
+                if self.state == CursorState::NotInitialized {
+                    self.inner
+                        .get_first()
+                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                } else {
+                    self.inner
+                        .retrieve_next(GetMode::NextNoDup)
+                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                }
+            }
+            Get::PrevNoDup => {
+                if self.state == CursorState::NotInitialized {
+                    self.inner
+                        .get_last()
+                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                } else {
+                    self.inner
+                        .retrieve_next(GetMode::PrevNoDup)
+                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                }
+            }
+            Get::SearchBoth => {
+                let key_bytes = key.get_data().unwrap_or(&[]);
+                let data_bytes = data.get_data();
+                self.inner
+                    .search(key_bytes, data_bytes, SearchMode::Both)
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            }
             Get::Current => {
                 // Already checked initialized above.
                 // JE: re-check for deletion — Cursor.getCurrentLN() returns
@@ -276,7 +317,10 @@ impl Cursor {
             return Ok(0);
         }
 
-        Ok(1)
+        self.inner
+            .count()
+            .map(|c| c.max(1) as u64)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
     }
 
     /// Close the cursor.

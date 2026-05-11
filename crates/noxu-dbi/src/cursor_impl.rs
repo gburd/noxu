@@ -1806,48 +1806,28 @@ impl CursorImpl {
         // For sorted-dup databases, count all entries sharing the same primary
         // key as the current position.
         //
-        // From 7.5: position at the lower
-        // bound of the current primary key and iterate until the primary key
-        // changes.
+        // Strategy: clone the cursor at the current position (already on some
+        // dup for the primary key), then:
+        //   1. Walk backward with PrevDup until NotFound — each success is one
+        //      dup before the original position.
+        //   2. Walk forward with NextDup until NotFound — each success is one
+        //      dup after.
+        //   3. Total = backward + 1 + forward.
+        //
+        // This reuses the existing retrieve_next(PrevDup/NextDup) logic which
+        // correctly handles BIN boundaries and the two-part key filter.
         if self.is_sorted_dup() {
-            let raw_key = match &self.current_key {
-                Some(k) => k.clone(),
-                None => return Ok(0),
-            };
-            let primary_key = match dup_key_data::get_key(&raw_key) {
-                Some(pk) => pk,
-                None => return Ok(1),
-            };
-            let lb = dup_key_data::lower_bound(&primary_key);
-            let mut count: i64 = 0;
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                // Use first_entry_at_or_after to position, then count via
-                // get_next_bin until primary key changes.
-                let mut current_raw = match tree.first_entry_at_or_after(&lb) {
-                    Some((k, _, _)) => k,
-                    None => return Ok(0),
-                };
-                loop {
-                    if !dup_key_data::matches_key(&current_raw, &primary_key) {
-                        break;
-                    }
-                    count += 1;
-                    // Advance to next entry in the tree.
-                    match tree.get_next_bin(&current_raw) {
-                        Some(entries) if !entries.is_empty() => {
-                            let e = entries.into_iter().next().unwrap();
-                            // If the next BIN's first entry doesn't match, stop.
-                            if !dup_key_data::matches_key(&e.key, &primary_key) {
-                                break;
-                            }
-                            current_raw = e.key;
-                        }
-                        _ => break,
-                    }
-                }
+            let mut scratch = self.dup(true)?;
+            let mut backward: i64 = 0;
+            while let Ok(OperationStatus::Success) = scratch.retrieve_next(GetMode::PrevDup) {
+                backward += 1;
             }
-            return Ok(count.max(1));
+            // scratch is now at the first dup for this primary key.
+            let mut forward: i64 = 0;
+            while let Ok(OperationStatus::Success) = scratch.retrieve_next(GetMode::NextDup) {
+                forward += 1;
+            }
+            return Ok(backward + 1 + forward);
         }
 
         Ok(1)

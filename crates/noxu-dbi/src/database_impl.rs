@@ -309,11 +309,22 @@ impl DatabaseImpl {
     ///
     /// Called by `EnvironmentImpl::open_database()` when a matching
     /// `recovered_trees` entry exists (Approach B of P1b wiring).
-    pub fn set_recovered_tree(&mut self, tree: Tree) {
+    pub fn set_recovered_tree(&mut self, mut tree: Tree) {
         // Synchronise the in-memory entry_count counter from the recovered
         // tree so that Database::count() returns the correct value after reopen.
         let count = tree.count_entries();
         self.entry_count.store(count, std::sync::atomic::Ordering::Relaxed);
+        // If the current (freshly-created) tree has a key comparator (e.g.
+        // TwoPartKeyComparator for sorted-dup databases), transfer it to the
+        // recovered tree.  The recovered tree was built by RecoveryManager
+        // which has no database-level config, so it always uses default byte
+        // comparison.  Without the comparator, lookups on two-part keys would
+        // fail because the BIN's find_entry_cmp path would not be used.
+        if let Some(ref mut current) = self.real_tree
+            && let Some(cmp) = current.take_comparator()
+        {
+            tree.set_comparator(cmp);
+        }
         self.real_tree = Some(tree);
     }
 
