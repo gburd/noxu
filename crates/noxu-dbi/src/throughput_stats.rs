@@ -29,6 +29,24 @@ pub struct ThroughputStats {
     pub n_pri_search_fails: AtomicU64,
     /// Primary-database cursor position operations (get_next, get_prev, etc.).
     pub n_pri_positions: AtomicU64,
+
+    // ── Secondary-index operations ──────────────────────────────────────────
+    /// Successful secondary-index insert operations.
+    pub n_sec_inserts: AtomicU64,
+    /// Failed secondary-index insert operations (key already exists).
+    pub n_sec_insert_fails: AtomicU64,
+    /// Successful secondary-index update operations.
+    pub n_sec_updates: AtomicU64,
+    /// Successful secondary-index delete operations.
+    pub n_sec_deletes: AtomicU64,
+    /// Failed secondary-index delete operations (key not found).
+    pub n_sec_delete_fails: AtomicU64,
+    /// Successful secondary-index search operations.
+    pub n_sec_searches: AtomicU64,
+    /// Failed secondary-index search operations (key not found).
+    pub n_sec_search_fails: AtomicU64,
+    /// Secondary-index cursor position operations.
+    pub n_sec_positions: AtomicU64,
 }
 
 impl ThroughputStats {
@@ -47,6 +65,14 @@ impl ThroughputStats {
             n_pri_searches: self.n_pri_searches.load(Ordering::Relaxed),
             n_pri_search_fails: self.n_pri_search_fails.load(Ordering::Relaxed),
             n_pri_positions: self.n_pri_positions.load(Ordering::Relaxed),
+            n_sec_inserts: self.n_sec_inserts.load(Ordering::Relaxed),
+            n_sec_insert_fails: self.n_sec_insert_fails.load(Ordering::Relaxed),
+            n_sec_updates: self.n_sec_updates.load(Ordering::Relaxed),
+            n_sec_deletes: self.n_sec_deletes.load(Ordering::Relaxed),
+            n_sec_delete_fails: self.n_sec_delete_fails.load(Ordering::Relaxed),
+            n_sec_searches: self.n_sec_searches.load(Ordering::Relaxed),
+            n_sec_search_fails: self.n_sec_search_fails.load(Ordering::Relaxed),
+            n_sec_positions: self.n_sec_positions.load(Ordering::Relaxed),
         }
     }
 
@@ -60,6 +86,14 @@ impl ThroughputStats {
         self.n_pri_searches.fetch_add(other.n_pri_searches, Ordering::Relaxed);
         self.n_pri_search_fails.fetch_add(other.n_pri_search_fails, Ordering::Relaxed);
         self.n_pri_positions.fetch_add(other.n_pri_positions, Ordering::Relaxed);
+        self.n_sec_inserts.fetch_add(other.n_sec_inserts, Ordering::Relaxed);
+        self.n_sec_insert_fails.fetch_add(other.n_sec_insert_fails, Ordering::Relaxed);
+        self.n_sec_updates.fetch_add(other.n_sec_updates, Ordering::Relaxed);
+        self.n_sec_deletes.fetch_add(other.n_sec_deletes, Ordering::Relaxed);
+        self.n_sec_delete_fails.fetch_add(other.n_sec_delete_fails, Ordering::Relaxed);
+        self.n_sec_searches.fetch_add(other.n_sec_searches, Ordering::Relaxed);
+        self.n_sec_search_fails.fetch_add(other.n_sec_search_fails, Ordering::Relaxed);
+        self.n_sec_positions.fetch_add(other.n_sec_positions, Ordering::Relaxed);
     }
 }
 
@@ -74,6 +108,14 @@ pub struct ThroughputStatsSnapshot {
     pub n_pri_searches: u64,
     pub n_pri_search_fails: u64,
     pub n_pri_positions: u64,
+    pub n_sec_inserts: u64,
+    pub n_sec_insert_fails: u64,
+    pub n_sec_updates: u64,
+    pub n_sec_deletes: u64,
+    pub n_sec_delete_fails: u64,
+    pub n_sec_searches: u64,
+    pub n_sec_search_fails: u64,
+    pub n_sec_positions: u64,
 }
 
 impl ThroughputStatsSnapshot {
@@ -87,6 +129,14 @@ impl ThroughputStatsSnapshot {
         self.n_pri_searches += other.n_pri_searches;
         self.n_pri_search_fails += other.n_pri_search_fails;
         self.n_pri_positions += other.n_pri_positions;
+        self.n_sec_inserts += other.n_sec_inserts;
+        self.n_sec_insert_fails += other.n_sec_insert_fails;
+        self.n_sec_updates += other.n_sec_updates;
+        self.n_sec_deletes += other.n_sec_deletes;
+        self.n_sec_delete_fails += other.n_sec_delete_fails;
+        self.n_sec_searches += other.n_sec_searches;
+        self.n_sec_search_fails += other.n_sec_search_fails;
+        self.n_sec_positions += other.n_sec_positions;
     }
 }
 
@@ -123,5 +173,43 @@ mod tests {
         acc.add(&s2);
         assert_eq!(acc.n_pri_inserts, 8);
         assert_eq!(acc.n_pri_searches, 30);
+    }
+
+    #[test]
+    fn test_sec_counters() {
+        let s = ThroughputStats::new();
+        s.n_sec_inserts.fetch_add(10, Ordering::Relaxed);
+        s.n_sec_searches.fetch_add(50, Ordering::Relaxed);
+        s.n_sec_search_fails.fetch_add(2, Ordering::Relaxed);
+        let snap = s.snapshot();
+        assert_eq!(snap.n_sec_inserts, 10);
+        assert_eq!(snap.n_sec_searches, 50);
+        assert_eq!(snap.n_sec_search_fails, 2);
+        assert_eq!(snap.n_sec_deletes, 0);
+    }
+
+    #[test]
+    fn test_add_snapshot_includes_sec() {
+        let acc = ThroughputStats::new();
+        let other = ThroughputStatsSnapshot {
+            n_sec_updates: 7,
+            n_sec_positions: 3,
+            ..Default::default()
+        };
+        acc.add_snapshot(&other);
+        let snap = acc.snapshot();
+        assert_eq!(snap.n_sec_updates, 7);
+        assert_eq!(snap.n_sec_positions, 3);
+    }
+
+    #[test]
+    fn test_sec_snapshot_add() {
+        let mut acc = ThroughputStatsSnapshot::default();
+        let s = ThroughputStatsSnapshot {
+            n_sec_inserts: 4, n_sec_deletes: 2, ..Default::default()
+        };
+        acc.add(&s);
+        assert_eq!(acc.n_sec_inserts, 4);
+        assert_eq!(acc.n_sec_deletes, 2);
     }
 }

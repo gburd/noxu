@@ -678,8 +678,9 @@ impl LogManager {
         let file_offset = lsn.file_offset() as u64;
 
         // Step 1: Read the minimum header.
+        // Uses the random-read path (point lookup), not sequential scan.
         let mut header_buf = vec![0u8; MIN_HEADER_SIZE];
-        let n = self.file_manager.read_from_file(
+        let n = self.file_manager.read_from_file_random(
             lsn.file_number(),
             file_offset,
             &mut header_buf,
@@ -719,7 +720,7 @@ impl LogManager {
 
         // Step 4: Read the full entry (header + payload) in one call.
         let mut full_buf = vec![0u8; entry_size];
-        let n = self.file_manager.read_from_file(
+        let n = self.file_manager.read_from_file_random(
             lsn.file_number(),
             file_offset,
             &mut full_buf,
@@ -795,11 +796,16 @@ impl LogManager {
             buffer_pool_stats: pool_stats,
             n_log_fsyncs: self.fsync_manager.fsync_count(),
             n_fsync_requests: self.fsync_manager.fsync_request_count(),
+            n_fsync_timeouts: self.fsync_manager.fsync_timeout_count(),
+            n_group_commits: self.fsync_manager.group_commit_count(),
+            fsync_time_ms: self.fsync_manager.fsync_time_ms(),
             n_file_opens: io_stats.n_file_opens,
             n_sequential_reads: io_stats.n_sequential_reads,
             n_sequential_read_bytes: io_stats.n_sequential_read_bytes,
             n_sequential_writes: io_stats.n_sequential_writes,
             n_sequential_write_bytes: io_stats.n_sequential_write_bytes,
+            n_random_reads: io_stats.n_random_reads,
+            n_random_read_bytes: io_stats.n_random_read_bytes,
         }
     }
 }
@@ -816,9 +822,15 @@ pub struct LogManagerStats {
     pub n_log_fsyncs: u64,
     /// Number of fsync requests (before coalescing).
     pub n_fsync_requests: u64,
+    /// Number of fsync requests that timed out.
+    pub n_fsync_timeouts: u64,
+    /// Number of group-commit batches (leader served ≥1 waiter).
+    pub n_group_commits: u64,
+    /// Cumulative fsync duration in milliseconds.
+    pub fsync_time_ms: u64,
     /// Number of log file opens (cache miss).
     pub n_file_opens: u64,
-    /// Number of sequential read operations.
+    /// Number of sequential read operations (recovery scan).
     pub n_sequential_reads: u64,
     /// Total bytes read sequentially.
     pub n_sequential_read_bytes: u64,
@@ -826,6 +838,10 @@ pub struct LogManagerStats {
     pub n_sequential_writes: u64,
     /// Total bytes written sequentially.
     pub n_sequential_write_bytes: u64,
+    /// Number of random (point-lookup) read operations.
+    pub n_random_reads: u64,
+    /// Total bytes from random reads.
+    pub n_random_read_bytes: u64,
 }
 
 #[cfg(test)]

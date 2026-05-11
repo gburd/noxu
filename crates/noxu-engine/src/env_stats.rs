@@ -148,6 +148,8 @@ impl Default for EnvironmentStats {
                 available_log_size: 0,
                 min_utilization: 0,
                 max_utilization: 0,
+                probe_runs: 0,
+                repeat_iterator_reads: 0,
             },
             checkpoint: CheckpointStatsSnapshot {
                 checkpoints: 0,
@@ -210,6 +212,24 @@ pub struct EvictorStatsSnapshot {
     pub pri2_lru_size: u64,
     /// Sum of pri1 + pri2.
     pub lru_size: u64,
+
+    // Thread pool
+    /// Number of eviction tasks refused because all threads were busy.
+    pub thread_unavailable: u64,
+
+    // Cache composition (instant stats)
+    /// Number of upper INs in main cache.
+    pub cached_upper_ins: u64,
+    /// Number of BINs and BIN-deltas in main cache.
+    pub cached_bins: u64,
+    /// Number of BIN-deltas in main cache.
+    pub cached_bin_deltas: u64,
+    /// Number of INs using compact sparse array representation.
+    pub cached_in_sparse_target: u64,
+    /// Number of INs using compact no-child representation.
+    pub cached_in_no_target: u64,
+    /// Number of INs using compact key representation.
+    pub cached_in_compact_key: u64,
 }
 
 impl From<&EvictorStats> for EvictorStatsSnapshot {
@@ -249,6 +269,13 @@ impl From<&EvictorStats> for EvictorStatsSnapshot {
             pri1_lru_size: p1,
             pri2_lru_size: p2,
             lru_size: p1 + p2,
+            thread_unavailable: stats.thread_unavailable.load(Ordering::Relaxed),
+            cached_upper_ins: stats.cached_upper_ins.load(Ordering::Relaxed),
+            cached_bins: stats.cached_bins.load(Ordering::Relaxed),
+            cached_bin_deltas: stats.cached_bin_deltas.load(Ordering::Relaxed),
+            cached_in_sparse_target: stats.cached_in_sparse_target.load(Ordering::Relaxed),
+            cached_in_no_target: stats.cached_in_no_target.load(Ordering::Relaxed),
+            cached_in_compact_key: stats.cached_in_compact_key.load(Ordering::Relaxed),
         }
     }
 }
@@ -288,6 +315,16 @@ pub struct LogStatsSnapshot {
     pub n_sequential_writes: u64,
     /// Total bytes written sequentially.
     pub n_sequential_write_bytes: u64,
+    /// Number of random (point-lookup) read operations.
+    pub n_random_reads: u64,
+    /// Total bytes from random reads.
+    pub n_random_read_bytes: u64,
+    /// Number of fsync requests that timed out.
+    pub n_fsync_timeouts: u64,
+    /// Number of group-commit batches (leader served ≥1 waiter).
+    pub n_group_commits: u64,
+    /// Cumulative fsync duration in milliseconds.
+    pub fsync_time_ms: u64,
 }
 
 impl From<&LogManagerStats> for LogStatsSnapshot {
@@ -307,6 +344,11 @@ impl From<&LogManagerStats> for LogStatsSnapshot {
             n_sequential_read_bytes: s.n_sequential_read_bytes,
             n_sequential_writes: s.n_sequential_writes,
             n_sequential_write_bytes: s.n_sequential_write_bytes,
+            n_random_reads: s.n_random_reads,
+            n_random_read_bytes: s.n_random_read_bytes,
+            n_fsync_timeouts: s.n_fsync_timeouts,
+            n_group_commits: s.n_group_commits,
+            fsync_time_ms: s.fsync_time_ms,
         }
     }
 }
@@ -336,6 +378,8 @@ pub struct LockStatsSnapshot {
     pub n_waiters: u64,
     /// Number of lock tables (shards).
     pub n_lock_tables: u64,
+    /// Number of lock acquisitions that timed out.
+    pub n_lock_timeouts: u64,
 }
 
 impl From<&LockStats> for LockStatsSnapshot {
@@ -349,6 +393,7 @@ impl From<&LockStats> for LockStatsSnapshot {
             n_owners: s.n_owners,
             n_waiters: s.n_waiters,
             n_lock_tables: 0, // filled in by engine.rs
+            n_lock_timeouts: s.n_lock_timeouts,
         }
     }
 }
@@ -527,9 +572,17 @@ mod tests {
             pri1_lru_size: 100,
             pri2_lru_size: 200,
             lru_size: 300,
+            thread_unavailable: 0,
+            cached_upper_ins: 10,
+            cached_bins: 20,
+            cached_bin_deltas: 5,
+            cached_in_sparse_target: 3,
+            cached_in_no_target: 2,
+            cached_in_compact_key: 1,
         };
         assert_eq!(snap.bytes_evicted, 1000);
         assert_eq!(snap.lru_size, 300);
+        assert_eq!(snap.cached_bins, 20);
     }
 
     #[test]
