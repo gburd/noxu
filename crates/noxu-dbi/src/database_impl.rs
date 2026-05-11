@@ -294,6 +294,17 @@ impl DatabaseImpl {
             .unwrap_or(false)
     }
 
+    /// Collects structural B-tree statistics.
+    ///
+    /// Walks the full tree (O(n) in node count) and returns node counts
+    /// and maximum depth.  Mirrors JE `DatabaseImpl.getDbStats(fast=false)`.
+    ///
+    /// Returns `None` if this DatabaseImpl has no real tree (e.g. internal
+    /// metadata databases).
+    pub fn collect_btree_stats(&self) -> Option<noxu_tree::TreeStats> {
+        self.real_tree.as_ref().map(|t| t.collect_stats())
+    }
+
     /// Replace the real B+tree with a tree recovered from the log.
     ///
     /// Called by `EnvironmentImpl::open_database()` when a matching
