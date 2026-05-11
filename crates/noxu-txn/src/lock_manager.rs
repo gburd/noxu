@@ -85,6 +85,9 @@ struct LockManagerStats {
 
     /// Total number of lock waits (blocked requests).
     lock_waits: AtomicU64,
+
+    /// Total number of lock acquisitions that timed out.
+    lock_timeouts: AtomicU64,
 }
 
 impl LockManager {
@@ -110,6 +113,7 @@ impl LockManager {
             stats: LockManagerStats {
                 lock_requests: AtomicU64::new(0),
                 lock_waits: AtomicU64::new(0),
+                lock_timeouts: AtomicU64::new(0),
             },
             lock_timeout_ms: AtomicU64::new(timeout_ms),
             share_registry: RwLock::new(HashMap::new()),
@@ -305,6 +309,7 @@ impl LockManager {
                             table.remove(&lsn);
                         }
                     }
+                    self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                     return Err(TxnError::LockTimeout {
                         timeout_ms,
                         lsn,
@@ -377,6 +382,7 @@ impl LockManager {
                             table.remove(&lsn);
                         }
                     }
+                    self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                     return Err(TxnError::LockTimeout {
                         timeout_ms,
                         lsn,
@@ -516,6 +522,7 @@ impl LockManager {
             n_total_locks: self.n_total_locks() as u64,
             n_read_locks: 0,
             n_write_locks: 0,
+            n_lock_timeouts: self.stats.lock_timeouts.load(Ordering::Relaxed),
         }
     }
 

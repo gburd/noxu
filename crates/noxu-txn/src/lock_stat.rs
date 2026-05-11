@@ -27,6 +27,9 @@ pub struct LockStats {
 
     /// Number of write locks currently held.
     pub n_write_locks: u64,
+
+    /// Number of lock requests that timed out (LockTimeout errors returned).
+    pub n_lock_timeouts: u64,
 }
 
 impl LockStats {
@@ -58,6 +61,7 @@ impl LockStats {
         self.n_total_locks += other.n_total_locks;
         self.n_read_locks += other.n_read_locks;
         self.n_write_locks += other.n_write_locks;
+        self.n_lock_timeouts += other.n_lock_timeouts;
     }
 }
 
@@ -114,6 +118,7 @@ mod tests {
         stats1.n_total_locks = 50;
         stats1.n_read_locks = 30;
         stats1.n_write_locks = 20;
+        stats1.n_lock_timeouts = 3;
 
         let mut stats2 = LockStats::new();
         stats2.lock_requests = 50;
@@ -123,6 +128,7 @@ mod tests {
         stats2.n_total_locks = 25;
         stats2.n_read_locks = 15;
         stats2.n_write_locks = 10;
+        stats2.n_lock_timeouts = 2;
 
         stats1.add(&stats2);
         assert_eq!(stats1.lock_requests, 150);
@@ -132,5 +138,16 @@ mod tests {
         assert_eq!(stats1.n_total_locks, 75);
         assert_eq!(stats1.n_read_locks, 45);
         assert_eq!(stats1.n_write_locks, 30);
+        assert_eq!(stats1.n_lock_timeouts, 5);
+    }
+
+    #[test]
+    fn test_lock_timeout_counter() {
+        let mut stats = LockStats::new();
+        assert_eq!(stats.n_lock_timeouts, 0);
+        stats.n_lock_timeouts = 7;
+        assert_eq!(stats.n_lock_timeouts, 7);
+        stats.reset();
+        assert_eq!(stats.n_lock_timeouts, 0);
     }
 }

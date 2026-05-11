@@ -123,6 +123,14 @@ pub struct CleanerStats {
 
     /// The current maximum (upper bound) log utilization as a percentage.
     pub max_utilization: AtomicU64,
+
+    /// Number of cleaner probing runs (without any cleaning) to update
+    /// utilization information.
+    pub probe_runs: AtomicU64,
+
+    /// Number of repeat-reads through the log caused by the repeat-iterator
+    /// cleaning strategy.
+    pub repeat_iterator_reads: AtomicU64,
 }
 
 impl CleanerStats {
@@ -164,6 +172,8 @@ impl CleanerStats {
             available_log_size: AtomicU64::new(0),
             min_utilization: AtomicU64::new(0),
             max_utilization: AtomicU64::new(0),
+            probe_runs: AtomicU64::new(0),
+            repeat_iterator_reads: AtomicU64::new(0),
         }
     }
 
@@ -204,6 +214,8 @@ impl CleanerStats {
         self.available_log_size.store(0, Ordering::Relaxed);
         self.min_utilization.store(0, Ordering::Relaxed);
         self.max_utilization.store(0, Ordering::Relaxed);
+        self.probe_runs.store(0, Ordering::Relaxed);
+        self.repeat_iterator_reads.store(0, Ordering::Relaxed);
     }
 
     /// Creates a non-atomic snapshot of the current statistics.
@@ -258,6 +270,8 @@ impl CleanerStats {
             available_log_size: self.available_log_size.load(Ordering::Relaxed),
             min_utilization: self.min_utilization.load(Ordering::Relaxed),
             max_utilization: self.max_utilization.load(Ordering::Relaxed),
+            probe_runs: self.probe_runs.load(Ordering::Relaxed),
+            repeat_iterator_reads: self.repeat_iterator_reads.load(Ordering::Relaxed),
         }
     }
 }
@@ -308,6 +322,10 @@ pub struct CleanerStatsSnapshot {
     pub available_log_size: u64,
     pub min_utilization: u64,
     pub max_utilization: u64,
+    /// Number of probing runs (update utilization without cleaning).
+    pub probe_runs: u64,
+    /// Number of repeat-iterator reads through the log.
+    pub repeat_iterator_reads: u64,
 }
 
 #[cfg(test)]
@@ -445,5 +463,27 @@ mod tests {
         let snap = stats.snapshot();
         assert_eq!(snap.runs, 0);
         assert_eq!(snap.lns_cleaned, 0);
+    }
+
+    #[test]
+    fn test_probe_runs_and_repeat_reads() {
+        let stats = CleanerStats::new();
+        stats.probe_runs.fetch_add(5, Ordering::Relaxed);
+        stats.repeat_iterator_reads.fetch_add(12, Ordering::Relaxed);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.probe_runs, 5);
+        assert_eq!(snap.repeat_iterator_reads, 12);
+    }
+
+    #[test]
+    fn test_reset_includes_new_fields() {
+        let stats = CleanerStats::new();
+        stats.probe_runs.fetch_add(3, Ordering::Relaxed);
+        stats.repeat_iterator_reads.fetch_add(7, Ordering::Relaxed);
+        stats.reset();
+        let snap = stats.snapshot();
+        assert_eq!(snap.probe_runs, 0);
+        assert_eq!(snap.repeat_iterator_reads, 0);
     }
 }
