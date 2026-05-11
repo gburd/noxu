@@ -402,6 +402,14 @@ fn test_aborted_transaction_full_rollback() {
     );
 }
 
+fn scratch_dir(prefix: &str) -> TempDir {
+    let base = std::path::Path::new("/scratch");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .expect("create temp dir under /scratch")
+}
+
 // ---------------------------------------------------------------------------
 // 9. 32-thread concurrent readers
 // ---------------------------------------------------------------------------
@@ -555,5 +563,313 @@ fn test_8r8w_all_committed_data_visible() {
     assert_eq!(
         missing, 0,
         "{missing}/{total} keys missing after all writers committed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P5-1  64-thread concurrent readers (slow — needs --run-ignored all)
+// ---------------------------------------------------------------------------
+
+/// 64 concurrent reader threads each execute 1 000 read-committed transactions
+/// containing 10 point lookups.  Keys are pre-populated before the threads
+/// start; all reads must return `Success`.
+///
+/// Exercises the shared-lock (READERS_LOCK) path at much higher contention
+/// than the 32-thread test above, verifying that the 64-shard lock manager
+/// does not deadlock or corrupt results.
+#[test]
+#[ignore]
+fn test_64_thread_concurrent_readers() {
+    use std::time::Instant;
+    const KEYS: u32 = 1_000;
+    const THREADS: usize = 64;
+    const TXNS_PER_THREAD: u32 = 1_000;
+    const LOOKUPS_PER_TXN: u32 = 10;
+
+    let dir = scratch_dir("noxu_64r_");
+    let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
+    let db = Arc::new(
+        env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+            .unwrap(),
+    );
+
+    // Pre-populate KEYS records.
+    for i in 0u32..KEYS {
+        let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let v = DatabaseEntry::from_bytes(b"rval");
+        let txn = env.begin_transaction(None, None).unwrap();
+        db.put(Some(&txn), &k, &v).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let start = std::sync::OnceLock::new();
+    let start = Arc::new(start);
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|tid| {
+            let env = Arc::clone(&env);
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                barrier.wait();
+                start.get_or_init(Instant::now);
+                let rc = TransactionConfig::read_committed();
+                let mut errors = 0u32;
+                for _ in 0..TXNS_PER_THREAD {
+                    let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                    for j in 0u32..LOOKUPS_PER_TXN {
+                        // Spread lookups across the key space.
+                        let idx = (tid as u32 * LOOKUPS_PER_TXN + j) % KEYS;
+                        let k = DatabaseEntry::from_bytes(&idx.to_be_bytes());
+                        let mut v = DatabaseEntry::new();
+                        if db.get(Some(&txn), &k, &mut v).unwrap() != OperationStatus::Success {
+                            errors += 1;
+                        }
+                    }
+                    txn.commit().unwrap();
+                }
+                errors
+            })
+        })
+        .collect();
+
+    let total_errors: u32 = handles
+        .into_iter()
+        .map(|h| h.join().expect("reader thread panicked"))
+        .sum();
+
+    let elapsed = start.get().map(|t| t.elapsed()).unwrap_or_default();
+    let total_ops = THREADS as u64 * TXNS_PER_THREAD as u64 * LOOKUPS_PER_TXN as u64;
+    let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
+    println!("64-thread readers: {total_ops} lookups in {elapsed:?} ({ops_per_sec:.0} ops/s)");
+
+    assert_eq!(
+        total_errors, 0,
+        "{total_errors} lookups returned NotFound across 64 concurrent readers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P5-2  32-reader + 32-writer concurrent (slow — needs --run-ignored all)
+// ---------------------------------------------------------------------------
+
+/// 32 writer threads each commit 5 000 operations (one key per txn, disjoint
+/// key prefix) while 32 reader threads continuously full-scan under
+/// read-committed isolation.
+///
+/// After all writers finish every written key must be visible.
+#[test]
+#[ignore]
+fn test_32r32w_concurrent() {
+    const WRITERS: usize = 32;
+    const READERS: usize = 32;
+    const OPS_PER_WRITER: u32 = 5_000;
+
+    let dir = scratch_dir("noxu_32r32w_");
+    let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
+    let db = Arc::new(
+        env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+            .unwrap(),
+    );
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(WRITERS + READERS));
+
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|wid| {
+            let env = Arc::clone(&env);
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for j in 0..OPS_PER_WRITER {
+                    let key = format!("w{wid:03}:{j:04}");
+                    let k = DatabaseEntry::from_bytes(key.as_bytes());
+                    let v = DatabaseEntry::from_bytes(b"wval");
+                    let txn = env.begin_transaction(None, None).unwrap();
+                    db.put(Some(&txn), &k, &v).unwrap();
+                    txn.commit().unwrap();
+                }
+            })
+        })
+        .collect();
+
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let env = Arc::clone(&env);
+            let db = Arc::clone(&db);
+            let done = Arc::clone(&done);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let rc = TransactionConfig::read_committed();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+                    let mut k = DatabaseEntry::new();
+                    let mut v = DatabaseEntry::new();
+                    let _ = cursor.get(&mut k, &mut v, noxu_db::Get::First, None);
+                    while cursor
+                        .get(&mut k, &mut v, noxu_db::Get::Next, None)
+                        .unwrap()
+                        == OperationStatus::Success
+                    {}
+                    cursor.close().unwrap();
+                    txn.commit().unwrap();
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        })
+        .collect();
+
+    for w in writers {
+        w.join().expect("writer thread panicked");
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in readers {
+        r.join().expect("reader thread panicked");
+    }
+
+    // Verify all written keys are present.
+    let mut missing = 0u32;
+    for wid in 0..WRITERS {
+        for j in 0..OPS_PER_WRITER {
+            let key = format!("w{wid:03}:{j:04}");
+            let k = DatabaseEntry::from_bytes(key.as_bytes());
+            let mut v = DatabaseEntry::new();
+            if db.get(None, &k, &mut v).unwrap() == OperationStatus::NotFound {
+                missing += 1;
+            }
+        }
+    }
+    let total = WRITERS as u32 * OPS_PER_WRITER;
+    assert_eq!(
+        missing, 0,
+        "{missing}/{total} keys missing after 32r32w workload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P5-3  200-thread disjoint writers (slow — needs --run-ignored all)
+// ---------------------------------------------------------------------------
+
+/// 200 threads each write 50 disjoint keys (key range `range{tid:03}:{i:04}`)
+/// under synchronized start.
+///
+/// Assertions:
+/// - all 200 threads complete without error
+/// - all 200 × 50 = 10 000 keys are present after completion
+/// - sorted order is preserved (cursor scan returns keys in lexicographic
+///   order, spot-checked at 100 positions)
+/// - total wall time < 120 s (throughput sanity floor)
+#[test]
+#[ignore]
+fn test_200_thread_disjoint_writers() {
+    use std::time::Instant;
+    const THREADS: usize = 200;
+    const KEYS_PER_THREAD: u32 = 50;
+    const TOTAL_KEYS: u32 = THREADS as u32 * KEYS_PER_THREAD;
+
+    let dir = scratch_dir("noxu_200w_");
+    let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
+    let db = Arc::new(
+        env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+            .unwrap(),
+    );
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|tid| {
+            let env = Arc::clone(&env);
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for i in 0..KEYS_PER_THREAD {
+                    let key = format!("range{tid:03}:{i:04}");
+                    let k = DatabaseEntry::from_bytes(key.as_bytes());
+                    let v = DatabaseEntry::from_bytes(b"dval");
+                    let txn = env.begin_transaction(None, None).unwrap();
+                    db.put(Some(&txn), &k, &v).unwrap();
+                    txn.commit().unwrap();
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("writer thread panicked");
+    }
+
+    let elapsed = start.elapsed();
+    let ops_per_sec = TOTAL_KEYS as f64 / elapsed.as_secs_f64();
+    println!(
+        "200-thread disjoint writers: {TOTAL_KEYS} keys in {elapsed:?} ({ops_per_sec:.0} ops/s)"
+    );
+    assert!(
+        elapsed.as_secs() < 120,
+        "200-thread test took {elapsed:?}, exceeded 120 s budget"
+    );
+
+    // Verify all keys present.
+    let mut missing = 0u32;
+    for tid in 0..THREADS {
+        for i in 0..KEYS_PER_THREAD {
+            let key = format!("range{tid:03}:{i:04}");
+            let k = DatabaseEntry::from_bytes(key.as_bytes());
+            let mut v = DatabaseEntry::new();
+            if db.get(None, &k, &mut v).unwrap() == OperationStatus::NotFound {
+                missing += 1;
+            }
+        }
+    }
+    assert_eq!(
+        missing, 0,
+        "{missing}/{TOTAL_KEYS} keys missing after 200-thread write"
+    );
+
+    // Spot-check sorted order via cursor scan.
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut prev: Option<String> = None;
+    let mut k = DatabaseEntry::new();
+    let mut v = DatabaseEntry::new();
+    let mut order_errors = 0u32;
+    let mut checked = 0u32;
+    let mut op = noxu_db::Get::First;
+    loop {
+        if cursor.get(&mut k, &mut v, op, None).unwrap() != OperationStatus::Success {
+            break;
+        }
+        let cur = String::from_utf8_lossy(k.get_data().unwrap_or_default()).into_owned();
+        if let Some(ref p) = prev {
+            if cur < *p {
+                order_errors += 1;
+            }
+        }
+        prev = Some(cur);
+        checked += 1;
+        op = noxu_db::Get::Next;
+    }
+    cursor.close().unwrap();
+    assert_eq!(
+        order_errors, 0,
+        "{order_errors} out-of-order keys found in cursor scan of {checked} entries"
+    );
+    assert_eq!(
+        checked, TOTAL_KEYS,
+        "cursor scan returned {checked} entries, expected {TOTAL_KEYS}"
     );
 }

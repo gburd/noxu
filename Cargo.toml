@@ -74,6 +74,10 @@ path = "examples/sequence.rs"
 name = "getting_started"
 path = "examples/getting_started.rs"
 
+[[example]]
+name = "scale_validation"
+path = "examples/scale_validation.rs"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
