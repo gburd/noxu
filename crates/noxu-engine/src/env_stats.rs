@@ -325,6 +325,8 @@ pub struct LogStatsSnapshot {
     pub n_group_commits: u64,
     /// Cumulative fsync duration in milliseconds.
     pub fsync_time_ms: u64,
+    /// Sum of all group-commit batch sizes (total waiters served across all batches).
+    pub n_fsync_batch_size_sum: u64,
 }
 
 impl From<&LogManagerStats> for LogStatsSnapshot {
@@ -349,6 +351,7 @@ impl From<&LogManagerStats> for LogStatsSnapshot {
             n_fsync_timeouts: s.n_fsync_timeouts,
             n_group_commits: s.n_group_commits,
             fsync_time_ms: s.fsync_time_ms,
+            n_fsync_batch_size_sum: s.n_fsync_batch_size_sum,
         }
     }
 }
