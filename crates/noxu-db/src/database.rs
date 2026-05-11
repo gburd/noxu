@@ -58,8 +58,10 @@ pub struct Database {
     pub(crate) db_impl: Arc<RwLock<DatabaseImpl>>,
     /// Back-reference to the owning EnvironmentImpl (for close/cleanup).
     env_impl: Arc<Mutex<EnvironmentImpl>>,
-    /// Whether this handle is open
-    open: AtomicBool,
+    /// Shared open flag — same `Arc<AtomicBool>` as the environment's
+    /// `DatabaseHandle.open`, so that `Database::close()` automatically
+    /// marks the environment-side handle as closed too.
+    open: Arc<AtomicBool>,
     /// Throughput counters for this database's operations.
     ///
     /// Cloned from `DatabaseImpl.throughput` at open time so that
@@ -172,12 +174,19 @@ impl Database {
     /// Creates a new database handle.
     ///
     /// Internal constructor called by Environment.
+    ///
+    /// `open_flag` is a shared `Arc<AtomicBool>` that is also stored in the
+    /// environment's `DatabaseHandle` for this database.  Setting it to `false`
+    /// (via `Database::close()`) simultaneously marks the env-side handle as
+    /// closed, allowing `Environment::close()` to succeed without a separate
+    /// callback.
     pub(crate) fn new(
         name: String,
         id: u64,
         config: DatabaseConfig,
         db_impl: Arc<RwLock<DatabaseImpl>>,
         env_impl: Arc<Mutex<EnvironmentImpl>>,
+        open_flag: Arc<AtomicBool>,
         no_sync: bool,
         write_no_sync: bool,
     ) -> Self {
@@ -196,7 +205,7 @@ impl Database {
             config,
             db_impl,
             env_impl,
-            open: AtomicBool::new(true),
+            open: open_flag,
             throughput,
             lock_manager,
             log_manager,
@@ -713,6 +722,30 @@ impl Database {
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Verifies the structural integrity of this database's B-tree.
+    ///
+    /// Walks the B-tree from root to BIN leaves and checks:
+    /// - Each upper IN's children are accessible (non-null child references).
+    /// - Each BIN entry that is not known-deleted has a valid (non-NULL) LSN.
+    /// - The BIN's first key is >= the parent routing key (key-range containment).
+    ///
+    /// Mirrors `Database.verify(VerifyConfig)` in JE — calls BtreeVerifier on the
+    /// underlying tree.
+    ///
+    /// # Arguments
+    /// * `config` - Verification options (which checks to run, max errors, etc.)
+    ///
+    /// # Returns
+    /// A `VerifyResult` with any structural errors and the count of records verified.
+    ///
+    /// # Errors
+    /// Returns an error if the database is closed.
+    pub fn verify(&self, config: &noxu_engine::VerifyConfig) -> Result<noxu_engine::VerifyResult> {
+        self.check_open()?;
+        let guard = self.db_impl.read();
+        Ok(noxu_engine::verify_database_impl(&guard, config))
     }
 
     /// Checks if the database is open, returns an error if not.
@@ -1324,6 +1357,41 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         db.close().unwrap();
         assert!(db.sync().is_err());
+    }
+
+    // ── verify ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_empty_database_passes() {
+        use noxu_engine::VerifyConfig;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let config = VerifyConfig::default();
+        let result = db.verify(&config).unwrap();
+        assert!(result.passed, "empty db should pass: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_verify_populated_database_passes() {
+        use noxu_engine::VerifyConfig;
+        let (_tmp, _env, db) = temp_env_and_db();
+        for i in 0u32..20 {
+            let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
+            let v = DatabaseEntry::from_bytes(&(i * 2).to_be_bytes());
+            db.put(None, &k, &v).unwrap();
+        }
+        let config = VerifyConfig::default();
+        let result = db.verify(&config).unwrap();
+        assert!(result.passed, "populated db should pass: {:?}", result.errors);
+        assert!(result.records_verified > 0);
+    }
+
+    #[test]
+    fn test_verify_closed_database_fails() {
+        use noxu_engine::VerifyConfig;
+        let (_tmp, _env, db) = temp_env_and_db();
+        db.close().unwrap();
+        let config = VerifyConfig::default();
+        assert!(db.verify(&config).is_err());
     }
 
     // ── get_with_options / put_with_options ────────────────────────────────

@@ -69,7 +69,10 @@ struct DatabaseHandle {
     id: u64,
     #[allow(dead_code)]
     config: DatabaseConfig,
-    open: AtomicBool,
+    /// Shared open flag — same `Arc<AtomicBool>` as `Database.open` so that
+    /// `Database::close()` setting the flag to false also marks this handle
+    /// as closed, letting `Environment::close()` succeed.
+    open: Arc<AtomicBool>,
 }
 
 /// Internal transaction state.
@@ -423,11 +426,16 @@ impl Environment {
 
         let db_id = db_impl_arc.read().get_id().id() as u64;
 
+        // Shared open flag: stored in both `DatabaseHandle` and `Database`.
+        // When `Database::close()` sets it to false the env-side handle is
+        // also marked as closed, so `Environment::close()` can proceed.
+        let open_flag = Arc::new(AtomicBool::new(true));
+
         let db_handle = Arc::new(DatabaseHandle {
             name: name.to_string(),
             id: db_id,
             config: config.clone(),
-            open: AtomicBool::new(true),
+            open: Arc::clone(&open_flag),
         });
 
         databases.insert(name.to_string(), db_handle);
@@ -439,6 +447,7 @@ impl Environment {
             config.clone(),
             db_impl_arc,
             Arc::clone(&self.env_impl),
+            open_flag,
             self.config.txn_no_sync,
             self.config.txn_write_no_sync,
         ))
@@ -752,6 +761,49 @@ impl Environment {
             .as_ref()
             .map(|lm| lm.fsync_count())
             .unwrap_or(0)
+    }
+
+    /// Verifies the structural integrity of all databases in this environment.
+    ///
+    /// Iterates every open `DatabaseImpl` in the environment's db_map and
+    /// calls `verify_database_impl()` on each one (B-tree key-order checks,
+    /// LSN validity, child-pointer completeness).  Results are merged into a
+    /// single `VerifyResult`.
+    ///
+    /// Mirrors `Environment.verify(VerifyConfig, PrintStream)` in JE which
+    /// creates a `BtreeVerifier` and calls `verifier.verifyAll()`.
+    ///
+    /// # Arguments
+    /// * `config` - Verification options (btree, log, checksums, max_errors).
+    ///
+    /// # Returns
+    /// A combined `VerifyResult` over all databases.
+    ///
+    /// # Errors
+    /// Returns an error if the environment is closed or invalidated.
+    pub fn verify(&self, config: &noxu_engine::VerifyConfig) -> Result<noxu_engine::VerifyResult> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let all_dbs = env_impl.get_all_database_impls();
+        drop(env_impl);
+
+        let mut merged = noxu_engine::VerifyResult::new();
+        for db_arc in &all_dbs {
+            let guard = db_arc.read();
+            let result = noxu_engine::verify_database_impl(&guard, config);
+            merged.databases_verified += result.databases_verified;
+            merged.records_verified += result.records_verified;
+            for err in result.errors {
+                merged.add_error(err);
+                if merged.error_count() >= config.max_errors as usize {
+                    return Ok(merged);
+                }
+            }
+            for w in result.warnings {
+                merged.add_warning(w);
+            }
+        }
+        Ok(merged)
     }
 
     /// Internal method to mark a database as closed.
@@ -1222,5 +1274,50 @@ mod tests {
 
         // Now close should succeed.
         env.close().unwrap();
+    }
+
+    // ── verify ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_empty_environment_passes() {
+        use crate::VerifyConfig;
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        let verify_cfg = VerifyConfig::default();
+        let result = env.verify(&verify_cfg).unwrap();
+        assert!(result.passed, "empty env should pass: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_verify_environment_with_data_passes() {
+        use crate::{DatabaseConfig, DatabaseEntry, VerifyConfig};
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+
+        let mut db_config = DatabaseConfig::new();
+        db_config.set_allow_create(true);
+        let db = env.open_database(None, "vtest", &db_config).unwrap();
+        for i in 0u32..10 {
+            let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
+            let v = DatabaseEntry::from_bytes(&(i * 3).to_be_bytes());
+            db.put(None, &k, &v).unwrap();
+        }
+
+        let verify_cfg = VerifyConfig::default();
+        let result = env.verify(&verify_cfg).unwrap();
+        assert!(result.passed, "env with data should pass: {:?}", result.errors);
+        assert!(result.records_verified >= 10);
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_verify_closed_environment_fails() {
+        use crate::VerifyConfig;
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        env.close().unwrap();
+        let verify_cfg = VerifyConfig::default();
+        assert!(env.verify(&verify_cfg).is_err());
     }
 }

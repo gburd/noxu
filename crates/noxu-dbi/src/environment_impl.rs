@@ -729,6 +729,14 @@ impl EnvironmentImpl {
         self.db_map.read().get(&db_id).cloned()
     }
 
+    /// Returns all open `DatabaseImpl` arcs for iteration (e.g., verification).
+    ///
+    /// The returned `Vec` holds cloned `Arc`s so the db_map lock is released
+    /// before the caller accesses individual databases.
+    pub fn get_all_database_impls(&self) -> Vec<Arc<RwLock<DatabaseImpl>>> {
+        self.db_map.read().values().cloned().collect()
+    }
+
     /// Closes a database handle.
     pub fn close_database(&self, db_id: DatabaseId) -> Result<(), DbiError> {
         if let Some(db) = self.db_map.read().get(&db_id) {
