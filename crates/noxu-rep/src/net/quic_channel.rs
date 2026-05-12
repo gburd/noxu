@@ -133,7 +133,13 @@ pub fn default_server_config() -> Result<quinn::ServerConfig> {
         .map_err(|e| RepError::NetworkError(format!("TLS: {e}")))?;
     let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|e| RepError::NetworkError(format!("QUIC server config: {e}")))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_tls)))
+    let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
+    // Disable PMTUD: on loopback the MTU is fixed at 65535, and quinn-proto's
+    // MTUD state machine can assert under netem duplicate/corrupt injection.
+    let mut transport = quinn::TransportConfig::default();
+    transport.mtu_discovery_config(None);
+    cfg.transport_config(Arc::new(transport));
+    Ok(cfg)
 }
 
 /// Build a `quinn::ClientConfig` that skips certificate verification.
@@ -144,10 +150,15 @@ pub fn insecure_client_config() -> quinn::ClientConfig {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
-    quinn::ClientConfig::new(Arc::new(
+    let mut cfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .expect("valid insecure client config"),
-    ))
+    ));
+    // Disable PMTUD for the same reason as the server config above.
+    let mut transport = quinn::TransportConfig::default();
+    transport.mtu_discovery_config(None);
+    cfg.transport_config(Arc::new(transport));
+    cfg
 }
 
 /// 4-byte connection handshake sent by the client immediately after opening

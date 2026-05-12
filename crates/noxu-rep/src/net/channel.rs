@@ -223,9 +223,10 @@ impl TcpChannel {
 
     /// Connect to a remote address and return a `TcpChannel`.
     ///
-    /// This is a synchronous blocking connect.
+    /// Uses a 30-second timeout so that a dropped SYN under kernel netem
+    /// packet-loss chaos does not block indefinitely (Linux default: ~127 s).
     pub fn connect(addr: SocketAddr) -> Result<Self> {
-        let stream = TcpStream::connect(addr)
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
         Ok(Self::new(stream))
     }
@@ -242,6 +243,8 @@ impl Channel for TcpChannel {
         }
         let len = data.len() as u32;
         let mut stream = self.stream.lock();
+        // Cap write time at 30 s to prevent indefinite stall under packet loss.
+        stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
         stream
             .write_all(&len.to_le_bytes())
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
@@ -294,9 +297,13 @@ impl Channel for TcpChannel {
 
         let payload_len = u32::from_le_bytes(len_buf) as usize;
 
-        // Remove the timeout for reading the payload so a slow sender does
-        // not cause a spurious timeout mid-message.
-        stream.set_read_timeout(None).ok();
+        // Use a generous timeout for the payload read: the caller's `timeout`
+        // may be as short as 1 ms (FeederRunner ACK polling), which is far too
+        // small once a message header has been received.  Cap at 30 s so we
+        // never hang indefinitely under kernel netem packet loss while still
+        // being patient enough for real retransmit scenarios.
+        let payload_timeout = timeout.max(Duration::from_secs(30));
+        stream.set_read_timeout(Some(payload_timeout)).ok();
 
         let mut payload = vec![0u8; payload_len];
         stream
