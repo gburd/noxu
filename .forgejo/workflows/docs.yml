@@ -23,52 +23,48 @@ env:
 jobs:
   spell:
     name: Spell check (typos)
-    runs-on: ubuntu-latest
+    runs-on: lxc-bookworm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install typos
+      - name: Install typos and check spelling
         run: |
+          apt-get install -qy curl
           curl -fsSL \
             https://github.com/crate-ci/typos/releases/latest/download/typos-x86_64-unknown-linux-musl.tar.gz \
             | tar xz -C /usr/local/bin ./typos
-
-      - name: Check spelling
-        run: typos docs/src/
+          typos docs/src/
 
   prose:
     name: Markdown lint (markdownlint-cli2)
-    runs-on: ubuntu-latest
+    runs-on: lxc-bookworm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install markdownlint-cli2
-        run: npm install -g markdownlint-cli2
-
-      - name: Lint markdown
-        run: markdownlint-cli2 "docs/src/**/*.md"
+      - name: Install Node and lint markdown
+        run: |
+          apt-get install -qy nodejs npm
+          npm install -g markdownlint-cli2
+          markdownlint-cli2 "docs/src/**/*.md"
 
   build-deploy:
     name: Build and deploy mdBook
-    runs-on: ubuntu-latest
+    runs-on: lxc-bookworm
     needs: [spell, prose]
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache mdBook binaries
-        id: cache-mdbook
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin
-          key: mdbook-${{ env.MDBOOK_VERSION }}-mermaid-${{ env.MDBOOK_MERMAID_VERSION }}
-
-      - name: Install mdBook
-        if: steps.cache-mdbook.outputs.cache-hit != 'true'
+      - name: Install mdBook from pre-built binaries
         run: |
-          cargo install mdbook --version ${{ env.MDBOOK_VERSION }} --locked
-          cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }} --locked
+          apt-get install -qy curl
+          # mdbook
+          curl -fsSL \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin
+          # mdbook-mermaid
+          curl -fsSL \
+            "https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin
 
       - name: Build book
         run: mdbook build docs/
