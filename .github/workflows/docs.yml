@@ -1,0 +1,189 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+
+# Allow one concurrent deployment per branch/PR.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MDBOOK_VERSION: "0.4.40"
+  MDBOOK_MERMAID_VERSION: "0.13.0"
+
+jobs:
+  spell:
+    name: Spell check (typos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install typos
+        uses: taiki-e/install-action@v2
+        with:
+          tool: typos
+
+      - name: Check spelling
+        run: typos docs/src/
+
+  prose:
+    name: Markdown lint (markdownlint-cli2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install markdownlint-cli2
+        run: npm install -g markdownlint-cli2
+
+      - name: Lint markdown
+        run: markdownlint-cli2 "docs/src/**/*.md"
+
+  build:
+    name: Build mdBook
+    runs-on: ubuntu-latest
+    needs: [spell, prose]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache mdBook binaries
+        id: cache-mdbook
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: mdbook-${{ env.MDBOOK_VERSION }}-mermaid-${{ env.MDBOOK_MERMAID_VERSION }}
+
+      - name: Install mdBook
+        if: steps.cache-mdbook.outputs.cache-hit != 'true'
+        run: |
+          cargo install mdbook --version ${{ env.MDBOOK_VERSION }} --locked
+          cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }} --locked
+
+      - name: Build book
+        run: mdbook build docs/
+        env:
+          MDBOOK_OUTPUT__HTML__SITE_URL: /lamdb/
+
+      - name: Check links (lychee)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --base docs/book
+            --exclude 'docs.oracle.com'
+            --exclude 'crates.io'
+            --exclude 'localhost'
+            docs/book/**/*.html
+          fail: true
+
+      - name: Upload book artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noxu-docs
+          path: docs/book/
+          retention-days: 7
+
+  deploy-github:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache mdBook binaries
+        id: cache-mdbook
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: mdbook-${{ env.MDBOOK_VERSION }}-mermaid-${{ env.MDBOOK_MERMAID_VERSION }}
+
+      - name: Install mdBook
+        if: steps.cache-mdbook.outputs.cache-hit != 'true'
+        run: |
+          cargo install mdbook --version ${{ env.MDBOOK_VERSION }} --locked
+          cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }} --locked
+
+      - name: Build book for GitHub Pages
+        run: mdbook build docs/
+        env:
+          MDBOOK_OUTPUT__HTML__SITE_URL: /lamdb/
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  deploy-codeberg:
+    name: Deploy to Codeberg Pages
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache mdBook binaries
+        id: cache-mdbook
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: mdbook-${{ env.MDBOOK_VERSION }}-mermaid-${{ env.MDBOOK_MERMAID_VERSION }}
+
+      - name: Install mdBook
+        if: steps.cache-mdbook.outputs.cache-hit != 'true'
+        run: |
+          cargo install mdbook --version ${{ env.MDBOOK_VERSION }} --locked
+          cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }} --locked
+
+      - name: Build book for Codeberg Pages
+        run: mdbook build docs/
+        env:
+          MDBOOK_OUTPUT__HTML__SITE_URL: /
+          MDBOOK_OUTPUT__HTML__GIT_REPOSITORY_URL: https://codeberg.org/gburd/lamdb
+
+      - name: Deploy to Codeberg pages branch via SSH
+        env:
+          CODEBERG_DEPLOY_KEY: ${{ secrets.CODEBERG_DEPLOY_KEY }}
+        run: |
+          # Configure SSH
+          mkdir -p ~/.ssh
+          echo "$CODEBERG_DEPLOY_KEY" > ~/.ssh/codeberg_deploy
+          chmod 600 ~/.ssh/codeberg_deploy
+          ssh-keyscan codeberg.org >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Configure git identity
+          git config --global user.email "ci@noxu-db"
+          git config --global user.name "Noxu DB CI"
+
+          # Push built book to pages branch
+          cd docs/book
+          git init
+          git checkout -b pages
+          git add -A
+          git commit -m "docs: deploy $(git -C ../.. rev-parse --short HEAD)"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/codeberg_deploy -o StrictHostKeyChecking=yes" \
+            git push --force git@codeberg.org:gburd/lamdb.git pages:pages
+
+          # Clean up key
+          rm -f ~/.ssh/codeberg_deploy

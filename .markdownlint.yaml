@@ -1,0 +1,22 @@
+default: true
+
+# Technical tables and long code paths make 80-char lines impractical
+MD013:
+  line_length: 120
+  tables: false
+  code_blocks: false
+  headings: false
+
+# Inline HTML is needed for mdBook admonition syntax and some tables
+MD033: false
+
+# Chapter intro pages don't always start with an H1; mdBook provides the title
+MD041: false
+
+# Allow duplicate heading text in different sections (e.g., multiple "Overview" headings)
+MD024:
+  allow_different_nesting: true
+
+# Ordered lists: allow any starting number (1. 1. 1. style is valid)
+MD029:
+  style: "ordered"

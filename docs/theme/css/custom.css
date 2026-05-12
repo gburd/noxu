@@ -1,0 +1,26 @@
+/* Noxu DB documentation — custom theme overrides */
+
+/* Slightly tighter code block padding for dense reference tables */
+.content pre {
+    padding: 0.75em 1em;
+}
+
+/* Ensure wide tables scroll horizontally rather than overflow */
+.content table {
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+}
+
+/* Consistent line-height for code in tables */
+.content td code,
+.content th code {
+    font-size: 0.875em;
+}
+
+/* Admonition-style callout blocks (> **Note:** prefix) */
+.content blockquote strong:first-child {
+    display: block;
+    margin-bottom: 0.25em;
+    color: var(--links);
+}
