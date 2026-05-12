@@ -328,6 +328,18 @@ impl DatabaseImpl {
         self.real_tree = Some(tree);
     }
 
+    /// Wires the environment's shared memory-usage counter into this database's
+    /// tree so that BIN insertions/deletions update the Arbiter's budget.
+    ///
+    /// Must be called after `new()` in `EnvironmentImpl::open_database()`.
+    /// Also forwards the counter to the recovered tree (if any) so that
+    /// databases opened after recovery also track memory.
+    pub fn set_memory_counter(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicI64>) {
+        if let Some(tree) = self.real_tree.as_mut() {
+            tree.set_memory_counter(counter);
+        }
+    }
+
     // Configuration
     pub fn max_tree_entries_per_node(&self) -> i32 {
         self.max_tree_entries_per_node

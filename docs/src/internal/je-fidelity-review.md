@@ -186,6 +186,44 @@ JE has been production-validated across all of these scenarios over two decades.
 
 ---
 
+## Session 42: JE Team Review — 6-Item Response (2026-05-12)
+
+**Commit**: TBD  **Tests**: all passing | **Clippy**: zero errors
+
+### S42-1 — Fix concurrent fsync coalescing gap (JE team item #1)
+**Files**: `crates/noxu-log/src/log_manager.rs`
+**Problem**: `write_io_latch` serialized the pwrite64→FsyncManager pipeline, preventing concurrent writers from arriving at `fsync_manager.fsync()` simultaneously. Thread A would complete fdatasync before Thread B even entered FsyncManager, resulting in ~1:1 fsync-per-commit coalescing instead of JE's 3.6:1.
+**Fix**: Removed `write_io_latch` entirely. Moved pwrite64 inside the LWL (matching JE's `logWriteMutex` design). All threads now complete their kernel writes while holding LWL, release it, then arrive at `FsyncManager.fsync()` nearly simultaneously — enabling the leader/waiter algorithm to coalesce multiple commits into a single fdatasync.
+**Expected impact**: w10_conc_8r8w fsync coalescing ratio should improve toward JE's 3.6:1 on encrypted NVMe.
+
+### S42-2 — Fix w11 recovery benchmark showing 0 ops/s (JE team item #6)
+**Files**: `crates/noxu-dbi/src/environment_impl.rs`
+**Problem**: INCompressor daemon used raw `thread::sleep(5000ms)` without early-wakeup. When `env.close()` called `shutdown()` then `handle.join()`, it blocked for up to 5 seconds. This inflated w11 elapsed_ms to ~5037ms regardless of record count, causing `1/5.037s = 0.198 ops/s` which `{:.0}` format truncated to 0.
+**Fix**: Replaced raw sleep with chunked 100ms sleep (matching the cleaner daemon pattern). Shutdown now completes in ≤100ms, dropping w11 elapsed to ~50-150ms.
+
+### S42-3 — Within-BIN cursor fast path (JE team item #2)
+**Files**: `crates/noxu-dbi/src/cursor_impl.rs`
+**Problem**: `retrieve_next()` called `find_bin_for_key(root, current_key)` on every cursor advance — a full root-to-leaf B-tree traversal per step. JE's `CursorImpl.getNext()` latches the current BIN in-place (O(1)).
+**Fix**: Added `current_bin_arc` fast path in `retrieve_next()`. When the cursor has a pinned BIN arc, it reads `next_index` directly from the BIN without tree traversal. `get_first()` and `get_last()` now set `current_bin_arc` on initial positioning. The slow path (B-tree traversal) only fires when no BIN is pinned, and saves the discovered arc for subsequent calls.
+**Expected impact**: w05 range scan at 100K should improve from JE 1.67x faster toward parity.
+
+### S42-4 — Wire memory budget counter to user database trees (JE team item #3)
+**Files**: `crates/noxu-dbi/src/environment_impl.rs`, `crates/noxu-dbi/src/database_impl.rs`
+**Problem**: `Arbiter::cache_usage` was a shared `Arc<AtomicI64>`, but only `primary_tree` had `set_memory_counter()` called. User database trees were created without the counter, so `Arbiter::is_over_budget()` always read 0 and the evictor never triggered based on actual memory pressure.
+**Fix**: Added `cache_usage: Arc<AtomicI64>` field to `EnvironmentImpl`. Added `DatabaseImpl::set_memory_counter()` that forwards to the tree. `open_database()` now calls `set_memory_counter(Arc::clone(&self.cache_usage))` after creating the `DatabaseImpl`, and again after `set_recovered_tree()` (which replaces the tree).
+
+### S42-5 — TupleSerdeBinding sort order (JE team item #4) — ALREADY RESOLVED
+**Status**: Resolved in Session 32 (S32-1). `TupleSerdeBinding<K,V>` requires `K: SortKey`; sort-preserving fixed-width BE encoding with sign-bit XOR flip for signed types, null-escaped strings. 25 unit tests verify sort order for all types. The fidelity review document correctly records this as resolved.
+
+### S42-6 — Crash recovery fault-injection test suite (JE team item #5) — ALREADY EXISTS
+**Status**: Complete. `crates/noxu-db/tests/crash_recovery_test.rs` contains 6 adversarial SIGKILL tests; `crates/noxu-db/src/bin/crash_worker.rs` implements 4 worker modes. All 6 tests pass: committed survives, uncommitted absent, repeated crash idempotent, commit ordering preserved, torn write recovered, clean/SIGKILL parity.
+
+### S42-7 — Pre-existing clippy fix (noxu-rep)
+**File**: `crates/noxu-rep/src/stream/peer_feeder.rs`
+Removed unnecessary `let w = winner.lock().clone(); w` pattern → `winner.lock().clone()`.
+
+---
+
 ## Session 34: Concurrent Performance + Group Commit Fix (2026-05-09)
 
 **Commit**: 0b0795b  **Tests**: 4,702 passing | **Clippy**: zero errors
