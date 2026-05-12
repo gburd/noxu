@@ -89,6 +89,9 @@ const NUM_STREAMS: usize = 4;
 pub fn mux_server_config() -> Result<quinn::ServerConfig> {
     let mut cfg = default_server_config()?;
     let mut transport = quinn::TransportConfig::default();
+    // Disable PMTUD: loopback MTU is fixed; MTUD asserts under netem
+    // duplicate/corrupt injection (quinn-proto mtud.rs:88).
+    transport.mtu_discovery_config(None);
     transport.datagram_receive_buffer_size(Some(64 * 1024));
     cfg.transport_config(Arc::new(transport));
     Ok(cfg)
@@ -99,6 +102,8 @@ pub fn mux_server_config() -> Result<quinn::ServerConfig> {
 pub fn mux_insecure_client_config() -> quinn::ClientConfig {
     let mut cfg = insecure_client_config();
     let mut transport = quinn::TransportConfig::default();
+    // Disable PMTUD: same reason as mux_server_config.
+    transport.mtu_discovery_config(None);
     transport.datagram_receive_buffer_size(Some(64 * 1024));
     cfg.transport_config(Arc::new(transport));
     cfg
