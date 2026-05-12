@@ -16,20 +16,20 @@ create-missing = false
 command = "mdbook-mermaid"
 renderer = ["html"]
 
-# Link checking is done by lychee in CI (see .github/workflows/docs.yml)
+# Link checking is done by lychee in CI (see .woodpecker.yml / .github/workflows/docs.yml)
 # rather than as an mdBook preprocessor, because mdbook-linkcheck has
 # compatibility issues with mdBook 0.4.40.
 
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "ayu"
-git-repository-url = "https://github.com/gburd/lamdb"
+git-repository-url = "https://codeberg.org/gregburd/noxu"
 git-repository-icon = "fa-github"
-edit-url-template = "https://github.com/gburd/lamdb/edit/main/docs/src/{path}"
+edit-url-template = "https://codeberg.org/gregburd/noxu/src/branch/main/docs/src/{path}"
 # site-url is overridden per-deploy via MDBOOK_OUTPUT__HTML__SITE_URL env var:
-#   GitHub Pages:  /lamdb/
-#   Codeberg Pages: /
-site-url = "/lamdb/"
+#   Codeberg Pages: /noxu/   (Woodpecker CI)
+#   GitHub Pages:  /lamdb/  (GitHub Actions mirror)
+site-url = "/noxu/"
 fold.enable = true
 fold.level = 1
 
