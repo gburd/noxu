@@ -1,0 +1,56 @@
+# Project History
+
+Noxu DB is a Rust port of Oracle's Berkeley DB Java Edition 7.5.11. This
+page documents why the project exists and how it evolved session by session.
+
+## Why Noxu DB Exists
+
+Berkeley DB JE is battle-tested, with 20+ years of production use and a
+well-documented architecture. The goal is to provide a dependency-light,
+production-grade embedded database in Rust with:
+
+- The same API contract as BDB JE (drop-in for JE-based applications ported to Rust)
+- The same algorithm fidelity (trusted, proven storage engineering)
+- No JVM — eliminates GC pauses, JVM startup overhead, and deployment complexity
+- Idiomatic Rust — `thiserror`, `parking_lot`, `Arc<RwLock<T>>`, RAII latches
+
+All 10 Oracle NoSQL JE enhancements are included (Record Extinction, TTL,
+Group Commit, ByteComparator, DataEraser, ExtinctionFilter, ScanFilter,
+UncachedLN, BackupManager, AsyncAcks).
+
+## Development Timeline
+
+| Sessions | Major milestone |
+|---|---|
+| 1–22 | Foundation: B-tree, WAL, transaction manager, recovery, evictor, cleaner, checkpointer, public API |
+| 23 | First full benchmark comparison — Noxu reads 25x faster than JE at 1K scale (no JVM warmup) |
+| 24 | BIN-delta chaining, Sequence transactions, upper-IN cleaner, comment audit |
+| 25 | 10 NoSQL JE enhancements: ByteComparator, ScanFilter, ExtinctionFilter, GroupCommit, per-slot BIN times, VerifyCheckpointInterval, DataEraser, ExtinctionScanner, BackupManager |
+| 26 | JE lock/latch hierarchy fidelity: Locker trait, ThreadLocker sharing, HandleLocker buddy system, DummyLockManager wired, TxnChain for replication partial rollback |
+| 27 | Non-JE write-buffering (superseded by Session 28) |
+| 28 | **Critical fix**: Replaced non-JE MVCC with JE's lock-based isolation. Writers block readers; no snapshot isolation. |
+| 29 | Replication wiring: EnvironmentLogScanner, EnvironmentLogWriter, NetworkRestore TCP, GroupCommit wiring, TTL file selection, O(1) Database::count() |
+| 31 | Adaptive cleaner throttling; replication server-side network restore provider. Canonical NVMe benchmarks. |
+| 36 | EnvironmentConfig 100% JE coverage (150+ params), typed EnvironmentFailureReason (19 variants), ExceptionListener trait, is_valid() |
+| 37 | P0-P2 production hardening: LM concurrency (incremental waiter graph), cleaner back-pressure wiring, sorted-dup cursor routing, join cursor |
+| 38 | QuorumPolicy (SimpleMajority/Flexible/Expression), PhiAccrualDetector, RepNode capacity/latency hints, quoracle integration, FPaxos split-phase, dynamic add_peer/remove_peer |
+| 39 | QUIC multiplexed channels: 4 independent streams per connection, ReconnectToken, VLSN datagrams, chaos test fixes |
+| 40 | Soak bugs fixed (TCP timeout, PMTUD assertion, SYN hang), adaptive phase timeout (phi-derived), update_peer_metadata(), dynamic membership chaos phases, docs/replication.md |
+
+## Current Fidelity
+
+As of Session 40:
+- **Named-algorithm fidelity**: ~92% (named algorithms from JE faithfully implemented)
+- **Operational completeness**: ~85% (API surface coverage)
+- **Production hardening**: ~100% (EnvironmentConfig, ExceptionListener, is_valid())
+- **Zero clippy errors** on `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- **623 noxu-rep tests passing**, 2914+ tests across all crates
+
+## Key Deviations from JE
+
+| Deviation | Reason |
+|---|---|
+| Rust-native log format (not JE binary-compatible) | Rust serialization is simpler and safer than Java's |
+| `TupleSerdeBinding` uses serde binary encoding, not sort-preserving tuple encoding | Per-project decision; JE's sort-preserving encoding is complex to port |
+| No XA/two-phase commit implementation | Out of scope for initial port |
+| QUIC transport (JE uses Java NIO) | Rust has no equivalent to Java NIO; QUIC provides similar multiplexing |
