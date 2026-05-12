@@ -159,8 +159,8 @@ jobs:
       - name: Build book for Codeberg Pages
         run: mdbook build docs/
         env:
-          MDBOOK_OUTPUT__HTML__SITE_URL: /
-          MDBOOK_OUTPUT__HTML__GIT_REPOSITORY_URL: https://codeberg.org/gburd/lamdb
+          MDBOOK_OUTPUT__HTML__SITE_URL: /noxu/
+          MDBOOK_OUTPUT__HTML__GIT_REPOSITORY_URL: https://codeberg.org/gregburd/noxu
 
       - name: Deploy to Codeberg pages branch via SSH
         env:
@@ -183,7 +183,7 @@ jobs:
           git add -A
           git commit -m "docs: deploy $(git -C ../.. rev-parse --short HEAD)"
           GIT_SSH_COMMAND="ssh -i ~/.ssh/codeberg_deploy -o StrictHostKeyChecking=yes" \
-            git push --force git@codeberg.org:gburd/lamdb.git pages:pages
+            git push --force git@codeberg.org:gregburd/noxu.git pages:pages
 
           # Clean up key
           rm -f ~/.ssh/codeberg_deploy
