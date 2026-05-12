@@ -562,13 +562,14 @@ impl LockImpl {
     ///
     /// `shares_fn(owner_id)` should return `true` if the requesting locker
     /// (`locker_id`) shares locks with `owner_id`.
-    pub fn lock_with_sharing(
+    #[inline]
+    pub fn lock_with_sharing<F: Fn(i64) -> bool>(
         &mut self,
         request_type: LockType,
         locker_id: i64,
         non_blocking: bool,
         jump_ahead_of_waiters: bool,
-        shares_fn: &dyn Fn(i64) -> bool,
+        shares_fn: &F,
     ) -> LockAttemptResult {
         let new_lock = LockInfo::new(locker_id, request_type);
         let mut grant = self.try_lock_with_sharing(
@@ -642,6 +643,7 @@ impl LockImpl {
     ///
     /// @return LockGrantType::EXISTING, NEW, PROMOTION, WAIT_RESTART, WAIT_NEW
     /// or WAIT_PROMOTION.
+    #[inline]
     fn try_lock(
         &mut self,
         new_lock: LockInfo,
@@ -657,12 +659,13 @@ impl LockImpl {
     /// is skipped and the lock is co-granted.  This allows multiple
     /// ThreadLockers on the same thread to share a lock without deadlock.
     ///
-    /// 
-    fn try_lock_with_sharing(
+    ///
+    #[inline]
+    fn try_lock_with_sharing<F: Fn(i64) -> bool>(
         &mut self,
         new_lock: LockInfo,
         first_waiter_in_line: bool,
-        shares_fn: &dyn Fn(i64) -> bool,
+        shares_fn: &F,
     ) -> LockGrantType {
         // If no one owns this right now, just grab it.
         if self.n_owners() == 0 {

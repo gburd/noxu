@@ -36,6 +36,7 @@ impl Lock {
     ///
     /// If the lock is thin and needs to mutate to full, this method
     /// performs the mutation transparently.
+    #[inline]
     pub fn lock(
         &mut self,
         request_type: LockType,
@@ -82,13 +83,14 @@ impl Lock {
     /// `shares_fn(owner_id)` returns true if the requesting locker shares locks
     /// with `owner_id`.
     ///
-    pub fn lock_with_sharing(
+    #[inline]
+    pub fn lock_with_sharing<F: Fn(i64) -> bool>(
         &mut self,
         request_type: LockType,
         locker_id: i64,
         non_blocking: bool,
         jump_ahead_of_waiters: bool,
-        shares_fn: &dyn Fn(i64) -> bool,
+        shares_fn: &F,
     ) -> LockAttemptResult {
         match self {
             Lock::Thin(thin) => {
@@ -128,6 +130,7 @@ impl Lock {
     /// Releases a lock held by the given locker.
     /// Returns the set of locker IDs that should be notified (woken up).
     /// Returns None if the locker wasn't an owner.
+    #[inline]
     pub fn release(&mut self, locker_id: i64) -> Option<Vec<i64>> {
         match self {
             Lock::Thin(thin) => thin.release(locker_id),
@@ -217,6 +220,7 @@ impl Lock {
     }
 
     /// Return the number of waiters.
+    #[inline]
     pub fn n_waiters(&self) -> usize {
         match self {
             Lock::Thin(thin) => thin.n_waiters(),
@@ -225,6 +229,7 @@ impl Lock {
     }
 
     /// Return the number of owners.
+    #[inline]
     pub fn n_owners(&self) -> usize {
         match self {
             Lock::Thin(thin) => thin.n_owners(),

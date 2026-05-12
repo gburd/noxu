@@ -1,6 +1,7 @@
 //! TupleInput: reads primitive types from a byte buffer using sortable encodings.
 //!
 
+use bytes::Bytes;
 use crate::error::{BindError, Result};
 
 /// A reader for tuple-encoded byte data.
@@ -10,21 +11,29 @@ use crate::error::{BindError, Result};
 /// flipped for sortable ordering. Floats use IEEE 754 with bit manipulation
 /// for sortable ordering.
 ///
-/// 
+/// Internally uses `bytes::Bytes` so that `clone()` is O(1) and `from_vec`
+/// is zero-copy.
+///
+///
 #[derive(Debug, Clone)]
 pub struct TupleInput {
-    buf: Vec<u8>,
+    buf: Bytes,
     off: usize,
 }
 
 impl TupleInput {
-    /// Creates a new `TupleInput` from a byte slice.
+    /// Creates a new `TupleInput` from a byte slice (copies the slice).
     pub fn new(data: &[u8]) -> Self {
-        Self { buf: data.to_vec(), off: 0 }
+        Self { buf: Bytes::copy_from_slice(data), off: 0 }
     }
 
-    /// Creates a new `TupleInput` from a byte vector.
+    /// Creates a new `TupleInput` from a byte vector — zero-copy.
     pub fn from_vec(data: Vec<u8>) -> Self {
+        Self { buf: Bytes::from(data), off: 0 }
+    }
+
+    /// Creates a new `TupleInput` from existing `Bytes` — zero-copy.
+    pub fn from_bytes(data: Bytes) -> Self {
         Self { buf: data, off: 0 }
     }
 
