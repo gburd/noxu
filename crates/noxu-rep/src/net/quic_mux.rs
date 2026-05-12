@@ -50,7 +50,7 @@
 //! reconnect latency from ~3 RTT (TCP+TLS) to ~1 RTT.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -321,6 +321,37 @@ impl QuicMultiplexedChannel {
     ) -> Result<Self> {
         let runtime = Self::build_runtime()?;
         Self::connect_inner(addr, server_name, client_cfg, runtime, None)
+    }
+
+    /// Connect by hostname (or IP string) and port with DNS resolution.
+    ///
+    /// Happy Eyeballs: IPv6 addresses are tried before IPv4. The first address
+    /// that completes the QUIC handshake wins.
+    pub fn connect_host(host: &str, port: u16, server_name: &str) -> Result<Self> {
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| RepError::NetworkError(
+                format!("DNS resolution failed for {host}:{port}: {e}")))?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(RepError::NetworkError(
+                format!("no addresses resolved for {host}:{port}")));
+        }
+
+        // Happy Eyeballs: prefer IPv6.
+        let mut sorted = addrs;
+        sorted.sort_by_key(|a| if a.is_ipv6() { 0u8 } else { 1u8 });
+
+        let mut last_err = None;
+        for addr in &sorted {
+            match Self::connect(*addr, server_name) {
+                Ok(ch) => return Ok(ch),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| RepError::NetworkError(
+            format!("could not connect to {host}:{port}"))))
     }
 
     /// Reconnect using a [`ReconnectToken`] produced by

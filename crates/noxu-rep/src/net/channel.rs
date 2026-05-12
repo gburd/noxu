@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read as IoRead, Write as IoWrite};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -229,6 +229,60 @@ impl TcpChannel {
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
         Ok(Self::new(stream))
+    }
+
+    /// Connect by hostname (or IP string) and port, with DNS resolution and
+    /// Happy Eyeballs address ordering (IPv6 candidates tried before IPv4).
+    ///
+    /// All addresses returned by DNS are tried in order; the first successful
+    /// connection wins. Each attempt uses a 30-second TCP connect timeout.
+    ///
+    /// This enables peer addresses in `RepNode` to be specified as hostnames,
+    /// IPv6 literals (`[::1]:6200`), or plain IPv4 (`127.0.0.1:6200`).
+    pub fn connect_host(host: &str, port: u16) -> Result<Self> {
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| RepError::NetworkError(format!("DNS resolution failed for {host}:{port}: {e}")))?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(RepError::NetworkError(format!("no addresses resolved for {host}:{port}")));
+        }
+
+        // Happy Eyeballs: prefer IPv6 over IPv4 when both are available.
+        let mut sorted = addrs;
+        sorted.sort_by_key(|a| if a.is_ipv6() { 0u8 } else { 1u8 });
+
+        let mut last_err = None;
+        for addr in &sorted {
+            match TcpStream::connect_timeout(addr, Duration::from_secs(30)) {
+                Ok(stream) => return Ok(Self::new(stream)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(RepError::NetworkError(format!(
+            "could not connect to {host}:{port}: {}",
+            last_err.unwrap()
+        )))
+    }
+
+    /// Bind a dual-stack (IPv4 + IPv6) TCP listener on the given port.
+    ///
+    /// First attempts `[::]:port` (dual-stack on systems that support it, e.g.
+    /// Linux with `IPV6_V6ONLY=0`). Falls back to `0.0.0.0:port` if IPv6 is
+    /// unavailable (e.g., BSD with `IPV6_V6ONLY=1` requires a separate socket,
+    /// or the kernel has IPv6 disabled).
+    pub fn bind_dual_stack(port: u16) -> Result<TcpChannelListener> {
+        // Try IPv6 wildcard first (accepts both IPv4-mapped and native IPv6 on Linux).
+        if let Ok(listener) = TcpListener::bind(format!("[::]:{}",  port)) {
+            return Ok(TcpChannelListener { listener });
+        }
+        // Fall back to IPv4 wildcard.
+        let addr: SocketAddr = format!("0.0.0.0:{port}")
+            .parse()
+            .map_err(|e| RepError::NetworkError(format!("invalid bind addr: {e}")))?;
+        TcpChannelListener::bind(addr)
     }
 }
 
