@@ -74,6 +74,12 @@ pub struct NodeInfo {
     ///
     /// Corresponds to `ReplicaState.getRepTxnEndVLSN()` in JE HA.
     pub log_range: Option<(u64, u64)>,
+    /// Relative read throughput capacity x 100 (default 100 = 1.0).
+    pub read_capacity_pct: u32,
+    /// Relative write throughput capacity x 100 (default 100 = 1.0).
+    pub write_capacity_pct: u32,
+    /// Expected one-way latency hint in milliseconds (default 1).
+    pub latency_hint_ms: u64,
 }
 
 impl GroupService {
@@ -264,6 +270,33 @@ impl GroupService {
         }
     }
 
+    /// Update the capacity and latency metadata for an existing node.
+    ///
+    /// Only updates `read_capacity_pct`, `write_capacity_pct`, and
+    /// `latency_hint_ms`. The node's identity and network address are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named node does not exist.
+    pub fn update_node_metadata(
+        &self,
+        name: &str,
+        read_capacity_pct: u32,
+        write_capacity_pct: u32,
+        latency_hint_ms: u64,
+    ) -> crate::error::Result<()> {
+        let mut nodes = self.nodes.write();
+        match nodes.get_mut(name) {
+            Some(info) => {
+                info.read_capacity_pct = read_capacity_pct;
+                info.write_capacity_pct = write_capacity_pct;
+                info.latency_hint_ms = latency_hint_ms;
+                Ok(())
+            }
+            None => Err(crate::error::RepError::NodeNotFound(name.to_string())),
+        }
+    }
+
     /// Get a clone of the node info for the named node.
     pub fn get_node(&self, name: &str) -> Option<NodeInfo> {
         self.nodes.read().get(name).cloned()
@@ -349,6 +382,9 @@ mod tests {
             known_vlsn: 0,
             log_range: None,
             is_active: true,
+            read_capacity_pct: 100,
+            write_capacity_pct: 100,
+            latency_hint_ms: 1,
         }
     }
 

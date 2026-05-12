@@ -73,6 +73,17 @@ pub enum RepError {
     #[error("network error: {0}")]
     NetworkError(String),
 
+    /// A replication frame failed CRC32 verification.
+    ///
+    /// Indicates in-flight corruption (hardware error, kernel bug, or an
+    /// adversarial sender). The receiver closes the channel when this occurs.
+    #[error("frame corrupted: vlsn={vlsn} expected_crc={expected:#010x} actual_crc={actual:#010x}")]
+    FrameCorrupted {
+        vlsn: u64,
+        expected: u32,
+        actual: u32,
+    },
+
     /// A replication protocol error occurred (unexpected message, version
     /// mismatch, etc.).
     #[error("protocol error: {0}")]

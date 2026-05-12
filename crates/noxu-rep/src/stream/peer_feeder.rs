@@ -35,9 +35,13 @@ use std::sync::Arc;
 
 use noxu_sync::Mutex;
 
-use crate::error::Result;
+use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
+use crate::net::service_dispatcher::ServiceHandler;
 use crate::stream::feeder::{FeederRunner, LogScanner};
+
+/// Service name registered with `TcpServiceDispatcher` for peer log feeds.
+pub const PEER_FEEDER_SERVICE_NAME: &str = "PEER_FEEDER";
 
 // ---------------------------------------------------------------------------
 // PeerLogScanner
@@ -280,6 +284,252 @@ pub fn negotiate_syncup(
 }
 
 // ---------------------------------------------------------------------------
+// PeerFeederService — TCP ServiceHandler backed by a PeerLogScanner
+// ---------------------------------------------------------------------------
+
+/// A [`ServiceHandler`] that streams peer-held log entries to a requesting
+/// downstream replica over the `"PEER_FEEDER"` service.
+///
+/// The service is registered on the `TcpServiceDispatcher` at startup.
+/// When a downstream replica connects, the protocol is:
+///
+/// 1. The downstream sends `[start_vlsn: u64 LE]` (8 bytes) — the first VLSN
+///    it needs.
+/// 2. The server negotiates via `negotiate_syncup()`.
+/// 3. If the range is available, a `PeerFeederRunner` is spawned in a new
+///    thread and streams entries until the channel closes.
+/// 4. If the range is not available, the server responds with
+///    `[NEEDS_RESTORE: u8 = 1]` and closes the connection.
+///
+/// The `PeerLogScanner` (`source`) is populated by the node's own
+/// `ReplicaReceiver` as entries arrive from the master.
+pub struct PeerFeederService {
+    source: Arc<PeerLogScanner>,
+}
+
+impl PeerFeederService {
+    /// Create a new service backed by `source`.
+    pub fn new(source: Arc<PeerLogScanner>) -> Self {
+        Self { source }
+    }
+}
+
+/// Wire-level response codes sent by the server.
+const PEER_FEEDER_CAN_SERVE: u8  = 0;
+const PEER_FEEDER_NEEDS_RESTORE: u8 = 1;
+
+impl ServiceHandler for PeerFeederService {
+    fn service_name(&self) -> &str {
+        PEER_FEEDER_SERVICE_NAME
+    }
+
+    fn handle(&self, channel: Box<dyn Channel>) -> Result<()> {
+        use std::time::Duration;
+
+        // 1. Read the 8-byte start_vlsn from the downstream replica.
+        let msg = channel
+            .receive(Duration::from_secs(30))?
+            .ok_or_else(|| RepError::NetworkError(
+                "PEER_FEEDER: no start_vlsn received".into()))?;
+
+        if msg.len() < 8 {
+            return Err(RepError::NetworkError(format!(
+                "PEER_FEEDER: short handshake ({} bytes)", msg.len())));
+        }
+        let start_vlsn = u64::from_le_bytes(
+            msg[..8].try_into().expect("slice of 8 bytes")
+        );
+
+        // 2. Negotiate: do we hold the requested VLSN range?
+        let range = self.source.log_range();
+        match negotiate_syncup(range, start_vlsn) {
+            SyncupResult::CanServe { start_vlsn: sv } => {
+                // Tell the downstream it can proceed.
+                channel.send(&[PEER_FEEDER_CAN_SERVE])?;
+
+                // 3. Stream entries in this thread (the dispatcher already
+                //    called us from a per-connection thread).
+                let channel_arc: Arc<dyn Channel> = Arc::from(channel);
+                let runner = PeerFeederRunner::new(
+                    channel_arc,
+                    Arc::clone(&self.source),
+                    sv,
+                );
+                let _ = runner.run();
+                Ok(())
+            }
+            SyncupResult::NeedsRestore => {
+                channel.send(&[PEER_FEEDER_NEEDS_RESTORE])?;
+                Err(RepError::NetworkError(format!(
+                    "PEER_FEEDER: cannot serve vlsn={start_vlsn}, \
+                     range={range:?}")))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client-side peer catch-up
+// ---------------------------------------------------------------------------
+
+/// Connect to a peer node's `PEER_FEEDER` service and pull log entries
+/// starting from `start_vlsn`.
+///
+/// This is the client counterpart to [`PeerFeederService`].  It is called
+/// by a replica that is behind and wants to catch up from a peer that holds
+/// the needed VLSN range (rather than routing all traffic through the master).
+///
+/// Protocol (matches `PeerFeederService::handle`):
+///   1. Open a TCP connection and request the `"PEER_FEEDER"` service via
+///      `service_dispatcher::connect_to_service()`.
+///   2. Send `[start_vlsn: u64 LE]`.
+///   3. Read the one-byte response:
+///      - `0` (`PEER_FEEDER_CAN_SERVE`) — peer has the range; proceed.
+///      - `1` (`PEER_FEEDER_NEEDS_RESTORE`) — peer cannot serve; return
+///        `Ok(false)` so the caller can fall back to the master.
+///   4. Start a `ReplicaReceiver` loop on the channel, passing each entry
+///      to `log_writer`.  Returns `Ok(true)` when the peer closes the
+///      channel (i.e. the catch-up is complete).
+///
+/// # Pipelining
+///
+/// `catch_up_from_peer` is intentionally non-async.  Call it from a
+/// dedicated thread per peer.  To pipeline catch-up from multiple peers
+/// simultaneously, spawn one thread per peer (e.g. from a `ThreadPool`).
+/// The [`MultiPeerCatchUp`] helper below manages this.
+pub fn catch_up_from_peer(
+    peer_addr: std::net::SocketAddr,
+    start_vlsn: u64,
+    log_writer: &mut dyn crate::stream::replica_stream::LogWriter,
+) -> Result<bool> {
+    use crate::net::service_dispatcher::connect_to_service;
+    use crate::stream::replica_stream::ReplicaReceiver;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Connect and request the PEER_FEEDER service.
+    let channel = connect_to_service(peer_addr, PEER_FEEDER_SERVICE_NAME)?;
+
+    // Send start_vlsn.
+    channel.send(&start_vlsn.to_le_bytes())?;
+
+    // Read the one-byte response.
+    let resp = channel
+        .receive(Duration::from_secs(30))?
+        .ok_or_else(|| RepError::NetworkError("no response from peer feeder".into()))?;
+    if resp.is_empty() {
+        return Err(RepError::NetworkError("empty response from peer feeder".into()));
+    }
+    match resp[0] {
+        PEER_FEEDER_CAN_SERVE => {}
+        PEER_FEEDER_NEEDS_RESTORE => return Ok(false),
+        other => {
+            return Err(RepError::ProtocolError(format!(
+                "peer feeder unknown response byte: {other:#x}"
+            )));
+        }
+    }
+
+    // Run the replica receive loop.
+    let channel_arc: Arc<dyn Channel> = Arc::from(channel);
+    let receiver = ReplicaReceiver::new(channel_arc);
+    receiver.run(log_writer)?;
+
+    Ok(true)
+}
+
+/// Pipelined catch-up from multiple peer nodes simultaneously.
+///
+/// Spawns one thread per peer in `peers` and waits for all to finish (or
+/// for the first to succeed).  Returns the name of the peer that supplied
+/// the entries, or `None` if no peer could serve the range.
+///
+/// The `log_writer_factory` closure is called once per thread to produce a
+/// per-thread `LogWriter`.  The factory must be `Send + Sync`.
+pub struct MultiPeerCatchUp {
+    peers: Vec<(String, std::net::SocketAddr)>,
+    start_vlsn: u64,
+}
+
+impl MultiPeerCatchUp {
+    /// Create a new multi-peer catch-up request.
+    ///
+    /// `peers` is a list of `(node_name, socket_addr)` pairs to try.
+    pub fn new(peers: Vec<(String, std::net::SocketAddr)>, start_vlsn: u64) -> Self {
+        Self { peers, start_vlsn }
+    }
+
+    /// Run pipelined catch-up.
+    ///
+    /// Spawns one thread per peer and waits for the first to succeed.
+    /// Each thread calls `catch_up_from_peer`; the winning thread's entries
+    /// are applied through `make_writer()`.  Other threads are joined once
+    /// the first succeeds.
+    ///
+    /// Returns the name of the first peer that successfully served the range,
+    /// or `None` if all peers declined.
+    pub fn run<F, W>(self, make_writer: F) -> Option<String>
+    where
+        F: Fn() -> W + Send + Sync + 'static,
+        W: crate::stream::replica_stream::LogWriter + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let make_writer = std::sync::Arc::new(make_writer);
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let winner: std::sync::Arc<noxu_sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(noxu_sync::Mutex::new(None));
+
+        let mut handles = Vec::new();
+
+        for (name, addr) in self.peers {
+            let make_writer = std::sync::Arc::clone(&make_writer);
+            let done = std::sync::Arc::clone(&done);
+            let winner = std::sync::Arc::clone(&winner);
+            let start_vlsn = self.start_vlsn;
+            let name_clone = name.clone();
+
+            let handle = std::thread::Builder::new()
+                .name(format!("noxu-peer-catchup-{}", name))
+                .spawn(move || {
+                    if done.load(Ordering::Acquire) {
+                        return; // another peer already won
+                    }
+                    let mut writer = make_writer();
+                    match catch_up_from_peer(addr, start_vlsn, &mut writer) {
+                        Ok(true) => {
+                            if !done.swap(true, Ordering::AcqRel) {
+                                *winner.lock() = Some(name_clone);
+                            }
+                        }
+                        Ok(false) => {
+                            log::debug!(
+                                "peer '{}' cannot serve vlsn={start_vlsn}",
+                                name
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "catch-up from peer '{}' failed: {e}",
+                                name
+                            );
+                        }
+                    }
+                })
+                .expect("failed to spawn peer catch-up thread");
+
+            handles.push(handle);
+        }
+
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let w = winner.lock().clone();
+        w
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -467,6 +717,9 @@ mod tests {
                 is_active: true,
                 known_vlsn: 0,
                 log_range: None,
+                read_capacity_pct: 100,
+                write_capacity_pct: 100,
+                latency_hint_ms: 1,
             })
             .unwrap();
         }
@@ -508,6 +761,9 @@ mod tests {
                 is_active: true,
                 known_vlsn: 0,
                 log_range: None,
+                read_capacity_pct: 100,
+                write_capacity_pct: 100,
+                latency_hint_ms: 1,
             })
             .unwrap();
         }
@@ -558,6 +814,9 @@ mod tests {
                 is_active: true,
                 known_vlsn: 0,
                 log_range: range,
+                read_capacity_pct: 100,
+                write_capacity_pct: 100,
+                latency_hint_ms: 1,
             };
             // Set last_seen differently so we can check sort order.
             info.last_seen = Instant::now()
@@ -597,6 +856,9 @@ mod tests {
             is_active: true,
             known_vlsn: 0,
             log_range: None,
+            read_capacity_pct: 100,
+            write_capacity_pct: 100,
+            latency_hint_ms: 1,
         })
         .unwrap();
 

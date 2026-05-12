@@ -45,6 +45,9 @@ use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
 use crate::state_change_listener::{StateChangeEvent, StateChangeListener};
 use crate::stream::feeder::{EnvironmentLogScanner, Feeder, LogScanner};
+use crate::stream::peer_feeder::{
+    PEER_FEEDER_SERVICE_NAME, PeerFeederService, PeerLogScanner,
+};
 use crate::stream::replica_stream::{EnvironmentLogWriter, ReplicaStream};
 use crate::vlsn::vlsn_index::VlsnIndex;
 use crate::vlsn::vlsn_range::VlsnRange;
@@ -149,6 +152,14 @@ pub struct ReplicatedEnvironment {
     /// When `config.env_home` is `None` at construction time, registration is
     /// deferred until `with_environment()` provides the env home path.
     restore_registered: AtomicBool,
+
+    /// In-memory log queue used by the peer feeder service.
+    ///
+    /// When this node is a replica, `apply_entry()` pushes each received log
+    /// entry here.  The `PeerFeederService` registered on the TCP dispatcher
+    /// reads from this queue to stream entries to downstream replicas that
+    /// are behind this node (peer-to-peer log distribution, BDB/HA style).
+    peer_scanner: Arc<PeerLogScanner>,
 }
 
 impl ReplicatedEnvironment {
@@ -246,6 +257,21 @@ impl ReplicatedEnvironment {
                 }
             };
 
+        // Build the in-memory peer log scanner; register the peer feeder
+        // service on the dispatcher so downstream replicas can connect.
+        let peer_scanner = Arc::new(PeerLogScanner::new());
+        if let Some(ref dispatcher) = tcp_dispatcher {
+            let service = PeerFeederService::new(Arc::clone(&peer_scanner));
+            dispatcher.register(
+                PEER_FEEDER_SERVICE_NAME,
+                Arc::new(service),
+            );
+            log::debug!(
+                "Node '{}' PEER_FEEDER service registered",
+                config.node_name,
+            );
+        }
+
         let env = Self {
             config,
             node_state,
@@ -264,6 +290,7 @@ impl ReplicatedEnvironment {
             io_threads: StdMutex::new(Vec::new()),
             io_shutdown: AtomicBool::new(false),
             restore_registered: AtomicBool::new(restore_registered_init),
+            peer_scanner,
         };
 
         Ok(env)
@@ -401,6 +428,9 @@ impl ReplicatedEnvironment {
             is_active: true,
             known_vlsn: 0,
             log_range: None,
+            read_capacity_pct: node.read_capacity_pct,
+            write_capacity_pct: node.write_capacity_pct,
+            latency_hint_ms: node.latency_hint_ms,
         };
         self.group_service.add_node(info)?;
         log::info!(
@@ -429,6 +459,41 @@ impl ReplicatedEnvironment {
         Ok(())
     }
 
+    /// Update the capacity and latency metadata of an existing peer.
+    ///
+    /// Only the following fields are updated from `node`:
+    ///   - `read_capacity_pct`
+    ///   - `write_capacity_pct`
+    ///   - `latency_hint_ms`
+    ///
+    /// The node's identity (name, address, port, node_type) is preserved.
+    /// Safe to call while replication is active.
+    ///
+    /// If the quorum policy is `Flexible` or `Expression`, the quorum system
+    /// is rebuilt to reflect the new capacity/latency weights.
+    pub fn update_peer_metadata(
+        &self,
+        name: &str,
+        node: crate::rep_node::RepNode,
+    ) -> Result<()> {
+        self.group_service.update_node_metadata(
+            name,
+            node.read_capacity_pct,
+            node.write_capacity_pct,
+            node.latency_hint_ms,
+        )?;
+        log::info!(
+            "Node '{}': updated metadata for peer '{}' \
+             (read_cap={}, write_cap={}, latency={}ms)",
+            self.config.node_name,
+            name,
+            node.read_capacity_pct,
+            node.write_capacity_pct,
+            node.latency_hint_ms,
+        );
+        Ok(())
+    }
+
     /// Returns a snapshot of the current replication group as a [`RepGroup`].
     ///
     /// The snapshot reflects the state at the time of the call; subsequent
@@ -441,13 +506,16 @@ impl ReplicatedEnvironment {
             self.group_service.get_group_id(),
         );
         for info in self.group_service.get_all_nodes() {
-            let node = crate::rep_node::RepNode::new(
+            let mut node = crate::rep_node::RepNode::new(
                 info.name.clone(),
                 info.node_type,
                 info.host.clone(),
                 info.port,
                 info.node_id,
             );
+            node.read_capacity_pct = info.read_capacity_pct;
+            node.write_capacity_pct = info.write_capacity_pct;
+            node.latency_hint_ms = info.latency_hint_ms;
             group.add_node(node);
         }
         group
@@ -788,10 +856,11 @@ impl ReplicatedEnvironment {
         }
 
         // Register the VLSN in the index.
-        // Log position is 0/0 here because the replication feeder path
-        // (G19 — deferred) is not yet wired to the live log; the VLSN
-        // index still tracks membership for election/ack purposes.
         self.vlsn_index.register(vlsn, 0, 0);
+
+        // Push into the peer log scanner so downstream replicas can
+        // receive this entry via the PEER_FEEDER service.
+        self.peer_scanner.push(vlsn, entry_type, _data);
 
         log::trace!(
             "Applied replicated entry: vlsn={}, type={}",

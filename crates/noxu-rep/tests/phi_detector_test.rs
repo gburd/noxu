@@ -153,6 +153,66 @@ fn test_master_tracker_phi_mode() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive timeout tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_suggested_timeout_adapts_to_high_latency() {
+    let det = PhiAccrualDetector::new(8.0, 200);
+    // Simulate 80ms mean inter-arrival
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(80));
+        det.record_heartbeat();
+    }
+    let timeout = det.suggested_phase_timeout(3.0, Duration::from_millis(500));
+    // Should be >= 50ms floor (mean ~80ms + 3*sigma >= 80ms) and <= 5s
+    // Must differ from fallback (500ms) — proves adaptation is working
+    assert!(timeout >= Duration::from_millis(50), "timeout={:?} must be >= 50ms floor", timeout);
+    assert!(timeout <= Duration::from_secs(5));
+    assert_ne!(timeout, Duration::from_millis(500), "timeout should differ from fallback");
+}
+
+#[test]
+fn test_suggested_timeout_falls_back_without_samples() {
+    let det = PhiAccrualDetector::new(8.0, 200);
+    let fallback = Duration::from_millis(500);
+    let timeout = det.suggested_phase_timeout(3.0, fallback);
+    assert_eq!(timeout, fallback, "should return fallback with no samples");
+}
+
+#[test]
+fn test_suggested_timeout_floor_clamp() {
+    let det = PhiAccrualDetector::new(8.0, 200);
+    // Very fast heartbeats (1ms) — timeout should be clamped to 50ms floor
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(1));
+        det.record_heartbeat();
+    }
+    let timeout = det.suggested_phase_timeout(3.0, Duration::from_millis(500));
+    assert!(timeout >= Duration::from_millis(50), "timeout={:?} must be >= 50ms floor", timeout);
+}
+
+#[test]
+fn test_mean_and_stddev_interval() {
+    let det = PhiAccrualDetector::new(8.0, 200);
+    // No samples yet
+    assert_eq!(det.mean_interval(), None);
+    assert_eq!(det.stddev_interval(), None);
+
+    // Populate with regular ~50ms heartbeats
+    for _ in 0..15 {
+        thread::sleep(Duration::from_millis(50));
+        det.record_heartbeat();
+    }
+    let mean = det.mean_interval().unwrap();
+    let stddev = det.stddev_interval().unwrap();
+    // Mean should be approximately 50ms (0.05s), allow wide margin for CI
+    assert!(mean > 0.03 && mean < 0.15, "mean={mean}");
+    // Stddev should be small relative to mean
+    assert!(stddev < mean, "stddev={stddev} should be < mean={mean}");
+}
+
 #[test]
 fn test_master_tracker_timeout_mode_unchanged() {
     // Without a phi detector, the tracker falls back to binary heartbeat timeout.

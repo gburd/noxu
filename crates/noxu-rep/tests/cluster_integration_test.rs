@@ -744,3 +744,90 @@ fn test_dynamic_peer_add_remove() {
         "remaining peer dyn_node3 must still be in the group"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic peer metadata update
+// ---------------------------------------------------------------------------
+
+/// Verify that `update_peer_metadata` updates capacity/latency on an existing
+/// peer without corrupting group state or disrupting replication.
+#[test]
+fn test_update_peer_metadata_while_active() {
+    let env = ReplicatedEnvironment::new(
+        RepConfig::builder("meta_group", "meta_node1", "127.0.0.1")
+            .node_port(0)
+            .build(),
+    )
+    .expect("env creation failed");
+
+    // Add two peers.
+    env.add_peer(RepNode::new(
+        "meta_node2".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        5902,
+        2,
+    ))
+    .unwrap();
+    env.add_peer(RepNode::new(
+        "meta_node3".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        5903,
+        3,
+    ))
+    .unwrap();
+
+    // Become master and register some VLSNs to prove replication works.
+    env.become_master(1).unwrap();
+    for vlsn in 1u64..=5 {
+        env.register_vlsn(vlsn, 0, vlsn as u32 * 8);
+    }
+    assert_eq!(env.get_current_vlsn(), 5);
+
+    // Update meta_node2's write capacity to 2.0 (200 pct).
+    let updated_node = RepNode::new(
+        "meta_node2".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        5902,
+        2,
+    )
+    .with_write_capacity(2.0)
+    .with_latency_hint(std::time::Duration::from_millis(5));
+
+    env.update_peer_metadata("meta_node2", updated_node).unwrap();
+
+    // Verify the group snapshot reflects the new metadata.
+    let group = env.get_rep_group();
+    let node2 = group.get_node("meta_node2").expect("meta_node2 must exist");
+    assert_eq!(node2.write_capacity_pct, 200, "write capacity must be updated to 200");
+    assert_eq!(node2.latency_hint_ms, 5, "latency must be updated to 5ms");
+    assert_eq!(node2.read_capacity_pct, 100, "read capacity must remain default");
+
+    // meta_node3 must be unaffected.
+    let node3 = group.get_node("meta_node3").expect("meta_node3 must exist");
+    assert_eq!(node3.write_capacity_pct, 100);
+    assert_eq!(node3.latency_hint_ms, 1);
+
+    // Replication still works after metadata update.
+    for vlsn in 6u64..=10 {
+        env.register_vlsn(vlsn, 0, vlsn as u32 * 8);
+    }
+    assert_eq!(env.get_current_vlsn(), 10);
+
+    // Updating a non-existent peer must fail.
+    let bogus = RepNode::new(
+        "ghost".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        9999,
+        99,
+    );
+    assert!(
+        env.update_peer_metadata("ghost", bogus).is_err(),
+        "updating non-existent peer must return error"
+    );
+
+    env.close().unwrap();
+}

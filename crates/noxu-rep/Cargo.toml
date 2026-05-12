@@ -20,6 +20,7 @@ noxu-dbi = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 quoracle = { workspace = true }
+crc32fast = { workspace = true }
 # Optional QUIC transport deps.
 quinn  = { workspace = true, optional = true }
 tokio  = { workspace = true, optional = true }
