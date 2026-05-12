@@ -343,66 +343,171 @@ impl Channel for MuxLogChannel {
 // tc netem RAII guard
 // ============================================================================
 
+/// Always-on baseline network variability applied at setup and restored after
+/// each chaos spike.  Unlike the old zero-calm design, the network never
+/// goes perfectly clean — there is always background noise.
+struct TcNetemBaseline {
+    loss:      f32,   // percent
+    delay_ms:  u64,
+    jitter_ms: u64,
+    reorder:   f32,   // percent
+}
+
+impl Default for TcNetemBaseline {
+    fn default() -> Self {
+        // Light permanent noise: 1% loss, 3 ± 2 ms jitter, 2% reorder.
+        Self { loss: 1.0, delay_ms: 3, jitter_ms: 2, reorder: 2.0 }
+    }
+}
+
 struct TcNetemGuard {
-    pub active: bool,
+    pub active:   bool,
+    baseline: TcNetemBaseline,
 }
 
 impl TcNetemGuard {
     fn setup() -> Self {
-        // Clean up any leftover qdisc from a previous killed run.  The 'del'
-        // fails harmlessly when no netem qdisc is present.
+        let baseline = TcNetemBaseline::default();
+        // Clean up any leftover qdisc from a previous killed run.
         Self::run_tc(&["qdisc", "del", "dev", "lo", "root"]);
-        if Self::run_tc(&["qdisc", "add", "dev", "lo", "root", "netem",
-                          "loss", "2%", "delay", "5ms", "2ms",
-                          "reorder", "5%", "25%"]) {
-            eprintln!("[torture] tc netem active on lo");
-            Self { active: true }
+        let ok = Self::run_tc(&[
+            "qdisc", "add", "dev", "lo", "root", "netem",
+            "loss",    &format!("{}%", baseline.loss),
+            "delay",   &format!("{}ms", baseline.delay_ms),
+                       &format!("{}ms", baseline.jitter_ms),
+            "reorder", &format!("{}%", baseline.reorder), "50%",
+        ]);
+        if ok {
+            eprintln!("[torture] tc netem active on lo (baseline: \
+                       loss={}% delay={}ms±{}ms reorder={}%)",
+                      baseline.loss, baseline.delay_ms,
+                      baseline.jitter_ms, baseline.reorder);
+            Self { active: true, baseline }
         } else {
             eprintln!("[torture] WARNING: tc netem not available \
                        (CAP_NET_ADMIN?); software-only fault injection");
-            Self { active: false }
+            Self { active: false, baseline }
         }
     }
 
-    fn change(&self, loss_pct: f32, delay_ms: u64, jitter_ms: u64,
+    /// Apply a chaos spike.  The effective parameters are the maximum of the
+    /// spike and the baseline on each axis so the baseline is never undercut.
+    fn overlay(&self, loss_pct: f32, delay_ms: u64, jitter_ms: u64,
                reorder_pct: f32, dup_pct: f32, corrupt_pct: f32) {
         if !self.active { return; }
+        let l  = loss_pct.max(self.baseline.loss);
+        let d  = delay_ms.max(self.baseline.delay_ms);
+        let j  = jitter_ms.max(self.baseline.jitter_ms);
+        let ro = reorder_pct.max(self.baseline.reorder);
         Self::run_tc(&[
             "qdisc", "change", "dev", "lo", "root", "netem",
-            "loss",      &format!("{loss_pct}%"),
-            "delay",     &format!("{delay_ms}ms"), &format!("{jitter_ms}ms"),
-            "reorder",   &format!("{reorder_pct}%"), "50%",
+            "loss",      &format!("{l}%"),
+            "delay",     &format!("{d}ms"), &format!("{j}ms"),
+            "reorder",   &format!("{ro}%"), "50%",
             "duplicate", &format!("{dup_pct}%"),
             "corrupt",   &format!("{corrupt_pct}%"),
         ]);
     }
 
-    fn calm(&self) {
-        if self.active { self.change(0.0, 0, 0, 0.0, 0.0, 0.0); }
+    /// Gilbert-Elliott correlated burst loss: p13 = prob entering bad state,
+    /// p31 = prob leaving bad state per packet.  With p13=5% p31=90% the
+    /// average burst length is ~11 packets — worst case for TCP.
+    fn overlay_burst_loss(&self, p13: f32, p31: f32) {
+        if !self.active { return; }
+        Self::run_tc(&[
+            "qdisc", "change", "dev", "lo", "root", "netem",
+            "loss", "state", &format!("{p13}%"), &format!("{p31}%"),
+            "delay",   &format!("{}ms", self.baseline.delay_ms),
+                       &format!("{}ms", self.baseline.jitter_ms),
+            "reorder", &format!("{}%", self.baseline.reorder), "50%",
+        ]);
+    }
+
+    /// Bandwidth cap via tc rate — stresses QUIC flow-control and TCP
+    /// send-buffer backpressure paths.
+    fn overlay_bandwidth_cap(&self, rate_mbit: u32) {
+        if !self.active { return; }
+        Self::run_tc(&[
+            "qdisc", "change", "dev", "lo", "root", "netem",
+            "rate",    &format!("{rate_mbit}mbit"),
+            "delay",   &format!("{}ms", self.baseline.delay_ms),
+                       &format!("{}ms", self.baseline.jitter_ms),
+            "loss",    &format!("{}%", self.baseline.loss),
+        ]);
+    }
+
+    /// Slotted delivery — packets are held and released in time slots,
+    /// emulating cellular or satellite batched delivery.
+    fn overlay_slot(&self, slot_min_ms: u64, slot_max_ms: u64) {
+        if !self.active { return; }
+        Self::run_tc(&[
+            "qdisc", "change", "dev", "lo", "root", "netem",
+            "slot",    &format!("{slot_min_ms}ms"), &format!("{slot_max_ms}ms"),
+            "delay",   &format!("{}ms", self.baseline.delay_ms),
+                       &format!("{}ms", self.baseline.jitter_ms),
+            "loss",    &format!("{}%", self.baseline.loss),
+        ]);
+    }
+
+    /// Queue bloat: deterministic delay + shallow queue cap.  Stresses
+    /// election-timeout math when the queue fills and drops begin.
+    fn overlay_queue_bloat(&self, delay_ms: u64, queue_limit: u32) {
+        if !self.active { return; }
+        let d = delay_ms.max(self.baseline.delay_ms);
+        Self::run_tc(&[
+            "qdisc", "change", "dev", "lo", "root", "netem",
+            "delay",   &format!("{d}ms"),
+            "limit",   &queue_limit.to_string(),
+            "loss",    &format!("{}%", self.baseline.loss),
+        ]);
+    }
+
+    /// Revert to the always-on baseline (NOT to zero).  The cluster is never
+    /// in a perfectly clean network — baseline noise always applies.
+    fn overlay_calm(&self) {
+        if !self.active { return; }
+        Self::run_tc(&[
+            "qdisc", "change", "dev", "lo", "root", "netem",
+            "loss",    &format!("{}%", self.baseline.loss),
+            "delay",   &format!("{}ms", self.baseline.delay_ms),
+                       &format!("{}ms", self.baseline.jitter_ms),
+            "reorder", &format!("{}%", self.baseline.reorder), "50%",
+            "duplicate", "0%",
+            "corrupt",   "0%",
+        ]);
     }
 
     fn run_tc(args: &[&str]) -> bool {
-        // 1. Try setuid helper (user installs this via `make tc-helper`).
-        let helper = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .map(|d| d.join("../../../scripts/tc_netem_helper"))
-            .unwrap_or_else(|| PathBuf::from("scripts/tc_netem_helper"));
-        if helper.exists() && Command::new(&helper).args(args).status()
-            .map(|s| s.success()).unwrap_or(false) { return true; }
-        // 2. Try direct tc (works if process already has CAP_NET_ADMIN).
-        if Command::new("tc").args(args).status()
-            .map(|s| s.success()).unwrap_or(false) { return true; }
-        // 3. Try passwordless sudo tc.
-        if Command::new("sudo").arg("-n").arg("tc").args(args).status()
-            .map(|s| s.success()).unwrap_or(false) { return true; }
-        false
+        // tc netem is Linux-only.  On other platforms chaos falls back to
+        // software-only fault injection (TcNetemGuard::active == false).
+        #[cfg(not(target_os = "linux"))]
+        { let _ = args; return false; }
+
+        #[cfg(target_os = "linux")]
+        {
+            // 1. Try setuid helper (user installs via `make tc-helper`).
+            let helper = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .map(|d| d.join("../../../scripts/tc_netem_helper"))
+                .unwrap_or_else(|| PathBuf::from("scripts/tc_netem_helper"));
+            if helper.exists() && Command::new(&helper).args(args).status()
+                .map(|s| s.success()).unwrap_or(false) { return true; }
+            // 2. Try direct tc (works if process already has CAP_NET_ADMIN).
+            if Command::new("tc").args(args).status()
+                .map(|s| s.success()).unwrap_or(false) { return true; }
+            // 3. Try passwordless sudo tc.
+            if Command::new("sudo").arg("-n").arg("tc").args(args).status()
+                .map(|s| s.success()).unwrap_or(false) { return true; }
+            false
+        }
     }
 }
 
 impl Drop for TcNetemGuard {
     fn drop(&mut self) {
         if self.active {
+            self.overlay_calm();
             Self::run_tc(&["qdisc", "del", "dev", "lo", "root"]);
         }
     }
@@ -720,6 +825,24 @@ enum ChaosPhase {
     DuplicateAndCorrupt,
     NodeCrash(usize),
     MinorityPartition,
+    /// Add a new electable node to the replication group mid-run.
+    PeerJoin,
+    /// Remove an existing non-master node from the group mid-run.
+    PeerLeave,
+    /// Update the read/write capacity hint for a random group member.
+    CapacityChange,
+    /// Grow the cluster by two sequential PeerJoins.
+    ClusterGrow,
+    /// Shrink the cluster by two sequential PeerLeaves.
+    ClusterShrink,
+    /// Gilbert-Elliott correlated burst loss (bad-state Markov chain).
+    BurstLoss,
+    /// Hard bandwidth cap — stresses QUIC flow control and TCP send buffers.
+    BandwidthCap,
+    /// Slotted packet delivery — emulates cellular/satellite batching.
+    SlottedDelivery,
+    /// Queue-bloat: high deterministic delay + shallow queue limit.
+    QueueBloat,
 }
 
 // ============================================================================
@@ -739,9 +862,15 @@ fn torture_replication() {
 
     let state_dir = TempDir::new().expect("TempDir");
 
-    let nodes: Vec<ClusterNode> = (1..=NUM_NODES as u32)
+    let mut nodes: Vec<ClusterNode> = (1..=NUM_NODES as u32)
         .map(|id| ClusterNode::new(id, transports[(id - 1) as usize], state_dir.path()))
         .collect();
+
+    // `members` tracks which indices into `nodes` are currently in the group.
+    // It starts as [0, 1, 2] and grows/shrinks with PeerJoin/PeerLeave chaos.
+    let mut members: Vec<usize> = (0..NUM_NODES).collect();
+    // Next node ID for dynamically added peers.
+    let mut next_node_id: u32 = NUM_NODES as u32 + 1;
 
     let mut group = RepGroup::new("torture".to_string(), 99);
     for n in &nodes {
@@ -762,6 +891,7 @@ fn torture_replication() {
     // Stats
     let (mut n_elections, mut n_won, mut n_streams, mut n_crashes, mut n_chaos) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut n_joins, mut n_leaves, mut n_cap_changes) = (0u64, 0u64, 0u64);
 
     let start = Instant::now();
     let mut next_report = start + Duration::from_secs(30);
@@ -772,31 +902,153 @@ fn torture_replication() {
         // ── Chaos injection ───────────────────────────────────────────────
         let phase: ChaosPhase = if rng.gen_bool(0.15) {
             n_chaos += 1;
-            match rng.gen_range(0u32..6) {
+            match rng.gen_range(0u32..15) {
                 0 => ChaosPhase::ModeratePacketLoss,
                 1 => ChaosPhase::HighLatency,
                 2 => ChaosPhase::ReorderHeavy,
                 3 => ChaosPhase::DuplicateAndCorrupt,
                 4 => {
-                    let alive: Vec<_> = (0..NUM_NODES).filter(|&i| nodes[i].is_alive()).collect();
-                    if alive.len() > 1 {
-                        let idx = alive[rng.gen_range(0..alive.len())];
+                    let alive_m: Vec<_> = members.iter().copied()
+                        .filter(|&i| nodes[i].is_alive()).collect();
+                    if alive_m.len() > 1 {
+                        let idx = alive_m[rng.gen_range(0..alive_m.len())];
                         ChaosPhase::NodeCrash(idx)
                     } else { n_chaos -= 1; ChaosPhase::Calm }
                 }
-                _ => ChaosPhase::MinorityPartition,
+                5 => ChaosPhase::MinorityPartition,
+                6 => {
+                    if members.len() < 7 { ChaosPhase::PeerJoin }
+                    else { n_chaos -= 1; ChaosPhase::Calm }
+                }
+                7 => {
+                    if members.len() >= 4 { ChaosPhase::PeerLeave }
+                    else { n_chaos -= 1; ChaosPhase::Calm }
+                }
+                8 => ChaosPhase::CapacityChange,
+                9 => {
+                    if members.len() < 6 { ChaosPhase::ClusterGrow }
+                    else { n_chaos -= 1; ChaosPhase::Calm }
+                }
+                10 => {
+                    if members.len() >= 5 { ChaosPhase::ClusterShrink }
+                    else { n_chaos -= 1; ChaosPhase::Calm }
+                }
+                11 => ChaosPhase::BurstLoss,
+                12 => ChaosPhase::BandwidthCap,
+                13 => ChaosPhase::SlottedDelivery,
+                _ => ChaosPhase::QueueBloat,
             }
         } else {
             ChaosPhase::Calm
         };
 
         match &phase {
-            ChaosPhase::Calm               => netem.calm(),
-            ChaosPhase::ModeratePacketLoss => netem.change(5.0, 2, 1, 2.0, 0.0, 0.0),
-            ChaosPhase::HighLatency        => netem.change(1.0, 80, 40, 5.0, 0.0, 0.0),
-            ChaosPhase::ReorderHeavy       => netem.change(3.0, 10, 5, 20.0, 0.0, 0.0),
-            ChaosPhase::DuplicateAndCorrupt=> netem.change(1.0, 5, 2, 5.0, 10.0, 1.0),
-            ChaosPhase::MinorityPartition  => netem.change(80.0, 5, 2, 0.0, 0.0, 0.0),
+            ChaosPhase::Calm               => netem.overlay_calm(),
+            ChaosPhase::ModeratePacketLoss => netem.overlay(5.0, 2, 1, 2.0, 0.0, 0.0),
+            ChaosPhase::HighLatency        => netem.overlay(1.0, 80, 40, 5.0, 0.0, 0.0),
+            ChaosPhase::ReorderHeavy       => netem.overlay(3.0, 10, 5, 20.0, 0.0, 0.0),
+            ChaosPhase::DuplicateAndCorrupt=> netem.overlay(1.0, 5, 2, 5.0, 10.0, 1.0),
+            ChaosPhase::MinorityPartition  => netem.overlay(80.0, 5, 2, 0.0, 0.0, 0.0),
+            ChaosPhase::BurstLoss          => netem.overlay_burst_loss(5.0, 90.0),
+            ChaosPhase::BandwidthCap       => netem.overlay_bandwidth_cap(10),
+            ChaosPhase::SlottedDelivery    => netem.overlay_slot(20, 40),
+            ChaosPhase::QueueBloat         => netem.overlay_queue_bloat(50, 100),
+
+            ChaosPhase::PeerJoin => {
+                // Add a fresh electable node to the group under live replication.
+                let new_id = next_node_id;
+                next_node_id += 1;
+                let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
+                let new_idx = nodes.len();
+                let new_name = new_node.name.clone();
+                nodes.push(new_node);
+                members.push(new_idx);
+                group.add_node(RepNode::new(
+                    new_name.clone(),
+                    NodeType::Electable,
+                    "127.0.0.1".to_string(),
+                    6900 + new_id as u16,
+                    new_id,
+                ));
+                n_joins += 1;
+                eprintln!("[torture] r={round} PeerJoin: {new_name} members={}", members.len());
+                netem.overlay_calm();
+            }
+
+            ChaosPhase::PeerLeave => {
+                // Remove one non-master alive member; keep at least 3 for quorum.
+                let removable: Vec<usize> = members.iter().copied()
+                    .filter(|&i| nodes[i].is_alive() && current_master != Some(i))
+                    .collect();
+                if members.len() >= 4 && !removable.is_empty() {
+                    let mi = removable[rng.gen_range(0..removable.len())];
+                    let name = nodes[mi].name.clone();
+                    group.remove_node(&name);
+                    members.retain(|&i| i != mi);
+                    nodes[mi].alive.store(false, Ordering::SeqCst);
+                    n_leaves += 1;
+                    eprintln!("[torture] r={round} PeerLeave: {name} members={}", members.len());
+                }
+                netem.overlay_calm();
+            }
+
+            ChaosPhase::CapacityChange => {
+                // Hot-swap read/write capacity for a random group member.
+                let mi = members[rng.gen_range(0..members.len())];
+                let name = nodes[mi].name.clone();
+                if let Some(mut n) = group.remove_node(&name) {
+                    let new_cap = [50u32, 75, 100, 125, 150][rng.gen_range(0..5)];
+                    n.write_capacity_pct = new_cap;
+                    n.read_capacity_pct  = new_cap;
+                    group.add_node(n);
+                    n_cap_changes += 1;
+                    eprintln!("[torture] r={round} CapacityChange: {name} cap={new_cap}%");
+                }
+                netem.overlay_calm();
+            }
+
+            ChaosPhase::ClusterGrow => {
+                // Add two nodes sequentially while replication is active.
+                for _ in 0..2 {
+                    if members.len() >= 7 { break; }
+                    let new_id = next_node_id;
+                    next_node_id += 1;
+                    let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
+                    let new_idx = nodes.len();
+                    let new_name = new_node.name.clone();
+                    nodes.push(new_node);
+                    members.push(new_idx);
+                    group.add_node(RepNode::new(
+                        new_name,
+                        NodeType::Electable,
+                        "127.0.0.1".to_string(),
+                        6900 + new_id as u16,
+                        new_id,
+                    ));
+                    n_joins += 1;
+                }
+                eprintln!("[torture] r={round} ClusterGrow: members={}", members.len());
+                netem.overlay_calm();
+            }
+
+            ChaosPhase::ClusterShrink => {
+                // Remove two non-master members sequentially; floor at 3.
+                for _ in 0..2 {
+                    let removable: Vec<usize> = members.iter().copied()
+                        .filter(|&i| nodes[i].is_alive() && current_master != Some(i))
+                        .collect();
+                    if members.len() < 4 || removable.is_empty() { break; }
+                    let mi = removable[rng.gen_range(0..removable.len())];
+                    let name = nodes[mi].name.clone();
+                    group.remove_node(&name);
+                    members.retain(|&i| i != mi);
+                    nodes[mi].alive.store(false, Ordering::SeqCst);
+                    n_leaves += 1;
+                }
+                eprintln!("[torture] r={round} ClusterShrink: members={}", members.len());
+                netem.overlay_calm();
+            }
+
             ChaosPhase::NodeCrash(idx) => {
                 let n = &nodes[*idx];
                 let disk_vlsn = n.vlsn();
@@ -823,16 +1075,21 @@ fn torture_replication() {
                     eprintln!("[torture] restart node{node_id} vlsn={restart_vlsn}");
                 });
 
-                netem.calm();
+                netem.overlay_calm();
             }
         }
 
-        if !matches!(phase, ChaosPhase::Calm | ChaosPhase::NodeCrash(_)) {
+        if !matches!(phase, ChaosPhase::Calm | ChaosPhase::NodeCrash(_)
+            | ChaosPhase::PeerJoin | ChaosPhase::PeerLeave | ChaosPhase::CapacityChange
+            | ChaosPhase::ClusterGrow | ChaosPhase::ClusterShrink) {
             eprintln!("[torture] r={round} chaos={:?}", phase);
         }
 
         // ── Election ──────────────────────────────────────────────────────
-        let alive: Vec<usize> = (0..NUM_NODES).filter(|&i| nodes[i].is_alive()).collect();
+        // Use `members` so dynamically added/removed nodes are included.
+        let alive: Vec<usize> = members.iter().copied()
+            .filter(|&i| nodes[i].is_alive())
+            .collect();
         if alive.len() < 2 { std::thread::sleep(Duration::from_millis(50)); continue; }
 
         let proposer = *alive.iter().max_by_key(|&&i| nodes[i].vlsn()).unwrap();
@@ -855,7 +1112,7 @@ fn torture_replication() {
 
         if !won {
             eprintln!("[torture] r={round} election failed after {RETRY_BUDGET} attempts");
-            netem.calm();
+            netem.overlay_calm();
             continue;
         }
 
@@ -878,9 +1135,11 @@ fn torture_replication() {
         }
 
         // Restore calm after a network-chaos phase.
-        if !matches!(phase, ChaosPhase::Calm | ChaosPhase::NodeCrash(_)) {
+        if !matches!(phase, ChaosPhase::Calm | ChaosPhase::NodeCrash(_)
+            | ChaosPhase::PeerJoin | ChaosPhase::PeerLeave | ChaosPhase::CapacityChange
+            | ChaosPhase::ClusterGrow | ChaosPhase::ClusterShrink) {
             std::thread::sleep(Duration::from_millis(20));
-            netem.calm();
+            netem.overlay_calm();
         }
 
         // ── Periodic stats ────────────────────────────────────────────────
@@ -890,14 +1149,15 @@ fn torture_replication() {
             eprintln!(
                 "[torture] elapsed={:.0?} r={round} elect={n_elections} won={n_won} \
                  streams={n_streams} crashes={n_crashes} chaos={n_chaos} \
-                 violations={}",
-                start.elapsed(), inv.violations()
+                 joins={n_joins} leaves={n_leaves} cap_changes={n_cap_changes} \
+                 members={} violations={}",
+                start.elapsed(), members.len(), inv.violations()
             );
         }
     }
 
     // ── Final report ──────────────────────────────────────────────────────
-    netem.calm();
+    netem.overlay_calm();
     let violations = inv.violations();
 
     eprintln!("[torture] ═══════════════════════════════════════════════════");
@@ -910,8 +1170,20 @@ fn torture_replication() {
     eprintln!("[torture]   vlsn streams       : {n_streams}");
     eprintln!("[torture]   node crashes       : {n_crashes}");
     eprintln!("[torture]   chaos rounds       : {n_chaos}");
-    for n in &nodes {
+    eprintln!("[torture]   peer joins         : {n_joins}");
+    eprintln!("[torture]   peer leaves        : {n_leaves}");
+    eprintln!("[torture]   capacity changes   : {n_cap_changes}");
+    eprintln!("[torture]   final group size   : {}", members.len());
+    for &mi in &members {
+        let n = &nodes[mi];
         eprintln!("[torture]   {} ({})  vlsn={}", n.name, n.transport.name(), n.vlsn());
+    }
+    // Also report any dynamically removed nodes for completeness.
+    for (i, n) in nodes.iter().enumerate() {
+        if !members.contains(&i) {
+            eprintln!("[torture]   {} ({})  vlsn={} [removed]",
+                      n.name, n.transport.name(), n.vlsn());
+        }
     }
     eprintln!("[torture]   violations         : {violations}");
     eprintln!("[torture] ═══════════════════════════════════════════════════");

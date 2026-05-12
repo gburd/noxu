@@ -186,19 +186,11 @@ impl FileManager {
         let lock_file =
             OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)?;
 
-        // Try to acquire an exclusive lock
-        #[cfg(unix)]
-        {
-            use fs2::FileExt;
-            lock_file.try_lock_exclusive().map_err(|_| {
-                LogError::EnvironmentLocked(format!(
-                    "Environment is locked by another process: {}",
-                    self.env_dir.display()
-                ))
-            })?;
-        }
-
-        #[cfg(windows)]
+        // Try to acquire an exclusive lock.
+        // fs2::FileExt is supported on unix and windows; on other platforms
+        // (e.g. WASM, embedded) we skip the lock — acceptable since those
+        // targets run single-process environments.
+        #[cfg(any(unix, windows))]
         {
             use fs2::FileExt;
             lock_file.try_lock_exclusive().map_err(|_| {
@@ -347,9 +339,9 @@ impl FileManager {
         file_num: u32,
     ) -> Result<u32> {
         #[cfg(unix)]
-        use std::os::unix::fs::FileExt;
+        use std::os::unix::fs::FileExt as PosixFileExt;
         #[cfg(windows)]
-        use std::os::windows::fs::FileExt;
+        use std::os::windows::fs::FileExt as PosixFileExt;
 
         // Read the header bytes
         let mut header_buf = vec![0u8; FILE_HEADER_SIZE];

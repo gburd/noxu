@@ -1,8 +1,8 @@
-//! Benchmarks for noxu-util: LSN, VLSN, packed integer encoding, CRC32.
+//! Benchmarks for noxu-util: LSN, VLSN, packed integer encoding, CRC32 vs CRC32C.
 
 #![allow(clippy::unit_arg)]
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::io::Cursor;
 
 use noxu_util::lsn::Lsn;
@@ -247,29 +247,43 @@ fn bench_read_sorted_i64(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// CRC32 benchmark
+// CRC32 (Ethernet / zlib polynomial) vs CRC32C (Castagnoli / iSCSI / NVMe)
+//
+// CRC32C has hardware acceleration (SSE4.2 on x86-64, crc32 instruction on
+// ARMv8.1) reaching ~20 GB/s; the software fallback is ~500 MB/s.
+// CRC32 (crc32fast) uses SIMD acceleration where available (~3–5 GB/s).
+//
+// Payload sizes mirror typical replication feeder frames:
+//   64 B  — heartbeat / CBVLSN datagram
+//   256 B — small key-value LN
+//   1 KB  — typical BIN-delta
+//   4 KB  — full BIN / log page
+//  64 KB  — large restore chunk
 // ---------------------------------------------------------------------------
 
-fn bench_crc32_100_bytes(c: &mut Criterion) {
-    let data = vec![0xABu8; 100];
-    c.bench_function("crc32_100_bytes", |b| {
-        b.iter(|| {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(black_box(&data));
-            black_box(hasher.finalize());
-        })
-    });
-}
+const CHECKSUM_SIZES: &[usize] = &[64, 256, 1024, 4096, 65536];
 
-fn bench_crc32_1024_bytes(c: &mut Criterion) {
-    let data = vec![0xABu8; 1024];
-    c.bench_function("crc32_1024_bytes", |b| {
-        b.iter(|| {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(black_box(&data));
-            black_box(hasher.finalize());
-        })
-    });
+fn bench_checksums(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checksum");
+
+    for &size in CHECKSUM_SIZES {
+        let data: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("crc32_ethernet", size), &data, |b, d| {
+            b.iter(|| {
+                let mut h = crc32fast::Hasher::new();
+                h.update(black_box(d));
+                black_box(h.finalize())
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("crc32c_castagnoli", size), &data, |b, d| {
+            b.iter(|| black_box(crc32c::crc32c(black_box(d))))
+        });
+    }
+
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -334,11 +348,7 @@ criterion_group!(
     bench_read_sorted_i64,
 );
 
-criterion_group!(
-    checksum_benches,
-    bench_crc32_100_bytes,
-    bench_crc32_1024_bytes,
-);
+criterion_group!(checksum_benches, bench_checksums);
 
 criterion_group!(
     key_cmp_benches,

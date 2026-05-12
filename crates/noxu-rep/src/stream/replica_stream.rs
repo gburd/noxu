@@ -20,6 +20,10 @@ use std::time::Duration;
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
 
+// CRC32 (Ethernet/zlib polynomial) for per-frame integrity verification.
+// Same polynomial used in feeder.rs; see docs/checksum-selection.md.
+use crc32fast::hash as crc32_hash;
+
 // ---------------------------------------------------------------------------
 // LogWriter trait
 // ---------------------------------------------------------------------------
@@ -140,17 +144,21 @@ impl LogWriter for EnvironmentLogWriter {
 // ---------------------------------------------------------------------------
 
 /// Wire frame header size (matches FeederRunner::FRAME_HEADER_LEN).
-const FRAME_HEADER_LEN: usize = 8 + 1 + 4;
+///
+/// Format: `[vlsn:8][type:1][payload_len:4][crc32:4]` = 17 bytes.
+const FRAME_HEADER_LEN: usize = 8 + 1 + 4 + 4; // vlsn + type + len + crc32
 
 /// Active replica I/O loop.
 ///
 /// `ReplicaReceiver` owns a channel to the master feeder. `run()` is a
 /// blocking loop that:
 ///   1. Reads framed entries from the feeder.
-///   2. Deserializes each entry: `[vlsn:8][type:1][len:4][payload]`.
-///   3. Passes the entry to `log_writer`.
-///   4. Sends an 8-byte LE VLSN ack back to the master.
-///   5. Returns when the channel is closed or an I/O error occurs.
+///   2. Deserializes each entry: `[vlsn:8][type:1][len:4][crc32:4][payload]`.
+///   3. Verifies `crc32fast::hash(payload) == crc32` — returns
+///      [`RepError::FrameCorrupted`] on mismatch.
+///   4. Passes the entry to `log_writer`.
+///   5. Sends an 8-byte LE VLSN ack back to the master.
+///   6. Returns when the channel is closed or an I/O error occurs.
 ///
 /// Read thread and replay thread in the replica.
 pub struct ReplicaReceiver {
@@ -190,7 +198,8 @@ impl ReplicaReceiver {
             };
 
             // ----------------------------------------------------------------
-            // Parse frame: [vlsn:8 LE][entry_type:1][payload_len:4 LE][payload]
+            // Parse frame: [vlsn:8 LE][entry_type:1][payload_len:4 LE]
+            //              [crc32:4 LE][payload]
             // ----------------------------------------------------------------
             if frame.len() < FRAME_HEADER_LEN {
                 return Err(RepError::ProtocolError(format!(
@@ -205,6 +214,9 @@ impl ReplicaReceiver {
             let payload_len = u32::from_le_bytes(
                 frame[9..13].try_into().unwrap(),
             ) as usize;
+            let expected_crc = u32::from_le_bytes(
+                frame[13..17].try_into().unwrap(),
+            );
 
             if frame.len() < FRAME_HEADER_LEN + payload_len {
                 return Err(RepError::ProtocolError(format!(
@@ -215,6 +227,18 @@ impl ReplicaReceiver {
             }
 
             let payload = &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len];
+
+            // ----------------------------------------------------------------
+            // Verify CRC32 — reject corrupted frames before applying.
+            // ----------------------------------------------------------------
+            let actual_crc = crc32_hash(payload);
+            if actual_crc != expected_crc {
+                return Err(RepError::FrameCorrupted {
+                    vlsn,
+                    expected: expected_crc,
+                    actual: actual_crc,
+                });
+            }
 
             // ----------------------------------------------------------------
             // Apply the entry to the local log.
@@ -440,10 +464,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_frame(vlsn: u64, entry_type: u8, payload: &[u8]) -> Vec<u8> {
-        let mut f = Vec::with_capacity(13 + payload.len());
+        let crc = crc32_hash(payload);
+        let mut f = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
         f.extend_from_slice(&vlsn.to_le_bytes());
         f.push(entry_type);
         f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(&crc.to_le_bytes());
         f.extend_from_slice(payload);
         f
     }

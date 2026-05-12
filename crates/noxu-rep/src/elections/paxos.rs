@@ -32,6 +32,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::elections::phi_detector::PhiAccrualDetector;
 use crate::elections::proposal::Proposal;
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
@@ -74,6 +75,26 @@ pub fn run_election(
     priority: u32,
     term: u64,
 ) -> Option<NodeId> {
+    run_election_with_phi(node_id, node_name, group, channels, proposed_vlsn, priority, term, None, Duration::from_millis(500))
+}
+
+/// Run a two-phase Paxos election with an optional phi accrual detector for
+/// adaptive phase timeouts.
+///
+/// When a `phi_detector` is provided, the phase timeout is computed as
+/// mean + 3*stddev of observed heartbeat inter-arrival times, clamped to
+/// [50ms, 5s]. Otherwise, `fallback_timeout` is used.
+pub fn run_election_with_phi(
+    node_id: NodeId,
+    node_name: &str,
+    group: &RepGroup,
+    channels: &[Arc<dyn Channel>],
+    proposed_vlsn: u64,
+    priority: u32,
+    term: u64,
+    phi_detector: Option<&PhiAccrualDetector>,
+    fallback_timeout: Duration,
+) -> Option<NodeId> {
     // Flexible Paxos: Phase 1 and Phase 2 may use different quorum sizes.
     // For SimpleMajority both equal (n/2)+1; for Flexible they differ.
     let phase1_quorum = group.phase1_quorum();
@@ -81,6 +102,11 @@ pub fn run_election(
     if phase1_quorum == 0 || phase2_quorum == 0 {
         return None;
     }
+
+    // Adaptive phase timeout from phi accrual statistics.
+    let phase_timeout = phi_detector
+        .map(|p| p.suggested_phase_timeout(3.0, fallback_timeout))
+        .unwrap_or(fallback_timeout);
 
     // We always count ourselves as one vote in both phases.
     let self_needed = 1usize;
@@ -104,7 +130,7 @@ pub fn run_election(
     // Track the best proposal seen in promises (for phase 2 value selection).
     let mut best_proposal = our_proposal;
 
-    let phase1_timeout = Duration::from_millis(500);
+    let phase1_timeout = phase_timeout;
 
     for ch in channels {
         if let Ok(()) = send_message(ch.as_ref(), &phase1_msg) {
@@ -158,7 +184,7 @@ pub fn run_election(
     };
 
     let mut accepts = 0usize;
-    let phase2_timeout = Duration::from_millis(500);
+    let phase2_timeout = phase_timeout;
 
     for ch in &promises {
         if send_message(ch.as_ref(), &accept_msg).is_ok()

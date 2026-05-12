@@ -13,6 +13,7 @@ byteorder = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 crc32fast = { workspace = true }
+crc32c = { workspace = true }
 proptest = { workspace = true }
 
 [[bench]]

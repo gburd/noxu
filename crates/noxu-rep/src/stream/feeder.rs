@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
 
+// CRC32 (Ethernet/zlib polynomial via PCLMULQDQ on x86-64 — ~18 GiB/s).
+// See docs/checksum-selection.md for the full benchmark rationale.
+use crc32fast;
+
 // ---------------------------------------------------------------------------
 // Log scanner trait
 // ---------------------------------------------------------------------------
@@ -262,11 +266,22 @@ impl LogScanner for EnvironmentLogScanner {
 // FeederRunner
 // ---------------------------------------------------------------------------
 
-/// Wire frame sizes.
+/// Wire frame format (all integers little-endian):
 ///
-/// Each entry sent over the wire is:
-/// `[vlsn: 8 bytes LE][entry_type: 1 byte][payload_len: 4 bytes LE][payload]`
-const FRAME_HEADER_LEN: usize = 8 + 1 + 4;
+/// ```text
+/// ┌──────────────────────────────────────────────────────────┐
+/// │  vlsn        : u64  (8 bytes)                           │
+/// │  entry_type  : u8   (1 byte)                            │
+/// │  payload_len : u32  (4 bytes)                           │
+/// │  crc32       : u32  (4 bytes) — CRC32 of payload bytes  │
+/// ├──────────────────────────────────────────────────────────┤
+/// │  payload     : [u8; payload_len]                        │
+/// └──────────────────────────────────────────────────────────┘
+/// ```
+///
+/// The receiver verifies `crc32fast::hash(payload) == crc32` before
+/// applying the entry.  A mismatch is returned as [`RepError::FrameCorrupted`].
+const FRAME_HEADER_LEN: usize = 8 + 1 + 4 + 4; // vlsn + type + len + crc32
 
 /// Active feeder I/O loop.
 ///
@@ -364,17 +379,20 @@ impl FeederRunner {
 
     /// Frame and send a single log entry.
     ///
-    /// Frame format: `[vlsn: 8 LE][entry_type: 1][payload_len: 4 LE][payload]`
+    /// Frame format (all LE):
+    ///   `[vlsn:8][type:1][payload_len:4][crc32:4][payload]`
     fn send_entry(
         &self,
         vlsn: u64,
         entry_type: u8,
         payload: &[u8],
     ) -> Result<()> {
+        let crc = crc32fast::hash(payload);
         let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
         frame.extend_from_slice(&vlsn.to_le_bytes());
         frame.push(entry_type);
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&crc.to_le_bytes());
         frame.extend_from_slice(payload);
         self.channel.send(&frame)
     }
@@ -592,14 +610,19 @@ mod tests {
 
                 for _ in 0..3 {
                     let frame = receiver.receive(timeout).unwrap().unwrap();
-                    // Parse frame: [vlsn:8][type:1][len:4][payload]
+                    // Parse frame: [vlsn:8][type:1][len:4][crc32:4][payload]
                     let vlsn =
                         u64::from_le_bytes(frame[0..8].try_into().unwrap());
                     let entry_type = frame[8];
                     let payload_len = u32::from_le_bytes(
                         frame[9..13].try_into().unwrap(),
                     ) as usize;
-                    let payload = frame[13..13 + payload_len].to_vec();
+                    let expected_crc = u32::from_le_bytes(
+                        frame[13..17].try_into().unwrap(),
+                    );
+                    let payload = frame[17..17 + payload_len].to_vec();
+                    let actual_crc = crc32fast::hash(&payload);
+                    assert_eq!(actual_crc, expected_crc, "CRC mismatch for vlsn={vlsn}");
                     received.push((vlsn, entry_type, payload));
 
                     // Send ack.

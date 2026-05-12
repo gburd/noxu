@@ -37,7 +37,7 @@
 //! protected by `tokio::sync::Mutex` so that guards can be held across `.await`
 //! points without violating borrow rules.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -215,6 +215,38 @@ impl QuicChannel {
     /// [`default_server_config`]).
     pub fn connect(addr: SocketAddr, server_name: &str) -> Result<Self> {
         Self::connect_with_config(addr, server_name, insecure_client_config())
+    }
+
+    /// Connect by hostname (or IP string) and port with DNS resolution.
+    ///
+    /// Happy Eyeballs: IPv6 addresses are tried before IPv4. The first
+    /// address that accepts a QUIC connection wins.  `server_name` is passed
+    /// as the TLS SNI; use `"localhost"` when connecting to a self-signed cert.
+    pub fn connect_host(host: &str, port: u16, server_name: &str) -> Result<Self> {
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| RepError::NetworkError(
+                format!("DNS resolution failed for {host}:{port}: {e}")))?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(RepError::NetworkError(
+                format!("no addresses resolved for {host}:{port}")));
+        }
+
+        // Happy Eyeballs: prefer IPv6.
+        let mut sorted = addrs;
+        sorted.sort_by_key(|a| if a.is_ipv6() { 0u8 } else { 1u8 });
+
+        let mut last_err = None;
+        for addr in &sorted {
+            match Self::connect(*addr, server_name) {
+                Ok(ch) => return Ok(ch),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| RepError::NetworkError(
+            format!("could not connect to {host}:{port}"))))
     }
 
     /// Connect to a QUIC endpoint with a caller-supplied `ClientConfig`.

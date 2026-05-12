@@ -25,7 +25,7 @@
 //! dependencies required.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use noxu_sync::RwLock;
 
@@ -149,6 +149,40 @@ impl PhiAccrualDetector {
     /// Number of inter-arrival samples currently in the window.
     pub fn sample_count(&self) -> usize {
         self.samples.read().len()
+    }
+
+    /// Mean heartbeat inter-arrival time in seconds.
+    /// Returns None if fewer than 2 samples in the window.
+    pub fn mean_interval(&self) -> Option<f64> {
+        let samples = self.samples.read();
+        if samples.len() < 2 {
+            return None;
+        }
+        Some(samples.iter().sum::<f64>() / samples.len() as f64)
+    }
+
+    /// Standard deviation of heartbeat inter-arrival times in seconds.
+    /// Returns None if fewer than 2 samples.
+    pub fn stddev_interval(&self) -> Option<f64> {
+        let samples = self.samples.read();
+        if samples.len() < 2 {
+            return None;
+        }
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+        Some(variance.sqrt())
+    }
+
+    /// Recommended election phase timeout: mean + k * stddev, clamped to [50ms, 5s].
+    /// Returns the configured fallback duration if window has < 2 samples.
+    pub fn suggested_phase_timeout(&self, k: f64, fallback: Duration) -> Duration {
+        let mean = match self.mean_interval() {
+            Some(m) => m,
+            None => return fallback,
+        };
+        let std = self.stddev_interval().unwrap_or(0.0);
+        let secs = (mean + k * std).clamp(0.05, 5.0);
+        Duration::from_secs_f64(secs)
     }
 }
 
