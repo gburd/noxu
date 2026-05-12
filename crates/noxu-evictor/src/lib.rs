@@ -54,6 +54,9 @@ pub mod evictor;
 pub mod evictor_stat;
 pub mod lru_list;
 pub mod off_heap;
+pub mod policies;
+pub mod policy;
+pub(crate) mod slab;
 
 // Re-export main types at crate root
 pub use arbiter::Arbiter;
@@ -66,6 +69,8 @@ pub use evictor::{
 pub use evictor_stat::EvictorStats;
 pub use lru_list::LruList;
 pub use off_heap::{OffHeapCache, OffHeapStats};
+pub use policy::{EvictionAlgorithm, EvictionPolicy};
+pub use policies::{ArcPolicy, CarPolicy, ClockPolicy, LirsPolicy, LruPolicy};
 
 #[cfg(test)]
 mod tests {

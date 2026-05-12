@@ -8,6 +8,7 @@ description = "Serialization bindings for Noxu DB"
 [dependencies]
 noxu-db = { workspace = true }
 noxu-util = { workspace = true }
+bytes = { workspace = true }
 byteorder = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
