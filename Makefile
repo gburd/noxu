@@ -1,4 +1,5 @@
-.PHONY: build test check fmt doc clean bench fuzz test-crate tc-helper torture torture-quic
+.PHONY: build test check fmt doc clean bench fuzz test-crate tc-helper torture torture-quic \
+        docs docs-serve docs-check docs-spell docs-lint docs-clean
 
 build:
 	cargo build --workspace
@@ -20,8 +21,27 @@ fmt-check:
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+docs:
+	mdbook build docs/
+
+docs-serve:
+	mdbook serve docs/ --open
+
+docs-check: docs-spell docs-lint docs
+	@echo "All docs quality gates passed."
+
+docs-spell:
+	typos docs/src/
+
+docs-lint:
+	markdownlint-cli2 "docs/src/**/*.md"
+
+docs-clean:
+	rm -rf docs/book/
+
 clean:
 	cargo clean
+	$(MAKE) docs-clean
 
 bench:
 	cargo bench --workspace

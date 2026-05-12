@@ -37,6 +37,8 @@ Complete all items before publishing a release.
 - [ ] README.md examples compile and run
 - [ ] API documentation builds without warnings: `cargo doc --no-deps`
 - [ ] ARCHITECTURE.md reflects any structural changes
+- [ ] `make docs-check` passes — zero spelling errors, lint violations, broken links
+- [ ] mdBook docs reflect any new public API, config parameters, or architectural changes
 
 ## Release Process
 

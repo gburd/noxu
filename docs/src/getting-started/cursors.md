@@ -1,0 +1,175 @@
+# Cursors
+
+## What is a Cursor?
+
+A cursor is a position marker that can move through a database's records in sorted key order. Cursors allow you to:
+
+- Iterate forward or backward through all records.
+- Seek to a specific key or to the nearest key that is greater-than-or-equal to a target.
+- Insert, update, or delete records at the current cursor position.
+
+Cursors are the primary tool for bulk reads, range scans, and operating on databases that allow duplicate keys.
+
+## Opening and Closing Cursors
+
+```rust
+let mut cursor = db.open_cursor(None, None)?;
+
+// ... use cursor ...
+
+cursor.close()?;
+```
+
+The first argument is an optional transaction. The second is an optional `CursorConfig`. Both are typically `None` for simple use cases.
+
+Cursors must be closed before the database they belong to is closed. Failing to close cursors before closing a database returns an error.
+
+## Navigating with Get
+
+All cursor navigation is done through a single method with a `Get` enum that specifies the movement:
+
+```rust
+use noxu_db::Get;
+
+let mut key  = DatabaseEntry::new();
+let mut data = DatabaseEntry::new();
+
+let status = cursor.get(&mut key, &mut data, Get::First, None)?;
+```
+
+The `Get` variants:
+
+| Variant | Behavior |
+|---|---|
+| `Get::First` | Move to the first record (smallest key) |
+| `Get::Last` | Move to the last record (largest key) |
+| `Get::Next` | Move to the next record |
+| `Get::Prev` | Move to the previous record |
+| `Get::Search` | Move to the record with exactly the given key |
+| `Get::SearchGte` | Move to the first record with key >= the given key |
+| `Get::SearchRange` | Alias for `SearchGte` (matches `getSearchKeyRange` in JE) |
+| `Get::Current` | Re-read the record at the current position |
+
+For `Search`, `SearchGte`, and `SearchRange`, the key to search for must be placed in the key `DatabaseEntry` before calling `get`. After a successful `Search` the key entry holds the found key; after `SearchGte` the key entry holds the actual key found (which may be greater than the search key).
+
+## Forward Iteration
+
+```rust
+let mut cursor = db.open_cursor(None, None)?;
+let mut key  = DatabaseEntry::new();
+let mut data = DatabaseEntry::new();
+
+let mut status = cursor.get(&mut key, &mut data, Get::First, None)?;
+while status == OperationStatus::Success {
+    println!(
+        "{} = {}",
+        std::str::from_utf8(key.data())?,
+        std::str::from_utf8(data.data())?
+    );
+    status = cursor.get(&mut key, &mut data, Get::Next, None)?;
+}
+cursor.close()?;
+```
+
+## Reverse Iteration
+
+```rust
+let mut cursor = db.open_cursor(None, None)?;
+let mut key  = DatabaseEntry::new();
+let mut data = DatabaseEntry::new();
+
+let mut status = cursor.get(&mut key, &mut data, Get::Last, None)?;
+while status == OperationStatus::Success {
+    println!("{} = {}", std::str::from_utf8(key.data())?, std::str::from_utf8(data.data())?);
+    status = cursor.get(&mut key, &mut data, Get::Prev, None)?;
+}
+cursor.close()?;
+```
+
+## Searching for a Specific Key
+
+```rust
+let mut cursor = db.open_cursor(None, None)?;
+let mut search_key = DatabaseEntry::from_bytes(b"carol");
+let mut data = DatabaseEntry::new();
+
+let status = cursor.get(&mut search_key, &mut data, Get::Search, None)?;
+if status == OperationStatus::Success {
+    println!("Found: {}", std::str::from_utf8(data.data())?);
+} else {
+    println!("Not found");
+}
+cursor.close()?;
+```
+
+## Range Scan (Greater-Than-Or-Equal Search)
+
+`Get::SearchGte` (or its alias `Get::SearchRange`) positions the cursor at the first record with a key that is greater than or equal to the search key. This is the key primitive for prefix and range scans:
+
+```rust
+let mut cursor = db.open_cursor(None, None)?;
+let mut range_key = DatabaseEntry::from_bytes(b"user:m");  // start of range
+let mut data = DatabaseEntry::new();
+
+let mut status = cursor.get(&mut range_key, &mut data, Get::SearchGte, None)?;
+while status == OperationStatus::Success {
+    let k = std::str::from_utf8(range_key.data())?;
+    if !k.starts_with("user:") {
+        break; // left the user: namespace
+    }
+    println!("{} = {}", k, std::str::from_utf8(data.data())?);
+    status = cursor.get(&mut range_key, &mut data, Get::Next, None)?;
+}
+cursor.close()?;
+```
+
+## Deleting via Cursor
+
+`cursor.delete()` removes the record at the current cursor position. The cursor must have been successfully positioned (i.e., the most recent `get` returned `Success`) before calling `delete`.
+
+```rust
+let mut cursor = db.open_cursor(None, None)?;
+let mut search_key = DatabaseEntry::from_bytes(b"user:bob");
+let mut data = DatabaseEntry::new();
+
+if cursor.get(&mut search_key, &mut data, Get::Search, None)? == OperationStatus::Success {
+    cursor.delete()?;
+}
+cursor.close()?;
+```
+
+## Writing via Cursor
+
+`cursor.put` inserts or overwrites the record at the current cursor position. Use the `Put` enum to control overwrite behavior:
+
+```rust
+use noxu_db::Put;
+
+let key  = DatabaseEntry::from_bytes(b"user:dave");
+let data = DatabaseEntry::from_bytes(b"Dave Brown, Finance");
+cursor.put(&key, &data, Put::Overwrite)?;
+```
+
+`Put::Overwrite` replaces any existing record with the given key. `Put::NoOverwrite` returns `OperationStatus::KeyExists` if the key already exists.
+
+## Replacing Data via Cursor
+
+To update the data for the current cursor position without changing the key:
+
+```rust
+// Position cursor on the record to update
+let mut search_key = DatabaseEntry::from_bytes(b"user:alice");
+let mut old_data = DatabaseEntry::new();
+cursor.get(&mut search_key, &mut old_data, Get::Search, None)?;
+
+// Replace the data
+let new_data = DatabaseEntry::from_bytes(b"Alice Smith, VP Engineering");
+cursor.put(&search_key, &new_data, Put::Overwrite)?;
+```
+
+## Important: Always Close Cursors
+
+Cursors hold page locks. Open cursors consume resources and can block other threads. Always close cursors as soon as you are done with them — preferably in a `defer`-style pattern or at the end of a lexical scope using Rust's RAII.
+
+---
+
