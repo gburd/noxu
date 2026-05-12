@@ -194,6 +194,13 @@ pub struct EnvironmentImpl {
     /// / `getUtilizationTracker()`
     ///.
     utilization_tracker: Option<Arc<NoxuMutex<UtilizationTracker>>>,
+
+    /// Shared memory-usage counter wired into every user database tree and
+    /// into the Arbiter.  Each BIN insert/delete updates this counter via
+    /// `Tree::set_memory_counter`; the Arbiter reads it for eviction decisions.
+    ///
+    /// MemoryBudget.updateTreeMemoryUsage(delta) path.
+    cache_usage: Arc<AtomicI64>,
 }
 
 impl EnvironmentImpl {
@@ -520,7 +527,16 @@ impl EnvironmentImpl {
                     return;
                 }
                 while !in_compressor_shutdown_clone.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(compressor_interval_ms));
+                    // Sleep in small chunks so shutdown is responsive (same
+                    // pattern as the cleaner daemon — avoids a full 5-second
+                    // stall on env.close() / drop, which inflates w11 recovery
+                    // benchmark elapsed time).
+                    let chunk_ms = 100u64;
+                    let mut remaining = compressor_interval_ms;
+                    while remaining > 0 && !in_compressor_shutdown_clone.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(chunk_ms.min(remaining)));
+                        remaining = remaining.saturating_sub(chunk_ms);
+                    }
                     if in_compressor_shutdown_clone.load(Ordering::Relaxed) {
                         break;
                     }
@@ -606,6 +622,7 @@ impl EnvironmentImpl {
             extinction_scanner: Mutex::new(noxu_cleaner::ExtinctionScanner::new()),
             backup_manager: Mutex::new(crate::backup_manager::BackupManager::new()),
             utilization_tracker,
+            cache_usage,
         };
 
         // Mark as open
@@ -692,6 +709,11 @@ impl EnvironmentImpl {
         let mut db_impl =
             DatabaseImpl::new(db_id, name.to_string(), DbType::User, config);
 
+        // Wire the environment's shared memory counter into the new database
+        // tree so that BIN insertions/deletions are visible to the Arbiter
+        // (MemoryBudget.updateTreeMemoryUsage path).
+        db_impl.set_memory_counter(Arc::clone(&self.cache_usage));
+
         // If recovery populated a tree for this db_id, transplant it so the
         // database starts from its recovered (crash-consistent) state rather
         // than an empty tree.  We use `remove` so the tree is transferred
@@ -704,6 +726,8 @@ impl EnvironmentImpl {
             .remove(&(db_id.id() as u64))
         {
             db_impl.set_recovered_tree(recovered_tree);
+            // Re-wire counter since set_recovered_tree replaces the tree.
+            db_impl.set_memory_counter(Arc::clone(&self.cache_usage));
         }
 
         let db = Arc::new(RwLock::new(db_impl));

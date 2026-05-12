@@ -14,12 +14,20 @@
 //! 3. Serialise: build the raw byte slice [header | payload].
 //! 4. Fill in the checksum and prev_offset in the header.
 //! 5. Obtain a write buffer from the pool; allocate a segment.
-//! 6. If the entry fits in the pool buffer, register the LSN and let the
-//!    caller copy the bytes into the segment outside the latch.
+//! 6. If the entry fits in the pool buffer, register the LSN and copy bytes
+//!    into the segment under the LWL.
 //!    If the entry is too large for any pool buffer, write directly to the
-//!    file via FileManager.
+//!    file via FileManager (also under LWL).
 //! 7. Advance next_available_lsn / last_used_lsn in the FileManager.
 //! 8. Return the assigned LSN.
+//!
+//! # Flush/fsync path (flush_sync)
+//!
+//! Under LWL: collect dirty buffers + pwrite64 (JE logWriteMutex design).
+//! Outside LWL: fdatasync via FsyncManager leader/waiter (group-commit).
+//! Holding LWL through pwrite64 ensures concurrent threads complete their
+//! kernel writes before releasing, so they arrive at FsyncManager
+//! simultaneously and coalesce into a single fdatasync.
 //!
 //! # Read path (getLogEntryFromLogSource -> Rust LogManager::read_entry)
 //!
@@ -53,26 +61,15 @@ pub struct LogManager {
     buffer_pool: Arc<Mutex<LogBufferPool>>,
 
     /// Serializes all log writes so entries appear in LSN order.
-    /// calls this the "Log Write Latch" (LWL).
+    /// JE calls this the "Log Write Latch" (LWL).
     ///
-    /// Held only long enough to assign the LSN and copy bytes into the write
-    /// buffer (both are pure in-memory operations).  All disk I/O happens
-    /// under `write_io_latch`, outside the LWL.
+    /// Held through LSN assignment, memcpy into the write buffer, and the
+    /// pwrite64 syscall (matching JE's `logWriteMutex` design).  Holding the
+    /// latch through pwrite64 ensures that all concurrent writers complete
+    /// their kernel writes before entering `FsyncManager`, so they arrive
+    /// simultaneously and the leader/waiter algorithm can coalesce multiple
+    /// commits into a single fdatasync.
     log_write_latch: Mutex<()>,
-
-    /// Serializes the pwrite64 + fdatasync pair outside the LWL.
-    ///
-    /// Two-latch coalescing design:
-    ///   1. Under LWL: assign LSN, copy entry to write buffer, advance
-    ///      watermarks (`collect_dirty_buffers`).  The LWL is released as
-    ///      soon as the in-memory snapshot is complete — no disk I/O.
-    ///   2. Under write_io_latch: write pending bytes with pwrite64, then
-    ///      fdatasync via `FsyncManager`.  Concurrent writers that finish
-    ///      their LWL phase while this I/O is in flight accumulate more data
-    ///      in the write buffer; the next holder of `write_io_latch` may find
-    ///      all buffers already marked flushed (nothing to write) and only
-    ///      pays for a single coalesced fsync.
-    write_io_latch: Mutex<()>,
 
     /// Last flushed LSN (updated when buffers are written to disk).
     last_flush_lsn: AtomicU64,
@@ -122,7 +119,6 @@ impl LogManager {
         LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
             log_write_latch: Mutex::new(()),
-            write_io_latch: Mutex::new(()),
             // 0 means "nothing flushed yet". NULL_LSN = u64::MAX would make
             // flush_sync_if_needed's `already_flushed >= lsn` always true,
             // causing all flushes to be skipped.
@@ -389,10 +385,10 @@ impl LogManager {
 
         // Flush / fsync if requested, outside the LWL (matching JE).
         // Use flush_sync_if_needed(lsn) rather than flush_sync() so that a
-        // concurrent committer whose data was already written by a racing
-        // leader thread can return immediately without competing for
-        // write_io_latch.  One thread flushes all pending writes; the others
-        // see last_flush_lsn > their_commit_lsn and skip the I/O entirely.
+        // concurrent committer whose data was already flushed by a racing
+        // leader thread can return immediately.  One thread flushes all
+        // pending writes; the others see last_flush_lsn > their_commit_lsn
+        // and skip the I/O entirely.
         // This is the JE LogManager.flushTo(lsn) coalescing optimisation.
         if fsync_required {
             self.flush_sync_if_needed(lsn)?;
@@ -429,58 +425,36 @@ impl LogManager {
     ///
     /// Three-phase write coalescing:
     ///
-    /// Phase 1 — under LWL (fast, in-memory only): snapshot each dirty
-    ///   buffer's pending bytes and advance the flush watermark via
-    ///   `collect_dirty_buffers()`.  The LWL is released immediately after
-    ///   snapshotting — no disk I/O holds it.  Concurrent committers can now
-    ///   fill write buffers while this caller waits for `write_io_latch`.
+    /// Phase 1 — under LWL (includes pwrite64, matching JE logWriteMutex):
+    ///   snapshot each dirty buffer's pending bytes, do pwrite64 while still
+    ///   holding the LWL, then release the LWL.  Holding the LWL through
+    ///   pwrite64 means that all concurrent committers complete their kernel
+    ///   writes before the next thread acquires LWL, so they all arrive at
+    ///   `FsyncManager` nearly simultaneously — enabling fsync coalescing
+    ///   without a separate group-commit window.
     ///
-    /// Phase 2 — under write_io_latch (slow, disk I/O): write each snapshot
-    ///   to disk via pwrite64, then fdatasync via `FsyncManager`.  The
-    ///   `write_io_latch` ensures that a caller cannot return to its caller
-    ///   (signalling durability) before the pwrite64 completes, which would
-    ///   allow a concurrent reader to see data that is not yet on disk.
-    ///
-    /// Coalescing benefit: multiple concurrent committers complete Phase 1
-    ///   (fast) while one caller holds `write_io_latch`.  The next holder of
-    ///   `write_io_latch` may find all buffers already marked flushed (nothing
-    ///   to write) and only pays for a single coalesced fsync via
-    ///   `FsyncManager`.
+    /// Phase 2 — outside LWL (fdatasync via FsyncManager): multiple concurrent
+    ///   callers elect one leader; the leader calls fdatasync once while waiters
+    ///   piggyback, matching JE's FSyncManager group-commit flow.
     pub fn flush_sync(&self) -> Result<Lsn> {
-        // Phase 1: snapshot dirty buffer data (in-memory only, under LWL).
-        let (eol, pending_writes) = {
+        // Under LWL: snapshot dirty buffers and pwrite64 (JE logWriteMutex
+        // design).  Holding through pwrite64 ensures threads serialise their
+        // kernel writes and then all arrive at FsyncManager simultaneously,
+        // allowing the leader/waiter algorithm to coalesce fsyncs.
+        let eol = {
             let _lwl = self.log_write_latch.lock();
             let pending = self.collect_dirty_buffers();
             let eol = self.file_manager.get_next_available_lsn();
-            (eol, pending)
-        };
-        // LWL released — concurrent committers can now accumulate more data
-        // in write buffers while we wait for the I/O latch below.
-
-        // Phase 2a: pwrite64 under write_io_latch only.
-        //
-        // The latch ensures our pwrite64 calls complete before we return, so
-        // readers that observe the committed LSN always find the data on disk.
-        // We release the latch BEFORE calling fsync_manager.fsync() so that
-        // multiple concurrent callers can enter fsync_manager.fsync()
-        // simultaneously — the FsyncManager's leader-waiter algorithm then
-        // coalesces them into a single fdatasync (identical to the JE
-        // FSyncManager.fsync() group-commit flow).
-        {
-            let _io = self.write_io_latch.lock();
-            for (data, offset) in pending_writes {
+            for (data, offset) in pending {
                 self.file_manager.write_buffer(&data, offset)?;
             }
-            // write_io_latch released here — fsync coalescing begins.
-        }
+            eol
+        };
+        // LWL released — all pwrite64s done, data in kernel page cache.
+        // Concurrent waiters on LWL are now released and will each complete
+        // their own pwrite64 under LWL, then enter FsyncManager ~
+        // simultaneously, enabling coalesced fdatasync.
 
-        // Phase 2b: fdatasync outside write_io_latch.
-        //
-        // Any thread that held write_io_latch and wrote its pwrite64 data has
-        // now released it, so our fsync will cover all their writes.  Multiple
-        // concurrent callers here elect one leader via FsyncManager; the leader
-        // calls fdatasync once while waiters piggyback, matching JE's 3.7:1
-        // writes/fsync ratio under concurrent load.
         let fm = &self.file_manager;
         self.fsync_manager.fsync(|| {
             fm.sync_log_end().map_err(|e| {
@@ -530,18 +504,15 @@ impl LogManager {
 
     /// Flushes all dirty write buffers to disk without an fsync.
     pub fn flush_no_sync(&self) -> Result<Lsn> {
-        let (eol, pending_writes) = {
+        let eol = {
             let _lwl = self.log_write_latch.lock();
             let pending = self.collect_dirty_buffers();
             let eol = self.file_manager.get_next_available_lsn();
-            (eol, pending)
-        };
-        {
-            let _io = self.write_io_latch.lock();
-            for (data, offset) in pending_writes {
+            for (data, offset) in pending {
                 self.file_manager.write_buffer(&data, offset)?;
             }
-        }
+            eol
+        };
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
     }
@@ -554,9 +525,9 @@ impl LogManager {
     ///   3. Calls `mark_flushed()` so the watermark advances immediately.
     ///   4. Releases the buffer latch.
     ///
-    /// Returns a `Vec<(data, file_offset)>` that the caller writes to disk
-    /// **outside** the LWL.  This decouples the slow pwrite64 syscall from the
-    /// serialised LSN-assignment critical section.
+    /// Returns a `Vec<(data, file_offset)>` for the caller to write to disk.
+    /// Must be called under the LWL; the caller does pwrite64 before releasing
+    /// the LWL (JE logWriteMutex design).
     fn collect_dirty_buffers(&self) -> Vec<(Vec<u8>, u64)> {
         let pool = self.buffer_pool.lock();
         let buffers = pool.get_all_buffers();
