@@ -524,8 +524,7 @@ impl MultiPeerCatchUp {
             let _ = h.join();
         }
 
-        let w = winner.lock().clone();
-        w
+        winner.lock().clone()
     }
 }
 

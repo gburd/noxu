@@ -929,7 +929,7 @@ impl CursorImpl {
     pub fn get_first(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)> = {
+        let result: Option<(Vec<u8>, Vec<u8>, i32, u64, std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -938,24 +938,23 @@ impl CursorImpl {
                     use noxu_tree::tree::TreeNode;
                     tree.get_root().and_then(|r| {
                         let bin_arc = Self::descend_to_bin(r)?;
-                        let g = bin_arc.read().ok()?;
-                        match &*g {
-                            TreeNode::Bottom(bin) => {
-                                // Use get_full_key so prefix-compressed keys
-                                // are correctly reconstructed via get_full_key().
-                                if bin.entries.is_empty() {
-                                    None
-                                } else {
-                                    Some((
+                        let (key, data, lsn) = {
+                            let g = bin_arc.read().ok()?;
+                            match &*g {
+                                TreeNode::Bottom(bin) => {
+                                    if bin.entries.is_empty() {
+                                        return None;
+                                    }
+                                    (
                                         bin.get_full_key(0).unwrap_or_default(),
                                         bin.entries[0].data.clone().unwrap_or_default(),
-                                        0i32,
                                         bin.entries[0].lsn.as_u64(),
-                                    ))
+                                    )
                                 }
+                                _ => return None,
                             }
-                            _ => None,
-                        }
+                        };
+                        Some((key, data, 0i32, lsn, bin_arc))
                     })
                 }
             } else {
@@ -963,14 +962,15 @@ impl CursorImpl {
             }
         };
 
-        match entry {
-            Some((key, data, idx, lsn)) => {
+        match result {
+            Some((key, data, idx, lsn, bin_arc)) => {
                 self.lock_ln(lsn)?;
                 self.current_key = Some(key);
                 self.current_data = Some(data);
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
+                self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
             None => Ok(OperationStatus::NotFound),
@@ -991,7 +991,7 @@ impl CursorImpl {
     pub fn get_last(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)> = {
+        let result: Option<(Vec<u8>, Vec<u8>, i32, u64, std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -1000,26 +1000,26 @@ impl CursorImpl {
                     use noxu_tree::tree::TreeNode;
                     tree.get_root().and_then(|r| {
                         let bin_arc = Self::descend_to_last_bin(r)?;
-                        let g = bin_arc.read().ok()?;
-                        match &*g {
-                            TreeNode::Bottom(bin) => {
-                                let n = bin.entries.len();
-                                if n == 0 {
-                                    None
-                                } else {
+                        let (key, data, last_idx, lsn) = {
+                            let g = bin_arc.read().ok()?;
+                            match &*g {
+                                TreeNode::Bottom(bin) => {
+                                    let n = bin.entries.len();
+                                    if n == 0 {
+                                        return None;
+                                    }
                                     let last_idx = n - 1;
-                                    // Use get_full_key to reconstruct
-                                    // prefix-compressed keys correctly.
-                                    Some((
+                                    (
                                         bin.get_full_key(last_idx).unwrap_or_default(),
                                         bin.entries[last_idx].data.clone().unwrap_or_default(),
                                         last_idx as i32,
                                         bin.entries[last_idx].lsn.as_u64(),
-                                    ))
+                                    )
                                 }
+                                _ => return None,
                             }
-                            _ => None,
-                        }
+                        };
+                        Some((key, data, last_idx, lsn, bin_arc))
                     })
                 }
             } else {
@@ -1027,14 +1027,15 @@ impl CursorImpl {
             }
         };
 
-        match entry {
-            Some((key, data, idx, lsn)) => {
+        match result {
+            Some((key, data, idx, lsn, bin_arc)) => {
                 self.lock_ln(lsn)?;
                 self.current_key = Some(key);
                 self.current_data = Some(data);
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
+                self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
             None => Ok(OperationStatus::NotFound),
@@ -1157,43 +1158,97 @@ impl CursorImpl {
             self.current_index - 1
         };
 
-        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)> = {
+        // Within-BIN traversal.
+        //
+        // Fast path (O(1)): use the pinned `current_bin_arc` to read
+        // `next_index` directly, avoiding a root-to-leaf B-tree traversal on
+        // every cursor step.  This mirrors JE CursorImpl.getNext() which
+        // latches the current BIN and increments the index in-place.
+        //
+        // Slow path (O(log N)): only taken when `current_bin_arc` is not yet
+        // set (e.g. first advance after `get_first()` in an older code path).
+        // We save the discovered arc so subsequent steps use the fast path.
+        use noxu_tree::tree::TreeNode;
+        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)>;
+        let new_bin_arc: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>;
+
+        if let Some(bin_arc) = &self.current_bin_arc {
+            // Fast path: pinned BIN — no tree traversal.
+            if let Ok(g) = bin_arc.read() {
+                if let TreeNode::Bottom(bin) = &*g {
+                    if next_index >= 0 && next_index < bin.entries.len() as i32 {
+                        let idx = next_index as usize;
+                        entry = Some((
+                            bin.get_full_key(idx).unwrap_or_default(),
+                            bin.entries[idx].data.clone().unwrap_or_default(),
+                            next_index,
+                            bin.entries[idx].lsn.as_u64(),
+                        ));
+                    } else {
+                        entry = None; // BIN exhausted — fall through to cross-BIN
+                    }
+                } else {
+                    entry = None;
+                }
+            } else {
+                entry = None;
+            }
+            new_bin_arc = None;
+        } else {
+            // Slow path: traverse from root, then pin the discovered BIN.
+            let current_key_slice_opt = self.current_key.as_deref().map(|s| s.to_vec());
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
-                    None
-                } else {
-                    use noxu_tree::tree::TreeNode;
-                    let current_key_slice_opt = self.current_key.as_deref().map(|s| s.to_vec());
-                    tree.get_root().and_then(|r| {
-                        let current_key_slice = current_key_slice_opt.as_deref()?;
-                        let bin_arc =
-                            Self::find_bin_for_key(r, current_key_slice)?;
-                        let g = bin_arc.read().ok()?;
-                        match &*g {
-                            TreeNode::Bottom(bin) => {
-                                if next_index < 0
-                                    || next_index >= bin.entries.len() as i32
-                                {
-                                    None
-                                } else {
+                    entry = None;
+                    new_bin_arc = None;
+                } else if let (Some(current_key), Some(root)) =
+                    (current_key_slice_opt.as_deref(), tree.get_root())
+                {
+                    if let Some(bin_arc) = Self::find_bin_for_key(root, current_key) {
+                        // Clone so we can move the arc after the read guard is dropped.
+                        let arc_to_save = bin_arc.clone();
+                        if let Ok(g) = bin_arc.read() {
+                            if let TreeNode::Bottom(bin) = &*g {
+                                if next_index >= 0 && next_index < bin.entries.len() as i32 {
                                     let idx = next_index as usize;
-                                    Some((
+                                    entry = Some((
                                         bin.get_full_key(idx).unwrap_or_default(),
                                         bin.entries[idx].data.clone().unwrap_or_default(),
                                         next_index,
                                         bin.entries[idx].lsn.as_u64(),
-                                    ))
+                                    ));
+                                    new_bin_arc = Some(arc_to_save);
+                                } else {
+                                    entry = None;
+                                    new_bin_arc = None;
                                 }
+                            } else {
+                                entry = None;
+                                new_bin_arc = None;
                             }
-                            _ => None,
+                        } else {
+                            entry = None;
+                            new_bin_arc = None;
                         }
-                    })
+                    } else {
+                        entry = None;
+                        new_bin_arc = None;
+                    }
+                } else {
+                    entry = None;
+                    new_bin_arc = None;
                 }
             } else {
-                None
+                entry = None;
+                new_bin_arc = None;
             }
-        };
+        }
+
+        // Pin the BIN we discovered via the slow path.
+        if new_bin_arc.is_some() {
+            self.update_bin_pin(new_bin_arc);
+        }
 
         if let Some((key, data, idx, lsn)) = entry {
             // For dup-mode traversal modes, filter by primary key.
