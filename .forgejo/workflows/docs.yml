@@ -1,0 +1,91 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.forgejo/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.forgejo/workflows/docs.yml'
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MDBOOK_VERSION: "0.4.40"
+  MDBOOK_MERMAID_VERSION: "0.13.0"
+
+jobs:
+  spell:
+    name: Spell check (typos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install typos
+        run: |
+          curl -fsSL \
+            https://github.com/crate-ci/typos/releases/latest/download/typos-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C /usr/local/bin ./typos
+
+      - name: Check spelling
+        run: typos docs/src/
+
+  prose:
+    name: Markdown lint (markdownlint-cli2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install markdownlint-cli2
+        run: npm install -g markdownlint-cli2
+
+      - name: Lint markdown
+        run: markdownlint-cli2 "docs/src/**/*.md"
+
+  build-deploy:
+    name: Build and deploy mdBook
+    runs-on: ubuntu-latest
+    needs: [spell, prose]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache mdBook binaries
+        id: cache-mdbook
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: mdbook-${{ env.MDBOOK_VERSION }}-mermaid-${{ env.MDBOOK_MERMAID_VERSION }}
+
+      - name: Install mdBook
+        if: steps.cache-mdbook.outputs.cache-hit != 'true'
+        run: |
+          cargo install mdbook --version ${{ env.MDBOOK_VERSION }} --locked
+          cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }} --locked
+
+      - name: Build book
+        run: mdbook build docs/
+        env:
+          MDBOOK_OUTPUT__HTML__SITE_URL: /noxu/
+          MDBOOK_OUTPUT__HTML__GIT_REPOSITORY_URL: https://codeberg.org/gregburd/noxu
+
+      - name: Deploy to pages branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cd docs/book
+          git init
+          git config user.email "ci@noxu-db"
+          git config user.name "Forgejo CI"
+          git checkout -b pages
+          git add -A
+          git commit -m "docs: deploy ${GITHUB_SHA:0:8}"
+          git push --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@codeberg.org/gregburd/noxu.git" \
+            pages:pages
