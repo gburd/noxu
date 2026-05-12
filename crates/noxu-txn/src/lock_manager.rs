@@ -171,7 +171,8 @@ impl LockManager {
     /// - `TxnError::LockTimeout` if the timeout expired while waiting
     /// - `TxnError::Deadlock` if a wait-for cycle is detected before waiting
     ///
-    /// 
+    ///
+    #[inline]
     pub fn lock(
         &self,
         lsn: u64,
@@ -786,7 +787,8 @@ impl LockManager {
     /// Returns the lock table index for a given LSN.
     ///
     ///
-    /// 
+    ///
+    #[inline]
     fn get_table_index(&self, lsn: u64) -> usize {
         ((lsn as usize) & 0x7fff_ffff) % N_LOCK_TABLES
     }

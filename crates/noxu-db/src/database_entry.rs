@@ -1,17 +1,22 @@
 //! Database entry for keys and data.
 //!
 
+use bytes::Bytes;
+
 /// Encodes database key and data items as byte arrays.
 ///
 /// Both key and data items are represented by DatabaseEntry objects.
 /// Key and data byte arrays may refer to arrays of zero length up to
 /// arrays of essentially unlimited length.
 ///
-/// 
+/// Internally uses `bytes::Bytes` so that `clone()` is O(1) (reference-count
+/// increment) and `from_vec` / `set_data_vec` are zero-copy.
+///
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseEntry {
-    /// The data bytes.
-    data: Option<Vec<u8>>,
+    /// The data bytes.  `Bytes::clone()` is O(1).
+    data: Option<Bytes>,
     /// Offset into the data array.
     offset: usize,
     /// Size of the data.
@@ -37,12 +42,12 @@ impl DatabaseEntry {
         }
     }
 
-    /// Creates a DatabaseEntry from a byte slice.
+    /// Creates a DatabaseEntry from a byte slice (copies the slice).
     ///
     /// Alias: `from_data` is also available.
     pub fn from_bytes(data: &[u8]) -> Self {
         Self {
-            data: Some(data.to_vec()),
+            data: Some(Bytes::copy_from_slice(data)),
             offset: 0,
             size: data.len(),
             partial: false,
@@ -51,8 +56,21 @@ impl DatabaseEntry {
         }
     }
 
-    /// Creates a DatabaseEntry from an owned Vec.
+    /// Creates a DatabaseEntry from an owned `Vec<u8>` — zero-copy.
     pub fn from_vec(data: Vec<u8>) -> Self {
+        let size = data.len();
+        Self {
+            data: Some(Bytes::from(data)),
+            offset: 0,
+            size,
+            partial: false,
+            partial_offset: 0,
+            partial_length: 0,
+        }
+    }
+
+    /// Creates a DatabaseEntry from an existing `Bytes` — zero-copy.
+    pub fn from_bytes_ref(data: Bytes) -> Self {
         let size = data.len();
         Self {
             data: Some(data),
@@ -76,15 +94,22 @@ impl DatabaseEntry {
         })
     }
 
-    /// Sets the data from a byte slice.
+    /// Sets the data from a byte slice (copies the slice).
     pub fn set_data(&mut self, data: &[u8]) {
-        self.data = Some(data.to_vec());
+        self.data = Some(Bytes::copy_from_slice(data));
         self.offset = 0;
         self.size = data.len();
     }
 
-    /// Sets the data from an owned Vec.
+    /// Sets the data from an owned `Vec<u8>` — zero-copy.
     pub fn set_data_vec(&mut self, data: Vec<u8>) {
+        self.size = data.len();
+        self.data = Some(Bytes::from(data));
+        self.offset = 0;
+    }
+
+    /// Sets the data from an existing `Bytes` — zero-copy.
+    pub fn set_data_bytes(&mut self, data: Bytes) {
         self.size = data.len();
         self.data = Some(data);
         self.offset = 0;
@@ -173,6 +198,12 @@ impl Default for DatabaseEntry {
 impl From<Vec<u8>> for DatabaseEntry {
     fn from(data: Vec<u8>) -> Self {
         Self::from_vec(data)
+    }
+}
+
+impl From<Bytes> for DatabaseEntry {
+    fn from(data: Bytes) -> Self {
+        Self::from_bytes_ref(data)
     }
 }
 
