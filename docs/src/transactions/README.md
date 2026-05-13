@@ -1,12 +1,12 @@
 # Transaction Processing
 
 This chapter covers Noxu DB's transaction model in depth. It corresponds to the
-**Berkeley DB JE Getting Started with Transaction Processing** guide, adapted
+**Noxu DB Getting Started with Transaction Processing** guide, adapted
 for the Rust API.
 
 Noxu DB uses **record-level locking** (not MVCC). Writers hold locks until
 commit or abort; readers block on write-locked records. This is faithful to
-BDB JE's isolation model and is the basis for all concurrency guarantees
+Noxu's isolation model and is the basis for all concurrency guarantees
 described here.
 
 ## In This Chapter

@@ -1,6 +1,6 @@
 //! Secondary database example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's `SecondaryExample.java`.
+//! Example showing Noxu DB usage.java`.
 //!
 //! Demonstrates secondary databases (secondary indexes):
 //!   - Open a primary database keyed by employee name

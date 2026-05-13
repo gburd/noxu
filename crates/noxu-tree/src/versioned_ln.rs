@@ -1,7 +1,7 @@
 //! Versioned LN  -  LN that preserves VLSN information.
 //!
 //!
-//! In JE, VersionedLN is a subclass of LN that preserves VLSN information
+//! VersionedLN is a subclass of LN that preserves VLSN information
 //! for replication purposes. In Noxu DB, all LNs can hold VLSNs, so this
 //! module provides a convenience constructor for creating versioned LNs.
 
@@ -10,7 +10,7 @@ use noxu_util::Vlsn;
 
 /// Creates a versioned LN (one that preserves its VLSN).
 ///
-/// In JE, VersionedLN is a subclass. In Noxu, all LNs can hold VLSNs,
+/// VersionedLN is a subclass. In Noxu, all LNs can hold VLSNs,
 /// so this is just a convenience constructor.
 ///
 /// # Arguments

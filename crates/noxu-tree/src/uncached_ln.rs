@@ -1,13 +1,13 @@
 //! UncachedLN  -  LN variant that avoids data copy when not cached.
 //!
 //!
-//! This is one of the 10 NoSQL enhancements. An UncachedLN is used
+//! This is one of the 10 extended-fork enhancements. An UncachedLN is used
 //! when the LN data is not needed in cache  -  the data is read directly
 //! from the log without copying into the BIN cache. This optimization
 //! reduces memory usage for workloads where data is read once and
 //! discarded (e.g., sequential scans).
 //!
-//! In JE, UncachedLN is a subclass of LN. In Noxu DB, we use a factory
+//! UncachedLN is a subclass of LN. In Noxu DB, we use a factory
 //! function to create LNs with appropriate hints for the evictor.
 
 use crate::ln::Ln;

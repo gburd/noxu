@@ -1,6 +1,6 @@
 //! Observer trait for log write events.
 //!
-//! (`serialLogWork`). In JE, `UtilizationTracker` is fetched from `envImpl`
+//! (`serialLogWork`). `UtilizationTracker` is fetched from `envImpl`
 //! and called under the Log Write Latch (LWL) each time an entry is written.
 //!
 //! Defining the trait here in `noxu-log` avoids a circular dependency:

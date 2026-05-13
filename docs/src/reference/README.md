@@ -1,7 +1,7 @@
 # Programmer's Reference
 
 This chapter documents Noxu DB's internal architecture at the level needed to
-understand, debug, or extend the system. It corresponds to the **Berkeley DB
+understand, debug, or extend the system. It corresponds to the **Noxu DB
 Programmer's Reference Guide**, adapted for the Rust implementation.
 
 The canonical high-level overview is also available in [`ARCHITECTURE.md`](https://github.com/gburd/lamdb/blob/main/ARCHITECTURE.md)

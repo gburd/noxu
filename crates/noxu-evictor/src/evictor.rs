@@ -366,7 +366,7 @@ impl Evictor {
         // Snapshot phase quotas at the start.  Put-back re-inserts nodes at
         // the hot end; without quotas the batch would re-select them in the
         // same pass, causing infinite cycling.  We process at most (quota)
-        // candidates per phase — matching JE's maxNodesScanned semantics.
+        // candidates per phase — correct's maxNodesScanned semantics.
         let scan_quota    = self.scan_policy.len();
         let primary_quota = self.primary_policy.len();
         let pri2_quota    = self.pri2.lock().len;

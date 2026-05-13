@@ -1,6 +1,6 @@
 [book]
 title = "Noxu DB Documentation"
-description = "An embedded transactional key-value database — a faithful Rust port of Berkeley DB Java Edition."
+description = "An embedded transactional key-value database engine written in Rust."
 authors = ["The Noxu DB Contributors"]
 language = "en"
 src = "src"

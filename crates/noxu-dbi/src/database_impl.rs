@@ -297,7 +297,7 @@ impl DatabaseImpl {
     /// Collects structural B-tree statistics.
     ///
     /// Walks the full tree (O(n) in node count) and returns node counts
-    /// and maximum depth.  Mirrors JE `DatabaseImpl.getDbStats(fast=false)`.
+    /// and maximum depth.  Implements `DatabaseImpl.getDbStats(fast=false)`.
     ///
     /// Returns `None` if this DatabaseImpl has no real tree (e.g. internal
     /// metadata databases).

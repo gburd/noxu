@@ -994,7 +994,7 @@ impl FileProcessor {
 
     /// Main entry point — processes a single log file for cleaning.
     ///
-    /// In JE, adapted to accept a
+    /// adapted to accept a
     /// pre-decoded entry slice so the loop is testable without I/O.
     ///
     /// # Arguments
@@ -1171,7 +1171,7 @@ impl FileProcessor {
     ///
     /// 
     ///
-    /// The algorithm (faithful to JE):
+    /// The algorithm (correct):
     /// 1. Dequeue the lowest-offset LN from `cache`.
     /// 2. Look up its parent BIN slot via `tree`.
     /// 3. If not found or slot is known-deleted → mark dead.
@@ -1251,7 +1251,7 @@ impl FileProcessor {
     ///
     /// 
     ///
-    /// Decision tree (faithful to JE):
+    /// Decision tree (correct):
     ///
     /// | Condition                               | Action            |
     /// |-----------------------------------------|-------------------|

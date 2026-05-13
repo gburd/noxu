@@ -1,6 +1,6 @@
 //! Error types for Noxu DB.
 //!
-//! Mirrors JE's exception hierarchy:
+//! Implements exception hierarchy:
 //!
 //! ```text
 //! DatabaseException (base)
@@ -30,85 +30,85 @@ use thiserror::Error;
 
 /// Distinguishes the root cause of an `EnvironmentFailure`.
 ///
-/// Mirrors `com.sleepycat.je.dbi.EnvironmentFailureReason`.  Callers can
+/// Callers can
 /// match on this to decide whether to attempt restart (`invalidates_environment
 /// = false`) or give up (`invalidates_environment = true`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentFailureReason {
     // ── Log / checksum ─────────────────────────────────────────────────────
     /// A checksum mismatch was detected in the log (persistent corruption).
-    /// `isCorrupted() == true`.  JE: `LOG_CHECKSUM`.
+    /// `isCorrupted() == true`.  : `LOG_CHECKSUM`.
     LogChecksum,
 
-    /// A log write I/O error occurred.  JE: `LOG_WRITE`.
+    /// A log write I/O error occurred.  : `LOG_WRITE`.
     LogWrite,
 
     /// A log file was not found during read (truncation or deletion).
-    /// JE: `LOG_FILE_NOT_FOUND`.
+    /// : `LOG_FILE_NOT_FOUND`.
     LogFileNotFound,
 
     /// The log is incomplete or internally inconsistent.
-    /// JE: `LOG_INTEGRITY`.
+    /// : `LOG_INTEGRITY`.
     LogIntegrity,
 
     // ── B-tree ──────────────────────────────────────────────────────────────
     /// A persistent B-tree structure inconsistency was detected.
-    /// `isCorrupted() == true`.  JE: `BTREE_CORRUPTION`.
+    /// `isCorrupted() == true`.  : `BTREE_CORRUPTION`.
     BtreeCorruption,
 
     // ── Unexpected internal state ──────────────────────────────────────────
     /// An unexpected internal state was reached (non-fatal; env still valid).
-    /// JE: `UNEXPECTED_STATE`.
+    /// : `UNEXPECTED_STATE`.
     UnexpectedState,
 
     /// An unexpected internal state was reached (fatal; env is invalidated).
-    /// JE: `UNEXPECTED_STATE_FATAL`.
+    /// : `UNEXPECTED_STATE_FATAL`.
     UnexpectedStateFatal,
 
     /// An unexpected exception was caught internally (non-fatal).
-    /// JE: `UNEXPECTED_EXCEPTION`.
+    /// : `UNEXPECTED_EXCEPTION`.
     UnexpectedException,
 
     /// An unexpected exception was caught internally (fatal; env invalidated).
-    /// JE: `UNEXPECTED_EXCEPTION_FATAL`.
+    /// : `UNEXPECTED_EXCEPTION_FATAL`.
     UnexpectedExceptionFatal,
 
     // ── Resource limits ─────────────────────────────────────────────────────
     /// The disk limit (`MAX_DISK`) or free-disk threshold (`FREE_DISK`) was
-    /// exceeded.  JE: `DISK_LIMIT`.
+    /// exceeded.  : `DISK_LIMIT`.
     DiskLimit,
 
-    /// A latch acquisition timed out.  JE: `LATCH_TIMEOUT`.
+    /// A latch acquisition timed out.  : `LATCH_TIMEOUT`.
     LatchTimeout,
 
     // ── Thread lifecycle ────────────────────────────────────────────────────
-    /// The calling thread was interrupted while performing a JE operation.
-    /// JE: `THREAD_INTERRUPTED`.
+    /// The calling thread was interrupted while performing a
+    /// : `THREAD_INTERRUPTED`.
     ThreadInterrupted,
 
     // ── Replication ─────────────────────────────────────────────────────────
     /// The master transitioned to a replica while a transaction was active.
-    /// JE: `MASTER_TO_REPLICA_TRANSITION`.
+    /// : `MASTER_TO_REPLICA_TRANSITION`.
     MasterToReplicaTransition,
 
     /// The replica was fenced by the master.
-    /// JE: `REPLICA_FENCING`.
+    /// : `REPLICA_FENCING`.
     ReplicaFencing,
 
     /// A replication handshake error occurred.
-    /// JE: `HANDSHAKE_ERROR`.
+    /// : `HANDSHAKE_ERROR`.
     HandshakeError,
 
     /// Replication protocol version mismatch.
-    /// JE: `PROTOCOL_VERSION_MISMATCH`.
+    /// : `PROTOCOL_VERSION_MISMATCH`.
     ProtocolVersionMismatch,
 
     /// An uncaught exception in a background replication thread.
-    /// JE: `UNCAUGHT_EXCEPTION`.
+    /// : `UNCAUGHT_EXCEPTION`.
     UncaughtException,
 
     /// Forced shutdown was requested.
-    /// JE: `FORCED_SHUTDOWN`.
+    /// : `FORCED_SHUTDOWN`.
     ForcedShutdown,
 
     // ── Catch-all ──────────────────────────────────────────────────────────
@@ -191,7 +191,7 @@ impl std::fmt::Display for EnvironmentFailureReason {
 
 /// The source subsystem that raised an exception event.
 ///
-/// Mirrors the thread-name conventions used by JE when reporting background
+/// Mirrors the thread-name conventions used by reporting background
 /// daemon exceptions via `ExceptionListener`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExceptionSource {
@@ -220,7 +220,7 @@ impl std::fmt::Display for ExceptionSource {
 
 /// An exception event delivered to an [`ExceptionListener`].
 ///
-/// Mirrors `com.sleepycat.je.ExceptionEvent`.
+
 #[derive(Debug, Clone)]
 pub struct ExceptionEvent {
     /// Human-readable error message.
@@ -253,8 +253,6 @@ impl ExceptionEvent {
 /// (Checkpointer, Cleaner, Evictor, INCompressor, Verifier) call
 /// [`ExceptionListener::exception_event`] when they encounter an unhandled
 /// error.
-///
-/// Mirrors `com.sleepycat.je.ExceptionListener`.
 pub trait ExceptionListener: Send + Sync {
     fn exception_event(&self, event: &ExceptionEvent);
 }
@@ -263,7 +261,7 @@ pub trait ExceptionListener: Send + Sync {
 
 /// Errors that can occur when using Noxu DB.
 ///
-/// Mirrors JE's exception hierarchy:
+/// Implements exception hierarchy:
 ///
 /// - [`NoxuError::EnvironmentFailure`] — potentially fatal; check
 ///   [`NoxuError::is_fatal_to_environment`].  Carries an
@@ -280,7 +278,7 @@ pub enum NoxuError {
     /// and re-opened.  Check [`NoxuError::is_fatal_to_environment`] /
     /// [`NoxuError::reason`] to determine whether restart is required.
     ///
-    /// Mirrors `com.sleepycat.je.EnvironmentFailureException`.
+    
     #[error("environment failure ({reason}): {msg}")]
     EnvironmentFailure {
         /// The root cause of the failure.
@@ -292,31 +290,31 @@ pub enum NoxuError {
     /// The environment is permanently wedged and cannot recover even after
     /// close/re-open.  Operator intervention or backup restore is required.
     ///
-    /// Mirrors `com.sleepycat.je.EnvironmentWedgedException`.
+    
     #[error("environment wedged (permanent failure): {0}")]
     EnvironmentWedged(String),
 
     /// The environment home directory was not found and `allow_create = false`.
     ///
-    /// Mirrors `com.sleepycat.je.EnvironmentNotFoundException`.
+    
     #[error("environment not found: {0}")]
     EnvironmentNotFound(String),
 
     /// The environment is already open by another process.
     ///
-    /// Mirrors `com.sleepycat.je.EnvironmentLockedException`.
+    
     #[error("environment locked by another process: {0}")]
     EnvironmentLocked(String),
 
     /// An I/O error occurred while writing to the log.  The disk may be full.
     ///
-    /// Mirrors `com.sleepycat.je.LogWriteException`.
+    
     #[error("log write failure: {0}")]
     LogWriteFailure(String),
 
     /// The disk limit (`MAX_DISK` / `FREE_DISK`) was exceeded.
     ///
-    /// Mirrors `com.sleepycat.je.DiskLimitException`.
+    
     #[error("disk limit exceeded: used={used}, limit={limit}")]
     DiskLimitExceeded {
         /// Bytes currently used by the environment.
@@ -325,9 +323,9 @@ pub enum NoxuError {
         limit: u64,
     },
 
-    /// The calling thread was interrupted while performing a JE operation.
+    /// The calling thread was interrupted while performing a
     ///
-    /// Mirrors `com.sleepycat.je.ThreadInterruptedException`.
+    
     #[error("thread interrupted during database operation")]
     ThreadInterrupted,
 
@@ -339,7 +337,7 @@ pub enum NoxuError {
 
     /// An attempt was made to create a database that already exists.
     ///
-    /// Mirrors `com.sleepycat.je.DatabaseExistsException`.
+    
     #[error("database already exists: {0}")]
     DatabaseAlreadyExists(String),
 
@@ -359,19 +357,19 @@ pub enum NoxuError {
 
     /// A lock conflict occurred (locker blocked and could not acquire).
     ///
-    /// Mirrors `com.sleepycat.je.LockConflictException`.  Retryable.
+    /// Retryable.
     #[error("lock conflict: {0}")]
     LockConflict(String),
 
     /// A deadlock was detected between two or more transactions.
     ///
-    /// Mirrors `com.sleepycat.je.DeadlockException`.  Retryable.
+    /// Retryable.
     #[error("deadlock detected")]
     DeadlockDetected,
 
     /// A lock-wait timeout expired.
     ///
-    /// Mirrors `com.sleepycat.je.LockTimeoutException`.  Retryable.
+    /// Retryable.
     #[error("lock timeout after {timeout_ms}ms")]
     LockTimeout {
         /// How long the locker waited before giving up.
@@ -381,13 +379,13 @@ pub enum NoxuError {
     /// A lock was requested with `no-wait` semantics and was not immediately
     /// available.
     ///
-    /// Mirrors `com.sleepycat.je.LockNotAvailableException`.  Retryable.
+    /// Retryable.
     #[error("lock not available (no-wait)")]
     LockNotAvailable,
 
     /// A transaction-level timeout expired.
     ///
-    /// Mirrors `com.sleepycat.je.TransactionTimeoutException`.  Retryable.
+    /// Retryable.
     #[error("transaction timeout after {timeout_ms}ms for txn {txn_id}")]
     TransactionTimeout {
         /// Transaction-level timeout in milliseconds.
@@ -398,7 +396,7 @@ pub enum NoxuError {
 
     /// A lock was preempted by a higher-priority locker (HA).
     ///
-    /// Mirrors `com.sleepycat.je.rep.LockPreemptedException`.  Retryable.
+    /// Retryable.
     #[error("lock preempted by higher-priority locker")]
     LockPreempted,
 
@@ -414,33 +412,33 @@ pub enum NoxuError {
 
     /// A unique-index constraint was violated.
     ///
-    /// Mirrors `com.sleepycat.je.UniqueConstraintException`.
+    
     #[error("unique constraint violated: {0}")]
     UniqueConstraintViolation(String),
 
     /// A delete was attempted on a primary record referenced by a secondary
     /// index.
     ///
-    /// Mirrors `com.sleepycat.je.DeleteConstraintException`.
+    
     #[error("delete constraint violated: {0}")]
     DeleteConstraintViolation(String),
 
     /// A foreign-key constraint was violated.
     ///
-    /// Mirrors `com.sleepycat.je.ForeignConstraintException`.
+    
     #[error("foreign constraint violated: {0}")]
     ForeignConstraintViolation(String),
 
     /// Duplicate data was supplied to a `putNoDupData` operation in a
     /// duplicate-sorted database.
     ///
-    /// Mirrors `com.sleepycat.je.DuplicateDataException`.
+    
     #[error("duplicate data not allowed in no-dup-data operation")]
     DuplicateDataException,
 
     /// A secondary database integrity constraint was violated.
     ///
-    /// Mirrors `com.sleepycat.je.SecondaryIntegrityException`.
+    
     #[error("secondary integrity constraint violated: {0}")]
     SecondaryIntegrityException(String),
 
@@ -448,25 +446,25 @@ pub enum NoxuError {
 
     /// A sequence with the given name already exists.
     ///
-    /// Mirrors `com.sleepycat.je.SequenceExistsException`.
+    
     #[error("sequence already exists: {0}")]
     SequenceExists(String),
 
     /// A sequence with the given name was not found.
     ///
-    /// Mirrors `com.sleepycat.je.SequenceNotFoundException`.
+    
     #[error("sequence not found: {0}")]
     SequenceNotFound(String),
 
     /// A sequence has overflowed or underflowed its range.
     ///
-    /// Mirrors `com.sleepycat.je.SequenceOverflowException`.
+    
     #[error("sequence overflow")]
     SequenceOverflow,
 
     /// A sequence integrity violation was detected.
     ///
-    /// Mirrors `com.sleepycat.je.SequenceIntegrityException`.
+    
     #[error("sequence integrity violation: {0}")]
     SequenceIntegrity(String),
 
@@ -484,13 +482,13 @@ pub enum NoxuError {
 
     /// A write was attempted on a replica node.
     ///
-    /// Mirrors `com.sleepycat.je.rep.ReplicaWriteException`.
+    
     #[error("write not allowed on replica")]
     ReplicaWrite,
 
     /// Insufficient replicas acknowledged the commit.
     ///
-    /// Mirrors `com.sleepycat.je.rep.InsufficientReplicasException`.
+    
     #[error("insufficient replicas: required {required}, available {available}")]
     InsufficientReplicas {
         /// Acknowledgement quorum required.
@@ -501,7 +499,7 @@ pub enum NoxuError {
 
     /// The transaction must be rolled back due to a replication state change.
     ///
-    /// Mirrors `com.sleepycat.je.rep.RollbackException`.
+    
     #[error("rollback required: {0}")]
     RollbackRequired(String),
 
@@ -515,7 +513,7 @@ pub enum NoxuError {
 
     /// A log file was not found.
     ///
-    /// Mirrors `com.sleepycat.je.log.LogFileNotFoundException`.
+    
     #[error("log file not found: {0}")]
     LogFileNotFound(String),
 
@@ -527,7 +525,7 @@ pub enum NoxuError {
 
     /// A version mismatch occurred (e.g. on-disk format vs. code version).
     ///
-    /// Mirrors `com.sleepycat.je.VersionMismatchException`.
+    
     #[error("version mismatch: {0}")]
     VersionMismatch(String),
 
@@ -535,7 +533,7 @@ pub enum NoxuError {
 
     /// The operation is not allowed in the current state.
     ///
-    /// Mirrors `com.sleepycat.je.OperationNotAllowedException`.
+    
     #[error("operation not allowed: {0}")]
     OperationNotAllowed(String),
 

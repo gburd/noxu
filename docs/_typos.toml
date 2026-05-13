@@ -6,11 +6,9 @@
 "CBVLSN"    = "CBVLSN"     # Committed Barrier VLSN
 "FPaxos"    = "FPaxos"     # Flexible Paxos
 "Paxos"     = "Paxos"
-"BDB"       = "BDB"        # Berkeley DB
 "NDB"       = "NDB"        # .ndb file extension
 "BIN"       = "BIN"        # Bottom Internal Node
 "LN"        = "LN"         # Leaf Node
-"JE"        = "JE"         # Java Edition
 "QUIC"      = "QUIC"       # Transport protocol (RFC 9000)
 "quoracle"  = "quoracle"   # quorum system library
 "PMTUD"     = "PMTUD"      # Path MTU Discovery
@@ -19,8 +17,6 @@
 
 [files]
 extend-exclude = [
-    "target/",
-    "_/",
+    "book/",
     "*.lock",
-    "docs/book/",
 ]

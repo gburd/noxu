@@ -1,6 +1,6 @@
-//! Peer-to-peer log distribution — BDB/HA-style peer feeder.
+//! Peer-to-peer log distribution — master-feeder pattern.
 //!
-//! In Berkeley DB/HA each replica maintains a log range `[first_vlsn,
+//! Each replica maintains a log range `[first_vlsn,
 //! last_vlsn]` and can act as a feeder for other replicas that need entries
 //! in that range.  This avoids routing all log-shipping traffic through the
 //! master, which would otherwise be the sole bottleneck.
@@ -28,7 +28,7 @@
 //! and updated on every heartbeat / ack.
 //!
 //! Corresponds to `FeederReplicaSyncup`, `LocalCBVLSNUpdater`, and
-//! `RepGroupImpl.getCBVLSN()` in the JE HA implementation.
+//! `RepGroupImpl.getCBVLSN()` in the implementation.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -212,7 +212,7 @@ impl LogScanner for PeerScannerAdapter {
 /// This is a thin wrapper around `FeederRunner` that uses a
 /// `PeerScannerAdapter` as the log source instead of reading from disk.
 ///
-/// Corresponds to JE's peer-to-peer feeder path in `FeederReplicaSyncup`.
+/// Corresponds to 's peer-to-peer feeder path in `FeederReplicaSyncup`.
 pub struct PeerFeederRunner {
     inner: FeederRunner,
     source: Arc<PeerLogScanner>,
@@ -253,7 +253,7 @@ impl PeerFeederRunner {
 
 /// Result of a peer syncup negotiation.
 ///
-/// In JE HA, `FeederReplicaSyncup` finds the highest VLSN that is committed
+///  HA, `FeederReplicaSyncup` finds the highest VLSN that is committed
 /// on BOTH the feeder and the replica (the "matchpoint").  The feeder then
 /// streams entries from matchpoint+1 onwards.
 ///

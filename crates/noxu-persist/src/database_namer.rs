@@ -6,7 +6,7 @@
 
 /// Generates database names for entity stores.
 ///
-/// In JE, each entity type and secondary index gets its own BDB database.
+/// each entity type and secondary index gets its own Noxu database.
 /// The `DatabaseNamer` controls the naming convention used to map entity
 /// types and key names to underlying database names.
 ///

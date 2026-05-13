@@ -113,7 +113,7 @@ fn tick_fail() -> bool {
 /// get/put/delete operations. The cursor state machine ensures
 /// proper initialization before operations.
 ///
-/// In JE, a cursor tracks its position via a BIN reference and slot index.
+/// a cursor tracks its position via a BIN reference and slot index.
 /// This implementation wires cursor traversal to `noxu_tree::Tree`:
 ///
 /// * `get_first` / `get_last` — use `Tree::get_first_node()` /
@@ -1073,7 +1073,7 @@ impl CursorImpl {
     /// Returns true if the slot the cursor is positioned on has been deleted
     /// since the cursor was last positioned.
     ///
-    /// JE: analogous to checking KNOWN_DELETED_BIT / entry removal on
+    /// : analogous to checking KNOWN_DELETED_BIT / entry removal on
     /// Cursor.getCurrentLN() path — returns KEYEMPTY when the record is gone.
     pub fn is_current_slot_deleted(&self) -> bool {
         use noxu_tree::tree::TreeNode;
@@ -1162,7 +1162,7 @@ impl CursorImpl {
         //
         // Fast path (O(1)): use the pinned `current_bin_arc` to read
         // `next_index` directly, avoiding a root-to-leaf B-tree traversal on
-        // every cursor step.  This mirrors JE CursorImpl.getNext() which
+        // every cursor step.  This mirrors() which
         // latches the current BIN and increments the index in-place.
         //
         // Slow path (O(log N)): only taken when `current_bin_arc` is not yet

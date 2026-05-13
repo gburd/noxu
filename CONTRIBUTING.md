@@ -27,19 +27,19 @@ cargo nextest run        # Run tests with nextest (faster)
 - Run `cargo clippy` and resolve all warnings. CI enforces zero warnings.
 - Workspace-level clippy lints are configured in the root `Cargo.toml`.
 
-## Porting Guidelines
+## Development Guidelines
 
-Noxu DB is a Rust port of Berkeley DB Java Edition (BDB JE). When porting Java code to Rust:
+When modifying or extending Noxu DB subsystems:
 
-- **Preserve naming**: Keep JE's class/method names, comments, and doc strings as Rust doc comments.
-- **Preserve logic**: JE's logic is there for a reason. When Rust code diverges from JE logic, it is likely a bug.
+- **Preserve naming**: Keep established type/method names, comments, and doc strings.
+- **Preserve logic**: The existing logic reflects careful design. Divergence from the intended algorithm is likely a bug.
 - **Use enums** for closed class hierarchies (node types, log entry types).
 - **Use traits** for open extension points (comparators, key creators).
-- **Port MemoryBudget tracking** explicitly -- do not rely on the allocator.
+- **Update MemoryBudget** explicitly — do not rely on the allocator.
 - **No unsafe** in core code. Exceptions only for memmap2 and off-heap cache.
 - **No async** in the core engine. Only `noxu-rep` networking may use tokio.
 
-Reference codebases live in `_/je/` (standalone JE 7.5.11) and `_/nosql/` (Oracle NoSQL with enhanced JE fork).
+Reference archives live in `_/je/` and `_/nosql/` (read-only).
 
 ## External Dependencies
 
@@ -47,7 +47,7 @@ Keep the dependency set minimal. The approved core set is: parking_lot, thiserro
 
 ## Architecture
 
-The workspace contains 16 crates under `crates/`, each mapping to a JE package:
+The workspace contains 16 crates under `crates/`:
 
 - **Foundation**: noxu-util, noxu-latch, noxu-config
 - **Core Engine**: noxu-log, noxu-tree, noxu-txn, noxu-evictor, noxu-cleaner, noxu-recovery, noxu-dbi, noxu-engine, noxu-db

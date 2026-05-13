@@ -35,7 +35,7 @@ pub struct GroupService {
     /// one or more replicas may still need those entries. Updated whenever a
     /// replica's `known_vlsn` is refreshed.
     ///
-    /// Corresponds to `LocalCBVLSNUpdater` / `RepGroupImpl.getCBVLSN()` in JE HA.
+    /// Corresponds to `LocalCBVLSNUpdater` / `RepGroupImpl.getCBVLSN()` in
     cbvlsn: Arc<AtomicU64>,
 }
 
@@ -72,7 +72,7 @@ pub struct NodeInfo {
     /// any other replica that needs VLSNs within that range.  `None` means
     /// the range is not yet known (node just joined or is restoring).
     ///
-    /// Corresponds to `ReplicaState.getRepTxnEndVLSN()` in JE HA.
+    /// Corresponds to `ReplicaState.getRepTxnEndVLSN()` in
     pub log_range: Option<(u64, u64)>,
     /// Relative read throughput capacity x 100 (default 100 = 1.0).
     pub read_capacity_pct: u32,

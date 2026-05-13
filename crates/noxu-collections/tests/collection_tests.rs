@@ -1,10 +1,10 @@
 //! CollectionTest, ForeignKeyTest, NullValueTest, and TestSR15721.
 //!
 //! Reference:
-//!   _/je/test/com/sleepycat/collections/test/CollectionTest.java
-//!   _/je/test/com/sleepycat/collections/test/ForeignKeyTest.java
-//!   _/je/test/com/sleepycat/collections/test/NullValueTest.java
-//!   _/je/test/com/sleepycat/collections/test/TestSR15721.java
+//!   Reference: `_/je/test/.../CollectionTest.java`
+//!   Reference: `_/je/test/.../ForeignKeyTest.java`
+//!   Reference: `_/je/test/.../NullValueTest.java`
+//!   Reference: `_/je/test/.../TestSR15721.java`
 
 use noxu_collections::{
     CollectionError, StoredKeySet, StoredList, StoredMap, StoredSortedMap,

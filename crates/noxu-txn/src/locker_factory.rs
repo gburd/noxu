@@ -55,7 +55,7 @@ impl LockerFactory {
 
     /// Generate the next unique locker ID.
     ///
-    /// IDs are sequential starting from 1. In JE, different locker types
+    /// IDs are sequential starting from 1. different locker types
     /// have different ID generation strategies, but for now we use a
     /// simple sequential counter.
     pub fn next_id(&self) -> i64 {

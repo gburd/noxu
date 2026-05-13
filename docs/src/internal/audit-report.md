@@ -1,7 +1,7 @@
 # Noxu DB  -  Comprehensive Audit Report
 
-This report compares all 16 Noxu DB crates against their Berkeley DB Java
-Edition (JE 7.5.11) counterparts and the Oracle NoSQL fork. It consolidates
+This report compares all 16 Noxu DB crates against their Noxu DB Java
+Edition (Noxu 7.5.11) counterparts and the the extended fork. It consolidates
 findings from three independent audits:
 
 1. **Foundation & Storage Audit**  -  noxu-util, noxu-latch, noxu-config, noxu-log, noxu-tree
@@ -10,11 +10,11 @@ findings from three independent audits:
 
 See also:
 - `docs/RUST_REVIEW.md`  -  Idiomatic Rust quality review (B+ overall)
-- `docs/JE_FIDELITY_REVIEW.md`  -  Algorithm fidelity review with JE code comparisons
+- `docs/JE_FIDELITY_REVIEW.md`  -  Algorithm fidelity review with Noxu code comparisons
 
 ## Overall Assessment
 
-The 16-crate structure maps cleanly to JE's package hierarchy. Data structures,
+The 16-crate structure maps cleanly to Noxu's package hierarchy. Data structures,
 enums, and traits are well-designed and idiomatic Rust. The primary gap is that
 layers are **not yet integrated end-to-end**: the public API operates on an
 in-memory HashMap store, the engine orchestrates subsystems that aren't connected
@@ -45,28 +45,28 @@ to the API, and replication is stubbed.
 | **Critical** | Checkpoint dirty IN tracking missing | noxu-recovery |
 | **Critical** | Cleaner LN migration not implemented  -  can't reclaim space | noxu-cleaner |
 | **Critical** | Replication entirely stubbed  -  no networking | noxu-rep |
-| **High** | Lsn::cmp() does not reject NULL_LSN (JE throws) | noxu-util |
-| **High** | SharedLatch read-to-write upgrade causes deadlock (JE panics) | noxu-latch |
+| **High** | Lsn::cmp() does not reject NULL_LSN (Noxu throws) | noxu-util |
+| **High** | SharedLatch read-to-write upgrade causes deadlock (Noxu panics) | noxu-latch |
 | **High** | Latch timeout defined but never enforced | noxu-latch |
 | **High** | ~143 config parameters missing (33 of 176 ported) | noxu-config |
 | **High** | VLSN has no serialization  -  can't write to/read from log | noxu-util |
 | **High** | No key prefix compression  -  25-40% more memory for common prefixes | noxu-tree |
-| **High** | IN has ~120 missing methods vs JE's 194 public/protected | noxu-tree |
+| **High** | IN has ~120 missing methods vs Noxu's 194 public/protected | noxu-tree |
 | **High** | No SecondaryDatabase/SecondaryIndex | noxu-db, noxu-persist |
 | **High** | FileProcessor stubbed  -  cleaner can't clean | noxu-cleaner |
 | **High** | Evictor can't actually evict nodes | noxu-evictor |
 | **High** | LRU list is O(n) per operation, not actually LRU | noxu-evictor |
 | **High** | String tuple encoding truncates on embedded \0 | noxu-bind |
 | **High** | PrimaryKey sort order wrong for signed integers | noxu-persist |
-| **Medium** | Packed integer encoding uses different format than JE (intentional) | noxu-util |
+| **Medium** | Packed integer encoding uses different format than Noxu (intentional) | noxu-util |
 | **Medium** | No schema evolution in persist layer | noxu-persist |
 | **Medium** | Collections key index can diverge from database | noxu-collections |
 | **Medium** | No group commit optimization (5-10x slower writes) | noxu-log |
 | **Medium** | No file handle caching in FileManager | noxu-log |
 | **Medium** | No Sequence support | noxu-db |
-| **Low** | Stat framework minimal (1 type vs JE's 15+) | noxu-util |
+| **Low** | Stat framework minimal (1 type vs Noxu's 15+) | noxu-util |
 | **Low** | No latch debugging/tracking (LatchTable, OwnerInfo) | noxu-latch |
-| **Low** | 30+ JE exception types not ported | all |
+| **Low** | 30+ Noxu exception types not ported | all |
 | **Low** | Daemon threads use sleep loops vs condition vars | noxu-engine |
 
 ## What Is Well-Ported
@@ -74,14 +74,14 @@ to the API, and replication is stubbed.
 - Entry state flags (KD/PD/dirty/embedded_ln/no_data_ln)  -  perfect fidelity
 - Lock type conflict/upgrade matrices (verified correct)
 - Deadlock detection DFS algorithm (correct cycle detection)
-- Lock table sharding (16 tables, improves on JE's default of 1)
+- Lock table sharding (16 tables, improves on Noxu's default of 1)
 - ThinLock vs FullLock mutation optimization
-- LSN representation  -  bit-identical to JE's DbLsn
+- LSN representation  -  bit-identical to Noxu's DbLsn
 - Log entry header format (14/22 bytes, correct fields and flags)
 - Checksum coverage (CRC32, skip first 8 bytes)
 - File naming convention (.ndb with hex numbering)
 - LogBuffer management with manual latch semantics
-- FileSelector state machine (matches JE lifecycle)
+- FileSelector state machine (matches Noxu lifecycle)
 - DirtyINMap level-based organization (correct algorithm)
 - RollbackTracker period tracking (correct data structures)
 - CheckpointStart/CheckpointEnd data structures (correct fields)
@@ -98,7 +98,7 @@ to the API, and replication is stubbed.
 
 ## Per-Crate Code Size Comparison
 
-| Crate | Noxu (lines) | JE (lines) | Ratio | Status |
+| Crate | Noxu (lines) | Noxu (lines) | Ratio | Status |
 |-------|-------------|-----------|-------|--------|
 | noxu-util | 1,019 | ~2,500 | 41% | Well ported |
 | noxu-latch | 513 | ~800 | 64% | Well ported, missing upgrade detection |
@@ -157,5 +157,5 @@ to the API, and replication is stubbed.
 25. Add Sequence support
 26. Implement evictor with real LRU (O(1) operations)
 27. Add INCompressor for empty BIN pruning
-28. Port remaining JE exception types
+28. Port remaining Noxu exception types
 29. Replace sleep loops with condvar-based daemon wakeup

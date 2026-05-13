@@ -9,7 +9,7 @@ use std::fmt;
 
 /// Current log version for Noxu DB.
 ///
-/// This is a NEW Rust-native log format (NOT binary-compatible with JE).
+/// This is a NEW Rust-native log format (NOT binary-compatible with ).
 /// We start at version 1 for the Noxu format.
 pub const LOG_VERSION: u8 = 1;
 

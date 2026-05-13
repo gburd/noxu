@@ -4,7 +4,7 @@ This chapter describes Noxu DB's replication subsystem (`noxu-rep`), which
 provides active/passive multi-node high availability using the **Flexible
 Paxos** consensus protocol.
 
-The architecture corresponds to the **BDB JE High Availability (HA) Guide**,
+The architecture corresponds to the **Noxu DB High Availability (HA) Guide**,
 with significant extensions: the phi accrual failure detector replaces binary
 heartbeat timeouts; `quoracle` provides LP-optimal quorum selection; and both
 TCP and QUIC transports are supported.

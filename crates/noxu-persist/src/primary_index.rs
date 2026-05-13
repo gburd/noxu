@@ -32,7 +32,7 @@ pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     ///
     /// Each secondary index deposits a `SecondaryRegistration` here. On every
     /// `put` / `delete_with_entity` every maintainer is notified so the
-    /// secondary maps stay in sync with the primary store — mirroring BDB the
+    /// secondary maps stay in sync with the primary store — mirroring the
     /// `SecondaryDatabase` auto-maintenance.
     secondaries: Vec<Box<dyn SecondaryIndexMaintainer<K, E> + Send + Sync>>,
     _phantom: PhantomData<(K, E)>,

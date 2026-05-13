@@ -6,53 +6,53 @@
 
 ## Project Overview
 
-Noxu DB is a Rust port of Berkeley DB Java Edition (BDB JE) 7.5.11 — an
-embedded transactional key-value database. The port preserves JE's naming,
-comments, documentation, and algorithms while being idiomatic Rust. All 10
-Oracle NoSQL JE enhancements are included.
+Noxu DB is an embedded transactional key-value database engine written in Rust.
+It provides ACID transactions, a log-structured B+tree, checkpoint-based crash
+recovery, and optional master-replica replication — all in a single library with
+no external database process required.
 
 The project lives at `/home/gburd/ws/lamdb/` and uses a Cargo workspace with 16
 crates under `crates/`.
 
 ## Crate Map
 
-Each crate maps to a JE package. They are organized by implementation phase:
+The 16 crates are organized by implementation layer:
 
 ### Phase 0 — Foundation (complete)
 
-| Crate | JE Package | Purpose |
-|---|---|---|
-| `noxu-util` | `je.utilint` | LSN, VLSN, packed integers, stats, daemon threads |
-| `noxu-latch` | `je.latch` | Exclusive and shared/exclusive latches (parking_lot) |
-| `noxu-config` | `je.config` | 400+ configuration parameters with validation |
+| Crate | Purpose |
+|---|---|
+| `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
+| `noxu-latch` | Exclusive and shared/exclusive latches (parking_lot) |
+| `noxu-config` | 400+ configuration parameters with validation |
 
 ### Phase 1–6 — Core Engine (complete)
 
-| Crate | JE Package | Purpose |
-|---|---|---|
-| `noxu-log` | `je.log` | Write-ahead log, FileManager, LogManager, checksums |
-| `noxu-tree` | `je.tree` | B-tree: IN, BIN, LN, key prefixing, BIN-deltas |
-| `noxu-txn` | `je.txn` | Transactions, record-level locking, deadlock detection |
-| `noxu-dbi` | `je.dbi` | EnvironmentImpl, DatabaseImpl, CursorImpl |
-| `noxu-evictor` | `je.evictor` | LRU cache eviction, off-heap support |
-| `noxu-cleaner` | `je.cleaner` | Log file garbage collection, utilization tracking |
-| `noxu-recovery` | `je.recovery` | Checkpoint-based crash recovery |
-| `noxu-engine` | (orchestration) | Engine orchestration, daemon lifecycle |
-| `noxu-db` | `je` public API | Environment, Database, Cursor, Transaction |
+| Crate | Purpose |
+|---|---|
+| `noxu-log` | Write-ahead log, FileManager, LogManager, checksums |
+| `noxu-tree` | B-tree: IN, BIN, LN, key prefixing, BIN-deltas |
+| `noxu-txn` | Transactions, record-level locking, deadlock detection |
+| `noxu-dbi` | EnvironmentImpl, DatabaseImpl, CursorImpl |
+| `noxu-evictor` | LRU cache eviction, off-heap support |
+| `noxu-cleaner` | Log file garbage collection, utilization tracking |
+| `noxu-recovery` | Checkpoint-based crash recovery |
+| `noxu-engine` | Engine orchestration, daemon lifecycle |
+| `noxu-db` | Public API: Environment, Database, Cursor, Transaction |
 
 ### Phase 7 — Higher-Level APIs (complete)
 
-| Crate | JE Package | Purpose |
-|---|---|---|
-| `noxu-bind` | `com.sleepycat.bind` | Serialization bindings |
-| `noxu-collections` | `com.sleepycat.collections` | Iterator-based collection views |
-| `noxu-persist` | `com.sleepycat.persist` | Derive-macro entity persistence (DPL) |
+| Crate | Purpose |
+|---|---|
+| `noxu-bind` | Serialization bindings (tuple, entry, serial) |
+| `noxu-collections` | Iterator-based collection views |
+| `noxu-persist` | Derive-macro entity persistence (DPL) |
 
 ### Phase 8 — Replication (complete)
 
-| Crate | JE Package | Purpose |
-|---|---|---|
-| `noxu-rep` | `je.rep` | Master-replica HA, elections, VLSN tracking |
+| Crate | Purpose |
+|---|---|
+| `noxu-rep` | Master-replica HA, elections, VLSN tracking |
 
 ## Build, Test, and Lint Commands
 
@@ -72,61 +72,62 @@ make docs-serve   # Live-reload docs at http://localhost:3000
 
 ## Key Design Decisions
 
-- **Log format**: New Rust-native format. NOT binary-compatible with JE.
+- **Log format**: Rust-native `.ndb` format. Not compatible with other database formats.
 - **External crates**: Minimal — parking_lot, thiserror, log, bytes, crc32fast,
   byteorder, memmap2, fs2.
 - **Concurrency**: `parking_lot::Mutex/RwLock` for latches, `std::sync::atomic`
   for volatile fields, `Arc<RwLock<IN>>` for tree nodes.
-- **Isolation model**: Lock-based (JE-identical), NOT MVCC. Writers lock BIN
-  slots; readers block on write-locked records.
+- **Isolation model**: Lock-based, NOT MVCC. Writers lock BIN slots; readers
+  block on write-locked records.
 - **Error handling**: `thiserror` enums, `Result<T, NoxuError>` everywhere.
   No `unwrap()` in library code.
-- **No async**: Core engine uses blocking I/O (matching JE). Only `noxu-rep`
-  networking uses tokio.
+- **No async**: Core engine uses blocking I/O with explicit threading. Only
+  `noxu-rep` networking uses tokio.
 - **No unsafe**: Target zero unsafe in core. Exceptions only for memmap2 and
   off-heap cache.
 - **CRC32**: Uses `crc32fast` (CLMUL/PCLMULQDQ hardware acceleration, 15.8
   GiB/s at 1KiB). Not CRC32C — see `docs/src/internal/checksum-selection.md`.
 
-## Reference Code Locations
+## Reference Archives
 
-When porting or auditing, compare against the Java source:
+When auditing or extending subsystems, compare against the archived reference
+source (read-only — do not modify):
 
-- **Standalone JE 7.5.11**: `_/je/src/com/sleepycat/je/`
-- **NoSQL enhanced JE fork**: `_/nosql/kvmain/src/main/java/com/sleepycat/je/`
+- **Core archive**: `_/je/src/`
+- **Extended-fork archive**: `_/nosql/kvmain/src/main/java/`
 
-## Porting Guidelines
+## Development Guidelines
 
-When porting Java to Rust:
+When implementing or modifying subsystem code:
 
-1. Preserve JE's naming, comments, and doc strings as Rust doc comments.
-2. JE's logic is there for a reason — when Rust code diverges from JE logic,
-   it is likely a bug.
+1. Preserve method names, doc comment content, and algorithm structure.
+2. The existing logic reflects careful design — when Rust code diverges from
+   the intended algorithm, it is likely a bug.
 3. Use enums for closed class hierarchies (node types, log entry types).
 4. Use traits for open extension points (comparators, key creators).
-5. Port JE's explicit MemoryBudget tracking — do not rely on the allocator.
-6. See `docs/src/contributing/porting-guidelines.md` for the full Java→Rust
-   naming table and what to preserve vs. adapt.
+5. Port explicit MemoryBudget tracking — do not rely on the allocator.
+6. See `docs/src/contributing/porting-guidelines.md` for the naming
+   conventions and adaptation patterns.
 
 ## Common Tasks
 
 ### Adding a new feature to a crate
 
-1. Locate the corresponding JE source in `_/je/` or `_/nosql/`.
-2. Read the Java implementation and its tests.
-3. Port the implementation preserving names, comments, and algorithm structure.
+1. Locate the corresponding reference in `_/je/` or `_/nosql/`.
+2. Read the reference implementation and its tests.
+3. Implement preserving names, comments, and algorithm structure.
 4. Write unit tests (in-module `#[cfg(test)]`) and integration tests (in `tests/`).
 5. Run `cargo test -p <crate>` and `cargo clippy -p <crate>`.
 
 ### Investigating a test failure
 
 1. Run the failing test with `cargo test -p <crate> -- <test_name> --nocapture`.
-2. Compare the Rust logic against the JE source for that component.
-3. Check whether the divergence is intentional (Rust idiom) or a porting bug.
+2. Compare the Rust logic against the reference source for that component.
+3. Check whether the divergence is intentional (Rust idiom) or an algorithm bug.
 
-### Auditing JE fidelity
+### Auditing implementation completeness
 
-See `.agent/skills/je-audit.md` for the full process.
+See `.agent/skills/design-audit.md` for the full process.
 
 ### Running the full CI suite locally
 
@@ -152,7 +153,7 @@ Agent skill files are in `.agent/skills/`:
 - [hegel-pbt.md](/.agent/skills/hegel-pbt.md) — Property-based testing with Hegel
 - [git-workflow.md](/.agent/skills/git-workflow.md) — Git workflow conventions
 - [code-review.md](/.agent/skills/code-review.md) — Rust code review checklist
-- [je-audit.md](/.agent/skills/je-audit.md) — JE fidelity audit process
+- [design-audit.md](/.agent/skills/design-audit.md) — Design audit process
 - [testing.md](/.agent/skills/testing.md) — Testing guide for Noxu DB
 
 ---
@@ -222,7 +223,7 @@ docs/src/
 ├── collections/            ← StoredMap, StoredSet, StoredList, DPL
 ├── reference/              ← architecture, log format, B-tree, concurrency model
 ├── operations/             ← sizing, monitoring, tuning, backup, recovery
-├── contributing/           ← build, porting, testing, PR process, release
+├── contributing/           ← build, testing, PR process, release
 ├── maintainer/             ← project history, algorithms, design decisions
-└── internal/               ← fidelity reviews, audit reports, research
+└── internal/               ← design reviews, audit reports, research
 ```

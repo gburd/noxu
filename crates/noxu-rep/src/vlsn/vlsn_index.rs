@@ -85,7 +85,7 @@ impl VlsnIndex {
 
     /// Alias for `put`  -  register a new VLSN->LSN mapping.
     ///
-    /// Provided for compatibility with callers that use JE-style naming.
+    /// Provided for compatibility with callers that use -style naming.
     pub fn register(&self, vlsn: u64, file_number: u32, file_offset: u32) {
         self.put(vlsn, file_number, file_offset);
     }
@@ -687,7 +687,7 @@ mod tests {
             index.put(i, 33, i as u32 * 100);
         }
 
-        // Bucket boundaries with stride=5, maxMappings=2 (JE):
+        // Bucket boundaries with stride=5, maxMappings=2 ():
         //   bucket1 = 1, 6, 10
         //   bucket2 = 11, 16, 20
         //   bucket3 = 21, 25

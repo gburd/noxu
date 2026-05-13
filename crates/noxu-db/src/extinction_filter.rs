@@ -13,7 +13,7 @@
 //! `discard_extinct_records`, the application must not read or write them
 //! again. does not guarantee transactional semantics for extinct records.
 //!
-//! ExtinctionFilter.ExtinctionStatus` (NoSQL 18.1+).
+//! ExtinctionFilter.ExtinctionStatus` (extended fork 18.1+).
 
 /// Classification returned by [`ExtinctionFilter::get_extinction_status`].
 ///

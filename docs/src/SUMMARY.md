@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[Acknowledgements](acknowledgements.md)
 
 ---
 
@@ -90,7 +91,7 @@
   - [Crate Guide](maintainer/crate-guide.md)
   - [Algorithms](maintainer/algorithms.md)
   - [Design Decisions](maintainer/design-decisions.md)
-  - [JE Source Navigation](maintainer/je-source-guide.md)
+  - [Reference Source Navigation](maintainer/reference-source-guide.md)
   - [Development Workflow](maintainer/development.md)
   - [Testing](maintainer/testing.md)
   - [Chaos and Soak Testing](maintainer/chaos-soak-testing.md)
@@ -101,7 +102,7 @@
 # Internal Documents
 
 - [Internal Overview](internal/README.md)
-  - [JE Fidelity Review](internal/je-fidelity-review.md)
+  - [Design Review](internal/design-review.md)
   - [Audit Report](internal/audit-report.md)
   - [Rust Code Review](internal/rust-review.md)
   - [Serialization Research](internal/serialization-research.md)

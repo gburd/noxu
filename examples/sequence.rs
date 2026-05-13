@@ -1,6 +1,6 @@
 //! Sequence example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's `SequenceExample.java`.
+//! Example showing Noxu DB usage.java`.
 //!
 //! Demonstrates the Sequence (auto-increment) API:
 //!   - Open an Environment and Database

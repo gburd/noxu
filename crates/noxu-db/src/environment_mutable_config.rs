@@ -1,6 +1,6 @@
 //! Runtime-mutable environment configuration.
 //!
-//! Mirrors JE's `EnvironmentMutableConfig`.
+//! Implements `EnvironmentMutableConfig`.
 
 use crate::durability::Durability;
 
@@ -10,7 +10,7 @@ use crate::durability::Durability;
 /// Obtain via [`Environment::get_mutable_config`][crate::environment::Environment::get_mutable_config]
 /// and apply via [`Environment::set_mutable_config`][crate::environment::Environment::set_mutable_config].
 ///
-/// Mirrors JE's `EnvironmentMutableConfig`.
+/// Implements `EnvironmentMutableConfig`.
 ///
 /// # Example
 /// ```ignore
@@ -22,24 +22,24 @@ use crate::durability::Durability;
 pub struct EnvironmentMutableConfig {
     /// Override the B-tree cache size in bytes.  `None` means unchanged.
     ///
-    /// Matches JE `EnvironmentMutableConfig.setCacheSize()`.
+    /// Implements `EnvironmentMutableConfig.setCacheSize()`.
     pub cache_size: Option<usize>,
 
     /// Override the default transaction durability for this environment.
     /// `None` means unchanged.
     ///
-    /// Matches JE `EnvironmentMutableConfig.setDurability()`.
+    /// Implements `EnvironmentMutableConfig.setDurability()`.
     pub durability: Option<Durability>,
 
     /// If `true`, committed transactions do not flush to disk (no-sync).
     ///
-    /// Deprecated in JE in favour of `durability`; retained for compatibility.
+    /// Deprecated in favour of `durability`; retained for compatibility.
     pub txn_no_sync: bool,
 
     /// If `true`, committed transactions flush to the OS buffer but do not
     /// call `fdatasync` (write-no-sync).
     ///
-    /// Deprecated in JE in favour of `durability`; retained for compatibility.
+    /// Deprecated in favour of `durability`; retained for compatibility.
     pub txn_write_no_sync: bool,
 
     /// Enable or disable the cleaner daemon.  `None` means unchanged.

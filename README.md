@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
 [![license](https://img.shields.io/badge/license-Apache--2.0%2FMIT-blue.svg)](LICENSE)
 
-An embedded transactional key-value database engine, written in Rust. Noxu DB is a faithful port of [Berkeley DB Java Edition](https://www.oracle.com/database/technologies/related/berkeleydb.html) (BDB JE), preserving its architecture, naming, algorithms, and documentation while targeting idiomatic Rust.
+An embedded transactional key-value database engine, written in Rust. Noxu DB provides ACID transactions, a log-structured B+tree, checkpoint-based crash recovery, and optional master-replica replication — all in a single library with no external database process required.
 
 ## Quick Start
 
@@ -70,7 +70,7 @@ fn main() -> noxu_db::Result<()> {
 
 ## Workspace Structure
 
-Noxu DB is organized as a Cargo workspace of 16 crates, each mapping to a BDB JE package:
+Noxu DB is organized as a Cargo workspace of 16 crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -105,16 +105,18 @@ Requires Rust 1.85+ (2024 edition).
 
 ## Design Principles
 
-- **Faithful port.** JE's naming, comments, logic, and algorithms are preserved. When Rust code diverges from JE logic, it is likely a bug.
+- **Correctness first.** Algorithms and invariants are implemented to match their specifications. Divergence from intended behaviour is a bug.
 - **Idiomatic Rust.** RAII latches, `Result<T, NoxuError>` error handling, enums for closed hierarchies, traits for open extension points.
 - **Minimal dependencies.** Core set: `parking_lot`, `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`.
 - **No unsafe.** Target zero `unsafe` in core crates. Exceptions only for memory-mapped I/O and off-heap cache.
-- **No async.** Core engine uses blocking I/O matching JE's threading model. Only replication networking may use async.
-- **New log format.** Noxu DB uses its own Rust-native on-disk format. It is not binary-compatible with BDB JE.
+- **No async.** Core engine uses blocking I/O with explicit threading. Only replication networking may use async.
+- **Own log format.** Noxu DB uses a Rust-native on-disk format — `.ndb` files — not compatible with any other database.
 
-## Reference
+## Acknowledgements
 
-Noxu DB is ported from Berkeley DB Java Edition 7.5.11, incorporating all 10 enhancements from the Oracle NoSQL Database JE fork: Record Extinction, Before-Image logging, Data Erasure, Async Acks, Group Commit, ByteComparator, UncachedLN, Auto-Backup, Enhanced Verify, and ScanFilter.
+Noxu DB's architecture draws on research and engineering work that spans several decades of embedded database design. The B+tree with write-ahead logging and checkpoint recovery follows the structure established in the embedded database literature. The log-structured approach to record management, BIN-delta write optimisation, and the memory-budget accounting model are derived from published techniques for transactional embedded stores.
+
+The replication subsystem implements Flexible Paxos for leader election (Howard, Malkhi, and Spiegelman, 2016), the Phi Accrual Failure Detector (Hayashibara et al., 2004), and VLSN-based log streaming. The adaptive replacement cache policy (Megiddo and Modha, 2003) and its CART variant (Bansal and Modha, 2004) are available as optional eviction strategies. The Clock with Adaptive Replacement policy references work by Jiang and Zhang (2005).
 
 ## License
 

@@ -48,7 +48,7 @@ pub struct TxnManager {
     /// `FSyncManager`.  When set, committing transactions call
     /// `group_commit.buffer_commit()` after writing their WAL entry.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     group_commit: StdRwLock<Option<Arc<dyn GroupCommit>>>,
 
     /// Statistics.
@@ -196,12 +196,12 @@ impl TxnManager {
     }
 
     // ========================================================================
-    // GroupCommit  —  NoSQL fork
+    // GroupCommit  —  extended fork
     // ========================================================================
 
     /// Returns the current group-commit handler, if any.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     pub fn get_group_commit(&self) -> Option<Arc<dyn GroupCommit>> {
         self.group_commit.read().unwrap().clone()
     }
@@ -212,7 +212,7 @@ impl TxnManager {
     /// environment.  Creates a [`crate::group_commit::GroupCommitMaster`]
     /// with default configuration and stores it.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     pub fn setup_group_commit_master(&self) {
         use crate::group_commit::GroupCommitMaster;
         let gc = Arc::new(GroupCommitMaster::default());
@@ -223,7 +223,7 @@ impl TxnManager {
     ///
     /// Called when this node is operating as a Replica.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     pub fn setup_group_commit_replica(&self) {
         use crate::group_commit::GroupCommitReplica;
         let gc = Arc::new(GroupCommitReplica::default());

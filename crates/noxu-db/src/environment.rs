@@ -53,7 +53,7 @@ pub struct Environment {
     open: AtomicBool,
     /// Whether the environment is valid (not invalidated by a fatal error).
     ///
-    /// JE: `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
+    /// : `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
     /// Set to `false` when an `EnvironmentFailure` with `invalidates_environment() == true`
     /// is returned; all subsequent API calls check this and return `EnvironmentFailure`.
     env_valid: AtomicBool,
@@ -500,7 +500,7 @@ impl Environment {
     ///
     /// Returns the number of records that were in the database before truncation.
     ///
-    /// JE: `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    /// : `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(
         &self,
         _txn: Option<&Transaction>,
@@ -683,7 +683,7 @@ impl Environment {
 
     /// Returns the mutable subset of environment configuration.
     ///
-    /// JE: `Environment.getMutableConfig()`.  The returned struct reflects the
+    /// : `Environment.getMutableConfig()`.  The returned struct reflects the
     /// current runtime values; pass it (modified) to `set_mutable_config()` to
     /// apply changes without re-opening the environment.
     pub fn get_mutable_config(&self) -> Result<EnvironmentMutableConfig> {
@@ -703,7 +703,7 @@ impl Environment {
 
     /// Applies a set of mutable configuration changes to the running environment.
     ///
-    /// JE: `Environment.setMutableConfig(EnvironmentMutableConfig)`.
+    /// : `Environment.setMutableConfig(EnvironmentMutableConfig)`.
     /// Only the fields that differ from their sentinel "no-change" values are
     /// applied (`None` / `0` means unchanged).
     ///
@@ -723,7 +723,7 @@ impl Environment {
         self.config.txn_no_sync = cfg.txn_no_sync;
         self.config.txn_write_no_sync = cfg.txn_write_no_sync;
         // Daemon enable/disable flags are advisory at runtime; dbi-level wiring
-        // for live daemon pause/resume is future work (mirrors JE behaviour where
+        // for live daemon pause/resume is future work (mirrors where
         // setMutableConfig re-reads the flag on next daemon wakeup).
         if let Some(v) = cfg.run_cleaner {
             self.config.run_cleaner = v;
@@ -739,7 +739,7 @@ impl Environment {
 
     /// Runs a checkpoint.
     ///
-    /// JE: `Environment.checkpoint(CheckpointConfig)`.  If the environment has
+    /// : `Environment.checkpoint(CheckpointConfig)`.  If the environment has
     /// no checkpointer (e.g. non-transactional or in-memory), this is a no-op.
     ///
     /// # Arguments
@@ -758,7 +758,7 @@ impl Environment {
 
     /// Returns `true` if the environment is open and has not been invalidated by a fatal error.
     ///
-    /// JE: `Environment.isValid()`.  Returns `false` after the environment is closed
+    /// : `Environment.isValid()`.  Returns `false` after the environment is closed
     /// or after an `EnvironmentFailure` whose `reason.invalidates_environment()` returns
     /// `true` (e.g. `LogChecksum`, `BtreeCorruption`, `DiskLimit`).
     /// Once invalidated the environment must be closed and re-opened.
@@ -792,7 +792,7 @@ impl Environment {
 
     /// Returns a snapshot of environment statistics from all subsystems.
     ///
-    /// JE: `Environment.getStats(StatsConfig)`.
+    /// : `Environment.getStats(StatsConfig)`.
     pub fn get_stats(&self) -> Result<EnvironmentStats> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
@@ -847,7 +847,7 @@ impl Environment {
     /// LSN validity, child-pointer completeness).  Results are merged into a
     /// single `VerifyResult`.
     ///
-    /// Mirrors `Environment.verify(VerifyConfig, PrintStream)` in JE which
+    /// Mirrors `Environment.verify(VerifyConfig, PrintStream)` in
     /// creates a `BtreeVerifier` and calls `verifier.verifyAll()`.
     ///
     /// # Arguments

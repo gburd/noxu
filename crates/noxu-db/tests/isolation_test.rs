@@ -1,7 +1,7 @@
 //! Concurrency isolation correctness tests.
 //!
 //! Covers serializable and read-committed isolation levels under the lock-based
-//! model Noxu inherits from JE:
+//! model Noxu inherits from :
 //!
 //!  - Default (serializable): read locks held for the entire transaction.
 //!    A writer cannot acquire a WRITE lock on a key that another transaction

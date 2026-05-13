@@ -1,8 +1,6 @@
 # Introduction
 
 Noxu DB is an embedded, transactional key-value database written in Rust. It is
-a faithful port of [Berkeley DB Java Edition (BDB JE) 7.5.11](https://docs.oracle.com/cd/E17277_02/html/index.html)
-— preserving JE's algorithms, naming conventions, and documented behaviour while
 being idiomatic Rust with zero unsafe code in library logic.
 
 ## Quick Start
@@ -60,23 +58,17 @@ fn main() -> noxu_db::Result<()> {
 - **Crash recovery** via checkpoint-based 3-phase recovery
 - **Replication / High Availability** via FPaxos leader election over TCP or QUIC
 - **Collections API** (`StoredMap`, `StoredSet`, `StoredList`) and **DPL** entity persistence
-- **NoSQL JE enhancements**: TTL, ByteComparator, ExtinctionFilter, GroupCommit, BackupManager, DataEraser, and more
+- **Extended capabilities**: TTL record expiry, ByteComparator, ExtinctionFilter, GroupCommit, BackupManager, DataEraser, and more
 
-## Heritage
+## Reference Archives
 
-Noxu DB derives from a 40-year lineage:
+Reference source archives used during development are kept read-only in the
+development tree:
 
 ```
-UC Berkeley INGRES (1970s)
-  └─ Berkeley DB (Sleepycat Software, 1991)
-       └─ Berkeley DB Java Edition (Sleepycat / Oracle, 2002)
-            └─ Oracle NoSQL Database JE fork (Oracle, 2011)
-                 └─ Noxu DB (Rust port, 2024–)
+_/je/       embedded database reference — Java, read-only
+_/nosql/    extended fork with 10 additional capabilities — Java, read-only
 ```
-
-The reference Java source lives at `_/je/` (BDB JE 7.5.11) and
-`_/nosql/kvmain/src/main/java/com/sleepycat/` (Oracle NoSQL fork) in the
-development tree.
 
 ## Documentation Map
 
@@ -88,5 +80,5 @@ development tree.
 | Use the collections or DPL API | [Collections and Persistence](collections/README.md) |
 | Tune performance or operate in production | [Operations Guide](operations/README.md) |
 | Understand the internals | [Programmer's Reference](reference/README.md) |
-| Contribute or port new JE features | [Contributing](contributing/README.md) |
+| Contribute or port new Noxu features | [Contributing](contributing/README.md) |
 | Take over maintenance of the project | [Maintainer's Guide](maintainer/README.md) |

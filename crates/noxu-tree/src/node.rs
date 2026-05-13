@@ -1,7 +1,7 @@
 //! Base node types and identifiers for the B-tree.
 //!
 //!
-//! In JE, Node is an abstract base class. In Rust, we use an enum for the
+//! Node is an abstract base class. In Rust, we use an enum for the
 //! closed set of node types, plus utilities for node ID generation.
 
 use std::sync::atomic::{AtomicI64, Ordering};

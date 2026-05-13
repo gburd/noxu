@@ -1,7 +1,7 @@
 # Introduction
 
 This guide provides a thorough introduction to transactions as used with Noxu DB,
-a Rust port of Berkeley DB Java Edition (BDB JE 7.5.11). It covers the guarantees
+a Rust port of Noxu DB (Noxu DB 7.5.11). It covers the guarantees
 that transactions provide, the application infrastructure required for full
 transactional protection, and practical examples of writing transactional Rust code.
 

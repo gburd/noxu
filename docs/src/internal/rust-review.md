@@ -5,7 +5,7 @@
 
 ## Executive Summary
 
-This is a comprehensive Rust port of Berkeley DB Java Edition. The codebase demonstrates **strong architectural discipline** and generally follows Rust idioms well. All 16 crates compile and 2233 tests pass. The code shows careful attention to concurrency primitives, error handling with `thiserror`, and appropriate use of Rust's type system.
+This is a comprehensive Rust port of Noxu DB. The codebase demonstrates **strong architectural discipline** and generally follows Rust idioms well. All 16 crates compile and 2233 tests pass. The code shows careful attention to concurrency primitives, error handling with `thiserror`, and appropriate use of Rust's type system.
 
 **Overall Grade: B+**
 
@@ -86,7 +86,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 **Issues:**
 1. **Manual mutex management**: LogBuffer uses RawMutex with manual lock/unlock (log_buffer.rs:49)
-   - This is intentional to match JE's explicit latch pattern, but risky
+   - This is intentional to match Noxu's explicit latch pattern, but risky
    - Consider wrapping in a safer abstraction
 2. **Missing inline annotations**: Hot path functions in log_manager.rs lack `#[inline]`
    - `allocate()`, `write_to_log()` should be inline
@@ -261,7 +261,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 **Grade: B**
 
 **Strengths:**
-- Clean public API closely matching Berkeley DB JE
+- Clean public API closely matching Noxu DB
 - Good use of thiserror for error types
 - Proper builder patterns for configs
 - Well-documented examples
@@ -519,7 +519,7 @@ impl<T> LatchHeld<T> {
 }
 ```
 
-**Benefit:** Eliminates unsafe code, prevents lock leaks, maintains JE semantics.
+**Benefit:** Eliminates unsafe code, prevents lock leaks, maintains Noxu semantics.
 
 ---
 
@@ -543,7 +543,7 @@ pub enum ParamValue {
 
 ### What's Good
 
-1. **Strong architectural fidelity**: The port maintains BDB JE's proven architecture while adapting to Rust idioms
+1. **Strong architectural fidelity**: The port maintains Noxu's proven architecture while adapting to Rust idioms
 2. **Excellent error handling**: Consistent use of `thiserror` and proper Result propagation
 3. **Comprehensive testing**: 2233 tests provide good coverage
 4. **Concurrency correctness**: Careful use of atomics, mutexes, and latches
@@ -566,7 +566,7 @@ The codebase is in excellent shape for a port of this complexity. The main prior
 3. **Concurrency**: Implement proper lock waiting and consider async
 4. **Safety**: Document or eliminate unsafe code
 
-With these improvements, Noxu DB will be a production-ready, idiomatic Rust database engine that matches or exceeds Berkeley DB JE's performance.
+With these improvements, Noxu DB will be a production-ready, idiomatic Rust database engine that matches or exceeds Noxu DB's performance.
 
 ### Rust-Specific Praise
 

@@ -1,7 +1,7 @@
 # B-tree Internals
 
 Noxu DB stores all records in a B+tree maintained by `noxu-tree`. The tree
-is a direct port of BDB JE's in-memory tree with three node types, key prefix
+is a direct port of Noxu's in-memory tree with three node types, key prefix
 compression, BIN-delta incremental logging, and latch-coupling traversal.
 
 ## Node Types

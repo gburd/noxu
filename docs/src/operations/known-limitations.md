@@ -2,7 +2,7 @@
 
 | Limitation | Status | Workaround |
 |-----------|--------|------------|
-| **Concurrent write throughput gap vs JE** | Known — Noxu LockManager uses 64 shards; JE uses per-slot lock design that scales better at 16+ concurrent writers | Keep writer concurrency ≤ 8 threads per environment for optimal throughput; use disjoint key ranges when possible |
+| **Concurrent write throughput gap** | Known — Noxu LockManager uses 64 shards; alternative implementations using per-slot lock designs scale better at 16+ concurrent writers | Keep writer concurrency ≤ 8 threads per environment for optimal throughput; use disjoint key ranges when possible |
 | **TiB-scale validation not automated** | `examples/scale_validation.rs` is a manual pre-production check; not run in CI | Run manually: `cargo run --example scale_validation -- --records 10000000 --threads 8` |
 | **Sustained slow-test suite not in default CI** | P4/P5 tests marked `#[ignore]` to avoid CI timeouts | Run explicitly: `cargo nextest run -p noxu-db --profile slow --run-ignored all` |
 | **`TupleSerdeBinding` sort order** | Uses `serde` binary encoding, not sort-preserving tuple encoding | Use raw `DatabaseEntry` with manually constructed sort-preserving keys for range scans on tuples |

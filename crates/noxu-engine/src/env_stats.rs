@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 /// Aggregated statistics for the environment.
 ///
 /// Collects statistics from all subsystems into a single snapshot
-/// for convenient reporting and monitoring.  Mirrors JE's
+/// for convenient reporting and monitoring.  Mirrors 's
 /// `EnvironmentStats` grouping: Cache, Evictor, Log, Lock, Txn,
 /// Cleaner, Checkpoint, Throughput.
 #[derive(Debug, Clone)]
@@ -172,7 +172,7 @@ impl Default for EnvironmentStats {
 
 /// Full snapshot of evictor statistics.
 ///
-/// Mirrors JE EvictorStatDefinition.
+/// EvictorStatDefinition.
 #[derive(Debug, Clone, Default)]
 pub struct EvictorStatsSnapshot {
     // Eviction counts
@@ -286,7 +286,7 @@ impl From<&EvictorStats> for EvictorStatsSnapshot {
 
 /// Snapshot of log subsystem statistics.
 ///
-/// Mirrors JE LogStatDefinition (LOGMGR_*, FILEMGR_*, FSYNCMGR_*).
+/// LogStatDefinition (LOGMGR_*, FILEMGR_*, FSYNCMGR_*).
 #[derive(Debug, Clone, Default)]
 pub struct LogStatsSnapshot {
     /// Current end-of-log LSN (as raw u64).
@@ -362,7 +362,7 @@ impl From<&LogManagerStats> for LogStatsSnapshot {
 
 /// Snapshot of lock manager statistics.
 ///
-/// Mirrors JE LockStatDefinition.
+/// LockStatDefinition.
 #[derive(Debug, Clone, Default)]
 pub struct LockStatsSnapshot {
     /// Total lock requests.
