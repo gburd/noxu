@@ -23,7 +23,7 @@
 use crate::policy::EvictionPolicy;
 use crate::slab::{SlabList, SENTINEL};
 use noxu_sync::Mutex;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 const MAX_GHOST_RATIO: usize = 2;
 const MIN_GHOST_CAP: usize = 64;

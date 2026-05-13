@@ -11,7 +11,7 @@
 use crate::policy::EvictionPolicy;
 use crate::slab::{SlabList, SENTINEL};
 use noxu_sync::Mutex;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 #[derive(Debug)]
 struct ClockState {

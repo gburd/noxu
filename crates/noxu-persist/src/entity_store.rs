@@ -1,7 +1,7 @@
 //! Entity store for managing databases of typed entities.
 //!
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment};
 

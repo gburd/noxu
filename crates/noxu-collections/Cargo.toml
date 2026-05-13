@@ -6,6 +6,7 @@ license.workspace = true
 description = "Iterator-based collection views for Noxu DB"
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-db = { workspace = true }
 noxu-bind = { workspace = true }
 thiserror = { workspace = true }

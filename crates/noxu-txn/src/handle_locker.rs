@@ -1,7 +1,7 @@
 //! HandleLocker - database handle locker.
 //!
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use std::sync::Arc;
 
 use crate::lock_manager::LockManager;

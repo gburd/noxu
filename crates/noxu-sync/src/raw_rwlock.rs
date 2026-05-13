@@ -40,7 +40,6 @@ pub struct NoxuRawRwLock {
 }
 
 unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
-    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: Self = NoxuRawRwLock {
         state: AtomicU32::new(0),
         read_waiters: AtomicUsize::new(0),

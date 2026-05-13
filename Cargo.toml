@@ -115,6 +115,7 @@ rustls  = { version = "0.23", features = ["ring"], default-features = false }
 rcgen   = { version = "0.13" }
 
 # External crates (approved core set)
+hashbrown = "0.15"
 lock_api = "0.4"
 libc = "0.2"
 thiserror = "2"

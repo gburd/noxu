@@ -291,7 +291,7 @@ pub struct LnLogEntry {
 
 impl LnLogEntry {
     /// Creates a new LN log entry for a write operation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         db_id: u64,
         txn_id: Option<i64>,

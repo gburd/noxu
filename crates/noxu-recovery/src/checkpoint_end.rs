@@ -47,7 +47,7 @@ pub struct CheckpointEnd {
 
 impl CheckpointEnd {
     /// Creates a new checkpoint end entry.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         invoker: &str,
@@ -82,7 +82,7 @@ impl CheckpointEnd {
     /// Creates a checkpoint end entry with a specific timestamp.
     ///
     /// Used primarily for testing and deserialization.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn with_time(
         id: u64,
         invoker: &str,

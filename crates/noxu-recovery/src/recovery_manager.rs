@@ -36,7 +36,7 @@ use crate::log_scanner::{LnOperation, LnRecord, LogEntry, LogScanner};
 use crate::recovery_info::RecoveryInfo;
 use crate::rollback_tracker::RollbackTracker;
 use noxu_util::{Lsn, NULL_LSN};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -621,12 +621,13 @@ impl RecoveryManager {
                         root_lsn = rec.root_lsn;
                     }
                 }
-                LogEntry::CkptStart(_) => {
+                LogEntry::CkptStart(_)
+                    if partial_start_lsn == NULL_LSN && ckpt_end_lsn != NULL_LSN =>
+                {
                     // First CkptStart after the last CkptEnd is the partial one.
-                    if partial_start_lsn == NULL_LSN && ckpt_end_lsn != NULL_LSN {
-                        partial_start_lsn = pe.lsn;
-                    }
+                    partial_start_lsn = pe.lsn;
                 }
+                LogEntry::CkptStart(_) => {}
                 LogEntry::DbTree(rec) => {
                     // Always keep the latest root seen.
                     root_lsn = rec.lsn;
@@ -1126,11 +1127,10 @@ impl RecoveryManager {
                         // RecoveryManager.undo() → bin.deleteEntry()
                         //.  Delete the slot; if it was already removed by
                         // a later operation, this is a no-op.
-                        if let Some(t) = tree.as_deref_mut() {
-                            // Only undo into the matching database's tree.
-                            if t.get_database_id() == rec.db_id {
-                                t.delete(&rec.key);
-                            }
+                        if let Some(t) = tree.as_deref_mut()
+                            && t.get_database_id() == rec.db_id
+                        {
+                            t.delete(&rec.key);
                         }
                         self.stats.lns_undone += 1;
                         self.stats.active_txns_undone += 1;

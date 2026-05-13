@@ -41,7 +41,7 @@ use crate::entry_states::DIRTY_BIT;
 use crate::error::TreeError;
 use crate::key::{create_key_prefix, get_key_prefix_length};
 use noxu_util::{Lsn, NULL_LSN, Vlsn};
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 // BIN builds on the same slot-array model as the upper IN but lives at level 1.
 // It carries its own lightweight InNode helper (distinct from in_node::InNode)

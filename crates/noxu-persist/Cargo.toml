@@ -6,6 +6,7 @@ license.workspace = true
 description = "Derive-macro-based entity persistence for Noxu DB"
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-db = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

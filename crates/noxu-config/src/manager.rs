@@ -4,7 +4,7 @@
 //! lookup, default values, and runtime mutation of mutable parameters.
 
 use crate::param::{ConfigError, ConfigParam, ParamValue};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Manages configuration parameters for a database environment.
 ///

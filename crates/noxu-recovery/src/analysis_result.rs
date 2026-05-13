@@ -20,7 +20,7 @@
 
 use crate::log_scanner::InRecord;
 use noxu_util::{Lsn, NULL_LSN};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 /// Key that uniquely identifies a dirty IN across databases.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -5,7 +5,7 @@
 //! their activity status.
 
 use noxu_sync::RwLock;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -164,7 +164,7 @@ impl GroupService {
             .map(|n| (n.name.as_str(), n.last_seen))
             .collect();
         // Sort by most-recently-seen first (freshest peer first).
-        peers.sort_by(|a, b| b.1.cmp(&a.1));
+        peers.sort_by_key(|b| std::cmp::Reverse(b.1));
         peers.into_iter().map(|(name, _)| name.to_string()).collect()
     }
 

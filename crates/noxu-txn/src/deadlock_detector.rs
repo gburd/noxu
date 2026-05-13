@@ -1,7 +1,7 @@
 //! Deadlock detection using waits-for graph analysis.
 //!
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 /// Deadlock detector using waits-for graph analysis.
 ///

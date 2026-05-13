@@ -1,7 +1,7 @@
 //! Configuration for eager schema evolution.
 //!
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 /// A progress listener invoked during eager entity evolution.
 ///
