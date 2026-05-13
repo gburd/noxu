@@ -457,6 +457,329 @@ impl TcpChannelListener {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TlsTcpChannel  (requires tls-rustls or tls-native feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+use crate::tls::TlsConfig;
+
+/// Internal abstraction over a TLS-wrapped TCP stream.
+///
+/// `&mut self` is used because TLS state is mutable; the outer `Mutex` in
+/// `TlsTcpChannel` provides `Send`-safe `&self` access via interior mutability.
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+trait TlsStreamOps: Send + 'static {
+    fn read_exact_buf(&mut self, buf: &mut [u8]) -> std::io::Result<()>;
+    fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()>;
+    fn flush_buf(&mut self) -> std::io::Result<()>;
+    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn shutdown_inner(&self) -> std::io::Result<()>;
+}
+
+// ── rustls backend ───────────────────────────────────────────────────────────
+
+#[cfg(feature = "tls-rustls")]
+impl TlsStreamOps for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn read_exact_buf(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        IoRead::read_exact(self, buf)
+    }
+    fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        IoWrite::write_all(self, buf)
+    }
+    fn flush_buf(&mut self) -> std::io::Result<()> {
+        IoWrite::flush(self)
+    }
+    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(dur)
+    }
+    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_write_timeout(dur)
+    }
+    fn shutdown_inner(&self) -> std::io::Result<()> {
+        self.sock.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+#[cfg(feature = "tls-rustls")]
+impl TlsStreamOps for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn read_exact_buf(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        IoRead::read_exact(self, buf)
+    }
+    fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        IoWrite::write_all(self, buf)
+    }
+    fn flush_buf(&mut self) -> std::io::Result<()> {
+        IoWrite::flush(self)
+    }
+    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(dur)
+    }
+    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_write_timeout(dur)
+    }
+    fn shutdown_inner(&self) -> std::io::Result<()> {
+        self.sock.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+// ── native-tls backend ───────────────────────────────────────────────────────
+
+#[cfg(feature = "tls-native")]
+impl TlsStreamOps for native_tls::TlsStream<TcpStream> {
+    fn read_exact_buf(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        IoRead::read_exact(self, buf)
+    }
+    fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        IoWrite::write_all(self, buf)
+    }
+    fn flush_buf(&mut self) -> std::io::Result<()> {
+        IoWrite::flush(self)
+    }
+    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.get_ref().set_read_timeout(dur)
+    }
+    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.get_ref().set_write_timeout(dur)
+    }
+    fn shutdown_inner(&self) -> std::io::Result<()> {
+        self.get_ref().shutdown(std::net::Shutdown::Both)
+    }
+}
+
+// ── TlsTcpChannel ────────────────────────────────────────────────────────────
+
+/// An encrypted TCP channel backed by either `rustls` (pure Rust, default)
+/// or `native-tls` (system OpenSSL / LibreSSL).
+///
+/// Wire framing is identical to [`TcpChannel`]: every message is prefixed
+/// with a 4-byte little-endian length.  The TLS layer is transparent to the
+/// protocol.
+///
+/// ## Feature flags
+///
+/// | Feature | Backend |
+/// |---------|---------|
+/// | `tls-rustls` (default) | rustls + ring (pure Rust, no C) |
+/// | `tls-native` | native-tls → system OpenSSL or LibreSSL |
+///
+/// When both features are enabled `tls-rustls` is preferred.
+///
+/// ## Example
+///
+/// ```ignore
+/// let tls = TlsConfig::insecure("localhost");
+/// let listener = TlsTcpChannelListener::bind_with_tls(addr, &tls)?;
+/// let client   = TlsTcpChannel::connect_with_tls(addr, &tls)?;
+/// ```
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+pub struct TlsTcpChannel {
+    stream: Arc<std::sync::Mutex<Box<dyn TlsStreamOps>>>,
+    open: AtomicBool,
+}
+
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+impl TlsTcpChannel {
+    fn wrap(stream: Box<dyn TlsStreamOps>) -> Self {
+        Self {
+            stream: Arc::new(std::sync::Mutex::new(stream)),
+            open: AtomicBool::new(true),
+        }
+    }
+
+    /// Connect to `addr` and establish a TLS session described by `tls`.
+    ///
+    /// When both `tls-rustls` and `tls-native` features are enabled,
+    /// `tls-rustls` is preferred.
+    pub fn connect_with_tls(addr: SocketAddr, tls: &TlsConfig) -> Result<Self> {
+        #[cfg(feature = "tls-rustls")]
+        {
+            return Self::connect_rustls(addr, tls);
+        }
+        #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
+        {
+            return Self::connect_native(addr, tls);
+        }
+        #[allow(unreachable_code)]
+        Err(RepError::NetworkError("no TLS feature enabled".into()))
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    fn connect_rustls(addr: SocketAddr, tls: &TlsConfig) -> Result<Self> {
+        use rustls::pki_types::ServerName;
+        let cfg = tls.to_rustls_client_config()?;
+        let server_name = ServerName::try_from(tls.server_name.clone())
+            .map_err(|e| RepError::NetworkError(format!("invalid server name: {e}")))?;
+        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        let conn = rustls::ClientConnection::new(cfg, server_name)
+            .map_err(|e| RepError::NetworkError(format!("TLS client init: {e}")))?;
+        let stream = rustls::StreamOwned::new(conn, tcp);
+        Ok(Self::wrap(Box::new(stream)))
+    }
+
+    #[cfg(feature = "tls-native")]
+    fn connect_native(addr: SocketAddr, tls: &TlsConfig) -> Result<Self> {
+        let connector = tls.to_native_connector()?;
+        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        let stream = connector
+            .connect(&tls.server_name, tcp)
+            .map_err(|e| RepError::NetworkError(format!("TLS handshake: {e}")))?;
+        Ok(Self::wrap(Box::new(stream)))
+    }
+}
+
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+impl Channel for TlsTcpChannel {
+    fn send(&self, data: &[u8]) -> Result<()> {
+        if !self.is_open() {
+            return Err(RepError::ChannelClosed("TlsTcpChannel is closed".into()));
+        }
+        let len = data.len() as u32;
+        let mut s = self
+            .stream
+            .lock()
+            .map_err(|_| RepError::NetworkError("TLS stream lock poisoned".into()))?;
+        s.set_write_timeout_inner(Some(Duration::from_secs(30)))
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        s.write_all_buf(&len.to_le_bytes())
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        s.write_all_buf(data)
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        s.flush_buf()
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        if !self.is_open() {
+            return Err(RepError::ChannelClosed("TlsTcpChannel is closed".into()));
+        }
+        let mut s = self
+            .stream
+            .lock()
+            .map_err(|_| RepError::NetworkError("TLS stream lock poisoned".into()))?;
+        s.set_read_timeout_inner(Some(timeout))
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        let mut len_buf = [0u8; 4];
+        match s.read_exact_buf(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                {
+                    return Ok(None);
+                }
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(RepError::ChannelClosed(
+                        "connection closed by peer".into(),
+                    ));
+                }
+                return Err(RepError::NetworkError(e.to_string()));
+            }
+        }
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let payload_timeout = timeout.max(Duration::from_secs(30));
+        s.set_read_timeout_inner(Some(payload_timeout))
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        let mut payload = vec![0u8; payload_len];
+        s.read_exact_buf(&mut payload)
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        Ok(Some(payload))
+    }
+
+    fn close(&self) -> Result<()> {
+        self.open.store(false, Ordering::SeqCst);
+        let s = self
+            .stream
+            .lock()
+            .map_err(|_| RepError::NetworkError("TLS stream lock poisoned".into()))?;
+        s.shutdown_inner()
+            .map_err(|e| RepError::NetworkError(e.to_string()))
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+}
+
+// ── TlsTcpChannelListener ────────────────────────────────────────────────────
+
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+enum TlsAcceptorImpl {
+    #[cfg(feature = "tls-rustls")]
+    Rustls(std::sync::Arc<rustls::ServerConfig>),
+    #[cfg(feature = "tls-native")]
+    Native(native_tls::TlsAcceptor),
+}
+
+/// Listens for incoming TCP connections, performs TLS handshakes, and
+/// returns [`TlsTcpChannel`] instances.
+///
+/// Enable `tls-rustls` (pure Rust, default) or `tls-native` (system
+/// OpenSSL / LibreSSL) to use this type.
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+pub struct TlsTcpChannelListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptorImpl,
+}
+
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+impl TlsTcpChannelListener {
+    /// Bind `addr` and configure TLS from `tls`.
+    ///
+    /// When both `tls-rustls` and `tls-native` features are enabled,
+    /// `tls-rustls` is preferred.
+    pub fn bind_with_tls(addr: SocketAddr, tls: &TlsConfig) -> Result<Self> {
+        let listener = TcpListener::bind(addr)
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        #[cfg(feature = "tls-rustls")]
+        let acceptor = {
+            let cfg = tls.to_rustls_server_config()?;
+            TlsAcceptorImpl::Rustls(cfg)
+        };
+        #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
+        let acceptor = {
+            let a = tls.to_native_acceptor()?;
+            TlsAcceptorImpl::Native(a)
+        };
+        Ok(Self { listener, acceptor })
+    }
+
+    /// Return the local address the listener is bound to.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.listener
+            .local_addr()
+            .map_err(|e| RepError::NetworkError(e.to_string()))
+    }
+
+    /// Accept the next incoming connection and perform the TLS handshake.
+    pub fn accept(&self) -> Result<TlsTcpChannel> {
+        let (tcp, _peer) = self
+            .listener
+            .accept()
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        match &self.acceptor {
+            #[cfg(feature = "tls-rustls")]
+            TlsAcceptorImpl::Rustls(cfg) => {
+                let conn = rustls::ServerConnection::new(Arc::clone(cfg))
+                    .map_err(|e| RepError::NetworkError(format!("TLS server init: {e}")))?;
+                let stream = rustls::StreamOwned::new(conn, tcp);
+                Ok(TlsTcpChannel::wrap(Box::new(stream)))
+            }
+            #[cfg(feature = "tls-native")]
+            TlsAcceptorImpl::Native(acceptor) => {
+                let stream = acceptor
+                    .accept(tcp)
+                    .map_err(|e| RepError::NetworkError(format!("TLS handshake: {e}")))?;
+                Ok(TlsTcpChannel::wrap(Box::new(stream)))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +1042,126 @@ mod tests {
         let client = TcpChannel::connect(addr).unwrap();
         client.send(b"ping").unwrap();
         handle.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // TlsTcpChannel tests (tls-rustls backend)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "tls-rustls")]
+    mod tls_tests {
+        use super::*;
+        use crate::tls::TlsConfig;
+
+        #[test]
+        fn test_tls_tcp_send_receive() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener =
+                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
+                    .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = std::thread::spawn(move || {
+                let ch = listener.accept().unwrap();
+                let msg = ch.receive(Duration::from_secs(5)).unwrap();
+                assert_eq!(msg, Some(b"hello tls".to_vec()));
+                ch.send(b"world tls").unwrap();
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            client.send(b"hello tls").unwrap();
+            let reply = client.receive(Duration::from_secs(5)).unwrap();
+            assert_eq!(reply, Some(b"world tls".to_vec()));
+
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn test_tls_tcp_multiple_messages() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener =
+                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
+                    .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = std::thread::spawn(move || {
+                let ch = listener.accept().unwrap();
+                for i in 0u8..4 {
+                    let msg = ch.receive(Duration::from_secs(5)).unwrap().unwrap();
+                    assert_eq!(msg, vec![i]);
+                }
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            for i in 0u8..4 {
+                client.send(&[i]).unwrap();
+            }
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn test_tls_tcp_large_payload() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener =
+                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
+                    .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let payload: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
+            let expected = payload.clone();
+
+            let handle = std::thread::spawn(move || {
+                let ch = listener.accept().unwrap();
+                let msg = ch.receive(Duration::from_secs(5)).unwrap().unwrap();
+                assert_eq!(msg, expected);
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            client.send(&payload).unwrap();
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn test_tls_tcp_receive_timeout() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener =
+                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
+                    .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Server accepts but never sends.
+            let handle = std::thread::spawn(move || {
+                let _ch = listener.accept().unwrap();
+                std::thread::sleep(Duration::from_secs(2));
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            // The first receive call triggers the TLS handshake lazily; give it
+            // enough time to complete before the payload timeout fires.
+            let result = client.receive(Duration::from_millis(500)).unwrap();
+            assert_eq!(result, None, "expected timeout → None");
+
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn test_tls_tcp_close() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener =
+                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
+                    .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = std::thread::spawn(move || {
+                let _ch = listener.accept().unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            assert!(client.is_open());
+            client.close().unwrap();
+            assert!(!client.is_open());
+
+            handle.join().unwrap();
+        }
     }
 }

@@ -15,6 +15,8 @@ pub mod service_dispatcher;
 pub use channel::{
     Channel, LocalChannel, LocalChannelPair, TcpChannel, TcpChannelListener,
 };
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+pub use channel::{TlsTcpChannel, TlsTcpChannelListener};
 pub use data_channel::DataChannel;
 #[cfg(feature = "quic")]
 pub use quic_channel::{
