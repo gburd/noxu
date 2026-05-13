@@ -1,7 +1,7 @@
 # On-Disk Format
 
 Noxu DB uses a Rust-native on-disk format. It is **not** binary-compatible
-with BDB JE (`.jdb` files).
+with Noxu DB (`.jdb` files).
 
 ## Directory Layout
 
@@ -70,8 +70,7 @@ fields also use little-endian. Big-endian hosts are not currently supported.
 | 0x31 | `CHECKPOINT_END` | End checkpoint |
 | 0x40 | `MAP_LN` | Database name→id mapping |
 | 0x50 | `MATCHPOINT` | Replication sync point |
-| 0x60 | `EXTINCT_LN` | TTL-expired record (NoSQL) |
+| 0x60 | `EXTINCT_LN` | TTL-expired record (Noxu) |
 
-> **Not binary compatible with BDB JE.** JE `.jdb` files use Java
+> **Not binary compatible with other database formats.**
 > serialization and different type codes; Noxu `.ndb` files are not readable
-> by JE tools.

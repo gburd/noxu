@@ -1,4 +1,4 @@
-//! CursorTest — JE JCK cursor API tests ported to Rust.
+//! CursorTest — cursor API tests ported to Rust.
 //!
 //! Covers: cursor lifecycle (open/close/state), get operations (First, Last,
 //! Next, Prev, Search, SearchGte, Current), put via cursor (Overwrite,

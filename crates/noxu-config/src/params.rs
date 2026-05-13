@@ -1570,7 +1570,7 @@ pub static LOG_CHUNKED_NIO: ConfigParam = ConfigParam::long_param(
 );
 
 // =========================================================================
-// NoSQL-specific parameters (from Oracle NoSQL kvmain fork)
+// Extended-fork parameters (from the kvmain fork archive at _/nosql/)
 // =========================================================================
 
 /// Amount of disk space to reserve for internal use, in bytes.
@@ -1802,7 +1802,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &LOGGING_DBLOG,
         &CONSOLE_HANDLER_LEVEL,
         &FILE_HANDLER_LEVEL,
-        // NoSQL-specific
+        // extended-fork-specific
         &RESERVED_DISK,
         &TEST_MODE,
         &ENV_NETWORK_RESTORE_LOCK_TIMEOUT,
@@ -1883,7 +1883,7 @@ mod tests {
             "noxu.checkpointer.bytesInterval"
         );
 
-        // NoSQL-specific
+        // extended-fork-specific
         assert_eq!(RESERVED_DISK.name, "noxu.reservedDisk");
         assert_eq!(TEST_MODE.name, "noxu.testMode");
         assert_eq!(LOG_CHECKSUM_FATAL.name, "noxu.log.checksumFatal");
@@ -2016,7 +2016,7 @@ mod tests {
             ParamValue::Duration(Duration::from_secs(5 * 60))
         );
 
-        // NoSQL-specific defaults
+        // extended-fork-specific defaults
         assert_eq!(RESERVED_DISK.default, ParamValue::Long(0));
         assert_eq!(TEST_MODE.default, ParamValue::Bool(false));
         assert_eq!(LOG_CHECKSUM_FATAL.default, ParamValue::Bool(true));

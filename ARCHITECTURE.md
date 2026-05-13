@@ -1,10 +1,6 @@
 # Noxu DB Architecture
 
-Noxu DB is a Rust port of Berkeley DB Java Edition (BDB JE), an embedded transactional key-value database. This document describes the system architecture, data flow, on-disk format, concurrency model, and recovery protocol.
-
-## Heritage
-
-Berkeley DB Java Edition is a mature, production-grade embedded database with a well-tested architecture built around a write-ahead log, a B+tree, and checkpoint-based recovery. Noxu DB preserves this architecture faithfully: the same subsystem boundaries, the same algorithms, and the same naming conventions. Where JE uses Java monitors and synchronized blocks, Noxu uses `parking_lot` latches. Where JE uses class hierarchies, Noxu uses enums and traits. The core invariants and control flow are the same.
+Noxu DB is an embedded transactional key-value database written in Rust. This document describes the system architecture, data flow, on-disk format, concurrency model, and recovery protocol.
 
 ## Data Flow
 
@@ -144,7 +140,7 @@ Noxu DB provides serializable ACID transactions with record-level locking.
 
 **Deadlock detection** identifies cycles in the waiter graph. When a deadlock is found, one transaction is selected as the victim and forced to abort.
 
-**Locker hierarchy**: `BasicLocker` for non-transactional auto-commit operations, `ThreadLocker` for per-thread implicit locking, `HandleLocker` for cursor-lifetime locks, and full `Txn` for explicit transactions. This mirrors JE's locker class hierarchy.
+**Locker hierarchy**: `BasicLocker` for non-transactional auto-commit operations, `ThreadLocker` for per-thread implicit locking, `HandleLocker` for cursor-lifetime locks, and full `Txn` for explicit transactions.
 
 **Write lock info** tracks enough information for undo: the previous LSN and previous data of each modified record, enabling rollback on abort.
 
@@ -162,7 +158,7 @@ Eviction is triggered by:
 
 Applications can influence caching behavior per-operation through `CacheMode`: `Default`, `Unchanged`, `EvictLn`, `EvictBin`, `KeepHot`, `MakeEvictable`.
 
-The `MemoryBudget` (in `noxu-dbi`) explicitly tracks memory consumption of every tree node, lock, and buffer. Noxu DB does not rely on the allocator for memory accounting -- this is a direct port of JE's MemoryBudget.
+The `MemoryBudget` (in `noxu-dbi`) explicitly tracks memory consumption of every tree node, lock, and buffer. Noxu DB does not rely on the allocator for memory accounting.
 
 ### Cleaner (noxu-cleaner)
 
@@ -224,7 +220,7 @@ Noxu DB uses a **latch-based** concurrency model, directly porting JE's approach
 - **ExclusiveLatch**: Wraps `parking_lot::Mutex`. Used for single-writer access to mutable structures. RAII-based -- the guard drops on scope exit.
 - **SharedLatch**: Wraps `parking_lot::RwLock`. Used for reader-writer access to tree nodes and other shared structures.
 - **Atomics**: `std::sync::atomic` types are used for volatile fields (counters, flags, sequence numbers) that JE marks as `volatile`.
-- **No lock-free data structures**: Unlike some modern embedded databases, Noxu DB uses traditional latch-based concurrency following JE's proven design. The latching protocol is well-understood and heavily tested in JE's 20+ year history.
+- **No lock-free data structures**: Noxu DB uses traditional latch-based concurrency. The latching protocol is straightforward to reason about and extensively tested.
 
 Tree traversal uses **latch coupling** (also called lock coupling or crabbing): acquire the child's latch, then release the parent's latch. This allows concurrent access to different parts of the tree without holding a global lock.
 
@@ -232,7 +228,7 @@ The `LogManager` serializes log writes through a write latch, but readers can ac
 
 ## On-Disk Format
 
-Noxu DB uses its own Rust-native format. It is **not** binary-compatible with BDB JE.
+Noxu DB uses its own Rust-native format (`.ndb` files).
 
 ### Directory Layout
 

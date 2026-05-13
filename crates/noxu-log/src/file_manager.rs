@@ -680,7 +680,7 @@ impl Drop for FileManager {
 
 /// Snapshot of FileManager I/O statistics.
 ///
-/// Mirrors JE FILEMGR_FILE_OPENS, FILEMGR_SEQUENTIAL_READS/WRITES,
+/// FILEMGR_FILE_OPENS, FILEMGR_SEQUENTIAL_READS/WRITES,
 /// FILEMGR_RANDOM_READS etc.
 #[derive(Debug, Clone, Default)]
 pub struct FileManagerIoStats {

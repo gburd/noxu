@@ -1,6 +1,6 @@
 //! Simple example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's `SimpleExample.java`.
+//! Example showing Noxu DB usage.java`.
 //!
 //! Demonstrates basic database operations: opening an environment and database,
 //! inserting key-value pairs, retrieving them, deleting one, and iterating

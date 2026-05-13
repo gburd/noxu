@@ -5,7 +5,7 @@
 Noxu replication provides multi-node active/passive Paxos-based replication across
 TCP and QUIC transports with Flexible Paxos quorum optimization, phi accrual failure
 detection, and dynamic membership. The implementation lives in `crates/noxu-rep/` and
-ports the BDB JE `com.sleepycat.je.rep` package with several significant enhancements:
+ports the Noxu DB the corresponding Noxu type package with several significant enhancements:
 FPaxos quorum decoupling, adaptive failure detection, QUIC multiplexed streams, and
 LP-optimal quorum selection via the quoracle library.
 
@@ -119,22 +119,22 @@ detector. When configured via `with_phi(detector)`, `is_master_alive()` returns
 the timestamp tracker and the phi detector.
 
 The binary heartbeat timeout is retained as a fallback for deployments that do not
-configure phi detection, matching BDB JE's original behavior.
+configure phi detection, matching Noxu's original behavior.
 
 ### Adaptive election timeout (derived from phi statistics)
 
-Election phase timeouts are currently fixed at 500ms (matching BDB JE defaults). The
+Election phase timeouts are currently fixed at 500ms (matching Noxu DB defaults). The
 planned enhancement derives adaptive timeouts from the phi detector's statistics:
 `phase_timeout = mu + k*sigma` where k=3.0 (3-sigma gives 99.7% coverage), with a
 floor of 50ms and ceiling of 5s.
 
-Why not a fixed 500ms: BDB JE's default assumes LAN. This is wrong for WAN links,
+Why not a fixed 500ms: Noxu's default assumes LAN. This is wrong for WAN links,
 loaded systems, or ultra-fast NVMe/RDMA networks where the optimal timeout differs by
 orders of magnitude.
 
 ### Alternatives considered
 
-- **Binary heartbeat timeout** (BDB JE style): Non-adaptive; must be manually tuned
+- **Binary heartbeat timeout** (Noxu DB style): Non-adaptive; must be manually tuned
   per deployment. Kept as the default fallback when no phi detector is configured.
 - **SWIM gossip-based failure detection** (Das et al. 2002): Better suited for large
   clusters (>20 nodes) where O(n) heartbeats become expensive. Overkill for 3-9 node
@@ -159,7 +159,7 @@ orders of magnitude.
 The `QuorumPolicy` enum (`crates/noxu-rep/src/quorum_policy.rs`) provides three
 strategies for determining election quorums:
 
-1. **`SimpleMajority`** — Classic `(n/2)+1` for both phases. Default; matches BDB JE's
+1. **`SimpleMajority`** — Classic `(n/2)+1` for both phases. Default; matches Noxu's
    `RepGroup.quorumSize()`.
 
 2. **`Flexible { phase1, phase2 }`** — Operator-chosen sizes with a built-in safety
@@ -361,4 +361,4 @@ unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 ### References
 
 - Lamport, L. (1978). Time, Clocks, and the Ordering of Events in a Distributed System. *CACM*, 21(7), 558-565.
-- Oracle. Berkeley DB Java Edition High Availability Guide. https://docs.oracle.com/cd/E17277_02/html/java/com/sleepycat/je/rep/package-summary.html
+- [Flexible Paxos (Howard et al., 2016)](https://arxiv.org/abs/1608.06696)

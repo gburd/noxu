@@ -192,7 +192,7 @@ impl SlotState {
 
     /// Returns true if the tombstone bit is set.
     ///
-    /// A tombstone slot is a blind-deletion marker (NoSQL extension).
+    /// A tombstone slot is a blind-deletion marker (extended capability).
     /// 
     #[inline]
     pub fn is_tombstone(self) -> bool {

@@ -1,6 +1,6 @@
 //! Transaction example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's `TxnGuide.java`.
+//! Example showing Noxu DB usage.java`.
 //!
 //! Demonstrates transactional operations: beginning transactions, committing,
 //! aborting, and verifying that only committed data persists.

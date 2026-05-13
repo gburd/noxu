@@ -42,7 +42,7 @@ writers should sleep to let the cleaner catch up. Wired into:
 - `Transaction::commit_with_durability()`
 - `Database::put()` auto-commit path
 
-## NoSQL Extensions
+## Extended-Fork Entry Types
 
 ### DataEraser
 Securely erases obsolete record bytes using `pwrite64` zero-overwrite.

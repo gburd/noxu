@@ -1,10 +1,10 @@
 //! Per-database statistics.
 //!
-//! Mirrors JE's `DatabaseStats` (abstract) and `BtreeStats` (concrete).
+//! Implements `DatabaseStats` (abstract) and `BtreeStats` (concrete).
 
 /// Base statistics type for a database.
 ///
-/// Mirrors JE's abstract `DatabaseStats`.  All concrete database stats in
+/// Implements abstract `DatabaseStats`.  All concrete database stats in
 /// Noxu are represented by [`BtreeStats`].
 #[derive(Clone, Debug, Default)]
 pub struct DatabaseStats {
@@ -23,9 +23,9 @@ impl DatabaseStats {
 ///
 /// Returned by [`Database::get_stats`][crate::database::Database::get_stats].
 ///
-/// Mirrors JE's `BtreeStats` with the most commonly used fields:
+/// Implements `BtreeStats` with the most commonly used fields:
 ///
-/// | Field | JE equivalent |
+/// | Field | |
 /// |-------|--------------|
 /// | `leaf_node_count` | `getLNCount()` |
 /// | `deleted_leaf_node_count` | `getDeletedLNCount()` |

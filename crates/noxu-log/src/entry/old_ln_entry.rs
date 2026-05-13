@@ -21,7 +21,7 @@ pub enum OldLnEntryError {
 /// OldLN log entry.
 ///
 /// Legacy format LN entry without abort fields. Used for reading log files
-/// written by older versions of JE/Noxu DB during recovery.
+/// written by older versions of /Noxu DB during recovery.
 ///
 /// # Fields
 ///

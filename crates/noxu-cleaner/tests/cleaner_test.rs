@@ -1,4 +1,4 @@
-//! CleanerTest — JE JCK cleaner and file-selector tests ported to Rust.
+//! CleanerTest — cleaner and file-selector tests ported to Rust.
 //!
 //! Covers: FileSelector lifecycle (add/select/mark/delete), file status
 //! transitions, utilization scoring, force cleaning, two-pass cleaning,

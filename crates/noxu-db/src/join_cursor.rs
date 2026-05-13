@@ -1,16 +1,16 @@
 //! Join cursor for multi-secondary-index intersection queries.
 //!
-//! Mirrors JE's `JoinCursor`.  A join cursor is obtained by calling
+//! Implements `JoinCursor`.  A join cursor is obtained by calling
 //! [`Database::join`][crate::database::Database::join] with an array of
 //! [`SecondaryCursor`][crate::secondary_cursor::SecondaryCursor] objects,
 //! each pre-positioned at the desired secondary key value.
 //!
 //! # Algorithm
 //!
-//! The join algorithm is a faithful port of JE's natural-join algorithm:
+//! The join algorithm is a faithful port of 's natural-join algorithm:
 //!
 //! 1. Iterate through all candidate primary keys from cursor C(0) —
-//!    in JE these are the "duplicate" records sharing C(0)'s secondary key.
+//!    in are the "duplicate" records sharing C(0)'s secondary key.
 //!    In Noxu's current one-to-one secondary model there is at most one
 //!    candidate per secondary key position.
 //!
@@ -21,7 +21,7 @@
 //! 3. If all probes succeed, optionally read the primary record and
 //!    return the key (and data if requested).
 //!
-//! 4. Cursor order matters: JE sorts cursors by ascending duplicate count
+//! 4. Cursor order matters: cursors by ascending duplicate count
 //!    unless `JoinConfig::no_sort` is set.
 //!
 //! # Example
@@ -75,7 +75,7 @@ impl<'a> JoinCursor<'a> {
     /// Creates a new `JoinCursor`.
     ///
     /// Sorts `cursors` by ascending `count_estimate()` unless
-    /// `config.no_sort` is `true`, mirroring JE's optimisation.
+    /// `config.no_sort` is `true`, mirroring 's optimisation.
     pub(crate) fn new(
         primary_db: &'a Database,
         mut cursors: Vec<SecondaryCursor<'a>>,
@@ -100,7 +100,7 @@ impl<'a> JoinCursor<'a> {
         }
 
         // Collect the initial set of candidate primary keys from cursor[0].
-        // In JE these are all "duplicate" records with the same secondary key.
+        //  these are all "duplicate" records with the same secondary key.
         // In Noxu's current one-to-one secondary model there is at most one.
         let mut candidates = std::collections::VecDeque::new();
         if let Some(first) = cursors.first_mut()
@@ -110,7 +110,7 @@ impl<'a> JoinCursor<'a> {
             // Collect all duplicates at this secondary key position.
             // For non-dup secondaries this loop runs at most once; for
             // sorted-dup secondaries it drains all entries sharing the
-            // same secondary key value (JE JoinCursor.getNext() pattern).
+            // same secondary key value ( JoinCursor.getNext() pattern).
             while first.get_next_dup()? == OperationStatus::Success {
                 if let Some(pk_extra) = first.get_current_primary_key_only()? {
                     candidates.push_back(pk_extra);
@@ -157,7 +157,7 @@ impl<'a> JoinCursor<'a> {
 
     /// Returns the next primary key **only** — does not read primary data.
     ///
-    /// Equivalent to JE's `JoinCursor.getNext(key, lockMode)` single-arg
+    /// Equivalent to 's `JoinCursor.getNext(key, lockMode)` single-arg
     /// overload.  Useful when only the key is needed and avoiding a primary
     /// read is desirable.
     pub fn get_next_key(&mut self, key: &mut DatabaseEntry) -> Result<OperationStatus> {

@@ -1,4 +1,4 @@
-//! LockManagerTest — JE JCK stress tests ported to Rust.
+//! LockManagerTest — stress tests ported to Rust.
 //!
 //! Covers: non-blocking acquire, lock demote, lock release,
 //! n_total_locks, get_lock_info, get_stats, sharing registry,

@@ -1,6 +1,6 @@
 # Architecture
 
-Noxu DB is a Rust port of Berkeley DB Java Edition (BDB JE), an embedded
+Noxu DB is a Rust port of Noxu DB (Noxu DB), an embedded
 transactional key-value database. This chapter documents the system
 architecture, data flow, crate structure, and subsystem interactions.
 
@@ -10,12 +10,12 @@ in the repository root.
 
 ## Heritage
 
-Berkeley DB Java Edition is a mature, production-grade embedded database with a
+Noxu DB is a mature, production-grade embedded database with a
 well-tested architecture built around a write-ahead log, a B+tree, and
 checkpoint-based recovery. Noxu DB preserves this architecture faithfully: the
 same subsystem boundaries, the same algorithms, and the same naming conventions.
-Where JE uses Java monitors and synchronized blocks, Noxu uses `parking_lot`
-latches. Where JE uses class hierarchies, Noxu uses enums and traits. The core
+Noxu uses `parking_lot`
+latches, and enums and traits for class hierarchies. The
 invariants and control flow are the same.
 
 ## Data Flow

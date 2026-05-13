@@ -1,12 +1,12 @@
 # Crate Guide
 
 All 16 crates in the Noxu DB workspace, with purpose, key files, critical
-types, and JE correspondence.
+types, and crate purpose.
 
 ## Phase 0 — Foundation
 
 ### `noxu-util`
-**JE**: `com.sleepycat.je.utilint`
+ the corresponding Noxu type
 
 Core types used across all crates.
 
@@ -14,21 +14,21 @@ Core types used across all crates.
 |---|---|
 | `Lsn` | 64-bit `(file_number, offset)` pair; `NULL_LSN = 0` |
 | `Vlsn` | 64-bit signed replication sequence number; `NULL_VLSN = i64::MIN` |
-| `PackedInteger` | Variable-length integer encoding (JE's `PackedInteger`) |
+| `PackedInteger` | Variable-length integer encoding (Noxu's `PackedInteger`) |
 | `StatGroup` | Hierarchical statistics registry |
 | `DaemonThread` | Background thread lifecycle management |
 
 Re-exports: `Lsn`, `Vlsn`, `NULL_LSN` at crate root.
 
 ### `noxu-latch`
-**JE**: `com.sleepycat.je.latch`
+ the corresponding Noxu type
 
 Thin wrappers around `parking_lot`:
 - `ExclusiveLatch<T>` — RAII exclusive latch (wraps `Mutex<T>`)
 - `SharedLatch<T>` — RAII reader-writer latch (wraps `RwLock<T>`)
 
 ### `noxu-config`
-**JE**: `com.sleepycat.je.config`
+ the corresponding Noxu type
 
 400+ configuration parameters with validation. Key types:
 - `EnvironmentConfig` / `EnvironmentConfigBuilder` — all 150+ env parameters
@@ -40,7 +40,7 @@ Thin wrappers around `parking_lot`:
 ## Phase 1 — Storage
 
 ### `noxu-log`
-**JE**: `com.sleepycat.je.log`
+ the corresponding Noxu type
 
 The write-ahead log. All mutations go here first.
 
@@ -54,7 +54,7 @@ Key files:
 ## Phase 2 — Data Structures
 
 ### `noxu-tree`
-**JE**: `com.sleepycat.je.tree`
+ the corresponding Noxu type
 
 The B+tree. Key files:
 - `src/tree.rs` — `Tree`: root management, `get/put/delete`, dirty node collection
@@ -67,7 +67,7 @@ Critical: `Tree::set_comparator()` / `take_comparator()` for `TwoPartKeyComparat
 ## Phase 3 — Transactions
 
 ### `noxu-txn`
-**JE**: `com.sleepycat.je.txn`
+ the corresponding Noxu type
 
 Record-level locking and transaction lifecycle.
 
@@ -81,7 +81,7 @@ Key files:
 ## Phase 4 — Internals
 
 ### `noxu-dbi`
-**JE**: `com.sleepycat.je.dbi`
+ the corresponding Noxu type
 
 The bridge between the public API and internal subsystems.
 
@@ -98,12 +98,12 @@ Key files:
 ## Phase 5 — Background Services
 
 ### `noxu-evictor`
-**JE**: `com.sleepycat.je.evictor`
+ the corresponding Noxu type
 
 Dual-priority LRU cache eviction. Key type: `Evictor`.
 
 ### `noxu-cleaner`
-**JE**: `com.sleepycat.je.cleaner`
+ the corresponding Noxu type
 
 Log GC pipeline. Key files:
 - `src/cleaner.rs` — `Cleaner` daemon
@@ -111,11 +111,11 @@ Log GC pipeline. Key files:
 - `src/file_selector.rs` — `FileSelector`
 - `src/file_processor.rs` — `FileProcessor`
 - `src/cleaner_throttle.rs` — `CleanerThrottle`
-- `src/data_eraser.rs` — `DataEraser` (NoSQL)
-- `src/extinction_scanner.rs` — `ExtinctionScanner` (NoSQL)
+- `src/data_eraser.rs` — `DataEraser` (Noxu)
+- `src/extinction_scanner.rs` — `ExtinctionScanner` (Noxu)
 
 ### `noxu-recovery`
-**JE**: `com.sleepycat.je.recovery`
+ the corresponding Noxu type
 
 Checkpoint and 3-phase crash recovery. Key file: `src/recovery_manager.rs`.
 
@@ -125,7 +125,7 @@ Checkpoint and 3-phase crash recovery. Key file: `src/recovery_manager.rs`.
 Daemon lifecycle and environment open/close coordination.
 
 ### `noxu-db`
-**JE**: `com.sleepycat.je` public API.
+ the corresponding Noxu type public API.
 
 Public types: `Environment`, `Database`, `Cursor`, `Transaction`,
 `DatabaseEntry`, `OperationStatus`, `SecondaryDatabase`, `JoinCursor`.
@@ -133,7 +133,7 @@ Public types: `Environment`, `Database`, `Cursor`, `Transaction`,
 ## Phase 7 — Higher-Level APIs
 
 ### `noxu-bind`
-**JE**: `com.sleepycat.bind`
+ the corresponding Noxu type
 
 Serialization bindings:
 - `TupleBinding<T>` — sort-preserving tuple encoding
@@ -141,12 +141,12 @@ Serialization bindings:
 - `SerialBinding<T>` — serde-based binary serialization
 
 ### `noxu-collections`
-**JE**: `com.sleepycat.collections`
+ `noxu_collections`
 
 `StoredMap<K,V>`, `StoredSet<K>`, `StoredList<V>`.
 
 ### `noxu-persist`
-**JE**: `com.sleepycat.persist`
+ `noxu_persist`
 
 DPL derive macros: `#[derive(Entity)]`, `#[primary_key]`, `#[secondary_key]`.
 Key type: `EntityStore`.
@@ -154,7 +154,7 @@ Key type: `EntityStore`.
 ## Phase 8 — Replication
 
 ### `noxu-rep`
-**JE**: `com.sleepycat.je.rep`
+ the corresponding Noxu type
 
 Master-replica HA. Key files:
 - `src/replicated_environment.rs` — `ReplicatedEnvironment`

@@ -7,7 +7,7 @@ configured memory budget using a dual-priority LRU system.
 
 `MemoryBudget` (in `noxu-dbi`) explicitly tracks memory of every tree node,
 lock, and buffer. Noxu DB does not rely on the allocator for memory accounting
-— this is a direct port of JE's `MemoryBudget`.
+— this is a direct port of Noxu's `MemoryBudget`.
 
 ```rust
 EnvironmentConfig::new(path)

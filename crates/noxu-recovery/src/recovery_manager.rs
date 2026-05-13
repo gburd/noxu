@@ -360,7 +360,7 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // Start VerifyCheckpointInterval background thread.
         //
-        // (NoSQL fork):
+        // (extended fork):
         // a background thread verifies checksums in the checkpoint interval
         // while the main thread builds the BTree. After buildTree() completes,
         // verifyThread.finish() is called to join the verifier before

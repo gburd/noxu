@@ -362,7 +362,7 @@ pub struct Bin {
     /// Only populated for slots with embedded LN data. A value of 0 means
     /// no modification time is recorded for that slot.
     ///
-    /// `BIN.modificationTimes` (`INLongRep` array, NoSQL fork).
+    /// `BIN.modificationTimes` (`INLongRep` array, extended fork).
     /// `INLongRep` uses variable-length encoding with a delta base to
     /// pack times compactly; Noxu stores absolute millis in a plain Vec for
     /// simplicity while preserving the same per-slot semantics.
@@ -373,7 +373,7 @@ pub struct Bin {
     /// Only populated for slots with embedded LN data. A value of 0 means
     /// no creation time is recorded for that slot.
     ///
-    /// `BIN.creationTimes` (`INLongRep` array, NoSQL fork).
+    /// `BIN.creationTimes` (`INLongRep` array, extended fork).
     pub(crate) creation_times: Vec<u64>,
 }
 
@@ -956,13 +956,13 @@ impl Bin {
     }
 
     // ========================================================================
-    // Per-slot modification / creation time  —  NoSQL fork
+    // Per-slot modification / creation time  —  extended fork
     // ========================================================================
 
     /// Returns the last-modification time for slot `index` in milliseconds
     /// since the Unix epoch, or `0` if not set.
     ///
-    /// `BIN.getModificationTime(int idx)` (NoSQL fork).
+    /// `BIN.getModificationTime(int idx)` (extended fork).
     pub fn get_modification_time(&self, index: usize) -> u64 {
         self.modification_times.get(index).copied().unwrap_or(0)
     }
@@ -970,7 +970,7 @@ impl Bin {
     /// Sets the last-modification time for slot `index` in milliseconds
     /// since the Unix epoch.
     ///
-    /// `BIN.setModificationTime(int idx, long time)` (NoSQL fork).
+    /// `BIN.setModificationTime(int idx, long time)` (extended fork).
     pub fn set_modification_time(&mut self, index: usize, time_ms: u64) {
         while self.modification_times.len() <= index {
             self.modification_times.push(0);
@@ -981,7 +981,7 @@ impl Bin {
     /// Returns the creation time for slot `index` in milliseconds since the
     /// Unix epoch, or `0` if not set.
     ///
-    /// `BIN.getCreationTime(int idx)` (NoSQL fork).
+    /// `BIN.getCreationTime(int idx)` (extended fork).
     pub fn get_creation_time(&self, index: usize) -> u64 {
         self.creation_times.get(index).copied().unwrap_or(0)
     }
@@ -989,7 +989,7 @@ impl Bin {
     /// Sets the creation time for slot `index` in milliseconds since the
     /// Unix epoch.
     ///
-    /// `BIN.setCreationTime(int idx, long time)` (NoSQL fork).
+    /// `BIN.setCreationTime(int idx, long time)` (extended fork).
     pub fn set_creation_time(&mut self, index: usize, time_ms: u64) {
         while self.creation_times.len() <= index {
             self.creation_times.push(0);

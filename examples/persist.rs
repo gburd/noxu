@@ -1,6 +1,6 @@
 //! Persist example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's PersonExample from the Direct
+//! Example showing Noxu DB entity persistence (Direct Persistence Layer).
 //! Persistence Layer (DPL) demo.
 //!
 //! Demonstrates the noxu-persist API:

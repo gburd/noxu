@@ -71,7 +71,7 @@ pub struct LockManager {
     /// ThreadLockers register their thread_id (as i64) as the group_id.
     /// HandleLockers with a buddy register the buddy's ID as the group_id.
     /// Two lockers are in the same sharing group iff they map to the same
-    /// group_id, and thus bypass lock-conflict detection (JE
+    /// group_id, and thus bypass lock-conflict detection (
     /// `Locker.sharesLocksWith(other)`).
     ///
     /// (thread-locker map), extended

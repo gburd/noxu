@@ -10,8 +10,8 @@ not end users.
 
 ## Documents
 
-- [JE Fidelity Review](je-fidelity-review.md) — code-verified fidelity comparison
-  against BDB JE 7.5.11 (754 production classes). Last updated: Session 36.
+- [Noxu Fidelity Review](je-fidelity-review.md) — code-verified fidelity comparison
+  against Noxu DB 7.5.11 (754 production classes). Last updated: Session 36.
 - [Audit Report](audit-report.md) — consolidated findings across three
   independent audits (Foundation/Storage, Core/Background, API/Extensions).
 - [Rust Code Review](rust-review.md) — Rust quality review of all 16 crates

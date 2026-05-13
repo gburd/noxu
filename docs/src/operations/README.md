@@ -10,4 +10,4 @@ performance tuning, backup, recovery, and known limitations.
 3. [Performance Tuning](tuning.md) — write throughput, read latency, group commit tuning
 4. [Backup](backup.md) — `BackupManager`, live backup while serving traffic
 5. [Recovery Procedures](recovery-ops.md) — crash recovery, data verification, catastrophic failure
-6. [Known Limitations](known-limitations.md) — accepted deviations from BDB JE, known gaps
+6. [Known Limitations](known-limitations.md) — accepted deviations from Noxu DB, known gaps

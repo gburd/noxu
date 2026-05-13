@@ -2,7 +2,7 @@
 
 The Direct Persistence Layer (`noxu-persist`) allows Rust structs to be
 stored directly in Noxu databases without manual key/value encoding.
-This is a port of `com.sleepycat.persist` in BDB JE.
+This is a port of `noxu_persist` in Noxu DB.
 
 ## Defining an Entity
 

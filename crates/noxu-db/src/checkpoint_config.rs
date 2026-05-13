@@ -1,6 +1,6 @@
 //! Configuration for manual checkpoint operations.
 //!
-//! Mirrors JE's `CheckpointConfig`.
+//! Implements `CheckpointConfig`.
 
 /// Specifies the attributes of a checkpoint operation invoked via
 /// [`Environment::checkpoint`][crate::environment::Environment::checkpoint].
@@ -13,7 +13,7 @@
 #[derive(Clone, Debug, Default)]
 pub struct CheckpointConfig {
     /// If `true`, force a checkpoint regardless of whether thresholds have
-    /// been exceeded.  Equivalent to JE `CheckpointConfig.setForce(true)`.
+    /// been exceeded.  Equivalent to`CheckpointConfig.setForce(true)`.
     pub force: bool,
     /// Run a checkpoint if more than this many kibibytes of log data have
     /// been written since the last checkpoint.  `0` means disabled.

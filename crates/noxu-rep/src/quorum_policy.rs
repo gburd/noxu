@@ -8,7 +8,7 @@
 //!
 //! This module provides [`QuorumPolicy`], which wraps three strategies:
 //!
-//! - [`QuorumPolicy::SimpleMajority`] — classic `(n/2)+1`, matches JE and
+//! - [`QuorumPolicy::SimpleMajority`] — classic `(n/2)+1`, and
 //!   the previous hard-coded behaviour.
 //! - [`QuorumPolicy::Flexible`] — operator-chosen `phase1` / `phase2` sizes
 //!   with a built-in safety check (`phase1 + phase2 > n`).
@@ -28,7 +28,7 @@ use quoracle::{Expr, Node, QuorumSystem, choose, majority};
 #[derive(Debug, Clone, Default)]
 pub enum QuorumPolicy {
     /// Classic simple majority — `(n/2)+1` for both phases.  Default; matches
-    /// JE's `RepGroup.quorumSize()`.
+    /// 's `RepGroup.quorumSize()`.
     #[default]
     SimpleMajority,
 

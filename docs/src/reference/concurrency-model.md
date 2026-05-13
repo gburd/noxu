@@ -1,6 +1,6 @@
 # Concurrency Model
 
-Noxu DB uses a **latch-based** concurrency model porting JE's approach.
+Noxu DB uses a **latch-based** concurrency model porting Noxu's approach.
 Two distinct levels of concurrency control apply:
 
 1. **Latches** — short-duration mutual exclusion for in-memory structures

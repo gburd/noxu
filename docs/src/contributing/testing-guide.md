@@ -129,9 +129,9 @@ RUST_BACKTRACE=full cargo test -p noxu-rep -- test_name --nocapture
 cargo nextest run -p noxu-rep -E 'test(test_name)'
 ```
 
-## Adding Tests for a JE Feature
+## Adding Tests for a Noxu Feature
 
-When porting a JE feature, locate its Java tests in `_/je/` under the same
-package path as the source (e.g., `_/je/src/com/sleepycat/je/tree/`). Port
+When porting a Noxu feature, locate its Java tests in `_/je/` under the same
+package path. Port
 each `@Test` method to a Rust `#[test]`. Preserve the test names (translated to
 snake_case) and the intent of each assertion.

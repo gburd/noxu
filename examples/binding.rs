@@ -1,6 +1,6 @@
 //! Binding example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's `BindingExample.java`.
+//! Example showing Noxu DB usage.java`.
 //!
 //! Demonstrates using noxu-bind tuple bindings to store typed data
 //! (integers, strings, floats) as sortable keys and read them back

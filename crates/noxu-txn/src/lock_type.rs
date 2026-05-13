@@ -208,7 +208,7 @@ mod tests {
         assert!(LockType::Write.is_write_lock());
         assert!(!LockType::RangeRead.is_write_lock());
         assert!(LockType::RangeWrite.is_write_lock());
-        assert!(!LockType::RangeInsert.is_write_lock()); // Important: NOT a write lock per JE
+        assert!(!LockType::RangeInsert.is_write_lock()); // Important: NOT a write lock per 
         assert!(!LockType::None.is_write_lock());
         assert!(!LockType::Restart.is_write_lock());
     }

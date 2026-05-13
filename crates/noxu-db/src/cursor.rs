@@ -185,7 +185,7 @@ impl Cursor {
             }
             Get::Current => {
                 // Already checked initialized above.
-                // JE: re-check for deletion — Cursor.getCurrentLN() returns
+                // : re-check for deletion — Cursor.getCurrentLN() returns
                 // KEYEMPTY when the record at the cursor position was deleted
                 // after the cursor was positioned.
                 if self.inner.is_current_slot_deleted() {
@@ -211,7 +211,7 @@ impl Cursor {
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
                 data.set_data(&v);
                 // Write back the current key for navigation operations.
-                // In JE, `key` is always an output parameter for positioning ops.
+                // `key` is always an output parameter for positioning ops.
                 key.set_data(&k);
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)

@@ -99,7 +99,7 @@ pub struct Cleaner {
     /// Adaptive throttle: tracks the log write rate and computes sleep
     /// intervals and files-per-pass recommendations for the daemon loop.
     ///
-    /// Mirrors JE `CleanerThrottle`.
+    /// Implements `CleanerThrottle`.
     pub throttle: Arc<CleanerThrottle>,
 }
 
@@ -344,7 +344,7 @@ impl Cleaner {
         // Attempt to delete pending files
         let files_deleted = self.delete_pending_files();
 
-        // Adaptive throttle update (JE CleanerThrottle.update()).
+        // Adaptive throttle update (CleanerThrottle.update()).
         // Pull current cumulative write bytes from the LogManager and pass
         // them to the throttle so it can compute a new sleep interval for
         // the next cleaning pass.  `cleaning_needed` is true when files were

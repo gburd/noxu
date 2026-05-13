@@ -1,4 +1,4 @@
-//! BinInTest — JE JCK BIN and IN B-tree node tests ported to Rust.
+//! BinInTest — BIN and IN B-tree node tests ported to Rust.
 //!
 //! Covers: BIN entry insert/find/delete, dirty-slot tracking, key prefix
 //! compression, BIN-delta mutation, cursor tracking, deleted slots,
@@ -154,7 +154,7 @@ fn bin_set_bin_delta_false_clears() {
 
 #[test]
 fn bin_should_log_delta_false_when_all_dirty() {
-    // When all slots are dirty (100%), should NOT log delta (JE threshold is ≤25%).
+    // When all slots are dirty (100%), should NOT log delta ( threshold is ≤25%).
     let mut b = make_bin();
     b.set_last_full_version(lsn(1));
     insert_dirty(&mut b, b"a", 1);

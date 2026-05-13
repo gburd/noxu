@@ -80,7 +80,7 @@ pub struct Transaction {
     /// Used by `abort()` to look up each modified database by ID and apply
     /// undo records to the B-tree.
     ///
-    /// In JE, which is used by `Txn.undoLNs()` to call
+    /// which is used by `Txn.undoLNs()` to call
     /// `EnvironmentImpl.getDatabase(dbId).abort(undoLsn, locker)`.
     env_impl: Option<Arc<SyncMutex<EnvironmentImpl>>>,
 }
@@ -194,7 +194,7 @@ impl Transaction {
 
         // Apply cleaner write-path backpressure: if the log write rate exceeds
         // the cleaner's capacity, sleep briefly to let cleaning catch up.
-        // Mirrors JE's CleanerThrottle.getWriteDelay() path in Txn.commit().
+        // Implements CleanerThrottle.getWriteDelay() path in Txn.commit().
         // Extract the throttle Arc while holding the env lock, then
         // drop the lock BEFORE sleeping to avoid blocking other threads.
         if !self.read_only

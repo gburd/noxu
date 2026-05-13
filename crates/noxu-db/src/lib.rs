@@ -5,7 +5,7 @@
 //! Cursor, Transaction, DatabaseEntry, SecondaryDatabase, Sequence, etc.
 //!
 //! This crate provides the public API for Noxu DB.
-//! Java Edition. It is designed to be familiar to BDB users while being
+//! It is designed to be familiar to embedded database users while being
 //! idiomatic Rust.
 //!
 //! # Example

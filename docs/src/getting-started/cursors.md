@@ -47,7 +47,7 @@ The `Get` variants:
 | `Get::Prev` | Move to the previous record |
 | `Get::Search` | Move to the record with exactly the given key |
 | `Get::SearchGte` | Move to the first record with key >= the given key |
-| `Get::SearchRange` | Alias for `SearchGte` (matches `getSearchKeyRange` in JE) |
+| `Get::SearchRange` | Alias for `SearchGte`  |
 | `Get::Current` | Re-read the record at the current position |
 
 For `Search`, `SearchGte`, and `SearchRange`, the key to search for must be placed in the key `DatabaseEntry` before calling `get`. After a successful `Search` the key entry holds the found key; after `SearchGte` the key entry holds the actual key found (which may be greater than the search key).
