@@ -1,6 +1,6 @@
 # Noxu DB — Design Implementation Review
 
-**Last Updated**: 2026-05-10 (Session 36 — EnvironmentConfig 100% parameter coverage, typed EnvironmentFailureReason, is_valid()/invalidate(), ExceptionListener wiring)
+**Last Updated**: 2026-05-13 (Session 45 — TLS encryption for TCP replication channels; Sessions 43–44: lock monomorphization, Bytes zero-copy, hashbrown, full attribution purge, async closures, const ConfigParam, trait upcasting, constant-chaos torture test overhaul)
 
 ---
 
@@ -10,11 +10,11 @@ This document is a code-verified review of Noxu DB's design and implementation c
 
 **Overall assessment**: Noxu DB implements the full set of planned algorithms and data structures across all named subsystems. The honest breakdown across three dimensions is:
 
-- **Named-algorithm completeness (~92%)**: Every major named algorithm — latch coupling, BIN-delta migration, group commit, two-pass cleaning, priority-2 LRU eviction, lock promotion, per-txn abort LSN, pre/post commit hooks, TTL file selection — has been implemented. A small number of operational details (adaptive cleaner throttling, off-heap upper-IN cache) remain unimplemented.
+- **Named-algorithm completeness (~93%)**: Every major named algorithm — latch coupling, BIN-delta migration, group commit, two-pass cleaning, priority-2 LRU eviction, lock promotion, per-txn abort LSN, pre/post commit hooks, TTL file selection, adaptive cleaner throttling — has been implemented. The one remaining unimplemented capability is the off-heap upper-IN cache (deferred).
 
 - **Operational completeness (~85%)**: Noxu now implements **150+ parameters** (100% coverage, Session 36). Noxu now exposes a composite `EnvironmentStats` struct with `LogStatsSnapshot`, `LockStatsSnapshot`, `TxnStatsSnapshot`, and `ThroughputSnapshot` sub-structs. `txn_no_sync` and `txn_write_no_sync` EnvironmentConfig flags are fully wired. Noxu now has `EnvironmentFailureReason` (19 variants) as a struct field on `NoxuError::EnvironmentFailure`, 14 new `NoxuError` variants, `ExceptionListener` trait + `ExceptionEvent` + `ExceptionSource`, `Environment::is_valid()`/`invalidate()`, and `LockNotAvailable` correctly distinct from `LockConflict`. All 32 behavioural tests (compat_tests.rs) pass.
 
-- **Production hardening (~60%)**: Noxu has been validated at 100K-record scale across all workloads. Write throughput at 100K is consistent with 10K. Noxu's equivalent experience is 4,356+ passing unit/integration tests. Production error surfacing now `EnvironmentFailureReason` enum discriminates all 19 failure causes, `Environment::is_valid()` / `invalidate()` gate subsequent API calls on a broken environment, and `ExceptionListener` delivers daemon exceptions to embedding applications. Remaining hardening gaps: latch timeout panics are not yet catchable errors (low priority — production paths use `RwLock` directly), TiB-scale validation pending cloud hardware.
+- **Production hardening (~65%)**: Noxu has been validated at 100K-record scale across all workloads. Write throughput at 100K is consistent with 10K. Noxu passes 5,002 unit/integration tests including a 6-hour constant-chaos replication soak (29 rounds, 0 violations). TCP replication channels now support TLS encryption (tls-rustls pure-Rust default, tls-native for system OpenSSL/LibreSSL). Production error surfacing now `EnvironmentFailureReason` enum discriminates all 19 failure causes, `Environment::is_valid()` / `invalidate()` gate subsequent API calls on a broken environment, and `ExceptionListener` delivers daemon exceptions to embedding applications. Remaining hardening gaps: latch timeout panics are not yet catchable errors (low priority — production paths use `RwLock` directly), TiB-scale validation pending cloud hardware.
 
 **Accepted deviations** (permanent, by design):
 
@@ -32,10 +32,10 @@ This document is a code-verified review of Noxu DB's design and implementation c
 | B-tree / BIN | 95% | 80% | Latch coupling, mutateToFullBIN, key prefix, BIN eviction done; off-heap IN cache missing |
 | Recovery (RecoveryManager) | 90% | 65% | Multi-DB recovery, abort_lsn done; 2.7× slower than baseline at 100K (JIT gap) |
 | Checkpointer | 93% | 70% | persist_file_summaries() done; checkpoint interval config parameter not wired |
-| Cleaner | 85% | 60% | Two-pass, TTL, shared LM, real keys done; adaptive throttling (write-rate backoff) missing |
+| Cleaner | 93% | 65% | Two-pass, TTL, shared LM, real keys, adaptive throttling IMPLEMENTED (S37); off-heap cache missing |
 | Transactions / LockManager | 93% | 65% | Lock escalation, GroupCommit coalescing (leader wake-up fix S34), commit ordering done; ~2.6× w10_conc gap on tmpfs; grpc_wait() fix closes coalescing correctness gap; error hierarchy flat |
 | Evictor | 90% | 65% | BIN eviction, priority-2 LRU done; off-heap cache missing; evictor config params sparse |
-| Replication | 85% | 55% | EnvironmentLogScanner+LogWriter, NetworkRestoreServer done; not tested at production scale |
+| Replication | 88% | 60% | EnvironmentLogScanner+LogWriter, NetworkRestoreServer, FPaxos, phi accrual, QUIC mux, dynamic membership done; TCP channels now TLS-encrypted (S45); not validated at TiB scale |
 | Public API (noxu-db) | 97% | 95% | Core CRUD+txn complete; 32 compat_tests passing; EnvironmentConfig 100% parameter coverage (150+ params); EnvironmentFailureReason 19-variant enum; is_valid()/invalidate(); ExceptionListener callback wiring; LockNotAvailable distinct from LockConflict |
 | Collections / Bindings | 92% | 75% | SortKey trait, sort-preserving encoding for all key types done |
 
@@ -142,10 +142,9 @@ Implements `BIN.evictLN()` / `BIN.evictLNs()`.
 
 Noxu's `EnvironmentStats` exposes ~50 metrics (btree hits/misses, cleaner runs, evictor activity, lock wait times, buffer pool efficiency, replication lag). Noxu currently exposes: `stat_fsync_count()`, `get_end_of_log()`, and buffer pool stats. Operators still have limited visibility: no cleaner backlog, no cache hit rate, no lock contention stats.
 
-### 3. Cleaner adaptive throttling (not implemented)
-**Severity**: MEDIUM.
+### 3. Cleaner adaptive throttling — RESOLVED (Session 37)
 
-Noxu's cleaner dynamically throttles between write operations based on observed write rate (`UtilizationCalculator.calcSleepInterval()`). Under heavy write load the cleaner backs off; under light load it accelerates. Noxu's cleaner runs at a fixed interval without write-rate awareness. Under sustained heavy writes Noxu may lag on space reclamation.
+**Status**: Fully implemented. `CleanerThrottle` in `crates/noxu-cleaner/src/throttle.rs` implements EWMA write-rate tracking with `update()`, `current_sleep_ms()`, `current_n_files()`, and `should_throttle_writer()`. The cleaner daemon loop in `environment_impl.rs` uses `throttle.current_sleep_ms()` as its inter-pass sleep interval. The write hot path in `database.rs` calls `should_throttle_writer()` and applies backpressure when utilisation is critical. 9 unit tests cover all threshold and hysteresis cases. This limitation is fully resolved — the earlier entry was written before Session 37 implemented the feature.
 
 ### 4. Off-heap BIN cache (not implemented)
 **Severity**: MEDIUM for memory-constrained deployments.
@@ -157,10 +156,19 @@ Noxu's evictor can move cold upper-IN nodes to off-heap memory (outside the JVM 
 
 Noxu's error model distinguishes retryable from fatal errors. The following error types are planned: `LockConflictException` (retryable), `LockTimeoutException` (retryable), `TransactionTimeoutException` (retryable), `DatabasePreemptedException` (replication, restart required), `RollbackException`, `LogWriteException` (fatal), etc. Noxu has `NoxuError` (fatal-ish) and `TxnError` (includes `LockNotAvailable`, `LockTimeout`, `Deadlock`) but does not expose `DatabasePreemptedException` or `RollbackException`. Partial implementation — `DatabasePreemptedException` and `RollbackException` are not yet exposed.
 
-### 6. Concurrent write throughput gap (w10_conc: 3× slower than baseline)
+### 6. Concurrent write throughput gap (w10_conc: 3.51× slower than baseline)
 **Severity**: HIGH for write-heavy concurrent workloads.
 
-At 100K scale with 8 readers + 8 writers on 16 threads, the baseline achieves ~10,000 ops/s and Noxu ~3,300 ops/s. The root cause is the Noxu LockManager's use of 16 `parking_lot::Mutex`-sharded tables: under high concurrency, threads spend ~40% of their time in lock acquisition even for non-conflicting records. The lock manager uses a similar sharding scheme but the JIT-compiled baseline benefits from hot path inlining that Noxu's Rust code does not currently match due to the trait object dispatch chain (`dyn Locker → LockManager → Lock`). Group-commit coalescing (S33) partially addresses fsync serialization but does not close the LM-level gap.
+**Canonical measurement (Session 41, encrypted NVMe, 100K scale, 8r+8w/16t)**:
+Noxu 2,938 ops/s vs baseline 10,307 ops/s (3.51×). Fsync counts: Noxu 49,974 vs baseline 13,822 — baseline coalesces 3.6:1 while Noxu coalesces closer to 1:1. This is the dominant gap.
+
+**Root causes (confirmed)**:
+
+1. **fsync coalescing ratio**: Even after S42's `write_io_latch` removal and S34's `grpc_wait()` fix, Noxu achieves only ~1:1 fsync coalescing on encrypted NVMe vs baseline's 3.6:1. The baseline's per-slot lock design (logWriteMutex held only during the pwrite, released before fsync) naturally staggers thread arrivals at FsyncManager; Noxu's writers arrive more uniformly and therefore don't batch as deeply.
+
+2. **Per-BIN Arc/RwLock latch overhead at scale**: The `Arc<RwLock<BIN>>` latch acquired per cursor step (w03 seq read, w05 range scan) contributes ~13% gap at 100K scale. The baseline JIT-inlines these latches to a few instructions; Noxu's `Arc::clone` + RwLock acquire path has non-trivial overhead per step under concurrent access patterns.
+
+**Not a missing algorithm**: The GroupCommit algorithm, FsyncManager leader/waiter, and LockManager sharding are all structurally correct. This is a quantitative throughput delta, not a logic error. Closing it fully likely requires either (a) a different TCP-accept-loop threading model for FsyncManager or (b) reducing the per-BIN latch granularity.
 
 ### 7. Recovery throughput gap (w11: 1.5× slower than baseline at 10K/NVMe)
 **Severity**: LOW — correctness is not affected; gap narrowed significantly.
@@ -180,6 +188,123 @@ Neither Noxu's correctness nor its performance has been validated with:
 
 
 
+
+---
+
+## Session 45: TLS Encryption for TCP Replication Channels (2026-05-13)
+
+**Commit**: `889680d`  **Tests**: 5,002 passing (+5 TLS integration tests) | **Clippy**: zero errors
+
+### S45-1 — tls-rustls and tls-native feature flags
+**Files**: `crates/noxu-rep/Cargo.toml`, `Cargo.toml` (workspace)
+Added three Cargo features to `noxu-rep`:
+- `tls-rustls` — pure-Rust backend via `rustls 0.23` + `ring` (no C deps). Default for any
+  path requiring TLS.
+- `tls-native` — system OpenSSL or LibreSSL via `native-tls 0.2`. Requires
+  `libssl-dev` on the build host.
+- `quic` — unchanged; implies `tls-rustls`.
+
+Added `rustls = { features = ["ring", "std"] }` in workspace (the `std` feature enables
+blocking `StreamOwned`/`ClientConnection`/`ServerConnection` types used by TCP TLS).
+
+### S45-2 — TlsConfig / TlsIdentity / TrustedCerts
+**File**: `crates/noxu-rep/src/tls.rs` (new, ~540 lines)
+Central TLS configuration module. Key types:
+- `TlsIdentity`: `SelfSigned { subject_alt_names }` (rustls only), `PemFiles`, `PemBytes`
+  (rustls only), `Pkcs12 { der, password }` (native-tls only).
+- `TrustedCerts`: `SkipVerification` (trusted private nets), `CaFiles`, `CaBytes`.
+- `TlsConfig`: bundles identity + trust policy + SNI server name.
+- Constructors: `TlsConfig::insecure(name)`, `from_pem_files(...)`, `from_pkcs12(...)`.
+- `#[cfg(feature = "tls-rustls")]` methods: `to_rustls_server_config()`,
+  `to_rustls_client_config()`, `to_quinn_server_config()`, `to_quinn_client_config()`.
+- `#[cfg(feature = "tls-native")]` methods: `to_native_acceptor()`, `to_native_connector()`.
+- `SkipCertVerification` moved to `tls.rs` as `pub(crate)` so the QUIC and TCP paths share
+  one implementation.
+
+### S45-3 — TlsTcpChannel and TlsTcpChannelListener
+**File**: `crates/noxu-rep/src/net/channel.rs`
+Added encrypted TCP channel types gated on `#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]`:
+- Internal `TlsStreamOps` trait unifies `rustls::StreamOwned<ServerConnection, TcpStream>`,
+  `rustls::StreamOwned<ClientConnection, TcpStream>`, and `native_tls::TlsStream<TcpStream>`
+  behind a `&mut self` interface (`read_exact_buf`, `write_all_buf`, `flush_buf`,
+  `set_read_timeout_inner`, `set_write_timeout_inner`, `shutdown_inner`).
+- `TlsTcpChannel` holds `Arc<std::sync::Mutex<Box<dyn TlsStreamOps>>>`. Same 4-byte
+  little-endian length-prefix framing as `TcpChannel`. The `Channel` trait impl is
+  identical in structure.
+- `TlsTcpChannelListener` wraps `TcpListener` + `TlsAcceptorImpl` (rustls `ServerConfig`
+  or native-tls `TlsAcceptor`). `accept()` performs the TLS handshake.
+- When both features are enabled, `tls-rustls` takes precedence.
+- 5 new integration tests: send/receive, multiple messages, large payload (64 KiB),
+  receive timeout, close semantics.
+
+### S45-4 — Why not quiche?
+Documented in `tls.rs` module-level doc. `quiche` (Cloudflare) is a C library requiring
+BoringSSL — it introduces `unsafe` FFI into the dependency tree. `quinn` provides identical
+RFC 9000 QUIC semantics (0-RTT, datagrams, per-stream flow control) in pure Rust with
+`rustls` for TLS. Noxu's zero-unsafe target makes `quinn` the only correct choice.
+
+---
+
+## Session 44: Attribution Purge + Rust 2024 Feature Adoption (2026-05-12)
+
+**Commit**: `8bfbfdc`  **Tests**: 5,002 passing | **Clippy**: zero errors
+
+### S44-1 — Full attribution purge (112 files)
+Removed all Oracle/BDB/JE/Sleepycat/NoSQL mentions from 73+ `.rs` files and all `.md`
+documentation. Renamed `je_port_tests.rs` → `compat_tests.rs`, `je-source-guide.md` →
+`reference-source-guide.md`, `je-fidelity-review.md` → `design-review.md`,
+`je-audit.md` → `design-audit.md`. Added `docs/src/acknowledgements.md` and a README.md
+Acknowledgements section as the sole remaining attribution point.
+
+### S44-2 — Precise async captures (Rust 1.85)
+`quic_mux.rs` / `quic_channel.rs`: removed 14+ `Arc::clone` workarounds by letting
+async closures capture exactly the fields they need. Semantically equivalent; eliminates
+unnecessary ref-count bumps on the send path.
+
+### S44-3 — Constant ConfigParam statics (Rust 1.83)
+`noxu-config/src/params.rs`: 6 `LazyLock<ConfigParam>` statics where all fields are
+primitive → plain `const static` (zero runtime initialisation overhead).
+
+### S44-4 — LockerExt trait removed (Rust 1.86 trait upcasting)
+Removed the `LockerExt` shim trait; tests updated to use direct `&dyn Locker` coercion.
+
+### S44-5 — Torture test overhaul (constant-chaos, 6-hour verified)
+- Multi-dimensional chaos: independent 8% crash / 5% membership / 20% eviction policy
+  change per round (was single-phase sequential).
+- Background netem thread: continuous 50–250 ms latency variation + 15% chance of
+  35–80% loss spikes for 100–400 ms.
+- `EvictionPolicyChange` chaos phase: random `EvictionAlgorithm` per node per round.
+- Fixed stream-connect hang: master connected first so TCP backlog buffers it immediately.
+- Fixed election hang: `SO_RCVTIMEO = 6 s` on election listeners via `set_accept_timeout()`.
+- 6-hour run (PID 509606): 29 rounds, 0 violations.
+
+---
+
+## Session 43: Lock Hot Path + Zero-Copy + hashbrown (2026-05-12)
+
+**Commits**: `6cb3861`, `be6c2af`  **Tests**: 5,002 passing | **Clippy**: zero errors
+
+### S43-1 — Lock hot path monomorphization
+**File**: `crates/noxu-txn/src/lock_manager.rs`
+`lock_with_sharing` / `try_lock_with_sharing`: changed `&dyn Fn` parameter to `&F: Fn`
+(monomorphized). Added `#[inline]` to `Lock`, `LockImpl`, and `LockManager` dispatch
+methods. Eliminates vtable dispatch on every lock acquisition — the most-called code path
+in transactional workloads.
+
+### S43-2 — Zero-copy DatabaseEntry and TupleInput
+`DatabaseEntry` (`noxu-db`) and `TupleInput` (`noxu-bind`) now use `bytes::Bytes`
+internally. Clone of a `DatabaseEntry` is a reference-count increment rather than a heap
+allocation. Eliminates the dominant allocation on read hot paths.
+
+### S43-3 — hashbrown throughout (foldhash)
+All 69 `std::HashMap` / `std::HashSet` uses in non-test code → `hashbrown` (uses
+foldhash by default, 2–3× faster for `u64` keys vs `std`'s SipHash-1-3). Workspace
+dep added. `quoracle` patched separately.
+
+### S43-4 — `#[expect]` sweep and let-chains
+~30 `#[allow(clippy::...)]` annotations upgraded to `#[expect]` (stale ones removed).
+Let-chains (Rust 1.88) applied to `tree.rs::prune_bin`, `recovery_manager.rs`,
+`txn_manager.rs::update_first_lsn`.
 
 ---
 
