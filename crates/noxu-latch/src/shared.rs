@@ -441,9 +441,9 @@ mod tests {
 
     /// Re-acquiring a shared latch on the same thread should panic (reentrancy prevention).
     #[test]
-    fn test_je_shared_reacquire_panics() {
+    fn test_shared_reacquire_panics() {
         let result = std::panic::catch_unwind(|| {
-            let latch = SharedLatch::named("je-shared-reacquire", false);
+            let latch = SharedLatch::named("noxu-shared-reacquire", false);
             let _g1 = latch.acquire_shared().expect("first acquire_shared");
             // Second shared acquire on same thread must panic.
             let _ = latch.acquire_shared();
@@ -453,9 +453,9 @@ mod tests {
 
     /// Acquiring exclusively after a shared guard is held on the same thread must panic (would deadlock).
     #[test]
-    fn test_je_read_to_write_upgrade_panics() {
+    fn test_read_to_write_upgrade_panics_while_shared() {
         let result = std::panic::catch_unwind(|| {
-            let latch = SharedLatch::named("je-rwupgrade", false);
+            let latch = SharedLatch::named("rwupgrade", false);
             let _rg = latch.acquire_shared().expect("acquire_shared"); // increments read hold count
             let _ = latch.acquire_exclusive(); // must panic
         });
@@ -464,16 +464,16 @@ mod tests {
 
     /// Releasing a latch that is not held (release_if_owner style) should be safe on exclusive path.
     #[test]
-    fn test_je_shared_release_not_held_exclusive_path() {
-        let latch = SharedLatch::named("je-not-held", false);
+    fn test_shared_release_not_held_exclusive_path() {
+        let latch = SharedLatch::named("noxu-not-held", false);
         // Not held at all — is_exclusive_owner should be false.
         assert!(!latch.is_exclusive_owner());
     }
 
     /// Multiple threads can hold shared guards simultaneously while no exclusive holder is present.
     #[test]
-    fn test_je_multiple_readers_concurrent() {
-        let latch = Arc::new(SharedLatch::named("je-multi-read", false));
+    fn test_multiple_readers_concurrent() {
+        let latch = Arc::new(SharedLatch::named("noxu-multi-read", false));
         let ready = Arc::new((noxu_sync::Mutex::new(0usize), noxu_sync::Condvar::new()));
         let mut handles = Vec::new();
 
@@ -510,8 +510,8 @@ mod tests {
 
     /// Exclusive mode blocks shared; after exclusive releases shared can be acquired.
     #[test]
-    fn test_je_exclusive_blocks_then_shared_granted() {
-        let latch = Arc::new(SharedLatch::named("je-excl-blocks-shared", false));
+    fn test_exclusive_blocks_then_shared_granted() {
+        let latch = Arc::new(SharedLatch::named("noxu-excl-blocks-shared", false));
 
         // Acquire exclusive.
         let g = latch.acquire_exclusive().expect("acquire_exclusive");
@@ -536,8 +536,8 @@ mod tests {
 
     /// `try_acquire_exclusive` (non-blocking) returns None while an exclusive holder is present.
     #[test]
-    fn test_je_try_acquire_exclusive_no_wait() {
-        let latch = Arc::new(SharedLatch::named("je-try-excl", false));
+    fn test_try_acquire_exclusive_no_wait() {
+        let latch = Arc::new(SharedLatch::named("noxu-try-excl", false));
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
         let latch2 = latch.clone();
@@ -563,9 +563,9 @@ mod tests {
     /// In exclusive-only mode the latch behaves like a plain exclusive latch
     /// (shared acquisition acts as exclusive).
     #[test]
-    fn test_je_exclusive_only_mode_serializes() {
+    fn test_exclusive_only_mode_serializes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let latch = Arc::new(SharedLatch::named("je-excl-only", true));
+        let latch = Arc::new(SharedLatch::named("noxu-excl-only", true));
         let counter = Arc::new(AtomicUsize::new(0));
         let concurrent = Arc::new(AtomicUsize::new(0));
         let violations = Arc::new(AtomicUsize::new(0));

@@ -66,7 +66,7 @@ pub use deadlock_detector::DeadlockDetector;
 
 // Locker hierarchy (Agent 3)
 pub mod locker;
-pub use locker::{Locker, LockerExt};
+pub use locker::Locker;
 
 pub mod basic_locker;
 pub use basic_locker::BasicLocker;

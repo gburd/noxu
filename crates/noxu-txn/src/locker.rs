@@ -214,26 +214,6 @@ pub trait Locker: Send + Sync {
     fn is_open(&self) -> bool;
 }
 
-/// Helper trait for lockers that can be converted to trait objects.
-///
-/// This allows storing different locker types in the same collection.
-pub trait LockerExt: Locker {
-    /// Returns self as a trait object reference.
-    fn as_locker(&self) -> &dyn Locker;
-
-    /// Returns self as a mutable trait object reference.
-    fn as_locker_mut(&mut self) -> &mut dyn Locker;
-}
-
-impl<T: Locker> LockerExt for T {
-    fn as_locker(&self) -> &dyn Locker {
-        self
-    }
-
-    fn as_locker_mut(&mut self) -> &mut dyn Locker {
-        self
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -304,7 +284,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Additional coverage for default trait methods and LockerExt
+    // Additional coverage for default trait methods and direct trait-object coercion
+    // (Rust 1.86 makes &dyn SubTrait → &dyn SuperTrait coercion implicit)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -375,18 +356,19 @@ mod tests {
     }
 
     #[test]
-    fn test_locker_ext_as_locker() {
+    fn test_locker_as_dyn_ref() {
         let locker = TestLocker { id: 7, is_open: true };
-        let as_ref: &dyn Locker = locker.as_locker();
+        // Direct coercion to &dyn Locker (Rust 1.86 — no helper trait needed).
+        let as_ref: &dyn Locker = &locker;
         assert_eq!(as_ref.id(), 7);
         assert!(as_ref.is_open());
     }
 
     #[test]
-    fn test_locker_ext_as_locker_mut() {
+    fn test_locker_as_dyn_mut() {
         let mut locker = TestLocker { id: 7, is_open: true };
         {
-            let as_mut: &mut dyn Locker = locker.as_locker_mut();
+            let as_mut: &mut dyn Locker = &mut locker;
             as_mut.close();
         }
         assert!(!locker.is_open());
@@ -453,9 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn test_locker_ext_on_custom_locker() {
+    fn test_custom_locker_as_dyn_ref() {
         let locker = CustomDefaultsLocker;
-        let as_ref: &dyn Locker = locker.as_locker();
+        let as_ref: &dyn Locker = &locker;
         assert_eq!(as_ref.id(), 99);
         assert!(as_ref.retains_locks_on_commit());
     }

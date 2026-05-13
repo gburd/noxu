@@ -11,6 +11,7 @@ quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:bytes"]
 
 [dependencies]
 hashbrown = { workspace = true }
+libc = { workspace = true }
 noxu-engine = { workspace = true }
 noxu-util = { workspace = true }
 noxu-log = { workspace = true }
@@ -33,6 +34,7 @@ bytes  = { workspace = true, optional = true }
 proptest = { workspace = true }
 tempfile = "3"
 rand = "0.8"
+noxu-evictor = { path = "../noxu-evictor" }
 
 [lints]
 workspace = true

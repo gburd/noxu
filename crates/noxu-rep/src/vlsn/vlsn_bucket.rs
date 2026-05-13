@@ -400,7 +400,7 @@ mod tests {
     ///     back to the nearest lower stride entry
     ///   - the last vlsn in the bucket is always stored exactly
     #[test]
-    fn je_test_basic() {
+    fn test_basic() {
         let stride = 3u32;
         let vals = init_data(); // (vlsn, file, offset)
 
@@ -479,7 +479,7 @@ mod tests {
     /// Vlsns inserted in
     /// non-monotonic order; ownership and LTE lookup must still be correct.
     #[test]
-    fn je_test_out_of_order_puts() {
+    fn test_out_of_order_puts_with_stride() {
         let stride = 3u32;
         let vals = init_data();
         let mut bucket = VlsnBucket::new(vals[0].0, stride);
@@ -515,7 +515,7 @@ mod tests {
     /// (out-of-order puts that leave unpopulated stride slots), checking
     /// that LTE and GTE semantics work correctly around holes.
     #[test]
-    fn je_test_get_non_null_with_holes() {
+    fn test_get_non_null_with_holes() {
         // stride=2, file=0
         let mut bucket = VlsnBucket::new(1, 2);
         assert!(bucket.put(1, 0, 10));
@@ -538,7 +538,7 @@ mod tests {
     /// We simulate this by verifying ownership after truncating the bucket
     /// range through the index (VlsnIndex::truncate_after).
     #[test]
-    fn je_test_ownership_boundary() {
+    fn test_ownership_boundary() {
         // Build a bucket with vlsns 10-19 at stride=3, file=0.
         let mut bucket = VlsnBucket::new(10, 3);
         for i in 10u64..20 {
@@ -557,7 +557,7 @@ mod tests {
     /// the last tracked vlsn after insert is correct, including when the
     /// last insert is not on a stride boundary.
     #[test]
-    fn je_test_last_vlsn_tracking() {
+    fn test_last_vlsn_tracking() {
         let mut bucket = VlsnBucket::new(10, 5);
         bucket.put(10, 0, 10);
         assert_eq!(bucket.get_last_vlsn(), 10);
@@ -586,7 +586,7 @@ mod tests {
 
     /// First_vlsn is always returned exactly.
     #[test]
-    fn je_test_first_vlsn_exact_lookup() {
+    fn test_first_vlsn_exact_lookup() {
         let mut bucket = VlsnBucket::new(1, 3);
         bucket.put(1, 3, 10);
         bucket.put(2, 3, 20);
@@ -596,7 +596,7 @@ mod tests {
 
     /// Verify get_first_vlsn / get_last_vlsn match bucket contents.
     #[test]
-    fn je_test_first_last_accessors() {
+    fn test_first_last_accessors() {
         let mut bucket = VlsnBucket::new(5, 2);
         assert_eq!(bucket.get_first_vlsn(), 5);
         assert_eq!(bucket.get_last_vlsn(), 5);

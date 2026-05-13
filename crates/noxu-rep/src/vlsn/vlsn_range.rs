@@ -459,7 +459,7 @@ mod tests {
     /// The commit VLSN must never exceed the last VLSN in the range.
     /// Ported from VLSNConsistencyTest — VLSN ordering invariant.
     #[test]
-    fn je_test_commit_vlsn_le_last() {
+    fn test_commit_vlsn_le_last() {
         let mut range = VlsnRange::with_range(1, 20);
         range.update_commit(20);
         assert!(range.get_commit_vlsn() <= range.get_last());
@@ -476,7 +476,7 @@ mod tests {
 
     /// The sync VLSN must never exceed the last VLSN in the range.
     #[test]
-    fn je_test_sync_vlsn_le_last() {
+    fn test_sync_vlsn_le_last() {
         let mut range = VlsnRange::with_range(1, 20);
         range.update_sync(18);
         range.truncate_after(12);
@@ -488,7 +488,7 @@ mod tests {
 
     /// After any number of extend() calls, first must remain <= last.
     #[test]
-    fn je_test_extend_maintains_first_le_last() {
+    fn test_extend_maintains_first_le_last() {
         let mut range = VlsnRange::new();
         for v in [10u64, 3, 20, 7, 15, 1, 25] {
             range.extend(v);
@@ -504,7 +504,7 @@ mod tests {
 
     /// Truncation to a point within the range preserves first <= last.
     #[test]
-    fn je_test_truncate_preserves_first_le_last() {
+    fn test_truncate_preserves_first_le_last() {
         for last in 1u64..=20 {
             let mut range = VlsnRange::with_range(1, 20);
             range.truncate_after(last);
@@ -520,7 +520,7 @@ mod tests {
 
     /// Merging two ranges always yields first <= last (if non-empty).
     #[test]
-    fn je_test_merge_maintains_first_le_last() {
+    fn test_merge_maintains_first_le_last() {
         let cases: &[(u64, u64, u64, u64)] = &[
             (1, 10, 5, 15),
             (5, 5, 5, 5),
@@ -544,7 +544,7 @@ mod tests {
 
     /// Commit VLSN must never move backwards (monotonically non-decreasing).
     #[test]
-    fn je_test_commit_vlsn_monotone() {
+    fn test_commit_vlsn_monotone() {
         let mut range = VlsnRange::with_range(1, 100);
         let updates = [5u64, 10, 8, 20, 15, 30];
         let mut prev = 0u64;
@@ -558,7 +558,7 @@ mod tests {
 
     /// Sync VLSN must never move backwards.
     #[test]
-    fn je_test_sync_vlsn_monotone() {
+    fn test_sync_vlsn_monotone() {
         let mut range = VlsnRange::with_range(1, 100);
         let updates = [3u64, 12, 7, 25, 18, 40];
         let mut prev = 0u64;
@@ -572,7 +572,7 @@ mod tests {
 
     /// An empty range contains no vlsn.
     #[test]
-    fn je_test_empty_range_contains_nothing() {
+    fn test_empty_range_contains_nothing() {
         let range = VlsnRange::new();
         for v in [0u64, 1, 100, u64::MAX / 2] {
             assert!(!range.contains(v));
@@ -582,7 +582,7 @@ mod tests {
     /// Verify that the length formula is always correct relative to
     /// first and last.
     #[test]
-    fn je_test_len_formula() {
+    fn test_len_formula() {
         let cases: &[(u64, u64)] = &[(1, 1), (1, 10), (5, 20), (100, 100)];
         for &(f, l) in cases {
             let range = VlsnRange::with_range(f, l);
