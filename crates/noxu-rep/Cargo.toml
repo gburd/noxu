@@ -6,8 +6,16 @@ license.workspace = true
 description = "Replication and high availability for Noxu DB"
 
 [features]
-# Enable QUIC transport (requires quinn, tokio, rustls, rcgen, bytes).
-quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:bytes"]
+# Pure-Rust TLS backend (rustls + ring). No C dependencies.
+# Default for any feature that requires TLS.
+tls-rustls = ["dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
+# OpenSSL / LibreSSL backend via the system-installed library.
+# On Linux, links against whichever libssl.so is on the system (OpenSSL or
+# LibreSSL). Set OPENSSL_DIR to point at a specific installation.
+tls-native = ["dep:native-tls"]
+# QUIC transport over multiplexed streams. QUIC mandates TLS 1.3, so this
+# always pulls in the pure-Rust TLS backend.
+quic = ["dep:quinn", "dep:tokio", "dep:bytes", "tls-rustls"]
 
 [dependencies]
 hashbrown = { workspace = true }
@@ -23,12 +31,15 @@ log = { workspace = true }
 thiserror = { workspace = true }
 quoracle = { workspace = true }
 crc32fast = { workspace = true }
-# Optional QUIC transport deps.
+# Optional QUIC transport deps (implied by the `quic` feature).
 quinn  = { workspace = true, optional = true }
 tokio  = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-rcgen  = { workspace = true, optional = true }
 bytes  = { workspace = true, optional = true }
+# Optional TLS deps: tls-rustls (pure Rust) or tls-native (system OpenSSL/LibreSSL).
+rustls         = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rcgen          = { workspace = true, optional = true }
+native-tls     = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
