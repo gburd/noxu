@@ -14,7 +14,7 @@ use crate::entry_type::LogEntryType;
 use crate::error::{NoxuLogError, Result};
 use crate::file_reader::LogFileAccess;
 use noxu_util::lsn::{Lsn, NULL_LSN};
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 // Maximum plausible payload size (64 MiB).
 const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;

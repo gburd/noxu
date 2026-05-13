@@ -1,7 +1,7 @@
 //! Collection of schema-evolution mutations.
 //!
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use super::converter::Converter;
 use super::deleter::Deleter;

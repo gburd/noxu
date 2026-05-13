@@ -4,7 +4,7 @@
 //! head = cold/LRU end (evicted first), tail = hot/MRU end (most recently
 //! used).  All operations are O(1) amortised.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 pub(crate) const SENTINEL: usize = usize::MAX;
 

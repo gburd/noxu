@@ -49,7 +49,7 @@
 //! cached session ticket and issues a 0-RTT / early-data reconnect, cutting
 //! reconnect latency from ~3 RTT (TCP+TLS) to ~1 RTT.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

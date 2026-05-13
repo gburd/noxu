@@ -5,7 +5,7 @@
 //! system. It manages N sharded lock tables, each protected by its own mutex,
 //! to allow concurrent lock operations on different LSNs.
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -656,7 +656,7 @@ impl LockManager {
         // Only clone the registry when the requester is actually in a sharing
         // group — avoids a HashMap allocation on every lock call for the common
         // path where requester_group is None (BasicLockers, most internal ops).
-        let registry_snapshot: Option<std::collections::HashMap<i64, i64>> =
+        let registry_snapshot: Option<hashbrown::HashMap<i64, i64>> =
             if requester_group.is_some() {
                 Some(self.share_registry.read().unwrap().clone())
             } else {

@@ -1,7 +1,7 @@
 //! Transaction manager.
 //!
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 
@@ -108,11 +108,11 @@ impl TxnManager {
     /// (implicit in via Txn field access).
     pub fn update_first_lsn(&self, txn_id: i64, first_lsn: u64) {
         let mut guard = self.all_txns.write();
-        if let Some(entry) = guard.get_mut(&txn_id) {
-            // Only update to an earlier LSN (preserve the first-ever entry).
-            if *entry == NULL_LSN.as_u64() || first_lsn < *entry {
-                *entry = first_lsn;
-            }
+        // Only update to an earlier LSN (preserve the first-ever entry).
+        if let Some(entry) = guard.get_mut(&txn_id)
+            && (*entry == NULL_LSN.as_u64() || first_lsn < *entry)
+        {
+            *entry = first_lsn;
         }
     }
 

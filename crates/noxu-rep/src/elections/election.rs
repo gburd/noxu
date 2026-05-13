@@ -13,7 +13,7 @@
 //! Thread safety is achieved via `noxu_sync::Mutex` on interior fields so
 //! that vote recording can happen concurrently from multiple network threads.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use noxu_sync::Mutex;
 

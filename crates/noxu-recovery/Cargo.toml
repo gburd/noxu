@@ -6,6 +6,7 @@ license.workspace = true
 description = "Checkpoint-based crash recovery for Noxu DB"
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 noxu-log = { workspace = true }
 noxu-tree = { workspace = true }

@@ -3,7 +3,7 @@
 use noxu_collections::StoredMap;
 use noxu_db::{Database, DatabaseConfig, Environment, EnvironmentConfig};
 use proptest::prelude::*;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use tempfile::TempDir;
 
 /// Helper: create a temporary environment and database for testing.

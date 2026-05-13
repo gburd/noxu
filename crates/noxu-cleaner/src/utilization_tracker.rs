@@ -4,7 +4,7 @@
 //! tracks per-file utilization changes in memory between checkpoints.
 
 use crate::tracked_file_summary::TrackedFileSummary;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Tracks per-file utilization changes in memory.
 ///

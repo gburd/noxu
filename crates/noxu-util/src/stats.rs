@@ -5,7 +5,7 @@
 //! Provides a framework for defining, collecting, and reporting statistics
 //! across all database subsystems.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
 

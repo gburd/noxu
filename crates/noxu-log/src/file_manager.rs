@@ -11,7 +11,7 @@ use memmap2::Mmap;
 use noxu_latch::ExclusiveLatch;
 use noxu_util::lsn::Lsn;
 use noxu_sync::{Mutex, RwLock};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::num::NonZeroUsize;

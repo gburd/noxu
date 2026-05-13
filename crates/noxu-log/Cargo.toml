@@ -6,6 +6,7 @@ license.workspace = true
 description = "Log-structured storage engine for Noxu DB"
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 noxu-latch = { workspace = true }
 noxu-config = { workspace = true }

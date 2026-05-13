@@ -7,7 +7,7 @@
 use crate::error::{NoxuLogError, Result};
 use crate::file_reader::{FileReader, LogFileAccess};
 use noxu_util::lsn::{Lsn, NULL_LSN};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 /// Tracks the last occurrence of specific log entry types.
 ///
@@ -82,7 +82,7 @@ impl<F: LogFileAccess> LastFileReader<F> {
         let mut last_good_file = None;
 
         // Scan forward to find all files
-        #[allow(clippy::while_let_loop)]
+        #[expect(clippy::while_let_loop)]
         loop {
             match file_access.get_file_length(current_file) {
                 Ok(len) => {

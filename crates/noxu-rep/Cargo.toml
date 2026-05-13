@@ -10,6 +10,7 @@ description = "Replication and high availability for Noxu DB"
 quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:bytes"]
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-engine = { workspace = true }
 noxu-util = { workspace = true }
 noxu-log = { workspace = true }

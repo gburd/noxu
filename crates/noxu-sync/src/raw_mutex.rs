@@ -51,7 +51,6 @@ pub struct NoxuRawMutex {
 unsafe impl lock_api::RawMutex for NoxuRawMutex {
     /// Const-initializer, needed for embedding `NoxuRawMutex` directly in
     /// structs (e.g., `LogBuffer`) without heap allocation.
-    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: Self = NoxuRawMutex {
         state: AtomicU32::new(UNLOCKED),
         waiters: AtomicUsize::new(0),

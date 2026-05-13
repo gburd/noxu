@@ -34,7 +34,7 @@
 use crate::policy::EvictionPolicy;
 use crate::slab::SlabList;
 use noxu_sync::Mutex;
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 /// LIR set target fraction of total tracked pages.
 const LIR_RATIO: f64 = 0.99;

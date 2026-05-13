@@ -343,10 +343,9 @@ fn test_election_tolerates_message_drops() {
     const RETRIES: u32 = 15;
 
     let group = make_group(3);
-    let mut term = 1u64;
     let mut succeeded = false;
 
-    for attempt in 0..RETRIES {
+    for (attempt, term) in (0..RETRIES).zip(1u64..) {
         let pair12 = LocalChannelPair::new();
         let pair13 = LocalChannelPair::new();
 
@@ -388,7 +387,6 @@ fn test_election_tolerates_message_drops() {
             succeeded = true;
             break;
         }
-        term += 1;
     }
 
     assert!(

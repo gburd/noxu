@@ -6,6 +6,7 @@ license.workspace = true
 description = "Configuration parameter system for Noxu DB"
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

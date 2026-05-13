@@ -14,7 +14,7 @@ use noxu_engine::EnvironmentStats;
 use noxu_engine::env_stats::{EvictorStatsSnapshot, LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot};
 use noxu_log::LogManager;
 use noxu_sync::Mutex;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,9 +67,9 @@ pub struct Environment {
 /// Internal database handle state.
 struct DatabaseHandle {
     name: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     id: u64,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     config: DatabaseConfig,
     /// Shared open flag — same `Arc<AtomicBool>` as `Database.open` so that
     /// `Database::close()` setting the flag to false also marks this handle
@@ -79,13 +79,13 @@ struct DatabaseHandle {
 
 /// Internal transaction state.
 struct TransactionState {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     id: u64,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     config: TransactionConfig,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     committed: AtomicBool,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     aborted: AtomicBool,
 }
 

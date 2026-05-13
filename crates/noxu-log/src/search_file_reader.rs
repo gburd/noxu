@@ -6,7 +6,7 @@
 use crate::error::Result;
 use crate::file_reader::{FileReader, LogFileAccess};
 use noxu_util::lsn::{Lsn, NULL_LSN};
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 /// Searches for log entries of specific types.
 ///

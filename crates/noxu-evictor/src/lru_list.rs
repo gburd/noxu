@@ -2,7 +2,7 @@
 //!
 
 use noxu_sync::Mutex;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 // Sentinel index value used as the list head/tail marker.
 const SENTINEL: usize = usize::MAX;

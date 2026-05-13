@@ -11,7 +11,7 @@
 //!   - WriteLockInfo: create, clone, restore
 //!   - Txn::n_locks and set_only_abortable
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use std::sync::Arc;
 
 use noxu_txn::{

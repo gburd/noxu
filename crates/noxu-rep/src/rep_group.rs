@@ -1,7 +1,7 @@
 //! Replication group management.
 //!
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 use crate::node_type::NodeType;
 use crate::quorum_policy::QuorumPolicy;

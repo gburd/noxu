@@ -16,7 +16,7 @@
 //!   from AND / OR / Choose expressions; the intersection property is
 //!   validated by the quoracle library at construction time.
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 use quoracle::{Expr, Node, QuorumSystem, choose, majority};
 

@@ -1,7 +1,8 @@
 //! Dirty IN tracking for checkpoint.
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use hashbrown::{HashMap, HashSet};
 
 /// Checkpoint state machine.
 ///

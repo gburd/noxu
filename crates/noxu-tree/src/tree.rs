@@ -2599,16 +2599,12 @@ impl Tree {
         };
 
         if now_empty {
-            if let Some(key) = id_key {
-                // pruneBIN calls tree.delete(idKey) to remove the empty
-                // BIN's parent IN slot.  We call our own delete() which walks
-                // the tree by key and removes the entry from the parent IN.
-                //
-                // Note: we only prune if n_entries was > 0 before compression
-                // (an already-empty BIN would have no id_key).
-                if n_entries > 0 {
-                    self.delete(&key);
-                }
+            // pruneBIN calls tree.delete(idKey) to remove the empty
+            // BIN's parent IN slot.  We call our own delete() which walks
+            // the tree by key and removes the entry from the parent IN.
+            // Note: we only prune if n_entries was > 0 before compression.
+            if let Some(key) = id_key && n_entries > 0 {
+                self.delete(&key);
             }
             return true;
         }
