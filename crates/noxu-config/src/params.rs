@@ -5,7 +5,6 @@
 
 use crate::param::ConfigParam;
 use crate::param::ParamValue;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 // =========================================================================
@@ -15,7 +14,7 @@ use std::time::Duration;
 /// Maximum number of bytes used for the in-memory cache.
 /// A value of 0 means use MAX_MEMORY_PERCENT instead.
 pub static MAX_MEMORY: ConfigParam = ConfigParam::long_param(
-    "je.maxMemory",
+    "noxu.maxMemory",
     None,    // min
     None,    // max
     0,       // default: use percent
@@ -25,7 +24,7 @@ pub static MAX_MEMORY: ConfigParam = ConfigParam::long_param(
 
 /// Percentage of JVM memory to use for the cache (1-90).
 pub static MAX_MEMORY_PERCENT: ConfigParam = ConfigParam::int_param(
-    "je.maxMemoryPercent",
+    "noxu.maxMemoryPercent",
     Some(1),  // min
     Some(90), // max
     60,       // default
@@ -35,7 +34,7 @@ pub static MAX_MEMORY_PERCENT: ConfigParam = ConfigParam::int_param(
 
 /// Whether multiple environments share the cache.
 pub static SHARED_CACHE: ConfigParam = ConfigParam::bool_param(
-    "je.sharedCache",
+    "noxu.sharedCache",
     false, // default
     false, // mutable
     false, // forReplication
@@ -43,7 +42,7 @@ pub static SHARED_CACHE: ConfigParam = ConfigParam::bool_param(
 
 /// Maximum total disk space used by log files, in bytes. 0 means unlimited.
 pub static MAX_DISK: ConfigParam = ConfigParam::long_param(
-    "je.maxDisk",
+    "noxu.maxDisk",
     Some(0), // min
     None,    // max
     0,       // default: unlimited
@@ -53,7 +52,7 @@ pub static MAX_DISK: ConfigParam = ConfigParam::long_param(
 
 /// Minimum free disk space to reserve, in bytes.
 pub static FREE_DISK: ConfigParam = ConfigParam::long_param(
-    "je.freeDisk",
+    "noxu.freeDisk",
     Some(0),       // min
     None,          // max
     5_368_709_120, // default: 5 GB
@@ -63,7 +62,7 @@ pub static FREE_DISK: ConfigParam = ConfigParam::long_param(
 
 /// Maximum off-heap cache size in bytes. 0 means disabled.
 pub static MAX_OFF_HEAP_MEMORY: ConfigParam = ConfigParam::long_param(
-    "je.maxOffHeapMemory",
+    "noxu.maxOffHeapMemory",
     Some(0), // min
     None,    // max
     0,       // default: disabled
@@ -78,7 +77,7 @@ pub static MAX_OFF_HEAP_MEMORY: ConfigParam = ConfigParam::long_param(
 /// If true, btree and dup comparators will be instantiated even when recovery
 /// is not run (used by utilities such as DbScavenger).
 pub static ENV_COMPARATORS_REQUIRED: ConfigParam = ConfigParam::bool_param(
-    "je.env.comparatorsRequired",
+    "noxu.env.comparatorsRequired",
     false, // default
     false, // mutable
     false, // forReplication
@@ -86,7 +85,7 @@ pub static ENV_COMPARATORS_REQUIRED: ConfigParam = ConfigParam::bool_param(
 
 /// If true, create the environment with recovery enabled.
 pub static ENV_RECOVERY: ConfigParam = ConfigParam::bool_param(
-    "je.env.recovery",
+    "noxu.env.recovery",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -94,7 +93,7 @@ pub static ENV_RECOVERY: ConfigParam = ConfigParam::bool_param(
 
 /// If true, force a checkpoint during recovery.
 pub static ENV_RECOVERY_FORCE_CHECKPOINT: ConfigParam = ConfigParam::bool_param(
-    "je.env.recoveryForceCheckpoint",
+    "noxu.env.recoveryForceCheckpoint",
     false, // default
     false, // mutable
     false, // forReplication
@@ -102,7 +101,7 @@ pub static ENV_RECOVERY_FORCE_CHECKPOINT: ConfigParam = ConfigParam::bool_param(
 
 /// If true, force writing to a new log file during recovery.
 pub static ENV_RECOVERY_FORCE_NEW_FILE: ConfigParam = ConfigParam::bool_param(
-    "je.env.recoveryForceNewFile",
+    "noxu.env.recoveryForceNewFile",
     false, // default
     false, // mutable
     false, // forReplication
@@ -110,7 +109,7 @@ pub static ENV_RECOVERY_FORCE_NEW_FILE: ConfigParam = ConfigParam::bool_param(
 
 /// If true, halt the JVM on a commit that follows a checksum exception.
 pub static HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION: ConfigParam = ConfigParam::bool_param(
-    "je.haltOnCommitAfterChecksumException",
+    "noxu.haltOnCommitAfterChecksumException",
     false, // default
     false, // mutable
     false, // forReplication
@@ -118,7 +117,7 @@ pub static HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION: ConfigParam = ConfigParam::bo
 
 /// If true, the environment is transactional.
 pub static ENV_IS_TRANSACTIONAL: ConfigParam = ConfigParam::bool_param(
-    "je.env.isTransactional",
+    "noxu.env.isTransactional",
     false, // default
     false, // mutable
     false, // forReplication
@@ -126,7 +125,7 @@ pub static ENV_IS_TRANSACTIONAL: ConfigParam = ConfigParam::bool_param(
 
 /// If true, the environment uses locking for concurrent access.
 pub static ENV_IS_LOCKING: ConfigParam = ConfigParam::bool_param(
-    "je.env.isLocking",
+    "noxu.env.isLocking",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -134,7 +133,7 @@ pub static ENV_IS_LOCKING: ConfigParam = ConfigParam::bool_param(
 
 /// If true, the environment is read-only.
 pub static ENV_IS_READ_ONLY: ConfigParam = ConfigParam::bool_param(
-    "je.env.isReadOnly",
+    "noxu.env.isReadOnly",
     false, // default
     false, // mutable
     false, // forReplication
@@ -142,7 +141,7 @@ pub static ENV_IS_READ_ONLY: ConfigParam = ConfigParam::bool_param(
 
 /// If true, use fair latches (FIFO ordering for waiters).
 pub static ENV_FAIR_LATCHES: ConfigParam = ConfigParam::bool_param(
-    "je.env.fairLatches",
+    "noxu.env.fairLatches",
     false, // default
     false, // mutable
     false, // forReplication
@@ -150,7 +149,7 @@ pub static ENV_FAIR_LATCHES: ConfigParam = ConfigParam::bool_param(
 
 /// No longer used. Left in place to avoid errors from existing config settings.
 pub static ENV_SHARED_LATCHES: ConfigParam = ConfigParam::bool_param(
-    "je.env.sharedLatches",
+    "noxu.env.sharedLatches",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -158,7 +157,7 @@ pub static ENV_SHARED_LATCHES: ConfigParam = ConfigParam::bool_param(
 
 /// If true, configure the logging framework on environment open.
 pub static ENV_SETUP_LOGGER: ConfigParam = ConfigParam::bool_param(
-    "je.env.setupLogger",
+    "noxu.env.setupLogger",
     false, // default
     false, // mutable
     false, // forReplication
@@ -166,7 +165,7 @@ pub static ENV_SETUP_LOGGER: ConfigParam = ConfigParam::bool_param(
 
 /// Latch timeout duration.
 pub static ENV_LATCH_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.env.latchTimeout",
+    name: "noxu.env.latchTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
     min: None,
@@ -177,7 +176,7 @@ pub static ENV_LATCH_TIMEOUT: ConfigParam = ConfigParam {
 
 /// Clock tolerance used for TTL (time-to-live) expiration checks.
 pub static ENV_TTL_CLOCK_TOLERANCE: ConfigParam = ConfigParam {
-    name: "je.env.ttlClockTolerance",
+    name: "noxu.env.ttlClockTolerance",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(2 * 3600)), // 2 h
     min: None,
@@ -188,7 +187,7 @@ pub static ENV_TTL_CLOCK_TOLERANCE: ConfigParam = ConfigParam {
 
 /// Maximum assumed lock-hold time for TTL-related decisions.
 pub static ENV_TTL_MAX_TXN_TIME: ConfigParam = ConfigParam {
-    name: "je.env.ttlMaxTxnTime",
+    name: "noxu.env.ttlMaxTxnTime",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(24 * 3600)), // 24 h
     min: None,
@@ -199,7 +198,7 @@ pub static ENV_TTL_MAX_TXN_TIME: ConfigParam = ConfigParam {
 
 /// Delay added to record expiration time before purging in the cleaner.
 pub static ENV_TTL_LN_PURGE_DELAY: ConfigParam = ConfigParam {
-    name: "je.env.ttlLnPurgeDelay",
+    name: "noxu.env.ttlLnPurgeDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
     min: None,
@@ -210,7 +209,7 @@ pub static ENV_TTL_LN_PURGE_DELAY: ConfigParam = ConfigParam {
 
 /// If true, include user key/data in exception and log messages.
 pub static ENV_EXPOSE_USER_DATA: ConfigParam = ConfigParam::bool_param(
-    "je.env.exposeUserData",
+    "noxu.env.exposeUserData",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -218,7 +217,7 @@ pub static ENV_EXPOSE_USER_DATA: ConfigParam = ConfigParam::bool_param(
 
 /// If true, enable database-level eviction.
 pub static ENV_DB_EVICTION: ConfigParam = ConfigParam::bool_param(
-    "je.env.dbEviction",
+    "noxu.env.dbEviction",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -226,7 +225,7 @@ pub static ENV_DB_EVICTION: ConfigParam = ConfigParam::bool_param(
 
 /// If true, enable duplicate-db conversion preload of all data.
 pub static ENV_DUP_CONVERT_PRELOAD_ALL: ConfigParam = ConfigParam::bool_param(
-    "je.env.dupConvertPreloadAll",
+    "noxu.env.dupConvertPreloadAll",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -234,7 +233,7 @@ pub static ENV_DUP_CONVERT_PRELOAD_ALL: ConfigParam = ConfigParam::bool_param(
 
 /// Chunk size for Adler32 checksum computation. 0 means compute over whole entry.
 pub static ADLER32_CHUNK_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.adler32.chunkSize",
+    "noxu.adler32.chunkSize",
     Some(0),       // min
     Some(1 << 20), // max: 1 MB
     0,             // default
@@ -244,7 +243,7 @@ pub static ADLER32_CHUNK_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// If true, check for resource leaks (cursors, transactions) when closing.
 pub static ENV_CHECK_LEAKS: ConfigParam = ConfigParam::bool_param(
-    "je.env.checkLeaks",
+    "noxu.env.checkLeaks",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -252,7 +251,7 @@ pub static ENV_CHECK_LEAKS: ConfigParam = ConfigParam::bool_param(
 
 /// If true, yield the thread after each latch acquisition (for testing).
 pub static ENV_FORCED_YIELD: ConfigParam = ConfigParam::bool_param(
-    "je.env.forcedYield",
+    "noxu.env.forcedYield",
     false, // default
     false, // mutable
     false, // forReplication
@@ -260,7 +259,7 @@ pub static ENV_FORCED_YIELD: ConfigParam = ConfigParam::bool_param(
 
 /// If true, enable TTL (time-to-live) expiration.
 pub static ENV_EXPIRATION_ENABLED: ConfigParam = ConfigParam::bool_param(
-    "je.env.expirationEnabled",
+    "noxu.env.expirationEnabled",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -268,7 +267,7 @@ pub static ENV_EXPIRATION_ENABLED: ConfigParam = ConfigParam::bool_param(
 
 /// Number of processed entries after which the database cache is cleared.
 pub static ENV_DB_CACHE_CLEAR_COUNT: ConfigParam = ConfigParam::int_param(
-    "je.env.dbCacheClearCount",
+    "noxu.env.dbCacheClearCount",
     Some(1), // min
     None,    // max
     100,     // default
@@ -282,7 +281,7 @@ pub static ENV_DB_CACHE_CLEAR_COUNT: ConfigParam = ConfigParam::int_param(
 
 /// If true, run the IN compressor daemon thread.
 pub static ENV_RUN_IN_COMPRESSOR: ConfigParam = ConfigParam::bool_param(
-    "je.env.runINCompressor",
+    "noxu.env.runINCompressor",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -290,7 +289,7 @@ pub static ENV_RUN_IN_COMPRESSOR: ConfigParam = ConfigParam::bool_param(
 
 /// If true, run the evictor daemon threads.
 pub static ENV_RUN_EVICTOR: ConfigParam = ConfigParam::bool_param(
-    "je.env.runEvictor",
+    "noxu.env.runEvictor",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -298,7 +297,7 @@ pub static ENV_RUN_EVICTOR: ConfigParam = ConfigParam::bool_param(
 
 /// If true, run the off-heap evictor daemon threads.
 pub static ENV_RUN_OFFHEAP_EVICTOR: ConfigParam = ConfigParam::bool_param(
-    "je.env.runOffHeapEvictor",
+    "noxu.env.runOffHeapEvictor",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -306,7 +305,7 @@ pub static ENV_RUN_OFFHEAP_EVICTOR: ConfigParam = ConfigParam::bool_param(
 
 /// If true, run the cleaner daemon threads.
 pub static ENV_RUN_CLEANER: ConfigParam = ConfigParam::bool_param(
-    "je.env.runCleaner",
+    "noxu.env.runCleaner",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -314,7 +313,7 @@ pub static ENV_RUN_CLEANER: ConfigParam = ConfigParam::bool_param(
 
 /// If true, run the checkpointer daemon thread.
 pub static ENV_RUN_CHECKPOINTER: ConfigParam = ConfigParam::bool_param(
-    "je.env.runCheckpointer",
+    "noxu.env.runCheckpointer",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -322,7 +321,7 @@ pub static ENV_RUN_CHECKPOINTER: ConfigParam = ConfigParam::bool_param(
 
 /// If true, run the background verifier daemon.
 pub static ENV_RUN_VERIFIER: ConfigParam = ConfigParam::bool_param(
-    "je.env.runVerifier",
+    "noxu.env.runVerifier",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -330,7 +329,7 @@ pub static ENV_RUN_VERIFIER: ConfigParam = ConfigParam::bool_param(
 
 /// Maximum reads per second for background threads (0 = unlimited).
 pub static ENV_BACKGROUND_READ_LIMIT: ConfigParam = ConfigParam::int_param(
-    "je.env.backgroundReadLimit",
+    "noxu.env.backgroundReadLimit",
     Some(0), // min
     None,    // max
     0,       // default: unlimited
@@ -340,7 +339,7 @@ pub static ENV_BACKGROUND_READ_LIMIT: ConfigParam = ConfigParam::int_param(
 
 /// Maximum writes per second for background threads (0 = unlimited).
 pub static ENV_BACKGROUND_WRITE_LIMIT: ConfigParam = ConfigParam::int_param(
-    "je.env.backgroundWriteLimit",
+    "noxu.env.backgroundWriteLimit",
     Some(0), // min
     None,    // max
     0,       // default: unlimited
@@ -350,7 +349,7 @@ pub static ENV_BACKGROUND_WRITE_LIMIT: ConfigParam = ConfigParam::int_param(
 
 /// Sleep interval between background thread operations (for rate limiting).
 pub static ENV_BACKGROUND_SLEEP_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.env.backgroundSleepInterval",
+    name: "noxu.env.backgroundSleepInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(1)),
     min: None,
@@ -363,20 +362,20 @@ pub static ENV_BACKGROUND_SLEEP_INTERVAL: ConfigParam = ConfigParam {
 // Log parameters
 // =========================================================================
 
-/// Total memory for log buffers. 0 means compute from je.maxMemory.
+/// Total memory for log buffers. 0 means compute from noxu.maxMemory.
 /// Minimum value: NUM_LOG_BUFFERS_DEFAULT (3) * MIN_LOG_BUFFER_SIZE (2048) = 6144.
 pub static LOG_MEM_SIZE: ConfigParam = ConfigParam::long_param(
-    "je.log.totalBufferBytes",
+    "noxu.log.totalBufferBytes",
     Some(6144), // min: 3 * 2048
     None,       // max
-    0,          // default: computed from je.maxMemory
+    0,          // default: computed from noxu.maxMemory
     false,      // mutable
     false,      // forReplication
 );
 
 /// Number of log buffers.
 pub static LOG_NUM_BUFFERS: ConfigParam = ConfigParam::int_param(
-    "je.log.numBuffers",
+    "noxu.log.numBuffers",
     Some(2), // min
     None,    // max
     3,       // default
@@ -386,7 +385,7 @@ pub static LOG_NUM_BUFFERS: ConfigParam = ConfigParam::int_param(
 
 /// Maximum size of each log buffer in bytes.
 pub static LOG_BUFFER_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.bufferSize",
+    "noxu.log.bufferSize",
     Some(1 << 10), // min: 1 KB
     None,          // max
     1 << 20,       // default: 1 MB
@@ -396,7 +395,7 @@ pub static LOG_BUFFER_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Size of read buffer for log faulting, in bytes.
 pub static LOG_FAULT_READ_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.faultReadSize",
+    "noxu.log.faultReadSize",
     Some(32), // min
     None,     // max
     2048,     // default: 2 KB
@@ -406,7 +405,7 @@ pub static LOG_FAULT_READ_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Size of iterator read buffer for log scanning.
 pub static LOG_ITERATOR_READ_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.iteratorReadSize",
+    "noxu.log.iteratorReadSize",
     Some(128), // min
     None,      // max
     8192,      // default: 8 KB
@@ -416,7 +415,7 @@ pub static LOG_ITERATOR_READ_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Maximum size of the iterator buffer for log scanning.
 pub static LOG_ITERATOR_MAX_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.iteratorMaxSize",
+    "noxu.log.iteratorMaxSize",
     Some(128),  // min
     None,       // max
     16_777_216, // default: 16 MB
@@ -426,7 +425,7 @@ pub static LOG_ITERATOR_MAX_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Maximum size of a single log file in bytes.
 pub static LOG_FILE_MAX: ConfigParam = ConfigParam::long_param(
-    "je.log.fileMax",
+    "noxu.log.fileMax",
     Some(1_000_000),     // min: 1 MB
     Some(1_073_741_824), // max: 1 GB
     10_000_000,          // default: 10 MB
@@ -436,7 +435,7 @@ pub static LOG_FILE_MAX: ConfigParam = ConfigParam::long_param(
 
 /// Number of data directories for log striping (0 = single directory).
 pub static LOG_N_DATA_DIRECTORIES: ConfigParam = ConfigParam::int_param(
-    "je.log.nDataDirectories",
+    "noxu.log.nDataDirectories",
     Some(0),   // min
     Some(256), // max
     0,         // default: no striping
@@ -446,7 +445,7 @@ pub static LOG_N_DATA_DIRECTORIES: ConfigParam = ConfigParam::int_param(
 
 /// If true, verify checksums when reading log entries.
 pub static LOG_CHECKSUM_READ: ConfigParam = ConfigParam::bool_param(
-    "je.log.checksumRead",
+    "noxu.log.checksumRead",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -454,7 +453,7 @@ pub static LOG_CHECKSUM_READ: ConfigParam = ConfigParam::bool_param(
 
 /// If true, verify all checksums at startup (not just on read).
 pub static LOG_VERIFY_CHECKSUMS: ConfigParam = ConfigParam::bool_param(
-    "je.log.verifyChecksums",
+    "noxu.log.verifyChecksums",
     false, // default
     false, // mutable
     false, // forReplication
@@ -462,7 +461,7 @@ pub static LOG_VERIFY_CHECKSUMS: ConfigParam = ConfigParam::bool_param(
 
 /// If true, the environment uses an in-memory log (no files).
 pub static LOG_MEM_ONLY: ConfigParam = ConfigParam::bool_param(
-    "je.log.memOnly",
+    "noxu.log.memOnly",
     false, // default
     false, // mutable
     false, // forReplication
@@ -470,7 +469,7 @@ pub static LOG_MEM_ONLY: ConfigParam = ConfigParam::bool_param(
 
 /// Number of log file handle descriptors to cache.
 pub static LOG_FILE_CACHE_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.fileCacheSize",
+    "noxu.log.fileCacheSize",
     Some(3), // min
     None,    // max
     100,     // default
@@ -480,7 +479,7 @@ pub static LOG_FILE_CACHE_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Experimental warm-up file read size in bytes (0 = disabled).
 pub static LOG_FILE_WARM_UP_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.fileWarmUpSize",
+    "noxu.log.fileWarmUpSize",
     Some(0), // min
     None,    // max
     0,       // default: disabled
@@ -490,7 +489,7 @@ pub static LOG_FILE_WARM_UP_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Buffer size for warm-up file reads.
 pub static LOG_FILE_WARM_UP_BUF_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.fileWarmUpReadSize",
+    "noxu.log.fileWarmUpReadSize",
     Some(128),  // min
     None,       // max
     10_485_760, // default: 10 MB
@@ -500,7 +499,7 @@ pub static LOG_FILE_WARM_UP_BUF_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// If true, detect unexpected log file deletion.
 pub static LOG_DETECT_FILE_DELETE: ConfigParam = ConfigParam::bool_param(
-    "je.log.detectFileDelete",
+    "noxu.log.detectFileDelete",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -508,7 +507,7 @@ pub static LOG_DETECT_FILE_DELETE: ConfigParam = ConfigParam::bool_param(
 
 /// Interval at which to check for unexpected file deletions.
 pub static LOG_DETECT_FILE_DELETE_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.log.detectFileDeleteInterval",
+    name: "noxu.log.detectFileDeleteInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(1000)),
     min: None,
@@ -519,7 +518,7 @@ pub static LOG_DETECT_FILE_DELETE_INTERVAL: ConfigParam = ConfigParam {
 
 /// Timeout for fsync operations.
 pub static LOG_FSYNC_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.log.fsyncTimeout",
+    name: "noxu.log.fsyncTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
     min: None,
@@ -530,7 +529,7 @@ pub static LOG_FSYNC_TIMEOUT: ConfigParam = ConfigParam {
 
 /// Time limit for an fsync before logging a warning.
 pub static LOG_FSYNC_TIME_LIMIT: ConfigParam = ConfigParam {
-    name: "je.log.fsyncTimeLimit",
+    name: "noxu.log.fsyncTimeLimit",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
     min: None,
@@ -541,7 +540,7 @@ pub static LOG_FSYNC_TIME_LIMIT: ConfigParam = ConfigParam {
 
 /// Interval for group commit batching. 0 = no group commit.
 pub static LOG_GROUP_COMMIT_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.log.groupCommitInterval",
+    name: "noxu.log.groupCommitInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
     min: None,
@@ -552,7 +551,7 @@ pub static LOG_GROUP_COMMIT_INTERVAL: ConfigParam = ConfigParam {
 
 /// Number of commits to batch before flushing. 0 = no group commit.
 pub static LOG_GROUP_COMMIT_THRESHOLD: ConfigParam = ConfigParam::int_param(
-    "je.log.groupCommitThreshold",
+    "noxu.log.groupCommitThreshold",
     Some(0), // min
     None,    // max
     0,       // default
@@ -562,7 +561,7 @@ pub static LOG_GROUP_COMMIT_THRESHOLD: ConfigParam = ConfigParam::int_param(
 
 /// Interval for periodic log flush with sync durability.
 pub static LOG_FLUSH_SYNC_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.log.flushSyncInterval",
+    name: "noxu.log.flushSyncInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(20)),
     min: None,
@@ -573,7 +572,7 @@ pub static LOG_FLUSH_SYNC_INTERVAL: ConfigParam = ConfigParam {
 
 /// Interval for periodic log flush without sync (write-no-sync).
 pub static LOG_FLUSH_NO_SYNC_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.log.flushNoSyncInterval",
+    name: "noxu.log.flushNoSyncInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
     min: None,
@@ -584,7 +583,7 @@ pub static LOG_FLUSH_NO_SYNC_INTERVAL: ConfigParam = ConfigParam {
 
 /// If true, use O_DSYNC flag for log writes.
 pub static LOG_USE_ODSYNC: ConfigParam = ConfigParam::bool_param(
-    "je.log.useODSYNC",
+    "noxu.log.useODSYNC",
     false, // default
     false, // mutable
     false, // forReplication
@@ -592,7 +591,7 @@ pub static LOG_USE_ODSYNC: ConfigParam = ConfigParam::bool_param(
 
 /// If true, use Java NIO for log writes (deprecated, prefer write queue).
 pub static LOG_USE_NIO: ConfigParam = ConfigParam::bool_param(
-    "je.log.useNIO",
+    "noxu.log.useNIO",
     false, // default
     false, // mutable
     false, // forReplication
@@ -600,7 +599,7 @@ pub static LOG_USE_NIO: ConfigParam = ConfigParam::bool_param(
 
 /// If true, use a write queue for asynchronous log I/O.
 pub static LOG_USE_WRITE_QUEUE: ConfigParam = ConfigParam::bool_param(
-    "je.log.useWriteQueue",
+    "noxu.log.useWriteQueue",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -608,7 +607,7 @@ pub static LOG_USE_WRITE_QUEUE: ConfigParam = ConfigParam::bool_param(
 
 /// Size of the log write queue in bytes (4 KB – 32 MB).
 pub static LOG_WRITE_QUEUE_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.log.writeQueueSize",
+    "noxu.log.writeQueueSize",
     Some(1 << 12), // min: 4 KB
     Some(1 << 28), // max: 256 MB
     1 << 20,       // default: 1 MB
@@ -618,7 +617,7 @@ pub static LOG_WRITE_QUEUE_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Deprecated. Use deferred-write optimisation for temporary databases.
 pub static LOG_DEFERREDWRITE_TEMP: ConfigParam = ConfigParam::bool_param(
-    "je.deferredWrite.temp",
+    "noxu.deferredWrite.temp",
     false, // default
     false, // mutable
     false, // forReplication
@@ -626,7 +625,7 @@ pub static LOG_DEFERREDWRITE_TEMP: ConfigParam = ConfigParam::bool_param(
 
 /// Deprecated compat: whether replication log-flush task is active.
 pub static OLD_REP_RUN_LOG_FLUSH_TASK: ConfigParam = ConfigParam::bool_param(
-    "je.rep.runLogFlushTask",
+    "noxu.rep.runLogFlushTask",
     true, // default
     true, // mutable
     true, // forReplication
@@ -634,7 +633,7 @@ pub static OLD_REP_RUN_LOG_FLUSH_TASK: ConfigParam = ConfigParam::bool_param(
 
 /// Deprecated compat: interval for replication log-flush task.
 pub static OLD_REP_LOG_FLUSH_TASK_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.rep.logFlushTaskInterval",
+    name: "noxu.rep.logFlushTaskInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
     min: None,
@@ -648,19 +647,16 @@ pub static OLD_REP_LOG_FLUSH_TASK_INTERVAL: ConfigParam = ConfigParam {
 // =========================================================================
 
 /// Cron-style schedule for the background verifier (e.g., "0 0 * * *").
-pub static VERIFY_SCHEDULE: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
-    name: "je.env.verifySchedule",
-    param_type: crate::param::ParamType::String,
-    default: ParamValue::String("0 0 * * *".to_string()),
-    min: None,
-    max: None,
-    mutable: true,
-    for_replication: false,
-});
+pub static VERIFY_SCHEDULE: ConfigParam = ConfigParam::string_param(
+    "noxu.env.verifySchedule",
+    "0 0 * * *", // default
+    true,        // mutable
+    false,       // forReplication
+);
 
 /// Maximum tardiness tolerated before skipping a scheduled verification run.
 pub static VERIFY_MAX_TARDINESS: ConfigParam = ConfigParam {
-    name: "je.env.verifyMaxTardiness",
+    name: "noxu.env.verifyMaxTardiness",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
     min: None,
@@ -671,7 +667,7 @@ pub static VERIFY_MAX_TARDINESS: ConfigParam = ConfigParam {
 
 /// If true, verify B-tree structure during background verification.
 pub static VERIFY_BTREE: ConfigParam = ConfigParam::bool_param(
-    "je.env.verifyBtree",
+    "noxu.env.verifyBtree",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -679,7 +675,7 @@ pub static VERIFY_BTREE: ConfigParam = ConfigParam::bool_param(
 
 /// Delay between log entry reads during log verification.
 pub static VERIFY_LOG_READ_DELAY: ConfigParam = ConfigParam {
-    name: "je.env.verifyLogReadDelay",
+    name: "noxu.env.verifyLogReadDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(100)),
     min: None,
@@ -690,7 +686,7 @@ pub static VERIFY_LOG_READ_DELAY: ConfigParam = ConfigParam {
 
 /// If true, verify log checksums during background verification.
 pub static VERIFY_LOG: ConfigParam = ConfigParam::bool_param(
-    "je.env.verifyLog",
+    "noxu.env.verifyLog",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -698,7 +694,7 @@ pub static VERIFY_LOG: ConfigParam = ConfigParam::bool_param(
 
 /// If true, verify secondary database integrity during background verification.
 pub static VERIFY_SECONDARIES: ConfigParam = ConfigParam::bool_param(
-    "je.env.verifySecondaries",
+    "noxu.env.verifySecondaries",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -706,7 +702,7 @@ pub static VERIFY_SECONDARIES: ConfigParam = ConfigParam::bool_param(
 
 /// If true, verify data record checksums during background verification.
 pub static VERIFY_DATA_RECORDS: ConfigParam = ConfigParam::bool_param(
-    "je.env.verifyDataRecords",
+    "noxu.env.verifyDataRecords",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -714,7 +710,7 @@ pub static VERIFY_DATA_RECORDS: ConfigParam = ConfigParam::bool_param(
 
 /// If true, verify that obsolete records are truly obsolete.
 pub static VERIFY_OBSOLETE_RECORDS: ConfigParam = ConfigParam::bool_param(
-    "je.env.verifyObsoleteRecords",
+    "noxu.env.verifyObsoleteRecords",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -722,7 +718,7 @@ pub static VERIFY_OBSOLETE_RECORDS: ConfigParam = ConfigParam::bool_param(
 
 /// Number of B-tree entries verified per batch during background verification.
 pub static VERIFY_BTREE_BATCH_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.env.verifyBtreeBatchSize",
+    "noxu.env.verifyBtreeBatchSize",
     Some(1),     // min
     Some(10000), // max
     1000,        // default
@@ -732,7 +728,7 @@ pub static VERIFY_BTREE_BATCH_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// Delay between B-tree verification batches.
 pub static VERIFY_BTREE_BATCH_DELAY: ConfigParam = ConfigParam {
-    name: "je.env.verifyBtreeBatchDelay",
+    name: "noxu.env.verifyBtreeBatchDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(10)),
     min: None,
@@ -747,7 +743,7 @@ pub static VERIFY_BTREE_BATCH_DELAY: ConfigParam = ConfigParam {
 
 /// Maximum number of entries in an Internal Node (IN).
 pub static NODE_MAX_ENTRIES: ConfigParam = ConfigParam::int_param(
-    "je.nodeMaxEntries",
+    "noxu.nodeMaxEntries",
     Some(4),     // min
     Some(32767), // max
     128,         // default
@@ -757,7 +753,7 @@ pub static NODE_MAX_ENTRIES: ConfigParam = ConfigParam::int_param(
 
 /// Maximum number of entries in a duplicate subtree node.
 pub static NODE_DUP_TREE_MAX_ENTRIES: ConfigParam = ConfigParam::int_param(
-    "je.nodeDupTreeMaxEntries",
+    "noxu.nodeDupTreeMaxEntries",
     Some(4),     // min
     Some(32767), // max
     128,         // default
@@ -767,7 +763,7 @@ pub static NODE_DUP_TREE_MAX_ENTRIES: ConfigParam = ConfigParam::int_param(
 
 /// Maximum size for an embedded LN (data stored directly in BIN slot).
 pub static TREE_MAX_EMBEDDED_LN: ConfigParam = ConfigParam::int_param(
-    "je.tree.maxEmbeddedLN",
+    "noxu.tree.maxEmbeddedLN",
     Some(0), // min
     None,    // max
     16,      // default: 16 bytes
@@ -777,7 +773,7 @@ pub static TREE_MAX_EMBEDDED_LN: ConfigParam = ConfigParam::int_param(
 
 /// Maximum number of BIN-delta slots as a percentage of total BIN slots.
 pub static TREE_BIN_DELTA: ConfigParam = ConfigParam::int_param(
-    "je.tree.binDelta",
+    "noxu.tree.binDelta",
     Some(0),  // min
     Some(75), // max
     25,       // default
@@ -787,7 +783,7 @@ pub static TREE_BIN_DELTA: ConfigParam = ConfigParam::int_param(
 
 /// Whether blind insertions are allowed in BIN-deltas.
 pub static BIN_DELTA_BLIND_OPS: ConfigParam = ConfigParam::bool_param(
-    "je.tree.binDeltaBlindOps",
+    "noxu.tree.binDeltaBlindOps",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -795,7 +791,7 @@ pub static BIN_DELTA_BLIND_OPS: ConfigParam = ConfigParam::bool_param(
 
 /// Whether blind puts (with bloom filters) are allowed in BIN-deltas.
 pub static BIN_DELTA_BLIND_PUTS: ConfigParam = ConfigParam::bool_param(
-    "je.tree.binDeltaBlindPuts",
+    "noxu.tree.binDeltaBlindPuts",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -803,7 +799,7 @@ pub static BIN_DELTA_BLIND_PUTS: ConfigParam = ConfigParam::bool_param(
 
 /// Minimum memory for B-tree nodes, in bytes.
 pub static TREE_MIN_MEMORY: ConfigParam = ConfigParam::long_param(
-    "je.tree.minMemory",
+    "noxu.tree.minMemory",
     Some(50 * 1024),  // min: 50 KB
     None,             // max
     500 * 1024,       // default: 500 KB
@@ -813,7 +809,7 @@ pub static TREE_MIN_MEMORY: ConfigParam = ConfigParam::long_param(
 
 /// Maximum key length for compact (inline) key storage.
 pub static TREE_COMPACT_MAX_KEY_LENGTH: ConfigParam = ConfigParam::int_param(
-    "je.tree.compactMaxKeyLength",
+    "noxu.tree.compactMaxKeyLength",
     Some(0),   // min
     Some(255), // max
     16,        // default
@@ -827,7 +823,7 @@ pub static TREE_COMPACT_MAX_KEY_LENGTH: ConfigParam = ConfigParam::int_param(
 
 /// Wakeup interval for the IN compressor daemon.
 pub static COMPRESSOR_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.compressor.wakeupInterval",
+    name: "noxu.compressor.wakeupInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
     min: None,
@@ -838,7 +834,7 @@ pub static COMPRESSOR_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
 
 /// Number of times to retry on lock conflict in compressor.
 pub static COMPRESSOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
-    "je.compressor.deadlockRetry",
+    "noxu.compressor.deadlockRetry",
     Some(0), // min
     None,    // max
     3,       // default
@@ -848,7 +844,7 @@ pub static COMPRESSOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
 
 /// Lock timeout used during IN compressor operations.
 pub static COMPRESSOR_LOCK_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.compressor.lockTimeout",
+    name: "noxu.compressor.lockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
     min: None,
@@ -863,7 +859,7 @@ pub static COMPRESSOR_LOCK_TIMEOUT: ConfigParam = ConfigParam {
 
 /// Number of evictor core threads.
 pub static EVICTOR_CORE_THREADS: ConfigParam = ConfigParam::int_param(
-    "je.evictor.coreThreads",
+    "noxu.evictor.coreThreads",
     Some(0), // min
     None,    // max
     1,       // default
@@ -873,7 +869,7 @@ pub static EVICTOR_CORE_THREADS: ConfigParam = ConfigParam::int_param(
 
 /// Maximum number of evictor threads.
 pub static EVICTOR_MAX_THREADS: ConfigParam = ConfigParam::int_param(
-    "je.evictor.maxThreads",
+    "noxu.evictor.maxThreads",
     Some(1), // min
     None,    // max
     10,      // default
@@ -883,7 +879,7 @@ pub static EVICTOR_MAX_THREADS: ConfigParam = ConfigParam::int_param(
 
 /// Keep-alive time for idle evictor threads.
 pub static EVICTOR_KEEP_ALIVE: ConfigParam = ConfigParam {
-    name: "je.evictor.keepAlive",
+    name: "noxu.evictor.keepAlive",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10 * 60)), // 10 min
     min: None,
@@ -894,7 +890,7 @@ pub static EVICTOR_KEEP_ALIVE: ConfigParam = ConfigParam {
 
 /// Timeout waiting for evictor pool termination at shutdown.
 pub static EVICTOR_TERMINATE_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.env.terminateTimeout",
+    name: "noxu.env.terminateTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10)),
     min: None,
@@ -905,7 +901,7 @@ pub static EVICTOR_TERMINATE_TIMEOUT: ConfigParam = ConfigParam {
 
 /// If true, allow BIN-delta eviction.
 pub static EVICTOR_ALLOW_BIN_DELTAS: ConfigParam = ConfigParam::bool_param(
-    "je.evictor.allowBinDeltas",
+    "noxu.evictor.allowBinDeltas",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -913,7 +909,7 @@ pub static EVICTOR_ALLOW_BIN_DELTAS: ConfigParam = ConfigParam::bool_param(
 
 /// If true, mutate BINs to BIN-deltas during eviction (internal/debug only).
 pub static EVICTOR_MUTATE_BINS: ConfigParam = ConfigParam::bool_param(
-    "je.evictor.mutateBins",
+    "noxu.evictor.mutateBins",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -921,7 +917,7 @@ pub static EVICTOR_MUTATE_BINS: ConfigParam = ConfigParam::bool_param(
 
 /// Number of bytes to evict in each eviction pass.
 pub static EVICTOR_EVICT_BYTES: ConfigParam = ConfigParam::long_param(
-    "je.evictor.evictBytes",
+    "noxu.evictor.evictBytes",
     Some(1024), // min
     None,       // max
     524_288,    // default: 512 KB
@@ -931,7 +927,7 @@ pub static EVICTOR_EVICT_BYTES: ConfigParam = ConfigParam::long_param(
 
 /// Critical percentage above which eviction is more aggressive.
 pub static EVICTOR_CRITICAL_PERCENTAGE: ConfigParam = ConfigParam::int_param(
-    "je.evictor.criticalPercentage",
+    "noxu.evictor.criticalPercentage",
     Some(0),    // min
     Some(1000), // max
     0,          // default: disabled
@@ -941,7 +937,7 @@ pub static EVICTOR_CRITICAL_PERCENTAGE: ConfigParam = ConfigParam::int_param(
 
 /// If true, use a 2-level LRU: dirty nodes are moved to a second level.
 pub static EVICTOR_USE_DIRTY_LRU: ConfigParam = ConfigParam::bool_param(
-    "je.evictor.useDirtyLRU",
+    "noxu.evictor.useDirtyLRU",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -949,7 +945,7 @@ pub static EVICTOR_USE_DIRTY_LRU: ConfigParam = ConfigParam::bool_param(
 
 /// Number of LRU lists used by the evictor (for concurrency).
 pub static EVICTOR_N_LRU_LISTS: ConfigParam = ConfigParam::int_param(
-    "je.evictor.nLRULists",
+    "noxu.evictor.nLRULists",
     Some(1),  // min
     Some(32), // max
     4,        // default
@@ -959,7 +955,7 @@ pub static EVICTOR_N_LRU_LISTS: ConfigParam = ConfigParam::int_param(
 
 /// If true, yield the thread after each evictor step (for testing).
 pub static EVICTOR_FORCED_YIELD: ConfigParam = ConfigParam::bool_param(
-    "je.evictor.forcedYield",
+    "noxu.evictor.forcedYield",
     false, // default
     false, // mutable
     false, // forReplication
@@ -971,7 +967,7 @@ pub static EVICTOR_FORCED_YIELD: ConfigParam = ConfigParam::bool_param(
 
 /// Number of bytes to evict from the off-heap cache per pass.
 pub static OFFHEAP_EVICT_BYTES: ConfigParam = ConfigParam::long_param(
-    "je.offHeap.evictBytes",
+    "noxu.offHeap.evictBytes",
     Some(1024),           // min
     None,                 // max
     50 * 1024 * 1024,     // default: 50 MB
@@ -981,7 +977,7 @@ pub static OFFHEAP_EVICT_BYTES: ConfigParam = ConfigParam::long_param(
 
 /// If true, store checksums in off-heap cache entries.
 pub static OFFHEAP_CHECKSUM: ConfigParam = ConfigParam::bool_param(
-    "je.offHeap.checksum",
+    "noxu.offHeap.checksum",
     false, // default
     false, // mutable
     false, // forReplication
@@ -989,7 +985,7 @@ pub static OFFHEAP_CHECKSUM: ConfigParam = ConfigParam::bool_param(
 
 /// Number of off-heap evictor core threads.
 pub static OFFHEAP_CORE_THREADS: ConfigParam = ConfigParam::int_param(
-    "je.offHeap.coreThreads",
+    "noxu.offHeap.coreThreads",
     Some(0), // min
     None,    // max
     1,       // default
@@ -999,7 +995,7 @@ pub static OFFHEAP_CORE_THREADS: ConfigParam = ConfigParam::int_param(
 
 /// Maximum number of off-heap evictor threads.
 pub static OFFHEAP_MAX_THREADS: ConfigParam = ConfigParam::int_param(
-    "je.offHeap.maxThreads",
+    "noxu.offHeap.maxThreads",
     Some(1), // min
     None,    // max
     3,       // default
@@ -1009,7 +1005,7 @@ pub static OFFHEAP_MAX_THREADS: ConfigParam = ConfigParam::int_param(
 
 /// Keep-alive time for idle off-heap evictor threads.
 pub static OFFHEAP_KEEP_ALIVE: ConfigParam = ConfigParam {
-    name: "je.offHeap.keepAlive",
+    name: "noxu.offHeap.keepAlive",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10 * 60)), // 10 min
     min: None,
@@ -1021,7 +1017,7 @@ pub static OFFHEAP_KEEP_ALIVE: ConfigParam = ConfigParam {
 /// Number of LRU lists used by the off-heap evictor (for concurrency).
 /// Note: reuses the same property name as EVICTOR_N_LRU_LISTS.
 pub static OFFHEAP_N_LRU_LISTS: ConfigParam = ConfigParam::int_param(
-    "je.evictor.nLRULists",
+    "noxu.evictor.nLRULists",
     Some(1),  // min
     Some(32), // max
     4,        // default
@@ -1035,7 +1031,7 @@ pub static OFFHEAP_N_LRU_LISTS: ConfigParam = ConfigParam::int_param(
 
 /// Number of bytes written between checkpoints. 0 means use time-based interval.
 pub static CHECKPOINTER_BYTES_INTERVAL: ConfigParam = ConfigParam::long_param(
-    "je.checkpointer.bytesInterval",
+    "noxu.checkpointer.bytesInterval",
     Some(0),    // min
     None,       // max (Long.MAX_VALUE)
     20_000_000, // default: 20 MB
@@ -1045,7 +1041,7 @@ pub static CHECKPOINTER_BYTES_INTERVAL: ConfigParam = ConfigParam::long_param(
 
 /// Time between checkpoints. 0 means use bytes-based interval.
 pub static CHECKPOINTER_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.checkpointer.wakeupInterval",
+    name: "noxu.checkpointer.wakeupInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
     min: None,
@@ -1056,7 +1052,7 @@ pub static CHECKPOINTER_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
 
 /// Number of times to retry on lock conflict during checkpoint.
 pub static CHECKPOINTER_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
-    "je.checkpointer.deadlockRetry",
+    "noxu.checkpointer.deadlockRetry",
     Some(0), // min
     None,    // max
     3,       // default
@@ -1066,7 +1062,7 @@ pub static CHECKPOINTER_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
 
 /// If true, the checkpointer runs at high priority (flushes more aggressively).
 pub static CHECKPOINTER_HIGH_PRIORITY: ConfigParam = ConfigParam::bool_param(
-    "je.checkpointer.highPriority",
+    "noxu.checkpointer.highPriority",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1078,7 +1074,7 @@ pub static CHECKPOINTER_HIGH_PRIORITY: ConfigParam = ConfigParam::bool_param(
 
 /// Minimum utilization percentage below which log files become candidates for cleaning.
 pub static CLEANER_MIN_UTILIZATION: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.minUtilization",
+    "noxu.cleaner.minUtilization",
     Some(0),  // min
     Some(90), // max
     50,       // default
@@ -1088,7 +1084,7 @@ pub static CLEANER_MIN_UTILIZATION: ConfigParam = ConfigParam::int_param(
 
 /// Minimum utilization of individual log files; files below this are cleaned.
 pub static CLEANER_MIN_FILE_UTILIZATION: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.minFileUtilization",
+    "noxu.cleaner.minFileUtilization",
     Some(0),  // min
     Some(50), // max
     5,        // default
@@ -1098,7 +1094,7 @@ pub static CLEANER_MIN_FILE_UTILIZATION: ConfigParam = ConfigParam::int_param(
 
 /// Number of bytes written between cleaner wakeups. 0 means time-based.
 pub static CLEANER_BYTES_INTERVAL: ConfigParam = ConfigParam::long_param(
-    "je.cleaner.bytesInterval",
+    "noxu.cleaner.bytesInterval",
     Some(0), // min
     None,    // max
     0,       // default: use time-based wakeup
@@ -1108,7 +1104,7 @@ pub static CLEANER_BYTES_INTERVAL: ConfigParam = ConfigParam::long_param(
 
 /// Wakeup interval for the cleaner daemon.
 pub static CLEANER_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.cleaner.wakeupInterval",
+    name: "noxu.cleaner.wakeupInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10)),
     min: None,
@@ -1119,7 +1115,7 @@ pub static CLEANER_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
 
 /// If true, fetch the obsolete LN size before cleaning (for accurate stats).
 pub static CLEANER_FETCH_OBSOLETE_SIZE: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.fetchObsoleteSize",
+    "noxu.cleaner.fetchObsoleteSize",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1127,7 +1123,7 @@ pub static CLEANER_FETCH_OBSOLETE_SIZE: ConfigParam = ConfigParam::bool_param(
 
 /// Number of times to retry a cleaner operation on lock conflict.
 pub static CLEANER_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.deadlockRetry",
+    "noxu.cleaner.deadlockRetry",
     Some(0), // min
     None,    // max
     3,       // default
@@ -1137,7 +1133,7 @@ pub static CLEANER_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
 
 /// Lock timeout for cleaner lock acquisitions.
 pub static CLEANER_LOCK_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.cleaner.lockTimeout",
+    name: "noxu.cleaner.lockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
     min: None,
@@ -1148,7 +1144,7 @@ pub static CLEANER_LOCK_TIMEOUT: ConfigParam = ConfigParam {
 
 /// If true, delete cleaned log files (expunge). If false, rename them.
 pub static CLEANER_REMOVE: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.expunge",
+    "noxu.cleaner.expunge",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -1156,7 +1152,7 @@ pub static CLEANER_REMOVE: ConfigParam = ConfigParam::bool_param(
 
 /// If true, move cleaned files to a "deleted" subdirectory instead of deleting them.
 pub static CLEANER_USE_DELETED_DIR: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.useDeletedDir",
+    "noxu.cleaner.useDeletedDir",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1164,7 +1160,7 @@ pub static CLEANER_USE_DELETED_DIR: ConfigParam = ConfigParam::bool_param(
 
 /// Minimum age of a log file in number of files before it can be cleaned.
 pub static CLEANER_MIN_AGE: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.minAge",
+    "noxu.cleaner.minAge",
     Some(1),    // min
     Some(1000), // max
     2,          // default
@@ -1174,7 +1170,7 @@ pub static CLEANER_MIN_AGE: ConfigParam = ConfigParam::int_param(
 
 /// Maximum number of log files cleaned in one cleaner run. 0 means unlimited.
 pub static CLEANER_MAX_BATCH_FILES: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.maxBatchFiles",
+    "noxu.cleaner.maxBatchFiles",
     Some(0),      // min
     Some(100000), // max
     0,            // default: unlimited
@@ -1184,7 +1180,7 @@ pub static CLEANER_MAX_BATCH_FILES: ConfigParam = ConfigParam::int_param(
 
 /// Read buffer size for the cleaner. 0 means use LOG_ITERATOR_READ_SIZE.
 pub static CLEANER_READ_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.readSize",
+    "noxu.cleaner.readSize",
     Some(128), // min
     None,      // max
     0,         // default: use log iterator size
@@ -1194,7 +1190,7 @@ pub static CLEANER_READ_SIZE: ConfigParam = ConfigParam::int_param(
 
 /// DiskOrderedScan producer queue timeout.
 pub static DOS_PRODUCER_QUEUE_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.env.diskOrderedScanLockTimeout",
+    name: "noxu.env.diskOrderedScanLockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10)),
     min: None,
@@ -1205,7 +1201,7 @@ pub static DOS_PRODUCER_QUEUE_TIMEOUT: ConfigParam = ConfigParam {
 
 /// If true, the cleaner tracks and stores detail info for cheaper cleaning.
 pub static CLEANER_TRACK_DETAIL: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.trackDetail",
+    "noxu.cleaner.trackDetail",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -1213,7 +1209,7 @@ pub static CLEANER_TRACK_DETAIL: ConfigParam = ConfigParam::bool_param(
 
 /// If true, data expires gradually to prevent cleaning spikes at hour/day boundaries.
 pub static CLEANER_GRADUAL_EXPIRATION: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.gradualExpiration",
+    "noxu.cleaner.gradualExpiration",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -1221,7 +1217,7 @@ pub static CLEANER_GRADUAL_EXPIRATION: ConfigParam = ConfigParam::bool_param(
 
 /// Utilization gap between min and max before triggering two-pass cleaning.
 pub static CLEANER_TWO_PASS_GAP: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.twoPassGap",
+    "noxu.cleaner.twoPassGap",
     Some(1),   // min
     Some(100), // max
     10,        // default
@@ -1231,7 +1227,7 @@ pub static CLEANER_TWO_PASS_GAP: ConfigParam = ConfigParam::int_param(
 
 /// Utilization threshold for two-pass cleaning. 0 = CLEANER_MIN_UTILIZATION - 5.
 pub static CLEANER_TWO_PASS_THRESHOLD: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.twoPassThreshold",
+    "noxu.cleaner.twoPassThreshold",
     Some(0),   // min
     Some(100), // max
     0,         // default
@@ -1241,7 +1237,7 @@ pub static CLEANER_TWO_PASS_THRESHOLD: ConfigParam = ConfigParam::int_param(
 
 /// Maximum percentage of cache used for cleaner detail tracking.
 pub static CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.detailMaxMemoryPercentage",
+    "noxu.cleaner.detailMaxMemoryPercentage",
     Some(1),  // min
     Some(90), // max
     2,        // default
@@ -1251,26 +1247,23 @@ pub static CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE: ConfigParam = ConfigParam::int_
 
 /// If true, discard potentially invalid cleaner detail info from old log formats.
 pub static CLEANER_RMW_FIX: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.rmwFix",
+    "noxu.cleaner.rmwFix",
     true,  // default
     false, // mutable
     false, // forReplication
 );
 
 /// Comma-separated list of log files to force-clean (by file number range).
-pub static CLEANER_FORCE_CLEAN_FILES: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
-    name: "je.cleaner.forceCleanFiles",
-    param_type: crate::param::ParamType::String,
-    default: ParamValue::String(String::new()),
-    min: None,
-    max: None,
-    mutable: true,
-    for_replication: false,
-});
+pub static CLEANER_FORCE_CLEAN_FILES: ConfigParam = ConfigParam::string_param(
+    "noxu.cleaner.forceCleanFiles",
+    "", // default: empty (no forced files)
+    true,  // mutable
+    false, // forReplication
+);
 
 /// Log version to upgrade to during cleaning. 0 = no upgrade. -1 = current.
 pub static CLEANER_UPGRADE_TO_LOG_VERSION: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.upgradeToLogVersion",
+    "noxu.cleaner.upgradeToLogVersion",
     Some(-1), // min
     None,     // max
     0,        // default
@@ -1280,7 +1273,7 @@ pub static CLEANER_UPGRADE_TO_LOG_VERSION: ConfigParam = ConfigParam::int_param(
 
 /// Number of cleaner threads.
 pub static CLEANER_THREADS: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.threads",
+    "noxu.cleaner.threads",
     Some(1), // min
     None,    // max
     1,       // default
@@ -1290,7 +1283,7 @@ pub static CLEANER_THREADS: ConfigParam = ConfigParam::int_param(
 
 /// Number of LookAheadCache entries for the cleaner.
 pub static CLEANER_LOOK_AHEAD_CACHE_SIZE: ConfigParam = ConfigParam::int_param(
-    "je.cleaner.lookAheadCacheSize",
+    "noxu.cleaner.lookAheadCacheSize",
     Some(0), // min
     None,    // max
     8192,    // default: 8 KB
@@ -1298,9 +1291,9 @@ pub static CLEANER_LOOK_AHEAD_CACHE_SIZE: ConfigParam = ConfigParam::int_param(
     false,   // forReplication
 );
 
-/// Deprecated. Retained to avoid errors in old je.properties files.
+/// Deprecated. Retained to avoid errors in old noxu.properties files.
 pub static CLEANER_BACKGROUND_PROACTIVE_MIGRATION: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.backgroundProactiveMigration",
+    "noxu.cleaner.backgroundProactiveMigration",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1312,7 +1305,7 @@ pub static CLEANER_BACKGROUND_PROACTIVE_MIGRATION: ConfigParam = ConfigParam::bo
 
 /// Number of lock tables (for lock striping).
 pub static LOCK_N_LOCK_TABLES: ConfigParam = ConfigParam::int_param(
-    "je.lock.nLockTables",
+    "noxu.lock.nLockTables",
     Some(1),     // min
     Some(32767), // max
     1,           // default
@@ -1322,7 +1315,7 @@ pub static LOCK_N_LOCK_TABLES: ConfigParam = ConfigParam::int_param(
 
 /// Lock timeout duration. 0 means no timeout.
 pub static LOCK_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.lock.timeout",
+    name: "noxu.lock.timeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
     min: None,
@@ -1333,7 +1326,7 @@ pub static LOCK_TIMEOUT: ConfigParam = ConfigParam {
 
 /// If true, enable automatic deadlock detection.
 pub static LOCK_DEADLOCK_DETECT: ConfigParam = ConfigParam::bool_param(
-    "je.lock.deadlockDetect",
+    "noxu.lock.deadlockDetect",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -1341,7 +1334,7 @@ pub static LOCK_DEADLOCK_DETECT: ConfigParam = ConfigParam::bool_param(
 
 /// Delay before deadlock detection begins after a lock conflict.
 pub static LOCK_DEADLOCK_DETECT_DELAY: ConfigParam = ConfigParam {
-    name: "je.lock.deadlockDetectDelay",
+    name: "noxu.lock.deadlockDetectDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
     min: None,
@@ -1352,7 +1345,7 @@ pub static LOCK_DEADLOCK_DETECT_DELAY: ConfigParam = ConfigParam {
 
 /// If true, throw legacy-style lock exceptions (LockException, etc.).
 pub static LOCK_OLD_LOCK_EXCEPTIONS: ConfigParam = ConfigParam::bool_param(
-    "je.lock.oldLockExceptions",
+    "noxu.lock.oldLockExceptions",
     false, // default
     false, // mutable
     false, // forReplication
@@ -1360,7 +1353,7 @@ pub static LOCK_OLD_LOCK_EXCEPTIONS: ConfigParam = ConfigParam::bool_param(
 
 /// Transaction timeout duration. 0 means no timeout.
 pub static TXN_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.txn.timeout",
+    name: "noxu.txn.timeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
     min: None,
@@ -1371,7 +1364,7 @@ pub static TXN_TIMEOUT: ConfigParam = ConfigParam {
 
 /// If true, all transactions use serializable isolation by default.
 pub static TXN_SERIALIZABLE_ISOLATION: ConfigParam = ConfigParam::bool_param(
-    "je.txn.serializableIsolation",
+    "noxu.txn.serializableIsolation",
     false, // default
     false, // mutable
     false, // forReplication
@@ -1379,7 +1372,7 @@ pub static TXN_SERIALIZABLE_ISOLATION: ConfigParam = ConfigParam::bool_param(
 
 /// If true, include a stack trace in deadlock exception messages.
 pub static TXN_DEADLOCK_STACK_TRACE: ConfigParam = ConfigParam::bool_param(
-    "je.txn.deadlockStackTrace",
+    "noxu.txn.deadlockStackTrace",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1387,22 +1380,19 @@ pub static TXN_DEADLOCK_STACK_TRACE: ConfigParam = ConfigParam::bool_param(
 
 /// If true, dump all lock tables when a deadlock occurs.
 pub static TXN_DUMP_LOCKS: ConfigParam = ConfigParam::bool_param(
-    "je.txn.dumpLocks",
+    "noxu.txn.dumpLocks",
     false, // default
     true,  // mutable
     false, // forReplication
 );
 
 /// Default durability policy (as a string). Null means use sync defaults.
-pub static TXN_DURABILITY: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
-    name: "je.txn.durability",
-    param_type: crate::param::ParamType::String,
-    default: ParamValue::String(String::new()),
-    min: None,
-    max: None,
-    mutable: true,
-    for_replication: false,
-});
+pub static TXN_DURABILITY: ConfigParam = ConfigParam::string_param(
+    "noxu.txn.durability",
+    "", // default: empty (use sync defaults)
+    true,  // mutable
+    false, // forReplication
+);
 
 // =========================================================================
 // Stats / startup parameters
@@ -1410,7 +1400,7 @@ pub static TXN_DURABILITY: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam 
 
 /// If environment startup exceeds this duration, startup statistics are logged.
 pub static STARTUP_DUMP_THRESHOLD: ConfigParam = ConfigParam {
-    name: "je.env.startupThreshold",
+    name: "noxu.env.startupThreshold",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
     min: None,
@@ -1421,7 +1411,7 @@ pub static STARTUP_DUMP_THRESHOLD: ConfigParam = ConfigParam {
 
 /// If true, collect statistics in a stats CSV file.
 pub static STATS_COLLECT: ConfigParam = ConfigParam::bool_param(
-    "je.stats.collect",
+    "noxu.stats.collect",
     true,  // default
     true,  // mutable
     false, // forReplication
@@ -1429,7 +1419,7 @@ pub static STATS_COLLECT: ConfigParam = ConfigParam::bool_param(
 
 /// Number of rows per stats file before rotating to a new file.
 pub static STATS_FILE_ROW_COUNT: ConfigParam = ConfigParam::int_param(
-    "je.stats.file.row.count",
+    "noxu.stats.file.row.count",
     Some(2),  // min
     None,     // max
     1440,     // default
@@ -1439,7 +1429,7 @@ pub static STATS_FILE_ROW_COUNT: ConfigParam = ConfigParam::int_param(
 
 /// Maximum number of stats files to retain.
 pub static STATS_MAX_FILES: ConfigParam = ConfigParam::int_param(
-    "je.stats.max.files",
+    "noxu.stats.max.files",
     Some(1), // min
     None,    // max
     10,      // default
@@ -1449,7 +1439,7 @@ pub static STATS_MAX_FILES: ConfigParam = ConfigParam::int_param(
 
 /// Interval at which statistics are collected.
 pub static STATS_COLLECT_INTERVAL: ConfigParam = ConfigParam {
-    name: "je.stats.collect.interval",
+    name: "noxu.stats.collect.interval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(60)), // 1 min
     min: None,
@@ -1459,75 +1449,66 @@ pub static STATS_COLLECT_INTERVAL: ConfigParam = ConfigParam {
 };
 
 /// Directory for stats files (empty string = environment home directory).
-pub static STATS_FILE_DIRECTORY: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
-    name: "je.stats.file.directory",
-    param_type: crate::param::ParamType::String,
-    default: ParamValue::String(String::new()),
-    min: None,
-    max: None,
-    mutable: false,
-    for_replication: false,
-});
+pub static STATS_FILE_DIRECTORY: ConfigParam = ConfigParam::string_param(
+    "noxu.stats.file.directory",
+    "", // default: empty (use env home dir)
+    false, // mutable
+    false, // forReplication
+);
 
 // =========================================================================
 // Logging parameters
 // =========================================================================
 
 /// If true, exceptions and critical events are written to the .jdb log files.
-pub static JE_LOGGING_DBLOG: ConfigParam = ConfigParam::bool_param(
-    "je.env.logTrace",
+pub static LOGGING_DBLOG: ConfigParam = ConfigParam::bool_param(
+    "noxu.env.logTrace",
     true,  // default
     false, // mutable
     false, // forReplication
 );
 
 /// Log level for the console (stdout) logging handler.
-pub static JE_CONSOLE_LEVEL: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
-    name: "je.consoleHandler.level",
-    param_type: crate::param::ParamType::String,
-    default: ParamValue::String("OFF".to_string()),
-    min: None,
-    max: None,
-    mutable: true,
-    for_replication: false,
-});
+pub static CONSOLE_HANDLER_LEVEL: ConfigParam = ConfigParam::string_param(
+    "noxu.consoleHandler.level",
+    "OFF", // default
+    true,  // mutable
+    false, // forReplication
+);
 
 /// Log level for the file logging handler.
-pub static JE_FILE_LEVEL: LazyLock<ConfigParam> = LazyLock::new(|| ConfigParam {
-    name: "je.fileHandler.level",
-    param_type: crate::param::ParamType::String,
-    default: ParamValue::String("INFO".to_string()),
-    min: None,
-    max: None,
-    mutable: true,
-    for_replication: false,
-});
+pub static FILE_HANDLER_LEVEL: ConfigParam = ConfigParam::string_param(
+    "noxu.fileHandler.level",
+    "INFO", // default
+    true,   // mutable
+    false,  // forReplication
+);
 
 // =========================================================================
 // Deprecated / compat parameters
-// Retained to avoid errors when old je.properties files are used.
+// Retained to avoid errors when old noxu.properties files are used.
 // =========================================================================
 
 /// Deprecated. Adjustments are no longer needed because LN log
 /// sizes are stored in the B-tree.
 pub static CLEANER_ADJUST_UTILIZATION: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.adjustUtilization",
+    "noxu.cleaner.adjustUtilization",
     false, // default
     true,  // mutable
     false, // forReplication
 );
 
-/// @deprecated. Retained to avoid errors in old je.properties files.
+/// @deprecated. Retained to avoid errors in old noxu.properties files.
 pub static CLEANER_FOREGROUND_PROACTIVE_MIGRATION: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.foregroundProactiveMigration",
+    "noxu.cleaner.foregroundProactiveMigration",
     false, // default
     true,  // mutable
     false, // forReplication
 );
 
-/// @deprecated. Retained to avoid errors in old je.properties files.
+/// @deprecated. Retained to avoid errors in old noxu.properties files.
 pub static CLEANER_LAZY_MIGRATION: ConfigParam = ConfigParam::bool_param(
-    "je.cleaner.lazyMigration",
+    "noxu.cleaner.lazyMigration",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1536,7 +1517,7 @@ pub static CLEANER_LAZY_MIGRATION: ConfigParam = ConfigParam::bool_param(
 /// If true, compress (remove empty slots from) the root of the B-tree
 /// during compressor runs. Normally only non-root INs are compressed.
 pub static COMPRESSOR_PURGE_ROOT: ConfigParam = ConfigParam::bool_param(
-    "je.compressor.purgeRoot",
+    "noxu.compressor.purgeRoot",
     false, // default
     false, // mutable
     false, // forReplication
@@ -1544,7 +1525,7 @@ pub static COMPRESSOR_PURGE_ROOT: ConfigParam = ConfigParam::bool_param(
 
 /// Deprecated. Replaced by EVICTOR_EVICT_BYTES.
 pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
-    "je.evictor.nodesPerScan",
+    "noxu.evictor.nodesPerScan",
     Some(1),    // min
     Some(1000), // max
     10,         // default
@@ -1554,7 +1535,7 @@ pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
 
 /// Deprecated. Use the evictor thread pool instead.
 pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
-    "je.evictor.deadlockRetry",
+    "noxu.evictor.deadlockRetry",
     Some(0), // min
     None,    // max
     3,       // default
@@ -1564,7 +1545,7 @@ pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
 
 /// Deprecated.
 pub static EVICTOR_LRU_ONLY: ConfigParam = ConfigParam::bool_param(
-    "je.evictor.lruOnly",
+    "noxu.evictor.lruOnly",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -1572,7 +1553,7 @@ pub static EVICTOR_LRU_ONLY: ConfigParam = ConfigParam::bool_param(
 
 /// @deprecated. Use NIO directly; Java NIO direct buffers.
 pub static LOG_DIRECT_NIO: ConfigParam = ConfigParam::bool_param(
-    "je.log.directNIO",
+    "noxu.log.directNIO",
     false, // default
     false, // mutable
     false, // forReplication
@@ -1580,7 +1561,7 @@ pub static LOG_DIRECT_NIO: ConfigParam = ConfigParam::bool_param(
 
 /// @deprecated. NIO chunked write size in bytes. 0 = no chunking.
 pub static LOG_CHUNKED_NIO: ConfigParam = ConfigParam::long_param(
-    "je.log.chunkedNIO",
+    "noxu.log.chunkedNIO",
     Some(0),        // min
     Some(1 << 26),  // max: 64 MB
     0,              // default: no chunking
@@ -1595,7 +1576,7 @@ pub static LOG_CHUNKED_NIO: ConfigParam = ConfigParam::long_param(
 /// Amount of disk space to reserve for internal use, in bytes.
 /// When non-zero, this limit is applied in addition to MAX_DISK and FREE_DISK.
 pub static RESERVED_DISK: ConfigParam = ConfigParam::long_param(
-    "je.reservedDisk",
+    "noxu.reservedDisk",
     Some(0), // min
     None,    // max
     0,       // default: disabled
@@ -1605,7 +1586,7 @@ pub static RESERVED_DISK: ConfigParam = ConfigParam::long_param(
 
 /// If true, operates in test mode — behavior may be modified from normal operation.
 pub static TEST_MODE: ConfigParam = ConfigParam::bool_param(
-    "je.testMode",
+    "noxu.testMode",
     false, // default
     true,  // mutable
     false, // forReplication
@@ -1613,7 +1594,7 @@ pub static TEST_MODE: ConfigParam = ConfigParam::bool_param(
 
 /// Lock timeout used during network restore operations.
 pub static ENV_NETWORK_RESTORE_LOCK_TIMEOUT: ConfigParam = ConfigParam {
-    name: "je.env.networkRestoreLockTimeout",
+    name: "noxu.env.networkRestoreLockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(2 * 60)), // 2 min
     min: None,
@@ -1624,7 +1605,7 @@ pub static ENV_NETWORK_RESTORE_LOCK_TIMEOUT: ConfigParam = ConfigParam {
 
 /// If true, a checksum error in the log is treated as fatal (environment is closed).
 pub static LOG_CHECKSUM_FATAL: ConfigParam = ConfigParam::bool_param(
-    "je.log.checksumFatal",
+    "noxu.log.checksumFatal",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -1632,7 +1613,7 @@ pub static LOG_CHECKSUM_FATAL: ConfigParam = ConfigParam::bool_param(
 
 /// If true, secondary index integrity errors are treated as fatal.
 pub static TREE_SECONDARY_INTEGRITY_FATAL: ConfigParam = ConfigParam::bool_param(
-    "je.tree.secondaryIntegrityFatal",
+    "noxu.tree.secondaryIntegrityFatal",
     true,  // default
     false, // mutable
     false, // forReplication
@@ -1714,7 +1695,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &OLD_REP_RUN_LOG_FLUSH_TASK,
         &OLD_REP_LOG_FLUSH_TASK_INTERVAL,
         // Verification
-        &*VERIFY_SCHEDULE,
+        &VERIFY_SCHEDULE,
         &VERIFY_MAX_TARDINESS,
         &VERIFY_BTREE,
         &VERIFY_LOG_READ_DELAY,
@@ -1781,7 +1762,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &CLEANER_TWO_PASS_THRESHOLD,
         &CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE,
         &CLEANER_RMW_FIX,
-        &*CLEANER_FORCE_CLEAN_FILES,
+        &CLEANER_FORCE_CLEAN_FILES,
         &CLEANER_UPGRADE_TO_LOG_VERSION,
         &CLEANER_THREADS,
         &CLEANER_LOOK_AHEAD_CACHE_SIZE,
@@ -1809,18 +1790,18 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &TXN_SERIALIZABLE_ISOLATION,
         &TXN_DEADLOCK_STACK_TRACE,
         &TXN_DUMP_LOCKS,
-        &*TXN_DURABILITY,
+        &TXN_DURABILITY,
         // Stats / startup
         &STARTUP_DUMP_THRESHOLD,
         &STATS_COLLECT,
         &STATS_FILE_ROW_COUNT,
         &STATS_MAX_FILES,
         &STATS_COLLECT_INTERVAL,
-        &*STATS_FILE_DIRECTORY,
+        &STATS_FILE_DIRECTORY,
         // Logging
-        &JE_LOGGING_DBLOG,
-        &*JE_CONSOLE_LEVEL,
-        &*JE_FILE_LEVEL,
+        &LOGGING_DBLOG,
+        &CONSOLE_HANDLER_LEVEL,
+        &FILE_HANDLER_LEVEL,
         // NoSQL-specific
         &RESERVED_DISK,
         &TEST_MODE,
@@ -1842,73 +1823,73 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_param_names_match_je() {
+    fn test_param_names_correct() {
         // Memory
-        assert_eq!(MAX_MEMORY.name, "je.maxMemory");
-        assert_eq!(MAX_MEMORY_PERCENT.name, "je.maxMemoryPercent");
-        assert_eq!(SHARED_CACHE.name, "je.sharedCache");
-        assert_eq!(MAX_DISK.name, "je.maxDisk");
-        assert_eq!(FREE_DISK.name, "je.freeDisk");
-        assert_eq!(MAX_OFF_HEAP_MEMORY.name, "je.maxOffHeapMemory");
+        assert_eq!(MAX_MEMORY.name, "noxu.maxMemory");
+        assert_eq!(MAX_MEMORY_PERCENT.name, "noxu.maxMemoryPercent");
+        assert_eq!(SHARED_CACHE.name, "noxu.sharedCache");
+        assert_eq!(MAX_DISK.name, "noxu.maxDisk");
+        assert_eq!(FREE_DISK.name, "noxu.freeDisk");
+        assert_eq!(MAX_OFF_HEAP_MEMORY.name, "noxu.maxOffHeapMemory");
 
-        // HALT: uses "je.haltOnCommitAfterChecksumException" (no "env." prefix)
+        // HALT: uses "noxu.haltOnCommitAfterChecksumException" (no "env." prefix)
         assert_eq!(
             HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION.name,
-            "je.haltOnCommitAfterChecksumException"
+            "noxu.haltOnCommitAfterChecksumException"
         );
 
         // Log
-        assert_eq!(LOG_MEM_SIZE.name, "je.log.totalBufferBytes");
-        assert_eq!(LOG_FILE_MAX.name, "je.log.fileMax");
-        assert_eq!(LOG_MEM_ONLY.name, "je.log.memOnly");
-        assert_eq!(LOG_CHECKSUM_READ.name, "je.log.checksumRead");
+        assert_eq!(LOG_MEM_SIZE.name, "noxu.log.totalBufferBytes");
+        assert_eq!(LOG_FILE_MAX.name, "noxu.log.fileMax");
+        assert_eq!(LOG_MEM_ONLY.name, "noxu.log.memOnly");
+        assert_eq!(LOG_CHECKSUM_READ.name, "noxu.log.checksumRead");
 
         // Stats: uses dot-separated sub-keys
-        assert_eq!(STATS_COLLECT.name, "je.stats.collect");
-        assert_eq!(STATS_FILE_ROW_COUNT.name, "je.stats.file.row.count");
-        assert_eq!(STATS_MAX_FILES.name, "je.stats.max.files");
-        assert_eq!(STATS_COLLECT_INTERVAL.name, "je.stats.collect.interval");
-        assert_eq!(STATS_FILE_DIRECTORY.name, "je.stats.file.directory");
+        assert_eq!(STATS_COLLECT.name, "noxu.stats.collect");
+        assert_eq!(STATS_FILE_ROW_COUNT.name, "noxu.stats.file.row.count");
+        assert_eq!(STATS_MAX_FILES.name, "noxu.stats.max.files");
+        assert_eq!(STATS_COLLECT_INTERVAL.name, "noxu.stats.collect.interval");
+        assert_eq!(STATS_FILE_DIRECTORY.name, "noxu.stats.file.directory");
 
-        // Startup threshold: name is "je.env.startupThreshold" (not "Dump")
-        assert_eq!(STARTUP_DUMP_THRESHOLD.name, "je.env.startupThreshold");
+        // Startup threshold: name is "noxu.env.startupThreshold" (not "Dump")
+        assert_eq!(STARTUP_DUMP_THRESHOLD.name, "noxu.env.startupThreshold");
 
         // Evictor
-        assert_eq!(EVICTOR_CORE_THREADS.name, "je.evictor.coreThreads");
-        assert_eq!(EVICTOR_MAX_THREADS.name, "je.evictor.maxThreads");
-        assert_eq!(EVICTOR_EVICT_BYTES.name, "je.evictor.evictBytes");
-        assert_eq!(EVICTOR_N_LRU_LISTS.name, "je.evictor.nLRULists");
+        assert_eq!(EVICTOR_CORE_THREADS.name, "noxu.evictor.coreThreads");
+        assert_eq!(EVICTOR_MAX_THREADS.name, "noxu.evictor.maxThreads");
+        assert_eq!(EVICTOR_EVICT_BYTES.name, "noxu.evictor.evictBytes");
+        assert_eq!(EVICTOR_N_LRU_LISTS.name, "noxu.evictor.nLRULists");
 
-        // Off-heap: reuses "je.evictor.nLRULists" for OFFHEAP_N_LRU_LISTS too
-        assert_eq!(OFFHEAP_N_LRU_LISTS.name, "je.evictor.nLRULists");
+        // Off-heap: reuses "noxu.evictor.nLRULists" for OFFHEAP_N_LRU_LISTS too
+        assert_eq!(OFFHEAP_N_LRU_LISTS.name, "noxu.evictor.nLRULists");
 
         // Cleaner
-        assert_eq!(CLEANER_MIN_UTILIZATION.name, "je.cleaner.minUtilization");
+        assert_eq!(CLEANER_MIN_UTILIZATION.name, "noxu.cleaner.minUtilization");
         assert_eq!(
             CLEANER_MIN_FILE_UTILIZATION.name,
-            "je.cleaner.minFileUtilization"
+            "noxu.cleaner.minFileUtilization"
         );
-        assert_eq!(CLEANER_THREADS.name, "je.cleaner.threads");
-        assert_eq!(CLEANER_REMOVE.name, "je.cleaner.expunge");
+        assert_eq!(CLEANER_THREADS.name, "noxu.cleaner.threads");
+        assert_eq!(CLEANER_REMOVE.name, "noxu.cleaner.expunge");
 
         // Lock / Txn
-        assert_eq!(LOCK_N_LOCK_TABLES.name, "je.lock.nLockTables");
-        assert_eq!(LOCK_TIMEOUT.name, "je.lock.timeout");
-        assert_eq!(TXN_TIMEOUT.name, "je.txn.timeout");
+        assert_eq!(LOCK_N_LOCK_TABLES.name, "noxu.lock.nLockTables");
+        assert_eq!(LOCK_TIMEOUT.name, "noxu.lock.timeout");
+        assert_eq!(TXN_TIMEOUT.name, "noxu.txn.timeout");
 
         // Checkpointer
         assert_eq!(
             CHECKPOINTER_BYTES_INTERVAL.name,
-            "je.checkpointer.bytesInterval"
+            "noxu.checkpointer.bytesInterval"
         );
 
         // NoSQL-specific
-        assert_eq!(RESERVED_DISK.name, "je.reservedDisk");
-        assert_eq!(TEST_MODE.name, "je.testMode");
-        assert_eq!(LOG_CHECKSUM_FATAL.name, "je.log.checksumFatal");
+        assert_eq!(RESERVED_DISK.name, "noxu.reservedDisk");
+        assert_eq!(TEST_MODE.name, "noxu.testMode");
+        assert_eq!(LOG_CHECKSUM_FATAL.name, "noxu.log.checksumFatal");
         assert_eq!(
             TREE_SECONDARY_INTEGRITY_FATAL.name,
-            "je.tree.secondaryIntegrityFatal"
+            "noxu.tree.secondaryIntegrityFatal"
         );
     }
 
@@ -2029,7 +2010,7 @@ mod tests {
         assert_eq!(STATS_FILE_ROW_COUNT.default, ParamValue::Int(1440));
         assert_eq!(STATS_MAX_FILES.default, ParamValue::Int(10));
 
-        // Startup threshold ("je.env.startupThreshold", default 5 min)
+        // Startup threshold ("noxu.env.startupThreshold", default 5 min)
         assert_eq!(
             STARTUP_DUMP_THRESHOLD.default,
             ParamValue::Duration(Duration::from_secs(5 * 60))
@@ -2056,12 +2037,12 @@ mod tests {
             *count += 1;
         }
         for (name, count) in &seen {
-            // The only known intentional duplicate is "je.evictor.nLRULists"
+            // The only known intentional duplicate is "noxu.evictor.nLRULists"
             // (shared by EVICTOR_N_LRU_LISTS and OFFHEAP_N_LRU_LISTS).
-            if *name == "je.evictor.nLRULists" {
+            if *name == "noxu.evictor.nLRULists" {
                 assert_eq!(
                     *count, 2,
-                    "je.evictor.nLRULists should appear exactly twice"
+                    "noxu.evictor.nLRULists should appear exactly twice"
                 );
             } else {
                 assert_eq!(*count, 1, "param '{}' is duplicated", name);
@@ -2074,45 +2055,45 @@ mod tests {
         let params = all_params();
         let names: Vec<&str> = params.iter().map(|p| p.name).collect();
         assert!(
-            names.contains(&"je.cleaner.adjustUtilization"),
+            names.contains(&"noxu.cleaner.adjustUtilization"),
             "CLEANER_ADJUST_UTILIZATION missing"
         );
         assert!(
-            names.contains(&"je.cleaner.foregroundProactiveMigration"),
+            names.contains(&"noxu.cleaner.foregroundProactiveMigration"),
             "CLEANER_FOREGROUND_PROACTIVE_MIGRATION missing"
         );
         assert!(
-            names.contains(&"je.cleaner.lazyMigration"),
+            names.contains(&"noxu.cleaner.lazyMigration"),
             "CLEANER_LAZY_MIGRATION missing"
         );
         assert!(
-            names.contains(&"je.compressor.purgeRoot"),
+            names.contains(&"noxu.compressor.purgeRoot"),
             "COMPRESSOR_PURGE_ROOT missing"
         );
         assert!(
-            names.contains(&"je.evictor.nodesPerScan"),
+            names.contains(&"noxu.evictor.nodesPerScan"),
             "EVICTOR_NODES_PER_SCAN missing"
         );
         assert!(
-            names.contains(&"je.evictor.deadlockRetry"),
+            names.contains(&"noxu.evictor.deadlockRetry"),
             "EVICTOR_DEADLOCK_RETRY missing"
         );
         assert!(
-            names.contains(&"je.evictor.lruOnly"),
+            names.contains(&"noxu.evictor.lruOnly"),
             "EVICTOR_LRU_ONLY missing"
         );
         assert!(
-            names.contains(&"je.log.directNIO"),
+            names.contains(&"noxu.log.directNIO"),
             "LOG_DIRECT_NIO missing"
         );
         assert!(
-            names.contains(&"je.log.chunkedNIO"),
+            names.contains(&"noxu.log.chunkedNIO"),
             "LOG_CHUNKED_NIO missing"
         );
     }
 
     #[test]
-    fn test_param_min_max_bounds_match_je() {
+    fn test_param_min_max_bounds() {
         // MAX_MEMORY_PERCENT: min=1, max=90
         assert_eq!(MAX_MEMORY_PERCENT.min, Some(ParamValue::Int(1)));
         assert_eq!(MAX_MEMORY_PERCENT.max, Some(ParamValue::Int(90)));

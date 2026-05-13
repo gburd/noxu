@@ -420,20 +420,39 @@ impl TcpChannelListener {
         Ok(TcpChannel::new(stream))
     }
 
-    /// Set the accept timeout.
+    /// Set the accept timeout via SO_RCVTIMEO.
     ///
-    /// After the timeout, `accept()` will return an `Err` with `WouldBlock`.
+    /// After the timeout, `accept()` returns `Err(WouldBlock)`.
+    /// Pass `None` to remove a previously set timeout (block forever).
     pub fn set_accept_timeout(&self, timeout: Option<Duration>) -> Result<()> {
-        self.listener
-            .set_nonblocking(false)
-            .map_err(|e| RepError::NetworkError(e.to_string()))?;
-        self.listener
-            .set_ttl(64)
-            .ok(); // best-effort
-        // TcpListener does not expose SO_RCVTIMEO directly; we use the
-        // underlying raw socket if needed. For our purposes the blocking
-        // accept is sufficient; callers can spawn a thread.
-        let _ = timeout; // accepted as documentation parameter
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = self.listener.as_raw_fd();
+            let tv = match timeout {
+                Some(d) => libc::timeval {
+                    tv_sec:  d.as_secs() as libc::time_t,
+                    tv_usec: d.subsec_micros() as libc::suseconds_t,
+                },
+                None => libc::timeval { tv_sec: 0, tv_usec: 0 },
+            };
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(RepError::NetworkError(
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        { let _ = timeout; }
         Ok(())
     }
 }

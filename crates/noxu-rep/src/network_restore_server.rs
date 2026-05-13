@@ -493,7 +493,7 @@ mod tests {
         // Only .ndb files should be transferred.
         let dir = make_env_home(&[
             ("00000001.ndb", b"log data"),
-            ("je.config.csv", b"config"),
+            ("noxu.config.csv", b"config"),
             ("README.txt", b"readme"),
         ]);
         let server = Arc::new(NetworkRestoreServer::new(dir.path()));
