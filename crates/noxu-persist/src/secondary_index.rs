@@ -8,7 +8,7 @@
 //!
 //! # Design
 //!
-//! In BDB the secondary database is a first-class on-disk store that is
+//! The secondary database is a first-class on-disk store that is
 //! automatically kept in sync with the primary database through the
 //! `SecondaryDatabase` association.  In this Rust port the persistence layer
 //! sits on top of `noxu-db`'s in-memory `HashMap` store, so we replicate the
@@ -229,7 +229,7 @@ where
     /// Returns the first entity whose secondary key equals `sk`, or `None`.
     ///
     /// When multiple primary keys map to the same secondary key (MANY_TO_ONE)
-    /// the entity with the smallest primary key is returned, matching BDB the
+    /// the entity with the smallest primary key is returned, matching the
     /// `SecondaryDatabase.get` behaviour (returns the first duplicate).
     ///
     /// 
@@ -372,7 +372,7 @@ where
 ///
 /// Yields `(SK, E)` tuples in secondary key order.  Missing primary records
 /// (which can occur if the primary was deleted without the secondary being
-/// properly maintained) are silently skipped, matching BDB behaviour.
+/// properly maintained) are silently skipped, correct Noxu behaviour.
 pub struct SecondaryIterator<'a, SK, PK, E, S>
 where
     PK: PrimaryKey + Ord + Send + Sync + 'static,

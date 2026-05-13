@@ -296,7 +296,7 @@ impl Txn {
 
             // Step: decide whether to fsync now or defer via GroupCommit.
             //
-            // (NoSQL fork): after writing the WAL entry, Txn.commit()
+            // (extended fork): after writing the WAL entry, Txn.commit()
             // calls GroupCommit.bufferCommit(nowNs, txn, commitVLSN).
             // - returns true  → commit is batched; skip fsync (another
             //                   commit will flush for us).
@@ -314,7 +314,7 @@ impl Txn {
                     _ => false,
                 };
                 if !should_skip_fsync && let Some(ref lm) = self.log_manager {
-                    // Port of JE LogManager.flushTo(commitLsn): skip fsync
+                    // Port of(commitLsn): skip fsync
                     // if a concurrent committer already flushed past our LSN.
                     lm.flush_sync_if_needed(commit_lsn)
                         .map_err(TxnError::LogError)?;

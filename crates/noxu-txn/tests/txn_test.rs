@@ -1,4 +1,4 @@
-//! TxnTest — JE JCK lifecycle and isolation tests ported to Rust.
+//! TxnTest — lifecycle and isolation tests ported to Rust.
 //!
 //! Covers: transaction lifecycle (begin/commit/abort), state transitions,
 //! lock acquisition via Locker trait, durability variants, isolation flags,

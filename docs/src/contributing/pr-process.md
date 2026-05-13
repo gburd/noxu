@@ -42,7 +42,7 @@ docs: write maintainer's guide — algorithms, design decisions, crate guide
 perf(noxu-log): release LWL before fsync for group commit coalescing
 ```
 
-Keep the summary line under 72 characters. Use the body for the "why": cite JE
+Keep the summary line under 72 characters. Use the body for the "why": cite Noxu
 source files, reference algorithm papers, explain non-obvious choices.
 
 ## Before Submitting
@@ -67,7 +67,7 @@ The PR author is responsible for the following before requesting review:
 - [ ] Zero clippy warnings with `-D warnings`
 - [ ] All tests pass on Linux, macOS, and Windows (CI will verify)
 - [ ] New public API has Rust doc comments
-- [ ] JE fidelity: logic matches `_/je/` source (or deviation is documented)
+- [ ] Noxu fidelity: logic matches `_/je/` source (or deviation is documented)
 - [ ] No `unwrap()` in library code paths (use `?` or explicit error handling)
 - [ ] No `unsafe` added without comment citing why it is sound
 
@@ -81,9 +81,9 @@ The PR author is responsible for the following before requesting review:
 - [ ] `CHANGELOG.md` entry added (for user-visible changes)
 - [ ] `make docs-check` passes if docs changed
 
-**JE Fidelity (porting PRs)**
+**Noxu Fidelity (porting PRs)**
 - [ ] Java source cited in commit message or code comment
-- [ ] Preserved JE method names, doc comments, algorithm structure
+- [ ] Preserved Noxu method names, doc comments, algorithm structure
 - [ ] Rust-specific deviations (error types, ownership) documented in comments
 
 ## Review Process

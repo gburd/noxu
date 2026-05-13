@@ -9,17 +9,17 @@ before changing them.
 **Decision**: Noxu DB uses record-level locking. Writers hold locks until
 commit or abort. Readers block on write-locked records.
 
-**Why**: This is BDB JE's isolation model. JE was designed for embedded use
+**Why**: This is Noxu's isolation model. Noxu was designed for embedded use
 where a single application controls both readers and writers. MVCC trades
 storage and GC overhead for non-blocking reads — a different point in the
-design space. Faithful JE fidelity requires the same isolation semantics.
+design space. Noxu DB requires the same isolation semantics.
 
 **Consequence**: Under high write concurrency, readers can block. Use
 `txn_timeout_ms` to bound wait times. Use `ReadUncommitted` isolation
-(the only non-blocking isolation in Noxu/JE) for analytics.
+(the only non-blocking isolation in Noxu) for analytics.
 
 **Where**: `crates/noxu-txn/src/`, `crates/noxu-dbi/src/cursor_impl.rs`
-**Session**: Corrected in Session 28 after non-JE write-buffering was tried and removed.
+**Session**: Corrected in Session 28 after a tentative write-buffering approach was tried and removed.
 
 ## 2. CRC32 Not CRC32C for Replication Feeder Protocol
 
@@ -38,18 +38,18 @@ a primary deployment target, reconsider.
 **Evidence**: Benchmarks in `crates/noxu-util/benches/util_bench.rs`.
 **Decision document**: `docs/src/internal/checksum-selection.md`.
 
-## 3. Rust-Native Log Format (Not Binary Compatible with JE)
+## 3. Rust-Native Log Format
 
-**Decision**: `.ndb` files use a Rust-native encoding, not JE's Java
+**Decision**: `.ndb` files use a Rust-native encoding, not Noxu's Java
 serialization format.
 
-**Why**: JE uses Java's object serialization and class-based dispatch for
+**Why**: The alternative uses Java's object serialization and class-based dispatch for
 log entries. Porting this faithfully would require reimplementing Java's
 serialization protocol — complex, brittle, and not idiomatic Rust.
 The log format is an internal implementation detail; applications use the
 public API, not the log files.
 
-**Consequence**: JE tools cannot read Noxu log files. Migration between JE
+**Consequence**: Noxu tools cannot read Noxu log files. Migration between Noxu
 and Noxu requires an export/import step at the application level.
 
 ## 4. TupleSerdeBinding Uses Serde Binary Encoding
@@ -71,7 +71,7 @@ explicit big-endian integer encoding for sorted keys.
 `QuicMultiplexedChannel` (optional `quic` feature), not Java's NIO or Netty.
 
 **Why**: Java NIO has no Rust equivalent. QUIC (via `quinn`) provides the same
-multiplexed stream model as JE's HA transport while being a first-class Rust
+multiplexed stream model as Noxu's HA transport while being a first-class Rust
 library. TCP is simpler and requires no TLS setup.
 
 **QUIC PMTUD disabled**: `mtu_discovery_config(None)` on all QUIC configs
@@ -85,7 +85,7 @@ PMTUD adds no value.
 
 **Why**: Allows concurrent readers to different BINs without contending on a
 tree-level lock. Added in Session 26 as a performance optimization matching
-JE's per-BIN latch model.
+Noxu's per-BIN latch model.
 
 **Trade-off**: Each BIN requires an allocation for the `RwLock`. For
 write-heavy workloads with many small BINs, the allocation overhead is
@@ -96,7 +96,7 @@ visible. Accepted: correct and performant for typical mixed workloads.
 **Decision**: `noxu-db` through `noxu-recovery` use blocking I/O. `noxu-rep`
 networking may use tokio but the core engine does not.
 
-**Why**: JE uses blocking I/O with explicit daemon threads. Async would
+**Why**: Noxu uses blocking I/O with explicit daemon threads. Async would
 require pervasive `await` throughout the codebase, complicating porting and
 making the latch hierarchy harder to reason about. Background daemon threads
 (evictor, cleaner, etc.) are straightforward to implement with blocking I/O.

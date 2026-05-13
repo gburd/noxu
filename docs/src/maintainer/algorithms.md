@@ -18,7 +18,7 @@ store suffix only. `recompute_key_prefix()` rebuilds on deserialization.
 **BIN-delta**: Changed slots only are logged, reducing write amplification.
 Base BIN reconstructed by reading `last_full_lsn` then applying deltas.
 
-**Reference**: BDB JE Architecture Notes; Ramakrishnan & Gehrke, *Database
+**Reference**: Noxu DB Architecture Notes; Ramakrishnan & Gehrke, *Database
 Management Systems*, Chapter 14.
 
 ## Write-Ahead Log — Group Commit
@@ -43,7 +43,7 @@ Chapter 9.
 2. **Build tree from checkpoint**: read `CheckpointEnd → root_lsn`, reconstruct INs/BINs
 3. **Redo committed / undo uncommitted**: scan from `first_active_lsn`
 
-**Reference**: BDB JE Architecture Notes; Ramakrishnan & Gehrke, Chapter 18.
+**Reference**: Noxu DB Architecture Notes; Ramakrishnan & Gehrke, Chapter 18.
 
 ## Log Cleaning — FIFO-Ish File Deletion
 
@@ -54,7 +54,7 @@ selected. Live entries migrated (re-logged). File deleted after next checkpoint.
 
 Adaptive back-pressure via `CleanerThrottle` prevents cleaner starvation.
 
-**Reference**: BDB JE Cleaner Design Notes; O'Neil et al., "The Log-Structured
+**Reference**: Noxu DB Cleaner Design Notes; O'Neil et al., "The Log-Structured
 Merge-Tree (LSM-Tree)", *Acta Informatica* 1996.
 
 ## Deadlock Detection — Waiter Graph Cycle Search
@@ -134,5 +134,5 @@ from the master's log without losing data needed by any replica.
 The master broadcasts CBVLSN to replicas via unreliable QUIC datagrams so
 replicas can safely advance their own cleaning.
 
-**Reference**: BDB JE HA Design Notes; Lamport, L. (1978). *Time, Clocks, and
+**Reference**: Noxu DB HA Design Notes; Lamport, L. (1978). *Time, Clocks, and
 the Ordering of Events in a Distributed System*. CACM.

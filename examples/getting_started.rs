@@ -1,7 +1,7 @@
 //! Getting Started example for Noxu DB.
 //!
-//! Port of Berkeley DB Java Edition's GettingStarted tutorial
-//! (Inventory/Vendor example from the JE documentation).
+//! Introductory Noxu DB example — getting started.
+//! (Inventory/Vendor example from the).
 //!
 //! Demonstrates a complete "getting started" scenario:
 //!   - Define two record types: Vendor and Item

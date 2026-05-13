@@ -1,7 +1,7 @@
 //! Group commit interface and implementations.
 //!
 //! Txn.GroupCommitMaster`, and
-//! Txn.GroupCommitReplica` from the Oracle NoSQL fork.
+//! group commit for transactional log writes.
 //!
 //! # Overview
 //!

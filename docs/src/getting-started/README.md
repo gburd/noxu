@@ -4,7 +4,7 @@ This chapter guides you through the core concepts and APIs of Noxu DB. By the
 end you will be able to open environments and databases, read and write records,
 iterate with cursors, define secondary indexes, and use serialization bindings.
 
-The material here corresponds to the **Berkeley DB JE Getting Started Guide**,
+The material here corresponds to the **Noxu DB Getting Started Guide**,
 adapted for Rust idioms.
 
 ## Prerequisites

@@ -1,19 +1,19 @@
 # Porting Guidelines
 
-Noxu DB is a faithful Rust port of Berkeley DB Java Edition 7.5.11 plus all 10
-Oracle NoSQL JE enhancements. Fidelity to JE's algorithms and behaviour is the
+Noxu DB is an embedded transactional database — Noxu DB 7.5.11 plus all 10
+Noxu extensions. Fidelity to Noxu's algorithms and behaviour is the
 primary quality criterion — not idiomatic Rust style.
 
 ## Guiding Principle
 
-> When the Rust code diverges from JE logic, it is likely a bug, not an
+> When the Rust code diverges from intended logic, it is likely a bug, not an
 > improvement.
 
-JE's implementation has been battle-tested in production systems for over 20
+Noxu's implementation has been battle-tested in production systems for over 20
 years. Its algorithms — the B-tree latch-coupling traversal, the three-phase
 recovery, the VLSN tracking, the phi accrual failure detector — are correct and
 have known complexity bounds. Before "simplifying" any ported code, verify
-against the JE source.
+against the algorithm specification.
 
 ## Java → Rust Naming Rules
 
@@ -26,13 +26,13 @@ against the JE source.
 | Final class | struct | `BIN` → `Bin` struct |
 | `static final` constant | `const` | `MAX_ENTRIES` → `MAX_ENTRIES: u32` |
 | Package name | crate name | `je.tree` → `noxu-tree` |
-| `com.sleepycat.je.Foo` | `noxu_X::Foo` | `DatabaseImpl` → `noxu_dbi::DatabaseImpl` |
+| the corresponding Noxu type | `noxu_X::Foo` | `DatabaseImpl` → `noxu_dbi::DatabaseImpl` |
 | Nested class | separate module or inner struct | `IN.Entry` → `bin::BinEntry` |
 | Exception hierarchy | `NoxuError` enum variants | `DatabaseException` → `NoxuError::Database` |
 
 ### Preserved Names
 
-The following identifiers are kept **exactly** as JE uses them (even though they
+The following identifiers are kept **exactly** as Noxu uses them (even though they
 are abbreviations or acronyms):
 
 - `BIN` / `Bin` — Bottom Internal Node
@@ -50,12 +50,12 @@ are abbreviations or acronyms):
 1. **Method names** — rename only to follow the Java→Rust table above.
 2. **Doc comments** — translate Javadoc to Rust doc comments; keep all content.
 3. **Algorithm structure** — latch order, traversal direction, retry loops must
-   match JE's `synchronized` blocks / latch scopes.
-4. **Error conditions** — if JE throws a specific exception in a branch, Noxu
+   match Noxu's `synchronized` blocks / latch scopes.
+4. **Error conditions** — if the algorithm specification requires a specific error in a branch, Noxu
    must return the corresponding `NoxuError` variant.
 5. **Configuration parameter names** — `EnvironmentConfig`, `DatabaseConfig`,
-   `CursorConfig` parameter names are public API; keep them identical to JE.
-6. **MemoryBudget tracking** — JE explicitly tracks every allocation; Noxu must
+   `CursorConfig` parameter names are public API; do not rename them.
+6. **MemoryBudget tracking** — MemoryBudget explicitly tracks every allocation; Noxu must
    call the equivalent `memory_budget().update_*()` methods.
 
 ## What to Adapt
@@ -72,16 +72,16 @@ are abbreviations or acronyms):
 7. **Thread locals** — replace with function arguments or thread-local
    `std::cell::RefCell<>` where unavoidable.
 
-## Finding the JE Source
+## Finding the Noxu Source
 
 Reference code lives in the repository:
 
 ```
-_/je/src/com/sleepycat/je/         ← standalone JE 7.5.11
-_/nosql/kvmain/src/main/java/com/sleepycat/je/  ← NoSQL enhanced fork
+_/je/  ← reference archive (read-only)
+_/nosql/  ← extended fork reference (read-only)
 ```
 
-The crate→JE package mapping is documented in
+The crate→Noxu package mapping is documented in
 `docs/src/maintainer/crate-guide.md`. The full naming guide is in
 `docs/src/maintainer/je-source-guide.md`.
 
@@ -95,9 +95,9 @@ The crate→JE package mapping is documented in
 6. Run `cargo clippy -p <crate>` and fix any warnings.
 7. Run `cargo test -p <crate>` and verify all tests pass.
 
-## NoSQL Enhancements
+## Noxu Enhancements
 
-The 10 NoSQL enhancements not present in standalone JE are:
+The 10 Noxu enhancements not present in standalone Noxu are:
 
 | Enhancement | Rust location |
 |---|---|

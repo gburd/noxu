@@ -1,6 +1,6 @@
 //! Configuration for JoinCursor.
 //!
-//! Mirrors JE's `JoinConfig` with one field: `no_sort`.
+//! Implements `JoinConfig` with one field: `no_sort`.
 
 /// Configuration properties for a [`JoinCursor`][crate::join_cursor::JoinCursor].
 ///

@@ -1,6 +1,6 @@
 //! Configuration for statistics retrieval operations.
 //!
-//! Mirrors JE's `StatsConfig`.
+//! Implements `StatsConfig`.
 
 /// Specifies the attributes of a statistics retrieval operation.
 ///
@@ -15,10 +15,10 @@
 #[derive(Clone, Debug, Default)]
 pub struct StatsConfig {
     /// If `true`, return only values that do not require expensive actions
-    /// (e.g. skip B-tree traversal counts).  Matches JE `StatsConfig.setFast(true)`.
+    /// (e.g. skip B-tree traversal counts).  Implements `StatsConfig.setFast(true)`.
     pub fast: bool,
     /// If `true`, reset all counters to zero after reading them.
-    /// Matches JE `StatsConfig.setClear(true)`.
+    /// Implements `StatsConfig.setClear(true)`.
     pub clear: bool,
 }
 
@@ -30,7 +30,7 @@ impl StatsConfig {
 
     /// Convenience constructor: `fast = false`, `clear = true`.
     ///
-    /// Mirrors JE's `StatsConfig.CLEAR` constant.
+    /// Implements `StatsConfig.CLEAR` constant.
     pub fn clear() -> Self {
         Self { fast: false, clear: true }
     }

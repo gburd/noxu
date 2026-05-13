@@ -1,6 +1,6 @@
-//! JE test suite port — production-correctness tests.
+//! suite port — production-correctness tests.
 //!
-//! Tests ported from (or inspired by) the JE Java test suite:
+//! Tests ported from (or inspired by) the test suite:
 //!   - DatabaseTest (basic ops, truncate, count, isolation)
 //!   - CursorEdgeTest (edge cases during concurrent modification)
 //!   - DirtyReadTest (read-uncommitted semantics)
@@ -10,7 +10,7 @@
 //!   - BIN-delta chain verification (multiple checkpoints, delta-then-full)
 //!   - Transaction abort undo correctness (insert, update, delete undone)
 //!
-//! Each test includes a comment referencing the JE test method it mirrors.
+//! Each test includes a comment referencing the method it mirrors.
 
 use noxu_db::{
     CursorConfig, DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, LockMode,
@@ -54,7 +54,7 @@ fn kv(k: u32, v: u32) -> (DatabaseEntry, DatabaseEntry) {
 // DatabaseTest — basic ops
 // ---------------------------------------------------------------------------
 
-/// JE: DatabaseTest.testBasicOperations
+/// : DatabaseTest.testBasicOperations
 /// Basic put/get/delete round-trip with a transaction.
 #[test]
 fn database_txn_put_get_delete() {
@@ -80,7 +80,7 @@ fn database_txn_put_get_delete() {
     assert_eq!(out2.data(), 100u32.to_be_bytes());
 }
 
-/// JE: DatabaseTest.testDeleteNonExistentKey
+/// : DatabaseTest.testDeleteNonExistentKey
 /// Deleting a key that does not exist returns NotFound.
 #[test]
 fn database_delete_nonexistent_returns_not_found() {
@@ -90,7 +90,7 @@ fn database_delete_nonexistent_returns_not_found() {
     assert_eq!(db.delete(None, &k).unwrap(), OperationStatus::NotFound);
 }
 
-/// JE: DatabaseTest.testOverwrite
+/// : DatabaseTest.testOverwrite
 /// Put is idempotent: second put on same key replaces the value.
 #[test]
 fn database_put_replaces_existing_value() {
@@ -104,7 +104,7 @@ fn database_put_replaces_existing_value() {
     assert_eq!(out.data(), b"v2");
 }
 
-/// JE: DatabaseTest.testCountAfterInsertDelete
+/// : DatabaseTest.testCountAfterInsertDelete
 /// count() is updated immediately after each put and delete.
 #[test]
 fn database_count_after_insert_delete() {
@@ -124,7 +124,7 @@ fn database_count_after_insert_delete() {
     assert_eq!(db.count().unwrap(), 5);
 }
 
-/// JE: DatabaseTest.testPutNoOverwrite
+/// : DatabaseTest.testPutNoOverwrite
 /// put_no_overwrite returns KeyExists; original value is unchanged.
 #[test]
 fn database_put_no_overwrite_returns_key_exists() {
@@ -145,7 +145,7 @@ fn database_put_no_overwrite_returns_key_exists() {
 // TruncateTest — truncateDatabase
 // ---------------------------------------------------------------------------
 
-/// JE: TruncateTest.testEnvTruncateCommit
+/// : TruncateTest.testEnvTruncateCommit
 /// truncate_database removes all records; subsequent gets return NotFound.
 #[test]
 fn truncate_database_clears_all_records() {
@@ -175,7 +175,7 @@ fn truncate_database_clears_all_records() {
     }
 }
 
-/// JE: TruncateTest.testEnvTruncateAndAdd
+/// : TruncateTest.testEnvTruncateAndAdd
 /// After truncation, new records can be inserted and retrieved correctly.
 #[test]
 fn truncate_then_add_records_works() {
@@ -204,7 +204,7 @@ fn truncate_then_add_records_works() {
     }
 }
 
-/// JE: TruncateTest.testEnvTruncateCountOnly
+/// : TruncateTest.testEnvTruncateCountOnly
 /// truncate_database on an empty database returns 0.
 #[test]
 fn truncate_empty_database_returns_zero() {
@@ -214,7 +214,7 @@ fn truncate_empty_database_returns_zero() {
     assert_eq!(count, 0);
 }
 
-/// JE: TruncateTest — non-existent database returns an error.
+/// : TruncateTest — non-existent database returns an error.
 #[test]
 fn truncate_nonexistent_database_errors() {
     let dir = TempDir::new().unwrap();
@@ -227,7 +227,7 @@ fn truncate_nonexistent_database_errors() {
 // DirtyReadTest — read-uncommitted semantics
 // ---------------------------------------------------------------------------
 
-/// JE: DirtyReadTest.testReadUncommitted (read-uncommitted via LockMode)
+/// : DirtyReadTest.testReadUncommitted (read-uncommitted via LockMode)
 ///
 /// A writer holds a WRITE lock on a key.  A cursor using ReadUncommitted must
 /// be able to see the dirty write without blocking; a cursor using Default
@@ -301,7 +301,7 @@ fn read_uncommitted_sees_dirty_write() {
     writer.join().unwrap();
 }
 
-/// JE: DirtyReadTest — ReadUncommitted via CursorConfig
+/// : DirtyReadTest — ReadUncommitted via CursorConfig
 /// A cursor configured with read_uncommitted=true can scan without acquiring locks.
 #[test]
 fn read_uncommitted_cursor_config_no_blocking() {
@@ -340,7 +340,7 @@ fn read_uncommitted_cursor_config_no_blocking() {
 /// BIN splits and at least one upper-IN node.  After insertion every key must
 /// be searchable and the cursor scan must visit all records in sorted order.
 ///
-/// JE: DatabaseTest.testInsert257Records (NUM_RECS = 257)
+/// : DatabaseTest.testInsert257Records (NUM_RECS = 257)
 #[test]
 fn large_scale_insert_search_scan_257() {
     const N: u32 = 257;
@@ -385,7 +385,7 @@ fn large_scale_insert_search_scan_257() {
 /// Exercises 10 000 records: forces the tree to depth ≥ 3 (BIN + IN + root IN).
 /// Point search after all inserts must succeed for every key.
 ///
-/// JE: scale test equivalent; validates multi-level tree traversal at scale.
+/// : scale test equivalent; validates multi-level tree traversal at scale.
 #[test]
 fn large_scale_10k_deep_tree_correctness() {
     const N: u32 = 10_000;
@@ -416,7 +416,7 @@ fn large_scale_10k_deep_tree_correctness() {
 /// Interleaved inserts and deletes on a large dataset to verify that
 /// tree compression and re-insertion work correctly.
 ///
-/// JE: DatabaseTest pattern — write 500, delete odd keys, re-read even keys.
+/// : DatabaseTest pattern — write 500, delete odd keys, re-read even keys.
 #[test]
 fn large_scale_interleaved_insert_delete() {
     const N: u32 = 500;
@@ -465,7 +465,7 @@ fn large_scale_interleaved_insert_delete() {
 // Recovery correctness — commit → checkpoint → more commits → reopen
 // ---------------------------------------------------------------------------
 
-/// JE: RecoveryTest pattern — ensures records committed before AND after a
+/// : RecoveryTest pattern — ensures records committed before AND after a
 /// checkpoint are both present after clean close and reopen.
 ///
 /// This specifically tests the BIN-delta / full-BIN log path used by the
@@ -544,7 +544,7 @@ fn recovery_across_checkpoint_boundary() {
 // Transaction abort undo correctness
 // ---------------------------------------------------------------------------
 
-/// JE: TransactionTest.testAbortInsert
+/// : TransactionTest.testAbortInsert
 /// An inserted record that is part of an aborted transaction must not be visible.
 #[test]
 fn txn_abort_insert_not_visible() {
@@ -564,7 +564,7 @@ fn txn_abort_insert_not_visible() {
     );
 }
 
-/// JE: TransactionTest.testAbortUpdate
+/// : TransactionTest.testAbortUpdate
 /// An update that is aborted must restore the original value.
 #[test]
 fn txn_abort_update_restores_original_value() {
@@ -591,7 +591,7 @@ fn txn_abort_update_restores_original_value() {
     assert_eq!(out.data(), 100u32.to_be_bytes(), "abort must restore pre-update value");
 }
 
-/// JE: TransactionTest.testAbortDelete
+/// : TransactionTest.testAbortDelete
 /// A deleted record whose transaction is aborted must reappear.
 #[test]
 fn txn_abort_delete_restores_record() {
@@ -614,7 +614,7 @@ fn txn_abort_delete_restores_record() {
     assert_eq!(out.data(), 777u32.to_be_bytes());
 }
 
-/// JE: TransactionTest.testAbortMultipleOps
+/// : TransactionTest.testAbortMultipleOps
 /// A transaction with multiple mixed operations (insert+update+delete) must
 /// undo them all on abort, leaving the database in its pre-transaction state.
 #[test]
@@ -696,7 +696,7 @@ fn txn_abort_multiple_ops_restores_prior_state() {
 // CursorEdgeTest — cursor edge cases
 // ---------------------------------------------------------------------------
 
-/// JE: CursorEdgeTest.testEmptyDatabase
+/// : CursorEdgeTest.testEmptyDatabase
 /// First / Last / Next / Prev on an empty database all return NotFound.
 #[test]
 fn cursor_edge_empty_database_all_ops_not_found() {
@@ -716,7 +716,7 @@ fn cursor_edge_empty_database_all_ops_not_found() {
     cursor.close().unwrap();
 }
 
-/// JE: CursorEdgeTest.testSearchOnDeletedRecord
+/// : CursorEdgeTest.testSearchOnDeletedRecord
 /// Searching for a deleted key returns NotFound.
 #[test]
 fn cursor_edge_search_after_delete_returns_not_found() {
@@ -737,7 +737,7 @@ fn cursor_edge_search_after_delete_returns_not_found() {
     cursor.close().unwrap();
 }
 
-/// JE: CursorEdgeTest — cursor positions correctly after adjacent deletes.
+/// : CursorEdgeTest — cursor positions correctly after adjacent deletes.
 /// Delete the first, last, and a middle key; cursor must skip all of them.
 #[test]
 fn cursor_edge_skip_deleted_records() {
@@ -771,7 +771,7 @@ fn cursor_edge_skip_deleted_records() {
     assert_eq!(seen, expected, "cursor must skip deleted keys");
 }
 
-/// JE: CursorEdgeTest.testGetCurrentAfterDelete
+/// : CursorEdgeTest.testGetCurrentAfterDelete
 /// Get::Current on a cursor positioned on a deleted record returns NotFound.
 #[test]
 fn cursor_edge_current_after_delete_not_found() {
@@ -806,7 +806,7 @@ fn cursor_edge_current_after_delete_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// SearchGte edge cases — mirrors JE CursorTest.testDbInternalSearch()
+// SearchGte edge cases — mirrors()
 // ---------------------------------------------------------------------------
 
 /// Get::SearchGte returns the smallest key >= search key.
@@ -859,7 +859,7 @@ fn cursor_search_gte_edge_cases() {
 // Isolation: non-repeatable reads under read-committed
 // ---------------------------------------------------------------------------
 
-/// JE: ReadCommittedTest.testWithTransactionConfig
+/// : ReadCommittedTest.testWithTransactionConfig
 /// Under read-committed, a second read in the same transaction may see a value
 /// committed by another transaction between the two reads.
 ///
@@ -927,7 +927,7 @@ fn read_committed_allows_non_repeatable_read() {
     // Second read under read-committed: read lock was released after first read,
     // so T1 may see v2 if the lock is re-acquired.
     let status = db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out);
-    // Under JE lock semantics the second read will block waiting for write-lock
+    // Under semantics the second read will block waiting for write-lock
     // from the writer (already released); it should succeed with v2.
     // We accept either v1 (if lock not released) or v2 (if released) depending
     // on the isolation implementation, but it must not error.
@@ -941,7 +941,7 @@ fn read_committed_allows_non_repeatable_read() {
 // Serializable isolation — repeatable read
 // ---------------------------------------------------------------------------
 
-/// JE: ReadCommittedTest.testRepeatableReadCombination
+/// : ReadCommittedTest.testRepeatableReadCombination
 /// Under serializable isolation (default), two reads of the same key within
 /// the same transaction must return the same value even if another thread
 /// commits a new value between them.
@@ -1021,7 +1021,7 @@ fn serializable_isolation_repeatable_read() {
 // Multiple databases — isolation between databases
 // ---------------------------------------------------------------------------
 
-/// JE: DatabaseTest.testMultipleDatabasesIsolated
+/// : DatabaseTest.testMultipleDatabasesIsolated
 /// Operations on different databases in the same environment are independent.
 #[test]
 fn multiple_databases_fully_isolated() {
@@ -1061,7 +1061,7 @@ fn multiple_databases_fully_isolated() {
 /// verifies every record is present with the correct value.
 /// This exercises the full write path (WAL + BIN insertion) and recovery path.
 ///
-/// JE: equivalent to JCK stress test with NUM_RECS = 1000.
+/// : equivalent to JCK stress test with NUM_RECS = 1000.
 #[test]
 fn recovery_1000_records_survive_reopen() {
     const N: u32 = 1_000;
@@ -1136,10 +1136,10 @@ fn recovery_updates_are_durable() {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor count() — mirrors JE Cursor.count()
+// Cursor count() — mirrors()
 // ---------------------------------------------------------------------------
 
-/// JE: CursorTest — cursor.count() returns 1 for a non-duplicate key.
+/// : CursorTest — cursor.count() returns 1 for a non-duplicate key.
 #[test]
 fn cursor_count_non_dup_key_is_one() {
     let dir = TempDir::new().unwrap();
@@ -1164,7 +1164,7 @@ fn cursor_count_non_dup_key_is_one() {
 // Cursor put operations via cursor handle
 // ---------------------------------------------------------------------------
 
-/// JE: CursorTest — cursor put (Put::Overwrite) replaces value in place.
+/// : CursorTest — cursor put (Put::Overwrite) replaces value in place.
 #[test]
 fn cursor_put_overwrite_replaces_value() {
     let dir = TempDir::new().unwrap();
@@ -1196,7 +1196,7 @@ fn cursor_put_overwrite_replaces_value() {
 // Environment stats — basic sanity
 // ---------------------------------------------------------------------------
 
-/// JE: EnvironmentStatTest — stats are non-negative and accumulate.
+/// : EnvironmentStatTest — stats are non-negative and accumulate.
 #[test]
 fn environment_stats_non_negative_after_writes() {
     let dir = TempDir::new().unwrap();

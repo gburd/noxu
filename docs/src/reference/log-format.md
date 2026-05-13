@@ -81,7 +81,7 @@ Base header: **14 bytes**. With VLSN: **22 bytes**.
 | Administrative | `CHECKPOINT_START`, `CHECKPOINT_END`, `FILE_HEADER`, `TRACE` |
 | Database mgmt | `MAP_LN` (name→id), `DELETED_DUPLICATE_LN` |
 | Replication | `MATCHPOINT`, `COMMIT` with VLSN |
-| NoSQL extensions | `EXTINCT_LN` (TTL expiry) |
+| Extended-fork entry types | `EXTINCT_LN` (TTL expiry) |
 
 ## VLSN — Virtual Log Sequence Number
 

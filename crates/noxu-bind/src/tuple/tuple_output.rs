@@ -248,7 +248,7 @@ impl TupleOutput {
         };
         self.buf.push(header);
 
-        // Write value bytes in little-endian order (matching JE)
+        // Write value bytes in little-endian order (correct)
         self.buf.push(adjusted as u8);
         if byte_len > 1 {
             self.buf.push((adjusted >> 8) as u8);
@@ -313,7 +313,7 @@ impl TupleOutput {
         };
         self.buf.push(header);
 
-        // Write value bytes in little-endian order (matching JE)
+        // Write value bytes in little-endian order (correct)
         self.buf.push(adjusted as u8);
         if byte_len > 1 {
             self.buf.push((adjusted >> 8) as u8);

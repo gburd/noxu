@@ -82,9 +82,9 @@ pub struct Database {
     /// Cached cleaner throttle — acquired once at open, None when no cleaner.
     /// Used by put() for write-path backpressure without locking env_impl.
     cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
-    /// If true, auto-commit writes skip the log flush entirely (JE: TXN_NO_SYNC).
+    /// If true, auto-commit writes skip the log flush entirely (: TXN_NO_SYNC).
     no_sync: bool,
-    /// If true, auto-commit writes flush to OS but skip fdatasync (JE: TXN_WRITE_NO_SYNC).
+    /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
     write_no_sync: bool,
 }
 
@@ -122,7 +122,7 @@ impl Database {
     ///
     /// Used by `get_with_options()` when `ReadOptions.lock_mode == ReadUncommitted`.
     /// Skips all lock acquisition so the cursor reads directly from the BIN
-    /// without blocking on write locks — mirrors JE's read-uncommitted cursor.
+    /// without blocking on write locks — mirrors 's read-uncommitted cursor.
     fn make_cursor_no_lock(&self) -> CursorImpl {
         match &self.log_manager {
             Some(lm) => {
@@ -153,7 +153,7 @@ impl Database {
     /// fsync the log before returning to the caller.
     ///
     /// `write_lsn` is the LSN assigned to the write operation just performed.
-    /// Port of JE `LogManager.flushTo(lsn)`: if a concurrent committer already
+    /// Port of`LogManager.flushTo(lsn)`: if a concurrent committer already
     /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
     /// natural many:1 fsync coalescing under concurrent write load with no
     /// explicit group-commit configuration required.
@@ -162,15 +162,15 @@ impl Database {
             return Ok(()); // explicit txn handles its own commit/fsync
         }
         if self.no_sync {
-            return Ok(()); // JE: TXN_NO_SYNC — skip log flush entirely
+            return Ok(()); // : TXN_NO_SYNC — skip log flush entirely
         }
         if let Some(lm) = &self.log_manager {
             if self.write_no_sync {
-                // JE: TXN_WRITE_NO_SYNC — flush to OS buffer, no fdatasync
+                // : TXN_WRITE_NO_SYNC — flush to OS buffer, no fdatasync
                 lm.flush_no_sync()
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
             } else {
-                // JE: flushTo(lsn) — skip if already covered by another flush.
+                // : flushTo(lsn) — skip if already covered by another flush.
                 lm.flush_sync_if_needed(write_lsn)
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
             }
@@ -286,7 +286,7 @@ impl Database {
     /// Retrieves a record with per-operation read options.
     ///
     /// Mirrors `Cursor.get()` with `ReadOptions` applied:
-    /// - `LockMode::ReadUncommitted` — dirty read, no lock acquired (JE read-uncommitted)
+    /// - `LockMode::ReadUncommitted` — dirty read, no lock acquired ( read-uncommitted)
     /// - `LockMode::ReadCommitted` — read-committed isolation (standard locking)
     /// - `LockMode::Rmw` — acquire write lock for read-modify-write
     /// - `LockMode::Default` — environment default isolation
@@ -445,7 +445,7 @@ impl Database {
     /// - `ttl` — if > 0, sets a per-record TTL expiration (hours from now); the
     ///   record will be treated as expired and invisible after the TTL elapses.
     ///   Stored in the BIN slot as absolute hours since Unix epoch, matching
-    ///   the `BIN.expirationInHours` / `IN.entryExpiration` JE TTL path.
+    ///   the `BIN.expirationInHours` / `IN.entryExpiration` path.
     /// - `update_ttl` — if true and the record already exists, refreshes its TTL
     ///   to the new value rather than leaving the original expiration.
     /// - `cache_mode` — advisory cache hint (currently informational).
@@ -734,7 +734,7 @@ impl Database {
 
     /// Flushes all pending writes for this database to stable storage.
     ///
-    /// Mirrors JE `Database.sync()` — issues an fdatasync on the log file,
+    /// Implements `Database.sync()` — issues an fdatasync on the log file,
     /// ensuring that all writes made by non-transactional or deferred-sync
     /// operations are durable before returning.
     pub fn sync(&self) -> Result<()> {
@@ -748,7 +748,7 @@ impl Database {
 
     /// Returns B-tree statistics for this database.
     ///
-    /// Mirrors JE's `Database.getStats(StatsConfig)`.
+    /// Implements `Database.getStats(StatsConfig)`.
     ///
     /// When `config.fast` is `true`, only the O(1) entry-count is returned
     /// and no tree traversal is performed.  When `fast` is `false` (default),
@@ -794,7 +794,7 @@ impl Database {
     /// - Each BIN entry that is not known-deleted has a valid (non-NULL) LSN.
     /// - The BIN's first key is >= the parent routing key (key-range containment).
     ///
-    /// Mirrors `Database.verify(VerifyConfig)` in JE — calls BtreeVerifier on the
+    /// Mirrors `Database.verify(VerifyConfig)` in— calls BtreeVerifier on the
     /// underlying tree.
     ///
     /// # Arguments
@@ -814,7 +814,7 @@ impl Database {
     /// Creates a join cursor that returns records matching all secondary-key
     /// constraints expressed by the pre-positioned `cursors`.
     ///
-    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)` from JE.
+    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)` from .
     ///
     /// Each cursor in `cursors` must already be positioned at the desired
     /// secondary key value (e.g. via `SecondaryCursor::get_search_key`).
@@ -825,7 +825,7 @@ impl Database {
     ///
     /// Unless `config.no_sort` is `true`, the cursor array is re-ordered by
     /// ascending duplicate-count estimate before the join starts, matching
-    /// JE's optimisation for minimum candidate-set size.
+    /// 's optimisation for minimum candidate-set size.
     ///
     /// The returned `JoinCursor` owns the `cursors` for its lifetime.
     ///

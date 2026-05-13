@@ -445,30 +445,30 @@ impl Default for EngineConfig {
             evictor_enabled: true,
             cleaner_enabled: true,
             checkpointer_enabled: true,
-            checkpoint_bytes_interval: 20_000_000, // 20 MB — matches JE
-            cleaner_min_utilization: 50,           // 50% — matches JE
+            checkpoint_bytes_interval: 20_000_000, // 20 MB — matches 
+            cleaner_min_utilization: 50,           // 50% — matches 
             cleaner_min_file_count: 5,
             evictor_wakeup_interval_ms: 5000, // 5 seconds
-            cleaner_wakeup_interval_ms: 10_000, // 10 s — matches JE
-            checkpointer_wakeup_interval_ms: 0, // 0 = bytes-based — matches JE
-            // Log defaults — match JE
+            cleaner_wakeup_interval_ms: 10_000, // 10 s — matches 
+            checkpointer_wakeup_interval_ms: 0, // 0 = bytes-based — matches 
+            // Log defaults — match 
             log_file_max: 10_000_000,      // 10 MB
             log_mem_only: false,
             log_checksum_read: true,
             log_total_buffer_bytes: 0,     // auto-computed
-            // Evictor defaults — match JE
+            // Evictor defaults — match 
             evictor_evict_bytes: 524_288,  // 512 KB
             evictor_core_threads: 1,
             evictor_max_threads: 10,
             evictor_n_lru_lists: 4,
-            // Cleaner defaults — match JE
+            // Cleaner defaults — match 
             cleaner_min_file_utilization: 5, // 5%
             cleaner_threads: 1,
             cleaner_lock_timeout_ms: 500,    // 500 ms
-            // Txn/lock defaults — match JE
+            // Txn/lock defaults — match 
             txn_serializable_isolation: false,
             lock_deadlock_detect: true,
-            // Checkpointer defaults — match JE
+            // Checkpointer defaults — match 
             checkpointer_high_priority: false,
         }
     }
@@ -491,7 +491,7 @@ mod tests {
         assert!(config.evictor_enabled);
         assert!(config.cleaner_enabled);
         assert!(config.checkpointer_enabled);
-        // Check JE-matched defaults
+        // Check -matched defaults
         assert_eq!(config.lock_timeout_ms, 500);
         assert_eq!(config.txn_timeout_ms, 0);
         assert_eq!(config.cleaner_min_utilization, 50);

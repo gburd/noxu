@@ -56,8 +56,8 @@ pub struct LnRecord {
     /// Data of the before-image (embedded in the log entry itself).
     ///
     /// In — populated for all embedded
-    /// LNs in the NoSQL fork so that undo does NOT need to re-read the log.
-    /// `None` for non-embedded LNs (rare in modern JE) and for first writes
+    /// LNs in the extended fork so that undo does NOT need to re-read the log.
+    /// `None` for non-embedded LNs (rare in modern ) and for first writes
     /// where the before-image is "deleted" (use `abort_known_deleted` instead).
     pub abort_data: Option<Bytes>,
     /// Whether this entry has been marked invisible (rolled-back by HA).

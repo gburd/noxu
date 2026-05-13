@@ -509,7 +509,7 @@ pub fn verify_database(db_name: &str, config: &VerifyConfig) -> VerifyResult {
 /// Used by `Database::verify()` in `noxu-db` to bridge the crate boundary
 /// (noxu-db does not depend directly on noxu-tree).
 ///
-/// Mirrors `DatabaseImpl.verify(VerifyConfig)` in JE — calls BtreeVerifier
+/// Mirrors `DatabaseImpl.verify(VerifyConfig)` in— calls BtreeVerifier
 /// on the tree owned by the DatabaseImpl.
 ///
 /// # Arguments

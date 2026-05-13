@@ -158,7 +158,7 @@ pub struct ReplicatedEnvironment {
     /// When this node is a replica, `apply_entry()` pushes each received log
     /// entry here.  The `PeerFeederService` registered on the TCP dispatcher
     /// reads from this queue to stream entries to downstream replicas that
-    /// are behind this node (peer-to-peer log distribution, BDB/HA style).
+    /// are behind this node (peer-to-peer log distribution, HA style).
     peer_scanner: Arc<PeerLogScanner>,
 }
 
@@ -312,7 +312,7 @@ impl ReplicatedEnvironment {
     ///
     /// If the RESTORE service was not registered at construction time (because
     /// `config.env_home` was `None`), it is registered here using the
-    /// environment's actual home path.  This mirrors JE `RepNode.envSetup()`
+    /// environment's actual home path.  This mirrors`RepNode.envSetup()`
     /// which registers the restore handler during environment wiring.
     ///
     /// Environment reference wiring.
@@ -1454,7 +1454,7 @@ mod tests {
     /// Verify that `with_environment` lazily registers the RESTORE service on
     /// the TCP dispatcher when `config.env_home` was not set at construction.
     ///
-    /// This mirrors JE `RepNode.envSetup()` which registers the restore handler
+    /// This mirrors`RepNode.envSetup()` which registers the restore handler
     /// when the environment is wired into the replicated node.
     #[test]
     fn test_restore_registered_lazily_via_with_environment() {

@@ -77,7 +77,7 @@ pub mod entry_states {
     pub const NO_DATA_LN_BIT: u8 = 0x20;
     /// Transient flag: key must be re-written when this slot is next logged.
     pub const UPDATE_KEY_WHEN_LOGGED: u8 = 0x40;
-    /// Tombstone: blind-deletion marker (NoSQL extension).
+    /// Tombstone: blind-deletion marker (extended capability).
     pub const TOMBSTONE_BIT: u8 = 0x80;
 
     /// Bits that are transient (cleared before persisting to disk).
@@ -1303,7 +1303,7 @@ impl InNode {
 
     /// Returns the size in bytes of this IN when serialized to the log.
     ///
-    /// This is a NEW Rust-native format, not JE-compatible.
+    /// This is a NEW Rust-native format, not -compatible.
     ///
     /// Format:
     /// - node_id: 8 bytes
@@ -1343,7 +1343,7 @@ impl InNode {
 
     /// Writes this IN to the log buffer.
     ///
-    /// This is a NEW Rust-native format, not JE-compatible.
+    /// This is a NEW Rust-native format, not -compatible.
     pub fn write_to_log(&self, buf: &mut Vec<u8>) {
         // Write fixed fields
         buf.extend_from_slice(&self.node_id.to_be_bytes());
@@ -1383,7 +1383,7 @@ impl InNode {
 
     /// Reads an IN from the log buffer.
     ///
-    /// This is a NEW Rust-native format, not JE-compatible.
+    /// This is a NEW Rust-native format, not -compatible.
     pub fn read_from_log(buf: &[u8], _level: i32) -> Result<Self, InError> {
         if buf.len() < 38 {
             return Err(InError::Deserialization(format!(

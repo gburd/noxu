@@ -139,7 +139,7 @@ struct WorkloadResult {
     write_kb: u64,
     disk_kb: u64,
     disk_bytes_per_op: f64,
-    /// Number of fdatasync calls during this workload (port of JE nFSyncs stat).
+    /// Number of fdatasync calls during this workload (port of stat).
     fsync_count: u64,
 }
 
@@ -493,8 +493,8 @@ fn main() {
 
         // W11: recovery/startup time
         // Pre-populate outside the timer; time only the re-open.
-        // Both Noxu and JE run full 3-phase recovery (analysis + redo + undo)
-        // on Environment::open().  Any speedup vs JE reflects lower per-entry
+        // Both Noxu and full 3-phase recovery (analysis + redo + undo)
+        // on Environment::open().  Any speedup vs lower per-entry
         // log-replay overhead in Rust (no JVM startup, no classloading, no
         // JIT warmup) and not a missing recovery step.
         {

@@ -5,12 +5,12 @@ key-value store:
 
 - **`noxu-collections`** — iterator-based `StoredMap`, `StoredSet`, and
   `StoredList` views that wrap databases with idiomatic Rust collection
-  semantics. Corresponds to `com.sleepycat.collections` in BDB JE.
+  semantics. Corresponds to `noxu_collections` in Noxu DB.
 
 - **`noxu-persist`** — the Direct Persistence Layer (DPL), which provides
   derive macros for serialising Rust structs directly into Noxu databases
-  without manual key/value encoding. Corresponds to `com.sleepycat.persist`
-  in BDB JE.
+  without manual key/value encoding. Corresponds to `noxu_persist`
+  in Noxu DB.
 
 ## In This Chapter
 

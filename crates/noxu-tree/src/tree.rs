@@ -3304,7 +3304,7 @@ impl Tree {
     /// representation.  Returns  if the node is not found or is a BIN
     /// (BINs are not upper INs).
     ///
-    /// JE: `OffHeapAllocator` serialises the same bytes that would be written
+    /// : `OffHeapAllocator` serialises the same bytes that would be written
     /// to the log, allowing the evictor to store upper-INs off-heap and avoid
     /// log-file reads on the next traversal.
     pub fn serialize_upper_in(&self, node_id: u64) -> Option<Vec<u8>> {

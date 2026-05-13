@@ -1,6 +1,6 @@
 //! Adaptive cleaner throttle: write-rate tracking, backoff and acceleration.
 //!
-//! Mirrors JE's `CleanerThrottle` — tracks an exponential moving average of
+//! Implements `CleanerThrottle` — tracks an exponential moving average of
 //! the log write rate (bytes/second) and uses it to:
 //!
 //! - Compute how long the cleaner daemon should **sleep** between passes
@@ -39,7 +39,7 @@ pub const MIN_SLEEP_MS: u64 = 100;
 
 /// Write-rate threshold above which cleaning accelerates (1 MB/s).
 ///
-/// Mirrors JE `EnvironmentParams.CLEANER_BYTES_INTERVAL` default (10 MiB),
+/// Implements `EnvironmentParams.CLEANER_BYTES_INTERVAL` default (10 MiB),
 /// divided by the base wakeup interval to yield a per-second figure.
 pub const HIGH_WRITE_THRESHOLD_BYTES_PER_SEC: u64 = 1_000_000;
 
@@ -174,7 +174,7 @@ impl CleanerThrottle {
     /// at 10× threshold it sleeps ~10 ms; above 50× it sleeps 50 ms.
     ///
     /// This is the write-path counterpart to the cleaner's adaptive sleep.
-    /// JE implements equivalent logic in `CleanerThrottle.getWriteDelay()`.
+    /// equivalent logic in `CleanerThrottle.getWriteDelay()`.
     pub fn should_throttle_writer(&self) -> Option<std::time::Duration> {
         let rate = self.write_rate_bytes_per_sec() as u64;
         if rate <= HIGH_WRITE_THRESHOLD_BYTES_PER_SEC {

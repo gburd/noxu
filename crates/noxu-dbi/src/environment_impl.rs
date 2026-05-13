@@ -149,14 +149,14 @@ pub struct EnvironmentImpl {
     /// / `INCompressor.run()`.
     in_compressor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 
-    /// Cleaner daemon shutdown flag (JE CleanerDaemon).
+    /// Cleaner daemon shutdown flag (CleanerDaemon).
     cleaner_shutdown: Arc<AtomicBool>,
 
     /// Background cleaner daemon thread handle.
     cleaner_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 
     // =========================================================================
-    // NoSQL fork: additional background services
+    // extended fork: additional background services
     // =========================================================================
 
     /// Background data-erasure daemon.
@@ -165,7 +165,7 @@ pub struct EnvironmentImpl {
     /// data is unrecoverable.  Started lazily when the first erasure request
     /// is enqueued.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     data_eraser: Mutex<noxu_cleaner::DataEraser>,
 
     /// Background record-extinction scanner.
@@ -173,7 +173,7 @@ pub struct EnvironmentImpl {
     /// Asynchronously removes extinct records from the B-tree after a
     /// `discard_extinct_records()` call commits.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     extinction_scanner: Mutex<noxu_cleaner::ExtinctionScanner>,
 
     /// Automatic backup manager.
@@ -181,7 +181,7 @@ pub struct EnvironmentImpl {
     /// Copies closed log files to a configured archive destination on a
     /// cron-style schedule.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     backup_manager: Mutex<crate::backup_manager::BackupManager>,
 
     /// Per-file utilization tracker shared between the LogManager write path
@@ -409,7 +409,7 @@ impl EnvironmentImpl {
             128 * 1024_i64,   // 128 KiB hysteresis (fixed)
             cache_bytes / 16, // critical threshold: 1/16 of cache
         );
-        // Build optional off-heap cache from config (JE MAX_OFF_HEAP_MEMORY).
+        // Build optional off-heap cache from config ( MAX_OFF_HEAP_MEMORY).
         let off_heap_cache = Arc::new(
             noxu_evictor::OffHeapCache::new(
                 cfg.max_off_heap_memory > 0,
@@ -512,9 +512,9 @@ impl EnvironmentImpl {
         let db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Start the background INCompressor daemon thread (JE INCompressor).
+        // Start the background INCompressor daemon thread (INCompressor).
         // Controlled by cfg.run_in_compressor; wakeup interval from
-        // cfg.in_compressor_wakeup_interval_ms (JE COMPRESSOR_WAKEUP_INTERVAL).
+        // cfg.in_compressor_wakeup_interval_ms ( COMPRESSOR_WAKEUP_INTERVAL).
         let in_compressor_shutdown = Arc::new(AtomicBool::new(false));
         let in_compressor_shutdown_clone = Arc::clone(&in_compressor_shutdown);
         let db_map_for_compressor = Arc::clone(&db_map);
@@ -557,7 +557,7 @@ impl EnvironmentImpl {
             })
             .expect("failed to spawn noxu-in-compressor thread");
 
-        // Start the background log-cleaner daemon thread (JE CleanerDaemon).
+        // Start the background log-cleaner daemon thread (CleanerDaemon).
         // Sleeps for throttle.current_sleep_ms() between cleaning passes so
         // the sleep interval adapts to the current log write rate.
         let cleaner_shutdown = Arc::new(AtomicBool::new(false));
@@ -744,7 +744,7 @@ impl EnvironmentImpl {
     /// Used by `Transaction::abort()` to look up each modified database for
     /// undo application.
     ///
-    /// In JE, called from
+    /// called from
     /// `Txn.undoLNs()`.
     pub fn get_database_by_id(
         &self,
@@ -840,7 +840,7 @@ impl EnvironmentImpl {
     ///
     /// Returns the number of records that were in the database before truncation.
     ///
-    /// JE: `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    /// : `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(&self, name: &str) -> Result<u64, DbiError> {
         self.check_open()?;
 
@@ -1105,7 +1105,7 @@ impl EnvironmentImpl {
             let _ = lm.flush_sync();
         }
 
-        // Shut down the NoSQL background services.
+        // Shut down the extended-fork background services.
         self.extinction_scanner.lock().unwrap().shutdown();
         self.data_eraser.lock().unwrap().shutdown();
         self.backup_manager.lock().unwrap().shutdown();
@@ -1115,7 +1115,7 @@ impl EnvironmentImpl {
     }
 
     // =========================================================================
-    // NoSQL fork: Record Extinction, Data Erasure, Auto-Backup
+    // extended fork: Record Extinction, Data Erasure, Auto-Backup
     // =========================================================================
 
     /// Schedules asynchronous removal of extinct records.
@@ -1125,7 +1125,7 @@ impl EnvironmentImpl {
     /// that the records will never be accessed again (see `ExtinctionFilter`).
     ///
     /// `Environment.discardExtinctRecords(Transaction, DatabaseImpl,
-    ///   DatabaseEntry startKey, DatabaseEntry endKey, ScanFilter)` (NoSQL fork).
+    ///   DatabaseEntry startKey, DatabaseEntry endKey, ScanFilter)` (extended fork).
     pub fn discard_extinct_records(
         &self,
         db_name: &str,
@@ -1143,21 +1143,21 @@ impl EnvironmentImpl {
 
     /// Returns `true` if an extinction scan is in progress.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     pub fn is_record_extinction_active(&self) -> bool {
         self.extinction_scanner.lock().unwrap().is_active()
     }
 
     /// Returns the total number of LN records discarded by extinction scans.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     pub fn n_lns_extinct(&self) -> u64 {
         self.extinction_scanner.lock().unwrap().n_lns_extinct()
     }
 
     /// Enqueues a disk region for physical data erasure.
     ///
-    /// (NoSQL fork).
+    /// (extended fork).
     pub fn enqueue_erase(&self, request: noxu_cleaner::EraseRequest) {
         self.data_eraser.lock().unwrap().enqueue_erase(request);
     }
@@ -1192,7 +1192,7 @@ impl Drop for EnvironmentImpl {
             let _ = handle.join();
         }
 
-        // Shut down the NoSQL background services.
+        // Shut down the extended-fork background services.
         self.extinction_scanner.lock().unwrap().shutdown();
         self.data_eraser.lock().unwrap().shutdown();
         self.backup_manager.lock().unwrap().shutdown();

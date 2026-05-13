@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Per-database operation throughput counters.
 ///
-/// Mirrors JE DbiStatDefinition THROUGHPUT_PRI_* statistics.
+/// DbiStatDefinition THROUGHPUT_PRI_* statistics.
 /// Shared across all CursorImpl instances for a single database via Arc.
 #[derive(Debug, Default)]
 pub struct ThroughputStats {

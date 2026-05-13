@@ -23,7 +23,7 @@
 //!
 //! # Flush/fsync path (flush_sync)
 //!
-//! Under LWL: collect dirty buffers + pwrite64 (JE logWriteMutex design).
+//! Under LWL: collect dirty buffers + pwrite64 ( logWriteMutex design).
 //! Outside LWL: fdatasync via FsyncManager leader/waiter (group-commit).
 //! Holding LWL through pwrite64 ensures concurrent threads complete their
 //! kernel writes before releasing, so they arrive at FsyncManager
@@ -61,10 +61,10 @@ pub struct LogManager {
     buffer_pool: Arc<Mutex<LogBufferPool>>,
 
     /// Serializes all log writes so entries appear in LSN order.
-    /// JE calls this the "Log Write Latch" (LWL).
+    /// this the "Log Write Latch" (LWL).
     ///
     /// Held through LSN assignment, memcpy into the write buffer, and the
-    /// pwrite64 syscall (matching JE's `logWriteMutex` design).  Holding the
+    /// pwrite64 syscall (correct's `logWriteMutex` design).  Holding the
     /// latch through pwrite64 ensures that all concurrent writers complete
     /// their kernel writes before entering `FsyncManager`, so they arrive
     /// simultaneously and the leader/waiter algorithm can coalesce multiple
@@ -313,7 +313,7 @@ impl LogManager {
 
             // Advance LSN bookkeeping in the FileManager so that the next
             // call to get_next_available_lsn() returns the correct value.
-            // We do this before the actual file write (matching JE).
+            // We do this before the actual file write (correct).
             let new_next = Lsn::new(
                 file_num,
                 current_lsn.file_offset() + entry_size as u32,
@@ -383,13 +383,13 @@ impl LogManager {
         };
         // LWL released here.
 
-        // Flush / fsync if requested, outside the LWL (matching JE).
+        // Flush / fsync if requested, outside the LWL (correct).
         // Use flush_sync_if_needed(lsn) rather than flush_sync() so that a
         // concurrent committer whose data was already flushed by a racing
         // leader thread can return immediately.  One thread flushes all
         // pending writes; the others see last_flush_lsn > their_commit_lsn
         // and skip the I/O entirely.
-        // This is the JE LogManager.flushTo(lsn) coalescing optimisation.
+        // This is the(lsn) coalescing optimisation.
         if fsync_required {
             self.flush_sync_if_needed(lsn)?;
         } else if flush_required {
@@ -425,7 +425,7 @@ impl LogManager {
     ///
     /// Three-phase write coalescing:
     ///
-    /// Phase 1 — under LWL (includes pwrite64, matching JE logWriteMutex):
+    /// Phase 1 — under LWL (includes pwrite64, correct logWriteMutex):
     ///   snapshot each dirty buffer's pending bytes, do pwrite64 while still
     ///   holding the LWL, then release the LWL.  Holding the LWL through
     ///   pwrite64 means that all concurrent committers complete their kernel
@@ -435,9 +435,9 @@ impl LogManager {
     ///
     /// Phase 2 — outside LWL (fdatasync via FsyncManager): multiple concurrent
     ///   callers elect one leader; the leader calls fdatasync once while waiters
-    ///   piggyback, matching JE's FSyncManager group-commit flow.
+    ///   piggyback, correct's FSyncManager group-commit flow.
     pub fn flush_sync(&self) -> Result<Lsn> {
-        // Under LWL: snapshot dirty buffers and pwrite64 (JE logWriteMutex
+        // Under LWL: snapshot dirty buffers and pwrite64 ( logWriteMutex
         // design).  Holding through pwrite64 ensures threads serialise their
         // kernel writes and then all arrive at FsyncManager simultaneously,
         // allowing the leader/waiter algorithm to coalesce fsyncs.
@@ -466,7 +466,7 @@ impl LogManager {
         Ok(eol)
     }
 
-    /// Port of JE `LogManager.flushTo(lsn)`:
+    /// Port of`LogManager.flushTo(lsn)`:
     /// flush and fsync only if `lsn` has not yet been flushed.
     ///
     /// Fast path: if `last_flush_lsn >= lsn`, return immediately — a
@@ -527,7 +527,7 @@ impl LogManager {
     ///
     /// Returns a `Vec<(data, file_offset)>` for the caller to write to disk.
     /// Must be called under the LWL; the caller does pwrite64 before releasing
-    /// the LWL (JE logWriteMutex design).
+    /// the LWL ( logWriteMutex design).
     fn collect_dirty_buffers(&self) -> Vec<(Vec<u8>, u64)> {
         let pool = self.buffer_pool.lock();
         let buffers = pool.get_all_buffers();
