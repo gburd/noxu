@@ -90,6 +90,9 @@ pub mod master_transfer;
 // Network transport
 pub mod net;
 
+// TLS configuration
+pub mod tls;
+
 // Subscription API
 pub mod subscription;
 
@@ -123,6 +126,8 @@ pub use state_change_listener::{StateChangeEvent, StateChangeListener};
 pub use subscription::{
     Subscription, SubscriptionCallback, SubscriptionConfig, SubscriptionState,
 };
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+pub use tls::TlsConfig;
 #[cfg(feature = "quic")]
 pub use net::{
     QuicChannel, QuicChannelListener, default_server_config, insecure_client_config,

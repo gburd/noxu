@@ -111,8 +111,10 @@ quoracle = { path = "crates/noxu-rep/quoracle" }
 # QUIC transport (optional, pulled in by noxu-rep's "quic" feature)
 quinn   = { version = "0.11" }
 tokio   = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "time"] }
-rustls  = { version = "0.23", features = ["ring"], default-features = false }
+rustls  = { version = "0.23", features = ["ring", "std"], default-features = false }
+rustls-pemfile = { version = "2" }
 rcgen   = { version = "0.13" }
+native-tls = { version = "0.2" }
 
 # External crates (approved core set)
 hashbrown = "0.15"
