@@ -6,6 +6,7 @@ license.workspace = true
 description = "Noxu DB - An embedded transactional database engine"
 
 [dependencies]
+hashbrown = { workspace = true }
 bytes = { workspace = true }
 noxu-cleaner = { workspace = true }
 noxu-dbi = { workspace = true }

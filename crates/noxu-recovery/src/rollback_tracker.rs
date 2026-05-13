@@ -8,7 +8,7 @@
 //! pre-txn version.
 
 use noxu_util::{Lsn, NULL_LSN};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Represents a rollback period  -  a range of LSNs that were rolled back.
 ///

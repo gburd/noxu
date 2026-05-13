@@ -30,7 +30,8 @@
 //! threshold and always returns the best file.
 
 use crate::file_summary::FileSummary;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+use hashbrown::{HashMap, HashSet};
 
 /// Status of a file in the cleaning pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

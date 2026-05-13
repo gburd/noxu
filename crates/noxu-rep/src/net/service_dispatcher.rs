@@ -21,7 +21,7 @@
 //! begin the actual service protocol. This `ServiceDispatcher`
 //! which reads a service name from each new socket before routing.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::SocketAddr;
 use std::sync::Arc;

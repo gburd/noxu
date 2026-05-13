@@ -32,7 +32,7 @@ use noxu_log::{
 };
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_util::vlsn::{NULL_VLSN, Vlsn};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 

@@ -4,7 +4,7 @@
 //! and provides methods for selecting files to clean based on utilization.
 
 use crate::file_summary::FileSummary;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Stores persistent file summaries and selects files for cleaning.
 ///

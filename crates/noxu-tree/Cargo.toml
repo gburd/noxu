@@ -6,6 +6,7 @@ license.workspace = true
 description = "B-tree implementation for Noxu DB"
 
 [dependencies]
+hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 noxu-latch = { workspace = true }
 noxu-log = { workspace = true }

@@ -55,7 +55,7 @@
     unused_imports
 )]
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

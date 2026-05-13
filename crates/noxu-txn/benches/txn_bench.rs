@@ -1,7 +1,7 @@
 //! Benchmarks for noxu-txn: lock conflict matrix, lock manager, deadlock detection.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 use noxu_txn::{DeadlockDetector, LockManager, LockType};
 

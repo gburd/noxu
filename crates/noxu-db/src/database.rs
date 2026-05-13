@@ -91,7 +91,6 @@ pub struct Database {
 /// State of a database handle.
 ///
 /// 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbState {
     /// Database is open and operational

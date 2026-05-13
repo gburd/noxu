@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use noxu_sync::RwLock;

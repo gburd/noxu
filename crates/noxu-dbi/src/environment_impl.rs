@@ -1,7 +1,7 @@
 //! Internal environment implementation.
 //!
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -329,8 +329,8 @@ impl EnvironmentImpl {
             //
             // We seed the map with db_id=1 (the primary user database) and let
             // recover_all() auto-insert entries for any other db_ids it discovers.
-            let mut recovery_trees: std::collections::HashMap<u64, noxu_tree::Tree> =
-                std::collections::HashMap::new();
+            let mut recovery_trees: HashMap<u64, noxu_tree::Tree> =
+                HashMap::new();
             recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
 
             if let Err(e) =

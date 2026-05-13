@@ -6,6 +6,7 @@ license.workspace = true
 description = "Internal utilities for Noxu DB (LSN, VLSN, byte encoding, stats framework)"
 
 [dependencies]
+hashbrown = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }

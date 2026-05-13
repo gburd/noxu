@@ -385,7 +385,7 @@ impl LogScanner for InMemoryLogScanner {
             })
             .cloned()
             .collect();
-        result.sort_by(|a, b| b.lsn.cmp(&a.lsn));
+        result.sort_by_key(|b| std::cmp::Reverse(b.lsn));
         result
     }
 

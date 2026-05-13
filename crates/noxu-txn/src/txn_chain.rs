@@ -1,7 +1,7 @@
 //! Partial transaction rollback for replication sync-up.
 //!
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use noxu_util::lsn::NULL_LSN;
 

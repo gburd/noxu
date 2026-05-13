@@ -1,7 +1,7 @@
 //! ThreadLocker - per-thread locker.
 //!
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use std::sync::Arc;
 use std::thread;
 

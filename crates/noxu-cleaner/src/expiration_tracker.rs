@@ -3,7 +3,7 @@
 //! tracks expired bytes in time windows
 //! (histogram) for each log file, used to calculate expired data during cleaning.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Tracks the expired bytes in each time window (histogram) for a log file.
 ///

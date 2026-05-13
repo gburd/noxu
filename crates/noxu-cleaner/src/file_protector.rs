@@ -4,7 +4,7 @@
 //! are being read or processed by various subsystems (backup, replication, etc.).
 
 use noxu_sync::Mutex;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Protects log files from deletion while they are being read or processed.
 ///

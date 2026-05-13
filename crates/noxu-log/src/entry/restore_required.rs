@@ -6,7 +6,7 @@
 
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::io::{self, Cursor};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
