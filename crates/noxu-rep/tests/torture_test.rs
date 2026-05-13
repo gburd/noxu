@@ -68,6 +68,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
+use noxu_evictor::{EvictionAlgorithm, EvictionPolicy};
 use noxu_rep::{NodeType, RepGroup, RepNode};
 use noxu_rep::elections::{run_acceptor, run_election};
 use noxu_rep::net::{Channel, TcpChannel, TcpChannelListener};
@@ -674,6 +675,12 @@ fn run_election_round(
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         match AnyListener::bind(kind, addr) {
             Some(l) => {
+                // Set SO_RCVTIMEO so the acceptor thread doesn't block forever
+                // when the proposer fails to connect under heavy netem chaos.
+                #[allow(irrefutable_let_patterns)]
+                if let AnyListener::Tcp(ref tl) = l {
+                    let _ = tl.set_accept_timeout(Some(Duration::from_secs(6)));
+                }
                 *nodes[i].last_election_port.lock().unwrap() = l.local_addr().port();
                 listeners.push((i, l));
             }
@@ -765,7 +772,17 @@ fn stream_vlsns(
     let replica_vlsn  = Arc::clone(&replica.vlsn);
     let disk_path     = replica.disk.path.clone();
 
-    // Replica receive thread.
+    // Connect the master first.  If the connect fails (e.g. under heavy
+    // netem chaos) we return immediately without spawning any receive thread.
+    // The kernel buffers the connection in the TCP backlog, so the receive
+    // thread's accept() will succeed immediately when it runs.
+    let master_ch: Arc<dyn Channel> = match connect_log(replica.transport, addr) {
+        Some(c) => c,
+        None    => return 0,
+    };
+
+    // Replica receive thread — accept() will return immediately from the
+    // backlog since the master already connected above.
     let recv_h = std::thread::spawn(move || {
         let ch = match listener.accept_log() {
             Some(c) => c,
@@ -791,12 +808,6 @@ fn stream_vlsns(
         }
         received
     });
-
-    // Master connects to replica's log listener using replica's transport.
-    let master_ch: Arc<dyn Channel> = match connect_log(replica.transport, addr) {
-        Some(c) => c,
-        None    => { let _ = recv_h.join(); return 0; }
-    };
 
     let runner = FeederRunner::new(Arc::clone(&master_ch), start_vlsn);
     let mut scanner = MemLogScanner::new(start_vlsn, count);
@@ -843,7 +854,22 @@ enum ChaosPhase {
     SlottedDelivery,
     /// Queue-bloat: high deterministic delay + shallow queue limit.
     QueueBloat,
+    /// Swap the primary and/or scan eviction policy on a node mid-run.
+    EvictionPolicyChange {
+        node_idx: usize,
+        primary:  EvictionAlgorithm,
+        scan:     EvictionAlgorithm,
+    },
 }
+
+/// All eviction algorithms available for random selection.
+const ALL_ALGOS: [EvictionAlgorithm; 5] = [
+    EvictionAlgorithm::Lru,
+    EvictionAlgorithm::Clock,
+    EvictionAlgorithm::Arc,
+    EvictionAlgorithm::Car,
+    EvictionAlgorithm::Lirs,
+];
 
 // ============================================================================
 // Main torture loop
@@ -881,17 +907,65 @@ fn torture_replication() {
     }
 
     let inv   = Arc::new(InvariantLog::new());
-    let netem = TcNetemGuard::setup();
+    let netem = Arc::new(TcNetemGuard::setup());
     let mut rng  = StdRng::seed_from_u64(0xDEAD_BEEF_CAFE);
     let mut term = 1u64;
     let mut vlsn_counter = 1u64;
     let mut round = 0u64;
     let mut current_master: Option<usize> = None;
 
+    // Per-node eviction policy pairs (primary, scan) — exercised each round.
+    // Initialised to LRU; swapped chaotically by EvictionPolicyChange phases.
+    let mut node_policies: Vec<(Box<dyn EvictionPolicy>, Box<dyn EvictionPolicy>)> =
+        (0..nodes.len())
+            .map(|_| (EvictionAlgorithm::Lru.new_policy(), EvictionAlgorithm::Lru.new_policy()))
+            .collect();
+    let mut node_algos: Vec<(EvictionAlgorithm, EvictionAlgorithm)> =
+        vec![(EvictionAlgorithm::Lru, EvictionAlgorithm::Lru); nodes.len()];
+
+    // Background network chaos thread — runs independently of the main loop
+    // so the network is never perfectly clean.  The thread continuously cycles
+    // between light noise and hard chaos spikes, updating tc netem every 50-250 ms.
+    let bg_netem = Arc::clone(&netem);
+    let bg_done  = Arc::new(AtomicBool::new(false));
+    let bg_done2 = Arc::clone(&bg_done);
+    let bg_seed  = rng.gen_range(0u64..u64::MAX);
+    let bg_handle = std::thread::spawn(move || {
+        let mut bg_rng = StdRng::seed_from_u64(bg_seed);
+        while !bg_done2.load(Ordering::Relaxed) {
+            if bg_rng.gen_bool(0.15) {
+                // Hard spike: severe faults for 100-400 ms.
+                let loss  = bg_rng.gen_range(35.0f32..80.0);
+                let delay = bg_rng.gen_range(40u64..200);
+                bg_netem.overlay(loss, delay, delay / 4 + 1, 5.0, 2.0, 0.5);
+                let spike_ms = bg_rng.gen_range(100u64..400);
+                let mut slept = 0u64;
+                while slept < spike_ms && !bg_done2.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    slept += 50;
+                }
+            } else {
+                // Background noise: light but non-zero faults.
+                let loss    = bg_rng.gen_range(0.5f32..12.0);
+                let delay   = bg_rng.gen_range(2u64..25);
+                let reorder = bg_rng.gen_range(0.0f32..6.0);
+                bg_netem.overlay(loss, delay, delay / 3 + 1, reorder, 0.3, 0.05);
+            }
+            // Sleep in small increments so we can notice `bg_done` quickly.
+            let sleep_ms = bg_rng.gen_range(50u64..250);
+            let mut slept = 0u64;
+            while slept < sleep_ms && !bg_done2.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+                slept += 20;
+            }
+        }
+    });
+
     // Stats
     let (mut n_elections, mut n_won, mut n_streams, mut n_crashes, mut n_chaos) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    let (mut n_joins, mut n_leaves, mut n_cap_changes) = (0u64, 0u64, 0u64);
+    let (mut n_joins, mut n_leaves, mut n_cap_changes, mut n_evict_changes) =
+        (0u64, 0u64, 0u64, 0u64);
 
     let start = Instant::now();
     let mut next_report = start + Duration::from_secs(30);
@@ -899,163 +973,23 @@ fn torture_replication() {
     while start.elapsed() < duration {
         round += 1;
 
-        // ── Chaos injection ───────────────────────────────────────────────
-        let phase: ChaosPhase = if rng.gen_bool(0.15) {
-            n_chaos += 1;
-            match rng.gen_range(0u32..15) {
-                0 => ChaosPhase::ModeratePacketLoss,
-                1 => ChaosPhase::HighLatency,
-                2 => ChaosPhase::ReorderHeavy,
-                3 => ChaosPhase::DuplicateAndCorrupt,
-                4 => {
-                    let alive_m: Vec<_> = members.iter().copied()
-                        .filter(|&i| nodes[i].is_alive()).collect();
-                    if alive_m.len() > 1 {
-                        let idx = alive_m[rng.gen_range(0..alive_m.len())];
-                        ChaosPhase::NodeCrash(idx)
-                    } else { n_chaos -= 1; ChaosPhase::Calm }
-                }
-                5 => ChaosPhase::MinorityPartition,
-                6 => {
-                    if members.len() < 7 { ChaosPhase::PeerJoin }
-                    else { n_chaos -= 1; ChaosPhase::Calm }
-                }
-                7 => {
-                    if members.len() >= 4 { ChaosPhase::PeerLeave }
-                    else { n_chaos -= 1; ChaosPhase::Calm }
-                }
-                8 => ChaosPhase::CapacityChange,
-                9 => {
-                    if members.len() < 6 { ChaosPhase::ClusterGrow }
-                    else { n_chaos -= 1; ChaosPhase::Calm }
-                }
-                10 => {
-                    if members.len() >= 5 { ChaosPhase::ClusterShrink }
-                    else { n_chaos -= 1; ChaosPhase::Calm }
-                }
-                11 => ChaosPhase::BurstLoss,
-                12 => ChaosPhase::BandwidthCap,
-                13 => ChaosPhase::SlottedDelivery,
-                _ => ChaosPhase::QueueBloat,
-            }
-        } else {
-            ChaosPhase::Calm
-        };
+        // ── Multi-dimensional chaos injection ─────────────────────────────
+        // Network chaos is handled by the background thread (constant, variable
+        // intensity).  Here we inject independent structural events per round.
 
-        match &phase {
-            ChaosPhase::Calm               => netem.overlay_calm(),
-            ChaosPhase::ModeratePacketLoss => netem.overlay(5.0, 2, 1, 2.0, 0.0, 0.0),
-            ChaosPhase::HighLatency        => netem.overlay(1.0, 80, 40, 5.0, 0.0, 0.0),
-            ChaosPhase::ReorderHeavy       => netem.overlay(3.0, 10, 5, 20.0, 0.0, 0.0),
-            ChaosPhase::DuplicateAndCorrupt=> netem.overlay(1.0, 5, 2, 5.0, 10.0, 1.0),
-            ChaosPhase::MinorityPartition  => netem.overlay(80.0, 5, 2, 0.0, 0.0, 0.0),
-            ChaosPhase::BurstLoss          => netem.overlay_burst_loss(5.0, 90.0),
-            ChaosPhase::BandwidthCap       => netem.overlay_bandwidth_cap(10),
-            ChaosPhase::SlottedDelivery    => netem.overlay_slot(20, 40),
-            ChaosPhase::QueueBloat         => netem.overlay_queue_bloat(50, 100),
-
-            ChaosPhase::PeerJoin => {
-                // Add a fresh electable node to the group under live replication.
-                let new_id = next_node_id;
-                next_node_id += 1;
-                let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
-                let new_idx = nodes.len();
-                let new_name = new_node.name.clone();
-                nodes.push(new_node);
-                members.push(new_idx);
-                group.add_node(RepNode::new(
-                    new_name.clone(),
-                    NodeType::Electable,
-                    "127.0.0.1".to_string(),
-                    6900 + new_id as u16,
-                    new_id,
-                ));
-                n_joins += 1;
-                eprintln!("[torture] r={round} PeerJoin: {new_name} members={}", members.len());
-                netem.overlay_calm();
-            }
-
-            ChaosPhase::PeerLeave => {
-                // Remove one non-master alive member; keep at least 3 for quorum.
-                let removable: Vec<usize> = members.iter().copied()
-                    .filter(|&i| nodes[i].is_alive() && current_master != Some(i))
-                    .collect();
-                if members.len() >= 4 && !removable.is_empty() {
-                    let mi = removable[rng.gen_range(0..removable.len())];
-                    let name = nodes[mi].name.clone();
-                    group.remove_node(&name);
-                    members.retain(|&i| i != mi);
-                    nodes[mi].alive.store(false, Ordering::SeqCst);
-                    n_leaves += 1;
-                    eprintln!("[torture] r={round} PeerLeave: {name} members={}", members.len());
-                }
-                netem.overlay_calm();
-            }
-
-            ChaosPhase::CapacityChange => {
-                // Hot-swap read/write capacity for a random group member.
-                let mi = members[rng.gen_range(0..members.len())];
-                let name = nodes[mi].name.clone();
-                if let Some(mut n) = group.remove_node(&name) {
-                    let new_cap = [50u32, 75, 100, 125, 150][rng.gen_range(0..5)];
-                    n.write_capacity_pct = new_cap;
-                    n.read_capacity_pct  = new_cap;
-                    group.add_node(n);
-                    n_cap_changes += 1;
-                    eprintln!("[torture] r={round} CapacityChange: {name} cap={new_cap}%");
-                }
-                netem.overlay_calm();
-            }
-
-            ChaosPhase::ClusterGrow => {
-                // Add two nodes sequentially while replication is active.
-                for _ in 0..2 {
-                    if members.len() >= 7 { break; }
-                    let new_id = next_node_id;
-                    next_node_id += 1;
-                    let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
-                    let new_idx = nodes.len();
-                    let new_name = new_node.name.clone();
-                    nodes.push(new_node);
-                    members.push(new_idx);
-                    group.add_node(RepNode::new(
-                        new_name,
-                        NodeType::Electable,
-                        "127.0.0.1".to_string(),
-                        6900 + new_id as u16,
-                        new_id,
-                    ));
-                    n_joins += 1;
-                }
-                eprintln!("[torture] r={round} ClusterGrow: members={}", members.len());
-                netem.overlay_calm();
-            }
-
-            ChaosPhase::ClusterShrink => {
-                // Remove two non-master members sequentially; floor at 3.
-                for _ in 0..2 {
-                    let removable: Vec<usize> = members.iter().copied()
-                        .filter(|&i| nodes[i].is_alive() && current_master != Some(i))
-                        .collect();
-                    if members.len() < 4 || removable.is_empty() { break; }
-                    let mi = removable[rng.gen_range(0..removable.len())];
-                    let name = nodes[mi].name.clone();
-                    group.remove_node(&name);
-                    members.retain(|&i| i != mi);
-                    nodes[mi].alive.store(false, Ordering::SeqCst);
-                    n_leaves += 1;
-                }
-                eprintln!("[torture] r={round} ClusterShrink: members={}", members.len());
-                netem.overlay_calm();
-            }
-
-            ChaosPhase::NodeCrash(idx) => {
-                let n = &nodes[*idx];
+        // (a) Node crash — 8% per round.
+        if rng.gen_bool(0.08) {
+            let alive_m: Vec<_> = members.iter().copied()
+                .filter(|&i| nodes[i].is_alive()).collect();
+            if alive_m.len() > 1 {
+                let idx = alive_m[rng.gen_range(0..alive_m.len())];
+                let n = &nodes[idx];
                 let disk_vlsn = n.vlsn();
-                eprintln!("[torture] crash node {} ({}), vlsn={disk_vlsn}", n.name, n.transport.name());
+                eprintln!("[torture] r={round} crash node {} ({}), vlsn={disk_vlsn}",
+                          n.name, n.transport.name());
                 n.alive.store(false, Ordering::SeqCst);
                 n_crashes += 1;
-                if current_master == Some(*idx) { current_master = None; }
+                if current_master == Some(idx) { current_master = None; }
 
                 let alive_flag = Arc::clone(&n.alive);
                 let vlsn_atom  = Arc::clone(&n.vlsn);
@@ -1074,15 +1008,138 @@ fn torture_replication() {
                     alive_flag.store(true, Ordering::SeqCst);
                     eprintln!("[torture] restart node{node_id} vlsn={restart_vlsn}");
                 });
-
-                netem.overlay_calm();
+                n_chaos += 1;
             }
         }
 
-        if !matches!(phase, ChaosPhase::Calm | ChaosPhase::NodeCrash(_)
-            | ChaosPhase::PeerJoin | ChaosPhase::PeerLeave | ChaosPhase::CapacityChange
-            | ChaosPhase::ClusterGrow | ChaosPhase::ClusterShrink) {
-            eprintln!("[torture] r={round} chaos={:?}", phase);
+        // (b) Membership change — 5% per round.
+        if rng.gen_bool(0.05) {
+            let membership_phase: Option<ChaosPhase> = match rng.gen_range(0u32..5) {
+                0 if members.len() < 7 => Some(ChaosPhase::PeerJoin),
+                1 if members.len() >= 4 => Some(ChaosPhase::PeerLeave),
+                2 => Some(ChaosPhase::CapacityChange),
+                3 if members.len() < 6 => Some(ChaosPhase::ClusterGrow),
+                4 if members.len() >= 5 => Some(ChaosPhase::ClusterShrink),
+                _ => None,
+            };
+            match membership_phase {
+                Some(ChaosPhase::PeerJoin) => {
+                    let new_id = next_node_id;
+                    next_node_id += 1;
+                    let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
+                    let new_idx = nodes.len();
+                    let new_name = new_node.name.clone();
+                    nodes.push(new_node);
+                    members.push(new_idx);
+                    // Extend policy vectors for the new node.
+                    node_policies.push((
+                        EvictionAlgorithm::Lru.new_policy(),
+                        EvictionAlgorithm::Lru.new_policy(),
+                    ));
+                    node_algos.push((EvictionAlgorithm::Lru, EvictionAlgorithm::Lru));
+                    group.add_node(RepNode::new(
+                        new_name.clone(), NodeType::Electable,
+                        "127.0.0.1".to_string(), 6900 + new_id as u16, new_id,
+                    ));
+                    n_joins += 1;
+                    n_chaos += 1;
+                    eprintln!("[torture] r={round} PeerJoin: {new_name} members={}", members.len());
+                }
+                Some(ChaosPhase::PeerLeave) => {
+                    let removable: Vec<usize> = members.iter().copied()
+                        .filter(|&i| nodes[i].is_alive() && current_master != Some(i))
+                        .collect();
+                    if members.len() >= 4 && !removable.is_empty() {
+                        let mi = removable[rng.gen_range(0..removable.len())];
+                        let name = nodes[mi].name.clone();
+                        group.remove_node(&name);
+                        members.retain(|&i| i != mi);
+                        nodes[mi].alive.store(false, Ordering::SeqCst);
+                        n_leaves += 1;
+                        n_chaos += 1;
+                        eprintln!("[torture] r={round} PeerLeave: {name} members={}",
+                                  members.len());
+                    }
+                }
+                Some(ChaosPhase::CapacityChange) => {
+                    let mi = members[rng.gen_range(0..members.len())];
+                    let name = nodes[mi].name.clone();
+                    if let Some(mut n) = group.remove_node(&name) {
+                        let new_cap = [50u32, 75, 100, 125, 150][rng.gen_range(0..5)];
+                        n.write_capacity_pct = new_cap;
+                        n.read_capacity_pct  = new_cap;
+                        group.add_node(n);
+                        n_cap_changes += 1;
+                        n_chaos += 1;
+                        eprintln!("[torture] r={round} CapacityChange: {name} cap={new_cap}%");
+                    }
+                }
+                Some(ChaosPhase::ClusterGrow) => {
+                    for _ in 0..2 {
+                        if members.len() >= 7 { break; }
+                        let new_id = next_node_id;
+                        next_node_id += 1;
+                        let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
+                        let new_idx = nodes.len();
+                        let new_name = new_node.name.clone();
+                        nodes.push(new_node);
+                        members.push(new_idx);
+                        node_policies.push((
+                            EvictionAlgorithm::Lru.new_policy(),
+                            EvictionAlgorithm::Lru.new_policy(),
+                        ));
+                        node_algos.push((EvictionAlgorithm::Lru, EvictionAlgorithm::Lru));
+                        group.add_node(RepNode::new(
+                            new_name, NodeType::Electable,
+                            "127.0.0.1".to_string(), 6900 + new_id as u16, new_id,
+                        ));
+                        n_joins += 1;
+                    }
+                    n_chaos += 1;
+                    eprintln!("[torture] r={round} ClusterGrow: members={}", members.len());
+                }
+                Some(ChaosPhase::ClusterShrink) => {
+                    for _ in 0..2 {
+                        let removable: Vec<usize> = members.iter().copied()
+                            .filter(|&i| nodes[i].is_alive() && current_master != Some(i))
+                            .collect();
+                        if members.len() < 4 || removable.is_empty() { break; }
+                        let mi = removable[rng.gen_range(0..removable.len())];
+                        let name = nodes[mi].name.clone();
+                        group.remove_node(&name);
+                        members.retain(|&i| i != mi);
+                        nodes[mi].alive.store(false, Ordering::SeqCst);
+                        n_leaves += 1;
+                    }
+                    n_chaos += 1;
+                    eprintln!("[torture] r={round} ClusterShrink: members={}", members.len());
+                }
+                _ => {}
+            }
+        }
+
+        // (c) Eviction policy change — 20% per round.
+        // Randomly select primary and (optionally distinct) scan algorithms
+        // for a random alive node; exercises all five policy implementations.
+        {
+            let alive_now: Vec<usize> = members.iter().copied()
+                .filter(|&i| nodes[i].is_alive() && i < node_policies.len())
+                .collect();
+            if rng.gen_bool(0.20) && !alive_now.is_empty() {
+                let target_ni = alive_now[rng.gen_range(0..alive_now.len())];
+                let new_primary = ALL_ALGOS[rng.gen_range(0..ALL_ALGOS.len())];
+                let new_scan = if rng.gen_bool(0.5) {
+                    ALL_ALGOS[rng.gen_range(0..ALL_ALGOS.len())]
+                } else {
+                    new_primary
+                };
+                node_policies[target_ni] = (new_primary.new_policy(), new_scan.new_policy());
+                node_algos[target_ni]    = (new_primary, new_scan);
+                n_evict_changes += 1;
+                n_chaos += 1;
+                eprintln!("[torture] r={round} evict_policy: node={} primary={new_primary:?} scan={new_scan:?}",
+                          nodes[target_ni].name);
+            }
         }
 
         // ── Election ──────────────────────────────────────────────────────
@@ -1112,7 +1169,6 @@ fn torture_replication() {
 
         if !won {
             eprintln!("[torture] r={round} election failed after {RETRY_BUDGET} attempts");
-            netem.overlay_calm();
             continue;
         }
 
@@ -1134,37 +1190,63 @@ fn torture_replication() {
             inv.record_vlsn(nodes[midx].id, nodes[midx].vlsn());
         }
 
-        // Restore calm after a network-chaos phase.
-        if !matches!(phase, ChaosPhase::Calm | ChaosPhase::NodeCrash(_)
-            | ChaosPhase::PeerJoin | ChaosPhase::PeerLeave | ChaosPhase::CapacityChange
-            | ChaosPhase::ClusterGrow | ChaosPhase::ClusterShrink) {
-            std::thread::sleep(Duration::from_millis(20));
-            netem.overlay_calm();
+        // ── Eviction policy simulation ─────────────────────────────────────
+        // Exercise the active (primary, scan) policies for every alive node to
+        // ensure that policy switches (EvictionPolicyChange chaos) and all five
+        // algorithm implementations are exercised under concurrent replication.
+        let page_base = vlsn_counter.wrapping_mul(37);
+        for &ni in &alive {
+            if ni >= node_policies.len() { continue; }
+            let (ref pri, ref scan) = node_policies[ni];
+            // Insert fake cache pages — spread by node index to avoid collisions.
+            let base = page_base + ni as u64 * 1000;
+            for k in 0u64..20 { pri.insert(base + k); }
+            for k in 0u64..10 { scan.insert_cold(base + 100 + k); }
+            // Touch half the primary pages (hot path).
+            for k in (0u64..20).step_by(2) { let _ = pri.touch(base + k); }
+            // Evict a handful — exercises LRU/Clock/ARC/CAR/LIRS candidate selection.
+            for _ in 0..5 { let _ = pri.evict_candidate(); }
+            for _ in 0..3 { let _ = scan.evict_candidate(); }
         }
+
+        // The background netem thread handles network restoration; no overlay_calm() here.
 
         // ── Periodic stats ────────────────────────────────────────────────
         let now = Instant::now();
         if now >= next_report {
             next_report = now + Duration::from_secs(30);
+            // Sample current policies for one node to show in the report.
+            let evict_info = if !alive.is_empty() {
+                let ni = alive[0];
+                if ni < node_algos.len() {
+                    let (p, s) = node_algos[ni];
+                    format!("{p:?}/{s:?}")
+                } else { "?/?".to_string() }
+            } else { "-".to_string() };
             eprintln!(
                 "[torture] elapsed={:.0?} r={round} elect={n_elections} won={n_won} \
                  streams={n_streams} crashes={n_crashes} chaos={n_chaos} \
                  joins={n_joins} leaves={n_leaves} cap_changes={n_cap_changes} \
+                 evict_changes={n_evict_changes} evict=[{evict_info}] \
                  members={} violations={}",
                 start.elapsed(), members.len(), inv.violations()
             );
         }
     }
 
+    // ── Tear-down background netem thread ──────────────────────────────────
+    bg_done.store(true, Ordering::Relaxed);
+    let _ = bg_handle.join();
+
     // ── Final report ──────────────────────────────────────────────────────
-    netem.overlay_calm();
+    let netem_active = netem.active;
     let violations = inv.violations();
 
     eprintln!("[torture] ═══════════════════════════════════════════════════");
     eprintln!("[torture] FINAL  elapsed={:.1?}", start.elapsed());
     eprintln!("[torture]   transport          : [{}]",
               transports.iter().map(|t| t.name()).collect::<Vec<_>>().join(","));
-    eprintln!("[torture]   tc netem active    : {}", netem.active);
+    eprintln!("[torture]   tc netem active    : {netem_active}");
     eprintln!("[torture]   rounds             : {round}");
     eprintln!("[torture]   elections          : {n_elections} attempted / {n_won} succeeded");
     eprintln!("[torture]   vlsn streams       : {n_streams}");
@@ -1173,10 +1255,14 @@ fn torture_replication() {
     eprintln!("[torture]   peer joins         : {n_joins}");
     eprintln!("[torture]   peer leaves        : {n_leaves}");
     eprintln!("[torture]   capacity changes   : {n_cap_changes}");
+    eprintln!("[torture]   evict changes      : {n_evict_changes}");
     eprintln!("[torture]   final group size   : {}", members.len());
     for &mi in &members {
         let n = &nodes[mi];
-        eprintln!("[torture]   {} ({})  vlsn={}", n.name, n.transport.name(), n.vlsn());
+        let (pa, sa) = if mi < node_algos.len() { node_algos[mi] }
+                       else { (EvictionAlgorithm::Lru, EvictionAlgorithm::Lru) };
+        eprintln!("[torture]   {} ({})  vlsn={}  evict={pa:?}/{sa:?}",
+                  n.name, n.transport.name(), n.vlsn());
     }
     // Also report any dynamically removed nodes for completeness.
     for (i, n) in nodes.iter().enumerate() {

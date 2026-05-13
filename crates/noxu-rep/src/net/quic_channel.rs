@@ -306,9 +306,9 @@ impl Channel for QuicChannel {
         }
         let len_prefix = (data.len() as u32).to_le_bytes();
         let payload = data.to_vec();
-        let send = Arc::clone(&self.send);
-        self.runtime.block_on(async move {
-            let mut stream = send.lock().await;
+        // Rust 2024: precise field capture — borrow self.send independently of self.runtime.
+        self.runtime.block_on(async {
+            let mut stream = self.send.lock().await;
             stream
                 .write_all(&len_prefix)
                 .await
@@ -328,9 +328,8 @@ impl Channel for QuicChannel {
         if !self.is_open() {
             return Err(RepError::ChannelClosed("QuicChannel is closed".into()));
         }
-        let recv = Arc::clone(&self.recv);
-        self.runtime.block_on(async move {
-            let mut stream = recv.lock().await;
+        self.runtime.block_on(async {
+            let mut stream = self.recv.lock().await;
 
             // Read the 4-byte length prefix, with a timeout.
             let mut len_buf = [0u8; 4];
@@ -378,9 +377,8 @@ impl Channel for QuicChannel {
         if !self.open.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
-        let send = Arc::clone(&self.send);
-        self.runtime.block_on(async move {
-            let mut stream = send.lock().await;
+        self.runtime.block_on(async {
+            let mut stream = self.send.lock().await;
             // FIN the send side.  The QUIC background task will piggyback the
             // FIN on the next STREAM frame or send it standalone.
             let _ = stream.finish();
@@ -468,11 +466,10 @@ impl QuicChannelListener {
     /// the 4-byte connection handshake (`NXUR`).  Returns a `QuicChannel`
     /// wrapping the accepted stream.
     pub fn accept(&self) -> Result<QuicChannel> {
-        let endpoint = self.endpoint.clone();
-        let runtime = Arc::clone(&self.runtime);
-        let rt = Arc::clone(&self.runtime);
-        runtime.block_on(async move {
-            let incoming = endpoint
+        // Rust 2024: self.endpoint and self.runtime are separate field borrows.
+        // Clone runtime once inside the future (instead of twice outside).
+        self.runtime.block_on(async {
+            let incoming = self.endpoint
                 .accept()
                 .await
                 .ok_or_else(|| RepError::NetworkError("QUIC endpoint closed".into()))?;
@@ -493,7 +490,7 @@ impl QuicChannelListener {
                     "invalid QUIC handshake magic: {magic:02x?}"
                 )));
             }
-            Ok(QuicChannel::from_streams(conn, send, recv, rt))
+            Ok(QuicChannel::from_streams(conn, send, recv, Arc::clone(&self.runtime)))
         })
     }
 }

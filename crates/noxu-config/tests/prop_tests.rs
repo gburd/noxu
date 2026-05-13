@@ -15,7 +15,7 @@ proptest! {
     #[test]
     fn config_int_set_get_roundtrip(val in 1i32..=90i32) {
         let mut mgr = ConfigManager::new();
-        mgr.set("je.maxMemoryPercent", ParamValue::Int(val), false).unwrap();
+        mgr.set("noxu.maxMemoryPercent", ParamValue::Int(val), false).unwrap();
         let result = mgr.get_int(&params::MAX_MEMORY_PERCENT);
         prop_assert_eq!(result, val);
     }
@@ -24,7 +24,7 @@ proptest! {
     #[test]
     fn config_int_out_of_range_rejected(val in 91i32..=i32::MAX) {
         let mut mgr = ConfigManager::new();
-        let result = mgr.set("je.maxMemoryPercent", ParamValue::Int(val), false);
+        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(val), false);
         prop_assert!(result.is_err());
     }
 
@@ -33,7 +33,7 @@ proptest! {
     #[test]
     fn config_long_set_get_roundtrip(val in 1_000_000i64..=1_073_741_824i64) {
         let mut mgr = ConfigManager::new();
-        mgr.set("je.log.fileMax", ParamValue::Long(val), false).unwrap();
+        mgr.set("noxu.log.fileMax", ParamValue::Long(val), false).unwrap();
         let result = mgr.get_long(&params::LOG_FILE_MAX);
         prop_assert_eq!(result, val);
     }
@@ -42,7 +42,7 @@ proptest! {
     #[test]
     fn config_long_below_min_rejected(val in 0i64..1_000_000i64) {
         let mut mgr = ConfigManager::new();
-        let result = mgr.set("je.log.fileMax", ParamValue::Long(val), false);
+        let result = mgr.set("noxu.log.fileMax", ParamValue::Long(val), false);
         prop_assert!(result.is_err());
     }
 
@@ -50,7 +50,7 @@ proptest! {
     #[test]
     fn config_bool_set_get_roundtrip(val: bool) {
         let mut mgr = ConfigManager::new();
-        mgr.set("je.env.recovery", ParamValue::Bool(val), false).unwrap();
+        mgr.set("noxu.env.recovery", ParamValue::Bool(val), false).unwrap();
         let result = mgr.get_bool(&params::ENV_RECOVERY);
         prop_assert_eq!(result, val);
     }
@@ -59,7 +59,7 @@ proptest! {
     #[test]
     fn config_type_mismatch_rejected(val: i32) {
         let mut mgr = ConfigManager::new();
-        let result = mgr.set("je.env.recovery", ParamValue::Int(val), false);
+        let result = mgr.set("noxu.env.recovery", ParamValue::Int(val), false);
         prop_assert!(result.is_err());
     }
 
@@ -76,7 +76,7 @@ proptest! {
     #[test]
     fn config_mutability_enforced(val in 1_000_000i64..=1_073_741_824i64) {
         let mut mgr = ConfigManager::new();
-        let result = mgr.set("je.log.fileMax", ParamValue::Long(val), true);
+        let result = mgr.set("noxu.log.fileMax", ParamValue::Long(val), true);
         prop_assert!(result.is_err());
     }
 
@@ -85,7 +85,7 @@ proptest! {
     #[test]
     fn config_mutable_param_set_when_open(val in 1i32..=90i32) {
         let mut mgr = ConfigManager::new();
-        let result = mgr.set("je.maxMemoryPercent", ParamValue::Int(val), true);
+        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(val), true);
         prop_assert!(result.is_ok());
     }
 }

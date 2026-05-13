@@ -316,9 +316,9 @@ mod tests {
 
     /// Acquiring an already-held exclusive latch must panic (reentrancy detection).
     #[test]
-    fn test_je_acquire_reacquire_panics() {
+    fn test_acquire_reacquire_panics() {
         let result = std::panic::catch_unwind(|| {
-            let latch = ExclusiveLatch::named("je-reacquire");
+            let latch = ExclusiveLatch::named("noxu-reacquire");
             let _g1 = latch.acquire().expect("first acquire");
             // Second acquire on same thread must panic.
             let _ = latch.acquire();
@@ -328,12 +328,12 @@ mod tests {
 
     /// Releasing a latch that is not held must panic.
     #[test]
-    fn test_je_release_not_held_panics() {
+    fn test_release_not_held_panics() {
         // release_if_owner on a latch not held should be a no-op (not panic).
         // But acquiring twice panics, so we verify the second-acquire path
         // by catching the panic (tested above).  Here verify the "not owner"
         // path via release_if_owner which is safe when not held.
-        let latch = ExclusiveLatch::named("je-not-held");
+        let latch = ExclusiveLatch::named("noxu-not-held");
         assert!(!latch.is_locked());
         // release_if_owner on a not-held latch should be a no-op.
         latch.release_if_owner();
@@ -342,8 +342,8 @@ mod tests {
 
     /// `try_acquire` returns None when held by another thread, and Some when available.
     #[test]
-    fn test_je_try_acquire_no_wait() {
-        let latch = Arc::new(ExclusiveLatch::named("je-no-wait"));
+    fn test_try_acquire_no_wait() {
+        let latch = Arc::new(ExclusiveLatch::named("noxu-no-wait"));
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
         // Thread 1 holds the latch.
@@ -387,8 +387,8 @@ mod tests {
     /// A second thread blocks on `acquire` while the first holds it;
     /// after the first releases, the second is granted.
     #[test]
-    fn test_je_wait_blocks_until_released() {
-        let latch = Arc::new(ExclusiveLatch::named("je-wait"));
+    fn test_wait_blocks_until_released() {
+        let latch = Arc::new(ExclusiveLatch::named("noxu-wait"));
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Thread 1 acquires the latch.
@@ -415,10 +415,10 @@ mod tests {
 
     /// N threads wait sequentially; each is granted after the previous releases.
     #[test]
-    fn test_je_multiple_waiters_sequential_grant() {
+    fn test_multiple_waiters_sequential_grant() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         const N: usize = 5;
-        let latch = Arc::new(ExclusiveLatch::named("je-multi-wait"));
+        let latch = Arc::new(ExclusiveLatch::named("noxu-multi-wait"));
         let order = Arc::new(AtomicUsize::new(0));
 
         // Main thread acquires.

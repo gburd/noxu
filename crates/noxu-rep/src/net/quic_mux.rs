@@ -145,9 +145,10 @@ impl Channel for QuicSubChannel {
         }
         let len_prefix = (data.len() as u32).to_le_bytes();
         let payload = data.to_vec();
-        let send = Arc::clone(&self.send);
-        self.runtime.block_on(async move {
-            let mut stream = send.lock().await;
+        // Rust 2024 edition: async block captures self.send by field (not all of self),
+        // so borrowing self.runtime for block_on and self.send inside the future is fine.
+        self.runtime.block_on(async {
+            let mut stream = self.send.lock().await;
             stream
                 .write_all(&len_prefix)
                 .await
@@ -163,9 +164,8 @@ impl Channel for QuicSubChannel {
         if !self.is_open() {
             return Err(RepError::ChannelClosed("QuicSubChannel is closed".into()));
         }
-        let recv = Arc::clone(&self.recv);
-        self.runtime.block_on(async move {
-            let mut stream = recv.lock().await;
+        self.runtime.block_on(async {
+            let mut stream = self.recv.lock().await;
 
             let mut len_buf = [0u8; 4];
             match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await {
@@ -200,9 +200,8 @@ impl Channel for QuicSubChannel {
         if !self.open.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
-        let send = Arc::clone(&self.send);
-        self.runtime.block_on(async move {
-            let mut stream = send.lock().await;
+        self.runtime.block_on(async {
+            let mut stream = self.send.lock().await;
             let _ = stream.finish();
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
@@ -526,17 +525,12 @@ impl QuicMultiplexedChannel {
         self.ack.open.store(false, Ordering::SeqCst);
         self.restore.open.store(false, Ordering::SeqCst);
 
-        let hb = Arc::clone(&self.heartbeat.send);
-        let log = Arc::clone(&self.log.send);
-        let ack = Arc::clone(&self.ack.send);
-        let rst = Arc::clone(&self.restore.send);
-
-        // Finish all four send streams concurrently, then wait once.
-        self.runtime.block_on(async move {
-            let _ = hb.lock().await.finish();
-            let _ = log.lock().await.finish();
-            let _ = ack.lock().await.finish();
-            let _ = rst.lock().await.finish();
+        // Rust 2024: async block captures each sub-channel's send field precisely.
+        self.runtime.block_on(async {
+            let _ = self.heartbeat.send.lock().await.finish();
+            let _ = self.log.send.lock().await.finish();
+            let _ = self.ack.send.lock().await.finish();
+            let _ = self.restore.send.lock().await.finish();
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
         Ok(())
@@ -569,9 +563,8 @@ impl ReplicationChannel for QuicMultiplexedChannel {
     }
 
     fn recv_vlsn_datagram(&self, timeout: Duration) -> Result<Option<i64>> {
-        let conn = self.connection.clone();
-        self.runtime.block_on(async move {
-            match tokio::time::timeout(timeout, conn.read_datagram()).await {
+        self.runtime.block_on(async {
+            match tokio::time::timeout(timeout, self.connection.read_datagram()).await {
                 Err(_elapsed) => Ok(None),
                 Ok(Ok(data)) => {
                     if data.len() != 8 {
@@ -660,12 +653,10 @@ impl QuicMultiplexedChannelListener {
     /// Waits for the client to open four bidirectional streams and validates
     /// the 5-byte handshake on each stream before returning.
     pub fn accept(&self) -> Result<QuicMultiplexedChannel> {
-        let endpoint = self.endpoint.clone();
-        let runtime = Arc::clone(&self.runtime);
-        let rt = Arc::clone(&self.runtime);
-
-        runtime.block_on(async move {
-            let incoming = endpoint
+        // Rust 2024: borrow self.endpoint and self.runtime as separate fields;
+        // the runtime Arc is cloned once inside the future (not twice outside).
+        self.runtime.block_on(async {
+            let incoming = self.endpoint
                 .accept()
                 .await
                 .ok_or_else(|| RepError::NetworkError("QUIC endpoint closed".into()))?;
@@ -720,20 +711,16 @@ impl QuicMultiplexedChannelListener {
                 .remove(&STREAM_RESTORE)
                 .ok_or_else(|| RepError::NetworkError("missing restore stream".into()))?;
 
-            let (hb_rt, log_rt, ack_rt, rst_rt) = (
-                Arc::clone(&rt),
-                Arc::clone(&rt),
-                Arc::clone(&rt),
-                Arc::clone(&rt),
-            );
-
+            // One clone of the runtime Arc, distributed to each sub-channel and
+            // to the channel itself (five Arc::clone total, down from six before).
+            let rt = Arc::clone(&self.runtime);
             Ok(QuicMultiplexedChannel {
                 endpoint: None, // server side: listener owns the endpoint
                 connection: conn,
-                heartbeat: QuicSubChannel::new(hb_s, hb_r, hb_rt),
-                log: QuicSubChannel::new(log_s, log_r, log_rt),
-                ack: QuicSubChannel::new(ack_s, ack_r, ack_rt),
-                restore: QuicSubChannel::new(rst_s, rst_r, rst_rt),
+                heartbeat: QuicSubChannel::new(hb_s, hb_r, Arc::clone(&rt)),
+                log: QuicSubChannel::new(log_s, log_r, Arc::clone(&rt)),
+                ack: QuicSubChannel::new(ack_s, ack_r, Arc::clone(&rt)),
+                restore: QuicSubChannel::new(rst_s, rst_r, Arc::clone(&rt)),
                 runtime: rt,
                 open: AtomicBool::new(true),
             })

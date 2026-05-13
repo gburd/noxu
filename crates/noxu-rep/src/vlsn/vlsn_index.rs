@@ -349,7 +349,7 @@ mod tests {
     ///   - LTE lookup (get_lsn) returns the expected stride-boundary lsn
     ///   - VLSNs without a stride entry return the nearest lower mapped entry
     #[test]
-    fn je_test_non_flushed_gets() {
+    fn test_non_flushed_gets() {
         let stride = 3u32;
         let index = VlsnIndex::new(stride);
         let num_entries = 25u64;
@@ -393,7 +393,7 @@ mod tests {
     /// Verify that VLSNs outside the tracked range
     /// return None.
     #[test]
-    fn je_test_out_of_range_returns_none() {
+    fn test_out_of_range_returns_none() {
         let index = VlsnIndex::new(3);
         for i in 5u64..=15 {
             index.put(i, 0, i as u32 * 10);
@@ -408,7 +408,7 @@ mod tests {
     /// Mappings inserted in
     /// non-sequential order; range and lookup must still be correct.
     #[test]
-    fn je_test_out_of_order_puts() {
+    fn test_out_of_order_puts() {
         let index = VlsnIndex::new(3);
         // Insert out of order: 1,2,5,3,6,4,8,9,7
         let order: &[u64] = &[1, 2, 5, 3, 6, 4, 8, 9, 7];
@@ -440,7 +440,7 @@ mod tests {
     /// authoritative boundary is the VlsnRange — callers must consult
     /// `get_range()` to determine the valid VLSN extent.
     #[test]
-    fn je_test_truncate_from_tail() {
+    fn test_truncate_from_tail() {
         let index = VlsnIndex::new(3);
         for i in 1u64..=20 {
             index.put(i, 0, i as u32 * 10);
@@ -479,7 +479,7 @@ mod tests {
     /// range is correct and that vlsns beyond the truncation point that do NOT
     /// have a bucket are not found.
     #[test]
-    fn je_test_truncate_removes_buckets_beyond_point() {
+    fn test_truncate_removes_buckets_beyond_point() {
         let index = VlsnIndex::new(5);
 
         // Bucket 1 (first_vlsn=1): insert vlsns 1-20.
@@ -519,7 +519,7 @@ mod tests {
     /// After truncation, the last committed
     /// and synced VLSNs tracked in the range are clamped to the new end.
     #[test]
-    fn je_test_truncate_clamps_range_metadata() {
+    fn test_truncate_clamps_range_metadata() {
         let index = VlsnIndex::new(3);
         for i in 1u64..=20 {
             index.put(i, 0, i as u32 * 10);
@@ -543,7 +543,7 @@ mod tests {
     /// vlsn in the range there is always a bucket whose first vlsn <=
     /// the query vlsn (LTE bucket exists).
     #[test]
-    fn je_test_lte_bucket_always_exists_for_range() {
+    fn test_lte_bucket_always_exists_for_range() {
         let stride = 3u32;
         let index = VlsnIndex::new(stride);
         let num_entries = 25u64;
@@ -567,7 +567,7 @@ mod tests {
     /// inserts with small gaps (holes at vlsn 12 and 24) and verifies
     /// the index still returns valid (non-None) lsns for all non-hole vlsns.
     #[test]
-    fn je_test_non_contiguous_small_holes() {
+    fn test_non_contiguous_small_holes() {
         let stride = 3u32;
         let index = VlsnIndex::new(stride);
         let num_entries = 30u64;
@@ -611,7 +611,7 @@ mod tests {
     /// VLSNIndexTest.testNonContiguousBucketLargeHoles —
     /// inserts with three-vlsn gaps and verifies index integrity.
     #[test]
-    fn je_test_non_contiguous_large_holes() {
+    fn test_non_contiguous_large_holes() {
         let stride = 5u32;
         let index = VlsnIndex::new(stride);
         let num_entries = 50u64;
@@ -644,7 +644,7 @@ mod tests {
     /// Range first/last track the actual vlsn
     /// extremes even when insertions arrive out of order.
     #[test]
-    fn je_test_range_tracks_extremes() {
+    fn test_range_tracks_extremes() {
         let index = VlsnIndex::new(5);
         index.put(5, 0, 500);
         index.put(1, 0, 100);
@@ -659,7 +659,7 @@ mod tests {
     /// The index correctly handles a single vlsn
     /// (degenerate range).
     #[test]
-    fn je_test_single_entry_range() {
+    fn test_single_entry_range() {
         let index = VlsnIndex::new(10);
         index.put(42, 1, 420);
         let range = index.get_range();
@@ -678,7 +678,7 @@ mod tests {
     /// adding vlsns 26-30 in a second batch, a query for vlsn 22 returns an
     /// entry from the first batch.
     #[test]
-    fn je_test_gte_search_after_second_batch() {
+    fn test_gte_search_after_second_batch() {
         let stride = 5u32;
         let index = VlsnIndex::new(stride);
 
@@ -717,7 +717,7 @@ mod tests {
     /// Truncation to zero makes the range empty
     /// and all subsequent lookups return None.
     #[test]
-    fn je_test_truncate_to_empty() {
+    fn test_truncate_to_empty() {
         let index = VlsnIndex::new(3);
         for i in 1u64..=15 {
             index.put(i, 0, i as u32 * 10);
@@ -735,7 +735,7 @@ mod tests {
     /// Ported from VLSNConsistencyTest invariants — the range's first vlsn
     /// must always be <= last vlsn, and commit/sync vlsns must be <= last.
     #[test]
-    fn je_test_range_invariants() {
+    fn test_range_invariants() {
         let index = VlsnIndex::new(5);
         for i in 1u64..=30 {
             index.put(i, 0, i as u32 * 100);
@@ -773,7 +773,7 @@ mod tests {
     /// Verify that inserting the same vlsn twice
     /// (idempotent re-registration) does not corrupt the range or lookups.
     #[test]
-    fn je_test_duplicate_vlsn_insert() {
+    fn test_duplicate_vlsn_insert() {
         let index = VlsnIndex::new(3);
         index.put(1, 0, 100);
         index.put(2, 0, 200);

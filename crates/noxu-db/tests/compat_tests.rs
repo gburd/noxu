@@ -57,7 +57,7 @@ fn kv(k: u32, v: u32) -> (DatabaseEntry, DatabaseEntry) {
 /// JE: DatabaseTest.testBasicOperations
 /// Basic put/get/delete round-trip with a transaction.
 #[test]
-fn je_database_txn_put_get_delete() {
+fn database_txn_put_get_delete() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -83,7 +83,7 @@ fn je_database_txn_put_get_delete() {
 /// JE: DatabaseTest.testDeleteNonExistentKey
 /// Deleting a key that does not exist returns NotFound.
 #[test]
-fn je_database_delete_nonexistent_returns_not_found() {
+fn database_delete_nonexistent_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let k = DatabaseEntry::from_bytes(b"absent");
@@ -93,7 +93,7 @@ fn je_database_delete_nonexistent_returns_not_found() {
 /// JE: DatabaseTest.testOverwrite
 /// Put is idempotent: second put on same key replaces the value.
 #[test]
-fn je_database_put_replaces_existing_value() {
+fn database_put_replaces_existing_value() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let k = DatabaseEntry::from_bytes(b"k");
@@ -107,7 +107,7 @@ fn je_database_put_replaces_existing_value() {
 /// JE: DatabaseTest.testCountAfterInsertDelete
 /// count() is updated immediately after each put and delete.
 #[test]
-fn je_database_count_after_insert_delete() {
+fn database_count_after_insert_delete() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -127,7 +127,7 @@ fn je_database_count_after_insert_delete() {
 /// JE: DatabaseTest.testPutNoOverwrite
 /// put_no_overwrite returns KeyExists; original value is unchanged.
 #[test]
-fn je_database_put_no_overwrite_returns_key_exists() {
+fn database_put_no_overwrite_returns_key_exists() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let k = DatabaseEntry::from_bytes(b"k");
@@ -148,7 +148,7 @@ fn je_database_put_no_overwrite_returns_key_exists() {
 /// JE: TruncateTest.testEnvTruncateCommit
 /// truncate_database removes all records; subsequent gets return NotFound.
 #[test]
-fn je_truncate_database_clears_all_records() {
+fn truncate_database_clears_all_records() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -178,7 +178,7 @@ fn je_truncate_database_clears_all_records() {
 /// JE: TruncateTest.testEnvTruncateAndAdd
 /// After truncation, new records can be inserted and retrieved correctly.
 #[test]
-fn je_truncate_then_add_records_works() {
+fn truncate_then_add_records_works() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -207,7 +207,7 @@ fn je_truncate_then_add_records_works() {
 /// JE: TruncateTest.testEnvTruncateCountOnly
 /// truncate_database on an empty database returns 0.
 #[test]
-fn je_truncate_empty_database_returns_zero() {
+fn truncate_empty_database_returns_zero() {
     let dir = TempDir::new().unwrap();
     let (env, _db) = open(&dir);
     let count = env.truncate_database(None, "test").unwrap();
@@ -216,7 +216,7 @@ fn je_truncate_empty_database_returns_zero() {
 
 /// JE: TruncateTest — non-existent database returns an error.
 #[test]
-fn je_truncate_nonexistent_database_errors() {
+fn truncate_nonexistent_database_errors() {
     let dir = TempDir::new().unwrap();
     let (env, _db) = open(&dir);
     let result = env.truncate_database(None, "nosuchdb");
@@ -233,7 +233,7 @@ fn je_truncate_nonexistent_database_errors() {
 /// be able to see the dirty write without blocking; a cursor using Default
 /// lock mode must block (or fail with no_wait).
 #[test]
-fn je_read_uncommitted_sees_dirty_write() {
+fn read_uncommitted_sees_dirty_write() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -304,7 +304,7 @@ fn je_read_uncommitted_sees_dirty_write() {
 /// JE: DirtyReadTest — ReadUncommitted via CursorConfig
 /// A cursor configured with read_uncommitted=true can scan without acquiring locks.
 #[test]
-fn je_read_uncommitted_cursor_config_no_blocking() {
+fn read_uncommitted_cursor_config_no_blocking() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -342,7 +342,7 @@ fn je_read_uncommitted_cursor_config_no_blocking() {
 ///
 /// JE: DatabaseTest.testInsert257Records (NUM_RECS = 257)
 #[test]
-fn je_large_scale_insert_search_scan_257() {
+fn large_scale_insert_search_scan_257() {
     const N: u32 = 257;
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
@@ -387,7 +387,7 @@ fn je_large_scale_insert_search_scan_257() {
 ///
 /// JE: scale test equivalent; validates multi-level tree traversal at scale.
 #[test]
-fn je_large_scale_10k_deep_tree_correctness() {
+fn large_scale_10k_deep_tree_correctness() {
     const N: u32 = 10_000;
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
@@ -418,7 +418,7 @@ fn je_large_scale_10k_deep_tree_correctness() {
 ///
 /// JE: DatabaseTest pattern — write 500, delete odd keys, re-read even keys.
 #[test]
-fn je_large_scale_interleaved_insert_delete() {
+fn large_scale_interleaved_insert_delete() {
     const N: u32 = 500;
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
@@ -472,7 +472,7 @@ fn je_large_scale_interleaved_insert_delete() {
 /// checkpointer and the recovery scanner's ability to reconstruct state from
 /// multiple checkpoints.
 #[test]
-fn je_recovery_across_checkpoint_boundary() {
+fn recovery_across_checkpoint_boundary() {
     const BATCH1: u32 = 100;
     const BATCH2: u32 = 100;
     let dir = TempDir::new().unwrap();
@@ -547,7 +547,7 @@ fn je_recovery_across_checkpoint_boundary() {
 /// JE: TransactionTest.testAbortInsert
 /// An inserted record that is part of an aborted transaction must not be visible.
 #[test]
-fn je_txn_abort_insert_not_visible() {
+fn txn_abort_insert_not_visible() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -567,7 +567,7 @@ fn je_txn_abort_insert_not_visible() {
 /// JE: TransactionTest.testAbortUpdate
 /// An update that is aborted must restore the original value.
 #[test]
-fn je_txn_abort_update_restores_original_value() {
+fn txn_abort_update_restores_original_value() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -594,7 +594,7 @@ fn je_txn_abort_update_restores_original_value() {
 /// JE: TransactionTest.testAbortDelete
 /// A deleted record whose transaction is aborted must reappear.
 #[test]
-fn je_txn_abort_delete_restores_record() {
+fn txn_abort_delete_restores_record() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -618,7 +618,7 @@ fn je_txn_abort_delete_restores_record() {
 /// A transaction with multiple mixed operations (insert+update+delete) must
 /// undo them all on abort, leaving the database in its pre-transaction state.
 #[test]
-fn je_txn_abort_multiple_ops_restores_prior_state() {
+fn txn_abort_multiple_ops_restores_prior_state() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
@@ -699,7 +699,7 @@ fn je_txn_abort_multiple_ops_restores_prior_state() {
 /// JE: CursorEdgeTest.testEmptyDatabase
 /// First / Last / Next / Prev on an empty database all return NotFound.
 #[test]
-fn je_cursor_edge_empty_database_all_ops_not_found() {
+fn cursor_edge_empty_database_all_ops_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -719,7 +719,7 @@ fn je_cursor_edge_empty_database_all_ops_not_found() {
 /// JE: CursorEdgeTest.testSearchOnDeletedRecord
 /// Searching for a deleted key returns NotFound.
 #[test]
-fn je_cursor_edge_search_after_delete_returns_not_found() {
+fn cursor_edge_search_after_delete_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -740,7 +740,7 @@ fn je_cursor_edge_search_after_delete_returns_not_found() {
 /// JE: CursorEdgeTest — cursor positions correctly after adjacent deletes.
 /// Delete the first, last, and a middle key; cursor must skip all of them.
 #[test]
-fn je_cursor_edge_skip_deleted_records() {
+fn cursor_edge_skip_deleted_records() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -774,7 +774,7 @@ fn je_cursor_edge_skip_deleted_records() {
 /// JE: CursorEdgeTest.testGetCurrentAfterDelete
 /// Get::Current on a cursor positioned on a deleted record returns NotFound.
 #[test]
-fn je_cursor_edge_current_after_delete_not_found() {
+fn cursor_edge_current_after_delete_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -812,7 +812,7 @@ fn je_cursor_edge_current_after_delete_not_found() {
 /// Get::SearchGte returns the smallest key >= search key.
 /// When the search key is larger than all keys, returns NotFound.
 #[test]
-fn je_cursor_search_gte_edge_cases() {
+fn cursor_search_gte_edge_cases() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -867,7 +867,7 @@ fn je_cursor_search_gte_edge_cases() {
 /// Thread 2 (T2): commits key → v2 between T1's two reads.
 /// Thread 1 (T1): reads key again → observes v2 (non-repeatable read allowed).
 #[test]
-fn je_read_committed_allows_non_repeatable_read() {
+fn read_committed_allows_non_repeatable_read() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -946,7 +946,7 @@ fn je_read_committed_allows_non_repeatable_read() {
 /// the same transaction must return the same value even if another thread
 /// commits a new value between them.
 #[test]
-fn je_serializable_isolation_repeatable_read() {
+fn serializable_isolation_repeatable_read() {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -1024,7 +1024,7 @@ fn je_serializable_isolation_repeatable_read() {
 /// JE: DatabaseTest.testMultipleDatabasesIsolated
 /// Operations on different databases in the same environment are independent.
 #[test]
-fn je_multiple_databases_fully_isolated() {
+fn multiple_databases_fully_isolated() {
     const N: u32 = 50;
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
@@ -1063,7 +1063,7 @@ fn je_multiple_databases_fully_isolated() {
 ///
 /// JE: equivalent to JCK stress test with NUM_RECS = 1000.
 #[test]
-fn je_recovery_1000_records_survive_reopen() {
+fn recovery_1000_records_survive_reopen() {
     const N: u32 = 1_000;
     let dir = TempDir::new().unwrap();
 
@@ -1101,7 +1101,7 @@ fn je_recovery_1000_records_survive_reopen() {
 /// that the *updated* values (not the originals) are present.
 /// Tests that WAL update records are correctly replayed during recovery.
 #[test]
-fn je_recovery_updates_are_durable() {
+fn recovery_updates_are_durable() {
     const N: u32 = 500;
     let dir = TempDir::new().unwrap();
 
@@ -1141,7 +1141,7 @@ fn je_recovery_updates_are_durable() {
 
 /// JE: CursorTest — cursor.count() returns 1 for a non-duplicate key.
 #[test]
-fn je_cursor_count_non_dup_key_is_one() {
+fn cursor_count_non_dup_key_is_one() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -1166,7 +1166,7 @@ fn je_cursor_count_non_dup_key_is_one() {
 
 /// JE: CursorTest — cursor put (Put::Overwrite) replaces value in place.
 #[test]
-fn je_cursor_put_overwrite_replaces_value() {
+fn cursor_put_overwrite_replaces_value() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -1198,7 +1198,7 @@ fn je_cursor_put_overwrite_replaces_value() {
 
 /// JE: EnvironmentStatTest — stats are non-negative and accumulate.
 #[test]
-fn je_environment_stats_non_negative_after_writes() {
+fn environment_stats_non_negative_after_writes() {
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
