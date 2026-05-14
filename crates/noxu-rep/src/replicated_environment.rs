@@ -44,7 +44,7 @@ use crate::node_state::{NodeState, NodeStateMachine};
 use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
 use crate::state_change_listener::{StateChangeEvent, StateChangeListener};
-use crate::stream::feeder::{EnvironmentLogScanner, Feeder, LogScanner};
+use crate::stream::feeder::Feeder;
 use crate::stream::peer_feeder::{
     PEER_FEEDER_SERVICE_NAME, PeerFeederService, PeerLogScanner,
 };
@@ -612,7 +612,7 @@ impl ReplicatedEnvironment {
         // → `Feeder.runFeedingLoop()`.
         // Each active feeder in the feeders list gets a dedicated thread that
         // runs `FeederRunner::run()` backed by `EnvironmentLogScanner`.
-        if let Some(env) = self.env_impl.lock().unwrap().clone() {
+        if self.env_impl.lock().unwrap().is_some() {
             let feeders_snap: Vec<String> = self
                 .feeders
                 .read()
@@ -621,59 +621,19 @@ impl ReplicatedEnvironment {
                 .collect();
 
             for replica_name in feeders_snap {
-                // Build a log scanner starting at the beginning of the log.
-                // In production the feeder would start from the replica's
-                // current VLSN (obtained via the handshake); we use None
-                // (start of log) here as the default.
-                let scanner_opt =
-                    EnvironmentLogScanner::new(&env, None);
-
-                if let Some(mut scanner) = scanner_opt {
-                    let io_shutdown_flag =
-                        self.io_shutdown.load(Ordering::SeqCst);
-                    if io_shutdown_flag {
-                        break;
-                    }
-
-                    // For tests without a real channel, we skip feeders that
-                    // have no channel assigned. The FeederRunner needs a
-                    // Channel; it's not stored in the Feeder state struct.
-                    // Log the intent and continue — callers that need a real
-                    // feeder use FeederRunner::new() + run() directly.
-                    log::info!(
-                        "Node '{}' (master): would start feeder thread for \
-                         replica '{}' (use FeederRunner::new + run() for \
-                         full wiring)",
-                        self.config.node_name.as_str(),
-                        replica_name,
-                    );
-
-                    // Consume `scanner` in a background thread that loops
-                    // until the environment is closed (no channel here —
-                    // channels are provided by the TCP dispatcher).
-                    let node_name = self.config.node_name.clone();
-                    let handle = std::thread::Builder::new()
-                        .name(format!(
-                            "noxu-feeder-{}",
-                            replica_name
-                        ))
-                        .spawn(move || {
-                            // Pre-scan: advance the scanner to the live end of
-                            // the log so the feeder position is initialised.
-                            // When a real channel becomes available the caller
-                            // constructs a FeederRunner and passes this scanner.
-                            let _ = scanner.next_entry(1);
-                            log::debug!(
-                                "noxu-feeder-{}: scanner initialised on \
-                                 master '{}'",
-                                replica_name,
-                                node_name,
-                            );
-                        })
-                        .expect("failed to spawn noxu-feeder thread");
-
-                    self.io_threads.lock().unwrap().push(handle);
-                }
+                // The PeerFeederService registered on the TCP dispatcher
+                // handles incoming replica connections automatically.
+                // Replicas connect to PEER_FEEDER_SERVICE_NAME and the
+                // dispatcher spawns a per-connection thread running
+                // PeerFeederRunner::run().
+                //
+                // Here we just log the known replicas for observability.
+                log::info!(
+                    "Node '{}' (master): feeder for replica '{}' is served \
+                     by PeerFeederService on the TCP dispatcher",
+                    self.config.node_name.as_str(),
+                    replica_name,
+                );
             }
         }
         // -------------------------------------------------------------------
@@ -718,61 +678,82 @@ impl ReplicatedEnvironment {
             crate::stream::replica_stream::ReplicaStreamState::Connecting,
         );
 
-        // --- G19: prepare EnvironmentLogWriter for incoming replication ----
+        // --- G19: start replica receive loop --------------------------------
         //
-        // → `Replica.run()`.
-        // When a `Channel` to the master is available (provided by the TCP
-        // dispatcher after handshake), the caller constructs a
-        // `ReplicaReceiver` and passes an `EnvironmentLogWriter`.  Here we
-        // log the intent and verify that the write path is available.
+        // Connects to the master's PEER_FEEDER service and runs a
+        // ReplicaReceiver loop in a background thread.  The receiver writes
+        // replicated entries via EnvironmentLogWriter.
         if let Some(env) = self.env_impl.lock().unwrap().clone() {
             if let Some(log_mgr) = env.get_log_manager() {
-                // The VLSN index shared with this ReplicatedEnvironment.
-                // We wrap it in an Arc so both the ReplicaReceiver thread
-                // and the ReplicatedEnvironment can access it.
                 let vlsn_index = Arc::new(
                     crate::vlsn::vlsn_index::VlsnIndex::new(10),
                 );
 
+                // Resolve the master's socket address from the GroupService.
+                let master_addr_opt: Option<SocketAddr> = self.group_service
+                    .get_all_nodes()
+                    .iter()
+                    .find(|n| n.name == master_name)
+                    .and_then(|info| {
+                        format!("{}:{}", info.host, info.port)
+                            .parse::<SocketAddr>()
+                            .ok()
+                    });
+
                 let node_name = self.config.node_name.clone();
                 let master = master_name.to_string();
-
-                // Spawn a stub thread that constructs the writer and marks
-                // the replica stream as Streaming.  Real I/O begins when a
-                // `Channel` is wired in by the TCP dispatcher.
                 let vlsn_index_clone = Arc::clone(&vlsn_index);
+                let shutdown_flag = self.io_shutdown.load(Ordering::SeqCst);
+
                 let handle = std::thread::Builder::new()
                     .name(format!("noxu-replica-{}", node_name))
                     .spawn(move || {
-                        // Construct the log writer (proves the path compiles
-                        // and is wired).  Real frames arrive via a Channel
-                        // that the TCP dispatcher provides.
-                        let _writer = EnvironmentLogWriter::new(
+                        let mut writer = EnvironmentLogWriter::new(
                             log_mgr,
                             vlsn_index_clone,
                         );
-                        log::info!(
-                            "noxu-replica-{}: EnvironmentLogWriter ready, \
-                             waiting for Channel from master '{}'",
-                            node_name,
-                            master,
-                        );
-                        // The ReplicaReceiver will be constructed by the
-                        // TCP service handler once the TCP handshake with
-                        // the master completes.  See TcpServiceDispatcher.
+
+                        if let Some(addr) = master_addr_opt {
+                            log::info!(
+                                "noxu-replica-{}: connecting to master '{}' at {}",
+                                node_name, master, addr,
+                            );
+                            // Run catch-up loop (blocks until channel closes
+                            // or the master disconnects).
+                            match crate::stream::peer_feeder::catch_up_from_peer(
+                                addr, 0, &mut writer,
+                            ) {
+                                Ok(true) => log::info!(
+                                    "noxu-replica-{}: catch-up complete from '{}'",
+                                    node_name, master,
+                                ),
+                                Ok(false) => log::warn!(
+                                    "noxu-replica-{}: master '{}' requires restore",
+                                    node_name, master,
+                                ),
+                                Err(e) => {
+                                    if !shutdown_flag {
+                                        log::error!(
+                                            "noxu-replica-{}: error from master '{}': {e}",
+                                            node_name, master,
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "noxu-replica-{}: master '{}' address not in RepGroup; \
+                                 waiting for TCP dispatcher connection",
+                                node_name, master,
+                            );
+                        }
                     })
                     .expect("failed to spawn noxu-replica thread");
 
                 self.io_threads.lock().unwrap().push(handle);
 
-                // Keep the vlsn_index Arc alive in the VLSN index field so
-                // apply_entry() updates it after each received entry.
-                // (The existing self.vlsn_index is kept for election/ack
-                // tracking; the replica's writer uses its own per-writer
-                // instance that can later be unified.)
                 log::debug!(
-                    "Node '{}': EnvironmentLogWriter wired for replication \
-                     from master '{}'",
+                    "Node '{}': replica receive thread started for master '{}'",
                     self.config.node_name.as_str(),
                     master_name,
                 );

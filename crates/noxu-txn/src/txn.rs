@@ -115,6 +115,8 @@ pub struct Txn {
     read_uncommitted_default: bool,
     /// Whether this txn can preempt other lockers' locks.
     importunate: bool,
+    /// When true, all lock requests are non-blocking (fail immediately).
+    no_wait: bool,
 
     /// Serializable (repeatable-read) isolation level.
     ///
@@ -197,6 +199,7 @@ impl Txn {
             txn_start: Instant::now(),
             read_uncommitted_default: false,
             importunate: false,
+            no_wait: false,
             serializable_isolation: false,
             read_committed_isolation: false,
             undo_records: Vec::new(),
@@ -415,6 +418,13 @@ impl Txn {
         self.read_committed_isolation = v;
     }
 
+    /// Sets the per-lock timeout in milliseconds.
+    ///
+    /// Controls how long a lock request waits before returning a timeout error.
+    pub fn set_lock_timeout(&mut self, timeout_ms: u64) {
+        self.lock_timeout_ms = timeout_ms;
+    }
+
     /// Sets the transaction-level timeout in milliseconds.
     ///
     /// A non-zero value causes `is_timed_out()` to return `true` after that
@@ -422,6 +432,12 @@ impl Txn {
     ///
     pub fn set_txn_timeout(&mut self, timeout_ms: u64) {
         self.txn_timeout_ms = timeout_ms;
+    }
+
+    /// Sets the no-wait flag. When true, all lock requests are non-blocking
+    /// and fail immediately if the lock is not available.
+    pub fn set_no_wait(&mut self, v: bool) {
+        self.no_wait = v;
     }
 
     /// Returns the first LSN written by this transaction.
@@ -875,12 +891,13 @@ impl Locker for Txn {
     ) -> Result<LockResult, TxnError> {
         self.check_state()?;
 
-        let grant = self.lock_manager.lock(
+        let grant = self.lock_manager.lock_with_timeout(
             lsn,
             self.id,
             lock_type,
-            non_blocking,
+            non_blocking || self.no_wait,
             self.importunate,
+            self.lock_timeout_ms,
         )?;
 
         // Track the lock.
