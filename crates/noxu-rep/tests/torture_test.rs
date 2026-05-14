@@ -101,9 +101,27 @@ fn torture_duration() -> Duration {
     Duration::from_secs(secs)
 }
 
-const NUM_NODES: usize = 3;
-const VLSNS_PER_ROUND: u64 = 50;
-const RETRY_BUDGET: u32 = 20;
+/// Initial cluster size. Override with `TORTURE_NODES` env var (clamped 3–20).
+fn num_nodes() -> usize {
+    std::env::var("TORTURE_NODES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(3, 20)
+}
+
+/// Payload bytes per log entry.  Override with `TORTURE_PAYLOAD_BYTES` (default 256).
+/// With 7 nodes, 200 VLSNs/round, 256 B/entry and ~10 rounds/sec:
+///   7-1=6 streams × 200 × 256 B ≈ 307 KB/round × 36 000 rounds ≈ 10.8 GB network I/O.
+fn entry_payload_bytes() -> usize {
+    std::env::var("TORTURE_PAYLOAD_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+const VLSNS_PER_ROUND: u64 = 200;
+const RETRY_BUDGET: u32 = 30;
 
 // ============================================================================
 // Transport selection
@@ -133,16 +151,19 @@ impl TransportKind {
 /// Read `TRANSPORT` env var and return per-node transport assignments.
 fn node_transports() -> Vec<TransportKind> {
     let raw = std::env::var("TRANSPORT").unwrap_or_else(|_| "tcp".to_string());
+    let n = num_nodes();
     let kind = match raw.to_lowercase().as_str() {
         "quic"     => TransportKind::Quic,
         "quic_mux" => TransportKind::QuicMux,
         "mix"      => {
-            // TCP for nodes 0-1, QUIC for node 2.
-            return vec![TransportKind::Tcp, TransportKind::Tcp, TransportKind::Quic];
+            // TCP for all but the last node, which uses QUIC.
+            let mut v = vec![TransportKind::Tcp; n];
+            if n > 0 { v[n - 1] = TransportKind::Quic; }
+            return v;
         }
         _ => TransportKind::Tcp,
     };
-    vec![kind; NUM_NODES]
+    vec![kind; n]
 }
 
 // ============================================================================
@@ -557,7 +578,13 @@ impl LogScanner for MemLogScanner {
         let v = self.next.max(from);
         if v > self.max { return None; }
         self.next = v + 1;
-        Some((v, 1u8, format!("e{v}").into_bytes()))
+        let prefix = format!("e{v}");
+        let target = entry_payload_bytes();
+        let mut payload = prefix.into_bytes();
+        if payload.len() < target {
+            payload.resize(target, 0u8);
+        }
+        Some((v, 1u8, payload))
     }
 }
 
@@ -809,9 +836,27 @@ fn stream_vlsns(
         received
     });
 
-    let runner = FeederRunner::new(Arc::clone(&master_ch), start_vlsn);
-    let mut scanner = MemLogScanner::new(start_vlsn, count);
-    let _ = runner.run(&mut scanner);
+    // Run FeederRunner in a background thread with a hard timeout.
+    // runner.run() only terminates on ChannelClosed.  Under heavy netem chaos
+    // the replica's TCP FIN can be delayed by OS retransmit backoff (up to
+    // minutes at 80 % loss), causing the main torture loop to hang forever.
+    // If the feeder has not finished within STREAM_TIMEOUT we force-close the
+    // channel, which immediately delivers ChannelClosed to runner.run().
+    const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+    let master_ch_feeder = Arc::clone(&master_ch);
+    let (feeder_done_tx, feeder_done_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let runner = FeederRunner::new(master_ch_feeder, start_vlsn);
+        let mut scanner = MemLogScanner::new(start_vlsn, count);
+        let _ = runner.run(&mut scanner);
+        let _ = feeder_done_tx.send(());
+    });
+    if feeder_done_rx.recv_timeout(STREAM_TIMEOUT).is_err() {
+        eprintln!("[torture] stream_vlsns: feeder stuck >{STREAM_TIMEOUT:?}, force-closing channel");
+        let _ = master_ch.close();
+        // Give the feeder up to 1 s to detect the close and exit.
+        let _ = feeder_done_rx.recv_timeout(Duration::from_secs(1));
+    }
     let _ = master_ch.close();
 
     let received = recv_h.join().unwrap_or(0);
@@ -886,17 +931,28 @@ fn torture_replication() {
         transports.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
     );
 
-    let state_dir = TempDir::new().expect("TempDir");
+    let _state_tmp: Option<TempDir>;
+    let state_dir_path: PathBuf;
+    if let Ok(dir) = std::env::var("TORTURE_DIR") {
+        std::fs::create_dir_all(&dir).expect("create TORTURE_DIR");
+        state_dir_path = PathBuf::from(dir);
+        _state_tmp = None;
+    } else {
+        let td = TempDir::new().expect("TempDir");
+        state_dir_path = td.path().to_path_buf();
+        _state_tmp = Some(td);
+    }
+    let n = num_nodes();
 
-    let mut nodes: Vec<ClusterNode> = (1..=NUM_NODES as u32)
-        .map(|id| ClusterNode::new(id, transports[(id - 1) as usize], state_dir.path()))
+    let mut nodes: Vec<ClusterNode> = (1..=n as u32)
+        .map(|id| ClusterNode::new(id, transports[(id - 1) as usize], &state_dir_path))
         .collect();
 
     // `members` tracks which indices into `nodes` are currently in the group.
-    // It starts as [0, 1, 2] and grows/shrinks with PeerJoin/PeerLeave chaos.
-    let mut members: Vec<usize> = (0..NUM_NODES).collect();
+    // It starts as [0..n] and grows/shrinks with PeerJoin/PeerLeave chaos.
+    let mut members: Vec<usize> = (0..n).collect();
     // Next node ID for dynamically added peers.
-    let mut next_node_id: u32 = NUM_NODES as u32 + 1;
+    let mut next_node_id: u32 = n as u32 + 1;
 
     let mut group = RepGroup::new("torture".to_string(), 99);
     for n in &nodes {
@@ -1026,7 +1082,7 @@ fn torture_replication() {
                 Some(ChaosPhase::PeerJoin) => {
                     let new_id = next_node_id;
                     next_node_id += 1;
-                    let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
+                    let new_node = ClusterNode::new(new_id, TransportKind::Tcp, &state_dir_path);
                     let new_idx = nodes.len();
                     let new_name = new_node.name.clone();
                     nodes.push(new_node);
@@ -1079,7 +1135,7 @@ fn torture_replication() {
                         if members.len() >= 7 { break; }
                         let new_id = next_node_id;
                         next_node_id += 1;
-                        let new_node = ClusterNode::new(new_id, TransportKind::Tcp, state_dir.path());
+                        let new_node = ClusterNode::new(new_id, TransportKind::Tcp, &state_dir_path);
                         let new_idx = nodes.len();
                         let new_name = new_node.name.clone();
                         nodes.push(new_node);
