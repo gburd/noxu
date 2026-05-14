@@ -26,6 +26,7 @@
   - [Deadlock Handling](transactions/deadlocks.md)
   - [Durability Policies](transactions/durability.md)
   - [Backup and Recovery](transactions/backup-recovery.md)
+  - [XA Distributed Transactions](transactions/xa-distributed.md)
 
 - [High Availability](replication/README.md)
   - [Concepts](replication/concepts.md)

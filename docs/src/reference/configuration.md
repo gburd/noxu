@@ -42,6 +42,48 @@ When the environment is invalidated by an internal error, the reason is:
 After an environment failure, `env.is_valid()` returns `false` and all
 subsequent operations return `NoxuError::EnvironmentFailure { reason, msg }`.
 
+## TransactionConfig
+
+Per-transaction overrides, set before `begin_transaction`:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `no_wait` | `bool` | `false` | Fail immediately on lock conflict instead of blocking |
+| `read_committed` | `bool` | `false` | Release read locks after each operation |
+| `read_uncommitted` | `bool` | `false` | Allow dirty reads |
+| `serializable_isolation` | `bool` | `false` | Full serializable (phantom protection) |
+| `importunate` | `bool` | `false` | Steal locks from waiters (priority txn) |
+| `lock_timeout_ms` | `u64` | `0` (env default) | Per-txn lock acquisition timeout |
+| `txn_timeout_ms` | `u64` | `0` (no limit) | Transaction total duration limit |
+| `local_write` | `bool` | `false` | Writes stay local (replica read-only mode) |
+| `durability` | `Option<Durability>` | `None` (env default) | Override commit sync policy |
+
+## DatabaseConfig
+
+Per-database options set when opening a database:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `allow_create` | `bool` | `false` | Create database if it doesn't exist |
+| `transactional` | `bool` | `false` | Participate in transactions |
+| `sorted_duplicates` | `bool` | `false` | Allow duplicate keys (sorted by data) |
+| `replicated` | `bool` | `false` | Participate in replication log |
+| `key_prefixing` | `bool` | `false` | Enable key prefix compression in BINs |
+| `cache_mode` | `CacheMode` | `Default` | Per-database eviction hint |
+| `bin_delta` | `bool` | `true` | Write BIN-deltas instead of full BINs |
+| `use_existing_config` | `bool` | `false` | Open existing DB without reconfiguring |
+
+## CursorConfig
+
+Per-cursor options:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `read_committed` | `bool` | `false` | Read-committed isolation for this cursor |
+| `read_uncommitted` | `bool` | `false` | Dirty reads for this cursor |
+| `evict_ln` | `bool` | `false` | Evict leaf nodes after reading (cache bypass) |
+| `prefix_constraint` | `Option<Vec<u8>>` | `None` | Stop scan at prefix boundary |
+
 ## Replication Parameters
 
 Replication is configured on `RepConfig` / `RepConfigBuilder`, not

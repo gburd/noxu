@@ -151,6 +151,31 @@ Serialization bindings:
 DPL derive macros: `#[derive(Entity)]`, `#[primary_key]`, `#[secondary_key]`.
 Key type: `EntityStore`.
 
+## Phase 7b — Distributed Transactions
+
+### `noxu-xa`
+
+XA (X/Open) distributed transaction support.
+
+Key files:
+- `src/environment.rs` — `XaEnvironment`: wraps `Environment`, manages branch state machine
+- `src/resource.rs` — `XaResource` trait: `xa_start`/`xa_end`/`xa_prepare`/`xa_commit`/`xa_rollback`/`xa_recover`/`xa_forget`
+- `src/xid.rs` — `Xid`: format_id + global_transaction_id + branch_qualifier
+- `src/flags.rs` — `XaFlags`: NOFLAGS, JOIN, RESUME, TMSUCCESS, TMFAIL, TMSUSPEND, ONEPHASE
+- `src/error.rs` — `XaError`, `PrepareResult` (Ok | ReadOnly)
+- `tests/xa_chaos_test.rs` — multi-cluster chaos, scale, and performance tests
+- `tests/xa_protocol_test.rs` — deterministic protocol corner-case coverage (51 tests)
+
+State machine per Xid:
+```
+[none] → xa_start → Active → xa_end(SUCCESS) → Idle → xa_prepare → Prepared → xa_commit → [done]
+                           → xa_end(SUSPEND) → Suspended → xa_start(RESUME) → Active
+                           → xa_end(FAIL) → RollbackOnly → xa_rollback → [done]
+                                             Idle → xa_rollback → [done]
+                                             Idle → xa_commit(ONEPHASE) → [done]
+                                             Prepared → xa_rollback → [done]
+```
+
 ## Phase 8 — Replication
 
 ### `noxu-rep`

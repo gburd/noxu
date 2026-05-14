@@ -81,4 +81,7 @@ amplification against recovery time.
 | Set environment lock timeout | `EnvironmentConfig::with_lock_timeout(ms)` |
 | Set per-transaction lock timeout | `txn.set_lock_timeout(ms)` |
 | Fail immediately on lock conflict | `TransactionConfig::with_no_wait(true)` |
+| Set per-txn lock timeout | `TransactionConfig::with_lock_timeout_ms(50)` |
+| Set per-txn transaction timeout | `TransactionConfig::with_txn_timeout_ms(5000)` |
+| Steal locks from waiters | `TransactionConfig::with_importunate(true)` |
 | Bound recovery time | Keep checkpointer enabled (`with_run_checkpointer(true)`) |
