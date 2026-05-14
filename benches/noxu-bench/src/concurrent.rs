@@ -32,6 +32,7 @@ pub fn run_concurrent(
     reader_threads: usize,
     writer_threads: usize,
     ops_per_thread: usize,
+    value_size: usize,
 ) -> ConcurrentResult {
     let total_threads = reader_threads + writer_threads;
     let barrier = Arc::new(Barrier::new(total_threads));
@@ -76,7 +77,7 @@ pub fn run_concurrent(
         let n = ops_per_thread;
 
         let handle = std::thread::spawn(move || -> u64 {
-            let value = b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+            let value = vec![0x58u8; value_size];
 
             barrier_clone.wait();
 
@@ -86,7 +87,7 @@ pub fn run_concurrent(
                 // artificially high lock conflicts.
                 let key_idx = writer_id * n + i;
                 let k = DatabaseEntry::from_vec(format!("{:010}", key_idx).into_bytes());
-                let v = DatabaseEntry::from_bytes(value);
+                let v = DatabaseEntry::from_bytes(&value);
                 let _ = db_clone.put(None, &k, &v);
                 ops += 1;
             }
@@ -134,6 +135,7 @@ pub fn run_concurrent_txn(
     db: &Database,
     writer_threads: usize,
     ops_per_thread: usize,
+    value_size: usize,
 ) -> ConcurrentResult {
     use std::sync::{Arc, Barrier};
     let barrier = Arc::new(Barrier::new(writer_threads));
@@ -146,8 +148,7 @@ pub fn run_concurrent_txn(
             .map(|writer_id| {
                 let barrier = Arc::clone(&barrier);
                 s.spawn(move || -> u64 {
-                    let value =
-                        b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+                    let value = vec![0x58u8; value_size];
                     barrier.wait();
                     let mut ops: u64 = 0;
                     for i in 0..ops_per_thread {
@@ -155,7 +156,7 @@ pub fn run_concurrent_txn(
                         let k = DatabaseEntry::from_vec(
                             format!("{:010}", key_idx).into_bytes(),
                         );
-                        let v = DatabaseEntry::from_bytes(value);
+                        let v = DatabaseEntry::from_bytes(&value);
                         let txn = env.begin_transaction(None, None).unwrap();
                         let _ = db.put(Some(&txn), &k, &v);
                         let _ = txn.commit();

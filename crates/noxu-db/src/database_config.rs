@@ -1,6 +1,8 @@
 //! Database configuration.
 //!
 
+use crate::cache_mode::CacheMode;
+
 /// Configuration for opening a database.
 ///
 /// Specifies the configuration parameters used to open a database within
@@ -42,6 +44,22 @@ pub struct DatabaseConfig {
 
     /// Node maximum entries (0 = use default).
     pub node_max_entries: u32,
+
+    /// Whether this database participates in replication.
+    pub replicated: bool,
+
+    /// Enable key prefix compression in BIN nodes.
+    pub key_prefixing: bool,
+
+    /// Per-database cache eviction hint.
+    pub cache_mode: CacheMode,
+
+    /// Write BIN-deltas to the log instead of full BINs (space optimization).
+    pub bin_delta: bool,
+
+    /// When true, opening an existing database reuses its stored config
+    /// rather than applying this config.
+    pub use_existing_config: bool,
 }
 
 impl DatabaseConfig {
@@ -58,6 +76,11 @@ impl DatabaseConfig {
             override_duplicate_comparator: false,
             exclusive: false,
             node_max_entries: 0,
+            replicated: false,
+            key_prefixing: false,
+            cache_mode: CacheMode::Default,
+            bin_delta: true, // enabled by default (JE default)
+            use_existing_config: false,
         }
     }
 
@@ -163,6 +186,66 @@ impl DatabaseConfig {
     /// Builder-style method to set deferred_write.
     pub fn with_deferred_write(mut self, deferred_write: bool) -> Self {
         self.deferred_write = deferred_write;
+        self
+    }
+
+    /// Sets whether this database participates in replication.
+    pub fn set_replicated(&mut self, replicated: bool) -> &mut Self {
+        self.replicated = replicated;
+        self
+    }
+
+    /// Builder-style method to set replicated.
+    pub fn with_replicated(mut self, replicated: bool) -> Self {
+        self.replicated = replicated;
+        self
+    }
+
+    /// Sets whether key prefix compression is enabled.
+    pub fn set_key_prefixing(&mut self, key_prefixing: bool) -> &mut Self {
+        self.key_prefixing = key_prefixing;
+        self
+    }
+
+    /// Builder-style method to set key_prefixing.
+    pub fn with_key_prefixing(mut self, key_prefixing: bool) -> Self {
+        self.key_prefixing = key_prefixing;
+        self
+    }
+
+    /// Sets the per-database cache eviction mode.
+    pub fn set_cache_mode(&mut self, cache_mode: CacheMode) -> &mut Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    /// Builder-style method to set cache_mode.
+    pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    /// Sets whether BIN-deltas are written to the log.
+    pub fn set_bin_delta(&mut self, bin_delta: bool) -> &mut Self {
+        self.bin_delta = bin_delta;
+        self
+    }
+
+    /// Builder-style method to set bin_delta.
+    pub fn with_bin_delta(mut self, bin_delta: bool) -> Self {
+        self.bin_delta = bin_delta;
+        self
+    }
+
+    /// Sets whether to reuse existing config when opening an existing database.
+    pub fn set_use_existing_config(&mut self, v: bool) -> &mut Self {
+        self.use_existing_config = v;
+        self
+    }
+
+    /// Builder-style method to set use_existing_config.
+    pub fn with_use_existing_config(mut self, v: bool) -> Self {
+        self.use_existing_config = v;
         self
     }
 }

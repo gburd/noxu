@@ -22,6 +22,18 @@ pub struct CursorConfig {
     ///
     /// Non-sticky cursors are automatically closed when the transaction commits.
     pub non_sticky: bool,
+
+    /// Evict leaf nodes (LNs) from cache after reading.
+    ///
+    /// When true, fetched LN data is evicted from the cache after the cursor
+    /// operation completes. Useful for scans that won't revisit data.
+    pub evict_ln: bool,
+
+    /// Key prefix constraint for range scans.
+    ///
+    /// When set, the cursor will stop advancing (return NotFound) when the
+    /// fetched key no longer shares this prefix. Optimizes bounded prefix scans.
+    pub prefix_constraint: Option<Vec<u8>>,
 }
 
 impl CursorConfig {
@@ -31,6 +43,8 @@ impl CursorConfig {
             read_committed: false,
             read_uncommitted: false,
             non_sticky: false,
+            evict_ln: false,
+            prefix_constraint: None,
         }
     }
 
@@ -76,6 +90,30 @@ impl CursorConfig {
     /// Builder-style method to set non_sticky.
     pub fn with_non_sticky(mut self, non_sticky: bool) -> Self {
         self.non_sticky = non_sticky;
+        self
+    }
+
+    /// Sets whether to evict LNs from cache after reading.
+    pub fn set_evict_ln(&mut self, evict_ln: bool) -> &mut Self {
+        self.evict_ln = evict_ln;
+        self
+    }
+
+    /// Builder-style method to set evict_ln.
+    pub fn with_evict_ln(mut self, evict_ln: bool) -> Self {
+        self.evict_ln = evict_ln;
+        self
+    }
+
+    /// Sets the prefix constraint for bounded scans.
+    pub fn set_prefix_constraint(&mut self, prefix: Option<Vec<u8>>) -> &mut Self {
+        self.prefix_constraint = prefix;
+        self
+    }
+
+    /// Builder-style method to set prefix_constraint.
+    pub fn with_prefix_constraint(mut self, prefix: Vec<u8>) -> Self {
+        self.prefix_constraint = Some(prefix);
         self
     }
 

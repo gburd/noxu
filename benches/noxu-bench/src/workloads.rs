@@ -8,9 +8,6 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-/// 64-byte benchmark value used across all workloads.
-const VALUE: &[u8] = b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-
 /// Build a 10-digit zero-padded decimal key for integer `i`.
 ///
 /// Keys produced this way sort in numeric order under lexicographic comparison
@@ -25,10 +22,10 @@ fn make_key(i: usize) -> Vec<u8> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Insert `n` records with sequential keys 0..n.
-pub fn w01_seq_write(db: &Database, n: usize) -> usize {
+pub fn w01_seq_write(db: &Database, n: usize, value: &[u8]) -> usize {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
-        let v = DatabaseEntry::from_bytes(VALUE);
+        let v = DatabaseEntry::from_bytes(value);
         db.put(None, &k, &v).unwrap();
     }
     n
@@ -39,14 +36,14 @@ pub fn w01_seq_write(db: &Database, n: usize) -> usize {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Insert `n` records with keys 0..n shuffled into random order.
-pub fn w02_rand_write(db: &Database, n: usize) -> usize {
+pub fn w02_rand_write(db: &Database, n: usize, value: &[u8]) -> usize {
     let mut rng = SmallRng::seed_from_u64(42);
     let mut keys: Vec<usize> = (0..n).collect();
     keys.shuffle(&mut rng);
 
     for i in keys {
         let k = DatabaseEntry::from_vec(make_key(i));
-        let v = DatabaseEntry::from_bytes(VALUE);
+        let v = DatabaseEntry::from_bytes(value);
         db.put(None, &k, &v).unwrap();
     }
     n
@@ -137,9 +134,9 @@ pub fn w05_range_scan(db: &Database, n: usize) -> usize {
 ///
 /// Assumes the database has been pre-populated with keys 0..n so that
 /// the get operations can find records.
-pub fn w06_write_heavy(db: &Database, n: usize) -> usize {
+pub fn w06_write_heavy(db: &Database, n: usize, value: &[u8]) -> usize {
     let mut data = DatabaseEntry::new();
-    let v = DatabaseEntry::from_bytes(VALUE);
+    let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i % n));
         if i % 10 == 9 {
@@ -160,9 +157,9 @@ pub fn w06_write_heavy(db: &Database, n: usize) -> usize {
 /// `n` operations: 9 gets then 1 put, cycling through key space.
 ///
 /// Assumes the database has been pre-populated with keys 0..n.
-pub fn w07_read_heavy(db: &Database, n: usize) -> usize {
+pub fn w07_read_heavy(db: &Database, n: usize, value: &[u8]) -> usize {
     let mut data = DatabaseEntry::new();
-    let v = DatabaseEntry::from_bytes(VALUE);
+    let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i % n));
         if i % 10 == 9 {
@@ -184,8 +181,8 @@ pub fn w07_read_heavy(db: &Database, n: usize) -> usize {
 ///
 /// Assumes the database has been pre-populated with keys 0..n.
 /// Returns 2*n (one delete + one insert per key).
-pub fn w08_delete_insert(db: &Database, n: usize) -> usize {
-    let v = DatabaseEntry::from_bytes(VALUE);
+pub fn w08_delete_insert(db: &Database, n: usize, value: &[u8]) -> usize {
+    let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
         let _ = db.delete(None, &k).unwrap();
@@ -203,8 +200,8 @@ pub fn w08_delete_insert(db: &Database, n: usize) -> usize {
 ///
 /// Assumes the database has been pre-populated with keys 0..n.
 /// Returns 5*n (3 gets + 2 puts per transaction).
-pub fn w09_txn_multi(env: &Environment, db: &Database, n: usize) -> usize {
-    let v = DatabaseEntry::from_bytes(VALUE);
+pub fn w09_txn_multi(env: &Environment, db: &Database, n: usize, value: &[u8]) -> usize {
+    let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let txn = env.begin_transaction(None, None).unwrap();
 

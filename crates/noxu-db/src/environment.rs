@@ -620,14 +620,27 @@ impl Environment {
         // Wire the transaction to the WAL so commit/abort write log entries.
         // Also create an inner Txn for per-record lock management.
         let env_guard = self.env_impl.lock();
-        let is_read_committed = txn_config.read_committed;
         let inner_txn = env_guard.begin_txn()
             .map(|mut t| {
-                // Propagate the isolation level from TransactionConfig into the
-                // inner Txn so that lock_ln() can release read locks immediately
-                // for read-committed transactions.
-                if is_read_committed {
+                // Propagate all relevant TransactionConfig fields into the
+                // inner Txn for lock management and isolation behavior.
+                if txn_config.read_committed {
                     t.set_read_committed_isolation(true);
+                }
+                if txn_config.serializable_isolation {
+                    t.set_serializable_isolation(true);
+                }
+                if txn_config.importunate {
+                    t.set_importunate(true);
+                }
+                if txn_config.no_wait {
+                    t.set_no_wait(true);
+                }
+                if txn_config.lock_timeout_ms > 0 {
+                    t.set_lock_timeout(txn_config.lock_timeout_ms);
+                }
+                if txn_config.txn_timeout_ms > 0 {
+                    t.set_txn_timeout(txn_config.txn_timeout_ms);
                 }
                 Arc::new(std::sync::Mutex::new(t))
             })

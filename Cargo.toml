@@ -27,6 +27,7 @@ members = [
     "crates/noxu-collections",
     "crates/noxu-persist",
     "crates/noxu-rep",
+    "crates/noxu-xa",
     "benches/comparison",
     "benches/noxu-bench",
 ]
