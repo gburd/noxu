@@ -27,8 +27,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-const VALUE: &[u8] = b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Bench directory helper
 //
@@ -40,18 +38,37 @@ const VALUE: &[u8] = b"noxu-workload-bench-value-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 //   NOXU_BENCH_DIR=/mnt/nvme/noxu_bench NOXU_MAX_SCALE=100000 ./noxu-workload-bench
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Holds either a managed TempDir (auto-deleted on drop) or a plain PathBuf
-/// pointing to a caller-managed real-storage directory.
+/// Holds either a managed TempDir (auto-deleted on drop) or a real-storage
+/// directory.  Real directories are deleted on drop when `cleanup=true`
+/// (set via `NOXU_BENCH_CLEANUP=1` — used for large-scale runs to stay
+/// within the 200 GB disk budget).
+struct RealDir {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl RealDir {
+    fn path(&self) -> &Path { &self.path }
+}
+
+impl Drop for RealDir {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 enum BenchDir {
     Temp(TempDir),
-    Real(PathBuf),
+    Real(RealDir),
 }
 
 impl BenchDir {
     fn path(&self) -> &Path {
         match self {
             BenchDir::Temp(d) => d.path(),
-            BenchDir::Real(p) => p.as_path(),
+            BenchDir::Real(r) => r.path(),
         }
     }
 }
@@ -62,7 +79,10 @@ impl BenchDir {
 /// 1. `NOXU_BENCH_DIR` env var (explicit override)
 /// 2. `/scratch/noxu_bench` if `/scratch` is writable (NVMe on this machine)
 /// 3. TempDir (tmpfs fallback — FSyncManager coalescing is invisible on tmpfs)
-fn new_bench_dir(base: &Option<PathBuf>, tag: &str, n: usize) -> BenchDir {
+///
+/// When `NOXU_BENCH_CLEANUP=1` the returned `RealDir` deletes itself on drop,
+/// keeping peak disk consumption to ~2× the per-workload dataset size.
+fn new_bench_dir(base: &Option<PathBuf>, tag: &str, n: usize, cleanup: bool) -> BenchDir {
     let root = match base {
         Some(r) => r.clone(),
         None => {
@@ -78,7 +98,7 @@ fn new_bench_dir(base: &Option<PathBuf>, tag: &str, n: usize) -> BenchDir {
     // Remove any leftover data from a previous run.
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("failed to create bench dir");
-    BenchDir::Real(dir)
+    BenchDir::Real(RealDir { path: dir, cleanup })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,10 +134,10 @@ fn open_db_group_commit(dir: &Path) -> (Environment, Database) {
     (env, db)
 }
 
-fn populate(db: &Database, n: usize) {
+fn populate(db: &Database, n: usize, value: &[u8]) {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        let v = DatabaseEntry::from_bytes(VALUE);
+        let v = DatabaseEntry::from_bytes(value);
         db.put(None, &k, &v).unwrap();
     }
 }
@@ -201,15 +221,37 @@ fn print_progress(r: &WorkloadResult) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Five scales: 1K, 10K, 100K, 500K, 1M
-    // NOXU_MAX_SCALE env var limits the run (e.g. NOXU_MAX_SCALE=10000).
+    // ── NOXU_BENCH_VALUE_SIZE: value payload size in bytes (default 64).
+    // Large values exercise I/O-bound paths.  At 100 KB and 1 M records the
+    // active dataset is ~100 GB.
+    let value_size: usize = std::env::var("NOXU_BENCH_VALUE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &usize| v >= 1)
+        .unwrap_or(64);
+    let value_bytes: Vec<u8> = vec![0x58u8; value_size]; // 'X' repeated
+
+    // ── NOXU_BENCH_SCALES: comma-separated explicit scale list (e.g. "1000000").
+    // Overrides NOXU_MAX_SCALE when set.
+    let custom_scales: Option<Vec<usize>> = std::env::var("NOXU_BENCH_SCALES")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect());
+
+    // ── NOXU_MAX_SCALE: upper limit on the default five-scale list.
     let max_scale: usize = std::env::var("NOXU_MAX_SCALE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(usize::MAX);
 
-    // NOXU_BENCH_DIR: explicit override for benchmark storage root.
+    // ── NOXU_BENCH_CLEANUP: delete each workload directory after collecting
+    // results.  Required for large-value runs to stay within disk budget.
+    let cleanup: bool = std::env::var("NOXU_BENCH_CLEANUP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // ── NOXU_BENCH_DIR: explicit override for benchmark storage root.
     // Falls back to /scratch/noxu_bench (NVMe) if available, then TempDir.
     let bench_base: Option<PathBuf> = std::env::var("NOXU_BENCH_DIR")
         .ok()
@@ -222,9 +264,17 @@ fn main() {
     } else {
         "TempDir (tmpfs — FSyncManager coalescing window is zero)".to_string()
     };
-    println!("  Storage: {}", storage_label);
+    println!("  Storage:    {}", storage_label);
+    println!("  ValueSize:  {} bytes  ({:.1} MB per 1M records)",
+        value_size, value_size as f64 * 1_000_000.0 / 1_073_741_824.0 * 1024.0);
+    println!("  Cleanup:    {}", cleanup);
+
     let all_scales: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000];
-    let scales: Vec<usize> = all_scales.iter().copied().filter(|&s| s <= max_scale).collect();
+    let scales: Vec<usize> = if let Some(cs) = custom_scales {
+        cs
+    } else {
+        all_scales.iter().copied().filter(|&s| s <= max_scale).collect()
+    };
     let scales: &[usize] = &scales;
 
     // W10 concurrent configurations: (label, reader_threads, writer_threads)
@@ -244,10 +294,10 @@ fn main() {
 
         // W01: sequential write
         {
-            let dir = new_bench_dir(&bench_base, "bench_2", n);
+            let dir = new_bench_dir(&bench_base, "bench_2", n, cleanup);
             let (env, db) = open_db(dir.path());
             let r = run_timed("w01_seq_write", n, 1, dir.path(), Some(&env), || {
-                workloads::w01_seq_write(&db, n)
+                workloads::w01_seq_write(&db, n, &value_bytes)
             });
             print_progress(&r);
             results.push(r);
@@ -256,10 +306,10 @@ fn main() {
 
         // W02: random write
         {
-            let dir = new_bench_dir(&bench_base, "bench_3", n);
+            let dir = new_bench_dir(&bench_base, "bench_3", n, cleanup);
             let (env, db) = open_db(dir.path());
             let r = run_timed("w02_rand_write", n, 1, dir.path(), Some(&env), || {
-                workloads::w02_rand_write(&db, n)
+                workloads::w02_rand_write(&db, n, &value_bytes)
             });
             print_progress(&r);
             results.push(r);
@@ -268,9 +318,9 @@ fn main() {
 
         // W03: sequential read (pre-populate)
         {
-            let dir = new_bench_dir(&bench_base, "bench_4", n);
+            let dir = new_bench_dir(&bench_base, "bench_4", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, n);
+            populate(&db, n, &value_bytes);
             let r = run_timed("w03_seq_read", n, 1, dir.path(), Some(&env), || {
                 workloads::w03_seq_read(&db, n)
             });
@@ -281,9 +331,9 @@ fn main() {
 
         // W04: random read
         {
-            let dir = new_bench_dir(&bench_base, "bench_5", n);
+            let dir = new_bench_dir(&bench_base, "bench_5", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, n);
+            populate(&db, n, &value_bytes);
             let r = run_timed("w04_rand_read", n, 1, dir.path(), Some(&env), || {
                 workloads::w04_rand_read(&db, n)
             });
@@ -294,9 +344,9 @@ fn main() {
 
         // W05: range scan
         {
-            let dir = new_bench_dir(&bench_base, "bench_6", n);
+            let dir = new_bench_dir(&bench_base, "bench_6", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, n);
+            populate(&db, n, &value_bytes);
             let r = run_timed("w05_range_scan", n, 1, dir.path(), Some(&env), || {
                 workloads::w05_range_scan(&db, n)
             });
@@ -307,11 +357,11 @@ fn main() {
 
         // W06: write-heavy mixed (90% write / 10% read)
         {
-            let dir = new_bench_dir(&bench_base, "bench_7", n);
+            let dir = new_bench_dir(&bench_base, "bench_7", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, n);
+            populate(&db, n, &value_bytes);
             let r = run_timed("w06_write_heavy", n, 1, dir.path(), Some(&env), || {
-                workloads::w06_write_heavy(&db, n)
+                workloads::w06_write_heavy(&db, n, &value_bytes)
             });
             print_progress(&r);
             results.push(r);
@@ -320,11 +370,11 @@ fn main() {
 
         // W07: read-heavy mixed (90% read / 10% write)
         {
-            let dir = new_bench_dir(&bench_base, "bench_8", n);
+            let dir = new_bench_dir(&bench_base, "bench_8", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, n);
+            populate(&db, n, &value_bytes);
             let r = run_timed("w07_read_heavy", n, 1, dir.path(), Some(&env), || {
-                workloads::w07_read_heavy(&db, n)
+                workloads::w07_read_heavy(&db, n, &value_bytes)
             });
             print_progress(&r);
             results.push(r);
@@ -333,11 +383,11 @@ fn main() {
 
         // W08: delete + insert pairs
         {
-            let dir = new_bench_dir(&bench_base, "bench_9", n);
+            let dir = new_bench_dir(&bench_base, "bench_9", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, n);
+            populate(&db, n, &value_bytes);
             let r = run_timed("w08_delete_insert", n, 1, dir.path(), Some(&env), || {
-                workloads::w08_delete_insert(&db, n)
+                workloads::w08_delete_insert(&db, n, &value_bytes)
             });
             print_progress(&r);
             results.push(r);
@@ -351,11 +401,11 @@ fn main() {
         // this correctly: the upgrade is granted immediately as LockGrantType::Promotion.
         {
             let w09_n = n;
-            let dir = new_bench_dir(&bench_base, "bench_10", n);
+            let dir = new_bench_dir(&bench_base, "bench_10", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, w09_n);
+            populate(&db, w09_n, &value_bytes);
             let r = run_timed("w09_txn_multi", w09_n, 1, dir.path(), Some(&env), || {
-                workloads::w09_txn_multi(&env, &db, w09_n)
+                workloads::w09_txn_multi(&env, &db, w09_n, &value_bytes)
             });
             print_progress(&r);
             results.push(r);
@@ -368,9 +418,9 @@ fn main() {
             // Cap ops at 100K when writer threads > 4 at large scale to keep runtime sane
             let ops_n = if n > 100_000 && wthreads > 4 { 100_000 } else { n };
 
-            let dir = new_bench_dir(&bench_base, "bench_11", n);
+            let dir = new_bench_dir(&bench_base, "bench_11", n, cleanup);
             let (env, db) = open_db(dir.path());
-            populate(&db, ops_n);
+            populate(&db, ops_n, &value_bytes);
 
             // Capture fsync baseline AFTER populate so we measure only workload fsyncs.
             let fsync0 = env.stat_fsync_count();
@@ -385,6 +435,7 @@ fn main() {
                 rthreads,
                 wthreads,
                 ops_n / total_threads.max(1),
+                value_size,
             );
 
             let cpu1 = cpu_time_ms();
@@ -430,12 +481,12 @@ fn main() {
 
             // No group commit variant: each commit does its own fsync.
             {
-                let dir = new_bench_dir(&bench_base, "bench_txn_no_gc", n);
+                let dir = new_bench_dir(&bench_base, "bench_txn_no_gc", n, cleanup);
                 let (env, db) = open_db(dir.path());
                 let fsync0 = env.stat_fsync_count();
                 let cpu0 = cpu_time_ms();
                 let io0 = proc_io();
-                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread);
+                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread, value_size);
                 let cpu1 = cpu_time_ms();
                 let io1 = proc_io();
                 let disk_kb = dir_size_kb(dir.path());
@@ -461,12 +512,12 @@ fn main() {
 
             // Group commit variant: leader coalesces fsyncs from concurrent committers.
             {
-                let dir = new_bench_dir(&bench_base, "bench_txn_gc", n);
+                let dir = new_bench_dir(&bench_base, "bench_txn_gc", n, cleanup);
                 let (env, db) = open_db_group_commit(dir.path());
                 let fsync0 = env.stat_fsync_count();
                 let cpu0 = cpu_time_ms();
                 let io0 = proc_io();
-                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread);
+                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread, value_size);
                 let cpu1 = cpu_time_ms();
                 let io1 = proc_io();
                 let disk_kb = dir_size_kb(dir.path());
@@ -498,10 +549,10 @@ fn main() {
         // log-replay overhead in Rust (no JVM startup, no classloading, no
         // JIT warmup) and not a missing recovery step.
         {
-            let dir = new_bench_dir(&bench_base, "bench_12", n);
+            let dir = new_bench_dir(&bench_base, "bench_12", n, cleanup);
             {
                 let (env_pre, db_pre) = open_db(dir.path());
-                populate(&db_pre, n);
+                populate(&db_pre, n, &value_bytes);
                 drop(db_pre); drop(env_pre);
             }
             // Time only the re-open; env is closed before and after — no file-lock conflict.

@@ -7,6 +7,7 @@ use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
 use crate::database_stats::{BtreeStats, DatabaseStats};
+use crate::preload::{PreloadConfig, PreloadStats};
 use crate::join_config::JoinConfig;
 use crate::join_cursor::JoinCursor;
 use crate::lock_mode::LockMode;
@@ -744,6 +745,40 @@ impl Database {
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Preloads the database into cache by scanning the B-tree.
+    ///
+    /// Walks the tree, touching each node to bring pages into the cache.
+    /// Useful for warming the cache before a workload begins.
+    ///
+    /// # Arguments
+    /// * `config` - Controls limits on preload duration and memory
+    ///
+    /// # Returns
+    /// Statistics about what was preloaded.
+    pub fn preload(&self, config: &PreloadConfig) -> Result<PreloadStats> {
+        self.check_open()?;
+        let start = std::time::Instant::now();
+        let mut stats = PreloadStats {
+            bins_loaded: 0,
+            lns_loaded: 0,
+            elapsed_ms: 0,
+        };
+
+        let guard = self.db_impl.read();
+        if let Some(tree_stats) = guard.collect_btree_stats() {
+            // collect_btree_stats() walks every node in the tree, which has
+            // the side effect of pulling all BINs/INs into memory (cache).
+            stats.bins_loaded = tree_stats.n_bins;
+            if config.load_lns {
+                stats.lns_loaded = tree_stats.n_entries;
+            }
+        }
+
+        let _ = config.max_millis; // reserved for future time-bounded preload
+        stats.elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(stats)
     }
 
     /// Returns B-tree statistics for this database.

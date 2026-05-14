@@ -24,6 +24,24 @@ pub struct TransactionConfig {
 
     /// Don't wait for locks (fail immediately if lock unavailable).
     pub no_wait: bool,
+
+    /// Lock timeout in milliseconds (0 = use environment default).
+    pub lock_timeout_ms: u64,
+
+    /// Transaction timeout in milliseconds (0 = no timeout).
+    pub txn_timeout_ms: u64,
+
+    /// Use serializable (repeatable-read) isolation.
+    /// Read locks are retained through commit/abort.
+    pub serializable_isolation: bool,
+
+    /// Importunate transactions can steal locks from other lockers
+    /// rather than waiting.
+    pub importunate: bool,
+
+    /// Writes stay local (used on read-only replicas for local modifications
+    /// that are not replicated).
+    pub local_write: bool,
 }
 
 impl TransactionConfig {
@@ -35,6 +53,11 @@ impl TransactionConfig {
             read_uncommitted: false,
             read_only: false,
             no_wait: false,
+            lock_timeout_ms: 0,
+            txn_timeout_ms: 0,
+            serializable_isolation: false,
+            importunate: false,
+            local_write: false,
         }
     }
 
@@ -77,6 +100,36 @@ impl TransactionConfig {
         self
     }
 
+    /// Sets the lock timeout in milliseconds (0 = use environment default).
+    pub fn set_lock_timeout_ms(&mut self, ms: u64) -> &mut Self {
+        self.lock_timeout_ms = ms;
+        self
+    }
+
+    /// Sets the transaction timeout in milliseconds (0 = no timeout).
+    pub fn set_txn_timeout_ms(&mut self, ms: u64) -> &mut Self {
+        self.txn_timeout_ms = ms;
+        self
+    }
+
+    /// Sets serializable isolation (read locks retained through commit).
+    pub fn set_serializable_isolation(&mut self, v: bool) -> &mut Self {
+        self.serializable_isolation = v;
+        self
+    }
+
+    /// Sets importunate mode (steal locks rather than wait).
+    pub fn set_importunate(&mut self, v: bool) -> &mut Self {
+        self.importunate = v;
+        self
+    }
+
+    /// Sets local-write mode (writes not replicated).
+    pub fn set_local_write(&mut self, v: bool) -> &mut Self {
+        self.local_write = v;
+        self
+    }
+
     /// Builder-style method to set durability.
     pub fn with_durability(mut self, durability: Durability) -> Self {
         self.durability = durability;
@@ -104,6 +157,36 @@ impl TransactionConfig {
     /// Builder-style method to set no_wait.
     pub fn with_no_wait(mut self, no_wait: bool) -> Self {
         self.no_wait = no_wait;
+        self
+    }
+
+    /// Builder-style method to set lock timeout.
+    pub fn with_lock_timeout_ms(mut self, ms: u64) -> Self {
+        self.lock_timeout_ms = ms;
+        self
+    }
+
+    /// Builder-style method to set transaction timeout.
+    pub fn with_txn_timeout_ms(mut self, ms: u64) -> Self {
+        self.txn_timeout_ms = ms;
+        self
+    }
+
+    /// Builder-style method to set serializable isolation.
+    pub fn with_serializable_isolation(mut self, v: bool) -> Self {
+        self.serializable_isolation = v;
+        self
+    }
+
+    /// Builder-style method to set importunate mode.
+    pub fn with_importunate(mut self, v: bool) -> Self {
+        self.importunate = v;
+        self
+    }
+
+    /// Builder-style method to set local-write mode.
+    pub fn with_local_write(mut self, v: bool) -> Self {
+        self.local_write = v;
         self
     }
 
