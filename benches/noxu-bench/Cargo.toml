@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 noxu-db = { workspace = true }
+noxu-xa = { path = "../../crates/noxu-xa" }
 tempfile = "3"
 rand = { version = "0.8", features = ["small_rng"] }

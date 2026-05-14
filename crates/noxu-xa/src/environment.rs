@@ -7,6 +7,7 @@ use noxu_db::{Environment, Transaction, TransactionConfig};
 
 use crate::error::{PrepareResult, XaError, XaResult};
 use crate::flags::XaFlags;
+use crate::prepared_log::PreparedLog;
 use crate::resource::XaResource;
 use crate::xid::Xid;
 
@@ -36,9 +37,13 @@ struct Branch {
 ///
 /// Manages the lifecycle of distributed transaction branches, implementing
 /// the full X/Open XA two-phase commit protocol.
+///
+/// If a `PreparedLog` is configured (via `with_prepared_log`), prepared
+/// branches are persisted to disk for crash recovery.
 pub struct XaEnvironment {
     env: Environment,
     branches: Mutex<HashMap<Xid, Branch>>,
+    prepared_log: Option<PreparedLog>,
 }
 
 impl XaEnvironment {
@@ -47,6 +52,7 @@ impl XaEnvironment {
         Self {
             env,
             branches: Mutex::new(HashMap::new()),
+            prepared_log: None,
         }
     }
 
@@ -81,6 +87,18 @@ impl XaEnvironment {
         let branch = branches.get_mut(xid).ok_or(XaError::NotFound)?;
         branch.has_writes = true;
         Ok(())
+    }
+
+    /// Enable persistent prepared-transaction logging for crash recovery.
+    ///
+    /// When enabled, `xa_prepare` writes the Xid to a persistent database,
+    /// and `xa_commit`/`xa_rollback`/`xa_forget` remove it. After a crash,
+    /// `xa_recover` returns XIDs from both the in-memory map and the
+    /// persistent log.
+    pub fn with_prepared_log(mut self) -> Result<Self, noxu_db::NoxuError> {
+        let log = PreparedLog::open(&self.env)?;
+        self.prepared_log = Some(log);
+        Ok(self)
     }
 }
 
@@ -174,8 +192,10 @@ impl XaResource for XaEnvironment {
             return Ok(PrepareResult::ReadOnly);
         }
 
-        // Mark as prepared. In a full implementation, we would write a
-        // "prepared" record to the WAL here for crash recovery.
+        // Persist prepared record for crash recovery.
+        if let Some(ref log) = self.prepared_log {
+            log.record_prepare(xid).map_err(XaError::Db)?;
+        }
         branch.state = BranchState::Prepared;
         log::debug!("xa_prepare: {xid:?} -> Prepared");
         Ok(PrepareResult::Ok)
@@ -203,6 +223,9 @@ impl XaResource for XaEnvironment {
         // Remove branch and commit the underlying transaction.
         let branch = branches.remove(xid).unwrap();
         branch.txn.commit().map_err(XaError::Db)?;
+        if let Some(ref log) = self.prepared_log {
+            let _ = log.remove(xid);
+        }
         log::debug!("xa_commit: {xid:?}");
         Ok(())
     }
@@ -224,24 +247,50 @@ impl XaResource for XaEnvironment {
 
         let branch = branches.remove(xid).unwrap();
         branch.txn.abort().map_err(XaError::Db)?;
+        if let Some(ref log) = self.prepared_log {
+            let _ = log.remove(xid);
+        }
         log::debug!("xa_rollback: {xid:?}");
         Ok(())
     }
 
     fn xa_recover(&self, _flags: XaFlags) -> XaResult<Vec<Xid>> {
+        // In-memory prepared branches
         let branches = self.branches.lock().unwrap();
-        let prepared: Vec<Xid> = branches
+        let mut prepared: Vec<Xid> = branches
             .iter()
             .filter(|(_, b)| b.state == BranchState::Prepared)
             .map(|(xid, _)| xid.clone())
             .collect();
+
+        // Add any from persistent log (crash recovery — not in memory)
+        if let Some(ref log) = self.prepared_log {
+            if let Ok(persisted) = log.recover_all() {
+                for xid in persisted {
+                    if !prepared.contains(&xid) {
+                        prepared.push(xid);
+                    }
+                }
+            }
+        }
         Ok(prepared)
     }
 
     fn xa_forget(&self, xid: &Xid, _flags: XaFlags) -> XaResult<()> {
         let mut branches = self.branches.lock().unwrap();
         if branches.remove(xid).is_none() {
-            return Err(XaError::NotFound);
+            // Check persistent log (may be from crash recovery)
+            if let Some(ref log) = self.prepared_log {
+                let recovered = log.recover_all().unwrap_or_default();
+                if !recovered.contains(xid) {
+                    return Err(XaError::NotFound);
+                }
+            } else {
+                return Err(XaError::NotFound);
+            }
+        }
+        if let Some(ref log) = self.prepared_log {
+            let _ = log.remove(xid);
         }
         log::debug!("xa_forget: {xid:?}");
         Ok(())
