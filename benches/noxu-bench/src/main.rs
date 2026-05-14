@@ -21,6 +21,7 @@ mod workloads;
 
 use metrics::{cpu_time_ms, dir_size_kb, proc_io, rss_kb};
 use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu_xa::XaEnvironment;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -563,6 +564,51 @@ fn main() {
             });
             print_progress(&r);
             results.push(r);
+        }
+
+        // W12: XA two-phase commit throughput
+        // Measures the overhead of XA 2PC vs single-phase commit.
+        {
+            let xa_n = n.min(10_000); // cap XA ops for sanity at large scale
+
+            // W12a: full 2PC (start → end → prepare → commit)
+            {
+                let dir = new_bench_dir(&bench_base, "bench_xa_2pc", n, cleanup);
+                let (env, db) = open_db(dir.path());
+                let xa = XaEnvironment::new(env);
+                let r = run_timed("w12_xa_2pc", xa_n, 1, dir.path(), Some(xa.inner()), || {
+                    workloads::w12_xa_2pc(&xa, &db, xa_n, &value_bytes)
+                });
+                print_progress(&r);
+                results.push(r);
+                drop(db);
+            }
+
+            // W12b: single-phase commit (ONEPHASE optimization)
+            {
+                let dir = new_bench_dir(&bench_base, "bench_xa_1pc", n, cleanup);
+                let (env, db) = open_db(dir.path());
+                let xa = XaEnvironment::new(env);
+                let r = run_timed("w12_xa_1pc", xa_n, 1, dir.path(), Some(xa.inner()), || {
+                    workloads::w12_xa_1pc(&xa, &db, xa_n, &value_bytes)
+                });
+                print_progress(&r);
+                results.push(r);
+                drop(db);
+            }
+
+            // W12c: plain txn baseline (for comparison)
+            {
+                let dir = new_bench_dir(&bench_base, "bench_xa_baseline", n, cleanup);
+                let (env, db) = open_db(dir.path());
+                populate(&db, xa_n, &value_bytes);
+                let r = run_timed("w12_plain_txn", xa_n, 1, dir.path(), Some(&env), || {
+                    workloads::w09_txn_multi(&env, &db, xa_n, &value_bytes)
+                });
+                print_progress(&r);
+                results.push(r);
+                drop(db); drop(env);
+            }
         }
     }
 

@@ -222,3 +222,72 @@ pub fn w09_txn_multi(env: &Environment, db: &Database, n: usize, value: &[u8]) -
     }
     5 * n
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12 – XA two-phase commit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full XA 2PC cycle: xa_start → put → xa_end → xa_prepare → xa_commit.
+///
+/// Each iteration is one complete distributed transaction branch.
+/// Returns `n` (one 2PC round trip per iteration).
+pub fn w12_xa_2pc(
+    xa: &noxu_xa::XaEnvironment,
+    db: &Database,
+    n: usize,
+    value: &[u8],
+) -> usize {
+    use noxu_xa::{XaFlags, XaResource, Xid};
+
+    let v = DatabaseEntry::from_bytes(value);
+    for i in 0..n {
+        let gtrid = format!("bench_{:010}", i);
+        let xid = Xid::new(1, gtrid.as_bytes(), b"w12").unwrap();
+
+        xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+
+        {
+            let txn = xa.get_transaction(&xid).unwrap();
+            let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
+            db.put(Some(txn), &k, &v).unwrap();
+            xa.mark_write(&xid).unwrap();
+        }
+
+        xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+        xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
+        xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
+    }
+    n
+}
+
+/// Single-phase XA commit (ONEPHASE optimization — skip prepare).
+///
+/// xa_start → put → xa_end → xa_commit(ONEPHASE).
+/// Returns `n`.
+pub fn w12_xa_1pc(
+    xa: &noxu_xa::XaEnvironment,
+    db: &Database,
+    n: usize,
+    value: &[u8],
+) -> usize {
+    use noxu_xa::{XaFlags, XaResource, Xid};
+
+    let v = DatabaseEntry::from_bytes(value);
+    for i in 0..n {
+        let gtrid = format!("bench1p_{:010}", i);
+        let xid = Xid::new(1, gtrid.as_bytes(), b"w12_1p").unwrap();
+
+        xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+
+        {
+            let txn = xa.get_transaction(&xid).unwrap();
+            let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
+            db.put(Some(txn), &k, &v).unwrap();
+            xa.mark_write(&xid).unwrap();
+        }
+
+        xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+        xa.xa_commit(&xid, XaFlags::ONEPHASE).unwrap();
+    }
+    n
+}

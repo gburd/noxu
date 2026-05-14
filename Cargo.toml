@@ -34,10 +34,12 @@ members = [
 
 [dependencies]
 noxu-db = { workspace = true }
+noxu-xa = { path = "crates/noxu-xa" }
 noxu-bind = { workspace = true }
 noxu-collections = { workspace = true }
 noxu-persist = { workspace = true }
 noxu-sync = { workspace = true }
+tempfile = "3"
 
 [[example]]
 name = "simple"
@@ -78,6 +80,14 @@ path = "examples/getting_started.rs"
 [[example]]
 name = "scale_validation"
 path = "examples/scale_validation.rs"
+
+[[example]]
+name = "xa_distributed"
+path = "examples/xa_distributed.rs"
+
+[[example]]
+name = "transaction_config"
+path = "examples/transaction_config.rs"
 
 [workspace.package]
 version = "0.1.0"

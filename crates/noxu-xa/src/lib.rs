@@ -29,11 +29,13 @@
 pub mod environment;
 pub mod error;
 pub mod flags;
+pub mod prepared_log;
 pub mod resource;
 pub mod xid;
 
 pub use environment::XaEnvironment;
 pub use error::{PrepareResult, XaError, XaResult};
 pub use flags::XaFlags;
+pub use prepared_log::PreparedLog;
 pub use resource::XaResource;
 pub use xid::{Xid, XidError};
