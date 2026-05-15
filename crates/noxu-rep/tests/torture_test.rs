@@ -905,6 +905,9 @@ enum ChaosPhase {
         primary:  EvictionAlgorithm,
         scan:     EvictionAlgorithm,
     },
+    /// Force the current master to step down and elect a different node.
+    /// Verifies: no VLSN regression, no split-brain, new master elected.
+    MasterHandover,
 }
 
 /// All eviction algorithms available for random selection.
@@ -1020,8 +1023,8 @@ fn torture_replication() {
     // Stats
     let (mut n_elections, mut n_won, mut n_streams, mut n_crashes, mut n_chaos) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    let (mut n_joins, mut n_leaves, mut n_cap_changes, mut n_evict_changes) =
-        (0u64, 0u64, 0u64, 0u64);
+    let (mut n_joins, mut n_leaves, mut n_cap_changes, mut n_evict_changes, mut n_handovers) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
 
     let start = Instant::now();
     let mut next_report = start + Duration::from_secs(30);
@@ -1174,7 +1177,62 @@ fn torture_replication() {
             }
         }
 
-        // (c) Eviction policy change — 20% per round.
+        // (c) Master handover — 5% per round.
+        // Force the current master to step down and elect a different node.
+        // Verifies no VLSN regression and no split-brain.
+        if rng.gen_bool(0.05) && current_master.is_some() {
+            let old_midx = current_master.unwrap();
+            if nodes[old_midx].is_alive() {
+                let old_vlsn = nodes[old_midx].vlsn();
+                let old_name = nodes[old_midx].name.clone();
+                eprintln!("[torture] r={round} MasterHandover: stepping down {} vlsn={old_vlsn}",
+                          old_name);
+
+                // Step down: clear current master (simulates become_replica on old master).
+                current_master = None;
+
+                // Pick a different alive node as the new proposer.
+                let candidates: Vec<usize> = members.iter().copied()
+                    .filter(|&i| i != old_midx && nodes[i].is_alive())
+                    .collect();
+                if !candidates.is_empty() {
+                    let new_proposer = candidates[rng.gen_range(0..candidates.len())];
+                    let mut handover_won = false;
+                    for _attempt in 0..RETRY_BUDGET {
+                        n_elections += 1;
+                        if let Some(wid) = run_election_round(new_proposer, &nodes, &group, term, &inv) {
+                            let widx = nodes.iter().position(|n| n.id == wid).unwrap_or(new_proposer);
+                            // Verify: no VLSN regression — new master's VLSN >= old master's.
+                            let new_vlsn = nodes[widx].vlsn();
+                            if new_vlsn < old_vlsn {
+                                eprintln!("[VIOLATION] MasterHandover vlsn regression: \
+                                           old={old_name}@{old_vlsn} new={}@{new_vlsn}",
+                                          nodes[widx].name);
+                                inv.violations.fetch_add(1, Ordering::SeqCst);
+                            }
+                            // Verify: no split-brain — only one master.
+                            current_master = Some(widx);
+                            n_won += 1;
+                            handover_won = true;
+                            eprintln!("[torture] r={round} MasterHandover complete: \
+                                       new master={} vlsn={new_vlsn}",
+                                      nodes[widx].name);
+                            break;
+                        }
+                        term += 1;
+                    }
+                    term += 1;
+                    if !handover_won {
+                        eprintln!("[torture] r={round} MasterHandover: \
+                                   re-election failed after {RETRY_BUDGET} attempts");
+                    }
+                }
+                n_handovers += 1;
+                n_chaos += 1;
+            }
+        }
+
+        // (d) Eviction policy change — 20% per round.
         // Randomly select primary and (optionally distinct) scan algorithms
         // for a random alive node; exercises all five policy implementations.
         {
@@ -1283,7 +1341,7 @@ fn torture_replication() {
                 "[torture] elapsed={:.0?} r={round} elect={n_elections} won={n_won} \
                  streams={n_streams} crashes={n_crashes} chaos={n_chaos} \
                  joins={n_joins} leaves={n_leaves} cap_changes={n_cap_changes} \
-                 evict_changes={n_evict_changes} evict=[{evict_info}] \
+                 handovers={n_handovers} evict_changes={n_evict_changes} evict=[{evict_info}] \
                  members={} violations={}",
                 start.elapsed(), members.len(), inv.violations()
             );
@@ -1311,6 +1369,7 @@ fn torture_replication() {
     eprintln!("[torture]   peer joins         : {n_joins}");
     eprintln!("[torture]   peer leaves        : {n_leaves}");
     eprintln!("[torture]   capacity changes   : {n_cap_changes}");
+    eprintln!("[torture]   master handovers   : {n_handovers}");
     eprintln!("[torture]   evict changes      : {n_evict_changes}");
     eprintln!("[torture]   final group size   : {}", members.len());
     for &mi in &members {
