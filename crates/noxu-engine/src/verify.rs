@@ -7,7 +7,8 @@ use noxu_tree::tree::{BinStub, InNodeStub, TreeNode};
 use noxu_tree::Tree;
 use noxu_util::NULL_LSN;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use noxu_tree::NodeRwLock as RwLock;
 
 /// Result of an environment verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,16 +303,7 @@ fn verify_node(
     result: &mut VerifyResult,
     records: &mut u64,
 ) {
-    let guard = match node_arc.read() {
-        Ok(g) => g,
-        Err(_) => {
-            result.add_error(VerifyError::BtreeError {
-                db_name: db_name.to_string(),
-                description: "Failed to acquire read lock on tree node".to_string(),
-            });
-            return;
-        }
-    };
+    let guard = node_arc.read();
 
     match &*guard {
         TreeNode::Internal(in_node) => {

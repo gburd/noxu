@@ -6,6 +6,7 @@ license.workspace = true
 description = "Log file garbage collection for Noxu DB"
 
 [dependencies]
+parking_lot = { workspace = true }
 hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 noxu-log = { workspace = true }

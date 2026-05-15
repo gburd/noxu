@@ -6,6 +6,7 @@ license.workspace = true
 description = "Engine orchestration for Noxu DB"
 
 [dependencies]
+parking_lot = { workspace = true }
 hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 noxu-config = { workspace = true }

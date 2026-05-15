@@ -278,10 +278,7 @@ impl TreeLookup for RealTreeLookup {
             tree_guard.get_parent_in_for_child_in(node_id_u64)
         {
             // Step 2a — get the LSN stored in the parent's slot for this child.
-            let parent_guard = match parent_arc.read() {
-                Ok(g) => g,
-                Err(_) => return InLookupResult::Obsolete,
-            };
+            let parent_guard = parent_arc.read();
             let slot_lsn = match &*parent_guard {
                 TreeNode::Internal(n) => {
                     // The parent slot's LSN tracks the last logged position
@@ -296,10 +293,7 @@ impl TreeLookup for RealTreeLookup {
             // Get the child arc from the parent to inspect the node's own
             // `last_full_lsn` (BIN) or dirty flag (Internal).
             let child_arc = {
-                let parent_guard = match parent_arc.read() {
-                    Ok(g) => g,
-                    Err(_) => return InLookupResult::Obsolete,
-                };
+                let parent_guard = parent_arc.read();
                 match &*parent_guard {
                     TreeNode::Internal(n) => {
                         n.entries.get(slot_idx).and_then(|e| e.child.clone())
@@ -315,10 +309,7 @@ impl TreeLookup for RealTreeLookup {
 
             // Step 2b — get the node's own LSN (BIN uses last_full_lsn).
             let node_lsn = {
-                let child_guard = match child_arc.read() {
-                    Ok(g) => g,
-                    Err(_) => return InLookupResult::Obsolete,
-                };
+                let child_guard = child_arc.read();
                 match &*child_guard {
                     TreeNode::Bottom(b) => b.last_full_lsn,
                     // For upper INs we don't have a per-node last_full_lsn;
@@ -349,7 +340,7 @@ impl TreeLookup for RealTreeLookup {
             // Step 4 — tree_lsn == log_lsn: mark dirty.
             // `inInTree.setDirty(true); inInTree.setProhibitNextDelta(true)`.
             drop(tree_guard);
-            if let Ok(mut child_write) = child_arc.write() {
+            { let mut child_write = child_arc.write();
                 child_write.set_dirty(true);
             }
             return InLookupResult::Found;
@@ -360,28 +351,22 @@ impl TreeLookup for RealTreeLookup {
         let root_arc_opt = tree_guard.get_root();
         drop(tree_guard);
         if let Some(root) = root_arc_opt {
-            let root_node_id = match root.read() {
-                Ok(g) => match &*g {
+            let root_node_id = { let g = root.read(); match &*g {
                     TreeNode::Bottom(b) => b.node_id,
                     TreeNode::Internal(n) => n.node_id,
-                },
-                Err(_) => return InLookupResult::Obsolete,
-            };
+                } };
 
             if root_node_id == node_id_u64 {
-                let root_lsn = match root.read() {
-                    Ok(g) => match &*g {
+                let root_lsn = { let g = root.read(); match &*g {
                         TreeNode::Bottom(b) => b.last_full_lsn,
                         TreeNode::Internal(_) => return InLookupResult::Obsolete,
-                    },
-                    Err(_) => return InLookupResult::Obsolete,
-                };
+                    } };
 
                 if root_lsn == noxu_util::NULL_LSN || root_lsn != log_lsn {
                     return InLookupResult::Obsolete;
                 }
 
-                if let Ok(mut w) = root.write() {
+                { let mut w = root.write();
                     w.set_dirty(true);
                 }
                 return InLookupResult::Found;
@@ -396,7 +381,7 @@ impl RealTreeLookup {
     /// Helper: returns the current LSN of the slot for `key` in the tree,
     /// or `None` if the key is not present.
     pub(crate) fn get_slot_lsn_from_root(
-        root: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>>,
+        root: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>>,
         key: &[u8],
     ) -> Option<Lsn> {
         let arc = root?;
@@ -405,7 +390,7 @@ impl RealTreeLookup {
 
     /// Helper: returns a copy of the data stored in the slot for `key`.
     pub(crate) fn get_slot_data_from_root(
-        root: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>>,
+        root: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>>,
         key: &[u8],
     ) -> Option<Vec<u8>> {
         let arc = root?;
@@ -414,11 +399,11 @@ impl RealTreeLookup {
 
     /// Recursive descent to find the LSN of the BIN slot for `key`.
     fn find_bin_entry_lsn(
-        node_arc: &std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>,
+        node_arc: &std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>,
         key: &[u8],
     ) -> Option<Lsn> {
         use noxu_tree::TreeNode;
-        let guard = node_arc.read().ok()?;
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
                 let idx = bin
@@ -447,11 +432,11 @@ impl RealTreeLookup {
 
     /// Recursive descent to find the data bytes of the BIN slot for `key`.
     fn find_bin_entry_data(
-        node_arc: &std::sync::Arc<std::sync::RwLock<noxu_tree::TreeNode>>,
+        node_arc: &std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>,
         key: &[u8],
     ) -> Option<Vec<u8>> {
         use noxu_tree::TreeNode;
-        let guard = node_arc.read().ok()?;
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
                 let idx = bin

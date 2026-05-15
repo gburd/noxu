@@ -26,7 +26,8 @@ use crate::search_result::SearchResult;
 use noxu_latch::{LatchContext, SharedLatch};
 use noxu_util::{Lsn, NULL_LSN};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::RwLock;
 
 // Level and flag constants re-exported here for tree-internal use.
 pub const DBMAP_LEVEL: i32 = 0x20000;
@@ -1230,14 +1231,14 @@ impl Tree {
 
     /// Returns true if the tree has no root (is empty).
     pub fn is_empty(&self) -> bool {
-        self.root.read().unwrap().is_none()
+        self.root.read().is_none()
     }
 
     /// Sets the root of the tree.
     ///
     /// Must hold root_latch exclusively before calling.
     pub fn set_root(&self, node: TreeNode) {
-        *self.root.write().unwrap() = Some(Arc::new(RwLock::new(node)));
+        *self.root.write() = Some(Arc::new(RwLock::new(node)));
     }
 
     /// Returns the root Arc, if any.
@@ -1245,7 +1246,7 @@ impl Tree {
     /// Returns a cloned `Arc` rather than a reference so the caller does not
     /// hold the inner `RwLock` guard.
     pub fn get_root(&self) -> Option<Arc<RwLock<TreeNode>>> {
-        self.root.read().unwrap().clone()
+        self.root.read().clone()
     }
 
     /// Returns the database ID.
@@ -1266,10 +1267,7 @@ impl Tree {
     }
 
     fn count_entries_recursive(node_arc: &Arc<RwLock<TreeNode>>, total: &mut u64) {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(b) => {
                 // Count only live (non-known_deleted) entries.
@@ -1332,7 +1330,7 @@ impl Tree {
             // is_bin check then separate child-find) left a window where a
             // concurrent split could relocate the child between the two
             // acquisitions.
-            let guard = current.read().ok()?;
+            let guard = current.read();
 
             if guard.is_bin() {
                 // Reached a BIN: final key lookup within the same guard.
@@ -1440,15 +1438,9 @@ impl Tree {
         loop {
             // Detect BIN with a read lock first, then re-acquire write lock.
             // This double-lock pattern matches `insert_recursive`.
-            let is_bin = match current.read() {
-                Ok(g) => g.is_bin(),
-                Err(_) => return false,
-            };
+            let is_bin = current.read().is_bin();
             if is_bin {
-                let mut guard = match current.write() {
-                    Ok(g) => g,
-                    Err(_) => return false,
-                };
+                let mut guard = current.write();
                 if let TreeNode::Bottom(bin) = &mut *guard {
                     let slot = if let Some(cmp) = &self.key_comparator {
                         let (idx, exact) = bin.find_entry_cmp(key, cmp.as_ref());
@@ -1470,10 +1462,7 @@ impl Tree {
             }
             // Upper IN: navigate to the child covering this key.
             let next_arc = {
-                let guard = match current.read() {
-                    Ok(g) => g,
-                    Err(_) => return false,
-                };
+                let guard = current.read();
                 match &*guard {
                     TreeNode::Internal(n) => {
                         if n.entries.is_empty() {
@@ -1520,7 +1509,7 @@ impl Tree {
         let mut current = self.get_root()?;
 
         loop {
-            let guard = current.read().ok()?;
+            let guard = current.read();
 
             if guard.is_bin() {
                 let result = match &*guard {
@@ -1595,7 +1584,7 @@ impl Tree {
         let key_len = key.len();
         let data_len = data.len();
 
-        if self.root.read().unwrap().is_none() {
+        if self.root.read().is_none() {
             // Tree.insert() first-key path:
             // Create the initial BIN, then a level-2 upper IN as root, and
             // make the upper IN point to the BIN (mirroring rootIN with
@@ -1632,11 +1621,11 @@ impl Tree {
             )));
 
             // Wire the BIN's parent pointer back to the root IN.
-            if let Ok(mut g) = bin.write() {
+            { let mut g = bin.write();
                 g.set_parent(Some(Arc::downgrade(&root_arc)));
             }
 
-            *self.root.write().unwrap() = Some(root_arc);
+            *self.root.write() = Some(root_arc);
 
             // Count the first entry.
             if let Some(counter) = &self.memory_counter {
@@ -1686,9 +1675,9 @@ impl Tree {
     /// ```
     fn split_root_if_needed(&self, lsn: Lsn) -> Result<(), TreeError> {
         let needs_split = {
-            let root_arc = self.root.read().unwrap().clone().unwrap();
+            let root_arc = self.root.read().clone().unwrap();
             let guard =
-                root_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
+                root_arc.read();
             guard.get_n_entries() >= self.max_entries_per_node
         };
 
@@ -1697,10 +1686,10 @@ impl Tree {
         }
 
         // Create a fresh new root one level above the current root.
-        let old_root_arc = self.root.write().unwrap().take().unwrap();
+        let old_root_arc = self.root.write().take().unwrap();
         let old_root_level = {
             let g =
-                old_root_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
+                old_root_arc.read();
             g.level()
         };
 
@@ -1723,7 +1712,7 @@ impl Tree {
         )));
 
         // Update the old root's parent pointer to the new root.
-        if let Ok(mut g) = old_root_arc.write() {
+        { let mut g = old_root_arc.write();
             g.set_parent(Some(Arc::downgrade(&new_root_arc)));
         }
 
@@ -1735,7 +1724,7 @@ impl Tree {
             lsn,
         )?;
 
-        *self.root.write().unwrap() = Some(new_root_arc);
+        *self.root.write() = Some(new_root_arc);
         self.root_splits.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1766,7 +1755,7 @@ impl Tree {
         // Extract the child Arc from the parent slot.
         let child_arc = {
             let parent_guard =
-                parent.read().map_err(|_| TreeError::NodeNotEmpty)?;
+                parent.read();
             match &*parent_guard {
                 TreeNode::Internal(p) => {
                     p.entries
@@ -1785,7 +1774,7 @@ impl Tree {
         // recalcKeyPrefix on each half independently.
         let (child_level, all_entries, bin_old_prefix) = {
             let child_guard =
-                child_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
+                child_arc.read();
             let level = child_guard.level();
             let (entries, old_prefix) = match &*child_guard {
                 TreeNode::Internal(n) => {
@@ -1827,7 +1816,7 @@ impl Tree {
         // Update the original child with the left half and recompute prefix.
         {
             let mut child_guard =
-                child_arc.write().map_err(|_| TreeError::NodeNotEmpty)?;
+                child_arc.write();
             match (&mut *child_guard, &left_entries) {
                 (TreeNode::Internal(n), SplitEntries::Internal(le)) => {
                     n.entries = le.clone();
@@ -1883,7 +1872,7 @@ impl Tree {
         };
 
         // Mark the child (left half) dirty as well.
-        if let Ok(mut g) = child_arc.write() {
+        { let mut g = child_arc.write();
             g.set_dirty(true);
         }
 
@@ -1892,7 +1881,7 @@ impl Tree {
         // Also wire the sibling's parent pointer and mark the parent dirty.
         {
             let mut parent_guard =
-                parent.write().map_err(|_| TreeError::NodeNotEmpty)?;
+                parent.write();
             match &mut *parent_guard {
                 TreeNode::Internal(p) => {
                     let insert_pos = child_index + 1;
@@ -1912,7 +1901,7 @@ impl Tree {
         }
 
         // Wire the new sibling's parent pointer to the parent node.
-        if let Ok(mut g) = new_sibling.write() {
+        { let mut g = new_sibling.write();
             g.set_parent(Some(Arc::downgrade(parent)));
         }
 
@@ -1941,7 +1930,7 @@ impl Tree {
     ) -> Result<bool, TreeError> {
         // Determine if this is a BIN (leaf level).
         let is_bin = {
-            let g = node_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
+            let g = node_arc.read();
             g.is_bin()
         };
 
@@ -1950,7 +1939,7 @@ impl Tree {
             // Tree.insertLN(): after modifying a BIN, call
             // bin.setDirty(true) so the checkpointer logs it.
             let mut guard =
-                node_arc.write().map_err(|_| TreeError::NodeNotEmpty)?;
+                node_arc.write();
             match &mut *guard {
                 TreeNode::Bottom(bin) => {
                     let is_new = if let Some(cmp) = key_comparator {
@@ -1980,7 +1969,7 @@ impl Tree {
             // any real key is routed to at least slot 0.
             let (child_index, child_arc) = {
                 let guard =
-                    node_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
+                    node_arc.read();
                 match &*guard {
                     TreeNode::Internal(n) => {
                         // Binary search for the largest key <= search key.
@@ -2018,7 +2007,7 @@ impl Tree {
             // If (child.needsSplitting()) child.split(parent, ...)
             let child_full = {
                 let g =
-                    child_arc.read().map_err(|_| TreeError::NodeNotEmpty)?;
+                    child_arc.read();
                 g.get_n_entries() >= max_entries
             };
 
@@ -2050,7 +2039,7 @@ impl Tree {
 
         loop {
             let (is_bin, n_entries, first_child) = {
-                let g = current.read().ok()?;
+                let g = current.read();
                 let is_bin = g.is_bin();
                 let n = g.get_n_entries();
                 let child = if !is_bin {
@@ -2086,7 +2075,7 @@ impl Tree {
 
         loop {
             let (is_bin, n_entries, last_child) = {
-                let g = current.read().ok()?;
+                let g = current.read();
                 let is_bin = g.is_bin();
                 let n = g.get_n_entries();
                 let child = if !is_bin {
@@ -2163,10 +2152,7 @@ impl Tree {
         key_comparator: Option<&KeyComparatorFn>,
     ) -> bool {
         let (is_bin, child_arc) = {
-            let g = match node_arc.read() {
-                Ok(g) => g,
-                Err(_) => return false,
-            };
+            let g = node_arc.read();
             let is_bin = g.is_bin();
             let child = if !is_bin {
                 match &*g {
@@ -2199,10 +2185,7 @@ impl Tree {
         };
 
         if is_bin {
-            let mut g = match node_arc.write() {
-                Ok(g) => g,
-                Err(_) => return false,
-            };
+            let mut g = node_arc.write();
             match &mut *g {
                 TreeNode::Bottom(bin) => {
                     if let Some(cmp) = key_comparator {
@@ -2274,10 +2257,7 @@ impl Tree {
     fn compress_node(node_arc: &Arc<RwLock<TreeNode>>, max_entries: usize) {
         // Collect child arcs to recurse without holding the node lock.
         let children: Vec<Arc<RwLock<TreeNode>>> = {
-            let g = match node_arc.read() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
+            let g = node_arc.read();
             match &*g {
                 TreeNode::Internal(n) => {
                     n.entries.iter().filter_map(|e| e.child.clone()).collect()
@@ -2296,10 +2276,7 @@ impl Tree {
         // Repeat until a full pass produces no merges.
         loop {
             let n_entries = {
-                let g = match node_arc.read() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
+                let g = node_arc.read();
                 g.get_n_entries()
             };
 
@@ -2310,10 +2287,7 @@ impl Tree {
             while i + 1 < n_entries {
                 // Fetch left and right child arcs.
                 let (left_arc, right_arc) = {
-                    let g = match node_arc.read() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
+                    let g = node_arc.read();
                     match &*g {
                         TreeNode::Internal(p) => {
                             let l = p.entries.get(i).and_then(|e| e.child.clone());
@@ -2328,16 +2302,10 @@ impl Tree {
                 };
 
                 let left_n = {
-                    match left_arc.read() {
-                        Ok(g) => g.get_n_entries(),
-                        Err(_) => { i += 1; continue; }
-                    }
+                    left_arc.read().get_n_entries()
                 };
                 let right_n = {
-                    match right_arc.read() {
-                        Ok(g) => g.get_n_entries(),
-                        Err(_) => { i += 1; continue; }
-                    }
+                    right_arc.read().get_n_entries()
                 };
 
                 // merge condition: combined count fits within one node.
@@ -2348,10 +2316,7 @@ impl Tree {
 
                 // Determine node kind from left child.
                 let left_is_bin = {
-                    match left_arc.read() {
-                        Ok(g) => g.is_bin(),
-                        Err(_) => { i += 1; continue; }
-                    }
+                    left_arc.read().is_bin()
                 };
 
                 if left_is_bin {
@@ -2361,8 +2326,7 @@ impl Tree {
                     // merge left into right, then
                     // recalcKeyPrefix on the merged node.
                     let left_full_entries: Vec<BinEntry> = {
-                        match left_arc.read() {
-                            Ok(g) => match &*g {
+                        { let g = left_arc.read(); match &*g {
                                 TreeNode::Bottom(b) => (0..b.entries.len())
                                     .map(|j| BinEntry {
                                         key: b.get_full_key(j).unwrap_or_default(),
@@ -2374,13 +2338,10 @@ impl Tree {
                                     })
                                     .collect(),
                                 _ => { i += 1; continue; }
-                            },
-                            Err(_) => { i += 1; continue; }
-                        }
+                            } }
                     };
                     {
-                        match right_arc.write() {
-                            Ok(mut g) => match &mut *g {
+                        { let mut g = right_arc.write(); match &mut *g {
                                 TreeNode::Bottom(rb) => {
                                     // Decompress right entries to full keys.
                                     let right_full: Vec<BinEntry> = (0..rb.entries.len())
@@ -2406,32 +2367,27 @@ impl Tree {
                                     rb.dirty = true;
                                 }
                                 _ => { i += 1; continue; }
-                            },
-                            Err(_) => { i += 1; continue; }
-                        }
+                            } }
                     }
                     // Clear the now-merged left BIN.
-                    if let Ok(mut g) = left_arc.write()
-                        && let TreeNode::Bottom(lb) = &mut *g
                     {
-                        lb.entries.clear();
-                        lb.key_prefix = Vec::new();
-                        lb.dirty = true;
+                        let mut g = left_arc.write();
+                        if let TreeNode::Bottom(lb) = &mut *g {
+                            lb.entries.clear();
+                            lb.key_prefix = Vec::new();
+                            lb.dirty = true;
+                        }
                     }
                 } else {
                     // Upper-IN merge: prepend left's InEntries into right.
                     let left_in_entries: Vec<InEntry> = {
-                        match left_arc.read() {
-                            Ok(g) => match &*g {
+                        { let g = left_arc.read(); match &*g {
                                 TreeNode::Internal(n) => n.entries.clone(),
                                 _ => { i += 1; continue; }
-                            },
-                            Err(_) => { i += 1; continue; }
-                        }
+                            } }
                     };
                     {
-                        match right_arc.write() {
-                            Ok(mut g) => match &mut *g {
+                        { let mut g = right_arc.write(); match &mut *g {
                                 TreeNode::Internal(rn) => {
                                     let mut combined = left_in_entries.clone();
                                     combined.append(&mut rn.entries);
@@ -2439,24 +2395,23 @@ impl Tree {
                                     rn.dirty = true;
                                 }
                                 _ => { i += 1; continue; }
-                            },
-                            Err(_) => { i += 1; continue; }
-                        }
+                            } }
                     }
                     // Update parent pointers for moved children.
                     for entry in &left_in_entries {
                         if let Some(child) = &entry.child
-                            && let Ok(mut cg) = child.write()
-                        {
+                            {
+                                let mut cg = child.write();
                             cg.set_parent(Some(Arc::downgrade(&right_arc)));
                         }
                     }
                     // Clear the now-merged left IN.
-                    if let Ok(mut g) = left_arc.write()
-                        && let TreeNode::Internal(ln) = &mut *g
                     {
-                        ln.entries.clear();
-                        ln.dirty = true;
+                        let mut g = left_arc.write();
+                        if let TreeNode::Internal(ln) = &mut *g {
+                            ln.entries.clear();
+                            ln.dirty = true;
+                        }
                     }
                 }
 
@@ -2467,8 +2422,7 @@ impl Tree {
                 // the merged BIN's range) and remove the RIGHT slot (i+1).
                 // This avoids having to update the parent key when i == 0.
                 {
-                    match node_arc.write() {
-                        Ok(mut g) => match &mut *g {
+                    { let mut g = node_arc.write(); match &mut *g {
                             TreeNode::Internal(p) => {
                                 // Update left slot (i) to point at right_arc
                                 // (which now contains the merged entries).
@@ -2480,9 +2434,7 @@ impl Tree {
                                 p.dirty = true;
                             }
                             TreeNode::Bottom(_) => return,
-                        },
-                        Err(_) => return,
-                    }
+                        } }
                 }
 
                 merged_any = true;
@@ -2490,10 +2442,7 @@ impl Tree {
                 // sibling (the old slot i+2 is now at i+1).
                 i += 1;
                 let updated_n = {
-                    match node_arc.read() {
-                        Ok(g) => g.get_n_entries(),
-                        Err(_) => return,
-                    }
+                    node_arc.read().get_n_entries()
                 };
                 if i + 1 >= updated_n {
                     break;
@@ -2538,8 +2487,7 @@ impl Tree {
     ) -> bool {
         // ---- Step 1: collect metadata without holding the write lock ----
         let (is_delta, n_entries, id_key) = {
-            match bin_arc.read() {
-                Ok(g) => match &*g {
+            { let g = bin_arc.read(); match &*g {
                     TreeNode::Bottom(b) => {
                         // Identifier key = first full key in the BIN
                         // (the: bin.getIdentifierKey()).
@@ -2547,9 +2495,7 @@ impl Tree {
                         (b.is_delta, b.entries.len(), id_key)
                     }
                     _ => return false, // not a BIN
-                },
-                Err(_) => return false,
-            }
+                } }
         };
 
         // If (bin.isBINDelta()) return; — deltas cannot be compressed.
@@ -2561,8 +2507,7 @@ impl Tree {
         // We compress dirty slots too (compress_dirty_slots = true) because
         // we are not writing a BIN-delta here.
         let removed_any = {
-            match bin_arc.write() {
-                Ok(mut g) => match &mut *g {
+            { let mut g = bin_arc.write(); match &mut *g {
                     TreeNode::Bottom(b) => {
                         let before = b.entries.len();
                         // BIN.compress(): walk backwards to remove
@@ -2586,16 +2531,14 @@ impl Tree {
                         b.entries.len() < before
                     }
                     _ => false,
-                },
-                Err(_) => return false,
-            }
+                } }
         };
 
         // ---- Step 3: prune empty BIN from parent ----
         // If (empty) pruneBIN(db, binRef, idKey)  → tree.delete(idKey).
         // We only prune when the BIN is actually empty after compression.
         let now_empty = {
-            bin_arc.read().ok().map(|g| g.get_n_entries() == 0).unwrap_or(false)
+            bin_arc.read().get_n_entries() == 0
         };
 
         if now_empty {
@@ -2633,8 +2576,7 @@ impl Tree {
         // Check whether the BIN has any deleted slots worth compressing.
         // lazyCompress: skip deltas and BINs with no defunct slots.
         let should_compress = {
-            match bin_arc.read() {
-                Ok(g) => match &*g {
+            { let g = bin_arc.read(); match &*g {
                     TreeNode::Bottom(b) => {
                         // Skip deltas (the: !in.isBIN() || in.isBINDelta()).
                         if b.is_delta {
@@ -2648,9 +2590,7 @@ impl Tree {
                         }
                     }
                     _ => false,
-                },
-                Err(_) => false,
-            }
+                } }
         };
 
         if !should_compress {
@@ -2679,10 +2619,7 @@ impl Tree {
         child_index: usize,
         child_arc: &Arc<RwLock<TreeNode>>,
     ) -> bool {
-        let g = match parent.read() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
+        let g = parent.read();
         match &*g {
             TreeNode::Internal(p) => match p.entries.get(child_index) {
                 Some(entry) => match &entry.child {
@@ -2718,7 +2655,7 @@ impl Tree {
             // Acquire this node's read lock ONCE — perform both the is_bin
             // check AND the child-pointer capture within the same lock scope
             // (single-pass latch-coupling, matching the pattern in search()).
-            let guard = current.read().ok()?;
+            let guard = current.read();
 
             if guard.is_bin() {
                 // Validate parent → child link before trusting the BIN.
@@ -2733,7 +2670,7 @@ impl Tree {
                     current = root.clone();
                     continue;
                 }
-                let g = current.read().ok()?;
+                let g = current.read();
                 let index = g.find_entry(key, true, true);
                 let found = index >= 0 && (index & EXACT_MATCH != 0);
                 return Some(SearchResult::with_values(
@@ -2794,9 +2731,8 @@ impl Tree {
     /// The evictor will not select a BIN with `cursor_count > 0` for eviction
     /// (`RealNodeInfo.pin_count`), matching `BIN.incrementCursorCount()`.
     pub fn pin_bin(bin_arc: &Arc<RwLock<TreeNode>>) {
-        if let Ok(mut guard) = bin_arc.write()
-            && let TreeNode::Bottom(ref mut stub) = *guard
-        {
+        let mut guard = bin_arc.write();
+        if let TreeNode::Bottom(ref mut stub) = *guard {
             stub.cursor_count += 1;
         }
     }
@@ -2807,9 +2743,8 @@ impl Tree {
     /// Uses `saturating_sub` to guard against an accidental double-unpin.
     /// Matching `BIN.decrementCursorCount()`.
     pub fn unpin_bin(bin_arc: &Arc<RwLock<TreeNode>>) {
-        if let Ok(mut guard) = bin_arc.write()
-            && let TreeNode::Bottom(ref mut stub) = *guard
-        {
+        let mut guard = bin_arc.write();
+        if let TreeNode::Bottom(ref mut stub) = *guard {
             stub.cursor_count = stub.cursor_count.saturating_sub(1);
         }
     }
@@ -3008,7 +2943,7 @@ impl Tree {
             // Acquire this node's read lock ONCE — perform both the is_bin
             // check AND the child-pointer capture within the same lock scope
             // (single-pass latch-coupling).
-            let guard = current.read().ok()?;
+            let guard = current.read();
 
             if guard.is_bin() {
                 // Reached the BIN level; stop — path already records the
@@ -3048,7 +2983,7 @@ impl Tree {
         // getNextIN's "ascend while at edge" loop.
         while let Some((parent_arc, taken_idx)) = path.pop() {
             let n_entries = {
-                parent_arc.read().ok()?.get_n_entries()
+                parent_arc.read().get_n_entries()
             };
 
             let sibling_idx = if forward {
@@ -3067,7 +3002,7 @@ impl Tree {
 
             // Found a sibling slot — fetch the sibling child arc.
             let sibling_arc = {
-                let g = parent_arc.read().ok()?;
+                let g = parent_arc.read();
                 match &*g {
                     TreeNode::Internal(p) => {
                         p.entries.get(sibling_idx)?.child.clone()?
@@ -3098,7 +3033,7 @@ impl Tree {
             // Acquire this node's read lock ONCE — perform both the is_bin
             // check AND the child-pointer capture within the same lock scope
             // (single-pass latch-coupling).
-            let guard = current.read().ok()?;
+            let guard = current.read();
 
             if guard.is_bin() {
                 // Reached a BIN: return its entries with full decompressed keys.
@@ -3179,10 +3114,7 @@ impl Tree {
         stats: &mut TreeStats,
         depth: u32,
     ) {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let guard = node_arc.read();
 
         let current_height = depth + 1;
         if current_height > stats.height {
@@ -3234,10 +3166,7 @@ impl Tree {
         db_id: u64,
         out: &mut Vec<(u64, Arc<RwLock<TreeNode>>)>,
     ) {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(b) => {
                 // Include this BIN if it is dirty or has any dirty slots.
@@ -3273,10 +3202,7 @@ impl Tree {
         node_arc: &Arc<RwLock<TreeNode>>,
         out: &mut Vec<Arc<RwLock<TreeNode>>>,
     ) {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(b) => {
                 if b.entries.iter().any(|e| e.known_deleted) {
@@ -3316,7 +3242,7 @@ impl Tree {
         node_arc: &Arc<RwLock<TreeNode>>,
         target_id: u64,
     ) -> Option<Vec<u8>> {
-        let guard = node_arc.read().ok()?;
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(_) => None, // BINs are not upper INs
             TreeNode::Internal(n) => {
@@ -3372,10 +3298,7 @@ impl Tree {
         depth: i32,
         out: &mut Vec<(i32, Arc<RwLock<TreeNode>>)>,
     ) {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(_) => {
                 // BINs are handled by flush_dirty_bins_internal; skip here.
@@ -3406,14 +3329,14 @@ impl Tree {
     ///
     /// .
     pub fn is_root_resident(&self) -> bool {
-        self.root.read().unwrap().is_some()
+        self.root.read().is_some()
     }
 
     /// Returns the root node `Arc` if present, or `None`.
     ///
     /// .
     pub fn get_resident_root_in(&self) -> Option<Arc<RwLock<TreeNode>>> {
-        self.root.read().unwrap().clone()
+        self.root.read().clone()
     }
 
     /// Returns the BIN that should contain a slot for `key` (the "parent" of
@@ -3431,7 +3354,7 @@ impl Tree {
         loop {
             // Single-pass latch-coupling: check is_bin AND capture child Arc
             // within the same lock scope.
-            let guard = current.read().ok()?;
+            let guard = current.read();
 
             if guard.is_bin() {
                 // Drop guard, return the BIN Arc we are currently holding.
@@ -3514,10 +3437,7 @@ impl Tree {
         // Push this node unconditionally — both INs and BINs belong in the list.
         out.push(Arc::clone(node_arc));
 
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let guard = node_arc.read();
 
         if let TreeNode::Internal(n) = &*guard {
             // Collect child arcs while holding the guard, then drop it before
@@ -3552,10 +3472,7 @@ impl Tree {
     }
 
     fn validate_node(node_arc: &Arc<RwLock<TreeNode>>) -> bool {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return false, // poisoned lock → invalid
-        };
+        let guard = node_arc.read();
 
         match &*guard {
             TreeNode::Bottom(_bin) => {
@@ -3607,10 +3524,7 @@ impl Tree {
         node_arc: &Arc<RwLock<TreeNode>>,
         target_id: u64,
     ) -> Option<(Arc<RwLock<TreeNode>>, usize)> {
-        let guard = match node_arc.read() {
-            Ok(g) => g,
-            Err(_) => return None,
-        };
+        let guard = node_arc.read();
 
         let TreeNode::Internal(n) = &*guard else {
             // BIN nodes have no IN children — cannot be a parent of another IN.
@@ -3624,13 +3538,10 @@ impl Tree {
                 // Read the child's node_id under a separate lock (acquire child
                 // while parent guard is still held — this is intentional for
                 // the ID comparison only; we release both immediately after).
-                let child_id = match child_arc.read() {
-                    Ok(cg) => match &*cg {
+                let child_id = { let cg = child_arc.read(); match &*cg {
                         TreeNode::Internal(cn) => cn.node_id,
                         TreeNode::Bottom(cb) => cb.node_id,
-                    },
-                    Err(_) => continue,
-                };
+                    } };
 
                 if child_id == target_id {
                     // Found — return a clone of this node as parent.
@@ -3667,16 +3578,13 @@ impl Tree {
     /// during split/insert callbacks.  Here we walk the weak parent chain.
     pub fn propagate_dirty_to_root(node_arc: &Arc<RwLock<TreeNode>>) {
         let parent_weak = {
-            match node_arc.read() {
-                Ok(g) => g.get_parent(),
-                Err(_) => return,
-            }
+            node_arc.read().get_parent()
         };
 
         if let Some(parent_arc) =
             parent_weak.and_then(|w| w.upgrade())
         {
-            if let Ok(mut g) = parent_arc.write() {
+            { let mut g = parent_arc.write();
                 g.set_dirty(true);
             }
             // Recurse further up.
@@ -4014,7 +3922,7 @@ mod tests {
 
         // The root level must be > level-2 (i.e., the tree has grown to 3+ levels).
         let root_arc = tree.get_root().as_ref().unwrap().clone();
-        let root_level = root_arc.read().unwrap().level();
+        let root_level = root_arc.read().level();
         let level_2 = MAIN_LEVEL | 2;
         assert!(
             root_level > level_2,
@@ -4131,7 +4039,7 @@ mod tests {
 
         // The root level must be > level-2 (i.e., the tree has grown past two levels).
         let root_arc = tree.get_root().as_ref().unwrap().clone();
-        let root_level = root_arc.read().unwrap().level();
+        let root_level = root_arc.read().level();
         let level_2 = MAIN_LEVEL | 2;
         assert!(
             root_level > level_2,
@@ -4186,14 +4094,14 @@ mod tests {
         let root_arc = tree.get_root().as_ref().unwrap().clone();
         // root is an upper IN — its slot 0 child is the BIN.
         let bin_arc = {
-            let g = root_arc.read().unwrap();
+            let g = root_arc.read();
             match &*g {
                 TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
 
-        let bin_dirty = bin_arc.read().unwrap().is_dirty();
+        let bin_dirty = bin_arc.read().is_dirty();
         assert!(bin_dirty, "BIN must be dirty after insert");
     }
 
@@ -4207,14 +4115,14 @@ mod tests {
 
         let root_arc = tree.get_root().as_ref().unwrap().clone();
         let bin_arc = {
-            let g = root_arc.read().unwrap();
+            let g = root_arc.read();
             match &*g {
                 TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
 
-        assert!(bin_arc.read().unwrap().is_dirty(), "BIN must be dirty after update");
+        assert!(bin_arc.read().is_dirty(), "BIN must be dirty after update");
     }
 
     /// After deleting a key the BIN must be dirty.
@@ -4227,27 +4135,27 @@ mod tests {
         {
             let root_arc = tree.get_root().as_ref().unwrap().clone();
             let bin_arc = {
-                let g = root_arc.read().unwrap();
+                let g = root_arc.read();
                 match &*g {
                     TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
                     _ => panic!("expected Internal root"),
                 }
             };
-            bin_arc.write().unwrap().set_dirty(false);
-            assert!(!bin_arc.read().unwrap().is_dirty());
+            bin_arc.write().set_dirty(false);
+            assert!(!bin_arc.read().is_dirty());
         }
 
         tree.delete(b"del");
 
         let root_arc = tree.get_root().as_ref().unwrap().clone();
         let bin_arc = {
-            let g = root_arc.read().unwrap();
+            let g = root_arc.read();
             match &*g {
                 TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
-        assert!(bin_arc.read().unwrap().is_dirty(), "BIN must be dirty after delete");
+        assert!(bin_arc.read().is_dirty(), "BIN must be dirty after delete");
     }
 
     /// BIN's parent pointer must point to the root IN.
@@ -4258,14 +4166,14 @@ mod tests {
 
         let root_arc = tree.get_root().as_ref().unwrap().clone();
         let bin_arc = {
-            let g = root_arc.read().unwrap();
+            let g = root_arc.read();
             match &*g {
                 TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
 
-        let parent_weak = bin_arc.read().unwrap().get_parent();
+        let parent_weak = bin_arc.read().get_parent();
         assert!(parent_weak.is_some(), "BIN must have a parent pointer");
 
         // Upgrading the weak pointer must give us the root arc.
@@ -4505,18 +4413,17 @@ mod tests {
         // Wire BIN's parent to root.
         bin_arc
             .write()
-            .unwrap()
             .set_parent(Some(Arc::downgrade(&root_arc)));
 
         // Root is not dirty before propagation.
-        assert!(!root_arc.read().unwrap().is_dirty());
+        assert!(!root_arc.read().is_dirty());
 
         // Propagate from the BIN up.
         Tree::propagate_dirty_to_root(&bin_arc);
 
         // Root must now be dirty.
         assert!(
-            root_arc.read().unwrap().is_dirty(),
+            root_arc.read().is_dirty(),
             "root must be dirty after propagate_dirty_to_root"
         );
     }
@@ -6028,17 +5935,17 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        if let Ok(mut g) = bin_arc.write() {
+        { let mut g = bin_arc.write();
             g.set_parent(Some(Arc::downgrade(&root_arc)));
         }
 
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc);
+        *tree.root.write() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when slots were removed");
 
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 2, "2 live entries must remain after compress");
@@ -6106,7 +6013,7 @@ mod tests {
         assert!(!result, "compress_bin must not compress a BIN-delta");
 
         // The slot must still be there.
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => assert_eq!(b.entries.len(), 1, "slot must not be removed from delta"),
             _ => panic!("expected BIN"),
@@ -6150,18 +6057,18 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        if let Ok(mut g) = bin_arc.write() {
+        { let mut g = bin_arc.write();
             g.set_parent(Some(Arc::downgrade(&root_arc)));
         }
 
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc);
+        *tree.root.write() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when pruning");
 
         // BIN must be empty after compression.
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => assert_eq!(b.entries.len(), 0, "all slots must be removed"),
             _ => panic!("expected BIN"),
@@ -6225,7 +6132,7 @@ mod tests {
         let result = tree.maybe_compress_bin_and_parent(&bin_arc);
         assert!(result, "maybe_compress must return true when deleted slots were removed");
 
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 1, "only live entry must remain");
@@ -6298,17 +6205,17 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
-        sibling_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
+        bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
+        sibling_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
 
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc.clone());
+        *tree.root.write() = Some(root_arc.clone());
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when a deleted slot was removed");
 
         // Exactly 2 live entries must remain.
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 2, "2 live slots must remain");
@@ -6320,7 +6227,7 @@ mod tests {
         drop(g);
 
         // Parent IN must still have 2 entries (BIN was not emptied).
-        let rg = root_arc.read().unwrap();
+        let rg = root_arc.read();
         match &*rg {
             TreeNode::Internal(n) => {
                 assert_eq!(n.entries.len(), 2, "parent IN must still have 2 entries");
@@ -6408,7 +6315,7 @@ mod tests {
             "maybe_compress must return false for BIN-deltas");
 
         // Slot must still be present and still known-deleted.
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 1, "slot must not be removed from delta BIN");
@@ -6447,7 +6354,7 @@ mod tests {
             "maybe_compress must return false when no deleted slots exist");
 
         // Both entries must remain untouched.
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => assert_eq!(b.entries.len(), 2, "no entries should be removed"),
             _ => panic!("expected BIN"),
@@ -6497,14 +6404,14 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
+        bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc);
+        *tree.root.write() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when one slot was removed");
 
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 2, "2 live slots must remain");
@@ -6660,17 +6567,17 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
-        sibling_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
+        bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
+        sibling_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
 
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc.clone());
+        *tree.root.write() = Some(root_arc.clone());
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true when one slot was removed");
 
         // The live entry must remain.
-        let bg = bin_arc.read().unwrap();
+        let bg = bin_arc.read();
         match &*bg {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 1, "one live slot must remain");
@@ -6681,7 +6588,7 @@ mod tests {
         drop(bg);
 
         // Parent IN must NOT have lost the BIN entry — the BIN is still non-empty.
-        let rg = root_arc.read().unwrap();
+        let rg = root_arc.read();
         match &*rg {
             TreeNode::Internal(n) => {
                 assert_eq!(n.entries.len(), 2,
@@ -6732,15 +6639,15 @@ mod tests {
             generation: 0,
             parent: None,
         })));
-        bin_arc.write().unwrap().set_parent(Some(Arc::downgrade(&root_arc)));
+        bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
 
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc);
+        *tree.root.write() = Some(root_arc);
 
         let result = tree.compress_bin(&bin_arc);
         assert!(result, "compress_bin must return true");
 
-        let g = bin_arc.read().unwrap();
+        let g = bin_arc.read();
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 2,
@@ -7003,10 +6910,10 @@ mod tests {
         assert!(!dirty.is_empty(), "should have dirty BINs after inserts");
 
         for (_db_id, bin_arc) in &dirty {
-            if let Ok(mut g) = bin_arc.write()
-                && let TreeNode::Bottom(b) = &mut *g {
-                    b.clear_dirty_after_full_log(Lsn::new(1, 100));
-                }
+            let mut g = bin_arc.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                b.clear_dirty_after_full_log(Lsn::new(1, 100));
+            }
         }
         let dirty2 = tree.collect_dirty_bins(1);
         assert!(dirty2.is_empty(), "no dirty BINs after clearing");
@@ -7103,7 +7010,7 @@ mod tests {
         let bin = tree.get_parent_bin_for_child_ln(b"alpha");
         assert!(bin.is_some(), "must return Some for a present key");
         assert!(
-            bin.unwrap().read().unwrap().is_bin(),
+            bin.unwrap().read().is_bin(),
             "returned node must be a BIN"
         );
     }
@@ -7118,7 +7025,7 @@ mod tests {
         for &k in keys {
             let bin = tree.get_parent_bin_for_child_ln(k);
             assert!(bin.is_some(), "must return Some for {:?}", k);
-            assert!(bin.unwrap().read().unwrap().is_bin());
+            assert!(bin.unwrap().read().is_bin());
         }
     }
 
@@ -7137,7 +7044,7 @@ mod tests {
             .unwrap();
         let bin = tree.find_bin_for_insert(b"newkey");
         assert!(bin.is_some());
-        assert!(bin.unwrap().read().unwrap().is_bin());
+        assert!(bin.unwrap().read().is_bin());
     }
 
     #[test]
@@ -7204,8 +7111,8 @@ mod tests {
         let list = tree.rebuild_in_list();
         // Expect root IN + BIN = 2 nodes.
         assert_eq!(list.len(), 2, "single-entry tree must have exactly 2 nodes");
-        let has_bin = list.iter().any(|a| a.read().unwrap().is_bin());
-        let has_in = list.iter().any(|a| !a.read().unwrap().is_bin());
+        let has_bin = list.iter().any(|a| a.read().is_bin());
+        let has_in = list.iter().any(|a| !a.read().is_bin());
         assert!(has_bin, "list must contain at least one BIN");
         assert!(has_in, "list must contain at least one upper IN");
     }
@@ -7263,7 +7170,7 @@ mod tests {
             parent: None,
         })));
         let tree = Tree::new(1, 128);
-        *tree.root.write().unwrap() = Some(root_arc);
+        *tree.root.write() = Some(root_arc);
         assert!(
             !tree.validate_in_list(),
             "a tree with an empty Internal node must fail validation"
@@ -7287,11 +7194,11 @@ mod tests {
 
         let root_arc = tree.get_root().as_ref().unwrap().clone();
         let bin_node_id = {
-            let g = root_arc.read().unwrap();
+            let g = root_arc.read();
             match &*g {
                 TreeNode::Internal(n) => {
                     let child = n.entries[0].child.as_ref().unwrap();
-                    let cg = child.read().unwrap();
+                    let cg = child.read();
                     match &*cg {
                         TreeNode::Bottom(b) => b.node_id,
                         _ => panic!("expected BIN"),
@@ -7329,7 +7236,7 @@ mod tests {
         let bin_ids: Vec<u64> = nodes
             .iter()
             .filter_map(|a| {
-                let g = a.read().unwrap();
+                let g = a.read();
                 if g.is_bin()
                     && let TreeNode::Bottom(b) = &*g {
                         return Some(b.node_id);
@@ -7346,7 +7253,7 @@ mod tests {
             );
             let (parent_arc, _slot) = result.unwrap();
             assert!(
-                !parent_arc.read().unwrap().is_bin(),
+                !parent_arc.read().is_bin(),
                 "parent of a BIN must be an Internal node"
             );
         }

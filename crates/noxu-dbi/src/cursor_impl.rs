@@ -153,7 +153,7 @@ pub struct CursorImpl {
     /// Increments `BinStub.cursor_count` via `Tree::pin_bin()` so the
     /// evictor skips this BIN while the cursor is positioned on it.
     /// Cleared (and unpinned) when the cursor is closed or moves to a new BIN.
-    current_bin_arc: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>,
+    current_bin_arc: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>,
 
     /// Write-ahead log manager for recording data operations.
     /// None for read-only cursors or cursors created outside a real env.
@@ -804,7 +804,7 @@ impl CursorImpl {
         let root = tree.get_root()?;
         // Descend to the BIN that should contain `key` (not always the leftmost).
         let bin_arc = Self::find_bin_for_key(root, key)?;
-        let guard = bin_arc.read().ok()?;
+        let guard = bin_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
                 // BIN entries store compressed (suffix) keys under the BIN's
@@ -836,7 +836,7 @@ impl CursorImpl {
         let root = tree.get_root()?;
         // Use find_bin_for_key so range searches also work for non-leftmost BINs.
         let bin_arc = Self::find_bin_for_key(root, key)?;
-        let guard = bin_arc.read().ok()?;
+        let guard = bin_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
                 // BIN entries use compressed (suffix) keys; range-compare
@@ -857,14 +857,14 @@ impl CursorImpl {
 
     /// Descends from the given node to the leftmost BIN, returning its Arc.
     fn descend_to_bin(
-        node: std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>,
-    ) -> Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>
+        node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
     {
         use noxu_tree::tree::TreeNode;
         let mut current = node;
         loop {
             let (is_bin, child) = {
-                let g = current.read().ok()?;
+                let g = current.read();
                 let is_bin = g.is_bin();
                 let child = if !is_bin {
                     match &*g {
@@ -887,14 +887,14 @@ impl CursorImpl {
 
     /// Descends from the given node to the rightmost BIN, returning its Arc.
     fn descend_to_last_bin(
-        node: std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>,
-    ) -> Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>
+        node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
     {
         use noxu_tree::tree::TreeNode;
         let mut current = node;
         loop {
             let (is_bin, child) = {
-                let g = current.read().ok()?;
+                let g = current.read();
                 let is_bin = g.is_bin();
                 let child = if !is_bin {
                     match &*g {
@@ -929,7 +929,7 @@ impl CursorImpl {
     pub fn get_first(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        let result: Option<(Vec<u8>, Vec<u8>, i32, u64, std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>)> = {
+        let result: Option<(Vec<u8>, Vec<u8>, i32, u64, std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -939,7 +939,7 @@ impl CursorImpl {
                     tree.get_root().and_then(|r| {
                         let bin_arc = Self::descend_to_bin(r)?;
                         let (key, data, lsn) = {
-                            let g = bin_arc.read().ok()?;
+                            let g = bin_arc.read();
                             match &*g {
                                 TreeNode::Bottom(bin) => {
                                     if bin.entries.is_empty() {
@@ -991,7 +991,7 @@ impl CursorImpl {
     pub fn get_last(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
-        let result: Option<(Vec<u8>, Vec<u8>, i32, u64, std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>)> = {
+        let result: Option<(Vec<u8>, Vec<u8>, i32, u64, std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 if tree.is_empty() {
@@ -1001,7 +1001,7 @@ impl CursorImpl {
                     tree.get_root().and_then(|r| {
                         let bin_arc = Self::descend_to_last_bin(r)?;
                         let (key, data, last_idx, lsn) = {
-                            let g = bin_arc.read().ok()?;
+                            let g = bin_arc.read();
                             match &*g {
                                 TreeNode::Bottom(bin) => {
                                     let n = bin.entries.len();
@@ -1086,10 +1086,7 @@ impl CursorImpl {
             None => return false,
         };
         let idx = self.current_index as usize;
-        let guard = match bin_arc.read() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
+        let guard = bin_arc.read();
         if let TreeNode::Bottom(bin) = &*guard {
             if idx >= bin.entries.len() {
                 return true; // entry was removed
@@ -1169,11 +1166,11 @@ impl CursorImpl {
         // We save the discovered arc so subsequent steps use the fast path.
         use noxu_tree::tree::TreeNode;
         let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)>;
-        let new_bin_arc: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>;
+        let new_bin_arc: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>;
 
         if let Some(bin_arc) = &self.current_bin_arc {
             // Fast path: pinned BIN — no tree traversal.
-            if let Ok(g) = bin_arc.read() {
+            { let g = bin_arc.read();
                 if let TreeNode::Bottom(bin) = &*g {
                     if next_index >= 0 && next_index < bin.entries.len() as i32 {
                         let idx = next_index as usize;
@@ -1189,8 +1186,6 @@ impl CursorImpl {
                 } else {
                     entry = None;
                 }
-            } else {
-                entry = None;
             }
             new_bin_arc = None;
         } else {
@@ -1207,7 +1202,7 @@ impl CursorImpl {
                     if let Some(bin_arc) = Self::find_bin_for_key(root, current_key) {
                         // Clone so we can move the arc after the read guard is dropped.
                         let arc_to_save = bin_arc.clone();
-                        if let Ok(g) = bin_arc.read() {
+                        { let g = bin_arc.read();
                             if let TreeNode::Bottom(bin) = &*g {
                                 if next_index >= 0 && next_index < bin.entries.len() as i32 {
                                     let idx = next_index as usize;
@@ -1226,9 +1221,6 @@ impl CursorImpl {
                                 entry = None;
                                 new_bin_arc = None;
                             }
-                        } else {
-                            entry = None;
-                            new_bin_arc = None;
                         }
                     } else {
                         entry = None;
@@ -1395,7 +1387,7 @@ impl CursorImpl {
                                     // Use the current raw_key to find the BIN.
                                     let bin_arc =
                                         Self::find_bin_for_key(r, &raw_key)?;
-                                    let g = bin_arc.read().ok()?;
+                                    let g = bin_arc.read();
                                     match &*g {
                                         TreeNode::Bottom(bin) => {
                                             if idx < 0
@@ -1489,15 +1481,15 @@ impl CursorImpl {
     /// we follow the child slot with the largest key <= `key`.  Returns the
     /// `Arc` of the matching BIN, or `None` if the tree is empty / malformed.
     fn find_bin_for_key(
-        node: std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>,
+        node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
         key: &[u8],
-    ) -> Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>
+    ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
     {
         use noxu_tree::tree::TreeNode;
         let mut current = node;
         loop {
             let (is_bin, child) = {
-                let g = current.read().ok()?;
+                let g = current.read();
                 let is_bin = g.is_bin();
                 let child = if !is_bin {
                     match &*g {
@@ -1950,7 +1942,7 @@ impl CursorImpl {
     ///  calls in cursor positioning.
     fn update_bin_pin(
         &mut self,
-        new_bin: Option<std::sync::Arc<std::sync::RwLock<noxu_tree::tree::TreeNode>>>,
+        new_bin: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>,
     ) {
         // Same BIN — nothing to do.
         match (&self.current_bin_arc, &new_bin) {

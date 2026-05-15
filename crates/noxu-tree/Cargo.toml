@@ -11,6 +11,7 @@ noxu-util = { workspace = true }
 noxu-latch = { workspace = true }
 noxu-log = { workspace = true }
 noxu-sync = { workspace = true }
+parking_lot = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
