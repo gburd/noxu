@@ -706,7 +706,7 @@ fn test_concurrent_prepared_log_stress() {
                 barrier.wait();
                 for i in 0..200u64 {
                     let xid = Xid::new(
-                        tid as i32 + 1,
+                        tid + 1,
                         format!("cpl_t{tid}_i{i:04}").as_bytes(),
                         b"br",
                     )
@@ -807,7 +807,7 @@ fn test_adversarial_mixed_operations_timed() {
                 while !stop.load(Ordering::Relaxed) {
                     counter += 1;
                     let xid = Xid::new(
-                        tid as i32 + 1,
+                        tid + 1,
                         format!("adv_t{tid}_{counter:08}").as_bytes(),
                         b"adv",
                     )
