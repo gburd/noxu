@@ -424,6 +424,13 @@ impl FsyncManager {
         &'a self,
         state: MutexGuard<'a, FsyncState>,
     ) -> MutexGuard<'a, FsyncState> {
+        // Skip wait entirely when no other threads are queued yet.  This
+        // eliminates the single-threaded latency penalty: a lone committer
+        // fsyncs immediately rather than waiting for companions that may
+        // never arrive.
+        if state.num_next_waiters == 0 {
+            return state;
+        }
         if state.num_next_waiters < self.grpc_threshold {
             let interval_ns = self.grpc_interval_ms as u128 * 1_000_000;
             let elapsed_ns = state
