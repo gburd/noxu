@@ -807,8 +807,8 @@ impl EnvironmentConfig {
             log_use_odsync: false,
             log_use_write_queue: false,
             log_write_queue_size: 1024 * 1024,
-            log_group_commit_threshold: 0,
-            log_group_commit_interval_ms: 0,
+            log_group_commit_threshold: 4,
+            log_group_commit_interval_ms: 1,
             // B-tree
             node_max_entries: 128,
             node_dup_tree_max_entries: 128,
@@ -1739,8 +1739,8 @@ mod tests {
         assert!(!c.log_use_odsync);
         assert!(!c.log_use_write_queue);
         assert_eq!(c.log_write_queue_size, 1024 * 1024);
-        assert_eq!(c.log_group_commit_threshold, 0);
-        assert_eq!(c.log_group_commit_interval_ms, 0);
+        assert_eq!(c.log_group_commit_threshold, 4);
+        assert_eq!(c.log_group_commit_interval_ms, 1);
     }
 
     #[test]

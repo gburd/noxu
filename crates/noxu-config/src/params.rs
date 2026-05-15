@@ -539,22 +539,28 @@ pub static LOG_FSYNC_TIME_LIMIT: ConfigParam = ConfigParam {
 };
 
 /// Interval for group commit batching. 0 = no group commit.
+/// Maximum milliseconds the leader waits for more concurrent committers
+/// before issuing fdatasync.  Default 1 ms — enough to batch 4+ writers on
+/// fast NVMe without penalising single-threaded workloads (the grpc_wait
+/// short-circuits when no waiters are queued).
 pub static LOG_GROUP_COMMIT_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.groupCommitInterval",
     param_type: crate::param::ParamType::Duration,
-    default: ParamValue::Duration(Duration::ZERO),
+    default: ParamValue::Duration(Duration::from_millis(1)),
     min: None,
     max: None,
     mutable: false,
     for_replication: false,
 };
 
-/// Number of commits to batch before flushing. 0 = no group commit.
+/// Minimum number of queued committers before the leader fsyncs immediately
+/// (skipping the interval wait).  Default 4 — under high concurrency, once
+/// 4 threads are waiting the leader fsyncs without further delay.
 pub static LOG_GROUP_COMMIT_THRESHOLD: ConfigParam = ConfigParam::int_param(
     "noxu.log.groupCommitThreshold",
     Some(0), // min
     None,    // max
-    0,       // default
+    4,       // default
     false,   // mutable
     false,   // forReplication
 );
