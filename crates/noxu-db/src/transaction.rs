@@ -92,6 +92,7 @@ impl Transaction {
     /// * `id` - Unique transaction ID
     /// * `config` - Transaction configuration
     pub fn new(id: u64, config: TransactionConfig) -> Self {
+        observe_gauge_inc!("noxu_db_active_transactions");
         Self {
             id,
             state: Mutex::new(TransactionState::Open),
@@ -115,6 +116,7 @@ impl Transaction {
         config: TransactionConfig,
         log_manager: Arc<LogManager>,
     ) -> Self {
+        observe_gauge_inc!("noxu_db_active_transactions");
         Self {
             id,
             state: Mutex::new(TransactionState::Open),
@@ -165,9 +167,15 @@ impl Transaction {
     /// # Errors
     /// Returns error if the transaction is not in Open state.
     pub fn commit(&self) -> Result<()> {
+        observe_span!("txn_commit", txn_id = self.id);
+        let _obs_timer = observe_timer_start!();
+        observe_counter!("noxu_db_operations_total", "op" => "commit");
         let durability =
             self.durability.unwrap_or(Durability::COMMIT_SYNC);
-        self.commit_with_durability(durability)
+        let result = self.commit_with_durability(durability);
+        observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "commit");
+        observe_gauge_dec!("noxu_db_active_transactions");
+        result
     }
 
     /// Commit the transaction with specific durability.
@@ -224,6 +232,8 @@ impl Transaction {
     /// # Errors
     /// Returns error if the transaction is already committed or aborted.
     pub fn abort(&self) -> Result<()> {
+        observe_span!("txn_abort", txn_id = self.id);
+        observe_counter!("noxu_db_operations_total", "op" => "abort");
         {
             let state = self.state.lock().unwrap();
             match *state {
@@ -290,6 +300,7 @@ impl Transaction {
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Aborted;
+        observe_gauge_dec!("noxu_db_active_transactions");
         Ok(())
     }
 

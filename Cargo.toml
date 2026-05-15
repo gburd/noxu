@@ -28,6 +28,7 @@ members = [
     "crates/noxu-persist",
     "crates/noxu-rep",
     "crates/noxu-xa",
+    "crates/noxu-observe",
     "benches/comparison",
     "benches/noxu-bench",
 ]
@@ -115,6 +116,7 @@ noxu-bind = { path = "crates/noxu-bind" }
 noxu-collections = { path = "crates/noxu-collections" }
 noxu-persist = { path = "crates/noxu-persist" }
 noxu-rep = { path = "crates/noxu-rep" }
+noxu-observe = { path = "crates/noxu-observe" }
 
 # Quorum system library (authored by Greg Burd — path dep from local copy)
 quoracle = { path = "crates/noxu-rep/quoracle" }
@@ -127,10 +129,15 @@ rustls-pemfile = { version = "2" }
 rcgen   = { version = "0.13" }
 native-tls = { version = "0.2" }
 
+# Observability (optional — behind noxu-db "observability" feature)
+tracing = "0.1"
+metrics = "0.24"
+
 # External crates (approved core set)
 hashbrown = "0.15"
 lock_api = "0.4"
 libc = "0.2"
+parking_lot = "0.12"
 thiserror = "2"
 log = "0.4"
 bytes = "1"

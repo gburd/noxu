@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Noxu DB - An embedded transactional database engine"
 
+[features]
+default = []
+observability = ["dep:noxu-observe", "dep:tracing", "dep:metrics"]
+
 [dependencies]
 hashbrown = { workspace = true }
 bytes = { workspace = true }
@@ -18,6 +22,11 @@ noxu-config = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 noxu-sync = { workspace = true }
+
+# Optional observability
+noxu-observe = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
 
 [lints]
 workspace = true
