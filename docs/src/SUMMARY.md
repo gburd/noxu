@@ -19,6 +19,7 @@
 
 - [Transaction Processing](transactions/README.md)
   - [Transaction Basics](transactions/basics.md)
+  - [Transaction Configuration](transactions/transaction-config.md)
   - [Cursors and Transactions](transactions/cursors.md)
   - [Secondary Indexes with Transactions](transactions/secondary-with-txn.md)
   - [Concurrency](transactions/concurrency.md)
