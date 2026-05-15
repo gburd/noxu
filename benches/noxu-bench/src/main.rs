@@ -117,17 +117,18 @@ fn open_db(dir: &Path) -> (Environment, Database) {
     (env, db)
 }
 
-/// Open with group commit enabled — used for w10_txn_conc benchmarks to show
+/// Open with aggressive group commit — used for w10_txn_conc benchmarks to show
 /// FsyncManager coalescing under concurrent transactional workloads.
 ///
-/// threshold=1, interval_ms=2: leader waits up to 2 ms for ≥1 other committer,
-/// then fsyncs on behalf of all accumulated waiters.  Under 8+ concurrent
-/// writers, almost every fsync serves multiple transactions.
+/// threshold=4, interval_ms=5: leader waits up to 5 ms for 4+ concurrent
+/// committers, then fsyncs on behalf of all accumulated waiters.  The longer
+/// interval (vs default 1ms) gives more threads time to pass through LWL and
+/// accumulate in the FsyncManager wait queue, maximising coalescing.
 fn open_db_group_commit(dir: &Path) -> (Environment, Database) {
     let cfg = EnvironmentConfig::new(dir.to_path_buf())
         .with_allow_create(true)
         .with_transactional(true)
-        .with_log_group_commit(1, 2);
+        .with_log_group_commit(4, 5);
     let env = Environment::open(cfg).unwrap();
     let db = env
         .open_database(None, "bench", &DatabaseConfig::new().with_allow_create(true))
@@ -414,6 +415,9 @@ fn main() {
         }
 
         // W10: concurrent — six thread configurations
+        // EnvironmentConfig defaults (threshold=4, interval_ms=1) provide optimal
+        // group commit: leader waits up to 1ms when 1-3 threads are queued,
+        // giving time for more threads to pass through LWL before the fsync.
         for &(label, rthreads, wthreads) in concurrent_configs {
             let total_threads = rthreads + wthreads;
             // Cap ops at 100K when writer threads > 4 at large scale to keep runtime sane
