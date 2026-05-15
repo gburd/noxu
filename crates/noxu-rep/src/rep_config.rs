@@ -9,6 +9,7 @@ use crate::consistency::ConsistencyPolicy;
 use crate::node_type::NodeType;
 use crate::quorum_policy::QuorumPolicy;
 use crate::rep_node::RepNode;
+use crate::stream::reconnect::ReconnectConfig;
 
 /// Default election timeout.
 const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -81,6 +82,8 @@ pub struct RepConfig {
     /// Timeout per peer message exchange during Phase 1 and Phase 2 of an
     /// election.  Default: 500 ms.
     pub election_phase_timeout: Duration,
+    /// Reconnection backoff configuration for replica partition recovery.
+    pub reconnect_config: ReconnectConfig,
 }
 
 impl RepConfig {
@@ -109,6 +112,7 @@ impl RepConfig {
             phi_window_size: DEFAULT_PHI_WINDOW_SIZE,
             initial_peers: Vec::new(),
             election_phase_timeout: DEFAULT_ELECTION_PHASE_TIMEOUT,
+            reconnect_config: ReconnectConfig::default(),
         }
     }
 
@@ -139,6 +143,7 @@ pub struct RepConfigBuilder {
     phi_window_size: usize,
     initial_peers: Vec<RepNode>,
     election_phase_timeout: Duration,
+    reconnect_config: ReconnectConfig,
 }
 
 impl RepConfigBuilder {
@@ -242,6 +247,12 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Sets the reconnection backoff configuration for replica partition recovery.
+    pub fn reconnect_config(mut self, config: ReconnectConfig) -> Self {
+        self.reconnect_config = config;
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -263,6 +274,7 @@ impl RepConfigBuilder {
             phi_window_size: self.phi_window_size,
             initial_peers: self.initial_peers,
             election_phase_timeout: self.election_phase_timeout,
+            reconnect_config: self.reconnect_config,
         }
     }
 }
