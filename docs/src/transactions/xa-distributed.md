@@ -139,15 +139,49 @@ xa.xa_end(&xid1, XaFlags::TMSUCCESS).unwrap();
 
 ## Recovery
 
+The `XaEnvironment` persists prepared transaction state in a dedicated
+internal database (`_xa_prepared`). This **PreparedLog** survives process
+crashes and ensures no in-doubt transactions are lost.
+
+### How it works
+
+1. On `xa_prepare`: the XID is serialized and written to `_xa_prepared`
+   as a durable record (format: `[format_id:4 LE][gtrid_len:1][gtrid][bqual]`).
+2. On `xa_commit` or `xa_rollback`: the PreparedLog record is deleted.
+3. On environment reopen: `xa_recover()` reads all surviving records —
+   these are the in-doubt branches that need resolution.
+
+### Recovery workflow
+
 After a crash, a TM can discover prepared-but-not-committed branches:
 
 ```rust
+// Reopen the environment after crash
+let env = Environment::open(config).unwrap();
+let xa = XaEnvironment::new(env);
+
+// Discover in-doubt branches
 let prepared_xids = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
 for xid in &prepared_xids {
     // Decide: commit or rollback based on TM's persistent log
     xa.xa_commit(xid, XaFlags::NOFLAGS).unwrap();
 }
+// At this point, no in-doubt branches remain
+assert!(xa.xa_recover(XaFlags::STARTRSCAN).unwrap().is_empty());
 ```
+
+### Heuristic completion
+
+If the TM has lost its own log and cannot determine the outcome, use
+`xa_forget` to discard the in-doubt branch without committing or rolling
+back its data:
+
+```rust
+xa.xa_forget(&xid, XaFlags::NOFLAGS).unwrap();
+```
+
+This removes the PreparedLog record but leaves any partially-committed
+data in place — use with caution.
 
 ## Error Handling
 
