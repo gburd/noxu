@@ -1162,8 +1162,7 @@ impl CursorImpl {
         //
         // Fast path (O(1)): use the pinned `current_bin_arc` to read
         // `next_index` directly, avoiding a root-to-leaf B-tree traversal on
-        // every cursor step.  This mirrors() which
-        // latches the current BIN and increments the index in-place.
+        // every cursor step.
         //
         // Slow path (O(log N)): only taken when `current_bin_arc` is not yet
         // set (e.g. first advance after `get_first()` in an older code path).
