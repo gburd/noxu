@@ -1,0 +1,23 @@
+[package]
+name = "noxu-ftdb"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A TigerBeetle-compatible financial transactions database using Noxu DB"
+publish = false
+
+[[bin]]
+name = "ftdb"
+path = "src/main.rs"
+
+[dependencies]
+noxu-db = { path = "../../crates/noxu-db" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "macros", "sync"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"

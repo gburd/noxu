@@ -31,6 +31,9 @@ members = [
     "crates/noxu-observe",
     "benches/comparison",
     "benches/noxu-bench",
+    "examples/cash",
+    "examples/cask",
+    "examples/ftdb",
 ]
 
 [dependencies]
