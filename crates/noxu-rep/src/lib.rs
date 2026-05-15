@@ -118,6 +118,7 @@ pub use node_state::{NodeState, NodeStateMachine};
 pub use node_type::NodeType;
 pub use quorum_policy::QuorumPolicy;
 pub use rep_config::RepConfig;
+pub use stream::reconnect::{ReconnectConfig, ReconnectOutcome, catch_up_with_retry};
 pub use rep_group::RepGroup;
 pub use rep_node::RepNode;
 pub use rep_stats::RepStats;
