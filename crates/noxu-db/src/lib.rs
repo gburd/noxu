@@ -1,4 +1,10 @@
-#![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+#![allow(
+    dead_code,
+    unused_macros,
+    unused_imports,
+    clippy::type_complexity,
+    clippy::too_many_arguments
+)]
 //! Noxu DB - An embedded transactional database engine.
 //!
 //! Public API : Environment, Database,
@@ -22,6 +28,15 @@
 //!     .with_allow_create(true)
 //!     .with_transactional(true);
 //! ```
+
+#[macro_use]
+mod observe;
+
+/// Re-export of the observability crate when the `observability` feature is enabled.
+/// Users can access `noxu_db::observe_crate::{metrics, tracing}` for their own
+/// recorder/subscriber setup.
+#[cfg(feature = "observability")]
+pub use noxu_observe as observe_crate;
 
 pub mod byte_comparator;
 pub mod cache_mode;

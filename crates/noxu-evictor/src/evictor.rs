@@ -43,6 +43,7 @@ use noxu_util::NULL_LSN;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use noxu_tree::NodeRwLock;
 
 // ---------------------------------------------------------------------------
 // EvictionSource
@@ -522,12 +523,12 @@ impl Evictor {
         let lm = match &self.log_manager { Some(lm) => Arc::clone(lm), None => return };
         let tree_arc = match &self.tree { Some(t) => Arc::clone(t), None => return };
 
-        let node_arc: Arc<RwLock<TreeNode>> = {
+        let node_arc: Arc<NodeRwLock<TreeNode>> = {
             let tree_guard = match tree_arc.read() { Ok(g) => g, Err(_) => return };
             match find_node_arc(&tree_guard, node_id) { Some(a) => a, None => return }
         };
 
-        let mut node_guard = match node_arc.write() { Ok(g) => g, Err(_) => return };
+        let mut node_guard = node_arc.write();
         let bin = match &mut *node_guard {
             TreeNode::Bottom(b) => b,
             _ => return,
@@ -647,10 +648,10 @@ fn real_node_info(tree: &Tree, node_id: u64) -> Option<Box<dyn NodeEvictionInfo>
 }
 
 fn find_node_info_recursive(
-    node_arc: &Arc<RwLock<TreeNode>>,
+    node_arc: &Arc<NodeRwLock<TreeNode>>,
     target_id: u64,
 ) -> Option<Box<dyn NodeEvictionInfo>> {
-    let guard = node_arc.read().ok()?;
+    let guard = node_arc.read();
     match &*guard {
         TreeNode::Bottom(b) => {
             if b.node_id == target_id {
@@ -665,7 +666,7 @@ fn find_node_info_recursive(
             if n.node_id == target_id {
                 return Some(Box::new(RealNodeInfo { dirty: n.dirty, is_bin: false, pin_count: 0 }));
             }
-            let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n.entries.iter()
                 .filter_map(|e| e.child.as_ref().map(Arc::clone))
                 .collect();
             drop(guard);
@@ -682,8 +683,8 @@ fn real_node_size(tree: &Tree, node_id: u64) -> u64 {
     find_node_size_recursive(&root_arc, node_id).unwrap_or(1024)
 }
 
-fn find_node_size_recursive(node_arc: &Arc<RwLock<TreeNode>>, target_id: u64) -> Option<u64> {
-    let guard = node_arc.read().ok()?;
+fn find_node_size_recursive(node_arc: &Arc<NodeRwLock<TreeNode>>, target_id: u64) -> Option<u64> {
+    let guard = node_arc.read();
     match &*guard {
         TreeNode::Bottom(b) => {
             if b.node_id == target_id {
@@ -700,7 +701,7 @@ fn find_node_size_recursive(node_arc: &Arc<RwLock<TreeNode>>, target_id: u64) ->
                     + n.entries.iter().map(|e| e.key.len()).sum::<usize>();
                 return Some(sz as u64);
             }
-            let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n.entries.iter()
                 .filter_map(|e| e.child.as_ref().map(Arc::clone))
                 .collect();
             drop(guard);
@@ -712,20 +713,20 @@ fn find_node_size_recursive(node_arc: &Arc<RwLock<TreeNode>>, target_id: u64) ->
     }
 }
 
-fn find_node_arc(tree: &Tree, node_id: u64) -> Option<Arc<RwLock<TreeNode>>> {
+fn find_node_arc(tree: &Tree, node_id: u64) -> Option<Arc<NodeRwLock<TreeNode>>> {
     let root_arc = tree.get_root()?;
     find_node_arc_recursive(&root_arc, node_id)
 }
 
-fn find_node_arc_recursive(node_arc: &Arc<RwLock<TreeNode>>, target_id: u64) -> Option<Arc<RwLock<TreeNode>>> {
-    let guard = node_arc.read().ok()?;
+fn find_node_arc_recursive(node_arc: &Arc<NodeRwLock<TreeNode>>, target_id: u64) -> Option<Arc<NodeRwLock<TreeNode>>> {
+    let guard = node_arc.read();
     match &*guard {
         TreeNode::Bottom(b) => {
             if b.node_id == target_id { Some(Arc::clone(node_arc)) } else { None }
         }
         TreeNode::Internal(n) => {
             if n.node_id == target_id { return Some(Arc::clone(node_arc)); }
-            let children: Vec<Arc<RwLock<TreeNode>>> = n.entries.iter()
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n.entries.iter()
                 .filter_map(|e| e.child.as_ref().map(Arc::clone))
                 .collect();
             drop(guard);

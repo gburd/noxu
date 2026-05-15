@@ -6,6 +6,7 @@ license.workspace = true
 description = "Cache eviction for Noxu DB"
 
 [dependencies]
+parking_lot = { workspace = true }
 hashbrown = { workspace = true }
 noxu-util = { workspace = true }
 noxu-latch = { workspace = true }

@@ -245,6 +245,12 @@ impl Database {
         data: &mut DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        observe_span!("db_get",
+            db_name = self.name.as_str(),
+            key_size = key.get_data().map_or(0, |k| k.len()),
+        );
+        let _obs_timer = observe_timer_start!();
+        observe_counter!("noxu_db_operations_total", "op" => "get");
 
         let key_bytes = match key.get_data() {
             Some(k) => k,
@@ -275,10 +281,12 @@ impl Database {
                     data.set_data(&value);
                 }
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
+                observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "get");
                 Ok(OperationStatus::Success)
             }
             _ => {
                 self.throughput.n_pri_search_fails.fetch_add(1, Ordering::Relaxed);
+                observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "get");
                 Ok(OperationStatus::NotFound)
             }
         }
@@ -373,6 +381,13 @@ impl Database {
     ) -> Result<OperationStatus> {
         self.check_open()?;
         self.check_writable()?;
+        observe_span!("db_put",
+            db_name = self.name.as_str(),
+            key_size = key.get_data().map_or(0, |k| k.len()),
+            data_size = data.get_data().map_or(0, |d| d.len()),
+        );
+        let _obs_timer = observe_timer_start!();
+        observe_counter!("noxu_db_operations_total", "op" => "put");
 
         let key_bytes = key.get_data().unwrap_or(&[]);
 
@@ -437,6 +452,7 @@ impl Database {
         self.auto_commit_sync(txn, write_lsn)?;
 
         self.throughput.n_pri_updates.fetch_add(1, Ordering::Relaxed);
+        observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "put");
         Ok(OperationStatus::Success)
     }
 
@@ -547,6 +563,12 @@ impl Database {
     ) -> Result<OperationStatus> {
         self.check_open()?;
         self.check_writable()?;
+        observe_span!("db_delete",
+            db_name = self.name.as_str(),
+            key_size = key.get_data().map_or(0, |k| k.len()),
+        );
+        let _obs_timer = observe_timer_start!();
+        observe_counter!("noxu_db_operations_total", "op" => "delete");
 
         let key_bytes = match key.get_data() {
             Some(k) => k,
@@ -578,6 +600,7 @@ impl Database {
         } else {
             self.throughput.n_pri_delete_fails.fetch_add(1, Ordering::Relaxed);
         }
+        observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "delete");
         Ok(status)
     }
 

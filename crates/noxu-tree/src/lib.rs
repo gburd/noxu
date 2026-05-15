@@ -90,3 +90,7 @@ pub use key::KeyComparator;
 pub use node::{NULL_NODE_ID, NodeType};
 pub use search_result::SearchResult;
 pub use tree_location::TreeLocation;
+
+// Re-export the RwLock used for tree nodes so downstream crates can reference
+// the same type without depending on parking_lot directly.
+pub use parking_lot::RwLock as NodeRwLock;

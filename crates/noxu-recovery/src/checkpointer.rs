@@ -18,6 +18,7 @@ use noxu_tree::tree::{Tree, TreeNode};
 use noxu_util::{Lsn, NULL_LSN};
 use noxu_sync::Mutex;
 use std::sync::{Arc, Condvar, RwLock};
+use parking_lot::RwLock as NodeRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Configuration for checkpoint behavior.
@@ -278,11 +279,8 @@ impl Checkpointer {
     /// representation yet.
     ///
     /// 
-    pub fn is_checkpointed(node: &RwLock<TreeNode>) -> bool {
-        let guard = match node.read() {
-            Ok(g) => g,
-            Err(_) => return false, // poisoned lock — treat as not checkpointed
-        };
+    pub fn is_checkpointed(node: &NodeRwLock<TreeNode>) -> bool {
+        let guard = node.read();
         match &*guard {
             TreeNode::Bottom(b) => b.last_full_lsn != NULL_LSN,
             // Non-BIN internal nodes are always considered checkpointed for
@@ -611,11 +609,7 @@ impl Checkpointer {
 
         for (_db_id, bin_arc) in dirty_bins {
             // Acquire write lock to serialize + clear dirty flags.
-            let mut bin_guard = bin_arc.write().map_err(|_| {
-                RecoveryError::CheckpointError(
-                    "BIN lock poisoned during checkpoint".to_string(),
-                )
-            })?;
+            let mut bin_guard = bin_arc.write();
 
             let b = match &mut *bin_guard {
                 TreeNode::Bottom(b) => b,
@@ -734,11 +728,7 @@ impl Checkpointer {
         let max_level = dirty_ins.iter().map(|(lvl, _)| *lvl).max().unwrap_or(0);
 
         for (level, node_arc) in &dirty_ins {
-            let mut node_guard = node_arc.write().map_err(|_| {
-                RecoveryError::CheckpointError(
-                    "IN lock poisoned during checkpoint".to_string(),
-                )
-            })?;
+            let mut node_guard = node_arc.write();
 
             if !node_guard.is_dirty() {
                 continue; // may have been cleared by a concurrent checkpoint
@@ -1106,7 +1096,7 @@ mod tests {
     #[test]
     fn test_is_checkpointed() {
         use noxu_tree::tree::{BinStub, TreeNode};
-        use std::sync::RwLock;
+        use parking_lot::RwLock as NodeRwLock;
 
         // Build a BIN node with last_full_lsn = NULL_LSN.
         let bin = BinStub {
@@ -1123,7 +1113,7 @@ mod tests {
             expiration_in_hours: false,
             cursor_count: 0,
         };
-        let node = RwLock::new(TreeNode::Bottom(bin));
+        let node = NodeRwLock::new(TreeNode::Bottom(bin));
 
         // Not yet checkpointed.
         assert!(
@@ -1133,7 +1123,7 @@ mod tests {
 
         // Simulate a checkpoint by setting last_full_lsn.
         {
-            let mut guard = node.write().unwrap();
+            let mut guard = node.write();
             if let TreeNode::Bottom(ref mut b) = *guard {
                 b.last_full_lsn = Lsn::new(1, 100);
             }
@@ -1213,7 +1203,6 @@ mod tests {
         use noxu_log::FileManager;
         use noxu_tree::tree::Tree;
         use noxu_util::lsn::Lsn;
-        use std::sync::RwLock;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
