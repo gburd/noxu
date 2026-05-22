@@ -37,11 +37,12 @@ A read follows the same path down to `noxu-dbi`, which searches the B+tree (`nox
 
 ## Crate Dependency Graph
 
-The 16 crates form a layered dependency structure:
+The 19 crates form a layered dependency structure:
 
 ```
 Layer 0 (Foundation):
     noxu-util          Core types: LSN, VLSN, packed integers, stats
+    noxu-sync          Internal sync primitives (raw locks, condvar, futex)
     noxu-latch         Latches wrapping parking_lot
     noxu-config        400+ configuration parameters
 
@@ -62,7 +63,7 @@ Layer 4 (Internals):
         depends on: noxu-util, noxu-latch, noxu-config, noxu-log, noxu-tree, noxu-txn
 
 Layer 5 (Background Services):
-    noxu-evictor       LRU cache eviction, memory budget enforcement
+    noxu-evictor       LRU/CLOCK/LIRS/ARC/CAR cache eviction, memory budget enforcement
     noxu-cleaner       Log garbage collection, utilization tracking
     noxu-recovery      Checkpointing, 3-phase crash recovery
         depend on: layers 0-4
@@ -75,12 +76,20 @@ Layer 6 (Orchestration):
 Layer 7 (Higher-Level APIs):
     noxu-bind          Serialization bindings (tuple, entry, serial)
     noxu-collections   Iterator-based collection views
-    noxu-persist       Derive-macro entity persistence (DPL)
+    noxu-persist       Trait-based entity persistence (DPL)
         depend on: noxu-db
+
+Layer 7b (Distributed Transactions):
+    noxu-xa            X/Open XA two-phase commit
+        depends on: noxu-db, noxu-engine
 
 Layer 8 (Replication):
     noxu-rep           Master-replica HA, elections, VLSN index
         depends on: layers 0-6
+
+Cross-cutting:
+    noxu-observe       Optional `tracing`/`metrics`/OpenTelemetry glue
+        depends on: nothing in noxu (pluggable)
 ```
 
 ## Key Subsystems
@@ -275,7 +284,7 @@ The `noxu-config` crate provides a typed configuration system with 400+ paramete
 
 ## External Dependencies
 
-Noxu DB uses a minimal set of external crates:
+Noxu DB uses a small set of external crates. The core engine pulls in:
 
 | Crate | Purpose |
 |-------|---------|
@@ -288,3 +297,12 @@ Noxu DB uses a minimal set of external crates:
 | `memmap2` | Memory-mapped file I/O |
 | `fs2` | File locking |
 | `serde` | Serialization framework (for bindings and persistence) |
+| `hashbrown` | Hash maps and sets |
+| `lock_api` | Trait-level lock primitives consumed by `noxu-sync` |
+| `lru` | Bounded LRU cache used by `noxu-evictor` and `noxu-log` |
+| `libc` | FFI for futex syscall in `noxu-sync` |
+
+Replication (`noxu-rep`) and observability (`noxu-observe`) pull in
+additional dependencies only when their cargo features are enabled:
+`tokio`, `quinn`, `rustls` / `native-tls`, `tracing`, `tracing-opentelemetry`,
+`metrics`, and `opentelemetry`.

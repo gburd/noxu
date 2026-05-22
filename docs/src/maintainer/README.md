@@ -12,7 +12,7 @@ subtle issues, and reason about correctness — within a day.
 ## In This Chapter
 
 1. [Project History](project-history.md) — why the project exists, major milestones, session-by-session evolution
-2. [Crate Guide](crate-guide.md) — all 16 crates: purpose, key types, crate purpose, critical files
+2. [Crate Guide](crate-guide.md) — all 19 crates: purpose, key types, crate purpose, critical files
 3. [Algorithms](algorithms.md) — every named algorithm with source file locations and academic references
 4. [Design Decisions](design-decisions.md) — the "why" behind non-obvious implementation choices
 5. [Codebase Navigation](reference-source-guide.md) — navigating reference archives and Noxu naming conventions
@@ -36,10 +36,14 @@ fidelity, and operational characteristics as Noxu DB — without a JVM.
 **Where does the code live?**
 
 ```
-/home/gburd/ws/lamdb/       ← this repository
-/home/gburd/ws/lamdb/_/je/  ← core reference archive (read-only)
-/home/gburd/ws/lamdb/_/nosql/ ← extended fork reference (read-only)
+<repo-root>/                 ← this repository (your local clone)
+<repo-root>/_/je/            ← core reference archive (read-only, optional)
+<repo-root>/_/nosql/         ← extended fork reference (read-only, optional)
 ```
+
+The `_/` directory is gitignored. The reference archives are not committed
+to the repository; they are guidance for porting work, not a build
+prerequisite.
 
 **Current fidelity** (as of the last audit):
 - Named-algorithm fidelity: ~92%

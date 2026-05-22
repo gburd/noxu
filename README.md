@@ -70,17 +70,18 @@ fn main() -> noxu_db::Result<()> {
 
 ## Workspace Structure
 
-Noxu DB is organized as a Cargo workspace of 16 crates:
+Noxu DB is organized as a Cargo workspace of 19 crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
+| `noxu-sync` | Internal sync primitives (raw mutex/rwlock, condvar, futex) |
 | `noxu-latch` | Exclusive and shared/exclusive latches (`parking_lot`) |
 | `noxu-config` | 400+ typed configuration parameters with validation |
 | `noxu-log` | Write-ahead log: file manager, log manager, entry I/O |
 | `noxu-tree` | B+tree: IN, BIN, LN, key prefixing, splits |
 | `noxu-txn` | Transactions, record-level locking, deadlock detection |
-| `noxu-evictor` | LRU cache eviction with memory budget |
+| `noxu-evictor` | LRU/CLOCK/LIRS/ARC/CAR cache eviction with memory budget |
 | `noxu-cleaner` | Log file garbage collection, utilization tracking |
 | `noxu-recovery` | Checkpoint-based crash recovery |
 | `noxu-dbi` | Internal implementations: EnvironmentImpl, DatabaseImpl, CursorImpl |
@@ -88,26 +89,37 @@ Noxu DB is organized as a Cargo workspace of 16 crates:
 | `noxu-db` | Public API: Environment, Database, Cursor, Transaction |
 | `noxu-bind` | Serialization bindings (tuple, entry, serial) |
 | `noxu-collections` | Iterator-based collection views over databases |
-| `noxu-persist` | Derive-macro entity persistence (DPL) |
+| `noxu-persist` | Trait-based entity persistence (DPL) |
+| `noxu-xa` | XA distributed transactions (X/Open XA two-phase commit) |
 | `noxu-rep` | Master-replica HA, elections, VLSN tracking |
+| `noxu-observe` | Optional `tracing`/`metrics` observability glue |
 
 ## Building
 
 ```bash
+# First-time setup: initialize the quoracle submodule (used by noxu-rep).
+git submodule update --init --recursive
+
 cargo build          # Build all crates
-cargo test           # Run all tests (2200+)
+cargo test           # Run all tests
 cargo test -p noxu-db    # Test a single crate
 cargo clippy         # Lint
 cargo fmt            # Format
 ```
 
-Requires Rust 1.85+ (2024 edition).
+Requires Rust 1.85+ (2024 edition); the workspace pins a specific stable
+toolchain in `rust-toolchain.toml`.
 
 ## Design Principles
 
 - **Correctness first.** Algorithms and invariants are implemented to match their specifications. Divergence from intended behaviour is a bug.
 - **Idiomatic Rust.** RAII latches, `Result<T, NoxuError>` error handling, enums for closed hierarchies, traits for open extension points.
-- **Minimal dependencies.** Core set: `parking_lot`, `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`.
+- **Minimal core dependencies.** The core engine pulls in only `parking_lot`,
+  `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`,
+  plus `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Replication
+  (`noxu-rep`) and observability (`noxu-observe`) pull in additional
+  dependencies (`tokio`, `quinn`, `rustls`/`native-tls`, `tracing`,
+  `metrics`, `opentelemetry`) only when their features are enabled.
 - **No unsafe.** Target zero `unsafe` in core crates. Exceptions only for memory-mapped I/O and off-heap cache.
 - **No async.** Core engine uses blocking I/O with explicit threading. Only replication networking may use async.
 - **Own log format.** Noxu DB uses a Rust-native on-disk format — `.ndb` files — not compatible with any other database.
