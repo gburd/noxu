@@ -1,11 +1,14 @@
 # Noxu DB Rust Code Review
 **Reviewer:** Jon Gjengset (simulated)
 **Date:** 2026-05-01
-**Scope:** All 16 crates in `/home/gburd/ws/lamdb/crates/`
+**Scope:** All crates under `crates/` (workspace covers 19 crates today;
+this review was originally written when the workspace had 16 crates and
+the findings reflect that snapshot — see `docs/src/internal/README.md`
+for caveats about historical internal documents).
 
 ## Executive Summary
 
-This is a comprehensive Rust port of Noxu DB. The codebase demonstrates **strong architectural discipline** and generally follows Rust idioms well. All 16 crates compile and 2233 tests pass. The code shows careful attention to concurrency primitives, error handling with `thiserror`, and appropriate use of Rust's type system.
+This is a comprehensive Rust port of Noxu DB. The codebase demonstrates **strong architectural discipline** and generally follows Rust idioms well. At the time this review was written, all crates compiled and 2233 tests passed; current counts are higher (see `docs/src/maintainer/testing.md`). The code shows careful attention to concurrency primitives, error handling with `thiserror`, and appropriate use of Rust's type system.
 
 **Overall Grade: B+**
 

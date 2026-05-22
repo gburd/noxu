@@ -14,8 +14,7 @@ not end users.
   against Noxu DB 7.5.11 (754 production classes). Last updated: Session 36.
 - [Audit Report](audit-report.md) — consolidated findings across three
   independent audits (Foundation/Storage, Core/Background, API/Extensions).
-- [Rust Code Review](rust-review.md) — Rust quality review of all 16 crates
-  (simulated expert review). Grade: B+.
+- [Rust Code Review](rust-review.md) — historical Rust quality review (originally covered the 16-crate workspace state; current workspace has 19 crates). Grade: B+.
 - [Serialization Research](serialization-research.md) — zero-copy log entry
   parsing research and recommendations for `noxu-log`.
 - [Checksum Selection](checksum-selection.md) — CRC32 vs CRC32C benchmark and
