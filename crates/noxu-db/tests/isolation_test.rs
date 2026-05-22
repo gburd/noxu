@@ -403,11 +403,22 @@ fn test_aborted_transaction_full_rollback() {
 }
 
 fn scratch_dir(prefix: &str) -> TempDir {
-    let base = std::path::Path::new("/scratch");
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(base)
-        .expect("create temp dir under /scratch")
+    // Honors NOXU_TEST_SCRATCH=/path/to/disk for I/O-sensitive measurement
+    // on a real disk (not tmpfs); falls back to the system temp dir so
+    // these tests are portable to macOS / Linux dev machines and CI.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    match std::env::var_os("NOXU_TEST_SCRATCH") {
+        Some(p) => builder
+            .tempdir_in(std::path::Path::new(&p))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "create temp dir under NOXU_TEST_SCRATCH={}: {e}",
+                    std::path::Path::new(&p).display()
+                )
+            }),
+        None => builder.tempdir().expect("create temp dir"),
+    }
 }
 
 // ---------------------------------------------------------------------------
