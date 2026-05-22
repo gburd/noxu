@@ -6,7 +6,7 @@
 //! to the registered handler. This Rust port provides:
 //!
 //! - [`ServiceDispatcher`] — an in-memory registry used in tests via
-//!   [`LocalChannel`].
+//!   `LocalChannel`.
 //! - [`TcpServiceDispatcher`] — a real TCP implementation with a spawned
 //!   accept loop. Clients connect and immediately send a length-prefixed
 //!   service-name string; the dispatcher routes the connection to the matching

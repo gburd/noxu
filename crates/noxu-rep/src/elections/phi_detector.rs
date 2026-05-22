@@ -62,8 +62,8 @@ fn p_later(u: f64, mean: f64, std_dev: f64) -> f64 {
 
 /// Phi accrual failure detector.
 ///
-/// Call [`record_heartbeat`] whenever a heartbeat arrives from the monitored
-/// process.  Query [`phi`] or [`is_available`] to assess liveness.
+/// Call `record_heartbeat` whenever a heartbeat arrives from the monitored
+/// process.  Query `phi` or `is_available` to assess liveness.
 ///
 /// All methods are thread-safe.
 pub struct PhiAccrualDetector {

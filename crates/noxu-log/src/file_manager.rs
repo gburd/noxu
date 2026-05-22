@@ -283,7 +283,7 @@ impl FileManager {
 
     /// Gets a file handle for the given file number.
     ///
-    /// Checks the LRU cache first`).
+    /// Checks the LRU cache first.
     /// On a cache miss the file is opened, its header validated, and the
     /// resulting `Arc<FileHandle>` is inserted — with automatic LRU eviction
     /// when the cache is at capacity.  Because `lru::LruCache::get()` mutates

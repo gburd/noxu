@@ -9,8 +9,9 @@
 //! `test_cleaner_reduces_log_files_under_load` is the only test that runs in
 //! normal CI (it completes in well under 60 s on any storage device).
 //!
-//! All temporary directories are created under `/scratch` (real disk, not
-//! tmpfs) so that I/O measurements reflect actual storage performance.
+//! By default temporary directories are created under the system temp dir.
+//! Set `NOXU_TEST_SCRATCH=/path/to/disk` to point them at a real disk (not
+//! tmpfs) when running I/O-sensitive measurements.
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, TransactionConfig,
@@ -25,13 +26,26 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a temporary directory under `/scratch` (real disk, not tmpfs).
+/// Create a temporary directory honoring `NOXU_TEST_SCRATCH` when set.
+///
+/// In normal CI we use the system temp dir, which is portable across
+/// macOS / Linux developer machines and CI runners. For sustained-load
+/// I/O measurements on a physical disk, set `NOXU_TEST_SCRATCH` to a
+/// path on the device under test.
 fn scratch_dir(prefix: &str) -> TempDir {
-    let base = std::path::Path::new("/scratch");
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(base)
-        .expect("create temp dir under /scratch")
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    match std::env::var_os("NOXU_TEST_SCRATCH") {
+        Some(p) => builder
+            .tempdir_in(std::path::Path::new(&p))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "create temp dir under NOXU_TEST_SCRATCH={:?}: {e}",
+                    p
+                )
+            }),
+        None => builder.tempdir().expect("create temp dir"),
+    }
 }
 
 fn open_env(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {

@@ -20,7 +20,7 @@ use std::cmp::Ordering;
 ///
 /// # Default implementation
 ///
-/// [`ByteComparator::DEFAULT`] provides unsigned lexicographic comparison,
+/// `ByteComparator::DEFAULT` provides unsigned lexicographic comparison,
 /// equivalent to `Key::compareUnsignedBytes`.
 ///
 /// # Example
