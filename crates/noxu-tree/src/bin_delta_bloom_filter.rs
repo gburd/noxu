@@ -6,7 +6,7 @@
 //! loss in accuracy.
 //!
 //! A nice introduction to bloom filters can be found here:
-//! http://en.wikipedia.org/wiki/Bloom_filter
+//! <http://en.wikipedia.org/wiki/Bloom_filter>
 
 /// Parameters for the Fowler-Noll-Vo (FNV) hash function.
 const FNV_OFFSET_BASIS: u64 = 2166136261;

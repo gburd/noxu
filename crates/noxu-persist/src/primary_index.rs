@@ -210,7 +210,7 @@ where
     /// the given key existed.
     ///
     /// **Note:** Secondary indexes are **not** updated by this method because
-    /// no entity is fetched. Use [`delete_with_entity`] when secondary index
+    /// no entity is fetched. Use `delete_with_entity` when secondary index
     /// maintenance is required.
     ///
     /// 

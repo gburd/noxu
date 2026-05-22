@@ -48,7 +48,7 @@ pub enum BinLookupResult {
 
 /// Outcome of a migration attempt for a single LN slot.
 ///
-/// Returned by [`TreeMigrator::migrate_ln_slot`].
+/// Returned by `TreeMigrator::migrate_ln_slot`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MigrationOutcome {
     /// The LN was migrated — it was re-logged and the BIN slot was updated to

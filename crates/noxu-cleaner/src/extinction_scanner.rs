@@ -6,7 +6,7 @@
 //!
 //! Record extinction is an optimized deletion mechanism for large sets of
 //! records that will never be accessed again. Instead of logging a delete
-//! tombstone per record, a single [`discard_extinct_records`] call logs one
+//! tombstone per record, a single `discard_extinct_records` call logs one
 //! entry covering the entire key range. The `ExtinctionScanner` then runs
 //! asynchronously to:
 //! 1. Walk the B-tree and identify extinct records.

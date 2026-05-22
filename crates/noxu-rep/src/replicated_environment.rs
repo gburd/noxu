@@ -494,7 +494,7 @@ impl ReplicatedEnvironment {
         Ok(())
     }
 
-    /// Returns a snapshot of the current replication group as a [`RepGroup`].
+    /// Returns a snapshot of the current replication group as a `RepGroup`.
     ///
     /// The snapshot reflects the state at the time of the call; subsequent
     /// `add_peer` / `remove_peer` calls are not reflected in it.

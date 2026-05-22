@@ -57,7 +57,7 @@ pub struct DataEraser {
 impl DataEraser {
     /// Creates a new DataEraser.
     ///
-    /// Call [`start`] to launch the background thread.
+    /// Call `start` to launch the background thread.
     ///
     /// Constructor.
     pub fn new() -> Self {
