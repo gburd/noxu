@@ -64,7 +64,7 @@ fn main() -> noxu_db::Result<()> {
 - **Cache Eviction** -- LRU-based evictor with dual-priority queues and per-operation cache mode control (Default, KeepHot, EvictLn, EvictBin, MakeEvictable). Explicit memory budget tracking.
 - **Log Cleaning** -- Background garbage collection of obsolete log entries with per-file utilization tracking and configurable thresholds.
 - **Replication & HA** -- Master-replica replication with automatic elections, VLSN-based log streaming, network restore, master transfer, and configurable consistency/durability policies.
-- **Serialization Bindings** -- Tuple and entry bindings for structured data, including derive-macro entity persistence (Direct Persistence Layer).
+- **Serialization Bindings** -- Tuple and entry bindings for structured data, plus a trait-based entity persistence layer (Direct Persistence Layer). Users implement `Entity` and an `EntitySerializer` for their types; entries are stored in typed `PrimaryIndex` and `SecondaryIndex` collections.
 - **Collection Views** -- Iterator-based collection abstractions over databases, with sorted map and sorted set semantics.
 - **400+ Configuration Parameters** -- Fine-grained tuning of every subsystem through a validated, typed configuration framework.
 
@@ -120,7 +120,7 @@ toolchain in `rust-toolchain.toml`.
   (`noxu-rep`) and observability (`noxu-observe`) pull in additional
   dependencies (`tokio`, `quinn`, `rustls`/`native-tls`, `tracing`,
   `metrics`, `opentelemetry`) only when their features are enabled.
-- **No unsafe.** Target zero `unsafe` in core crates. Exceptions only for memory-mapped I/O and off-heap cache.
+- **Limited unsafe.** Core data-path crates (`noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`, `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw locking), `noxu-log` (memory-mapped I/O), `noxu-evictor::off_heap` (off-heap cache), `noxu-rep` (network I/O glue), and a small number of single-line `unsafe` blocks in `noxu-latch`, `noxu-db`, and `noxu-xa` documented inline.
 - **No async.** Core engine uses blocking I/O with explicit threading. Only replication networking may use async.
 - **Own log format.** Noxu DB uses a Rust-native on-disk format — `.ndb` files — not compatible with any other database.
 

@@ -105,13 +105,23 @@ making the latch hierarchy harder to reason about. Background daemon threads
 requires an async runtime. The interface between `noxu-rep` and the core
 engine is synchronous.
 
-## 8. No unsafe in Library Code
+## 8. Limited unsafe in Library Code
 
-**Decision**: Zero `unsafe` in library code, with exactly two exceptions:
-`memmap2` usage for memory-mapped files and off-heap cache storage.
+**Decision**: Core data-path crates (`noxu-tree`, `noxu-txn`,
+`noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`,
+`noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`,
+`noxu-config`, `noxu-util`) target zero `unsafe`. New `unsafe` in those
+crates needs review and a justification comment.
 
-**Why**: Safety is a primary project goal. The exceptions are justified by
-the documented safety invariants of the mmap syscall.
+**Why**: Safety is a primary project goal. Confining `unsafe` to a small
+set of well-understood subsystems makes correctness easier to audit.
 
-**Where unsafe appears**: `crates/noxu-log/src/file_manager.rs` (mmap),
-`crates/noxu-evictor/src/off_heap.rs` (off-heap BIN storage).
+**Where unsafe is allowed and why**:
+
+| Location | Reason |
+|---|---|
+| `crates/noxu-sync/src/{raw_mutex,raw_rwlock,condvar,futex}.rs` | FFI to libc futex syscalls and `parking_lot` raw lock-API operations |
+| `crates/noxu-log/src/file_manager.rs` | Memory-mapped I/O for log files |
+| `crates/noxu-evictor/src/off_heap.rs` | Off-heap BIN storage |
+| `crates/noxu-rep/src/**` | Network I/O glue (TLS handshake, raw socket options) |
+| Single-line blocks in `noxu-latch`, `noxu-db`, `noxu-xa` | Each documented inline |
