@@ -498,15 +498,24 @@ impl TlsConfig {
         let identity = self.native_identity()?;
         let builder = native_tls::TlsAcceptor::builder(identity);
         // Note: `native_tls::TlsAcceptorBuilder` does not expose CA-root
-        // installation or "accept invalid client certs" knobs (those are
-        // client-side concepts in native_tls). If `self.trusted_certs` is
-        // not the default, log a warning rather than silently ignoring it.
-        if !matches!(&self.trusted_certs, TrustedCerts::CaFiles(v) if v.is_empty()) {
+        // installation or "accept invalid client certs" knobs; mTLS-style
+        // client-certificate verification is a `tls-rustls`-only feature
+        // on this transport. Warn loudly only when the user has expressed
+        // intent to do mTLS by populating CA roots — `SkipVerification`
+        // and an empty `CaFiles(vec![])` are both already what a
+        // native_tls server would do, so they're silent.
+        let mtls_intent = match &self.trusted_certs {
+            TrustedCerts::CaFiles(v) => !v.is_empty(),
+            TrustedCerts::CaBytes(v) => !v.is_empty(),
+            TrustedCerts::SkipVerification => false,
+        };
+        if mtls_intent {
             log::warn!(
-                "TlsConfig.trusted_certs is set on a server; \
-                 native_tls does not expose mTLS trust configuration on \
-                 the acceptor — the setting is ignored on this transport. \
-                 Use the rustls feature for mTLS."
+                "TlsConfig.trusted_certs is configured with CA roots on a \
+                 server transport, but native_tls::TlsAcceptorBuilder does \
+                 not expose mTLS trust configuration — the setting is \
+                 ignored on this transport. Use the tls-rustls feature for \
+                 mTLS."
             );
         }
         builder

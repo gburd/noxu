@@ -40,8 +40,8 @@ fn scratch_dir(prefix: &str) -> TempDir {
             .tempdir_in(std::path::Path::new(&p))
             .unwrap_or_else(|e| {
                 panic!(
-                    "create temp dir under NOXU_TEST_SCRATCH={:?}: {e}",
-                    p
+                    "create temp dir under NOXU_TEST_SCRATCH={}: {e}",
+                    std::path::Path::new(&p).display()
                 )
             }),
         None => builder.tempdir().expect("create temp dir"),
