@@ -1,6 +1,6 @@
 # Testing
 
-Noxu DB has 2914+ tests across 16 crates. This page explains the testing
+Noxu DB has 5,000+ tests across 19 crates. This page explains the testing
 approach, conventions, and how to run different test categories.
 
 ## Test Runner

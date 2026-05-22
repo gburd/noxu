@@ -17,7 +17,10 @@ correct toolchain automatically when you enter the workspace directory.
 ## Building
 
 ```bash
-# Build all 16 crates
+# First-time setup: initialize the quoracle submodule used by noxu-rep.
+git submodule update --init --recursive
+
+# Build all crates
 cargo build --workspace
 
 # Build in release mode (needed for benchmarks)

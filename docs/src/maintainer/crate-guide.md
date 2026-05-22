@@ -1,6 +1,6 @@
 # Crate Guide
 
-All 16 crates in the Noxu DB workspace, with purpose, key files, critical
+All 19 crates in the Noxu DB workspace, with purpose, key files, critical
 types, and crate purpose.
 
 ## Phase 0 — Foundation
