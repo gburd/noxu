@@ -1,0 +1,71 @@
+name: tla
+# Runs TLC over the specs in tla/ and the advisory sync check.
+#
+# This workflow is intentionally separate from `test.yml` because TLC
+# is a Java tool with a different toolchain footprint and the specs
+# tend to evolve at a different cadence than the Rust code. Failures
+# here gate merging into main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tla:
+    name: TLC model checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache tla2tools.jar
+        id: tla-cache
+        uses: actions/cache@v4
+        with:
+          path: tla/tla2tools.jar
+          key: tla2tools-1.8.0
+
+      - name: Download tla2tools.jar
+        if: steps.tla-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p tla
+          curl -sSL \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
+            -o tla/tla2tools.jar
+
+      - name: Run TLC on every spec
+        env:
+          TLA_JAR: ${{ github.workspace }}/tla/tla2tools.jar
+        run: tla/run.sh
+
+      - name: Upload TLC logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-logs
+          path: tla/states/**
+          if-no-files-found: ignore
+
+  tla-sync:
+    name: TLA+/Rust sync check (advisory)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Advisory only — does not fail the build by default.
+      # Set NOXU_TLA_CHECK_STRICT=1 in repo secrets to enforce.
+      - name: Run sync advisory
+        run: scripts/check_tla_in_sync.sh origin/${{ github.base_ref }}

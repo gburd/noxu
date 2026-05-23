@@ -1,5 +1,6 @@
 .PHONY: build test check fmt doc clean bench fuzz test-crate tc-helper torture torture-quic \
-        docs docs-serve docs-check docs-spell docs-lint docs-clean
+        docs docs-serve docs-check docs-spell docs-lint docs-clean \
+        tla tla-check coverage
 
 build:
 	cargo build --workspace
@@ -48,6 +49,25 @@ bench:
 
 fuzz:
 	@echo "Run: cargo +nightly fuzz run <target>"
+
+# Run every TLA+ spec under tla/ via TLC. See tla/README.md for what
+# each spec models and what it asserts. Buggy specs are expected to
+# fail; the run.sh wrapper inverts the success criterion for them.
+tla:
+	tla/run.sh
+
+# Advisory check that TLA+ specs were touched on PRs that touched the
+# Rust files they model. Prints warnings but exits 0 today; promote to
+# a failing check by setting NOXU_TLA_CHECK_STRICT=1 in the
+# environment.
+tla-check:
+	scripts/check_tla_in_sync.sh
+
+# Run the test suite under cargo-llvm-cov and emit both an HTML report
+# and a textual summary. Requires `cargo install cargo-llvm-cov`.
+coverage:
+	cargo llvm-cov --workspace --no-fail-fast --html
+	cargo llvm-cov --workspace --no-fail-fast --summary-only
 
 test-crate:
 ifndef CRATE
