@@ -1,7 +1,25 @@
-# Noxu DB  -  Comprehensive Audit Report
+# Noxu DB  -  Comprehensive Audit Report (historical snapshot)
 
-This report compares all 16 Noxu DB crates against their Noxu DB Java
-Edition (Noxu 7.5.11) counterparts and the the extended fork. It consolidates
+> **Status: HISTORICAL.** This report was written when the workspace
+> contained 16 crates (it now contains 19) and the public API still ran
+> against an in-memory HashMap store. **Most of the "Critical" findings
+> below have since been resolved**: the public API is wired to the
+> engine, B-tree split/merge is implemented, transactions are real, the
+> cleaner runs, recovery replays the WAL, and replication has working
+> TCP and QUIC transports with elections, VLSN streaming, master
+> transfer, and network restore. The numbers in the "Fidelity
+> Assessment" and "Test count" lines are no longer accurate — see
+> `docs/src/maintainer/testing.md` for the current test count and
+> `ARCHITECTURE.md` for the current subsystem status.
+>
+> This document is preserved as a record of where the project was at the
+> time of the audit. **Do not treat its claims about subsystem
+> completeness as descriptive of the codebase today.** Fresh audits
+> belong in new documents under `docs/src/internal/`; do not edit this
+> one in place.
+
+This report compared the (then) 16 Noxu DB crates against their Noxu DB Java
+Edition (Noxu 7.5.11) counterparts and the the extended fork. It consolidated
 findings from three independent audits:
 
 1. **Foundation & Storage Audit**  -  noxu-util, noxu-latch, noxu-config, noxu-log, noxu-tree
@@ -12,7 +30,7 @@ See also:
 - `docs/RUST_REVIEW.md`  -  Idiomatic Rust quality review (B+ overall)
 - `docs/JE_FIDELITY_REVIEW.md`  -  Algorithm fidelity review with Noxu code comparisons
 
-## Overall Assessment
+## Overall Assessment (as of audit date)
 
 The 16-crate structure maps cleanly to Noxu's package hierarchy. Data structures,
 enums, and traits are well-designed and idiomatic Rust. The primary gap is that
@@ -20,13 +38,14 @@ layers are **not yet integrated end-to-end**: the public API operates on an
 in-memory HashMap store, the engine orchestrates subsystems that aren't connected
 to the API, and replication is stubbed.
 
-**Fidelity Assessment:**
+**Fidelity Assessment:** *(snapshot — current numbers are higher; see
+`docs/src/maintainer/testing.md` and `ARCHITECTURE.md`)*
 - Data Structures: 95%
 - Read-Only Operations: 80%
 - Modification Operations: 40% (split/commit gaps)
 - Recovery/Cleaning: 30% (placeholders)
 
-**Test count**: 2,332 tests (including 99 property-based tests), 0 failures.
+**Test count at audit date**: 2,332 tests (including 99 property-based tests), 0 failures.
 
 ## Critical Findings
 
