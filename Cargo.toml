@@ -46,7 +46,11 @@ noxu-sync = { workspace = true }
 tempfile = "3"
 
 [[example]]
-name = "simple"
+# Renamed from "simple" to avoid an output filename collision with the
+# quoracle submodule's example of the same name. The source file path is
+# unchanged so README/quick-start references that show the file contents
+# still apply.
+name = "quickstart"
 path = "examples/simple.rs"
 
 [[example]]

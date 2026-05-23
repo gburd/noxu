@@ -8,6 +8,11 @@ crash_test_files
 *snap.*
 *grind.out*
 vgcore*
+# Process core dumps (Linux/macOS). Never commit these — they are very
+# large and may contain sensitive in-memory state. Anchored to avoid
+# accidentally ignoring a future module or directory called "core".
+/core
+**/core.[0-9]*
 *.bk
 *orig
 tags

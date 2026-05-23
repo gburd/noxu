@@ -55,11 +55,12 @@ in cache, the log is read (`noxu-log`) and the node is loaded into the tree.
 
 ## Crate Dependency Graph
 
-The 16 crates form a layered dependency structure:
+The 19 crates form a layered dependency structure:
 
 ```
 Layer 0 (Foundation):
     noxu-util          Core types: LSN, VLSN, packed integers, stats
+    noxu-sync          Internal sync primitives (raw locks, condvar, futex)
     noxu-latch         Latches wrapping parking_lot
     noxu-config        400+ configuration parameters
 
@@ -76,7 +77,7 @@ Layer 4 (Internals):
     noxu-dbi           EnvironmentImpl, DatabaseImpl, CursorImpl, MemoryBudget
 
 Layer 5 (Background Services):
-    noxu-evictor       LRU cache eviction, memory budget enforcement
+    noxu-evictor       LRU/CLOCK/LIRS/ARC/CAR cache eviction, memory budget enforcement
     noxu-cleaner       Log garbage collection, utilization tracking
     noxu-recovery      Checkpointing, 3-phase crash recovery
 
@@ -87,10 +88,16 @@ Layer 6 (Orchestration):
 Layer 7 (Higher-Level APIs):
     noxu-bind          Serialization bindings (tuple, entry, serial)
     noxu-collections   Iterator-based collection views
-    noxu-persist       Derive-macro entity persistence (DPL)
+    noxu-persist       Trait-based entity persistence (DPL)
+
+Layer 7b (Distributed Transactions):
+    noxu-xa            X/Open XA two-phase commit
 
 Layer 8 (Replication):
     noxu-rep           Master-replica HA, elections, VLSN index
+
+Cross-cutting:
+    noxu-observe       Optional `tracing`/`metrics`/OpenTelemetry glue
 ```
 
 ## Subsystem Overview
@@ -118,5 +125,8 @@ Layer 8 (Replication):
 | `memmap2` | Memory-mapped file I/O |
 | `fs2` | File locking |
 | `serde` | Serialization for bindings and persistence |
+| `hashbrown` / `lock_api` / `lru` / `libc` | Core utility deps |
 | `quinn` / `rustls` / `rcgen` | QUIC transport (optional, `quic` feature) |
+| `native-tls` | OpenSSL/LibreSSL TLS (optional, `tls-native` feature) |
+| `tracing` / `metrics` / `tracing-opentelemetry` / `opentelemetry` | Observability (optional, off by default) |
 | `quoracle` | LP-optimal quorum systems (replication) |
