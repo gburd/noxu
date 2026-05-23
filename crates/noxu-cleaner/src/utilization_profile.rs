@@ -82,7 +82,7 @@ impl UtilizationProfile {
     /// Files are ranked by descending score so that the file with the best
     /// ratio of obsolete data to migration work is cleaned first.
     ///
-    /// 
+    ///
     pub fn get_best_file_for_cleaning(
         &self,
         min_utilization: f64,

@@ -15,8 +15,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Load config from `config.toml` in the current directory, or use defaults.
-    let config = CaskConfig::from_file(Path::new("config.toml"))?
-        .unwrap_or_default();
+    let config =
+        CaskConfig::from_file(Path::new("config.toml"))?.unwrap_or_default();
 
     info!(
         address = %config.address,

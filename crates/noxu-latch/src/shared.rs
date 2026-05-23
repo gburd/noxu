@@ -77,7 +77,9 @@ impl SharedLatch {
     /// Panics if the latch is already held exclusively by the calling thread,
     /// or if the calling thread holds any read guards (which would deadlock).
     /// Both are programming errors and must not be silenced.
-    pub fn acquire_exclusive(&self) -> Result<SharedLatchWriteGuard<'_>, LatchError> {
+    pub fn acquire_exclusive(
+        &self,
+    ) -> Result<SharedLatchWriteGuard<'_>, LatchError> {
         let current = thread_id();
         if self.exclusive_owner.load(Ordering::Relaxed) == current {
             panic!(
@@ -299,7 +301,10 @@ mod tests {
     fn test_exclusive_acquire_timeout() {
         use std::time::Duration;
         // Create a latch with a very short timeout so the test completes fast.
-        let ctx = crate::LatchContext::with_timeout("test-timeout", Duration::from_millis(50));
+        let ctx = crate::LatchContext::with_timeout(
+            "test-timeout",
+            Duration::from_millis(50),
+        );
         let latch = Arc::new(SharedLatch::new(ctx, false));
 
         // Hold write lock from another thread so this thread will time out.
@@ -307,7 +312,8 @@ mod tests {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
         let handle = std::thread::spawn(move || {
-            let _g = latch2.acquire_exclusive().expect("acquire in spawned thread");
+            let _g =
+                latch2.acquire_exclusive().expect("acquire in spawned thread");
             barrier2.wait(); // signal: lock is held
             std::thread::sleep(Duration::from_millis(200));
         });
@@ -322,14 +328,18 @@ mod tests {
     #[test]
     fn test_shared_acquire_timeout() {
         use std::time::Duration;
-        let ctx = crate::LatchContext::with_timeout("test-timeout-r", Duration::from_millis(50));
+        let ctx = crate::LatchContext::with_timeout(
+            "test-timeout-r",
+            Duration::from_millis(50),
+        );
         let latch = Arc::new(SharedLatch::new(ctx, false));
 
         let latch2 = latch.clone();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
         let handle = std::thread::spawn(move || {
-            let _g = latch2.acquire_exclusive().expect("acquire in spawned thread");
+            let _g =
+                latch2.acquire_exclusive().expect("acquire in spawned thread");
             barrier2.wait();
             std::thread::sleep(Duration::from_millis(200));
         });
@@ -355,7 +365,10 @@ mod tests {
 
         let latch2 = latch.clone();
         let handle = std::thread::spawn(move || {
-            assert!(!latch2.is_exclusive_owner(), "non-owner should not be owner");
+            assert!(
+                !latch2.is_exclusive_owner(),
+                "non-owner should not be owner"
+            );
         });
         handle.join().unwrap();
     }
@@ -373,7 +386,10 @@ mod tests {
     #[test]
     fn test_context_fields() {
         use std::time::Duration;
-        let ctx = crate::LatchContext::with_timeout("ctx-test", Duration::from_secs(3));
+        let ctx = crate::LatchContext::with_timeout(
+            "ctx-test",
+            Duration::from_secs(3),
+        );
         let latch = SharedLatch::new(ctx, false);
         assert_eq!(latch.context().name, "ctx-test");
         assert_eq!(latch.context().timeout, Duration::from_secs(3));
@@ -412,27 +428,37 @@ mod tests {
         let concurrent = Arc::new(AtomicUsize::new(0));
         let violations = Arc::new(AtomicUsize::new(0));
 
-        let threads: Vec<_> = (0..4).map(|_| {
-            let latch = latch.clone();
-            let counter = counter.clone();
-            let concurrent = concurrent.clone();
-            let violations = violations.clone();
-            std::thread::spawn(move || {
-                for _ in 0..25 {
-                    let _guard = latch.acquire_exclusive().expect("acquire_exclusive");
-                    let prev = concurrent.fetch_add(1, Ordering::SeqCst);
-                    if prev != 0 {
-                        violations.fetch_add(1, Ordering::SeqCst);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let latch = latch.clone();
+                let counter = counter.clone();
+                let concurrent = concurrent.clone();
+                let violations = violations.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let _guard = latch
+                            .acquire_exclusive()
+                            .expect("acquire_exclusive");
+                        let prev = concurrent.fetch_add(1, Ordering::SeqCst);
+                        if prev != 0 {
+                            violations.fetch_add(1, Ordering::SeqCst);
+                        }
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        concurrent.fetch_sub(1, Ordering::SeqCst);
                     }
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    concurrent.fetch_sub(1, Ordering::SeqCst);
-                }
+                })
             })
-        }).collect();
+            .collect();
 
-        for t in threads { t.join().unwrap(); }
+        for t in threads {
+            t.join().unwrap();
+        }
         assert_eq!(counter.load(Ordering::SeqCst), 100);
-        assert_eq!(violations.load(Ordering::SeqCst), 0, "mutual exclusion violated");
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "mutual exclusion violated"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -474,7 +500,10 @@ mod tests {
     #[test]
     fn test_multiple_readers_concurrent() {
         let latch = Arc::new(SharedLatch::named("noxu-multi-read", false));
-        let ready = Arc::new((noxu_sync::Mutex::new(0usize), noxu_sync::Condvar::new()));
+        let ready = Arc::new((
+            noxu_sync::Mutex::new(0usize),
+            noxu_sync::Condvar::new(),
+        ));
         let mut handles = Vec::new();
 
         for _ in 0..4 {
@@ -511,7 +540,8 @@ mod tests {
     /// Exclusive mode blocks shared; after exclusive releases shared can be acquired.
     #[test]
     fn test_exclusive_blocks_then_shared_granted() {
-        let latch = Arc::new(SharedLatch::named("noxu-excl-blocks-shared", false));
+        let latch =
+            Arc::new(SharedLatch::named("noxu-excl-blocks-shared", false));
 
         // Acquire exclusive.
         let g = latch.acquire_exclusive().expect("acquire_exclusive");
@@ -556,7 +586,10 @@ mod tests {
 
         // Now it should succeed.
         let r2 = latch.try_acquire_exclusive();
-        assert!(r2.is_some(), "try_acquire_exclusive should succeed after release");
+        assert!(
+            r2.is_some(),
+            "try_acquire_exclusive should succeed after release"
+        );
         drop(r2);
     }
 
@@ -578,7 +611,8 @@ mod tests {
                 let violations = violations.clone();
                 std::thread::spawn(move || {
                     for _ in 0..10 {
-                        let _g = latch.acquire_shared().expect("acquire_shared"); // exclusive in excl-only mode
+                        let _g =
+                            latch.acquire_shared().expect("acquire_shared"); // exclusive in excl-only mode
                         let prev = concurrent.fetch_add(1, Ordering::SeqCst);
                         if prev != 0 {
                             violations.fetch_add(1, Ordering::SeqCst);
@@ -594,6 +628,10 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(counter.load(Ordering::SeqCst), 40);
-        assert_eq!(violations.load(Ordering::SeqCst), 0, "exclusive-only must serialize");
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "exclusive-only must serialize"
+        );
     }
 }

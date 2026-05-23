@@ -44,7 +44,7 @@ enum CurrentEntry {
 
 /// Scans a log file and classifies entries for the cleaner.
 ///
-/// 
+///
 ///
 /// Unlike recovery-oriented readers, this reader processes **every** entry
 /// (not just a target set) so that the full file utilization can be measured.
@@ -118,14 +118,14 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
         }
 
         loop {
-            let file_len =
-                match self.file_access.get_file_length(self.file_num) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        self.eof = true;
-                        return Ok(false);
-                    }
-                };
+            let file_len = match self.file_access.get_file_length(self.file_num)
+            {
+                Ok(l) => l,
+                Err(_) => {
+                    self.eof = true;
+                    return Ok(false);
+                }
+            };
 
             if self.current_offset >= file_len {
                 self.eof = true;
@@ -152,17 +152,16 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
 
             let entry_type_num = hdr[4];
             let flags = hdr[5];
-            let item_size = u32::from_le_bytes([
-                hdr[10], hdr[11], hdr[12], hdr[13],
-            ]) as usize;
+            let item_size =
+                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
+                    as usize;
 
             if item_size > MAX_SANE_ITEM_SIZE {
                 self.eof = true;
                 return Ok(false);
             }
 
-            let vlsn_present =
-                (flags & 0x08) != 0 || (flags & 0x20) != 0;
+            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
             let header_size =
                 if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
             let entry_size = header_size + item_size;
@@ -183,8 +182,7 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
                 return Ok(false);
             }
 
-            let lsn =
-                Lsn::new(self.file_num, self.current_offset as u32);
+            let lsn = Lsn::new(self.file_num, self.current_offset as u32);
             self.current_offset += entry_size as u64;
             self.current_lsn = lsn;
 
@@ -197,9 +195,7 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
                 Some(LogEntryType::FileHeader) => {
                     (CAT_FILE_HEADER, CurrentEntry::Other)
                 }
-                Some(LogEntryType::DbTree) => {
-                    (CAT_DBTREE, CurrentEntry::Other)
-                }
+                Some(LogEntryType::DbTree) => (CAT_DBTREE, CurrentEntry::Other),
                 Some(LogEntryType::BINDelta) => {
                     let e = BinDeltaLogEntry::read_from_log(payload)
                         .unwrap_or_else(|_| {
@@ -209,10 +205,9 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
                 }
                 Some(t) if t.is_in_type() => {
                     // IN or BIN (non-delta).
-                    let e = InLogEntry::read_from_log(payload)
-                        .unwrap_or_else(|_| {
-                            InLogEntry::new(0, NULL_LSN, NULL_LSN, vec![])
-                        });
+                    let e = InLogEntry::read_from_log(payload).unwrap_or_else(
+                        |_| InLogEntry::new(0, NULL_LSN, NULL_LSN, vec![]),
+                    );
                     (CAT_IN, CurrentEntry::In(e))
                 }
                 Some(t) if is_ln_type(t) => {
@@ -220,9 +215,18 @@ impl<F: LogFileAccess> CleanerFileReader<F> {
                     let e = LnLogEntry::read_from_log(payload, is_txn)
                         .unwrap_or_else(|_| {
                             LnLogEntry::new(
-                                0, None, NULL_LSN, false, None, None,
-                                noxu_util::vlsn::NULL_VLSN, 0, false,
-                                vec![], None, 0,
+                                0,
+                                None,
+                                NULL_LSN,
+                                false,
+                                None,
+                                None,
+                                noxu_util::vlsn::NULL_VLSN,
+                                0,
+                                false,
+                                vec![],
+                                None,
+                                0,
                                 noxu_util::vlsn::NULL_VLSN,
                             )
                         });
@@ -377,13 +381,9 @@ mod tests {
         }
 
         fn get_file_length(&self, file_num: u32) -> Result<u64> {
-            self.files
-                .get(&file_num)
-                .map(|d| d.len() as u64)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "File not found")
-                        .into()
-                })
+            self.files.get(&file_num).map(|d| d.len() as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "File not found").into()
+            })
         }
 
         fn get_first_file_num(&self) -> Option<u32> {
@@ -424,8 +424,19 @@ mod tests {
 
     fn make_ln_payload(db_id: u64) -> Vec<u8> {
         let e = LnLogEntry::new(
-            db_id, None, NULL_LSN, false, None, None, NULL_VLSN, 0, false,
-            b"key".to_vec(), Some(b"val".to_vec()), 0, NULL_VLSN,
+            db_id,
+            None,
+            NULL_LSN,
+            false,
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            false,
+            b"key".to_vec(),
+            Some(b"val".to_vec()),
+            0,
+            NULL_VLSN,
         );
         let mut buf = BytesMut::new();
         e.write_to_log(&mut buf);

@@ -52,7 +52,7 @@ struct FsyncGroupInner {
 
 /// Return value from `FSyncGroup::wait_for_event`.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitStatus {
     /// The fsync was completed on this thread's behalf; nothing to do.
@@ -77,7 +77,7 @@ impl FSyncGroup {
 
     /// Block until work is done, this thread becomes leader, or we time out.
     ///
-    /// 
+    ///
     fn wait_for_event(&self, timeout: Duration) -> WaitStatus {
         let mut inner = self.inner.lock().unwrap();
 
@@ -135,7 +135,7 @@ impl FSyncGroup {
     }
 
     /// Wake a single waiter to become the next leader.
-    /// 
+    ///
     fn wakeup_one(&self) {
         self.condvar.notify_one();
     }
@@ -166,7 +166,7 @@ struct FsyncState {
 
 /// Coalesces fsync requests so that one system call serves many threads.
 ///
-/// 
+///
 ///
 /// # Configuration
 ///
@@ -238,7 +238,7 @@ impl FsyncManager {
 
     /// Request an fsync, coalescing with concurrent callers.
     ///
-    /// 
+    ///
     ///
     /// The caller supplies `do_fsync`, a closure that performs the actual
     /// fsync.  This method guarantees that when it returns `Ok(())`, at least
@@ -272,7 +272,9 @@ impl FsyncManager {
                 // If this new waiter pushes us to the threshold, wake the
                 // leader early so it doesn't wait the full grpc_interval_ms.
                 // Mirrors: if (numNextWaiters >= grpcThreshold) mgrMutex.notifyAll()
-                if self.grp_wait_on && state.num_next_waiters >= self.grpc_threshold {
+                if self.grp_wait_on
+                    && state.num_next_waiters >= self.grpc_threshold
+                {
                     self.leader_condvar.notify_one();
                 }
             } else {
@@ -350,7 +352,8 @@ impl FsyncManager {
             // (meaning at least one other thread piggybacked on this fsync).
             if is_leader && in_progress_group.is_some() {
                 self.n_group_commits.fetch_add(1, Ordering::Relaxed);
-                self.n_fsync_batch_size_sum.fetch_add(leader_batch_size, Ordering::Relaxed);
+                self.n_fsync_batch_size_sum
+                    .fetch_add(leader_batch_size, Ordering::Relaxed);
             }
 
             if is_leader {
@@ -455,8 +458,8 @@ impl FsyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── required tests from task spec ─────────────────────────────────────
@@ -516,13 +519,12 @@ mod tests {
     #[test]
     fn test_fsync_error_propagated_to_waiters() {
         let mgr = FsyncManager::new(0, 0);
-        let result = mgr.fsync(|| {
-            Err(std::io::Error::other(
-                "simulated fsync failure",
-            ))
-        });
+        let result =
+            mgr.fsync(|| Err(std::io::Error::other("simulated fsync failure")));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("simulated fsync failure"));
+        assert!(
+            result.unwrap_err().to_string().contains("simulated fsync failure")
+        );
     }
 
     /// With grpc_threshold=2 and grpc_interval_ms=50, all threads finish

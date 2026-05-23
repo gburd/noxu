@@ -10,7 +10,7 @@ use noxu_db::Database;
 
 /// A sorted map view of a database.
 ///
-/// 
+///
 ///
 /// Provides all the operations of `StoredMap` plus sorted-map operations
 /// like `first_key()`, `last_key()`, and range iteration. Keys are

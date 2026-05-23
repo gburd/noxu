@@ -19,8 +19,8 @@ use tempfile::TempDir;
 
 fn setup_env_and_db() -> (TempDir, Environment, Database) {
     let temp_dir = TempDir::new().unwrap();
-    let env_config =
-        EnvironmentConfig::new(temp_dir.path().to_path_buf()).with_allow_create(true);
+    let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+        .with_allow_create(true);
     let env = Environment::open(env_config).unwrap();
     let db_config = DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, "testdb", &db_config).unwrap();
@@ -73,7 +73,11 @@ fn test_stored_map_put_get_roundtrip() {
 
     for i in 1u64..=6 {
         let val = map.get(&key_bytes(i)).unwrap();
-        assert_eq!(val, Some(key_bytes(i)), "get should return stored value for key {i}");
+        assert_eq!(
+            val,
+            Some(key_bytes(i)),
+            "get should return stored value for key {i}"
+        );
     }
 }
 
@@ -255,11 +259,8 @@ fn test_stored_map_iter_after_partial_remove() {
         map.remove(&key_bytes(i)).unwrap();
     }
 
-    let keys: Vec<_> = map
-        .keys()
-        .unwrap()
-        .map(|r| key_u64(&r.unwrap()))
-        .collect();
+    let keys: Vec<_> =
+        map.keys().unwrap().map(|r| key_u64(&r.unwrap())).collect();
     assert_eq!(keys, vec![2u64, 4, 6]);
 }
 
@@ -365,11 +366,8 @@ fn test_sorted_map_iter_from_beyond_all() {
         map.put(&key_bytes(i), &key_bytes(i)).unwrap();
     }
 
-    let items: Vec<_> = map
-        .iter_from(&key_bytes(100))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let items: Vec<_> =
+        map.iter_from(&key_bytes(100)).unwrap().map(|r| r.unwrap()).collect();
     assert!(items.is_empty());
 }
 
@@ -384,11 +382,8 @@ fn test_sorted_map_reverse_iter() {
         map.put(&key_bytes(i), &key_bytes(i)).unwrap();
     }
 
-    let items: Vec<u64> = map
-        .iter_reverse()
-        .unwrap()
-        .map(|r| key_u64(&r.unwrap().0))
-        .collect();
+    let items: Vec<u64> =
+        map.iter_reverse().unwrap().map(|r| key_u64(&r.unwrap().0)).collect();
     assert_eq!(items, vec![4, 3, 2, 1]);
 }
 
@@ -518,7 +513,7 @@ fn test_stored_list_remove_by_index() {
     let list = StoredList::new(&db);
 
     list.push(b"alpha").unwrap(); // 0
-    list.push(b"beta").unwrap();  // 1
+    list.push(b"beta").unwrap(); // 1
     list.push(b"gamma").unwrap(); // 2
 
     let removed = list.remove(1).unwrap();
@@ -596,12 +591,8 @@ fn test_stored_list_iteration_order() {
     }
 
     // Iterate via the underlying map's iter() to verify key order
-    let items: Vec<_> = list
-        .as_map()
-        .iter()
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let items: Vec<_> =
+        list.as_map().iter().unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(items.len(), 4);
     assert_eq!(items[0].1, b"first");
     assert_eq!(items[1].1, b"second");
@@ -689,7 +680,10 @@ fn test_stored_key_set_iteration_sorted() {
     ks.register_keys(&[b"cherry" as &[u8], b"apple", b"banana"]);
 
     let keys: Vec<_> = ks.iter().unwrap().map(|r| r.unwrap()).collect();
-    assert_eq!(keys, vec![b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]);
+    assert_eq!(
+        keys,
+        vec![b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]
+    );
 }
 
 /// StoredKeySet.contains() registers key in index
@@ -1103,9 +1097,8 @@ fn test_bulk_put_and_verify() {
     let (_td, _env, db) = setup_env_and_db();
     let map = StoredMap::new(&db, false);
 
-    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (1u64..=6)
-        .map(|i| (key_bytes(i), key_bytes(i)))
-        .collect();
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+        (1u64..=6).map(|i| (key_bytes(i), key_bytes(i))).collect();
 
     for (k, v) in &pairs {
         map.put(k, v).unwrap();
@@ -1300,7 +1293,11 @@ fn test_iter_count_matches_len_incremental() {
         map.put(&key_bytes(i), &key_bytes(i)).unwrap();
         let iter_count = map.iter().unwrap().count() as u64;
         let len = map.len().unwrap();
-        assert_eq!(iter_count, i, "iter count should equal len after {} inserts", i);
+        assert_eq!(
+            iter_count, i,
+            "iter count should equal len after {} inserts",
+            i
+        );
         assert_eq!(len, i);
     }
 }

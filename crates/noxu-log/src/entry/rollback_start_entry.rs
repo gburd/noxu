@@ -44,7 +44,7 @@ impl RollbackStartEntry {
     /// Returns the serialized size in bytes.
     pub fn log_size(&self) -> usize {
         8 + // active_txn_start
-        8   // matchpoint_lsn
+        8 // matchpoint_lsn
     }
 
     /// Writes this entry to a buffer.
@@ -69,7 +69,8 @@ mod tests {
 
     #[test]
     fn test_rollback_start_roundtrip() {
-        let entry = RollbackStartEntry::new(Lsn::new(3, 1200), Lsn::new(7, 4000));
+        let entry =
+            RollbackStartEntry::new(Lsn::new(3, 1200), Lsn::new(7, 4000));
 
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);

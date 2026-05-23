@@ -13,8 +13,8 @@ use crate::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::entry_type::LogEntryType;
 use crate::error::{NoxuLogError, Result};
 use crate::file_reader::LogFileAccess;
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use hashbrown::HashSet;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 
 // Maximum plausible payload size (64 MiB).
 const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;
@@ -31,7 +31,7 @@ enum CurrentEntry {
 
 /// Scans log files for Leaf Node (LN) entries during recovery.
 ///
-/// 
+///
 ///
 /// The reader maintains a set of *target* `LogEntryType` values registered via
 /// `add_target_type`.  Each call to `read_next_entry` advances to the next
@@ -135,7 +135,7 @@ impl<F: LogFileAccess> LNFileReader<F> {
 
     /// Register a log entry type that this reader should return.
     ///
-    /// 
+    ///
     pub fn add_target_type(&mut self, entry_type: LogEntryType) {
         self.target_types.insert(entry_type);
     }
@@ -214,47 +214,33 @@ impl<F: LogFileAccess> LNFileReader<F> {
     ///
     /// Panics if the current entry is not an LN.
     pub fn get_database_id(&self) -> u64 {
-        self.get_ln_log_entry()
-            .expect("current entry is not an LN")
-            .db_id
+        self.get_ln_log_entry().expect("current entry is not an LN").db_id
     }
 
     /// Returns the transaction ID from the current LN entry, or `None` for
     /// non-transactional operations.
     pub fn get_txn_id(&self) -> Option<u64> {
-        self.get_ln_log_entry()
-            .and_then(|e| e.txn_id)
-            .map(|id| id as u64)
+        self.get_ln_log_entry().and_then(|e| e.txn_id).map(|id| id as u64)
     }
 
     /// Returns `true` if the current entry is a `TxnCommit`.
     pub fn is_commit(&self) -> bool {
-        matches!(
-            self.current_entry,
-            Some(CurrentEntry::Commit(_))
-        )
+        matches!(self.current_entry, Some(CurrentEntry::Commit(_)))
     }
 
     /// Returns `true` if the current entry is a `TxnAbort`.
     pub fn is_abort(&self) -> bool {
-        matches!(
-            self.current_entry,
-            Some(CurrentEntry::Abort(_))
-        )
+        matches!(self.current_entry, Some(CurrentEntry::Abort(_)))
     }
 
     /// Returns the abort LSN from the current LN entry (`NULL_LSN` if none).
     pub fn get_abort_lsn(&self) -> Lsn {
-        self.get_ln_log_entry()
-            .map(|e| e.abort_lsn)
-            .unwrap_or(NULL_LSN)
+        self.get_ln_log_entry().map(|e| e.abort_lsn).unwrap_or(NULL_LSN)
     }
 
     /// Returns the `abort_known_deleted` flag from the current LN entry.
     pub fn get_abort_known_deleted(&self) -> bool {
-        self.get_ln_log_entry()
-            .map(|e| e.abort_known_deleted)
-            .unwrap_or(false)
+        self.get_ln_log_entry().map(|e| e.abort_known_deleted).unwrap_or(false)
     }
 
     /// Returns the LSN of the entry most recently returned by
@@ -276,16 +262,14 @@ impl<F: LogFileAccess> LNFileReader<F> {
     ) -> Result<Option<(Lsn, LogEntryType, Vec<u8>)>> {
         loop {
             // Check for end of current file.
-            let file_len = match self
-                .file_access
-                .get_file_length(self.current_file_num)
-            {
-                Ok(l) => l,
-                Err(_) => {
-                    self.eof = true;
-                    return Ok(None);
-                }
-            };
+            let file_len =
+                match self.file_access.get_file_length(self.current_file_num) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        self.eof = true;
+                        return Ok(None);
+                    }
+                };
 
             if self.current_offset >= file_len {
                 // Try next file.
@@ -325,17 +309,16 @@ impl<F: LogFileAccess> LNFileReader<F> {
 
             let entry_type_num = hdr[4];
             let flags = hdr[5];
-            let item_size = u32::from_le_bytes([
-                hdr[10], hdr[11], hdr[12], hdr[13],
-            ]) as usize;
+            let item_size =
+                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
+                    as usize;
 
             if item_size > MAX_SANE_ITEM_SIZE {
                 self.eof = true;
                 return Ok(None);
             }
 
-            let vlsn_present =
-                (flags & 0x08) != 0 || (flags & 0x20) != 0;
+            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
             let header_size =
                 if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
             let entry_size = header_size + item_size;
@@ -383,7 +366,9 @@ impl<F: LogFileAccess> LNFileReader<F> {
         match entry_type {
             LogEntryType::TxnCommit => {
                 let e = TxnEndEntry::read_from_log(payload).map_err(|e| {
-                    NoxuLogError::Internal(format!("TxnCommit parse error: {e}"))
+                    NoxuLogError::Internal(format!(
+                        "TxnCommit parse error: {e}"
+                    ))
                 })?;
                 Ok(CurrentEntry::Commit(e))
             }
@@ -394,18 +379,19 @@ impl<F: LogFileAccess> LNFileReader<F> {
                 Ok(CurrentEntry::Abort(e))
             }
             LogEntryType::NameLN | LogEntryType::NameLNTxn => {
-                let e =
-                    NameLnLogEntry::read_from_log(payload, is_txn).map_err(
-                        |e| NoxuLogError::Internal(format!("NameLN parse error: {e}")),
-                    )?;
+                let e = NameLnLogEntry::read_from_log(payload, is_txn)
+                    .map_err(|e| {
+                        NoxuLogError::Internal(format!(
+                            "NameLN parse error: {e}"
+                        ))
+                    })?;
                 Ok(CurrentEntry::NameLn(e))
             }
             _ => {
                 // All other target types are regular LN entries.
-                let e =
-                    LnLogEntry::read_from_log(payload, is_txn).map_err(
-                        |e| NoxuLogError::Internal(format!("LN parse error: {e}")),
-                    )?;
+                let e = LnLogEntry::read_from_log(payload, is_txn).map_err(
+                    |e| NoxuLogError::Internal(format!("LN parse error: {e}")),
+                )?;
                 Ok(CurrentEntry::Ln(e))
             }
         }
@@ -466,13 +452,9 @@ mod tests {
         }
 
         fn get_file_length(&self, file_num: u32) -> Result<u64> {
-            self.files
-                .get(&file_num)
-                .map(|d| d.len() as u64)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "File not found")
-                        .into()
-                })
+            self.files.get(&file_num).map(|d| d.len() as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "File not found").into()
+            })
         }
 
         fn get_first_file_num(&self) -> Option<u32> {

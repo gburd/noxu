@@ -38,7 +38,11 @@ impl RepGroup {
     }
 
     /// Creates a new replication group with an explicit quorum policy.
-    pub fn with_policy(name: String, group_id: u64, policy: QuorumPolicy) -> Self {
+    pub fn with_policy(
+        name: String,
+        group_id: u64,
+        policy: QuorumPolicy,
+    ) -> Self {
         Self { name, group_id, nodes: HashMap::new(), quorum_policy: policy }
     }
 

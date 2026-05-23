@@ -24,7 +24,11 @@ impl Xid {
     ///
     /// # Errors
     /// Returns error if gtrid or bqual exceed maximum sizes.
-    pub fn new(format_id: i32, gtrid: &[u8], bqual: &[u8]) -> Result<Self, XidError> {
+    pub fn new(
+        format_id: i32,
+        gtrid: &[u8],
+        bqual: &[u8],
+    ) -> Result<Self, XidError> {
         if gtrid.len() > MAXGTRIDSIZE {
             return Err(XidError::GtridTooLong(gtrid.len()));
         }

@@ -3,7 +3,9 @@
 //! Returns TigerBeetle-compatible result codes for batch processing.
 
 use crate::account::Account;
-use crate::error::{BatchResult, CreateAccountResult, CreateTransferResult, FtdbError};
+use crate::error::{
+    BatchResult, CreateAccountResult, CreateTransferResult, FtdbError,
+};
 use crate::storage::Storage;
 use crate::transfer::Transfer;
 
@@ -18,7 +20,10 @@ impl Engine {
     }
 
     /// Creates accounts in a batch. Returns results only for failed entries.
-    pub fn create_accounts(&self, accounts: &[Account]) -> Result<Vec<BatchResult>, FtdbError> {
+    pub fn create_accounts(
+        &self,
+        accounts: &[Account],
+    ) -> Result<Vec<BatchResult>, FtdbError> {
         let mut results = Vec::new();
 
         for (i, account) in accounts.iter().enumerate() {
@@ -35,7 +40,10 @@ impl Engine {
     }
 
     /// Creates transfers in a batch. Returns results only for failed entries.
-    pub fn create_transfers(&self, transfers: &[Transfer]) -> Result<Vec<BatchResult>, FtdbError> {
+    pub fn create_transfers(
+        &self,
+        transfers: &[Transfer],
+    ) -> Result<Vec<BatchResult>, FtdbError> {
         let mut results = Vec::new();
 
         for (i, transfer) in transfers.iter().enumerate() {
@@ -52,7 +60,8 @@ impl Engine {
                 Err(_) => {
                     results.push(BatchResult {
                         index: i as u32,
-                        result: CreateTransferResult::DebitAccountNotFound as u32,
+                        result: CreateTransferResult::DebitAccountNotFound
+                            as u32,
                     });
                 }
             }
@@ -62,7 +71,10 @@ impl Engine {
     }
 
     /// Looks up accounts by ID. Returns found accounts (missing IDs are omitted).
-    pub fn lookup_accounts(&self, ids: &[u128]) -> Result<Vec<Account>, FtdbError> {
+    pub fn lookup_accounts(
+        &self,
+        ids: &[u128],
+    ) -> Result<Vec<Account>, FtdbError> {
         let mut results = Vec::new();
         for &id in ids {
             if let Some(acct) = self.storage.get_account(id)? {
@@ -73,7 +85,10 @@ impl Engine {
     }
 
     /// Looks up transfers by ID. Returns found transfers (missing IDs are omitted).
-    pub fn lookup_transfers(&self, ids: &[u128]) -> Result<Vec<Transfer>, FtdbError> {
+    pub fn lookup_transfers(
+        &self,
+        ids: &[u128],
+    ) -> Result<Vec<Transfer>, FtdbError> {
         let mut results = Vec::new();
         for &id in ids {
             if let Some(t) = self.storage.get_transfer(id)? {
@@ -102,7 +117,9 @@ impl Engine {
 
         // Check for mutually exclusive flags
         let flags = account.flags;
-        if flags.debits_must_not_exceed_credits() && flags.credits_must_not_exceed_debits() {
+        if flags.debits_must_not_exceed_credits()
+            && flags.credits_must_not_exceed_debits()
+        {
             return CreateAccountResult::FlagsAreMutuallyExclusive;
         }
 
@@ -134,7 +151,10 @@ impl Engine {
         }
     }
 
-    fn create_one_transfer(&self, transfer: &Transfer) -> Result<CreateTransferResult, FtdbError> {
+    fn create_one_transfer(
+        &self,
+        transfer: &Transfer,
+    ) -> Result<CreateTransferResult, FtdbError> {
         // Validate
         if transfer.id == 0 {
             return Ok(CreateTransferResult::IdMustNotBeZero);
@@ -175,7 +195,10 @@ impl Engine {
 
         let txn = self.storage.begin_transaction()?;
 
-        let mut debit_acct = match self.storage.get_account_txn(&txn, transfer.debit_account_id)? {
+        let mut debit_acct = match self
+            .storage
+            .get_account_txn(&txn, transfer.debit_account_id)?
+        {
             Some(a) => a,
             None => {
                 txn.abort()?;
@@ -183,14 +206,16 @@ impl Engine {
             }
         };
 
-        let mut credit_acct =
-            match self.storage.get_account_txn(&txn, transfer.credit_account_id)? {
-                Some(a) => a,
-                None => {
-                    txn.abort()?;
-                    return Ok(CreateTransferResult::CreditAccountNotFound);
-                }
-            };
+        let mut credit_acct = match self
+            .storage
+            .get_account_txn(&txn, transfer.credit_account_id)?
+        {
+            Some(a) => a,
+            None => {
+                txn.abort()?;
+                return Ok(CreateTransferResult::CreditAccountNotFound);
+            }
+        };
 
         // Balance constraints
         if !debit_acct.can_debit(transfer.amount) {
@@ -207,8 +232,10 @@ impl Engine {
             debit_acct.apply_pending_debit(transfer.amount);
             credit_acct.apply_pending_credit(transfer.amount);
         } else {
-            debit_acct.debits_posted = debit_acct.debits_posted.saturating_add(transfer.amount);
-            credit_acct.credits_posted = credit_acct.credits_posted.saturating_add(transfer.amount);
+            debit_acct.debits_posted =
+                debit_acct.debits_posted.saturating_add(transfer.amount);
+            credit_acct.credits_posted =
+                credit_acct.credits_posted.saturating_add(transfer.amount);
         }
 
         // Persist with server-assigned timestamp
@@ -223,7 +250,10 @@ impl Engine {
         Ok(CreateTransferResult::Ok)
     }
 
-    fn execute_post_pending(&self, post: &Transfer) -> Result<CreateTransferResult, FtdbError> {
+    fn execute_post_pending(
+        &self,
+        post: &Transfer,
+    ) -> Result<CreateTransferResult, FtdbError> {
         if post.pending_id == 0 {
             return Ok(CreateTransferResult::PendingIdMustNotBeZero);
         }
@@ -235,20 +265,24 @@ impl Engine {
 
         let txn = self.storage.begin_transaction()?;
 
-        let pending = match self.storage.get_transfer_txn(&txn, post.pending_id)? {
-            Some(t) => t,
-            None => {
-                txn.abort()?;
-                return Ok(CreateTransferResult::PendingTransferNotFound);
-            }
-        };
+        let pending =
+            match self.storage.get_transfer_txn(&txn, post.pending_id)? {
+                Some(t) => t,
+                None => {
+                    txn.abort()?;
+                    return Ok(CreateTransferResult::PendingTransferNotFound);
+                }
+            };
 
         if !pending.is_pending() {
             txn.abort()?;
             return Ok(CreateTransferResult::PendingTransferNotPending);
         }
 
-        let mut debit_acct = match self.storage.get_account_txn(&txn, pending.debit_account_id)? {
+        let mut debit_acct = match self
+            .storage
+            .get_account_txn(&txn, pending.debit_account_id)?
+        {
             Some(a) => a,
             None => {
                 txn.abort()?;
@@ -256,14 +290,16 @@ impl Engine {
             }
         };
 
-        let mut credit_acct =
-            match self.storage.get_account_txn(&txn, pending.credit_account_id)? {
-                Some(a) => a,
-                None => {
-                    txn.abort()?;
-                    return Ok(CreateTransferResult::CreditAccountNotFound);
-                }
-            };
+        let mut credit_acct = match self
+            .storage
+            .get_account_txn(&txn, pending.credit_account_id)?
+        {
+            Some(a) => a,
+            None => {
+                txn.abort()?;
+                return Ok(CreateTransferResult::CreditAccountNotFound);
+            }
+        };
 
         // Post: move from pending to posted
         let amount = if post.amount != 0 {
@@ -285,7 +321,10 @@ impl Engine {
         Ok(CreateTransferResult::Ok)
     }
 
-    fn execute_void_pending(&self, void: &Transfer) -> Result<CreateTransferResult, FtdbError> {
+    fn execute_void_pending(
+        &self,
+        void: &Transfer,
+    ) -> Result<CreateTransferResult, FtdbError> {
         if void.pending_id == 0 {
             return Ok(CreateTransferResult::PendingIdMustNotBeZero);
         }
@@ -297,20 +336,24 @@ impl Engine {
 
         let txn = self.storage.begin_transaction()?;
 
-        let pending = match self.storage.get_transfer_txn(&txn, void.pending_id)? {
-            Some(t) => t,
-            None => {
-                txn.abort()?;
-                return Ok(CreateTransferResult::PendingTransferNotFound);
-            }
-        };
+        let pending =
+            match self.storage.get_transfer_txn(&txn, void.pending_id)? {
+                Some(t) => t,
+                None => {
+                    txn.abort()?;
+                    return Ok(CreateTransferResult::PendingTransferNotFound);
+                }
+            };
 
         if !pending.is_pending() {
             txn.abort()?;
             return Ok(CreateTransferResult::PendingTransferNotPending);
         }
 
-        let mut debit_acct = match self.storage.get_account_txn(&txn, pending.debit_account_id)? {
+        let mut debit_acct = match self
+            .storage
+            .get_account_txn(&txn, pending.debit_account_id)?
+        {
             Some(a) => a,
             None => {
                 txn.abort()?;
@@ -318,14 +361,16 @@ impl Engine {
             }
         };
 
-        let mut credit_acct =
-            match self.storage.get_account_txn(&txn, pending.credit_account_id)? {
-                Some(a) => a,
-                None => {
-                    txn.abort()?;
-                    return Ok(CreateTransferResult::CreditAccountNotFound);
-                }
-            };
+        let mut credit_acct = match self
+            .storage
+            .get_account_txn(&txn, pending.credit_account_id)?
+        {
+            Some(a) => a,
+            None => {
+                txn.abort()?;
+                return Ok(CreateTransferResult::CreditAccountNotFound);
+            }
+        };
 
         // Void: remove from pending
         debit_acct.void_pending_debit(pending.amount);
@@ -408,7 +453,8 @@ mod tests {
         let (engine, _dir) = setup();
 
         let mut sender = Account { code: 1, ..Account::new(1, 100) };
-        sender.flags = AccountFlags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS);
+        sender.flags =
+            AccountFlags(AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS);
         sender.credits_posted = 100;
         let receiver = Account { code: 1, ..Account::new(2, 100) };
         engine.create_accounts(&[sender, receiver]).unwrap();
@@ -416,7 +462,10 @@ mod tests {
         let transfer = Transfer::new(100, 1, 2, 200);
         let results = engine.create_transfers(&[transfer]).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].result, CreateTransferResult::ExceedsCredits as u32);
+        assert_eq!(
+            results[0].result,
+            CreateTransferResult::ExceedsCredits as u32
+        );
     }
 
     #[test]

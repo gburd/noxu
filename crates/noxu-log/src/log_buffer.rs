@@ -19,16 +19,16 @@
 //! - Read access requires holding either the LWL or the read_latch.
 
 use bytes::BytesMut;
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_sync::RawMutex;
 use noxu_sync::lock_api::RawMutex as RawMutexTrait;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
 /// A write buffer backed by `BytesMut`.
 ///
-/// 
+///
 ///
 /// Uses a RawMutex with manual lock/unlock to match explicit
 /// latch_for_write/release pattern (not RAII).
@@ -321,7 +321,7 @@ impl LogBuffer {
 
 /// A segment allocated within a LogBuffer for writing.
 ///
-/// 
+///
 ///
 /// Holds a raw pointer into the LogBuffer's data region. The LogBuffer's
 /// latch and pin count protocol ensures the pointer remains valid for the

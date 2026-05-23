@@ -19,8 +19,8 @@
 //! which LNs to undo.
 
 use crate::log_scanner::InRecord;
-use noxu_util::{Lsn, NULL_LSN};
 use hashbrown::{HashMap, HashSet};
+use noxu_util::{Lsn, NULL_LSN};
 
 /// Key that uniquely identifies a dirty IN across databases.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -137,10 +137,10 @@ impl AnalysisResult {
         if record.db_id > self.max_db_id {
             self.max_db_id = record.db_id;
         }
-        let entry = self.dirty_ins.entry(key).or_insert_with(|| DirtyInEntry {
-            record: record.clone(),
-            lsn,
-        });
+        let entry = self
+            .dirty_ins
+            .entry(key)
+            .or_insert_with(|| DirtyInEntry { record: record.clone(), lsn });
         // Keep the latest version
         if lsn > entry.lsn {
             entry.record = record;
@@ -219,9 +219,7 @@ impl AnalysisResult {
     ///
     /// Bottom-up level iteration.
     /// `redoDirtyNodes`.
-    pub fn take_dirty_ins_by_level(
-        &mut self,
-    ) -> Vec<(i32, Vec<DirtyInEntry>)> {
+    pub fn take_dirty_ins_by_level(&mut self) -> Vec<(i32, Vec<DirtyInEntry>)> {
         let mut by_level: HashMap<i32, Vec<DirtyInEntry>> = HashMap::new();
         for entry in self.dirty_ins.drain().map(|(_, v)| v) {
             by_level.entry(entry.record.level).or_default().push(entry);
@@ -244,8 +242,20 @@ mod tests {
     use super::*;
     use crate::log_scanner::InRecord;
 
-    fn make_in(db_id: u64, node_id: u64, level: i32, is_root: bool) -> InRecord {
-        InRecord { db_id, node_id, level, is_root, is_delta: false, node_data: None }
+    fn make_in(
+        db_id: u64,
+        node_id: u64,
+        level: i32,
+        is_root: bool,
+    ) -> InRecord {
+        InRecord {
+            db_id,
+            node_id,
+            level,
+            is_root,
+            is_delta: false,
+            node_data: None,
+        }
     }
 
     fn lsn(file: u32, offset: u32) -> Lsn {

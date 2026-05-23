@@ -84,7 +84,7 @@ impl VlsnRange {
 
     /// Return true if this VLSN is within the range described by this struct.
     ///
-    /// 
+    ///
     pub fn contains(&self, vlsn: u64) -> bool {
         if self.first == 0 {
             return false;
@@ -107,7 +107,7 @@ impl VlsnRange {
     /// Otherwise, first is updated if the new VLSN is smaller, and last
     /// is updated if the new VLSN is larger.
     ///
-    /// 
+    ///
     ///
     /// Note: does not track per-entry-type commit/barrier VLSNs (those are
     /// managed by `VlsnIndex` at a higher level).
@@ -147,7 +147,7 @@ impl VlsnRange {
     /// before the first VLSN, the range becomes empty. The commit and sync
     /// VLSNs are clamped to the new last VLSN.
     ///
-    /// 
+    ///
     pub fn truncate_after(&mut self, vlsn: u64) {
         if vlsn == 0 || (self.first > 0 && vlsn < self.first) {
             // Truncation point is before the range start; empty the range.
@@ -521,12 +521,8 @@ mod tests {
     /// Merging two ranges always yields first <= last (if non-empty).
     #[test]
     fn test_merge_maintains_first_le_last() {
-        let cases: &[(u64, u64, u64, u64)] = &[
-            (1, 10, 5, 15),
-            (5, 5, 5, 5),
-            (1, 1, 100, 100),
-            (3, 7, 1, 4),
-        ];
+        let cases: &[(u64, u64, u64, u64)] =
+            &[(1, 10, 5, 15), (5, 5, 5, 5), (1, 1, 100, 100), (3, 7, 1, 4)];
         for &(af, al, bf, bl) in cases {
             let mut a = VlsnRange::with_range(af, al);
             let b = VlsnRange::with_range(bf, bl);
@@ -586,7 +582,13 @@ mod tests {
         let cases: &[(u64, u64)] = &[(1, 1), (1, 10), (5, 20), (100, 100)];
         for &(f, l) in cases {
             let range = VlsnRange::with_range(f, l);
-            assert_eq!(range.len(), l - f + 1, "len mismatch for ({},{})", f, l);
+            assert_eq!(
+                range.len(),
+                l - f + 1,
+                "len mismatch for ({},{})",
+                f,
+                l
+            );
         }
         assert_eq!(VlsnRange::new().len(), 0);
     }

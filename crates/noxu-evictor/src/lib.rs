@@ -63,14 +63,14 @@ pub use arbiter::Arbiter;
 pub use cache_mode::CacheMode;
 pub use error::{EvictorError, Result};
 pub use evictor::{
-    decide_eviction, EvictResult, EvictionDecision, EvictionSource, Evictor,
-    NodeEvictionInfo,
+    EvictResult, EvictionDecision, EvictionSource, Evictor, NodeEvictionInfo,
+    decide_eviction,
 };
 pub use evictor_stat::EvictorStats;
 pub use lru_list::LruList;
 pub use off_heap::{OffHeapCache, OffHeapStats};
-pub use policy::{EvictionAlgorithm, EvictionPolicy};
 pub use policies::{ArcPolicy, CarPolicy, ClockPolicy, LirsPolicy, LruPolicy};
+pub use policy::{EvictionAlgorithm, EvictionPolicy};
 
 #[cfg(test)]
 mod tests {

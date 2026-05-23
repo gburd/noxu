@@ -25,15 +25,15 @@ pub const EMBEDDED_LN_BIT: u8 = 0x10;
 pub const NO_DATA_LN_BIT: u8 = 0x20;
 
 /// Update key when logged bit - transient flag to update key on next log.
-/// 
+///
 pub const UPDATE_KEY_WHEN_LOGGED: u8 = 0x40;
 
 /// Tombstone bit - slot is a blind-deletion tombstone.
-/// 
+///
 pub const TOMBSTONE_BIT: u8 = 0x80;
 
 /// Mask for transient state bits (not logged to disk).
-/// 
+///
 /// Bit 0x04 (MIGRATE_BIT) is always transient; UPDATE_KEY_WHEN_LOGGED is also transient.
 pub const TRANSIENT_BITS: u8 = MIGRATE_BIT | UPDATE_KEY_WHEN_LOGGED;
 
@@ -172,7 +172,7 @@ impl SlotState {
 
     /// Returns true if the update-key-when-logged (transient) bit is set.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_update_key_when_logged(self) -> bool {
         (self.0 & UPDATE_KEY_WHEN_LOGGED) != 0
@@ -193,7 +193,7 @@ impl SlotState {
     /// Returns true if the tombstone bit is set.
     ///
     /// A tombstone slot is a blind-deletion marker (extended capability).
-    /// 
+    ///
     #[inline]
     pub fn is_tombstone(self) -> bool {
         (self.0 & TOMBSTONE_BIT) != 0
@@ -214,7 +214,7 @@ impl SlotState {
     /// Clears all transient bits (not persisted to disk).
     ///
     /// Transient bits are: MIGRATE_BIT (0x04), UPDATE_KEY_WHEN_LOGGED (0x40).
-    /// 
+    ///
     #[inline]
     pub fn clear_transient_bits(&mut self) {
         self.0 &= !TRANSIENT_BITS;

@@ -9,7 +9,7 @@ use crate::lock_mode::LockMode;
 /// Specifies optional parameters that control read behavior, including
 /// locking and caching.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOptions {
     /// Lock mode for the read operation.

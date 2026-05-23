@@ -6,7 +6,9 @@
 //! cursor count(), key order verification, large-batch iteration.
 
 use noxu_db::cursor::CursorState;
-use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, Put};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, Put,
+};
 use tempfile::TempDir;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -418,7 +420,10 @@ fn cursor_iterates_100_records_in_order() {
     let mut s = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
     while s == OperationStatus::Success {
         if let Some(ref pk) = prev_key {
-            assert!(key.data() > pk.as_slice(), "keys must be strictly increasing");
+            assert!(
+                key.data() > pk.as_slice(),
+                "keys must be strictly increasing"
+            );
         }
         prev_key = Some(key.data().to_vec());
         count += 1;
@@ -456,5 +461,8 @@ fn cursor_keys_returned_in_lexicographic_order() {
     }
     let mut sorted = keys.clone();
     sorted.sort();
-    assert_eq!(keys, sorted, "iteration order must be lexicographically sorted");
+    assert_eq!(
+        keys, sorted,
+        "iteration order must be lexicographically sorted"
+    );
 }

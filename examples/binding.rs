@@ -33,7 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let binding = IntBinding::new();
 
         // Store integers as sorted keys
-        let values: Vec<i32> = vec![42, -7, 0, 1000, -999, 1, i32::MAX, i32::MIN];
+        let values: Vec<i32> =
+            vec![42, -7, 0, 1000, -999, 1, i32::MAX, i32::MIN];
         for &val in &values {
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut key_entry)?;

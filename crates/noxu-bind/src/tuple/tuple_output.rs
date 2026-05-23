@@ -11,7 +11,7 @@ use noxu_util::packed::{write_sorted_i32, write_sorted_i64};
 /// flipped for sortable ordering. Floats use IEEE 754 with bit manipulation
 /// for sortable ordering.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct TupleOutput {
     buf: Vec<u8>,
@@ -212,7 +212,7 @@ impl TupleOutput {
     /// This is an unsorted encoding  -  it is compact but the byte representation
     /// does NOT sort in the same order as the integer values.
     ///
-    /// 
+    ///
     ///
     /// Values can be read using `TupleInput::read_packed_int`.
     pub fn write_packed_int(&mut self, value: i32) {
@@ -269,7 +269,7 @@ impl TupleOutput {
     /// This is an unsorted encoding  -  it is compact but the byte representation
     /// does NOT sort in the same order as the integer values.
     ///
-    /// 
+    ///
     ///
     /// Values can be read using `TupleInput::read_packed_long`.
     pub fn write_packed_long(&mut self, value: i64) {
@@ -410,7 +410,7 @@ impl TupleOutput {
     /// The encoding is identical to an unsigned big-endian u16: the high byte
     /// first, then the low byte. This matches Java's `DataOutputStream.writeChar`.
     ///
-    /// 
+    ///
     ///
     /// Values can be read using `TupleInput::read_char`.
     pub fn write_char(&mut self, val: u16) {
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     fn test_format_multi_string_size() {
         let mut out = TupleOutput::new();
-        out.write_string("abc");  // 3 + 2 = 5
+        out.write_string("abc"); // 3 + 2 = 5
         out.write_string("defg"); // 4 + 2 = 6 → total 11
         assert_eq!(out.len(), 11);
     }
@@ -815,14 +815,14 @@ mod tests {
     /// TupleOrderingTest.testByte: signed byte full ordering.
     #[test]
     fn test_ordering_i8_full_boundary() {
-        let data: &[i8] = &[
-            i8::MIN, i8::MIN + 1, -1, 0, 1, i8::MAX - 1, i8::MAX,
-        ];
+        let data: &[i8] =
+            &[i8::MIN, i8::MIN + 1, -1, 0, 1, i8::MAX - 1, i8::MAX];
         for i in 0..data.len() - 1 {
             assert!(
                 encode_i8(data[i]) < encode_i8(data[i + 1]),
                 "i8 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -831,17 +831,24 @@ mod tests {
     #[test]
     fn test_ordering_i16_full_boundary() {
         let data: &[i16] = &[
-            i16::MIN, i16::MIN + 1,
-            i8::MIN as i16, i8::MIN as i16 + 1,
-            -1, 0, 1,
-            i8::MAX as i16 - 1, i8::MAX as i16,
-            i16::MAX - 1, i16::MAX,
+            i16::MIN,
+            i16::MIN + 1,
+            i8::MIN as i16,
+            i8::MIN as i16 + 1,
+            -1,
+            0,
+            1,
+            i8::MAX as i16 - 1,
+            i8::MAX as i16,
+            i16::MAX - 1,
+            i16::MAX,
         ];
         for i in 0..data.len() - 1 {
             assert!(
                 encode_i16(data[i]) < encode_i16(data[i + 1]),
                 "i16 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -850,19 +857,28 @@ mod tests {
     #[test]
     fn test_ordering_i32_full_boundary() {
         let data: &[i32] = &[
-            i32::MIN, i32::MIN + 1,
-            i16::MIN as i32, i16::MIN as i32 + 1,
-            i8::MIN as i32, i8::MIN as i32 + 1,
-            -1, 0, 1,
-            i8::MAX as i32 - 1, i8::MAX as i32,
-            i16::MAX as i32 - 1, i16::MAX as i32,
-            i32::MAX - 1, i32::MAX,
+            i32::MIN,
+            i32::MIN + 1,
+            i16::MIN as i32,
+            i16::MIN as i32 + 1,
+            i8::MIN as i32,
+            i8::MIN as i32 + 1,
+            -1,
+            0,
+            1,
+            i8::MAX as i32 - 1,
+            i8::MAX as i32,
+            i16::MAX as i32 - 1,
+            i16::MAX as i32,
+            i32::MAX - 1,
+            i32::MAX,
         ];
         for i in 0..data.len() - 1 {
             assert!(
                 encode_i32(data[i]) < encode_i32(data[i + 1]),
                 "i32 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -871,21 +887,32 @@ mod tests {
     #[test]
     fn test_ordering_i64_full_boundary() {
         let data: &[i64] = &[
-            i64::MIN, i64::MIN + 1,
-            i32::MIN as i64, i32::MIN as i64 + 1,
-            i16::MIN as i64, i16::MIN as i64 + 1,
-            i8::MIN as i64, i8::MIN as i64 + 1,
-            -1, 0, 1,
-            i8::MAX as i64 - 1, i8::MAX as i64,
-            i16::MAX as i64 - 1, i16::MAX as i64,
-            i32::MAX as i64 - 1, i32::MAX as i64,
-            i64::MAX - 1, i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
+            i32::MIN as i64,
+            i32::MIN as i64 + 1,
+            i16::MIN as i64,
+            i16::MIN as i64 + 1,
+            i8::MIN as i64,
+            i8::MIN as i64 + 1,
+            -1,
+            0,
+            1,
+            i8::MAX as i64 - 1,
+            i8::MAX as i64,
+            i16::MAX as i64 - 1,
+            i16::MAX as i64,
+            i32::MAX as i64 - 1,
+            i32::MAX as i64,
+            i64::MAX - 1,
+            i64::MAX,
         ];
         for i in 0..data.len() - 1 {
             assert!(
                 encode_i64(data[i]) < encode_i64(data[i + 1]),
                 "i64 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -898,7 +925,8 @@ mod tests {
             assert!(
                 encode_u8(data[i]) < encode_u8(data[i + 1]),
                 "u8 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -911,7 +939,8 @@ mod tests {
             assert!(
                 encode_u16(data[i]) < encode_u16(data[i + 1]),
                 "u16 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -920,14 +949,15 @@ mod tests {
     #[test]
     fn test_ordering_u32_full() {
         let data: &[u32] = &[
-            0, 1, 0xFE, 0xFF, 0x800, 0x7FFF, 0xFFFF,
-            0x80000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+            0, 1, 0xFE, 0xFF, 0x800, 0x7FFF, 0xFFFF, 0x80000, 0x7FFFFFFF,
+            0x80000000, 0xFFFFFFFF,
         ];
         for i in 0..data.len() - 1 {
             assert!(
                 encode_u32(data[i]) < encode_u32(data[i + 1]),
                 "u32 ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -950,8 +980,13 @@ mod tests {
             0.0,
             f32::MIN_POSITIVE,
             2.0 * f32::MIN_POSITIVE,
-            0.01, 0.02, 0.99,
-            1.0, 1.01, 1.02, 1.99,
+            0.01,
+            0.02,
+            0.99,
+            1.0,
+            1.01,
+            1.02,
+            1.99,
             f32::MAX,
             f32::INFINITY,
         ];
@@ -959,7 +994,8 @@ mod tests {
             assert!(
                 encode_f32(data[i]) < encode_f32(data[i + 1]),
                 "positive float ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -971,8 +1007,13 @@ mod tests {
             0.0,
             f64::MIN_POSITIVE,
             2.0 * f64::MIN_POSITIVE,
-            0.001, 0.002, 0.999,
-            1.0, 1.001, 1.002, 1.999,
+            0.001,
+            0.002,
+            0.999,
+            1.0,
+            1.001,
+            1.002,
+            1.999,
             f64::MAX,
             f64::INFINITY,
         ];
@@ -980,7 +1021,8 @@ mod tests {
             assert!(
                 encode_f64(data[i]) < encode_f64(data[i + 1]),
                 "positive double ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -991,14 +1033,25 @@ mod tests {
         let data: &[f32] = &[
             f32::NEG_INFINITY,
             -f32::MAX,
-            -1.99, -1.02, -1.01, -1.0, -0.99, -0.02, -0.01,
+            -1.99,
+            -1.02,
+            -1.01,
+            -1.0,
+            -0.99,
+            -0.02,
+            -0.01,
             -2.0 * f32::MIN_POSITIVE,
             -f32::MIN_POSITIVE,
             0.0,
             f32::MIN_POSITIVE,
             2.0 * f32::MIN_POSITIVE,
-            0.01, 0.02, 0.99,
-            1.0, 1.01, 1.02, 1.99,
+            0.01,
+            0.02,
+            0.99,
+            1.0,
+            1.01,
+            1.02,
+            1.99,
             f32::MAX,
             f32::INFINITY,
             f32::NAN,
@@ -1007,7 +1060,9 @@ mod tests {
             assert!(
                 encode_f32_sorted(data[i]) < encode_f32_sorted(data[i + 1]),
                 "sorted float ordering violated at index {}: {} should be < {}",
-                i, data[i], data[i + 1]
+                i,
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -1018,14 +1073,25 @@ mod tests {
         let data: &[f64] = &[
             f64::NEG_INFINITY,
             -f64::MAX,
-            -1.999, -1.002, -1.001, -1.0, -0.999, -0.002, -0.001,
+            -1.999,
+            -1.002,
+            -1.001,
+            -1.0,
+            -0.999,
+            -0.002,
+            -0.001,
             -2.0 * f64::MIN_POSITIVE,
             -f64::MIN_POSITIVE,
             0.0,
             f64::MIN_POSITIVE,
             2.0 * f64::MIN_POSITIVE,
-            0.001, 0.002, 0.999,
-            1.0, 1.001, 1.002, 1.999,
+            0.001,
+            0.002,
+            0.999,
+            1.0,
+            1.001,
+            1.002,
+            1.999,
             f64::MAX,
             f64::INFINITY,
             f64::NAN,
@@ -1034,7 +1100,9 @@ mod tests {
             assert!(
                 encode_f64_sorted(data[i]) < encode_f64_sorted(data[i + 1]),
                 "sorted double ordering violated at index {}: {} should be < {}",
-                i, data[i], data[i + 1]
+                i,
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -1050,7 +1118,8 @@ mod tests {
             assert!(
                 a.to_vec() < b.to_vec(),
                 "packed_int ordering violated: {} should be < {}",
-                i, i + 1
+                i,
+                i + 1
             );
         }
     }
@@ -1066,7 +1135,8 @@ mod tests {
             assert!(
                 a.to_vec() < b.to_vec(),
                 "packed_long ordering violated: {} should be < {}",
-                i, i + 1
+                i,
+                i + 1
             );
         }
     }
@@ -1075,13 +1145,21 @@ mod tests {
     #[test]
     fn test_ordering_sorted_packed_int_full_boundary() {
         let data: &[i32] = &[
-            i32::MIN, i32::MIN + 1,
-            i16::MIN as i32, i16::MIN as i32 + 1,
-            i8::MIN as i32, i8::MIN as i32 + 1,
-            -1, 0, 1,
-            i8::MAX as i32 - 1, i8::MAX as i32,
-            i16::MAX as i32 - 1, i16::MAX as i32,
-            i32::MAX - 1, i32::MAX,
+            i32::MIN,
+            i32::MIN + 1,
+            i16::MIN as i32,
+            i16::MIN as i32 + 1,
+            i8::MIN as i32,
+            i8::MIN as i32 + 1,
+            -1,
+            0,
+            1,
+            i8::MAX as i32 - 1,
+            i8::MAX as i32,
+            i16::MAX as i32 - 1,
+            i16::MAX as i32,
+            i32::MAX - 1,
+            i32::MAX,
         ];
         for i in 0..data.len() - 1 {
             let mut a = TupleOutput::new();
@@ -1091,7 +1169,8 @@ mod tests {
             assert!(
                 a.to_vec() < b.to_vec(),
                 "sorted_packed_int ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -1100,15 +1179,25 @@ mod tests {
     #[test]
     fn test_ordering_sorted_packed_long_full_boundary() {
         let data: &[i64] = &[
-            i64::MIN, i64::MIN + 1,
-            i32::MIN as i64, i32::MIN as i64 + 1,
-            i16::MIN as i64, i16::MIN as i64 + 1,
-            i8::MIN as i64, i8::MIN as i64 + 1,
-            -1, 0, 1,
-            i8::MAX as i64 - 1, i8::MAX as i64,
-            i16::MAX as i64 - 1, i16::MAX as i64,
-            i32::MAX as i64 - 1, i32::MAX as i64,
-            i64::MAX - 1, i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
+            i32::MIN as i64,
+            i32::MIN as i64 + 1,
+            i16::MIN as i64,
+            i16::MIN as i64 + 1,
+            i8::MIN as i64,
+            i8::MIN as i64 + 1,
+            -1,
+            0,
+            1,
+            i8::MAX as i64 - 1,
+            i8::MAX as i64,
+            i16::MAX as i64 - 1,
+            i16::MAX as i64,
+            i32::MAX as i64 - 1,
+            i32::MAX as i64,
+            i64::MAX - 1,
+            i64::MAX,
         ];
         for i in 0..data.len() - 1 {
             let mut a = TupleOutput::new();
@@ -1118,7 +1207,8 @@ mod tests {
             assert!(
                 a.to_vec() < b.to_vec(),
                 "sorted_packed_long ordering violated: {} should be < {}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -1224,8 +1314,14 @@ mod tests {
         let b = encode_strings(&["b"]);
 
         assert!(a < a_empty, "\"a\" should sort before \"a\"+\"\"");
-        assert!(a_empty < a_empty_a, "\"a\"+\"\" should sort before \"a\"+\"\"+\"a\"");
-        assert!(a_empty_a < a_b, "\"a\"+\"\"+\"a\" should sort before \"a\"+\"b\"");
+        assert!(
+            a_empty < a_empty_a,
+            "\"a\"+\"\" should sort before \"a\"+\"\"+\"a\""
+        );
+        assert!(
+            a_empty_a < a_b,
+            "\"a\"+\"\"+\"a\" should sort before \"a\"+\"b\""
+        );
         assert!(a_b < aa, "\"a\"+\"b\" should sort before \"aa\"");
         assert!(aa < b, "\"aa\" should sort before \"b\"");
     }

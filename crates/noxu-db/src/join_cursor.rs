@@ -85,11 +85,14 @@ impl<'a> JoinCursor<'a> {
 
         if !config.no_sort && cursors.len() > 1 {
             // Collect estimates first (avoids repeated mutable borrows).
-            let estimates: Vec<u64> = cursors.iter_mut().map(|c| c.count_estimate()).collect();
+            let estimates: Vec<u64> =
+                cursors.iter_mut().map(|c| c.count_estimate()).collect();
             // Stable sort by estimate ascending (smallest first = fewest candidates).
-            let mut indexed: Vec<(usize, u64)> = estimates.iter().copied().enumerate().collect();
+            let mut indexed: Vec<(usize, u64)> =
+                estimates.iter().copied().enumerate().collect();
             indexed.sort_by_key(|&(_, est)| est);
-            let order: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
+            let order: Vec<usize> =
+                indexed.into_iter().map(|(i, _)| i).collect();
             let mut sorted = Vec::with_capacity(cursors.len());
             let mut slots: Vec<Option<SecondaryCursor<'a>>> =
                 cursors.into_iter().map(Some).collect();
@@ -119,13 +122,7 @@ impl<'a> JoinCursor<'a> {
         }
 
         let exhausted = candidates.is_empty();
-        Ok(Self {
-            primary_db,
-            cursors,
-            config,
-            candidates,
-            exhausted,
-        })
+        Ok(Self { primary_db, cursors, config, candidates, exhausted })
     }
 
     /// Returns the next primary key **and** primary record data from the join.
@@ -160,7 +157,10 @@ impl<'a> JoinCursor<'a> {
     /// Equivalent to 's `JoinCursor.getNext(key, lockMode)` single-arg
     /// overload.  Useful when only the key is needed and avoiding a primary
     /// read is desirable.
-    pub fn get_next_key(&mut self, key: &mut DatabaseEntry) -> Result<OperationStatus> {
+    pub fn get_next_key(
+        &mut self,
+        key: &mut DatabaseEntry,
+    ) -> Result<OperationStatus> {
         match self.next_matching_candidate()? {
             None => Ok(OperationStatus::NotFound),
             Some(candidate) => {
@@ -207,7 +207,9 @@ impl<'a> JoinCursor<'a> {
             if self.candidates.is_empty() {
                 match self.cursors[0].get_next_dup()? {
                     OperationStatus::Success => {
-                        if let Some(pk) = self.cursors[0].get_current_primary_key_only()? {
+                        if let Some(pk) =
+                            self.cursors[0].get_current_primary_key_only()?
+                        {
                             self.candidates.push_back(pk);
                         }
                     }
@@ -352,13 +354,7 @@ mod tests {
             )
             .unwrap();
 
-            Fixture {
-                _tmp: tmp,
-                _env: env,
-                primary,
-                sec1,
-                sec2,
-            }
+            Fixture { _tmp: tmp, _env: env, primary, sec1, sec2 }
         }
 
         fn insert(&self, pk: &[u8], val: &[u8]) {
@@ -398,7 +394,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             let s = cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
             assert_eq!(s, OperationStatus::Success);
         }
@@ -408,7 +408,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             let s = cursor2
-                .get_search_key(&DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"B"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
             assert_eq!(s, OperationStatus::Success);
         }
@@ -457,7 +461,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
         let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
@@ -465,7 +473,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor2
-                .get_search_key(&DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"B"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
 
@@ -489,7 +501,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
         let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
@@ -497,13 +513,18 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor2
-                .get_search_key(&DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"B"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
 
         let config = JoinConfig::new().with_no_sort(true);
         let pri_guard = fix.primary.lock();
-        let mut join = pri_guard.join(vec![cursor1, cursor2], Some(config)).unwrap();
+        let mut join =
+            pri_guard.join(vec![cursor1, cursor2], Some(config)).unwrap();
         assert!(join.get_config().no_sort);
 
         let mut key = DatabaseEntry::new();
@@ -528,7 +549,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
         let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
@@ -536,7 +561,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor2
-                .get_search_key(&DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"B"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
 
@@ -560,7 +589,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
 
@@ -585,7 +618,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
 
@@ -605,7 +642,11 @@ mod tests {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             cursor1
-                .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
                 .unwrap();
         }
 

@@ -5,9 +5,7 @@
 //! FileSummary counting, CleanerThrottle EWMA, FileProtector, Cleaner
 //! construction and stats.
 
-use noxu_cleaner::{
-    CleanerThrottle, FileSummary, FileSelector, FileStatus,
-};
+use noxu_cleaner::{CleanerThrottle, FileSelector, FileStatus, FileSummary};
 
 // ─── 1. FileSelector: empty state ─────────────────────────────────────────────
 
@@ -84,7 +82,8 @@ fn file_selector_select_multiple_files_in_order() {
     let f2 = fs.select_file_for_cleaning().map(|(n, _)| n);
     let f3 = fs.select_file_for_cleaning().map(|(n, _)| n);
     // All three should be returned in some order.
-    let mut selected = [f1, f2, f3].iter().filter_map(|&x| x).collect::<Vec<_>>();
+    let mut selected =
+        [f1, f2, f3].iter().filter_map(|&x| x).collect::<Vec<_>>();
     selected.sort();
     assert_eq!(selected, vec![1, 2, 3]);
 }
@@ -229,7 +228,10 @@ fn file_selector_adjusted_util_lower_with_expired_lns() {
     let raw = FileSelector::utilization_pct(&s);
     let adj = FileSelector::adjusted_utilization_pct(&s);
     // Adjusted util should be lower than raw (expired bytes reduce effective active).
-    assert!(adj <= raw, "adjusted utilization must be ≤ raw when expired LNs exist");
+    assert!(
+        adj <= raw,
+        "adjusted utilization must be ≤ raw when expired LNs exist"
+    );
 }
 
 // ─── 6. FileSelector: clear ───────────────────────────────────────────────────
@@ -308,14 +310,20 @@ fn throttle_update_cleaning_needed_caps_sleep() {
     let t = CleanerThrottle::new(0);
     // With cleaning needed, sleep should be capped at BASE_SLEEP_MS.
     let (sleep, _n_files) = t.update(0, true);
-    assert!(sleep <= 1000, "when cleaning needed, sleep must be ≤ BASE_SLEEP_MS (1000ms)");
+    assert!(
+        sleep <= 1000,
+        "when cleaning needed, sleep must be ≤ BASE_SLEEP_MS (1000ms)"
+    );
 }
 
 #[test]
 fn throttle_n_files_at_least_one_when_cleaning_needed() {
     let t = CleanerThrottle::new(0);
     let (_sleep, n) = t.update(0, true);
-    assert!(n >= 1, "should recommend at least 1 file to clean when cleaning needed");
+    assert!(
+        n >= 1,
+        "should recommend at least 1 file to clean when cleaning needed"
+    );
 }
 
 #[test]

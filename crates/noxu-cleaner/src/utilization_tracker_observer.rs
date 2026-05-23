@@ -43,9 +43,12 @@ impl LogWriteObserver for UtilizationTrackerObserver {
         is_ln: bool,
         is_in: bool,
     ) {
-        self.tracker
-            .lock()
-            .count_new_log_entry(file_num, entry_size as i32, is_ln, is_in);
+        self.tracker.lock().count_new_log_entry(
+            file_num,
+            entry_size as i32,
+            is_ln,
+            is_in,
+        );
     }
 
     fn count_obsolete(
@@ -55,8 +58,11 @@ impl LogWriteObserver for UtilizationTrackerObserver {
         entry_size: u32,
         is_ln: bool,
     ) {
-        self.tracker
-            .lock()
-            .track_obsolete(file_num, offset, entry_size as i32, is_ln);
+        self.tracker.lock().track_obsolete(
+            file_num,
+            offset,
+            entry_size as i32,
+            is_ln,
+        );
     }
 }

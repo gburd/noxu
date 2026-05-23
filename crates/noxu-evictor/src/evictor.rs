@@ -38,12 +38,12 @@ use crate::slab::SlabList;
 use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_sync::Mutex;
+use noxu_tree::NodeRwLock;
 use noxu_tree::tree::{BinEntry, BinStub, InEntry, InNodeStub, Tree, TreeNode};
 use noxu_util::NULL_LSN;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use noxu_tree::NodeRwLock;
 
 // ---------------------------------------------------------------------------
 // EvictionSource
@@ -75,8 +75,12 @@ pub struct EvictResult {
 }
 
 impl EvictResult {
-    pub fn zero() -> Self { Self { nodes_evicted: 0, bytes_evicted: 0 } }
-    pub fn new(nodes_evicted: u64, bytes_evicted: u64) -> Self { Self { nodes_evicted, bytes_evicted } }
+    pub fn zero() -> Self {
+        Self { nodes_evicted: 0, bytes_evicted: 0 }
+    }
+    pub fn new(nodes_evicted: u64, bytes_evicted: u64) -> Self {
+        Self { nodes_evicted, bytes_evicted }
+    }
     pub fn add(&mut self, other: &EvictResult) {
         self.nodes_evicted += other.nodes_evicted;
         self.bytes_evicted += other.bytes_evicted;
@@ -116,10 +120,18 @@ pub fn decide_eviction(
     already_in_pri2: bool,
     use_dirty_lru: bool,
 ) -> EvictionDecision {
-    if !info.is_resident()                                        { return EvictionDecision::Skip; }
-    if info.ref_count() > 0                                       { return EvictionDecision::PutBack; }
-    if info.is_bin()                                              { return EvictionDecision::PartialEvict; }
-    if use_dirty_lru && info.is_dirty() && !already_in_pri2       { return EvictionDecision::MoveDirtyToPri2; }
+    if !info.is_resident() {
+        return EvictionDecision::Skip;
+    }
+    if info.ref_count() > 0 {
+        return EvictionDecision::PutBack;
+    }
+    if info.is_bin() {
+        return EvictionDecision::PartialEvict;
+    }
+    if use_dirty_lru && info.is_dirty() && !already_in_pri2 {
+        return EvictionDecision::MoveDirtyToPri2;
+    }
     EvictionDecision::Evict
 }
 
@@ -165,9 +177,13 @@ impl Evictor {
     ///
     /// Use the builder methods `with_algorithm`, `with_scan_algorithm`,
     /// `with_log_manager`, and `with_tree` to configure further.
-    pub fn new(arbiter: Arbiter, max_batch_size: usize, lru_only: bool) -> Self {
+    pub fn new(
+        arbiter: Arbiter,
+        max_batch_size: usize,
+        lru_only: bool,
+    ) -> Self {
         let primary = EvictionAlgorithm::Lru.new_policy();
-        let scan    = EvictionAlgorithm::Lru.new_policy();
+        let scan = EvictionAlgorithm::Lru.new_policy();
         Self::with_policies(arbiter, max_batch_size, lru_only, primary, scan)
     }
 
@@ -206,11 +222,17 @@ impl Evictor {
     /// Clears all currently tracked nodes.
     pub fn with_algorithm(self, algo: EvictionAlgorithm) -> Self {
         let primary = algo.new_policy();
-        let scan    = algo.new_policy();
-        Self::with_policies(self.arbiter, self.max_batch_size, self.lru_only, primary, scan)
-            .with_opt_log_manager(self.log_manager)
-            .with_opt_tree(self.tree, self.db_id)
-            .with_opt_off_heap(self.off_heap)
+        let scan = algo.new_policy();
+        Self::with_policies(
+            self.arbiter,
+            self.max_batch_size,
+            self.lru_only,
+            primary,
+            scan,
+        )
+        .with_opt_log_manager(self.log_manager)
+        .with_opt_tree(self.tree, self.db_id)
+        .with_opt_off_heap(self.off_heap)
     }
 
     /// Set only the scan-resistant policy to a different algorithm.
@@ -246,7 +268,11 @@ impl Evictor {
         self.log_manager = lm;
         self
     }
-    fn with_opt_tree(mut self, tree: Option<Arc<RwLock<Tree>>>, db_id: u64) -> Self {
+    fn with_opt_tree(
+        mut self,
+        tree: Option<Arc<RwLock<Tree>>>,
+        db_id: u64,
+    ) -> Self {
         self.tree = tree;
         self.db_id = db_id;
         self
@@ -321,7 +347,8 @@ impl Evictor {
     /// the checkpointer logs it, after which
     /// `complete_checkpoint_for_node` moves it back to primary.
     pub fn move_to_pri2(&self, node_id: u64) -> bool {
-        let removed = self.primary_policy.remove(node_id) || self.scan_policy.remove(node_id);
+        let removed = self.primary_policy.remove(node_id)
+            || self.scan_policy.remove(node_id);
         if removed {
             self.pri2.lock().add_back(node_id);
             self.stats.increment(&self.stats.nodes_moved_to_pri2_lru);
@@ -368,46 +395,73 @@ impl Evictor {
         // the hot end; without quotas the batch would re-select them in the
         // same pass, causing infinite cycling.  We process at most (quota)
         // candidates per phase — correct's maxNodesScanned semantics.
-        let scan_quota    = self.scan_policy.len();
+        let scan_quota = self.scan_policy.len();
         let primary_quota = self.primary_policy.len();
-        let pri2_quota    = self.pri2.lock().len;
+        let pri2_quota = self.pri2.lock().len;
 
-        let mut scan_processed    = 0usize;
+        let mut scan_processed = 0usize;
         let mut primary_processed = 0usize;
-        let mut pri2_processed    = 0usize;
+        let mut pri2_processed = 0usize;
 
         // Phase: 0 = scan, 1 = primary, 2 = pri2.
         let mut phase = if scan_quota == 0 { 1usize } else { 0usize };
 
         loop {
-            if nodes_processed >= self.max_batch_size { break; }
-            if !self.arbiter.still_needs_eviction() { break; }
+            if nodes_processed >= self.max_batch_size {
+                break;
+            }
+            if !self.arbiter.still_needs_eviction() {
+                break;
+            }
 
             // Pick a candidate from the current phase (respecting quotas).
             let (node_id, from_pri2) = loop {
                 match phase {
-                    0 if scan_processed < scan_quota => match self.scan_policy.evict_candidate() {
-                        Some(id) => { scan_processed += 1; break (id, false); }
-                        None     => { phase = 1; continue; }
-                    },
-                    0 => { phase = 1; continue; }
-                    1 if primary_processed < primary_quota => match self.primary_policy.evict_candidate() {
-                        Some(id) => { primary_processed += 1; break (id, false); }
-                        None     => {
-                            if self.lru_only { return result; }
-                            phase = 2;
-                            continue;
+                    0 if scan_processed < scan_quota => {
+                        match self.scan_policy.evict_candidate() {
+                            Some(id) => {
+                                scan_processed += 1;
+                                break (id, false);
+                            }
+                            None => {
+                                phase = 1;
+                                continue;
+                            }
                         }
-                    },
+                    }
+                    0 => {
+                        phase = 1;
+                        continue;
+                    }
+                    1 if primary_processed < primary_quota => {
+                        match self.primary_policy.evict_candidate() {
+                            Some(id) => {
+                                primary_processed += 1;
+                                break (id, false);
+                            }
+                            None => {
+                                if self.lru_only {
+                                    return result;
+                                }
+                                phase = 2;
+                                continue;
+                            }
+                        }
+                    }
                     1 => {
-                        if self.lru_only { return result; }
+                        if self.lru_only {
+                            return result;
+                        }
                         phase = 2;
                         continue;
                     }
                     2 if !self.lru_only && pri2_processed < pri2_quota => {
                         match self.pri2.lock().remove_front() {
-                            Some(id) => { pri2_processed += 1; break (id, true); }
-                            None     => return result,
+                            Some(id) => {
+                                pri2_processed += 1;
+                                break (id, true);
+                            }
+                            None => return result,
                         }
                     }
                     _ => return result,
@@ -432,7 +486,8 @@ impl Evictor {
             };
 
             let use_dirty_lru = !self.lru_only;
-            let decision = decide_eviction(info.as_ref(), from_pri2, use_dirty_lru);
+            let decision =
+                decide_eviction(info.as_ref(), from_pri2, use_dirty_lru);
 
             match decision {
                 EvictionDecision::Skip => {
@@ -470,10 +525,12 @@ impl Evictor {
 
                 EvictionDecision::Evict => {
                     let mut stored_off_heap = false;
-                    if let (Some(oh), Some(tree_arc)) = (&self.off_heap, &self.tree)
+                    if let (Some(oh), Some(tree_arc)) =
+                        (&self.off_heap, &self.tree)
                         && oh.is_enabled()
                         && let Ok(tree_guard) = tree_arc.read()
-                        && let Some(serialized) = tree_guard.serialize_upper_in(node_id)
+                        && let Some(serialized) =
+                            tree_guard.serialize_upper_in(node_id)
                     {
                         stored_off_heap = oh.store_node(node_id, serialized);
                     }
@@ -500,12 +557,13 @@ impl Evictor {
     /// Perform an eviction run.
     pub fn do_evict(&self, source: EvictionSource) -> EvictResult {
         if let Some(tree_arc) = &self.tree {
-            let tree_clone  = Arc::clone(tree_arc);
+            let tree_clone = Arc::clone(tree_arc);
             let tree_clone2 = Arc::clone(tree_arc);
-            let node_info_fn = move |node_id: u64| -> Option<Box<dyn NodeEvictionInfo>> {
-                let guard = tree_clone.read().ok()?;
-                real_node_info(&guard, node_id)
-            };
+            let node_info_fn =
+                move |node_id: u64| -> Option<Box<dyn NodeEvictionInfo>> {
+                    let guard = tree_clone.read().ok()?;
+                    real_node_info(&guard, node_id)
+                };
             let node_size_fn = move |node_id: u64| -> u64 {
                 match tree_clone2.read() {
                     Ok(g) => real_node_size(&g, node_id),
@@ -514,18 +572,34 @@ impl Evictor {
             };
             self.do_evict_with_callbacks(source, &node_info_fn, &node_size_fn)
         } else {
-            self.do_evict_with_callbacks(source, &default_node_info, &default_node_size)
+            self.do_evict_with_callbacks(
+                source,
+                &default_node_info,
+                &default_node_size,
+            )
         }
     }
 
     /// Flush a dirty node to the WAL before evicting it.
     fn flush_dirty_node_to_log(&self, node_id: u64) {
-        let lm = match &self.log_manager { Some(lm) => Arc::clone(lm), None => return };
-        let tree_arc = match &self.tree { Some(t) => Arc::clone(t), None => return };
+        let lm = match &self.log_manager {
+            Some(lm) => Arc::clone(lm),
+            None => return,
+        };
+        let tree_arc = match &self.tree {
+            Some(t) => Arc::clone(t),
+            None => return,
+        };
 
         let node_arc: Arc<NodeRwLock<TreeNode>> = {
-            let tree_guard = match tree_arc.read() { Ok(g) => g, Err(_) => return };
-            match find_node_arc(&tree_guard, node_id) { Some(a) => a, None => return }
+            let tree_guard = match tree_arc.read() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match find_node_arc(&tree_guard, node_id) {
+                Some(a) => a,
+                None => return,
+            }
         };
 
         let mut node_guard = node_arc.write();
@@ -534,14 +608,23 @@ impl Evictor {
             _ => return,
         };
 
-        if !bin.dirty && bin.dirty_count() == 0 { return; }
+        if !bin.dirty && bin.dirty_count() == 0 {
+            return;
+        }
 
         let full_bytes = bin.serialize_full();
-        let entry = InLogEntry::new(self.db_id, bin.last_full_lsn, NULL_LSN, full_bytes);
+        let entry = InLogEntry::new(
+            self.db_id,
+            bin.last_full_lsn,
+            NULL_LSN,
+            full_bytes,
+        );
         let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
-        if let Ok(logged_lsn) = lm.log(LogEntryType::BIN, &buf, Provisional::No, false, false) {
+        if let Ok(logged_lsn) =
+            lm.log(LogEntryType::BIN, &buf, Provisional::No, false, false)
+        {
             bin.clear_dirty_after_full_log(logged_lsn);
             self.stats.increment(&self.stats.dirty_nodes_evicted);
         }
@@ -554,17 +637,29 @@ impl Evictor {
         node_info_fn: &dyn Fn(u64) -> Option<Box<dyn NodeEvictionInfo>>,
         node_size_fn: &dyn Fn(u64) -> u64,
     ) -> EvictResult {
-        if self.shutdown.load(Ordering::Relaxed) { return EvictResult::zero(); }
+        if self.shutdown.load(Ordering::Relaxed) {
+            return EvictResult::zero();
+        }
         self.stats.increment(&self.stats.eviction_runs);
-        if !self.arbiter.still_needs_eviction() { return EvictResult::zero(); }
+        if !self.arbiter.still_needs_eviction() {
+            return EvictResult::zero();
+        }
 
         let result = self.evict_batch(source, node_info_fn, node_size_fn);
 
         match source {
-            EvictionSource::Daemon   => self.stats.add(&self.stats.bytes_evicted_daemon,    result.bytes_evicted),
-            EvictionSource::Critical => self.stats.add(&self.stats.bytes_evicted_critical,  result.bytes_evicted),
-            EvictionSource::Manual   => self.stats.add(&self.stats.bytes_evicted_manual,    result.bytes_evicted),
-            EvictionSource::CacheMode=> self.stats.add(&self.stats.bytes_evicted_cachemode, result.bytes_evicted),
+            EvictionSource::Daemon => self
+                .stats
+                .add(&self.stats.bytes_evicted_daemon, result.bytes_evicted),
+            EvictionSource::Critical => self
+                .stats
+                .add(&self.stats.bytes_evicted_critical, result.bytes_evicted),
+            EvictionSource::Manual => self
+                .stats
+                .add(&self.stats.bytes_evicted_manual, result.bytes_evicted),
+            EvictionSource::CacheMode => self
+                .stats
+                .add(&self.stats.bytes_evicted_cachemode, result.bytes_evicted),
         }
 
         result
@@ -574,19 +669,32 @@ impl Evictor {
     // Accessors
     // -----------------------------------------------------------------------
 
-    pub fn get_stats(&self) -> &EvictorStats { &self.stats }
+    pub fn get_stats(&self) -> &EvictorStats {
+        &self.stats
+    }
 
-    pub fn pri1_eviction_count(&self) -> u64 { self.next_pri1_index.load(Ordering::Relaxed) }
-    pub fn pri2_eviction_count(&self) -> u64 { self.next_pri2_index.load(Ordering::Relaxed) }
+    pub fn pri1_eviction_count(&self) -> u64 {
+        self.next_pri1_index.load(Ordering::Relaxed)
+    }
+    pub fn pri2_eviction_count(&self) -> u64 {
+        self.next_pri2_index.load(Ordering::Relaxed)
+    }
 
     /// Returns `(primary_len + scan_len, pri2_len)`.
     pub fn get_lru_sizes(&self) -> (usize, usize) {
-        (self.primary_policy.len() + self.scan_policy.len(), self.pri2.lock().len)
+        (
+            self.primary_policy.len() + self.scan_policy.len(),
+            self.pri2.lock().len,
+        )
     }
 
     /// Returns `(primary_len, scan_len, pri2_len)`.
     pub fn get_policy_sizes(&self) -> (usize, usize, usize) {
-        (self.primary_policy.len(), self.scan_policy.len(), self.pri2.lock().len)
+        (
+            self.primary_policy.len(),
+            self.scan_policy.len(),
+            self.pri2.lock().len,
+        )
     }
 
     pub fn update_lru_stats(&self) {
@@ -595,15 +703,25 @@ impl Evictor {
         self.stats.set(&self.stats.pri2_lru_size, pri2 as u64);
     }
 
-    pub fn shutdown(&self) { self.shutdown.store(true, Ordering::Relaxed); }
-    pub fn is_shutdown(&self) -> bool { self.shutdown.load(Ordering::Relaxed) }
-    pub fn get_arbiter(&self) -> &Arbiter { &self.arbiter }
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+    pub fn get_arbiter(&self) -> &Arbiter {
+        &self.arbiter
+    }
 
     /// Name of the primary eviction algorithm.
-    pub fn primary_algorithm_name(&self) -> &'static str { self.primary_policy.name() }
+    pub fn primary_algorithm_name(&self) -> &'static str {
+        self.primary_policy.name()
+    }
 
     /// Name of the scan-resistant eviction algorithm.
-    pub fn scan_algorithm_name(&self) -> &'static str { self.scan_policy.name() }
+    pub fn scan_algorithm_name(&self) -> &'static str {
+        self.scan_policy.name()
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -613,7 +731,9 @@ impl Evictor {
     #[doc(hidden)]
     pub fn pri2_insert_for_test(&self, node_id: u64) {
         let mut p = self.pri2.lock();
-        if !p.contains(node_id) { p.add_back(node_id); }
+        if !p.contains(node_id) {
+            p.add_back(node_id);
+        }
     }
 }
 
@@ -634,15 +754,30 @@ impl std::fmt::Debug for Evictor {
 // Real node-info / node-size helpers
 // ---------------------------------------------------------------------------
 
-struct RealNodeInfo { dirty: bool, is_bin: bool, pin_count: usize }
+struct RealNodeInfo {
+    dirty: bool,
+    is_bin: bool,
+    pin_count: usize,
+}
 impl NodeEvictionInfo for RealNodeInfo {
-    fn is_dirty(&self) -> bool  { self.dirty }
-    fn is_bin(&self) -> bool    { self.is_bin }
-    fn is_resident(&self) -> bool { true }
-    fn ref_count(&self) -> usize  { self.pin_count }
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+    fn is_bin(&self) -> bool {
+        self.is_bin
+    }
+    fn is_resident(&self) -> bool {
+        true
+    }
+    fn ref_count(&self) -> usize {
+        self.pin_count
+    }
 }
 
-fn real_node_info(tree: &Tree, node_id: u64) -> Option<Box<dyn NodeEvictionInfo>> {
+fn real_node_info(
+    tree: &Tree,
+    node_id: u64,
+) -> Option<Box<dyn NodeEvictionInfo>> {
     let root_arc = tree.get_root()?;
     find_node_info_recursive(&root_arc, node_id)
 }
@@ -660,18 +795,29 @@ fn find_node_info_recursive(
                     is_bin: true,
                     pin_count: b.cursor_count.max(0) as usize,
                 }))
-            } else { None }
+            } else {
+                None
+            }
         }
         TreeNode::Internal(n) => {
             if n.node_id == target_id {
-                return Some(Box::new(RealNodeInfo { dirty: n.dirty, is_bin: false, pin_count: 0 }));
+                return Some(Box::new(RealNodeInfo {
+                    dirty: n.dirty,
+                    is_bin: false,
+                    pin_count: 0,
+                }));
             }
-            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n.entries.iter()
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n
+                .entries
+                .iter()
                 .filter_map(|e| e.child.as_ref().map(Arc::clone))
                 .collect();
             drop(guard);
             for child in children {
-                if let Some(info) = find_node_info_recursive(&child, target_id) { return Some(info); }
+                if let Some(info) = find_node_info_recursive(&child, target_id)
+                {
+                    return Some(info);
+                }
             }
             None
         }
@@ -679,20 +825,34 @@ fn find_node_info_recursive(
 }
 
 fn real_node_size(tree: &Tree, node_id: u64) -> u64 {
-    let root_arc = match tree.get_root() { Some(r) => r, None => return 1024 };
+    let root_arc = match tree.get_root() {
+        Some(r) => r,
+        None => return 1024,
+    };
     find_node_size_recursive(&root_arc, node_id).unwrap_or(1024)
 }
 
-fn find_node_size_recursive(node_arc: &Arc<NodeRwLock<TreeNode>>, target_id: u64) -> Option<u64> {
+fn find_node_size_recursive(
+    node_arc: &Arc<NodeRwLock<TreeNode>>,
+    target_id: u64,
+) -> Option<u64> {
     let guard = node_arc.read();
     match &*guard {
         TreeNode::Bottom(b) => {
             if b.node_id == target_id {
                 let sz = size_of::<BinStub>()
                     + b.entries.len() * size_of::<BinEntry>()
-                    + b.entries.iter().map(|e| e.key.len() + e.data.as_ref().map(|d| d.len()).unwrap_or(0)).sum::<usize>();
+                    + b.entries
+                        .iter()
+                        .map(|e| {
+                            e.key.len()
+                                + e.data.as_ref().map(|d| d.len()).unwrap_or(0)
+                        })
+                        .sum::<usize>();
                 Some(sz as u64)
-            } else { None }
+            } else {
+                None
+            }
         }
         TreeNode::Internal(n) => {
             if n.node_id == target_id {
@@ -701,37 +861,58 @@ fn find_node_size_recursive(node_arc: &Arc<NodeRwLock<TreeNode>>, target_id: u64
                     + n.entries.iter().map(|e| e.key.len()).sum::<usize>();
                 return Some(sz as u64);
             }
-            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n.entries.iter()
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n
+                .entries
+                .iter()
                 .filter_map(|e| e.child.as_ref().map(Arc::clone))
                 .collect();
             drop(guard);
             for child in children {
-                if let Some(sz) = find_node_size_recursive(&child, target_id) { return Some(sz); }
+                if let Some(sz) = find_node_size_recursive(&child, target_id) {
+                    return Some(sz);
+                }
             }
             None
         }
     }
 }
 
-fn find_node_arc(tree: &Tree, node_id: u64) -> Option<Arc<NodeRwLock<TreeNode>>> {
+fn find_node_arc(
+    tree: &Tree,
+    node_id: u64,
+) -> Option<Arc<NodeRwLock<TreeNode>>> {
     let root_arc = tree.get_root()?;
     find_node_arc_recursive(&root_arc, node_id)
 }
 
-fn find_node_arc_recursive(node_arc: &Arc<NodeRwLock<TreeNode>>, target_id: u64) -> Option<Arc<NodeRwLock<TreeNode>>> {
+fn find_node_arc_recursive(
+    node_arc: &Arc<NodeRwLock<TreeNode>>,
+    target_id: u64,
+) -> Option<Arc<NodeRwLock<TreeNode>>> {
     let guard = node_arc.read();
     match &*guard {
         TreeNode::Bottom(b) => {
-            if b.node_id == target_id { Some(Arc::clone(node_arc)) } else { None }
+            if b.node_id == target_id {
+                Some(Arc::clone(node_arc))
+            } else {
+                None
+            }
         }
         TreeNode::Internal(n) => {
-            if n.node_id == target_id { return Some(Arc::clone(node_arc)); }
-            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n.entries.iter()
+            if n.node_id == target_id {
+                return Some(Arc::clone(node_arc));
+            }
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n
+                .entries
+                .iter()
                 .filter_map(|e| e.child.as_ref().map(Arc::clone))
                 .collect();
             drop(guard);
             for child in children {
-                if let Some(found) = find_node_arc_recursive(&child, target_id) { return Some(found); }
+                if let Some(found) = find_node_arc_recursive(&child, target_id)
+                {
+                    return Some(found);
+                }
             }
             None
         }
@@ -744,17 +925,27 @@ fn find_node_arc_recursive(node_arc: &Arc<NodeRwLock<TreeNode>>, target_id: u64)
 
 struct DefaultNodeInfo;
 impl NodeEvictionInfo for DefaultNodeInfo {
-    fn is_dirty(&self)    -> bool  { false }
-    fn is_bin(&self)      -> bool  { false }
-    fn is_resident(&self) -> bool  { true  }
-    fn ref_count(&self)   -> usize { 0     }
+    fn is_dirty(&self) -> bool {
+        false
+    }
+    fn is_bin(&self) -> bool {
+        false
+    }
+    fn is_resident(&self) -> bool {
+        true
+    }
+    fn ref_count(&self) -> usize {
+        0
+    }
 }
 
 fn default_node_info(_id: u64) -> Option<Box<dyn NodeEvictionInfo>> {
     Some(Box::new(DefaultNodeInfo))
 }
 
-fn default_node_size(_id: u64) -> u64 { 1024 }
+fn default_node_size(_id: u64) -> u64 {
+    1024
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -763,11 +954,15 @@ fn default_node_size(_id: u64) -> u64 { 1024 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, atomic::AtomicI64};
     use crate::arbiter::Arbiter;
     use crate::cache_mode::CacheMode;
+    use std::sync::{Arc, atomic::AtomicI64};
 
-    fn make_evictor(usage: i64, max: i64, batch: usize) -> (Arc<AtomicI64>, Evictor) {
+    fn make_evictor(
+        usage: i64,
+        max: i64,
+        batch: usize,
+    ) -> (Arc<AtomicI64>, Evictor) {
         let counter = Arc::new(AtomicI64::new(usage));
         let arbiter = Arbiter::new(max, Arc::clone(&counter), 100, 200);
         let evictor = Evictor::new(arbiter, batch, false);
@@ -778,31 +973,97 @@ mod tests {
     // EvictionDecision / decide_eviction
     // -----------------------------------------------------------------------
 
-    struct NodeInfo { dirty: bool, bin: bool, resident: bool, refs: usize }
+    struct NodeInfo {
+        dirty: bool,
+        bin: bool,
+        resident: bool,
+        refs: usize,
+    }
     impl NodeEvictionInfo for NodeInfo {
-        fn is_dirty(&self)    -> bool  { self.dirty }
-        fn is_bin(&self)      -> bool  { self.bin }
-        fn is_resident(&self) -> bool  { self.resident }
-        fn ref_count(&self)   -> usize { self.refs }
+        fn is_dirty(&self) -> bool {
+            self.dirty
+        }
+        fn is_bin(&self) -> bool {
+            self.bin
+        }
+        fn is_resident(&self) -> bool {
+            self.resident
+        }
+        fn ref_count(&self) -> usize {
+            self.refs
+        }
     }
     fn info(dirty: bool, bin: bool, resident: bool, refs: usize) -> NodeInfo {
         NodeInfo { dirty, bin, resident, refs }
     }
 
-    #[test] fn test_decide_skip()         { assert_eq!(decide_eviction(&info(false,false,false,0), false, true), EvictionDecision::Skip); }
-    #[test] fn test_decide_putback()      { assert_eq!(decide_eviction(&info(false,false,true,2),  false, true), EvictionDecision::PutBack); }
-    #[test] fn test_decide_partial()      { assert_eq!(decide_eviction(&info(false,true,true,0),   false, true), EvictionDecision::PartialEvict); }
-    #[test] fn test_decide_dirty_pri2()   { assert_eq!(decide_eviction(&info(true,false,true,0),   false, true), EvictionDecision::MoveDirtyToPri2); }
-    #[test] fn test_decide_dirty_in_pri2(){ assert_eq!(decide_eviction(&info(true,false,true,0),   true,  true), EvictionDecision::Evict); }
-    #[test] fn test_decide_dirty_lruonly(){ assert_eq!(decide_eviction(&info(true,false,true,0),   false, false),EvictionDecision::Evict); }
-    #[test] fn test_decide_clean()        { assert_eq!(decide_eviction(&info(false,false,true,0),  false, true), EvictionDecision::Evict); }
+    #[test]
+    fn test_decide_skip() {
+        assert_eq!(
+            decide_eviction(&info(false, false, false, 0), false, true),
+            EvictionDecision::Skip
+        );
+    }
+    #[test]
+    fn test_decide_putback() {
+        assert_eq!(
+            decide_eviction(&info(false, false, true, 2), false, true),
+            EvictionDecision::PutBack
+        );
+    }
+    #[test]
+    fn test_decide_partial() {
+        assert_eq!(
+            decide_eviction(&info(false, true, true, 0), false, true),
+            EvictionDecision::PartialEvict
+        );
+    }
+    #[test]
+    fn test_decide_dirty_pri2() {
+        assert_eq!(
+            decide_eviction(&info(true, false, true, 0), false, true),
+            EvictionDecision::MoveDirtyToPri2
+        );
+    }
+    #[test]
+    fn test_decide_dirty_in_pri2() {
+        assert_eq!(
+            decide_eviction(&info(true, false, true, 0), true, true),
+            EvictionDecision::Evict
+        );
+    }
+    #[test]
+    fn test_decide_dirty_lruonly() {
+        assert_eq!(
+            decide_eviction(&info(true, false, true, 0), false, false),
+            EvictionDecision::Evict
+        );
+    }
+    #[test]
+    fn test_decide_clean() {
+        assert_eq!(
+            decide_eviction(&info(false, false, true, 0), false, true),
+            EvictionDecision::Evict
+        );
+    }
 
     // -----------------------------------------------------------------------
     // EvictResult
     // -----------------------------------------------------------------------
 
-    #[test] fn test_evict_result_zero() { let r = EvictResult::zero(); assert_eq!(r.nodes_evicted,0); assert_eq!(r.bytes_evicted,0); }
-    #[test] fn test_evict_result_add()  { let mut r = EvictResult::new(5,1024); r.add(&EvictResult::new(3,512)); assert_eq!(r.nodes_evicted,8); assert_eq!(r.bytes_evicted,1536); }
+    #[test]
+    fn test_evict_result_zero() {
+        let r = EvictResult::zero();
+        assert_eq!(r.nodes_evicted, 0);
+        assert_eq!(r.bytes_evicted, 0);
+    }
+    #[test]
+    fn test_evict_result_add() {
+        let mut r = EvictResult::new(5, 1024);
+        r.add(&EvictResult::new(3, 512));
+        assert_eq!(r.nodes_evicted, 8);
+        assert_eq!(r.bytes_evicted, 1536);
+    }
 
     // -----------------------------------------------------------------------
     // Construction / algorithm selection
@@ -864,11 +1125,11 @@ mod tests {
     fn test_note_ins_added_scan_separate_from_primary() {
         let usage = Arc::new(AtomicI64::new(0));
         let e = Evictor::new(Arbiter::new(1000, usage, 100, 200), 100, false);
-        e.note_ins_added(1, CacheMode::Default);         // → primary
-        e.note_ins_added_scan(2);                         // → scan
+        e.note_ins_added(1, CacheMode::Default); // → primary
+        e.note_ins_added_scan(2); // → scan
         let (p, s, p2) = e.get_policy_sizes();
-        assert_eq!(p,  1, "primary should have 1");
-        assert_eq!(s,  1, "scan should have 1");
+        assert_eq!(p, 1, "primary should have 1");
+        assert_eq!(s, 1, "scan should have 1");
         assert_eq!(p2, 0);
     }
 
@@ -876,8 +1137,8 @@ mod tests {
     fn test_note_ins_added_scan_does_not_move_primary_pages() {
         let usage = Arc::new(AtomicI64::new(0));
         let e = Evictor::new(Arbiter::new(1000, usage, 100, 200), 100, false);
-        e.note_ins_added(1, CacheMode::Default);   // → primary
-        e.note_ins_added_scan(1);                   // already in primary → no-op
+        e.note_ins_added(1, CacheMode::Default); // → primary
+        e.note_ins_added_scan(1); // already in primary → no-op
         let (p, s, _) = e.get_policy_sizes();
         assert_eq!(p, 1);
         assert_eq!(s, 0); // not duplicated in scan policy
@@ -957,7 +1218,9 @@ mod tests {
     fn test_do_evict_over_budget() {
         let usage = Arc::new(AtomicI64::new(1500));
         let e = Evictor::new(Arbiter::new(1000, usage, 100, 200), 100, false);
-        for i in 1..=5 { e.note_ins_added(i, CacheMode::Default); }
+        for i in 1..=5 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
         let r = e.do_evict(EvictionSource::Critical);
         assert!(r.nodes_evicted > 0);
         let stats = e.get_stats();
@@ -977,7 +1240,9 @@ mod tests {
     fn test_batch_size_limit() {
         let usage = Arc::new(AtomicI64::new(2000));
         let e = Evictor::new(Arbiter::new(1000, usage, 100, 200), 3, false);
-        for i in 1..=10 { e.note_ins_added(i, CacheMode::Default); }
+        for i in 1..=10 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
         let r = e.do_evict(EvictionSource::Daemon);
         assert!(r.nodes_evicted <= 3);
     }
@@ -986,19 +1251,33 @@ mod tests {
     // evict_batch with custom callbacks — each decision path
     // -----------------------------------------------------------------------
 
-    fn static_info_fn(dirty: bool, bin: bool, resident: bool, refs: usize)
-        -> impl Fn(u64) -> Option<Box<dyn NodeEvictionInfo>>
-    {
-        move |_| Some(Box::new(NodeInfo { dirty, bin, resident, refs }) as Box<dyn NodeEvictionInfo>)
+    fn static_info_fn(
+        dirty: bool,
+        bin: bool,
+        resident: bool,
+        refs: usize,
+    ) -> impl Fn(u64) -> Option<Box<dyn NodeEvictionInfo>> {
+        move |_| {
+            Some(Box::new(NodeInfo { dirty, bin, resident, refs })
+                as Box<dyn NodeEvictionInfo>)
+        }
     }
 
-    fn size_512(_id: u64) -> u64 { 512 }
+    fn size_512(_id: u64) -> u64 {
+        512
+    }
 
     #[test]
     fn test_evict_batch_skip_path() {
         let (_c, e) = make_evictor(1500, 1000, 10);
-        for i in 1..=3u64 { e.note_ins_added(i, CacheMode::Default); }
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(false,false,false,0), &size_512);
+        for i in 1..=3u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(false, false, false, 0),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 0);
         let s = e.get_stats();
         assert_eq!(s.get(&s.nodes_skipped), 3);
@@ -1007,8 +1286,14 @@ mod tests {
     #[test]
     fn test_evict_batch_putback_path() {
         let (_c, e) = make_evictor(1500, 1000, 10);
-        for i in 1..=3u64 { e.note_ins_added(i, CacheMode::Default); }
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(false,false,true,1), &size_512);
+        for i in 1..=3u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(false, false, true, 1),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 0);
         let s = e.get_stats();
         assert_eq!(s.get(&s.nodes_put_back), 3);
@@ -1018,8 +1303,14 @@ mod tests {
     #[test]
     fn test_evict_batch_partial_evict_path() {
         let (_c, e) = make_evictor(1500, 1000, 10);
-        for i in 1..=3u64 { e.note_ins_added(i, CacheMode::Default); }
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(false,true,true,0), &size_512);
+        for i in 1..=3u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(false, true, true, 0),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 0);
         assert_eq!(r.bytes_evicted, 3 * 512);
         let s = e.get_stats();
@@ -1032,9 +1323,19 @@ mod tests {
         // batch_size == 3 so the batch stops after draining primary; avoids
         // spilling into pri2 and re-evicting the just-moved nodes.
         let counter = Arc::new(AtomicI64::new(1500));
-        let e = Evictor::new(Arbiter::new(1000, Arc::clone(&counter), 100, 200), 3, false);
-        for i in 1..=3u64 { e.note_ins_added(i, CacheMode::Default); }
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(true,false,true,0), &size_512);
+        let e = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&counter), 100, 200),
+            3,
+            false,
+        );
+        for i in 1..=3u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(true, false, true, 0),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 0);
         let s = e.get_stats();
         assert_eq!(s.get(&s.nodes_moved_to_pri2_lru), 3);
@@ -1044,8 +1345,14 @@ mod tests {
     #[test]
     fn test_evict_batch_evict_path() {
         let (_c, e) = make_evictor(1500, 1000, 10);
-        for i in 1..=3u64 { e.note_ins_added(i, CacheMode::Default); }
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(false,false,true,0), &size_512);
+        for i in 1..=3u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(false, false, true, 0),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 3);
         assert_eq!(r.bytes_evicted, 3 * 512);
         assert_eq!(e.get_lru_sizes(), (0, 0));
@@ -1059,7 +1366,11 @@ mod tests {
             e.move_to_pri2(i);
         }
         assert_eq!(e.get_lru_sizes(), (0, 3));
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(true,false,true,0), &size_512);
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(true, false, true, 0),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 3);
         let s = e.get_stats();
         assert_eq!(s.get(&s.nodes_evicted), 3);
@@ -1084,7 +1395,14 @@ mod tests {
 
         // Evict exactly 2 — scan pages should go first.
         let size_fn = |_| 512u64;
-        let info_fn = |_| Some(Box::new(NodeInfo { dirty: false, bin: false, resident: true, refs: 0 }) as Box<dyn NodeEvictionInfo>);
+        let info_fn = |_| {
+            Some(Box::new(NodeInfo {
+                dirty: false,
+                bin: false,
+                resident: true,
+                refs: 0,
+            }) as Box<dyn NodeEvictionInfo>)
+        };
         let r = e.evict_batch(EvictionSource::Daemon, &info_fn, &size_fn);
         // Scan policy had 2 nodes, they leave first.
         let (p, s, _) = e.get_policy_sizes();
@@ -1116,20 +1434,48 @@ mod tests {
 
     fn algo_evicts_all_nodes(algo: EvictionAlgorithm) {
         let usage = Arc::new(AtomicI64::new(5000));
-        let e = Evictor::new(Arbiter::new(1000, Arc::clone(&usage), 100, 200), 100, false)
-            .with_algorithm(algo);
-        for i in 1..=5u64 { e.note_ins_added(i, CacheMode::Default); }
+        let e = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            100,
+            false,
+        )
+        .with_algorithm(algo);
+        for i in 1..=5u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
         let size_fn = |_| 512u64;
-        let info_fn = |_| Some(Box::new(NodeInfo { dirty: false, bin: false, resident: true, refs: 0 }) as Box<dyn NodeEvictionInfo>);
+        let info_fn = |_| {
+            Some(Box::new(NodeInfo {
+                dirty: false,
+                bin: false,
+                resident: true,
+                refs: 0,
+            }) as Box<dyn NodeEvictionInfo>)
+        };
         let r = e.evict_batch(EvictionSource::Daemon, &info_fn, &size_fn);
         assert_eq!(r.nodes_evicted, 5, "{:?} failed to evict all nodes", algo);
     }
 
-    #[test] fn test_lru_evicts_all()   { algo_evicts_all_nodes(EvictionAlgorithm::Lru);   }
-    #[test] fn test_clock_evicts_all() { algo_evicts_all_nodes(EvictionAlgorithm::Clock); }
-    #[test] fn test_arc_evicts_all()   { algo_evicts_all_nodes(EvictionAlgorithm::Arc);   }
-    #[test] fn test_car_evicts_all()   { algo_evicts_all_nodes(EvictionAlgorithm::Car);   }
-    #[test] fn test_lirs_evicts_all()  { algo_evicts_all_nodes(EvictionAlgorithm::Lirs);  }
+    #[test]
+    fn test_lru_evicts_all() {
+        algo_evicts_all_nodes(EvictionAlgorithm::Lru);
+    }
+    #[test]
+    fn test_clock_evicts_all() {
+        algo_evicts_all_nodes(EvictionAlgorithm::Clock);
+    }
+    #[test]
+    fn test_arc_evicts_all() {
+        algo_evicts_all_nodes(EvictionAlgorithm::Arc);
+    }
+    #[test]
+    fn test_car_evicts_all() {
+        algo_evicts_all_nodes(EvictionAlgorithm::Car);
+    }
+    #[test]
+    fn test_lirs_evicts_all() {
+        algo_evicts_all_nodes(EvictionAlgorithm::Lirs);
+    }
 
     // -----------------------------------------------------------------------
     // do_evict_with_callbacks — source statistics
@@ -1138,19 +1484,38 @@ mod tests {
     #[test]
     fn test_do_evict_daemon_stats() {
         let (counter, e) = make_evictor(1500, 1000, 10);
-        for i in 1..=4u64 { e.note_ins_added(i, CacheMode::Default); }
-        let r = e.do_evict_with_callbacks(EvictionSource::Daemon, &static_info_fn(false,false,true,0), &size_512);
-        assert_eq!(e.get_stats().get(&e.get_stats().bytes_evicted_daemon), r.bytes_evicted);
+        for i in 1..=4u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.do_evict_with_callbacks(
+            EvictionSource::Daemon,
+            &static_info_fn(false, false, true, 0),
+            &size_512,
+        );
+        assert_eq!(
+            e.get_stats().get(&e.get_stats().bytes_evicted_daemon),
+            r.bytes_evicted
+        );
         drop(counter);
     }
 
     #[test]
     fn test_lru_only_ignores_pri2() {
         let usage = Arc::new(AtomicI64::new(1500));
-        let e = Evictor::new(Arbiter::new(1000, Arc::clone(&usage), 100, 200), 10, true);
-        for i in 1..=2u64 { e.note_ins_added(i, CacheMode::Default); }
+        let e = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            10,
+            true,
+        );
+        for i in 1..=2u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
         e.pri2_insert_for_test(99);
-        let r = e.evict_batch(EvictionSource::Daemon, &static_info_fn(false,false,true,0), &size_512);
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(false, false, true, 0),
+            &size_512,
+        );
         assert_eq!(r.nodes_evicted, 2);
         assert_eq!(e.get_lru_sizes().1, 1); // pri2 untouched
     }

@@ -17,31 +17,31 @@
 
 /// Classification returned by [`ExtinctionFilter::get_extinction_status`].
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtinctionStatus {
     /// The record is extinct: it was specified in a previous
     /// `discard_extinct_records` call and will never be accessed again.
     ///
-    /// 
+    ///
     Extinct,
 
     /// The record is not extinct: it has not been specified for extinction.
     ///
-    /// 
+    ///
     NotExtinct,
 
     /// The record may or may not be extinct. The application temporarily
     /// cannot determine extinction status (e.g. during startup before
     /// metadata is loaded). The cleaner will fall back to a BTree lookup.
     ///
-    /// 
+    ///
     MaybeExtinct,
 }
 
 /// Callback for classifying records as extinct.
 ///
-/// 
+///
 ///
 /// Implement this trait and register it with `EnvironmentConfig` before
 /// calling `crate::Environment::discard_extinct_records`.
@@ -63,7 +63,7 @@ pub trait ExtinctionFilter: Send + Sync {
     /// * `key` — the primary key of the record. When `dups` is true this is
     ///   the record's data field, treated as a primary key.
     ///
-    /// 
+    ///
     fn get_extinction_status(
         &self,
         db_name: &str,

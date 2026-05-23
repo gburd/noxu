@@ -42,16 +42,23 @@ impl SlabList {
         }
     }
 
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Allocate a slab slot for `id` (node has dangling prev/next).
     pub fn alloc_slot(&mut self, id: u64) -> usize {
         if let Some(slot) = self.free.pop() {
-            self.slab[slot] = Some(SlabNode { id, prev: SENTINEL, next: SENTINEL });
+            self.slab[slot] =
+                Some(SlabNode { id, prev: SENTINEL, next: SENTINEL });
             slot
         } else {
             let slot = self.slab.len();
-            self.slab.push(Some(SlabNode { id, prev: SENTINEL, next: SENTINEL }));
+            self.slab.push(Some(SlabNode {
+                id,
+                prev: SENTINEL,
+                next: SENTINEL,
+            }));
             slot
         }
     }
@@ -68,8 +75,16 @@ impl SlabList {
             let n = self.slab[slot].as_ref().unwrap();
             (n.prev, n.next)
         };
-        if prev == SENTINEL { self.head = next; } else { self.slab[prev].as_mut().unwrap().next = next; }
-        if next == SENTINEL { self.tail = prev; } else { self.slab[next].as_mut().unwrap().prev = prev; }
+        if prev == SENTINEL {
+            self.head = next;
+        } else {
+            self.slab[prev].as_mut().unwrap().next = next;
+        }
+        if next == SENTINEL {
+            self.tail = prev;
+        } else {
+            self.slab[next].as_mut().unwrap().prev = prev;
+        }
     }
 
     /// Link `slot` at the back (hot/MRU end).
@@ -78,7 +93,11 @@ impl SlabList {
         let n = self.slab[slot].as_mut().unwrap();
         n.prev = old_tail;
         n.next = SENTINEL;
-        if old_tail == SENTINEL { self.head = slot; } else { self.slab[old_tail].as_mut().unwrap().next = slot; }
+        if old_tail == SENTINEL {
+            self.head = slot;
+        } else {
+            self.slab[old_tail].as_mut().unwrap().next = slot;
+        }
         self.tail = slot;
     }
 
@@ -88,7 +107,11 @@ impl SlabList {
         let n = self.slab[slot].as_mut().unwrap();
         n.prev = SENTINEL;
         n.next = old_head;
-        if old_head == SENTINEL { self.tail = slot; } else { self.slab[old_head].as_mut().unwrap().prev = slot; }
+        if old_head == SENTINEL {
+            self.tail = slot;
+        } else {
+            self.slab[old_head].as_mut().unwrap().prev = slot;
+        }
         self.head = slot;
     }
 
@@ -113,22 +136,34 @@ impl SlabList {
     /// Move `id` to the hot/MRU end.  Returns false if not present.
     pub fn move_back(&mut self, id: u64) -> bool {
         if let Some(&slot) = self.index.get(&id) {
-            if slot != self.tail { self.unlink(slot); self.link_back(slot); }
+            if slot != self.tail {
+                self.unlink(slot);
+                self.link_back(slot);
+            }
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     /// Move `id` to the cold/LRU end.  Returns false if not present.
     pub fn move_front(&mut self, id: u64) -> bool {
         if let Some(&slot) = self.index.get(&id) {
-            if slot != self.head { self.unlink(slot); self.link_front(slot); }
+            if slot != self.head {
+                self.unlink(slot);
+                self.link_front(slot);
+            }
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     /// Remove and return the cold/LRU node.  Returns None if empty.
     pub fn remove_front(&mut self) -> Option<u64> {
-        if self.head == SENTINEL { return None; }
+        if self.head == SENTINEL {
+            return None;
+        }
         let slot = self.head;
         let id = self.slab[slot].as_ref().unwrap().id;
         self.unlink(slot);
@@ -140,7 +175,9 @@ impl SlabList {
 
     /// Remove and return the hot/MRU node.  Returns None if empty.
     pub fn remove_back(&mut self) -> Option<u64> {
-        if self.tail == SENTINEL { return None; }
+        if self.tail == SENTINEL {
+            return None;
+        }
         let slot = self.tail;
         let id = self.slab[slot].as_ref().unwrap().id;
         self.unlink(slot);
@@ -157,7 +194,9 @@ impl SlabList {
             self.free_slot(slot);
             self.len -= 1;
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     /// Returns true if `id` is present.
@@ -167,14 +206,20 @@ impl SlabList {
 
     /// Id of the node at the cold/LRU end without removing.  None if empty.
     pub fn peek_front(&self) -> Option<u64> {
-        if self.head == SENTINEL { None }
-        else { Some(self.slab[self.head].as_ref().unwrap().id) }
+        if self.head == SENTINEL {
+            None
+        } else {
+            Some(self.slab[self.head].as_ref().unwrap().id)
+        }
     }
 
     /// Id of the node at the hot/MRU end without removing.  None if empty.
     pub fn peek_back(&self) -> Option<u64> {
-        if self.tail == SENTINEL { None }
-        else { Some(self.slab[self.tail].as_ref().unwrap().id) }
+        if self.tail == SENTINEL {
+            None
+        } else {
+            Some(self.slab[self.tail].as_ref().unwrap().id)
+        }
     }
 
     /// Slot index for `id`, or SENTINEL.
@@ -185,12 +230,16 @@ impl SlabList {
     /// Next node id after `slot` in the hot→cold direction (following `next`).
     /// Returns None when `slot` is the tail or is SENTINEL.
     pub fn next_id(&self, slot: usize) -> Option<u64> {
-        if slot == SENTINEL { return None; }
+        if slot == SENTINEL {
+            return None;
+        }
         let next = self.slab[slot].as_ref()?.next;
         if next == SENTINEL { None } else { Some(self.slab[next].as_ref()?.id) }
     }
 }
 
 impl Default for SlabList {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

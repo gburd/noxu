@@ -4,8 +4,8 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get, OperationStatus,
-    Transaction, TransactionConfig,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
+    OperationStatus, Transaction, TransactionConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,14 +117,13 @@ fn bench_db_delete(c: &mut Criterion) {
 fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
     let (_dir, env) = open_env();
     let db_config = DatabaseConfig::new().with_allow_create(true);
-    let db = env
-        .open_database(None, "bench_cursor_scan", &db_config)
-        .unwrap();
+    let db = env.open_database(None, "bench_cursor_scan", &db_config).unwrap();
 
     // Insert 1000 records with sorted keys.
     for i in 0..1000u32 {
         let key = DatabaseEntry::from_vec(format!("key_{:06}", i).into_bytes());
-        let val = DatabaseEntry::from_vec(format!("value_{:06}", i).into_bytes());
+        let val =
+            DatabaseEntry::from_vec(format!("value_{:06}", i).into_bytes());
         db.put(None, &key, &val).unwrap();
     }
 
@@ -135,10 +134,12 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
             let mut data = DatabaseEntry::new();
             let mut count = 0u32;
 
-            let mut status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
+            let mut status =
+                cursor.get(&mut key, &mut data, Get::First, None).unwrap();
             while status == OperationStatus::Success {
                 count += 1;
-                status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
+                status =
+                    cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
             }
             cursor.close().unwrap();
             black_box(count);
@@ -153,7 +154,8 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
 fn bench_txn_commit(c: &mut Criterion) {
     c.bench_function("txn_commit", |b| {
         b.iter(|| {
-            let txn = Transaction::new(black_box(1), TransactionConfig::default());
+            let txn =
+                Transaction::new(black_box(1), TransactionConfig::default());
             txn.commit().unwrap();
             black_box(());
         })
@@ -163,7 +165,8 @@ fn bench_txn_commit(c: &mut Criterion) {
 fn bench_txn_abort(c: &mut Criterion) {
     c.bench_function("txn_abort", |b| {
         b.iter(|| {
-            let txn = Transaction::new(black_box(1), TransactionConfig::default());
+            let txn =
+                Transaction::new(black_box(1), TransactionConfig::default());
             txn.abort().unwrap();
             black_box(());
         })
@@ -207,10 +210,7 @@ fn bench_database_entry_get_data(c: &mut Criterion) {
 // Groups
 // ---------------------------------------------------------------------------
 
-criterion_group!(
-    env_benches,
-    bench_env_open_close,
-);
+criterion_group!(env_benches, bench_env_open_close,);
 
 criterion_group!(
     db_benches,
@@ -235,4 +235,10 @@ criterion_group!(
     bench_database_entry_get_data,
 );
 
-criterion_main!(env_benches, db_benches, cursor_benches, txn_benches, entry_benches);
+criterion_main!(
+    env_benches,
+    db_benches,
+    cursor_benches,
+    txn_benches,
+    entry_benches
+);

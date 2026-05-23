@@ -6,7 +6,7 @@
 /// Stores the "abort version"  -  the state of a record before this txn modified it.
 /// This allows the transaction to restore the previous state on abort.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct WriteLockInfo {
     /// LSN of the record's abort version.
@@ -65,7 +65,7 @@ impl WriteLockInfo {
 
     /// Copies all abort information from another WriteLockInfo.
     ///
-    /// 
+    ///
     pub fn copy_all_info(&mut self, from: &WriteLockInfo) {
         self.abort_lsn = from.abort_lsn;
         self.abort_known_deleted = from.abort_known_deleted;
@@ -81,7 +81,7 @@ impl WriteLockInfo {
 
     /// Sets the abort information from a log entry.
     ///
-    /// 
+    ///
     pub fn set_abort_info(
         &mut self,
         abort_lsn: u64,

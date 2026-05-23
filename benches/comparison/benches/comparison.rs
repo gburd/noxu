@@ -22,13 +22,18 @@
 //! * **Noxu**: txn commit is currently a no-op (WAL writes not yet
 //!   implemented); results are artificially fast for write-heavy workloads.
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, Criterion, black_box, criterion_group, criterion_main,
+};
 use heed::types::Bytes as HeedBytes;
 use heed::{Database as HeedDatabase, EnvOpenOptions};
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get, OperationStatus,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
+    OperationStatus,
 };
-use redb::{Database as ReDb, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database as ReDb, ReadableDatabase, ReadableTable, TableDefinition,
+};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -37,7 +42,8 @@ use tempfile::TempDir;
 
 const N: usize = 1_000;
 /// 64-byte value representative of a small record.
-const VALUE: &[u8] = b"noxu-comparison-bench-value-0123456789abcdef0123456789abcdefXXXX";
+const VALUE: &[u8] =
+    b"noxu-comparison-bench-value-0123456789abcdef0123456789abcdefXXXX";
 const LMDB_MAP_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 const REDB_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bench");
 
@@ -51,7 +57,8 @@ fn key(i: usize) -> Vec<u8> {
 
 fn noxu_open() -> (TempDir, Environment, noxu_db::Database) {
     let dir = TempDir::new().unwrap();
-    let cfg = EnvironmentConfig::new(dir.path().to_path_buf()).with_allow_create(true);
+    let cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true);
     let env = Environment::open(cfg).unwrap();
     let db_cfg = DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, "bench", &db_cfg).unwrap();
@@ -91,10 +98,7 @@ type HeedDb = HeedDatabase<HeedBytes, HeedBytes>;
 fn lmdb_open() -> (TempDir, heed::Env, HeedDb) {
     let dir = TempDir::new().unwrap();
     let env = unsafe {
-        EnvOpenOptions::new()
-            .map_size(LMDB_MAP_SIZE)
-            .open(dir.path())
-            .unwrap()
+        EnvOpenOptions::new().map_size(LMDB_MAP_SIZE).open(dir.path()).unwrap()
     };
     let mut wtxn = env.write_txn().unwrap();
     let db: HeedDb = env.create_database(&mut wtxn, None).unwrap();
@@ -337,11 +341,14 @@ fn bench_seq_scan_1000(c: &mut Criterion) {
                 let mut key_entry = DatabaseEntry::new();
                 let mut data = DatabaseEntry::new();
                 let mut count = 0u32;
-                let mut status =
-                    cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
+                let mut status = cursor
+                    .get(&mut key_entry, &mut data, Get::First, None)
+                    .unwrap();
                 while status == OperationStatus::Success {
                     count += 1;
-                    status = cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
+                    status = cursor
+                        .get(&mut key_entry, &mut data, Get::Next, None)
+                        .unwrap();
                 }
                 cursor.close().unwrap();
                 black_box(count)
@@ -404,7 +411,8 @@ fn bench_bulk_load_1000(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = TempDir::new().unwrap();
-                let cfg = EnvironmentConfig::new(dir.path().to_path_buf()).with_allow_create(true);
+                let cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+                    .with_allow_create(true);
                 let env = Environment::open(cfg).unwrap();
                 let db_cfg = DatabaseConfig::new().with_allow_create(true);
                 let db = env.open_database(None, "bench", &db_cfg).unwrap();

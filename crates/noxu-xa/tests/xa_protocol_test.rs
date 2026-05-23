@@ -16,8 +16,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
-use noxu_xa::{PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid, XidError};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+};
+use noxu_xa::{
+    PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid, XidError,
+};
 use tempfile::TempDir;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -779,12 +783,8 @@ fn test_concurrent_independent_xids() {
             let env = std::sync::Arc::clone(&env);
             let barrier = std::sync::Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let x = Xid::new(
-                    1,
-                    format!("conc_g{tid}").as_bytes(),
-                    b"b1",
-                )
-                .unwrap();
+                let x = Xid::new(1, format!("conc_g{tid}").as_bytes(), b"b1")
+                    .unwrap();
                 barrier.wait();
 
                 env.xa.xa_start(&x, XaFlags::NOFLAGS).unwrap();
@@ -895,4 +895,3 @@ fn test_uncommitted_data_isolated_until_commit() {
     // NOW visible (no lock conflict)
     assert!(env.exists(b"iso_key"));
 }
-

@@ -39,7 +39,7 @@ pub struct ExtinctionTask {
 /// Background scanner that asynchronously removes extinct records from the
 /// B-tree and updates the utilization profile.
 ///
-/// 
+///
 pub struct ExtinctionScanner {
     /// Pending extinction tasks queued by `discard_extinct_records`.
     task_queue: Arc<Mutex<Vec<ExtinctionTask>>>,
@@ -56,7 +56,7 @@ pub struct ExtinctionScanner {
 impl ExtinctionScanner {
     /// Creates a new `ExtinctionScanner`.
     ///
-    /// 
+    ///
     pub fn new() -> Self {
         ExtinctionScanner {
             task_queue: Arc::new(Mutex::new(Vec::new())),
@@ -69,7 +69,7 @@ impl ExtinctionScanner {
 
     /// Starts the background scanner thread.
     ///
-    /// 
+    ///
     pub fn start(&mut self) {
         let queue = Arc::clone(&self.task_queue);
         let shutdown = Arc::clone(&self.shutdown);
@@ -100,7 +100,9 @@ impl ExtinctionScanner {
                         counter.fetch_add(0, Ordering::Relaxed);
                     }
 
-                    thread::sleep(Duration::from_millis(DEFAULT_SCANNER_INTERVAL_MS));
+                    thread::sleep(Duration::from_millis(
+                        DEFAULT_SCANNER_INTERVAL_MS,
+                    ));
                 }
             })
             .expect("failed to spawn noxu-extinction-scanner thread");
@@ -133,7 +135,7 @@ impl ExtinctionScanner {
 
     /// Returns `true` if there are pending extinction tasks.
     ///
-    /// 
+    ///
     pub fn is_active(&self) -> bool {
         self.active && !self.task_queue.lock().unwrap().is_empty()
     }

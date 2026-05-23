@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 /// A collection view of database values.
 ///
-/// 
+///
 ///
 /// Provides a collection interface over the values stored in a Noxu DB
 /// database. Values are yielded in key-sorted order during iteration.

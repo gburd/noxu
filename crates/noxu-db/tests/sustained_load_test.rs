@@ -14,7 +14,8 @@
 //! tmpfs) when running I/O-sensitive measurements.
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, TransactionConfig,
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
+    TransactionConfig,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -36,14 +37,14 @@ fn scratch_dir(prefix: &str) -> TempDir {
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix);
     match std::env::var_os("NOXU_TEST_SCRATCH") {
-        Some(p) => builder
-            .tempdir_in(std::path::Path::new(&p))
-            .unwrap_or_else(|e| {
+        Some(p) => {
+            builder.tempdir_in(std::path::Path::new(&p)).unwrap_or_else(|e| {
                 panic!(
                     "create temp dir under NOXU_TEST_SCRATCH={}: {e}",
                     std::path::Path::new(&p).display()
                 )
-            }),
+            })
+        }
         None => builder.tempdir().expect("create temp dir"),
     }
 }
@@ -56,7 +57,11 @@ fn open_env(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
     )
     .expect("env open");
     let db = env
-        .open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .expect("db open");
     (env, db)
 }
@@ -139,9 +144,7 @@ fn test_sustained_8r8w_60s() {
                     let mut k = DatabaseEntry::new();
                     let mut v = DatabaseEntry::new();
                     let mut n: u64 = 0;
-                    if cursor
-                        .get(&mut k, &mut v, Get::First, None)
-                        .unwrap()
+                    if cursor.get(&mut k, &mut v, Get::First, None).unwrap()
                         == OperationStatus::Success
                     {
                         n += 1;
@@ -280,11 +283,15 @@ fn test_cleaner_reduces_log_files_under_load() {
             .with_allow_create(true)
             .with_transactional(true)
             .with_log_file_max_bytes(64 * 1024) // 64 KB files → many files
-            .with_cleaner_min_utilization(90),  // aggressive: clean when ≥ 10 % obsolete
+            .with_cleaner_min_utilization(90), // aggressive: clean when ≥ 10 % obsolete
     )
     .expect("env open");
     let db = env
-        .open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .expect("db open");
 
     const KEYS: usize = 500;
@@ -299,7 +306,10 @@ fn test_cleaner_reduces_log_files_under_load() {
         let v = DatabaseEntry::from_bytes(&val);
         let t = Instant::now();
         db.put(None, &k, &v).unwrap();
-        assert!(t.elapsed() < stall_limit, "put stalled on initial write k={i}");
+        assert!(
+            t.elapsed() < stall_limit,
+            "put stalled on initial write k={i}"
+        );
     }
 
     // Phase 2: overwrite each key OVERWRITES times → lots of obsolete LNs.
@@ -312,7 +322,10 @@ fn test_cleaner_reduces_log_files_under_load() {
             let v = DatabaseEntry::from_bytes(&val);
             let t = Instant::now();
             db.put(None, &k, &v).unwrap();
-            assert!(t.elapsed() < stall_limit, "put stalled on overwrite pass={pass} k={i}");
+            assert!(
+                t.elapsed() < stall_limit,
+                "put stalled on overwrite pass={pass} k={i}"
+            );
         }
     }
 

@@ -44,10 +44,18 @@ struct ArcState {
 
 impl ArcState {
     fn new() -> Self {
-        Self { t1: SlabList::new(), t2: SlabList::new(), b1: SlabList::new(), b2: SlabList::new(), p: 0.0 }
+        Self {
+            t1: SlabList::new(),
+            t2: SlabList::new(),
+            b1: SlabList::new(),
+            b2: SlabList::new(),
+            p: 0.0,
+        }
     }
 
-    fn live_len(&self) -> usize { self.t1.len + self.t2.len }
+    fn live_len(&self) -> usize {
+        self.t1.len + self.t2.len
+    }
 
     fn ghost_cap(&self) -> usize {
         (self.live_len() * MAX_GHOST_RATIO).max(MIN_GHOST_CAP)
@@ -64,7 +72,9 @@ impl ArcState {
     /// Returns the evicted node_id and a flag indicating whether it came
     /// from T1 (true) or T2 (false).
     fn replace(&mut self) -> Option<(u64, bool)> {
-        if self.t1.len == 0 && self.t2.len == 0 { return None; }
+        if self.t1.len == 0 && self.t2.len == 0 {
+            return None;
+        }
         let t1_len = self.t1.len as f64;
         // Evict from T1 when it is larger than target, unless T1 is empty.
         let evict_t1 = self.t1.len > 0 && (t1_len > self.p || self.t2.len == 0);
@@ -94,7 +104,8 @@ impl ArcState {
             let b1 = self.b1.len as f64;
             let b2 = self.b2.len as f64;
             let delta = if b1 >= b2 { 1.0 } else { b2 / b1.max(1.0) };
-            self.p = (self.p + delta).min((self.t1.len + self.t2.len + 1) as f64);
+            self.p =
+                (self.p + delta).min((self.t1.len + self.t2.len + 1) as f64);
             self.replace();
             self.b1.remove(id);
             self.t2.add_back(id);
@@ -139,7 +150,9 @@ impl ArcPolicy {
 }
 
 impl Default for ArcPolicy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EvictionPolicy for ArcPolicy {
@@ -172,10 +185,16 @@ impl EvictionPolicy for ArcPolicy {
 
     fn remove(&self, node_id: u64) -> bool {
         let mut s = self.state.lock();
-        if s.t1.remove(node_id) { return true; }
-        if s.t2.remove(node_id) { return true; }
+        if s.t1.remove(node_id) {
+            return true;
+        }
+        if s.t2.remove(node_id) {
+            return true;
+        }
         // Also clean up ghost entries if the caller explicitly removes them.
-        if s.b1.remove(node_id) { return true; }
+        if s.b1.remove(node_id) {
+            return true;
+        }
         s.b2.remove(node_id)
     }
 
@@ -201,7 +220,9 @@ impl EvictionPolicy for ArcPolicy {
         s.t1.len + s.t2.len
     }
 
-    fn name(&self) -> &'static str { "ARC" }
+    fn name(&self) -> &'static str {
+        "ARC"
+    }
 }
 
 #[cfg(test)]
@@ -213,7 +234,9 @@ mod tests {
     fn test_arc_promotes_on_second_access() {
         let p = ArcPolicy::new();
         // First insert: goes to T1.
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         assert_eq!(p.len(), 3);
         // Second access: promote to T2.
         p.touch(1);
@@ -223,7 +246,9 @@ mod tests {
     #[test]
     fn test_arc_evict_candidate() {
         let p = ArcPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         let v = p.evict_candidate().unwrap();
         assert!(v == 1 || v == 2 || v == 3);
         assert_eq!(p.len(), 2);
@@ -233,7 +258,9 @@ mod tests {
     fn test_arc_ghost_hit_adjusts_p() {
         let p = ArcPolicy::new();
         // Insert 4 pages, evict 2 (they become B1 ghosts).
-        for i in 1u64..=4 { p.insert(i); }
+        for i in 1u64..=4 {
+            p.insert(i);
+        }
         let v1 = p.evict_candidate().unwrap(); // goes to B1
         let v2 = p.evict_candidate().unwrap(); // goes to B1
         // Re-insert v1 — ghost hit in B1 should increase p.
@@ -247,7 +274,8 @@ mod tests {
     #[test]
     fn test_arc_put_back() {
         let p = ArcPolicy::new();
-        p.insert(1); p.insert(2);
+        p.insert(1);
+        p.insert(2);
         let v = p.evict_candidate().unwrap();
         p.put_back(v);
         assert_eq!(p.len(), 2); // v was re-inserted into T2
@@ -256,7 +284,9 @@ mod tests {
     #[test]
     fn test_arc_remove() {
         let p = ArcPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         assert!(p.remove(2));
         assert!(!p.remove(2));
         assert_eq!(p.len(), 2);
@@ -278,4 +308,3 @@ mod tests {
         assert!(s.b2.len <= ghost_cap, "B2 too large: {}", s.b2.len);
     }
 }
-

@@ -16,7 +16,7 @@ use crate::thread_locker::ThreadLocker;
 /// based on the requested configuration. Each factory is associated with
 /// a single LockManager instance.
 ///
-/// 
+///
 pub struct LockerFactory {
     /// Atomic counter for generating unique locker IDs.
     next_id: AtomicI64,

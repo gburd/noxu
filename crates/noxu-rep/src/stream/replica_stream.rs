@@ -60,7 +60,7 @@ pub trait LogWriter: Send {
 ///   3. Registers the returned LSN in the provided `vlsn_index` so that
 ///      the VLSN→LSN mapping is kept up-to-date on the replica.
 ///
-/// 
+///
 pub struct EnvironmentLogWriter {
     /// Shared log manager for appending replicated entries.
     log_manager: Arc<noxu_log::LogManager>,
@@ -95,8 +95,8 @@ impl LogWriter for EnvironmentLogWriter {
         payload: &[u8],
     ) -> crate::error::Result<()> {
         // Resolve the wire entry-type byte to the typed enum.
-        let log_entry_type =
-            LogEntryType::from_type_num(entry_type).ok_or_else(|| {
+        let log_entry_type = LogEntryType::from_type_num(entry_type)
+            .ok_or_else(|| {
                 crate::error::RepError::ProtocolError(format!(
                     "replica: unknown entry_type byte {}",
                     entry_type
@@ -120,11 +120,7 @@ impl LogWriter for EnvironmentLogWriter {
         // FeederRunner/ack tracking can correlate positions.
         // vlsn=0 is reserved as NULL_VLSN; skip it.
         if vlsn > 0 {
-            self.vlsn_index.put(
-                vlsn,
-                lsn.file_number(),
-                lsn.file_offset(),
-            );
+            self.vlsn_index.put(vlsn, lsn.file_number(), lsn.file_offset());
         }
 
         log::trace!(
@@ -208,15 +204,12 @@ impl ReplicaReceiver {
                 )));
             }
 
-            let vlsn =
-                u64::from_le_bytes(frame[0..8].try_into().unwrap());
+            let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
             let entry_type = frame[8];
-            let payload_len = u32::from_le_bytes(
-                frame[9..13].try_into().unwrap(),
-            ) as usize;
-            let expected_crc = u32::from_le_bytes(
-                frame[13..17].try_into().unwrap(),
-            );
+            let payload_len =
+                u32::from_le_bytes(frame[9..13].try_into().unwrap()) as usize;
+            let expected_crc =
+                u32::from_le_bytes(frame[13..17].try_into().unwrap());
 
             if frame.len() < FRAME_HEADER_LEN + payload_len {
                 return Err(RepError::ProtocolError(format!(
@@ -226,7 +219,8 @@ impl ReplicaReceiver {
                 )));
             }
 
-            let payload = &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len];
+            let payload =
+                &frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len];
 
             // ----------------------------------------------------------------
             // Verify CRC32 — reject corrupted frames before applying.
@@ -281,7 +275,7 @@ pub enum ReplicaStreamState {
 /// in a pending queue, and tracks which VLSNs have been received vs.
 /// applied to the local database.
 ///
-/// 
+///
 pub struct ReplicaStream {
     /// Name of the master we are connected to.
     master_name: Mutex<Option<String>>,
@@ -497,8 +491,7 @@ mod tests {
             let timeout = Duration::from_secs(5);
             for _ in 0..3 {
                 let ack = master_clone.receive(timeout).unwrap().unwrap();
-                let vlsn =
-                    u64::from_le_bytes(ack[..8].try_into().unwrap());
+                let vlsn = u64::from_le_bytes(ack[..8].try_into().unwrap());
                 acked.push(vlsn);
             }
             // Close the channel to terminate the receiver loop.
@@ -557,9 +550,10 @@ mod tests {
                 from_vlsn: u64,
             ) -> Option<(u64, u8, Vec<u8>)> {
                 if let Some(&(v, _, _)) = self.items.front()
-                    && v >= from_vlsn {
-                        return self.items.pop_front();
-                    }
+                    && v >= from_vlsn
+                {
+                    return self.items.pop_front();
+                }
                 None
             }
         }
@@ -569,9 +563,8 @@ mod tests {
         let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
         // Entries to replicate.
-        let entries: Vec<(u64, u8, Vec<u8>)> = (1..=5)
-            .map(|i| (i, i as u8, vec![i as u8; i as usize]))
-            .collect();
+        let entries: Vec<(u64, u8, Vec<u8>)> =
+            (1..=5).map(|i| (i, i as u8, vec![i as u8; i as usize])).collect();
 
         // Replica thread.
         let replica_ch_clone = Arc::clone(&replica_ch);
@@ -586,9 +579,8 @@ mod tests {
         let master_ch_clone = Arc::clone(&master_ch);
         let feeder_handle = std::thread::spawn(move || {
             let runner = FeederRunner::new(Arc::clone(&master_ch_clone), 1);
-            let mut scanner = SimpleScanner {
-                items: entries.into_iter().collect(),
-            };
+            let mut scanner =
+                SimpleScanner { items: entries.into_iter().collect() };
             runner.run(&mut scanner).unwrap();
             runner.known_replica_vlsn()
         });

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 /// The possible states of a replication node.
 ///
-/// 
+///
 ///
 /// These states determine which operations are permitted on the node. For
 /// example, only the Master node can execute write operations.

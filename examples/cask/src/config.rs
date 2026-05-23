@@ -30,7 +30,9 @@ impl CaskConfig {
     ///
     /// Returns `None` if the file does not exist; returns an error if the file
     /// exists but cannot be parsed.
-    pub fn from_file(path: &Path) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+    pub fn from_file(
+        path: &Path,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
         if !path.exists() {
             return Ok(None);
         }

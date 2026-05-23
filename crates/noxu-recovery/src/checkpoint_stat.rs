@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Tracks various metrics about checkpoint execution including the number of
 /// checkpoints performed, nodes flushed, and timing information.
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct CheckpointStats {
     /// Total number of checkpoints performed.

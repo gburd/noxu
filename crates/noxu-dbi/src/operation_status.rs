@@ -3,7 +3,7 @@
 
 /// Status returned by cursor and database operations.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStatus {
     /// Operation succeeded.
@@ -63,10 +63,12 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let statuses = [OperationStatus::Success,
+        let statuses = [
+            OperationStatus::Success,
             OperationStatus::NotFound,
             OperationStatus::KeyExist,
-            OperationStatus::KeyEmpty];
+            OperationStatus::KeyEmpty,
+        ];
 
         assert_eq!(statuses.len(), 4);
     }

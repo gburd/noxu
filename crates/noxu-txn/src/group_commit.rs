@@ -39,11 +39,11 @@ pub const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 20;
 
 /// Shared group-commit abstraction used by [`crate::TxnManager`].
 ///
-/// 
+///
 pub trait GroupCommit: Send + Sync {
     /// Returns `true` if group commit is currently enabled.
     ///
-    /// 
+    ///
     fn is_enabled(&self) -> bool;
 
     /// Called by each committing transaction to buffer itself and potentially
@@ -55,7 +55,7 @@ pub trait GroupCommit: Send + Sync {
     /// concurrent fsync) before returning; `false` if fsync was skipped
     /// (e.g. `CommitNoSync` durability).
     ///
-    /// 
+    ///
     fn buffer_commit(&self, commit_vlsn: i64) -> bool;
 
     /// Shuts down the group-commit background machinery.
@@ -82,7 +82,7 @@ pub trait GroupCommit: Send + Sync {
 /// correctly separates concerns: GroupCommit enforces the batch-size policy;
 /// FSyncManager enforces the time-window and leader/waiter coalescing.
 ///
-/// 
+///
 pub struct GroupCommitMaster {
     /// Whether group commit is currently active.
     enabled: AtomicBool,
@@ -174,7 +174,7 @@ impl GroupCommit for GroupCommitMaster {
 /// Batches acknowledgements during log replay, sending an ACK to the feeder
 /// once a batch of committed transactions has been applied and durably written.
 ///
-/// 
+///
 pub struct GroupCommitReplica {
     enabled: AtomicBool,
     interval_ms: u64,
@@ -183,12 +183,8 @@ pub struct GroupCommitReplica {
 impl GroupCommitReplica {
     /// Creates a new `GroupCommitReplica`.
     pub fn new(interval_ms: u64) -> Self {
-        GroupCommitReplica {
-            enabled: AtomicBool::new(true),
-            interval_ms,
-        }
+        GroupCommitReplica { enabled: AtomicBool::new(true), interval_ms }
     }
-
 }
 
 impl Default for GroupCommitReplica {
@@ -247,9 +243,12 @@ mod tests {
     fn test_master_threshold_fires_at_max_count() {
         // With max_count=3: commits 1 and 2 are buffered; commit 3 fires fsync.
         let gc = GroupCommitMaster::new(3, 20);
-        assert!(gc.buffer_commit(1),  "commit 1 should be buffered");
-        assert!(gc.buffer_commit(2),  "commit 2 should be buffered");
-        assert!(!gc.buffer_commit(3), "commit 3 must trigger flush (threshold)");
+        assert!(gc.buffer_commit(1), "commit 1 should be buffered");
+        assert!(gc.buffer_commit(2), "commit 2 should be buffered");
+        assert!(
+            !gc.buffer_commit(3),
+            "commit 3 must trigger flush (threshold)"
+        );
         assert_eq!(gc.flush_count(), 1, "exactly one flush should have fired");
     }
 
@@ -272,7 +271,10 @@ mod tests {
         // When max_count=0, group commit is disabled: every commit requires fsync.
         let gc = GroupCommitMaster::new(0, 20);
         assert!(!gc.is_enabled());
-        assert!(!gc.buffer_commit(1), "disabled GC must return false (always flush)");
+        assert!(
+            !gc.buffer_commit(1),
+            "disabled GC must return false (always flush)"
+        );
         assert!(!gc.buffer_commit(2));
     }
 

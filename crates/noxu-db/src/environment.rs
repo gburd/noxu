@@ -9,19 +9,21 @@ use crate::environment_mutable_config::EnvironmentMutableConfig;
 use crate::error::{NoxuError, Result};
 use crate::transaction::Transaction;
 use crate::transaction_config::TransactionConfig;
+use hashbrown::HashMap;
 use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
 use noxu_engine::EnvironmentStats;
-use noxu_engine::env_stats::{EvictorStatsSnapshot, LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot};
+use noxu_engine::env_stats::{
+    EvictorStatsSnapshot, LockStatsSnapshot, LogStatsSnapshot, TxnStatsSnapshot,
+};
 use noxu_log::LogManager;
 use noxu_sync::Mutex;
-use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A database environment.
 ///
-/// 
+///
 ///
 /// An Environment provides support for caching, locking, logging, and
 /// transactions. It is the top-level handle through which databases are
@@ -160,7 +162,8 @@ impl Environment {
             transactional: config.transactional,
             env_is_locking: config.env_is_locking,
             env_recovery_force_checkpoint: config.env_recovery_force_checkpoint,
-            env_recovery_force_checkpoint_field: config.env_recovery_force_checkpoint,
+            env_recovery_force_checkpoint_field: config
+                .env_recovery_force_checkpoint,
             env_recovery_force_new_file: config.env_recovery_force_new_file,
             halt_on_commit_after_checksum_exception: config
                 .halt_on_commit_after_checksum_exception,
@@ -192,7 +195,8 @@ impl Environment {
             log_n_data_directories: config.log_n_data_directories,
             log_mem_only: config.log_mem_only,
             log_detect_file_delete: config.log_detect_file_delete,
-            log_detect_file_delete_interval_ms: config.log_detect_file_delete_interval_ms,
+            log_detect_file_delete_interval_ms: config
+                .log_detect_file_delete_interval_ms,
             log_flush_sync_interval_ms: config.log_flush_sync_interval_ms,
             log_flush_no_sync_interval_ms: config.log_flush_no_sync_interval_ms,
             log_use_odsync: config.log_use_odsync,
@@ -210,7 +214,8 @@ impl Environment {
             tree_compact_max_key_length: config.tree_compact_max_key_length,
             // INCompressor
             run_in_compressor: config.run_in_compressor,
-            in_compressor_wakeup_interval_ms: config.in_compressor_wakeup_interval_ms,
+            in_compressor_wakeup_interval_ms: config
+                .in_compressor_wakeup_interval_ms,
             compressor_deadlock_retry: config.compressor_deadlock_retry,
             compressor_lock_timeout_ms: config.compressor_lock_timeout_ms,
             compressor_purge_root: config.compressor_purge_root,
@@ -231,7 +236,8 @@ impl Environment {
             cleaner_use_deleted_dir: config.cleaner_use_deleted_dir,
             cleaner_max_batch_files: config.cleaner_max_batch_files,
             cleaner_read_size: config.cleaner_read_size,
-            cleaner_detail_max_memory_percentage: config.cleaner_detail_max_memory_percentage,
+            cleaner_detail_max_memory_percentage: config
+                .cleaner_detail_max_memory_percentage,
             cleaner_look_ahead_cache_size: config.cleaner_look_ahead_cache_size,
             cleaner_foreground_proactive_migration: config
                 .cleaner_foreground_proactive_migration,
@@ -242,7 +248,8 @@ impl Environment {
             // Checkpointer
             run_checkpointer: config.run_checkpointer,
             checkpointer_bytes_interval: config.checkpointer_bytes_interval,
-            checkpointer_wakeup_interval_ms: config.checkpointer_wakeup_interval_ms,
+            checkpointer_wakeup_interval_ms: config
+                .checkpointer_wakeup_interval_ms,
             checkpointer_deadlock_retry: config.checkpointer_deadlock_retry,
             checkpointer_high_priority: config.checkpointer_high_priority,
             // Evictor
@@ -290,11 +297,11 @@ impl Environment {
             // Background rate limits
             env_background_read_limit_kb: config.env_background_read_limit_kb,
             env_background_write_limit_kb: config.env_background_write_limit_kb,
-            env_background_sleep_interval_us: config.env_background_sleep_interval_us,
+            env_background_sleep_interval_us: config
+                .env_background_sleep_interval_us,
         };
-        let env_impl =
-            EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
-                .map_err(|e| NoxuError::environment(e.to_string()))?;
+        let env_impl = EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
+            .map_err(|e| NoxuError::environment(e.to_string()))?;
 
         let log_manager = env_impl.get_log_manager();
         let env_impl_arc = Arc::new(Mutex::new(env_impl));
@@ -313,7 +320,7 @@ impl Environment {
 
     /// Closes the environment handle.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if:
@@ -357,7 +364,7 @@ impl Environment {
 
     /// Opens or creates a database.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -457,7 +464,7 @@ impl Environment {
 
     /// Removes a database.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -478,16 +485,14 @@ impl Environment {
         let mut databases = self.databases.lock();
         {
             let env_impl = self.env_impl.lock();
-            env_impl.remove_database(name).map_err(|e| {
-                match &e {
-                    noxu_dbi::DbiError::DatabaseNotFound(_) => {
-                        NoxuError::DatabaseNotFound(format!(
-                            "Database '{}' does not exist",
-                            name
-                        ))
-                    }
-                    _ => NoxuError::environment(e.to_string()),
+            env_impl.remove_database(name).map_err(|e| match &e {
+                noxu_dbi::DbiError::DatabaseNotFound(_) => {
+                    NoxuError::DatabaseNotFound(format!(
+                        "Database '{}' does not exist",
+                        name
+                    ))
                 }
+                _ => NoxuError::environment(e.to_string()),
             })?;
         }
         databases.remove(name);
@@ -508,13 +513,14 @@ impl Environment {
     ) -> Result<u64> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
-        env_impl.truncate_database(name).map_err(|e| {
-            match &e {
-                noxu_dbi::DbiError::DatabaseNotFound(_) => {
-                    NoxuError::DatabaseNotFound(format!("Database '{}' does not exist", name))
-                }
-                _ => NoxuError::environment(e.to_string()),
+        env_impl.truncate_database(name).map_err(|e| match &e {
+            noxu_dbi::DbiError::DatabaseNotFound(_) => {
+                NoxuError::DatabaseNotFound(format!(
+                    "Database '{}' does not exist",
+                    name
+                ))
             }
+            _ => NoxuError::environment(e.to_string()),
         })
     }
 
@@ -548,8 +554,8 @@ impl Environment {
         let mut databases = self.databases.lock();
         {
             let env_impl = self.env_impl.lock();
-            env_impl.rename_database(old_name, new_name).map_err(|e| {
-                match &e {
+            env_impl.rename_database(old_name, new_name).map_err(
+                |e| match &e {
                     noxu_dbi::DbiError::DatabaseNotFound(_) => {
                         NoxuError::DatabaseNotFound(format!(
                             "Database '{}' does not exist",
@@ -563,8 +569,8 @@ impl Environment {
                         ))
                     }
                     _ => NoxuError::environment(e.to_string()),
-                }
-            })?;
+                },
+            )?;
         }
 
         if let Some(handle) = databases.remove(old_name) {
@@ -576,7 +582,7 @@ impl Environment {
 
     /// Begins a new transaction.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `parent` - Optional parent transaction (currently ignored)
@@ -620,7 +626,8 @@ impl Environment {
         // Wire the transaction to the WAL so commit/abort write log entries.
         // Also create an inner Txn for per-record lock management.
         let env_guard = self.env_impl.lock();
-        let inner_txn = env_guard.begin_txn()
+        let inner_txn = env_guard
+            .begin_txn()
             .map(|mut t| {
                 // Propagate all relevant TransactionConfig fields into the
                 // inner Txn for lock management and isolation behavior.
@@ -652,11 +659,8 @@ impl Environment {
         };
         drop(env_guard);
 
-        let txn = if let Some(it) = inner_txn {
-            txn.with_inner_txn(it)
-        } else {
-            txn
-        };
+        let txn =
+            if let Some(it) = inner_txn { txn.with_inner_txn(it) } else { txn };
 
         // Wire env_impl so Transaction::abort() can apply undo records.
         // Txn environment reference during construction.
@@ -667,7 +671,7 @@ impl Environment {
 
     /// Returns a list of database names.
     ///
-    /// 
+    ///
     ///
     /// # Returns
     /// A vector of database names
@@ -682,7 +686,7 @@ impl Environment {
 
     /// Returns the home directory path.
     ///
-    /// 
+    ///
     pub fn get_home(&self) -> &Path {
         &self.home
     }
@@ -722,7 +726,10 @@ impl Environment {
     ///
     /// # Errors
     /// Returns an error if the environment is closed or invalidated.
-    pub fn set_mutable_config(&mut self, cfg: EnvironmentMutableConfig) -> Result<()> {
+    pub fn set_mutable_config(
+        &mut self,
+        cfg: EnvironmentMutableConfig,
+    ) -> Result<()> {
         self.check_open()?;
         if let Some(sz) = cfg.cache_size {
             self.config.cache_size = sz as u64;
@@ -776,7 +783,8 @@ impl Environment {
     /// `true` (e.g. `LogChecksum`, `BtreeCorruption`, `DiskLimit`).
     /// Once invalidated the environment must be closed and re-opened.
     pub fn is_valid(&self) -> bool {
-        self.open.load(Ordering::Acquire) && self.env_valid.load(Ordering::Acquire)
+        self.open.load(Ordering::Acquire)
+            && self.env_valid.load(Ordering::Acquire)
     }
 
     /// Invalidates the environment in response to a fatal error.
@@ -811,14 +819,18 @@ impl Environment {
         let env_impl = self.env_impl.lock();
         let n_databases = env_impl.n_databases() as u32;
         // Use cached log_manager for the log stats to avoid double-locking.
-        let log = self.log_manager
+        let log = self
+            .log_manager
             .as_ref()
             .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
             .unwrap_or_default();
-        let lock = LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
-        let txn = TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
+        let lock =
+            LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
+        let txn =
+            TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
         let throughput = env_impl.get_throughput_snapshot();
-        let evictor = EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
+        let evictor =
+            EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
         let cleaner = env_impl
             .get_cleaner()
             .map(|c| c.get_stats().snapshot())
@@ -847,10 +859,7 @@ impl Environment {
     /// and for verifying that group commit is working (fewer fsyncs than commits).
     /// Returns 0 if the environment is non-transactional (no log manager).
     pub fn stat_fsync_count(&self) -> u64 {
-        self.log_manager
-            .as_ref()
-            .map(|lm| lm.fsync_count())
-            .unwrap_or(0)
+        self.log_manager.as_ref().map(|lm| lm.fsync_count()).unwrap_or(0)
     }
 
     /// Verifies the structural integrity of all databases in this environment.
@@ -871,7 +880,10 @@ impl Environment {
     ///
     /// # Errors
     /// Returns an error if the environment is closed or invalidated.
-    pub fn verify(&self, config: &noxu_engine::VerifyConfig) -> Result<noxu_engine::VerifyResult> {
+    pub fn verify(
+        &self,
+        config: &noxu_engine::VerifyConfig,
+    ) -> Result<noxu_engine::VerifyResult> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let all_dbs = env_impl.get_all_database_impls();
@@ -921,7 +933,8 @@ impl Environment {
         if !self.env_valid.load(Ordering::Acquire) {
             return Err(NoxuError::environment_with_reason(
                 crate::error::EnvironmentFailureReason::ForcedShutdown,
-                "environment has been invalidated due to a prior fatal error".to_string(),
+                "environment has been invalidated due to a prior fatal error"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -974,8 +987,7 @@ mod tests {
     fn test_open_fails_without_allow_create() {
         let temp_dir = TempDir::new().unwrap();
         let home = temp_dir.path().join("nonexistent");
-        let config =
-            EnvironmentConfig::new(home).with_allow_create(false);
+        let config = EnvironmentConfig::new(home).with_allow_create(false);
 
         let result = Environment::open(config);
         assert!(result.is_err());
@@ -1288,7 +1300,8 @@ mod tests {
             let env_impl = env.env_impl.lock();
             let mut dbi_config = noxu_dbi::DatabaseConfig::new();
             dbi_config.set_allow_create(true);
-            let db_arc = env_impl.open_database("ghost_db", &dbi_config).unwrap();
+            let db_arc =
+                env_impl.open_database("ghost_db", &dbi_config).unwrap();
             let db_id = db_arc.read().get_id();
             env_impl.close_database(db_id).unwrap();
         }
@@ -1395,7 +1408,11 @@ mod tests {
 
         let verify_cfg = VerifyConfig::default();
         let result = env.verify(&verify_cfg).unwrap();
-        assert!(result.passed, "env with data should pass: {:?}", result.errors);
+        assert!(
+            result.passed,
+            "env with data should pass: {:?}",
+            result.errors
+        );
         assert!(result.records_verified >= 10);
         db.close().unwrap();
         env.close().unwrap();

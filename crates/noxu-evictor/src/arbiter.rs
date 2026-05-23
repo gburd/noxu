@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// - Eviction threshold (evict_bytes)
 /// - Critical eviction threshold
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct Arbiter {
     /// Maximum memory budget in bytes.

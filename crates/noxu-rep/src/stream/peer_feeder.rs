@@ -276,7 +276,9 @@ pub fn negotiate_syncup(
     replica_needs: u64,
 ) -> SyncupResult {
     match peer_range {
-        Some((first, last)) if first <= replica_needs && replica_needs <= last => {
+        Some((first, last))
+            if first <= replica_needs && replica_needs <= last =>
+        {
             SyncupResult::CanServe { start_vlsn: replica_needs }
         }
         _ => SyncupResult::NeedsRestore,
@@ -315,7 +317,7 @@ impl PeerFeederService {
 }
 
 /// Wire-level response codes sent by the server.
-const PEER_FEEDER_CAN_SERVE: u8  = 0;
+const PEER_FEEDER_CAN_SERVE: u8 = 0;
 const PEER_FEEDER_NEEDS_RESTORE: u8 = 1;
 
 impl ServiceHandler for PeerFeederService {
@@ -327,18 +329,21 @@ impl ServiceHandler for PeerFeederService {
         use std::time::Duration;
 
         // 1. Read the 8-byte start_vlsn from the downstream replica.
-        let msg = channel
-            .receive(Duration::from_secs(30))?
-            .ok_or_else(|| RepError::NetworkError(
-                "PEER_FEEDER: no start_vlsn received".into()))?;
+        let msg =
+            channel.receive(Duration::from_secs(30))?.ok_or_else(|| {
+                RepError::NetworkError(
+                    "PEER_FEEDER: no start_vlsn received".into(),
+                )
+            })?;
 
         if msg.len() < 8 {
             return Err(RepError::NetworkError(format!(
-                "PEER_FEEDER: short handshake ({} bytes)", msg.len())));
+                "PEER_FEEDER: short handshake ({} bytes)",
+                msg.len()
+            )));
         }
-        let start_vlsn = u64::from_le_bytes(
-            msg[..8].try_into().expect("slice of 8 bytes")
-        );
+        let start_vlsn =
+            u64::from_le_bytes(msg[..8].try_into().expect("slice of 8 bytes"));
 
         // 2. Negotiate: do we hold the requested VLSN range?
         let range = self.source.log_range();
@@ -362,7 +367,8 @@ impl ServiceHandler for PeerFeederService {
                 channel.send(&[PEER_FEEDER_NEEDS_RESTORE])?;
                 Err(RepError::NetworkError(format!(
                     "PEER_FEEDER: cannot serve vlsn={start_vlsn}, \
-                     range={range:?}")))
+                     range={range:?}"
+                )))
             }
         }
     }
@@ -414,11 +420,13 @@ pub fn catch_up_from_peer(
     channel.send(&start_vlsn.to_le_bytes())?;
 
     // Read the one-byte response.
-    let resp = channel
-        .receive(Duration::from_secs(30))?
-        .ok_or_else(|| RepError::NetworkError("no response from peer feeder".into()))?;
+    let resp = channel.receive(Duration::from_secs(30))?.ok_or_else(|| {
+        RepError::NetworkError("no response from peer feeder".into())
+    })?;
     if resp.is_empty() {
-        return Err(RepError::NetworkError("empty response from peer feeder".into()));
+        return Err(RepError::NetworkError(
+            "empty response from peer feeder".into(),
+        ));
     }
     match resp[0] {
         PEER_FEEDER_CAN_SERVE => {}
@@ -455,7 +463,10 @@ impl MultiPeerCatchUp {
     /// Create a new multi-peer catch-up request.
     ///
     /// `peers` is a list of `(node_name, socket_addr)` pairs to try.
-    pub fn new(peers: Vec<(String, std::net::SocketAddr)>, start_vlsn: u64) -> Self {
+    pub fn new(
+        peers: Vec<(String, std::net::SocketAddr)>,
+        start_vlsn: u64,
+    ) -> Self {
         Self { peers, start_vlsn }
     }
 
@@ -633,7 +644,8 @@ mod tests {
                         .receive(Duration::from_secs(5))
                         .unwrap()
                         .unwrap();
-                    let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+                    let vlsn =
+                        u64::from_le_bytes(frame[0..8].try_into().unwrap());
                     vlsns.push(vlsn);
                     // Send ack.
                     let _ = receiver.send(&vlsn.to_le_bytes());
@@ -642,7 +654,8 @@ mod tests {
             })
         };
 
-        let runner = PeerFeederRunner::new(Arc::clone(&sender), Arc::clone(&source), 10);
+        let runner =
+            PeerFeederRunner::new(Arc::clone(&sender), Arc::clone(&source), 10);
         let sender_clone = Arc::clone(&sender);
         let run_handle = std::thread::spawn(move || {
             let _ = runner.run();
@@ -676,13 +689,19 @@ mod tests {
     #[test]
     fn test_negotiate_syncup_needs_restore_too_early() {
         // Replica needs VLSN 3 but peer only has [5, 20].
-        assert_eq!(negotiate_syncup(Some((5, 20)), 3), SyncupResult::NeedsRestore);
+        assert_eq!(
+            negotiate_syncup(Some((5, 20)), 3),
+            SyncupResult::NeedsRestore
+        );
     }
 
     #[test]
     fn test_negotiate_syncup_needs_restore_too_late() {
         // Replica needs VLSN 25 but peer only has [5, 20].
-        assert_eq!(negotiate_syncup(Some((5, 20)), 25), SyncupResult::NeedsRestore);
+        assert_eq!(
+            negotiate_syncup(Some((5, 20)), 25),
+            SyncupResult::NeedsRestore
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::durability::Durability;
 ///
 /// Specifies the configuration parameters used when beginning a transaction.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionConfig {
     /// Durability for this transaction.

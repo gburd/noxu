@@ -39,7 +39,9 @@ use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
 use crate::master_transfer::MasterTransferConfig;
 use crate::net::service_dispatcher::TcpServiceDispatcher;
-use crate::network_restore_server::{NetworkRestoreServer, RESTORE_SERVICE_NAME};
+use crate::network_restore_server::{
+    NetworkRestoreServer, RESTORE_SERVICE_NAME,
+};
 use crate::node_state::{NodeState, NodeStateMachine};
 use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
@@ -57,7 +59,7 @@ const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A replicated database environment.
 ///
-/// 
+///
 ///
 /// This is the entry point for replication. It wraps a standard Environment
 /// and adds replication capabilities including master election, replica
@@ -165,7 +167,7 @@ pub struct ReplicatedEnvironment {
 impl ReplicatedEnvironment {
     /// Create a new replicated environment.
     ///
-    /// 
+    ///
     ///
     /// Creates a replicated environment handle and starts participating in the
     /// replication group. The node's state is determined when it joins the
@@ -192,80 +194,79 @@ impl ReplicatedEnvironment {
         // which binds a ServerSocketChannel on the configured port and begins
         // accepting connections. We do the same here using the node_host and
         // node_port from RepConfig.
-        let listen_addr_str = format!("{}:{}", config.node_host, config.node_port);
+        let listen_addr_str =
+            format!("{}:{}", config.node_host, config.node_port);
         let mut restore_registered_init = false;
 
-        let (tcp_dispatcher, bound_addr) =
-            match listen_addr_str.parse::<SocketAddr>() {
-                Ok(addr) => {
-                    match TcpServiceDispatcher::new(addr) {
-                        Ok(dispatcher) => match dispatcher.start() {
-                            Ok(bound) => {
-                                // Register the network restore handler so any
-                                // node in the group can request a full file-set
-                                // copy from this node's environment.
-                                if let Some(ref home) = config.env_home {
-                                    let restore_server =
-                                        NetworkRestoreServer::new(home.clone());
-                                    dispatcher.register(
-                                        RESTORE_SERVICE_NAME,
-                                        Arc::new(restore_server),
-                                    );
-                                    log::debug!(
-                                        "Node '{}' RESTORE service registered \
+        let (tcp_dispatcher, bound_addr) = match listen_addr_str
+            .parse::<SocketAddr>()
+        {
+            Ok(addr) => {
+                match TcpServiceDispatcher::new(addr) {
+                    Ok(dispatcher) => match dispatcher.start() {
+                        Ok(bound) => {
+                            // Register the network restore handler so any
+                            // node in the group can request a full file-set
+                            // copy from this node's environment.
+                            if let Some(ref home) = config.env_home {
+                                let restore_server =
+                                    NetworkRestoreServer::new(home.clone());
+                                dispatcher.register(
+                                    RESTORE_SERVICE_NAME,
+                                    Arc::new(restore_server),
+                                );
+                                log::debug!(
+                                    "Node '{}' RESTORE service registered \
                                          (env_home={})",
-                                        config.node_name,
-                                        home.display(),
-                                    );
-                                    restore_registered_init = true;
-                                }
-                                log::info!(
-                                    "Node '{}' TCP service dispatcher started on {}",
                                     config.node_name,
-                                    bound
+                                    home.display(),
                                 );
-                                (Some(dispatcher), Some(bound))
+                                restore_registered_init = true;
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "Node '{}' failed to start TCP dispatcher on {}: {}",
-                                    config.node_name,
-                                    listen_addr_str,
-                                    e
-                                );
-                                (None, None)
-                            }
-                        },
+                            log::info!(
+                                "Node '{}' TCP service dispatcher started on {}",
+                                config.node_name,
+                                bound
+                            );
+                            (Some(dispatcher), Some(bound))
+                        }
                         Err(e) => {
                             log::warn!(
-                                "Node '{}' failed to create TCP dispatcher: {}",
+                                "Node '{}' failed to start TCP dispatcher on {}: {}",
                                 config.node_name,
+                                listen_addr_str,
                                 e
                             );
                             (None, None)
                         }
+                    },
+                    Err(e) => {
+                        log::warn!(
+                            "Node '{}' failed to create TCP dispatcher: {}",
+                            config.node_name,
+                            e
+                        );
+                        (None, None)
                     }
                 }
-                Err(e) => {
-                    log::warn!(
-                        "Node '{}' cannot parse listen address '{}': {}",
-                        config.node_name,
-                        listen_addr_str,
-                        e
-                    );
-                    (None, None)
-                }
-            };
+            }
+            Err(e) => {
+                log::warn!(
+                    "Node '{}' cannot parse listen address '{}': {}",
+                    config.node_name,
+                    listen_addr_str,
+                    e
+                );
+                (None, None)
+            }
+        };
 
         // Build the in-memory peer log scanner; register the peer feeder
         // service on the dispatcher so downstream replicas can connect.
         let peer_scanner = Arc::new(PeerLogScanner::new());
         if let Some(ref dispatcher) = tcp_dispatcher {
             let service = PeerFeederService::new(Arc::clone(&peer_scanner));
-            dispatcher.register(
-                PEER_FEEDER_SERVICE_NAME,
-                Arc::new(service),
-            );
+            dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(service));
             log::debug!(
                 "Node '{}' PEER_FEEDER service registered",
                 config.node_name,
@@ -324,10 +325,7 @@ impl ReplicatedEnvironment {
         {
             let env_home = env.get_env_home().to_path_buf();
             let restore_server = NetworkRestoreServer::new(env_home.clone());
-            dispatcher.register(
-                RESTORE_SERVICE_NAME,
-                Arc::new(restore_server),
-            );
+            dispatcher.register(RESTORE_SERVICE_NAME, Arc::new(restore_server));
             self.restore_registered.store(true, Ordering::SeqCst);
             log::debug!(
                 "Node '{}' RESTORE service registered via with_environment \
@@ -342,7 +340,7 @@ impl ReplicatedEnvironment {
 
     /// Get the current node state.
     ///
-    /// 
+    ///
     ///
     /// Returns the current state of the node associated with this replication
     /// environment. If the caller's intent is to track the state of the node,
@@ -373,7 +371,7 @@ impl ReplicatedEnvironment {
 
     /// Get the node name.
     ///
-    /// 
+    ///
     ///
     /// Returns the unique name used to identify this replicated environment.
     pub fn get_node_name(&self) -> &str {
@@ -523,7 +521,7 @@ impl ReplicatedEnvironment {
 
     /// Get the replication configuration.
     ///
-    /// 
+    ///
     ///
     /// Returns the replication configuration that has been used to create this
     /// environment.
@@ -547,7 +545,7 @@ impl ReplicatedEnvironment {
 
     /// Get replication statistics.
     ///
-    /// 
+    ///
     ///
     /// Returns statistics associated with this environment.
     pub fn get_stats(&self) -> &RepStats {
@@ -685,12 +683,12 @@ impl ReplicatedEnvironment {
         // replicated entries via EnvironmentLogWriter.
         if let Some(env) = self.env_impl.lock().unwrap().clone() {
             if let Some(log_mgr) = env.get_log_manager() {
-                let vlsn_index = Arc::new(
-                    crate::vlsn::vlsn_index::VlsnIndex::new(10),
-                );
+                let vlsn_index =
+                    Arc::new(crate::vlsn::vlsn_index::VlsnIndex::new(10));
 
                 // Resolve the master's socket address from the GroupService.
-                let master_addr_opt: Option<SocketAddr> = self.group_service
+                let master_addr_opt: Option<SocketAddr> = self
+                    .group_service
                     .get_all_nodes()
                     .iter()
                     .find(|n| n.name == master_name)
@@ -780,7 +778,7 @@ impl ReplicatedEnvironment {
 
     /// Initiate a master transfer to the target node.
     ///
-    /// 
+    ///
     ///
     /// Transfers the current master state from this node to one of the
     /// electable replicas. The replica that is actually chosen to be the new
@@ -862,7 +860,7 @@ impl ReplicatedEnvironment {
 
     /// Set the state change listener.
     ///
-    /// 
+    ///
     ///
     /// Sets the listener used to receive asynchronous replication node state
     /// change events. Note that there is one listener per replication node,
@@ -891,7 +889,7 @@ impl ReplicatedEnvironment {
 
     /// Close the replicated environment.
     ///
-    /// 
+    ///
     ///
     /// Closes this handle and releases any resources. When closed, daemon
     /// threads are stopped, even if they are performing work. The node ceases
@@ -952,7 +950,7 @@ impl ReplicatedEnvironment {
     /// Close this handle and shut down the Replication Group by forcing all
     /// active Replicas to exit.
     ///
-    /// 
+    ///
     ///
     /// This method must be invoked on the node that's currently the Master
     /// after all other outstanding handles have been closed. The Master waits
@@ -1310,22 +1308,30 @@ mod tests {
         let env =
             ReplicatedEnvironment::new(test_config_port0("tcp_node2")).unwrap();
         // Dispatcher is running.
-        assert!(env.tcp_dispatcher.as_ref().map(|d| d.is_running()).unwrap_or(false));
+        assert!(
+            env.tcp_dispatcher
+                .as_ref()
+                .map(|d| d.is_running())
+                .unwrap_or(false)
+        );
 
         env.close().unwrap();
 
         // After close, dispatcher must be stopped.
         assert!(
-            !env.tcp_dispatcher.as_ref().map(|d| d.is_running()).unwrap_or(false),
+            !env.tcp_dispatcher
+                .as_ref()
+                .map(|d| d.is_running())
+                .unwrap_or(false),
             "dispatcher should be stopped after close"
         );
     }
 
     #[test]
     fn test_tcp_dispatcher_accepts_connection() {
-        use crate::net::service_dispatcher::connect_to_service;
-        use crate::net::ServiceHandler;
         use crate::net::Channel;
+        use crate::net::ServiceHandler;
+        use crate::net::service_dispatcher::connect_to_service;
         use std::sync::atomic::{AtomicU32, Ordering as AO};
         use std::time::Duration;
 
@@ -1333,7 +1339,9 @@ mod tests {
             count: AtomicU32,
         }
         impl ServiceHandler for PingHandler {
-            fn service_name(&self) -> &str { "ping" }
+            fn service_name(&self) -> &str {
+                "ping"
+            }
             fn handle(&self, ch: Box<dyn Channel>) -> crate::error::Result<()> {
                 self.count.fetch_add(1, AO::SeqCst);
                 // Echo the first message back.
@@ -1452,7 +1460,11 @@ mod tests {
         let rep_env = ReplicatedEnvironment::new(config).unwrap();
 
         // Not yet registered.
-        assert!(!rep_env.restore_registered.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !rep_env
+                .restore_registered
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
 
         // Wire in a real EnvironmentImpl so get_env_home() returns the temp dir.
         let env_impl = Arc::new(
@@ -1461,7 +1473,11 @@ mod tests {
         rep_env.with_environment(env_impl);
 
         // Now the RESTORE service must be registered.
-        assert!(rep_env.restore_registered.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            rep_env
+                .restore_registered
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     /// Verify that when `config.env_home` IS set at construction, the RESTORE
@@ -1480,6 +1496,10 @@ mod tests {
         let rep_env = ReplicatedEnvironment::new(config).unwrap();
 
         // Should be registered immediately (env_home was in config).
-        assert!(rep_env.restore_registered.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            rep_env
+                .restore_registered
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }

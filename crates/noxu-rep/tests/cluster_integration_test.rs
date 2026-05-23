@@ -39,12 +39,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use noxu_rep::elections::{run_acceptor, run_election};
+use noxu_rep::net::{Channel, TcpChannel, TcpChannelListener};
 use noxu_rep::{
     NetworkRestore, NetworkRestoreConfig, NetworkRestoreServer, NodeState,
     NodeType, RepConfig, RepGroup, RepNode, ReplicatedEnvironment,
 };
-use noxu_rep::elections::{run_acceptor, run_election};
-use noxu_rep::net::{Channel, TcpChannel, TcpChannelListener};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -170,8 +170,7 @@ fn test_election_tcp_higher_vlsn_peer_wins() {
     let ch3: Arc<dyn Channel> = Arc::new(TcpChannel::connect(addr3).unwrap());
 
     // node1 proposes with vlsn=5 — lower than node2's vlsn=999.
-    let winner =
-        run_election(1, "cluster_node1", &group, &[ch2, ch3], 5, 1, 1);
+    let winner = run_election(1, "cluster_node1", &group, &[ch2, ch3], 5, 1, 1);
 
     let acc2 = h2.join().unwrap();
     let acc3 = h3.join().unwrap();
@@ -234,10 +233,7 @@ fn test_replica_applies_1000_entries() {
 
     // Range span must be at least N — no gaps, no duplicates lost.
     let span = range.get_last().saturating_sub(range.get_first()) + 1;
-    assert!(
-        span >= N,
-        "VLSN range must span ≥ {N} entries; got span={span}"
-    );
+    assert!(span >= N, "VLSN range must span ≥ {N} entries; got span={span}");
 
     env.close().expect("close failed");
 }
@@ -270,16 +266,14 @@ fn test_env_home_registers_restore_service() {
     // Create a ReplicatedEnvironment with env_home and port=0.
     // At construction the TCP service dispatcher binds on an OS-assigned port
     // and registers the RESTORE handler for `env_home`.
-    let config = RepConfig::builder(
-        "restore_group",
-        "restore_node",
-        "127.0.0.1",
-    )
-    .node_port(0)
-    .env_home(env_home.path())
-    .build();
+    let config =
+        RepConfig::builder("restore_group", "restore_node", "127.0.0.1")
+            .node_port(0)
+            .env_home(env_home.path())
+            .build();
 
-    let rep_env = ReplicatedEnvironment::new(config).expect("env creation failed");
+    let rep_env =
+        ReplicatedEnvironment::new(config).expect("env creation failed");
 
     // bound_addr must be Some — service dispatcher started successfully.
     assert!(
@@ -411,19 +405,15 @@ fn test_three_node_failover() {
     for vlsn in 31u64..=50 {
         node2.register_vlsn(vlsn, 0, vlsn as u32 * 16);
     }
-    assert_eq!(
-        node2.get_current_vlsn(),
-        50,
-        "new master must reach VLSN 50"
-    );
+    assert_eq!(node2.get_current_vlsn(), 50, "new master must reach VLSN 50");
 
     // node3 follows the new master and catches up.
     node3.ensure_unknown_state().unwrap();
     node3.become_replica("failover_node2").unwrap();
     for vlsn in 31u64..=50 {
-        node3
-            .apply_entry(vlsn, 0, vec![vlsn as u8; 8])
-            .unwrap_or_else(|e| panic!("node3 catch-up apply_entry({vlsn}): {e}"));
+        node3.apply_entry(vlsn, 0, vec![vlsn as u8; 8]).unwrap_or_else(|e| {
+            panic!("node3 catch-up apply_entry({vlsn}): {e}")
+        });
     }
     assert_eq!(
         node3.get_current_vlsn(),
@@ -451,8 +441,7 @@ fn test_three_node_failover() {
 #[test]
 fn test_partition_and_catch_up() {
     let master = ReplicatedEnvironment::new(
-        RepConfig::builder("partition_grp", "part_master", "127.0.0.1")
-            .build(),
+        RepConfig::builder("partition_grp", "part_master", "127.0.0.1").build(),
     )
     .unwrap();
     master.become_master(1).unwrap();
@@ -467,9 +456,9 @@ fn test_partition_and_catch_up() {
     // --- Phase 1: pre-partition — both nodes in sync (VLSNs 1–10) ---
     for vlsn in 1u64..=10 {
         master.register_vlsn(vlsn, 0, vlsn as u32 * 8);
-        replica
-            .apply_entry(vlsn, 0, vec![0u8; 8])
-            .unwrap_or_else(|e| panic!("pre-partition apply_entry({vlsn}): {e}"));
+        replica.apply_entry(vlsn, 0, vec![0u8; 8]).unwrap_or_else(|e| {
+            panic!("pre-partition apply_entry({vlsn}): {e}")
+        });
     }
     assert_eq!(master.get_current_vlsn(), 10, "master must be at 10");
     assert_eq!(replica.get_current_vlsn(), 10, "replica must be at 10");
@@ -620,10 +609,8 @@ fn test_fpaxos_5node_election_phase2_2() {
 
     // Spawn 4 acceptor threads (nodes 2–5).
     let listeners: Vec<_> = (0..4).map(|_| ephemeral_listener()).collect();
-    let addrs: Vec<_> = listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap())
-        .collect();
+    let addrs: Vec<_> =
+        listeners.iter().map(|l| l.local_addr().unwrap()).collect();
 
     let handles: Vec<_> = listeners
         .into_iter()
@@ -640,7 +627,10 @@ fn test_fpaxos_5node_election_phase2_2() {
     // Proposer: connect to all 4 acceptors.
     let channels: Vec<Arc<dyn Channel>> = addrs
         .iter()
-        .map(|&addr| Arc::new(TcpChannel::connect(addr).expect("connect")) as Arc<dyn Channel>)
+        .map(|&addr| {
+            Arc::new(TcpChannel::connect(addr).expect("connect"))
+                as Arc<dyn Channel>
+        })
         .collect();
 
     let winner = run_election(1, "fp_node1", &group, &channels, 200, 1, 1);
@@ -801,9 +791,15 @@ fn test_update_peer_metadata_while_active() {
     // Verify the group snapshot reflects the new metadata.
     let group = env.get_rep_group();
     let node2 = group.get_node("meta_node2").expect("meta_node2 must exist");
-    assert_eq!(node2.write_capacity_pct, 200, "write capacity must be updated to 200");
+    assert_eq!(
+        node2.write_capacity_pct, 200,
+        "write capacity must be updated to 200"
+    );
     assert_eq!(node2.latency_hint_ms, 5, "latency must be updated to 5ms");
-    assert_eq!(node2.read_capacity_pct, 100, "read capacity must remain default");
+    assert_eq!(
+        node2.read_capacity_pct, 100,
+        "read capacity must remain default"
+    );
 
     // meta_node3 must be unaffected.
     let node3 = group.get_node("meta_node3").expect("meta_node3 must exist");

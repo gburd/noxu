@@ -6,7 +6,7 @@ use std::io;
 
 /// A TxnCommit is logged when a transaction commits.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct TxnCommit {
     pub end: TxnEnd,

@@ -140,7 +140,11 @@ fn note_log_entry_updates_last_lsn_only() {
     let mut txn = noxu_txn::Txn::new(1, lm);
     txn.note_log_entry(10);
     txn.note_log_entry(20);
-    assert_eq!(txn.first_lsn(), 10, "first_lsn must not change after second note");
+    assert_eq!(
+        txn.first_lsn(),
+        10,
+        "first_lsn must not change after second note"
+    );
     assert_eq!(txn.last_lsn(), 20);
 }
 
@@ -302,7 +306,10 @@ fn post_commit_hook_fires_on_commit_with_logged_entry() {
         fired_clone.store(true, Ordering::Relaxed);
     });
     txn.commit().unwrap();
-    assert!(fired.load(Ordering::Relaxed), "post-commit hook should have fired");
+    assert!(
+        fired.load(Ordering::Relaxed),
+        "post-commit hook should have fired"
+    );
 }
 
 #[test]
@@ -317,7 +324,10 @@ fn pre_commit_hook_does_not_fire_for_read_only_txn() {
         fired_clone.store(true, Ordering::Relaxed);
     });
     txn.commit().unwrap();
-    assert!(!fired.load(Ordering::Relaxed), "hook must not fire for read-only txn");
+    assert!(
+        !fired.load(Ordering::Relaxed),
+        "hook must not fire for read-only txn"
+    );
 }
 
 // ─── 10. Durability variants ──────────────────────────────────────────────────

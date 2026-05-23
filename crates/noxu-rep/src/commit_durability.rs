@@ -7,7 +7,7 @@ use std::time::Duration;
 /// Policy for how many replicas must acknowledge a commit before it
 /// is considered durable.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ReplicaAckPolicy {
     /// All electable replicas must acknowledge the commit.

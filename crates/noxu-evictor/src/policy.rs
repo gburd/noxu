@@ -112,13 +112,15 @@ pub enum EvictionAlgorithm {
 impl EvictionAlgorithm {
     /// Instantiate a fresh, empty policy for this algorithm.
     pub fn new_policy(self) -> Box<dyn EvictionPolicy> {
-        use crate::policies::{ArcPolicy, CarPolicy, ClockPolicy, LirsPolicy, LruPolicy};
+        use crate::policies::{
+            ArcPolicy, CarPolicy, ClockPolicy, LirsPolicy, LruPolicy,
+        };
         match self {
-            EvictionAlgorithm::Lru   => Box::new(LruPolicy::new()),
+            EvictionAlgorithm::Lru => Box::new(LruPolicy::new()),
             EvictionAlgorithm::Clock => Box::new(ClockPolicy::new()),
-            EvictionAlgorithm::Arc   => Box::new(ArcPolicy::new()),
-            EvictionAlgorithm::Car   => Box::new(CarPolicy::new()),
-            EvictionAlgorithm::Lirs  => Box::new(LirsPolicy::new()),
+            EvictionAlgorithm::Arc => Box::new(ArcPolicy::new()),
+            EvictionAlgorithm::Car => Box::new(CarPolicy::new()),
+            EvictionAlgorithm::Lirs => Box::new(LirsPolicy::new()),
         }
     }
 }

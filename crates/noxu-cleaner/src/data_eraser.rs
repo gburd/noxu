@@ -42,7 +42,7 @@ pub struct EraseRequest {
 
 /// Background thread that physically erases obsolete data from log files.
 ///
-/// 
+///
 pub struct DataEraser {
     /// Shared queue of erasure requests produced by the cleaner.
     queue: Arc<Mutex<Vec<EraseRequest>>>,
@@ -71,7 +71,7 @@ impl DataEraser {
 
     /// Starts the background erasure thread.
     ///
-    /// 
+    ///
     pub fn start(&mut self) {
         let queue = Arc::clone(&self.queue);
         let shutdown = Arc::clone(&self.shutdown);
@@ -97,7 +97,9 @@ impl DataEraser {
                         // the queue and delegates back.
                     }
 
-                    thread::sleep(Duration::from_millis(DEFAULT_ERASER_INTERVAL_MS));
+                    thread::sleep(Duration::from_millis(
+                        DEFAULT_ERASER_INTERVAL_MS,
+                    ));
                 }
             })
             .expect("failed to spawn noxu-data-eraser thread");
@@ -110,7 +112,7 @@ impl DataEraser {
     ///
     /// Called by the cleaner when it marks an LN entry as erased.
     ///
-    /// 
+    ///
     pub fn enqueue_erase(&self, request: EraseRequest) {
         if self.active {
             self.queue.lock().unwrap().push(request);
@@ -129,7 +131,7 @@ impl DataEraser {
 
     /// Shuts down the background thread.
     ///
-    /// 
+    ///
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {

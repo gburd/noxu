@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+};
 use noxu_xa::{PrepareResult, XaEnvironment, XaFlags, XaResource, Xid};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -77,7 +79,8 @@ impl SimpleTM {
                 Err(e) => {
                     // Rollback all prepared clusters + remaining idle ones
                     for &pi in &prepared_indices {
-                        let _ = clusters[pi].xa.xa_rollback(xid, XaFlags::NOFLAGS);
+                        let _ =
+                            clusters[pi].xa.xa_rollback(xid, XaFlags::NOFLAGS);
                     }
                     // Rollback unprepared clusters (still in Idle state)
                     for cluster in clusters.iter().skip(i + 1) {
@@ -159,10 +162,7 @@ fn test_xa_multi_cluster_2pc() {
         let mut val = DatabaseEntry::new();
         let status = cluster.db.get(None, &key, &mut val).unwrap();
         assert_eq!(status, noxu_db::OperationStatus::Success);
-        assert_eq!(
-            val.get_data(),
-            Some(format!("val_{i}").as_bytes()),
-        );
+        assert_eq!(val.get_data(), Some(format!("val_{i}").as_bytes()),);
     }
 }
 
@@ -181,7 +181,8 @@ fn test_xa_multi_cluster_rollback() {
 
     for (i, cluster) in clusters.iter().enumerate() {
         let txn = cluster.xa.get_transaction(&xid).unwrap();
-        let key = DatabaseEntry::from_vec(format!("rollback_key_{i}").into_bytes());
+        let key =
+            DatabaseEntry::from_vec(format!("rollback_key_{i}").into_bytes());
         let val = DatabaseEntry::from_bytes(b"should_not_persist");
         cluster.db.put(Some(txn), &key, &val).unwrap();
         cluster.xa.mark_write(&xid).unwrap();
@@ -202,7 +203,8 @@ fn test_xa_multi_cluster_rollback() {
 
     // Verify data NOT present
     for (i, cluster) in clusters.iter().enumerate() {
-        let key = DatabaseEntry::from_vec(format!("rollback_key_{i}").into_bytes());
+        let key =
+            DatabaseEntry::from_vec(format!("rollback_key_{i}").into_bytes());
         let mut val = DatabaseEntry::new();
         let status = cluster.db.get(None, &key, &mut val).unwrap();
         assert_eq!(status, noxu_db::OperationStatus::NotFound);
@@ -421,9 +423,8 @@ fn test_xa_chaos_concurrent() {
                 );
 
                 // Decide which clusters participate (at least 1)
-                let participating: Vec<usize> = (0..clusters.len())
-                    .filter(|_| rng.gen_bool(0.7))
-                    .collect();
+                let participating: Vec<usize> =
+                    (0..clusters.len()).filter(|_| rng.gen_bool(0.7)).collect();
                 let participating = if participating.is_empty() {
                     vec![0]
                 } else {
@@ -483,8 +484,10 @@ fn test_xa_chaos_concurrent() {
                 let roll = rng.gen_range(0..100u32);
                 if roll < 50 {
                     // 2PC commit
-                    let cluster_refs: Vec<&Cluster> =
-                        started.iter().map(|&ci| clusters[ci].as_ref()).collect();
+                    let cluster_refs: Vec<&Cluster> = started
+                        .iter()
+                        .map(|&ci| clusters[ci].as_ref())
+                        .collect();
                     match SimpleTM::commit_2pc(&cluster_refs, &xid) {
                         Ok(_) => {
                             committed.fetch_add(1, Ordering::Relaxed);
@@ -505,9 +508,7 @@ fn test_xa_chaos_concurrent() {
                     // One-phase commit (only valid on single cluster)
                     if started.len() == 1 {
                         let ci = started[0];
-                        match clusters[ci]
-                            .xa
-                            .xa_commit(&xid, XaFlags::ONEPHASE)
+                        match clusters[ci].xa.xa_commit(&xid, XaFlags::ONEPHASE)
                         {
                             Ok(()) => {
                                 committed.fetch_add(1, Ordering::Relaxed);
@@ -540,7 +541,9 @@ fn test_xa_chaos_concurrent() {
     let total_rolled_back = rolled_back_count.load(Ordering::Relaxed);
     let total_errors = error_count.load(Ordering::Relaxed);
 
-    eprintln!("=== XA Chaos Results ({chaos_secs}s, {num_threads} threads) ===");
+    eprintln!(
+        "=== XA Chaos Results ({chaos_secs}s, {num_threads} threads) ==="
+    );
     eprintln!("  committed:   {total_committed}");
     eprintln!("  rolled_back: {total_rolled_back}");
     eprintln!("  errors:      {total_errors}");
@@ -765,10 +768,7 @@ fn test_xa_scale_concurrent_threads() {
                     cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
 
                     // One-phase commit (single cluster)
-                    cluster
-                        .xa
-                        .xa_commit(&xid, XaFlags::ONEPHASE)
-                        .unwrap();
+                    cluster.xa.xa_commit(&xid, XaFlags::ONEPHASE).unwrap();
                     committed.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -781,7 +781,9 @@ fn test_xa_scale_concurrent_threads() {
 
     let total = total_committed.load(Ordering::Relaxed);
     assert_eq!(total, (num_threads * ops_per_thread) as u64);
-    eprintln!("Scale concurrent: {total} XA commits across {num_threads} threads");
+    eprintln!(
+        "Scale concurrent: {total} XA commits across {num_threads} threads"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -808,10 +810,7 @@ fn test_xa_perf_2pc_vs_single_phase() {
             cluster.xa.mark_write(&xid).unwrap();
         }
         cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
-        cluster
-            .xa
-            .xa_commit(&xid, XaFlags::ONEPHASE)
-            .unwrap();
+        cluster.xa.xa_commit(&xid, XaFlags::ONEPHASE).unwrap();
     }
 
     // Benchmark: XA 2PC (prepare + commit)
@@ -821,16 +820,14 @@ fn test_xa_perf_2pc_vs_single_phase() {
         cluster.xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = cluster.xa.get_transaction(&xid).unwrap();
-            let key = DatabaseEntry::from_vec(format!("2pc_{i:06}").into_bytes());
+            let key =
+                DatabaseEntry::from_vec(format!("2pc_{i:06}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
             cluster.db.put(Some(txn), &key, &val).unwrap();
             cluster.xa.mark_write(&xid).unwrap();
         }
         cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
-        cluster
-            .xa
-            .xa_prepare(&xid, XaFlags::NOFLAGS)
-            .unwrap();
+        cluster.xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
         cluster.xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
     }
     let elapsed_2pc = start.elapsed();
@@ -842,16 +839,14 @@ fn test_xa_perf_2pc_vs_single_phase() {
         cluster.xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = cluster.xa.get_transaction(&xid).unwrap();
-            let key = DatabaseEntry::from_vec(format!("1pc_{i:06}").into_bytes());
+            let key =
+                DatabaseEntry::from_vec(format!("1pc_{i:06}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
             cluster.db.put(Some(txn), &key, &val).unwrap();
             cluster.xa.mark_write(&xid).unwrap();
         }
         cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
-        cluster
-            .xa
-            .xa_commit(&xid, XaFlags::ONEPHASE)
-            .unwrap();
+        cluster.xa.xa_commit(&xid, XaFlags::ONEPHASE).unwrap();
     }
     let elapsed_1pc = start.elapsed();
 

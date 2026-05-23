@@ -5,8 +5,8 @@
 
 use crate::error::Result;
 use crate::file_reader::{FileReader, LogFileAccess};
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use hashbrown::HashSet;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 
 /// Searches for log entries of specific types.
 ///
@@ -188,7 +188,12 @@ mod tests {
         mock.add_file(0, vec![0u8; 64]);
         let start_lsn = Lsn::new(0, 0);
         let result = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, HashSet::new(),
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            HashSet::new(),
         );
         assert!(result.is_ok());
     }
@@ -199,7 +204,12 @@ mod tests {
         mock.add_file(0, vec![0u8; 64]);
         let start_lsn = Lsn::new(0, 0);
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, HashSet::new(),
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            HashSet::new(),
         )
         .unwrap();
 
@@ -214,7 +224,12 @@ mod tests {
         mock.add_file(0, vec![0u8; 64]);
         let start_lsn = Lsn::new(0, 0);
         let reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, HashSet::new(),
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            HashSet::new(),
         )
         .unwrap();
 
@@ -228,7 +243,12 @@ mod tests {
         mock.add_file(0, vec![0u8; 64]);
         let start_lsn = Lsn::new(0, 0);
         let reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, HashSet::new(),
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            HashSet::new(),
         )
         .unwrap();
         assert_eq!(reader.get_num_read(), 0);
@@ -239,7 +259,12 @@ mod tests {
         let mock = MockFileAccess::new();
         let start_lsn = Lsn::new(0, 0);
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, HashSet::new(),
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            HashSet::new(),
         )
         .unwrap();
         let result = reader.read_next_entry();
@@ -256,7 +281,12 @@ mod tests {
         let start_lsn = Lsn::new(0, 0);
         let target_types = [0u8].iter().copied().collect();
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, target_types,
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            target_types,
         )
         .unwrap();
 
@@ -273,7 +303,12 @@ mod tests {
         let start_lsn = Lsn::new(0, 0);
         let target_types = [7u8].iter().copied().collect();
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, target_types,
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            target_types,
         )
         .unwrap();
 
@@ -290,7 +325,12 @@ mod tests {
         let start_lsn = Lsn::new(0, 0);
         let target_types = [0u8].iter().copied().collect();
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, target_types,
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            target_types,
         )
         .unwrap();
 
@@ -308,7 +348,12 @@ mod tests {
         let start_lsn = Lsn::new(0, 0);
         let target_types = [0u8].iter().copied().collect();
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, target_types,
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            target_types,
         )
         .unwrap();
 
@@ -326,7 +371,12 @@ mod tests {
         let start_lsn = Lsn::new(0, 0);
         let target_types = [7u8].iter().copied().collect();
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, target_types,
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            target_types,
         )
         .unwrap();
 
@@ -343,7 +393,12 @@ mod tests {
         mock.add_file(0, vec![0u8; 14]);
         let start_lsn = Lsn::new(0, 0);
         let mut reader = SearchFileReader::new(
-            mock, 64, true, start_lsn, NULL_LSN, HashSet::new(),
+            mock,
+            64,
+            true,
+            start_lsn,
+            NULL_LSN,
+            HashSet::new(),
         )
         .unwrap();
 

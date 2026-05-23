@@ -7,7 +7,7 @@ use crate::{LockGrantType, WriteLockInfo};
 ///
 /// Encapsulates the grant type and optional write lock info (for write locks).
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct LockResult {
     /// The type of lock grant that occurred.
@@ -33,7 +33,7 @@ impl LockResult {
 
     /// Sets the abort info in the write lock info, if present.
     ///
-    /// 
+    ///
     pub fn set_abort_info(
         &mut self,
         abort_lsn: u64,
@@ -61,7 +61,7 @@ impl LockResult {
 
     /// Copies write lock info from another WriteLockInfo.
     ///
-    /// 
+    ///
     pub fn copy_write_lock_info(&mut self, from: &WriteLockInfo) {
         if let Some(ref mut info) = self.write_lock_info {
             info.copy_all_info(from);
@@ -75,7 +75,7 @@ impl LockResult {
 
     /// Returns true if the lock was granted (NEW, PROMOTION, or EXISTING).
     ///
-    /// 
+    ///
     pub fn is_granted(&self) -> bool {
         matches!(
             self.grant,

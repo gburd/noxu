@@ -4,8 +4,8 @@
 //! cursor positions) using lock-free atomics so that CursorImpl can increment
 //! them on the hot path without acquiring any mutex.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-database operation throughput counters.
 ///
@@ -79,21 +79,29 @@ impl ThroughputStats {
     /// Adds another snapshot's counts into this snapshot (for aggregation).
     pub fn add_snapshot(&self, other: &ThroughputStatsSnapshot) {
         self.n_pri_inserts.fetch_add(other.n_pri_inserts, Ordering::Relaxed);
-        self.n_pri_insert_fails.fetch_add(other.n_pri_insert_fails, Ordering::Relaxed);
+        self.n_pri_insert_fails
+            .fetch_add(other.n_pri_insert_fails, Ordering::Relaxed);
         self.n_pri_updates.fetch_add(other.n_pri_updates, Ordering::Relaxed);
         self.n_pri_deletes.fetch_add(other.n_pri_deletes, Ordering::Relaxed);
-        self.n_pri_delete_fails.fetch_add(other.n_pri_delete_fails, Ordering::Relaxed);
+        self.n_pri_delete_fails
+            .fetch_add(other.n_pri_delete_fails, Ordering::Relaxed);
         self.n_pri_searches.fetch_add(other.n_pri_searches, Ordering::Relaxed);
-        self.n_pri_search_fails.fetch_add(other.n_pri_search_fails, Ordering::Relaxed);
-        self.n_pri_positions.fetch_add(other.n_pri_positions, Ordering::Relaxed);
+        self.n_pri_search_fails
+            .fetch_add(other.n_pri_search_fails, Ordering::Relaxed);
+        self.n_pri_positions
+            .fetch_add(other.n_pri_positions, Ordering::Relaxed);
         self.n_sec_inserts.fetch_add(other.n_sec_inserts, Ordering::Relaxed);
-        self.n_sec_insert_fails.fetch_add(other.n_sec_insert_fails, Ordering::Relaxed);
+        self.n_sec_insert_fails
+            .fetch_add(other.n_sec_insert_fails, Ordering::Relaxed);
         self.n_sec_updates.fetch_add(other.n_sec_updates, Ordering::Relaxed);
         self.n_sec_deletes.fetch_add(other.n_sec_deletes, Ordering::Relaxed);
-        self.n_sec_delete_fails.fetch_add(other.n_sec_delete_fails, Ordering::Relaxed);
+        self.n_sec_delete_fails
+            .fetch_add(other.n_sec_delete_fails, Ordering::Relaxed);
         self.n_sec_searches.fetch_add(other.n_sec_searches, Ordering::Relaxed);
-        self.n_sec_search_fails.fetch_add(other.n_sec_search_fails, Ordering::Relaxed);
-        self.n_sec_positions.fetch_add(other.n_sec_positions, Ordering::Relaxed);
+        self.n_sec_search_fails
+            .fetch_add(other.n_sec_search_fails, Ordering::Relaxed);
+        self.n_sec_positions
+            .fetch_add(other.n_sec_positions, Ordering::Relaxed);
     }
 }
 
@@ -167,8 +175,16 @@ mod tests {
     #[test]
     fn test_snapshot_add() {
         let mut acc = ThroughputStatsSnapshot::default();
-        let s1 = ThroughputStatsSnapshot { n_pri_inserts: 5, n_pri_searches: 20, ..Default::default() };
-        let s2 = ThroughputStatsSnapshot { n_pri_inserts: 3, n_pri_searches: 10, ..Default::default() };
+        let s1 = ThroughputStatsSnapshot {
+            n_pri_inserts: 5,
+            n_pri_searches: 20,
+            ..Default::default()
+        };
+        let s2 = ThroughputStatsSnapshot {
+            n_pri_inserts: 3,
+            n_pri_searches: 10,
+            ..Default::default()
+        };
         acc.add(&s1);
         acc.add(&s2);
         assert_eq!(acc.n_pri_inserts, 8);
@@ -206,7 +222,9 @@ mod tests {
     fn test_sec_snapshot_add() {
         let mut acc = ThroughputStatsSnapshot::default();
         let s = ThroughputStatsSnapshot {
-            n_sec_inserts: 4, n_sec_deletes: 2, ..Default::default()
+            n_sec_inserts: 4,
+            n_sec_deletes: 2,
+            ..Default::default()
         };
         acc.add(&s);
         assert_eq!(acc.n_sec_inserts, 4);

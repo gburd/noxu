@@ -1,8 +1,8 @@
 //! Dirty IN tracking for checkpoint.
 //!
 
-use std::collections::BTreeMap;
 use hashbrown::{HashMap, HashSet};
+use std::collections::BTreeMap;
 
 /// Checkpoint state machine.
 ///
@@ -46,7 +46,7 @@ impl CheckpointReference {
 /// Organizes dirty INs by level for bottom-up flushing (BINs first, then
 /// upper INs). Separates normal INs from BIN-deltas within each level.
 ///
-/// 
+///
 pub struct DirtyINMap {
     /// Map of level -> (normal_refs, delta_refs).
     /// BTreeMap ensures levels are processed in order (bottom-up).

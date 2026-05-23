@@ -1,6 +1,6 @@
 /// Result of a database truncate operation.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct TruncateResult {
     /// The new (empty) database.

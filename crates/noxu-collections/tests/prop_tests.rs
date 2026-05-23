@@ -1,9 +1,9 @@
 //! Property-based tests for noxu-collections using proptest.
 
+use hashbrown::HashMap;
 use noxu_collections::StoredMap;
 use noxu_db::{Database, DatabaseConfig, Environment, EnvironmentConfig};
 use proptest::prelude::*;
-use hashbrown::HashMap;
 use tempfile::TempDir;
 
 /// Helper: create a temporary environment and database for testing.

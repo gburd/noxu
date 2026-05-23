@@ -56,11 +56,7 @@ pub struct XaEnvironment {
 impl XaEnvironment {
     /// Creates a new XaEnvironment wrapping the given environment.
     pub fn new(env: Environment) -> Self {
-        Self {
-            env,
-            branches: Mutex::new(HashMap::new()),
-            prepared_log: None,
-        }
+        Self { env, branches: Mutex::new(HashMap::new()), prepared_log: None }
     }
 
     /// Returns a reference to the underlying Environment.
@@ -149,14 +145,19 @@ impl XaResource for XaEnvironment {
         }
 
         let config = TransactionConfig::new();
-        let txn = self.env.begin_transaction(None, Some(&config))
+        let txn = self
+            .env
+            .begin_transaction(None, Some(&config))
             .map_err(XaError::Db)?;
 
-        branches.insert(xid.clone(), Branch {
-            state: BranchState::Active,
-            txn: Box::new(txn),
-            has_writes: false,
-        });
+        branches.insert(
+            xid.clone(),
+            Branch {
+                state: BranchState::Active,
+                txn: Box::new(txn),
+                has_writes: false,
+            },
+        );
 
         log::debug!("xa_start: {xid:?}");
         Ok(())
@@ -250,7 +251,9 @@ impl XaResource for XaEnvironment {
         let branch = branches.get(xid).ok_or(XaError::NotFound)?;
 
         match branch.state {
-            BranchState::Idle | BranchState::Prepared | BranchState::RollbackOnly => {}
+            BranchState::Idle
+            | BranchState::Prepared
+            | BranchState::RollbackOnly => {}
             _ => {
                 return Err(XaError::Protocol(format!(
                     "xa_rollback: unexpected state {:?}",
@@ -475,7 +478,12 @@ mod tests {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(Some(txn), &DatabaseEntry::from_bytes(b"rk"), &DatabaseEntry::from_bytes(b"rv")).unwrap();
+            db.put(
+                Some(txn),
+                &DatabaseEntry::from_bytes(b"rk"),
+                &DatabaseEntry::from_bytes(b"rv"),
+            )
+            .unwrap();
         }
         xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();

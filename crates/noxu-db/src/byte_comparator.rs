@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 
 /// Key and duplicate-data comparator that avoids unnecessary allocations.
 ///
-/// 
+///
 ///
 /// Implement this trait instead of a simple `Fn(&[u8], &[u8]) -> Ordering`
 /// when the comparator needs to operate on sub-ranges of larger buffers
@@ -60,7 +60,7 @@ pub trait ByteComparator: Send + Sync {
 
 /// Default unsigned-lexicographic byte comparator.
 ///
-/// 
+///
 pub struct DefaultByteComparator;
 
 impl ByteComparator for DefaultByteComparator {
@@ -81,7 +81,7 @@ impl ByteComparator for DefaultByteComparator {
 
 /// Convenience function: compare full byte slices using unsigned-byte order.
 ///
-/// 
+///
 pub fn compare_unsigned(key1: &[u8], key2: &[u8]) -> Ordering {
     key1.cmp(key2)
 }
@@ -95,18 +95,9 @@ mod tests {
         let cmp = DefaultByteComparator;
         let k1 = b"abc";
         let k2 = b"abd";
-        assert_eq!(
-            cmp.compare(k1, 0, 3, k2, 0, 3),
-            Ordering::Less
-        );
-        assert_eq!(
-            cmp.compare(k2, 0, 3, k1, 0, 3),
-            Ordering::Greater
-        );
-        assert_eq!(
-            cmp.compare(k1, 0, 3, k1, 0, 3),
-            Ordering::Equal
-        );
+        assert_eq!(cmp.compare(k1, 0, 3, k2, 0, 3), Ordering::Less);
+        assert_eq!(cmp.compare(k2, 0, 3, k1, 0, 3), Ordering::Greater);
+        assert_eq!(cmp.compare(k1, 0, 3, k1, 0, 3), Ordering::Equal);
     }
 
     #[test]
@@ -115,10 +106,7 @@ mod tests {
         // "xabc" compared to "yabd", subrange [1..4]
         let buf1 = b"xabc";
         let buf2 = b"yabd";
-        assert_eq!(
-            cmp.compare(buf1, 1, 3, buf2, 1, 3),
-            Ordering::Less
-        );
+        assert_eq!(cmp.compare(buf1, 1, 3, buf2, 1, 3), Ordering::Less);
     }
 
     #[test]

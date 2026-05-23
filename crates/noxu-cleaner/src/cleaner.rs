@@ -5,19 +5,19 @@
 
 use crate::FileSelector;
 use crate::cleaner_stat::CleanerStats;
-use crate::throttle::CleanerThrottle;
 use crate::file_processor::{
     FileProcessResult, FileProcessor, LogEntry, LogEntryType, SharedTreeLookup,
 };
 use crate::file_protector::FileProtector;
+use crate::throttle::CleanerThrottle;
 use noxu_log::{
     FileManager, LogManager,
     entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     file_header::FILE_HEADER_SIZE,
 };
 use noxu_sync::Mutex;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// The Cleaner is responsible for garbage collecting the log.
 ///
@@ -390,11 +390,9 @@ impl Cleaner {
 
         // If we have a tree + log manager, decode LN entries from the file
         // and run them through the real migration path.
-        if let (Some(fm), Some(tree), Some(lm)) = (
-            &self.file_manager,
-            &self.tree,
-            &self.log_manager,
-        ) {
+        if let (Some(fm), Some(tree), Some(lm)) =
+            (&self.file_manager, &self.tree, &self.log_manager)
+        {
             let entries = self.decode_ln_entries_from_file(fm, file_number);
             // Use the environment's shared LockManager when available so that
             // cleaner-held locks contend with user transactions (fidelity).
@@ -406,10 +404,7 @@ impl Cleaner {
                     Arc::clone(shared_lm),
                 )
             } else {
-                SharedTreeLookup::new(
-                    Arc::clone(tree),
-                    Arc::clone(lm),
-                )
+                SharedTreeLookup::new(Arc::clone(tree), Arc::clone(lm))
             };
             return processor.process_file(
                 file_number,
@@ -434,7 +429,7 @@ impl Cleaner {
     /// IN, BIN-delta, and all other entry types are represented as
     /// `LogEntryType::Other` (they will be skipped by the migration loop).
     ///
-    /// 
+    ///
     fn decode_ln_entries_from_file(
         &self,
         fm: &Arc<FileManager>,
@@ -487,12 +482,20 @@ impl Cleaner {
                     let payload_offset = offset + header_size as u64;
                     let mut payload = vec![0u8; item_size];
                     let (key, db_id): (Vec<u8>, i64) = if item_size > 0
-                        && fm.read_from_file(file_number, payload_offset, &mut payload).is_ok()
+                        && fm
+                            .read_from_file(
+                                file_number,
+                                payload_offset,
+                                &mut payload,
+                            )
+                            .is_ok()
                     {
                         use noxu_log::entry::LnLogEntry;
                         match LnLogEntry::read_from_log(&payload, false) {
                             Ok(ln) => (ln.key.clone(), ln.db_id as i64),
-                            Err(_) => (file_offset.to_le_bytes().to_vec(), 1i64),
+                            Err(_) => {
+                                (file_offset.to_le_bytes().to_vec(), 1i64)
+                            }
                         }
                     } else {
                         (file_offset.to_le_bytes().to_vec(), 1i64)
@@ -511,12 +514,20 @@ impl Cleaner {
                     let payload_offset = offset + header_size as u64;
                     let mut payload = vec![0u8; item_size];
                     let (key, db_id): (Vec<u8>, i64) = if item_size > 0
-                        && fm.read_from_file(file_number, payload_offset, &mut payload).is_ok()
+                        && fm
+                            .read_from_file(
+                                file_number,
+                                payload_offset,
+                                &mut payload,
+                            )
+                            .is_ok()
                     {
                         use noxu_log::entry::LnLogEntry;
                         match LnLogEntry::read_from_log(&payload, true) {
                             Ok(ln) => (ln.key.clone(), ln.db_id as i64),
-                            Err(_) => (file_offset.to_le_bytes().to_vec(), 1i64),
+                            Err(_) => {
+                                (file_offset.to_le_bytes().to_vec(), 1i64)
+                            }
                         }
                     } else {
                         (file_offset.to_le_bytes().to_vec(), 1i64)
@@ -537,13 +548,21 @@ impl Cleaner {
                     let payload_offset = offset + header_size as u64;
                     let mut payload = vec![0u8; item_size];
                     let (key, db_id): (Vec<u8>, i64) = if item_size > 0
-                        && fm.read_from_file(file_number, payload_offset, &mut payload).is_ok()
+                        && fm
+                            .read_from_file(
+                                file_number,
+                                payload_offset,
+                                &mut payload,
+                            )
+                            .is_ok()
                     {
                         use noxu_log::entry::LnLogEntry;
                         let is_txn = entry_type_byte == 9;
                         match LnLogEntry::read_from_log(&payload, is_txn) {
                             Ok(ln) => (ln.key.clone(), ln.db_id as i64),
-                            Err(_) => (file_offset.to_le_bytes().to_vec(), 1i64),
+                            Err(_) => {
+                                (file_offset.to_le_bytes().to_vec(), 1i64)
+                            }
                         }
                     } else {
                         (file_offset.to_le_bytes().to_vec(), 1i64)
@@ -1175,20 +1194,16 @@ mod tests {
     fn make_fm_with_entries(
         dir: &std::path::Path,
     ) -> Arc<noxu_log::FileManager> {
-        use noxu_log::{FileManager, LogManager, LogEntryType, Provisional};
-        use noxu_log::entry::TxnEndEntry;
-        use noxu_util::{NULL_LSN, NULL_VLSN};
         use bytes::BytesMut;
+        use noxu_log::entry::TxnEndEntry;
+        use noxu_log::{FileManager, LogEntryType, LogManager, Provisional};
+        use noxu_util::{NULL_LSN, NULL_VLSN};
 
         let fm = Arc::new(
             FileManager::new(dir, false, 64 * 1024 * 1024, 100).unwrap(),
         );
-        let lm = Arc::new(LogManager::new(
-            Arc::clone(&fm),
-            3,
-            1024 * 1024,
-            65536,
-        ));
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
 
         // Write three commit entries so there is real data to scan.
         for txn_id in [1i64, 2, 3] {
@@ -1196,14 +1211,8 @@ mod tests {
                 TxnEndEntry::new_commit(txn_id, NULL_LSN, 0, 0, NULL_VLSN);
             let mut buf = BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);
-            lm.log(
-                LogEntryType::TxnCommit,
-                &buf,
-                Provisional::No,
-                true,
-                false,
-            )
-            .unwrap();
+            lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, true, false)
+                .unwrap();
         }
         lm.flush_sync().unwrap();
         fm
@@ -1215,8 +1224,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let fm = make_fm_with_entries(dir.path());
 
-        let cleaner =
-            Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
 
         // The written entries land in file 0.
         let summary = cleaner.scan_file_summary(&fm, 0);
@@ -1238,8 +1246,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let fm = make_fm_with_entries(dir.path());
 
-        let cleaner =
-            Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
 
         let result = cleaner.process_single_file(0).unwrap();
         assert!(result.completed, "processing must complete successfully");
@@ -1256,8 +1263,7 @@ mod tests {
         let file_path = dir.path().join("00000000.ndb");
         assert!(file_path.exists(), "log file must exist before deletion");
 
-        let cleaner =
-            Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
         cleaner.request_delete_files(&[0]);
 
         let deleted = cleaner.delete_pending_files();
@@ -1277,8 +1283,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let fm = make_fm_with_entries(dir.path());
 
-        let cleaner =
-            Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
         cleaner.request_delete_files(&[0]);
 
         // Protect the file so it should not be deleted.
@@ -1319,8 +1324,7 @@ mod tests {
         let file_path = dir.path().join("00000000.ndb");
         assert!(file_path.exists(), "log file must exist before do_clean");
 
-        let cleaner =
-            Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
 
         // Add file 0 to the selector so do_clean picks it up.
         cleaner.add_file_to_clean(0);
@@ -1346,12 +1350,8 @@ mod tests {
         let fm = Arc::new(
             FileManager::new(dir, false, 64 * 1024 * 1024, 100).unwrap(),
         );
-        let lm = Arc::new(LogManager::new(
-            Arc::clone(&fm),
-            3,
-            1024 * 1024,
-            65536,
-        ));
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
         (fm, lm)
     }
 
@@ -1359,10 +1359,10 @@ mod tests {
     fn make_fm_and_lm_with_entries(
         dir: &std::path::Path,
     ) -> (Arc<noxu_log::FileManager>, Arc<noxu_log::LogManager>) {
-        use noxu_log::{LogEntryType, Provisional};
-        use noxu_log::entry::TxnEndEntry;
-        use noxu_util::{NULL_LSN, NULL_VLSN};
         use bytes::BytesMut;
+        use noxu_log::entry::TxnEndEntry;
+        use noxu_log::{LogEntryType, Provisional};
+        use noxu_util::{NULL_LSN, NULL_VLSN};
 
         let (fm, lm) = make_fm_and_lm(dir);
 
@@ -1371,14 +1371,8 @@ mod tests {
                 TxnEndEntry::new_commit(txn_id, NULL_LSN, 0, 0, NULL_VLSN);
             let mut buf = BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);
-            lm.log(
-                LogEntryType::TxnCommit,
-                &buf,
-                Provisional::No,
-                true,
-                false,
-            )
-            .unwrap();
+            lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, true, false)
+                .unwrap();
         }
         lm.flush_sync().unwrap();
         (fm, lm)
@@ -1393,7 +1387,9 @@ mod tests {
         let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
 
         let cleaner = Cleaner::with_file_manager_and_tree(
-            60, 2, 90,
+            60,
+            2,
+            90,
             Arc::clone(&fm),
             Arc::clone(&tree),
             Arc::clone(&lm),
@@ -1421,7 +1417,9 @@ mod tests {
         let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
 
         let cleaner = Cleaner::with_file_manager_and_tree(
-            50, 0, 0,
+            50,
+            0,
+            0,
             Arc::clone(&fm),
             Arc::clone(&tree),
             Arc::clone(&lm),
@@ -1488,8 +1486,8 @@ mod tests {
         // (the first offset after the file header) into the tree at a
         // sentinel LSN, then write a raw log buffer whose header has type=4.
 
-        use noxu_log::file_header::FILE_HEADER_SIZE;
         use noxu_log::entry_header::MIN_HEADER_SIZE;
+        use noxu_log::file_header::FILE_HEADER_SIZE;
 
         // Offset where the first log entry lands after the file header.
         let first_ln_offset = FILE_HEADER_SIZE as u32;
@@ -1529,7 +1527,9 @@ mod tests {
         fm.write_buffer(&hdr, first_ln_offset as u64).unwrap();
 
         let cleaner = Cleaner::with_file_manager_and_tree(
-            50, 0, 0,
+            50,
+            0,
+            0,
             Arc::clone(&fm),
             Arc::clone(&tree),
             Arc::clone(&lm),
@@ -1540,14 +1540,8 @@ mod tests {
         assert!(result.completed, "processing must complete");
         // The InsertLN entry is decoded and its synthetic key matches the
         // tree entry at entry_lsn == log_lsn → migration.
-        assert_eq!(
-            result.lns_cleaned, 1,
-            "one LN entry should be cleaned"
-        );
-        assert_eq!(
-            result.lns_migrated, 1,
-            "the live LN must be migrated"
-        );
+        assert_eq!(result.lns_cleaned, 1, "one LN entry should be cleaned");
+        assert_eq!(result.lns_migrated, 1, "the live LN must be migrated");
         assert_eq!(result.lns_dead, 0, "no entries should be dead");
     }
 
@@ -1568,7 +1562,9 @@ mod tests {
         assert!(file_path.exists());
 
         let cleaner = Cleaner::with_file_manager_and_tree(
-            50, 0, 0,
+            50,
+            0,
+            0,
             Arc::clone(&fm),
             Arc::clone(&tree),
             Arc::clone(&lm),

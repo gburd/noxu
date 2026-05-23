@@ -100,7 +100,6 @@ pub struct EngineConfig {
     // -----------------------------------------------------------------------
     // Log parameters (je.log.*)
     // -----------------------------------------------------------------------
-
     /// Maximum size of each log file in bytes (je.log.fileMax).
     ///
     /// Range: 1 MB – 1 GB. Default: 10 MB.
@@ -122,7 +121,6 @@ pub struct EngineConfig {
     // -----------------------------------------------------------------------
     // Evictor parameters (je.evictor.*)
     // -----------------------------------------------------------------------
-
     /// Number of bytes to evict per eviction pass (je.evictor.evictBytes).
     ///
     /// Default: 512 KB.
@@ -142,7 +140,6 @@ pub struct EngineConfig {
     // -----------------------------------------------------------------------
     // Cleaner parameters (je.cleaner.*)
     // -----------------------------------------------------------------------
-
     /// Minimum per-file utilization (je.cleaner.minFileUtilization).
     ///
     /// Files below this percentage are cleaned regardless of overall utilization.
@@ -162,7 +159,6 @@ pub struct EngineConfig {
     // -----------------------------------------------------------------------
     // Transaction / lock parameters
     // -----------------------------------------------------------------------
-
     /// If true, all transactions use serializable isolation (je.txn.serializableIsolation).
     pub txn_serializable_isolation: bool,
 
@@ -172,7 +168,6 @@ pub struct EngineConfig {
     // -----------------------------------------------------------------------
     // Checkpointer parameters
     // -----------------------------------------------------------------------
-
     /// If true, the checkpointer runs at high priority (je.checkpointer.highPriority).
     pub checkpointer_high_priority: bool,
 }
@@ -394,9 +389,7 @@ impl EngineConfig {
         }
 
         if self.cleaner_min_file_utilization > 50 {
-            return Err(
-                "cleaner_min_file_utilization must be 0-50".to_string(),
-            );
+            return Err("cleaner_min_file_utilization must be 0-50".to_string());
         }
 
         if self.cleaner_threads == 0 {
@@ -405,13 +398,13 @@ impl EngineConfig {
 
         if !(1..=10_000_000).contains(&self.log_file_max) {
             return Err(
-                "log_file_max must be between 1 MB and 1 GB".to_string(),
+                "log_file_max must be between 1 MB and 1 GB".to_string()
             );
         }
 
         if self.evictor_n_lru_lists == 0 || self.evictor_n_lru_lists > 32 {
             return Err(
-                "evictor_n_lru_lists must be between 1 and 32".to_string(),
+                "evictor_n_lru_lists must be between 1 and 32".to_string()
             );
         }
 
@@ -440,35 +433,35 @@ impl Default for EngineConfig {
             read_only: false,
             cache_size: 64 * 1024 * 1024, // 64 MB
             lock_table_count: 16,
-            lock_timeout_ms: 500,  // 500 ms — matches default
-            txn_timeout_ms: 0,     // 0 = no timeout — matches default
+            lock_timeout_ms: 500, // 500 ms — matches default
+            txn_timeout_ms: 0,    // 0 = no timeout — matches default
             evictor_enabled: true,
             cleaner_enabled: true,
             checkpointer_enabled: true,
-            checkpoint_bytes_interval: 20_000_000, // 20 MB — matches 
-            cleaner_min_utilization: 50,           // 50% — matches 
+            checkpoint_bytes_interval: 20_000_000, // 20 MB — matches
+            cleaner_min_utilization: 50,           // 50% — matches
             cleaner_min_file_count: 5,
             evictor_wakeup_interval_ms: 5000, // 5 seconds
-            cleaner_wakeup_interval_ms: 10_000, // 10 s — matches 
-            checkpointer_wakeup_interval_ms: 0, // 0 = bytes-based — matches 
-            // Log defaults — match 
-            log_file_max: 10_000_000,      // 10 MB
+            cleaner_wakeup_interval_ms: 10_000, // 10 s — matches
+            checkpointer_wakeup_interval_ms: 0, // 0 = bytes-based — matches
+            // Log defaults — match
+            log_file_max: 10_000_000, // 10 MB
             log_mem_only: false,
             log_checksum_read: true,
-            log_total_buffer_bytes: 0,     // auto-computed
-            // Evictor defaults — match 
-            evictor_evict_bytes: 524_288,  // 512 KB
+            log_total_buffer_bytes: 0, // auto-computed
+            // Evictor defaults — match
+            evictor_evict_bytes: 524_288, // 512 KB
             evictor_core_threads: 1,
             evictor_max_threads: 10,
             evictor_n_lru_lists: 4,
-            // Cleaner defaults — match 
+            // Cleaner defaults — match
             cleaner_min_file_utilization: 5, // 5%
             cleaner_threads: 1,
-            cleaner_lock_timeout_ms: 500,    // 500 ms
-            // Txn/lock defaults — match 
+            cleaner_lock_timeout_ms: 500, // 500 ms
+            // Txn/lock defaults — match
             txn_serializable_isolation: false,
             lock_deadlock_detect: true,
-            // Checkpointer defaults — match 
+            // Checkpointer defaults — match
             checkpointer_high_priority: false,
         }
     }

@@ -26,10 +26,10 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let dir: PathBuf = env::var("NOXU_CRASH_DIR")
-        .expect("NOXU_CRASH_DIR must be set")
-        .into();
-    let mode = env::var("NOXU_CRASH_MODE").expect("NOXU_CRASH_MODE must be set");
+    let dir: PathBuf =
+        env::var("NOXU_CRASH_DIR").expect("NOXU_CRASH_DIR must be set").into();
+    let mode =
+        env::var("NOXU_CRASH_MODE").expect("NOXU_CRASH_MODE must be set");
 
     let env_config = EnvironmentConfig::new(dir.clone())
         .with_allow_create(true)

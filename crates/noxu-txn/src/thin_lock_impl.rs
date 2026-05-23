@@ -8,7 +8,7 @@ use crate::{LockAttemptResult, LockGrantType, LockInfo, LockType};
 /// When contention occurs (multiple owners or waiters needed), this lock
 /// "mutates" into a full LockImpl by returning a MutateToFull signal.
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct ThinLockImpl {
     /// The single lock owner info, or None if unlocked.
@@ -70,8 +70,7 @@ impl ThinLockImpl {
             }
         } else {
             // Lock is free - grant it
-            self.owner =
-                Some(LockInfo::new(locker_id, request_type));
+            self.owner = Some(LockInfo::new(locker_id, request_type));
             LockGrantType::New
         };
 

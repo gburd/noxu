@@ -3,7 +3,7 @@
 
 /// Transaction states.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
     /// Transaction is active and accepting operations.

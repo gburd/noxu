@@ -40,8 +40,8 @@
 use crate::entry_states::DIRTY_BIT;
 use crate::error::TreeError;
 use crate::key::{create_key_prefix, get_key_prefix_length};
-use noxu_util::{Lsn, NULL_LSN, Vlsn};
 use hashbrown::HashSet;
+use noxu_util::{Lsn, NULL_LSN, Vlsn};
 
 // BIN builds on the same slot-array model as the upper IN but lives at level 1.
 // It carries its own lightweight InNode helper (distinct from in_node::InNode)
@@ -180,27 +180,25 @@ impl InNode {
     }
 
     pub fn is_entry_known_deleted(&self, index: usize) -> bool {
-        self.states.get(index).is_some_and(|&s| {
-            s & crate::entry_states::KNOWN_DELETED_BIT != 0
-        })
+        self.states
+            .get(index)
+            .is_some_and(|&s| s & crate::entry_states::KNOWN_DELETED_BIT != 0)
     }
 
     pub fn is_entry_pending_deleted(&self, index: usize) -> bool {
-        self.states.get(index).is_some_and(|&s| {
-            s & crate::entry_states::PENDING_DELETED_BIT != 0
-        })
+        self.states
+            .get(index)
+            .is_some_and(|&s| s & crate::entry_states::PENDING_DELETED_BIT != 0)
     }
 
     pub fn is_entry_dirty(&self, index: usize) -> bool {
-        self.states
-            .get(index)
-            .is_some_and(|&s| s & DIRTY_BIT != 0)
+        self.states.get(index).is_some_and(|&s| s & DIRTY_BIT != 0)
     }
 
     pub fn is_tombstone(&self, index: usize) -> bool {
-        self.states.get(index).is_some_and(|&s| {
-            s & crate::entry_states::TOMBSTONE_BIT != 0
-        })
+        self.states
+            .get(index)
+            .is_some_and(|&s| s & crate::entry_states::TOMBSTONE_BIT != 0)
     }
 
     pub fn set_tombstone(&mut self, index: usize, tombstone: bool) {
@@ -428,7 +426,8 @@ impl Bin {
         if self.key_prefix.is_empty() {
             Some(suffix.to_vec())
         } else {
-            let mut full = Vec::with_capacity(self.key_prefix.len() + suffix.len());
+            let mut full =
+                Vec::with_capacity(self.key_prefix.len() + suffix.len());
             full.extend_from_slice(&self.key_prefix);
             full.extend_from_slice(suffix);
             Some(full)
@@ -442,7 +441,8 @@ impl Bin {
         if self.key_prefix.is_empty() {
             suffix.to_vec()
         } else {
-            let mut full = Vec::with_capacity(self.key_prefix.len() + suffix.len());
+            let mut full =
+                Vec::with_capacity(self.key_prefix.len() + suffix.len());
             full.extend_from_slice(&self.key_prefix);
             full.extend_from_slice(suffix);
             full
@@ -454,11 +454,7 @@ impl Bin {
     /// `IN.computeKeySuffix(prefix, key)`.
     fn compress_key(&self, full_key: &[u8]) -> Vec<u8> {
         let plen = self.key_prefix.len();
-        if plen == 0 {
-            full_key.to_vec()
-        } else {
-            full_key[plen..].to_vec()
-        }
+        if plen == 0 { full_key.to_vec() } else { full_key[plen..].to_vec() }
     }
 
     /// Compute the longest common prefix across all keys currently in this BIN,
@@ -495,7 +491,8 @@ impl Bin {
                 Some(k) => k,
                 None => continue,
             };
-            let new_len = get_key_prefix_length(&seed_full[..prefix_len], &full_key);
+            let new_len =
+                get_key_prefix_length(&seed_full[..prefix_len], &full_key);
             if new_len < prefix_len {
                 prefix_len = new_len;
             }
@@ -540,7 +537,8 @@ impl Bin {
     fn find_entry_compressed(&self, full_key: &[u8]) -> (usize, bool) {
         let plen = self.key_prefix.len();
         if plen > 0
-            && (full_key.len() < plen || &full_key[..plen] != self.key_prefix.as_slice())
+            && (full_key.len() < plen
+                || &full_key[..plen] != self.key_prefix.as_slice())
         {
             // Key does not share the stored prefix — use allocation-free
             // two-part comparison: compare (prefix ++ suffix) against full_key
@@ -548,7 +546,8 @@ impl Bin {
             let prefix = self.key_prefix.as_slice();
             let pos = self.inner.keys.partition_point(|s| {
                 // Compare prefix portion first, then suffix if prefix matches.
-                let pfx_cmp = prefix.cmp(&full_key[..prefix.len().min(full_key.len())]);
+                let pfx_cmp =
+                    prefix.cmp(&full_key[..prefix.len().min(full_key.len())]);
                 if pfx_cmp != std::cmp::Ordering::Equal {
                     return pfx_cmp == std::cmp::Ordering::Less;
                 }
@@ -651,7 +650,7 @@ impl Bin {
 
     /// Returns the set of cursor IDs currently positioned on this BIN.
     ///
-    /// 
+    ///
     pub fn get_cursor_set(&self) -> std::collections::BTreeSet<u64> {
         match &self.cursor_set {
             None => std::collections::BTreeSet::new(),
@@ -661,16 +660,14 @@ impl Bin {
 
     /// Registers a cursor (by ID) with this BIN.
     ///
-    /// 
+    ///
     pub fn add_cursor(&mut self, cursor_id: u64) {
-        self.cursor_set
-            .get_or_insert_with(HashSet::new)
-            .insert(cursor_id);
+        self.cursor_set.get_or_insert_with(HashSet::new).insert(cursor_id);
     }
 
     /// Unregisters a cursor (by ID) from this BIN.
     ///
-    /// 
+    ///
     pub fn remove_cursor(&mut self, cursor_id: u64) {
         if let Some(set) = self.cursor_set.as_mut() {
             set.remove(&cursor_id);
@@ -682,7 +679,7 @@ impl Bin {
 
     /// Returns the number of cursors currently positioned on this BIN.
     ///
-    /// 
+    ///
     #[inline]
     pub fn n_cursors(&self) -> usize {
         self.cursor_set.as_ref().map_or(0, |s| s.len())
@@ -690,7 +687,7 @@ impl Bin {
 
     /// Returns true if any cursors are currently positioned on this BIN.
     ///
-    /// 
+    ///
     #[inline]
     pub fn has_cursors(&self) -> bool {
         self.n_cursors() > 0
@@ -901,7 +898,8 @@ impl Bin {
             } else if !self.inner.keys.is_empty()
                 && let Some(first_full) = self.get_full_key(0)
             {
-                candidate = create_key_prefix(&first_full, &key).unwrap_or_default();
+                candidate =
+                    create_key_prefix(&first_full, &key).unwrap_or_default();
                 for i in 1..self.inner.get_n_entries() {
                     if candidate.is_empty() {
                         break;
@@ -1023,10 +1021,11 @@ impl Bin {
 
     /// Returns true if the slot is known-deleted or pending-deleted.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_deleted(&self, index: usize) -> bool {
-        self.inner.is_entry_known_deleted(index) || self.inner.is_entry_pending_deleted(index)
+        self.inner.is_entry_known_deleted(index)
+            || self.inner.is_entry_pending_deleted(index)
     }
 
     /// Returns true if the slot is defunct (deleted or TTL-expired).
@@ -1041,23 +1040,29 @@ impl Bin {
         // Check TTL expiration if tracked for this slot.
         if let Some(ref expirations) = self.slot_expirations
             && let Some(&exp) = expirations.get(index)
-                && noxu_util::ttl::is_expired(exp, true) {
-                    return true;
-                }
+            && noxu_util::ttl::is_expired(exp, true)
+        {
+            return true;
+        }
         false
     }
 
     /// Returns true if the slot is defunct, optionally treating tombstones as defunct.
     ///
-    /// 
+    ///
     #[inline]
-    pub fn is_defunct_with_tombstones(&self, index: usize, exclude_tombstones: bool) -> bool {
-        self.is_defunct(index) || (exclude_tombstones && self.is_tombstone(index))
+    pub fn is_defunct_with_tombstones(
+        &self,
+        index: usize,
+        exclude_tombstones: bool,
+    ) -> bool {
+        self.is_defunct(index)
+            || (exclude_tombstones && self.is_tombstone(index))
     }
 
     /// Returns true if the slot has the tombstone flag set.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_tombstone(&self, index: usize) -> bool {
         self.inner.is_tombstone(index)
@@ -1065,7 +1070,7 @@ impl Bin {
 
     /// Sets or clears the tombstone flag for the slot at `index`.
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_tombstone(&mut self, index: usize, tombstone: bool) {
         self.inner.set_tombstone(index, tombstone);
@@ -1073,7 +1078,7 @@ impl Bin {
 
     /// Sets the known-deleted flag on the slot (also clears pending-deleted).
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_known_deleted(&mut self, index: usize) {
         self.inner.set_known_deleted(index);
@@ -1081,7 +1086,7 @@ impl Bin {
 
     /// Clears the known-deleted flag on the slot.
     ///
-    /// 
+    ///
     #[inline]
     pub fn clear_known_deleted(&mut self, index: usize) {
         self.inner.clear_known_deleted(index);
@@ -1089,7 +1094,7 @@ impl Bin {
 
     /// Sets the pending-deleted flag on the slot.
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_pending_deleted(&mut self, index: usize) {
         self.inner.set_pending_deleted(index);
@@ -1097,7 +1102,7 @@ impl Bin {
 
     /// Clears the pending-deleted flag on the slot.
     ///
-    /// 
+    ///
     #[inline]
     pub fn clear_pending_deleted(&mut self, index: usize) {
         self.inner.clear_pending_deleted(index);
@@ -1109,7 +1114,7 @@ impl Bin {
 
     /// Returns true if the BIN has any deleted slots that could be compressed.
     ///
-    /// 
+    ///
     pub fn should_compress_obsolete_keys(&self) -> bool {
         if self.is_bin_delta() || self.get_n_entries() == 0 {
             return false;
@@ -1126,7 +1131,7 @@ impl Bin {
     ///
     /// Returns `true` always (locking checks are no-ops in this implementation).
     ///
-    /// 
+    ///
     pub fn compress(&mut self, compress_dirty_slots: bool) -> bool {
         assert!(!self.is_bin_delta(), "compress called on BIN-delta");
         assert!(self.n_cursors() == 0, "compress called with active cursors");
@@ -1169,7 +1174,7 @@ impl Bin {
     ///
     /// Returns the total bytes freed (estimated as key-len + data-len per slot).
     ///
-    /// 
+    ///
     pub fn evict_lns(
         &mut self,
         log_manager: Option<&noxu_log::LogManager>,
@@ -1196,7 +1201,7 @@ impl Bin {
     ///
     /// Returns an estimate of the bytes freed (key-len + data-len).
     ///
-    /// 
+    ///
     pub fn evict_ln(
         &mut self,
         index: usize,
@@ -1270,7 +1275,7 @@ impl Bin {
     ///
     /// A BIN is not evictable when it has active cursors.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_evictable(&self) -> bool {
         !self.has_cursors()
@@ -1280,7 +1285,7 @@ impl Bin {
     ///
     /// All slots must be known-deleted and there must be no active cursors.
     ///
-    /// 
+    ///
     pub fn is_valid_for_delete(&self) -> bool {
         if self.is_bin_delta() || self.has_cursors() {
             return false;
@@ -1294,7 +1299,7 @@ impl Bin {
 
     /// Returns true if this full BIN can be mutated to a BIN-delta.
     ///
-    /// 
+    ///
     pub fn can_mutate_to_bin_delta(&self) -> bool {
         if self.is_bin_delta() || self.inner.get_prohibit_next_delta() {
             return false;
@@ -1311,7 +1316,7 @@ impl Bin {
     ///
     /// Returns the approximate number of bytes freed.
     ///
-    /// 
+    ///
     pub fn mutate_to_bin_delta(&mut self) -> usize {
         assert!(self.can_mutate_to_bin_delta(), "cannot mutate to BIN-delta");
 
@@ -1330,7 +1335,8 @@ impl Bin {
                 delta_keys.push(fk);
                 delta_lsns.push(self.inner.get_lsn(i));
                 delta_states.push(self.inner.get_state(i));
-                delta_embedded.push(self.slot_embedded_data.get(i).cloned().flatten());
+                delta_embedded
+                    .push(self.slot_embedded_data.get(i).cloned().flatten());
             }
         }
 
@@ -1346,7 +1352,12 @@ impl Bin {
         self.key_prefix.clear();
 
         for j in 0..delta_n {
-            let _ = self.insert_entry(delta_keys[j].clone(), delta_lsns[j], delta_states[j], None);
+            let _ = self.insert_entry(
+                delta_keys[j].clone(),
+                delta_lsns[j],
+                delta_states[j],
+                None,
+            );
             self.slot_embedded_data.push(delta_embedded[j].clone());
         }
 
@@ -1371,8 +1382,12 @@ impl Bin {
     /// `full_bin` must be the full BIN matching `self.last_full_version`.
     /// After the call `self` is a full BIN.
     ///
-    /// 
-    pub fn mutate_to_full_bin(&mut self, full_bin: &mut Bin, leave_free_slot: bool) {
+    ///
+    pub fn mutate_to_full_bin(
+        &mut self,
+        full_bin: &mut Bin,
+        leave_free_slot: bool,
+    ) {
         assert!(self.is_bin_delta(), "mutate_to_full_bin called on non-delta");
 
         // Apply each delta slot onto the full BIN.
@@ -1385,7 +1400,8 @@ impl Bin {
             full_bin.apply_delta_slot(key, lsn, state, embedded);
         }
 
-        if leave_free_slot && full_bin.get_n_entries() >= full_bin.max_entries() {
+        if leave_free_slot && full_bin.get_n_entries() >= full_bin.max_entries()
+        {
             log::warn!(
                 "mutate_to_full_bin: leave_free_slot requested but BIN is full (n={})",
                 full_bin.get_n_entries()
@@ -1395,9 +1411,15 @@ impl Bin {
         // Swap contents so self becomes the full BIN.
         std::mem::swap(&mut self.inner, &mut full_bin.inner);
         std::mem::swap(&mut self.key_prefix, &mut full_bin.key_prefix);
-        std::mem::swap(&mut self.slot_embedded_data, &mut full_bin.slot_embedded_data);
+        std::mem::swap(
+            &mut self.slot_embedded_data,
+            &mut full_bin.slot_embedded_data,
+        );
         std::mem::swap(&mut self.slot_vlsns, &mut full_bin.slot_vlsns);
-        std::mem::swap(&mut self.slot_expirations, &mut full_bin.slot_expirations);
+        std::mem::swap(
+            &mut self.slot_expirations,
+            &mut full_bin.slot_expirations,
+        );
 
         self.inner.set_bin_delta(false);
         self.delta_bloom_filter = None;
@@ -1408,7 +1430,7 @@ impl Bin {
     ///
     /// Updates the slot if the key already exists; otherwise inserts a new slot.
     ///
-    /// 
+    ///
     pub fn apply_delta_slot(
         &mut self,
         key: Vec<u8>,
@@ -1433,7 +1455,7 @@ impl Bin {
     /// Skips if the slot is dirty and a delta should be logged, to avoid
     /// blocking a future delta write.
     ///
-    /// 
+    ///
     pub fn queue_slot_deletion(&self, index: usize) {
         if self.inner.is_entry_dirty(index) && self.should_log_delta() {
             return;
@@ -1676,13 +1698,20 @@ mod tests {
         let mut bin = Bin::new(1, 128);
 
         // First insert — no prefix yet (need ≥ 2 entries).
-        bin.insert_entry(b"user:alice".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        assert!(bin.key_prefix.is_empty(), "single-entry BIN must have no prefix");
+        bin.insert_entry(b"user:alice".to_vec(), Lsn::from_u64(1), 0, None)
+            .unwrap();
+        assert!(
+            bin.key_prefix.is_empty(),
+            "single-entry BIN must have no prefix"
+        );
 
         // Second insert — prefix "user:" should be established.
-        bin.insert_entry(b"user:bob".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
-        assert_eq!(&bin.key_prefix, b"user:",
-            "common prefix 'user:' must be extracted after 2nd insert");
+        bin.insert_entry(b"user:bob".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
+        assert_eq!(
+            &bin.key_prefix, b"user:",
+            "common prefix 'user:' must be extracted after 2nd insert"
+        );
     }
 
     /// `get_key` returns the full (decompressed) key regardless of what is
@@ -1690,9 +1719,12 @@ mod tests {
     #[test]
     fn test_get_key_decompresses() {
         let mut bin = Bin::new(1, 128);
-        bin.insert_entry(b"app:config".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"app:data".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
-        bin.insert_entry(b"app:log".to_vec(), Lsn::from_u64(3), 0, None).unwrap();
+        bin.insert_entry(b"app:config".to_vec(), Lsn::from_u64(1), 0, None)
+            .unwrap();
+        bin.insert_entry(b"app:data".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
+        bin.insert_entry(b"app:log".to_vec(), Lsn::from_u64(3), 0, None)
+            .unwrap();
 
         // All full keys must be recovered from get_key.
         assert_eq!(bin.get_key(0), Some(b"app:config".to_vec()));
@@ -1705,7 +1737,8 @@ mod tests {
     #[test]
     fn test_find_entry_with_prefix() {
         let mut bin = Bin::new(1, 128);
-        for key in [b"ns:aaa".as_ref(), b"ns:bbb".as_ref(), b"ns:ccc".as_ref()] {
+        for key in [b"ns:aaa".as_ref(), b"ns:bbb".as_ref(), b"ns:ccc".as_ref()]
+        {
             bin.insert_entry(key.to_vec(), Lsn::from_u64(1), 0, None).unwrap();
         }
 
@@ -1731,8 +1764,10 @@ mod tests {
     #[test]
     fn test_prefix_shrinks_when_key_breaks_it() {
         let mut bin = Bin::new(1, 128);
-        bin.insert_entry(b"abc:one".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"abc:two".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
+        bin.insert_entry(b"abc:one".to_vec(), Lsn::from_u64(1), 0, None)
+            .unwrap();
+        bin.insert_entry(b"abc:two".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
         assert_eq!(&bin.key_prefix, b"abc:", "initial prefix");
 
         // Insert a key that shares only "a" with existing ones.
@@ -1741,11 +1776,16 @@ mod tests {
         assert_eq!(&bin.key_prefix, b"a", "prefix must shrink to common part");
 
         // All full keys must still be recoverable.
-        let all_keys: Vec<Vec<u8>> = (0..bin.get_n_entries())
-            .filter_map(|i| bin.get_key(i))
-            .collect();
-        assert!(all_keys.contains(&b"abc:one".to_vec()), "abc:one must still be present");
-        assert!(all_keys.contains(&b"abc:two".to_vec()), "abc:two must still be present");
+        let all_keys: Vec<Vec<u8>> =
+            (0..bin.get_n_entries()).filter_map(|i| bin.get_key(i)).collect();
+        assert!(
+            all_keys.contains(&b"abc:one".to_vec()),
+            "abc:one must still be present"
+        );
+        assert!(
+            all_keys.contains(&b"abc:two".to_vec()),
+            "abc:two must still be present"
+        );
         assert!(all_keys.contains(&b"axe".to_vec()), "axe must be present");
     }
 
@@ -1753,9 +1793,12 @@ mod tests {
     #[test]
     fn test_compute_key_prefix_pure() {
         let mut bin = Bin::new(1, 128);
-        bin.insert_entry(b"log:debug".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"log:info".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
-        bin.insert_entry(b"log:warn".to_vec(), Lsn::from_u64(3), 0, None).unwrap();
+        bin.insert_entry(b"log:debug".to_vec(), Lsn::from_u64(1), 0, None)
+            .unwrap();
+        bin.insert_entry(b"log:info".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
+        bin.insert_entry(b"log:warn".to_vec(), Lsn::from_u64(3), 0, None)
+            .unwrap();
 
         let computed = bin.compute_key_prefix(None);
         assert_eq!(computed, b"log:", "computed prefix must be 'log:'");
@@ -1771,7 +1814,10 @@ mod tests {
 
         let prefix_before = bin.key_prefix.clone();
         bin.recompute_key_prefix();
-        assert_eq!(bin.key_prefix, prefix_before, "prefix must be stable after recompute");
+        assert_eq!(
+            bin.key_prefix, prefix_before,
+            "prefix must be stable after recompute"
+        );
 
         // All keys still intact.
         assert_eq!(bin.get_key(0), Some(b"key:a".to_vec()));
@@ -1785,7 +1831,9 @@ mod tests {
     fn test_prefix_reduces_stored_bytes() {
         let mut bin = Bin::new(1, 128);
         let prefix = b"very:long:common:prefix:";
-        for suffix in [b"a".as_ref(), b"b".as_ref(), b"c".as_ref(), b"d".as_ref()] {
+        for suffix in
+            [b"a".as_ref(), b"b".as_ref(), b"c".as_ref(), b"d".as_ref()]
+        {
             let mut full = prefix.to_vec();
             full.extend_from_slice(suffix);
             bin.insert_entry(full, Lsn::from_u64(1), 0, None).unwrap();
@@ -1795,8 +1843,12 @@ mod tests {
 
         // Stored suffixes must each be 1 byte.
         for entry in &bin.inner.keys {
-            assert_eq!(entry.len(), 1,
-                "stored suffix must be 1 byte, got {:?}", entry);
+            assert_eq!(
+                entry.len(),
+                1,
+                "stored suffix must be 1 byte, got {:?}",
+                entry
+            );
         }
     }
 
@@ -1805,9 +1857,13 @@ mod tests {
     fn test_no_common_prefix_leaves_prefix_empty() {
         let mut bin = Bin::new(1, 128);
         bin.insert_entry(b"apple".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"banana".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
+        bin.insert_entry(b"banana".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
         // "apple" and "banana" share no prefix.
-        assert!(bin.key_prefix.is_empty(), "differing-first-byte keys must have no prefix");
+        assert!(
+            bin.key_prefix.is_empty(),
+            "differing-first-byte keys must have no prefix"
+        );
     }
 
     // ========================================================================
@@ -1845,8 +1901,10 @@ mod tests {
     #[test]
     fn test_decompress_key_with_prefix() {
         let mut bin = Bin::new(1, 128);
-        bin.insert_entry(b"data:x".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"data:y".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
+        bin.insert_entry(b"data:x".to_vec(), Lsn::from_u64(1), 0, None)
+            .unwrap();
+        bin.insert_entry(b"data:y".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
         // After insertion the prefix is "data:" and suffixes are "x", "y".
         assert_eq!(bin.decompress_key(b"x"), b"data:x");
         assert_eq!(bin.decompress_key(b"y"), b"data:y");
@@ -1905,8 +1963,10 @@ mod tests {
     fn test_find_entry_key_outside_prefix() {
         // Keys outside the current prefix must still return a valid position.
         let mut bin = Bin::new(1, 128);
-        bin.insert_entry(b"prefix:a".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"prefix:b".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
+        bin.insert_entry(b"prefix:a".to_vec(), Lsn::from_u64(1), 0, None)
+            .unwrap();
+        bin.insert_entry(b"prefix:b".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
         assert!(bin.has_key_prefix(), "prefix must be active");
 
         // "other:x" does not share the "prefix:" prefix — must not panic,
@@ -1929,7 +1989,10 @@ mod tests {
         // After single insert, no prefix (< 2 entries when computing manually).
         // Force clear the prefix so compute_key_prefix sees raw state.
         let computed = bin.compute_key_prefix(None);
-        assert!(computed.is_empty(), "single-entry BIN has no computable prefix");
+        assert!(
+            computed.is_empty(),
+            "single-entry BIN has no computable prefix"
+        );
     }
 
     #[test]
@@ -1960,7 +2023,10 @@ mod tests {
         // Verify that recompute_key_prefix is idempotent: prefix stays "xyz:"
         // and full keys are still recoverable.
         bin.recompute_key_prefix();
-        assert_eq!(&bin.key_prefix, b"xyz:", "prefix must remain stable after recompute");
+        assert_eq!(
+            &bin.key_prefix, b"xyz:",
+            "prefix must remain stable after recompute"
+        );
 
         // Full keys must still be recoverable after re-encoding.
         assert_eq!(bin.get_key(0), Some(b"xyz:1".to_vec()));
@@ -1983,15 +2049,18 @@ mod tests {
     fn test_insert_entry_prefix_shrinks_to_empty() {
         let mut bin = Bin::new(1, 128);
         bin.insert_entry(b"alpha".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
-        bin.insert_entry(b"alpha2".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
+        bin.insert_entry(b"alpha2".to_vec(), Lsn::from_u64(2), 0, None)
+            .unwrap();
         // Now insert a key with no common prefix.
         bin.insert_entry(b"zzzzz".to_vec(), Lsn::from_u64(3), 0, None).unwrap();
         // "alpha" and "zzzzz" share no prefix.
-        assert!(bin.key_prefix.is_empty(), "prefix must be empty when no common bytes");
+        assert!(
+            bin.key_prefix.is_empty(),
+            "prefix must be empty when no common bytes"
+        );
         // All keys must still be readable.
-        let keys: Vec<Vec<u8>> = (0..bin.get_n_entries())
-            .filter_map(|i| bin.get_key(i))
-            .collect();
+        let keys: Vec<Vec<u8>> =
+            (0..bin.get_n_entries()).filter_map(|i| bin.get_key(i)).collect();
         assert!(keys.contains(&b"alpha".to_vec()));
         assert!(keys.contains(&b"alpha2".to_vec()));
         assert!(keys.contains(&b"zzzzz".to_vec()));
@@ -2045,7 +2114,10 @@ mod tests {
         bin.add_cursor(5);
         bin.remove_cursor(5);
         // cursor_set must be None (not Some(empty)).
-        assert!(bin.cursor_set.is_none(), "cursor_set should be None when empty");
+        assert!(
+            bin.cursor_set.is_none(),
+            "cursor_set should be None when empty"
+        );
         assert_eq!(bin.n_cursors(), 0);
     }
 
@@ -2283,7 +2355,10 @@ mod tests {
         bin.insert_entry(b"k2".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
         bin.set_known_deleted(0);
         bin.set_bin_delta(true); // pretend it's a delta
-        assert!(!bin.should_compress_obsolete_keys(), "delta BINs must not be compressed");
+        assert!(
+            !bin.should_compress_obsolete_keys(),
+            "delta BINs must not be compressed"
+        );
     }
 
     // ========================================================================
@@ -2304,9 +2379,8 @@ mod tests {
         assert_eq!(bin.get_n_entries(), 3);
         bin.compress(true);
         assert_eq!(bin.get_n_entries(), 2, "deleted slot must be removed");
-        let remaining: Vec<Vec<u8>> = (0..bin.get_n_entries())
-            .filter_map(|i| bin.get_key(i))
-            .collect();
+        let remaining: Vec<Vec<u8>> =
+            (0..bin.get_n_entries()).filter_map(|i| bin.get_key(i)).collect();
         assert!(remaining.contains(&b"k:a".to_vec()));
         assert!(remaining.contains(&b"k:c".to_vec()));
         assert!(!remaining.contains(&b"k:b".to_vec()));
@@ -2323,7 +2397,11 @@ mod tests {
 
         // compress with compress_dirty_slots=false must skip dirty slot.
         bin.compress(false);
-        assert_eq!(bin.get_n_entries(), 2, "dirty deleted slot must be skipped");
+        assert_eq!(
+            bin.get_n_entries(),
+            2,
+            "dirty deleted slot must be skipped"
+        );
     }
 
     #[test]
@@ -2336,7 +2414,11 @@ mod tests {
         bin.set_pending_deleted(0); // also sets DIRTY_BIT
 
         bin.compress(true);
-        assert_eq!(bin.get_n_entries(), 1, "dirty deleted slot must be removed when flag is true");
+        assert_eq!(
+            bin.get_n_entries(),
+            1,
+            "dirty deleted slot must be removed when flag is true"
+        );
         assert_eq!(bin.get_key(0), Some(b"k:b".to_vec()));
     }
 
@@ -2399,7 +2481,10 @@ mod tests {
         bin.insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
         bin.inner.states[0] = crate::entry_states::KNOWN_DELETED_BIT;
         bin.set_bin_delta(true);
-        assert!(!bin.is_valid_for_delete(), "delta BIN must not be valid for delete");
+        assert!(
+            !bin.is_valid_for_delete(),
+            "delta BIN must not be valid for delete"
+        );
     }
 
     #[test]
@@ -2408,7 +2493,10 @@ mod tests {
         bin.insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
         bin.inner.states[0] = crate::entry_states::KNOWN_DELETED_BIT;
         bin.add_cursor(1);
-        assert!(!bin.is_valid_for_delete(), "BIN with cursor must not be valid for delete");
+        assert!(
+            !bin.is_valid_for_delete(),
+            "BIN with cursor must not be valid for delete"
+        );
     }
 
     // ========================================================================
@@ -2418,7 +2506,8 @@ mod tests {
     #[test]
     fn test_can_mutate_to_bin_delta_false_when_already_delta() {
         let mut bin = Bin::new(1, 128);
-        bin.insert_entry(b"k".to_vec(), Lsn::from_u64(1), DIRTY_BIT, None).unwrap();
+        bin.insert_entry(b"k".to_vec(), Lsn::from_u64(1), DIRTY_BIT, None)
+            .unwrap();
         bin.set_bin_delta(true);
         assert!(!bin.can_mutate_to_bin_delta());
     }
@@ -2448,7 +2537,10 @@ mod tests {
         // All slots dirty — dirty == n, so delta would be as large as full BIN.
         bin.inner.states[0] = DIRTY_BIT;
         bin.inner.states[1] = DIRTY_BIT;
-        assert!(!bin.can_mutate_to_bin_delta(), "all-dirty BIN must not become delta");
+        assert!(
+            !bin.can_mutate_to_bin_delta(),
+            "all-dirty BIN must not become delta"
+        );
     }
 
     #[test]
@@ -2494,7 +2586,10 @@ mod tests {
         bin.inner.states[1] = 0;
 
         bin.mutate_to_bin_delta();
-        assert!(bin.get_bloom_filter().is_some(), "bloom filter must be set for non-empty delta");
+        assert!(
+            bin.get_bloom_filter().is_some(),
+            "bloom filter must be set for non-empty delta"
+        );
     }
 
     #[test]
@@ -2510,10 +2605,13 @@ mod tests {
 
         bin.mutate_to_bin_delta();
         assert!(bin.is_bin_delta());
-        assert_eq!(bin.get_n_entries(), 2, "only the 2 dirty slots should remain");
-        let keys: Vec<Vec<u8>> = (0..bin.get_n_entries())
-            .filter_map(|i| bin.get_key(i))
-            .collect();
+        assert_eq!(
+            bin.get_n_entries(),
+            2,
+            "only the 2 dirty slots should remain"
+        );
+        let keys: Vec<Vec<u8>> =
+            (0..bin.get_n_entries()).filter_map(|i| bin.get_key(i)).collect();
         assert!(keys.contains(&b"k:0".to_vec()));
         assert!(keys.contains(&b"k:3".to_vec()));
     }
@@ -2532,13 +2630,19 @@ mod tests {
 
         // Create a delta that updates "r:b" with a newer LSN.
         let mut delta = Bin::new(1, 128);
-        delta.insert_entry(b"r:b".to_vec(), Lsn::from_u64(99), DIRTY_BIT, None).unwrap();
+        delta
+            .insert_entry(b"r:b".to_vec(), Lsn::from_u64(99), DIRTY_BIT, None)
+            .unwrap();
         delta.set_bin_delta(true);
 
         delta.mutate_to_full_bin(&mut full, false);
 
         assert!(!delta.is_bin_delta(), "result must be a full BIN");
-        assert_eq!(delta.get_n_entries(), 3, "all 3 slots from full BIN must be present");
+        assert_eq!(
+            delta.get_n_entries(),
+            3,
+            "all 3 slots from full BIN must be present"
+        );
 
         // The updated LSN for "r:b" must be reflected.
         let idx = delta.find_entry(b"r:b", false, true);
@@ -2556,13 +2660,19 @@ mod tests {
 
         // Delta inserts a brand-new key "r:b".
         let mut delta = Bin::new(1, 128);
-        delta.insert_entry(b"r:b".to_vec(), Lsn::from_u64(2), DIRTY_BIT, None).unwrap();
+        delta
+            .insert_entry(b"r:b".to_vec(), Lsn::from_u64(2), DIRTY_BIT, None)
+            .unwrap();
         delta.set_bin_delta(true);
 
         delta.mutate_to_full_bin(&mut full, false);
 
         assert!(!delta.is_bin_delta());
-        assert_eq!(delta.get_n_entries(), 3, "new key from delta must be merged in");
+        assert_eq!(
+            delta.get_n_entries(),
+            3,
+            "new key from delta must be merged in"
+        );
         let keys: Vec<Vec<u8>> = (0..delta.get_n_entries())
             .filter_map(|i| delta.get_key(i))
             .collect();
@@ -2580,7 +2690,12 @@ mod tests {
         bin.insert_entry(b"k:y".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
 
         // Update "k:x" with a new LSN and state.
-        bin.apply_delta_slot(b"k:x".to_vec(), Lsn::from_u64(100), DIRTY_BIT, None);
+        bin.apply_delta_slot(
+            b"k:x".to_vec(),
+            Lsn::from_u64(100),
+            DIRTY_BIT,
+            None,
+        );
 
         let idx = bin.find_entry(b"k:x", false, true);
         assert_ne!(idx & 0x1_0000, 0);
@@ -2607,7 +2722,12 @@ mod tests {
         bin.insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
 
         let new_data = b"new_embedded".to_vec();
-        bin.apply_delta_slot(b"k".to_vec(), Lsn::from_u64(2), 0, Some(new_data.clone()));
+        bin.apply_delta_slot(
+            b"k".to_vec(),
+            Lsn::from_u64(2),
+            0,
+            Some(new_data.clone()),
+        );
 
         assert_eq!(bin.get_embedded_data(0), Some(new_data.as_slice()));
     }
@@ -2626,15 +2746,30 @@ mod tests {
     fn test_in_node_is_valid_for_delete_not_all_deleted() {
         let mut node = InNode::new(1, 1, 128);
         node.insert_entry(b"k1".to_vec(), Lsn::from_u64(1), 0).unwrap();
-        node.insert_entry(b"k2".to_vec(), Lsn::from_u64(2), crate::entry_states::KNOWN_DELETED_BIT).unwrap();
+        node.insert_entry(
+            b"k2".to_vec(),
+            Lsn::from_u64(2),
+            crate::entry_states::KNOWN_DELETED_BIT,
+        )
+        .unwrap();
         assert!(!node.is_valid_for_delete());
     }
 
     #[test]
     fn test_in_node_is_valid_for_delete_all_deleted() {
         let mut node = InNode::new(1, 1, 128);
-        node.insert_entry(b"k1".to_vec(), Lsn::from_u64(1), crate::entry_states::KNOWN_DELETED_BIT).unwrap();
-        node.insert_entry(b"k2".to_vec(), Lsn::from_u64(2), crate::entry_states::KNOWN_DELETED_BIT).unwrap();
+        node.insert_entry(
+            b"k1".to_vec(),
+            Lsn::from_u64(1),
+            crate::entry_states::KNOWN_DELETED_BIT,
+        )
+        .unwrap();
+        node.insert_entry(
+            b"k2".to_vec(),
+            Lsn::from_u64(2),
+            crate::entry_states::KNOWN_DELETED_BIT,
+        )
+        .unwrap();
         assert!(node.is_valid_for_delete());
     }
 
@@ -2655,7 +2790,9 @@ mod tests {
     fn test_in_node_insert_duplicate_updates_in_place() {
         let mut node = InNode::new(1, 1, 128);
         node.insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0).unwrap();
-        let r = node.insert_entry(b"k".to_vec(), Lsn::from_u64(99), DIRTY_BIT).unwrap();
+        let r = node
+            .insert_entry(b"k".to_vec(), Lsn::from_u64(99), DIRTY_BIT)
+            .unwrap();
         assert_ne!(r & 0x1_0000, 0, "EXACT_MATCH must be set on update");
         assert_eq!(node.get_n_entries(), 1, "no new slot must be added");
         assert_eq!(node.get_lsn(0), Lsn::from_u64(99));
@@ -2676,7 +2813,10 @@ mod tests {
     #[test]
     fn test_in_node_delete_entry_out_of_bounds() {
         let mut node = InNode::new(1, 1, 128);
-        assert!(!node.delete_entry(0), "deleting from empty node must return false");
+        assert!(
+            !node.delete_entry(0),
+            "deleting from empty node must return false"
+        );
     }
 
     // ========================================================================
@@ -2708,7 +2848,10 @@ mod tests {
     #[test]
     fn test_in_node_node_id_positive() {
         let node = InNode::new(1, 1, 128);
-        assert!(node.node_id() > 0, "node_id must be a positive assigned value");
+        assert!(
+            node.node_id() > 0,
+            "node_id must be a positive assigned value"
+        );
     }
 
     // ========================================================================
@@ -2724,12 +2867,15 @@ mod tests {
         let mut bin = Bin::new(1, 32);
         // 4 entries, 1 dirty → can_mutate is true (dirty < n && dirty > 0).
         for i in 0u8..4 {
-            bin.insert_entry(vec![i], Lsn::from_u64(i as u64), 0, None).unwrap();
+            bin.insert_entry(vec![i], Lsn::from_u64(i as u64), 0, None)
+                .unwrap();
         }
         bin.inner.states[2] = DIRTY_BIT; // only slot 2 dirty
 
-        assert!(bin.can_mutate_to_bin_delta(),
-            "precondition: must be mutable to delta");
+        assert!(
+            bin.can_mutate_to_bin_delta(),
+            "precondition: must be mutable to delta"
+        );
         assert!(!bin.is_bin_delta(), "must start as full BIN");
 
         bin.mutate_to_bin_delta();
@@ -2747,7 +2893,8 @@ mod tests {
     fn test_je_apply_delta_slot_updates_existing_key_lsn() {
         let mut full = Bin::new(1, 32);
         for i in 0u8..4 {
-            full.insert_entry(vec![i], Lsn::from_u64(i as u64 + 10), 0, None).unwrap();
+            full.insert_entry(vec![i], Lsn::from_u64(i as u64 + 10), 0, None)
+                .unwrap();
         }
 
         let new_lsn = Lsn::from_u64(999);
@@ -2757,8 +2904,11 @@ mod tests {
         let idx = full.find_entry(&[1u8], false, true);
         assert!(idx >= 0 && (idx & 0x1_0000) != 0, "key [1] must be found");
         let slot = (idx & 0xFFFF) as usize;
-        assert_eq!(full.get_lsn(slot), new_lsn,
-            "apply_delta_slot must update the LSN of the matched key");
+        assert_eq!(
+            full.get_lsn(slot),
+            new_lsn,
+            "apply_delta_slot must update the LSN of the matched key"
+        );
     }
 
     /// Full round-trip: mutate → reconstruct.
@@ -2774,7 +2924,8 @@ mod tests {
         let mut full = Bin::new(1, N * 2);
         for i in 0..N as u8 {
             // Insert with initial LSN.
-            full.insert_entry(vec![i], Lsn::from_u64(i as u64 * 10), 0, None).unwrap();
+            full.insert_entry(vec![i], Lsn::from_u64(i as u64 * 10), 0, None)
+                .unwrap();
         }
 
         // Record the original full set of (key, lsn) pairs.
@@ -2799,15 +2950,18 @@ mod tests {
         let mut delta = Bin::new(1, N * 2);
         for i in 0..N as u8 {
             let state = full.inner.states[i as usize];
-            let lsn   = full.inner.lsns[i as usize];
+            let lsn = full.inner.lsns[i as usize];
             if state & DIRTY_BIT != 0 {
                 delta.insert_entry(vec![i], lsn, state, None).unwrap();
             }
         }
         delta.set_bin_delta(true);
 
-        assert_eq!(delta.get_n_entries(), 2,
-            "delta must contain only the 2 dirty slots");
+        assert_eq!(
+            delta.get_n_entries(),
+            2,
+            "delta must contain only the 2 dirty slots"
+        );
         assert!(delta.is_bin_delta());
 
         // Reconstruct: apply delta onto the base snapshot.
@@ -2815,8 +2969,12 @@ mod tests {
 
         // After reconstruction:
         assert!(!delta.is_bin_delta(), "reconstructed BIN must not be a delta");
-        assert_eq!(delta.get_n_entries(), N,
-            "all {} original keys must be present after reconstruction", N);
+        assert_eq!(
+            delta.get_n_entries(),
+            N,
+            "all {} original keys must be present after reconstruction",
+            N
+        );
 
         // Verify updated LSNs for the delta slots.
         let idx1 = delta.find_entry(&[1u8], false, true);
@@ -2830,11 +2988,18 @@ mod tests {
         // All other keys must still be present with their original LSNs.
         for i in [0u8, 2, 4, 5] {
             let idx = delta.find_entry(&[i], false, true);
-            assert!(idx >= 0 && (idx & 0x1_0000) != 0,
-                "key [{}] must be present after reconstruction", i);
+            assert!(
+                idx >= 0 && (idx & 0x1_0000) != 0,
+                "key [{}] must be present after reconstruction",
+                i
+            );
             let expected_lsn = Lsn::from_u64(i as u64 * 10);
-            assert_eq!(delta.get_lsn((idx & 0xFFFF) as usize), expected_lsn,
-                "key [{}] must have its original LSN", i);
+            assert_eq!(
+                delta.get_lsn((idx & 0xFFFF) as usize),
+                expected_lsn,
+                "key [{}] must have its original LSN",
+                i
+            );
         }
     }
 
@@ -2853,8 +3018,8 @@ mod tests {
         assert_eq!(create_key_prefix(b"aaaa", b"aaab"), Some(b"aaa".to_vec()));
         assert_eq!(create_key_prefix(b"abaa", b"aaab"), Some(b"a".to_vec()));
         assert_eq!(create_key_prefix(b"baaa", b"aaab"), None);
-        assert_eq!(create_key_prefix(b"aaa",  b"aaa"),  Some(b"aaa".to_vec()));
-        assert_eq!(create_key_prefix(b"aaa",  b"aaab"), Some(b"aaa".to_vec()));
+        assert_eq!(create_key_prefix(b"aaa", b"aaa"), Some(b"aaa".to_vec()));
+        assert_eq!(create_key_prefix(b"aaa", b"aaab"), Some(b"aaa".to_vec()));
     }
 
     ///
@@ -2876,12 +3041,12 @@ mod tests {
             }
         }
 
-        assert!(is_prefix_of(Some(b"aaa"), b"aaa"),  "identical is subset");
-        assert!(is_prefix_of(Some(b"aa"),  b"aaa"),  "shorter prefix is subset");
-        assert!(!is_prefix_of(Some(b"aaa"), b"aa"),  "prefix longer than key");
-        assert!(!is_prefix_of(Some(b""),   b"aa"),   "empty prefix is not subset");
-        assert!(!is_prefix_of(None,         b"aa"),   "null prefix is not subset");
-        assert!(!is_prefix_of(Some(b"baa"), b"aa"),  "different first byte");
+        assert!(is_prefix_of(Some(b"aaa"), b"aaa"), "identical is subset");
+        assert!(is_prefix_of(Some(b"aa"), b"aaa"), "shorter prefix is subset");
+        assert!(!is_prefix_of(Some(b"aaa"), b"aa"), "prefix longer than key");
+        assert!(!is_prefix_of(Some(b""), b"aa"), "empty prefix is not subset");
+        assert!(!is_prefix_of(None, b"aa"), "null prefix is not subset");
+        assert!(!is_prefix_of(Some(b"baa"), b"aa"), "different first byte");
     }
 
     /// Inserting a key that breaks the existing prefix
@@ -2904,17 +3069,19 @@ mod tests {
         bin.insert_entry(b"baa".to_vec(), Lsn::from_u64(4), 0, None).unwrap();
 
         // Prefix must be cleared (no common bytes between 'a...' and 'b...').
-        assert!(bin.key_prefix.is_empty(),
-            "prefix must be cleared when new key shares no leading bytes");
+        assert!(
+            bin.key_prefix.is_empty(),
+            "prefix must be cleared when new key shares no leading bytes"
+        );
 
         // All full keys must still be decompressible.
-        let all_keys: Vec<Vec<u8>> = (0..bin.get_n_entries())
-            .filter_map(|i| bin.get_key(i))
-            .collect();
+        let all_keys: Vec<Vec<u8>> =
+            (0..bin.get_n_entries()).filter_map(|i| bin.get_key(i)).collect();
         for expected in [b"aaa".as_ref(), b"aab", b"aac", b"baa"] {
             assert!(
                 all_keys.iter().any(|k| k.as_slice() == expected),
-                "key {:?} must still be present and decompressible", expected
+                "key {:?} must still be present and decompressible",
+                expected
             );
         }
     }
@@ -2937,8 +3104,11 @@ mod tests {
         for &k in test_keys {
             let suffix = bin.compress_key(k);
             let recovered = bin.decompress_key(&suffix);
-            assert_eq!(recovered.as_slice(), k,
-                "compress then decompress must return the original key");
+            assert_eq!(
+                recovered.as_slice(),
+                k,
+                "compress then decompress must return the original key"
+            );
         }
     }
 
@@ -2962,21 +3132,33 @@ mod tests {
         }
 
         // Each BIN should have its own correct prefix.
-        assert!(bin1.key_prefix.starts_with(b"aa"),
-            "BIN1 prefix must start with 'aa', got {:?}", bin1.key_prefix);
-        assert!(bin6.key_prefix.starts_with(b"ba"),
-            "BIN6 prefix must start with 'ba', got {:?}", bin6.key_prefix);
+        assert!(
+            bin1.key_prefix.starts_with(b"aa"),
+            "BIN1 prefix must start with 'aa', got {:?}",
+            bin1.key_prefix
+        );
+        assert!(
+            bin6.key_prefix.starts_with(b"ba"),
+            "BIN6 prefix must start with 'ba', got {:?}",
+            bin6.key_prefix
+        );
 
         // All keys must still be decompressible in each half.
         for k in [b"aaa".as_ref(), b"aab", b"aac", b"aae"] {
             let idx = bin1.find_entry(k, false, true);
-            assert!(idx >= 0 && (idx & 0x1_0000) != 0,
-                "key {:?} must be found in bin1 after split", k);
+            assert!(
+                idx >= 0 && (idx & 0x1_0000) != 0,
+                "key {:?} must be found in bin1 after split",
+                k
+            );
         }
         for k in [b"baa".as_ref(), b"bab", b"bac", b"bam"] {
             let idx = bin6.find_entry(k, false, true);
-            assert!(idx >= 0 && (idx & 0x1_0000) != 0,
-                "key {:?} must be found in bin6 after split", k);
+            assert!(
+                idx >= 0 && (idx & 0x1_0000) != 0,
+                "key {:?} must be found in bin6 after split",
+                k
+            );
         }
     }
 
@@ -2999,7 +3181,8 @@ mod tests {
             let idx = bin.find_entry(k, false, true);
             assert!(
                 idx >= 0 && (idx & 0x1_0000) != 0,
-                "key {:?} must be found after recompute_key_prefix", k
+                "key {:?} must be found after recompute_key_prefix",
+                k
             );
         }
     }
@@ -3023,7 +3206,8 @@ mod tests {
 
         // Insert 10 entries (slots 0-9) with no dirty bits.
         for i in 0u8..10 {
-            bin.insert_entry(vec![i], Lsn::from_u64(i as u64 * 10), 0, None).unwrap();
+            bin.insert_entry(vec![i], Lsn::from_u64(i as u64 * 10), 0, None)
+                .unwrap();
         }
         // Clear all state bits (simulates a clean, checkpointed BIN).
         for s in bin.inner.states.iter_mut() {
@@ -3037,21 +3221,37 @@ mod tests {
         assert!(bin.can_mutate_to_bin_delta(), "precondition: must be mutable");
         let freed = bin.mutate_to_bin_delta();
 
-        assert!(bin.is_bin_delta(), "BIN must be marked as delta after mutation");
-        assert_eq!(bin.get_n_entries(), 2, "only the 2 dirty slots must remain");
+        assert!(
+            bin.is_bin_delta(),
+            "BIN must be marked as delta after mutation"
+        );
+        assert_eq!(
+            bin.get_n_entries(),
+            2,
+            "only the 2 dirty slots must remain"
+        );
         assert!(freed > 0, "some bytes must have been freed (8 slots removed)");
 
         // Both dirty keys must be present.
         let idx2 = bin.find_entry(&[2u8], false, true);
-        assert!(idx2 >= 0 && (idx2 & 0x1_0000) != 0, "dirty slot key=[2] must be in delta");
+        assert!(
+            idx2 >= 0 && (idx2 & 0x1_0000) != 0,
+            "dirty slot key=[2] must be in delta"
+        );
         let idx7 = bin.find_entry(&[7u8], false, true);
-        assert!(idx7 >= 0 && (idx7 & 0x1_0000) != 0, "dirty slot key=[7] must be in delta");
+        assert!(
+            idx7 >= 0 && (idx7 & 0x1_0000) != 0,
+            "dirty slot key=[7] must be in delta"
+        );
 
         // Non-dirty keys must be absent from the delta.
         for i in [0u8, 1, 3, 4, 5, 6, 8, 9] {
             let idx = bin.find_entry(&[i], false, true);
-            assert!(idx < 0 || (idx & 0x1_0000) == 0,
-                "non-dirty key [{}] must not be in the delta", i);
+            assert!(
+                idx < 0 || (idx & 0x1_0000) == 0,
+                "non-dirty key [{}] must not be in the delta",
+                i
+            );
         }
     }
 
@@ -3066,7 +3266,8 @@ mod tests {
 
         // Build a full BIN with 4 entries.
         for i in 0u8..4 {
-            bin.insert_entry(vec![i], Lsn::from_u64(i as u64 + 1), 0, None).unwrap();
+            bin.insert_entry(vec![i], Lsn::from_u64(i as u64 + 1), 0, None)
+                .unwrap();
         }
 
         let original_lsns: Vec<Lsn> = (0..4).map(|i| bin.get_lsn(i)).collect();
@@ -3079,10 +3280,16 @@ mod tests {
         let idx = bin.find_entry(&[2u8], false, true);
         assert!(idx >= 0 && (idx & 0x1_0000) != 0);
         let slot = (idx & 0xFFFF) as usize;
-        assert_eq!(bin.get_lsn(slot), new_lsn,
-            "apply_delta_slot must update the slot LSN");
-        assert_eq!(bin.inner.get_state(slot), DIRTY_BIT,
-            "apply_delta_slot must set the state on the updated slot");
+        assert_eq!(
+            bin.get_lsn(slot),
+            new_lsn,
+            "apply_delta_slot must update the slot LSN"
+        );
+        assert_eq!(
+            bin.inner.get_state(slot),
+            DIRTY_BIT,
+            "apply_delta_slot must set the state on the updated slot"
+        );
 
         // All other slots must be unchanged.
         for (i, &orig_lsn) in original_lsns.iter().enumerate() {
@@ -3090,8 +3297,12 @@ mod tests {
             assert!(idx_i >= 0 && (idx_i & 0x1_0000) != 0);
             let s = (idx_i & 0xFFFF) as usize;
             if bin.get_key(s) != Some(vec![2u8]) {
-                assert_eq!(bin.get_lsn(s), orig_lsn,
-                    "slot {} must be unchanged by apply_delta_slot", i);
+                assert_eq!(
+                    bin.get_lsn(s),
+                    orig_lsn,
+                    "slot {} must be unchanged by apply_delta_slot",
+                    i
+                );
             }
         }
 
@@ -3110,27 +3321,43 @@ mod tests {
         // Build a "base" full BIN representing the last checkpoint.
         let mut full = Bin::new(1, 64);
         for i in 0u8..8 {
-            full.insert_entry(vec![i], Lsn::from_u64(i as u64 + 1), 0, None).unwrap();
+            full.insert_entry(vec![i], Lsn::from_u64(i as u64 + 1), 0, None)
+                .unwrap();
         }
 
         // Create a delta with updates for keys [2] and [5], and a new key [9].
         let mut delta = Bin::new(1, 64);
-        delta.insert_entry(vec![2u8], Lsn::from_u64(200), DIRTY_BIT, None).unwrap();
-        delta.insert_entry(vec![5u8], Lsn::from_u64(500), DIRTY_BIT, None).unwrap();
-        delta.insert_entry(vec![9u8], Lsn::from_u64(900), DIRTY_BIT, None).unwrap();
+        delta
+            .insert_entry(vec![2u8], Lsn::from_u64(200), DIRTY_BIT, None)
+            .unwrap();
+        delta
+            .insert_entry(vec![5u8], Lsn::from_u64(500), DIRTY_BIT, None)
+            .unwrap();
+        delta
+            .insert_entry(vec![9u8], Lsn::from_u64(900), DIRTY_BIT, None)
+            .unwrap();
         delta.set_bin_delta(true);
 
-        assert!(delta.is_bin_delta(), "precondition: delta must be a BIN-delta");
+        assert!(
+            delta.is_bin_delta(),
+            "precondition: delta must be a BIN-delta"
+        );
 
         // Merge: delta.mutate_to_full_bin(&mut full)
         delta.mutate_to_full_bin(&mut full, false);
 
         // After merging, self (delta) must be a full BIN.
-        assert!(!delta.is_bin_delta(), "result must be a full BIN, not a delta");
+        assert!(
+            !delta.is_bin_delta(),
+            "result must be a full BIN, not a delta"
+        );
 
         // All 9 entries (0-8 from base + new key 9) must be present.
-        assert_eq!(delta.get_n_entries(), 9,
-            "merged BIN must have all 9 entries (8 base + 1 new)");
+        assert_eq!(
+            delta.get_n_entries(),
+            9,
+            "merged BIN must have all 9 entries (8 base + 1 new)"
+        );
 
         // Updated slots must carry the new LSNs.
         let idx2 = delta.find_entry(&[2u8], false, true);
@@ -3143,16 +3370,27 @@ mod tests {
 
         // New key from delta must have been inserted.
         let idx9 = delta.find_entry(&[9u8], false, true);
-        assert!(idx9 >= 0 && (idx9 & 0x1_0000) != 0, "new key [9] from delta must be present");
+        assert!(
+            idx9 >= 0 && (idx9 & 0x1_0000) != 0,
+            "new key [9] from delta must be present"
+        );
         assert_eq!(delta.get_lsn((idx9 & 0xFFFF) as usize), Lsn::from_u64(900));
 
         // Unchanged slots must retain original LSNs.
         for i in [0u8, 1, 3, 4, 6, 7] {
             let idx = delta.find_entry(&[i], false, true);
-            assert!(idx >= 0 && (idx & 0x1_0000) != 0, "key [{}] must be present", i);
+            assert!(
+                idx >= 0 && (idx & 0x1_0000) != 0,
+                "key [{}] must be present",
+                i
+            );
             let expected = Lsn::from_u64(i as u64 + 1);
-            assert_eq!(delta.get_lsn((idx & 0xFFFF) as usize), expected,
-                "key [{}] must have its original LSN", i);
+            assert_eq!(
+                delta.get_lsn((idx & 0xFFFF) as usize),
+                expected,
+                "key [{}] must have its original LSN",
+                i
+            );
         }
     }
 
@@ -3169,7 +3407,14 @@ mod tests {
 
         // Insert N entries; record their (key, lsn) pairs.
         for i in 0..N as u8 {
-            original.insert_entry(vec![i], Lsn::from_u64(i as u64 * 10 + 1), 0, None).unwrap();
+            original
+                .insert_entry(
+                    vec![i],
+                    Lsn::from_u64(i as u64 * 10 + 1),
+                    0,
+                    None,
+                )
+                .unwrap();
         }
         for s in original.inner.states.iter_mut() {
             *s = 0; // clear all dirty bits (clean state)
@@ -3200,7 +3445,11 @@ mod tests {
         }
         delta.set_bin_delta(true);
 
-        assert_eq!(delta.get_n_entries(), 2, "delta must contain only 2 dirty slots");
+        assert_eq!(
+            delta.get_n_entries(),
+            2,
+            "delta must contain only 2 dirty slots"
+        );
         assert!(delta.is_bin_delta());
 
         // Reconstruct: apply delta onto the base snapshot.
@@ -3208,25 +3457,43 @@ mod tests {
 
         // Post-reconstruction invariants.
         assert!(!delta.is_bin_delta(), "reconstructed BIN must not be a delta");
-        assert_eq!(delta.get_n_entries(), N,
-            "reconstructed BIN must have all {} original entries", N);
+        assert_eq!(
+            delta.get_n_entries(),
+            N,
+            "reconstructed BIN must have all {} original entries",
+            N
+        );
 
         // Updated slots carry the new LSNs.
         let i3 = delta.find_entry(&[3u8], false, true);
-        assert!(i3 >= 0 && (i3 & 0x1_0000) != 0, "key [3] must be present after reconstruction");
+        assert!(
+            i3 >= 0 && (i3 & 0x1_0000) != 0,
+            "key [3] must be present after reconstruction"
+        );
         assert_eq!(delta.get_lsn((i3 & 0xFFFF) as usize), Lsn::from_u64(330));
 
         let i6 = delta.find_entry(&[6u8], false, true);
-        assert!(i6 >= 0 && (i6 & 0x1_0000) != 0, "key [6] must be present after reconstruction");
+        assert!(
+            i6 >= 0 && (i6 & 0x1_0000) != 0,
+            "key [6] must be present after reconstruction"
+        );
         assert_eq!(delta.get_lsn((i6 & 0xFFFF) as usize), Lsn::from_u64(660));
 
         // All other slots carry their original LSNs.
         for i in [0u8, 1, 2, 4, 5, 7, 8, 9] {
             let idx = delta.find_entry(&[i], false, true);
-            assert!(idx >= 0 && (idx & 0x1_0000) != 0, "key [{}] must be present", i);
+            assert!(
+                idx >= 0 && (idx & 0x1_0000) != 0,
+                "key [{}] must be present",
+                i
+            );
             let expected = Lsn::from_u64(i as u64 * 10 + 1);
-            assert_eq!(delta.get_lsn((idx & 0xFFFF) as usize), expected,
-                "key [{}] must have its original LSN after round-trip", i);
+            assert_eq!(
+                delta.get_lsn((idx & 0xFFFF) as usize),
+                expected,
+                "key [{}] must have its original LSN after round-trip",
+                i
+            );
         }
     }
 
@@ -3241,12 +3508,20 @@ mod tests {
         assert_eq!(bin.get_n_entries(), 2);
 
         // Apply a delta for a key that does NOT yet exist ("key:b").
-        bin.apply_delta_slot(b"key:b".to_vec(), Lsn::from_u64(2), DIRTY_BIT, None);
+        bin.apply_delta_slot(
+            b"key:b".to_vec(),
+            Lsn::from_u64(2),
+            DIRTY_BIT,
+            None,
+        );
 
         assert_eq!(bin.get_n_entries(), 3, "new slot must have been inserted");
 
         let idx = bin.find_entry(b"key:b", false, true);
-        assert!(idx >= 0 && (idx & 0x1_0000) != 0, "newly inserted key must be findable");
+        assert!(
+            idx >= 0 && (idx & 0x1_0000) != 0,
+            "newly inserted key must be findable"
+        );
         assert_eq!(bin.get_lsn((idx & 0xFFFF) as usize), Lsn::from_u64(2));
     }
 
@@ -3263,7 +3538,8 @@ mod tests {
 
         // Insert 8 entries.
         for i in 0u8..8 {
-            bin.insert_entry(vec![i * 10], Lsn::from_u64(i as u64), 0, None).unwrap();
+            bin.insert_entry(vec![i * 10], Lsn::from_u64(i as u64), 0, None)
+                .unwrap();
         }
         for s in bin.inner.states.iter_mut() {
             *s = 0;
@@ -3279,18 +3555,24 @@ mod tests {
 
         // Exact search for a key present in the delta must succeed.
         let r_exact = bin.find_entry(&[10u8], false, true);
-        assert!(r_exact >= 0 && (r_exact & 0x1_0000) != 0,
-            "key [10] must be found in BIN-delta by exact search");
+        assert!(
+            r_exact >= 0 && (r_exact & 0x1_0000) != 0,
+            "key [10] must be found in BIN-delta by exact search"
+        );
 
         // Exact search for key [40] (the other dirty slot).
         let r40 = bin.find_entry(&[40u8], false, true);
-        assert!(r40 >= 0 && (r40 & 0x1_0000) != 0,
-            "key [40] must be found in BIN-delta by exact search");
+        assert!(
+            r40 >= 0 && (r40 & 0x1_0000) != 0,
+            "key [40] must be found in BIN-delta by exact search"
+        );
 
         // Exact search for a key NOT in the delta must return -1.
         let r_miss = bin.find_entry(&[20u8], false, true);
-        assert_eq!(r_miss, -1,
-            "key [20] (not in delta) must not be found by exact search");
+        assert_eq!(
+            r_miss, -1,
+            "key [20] (not in delta) must not be found by exact search"
+        );
     }
 
     /// `mutate_to_bin_delta` sets the bloom
@@ -3300,7 +3582,8 @@ mod tests {
     fn test_bindelta_bloom_filter_set_after_mutation() {
         let mut bin = Bin::new(1, 32);
         for i in 0u8..6 {
-            bin.insert_entry(vec![i], Lsn::from_u64(i as u64), 0, None).unwrap();
+            bin.insert_entry(vec![i], Lsn::from_u64(i as u64), 0, None)
+                .unwrap();
         }
         for s in bin.inner.states.iter_mut() {
             *s = 0;
@@ -3308,12 +3591,17 @@ mod tests {
         bin.inner.states[0] = DIRTY_BIT;
         bin.inner.states[3] = DIRTY_BIT;
 
-        assert!(bin.get_bloom_filter().is_none(), "no bloom filter before mutation");
+        assert!(
+            bin.get_bloom_filter().is_none(),
+            "no bloom filter before mutation"
+        );
 
         bin.mutate_to_bin_delta();
 
-        assert!(bin.get_bloom_filter().is_some(),
-            "bloom filter must be set after mutate_to_bin_delta for non-empty delta");
+        assert!(
+            bin.get_bloom_filter().is_some(),
+            "bloom filter must be set after mutate_to_bin_delta for non-empty delta"
+        );
 
         // Clearing it manually must work.
         bin.set_bloom_filter(None);

@@ -2,15 +2,18 @@
 
 #![allow(clippy::unit_arg)]
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId, Criterion, Throughput, black_box, criterion_group,
+    criterion_main,
+};
 use std::io::Cursor;
 
 use noxu_util::lsn::Lsn;
-use noxu_util::vlsn::Vlsn;
 use noxu_util::packed::{
-    read_packed_i32, read_packed_i64, read_sorted_i32, read_sorted_i64, write_packed_i32,
-    write_packed_i64, write_sorted_i32, write_sorted_i64,
+    read_packed_i32, read_packed_i64, read_sorted_i32, read_sorted_i64,
+    write_packed_i32, write_packed_i64, write_sorted_i32, write_sorted_i64,
 };
+use noxu_util::vlsn::Vlsn;
 
 // ---------------------------------------------------------------------------
 // LSN benchmarks
@@ -270,17 +273,23 @@ fn bench_checksums(c: &mut Criterion) {
         let data: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
         group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_with_input(BenchmarkId::new("crc32_ethernet", size), &data, |b, d| {
-            b.iter(|| {
-                let mut h = crc32fast::Hasher::new();
-                h.update(black_box(d));
-                black_box(h.finalize())
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("crc32_ethernet", size),
+            &data,
+            |b, d| {
+                b.iter(|| {
+                    let mut h = crc32fast::Hasher::new();
+                    h.update(black_box(d));
+                    black_box(h.finalize())
+                })
+            },
+        );
 
-        group.bench_with_input(BenchmarkId::new("crc32c_castagnoli", size), &data, |b, d| {
-            b.iter(|| black_box(crc32c::crc32c(black_box(d))))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("crc32c_castagnoli", size),
+            &data,
+            |b, d| b.iter(|| black_box(crc32c::crc32c(black_box(d)))),
+        );
     }
 
     group.finish();

@@ -3,7 +3,7 @@
 
 /// Distinguishes cursor search operations.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     /// Search for an exact key match.
@@ -56,10 +56,12 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let modes = [SearchMode::Set,
+        let modes = [
+            SearchMode::Set,
             SearchMode::Both,
             SearchMode::SetRange,
-            SearchMode::BothRange];
+            SearchMode::BothRange,
+        ];
 
         assert_eq!(modes.len(), 4);
 

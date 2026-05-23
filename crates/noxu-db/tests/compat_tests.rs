@@ -13,8 +13,8 @@
 //! Each test includes a comment referencing the method it mirrors.
 
 use noxu_db::{
-    CursorConfig, DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, LockMode,
-    OperationStatus, Put, TransactionConfig,
+    CursorConfig, DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get,
+    LockMode, OperationStatus, Put, TransactionConfig,
 };
 use tempfile::TempDir;
 
@@ -33,7 +33,10 @@ fn open(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
 }
 
 #[allow(dead_code)]
-fn open_named(dir: &TempDir, name: &str) -> (noxu_db::Environment, noxu_db::Database) {
+fn open_named(
+    dir: &TempDir,
+    name: &str,
+) -> (noxu_db::Environment, noxu_db::Database) {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
@@ -73,10 +76,7 @@ fn database_txn_put_get_delete() {
     txn.commit().unwrap();
 
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &k, &mut out2).unwrap(),
-        OperationStatus::Success
-    );
+    assert_eq!(db.get(None, &k, &mut out2).unwrap(), OperationStatus::Success);
     assert_eq!(out2.data(), 100u32.to_be_bytes());
 }
 
@@ -160,7 +160,10 @@ fn truncate_database_clears_all_records() {
     assert_eq!(db.count().unwrap(), N as u64);
 
     let count_before = env.truncate_database(None, "test").unwrap();
-    assert_eq!(count_before, N as u64, "truncate must return pre-truncation count");
+    assert_eq!(
+        count_before, N as u64,
+        "truncate must return pre-truncation count"
+    );
 
     // All records must be gone.
     assert_eq!(db.count().unwrap(), 0);
@@ -199,7 +202,10 @@ fn truncate_then_add_records_works() {
     for i in 100u32..110 {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(db.get(None, &k, &mut out).unwrap(), OperationStatus::Success);
+        assert_eq!(
+            db.get(None, &k, &mut out).unwrap(),
+            OperationStatus::Success
+        );
         assert_eq!(out.data(), (i * 3).to_be_bytes());
     }
 }
@@ -362,7 +368,11 @@ fn large_scale_insert_search_scan_257() {
             OperationStatus::Success,
             "key {i} must be findable after {N} inserts"
         );
-        assert_eq!(out.data(), (i * 3).to_be_bytes(), "value mismatch for key {i}");
+        assert_eq!(
+            out.data(),
+            (i * 3).to_be_bytes(),
+            "value mismatch for key {i}"
+        );
     }
 
     // Full cursor scan must visit exactly N records in ascending order.
@@ -397,7 +407,11 @@ fn large_scale_10k_deep_tree_correctness() {
         let (k, v) = kv(i, i.wrapping_mul(0x9e37_9117));
         db.put(None, &k, &v).unwrap();
     }
-    assert_eq!(db.count().unwrap(), N as u64, "count must equal N after {N} inserts");
+    assert_eq!(
+        db.count().unwrap(),
+        N as u64,
+        "count must equal N after {N} inserts"
+    );
 
     // Spot-check 100 uniformly-spaced keys.
     for i in (0u32..N).step_by(100) {
@@ -409,7 +423,11 @@ fn large_scale_10k_deep_tree_correctness() {
             "key {i} missing after 10K inserts"
         );
         let expected = i.wrapping_mul(0x9e37_9117);
-        assert_eq!(out.data(), expected.to_be_bytes(), "wrong value for key {i}");
+        assert_eq!(
+            out.data(),
+            expected.to_be_bytes(),
+            "wrong value for key {i}"
+        );
     }
 }
 
@@ -577,18 +595,18 @@ fn txn_abort_update_restores_original_value() {
 
     // Update within a transaction, then abort.
     let txn = env.begin_transaction(None, None).unwrap();
-    db.put(
-        Some(&txn),
-        &k,
-        &DatabaseEntry::from_bytes(&200u32.to_be_bytes()),
-    )
-    .unwrap();
+    db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&200u32.to_be_bytes()))
+        .unwrap();
     txn.abort().unwrap();
 
     // Original value must be restored.
     let mut out = DatabaseEntry::new();
     assert_eq!(db.get(None, &k, &mut out).unwrap(), OperationStatus::Success);
-    assert_eq!(out.data(), 100u32.to_be_bytes(), "abort must restore pre-update value");
+    assert_eq!(
+        out.data(),
+        100u32.to_be_bytes(),
+        "abort must restore pre-update value"
+    );
 }
 
 /// : TransactionTest.testAbortDelete
@@ -661,31 +679,27 @@ fn txn_abort_multiple_ops_restores_prior_state() {
     );
     // Key 2 must have original value 2.
     assert_eq!(
-        db.get(
-            None,
-            &DatabaseEntry::from_bytes(&2u32.to_be_bytes()),
-            &mut out
-        )
-        .unwrap(),
+        db.get(None, &DatabaseEntry::from_bytes(&2u32.to_be_bytes()), &mut out)
+            .unwrap(),
         OperationStatus::Success
     );
     assert_eq!(out.data(), 2u32.to_be_bytes());
     // Key 4 must be present with original value 4.
     assert_eq!(
-        db.get(
-            None,
-            &DatabaseEntry::from_bytes(&4u32.to_be_bytes()),
-            &mut out
-        )
-        .unwrap(),
+        db.get(None, &DatabaseEntry::from_bytes(&4u32.to_be_bytes()), &mut out)
+            .unwrap(),
         OperationStatus::Success
     );
     assert_eq!(out.data(), 4u32.to_be_bytes());
     // Keys 0, 1, 3 must be unchanged.
     for i in [0u32, 1, 3] {
         assert_eq!(
-            db.get(None, &DatabaseEntry::from_bytes(&i.to_be_bytes()), &mut out)
-                .unwrap(),
+            db.get(
+                None,
+                &DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                &mut out
+            )
+            .unwrap(),
             OperationStatus::Success
         );
         assert_eq!(out.data(), i.to_be_bytes());
@@ -767,7 +781,8 @@ fn cursor_edge_skip_deleted_records() {
     }
     cursor.close().unwrap();
 
-    let expected: Vec<u32> = (0u32..10).filter(|&x| x != 0 && x != 5 && x != 9).collect();
+    let expected: Vec<u32> =
+        (0u32..10).filter(|&x| x != 0 && x != 5 && x != 9).collect();
     assert_eq!(seen, expected, "cursor must skip deleted keys");
 }
 
@@ -792,8 +807,7 @@ fn cursor_edge_current_after_delete_not_found() {
     );
 
     // Delete key 1 through the database handle.
-    db.delete(None, &DatabaseEntry::from_bytes(&1u32.to_be_bytes()))
-        .unwrap();
+    db.delete(None, &DatabaseEntry::from_bytes(&1u32.to_be_bytes())).unwrap();
 
     // Get::Current should now return NotFound (key is deleted).
     let status = cursor.get(&mut ck, &mut cv, Get::Current, None).unwrap();
@@ -917,8 +931,7 @@ fn read_committed_allows_non_repeatable_read() {
 
     let mut out = DatabaseEntry::new();
     // First read: must see v1.
-    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out)
-        .unwrap();
+    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out).unwrap();
     assert_eq!(out.data(), b"v1", "first read must see v1");
 
     barrier_read1_done.wait(); // let writer commit v2
@@ -926,7 +939,8 @@ fn read_committed_allows_non_repeatable_read() {
 
     // Second read under read-committed: read lock was released after first read,
     // so T1 may see v2 if the lock is re-acquired.
-    let status = db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out);
+    let status =
+        db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out);
     // Under semantics the second read will block waiting for write-lock
     // from the writer (already released); it should succeed with v2.
     // We accept either v1 (if lock not released) or v2 (if released) depending
@@ -973,8 +987,7 @@ fn serializable_isolation_repeatable_read() {
     // T1 reads key under serializable (holds read lock).
     let txn1 = env.begin_transaction(None, None).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out)
-        .unwrap();
+    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out).unwrap();
     let first_read = out.data().to_vec();
     assert_eq!(first_read, b"v1");
 
@@ -1004,10 +1017,12 @@ fn serializable_isolation_repeatable_read() {
 
     // T1's second read must still see v1 (serializable = repeatable read).
     let mut out2 = DatabaseEntry::new();
-    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out2)
-        .unwrap();
+    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out2).unwrap();
     let second_read = out2.data().to_vec();
-    assert_eq!(second_read, b"v1", "serializable: second read must equal first read");
+    assert_eq!(
+        second_read, b"v1",
+        "serializable: second read must equal first read"
+    );
 
     txn1.commit().unwrap();
 
@@ -1079,7 +1094,11 @@ fn recovery_1000_records_survive_reopen() {
 
     {
         let (_env, db) = open(&dir);
-        assert_eq!(db.count().unwrap(), N as u64, "all {N} records must survive reopen");
+        assert_eq!(
+            db.count().unwrap(),
+            N as u64,
+            "all {N} records must survive reopen"
+        );
         for i in 0u32..N {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let mut out = DatabaseEntry::new();
@@ -1125,7 +1144,10 @@ fn recovery_updates_are_durable() {
         for i in 0u32..N {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let mut out = DatabaseEntry::new();
-            assert_eq!(db.get(None, &k, &mut out).unwrap(), OperationStatus::Success);
+            assert_eq!(
+                db.get(None, &k, &mut out).unwrap(),
+                OperationStatus::Success
+            );
             assert_eq!(
                 out.data(),
                 (i + 10_000).to_be_bytes(),
@@ -1187,8 +1209,7 @@ fn cursor_put_overwrite_replaces_value() {
     cursor.close().unwrap();
 
     let mut out = DatabaseEntry::new();
-    db.get(None, &DatabaseEntry::from_bytes(b"k"), &mut out)
-        .unwrap();
+    db.get(None, &DatabaseEntry::from_bytes(b"k"), &mut out).unwrap();
     assert_eq!(out.data(), b"v2");
 }
 

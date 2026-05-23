@@ -3,8 +3,8 @@
 use crate::daemon_manager::DaemonManager;
 use crate::engine_config::EngineConfig;
 use crate::env_stats::{
-    EnvironmentStats, EvictorStatsSnapshot, LockStatsSnapshot, LogStatsSnapshot,
-    TxnStatsSnapshot,
+    EnvironmentStats, EvictorStatsSnapshot, LockStatsSnapshot,
+    LogStatsSnapshot, TxnStatsSnapshot,
 };
 use crate::error::{EngineError, Result};
 use noxu_cleaner::{CleanResult, Cleaner};
@@ -130,7 +130,8 @@ impl Engine {
         let mut recovery_manager = RecoveryManager::new();
         let mut scanner = InMemoryLogScanner::new();
         log::info!("Running recovery...");
-        let recovery_info = recovery_manager.recover(&mut scanner, None, true)?;
+        let recovery_info =
+            recovery_manager.recover(&mut scanner, None, true)?;
         log::info!(
             "Recovery completed: last_used_lsn={:?}, checkpoint_start_lsn={:?}",
             recovery_info.last_used_lsn,
@@ -302,16 +303,11 @@ impl Engine {
         };
 
         // Determine if cleaning is needed (any file below min utilization).
-        let cleaning_needed = self
-            .cleaner
-            .get_file_selector()
-            .lock()
-            .has_files_to_clean();
+        let cleaning_needed =
+            self.cleaner.get_file_selector().lock().has_files_to_clean();
 
-        let (sleep_ms, n_files) = self
-            .cleaner
-            .throttle
-            .update(bytes_written, cleaning_needed);
+        let (sleep_ms, n_files) =
+            self.cleaner.throttle.update(bytes_written, cleaning_needed);
 
         let result = self
             .cleaner
@@ -355,7 +351,10 @@ impl Engine {
             cache_usage: self.cache_usage.load(Ordering::Relaxed) as u64,
             n_databases,
             evictor: EvictorStatsSnapshot::from(evictor_stats),
-            log: log_stats.as_ref().map(LogStatsSnapshot::from).unwrap_or_default(),
+            log: log_stats
+                .as_ref()
+                .map(LogStatsSnapshot::from)
+                .unwrap_or_default(),
             lock: LockStatsSnapshot {
                 n_lock_tables: self.config.lock_table_count as u64,
                 ..LockStatsSnapshot::from(&lock_stats)

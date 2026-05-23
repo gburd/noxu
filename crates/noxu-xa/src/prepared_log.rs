@@ -4,7 +4,9 @@
 //! after a crash, `xa_recover()` can return XIDs that were prepared but not yet
 //! committed or rolled back.
 
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, OperationStatus};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, OperationStatus,
+};
 
 use crate::xid::Xid;
 
@@ -58,7 +60,8 @@ impl PreparedLog {
     pub fn recover_all(&self) -> Result<Vec<Xid>, noxu_db::NoxuError> {
         use noxu_db::{CursorConfig, Get};
 
-        let mut cursor = self.db.open_cursor(None, Some(&CursorConfig::new()))?;
+        let mut cursor =
+            self.db.open_cursor(None, Some(&CursorConfig::new()))?;
         let mut xids = Vec::new();
         let mut key = DatabaseEntry::new();
         let mut val = DatabaseEntry::new();
@@ -80,7 +83,11 @@ impl PreparedLog {
     ///
     /// Format: [format_id:4 LE][gtrid_len:1][gtrid bytes][bqual bytes]
     fn xid_to_key(xid: &Xid) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(4 + 1 + xid.global_transaction_id.len() + xid.branch_qualifier.len());
+        let mut buf = Vec::with_capacity(
+            4 + 1
+                + xid.global_transaction_id.len()
+                + xid.branch_qualifier.len(),
+        );
         buf.extend_from_slice(&xid.format_id.to_le_bytes());
         buf.push(xid.global_transaction_id.len() as u8);
         buf.extend_from_slice(&xid.global_transaction_id);
@@ -171,9 +178,10 @@ mod tests {
 
         // First open: prepare
         {
-            let config = noxu_db::EnvironmentConfig::new(dir.path().to_path_buf())
-                .with_allow_create(true)
-                .with_transactional(true);
+            let config =
+                noxu_db::EnvironmentConfig::new(dir.path().to_path_buf())
+                    .with_allow_create(true)
+                    .with_transactional(true);
             let env = Environment::open(config).unwrap();
             let log = PreparedLog::open(&env).unwrap();
             log.record_prepare(&xid).unwrap();
@@ -183,9 +191,10 @@ mod tests {
 
         // Second open: recover (simulating crash + restart)
         {
-            let config = noxu_db::EnvironmentConfig::new(dir.path().to_path_buf())
-                .with_allow_create(true)
-                .with_transactional(true);
+            let config =
+                noxu_db::EnvironmentConfig::new(dir.path().to_path_buf())
+                    .with_allow_create(true)
+                    .with_transactional(true);
             let env = Environment::open(config).unwrap();
             let log = PreparedLog::open(&env).unwrap();
             let recovered = log.recover_all().unwrap();

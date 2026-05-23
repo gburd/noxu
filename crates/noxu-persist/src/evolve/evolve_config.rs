@@ -7,7 +7,7 @@ use hashbrown::HashSet;
 ///
 /// Return `true` to continue evolution; `false` to stop early.
 ///
-/// 
+///
 pub trait EvolveListener: Send + Sync {
     /// Called each time an entity is processed during eager evolution.
     ///
@@ -41,7 +41,7 @@ pub trait EvolveListener: Send + Sync {
 ///     .with_class_to_evolve("my.package.Person");
 /// ```
 ///
-/// 
+///
 ///
 /// [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 /// [`add_class_to_evolve`]: EvolveConfig::add_class_to_evolve
@@ -56,7 +56,7 @@ pub struct EvolveConfig {
 impl EvolveConfig {
     /// Creates an evolve configuration with default properties.
     ///
-    /// 
+    ///
     pub fn new() -> Self {
         Self { classes_to_evolve: HashSet::new(), listener: None }
     }
@@ -66,8 +66,11 @@ impl EvolveConfig {
     /// If no classes are added, all indexes that require evolution will be
     /// converted.
     ///
-    /// 
-    pub fn add_class_to_evolve(&mut self, entity_class: impl Into<String>) -> &mut Self {
+    ///
+    pub fn add_class_to_evolve(
+        &mut self,
+        entity_class: impl Into<String>,
+    ) -> &mut Self {
         self.classes_to_evolve.insert(entity_class.into());
         self
     }
@@ -75,7 +78,10 @@ impl EvolveConfig {
     /// Builder-style version of [`add_class_to_evolve`].
     ///
     /// [`add_class_to_evolve`]: EvolveConfig::add_class_to_evolve
-    pub fn with_class_to_evolve(mut self, entity_class: impl Into<String>) -> Self {
+    pub fn with_class_to_evolve(
+        mut self,
+        entity_class: impl Into<String>,
+    ) -> Self {
         self.classes_to_evolve.insert(entity_class.into());
         self
     }
@@ -84,7 +90,7 @@ impl EvolveConfig {
     ///
     /// An empty set means "evolve all classes".
     ///
-    /// 
+    ///
     pub fn classes_to_evolve(&self) -> &HashSet<String> {
         &self.classes_to_evolve
     }
@@ -94,13 +100,17 @@ impl EvolveConfig {
     ///
     /// If the classes set is empty, all classes should be evolved.
     pub fn should_evolve(&self, class_name: &str) -> bool {
-        self.classes_to_evolve.is_empty() || self.classes_to_evolve.contains(class_name)
+        self.classes_to_evolve.is_empty()
+            || self.classes_to_evolve.contains(class_name)
     }
 
     /// Sets a progress listener that is notified each time an entity is read.
     ///
-    /// 
-    pub fn set_listener(&mut self, listener: impl EvolveListener + 'static) -> &mut Self {
+    ///
+    pub fn set_listener(
+        &mut self,
+        listener: impl EvolveListener + 'static,
+    ) -> &mut Self {
         self.listener = Some(Box::new(listener));
         self
     }
@@ -108,14 +118,17 @@ impl EvolveConfig {
     /// Builder-style version of [`set_listener`].
     ///
     /// [`set_listener`]: EvolveConfig::set_listener
-    pub fn with_listener(mut self, listener: impl EvolveListener + 'static) -> Self {
+    pub fn with_listener(
+        mut self,
+        listener: impl EvolveListener + 'static,
+    ) -> Self {
         self.listener = Some(Box::new(listener));
         self
     }
 
     /// Returns the progress listener, if one was set.
     ///
-    /// 
+    ///
     pub fn listener(&self) -> Option<&dyn EvolveListener> {
         self.listener.as_deref()
     }
@@ -204,7 +217,8 @@ mod tests {
             }
         }
 
-        let cfg = EvolveConfig::new().with_listener(CountListener { calls: calls_clone });
+        let cfg = EvolveConfig::new()
+            .with_listener(CountListener { calls: calls_clone });
         let result = cfg.listener().unwrap().evolve_progress("my.Entity", 1, 1);
         assert!(result);
         assert_eq!(calls.lock().unwrap().len(), 1);

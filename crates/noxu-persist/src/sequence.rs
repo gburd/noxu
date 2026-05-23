@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// the underlying database. The `cache_size` controls how many values
 /// are pre-allocated in memory before a database write is required.
 ///
-/// 
+///
 ///
 /// # Example
 ///

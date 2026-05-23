@@ -146,7 +146,8 @@ impl EnvironmentFailureReason {
     pub fn is_corrupted(&self) -> bool {
         matches!(
             self,
-            EnvironmentFailureReason::LogChecksum | EnvironmentFailureReason::BtreeCorruption
+            EnvironmentFailureReason::LogChecksum
+                | EnvironmentFailureReason::BtreeCorruption
         )
     }
 }
@@ -156,10 +157,18 @@ impl std::fmt::Display for EnvironmentFailureReason {
         match self {
             EnvironmentFailureReason::LogChecksum => write!(f, "LOG_CHECKSUM"),
             EnvironmentFailureReason::LogWrite => write!(f, "LOG_WRITE"),
-            EnvironmentFailureReason::LogFileNotFound => write!(f, "LOG_FILE_NOT_FOUND"),
-            EnvironmentFailureReason::LogIntegrity => write!(f, "LOG_INTEGRITY"),
-            EnvironmentFailureReason::BtreeCorruption => write!(f, "BTREE_CORRUPTION"),
-            EnvironmentFailureReason::UnexpectedState => write!(f, "UNEXPECTED_STATE"),
+            EnvironmentFailureReason::LogFileNotFound => {
+                write!(f, "LOG_FILE_NOT_FOUND")
+            }
+            EnvironmentFailureReason::LogIntegrity => {
+                write!(f, "LOG_INTEGRITY")
+            }
+            EnvironmentFailureReason::BtreeCorruption => {
+                write!(f, "BTREE_CORRUPTION")
+            }
+            EnvironmentFailureReason::UnexpectedState => {
+                write!(f, "UNEXPECTED_STATE")
+            }
             EnvironmentFailureReason::UnexpectedStateFatal => {
                 write!(f, "UNEXPECTED_STATE_FATAL")
             }
@@ -170,18 +179,30 @@ impl std::fmt::Display for EnvironmentFailureReason {
                 write!(f, "UNEXPECTED_EXCEPTION_FATAL")
             }
             EnvironmentFailureReason::DiskLimit => write!(f, "DISK_LIMIT"),
-            EnvironmentFailureReason::LatchTimeout => write!(f, "LATCH_TIMEOUT"),
-            EnvironmentFailureReason::ThreadInterrupted => write!(f, "THREAD_INTERRUPTED"),
+            EnvironmentFailureReason::LatchTimeout => {
+                write!(f, "LATCH_TIMEOUT")
+            }
+            EnvironmentFailureReason::ThreadInterrupted => {
+                write!(f, "THREAD_INTERRUPTED")
+            }
             EnvironmentFailureReason::MasterToReplicaTransition => {
                 write!(f, "MASTER_TO_REPLICA_TRANSITION")
             }
-            EnvironmentFailureReason::ReplicaFencing => write!(f, "REPLICA_FENCING"),
-            EnvironmentFailureReason::HandshakeError => write!(f, "HANDSHAKE_ERROR"),
+            EnvironmentFailureReason::ReplicaFencing => {
+                write!(f, "REPLICA_FENCING")
+            }
+            EnvironmentFailureReason::HandshakeError => {
+                write!(f, "HANDSHAKE_ERROR")
+            }
             EnvironmentFailureReason::ProtocolVersionMismatch => {
                 write!(f, "PROTOCOL_VERSION_MISMATCH")
             }
-            EnvironmentFailureReason::UncaughtException => write!(f, "UNCAUGHT_EXCEPTION"),
-            EnvironmentFailureReason::ForcedShutdown => write!(f, "FORCED_SHUTDOWN"),
+            EnvironmentFailureReason::UncaughtException => {
+                write!(f, "UNCAUGHT_EXCEPTION")
+            }
+            EnvironmentFailureReason::ForcedShutdown => {
+                write!(f, "FORCED_SHUTDOWN")
+            }
             EnvironmentFailureReason::Other(s) => write!(f, "{s}"),
         }
     }
@@ -212,7 +233,9 @@ impl std::fmt::Display for ExceptionSource {
             ExceptionSource::Evictor => write!(f, "Evictor"),
             ExceptionSource::INCompressor => write!(f, "INCompressor"),
             ExceptionSource::Verifier => write!(f, "Verifier"),
-            ExceptionSource::ReplicationThread => write!(f, "ReplicationThread"),
+            ExceptionSource::ReplicationThread => {
+                write!(f, "ReplicationThread")
+            }
             ExceptionSource::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -273,12 +296,11 @@ pub trait ExceptionListener: Send + Sync {
 #[derive(Debug, Error)]
 pub enum NoxuError {
     // ── Fatal / environment failure ────────────────────────────────────────
-
     /// A failure has occurred that may require the environment to be closed
     /// and re-opened.  Check [`NoxuError::is_fatal_to_environment`] /
     /// [`NoxuError::reason`] to determine whether restart is required.
     ///
-    
+
     #[error("environment failure ({reason}): {msg}")]
     EnvironmentFailure {
         /// The root cause of the failure.
@@ -290,31 +312,31 @@ pub enum NoxuError {
     /// The environment is permanently wedged and cannot recover even after
     /// close/re-open.  Operator intervention or backup restore is required.
     ///
-    
+
     #[error("environment wedged (permanent failure): {0}")]
     EnvironmentWedged(String),
 
     /// The environment home directory was not found and `allow_create = false`.
     ///
-    
+
     #[error("environment not found: {0}")]
     EnvironmentNotFound(String),
 
     /// The environment is already open by another process.
     ///
-    
+
     #[error("environment locked by another process: {0}")]
     EnvironmentLocked(String),
 
     /// An I/O error occurred while writing to the log.  The disk may be full.
     ///
-    
+
     #[error("log write failure: {0}")]
     LogWriteFailure(String),
 
     /// The disk limit (`MAX_DISK` / `FREE_DISK`) was exceeded.
     ///
-    
+
     #[error("disk limit exceeded: used={used}, limit={limit}")]
     DiskLimitExceeded {
         /// Bytes currently used by the environment.
@@ -325,19 +347,18 @@ pub enum NoxuError {
 
     /// The calling thread was interrupted while performing a
     ///
-    
+
     #[error("thread interrupted during database operation")]
     ThreadInterrupted,
 
     // ── Database / cursor lifecycle ────────────────────────────────────────
-
     /// The requested database was not found in the environment.
     #[error("database not found: {0}")]
     DatabaseNotFound(String),
 
     /// An attempt was made to create a database that already exists.
     ///
-    
+
     #[error("database already exists: {0}")]
     DatabaseAlreadyExists(String),
 
@@ -354,7 +375,6 @@ pub enum NoxuError {
     CursorClosed,
 
     // ── Lock / transaction failures ────────────────────────────────────────
-
     /// A lock conflict occurred (locker blocked and could not acquire).
     ///
     /// Retryable.
@@ -405,71 +425,68 @@ pub enum NoxuError {
     TransactionAborted(String),
 
     // ── Constraint violations ──────────────────────────────────────────────
-
     /// The key already exists (`put_no_overwrite` / cursor `put_no_dup_data`).
     #[error("key already exists")]
     KeyExists,
 
     /// A unique-index constraint was violated.
     ///
-    
+
     #[error("unique constraint violated: {0}")]
     UniqueConstraintViolation(String),
 
     /// A delete was attempted on a primary record referenced by a secondary
     /// index.
     ///
-    
+
     #[error("delete constraint violated: {0}")]
     DeleteConstraintViolation(String),
 
     /// A foreign-key constraint was violated.
     ///
-    
+
     #[error("foreign constraint violated: {0}")]
     ForeignConstraintViolation(String),
 
     /// Duplicate data was supplied to a `putNoDupData` operation in a
     /// duplicate-sorted database.
     ///
-    
+
     #[error("duplicate data not allowed in no-dup-data operation")]
     DuplicateDataException,
 
     /// A secondary database integrity constraint was violated.
     ///
-    
+
     #[error("secondary integrity constraint violated: {0}")]
     SecondaryIntegrityException(String),
 
     // ── Sequence errors ────────────────────────────────────────────────────
-
     /// A sequence with the given name already exists.
     ///
-    
+
     #[error("sequence already exists: {0}")]
     SequenceExists(String),
 
     /// A sequence with the given name was not found.
     ///
-    
+
     #[error("sequence not found: {0}")]
     SequenceNotFound(String),
 
     /// A sequence has overflowed or underflowed its range.
     ///
-    
+
     #[error("sequence overflow")]
     SequenceOverflow,
 
     /// A sequence integrity violation was detected.
     ///
-    
+
     #[error("sequence integrity violation: {0}")]
     SequenceIntegrity(String),
 
     // ── Not-found / access control ─────────────────────────────────────────
-
     /// A key or data item was not found.
     #[error("not found")]
     NotFound,
@@ -479,17 +496,18 @@ pub enum NoxuError {
     ReadOnly,
 
     // ── HA / replication ───────────────────────────────────────────────────
-
     /// A write was attempted on a replica node.
     ///
-    
+
     #[error("write not allowed on replica")]
     ReplicaWrite,
 
     /// Insufficient replicas acknowledged the commit.
     ///
-    
-    #[error("insufficient replicas: required {required}, available {available}")]
+
+    #[error(
+        "insufficient replicas: required {required}, available {available}"
+    )]
     InsufficientReplicas {
         /// Acknowledgement quorum required.
         required: u32,
@@ -499,12 +517,11 @@ pub enum NoxuError {
 
     /// The transaction must be rolled back due to a replication state change.
     ///
-    
+
     #[error("rollback required: {0}")]
     RollbackRequired(String),
 
     // ── Log / I/O ──────────────────────────────────────────────────────────
-
     /// A log checksum mismatch was detected (potential corruption).
     ///
     /// Fatal: the environment will be invalidated.
@@ -513,7 +530,7 @@ pub enum NoxuError {
 
     /// A log file was not found.
     ///
-    
+
     #[error("log file not found: {0}")]
     LogFileNotFound(String),
 
@@ -522,18 +539,16 @@ pub enum NoxuError {
     IoError(#[from] std::io::Error),
 
     // ── Version ─────────────────────────────────────────────────────────────
-
     /// A version mismatch occurred (e.g. on-disk format vs. code version).
     ///
-    
+
     #[error("version mismatch: {0}")]
     VersionMismatch(String),
 
     // ── General ────────────────────────────────────────────────────────────
-
     /// The operation is not allowed in the current state.
     ///
-    
+
     #[error("operation not allowed: {0}")]
     OperationNotAllowed(String),
 
@@ -607,7 +622,9 @@ impl NoxuError {
     /// Mirrors `EnvironmentFailureException.isCorrupted()`.
     pub fn is_corrupted(&self) -> bool {
         match self {
-            NoxuError::EnvironmentFailure { reason, .. } => reason.is_corrupted(),
+            NoxuError::EnvironmentFailure { reason, .. } => {
+                reason.is_corrupted()
+            }
             NoxuError::LogChecksumMismatch(_) => true,
             _ => false,
         }
@@ -628,7 +645,8 @@ impl NoxuError {
     pub fn is_lock_timeout(&self) -> bool {
         matches!(
             self,
-            NoxuError::LockTimeout { .. } | NoxuError::TransactionTimeout { .. }
+            NoxuError::LockTimeout { .. }
+                | NoxuError::TransactionTimeout { .. }
         )
     }
 
@@ -658,10 +676,7 @@ impl NoxuError {
         reason: EnvironmentFailureReason,
         msg: impl Into<String>,
     ) -> Self {
-        NoxuError::EnvironmentFailure {
-            reason,
-            msg: msg.into(),
-        }
+        NoxuError::EnvironmentFailure { reason, msg: msg.into() }
     }
 
     /// Creates an `OperationNotAllowed` error.
@@ -702,22 +717,31 @@ impl From<noxu_dbi::DbiError> for NoxuError {
         use noxu_dbi::DbiError;
         match e {
             DbiError::DatabaseNotFound(s) => NoxuError::DatabaseNotFound(s),
-            DbiError::DatabaseAlreadyExists(s) | DbiError::DatabaseExists(s) => {
+            DbiError::DatabaseAlreadyExists(s)
+            | DbiError::DatabaseExists(s) => {
                 NoxuError::DatabaseAlreadyExists(s)
             }
-            DbiError::EnvironmentFailure { reason } => NoxuError::EnvironmentFailure {
-                reason: EnvironmentFailureReason::UnexpectedState,
-                msg: reason,
-            },
+            DbiError::EnvironmentFailure { reason } => {
+                NoxuError::EnvironmentFailure {
+                    reason: EnvironmentFailureReason::UnexpectedState,
+                    msg: reason,
+                }
+            }
             DbiError::EnvironmentNotOpen | DbiError::EnvironmentLocked(_) => {
                 NoxuError::EnvironmentClosed
             }
-            DbiError::CursorClosed | DbiError::CursorNotInitialized => NoxuError::CursorClosed,
+            DbiError::CursorClosed | DbiError::CursorNotInitialized => {
+                NoxuError::CursorClosed
+            }
             DbiError::LockConflict(s) => NoxuError::LockConflict(s),
             DbiError::IoError(io) => NoxuError::IoError(io),
             DbiError::TxnError(txn_err) => NoxuError::from(txn_err),
-            DbiError::LogError(log_err) => NoxuError::OperationNotAllowed(log_err.to_string()),
-            DbiError::TreeError(tree_err) => NoxuError::OperationNotAllowed(tree_err.to_string()),
+            DbiError::LogError(log_err) => {
+                NoxuError::OperationNotAllowed(log_err.to_string())
+            }
+            DbiError::TreeError(tree_err) => {
+                NoxuError::OperationNotAllowed(tree_err.to_string())
+            }
             DbiError::DatabaseInUse(s) => NoxuError::OperationNotAllowed(s),
             DbiError::OperationFailed(s) => NoxuError::OperationNotAllowed(s),
         }
@@ -730,17 +754,23 @@ impl From<noxu_txn::TxnError> for NoxuError {
         match e {
             TxnError::Deadlock(_) => NoxuError::DeadlockDetected,
             TxnError::LockConflict(s) => NoxuError::LockConflict(s),
-            TxnError::LockTimeout { timeout_ms, .. } => NoxuError::LockTimeout { timeout_ms },
+            TxnError::LockTimeout { timeout_ms, .. } => {
+                NoxuError::LockTimeout { timeout_ms }
+            }
             TxnError::TransactionTimeout { timeout_ms, txn_id } => {
                 NoxuError::TransactionTimeout { timeout_ms, txn_id }
             }
             TxnError::LockNotAvailable { .. } => NoxuError::LockNotAvailable,
-            TxnError::RangeRestart => NoxuError::LockConflict("range restart".into()),
+            TxnError::RangeRestart => {
+                NoxuError::LockConflict("range restart".into())
+            }
             TxnError::InvalidTransaction { txn_id, state } => {
                 NoxuError::TransactionAborted(format!("txn {txn_id}: {state}"))
             }
             TxnError::StateError(s) => NoxuError::TransactionAborted(s),
-            TxnError::LogError(log_err) => NoxuError::OperationNotAllowed(log_err.to_string()),
+            TxnError::LogError(log_err) => {
+                NoxuError::OperationNotAllowed(log_err.to_string())
+            }
         }
     }
 }
@@ -779,11 +809,21 @@ mod tests {
 
     #[test]
     fn test_environment_failure_reason_invalidates() {
-        assert!(EnvironmentFailureReason::LogChecksum.invalidates_environment());
-        assert!(EnvironmentFailureReason::BtreeCorruption.invalidates_environment());
+        assert!(
+            EnvironmentFailureReason::LogChecksum.invalidates_environment()
+        );
+        assert!(
+            EnvironmentFailureReason::BtreeCorruption.invalidates_environment()
+        );
         assert!(EnvironmentFailureReason::DiskLimit.invalidates_environment());
-        assert!(!EnvironmentFailureReason::UnexpectedState.invalidates_environment());
-        assert!(!EnvironmentFailureReason::UnexpectedException.invalidates_environment());
+        assert!(
+            !EnvironmentFailureReason::UnexpectedState
+                .invalidates_environment()
+        );
+        assert!(
+            !EnvironmentFailureReason::UnexpectedException
+                .invalidates_environment()
+        );
     }
 
     #[test]
@@ -808,7 +848,8 @@ mod tests {
 
     #[test]
     fn test_io_error_conversion() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: NoxuError = io_err.into();
         assert!(matches!(err, NoxuError::IoError(_)));
     }
@@ -846,11 +887,13 @@ mod tests {
         let err: NoxuError = NoxuError::from(dbi_err);
         assert!(matches!(err, NoxuError::CursorClosed));
 
-        let e: NoxuError = noxu_dbi::DbiError::DatabaseNotFound("x".into()).into();
+        let e: NoxuError =
+            noxu_dbi::DbiError::DatabaseNotFound("x".into()).into();
         assert!(matches!(e, NoxuError::DatabaseNotFound(_)));
 
         let e: NoxuError =
-            noxu_dbi::DbiError::EnvironmentFailure { reason: "disk".into() }.into();
+            noxu_dbi::DbiError::EnvironmentFailure { reason: "disk".into() }
+                .into();
         assert!(matches!(e, NoxuError::EnvironmentFailure { .. }));
     }
 
@@ -871,8 +914,13 @@ mod tests {
         .into();
         assert!(matches!(e, NoxuError::LockTimeout { timeout_ms: 500 }));
 
-        let e: NoxuError = TxnError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }.into();
-        assert!(matches!(e, NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }));
+        let e: NoxuError =
+            TxnError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }
+                .into();
+        assert!(matches!(
+            e,
+            NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }
+        ));
 
         // LockNotAvailable maps to NoxuError::LockNotAvailable (not LockConflict)
         let e: NoxuError = TxnError::LockNotAvailable { lsn: 0 }.into();
@@ -884,7 +932,10 @@ mod tests {
         assert!(NoxuError::DeadlockDetected.is_retryable());
         assert!(NoxuError::LockConflict("x".into()).is_retryable());
         assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_retryable());
-        assert!(NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }.is_retryable());
+        assert!(
+            NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }
+                .is_retryable()
+        );
         assert!(NoxuError::LockPreempted.is_retryable());
         assert!(NoxuError::LockNotAvailable.is_retryable());
 
@@ -895,22 +946,36 @@ mod tests {
 
     #[test]
     fn test_is_fatal_to_environment() {
-        assert!(NoxuError::environment_with_reason(
-            EnvironmentFailureReason::LogChecksum,
-            "x"
-        )
-        .is_fatal_to_environment());
-        assert!(NoxuError::LogChecksumMismatch("bad".into()).is_fatal_to_environment());
-        assert!(NoxuError::LogWriteFailure("io".into()).is_fatal_to_environment());
-        assert!(NoxuError::DiskLimitExceeded { used: 100, limit: 50 }.is_fatal_to_environment());
-        assert!(NoxuError::EnvironmentWedged("x".into()).is_fatal_to_environment());
+        assert!(
+            NoxuError::environment_with_reason(
+                EnvironmentFailureReason::LogChecksum,
+                "x"
+            )
+            .is_fatal_to_environment()
+        );
+        assert!(
+            NoxuError::LogChecksumMismatch("bad".into())
+                .is_fatal_to_environment()
+        );
+        assert!(
+            NoxuError::LogWriteFailure("io".into()).is_fatal_to_environment()
+        );
+        assert!(
+            NoxuError::DiskLimitExceeded { used: 100, limit: 50 }
+                .is_fatal_to_environment()
+        );
+        assert!(
+            NoxuError::EnvironmentWedged("x".into()).is_fatal_to_environment()
+        );
 
         // Non-fatal EnvironmentFailure variants
-        assert!(!NoxuError::environment_with_reason(
-            EnvironmentFailureReason::UnexpectedState,
-            "x"
-        )
-        .is_fatal_to_environment());
+        assert!(
+            !NoxuError::environment_with_reason(
+                EnvironmentFailureReason::UnexpectedState,
+                "x"
+            )
+            .is_fatal_to_environment()
+        );
 
         assert!(!NoxuError::DeadlockDetected.is_fatal_to_environment());
         assert!(!NoxuError::NotFound.is_fatal_to_environment());
@@ -1019,14 +1084,26 @@ mod tests {
             NoxuError::environment("x"),
             NoxuError::EnvironmentFailure { .. }
         ));
-        assert!(matches!(NoxuError::database("x"), NoxuError::OperationNotAllowed(_)));
-        assert!(matches!(NoxuError::invalid_argument("x"), NoxuError::IllegalArgument(_)));
-        assert!(matches!(NoxuError::lock_conflict("x"), NoxuError::LockConflict(_)));
+        assert!(matches!(
+            NoxuError::database("x"),
+            NoxuError::OperationNotAllowed(_)
+        ));
+        assert!(matches!(
+            NoxuError::invalid_argument("x"),
+            NoxuError::IllegalArgument(_)
+        ));
+        assert!(matches!(
+            NoxuError::lock_conflict("x"),
+            NoxuError::LockConflict(_)
+        ));
         assert!(matches!(
             NoxuError::lock_timeout(500),
             NoxuError::LockTimeout { timeout_ms: 500 }
         ));
-        assert!(matches!(NoxuError::database_not_found("db"), NoxuError::DatabaseNotFound(_)));
+        assert!(matches!(
+            NoxuError::database_not_found("db"),
+            NoxuError::DatabaseNotFound(_)
+        ));
         assert!(matches!(
             NoxuError::disk_limit_exceeded(100, 50),
             NoxuError::DiskLimitExceeded { used: 100, limit: 50 }
@@ -1046,14 +1123,19 @@ mod tests {
     #[test]
     fn test_is_lock_timeout() {
         assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_lock_timeout());
-        assert!(NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }.is_lock_timeout());
+        assert!(
+            NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }
+                .is_lock_timeout()
+        );
         assert!(!NoxuError::LockConflict("x".into()).is_lock_timeout());
         assert!(!NoxuError::NotFound.is_lock_timeout());
     }
 
     #[test]
     fn test_is_database_not_found() {
-        assert!(NoxuError::DatabaseNotFound("mydb".into()).is_database_not_found());
+        assert!(
+            NoxuError::DatabaseNotFound("mydb".into()).is_database_not_found()
+        );
         assert!(!NoxuError::DatabaseClosed.is_database_not_found());
         assert!(!NoxuError::NotFound.is_database_not_found());
     }
@@ -1078,15 +1160,25 @@ mod tests {
             fn exception_event(&self, _event: &ExceptionEvent) {}
         }
         let listener: Box<dyn ExceptionListener> = Box::new(NoopListener);
-        let evt = ExceptionEvent::new("x", ExceptionSource::Checkpointer, "ckpt");
+        let evt =
+            ExceptionEvent::new("x", ExceptionSource::Checkpointer, "ckpt");
         listener.exception_event(&evt);
     }
 
     #[test]
     fn test_reason_display() {
-        assert_eq!(EnvironmentFailureReason::LogChecksum.to_string(), "LOG_CHECKSUM");
-        assert_eq!(EnvironmentFailureReason::BtreeCorruption.to_string(), "BTREE_CORRUPTION");
-        assert_eq!(EnvironmentFailureReason::DiskLimit.to_string(), "DISK_LIMIT");
+        assert_eq!(
+            EnvironmentFailureReason::LogChecksum.to_string(),
+            "LOG_CHECKSUM"
+        );
+        assert_eq!(
+            EnvironmentFailureReason::BtreeCorruption.to_string(),
+            "BTREE_CORRUPTION"
+        );
+        assert_eq!(
+            EnvironmentFailureReason::DiskLimit.to_string(),
+            "DISK_LIMIT"
+        );
         assert_eq!(
             EnvironmentFailureReason::Other("CUSTOM".into()).to_string(),
             "CUSTOM"

@@ -6,7 +6,7 @@ use std::io;
 
 /// A TxnAbort is logged when a transaction aborts.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct TxnAbort {
     pub end: TxnEnd,

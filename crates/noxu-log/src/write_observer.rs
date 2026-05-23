@@ -18,7 +18,7 @@
 pub trait LogWriteObserver: Send + Sync {
     /// Called for every new log entry, with the assigned LSN.
     ///
-    /// 
+    ///
     ///
     /// # Parameters
     /// - `file_num`   : Log file number component of the assigned LSN.
@@ -37,7 +37,7 @@ pub trait LogWriteObserver: Send + Sync {
 
     /// Called when a previous version of a node is being replaced.
     ///
-    /// 
+    ///
     ///
     /// # Parameters
     /// - `file_num`   : File number of the obsolete LSN.
