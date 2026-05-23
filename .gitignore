@@ -36,3 +36,5 @@ cargo-timing*
 .agent
 _
 .jdb
+# TLA+ TLC scratch directories and logs
+tla/states/
