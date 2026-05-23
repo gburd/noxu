@@ -72,12 +72,10 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
             barrier.wait();
             for i in 0..N_KEYS {
                 let txn = env.begin_transaction(None, None).unwrap();
-                let key = DatabaseEntry::from_vec(
-                    format!("k{i:06}").into_bytes(),
-                );
-                let val = DatabaseEntry::from_vec(
-                    format!("v{i:06}").into_bytes(),
-                );
+                let key =
+                    DatabaseEntry::from_vec(format!("k{i:06}").into_bytes());
+                let val =
+                    DatabaseEntry::from_vec(format!("v{i:06}").into_bytes());
                 db.put(Some(&txn), &key, &val).unwrap();
                 txn.commit().unwrap();
                 // Publish the commit. Release ordering pairs with
@@ -106,14 +104,14 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
                 // the thread id (ThreadId::as_u64() is unstable per
                 // AGENTS.md).
                 use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                let mut hasher =
+                    std::collections::hash_map::DefaultHasher::new();
                 std::thread::current().id().hash(&mut hasher);
                 let mut rng = (std::process::id() as u64)
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     ^ hasher.finish();
                 let deadline = Instant::now() + Duration::from_secs(15);
-                while !stop.load(Ordering::Acquire)
-                    && Instant::now() < deadline
+                while !stop.load(Ordering::Acquire) && Instant::now() < deadline
                 {
                     let high = next_committed.load(Ordering::Acquire);
                     if high == 0 {
