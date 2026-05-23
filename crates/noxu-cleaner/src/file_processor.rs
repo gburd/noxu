@@ -169,6 +169,19 @@ impl TreeLookup for RealTreeLookup {
         log_lsn: Lsn,
         tree_lsn: Lsn,
     ) -> MigrationOutcome {
+        // TODO(noxu-cleaner): the multiple `let _ = self.lock_manager
+        // .release(lock_lsn, locker_id)` sites in this file (lines
+        // 200, 213, 223, 235, 246, 608, 619, 630, 642 as of 2759090)
+        // share the same swallow-error pattern called out in
+        // crates/noxu-db/src/transaction.rs::commit_with_durability
+        // and crates/noxu-txn/src/txn.rs::move_write_lock_to_new_lsn.
+        // They are intentionally best-effort here because the cleaner
+        // releases locks during cleanup and a release failure means a
+        // small leak in the lock_manager rather than data corruption,
+        // but a uniform decision (propagate / log+continue / panic)
+        // across all three sites would be preferable. Tracked
+        // alongside those.
+
         // H-4: attempt a non-blocking read lock on tree_lsn.
         // `locker.nonBlockingLock(treeLsn, LockType.READ, ...)`.
         let locker_id = next_cleaner_locker_id();

@@ -108,7 +108,11 @@ StartElection(leader, t) ==
 
 \* Acceptor n promises to leader at term t (Phase 1, "Promise" reply).
 \* run_acceptor in paxos.rs: an acceptor responds with granted=true iff
-\* it has not already promised a higher-termed proposer.
+\* it has not already promised a higher-termed proposer. The Rust code
+\* uses `term >= promised` (≥); this spec uses `<` for strict
+\* monotonicity (a node only re-promises at strictly higher terms),
+\* which is strictly stronger and also matches the practical noxu-rep
+\* assumption that each leader proposes at most one term at a time.
 PromiseVote(n, leader, t) ==
     /\ <<t, leader>> \in leaders_proposed
     /\ n \in Nodes
@@ -179,6 +183,22 @@ TypeOK ==
 \* sized at the configured thresholds must share at least one node.
 \* For uniform same-sized quorums this is the same as Q1 + Q2 > |Nodes|,
 \* which we already ASSUMEd above.
+\*
+\* The default cfg uses Q1=Q2=2, n=3 (simple majority), where
+\* QuorumIntersection holds trivially. To exercise the *asymmetric*
+\* Flexible Paxos shape (e.g. n=5, Q1=4, Q2=2 — fast commits and
+\* tolerant elections), edit the cfg's CONSTANTS to:
+\*
+\*    Nodes = {1, 2, 3, 4, 5}
+\*    Q1 = 4
+\*    Q2 = 2
+\*    MaxTerm = 1
+\*
+\* `MaxTerm = 1` is sufficient for static QuorumIntersection (it is a
+\* property of the constants, not of any reachable state); raising
+\* MaxTerm to 2 also exercises ElectionSafety on the asymmetric shape.
+\* On a development laptop the asymmetric run takes a few minutes vs
+\* ~10s for the symmetric default.
 QuorumIntersection ==
     \A V1 \in SUBSET Nodes, V2 \in SUBSET Nodes :
         Cardinality(V1) >= Q1 /\ Cardinality(V2) >= Q2 =>
@@ -196,10 +216,10 @@ PromiseHonoured ==
     \A n \in Nodes :
         accepted_term[n] = 0 \/ accepted_term[n] <= promised_term[n]
 
-\* PromiseMonotone: an acceptor's promised_term never decreases.
-\* (This is preserved by the action shape itself but is checked here so
-\* a refactor that introduces a regression is caught.)
-PromiseMonotone == TRUE   \* spec-shape-enforced; placeholder for clarity
+\* PromiseMonotone (placeholder): an acceptor's promised_term never
+\* decreases. This is enforced by the action shape (PromiseVote
+\* requires promised_term[n] < t and AcceptVote bumps to t), so we do
+\* not check it as a separate invariant. Left here as documentation.
 
 Safety == TypeOK /\ ElectionSafety /\ PromiseHonoured
 
