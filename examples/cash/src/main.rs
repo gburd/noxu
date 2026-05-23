@@ -3,15 +3,16 @@ use std::process;
 
 use tracing_subscriber::EnvFilter;
 
-use noxu_cash::{CashConfig, CashServer};
 use noxu_cash::store::CashStore;
+use noxu_cash::{CashConfig, CashServer};
 
 #[tokio::main]
 async fn main() {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -24,7 +25,10 @@ async fn main() {
     let config = match CashConfig::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error loading config from {}: {e}", config_path.display());
+            eprintln!(
+                "error loading config from {}: {e}",
+                config_path.display()
+            );
             process::exit(1);
         }
     };

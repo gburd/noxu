@@ -18,10 +18,8 @@ pub fn current_time_hours() -> u32 {
 
 /// Returns the current time as seconds since epoch (for second-resolution TTL).
 pub fn current_time_secs() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        as u32
 }
 
 /// Returns true if the given packed expiration time has passed.
@@ -32,11 +30,7 @@ pub fn is_expired(expiration_time: u32, in_hours: bool) -> bool {
     if expiration_time == 0 {
         return false;
     }
-    let now = if in_hours {
-        current_time_hours()
-    } else {
-        current_time_secs()
-    };
+    let now = if in_hours { current_time_hours() } else { current_time_secs() };
     expiration_time <= now
 }
 

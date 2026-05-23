@@ -12,7 +12,7 @@ use std::time::SystemTime;
 /// the time when the checkpoint started, and information about who invoked it
 /// (e.g., recovery, daemon, API call, cleaner).
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct CheckpointStart {
     /// Checkpoint ID - unique identifier for this checkpoint.

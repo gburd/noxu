@@ -12,7 +12,7 @@ use std::fmt;
 /// locations, transaction state, and the last allocated IDs for various
 /// database objects.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct RecoveryInfo {
     /// Location of last entry processed during recovery.

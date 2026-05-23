@@ -6,13 +6,12 @@
 
 pub mod cleaner;
 pub mod cleaner_stat;
-pub mod throttle;
 pub mod data_eraser;
 pub mod db_file_summary;
 pub mod error;
 pub mod expiration_profile;
-pub mod extinction_scanner;
 pub mod expiration_tracker;
+pub mod extinction_scanner;
 pub mod file_processor;
 pub mod file_protector;
 pub mod file_selector;
@@ -20,6 +19,7 @@ pub mod file_summary;
 pub mod in_summary;
 pub mod ln_info;
 pub mod packed_offsets;
+pub mod throttle;
 pub mod tracked_file_summary;
 pub mod utilization_profile;
 pub mod utilization_tracker;
@@ -27,12 +27,13 @@ pub mod utilization_tracker_observer;
 
 // Re-exports
 pub use cleaner::{CleanResult, Cleaner};
-pub use throttle::CleanerThrottle;
 pub use cleaner_stat::{CleanerStats, CleanerStatsSnapshot};
+pub use data_eraser::{DataEraser, EraseRequest};
 pub use db_file_summary::DbFileSummary;
 pub use error::{CleanerError, Result};
 pub use expiration_profile::ExpirationProfile;
 pub use expiration_tracker::ExpirationTracker;
+pub use extinction_scanner::{ExtinctionScanner, ExtinctionTask};
 pub use file_processor::{
     BinLookupResult, FileProcessResult, FileProcessor, InLookupResult,
     MigrationOutcome, RealTreeLookup, SharedTreeLookup, TreeLookup,
@@ -45,9 +46,8 @@ pub use file_summary::FileSummary;
 pub use in_summary::InSummary;
 pub use ln_info::LnInfo;
 pub use packed_offsets::PackedOffsets;
+pub use throttle::CleanerThrottle;
 pub use tracked_file_summary::TrackedFileSummary;
 pub use utilization_profile::UtilizationProfile;
 pub use utilization_tracker::UtilizationTracker;
 pub use utilization_tracker_observer::UtilizationTrackerObserver;
-pub use data_eraser::{DataEraser, EraseRequest};
-pub use extinction_scanner::{ExtinctionScanner, ExtinctionTask};

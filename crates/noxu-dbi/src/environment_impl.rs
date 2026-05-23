@@ -3,28 +3,27 @@
 
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 use noxu_sync::RwLock;
 
 use crate::database_impl::DatabaseImpl;
-use crate::throughput_stats::ThroughputStatsSnapshot;
 use crate::dbi_config::DbiEnvConfig;
 use crate::file_manager_scanner::FileManagerLogScanner;
+use crate::throughput_stats::ThroughputStatsSnapshot;
 use crate::{
     DatabaseConfig, DatabaseId, DbType, DbiError, EnvState,
     EnvironmentFailureReason, NodeSequence,
 };
 use noxu_cleaner::{Cleaner, UtilizationTracker, UtilizationTrackerObserver};
-use noxu_evictor::{Arbiter, Evictor, EvictionSource};
+use noxu_evictor::{Arbiter, EvictionSource, Evictor};
 use noxu_log::{
-    FileManager, LogManager, LogEntryType, Provisional,
-    entry::TxnEndEntry,
+    FileManager, LogEntryType, LogManager, Provisional, entry::TxnEndEntry,
 };
-use noxu_sync::Mutex as NoxuMutex;
 use noxu_recovery::RecoveryManager;
+use noxu_sync::Mutex as NoxuMutex;
 use noxu_txn::{LockManager, Txn, TxnManager};
 use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
 
@@ -33,7 +32,7 @@ use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
 /// Owns all subsystems: log manager, B-tree, transaction manager,
 /// lock manager, evictor, cleaner, checkpointer, and INCompressor daemon.
 ///
-/// 
+///
 pub struct EnvironmentImpl {
     /// Path to the environment home directory.
     env_home: PathBuf,
@@ -109,7 +108,7 @@ pub struct EnvironmentImpl {
     /// `Cleaner::with_file_manager_and_tree()`.  For read-only environments
     /// `cleaner` is `None`.
     ///
-    /// 
+    ///
     cleaner: Option<Arc<Cleaner>>,
 
     /// The checkpoint daemon.
@@ -117,7 +116,7 @@ pub struct EnvironmentImpl {
     /// Created for writable environments; wired to the LogManager and the
     /// primary tree so that `do_checkpoint()` flushes dirty BINs to the log.
     ///
-    /// 
+    ///
     checkpointer: Option<Arc<noxu_recovery::checkpointer::Checkpointer>>,
 
     /// Background checkpointer daemon thread handle.
@@ -137,7 +136,7 @@ pub struct EnvironmentImpl {
     /// Shared with the `in_compressor_handle` thread so that `close()` can
     /// signal the thread to exit.
     ///
-    /// 
+    ///
     in_compressor_shutdown: Arc<AtomicBool>,
 
     /// Background INCompressor daemon thread handle.
@@ -158,7 +157,6 @@ pub struct EnvironmentImpl {
     // =========================================================================
     // extended fork: additional background services
     // =========================================================================
-
     /// Background data-erasure daemon.
     ///
     /// Physically overwrites obsolete user data on disk so that sensitive
@@ -248,12 +246,15 @@ impl EnvironmentImpl {
         transactional: bool,
         checkpoint_interval_ms: u64,
     ) -> Result<Self, DbiError> {
-        Self::new_with_config_inner(env_home, &DbiEnvConfig {
-            read_only,
-            transactional,
-            checkpointer_wakeup_interval_ms: checkpoint_interval_ms,
-            ..DbiEnvConfig::default()
-        })
+        Self::new_with_config_inner(
+            env_home,
+            &DbiEnvConfig {
+                read_only,
+                transactional,
+                checkpointer_wakeup_interval_ms: checkpoint_interval_ms,
+                ..DbiEnvConfig::default()
+            },
+        )
     }
 
     fn new_with_config_inner(
@@ -366,19 +367,24 @@ impl EnvironmentImpl {
             // on-disk log.
             // LogManager.logItem() calls envImpl.getUtilizationTracker()
             // and passes it to serialLogWork().
-            let util_tracker = Arc::new(NoxuMutex::new(UtilizationTracker::new(true)));
-            let observer = Arc::new(UtilizationTrackerObserver::new(Arc::clone(&util_tracker)));
+            let util_tracker =
+                Arc::new(NoxuMutex::new(UtilizationTracker::new(true)));
+            let observer = Arc::new(UtilizationTrackerObserver::new(
+                Arc::clone(&util_tracker),
+            ));
             lm.set_write_observer(observer);
 
             Some((Arc::new(lm), util_tracker))
         } else {
             None
         };
-        let (log_manager, utilization_tracker): (Option<Arc<LogManager>>, Option<Arc<NoxuMutex<UtilizationTracker>>>) =
-            match log_manager_and_tracker {
-                Some((lm, ut)) => (Some(lm), Some(ut)),
-                None => (None, None),
-            };
+        let (log_manager, utilization_tracker): (
+            Option<Arc<LogManager>>,
+            Option<Arc<NoxuMutex<UtilizationTracker>>>,
+        ) = match log_manager_and_tracker {
+            Some((lm, ut)) => (Some(lm), Some(ut)),
+            None => (None, None),
+        };
 
         // Primary shared tree (db_id=1) used for LN migration by the cleaner
         // and as the backing store for the checkpointer.
@@ -410,18 +416,17 @@ impl EnvironmentImpl {
             cache_bytes / 16, // critical threshold: 1/16 of cache
         );
         // Build optional off-heap cache from config ( MAX_OFF_HEAP_MEMORY).
-        let off_heap_cache = Arc::new(
-            noxu_evictor::OffHeapCache::new(
-                cfg.max_off_heap_memory > 0,
-                cfg.max_off_heap_memory,
-            )
-        );
+        let off_heap_cache = Arc::new(noxu_evictor::OffHeapCache::new(
+            cfg.max_off_heap_memory > 0,
+            cfg.max_off_heap_memory,
+        ));
 
         let evictor_builder = Evictor::new(
             arbiter,
             cfg.evictor_nodes_per_scan,
             cfg.evictor_lru_only,
-        ).with_off_heap(Arc::clone(&off_heap_cache));
+        )
+        .with_off_heap(Arc::clone(&off_heap_cache));
         let evictor = Arc::new(evictor_builder);
 
         // Start the background daemon thread.  The thread loops as long as
@@ -466,7 +471,7 @@ impl EnvironmentImpl {
         // Constructor calling
         // `Checkpointer(env, DbEnvPool.CHECKPOINT_TIMEOUT_MS)`.
         let checkpointer = log_manager.as_ref().map(|lm| {
-            use noxu_recovery::checkpointer::{Checkpointer, CheckpointConfig};
+            use noxu_recovery::checkpointer::{CheckpointConfig, Checkpointer};
             Arc::new(
                 Checkpointer::new(
                     CheckpointConfig::new()
@@ -509,8 +514,9 @@ impl EnvironmentImpl {
 
         // Shared db_map Arc — also given to the INCompressor daemon so it can
         // iterate open databases without holding a reference to `self`.
-        let db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let db_map: Arc<
+            RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
 
         // Start the background INCompressor daemon thread (INCompressor).
         // Controlled by cfg.run_in_compressor; wakeup interval from
@@ -533,8 +539,12 @@ impl EnvironmentImpl {
                     // benchmark elapsed time).
                     let chunk_ms = 100u64;
                     let mut remaining = compressor_interval_ms;
-                    while remaining > 0 && !in_compressor_shutdown_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(chunk_ms.min(remaining)));
+                    while remaining > 0
+                        && !in_compressor_shutdown_clone.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            chunk_ms.min(remaining),
+                        ));
                         remaining = remaining.saturating_sub(chunk_ms);
                     }
                     if in_compressor_shutdown_clone.load(Ordering::Relaxed) {
@@ -543,7 +553,11 @@ impl EnvironmentImpl {
                     // Iterate all open databases and compress any BINs that
                     // have known-deleted slots (INCompressor.processQueue path).
                     let db_list: Vec<Arc<RwLock<DatabaseImpl>>> =
-                        db_map_for_compressor.read().values().cloned().collect();
+                        db_map_for_compressor
+                            .read()
+                            .values()
+                            .cloned()
+                            .collect();
                     for db_arc in db_list {
                         let db = db_arc.read();
                         if let Some(tree) = db.get_real_tree() {
@@ -580,8 +594,12 @@ impl EnvironmentImpl {
                     // Sleep in small chunks so shutdown is responsive.
                     let chunk_ms = 100u64;
                     let mut remaining = sleep_ms;
-                    while remaining > 0 && !cleaner_shutdown_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(chunk_ms.min(remaining)));
+                    while remaining > 0
+                        && !cleaner_shutdown_clone.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            chunk_ms.min(remaining),
+                        ));
                         remaining = remaining.saturating_sub(chunk_ms);
                     }
                 }
@@ -619,8 +637,12 @@ impl EnvironmentImpl {
             cleaner_shutdown,
             cleaner_handle: Mutex::new(Some(cleaner_handle)),
             data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
-            extinction_scanner: Mutex::new(noxu_cleaner::ExtinctionScanner::new()),
-            backup_manager: Mutex::new(crate::backup_manager::BackupManager::new()),
+            extinction_scanner: Mutex::new(
+                noxu_cleaner::ExtinctionScanner::new(),
+            ),
+            backup_manager: Mutex::new(
+                crate::backup_manager::BackupManager::new(),
+            ),
             utilization_tracker,
             cache_usage,
         };
@@ -719,11 +741,8 @@ impl EnvironmentImpl {
         // than an empty tree.  We use `remove` so the tree is transferred
         // (not cloned) and the map entry is consumed — each recovered tree is
         // used at most once.
-        if let Some(recovered_tree) = self
-            .recovered_trees
-            .lock()
-            .unwrap()
-            .remove(&(db_id.id() as u64))
+        if let Some(recovered_tree) =
+            self.recovered_trees.lock().unwrap().remove(&(db_id.id() as u64))
         {
             db_impl.set_recovered_tree(recovered_tree);
             // Re-wire counter since set_recovered_tree replaces the tree.
@@ -788,9 +807,10 @@ impl EnvironmentImpl {
 
         // "must not have any open Database handles" — enforce here.
         if let Some(db) = self.db_map.read().get(&db_id)
-            && db.read().reference_count() > 0 {
-                return Err(DbiError::DatabaseInUse(name.to_string()));
-            }
+            && db.read().reference_count() > 0
+        {
+            return Err(DbiError::DatabaseInUse(name.to_string()));
+        }
 
         self.name_map.write().remove(name);
         if let Some(db) = self.db_map.write().remove(&db_id) {
@@ -819,9 +839,10 @@ impl EnvironmentImpl {
 
         // "must not have any open Database handles" — enforce here.
         if let Some(db) = self.db_map.read().get(&db_id)
-            && db.read().reference_count() > 0 {
-                return Err(DbiError::DatabaseInUse(old_name.to_string()));
-            }
+            && db.read().reference_count() > 0
+        {
+            return Err(DbiError::DatabaseInUse(old_name.to_string()));
+        }
 
         if self.name_map.read().contains_key(new_name) {
             return Err(DbiError::DatabaseAlreadyExists(new_name.to_string()));
@@ -860,7 +881,8 @@ impl EnvironmentImpl {
             let old_count = db_guard.entry_count();
             // Replace the real tree with a fresh empty tree, preserving config.
             let max_entries = db_guard.max_tree_entries_per_node() as usize;
-            let new_tree = noxu_tree::Tree::new(db_id.as_i64() as u64, max_entries);
+            let new_tree =
+                noxu_tree::Tree::new(db_id.as_i64() as u64, max_entries);
             db_guard.set_recovered_tree(new_tree); // resets entry_count to 0
             old_count
         };
@@ -893,8 +915,10 @@ impl EnvironmentImpl {
 
     /// Returns the utilization tracker shared with the LogManager observer.
     ///
-    /// 
-    pub fn get_utilization_tracker(&self) -> Option<&Arc<NoxuMutex<UtilizationTracker>>> {
+    ///
+    pub fn get_utilization_tracker(
+        &self,
+    ) -> Option<&Arc<NoxuMutex<UtilizationTracker>>> {
         self.utilization_tracker.as_ref()
     }
 
@@ -926,14 +950,18 @@ impl EnvironmentImpl {
     ///
     /// Used by the write path to apply backpressure when the log write rate
     /// significantly exceeds the cleaner's capacity.
-    pub fn get_cleaner_throttle(&self) -> Option<Arc<noxu_cleaner::CleanerThrottle>> {
+    pub fn get_cleaner_throttle(
+        &self,
+    ) -> Option<Arc<noxu_cleaner::CleanerThrottle>> {
         self.cleaner.as_ref().map(|c| Arc::clone(&c.throttle))
     }
 
     /// Returns the checkpointer, if one was created.
     ///
     /// Returns `None` for read-only environments.
-    pub fn get_checkpointer(&self) -> Option<Arc<noxu_recovery::checkpointer::Checkpointer>> {
+    pub fn get_checkpointer(
+        &self,
+    ) -> Option<Arc<noxu_recovery::checkpointer::Checkpointer>> {
         self.checkpointer.as_ref().map(Arc::clone)
     }
 
@@ -945,12 +973,11 @@ impl EnvironmentImpl {
     pub fn run_checkpoint(&self) -> Result<(), DbiError> {
         match &self.checkpointer {
             None => Ok(()),
-            Some(ckpt) => ckpt
-                .do_checkpoint("manual")
-                .map(|_| ())
-                .map_err(|e| DbiError::EnvironmentFailure {
-                    reason: e.to_string(),
-                }),
+            Some(ckpt) => {
+                ckpt.do_checkpoint("manual").map(|_| ()).map_err(|e| {
+                    DbiError::EnvironmentFailure { reason: e.to_string() }
+                })
+            }
         }
     }
 
@@ -971,13 +998,12 @@ impl EnvironmentImpl {
     ) -> Result<noxu_cleaner::CleanResult, DbiError> {
         match &self.cleaner {
             None => Err(DbiError::EnvironmentFailure {
-                reason: "cleaner is not available (read-only environment)".to_string(),
+                reason: "cleaner is not available (read-only environment)"
+                    .to_string(),
             }),
-            Some(cleaner) => {
-                cleaner
-                    .do_clean(n_files, force)
-                    .map_err(|e| DbiError::EnvironmentFailure { reason: e })
-            }
+            Some(cleaner) => cleaner
+                .do_clean(n_files, force)
+                .map_err(|e| DbiError::EnvironmentFailure { reason: e }),
         }
     }
 
@@ -1004,7 +1030,8 @@ impl EnvironmentImpl {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let entry = TxnEndEntry::new_commit(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
+        let entry =
+            TxnEndEntry::new_commit(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
         let mut buf = BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
@@ -1027,7 +1054,8 @@ impl EnvironmentImpl {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let entry = TxnEndEntry::new_abort(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
+        let entry =
+            TxnEndEntry::new_abort(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
         let mut buf = BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
@@ -1206,8 +1234,7 @@ mod tests {
 
     fn make_env(read_only: bool) -> (TempDir, EnvironmentImpl) {
         let dir = TempDir::new().unwrap();
-        let env =
-            EnvironmentImpl::new(dir.path(), read_only, true).unwrap();
+        let env = EnvironmentImpl::new(dir.path(), read_only, true).unwrap();
         (dir, env)
     }
 
@@ -1431,8 +1458,7 @@ mod tests {
 
         // First open: write some commit entries and close cleanly.
         {
-            let env =
-                EnvironmentImpl::new(dir.path(), false, true).unwrap();
+            let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
             env.log_txn_commit(1, true, true).unwrap();
             env.log_txn_commit(2, true, true).unwrap();
             env.log_txn_abort(3).unwrap();
@@ -1442,8 +1468,7 @@ mod tests {
         // Second open: recovery should run over the existing log files.
         // If recovery fails (e.g. LSN state restored incorrectly), `new()`
         // will return an error.
-        let env2 =
-            EnvironmentImpl::new(dir.path(), false, true).unwrap();
+        let env2 = EnvironmentImpl::new(dir.path(), false, true).unwrap();
         assert!(env2.is_open());
 
         // The log manager should be at a position *after* the entries
@@ -1451,7 +1476,8 @@ mod tests {
         let lm = env2.get_log_manager().unwrap();
         let end_of_log = lm.get_end_of_log();
         assert!(
-            end_of_log.file_offset() > noxu_log::file_header::FILE_HEADER_SIZE as u32,
+            end_of_log.file_offset()
+                > noxu_log::file_header::FILE_HEADER_SIZE as u32,
             "end-of-log offset {:#x} should be past the file header ({})",
             end_of_log.file_offset(),
             noxu_log::file_header::FILE_HEADER_SIZE
@@ -1465,16 +1491,14 @@ mod tests {
 
         // Session 1: write txn 100.
         {
-            let env =
-                EnvironmentImpl::new(dir.path(), false, true).unwrap();
+            let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
             env.log_txn_commit(100, true, true).unwrap();
             env.close().unwrap();
         }
 
         // Session 2: write txn 200 after recovery.
         {
-            let env =
-                EnvironmentImpl::new(dir.path(), false, true).unwrap();
+            let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
             env.log_txn_commit(200, true, true).unwrap();
             env.close().unwrap();
         }
@@ -1486,8 +1510,7 @@ mod tests {
         use std::sync::Arc;
 
         let fm = Arc::new(
-            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100)
-                .unwrap(),
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
         );
         let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
         let (_, end) = scanner.find_end_of_log();
@@ -1523,8 +1546,7 @@ mod tests {
 
         // Session 1: write some entries and close cleanly.
         {
-            let env =
-                EnvironmentImpl::new(dir.path(), false, true).unwrap();
+            let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
             env.log_txn_commit(1, true, true).unwrap();
             env.log_txn_commit(2, true, true).unwrap();
             env.close().unwrap();
@@ -1533,13 +1555,11 @@ mod tests {
         // Session 2: reopen — recovery runs with a real B-tree.
         // If tree replay panics or fails, new() returns Err here.
         {
-            let env =
-                EnvironmentImpl::new(dir.path(), false, true).unwrap();
+            let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
             // Database can be opened after recovery.
             let mut config = DatabaseConfig::new();
             config.set_allow_create(true);
-            let _db =
-                env.open_database("mydb", &config).unwrap();
+            let _db = env.open_database("mydb", &config).unwrap();
             env.close().unwrap();
         }
         // Reaching here proves recovery with tree=Some succeeded.
@@ -1554,8 +1574,7 @@ mod tests {
 
         let mut config = DatabaseConfig::new();
         config.set_allow_create(true);
-        let db_arc =
-            env.open_database("test", &config).unwrap();
+        let db_arc = env.open_database("test", &config).unwrap();
         let db = db_arc.read();
 
         // The real_tree's database_id must equal db.get_id().id() as u64.
@@ -1595,7 +1614,10 @@ mod tests {
         env.close().unwrap();
 
         // After close the evictor's shutdown flag must be set.
-        assert!(evictor.is_shutdown(), "evictor should be shut down after close");
+        assert!(
+            evictor.is_shutdown(),
+            "evictor should be shut down after close"
+        );
     }
 
     /// Verify that the checkpointer daemon thread starts and stops cleanly.
@@ -1652,7 +1674,7 @@ mod tests {
     /// `noxu-recovery`).
     #[test]
     fn test_wakeup_after_write_triggers_checkpoint_via_env() {
-        use noxu_recovery::checkpointer::{Checkpointer, CheckpointConfig};
+        use noxu_recovery::checkpointer::{CheckpointConfig, Checkpointer};
         use std::sync::atomic::Ordering;
 
         let checkpointer = Checkpointer::new(CheckpointConfig::default())

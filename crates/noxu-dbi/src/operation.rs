@@ -3,7 +3,7 @@
 
 /// Types of operations for replication.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     /// Standard put operation.
@@ -26,9 +26,8 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let ops = [Operation::Put,
-            Operation::NoOverwrite,
-            Operation::Placeholder];
+        let ops =
+            [Operation::Put, Operation::NoOverwrite, Operation::Placeholder];
 
         assert_eq!(ops.len(), 3);
     }

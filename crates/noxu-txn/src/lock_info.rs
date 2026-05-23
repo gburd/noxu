@@ -21,7 +21,7 @@ pub type WaiterNotify = Arc<(Mutex<bool>, Condvar)>;
 /// For waiters, `notify` carries the condvar pair used to wake the blocked thread
 /// once the lock is granted.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct LockInfo {
     /// The ID of the locker holding/waiting for this lock.

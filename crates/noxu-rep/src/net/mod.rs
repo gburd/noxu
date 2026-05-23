@@ -20,14 +20,14 @@ pub use channel::{TlsTcpChannel, TlsTcpChannelListener};
 pub use data_channel::DataChannel;
 #[cfg(feature = "quic")]
 pub use quic_channel::{
-    QuicChannel, QuicChannelListener, default_server_config, insecure_client_config,
+    QuicChannel, QuicChannelListener, default_server_config,
+    insecure_client_config,
 };
 #[cfg(feature = "quic")]
 pub use quic_mux::{
-    QuicMultiplexedChannel, QuicMultiplexedChannelListener, ReconnectToken, ReplicationChannel,
-    mux_server_config, mux_insecure_client_config,
+    QuicMultiplexedChannel, QuicMultiplexedChannelListener, ReconnectToken,
+    ReplicationChannel, mux_insecure_client_config, mux_server_config,
 };
 pub use service_dispatcher::{
-    ServiceDispatcher, ServiceHandler, TcpServiceDispatcher,
-    connect_to_service,
+    ServiceDispatcher, ServiceHandler, TcpServiceDispatcher, connect_to_service,
 };

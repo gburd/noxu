@@ -13,7 +13,7 @@ use crate::{DatabaseId, DbType, DbiError};
 /// - nameDatabase: maps name -> database ID
 /// - idDatabase: maps database ID -> DatabaseImpl
 ///
-/// 
+///
 pub struct DbTree {
     /// Name -> DatabaseId mapping.
     name_to_id: RwLock<HashMap<String, DatabaseId>>,

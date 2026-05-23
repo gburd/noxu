@@ -11,8 +11,8 @@
 //!   - `notify_one()`
 //!   - `notify_all()`
 
-use crate::futex::{futex_wait, futex_wake};
 use crate::MutexGuard;
+use crate::futex::{futex_wait, futex_wake};
 use lock_api;
 use lock_api::RawMutex as RawMutexTrait;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -46,9 +46,7 @@ pub struct Condvar {
 impl Condvar {
     /// Creates a new `Condvar`.
     pub const fn new() -> Self {
-        Condvar {
-            seq: AtomicU32::new(0),
-        }
+        Condvar { seq: AtomicU32::new(0) }
     }
 
     /// Atomically releases the mutex guard and waits for a notification.

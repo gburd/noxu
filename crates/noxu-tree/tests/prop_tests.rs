@@ -3,8 +3,11 @@
 use proptest::prelude::*;
 use std::cmp::Ordering;
 
-use noxu_tree::in_node::{InNode, BIN_LEVEL, EXACT_MATCH, INSERT_SUCCESS};
-use noxu_tree::key::{compare_keys, compare_unsigned_bytes, create_key_prefix, get_key_prefix_length};
+use noxu_tree::in_node::{BIN_LEVEL, EXACT_MATCH, INSERT_SUCCESS, InNode};
+use noxu_tree::key::{
+    compare_keys, compare_unsigned_bytes, create_key_prefix,
+    get_key_prefix_length,
+};
 use noxu_util::{Lsn, NULL_LSN};
 
 // ============================================================================
@@ -118,7 +121,9 @@ proptest! {
 // ============================================================================
 
 /// Generate a set of distinct keys for insertion.
-fn distinct_keys_strategy(max_count: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
+fn distinct_keys_strategy(
+    max_count: usize,
+) -> impl Strategy<Value = Vec<Vec<u8>>> {
     prop::collection::hash_set(
         prop::collection::vec(any::<u8>(), 1..32),
         1..=max_count,

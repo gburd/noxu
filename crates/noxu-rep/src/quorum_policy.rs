@@ -68,10 +68,7 @@ impl QuorumPolicy {
             Self::SimpleMajority => majority_size(electable),
             Self::Flexible { phase1, .. } => *phase1,
             Self::Expression(qs) => {
-                qs.read_quorums()
-                    .map(|q| q.len())
-                    .min()
-                    .unwrap_or(electable)
+                qs.read_quorums().map(|q| q.len()).min().unwrap_or(electable)
             }
         }
     }
@@ -82,10 +79,7 @@ impl QuorumPolicy {
             Self::SimpleMajority => majority_size(electable),
             Self::Flexible { phase2, .. } => *phase2,
             Self::Expression(qs) => {
-                qs.write_quorums()
-                    .map(|q| q.len())
-                    .min()
-                    .unwrap_or(electable)
+                qs.write_quorums().map(|q| q.len()).min().unwrap_or(electable)
             }
         }
     }

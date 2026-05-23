@@ -29,7 +29,7 @@ const PREFIXING_ENABLED: u8 = 0x10;
 
 /// The underlying object for a given database.
 ///
-/// 
+///
 pub struct DatabaseImpl {
     /// Unique database ID.
     id: DatabaseId,
@@ -58,7 +58,7 @@ pub struct DatabaseImpl {
     real_tree: Option<Tree>,
     /// Whether writes are deferred (not WAL-logged immediately).
     ///
-    /// 
+    ///
     /// When true, `log_ln_write()` skips WAL logging and returns NULL_LSN;
     /// data is flushed to disk only at eviction or checkpoint.
     deferred_write: bool,
@@ -141,7 +141,12 @@ impl DatabaseImpl {
             // A custom comparator is required: pure lexicographic ordering fails
             // when a shorter primary key is a byte-prefix of a longer key's data.
             let dup_cmp: KeyComparatorFn = Arc::new(|a: &[u8], b: &[u8]| {
-                dup_key_data::cmp_two_part_keys(a, b, |x, y| x.cmp(y), |x, y| x.cmp(y))
+                dup_key_data::cmp_two_part_keys(
+                    a,
+                    b,
+                    |x, y| x.cmp(y),
+                    |x, y| x.cmp(y),
+                )
             });
             Tree::new_with_comparator(id.id() as u64, max_entries, dup_cmp)
         } else {
@@ -179,7 +184,7 @@ impl DatabaseImpl {
 
     /// Returns true if this database uses deferred write mode.
     ///
-    /// 
+    ///
     pub fn is_deferred_write(&self) -> bool {
         self.deferred_write
     }
@@ -255,8 +260,14 @@ impl DatabaseImpl {
             if cur == 0 {
                 break;
             }
-            if self.entry_count
-                .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+            if self
+                .entry_count
+                .compare_exchange_weak(
+                    cur,
+                    cur - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 break;
@@ -287,7 +298,11 @@ impl DatabaseImpl {
     ///
     /// Returns `true` if the key was found and updated.
     /// Delegates to `Tree::update_key_expiration()`.
-    pub fn update_key_expiration(&self, key: &[u8], expiration_hours: u32) -> bool {
+    pub fn update_key_expiration(
+        &self,
+        key: &[u8],
+        expiration_hours: u32,
+    ) -> bool {
         self.real_tree
             .as_ref()
             .map(|t| t.update_key_expiration(key, expiration_hours))
@@ -334,7 +349,10 @@ impl DatabaseImpl {
     /// Must be called after `new()` in `EnvironmentImpl::open_database()`.
     /// Also forwards the counter to the recovered tree (if any) so that
     /// databases opened after recovery also track memory.
-    pub fn set_memory_counter(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicI64>) {
+    pub fn set_memory_counter(
+        &mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    ) {
         if let Some(tree) = self.real_tree.as_mut() {
             tree.set_memory_counter(counter);
         }
@@ -425,8 +443,7 @@ impl DatabaseImpl {
         let mut tree = DatabaseTree::new();
         tree.root_lsn = root_lsn;
 
-        let real_tree =
-            Tree::new(id as u64, max_entries as usize);
+        let real_tree = Tree::new(id as u64, max_entries as usize);
         Ok(DatabaseImpl {
             id: DatabaseId::new(id),
             name,

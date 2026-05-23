@@ -264,7 +264,8 @@ impl ConfigParam {
                 }
             }
             (ParamType::Duration, ParamValue::Duration(_)) => {}
-            (ParamType::String, ParamValue::String(_) | ParamValue::Str(_)) => {}
+            (ParamType::String, ParamValue::String(_) | ParamValue::Str(_)) => {
+            }
             _ => {
                 return Err(ConfigError::TypeMismatch {
                     name: self.name,
@@ -379,7 +380,14 @@ mod tests {
 
     #[test]
     fn test_int_param_construction() {
-        let p = ConfigParam::int_param("noxu.test.int", Some(0), Some(100), 50, false, false);
+        let p = ConfigParam::int_param(
+            "noxu.test.int",
+            Some(0),
+            Some(100),
+            50,
+            false,
+            false,
+        );
         assert_eq!(p.default, ParamValue::Int(50));
         assert_eq!(p.min, Some(ParamValue::Int(0)));
         assert_eq!(p.max, Some(ParamValue::Int(100)));
@@ -388,7 +396,14 @@ mod tests {
 
     #[test]
     fn test_long_param_construction() {
-        let p = ConfigParam::long_param("noxu.test.long", Some(0), None, 1024, true, false);
+        let p = ConfigParam::long_param(
+            "noxu.test.long",
+            Some(0),
+            None,
+            1024,
+            true,
+            false,
+        );
         assert_eq!(p.default, ParamValue::Long(1024));
         assert_eq!(p.min, Some(ParamValue::Long(0)));
         assert!(p.max.is_none());
@@ -397,7 +412,14 @@ mod tests {
 
     #[test]
     fn test_int_param_no_bounds() {
-        let p = ConfigParam::int_param("noxu.test.unbounded", None, None, 5, false, false);
+        let p = ConfigParam::int_param(
+            "noxu.test.unbounded",
+            None,
+            None,
+            5,
+            false,
+            false,
+        );
         assert!(p.min.is_none());
         assert!(p.max.is_none());
     }
@@ -422,7 +444,14 @@ mod tests {
 
     #[test]
     fn test_validate_int_in_range() {
-        let p = ConfigParam::int_param("noxu.test", Some(0), Some(100), 50, false, false);
+        let p = ConfigParam::int_param(
+            "noxu.test",
+            Some(0),
+            Some(100),
+            50,
+            false,
+            false,
+        );
         assert!(p.validate(&ParamValue::Int(0)).is_ok());
         assert!(p.validate(&ParamValue::Int(50)).is_ok());
         assert!(p.validate(&ParamValue::Int(100)).is_ok());
@@ -430,35 +459,70 @@ mod tests {
 
     #[test]
     fn test_validate_int_below_min() {
-        let p = ConfigParam::int_param("noxu.test", Some(1), Some(100), 50, false, false);
+        let p = ConfigParam::int_param(
+            "noxu.test",
+            Some(1),
+            Some(100),
+            50,
+            false,
+            false,
+        );
         let err = p.validate(&ParamValue::Int(0));
         assert!(matches!(err, Err(ConfigError::OutOfRange { .. })));
     }
 
     #[test]
     fn test_validate_int_above_max() {
-        let p = ConfigParam::int_param("noxu.test", Some(0), Some(90), 50, false, false);
+        let p = ConfigParam::int_param(
+            "noxu.test",
+            Some(0),
+            Some(90),
+            50,
+            false,
+            false,
+        );
         let err = p.validate(&ParamValue::Int(91));
         assert!(matches!(err, Err(ConfigError::OutOfRange { .. })));
     }
 
     #[test]
     fn test_validate_long_in_range() {
-        let p = ConfigParam::long_param("noxu.test", Some(0), Some(1000), 500, false, false);
+        let p = ConfigParam::long_param(
+            "noxu.test",
+            Some(0),
+            Some(1000),
+            500,
+            false,
+            false,
+        );
         assert!(p.validate(&ParamValue::Long(0)).is_ok());
         assert!(p.validate(&ParamValue::Long(1000)).is_ok());
     }
 
     #[test]
     fn test_validate_long_below_min() {
-        let p = ConfigParam::long_param("noxu.test", Some(0), None, 100, false, false);
+        let p = ConfigParam::long_param(
+            "noxu.test",
+            Some(0),
+            None,
+            100,
+            false,
+            false,
+        );
         let err = p.validate(&ParamValue::Long(-1));
         assert!(matches!(err, Err(ConfigError::OutOfRange { .. })));
     }
 
     #[test]
     fn test_validate_long_above_max() {
-        let p = ConfigParam::long_param("noxu.test", None, Some(100), 50, false, false);
+        let p = ConfigParam::long_param(
+            "noxu.test",
+            None,
+            Some(100),
+            50,
+            false,
+            false,
+        );
         let err = p.validate(&ParamValue::Long(101));
         assert!(matches!(err, Err(ConfigError::OutOfRange { .. })));
     }
@@ -474,7 +538,9 @@ mod tests {
             mutable: false,
             for_replication: false,
         };
-        assert!(p.validate(&ParamValue::Duration(Duration::from_secs(5))).is_ok());
+        assert!(
+            p.validate(&ParamValue::Duration(Duration::from_secs(5))).is_ok()
+        );
     }
 
     #[test]
@@ -494,7 +560,8 @@ mod tests {
 
     #[test]
     fn test_config_param_display() {
-        let p = ConfigParam::bool_param("noxu.test.display", false, false, false);
+        let p =
+            ConfigParam::bool_param("noxu.test.display", false, false, false);
         assert_eq!(format!("{}", p), "noxu.test.display");
     }
 

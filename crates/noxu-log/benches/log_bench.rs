@@ -5,13 +5,11 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::io::Cursor;
 
-use noxu_log::{
-    ChecksumValidator, LogEntryHeader, LogEntryType, Provisional,
-};
-use noxu_util::{Lsn, Vlsn};
+use noxu_log::{ChecksumValidator, LogEntryHeader, LogEntryType, Provisional};
 use noxu_util::packed::{
     read_packed_i32, read_packed_i64, write_packed_i32, write_packed_i64,
 };
+use noxu_util::{Lsn, Vlsn};
 
 // ---------------------------------------------------------------------------
 // LogEntryHeader serialization benchmarks
@@ -263,4 +261,9 @@ criterion_group!(
     bench_packed_i64_large,
 );
 
-criterion_main!(header_benches, checksum_benches, lsn_benches, packed_int_benches);
+criterion_main!(
+    header_benches,
+    checksum_benches,
+    lsn_benches,
+    packed_int_benches
+);

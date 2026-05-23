@@ -48,7 +48,8 @@ pub fn run_concurrent(
         let handle = std::thread::spawn(move || -> u64 {
             // Seed is distinct per reader so different threads access different
             // keys, exercising more of the key space.
-            let mut rng = SmallRng::seed_from_u64(reader_id as u64 * 1_000_003 + 7);
+            let mut rng =
+                SmallRng::seed_from_u64(reader_id as u64 * 1_000_003 + 7);
 
             barrier_clone.wait();
 
@@ -58,7 +59,9 @@ pub fn run_concurrent(
             for _ in 0..n {
                 // Read from the pre-populated range 0..n (keys written by populate()).
                 let idx: usize = rng.gen_range(0..n);
-                let k = DatabaseEntry::from_vec(format!("{:010}", idx).into_bytes());
+                let k = DatabaseEntry::from_vec(
+                    format!("{:010}", idx).into_bytes(),
+                );
                 // Ignore NotFound — the key may have been deleted by a concurrent writer.
                 let _ = db_clone.get(None, &k, &mut data);
                 ops += 1;
@@ -86,7 +89,9 @@ pub fn run_concurrent(
                 // Each writer owns keys in a disjoint range to avoid
                 // artificially high lock conflicts.
                 let key_idx = writer_id * n + i;
-                let k = DatabaseEntry::from_vec(format!("{:010}", key_idx).into_bytes());
+                let k = DatabaseEntry::from_vec(
+                    format!("{:010}", key_idx).into_bytes(),
+                );
                 let v = DatabaseEntry::from_bytes(&value);
                 let _ = db_clone.put(None, &k, &v);
                 ops += 1;
@@ -117,11 +122,7 @@ pub fn run_concurrent(
         0.0
     };
 
-    ConcurrentResult {
-        total_ops,
-        elapsed_ms,
-        ops_per_sec,
-    }
+    ConcurrentResult { total_ops, elapsed_ms, ops_per_sec }
 }
 
 /// Run a transactional concurrent workload with explicit transactions.

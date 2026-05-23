@@ -51,8 +51,10 @@ use crate::error::Result;
 ///
 /// `PrimaryIndex` holds a `Vec<Box<dyn SecondaryIndexMaintainer<PK, E>>>` and
 /// calls `on_put` / `on_delete` for every write.
-pub(crate) trait SecondaryIndexMaintainer<PK: PrimaryKey, E: Entity<PrimaryKey = PK>>:
-    Send + Sync
+pub(crate) trait SecondaryIndexMaintainer<
+    PK: PrimaryKey,
+    E: Entity<PrimaryKey = PK>,
+>: Send + Sync
 {
     /// Called after a successful `put`.
     ///
@@ -99,7 +101,12 @@ impl<SK: Ord + Clone, PK: Ord + Clone> SecondaryMap<SK, PK> {
             if let Some(set) = self.map.get_mut(&old_sk_clone) {
                 set.remove(&pk);
             }
-            if self.map.get(&old_sk_clone).map(|s| s.is_empty()).unwrap_or(false) {
+            if self
+                .map
+                .get(&old_sk_clone)
+                .map(|s| s.is_empty())
+                .unwrap_or(false)
+            {
                 self.map.remove(&old_sk_clone);
             }
         }
@@ -135,7 +142,10 @@ impl<SK: Ord + Clone, PK: Ord + Clone> SecondaryMap<SK, PK> {
     }
 
     /// Iterate all `(sk, pk)` pairs where `sk >= from_sk`, in order.
-    fn iter_from<'a>(&'a self, from_sk: &'a SK) -> impl Iterator<Item = (&'a SK, &'a PK)> {
+    fn iter_from<'a>(
+        &'a self,
+        from_sk: &'a SK,
+    ) -> impl Iterator<Item = (&'a SK, &'a PK)> {
         self.map
             .range(from_sk..)
             .flat_map(|(sk, pks)| pks.iter().map(move |pk| (sk, pk)))
@@ -148,7 +158,7 @@ impl<SK: Ord + Clone, PK: Ord + Clone> SecondaryMap<SK, PK> {
 
 /// Typed secondary index that maps a secondary key `SK` to entities `E`.
 ///
-/// 
+///
 ///
 /// # Type Parameters
 ///
@@ -232,7 +242,7 @@ where
     /// the entity with the smallest primary key is returned, matching the
     /// `SecondaryDatabase.get` behaviour (returns the first duplicate).
     ///
-    /// 
+    ///
     pub fn get<S: EntitySerializer<E>>(
         &self,
         serializer: &S,
@@ -349,7 +359,7 @@ where
     /// Returns an iterator over only the secondary key → primary key mappings,
     /// without fetching the full entities.
     ///
-    /// 
+    ///
     pub fn keys_index(&self) -> Vec<(SK, PK)> {
         let guard = self.shared.lock().unwrap();
         guard.iter().map(|(sk, pk)| (sk.clone(), pk.clone())).collect()
@@ -357,10 +367,13 @@ where
 
     /// Returns all primary keys that map to `sk` (sub-index).
     ///
-    /// 
+    ///
     pub fn sub_index(&self, sk: &SK) -> Vec<PK> {
         let guard = self.shared.lock().unwrap();
-        guard.get_pks(sk).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+        guard
+            .get_pks(sk)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -432,7 +445,8 @@ where
     extractor: Arc<dyn Fn(&E) -> Option<SK> + Send + Sync>,
 }
 
-impl<SK, PK, E> SecondaryIndexMaintainer<PK, E> for SecondaryRegistration<SK, PK, E>
+impl<SK, PK, E> SecondaryIndexMaintainer<PK, E>
+    for SecondaryRegistration<SK, PK, E>
 where
     SK: Ord + Clone + Send + Sync + 'static,
     PK: PrimaryKey + Ord + Send + Sync + 'static,
@@ -475,8 +489,10 @@ where
     F: Fn(&E) -> Option<SK> + Send + Sync + 'static,
 {
     let shared = Arc::new(Mutex::new(SecondaryMap::new()));
-    let extractor_arc: Arc<dyn Fn(&E) -> Option<SK> + Send + Sync> = Arc::new(extractor);
-    let index = SecondaryIndex::new(Arc::clone(&shared), Arc::clone(&extractor_arc));
+    let extractor_arc: Arc<dyn Fn(&E) -> Option<SK> + Send + Sync> =
+        Arc::new(extractor);
+    let index =
+        SecondaryIndex::new(Arc::clone(&shared), Arc::clone(&extractor_arc));
     let reg = SecondaryRegistration { shared, extractor: extractor_arc };
     (index, reg)
 }
@@ -546,23 +562,24 @@ mod tests {
 
         fn deserialize(&self, bytes: &[u8]) -> Result<Employee> {
             let id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-            let name_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let name_len =
+                u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
             let name =
                 String::from_utf8(bytes[12..12 + name_len].to_vec()).unwrap();
             let pos = 12 + name_len;
             let dept_len =
-                u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-            let department = String::from_utf8(
-                bytes[pos + 4..pos + 4 + dept_len].to_vec(),
-            )
-            .unwrap();
+                u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap())
+                    as usize;
+            let department =
+                String::from_utf8(bytes[pos + 4..pos + 4 + dept_len].to_vec())
+                    .unwrap();
             let pos = pos + 4 + dept_len;
             let email = if bytes[pos] == 0 {
                 None
             } else {
-                let el =
-                    u32::from_be_bytes(bytes[pos + 1..pos + 5].try_into().unwrap())
-                        as usize;
+                let el = u32::from_be_bytes(
+                    bytes[pos + 1..pos + 5].try_into().unwrap(),
+                ) as usize;
                 Some(
                     String::from_utf8(bytes[pos + 5..pos + 5 + el].to_vec())
                         .unwrap(),
@@ -575,11 +592,16 @@ mod tests {
     fn setup() -> (TempDir, Environment, noxu_db::Database) {
         let td = TempDir::new().unwrap();
         let env = Environment::open(
-            EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true),
+            EnvironmentConfig::new(td.path().to_path_buf())
+                .with_allow_create(true),
         )
         .unwrap();
         let db = env
-            .open_database(None, "emp", &DatabaseConfig::new().with_allow_create(true))
+            .open_database(
+                None,
+                "emp",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
             .unwrap();
         (td, env, db)
     }
@@ -602,13 +624,14 @@ mod tests {
     fn test_secondary_get_found() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Engineering")).unwrap();
 
-        let found = dept_idx.get(&ser, &primary, &"Engineering".to_string()).unwrap();
+        let found =
+            dept_idx.get(&ser, &primary, &"Engineering".to_string()).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, 1);
     }
@@ -618,15 +641,14 @@ mod tests {
     fn test_secondary_get_not_found() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Engineering")).unwrap();
 
-        let found = dept_idx
-            .get(&ser, &primary, &"Marketing".to_string())
-            .unwrap();
+        let found =
+            dept_idx.get(&ser, &primary, &"Marketing".to_string()).unwrap();
         assert!(found.is_none());
     }
 
@@ -635,8 +657,8 @@ mod tests {
     fn test_secondary_contains() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         assert!(!dept_idx.contains(&"Engineering".to_string()));
@@ -650,8 +672,8 @@ mod tests {
     fn test_secondary_delete() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Engineering")).unwrap();
@@ -672,8 +694,8 @@ mod tests {
     fn test_secondary_delete_not_found() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         let deleted = dept_idx
@@ -687,8 +709,8 @@ mod tests {
     fn test_secondary_many_to_one() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         for i in 1u64..=5 {
@@ -709,8 +731,8 @@ mod tests {
     fn test_secondary_iter() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Zebra")).unwrap();
@@ -734,8 +756,8 @@ mod tests {
     fn test_secondary_iter_from() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Alpha")).unwrap();
@@ -759,8 +781,8 @@ mod tests {
     fn test_secondary_update_on_overwrite() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Engineering")).unwrap();
@@ -786,8 +808,8 @@ mod tests {
     fn test_secondary_cleanup_on_primary_delete() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Engineering")).unwrap();
@@ -824,8 +846,8 @@ mod tests {
     fn test_secondary_keys_index() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         primary.put(&ser, &emp(1, "Eng")).unwrap();
@@ -846,8 +868,8 @@ mod tests {
     fn test_multiple_secondary_indexes() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let email_idx: SecondaryIndex<String, u64, Employee> =
             primary.open_secondary_index(|e: &Employee| e.email.clone());
         let ser = EmpSerializer;
@@ -871,8 +893,8 @@ mod tests {
     fn test_secondary_iter_empty() {
         let (_td, _env, db) = setup();
         let mut primary: PrimaryIndex<u64, Employee> = PrimaryIndex::new(&db);
-        let dept_idx: SecondaryIndex<String, u64, Employee> =
-            primary.open_secondary_index(|e: &Employee| Some(e.department.clone()));
+        let dept_idx: SecondaryIndex<String, u64, Employee> = primary
+            .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
         let pairs: Vec<_> = dept_idx

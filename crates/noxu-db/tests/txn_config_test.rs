@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, TransactionConfig,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    TransactionConfig,
 };
 use tempfile::TempDir;
 
@@ -69,12 +70,16 @@ fn test_no_wait_causes_immediate_lock_failure() {
     let txn2 = env.begin_transaction(None, Some(&config)).unwrap();
 
     let start = Instant::now();
-    let result = db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"value2"));
+    let result =
+        db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"value2"));
     let elapsed = start.elapsed();
 
     // Should have failed quickly (< 100ms), not after the default 500ms timeout
-    assert!(elapsed < Duration::from_millis(100),
-        "no_wait took {:?}, expected < 100ms", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "no_wait took {:?}, expected < 100ms",
+        elapsed
+    );
     assert!(result.is_err(), "expected lock error with no_wait");
 
     txn2.abort().unwrap();
@@ -105,8 +110,11 @@ fn test_lock_timeout_bounds_wait_time() {
     let elapsed = start.elapsed();
 
     // Should timeout within ~50ms (+/- some jitter)
-    assert!(elapsed < Duration::from_millis(200),
-        "lock_timeout took {:?}, expected ~50ms", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "lock_timeout took {:?}, expected ~50ms",
+        elapsed
+    );
     assert!(result.is_err());
 
     txn2.abort().unwrap();

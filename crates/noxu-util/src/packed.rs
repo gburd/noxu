@@ -44,10 +44,15 @@ pub fn packed_i32_size(val: i32) -> usize {
     } else {
         (val - 119) as u32
     };
-    if mag & 0xFFFFFF00 == 0 { 2 }
-    else if mag & 0xFFFF0000 == 0 { 3 }
-    else if mag & 0xFF000000 == 0 { 4 }
-    else { 5 }
+    if mag & 0xFFFFFF00 == 0 {
+        2
+    } else if mag & 0xFFFF0000 == 0 {
+        3
+    } else if mag & 0xFF000000 == 0 {
+        4
+    } else {
+        5
+    }
 }
 
 /// Writes a packed (variable-length) i32 to the output.
@@ -67,16 +72,18 @@ pub fn write_packed_i32(w: &mut impl Write, val: i32) -> io::Result<usize> {
     };
 
     // Write value bytes in little-endian (least significant first)
-    let n: u8 = if mag & 0xFFFFFF00 == 0 { 1 }
-        else if mag & 0xFFFF0000 == 0 { 2 }
-        else if mag & 0xFF000000 == 0 { 3 }
-        else { 4 };
-
-    let prefix: u8 = if negative {
-        (-(119i16 + n as i16)) as i8 as u8
+    let n: u8 = if mag & 0xFFFFFF00 == 0 {
+        1
+    } else if mag & 0xFFFF0000 == 0 {
+        2
+    } else if mag & 0xFF000000 == 0 {
+        3
     } else {
-        119 + n
+        4
     };
+
+    let prefix: u8 =
+        if negative { (-(119i16 + n as i16)) as i8 as u8 } else { 119 + n };
 
     w.write_all(&[prefix])?;
     for i in 0..n {
@@ -108,11 +115,7 @@ pub fn read_packed_i32(r: &mut impl Read) -> io::Result<i32> {
         mag |= (byte[0] as u32) << (i * 8);
     }
 
-    if negative {
-        Ok(-(mag as i32) - 119)
-    } else {
-        Ok(mag as i32 + 119)
-    }
+    if negative { Ok(-(mag as i32) - 119) } else { Ok(mag as i32 + 119) }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,14 +132,23 @@ pub fn packed_i64_size(val: i64) -> usize {
     } else {
         (val - 119) as u64
     };
-    if mag & 0xFFFFFFFFFFFFFF00 == 0 { 2 }
-    else if mag & 0xFFFFFFFFFFFF0000 == 0 { 3 }
-    else if mag & 0xFFFFFFFFFF000000 == 0 { 4 }
-    else if mag & 0xFFFFFFFF00000000 == 0 { 5 }
-    else if mag & 0xFFFFFF0000000000 == 0 { 6 }
-    else if mag & 0xFFFF000000000000 == 0 { 7 }
-    else if mag & 0xFF00000000000000 == 0 { 8 }
-    else { 9 }
+    if mag & 0xFFFFFFFFFFFFFF00 == 0 {
+        2
+    } else if mag & 0xFFFFFFFFFFFF0000 == 0 {
+        3
+    } else if mag & 0xFFFFFFFFFF000000 == 0 {
+        4
+    } else if mag & 0xFFFFFFFF00000000 == 0 {
+        5
+    } else if mag & 0xFFFFFF0000000000 == 0 {
+        6
+    } else if mag & 0xFFFF000000000000 == 0 {
+        7
+    } else if mag & 0xFF00000000000000 == 0 {
+        8
+    } else {
+        9
+    }
 }
 
 /// Writes a packed (variable-length) i64 to the output.
@@ -155,20 +167,26 @@ pub fn write_packed_i64(w: &mut impl Write, val: i64) -> io::Result<usize> {
         (val - 119) as u64
     };
 
-    let n: u8 = if mag & 0xFFFFFFFFFFFFFF00 == 0 { 1 }
-        else if mag & 0xFFFFFFFFFFFF0000 == 0 { 2 }
-        else if mag & 0xFFFFFFFFFF000000 == 0 { 3 }
-        else if mag & 0xFFFFFFFF00000000 == 0 { 4 }
-        else if mag & 0xFFFFFF0000000000 == 0 { 5 }
-        else if mag & 0xFFFF000000000000 == 0 { 6 }
-        else if mag & 0xFF00000000000000 == 0 { 7 }
-        else { 8 };
-
-    let prefix: u8 = if negative {
-        (-(119i16 + n as i16)) as i8 as u8
+    let n: u8 = if mag & 0xFFFFFFFFFFFFFF00 == 0 {
+        1
+    } else if mag & 0xFFFFFFFFFFFF0000 == 0 {
+        2
+    } else if mag & 0xFFFFFFFFFF000000 == 0 {
+        3
+    } else if mag & 0xFFFFFFFF00000000 == 0 {
+        4
+    } else if mag & 0xFFFFFF0000000000 == 0 {
+        5
+    } else if mag & 0xFFFF000000000000 == 0 {
+        6
+    } else if mag & 0xFF00000000000000 == 0 {
+        7
     } else {
-        119 + n
+        8
     };
+
+    let prefix: u8 =
+        if negative { (-(119i16 + n as i16)) as i8 as u8 } else { 119 + n };
 
     w.write_all(&[prefix])?;
     for i in 0..n {
@@ -200,11 +218,7 @@ pub fn read_packed_i64(r: &mut impl Read) -> io::Result<i64> {
         mag |= (byte[0] as u64) << (i * 8);
     }
 
-    if negative {
-        Ok(-(mag as i64) - 119)
-    } else {
-        Ok(mag as i64 + 119)
-    }
+    if negative { Ok(-(mag as i64) - 119) } else { Ok(mag as i64 + 119) }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,10 +242,15 @@ pub fn write_sorted_i32(w: &mut impl Write, val: i32) -> io::Result<()> {
 
     if val > 120 {
         let adj = (val - 121) as u32;
-        let n = if adj & 0xFF000000 != 0 { 4u8 }
-            else if adj & 0xFFFF0000 != 0 { 3 }
-            else if adj & 0xFFFFFF00 != 0 { 2 }
-            else { 1 };
+        let n = if adj & 0xFF000000 != 0 {
+            4u8
+        } else if adj & 0xFFFF0000 != 0 {
+            3
+        } else if adj & 0xFFFFFF00 != 0 {
+            2
+        } else {
+            1
+        };
         w.write_all(&[0xF7 + n])?;
         for i in (0..n).rev() {
             w.write_all(&[((adj >> (i * 8)) & 0xFF) as u8])?;
@@ -239,11 +258,16 @@ pub fn write_sorted_i32(w: &mut impl Write, val: i32) -> io::Result<()> {
     } else {
         // val < -119
         let adj = val + 119; // negative, e.g. -120+119 = -1
-        let uadj = adj as u32;        // two's complement
-        let n = if (uadj | 0x00FFFFFF) != 0xFFFFFFFF { 4u8 }
-            else if (uadj | 0x0000FFFF) != 0xFFFFFFFF { 3 }
-            else if (uadj | 0x000000FF) != 0xFFFFFFFF { 2 }
-            else { 1 };
+        let uadj = adj as u32; // two's complement
+        let n = if (uadj | 0x00FFFFFF) != 0xFFFFFFFF {
+            4u8
+        } else if (uadj | 0x0000FFFF) != 0xFFFFFFFF {
+            3
+        } else if (uadj | 0x000000FF) != 0xFFFFFFFF {
+            2
+        } else {
+            1
+        };
         w.write_all(&[(0x08u8).wrapping_sub(n)])?;
         for i in (0..n).rev() {
             w.write_all(&[((uadj >> (i * 8)) & 0xFF) as u8])?;
@@ -292,14 +316,23 @@ pub fn write_sorted_i64(w: &mut impl Write, val: i64) -> io::Result<()> {
 
     if val > 120 {
         let adj = (val - 121) as u64;
-        let n = if adj & 0xFF00000000000000 != 0 { 8u8 }
-            else if adj & 0xFFFF000000000000 != 0 { 7 }
-            else if adj & 0xFFFFFF0000000000 != 0 { 6 }
-            else if adj & 0xFFFFFFFF00000000 != 0 { 5 }
-            else if adj & 0xFFFFFFFFFF000000 != 0 { 4 }
-            else if adj & 0xFFFFFFFFFFFF0000 != 0 { 3 }
-            else if adj & 0xFFFFFFFFFFFFFF00 != 0 { 2 }
-            else { 1 };
+        let n = if adj & 0xFF00000000000000 != 0 {
+            8u8
+        } else if adj & 0xFFFF000000000000 != 0 {
+            7
+        } else if adj & 0xFFFFFF0000000000 != 0 {
+            6
+        } else if adj & 0xFFFFFFFF00000000 != 0 {
+            5
+        } else if adj & 0xFFFFFFFFFF000000 != 0 {
+            4
+        } else if adj & 0xFFFFFFFFFFFF0000 != 0 {
+            3
+        } else if adj & 0xFFFFFFFFFFFFFF00 != 0 {
+            2
+        } else {
+            1
+        };
         w.write_all(&[0xF7 + n])?;
         for i in (0..n).rev() {
             w.write_all(&[((adj >> (i * 8)) & 0xFF) as u8])?;
@@ -308,14 +341,23 @@ pub fn write_sorted_i64(w: &mut impl Write, val: i64) -> io::Result<()> {
         // val < -119
         let adj = val + 119;
         let uadj = adj as u64;
-        let n = if (uadj | 0x00FFFFFFFFFFFFFF) != 0xFFFFFFFFFFFFFFFF { 8u8 }
-            else if (uadj | 0x0000FFFFFFFFFFFF) != 0xFFFFFFFFFFFFFFFF { 7 }
-            else if (uadj | 0x000000FFFFFFFFFF) != 0xFFFFFFFFFFFFFFFF { 6 }
-            else if (uadj | 0x00000000FFFFFFFF) != 0xFFFFFFFFFFFFFFFF { 5 }
-            else if (uadj | 0x0000000000FFFFFF) != 0xFFFFFFFFFFFFFFFF { 4 }
-            else if (uadj | 0x000000000000FFFF) != 0xFFFFFFFFFFFFFFFF { 3 }
-            else if (uadj | 0x00000000000000FF) != 0xFFFFFFFFFFFFFFFF { 2 }
-            else { 1 };
+        let n = if (uadj | 0x00FFFFFFFFFFFFFF) != 0xFFFFFFFFFFFFFFFF {
+            8u8
+        } else if (uadj | 0x0000FFFFFFFFFFFF) != 0xFFFFFFFFFFFFFFFF {
+            7
+        } else if (uadj | 0x000000FFFFFFFFFF) != 0xFFFFFFFFFFFFFFFF {
+            6
+        } else if (uadj | 0x00000000FFFFFFFF) != 0xFFFFFFFFFFFFFFFF {
+            5
+        } else if (uadj | 0x0000000000FFFFFF) != 0xFFFFFFFFFFFFFFFF {
+            4
+        } else if (uadj | 0x000000000000FFFF) != 0xFFFFFFFFFFFFFFFF {
+            3
+        } else if (uadj | 0x00000000000000FF) != 0xFFFFFFFFFFFFFFFF {
+            2
+        } else {
+            1
+        };
         w.write_all(&[(0x08u8).wrapping_sub(n)])?;
         for i in (0..n).rev() {
             w.write_all(&[((uadj >> (i * 8)) & 0xFF) as u8])?;
@@ -514,11 +556,29 @@ mod tests {
     #[test]
     fn test_packed_i32_roundtrip() {
         let values = [
-            0, 1, -1, 119, -119, 120, -120, 127, -128, 256,
-            -256, 65535, -65536, i32::MAX, i32::MIN,
+            0,
+            1,
+            -1,
+            119,
+            -119,
+            120,
+            -120,
+            127,
+            -128,
+            256,
+            -256,
+            65535,
+            -65536,
+            i32::MAX,
+            i32::MIN,
         ];
         for &val in &values {
-            assert_eq!(decode_i32(&encode_i32(val)), val, "roundtrip failed for {}", val);
+            assert_eq!(
+                decode_i32(&encode_i32(val)),
+                val,
+                "roundtrip failed for {}",
+                val
+            );
         }
     }
 
@@ -595,7 +655,7 @@ mod tests {
     #[test]
     fn test_packed_i64_size_tier6() {
         let start = 4_294_967_414i64 + 1;
-        let end   = 119i64 + 0xFF_FFFF_FFFFi64; // 119 + 2^40-1 = max 5-byte magnitude
+        let end = 119i64 + 0xFF_FFFF_FFFFi64; // 119 + 2^40-1 = max 5-byte magnitude
         for val in [start, end, -start, -end] {
             let buf = encode_i64(val);
             assert_eq!(buf.len(), 6, "expected 6 bytes for {}", val);
@@ -614,10 +674,25 @@ mod tests {
 
     #[test]
     fn test_packed_i64_roundtrip() {
-        let values = [0i64, 1, -1, 119, -119, 120, i32::MAX as i64,
-                      i32::MIN as i64, i64::MAX, i64::MIN];
+        let values = [
+            0i64,
+            1,
+            -1,
+            119,
+            -119,
+            120,
+            i32::MAX as i64,
+            i32::MIN as i64,
+            i64::MAX,
+            i64::MIN,
+        ];
         for &val in &values {
-            assert_eq!(decode_i64(&encode_i64(val)), val, "roundtrip failed for {}", val);
+            assert_eq!(
+                decode_i64(&encode_i64(val)),
+                val,
+                "roundtrip failed for {}",
+                val
+            );
         }
     }
 
@@ -627,7 +702,8 @@ mod tests {
 
     #[test]
     fn test_sorted_i32_roundtrip() {
-        let values = [i32::MIN, -1000, -120, -119, -1, 0, 1, 120, 121, 1000, i32::MAX];
+        let values =
+            [i32::MIN, -1000, -120, -119, -1, 0, 1, 120, 121, 1000, i32::MAX];
         for &val in &values {
             let decoded = decode_si32(&encode_si32(val));
             assert_eq!(val, decoded, "roundtrip failed for {}", val);
@@ -636,13 +712,27 @@ mod tests {
 
     #[test]
     fn test_sorted_i32_ordering() {
-        let values: Vec<i32> = vec![i32::MIN, -1000, -120, -119, -1, 0, 1, 120, 121, 1000, i32::MAX];
-        let encoded: Vec<Vec<u8>> = values.iter().map(|&v| encode_si32(v)).collect();
+        let values: Vec<i32> = vec![
+            i32::MIN,
+            -1000,
+            -120,
+            -119,
+            -1,
+            0,
+            1,
+            120,
+            121,
+            1000,
+            i32::MAX,
+        ];
+        let encoded: Vec<Vec<u8>> =
+            values.iter().map(|&v| encode_si32(v)).collect();
         for i in 0..encoded.len() - 1 {
             assert!(
                 encoded[i] < encoded[i + 1],
                 "sort order violated: encoded({}) >= encoded({})",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -662,7 +752,19 @@ mod tests {
 
     #[test]
     fn test_sorted_i64_roundtrip() {
-        let values: Vec<i64> = vec![i64::MIN, -1000, -120, -119, -1, 0, 1, 120, 121, 1000, i64::MAX];
+        let values: Vec<i64> = vec![
+            i64::MIN,
+            -1000,
+            -120,
+            -119,
+            -1,
+            0,
+            1,
+            120,
+            121,
+            1000,
+            i64::MAX,
+        ];
         for &val in &values {
             let decoded = decode_si64(&encode_si64(val));
             assert_eq!(val, decoded, "roundtrip failed for {}", val);
@@ -671,13 +773,25 @@ mod tests {
 
     #[test]
     fn test_sorted_i64_ordering() {
-        let values: Vec<i64> = vec![i64::MIN, -1_000_000_000_000i64, -1000, -119, 0, 120, 1000, 1_000_000_000_000i64, i64::MAX];
-        let encoded: Vec<Vec<u8>> = values.iter().map(|&v| encode_si64(v)).collect();
+        let values: Vec<i64> = vec![
+            i64::MIN,
+            -1_000_000_000_000i64,
+            -1000,
+            -119,
+            0,
+            120,
+            1000,
+            1_000_000_000_000i64,
+            i64::MAX,
+        ];
+        let encoded: Vec<Vec<u8>> =
+            values.iter().map(|&v| encode_si64(v)).collect();
         for i in 0..encoded.len() - 1 {
             assert!(
                 encoded[i] < encoded[i + 1],
                 "sort order violated: encoded({}) >= encoded({})",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -700,16 +814,21 @@ mod tests {
     #[test]
     fn test_sorted_f32_ordering() {
         let values = [f32::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, f32::INFINITY];
-        let encoded: Vec<Vec<u8>> = values.iter().map(|&v| {
-            let mut buf = Vec::new();
-            write_sorted_f32(&mut buf, v).unwrap();
-            buf
-        }).collect();
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|&v| {
+                let mut buf = Vec::new();
+                write_sorted_f32(&mut buf, v).unwrap();
+                buf
+            })
+            .collect();
         for i in 0..encoded.len() - 1 {
             assert!(
                 encoded[i] <= encoded[i + 1],
                 "sort order violated at index {} ({} vs {})",
-                i, values[i], values[i + 1]
+                i,
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -753,7 +872,10 @@ mod tests {
         // Encoding 200 (a 2-byte packed value) in both formats should differ
         let packed = encode_i32(200);
         let sorted = encode_si32(200);
-        assert_ne!(packed, sorted, "packed and sorted should use different encodings");
+        assert_ne!(
+            packed, sorted,
+            "packed and sorted should use different encodings"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1110,7 +1232,8 @@ mod tests {
         values.sort();
         values.dedup();
 
-        let encoded: Vec<Vec<u8>> = values.iter().map(|&v| encode_si32(v)).collect();
+        let encoded: Vec<Vec<u8>> =
+            values.iter().map(|&v| encode_si32(v)).collect();
 
         for i in 0..encoded.len() - 1 {
             assert!(
@@ -1152,7 +1275,8 @@ mod tests {
         values.sort();
         values.dedup();
 
-        let encoded: Vec<Vec<u8>> = values.iter().map(|&v| encode_si64(v)).collect();
+        let encoded: Vec<Vec<u8>> =
+            values.iter().map(|&v| encode_si64(v)).collect();
 
         for i in 0..encoded.len() - 1 {
             assert!(
@@ -1172,8 +1296,23 @@ mod tests {
     #[test]
     fn test_packed_i32_array_roundtrip() {
         let values: Vec<i32> = vec![
-            0, 1, -1, 119, -119, 120, -120, 374, -374, 375, -375,
-            65_654, -65_654, 65_655, -65_655, i32::MAX, i32::MIN,
+            0,
+            1,
+            -1,
+            119,
+            -119,
+            120,
+            -120,
+            374,
+            -374,
+            375,
+            -375,
+            65_654,
+            -65_654,
+            65_655,
+            -65_655,
+            i32::MAX,
+            i32::MIN,
         ];
 
         // Encode all values into one buffer

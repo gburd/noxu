@@ -15,11 +15,11 @@ use std::time::Duration;
 /// A value of 0 means use MAX_MEMORY_PERCENT instead.
 pub static MAX_MEMORY: ConfigParam = ConfigParam::long_param(
     "noxu.maxMemory",
-    None,    // min
-    None,    // max
-    0,       // default: use percent
-    true,    // mutable
-    false,   // forReplication
+    None,  // min
+    None,  // max
+    0,     // default: use percent
+    true,  // mutable
+    false, // forReplication
 );
 
 /// Percentage of JVM memory to use for the cache (1-90).
@@ -108,12 +108,13 @@ pub static ENV_RECOVERY_FORCE_NEW_FILE: ConfigParam = ConfigParam::bool_param(
 );
 
 /// If true, halt the JVM on a commit that follows a checksum exception.
-pub static HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION: ConfigParam = ConfigParam::bool_param(
-    "noxu.haltOnCommitAfterChecksumException",
-    false, // default
-    false, // mutable
-    false, // forReplication
-);
+pub static HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION: ConfigParam =
+    ConfigParam::bool_param(
+        "noxu.haltOnCommitAfterChecksumException",
+        false, // default
+        false, // mutable
+        false, // forReplication
+    );
 
 /// If true, the environment is transactional.
 pub static ENV_IS_TRANSACTIONAL: ConfigParam = ConfigParam::bool_param(
@@ -806,11 +807,11 @@ pub static BIN_DELTA_BLIND_PUTS: ConfigParam = ConfigParam::bool_param(
 /// Minimum memory for B-tree nodes, in bytes.
 pub static TREE_MIN_MEMORY: ConfigParam = ConfigParam::long_param(
     "noxu.tree.minMemory",
-    Some(50 * 1024),  // min: 50 KB
-    None,             // max
-    500 * 1024,       // default: 500 KB
-    true,             // mutable
-    false,            // forReplication
+    Some(50 * 1024), // min: 50 KB
+    None,            // max
+    500 * 1024,      // default: 500 KB
+    true,            // mutable
+    false,           // forReplication
 );
 
 /// Maximum key length for compact (inline) key storage.
@@ -974,11 +975,11 @@ pub static EVICTOR_FORCED_YIELD: ConfigParam = ConfigParam::bool_param(
 /// Number of bytes to evict from the off-heap cache per pass.
 pub static OFFHEAP_EVICT_BYTES: ConfigParam = ConfigParam::long_param(
     "noxu.offHeap.evictBytes",
-    Some(1024),           // min
-    None,                 // max
-    50 * 1024 * 1024,     // default: 50 MB
-    false,                // mutable
-    false,                // forReplication
+    Some(1024),       // min
+    None,             // max
+    50 * 1024 * 1024, // default: 50 MB
+    false,            // mutable
+    false,            // forReplication
 );
 
 /// If true, store checksums in off-heap cache entries.
@@ -1242,14 +1243,15 @@ pub static CLEANER_TWO_PASS_THRESHOLD: ConfigParam = ConfigParam::int_param(
 );
 
 /// Maximum percentage of cache used for cleaner detail tracking.
-pub static CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE: ConfigParam = ConfigParam::int_param(
-    "noxu.cleaner.detailMaxMemoryPercentage",
-    Some(1),  // min
-    Some(90), // max
-    2,        // default
-    true,     // mutable
-    false,    // forReplication
-);
+pub static CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE: ConfigParam =
+    ConfigParam::int_param(
+        "noxu.cleaner.detailMaxMemoryPercentage",
+        Some(1),  // min
+        Some(90), // max
+        2,        // default
+        true,     // mutable
+        false,    // forReplication
+    );
 
 /// If true, discard potentially invalid cleaner detail info from old log formats.
 pub static CLEANER_RMW_FIX: ConfigParam = ConfigParam::bool_param(
@@ -1262,7 +1264,7 @@ pub static CLEANER_RMW_FIX: ConfigParam = ConfigParam::bool_param(
 /// Comma-separated list of log files to force-clean (by file number range).
 pub static CLEANER_FORCE_CLEAN_FILES: ConfigParam = ConfigParam::string_param(
     "noxu.cleaner.forceCleanFiles",
-    "", // default: empty (no forced files)
+    "",    // default: empty (no forced files)
     true,  // mutable
     false, // forReplication
 );
@@ -1298,12 +1300,13 @@ pub static CLEANER_LOOK_AHEAD_CACHE_SIZE: ConfigParam = ConfigParam::int_param(
 );
 
 /// Deprecated. Retained to avoid errors in old noxu.properties files.
-pub static CLEANER_BACKGROUND_PROACTIVE_MIGRATION: ConfigParam = ConfigParam::bool_param(
-    "noxu.cleaner.backgroundProactiveMigration",
-    false, // default
-    true,  // mutable
-    false, // forReplication
-);
+pub static CLEANER_BACKGROUND_PROACTIVE_MIGRATION: ConfigParam =
+    ConfigParam::bool_param(
+        "noxu.cleaner.backgroundProactiveMigration",
+        false, // default
+        true,  // mutable
+        false, // forReplication
+    );
 
 // =========================================================================
 // Lock/Transaction parameters
@@ -1395,7 +1398,7 @@ pub static TXN_DUMP_LOCKS: ConfigParam = ConfigParam::bool_param(
 /// Default durability policy (as a string). Null means use sync defaults.
 pub static TXN_DURABILITY: ConfigParam = ConfigParam::string_param(
     "noxu.txn.durability",
-    "", // default: empty (use sync defaults)
+    "",    // default: empty (use sync defaults)
     true,  // mutable
     false, // forReplication
 );
@@ -1426,11 +1429,11 @@ pub static STATS_COLLECT: ConfigParam = ConfigParam::bool_param(
 /// Number of rows per stats file before rotating to a new file.
 pub static STATS_FILE_ROW_COUNT: ConfigParam = ConfigParam::int_param(
     "noxu.stats.file.row.count",
-    Some(2),  // min
-    None,     // max
-    1440,     // default
-    true,     // mutable
-    false,    // forReplication
+    Some(2), // min
+    None,    // max
+    1440,    // default
+    true,    // mutable
+    false,   // forReplication
 );
 
 /// Maximum number of stats files to retain.
@@ -1457,7 +1460,7 @@ pub static STATS_COLLECT_INTERVAL: ConfigParam = ConfigParam {
 /// Directory for stats files (empty string = environment home directory).
 pub static STATS_FILE_DIRECTORY: ConfigParam = ConfigParam::string_param(
     "noxu.stats.file.directory",
-    "", // default: empty (use env home dir)
+    "",    // default: empty (use env home dir)
     false, // mutable
     false, // forReplication
 );
@@ -1505,12 +1508,13 @@ pub static CLEANER_ADJUST_UTILIZATION: ConfigParam = ConfigParam::bool_param(
 );
 
 /// @deprecated. Retained to avoid errors in old noxu.properties files.
-pub static CLEANER_FOREGROUND_PROACTIVE_MIGRATION: ConfigParam = ConfigParam::bool_param(
-    "noxu.cleaner.foregroundProactiveMigration",
-    false, // default
-    true,  // mutable
-    false, // forReplication
-);
+pub static CLEANER_FOREGROUND_PROACTIVE_MIGRATION: ConfigParam =
+    ConfigParam::bool_param(
+        "noxu.cleaner.foregroundProactiveMigration",
+        false, // default
+        true,  // mutable
+        false, // forReplication
+    );
 
 /// @deprecated. Retained to avoid errors in old noxu.properties files.
 pub static CLEANER_LAZY_MIGRATION: ConfigParam = ConfigParam::bool_param(
@@ -1568,11 +1572,11 @@ pub static LOG_DIRECT_NIO: ConfigParam = ConfigParam::bool_param(
 /// @deprecated. NIO chunked write size in bytes. 0 = no chunking.
 pub static LOG_CHUNKED_NIO: ConfigParam = ConfigParam::long_param(
     "noxu.log.chunkedNIO",
-    Some(0),        // min
-    Some(1 << 26),  // max: 64 MB
-    0,              // default: no chunking
-    false,          // mutable
-    false,          // forReplication
+    Some(0),       // min
+    Some(1 << 26), // max: 64 MB
+    0,             // default: no chunking
+    false,         // mutable
+    false,         // forReplication
 );
 
 // =========================================================================
@@ -1618,12 +1622,13 @@ pub static LOG_CHECKSUM_FATAL: ConfigParam = ConfigParam::bool_param(
 );
 
 /// If true, secondary index integrity errors are treated as fatal.
-pub static TREE_SECONDARY_INTEGRITY_FATAL: ConfigParam = ConfigParam::bool_param(
-    "noxu.tree.secondaryIntegrityFatal",
-    true,  // default
-    false, // mutable
-    false, // forReplication
-);
+pub static TREE_SECONDARY_INTEGRITY_FATAL: ConfigParam =
+    ConfigParam::bool_param(
+        "noxu.tree.secondaryIntegrityFatal",
+        true,  // default
+        false, // mutable
+        false, // forReplication
+    );
 
 /// Returns all defined configuration parameters.
 pub fn all_params() -> Vec<&'static ConfigParam> {
@@ -1956,10 +1961,7 @@ mod tests {
             ParamValue::Duration(Duration::ZERO)
         );
         assert_eq!(CHECKPOINTER_DEADLOCK_RETRY.default, ParamValue::Int(3));
-        assert_eq!(
-            CHECKPOINTER_HIGH_PRIORITY.default,
-            ParamValue::Bool(false)
-        );
+        assert_eq!(CHECKPOINTER_HIGH_PRIORITY.default, ParamValue::Bool(false));
 
         // Cleaner
         assert_eq!(CLEANER_MIN_UTILIZATION.default, ParamValue::Int(50));
@@ -1972,10 +1974,7 @@ mod tests {
         );
         assert_eq!(CLEANER_REMOVE.default, ParamValue::Bool(true));
         assert_eq!(CLEANER_TRACK_DETAIL.default, ParamValue::Bool(true));
-        assert_eq!(
-            CLEANER_GRADUAL_EXPIRATION.default,
-            ParamValue::Bool(true)
-        );
+        assert_eq!(CLEANER_GRADUAL_EXPIRATION.default, ParamValue::Bool(true));
         assert_eq!(
             CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE.default,
             ParamValue::Int(2)
@@ -1987,19 +1986,10 @@ mod tests {
             LOCK_TIMEOUT.default,
             ParamValue::Duration(Duration::from_millis(500))
         );
-        assert_eq!(
-            TXN_TIMEOUT.default,
-            ParamValue::Duration(Duration::ZERO)
-        );
-        assert_eq!(
-            TXN_SERIALIZABLE_ISOLATION.default,
-            ParamValue::Bool(false)
-        );
+        assert_eq!(TXN_TIMEOUT.default, ParamValue::Duration(Duration::ZERO));
+        assert_eq!(TXN_SERIALIZABLE_ISOLATION.default, ParamValue::Bool(false));
         assert_eq!(LOCK_DEADLOCK_DETECT.default, ParamValue::Bool(true));
-        assert_eq!(
-            LOCK_OLD_LOCK_EXCEPTIONS.default,
-            ParamValue::Bool(false)
-        );
+        assert_eq!(LOCK_OLD_LOCK_EXCEPTIONS.default, ParamValue::Bool(false));
 
         // Env daemon flags
         assert_eq!(ENV_RUN_EVICTOR.default, ParamValue::Bool(true));
@@ -2113,14 +2103,8 @@ mod tests {
         assert_eq!(CLEANER_MIN_UTILIZATION.max, Some(ParamValue::Int(90)));
 
         // CLEANER_MIN_FILE_UTILIZATION: min=0, max=50
-        assert_eq!(
-            CLEANER_MIN_FILE_UTILIZATION.min,
-            Some(ParamValue::Int(0))
-        );
-        assert_eq!(
-            CLEANER_MIN_FILE_UTILIZATION.max,
-            Some(ParamValue::Int(50))
-        );
+        assert_eq!(CLEANER_MIN_FILE_UTILIZATION.min, Some(ParamValue::Int(0)));
+        assert_eq!(CLEANER_MIN_FILE_UTILIZATION.max, Some(ParamValue::Int(50)));
 
         // EVICTOR_N_LRU_LISTS: min=1, max=32
         assert_eq!(EVICTOR_N_LRU_LISTS.min, Some(ParamValue::Int(1)));

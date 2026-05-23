@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// Centralizes all memory calculations. Objects that need memory
 /// should get settings from this class.
 ///
-/// 
+///
 pub struct MemoryBudget {
     /// Maximum cache size in bytes.
     max_memory: i64,

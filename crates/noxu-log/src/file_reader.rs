@@ -126,8 +126,7 @@ impl LogEntryHeader {
             });
         }
 
-        let checksum =
-            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let checksum = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let entry_type = buf[4];
         let flags = buf[5];
         let prev_offset =
@@ -372,7 +371,6 @@ impl<F: LogFileAccess> FileReader<F> {
             // cannot occur for real log data, so 0 indicates unwritten space
             // or synthetic test entries.
             if self.validate_checksum && header.checksum != 0 {
-
                 let header_size = header.header_size;
                 let total_size = header_size + item_size;
 
@@ -431,7 +429,6 @@ impl<F: LogFileAccess> FileReader<F> {
                         ),
                     });
                 }
-
             }
 
             // Process the entry
@@ -809,8 +806,9 @@ mod tests {
     fn test_file_reader_creation_with_null_lsn() {
         // NULL_LSN with no files: eof is set but construction succeeds
         let mock = MockFileAccess::new();
-        let result =
-            FileReader::new(mock, true, NULL_LSN, NULL_LSN, NULL_LSN, 512, false);
+        let result = FileReader::new(
+            mock, true, NULL_LSN, NULL_LSN, NULL_LSN, 512, false,
+        );
         assert!(result.is_ok());
     }
 
@@ -963,16 +961,9 @@ mod tests {
         mock.add_file(0, data);
         let start_lsn = Lsn::new(0, 0);
         // Finish after 1 entry
-        let finish_lsn =
-            Lsn::new(0, LogEntryHeader::MIN_HEADER_SIZE as u32);
+        let finish_lsn = Lsn::new(0, LogEntryHeader::MIN_HEADER_SIZE as u32);
         let mut reader = FileReader::new(
-            mock,
-            true,
-            start_lsn,
-            NULL_LSN,
-            finish_lsn,
-            64,
-            false,
+            mock, true, start_lsn, NULL_LSN, finish_lsn, 64, false,
         )
         .unwrap();
 
@@ -1186,12 +1177,7 @@ mod tests {
 
         let start_lsn = Lsn::new(0, 0);
         let mut reader = FileReader::new(
-            mock,
-            true,
-            start_lsn,
-            NULL_LSN,
-            NULL_LSN,
-            256,
+            mock, true, start_lsn, NULL_LSN, NULL_LSN, 256,
             true, // validate_checksum = true
         )
         .unwrap();
@@ -1221,12 +1207,7 @@ mod tests {
 
         let start_lsn = Lsn::new(0, 0);
         let mut reader = FileReader::new(
-            mock,
-            true,
-            start_lsn,
-            NULL_LSN,
-            NULL_LSN,
-            256,
+            mock, true, start_lsn, NULL_LSN, NULL_LSN, 256,
             true, // validate_checksum = true
         )
         .unwrap();
@@ -1254,12 +1235,7 @@ mod tests {
 
         let start_lsn = Lsn::new(0, 0);
         let mut reader = FileReader::new(
-            mock,
-            true,
-            start_lsn,
-            NULL_LSN,
-            NULL_LSN,
-            256,
+            mock, true, start_lsn, NULL_LSN, NULL_LSN, 256,
             false, // validate_checksum = false
         )
         .unwrap();

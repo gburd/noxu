@@ -7,8 +7,8 @@
 //! whether intra or inter-txnal, while an abort always returns an LN to its
 //! pre-txn version.
 
-use noxu_util::{Lsn, NULL_LSN};
 use hashbrown::HashMap;
+use noxu_util::{Lsn, NULL_LSN};
 
 /// Represents a rollback period  -  a range of LSNs that were rolled back.
 ///
@@ -60,7 +60,7 @@ impl RollbackPeriod {
 
 /// Tracks rollback periods detected during recovery.
 ///
-/// 
+///
 ///
 /// Rollback periods affect how LNs are processed during recovery.
 /// A rollback returns an LN to its previous version (which differs from
@@ -193,7 +193,7 @@ impl RollbackTracker {
     /// Called by `RecoveryManager::run_analysis()` when it encounters a
     /// `RollbackStart` log entry.
     ///
-    /// 
+    ///
     pub fn record_rollback_start(
         &mut self,
         lsn: Lsn,
@@ -208,7 +208,7 @@ impl RollbackTracker {
     /// Called by `RecoveryManager::run_analysis()` when it encounters a
     /// `RollbackEnd` log entry.
     ///
-    /// 
+    ///
     pub fn record_rollback_end(
         &mut self,
         lsn: Lsn,
@@ -226,7 +226,8 @@ impl RollbackTracker {
             self.register_rollback_end(mp, lsn);
         } else {
             // No matching start found yet; store as pending using start_lsn as key.
-            let period = RollbackPeriod::new(NULL_LSN, entry.rollback_start_lsn, lsn);
+            let period =
+                RollbackPeriod::new(NULL_LSN, entry.rollback_start_lsn, lsn);
             self.pending_rollback_starts
                 .insert(entry.rollback_start_lsn.as_u64(), period);
         }
@@ -234,9 +235,10 @@ impl RollbackTracker {
 
     /// Returns true if any rollback periods were found during analysis.
     ///
-    /// 
+    ///
     pub fn is_active(&self) -> bool {
-        !self.rollback_periods.is_empty() || !self.pending_rollback_starts.is_empty()
+        !self.rollback_periods.is_empty()
+            || !self.pending_rollback_starts.is_empty()
     }
 
     /// Get all completed rollback periods.
@@ -250,7 +252,7 @@ impl RollbackTracker {
     /// rollback periods, or `None` if there are none.
     ///
     /// Used during recovery to know how far back in the log to replay.
-    /// 
+    ///
     pub fn earliest_rollback_start(&self) -> Option<Lsn> {
         self.rollback_periods
             .iter()
@@ -657,8 +659,8 @@ mod tests {
 
         let mut tracker = RollbackTracker::new();
         let start_entry = RollbackStartEntry::new(
-            make_lsn(1, 50),   // active_txn_start
-            make_lsn(1, 100),  // matchpoint_lsn
+            make_lsn(1, 50),  // active_txn_start
+            make_lsn(1, 100), // matchpoint_lsn
         );
         let start_lsn = make_lsn(1, 400);
         tracker.record_rollback_start(start_lsn, &start_entry);

@@ -7,7 +7,7 @@
 /// the operation that was performed. Note that not all operations return
 /// an OperationResult - some return None on success.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationResult {
     /// Whether the operation modified the database.

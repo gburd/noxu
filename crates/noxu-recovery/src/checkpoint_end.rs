@@ -14,7 +14,7 @@ use std::time::SystemTime;
 /// critical tree nodes and transaction state, as well as the last allocated IDs
 /// for various database objects.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct CheckpointEnd {
     /// Checkpoint ID - matches the corresponding CheckpointStart.

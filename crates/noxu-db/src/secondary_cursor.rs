@@ -20,7 +20,7 @@ use crate::secondary_database::SecondaryDatabase;
 
 /// A cursor that iterates a secondary index database.
 ///
-/// 
+///
 ///
 /// Each iteration step returns three values:
 /// * `key`   — the secondary key (the index key).
@@ -55,10 +55,7 @@ impl<'a> SecondaryCursor<'a> {
             .inner_db()
             .open_cursor(None, None)
             .expect("Failed to open inner secondary cursor");
-        Self {
-            inner,
-            secondary_db,
-        }
+        Self { inner, secondary_db }
     }
 
     // ------------------------------------------------------------------
@@ -82,7 +79,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Deletes the primary record at the current cursor position.
     ///
-    /// 
+    ///
     ///
     /// Reads the primary key from the current secondary record, then calls
     /// `Database::delete` on the primary database.  The secondary index
@@ -92,7 +89,12 @@ impl<'a> SecondaryCursor<'a> {
         // Read the current secondary record to obtain the primary key.
         let mut sec_key = DatabaseEntry::new();
         let mut p_key_entry = DatabaseEntry::new();
-        let status = self.inner.get(&mut sec_key, &mut p_key_entry, Get::Current, None)?;
+        let status = self.inner.get(
+            &mut sec_key,
+            &mut p_key_entry,
+            Get::Current,
+            None,
+        )?;
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
         }
@@ -121,7 +123,12 @@ impl<'a> SecondaryCursor<'a> {
         let del_status = primary.delete(None, &pri_key)?;
 
         // Reset the inner cursor state (current position is now deleted).
-        let _ = self.inner.get(&mut DatabaseEntry::new(), &mut DatabaseEntry::new(), Get::Current, None);
+        let _ = self.inner.get(
+            &mut DatabaseEntry::new(),
+            &mut DatabaseEntry::new(),
+            Get::Current,
+            None,
+        );
 
         Ok(del_status)
     }
@@ -133,7 +140,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Returns the current key/primary-key/primary-data triple.
     ///
-    /// 
+    ///
     pub fn get_current(
         &mut self,
         key: &mut DatabaseEntry,
@@ -145,7 +152,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the first record and returns the triple.
     ///
-    /// 
+    ///
     pub fn get_first(
         &mut self,
         key: &mut DatabaseEntry,
@@ -157,7 +164,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the last record and returns the triple.
     ///
-    /// 
+    ///
     pub fn get_last(
         &mut self,
         key: &mut DatabaseEntry,
@@ -169,7 +176,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the next record and returns the triple.
     ///
-    /// 
+    ///
     pub fn get_next(
         &mut self,
         key: &mut DatabaseEntry,
@@ -181,7 +188,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Moves to the previous record and returns the triple.
     ///
-    /// 
+    ///
     pub fn get_prev(
         &mut self,
         key: &mut DatabaseEntry,
@@ -193,7 +200,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Searches for the given secondary key (exact match).
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `search_key` - The secondary key to search for (input).
@@ -209,7 +216,12 @@ impl<'a> SecondaryCursor<'a> {
         let mut stored_pk = DatabaseEntry::new();
         // For Search, key is input-only; clone to satisfy &mut parameter.
         let mut search_key_mut = search_key.clone();
-        let status = self.inner.get(&mut search_key_mut, &mut stored_pk, Get::Search, None)?;
+        let status = self.inner.get(
+            &mut search_key_mut,
+            &mut stored_pk,
+            Get::Search,
+            None,
+        )?;
 
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
@@ -235,7 +247,7 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Searches for the first secondary key >= `search_key`.
     ///
-    /// 
+    ///
     pub fn get_search_key_range(
         &mut self,
         search_key: &mut DatabaseEntry,
@@ -243,7 +255,8 @@ impl<'a> SecondaryCursor<'a> {
         data: &mut DatabaseEntry,
     ) -> Result<OperationStatus> {
         let mut stored_pk = DatabaseEntry::new();
-        let status = self.inner.get(search_key, &mut stored_pk, Get::SearchGte, None)?;
+        let status =
+            self.inner.get(search_key, &mut stored_pk, Get::SearchGte, None)?;
 
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
@@ -287,13 +300,20 @@ impl<'a> SecondaryCursor<'a> {
     /// Returns the primary key at the current cursor position *without*
     /// fetching primary data.  Returns `None` if the cursor is not
     /// positioned on a record.
-    pub(crate) fn get_current_primary_key_only(&mut self) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get_current_primary_key_only(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>> {
         let mut sec_key = DatabaseEntry::new();
         let mut pri_key_entry = DatabaseEntry::new();
         // A "not positioned" or "not found" condition returns Ok(None) so the
         // caller (JoinCursor) can treat it as an empty candidate set rather than
         // propagating a spurious error.
-        let status = match self.inner.get(&mut sec_key, &mut pri_key_entry, Get::Current, None) {
+        let status = match self.inner.get(
+            &mut sec_key,
+            &mut pri_key_entry,
+            Get::Current,
+            None,
+        ) {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
@@ -305,10 +325,17 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Returns the secondary key bytes at the current cursor position.
     /// Returns `None` if the cursor is not positioned on a record.
-    pub(crate) fn get_current_sec_key_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get_current_sec_key_bytes(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>> {
         let mut sec_key = DatabaseEntry::new();
         let mut pri_key_entry = DatabaseEntry::new();
-        let status = match self.inner.get(&mut sec_key, &mut pri_key_entry, Get::Current, None) {
+        let status = match self.inner.get(
+            &mut sec_key,
+            &mut pri_key_entry,
+            Get::Current,
+            None,
+        ) {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
@@ -339,7 +366,12 @@ impl<'a> SecondaryCursor<'a> {
         };
         let mut sec_key = DatabaseEntry::new();
         let mut pri_key_entry = DatabaseEntry::new();
-        let status = self.inner.get(&mut sec_key, &mut pri_key_entry, Get::Next, None)?;
+        let status = self.inner.get(
+            &mut sec_key,
+            &mut pri_key_entry,
+            Get::Next,
+            None,
+        )?;
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
         }
@@ -355,7 +387,10 @@ impl<'a> SecondaryCursor<'a> {
     /// Returns `true` if the primary key at the current cursor position
     /// matches `candidate`.  Used by `JoinCursor` to probe secondary
     /// cursors without touching the primary database.
-    pub(crate) fn has_candidate_primary_key(&mut self, candidate: &[u8]) -> Result<bool> {
+    pub(crate) fn has_candidate_primary_key(
+        &mut self,
+        candidate: &[u8],
+    ) -> Result<bool> {
         match self.get_current_primary_key_only()? {
             Some(pk) => Ok(pk == candidate),
             None => Ok(false),
@@ -385,7 +420,8 @@ impl<'a> SecondaryCursor<'a> {
         // The inner cursor returns (sec_key, pri_key) where the "data" side
         // is actually the primary key.
         let mut pri_key_bytes_entry = DatabaseEntry::new();
-        let status = self.inner.get(key, &mut pri_key_bytes_entry, mode, None)?;
+        let status =
+            self.inner.get(key, &mut pri_key_bytes_entry, mode, None)?;
 
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
@@ -396,7 +432,8 @@ impl<'a> SecondaryCursor<'a> {
         // `key` is always an output DatabaseEntry for all cursor ops.
 
         // Step 2: the "data" from the inner cursor IS the primary key.
-        let pri_key_bytes = pri_key_bytes_entry.get_data().unwrap_or(&[]).to_vec();
+        let pri_key_bytes =
+            pri_key_bytes_entry.get_data().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
         // Step 3: look up the primary record.
@@ -450,16 +487,17 @@ mod tests {
             result: &mut DatabaseEntry,
         ) -> bool {
             if let Some(d) = data.get_data()
-                && !d.is_empty() {
-                    result.set_data(&d[..1]);
-                    return true;
-                }
+                && !d.is_empty()
+            {
+                result.set_data(&d[..1]);
+                return true;
+            }
             false
         }
     }
 
-    fn temp_env_primary_secondary(
-    ) -> (TempDir, Environment, Arc<Mutex<Database>>, SecondaryDatabase) {
+    fn temp_env_primary_secondary()
+    -> (TempDir, Environment, Arc<Mutex<Database>>, SecondaryDatabase) {
         let temp_dir = TempDir::new().unwrap();
         let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
             .with_allow_create(true)
@@ -467,16 +505,19 @@ mod tests {
         let env = Environment::open(env_config).unwrap();
 
         let db_config = DatabaseConfig::new().with_allow_create(true);
-        let primary_db = env.open_database(None, "primary", &db_config).unwrap();
+        let primary_db =
+            env.open_database(None, "primary", &db_config).unwrap();
         let primary = Arc::new(Mutex::new(primary_db));
 
         let sec_db_config = DatabaseConfig::new().with_allow_create(true);
-        let sec_db = env.open_database(None, "secondary", &sec_db_config).unwrap();
+        let sec_db =
+            env.open_database(None, "secondary", &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()
             .with_allow_create(true)
             .with_key_creator(Box::new(FirstByteKeyCreator));
         let secondary =
-            SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config).unwrap();
+            SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+                .unwrap();
 
         (temp_dir, env, primary, secondary)
     }
@@ -505,11 +546,13 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Apple");
 
-        let status = cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Cherry");
     }
@@ -527,10 +570,12 @@ mod tests {
         let mut data = DatabaseEntry::new();
 
         let mut results: Vec<Vec<u8>> = Vec::new();
-        let mut status = cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let mut status =
+            cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         while status == OperationStatus::Success {
             results.push(data.get_data().unwrap().to_vec());
-            status = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
+            status =
+                cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         }
 
         assert_eq!(results.len(), 3);
@@ -550,7 +595,8 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Mango");
         assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -566,7 +612,8 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -579,7 +626,8 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -614,22 +662,26 @@ mod tests {
         let mut data = DatabaseEntry::new();
 
         // Position at last
-        let status = cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Cherry");
 
         // Step back to prev
-        let status = cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Banana");
 
         // Step back again
-        let status = cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Apple");
 
         // No more prev
-        let status = cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -644,7 +696,8 @@ mod tests {
         let mut data = DatabaseEntry::new();
 
         // First positions the cursor
-        let status = cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Mango");
 
@@ -652,7 +705,8 @@ mod tests {
         let mut sec_key2 = DatabaseEntry::new();
         let mut p_key2 = DatabaseEntry::new();
         let mut data2 = DatabaseEntry::new();
-        let status2 = cursor.get_current(&mut sec_key2, &mut p_key2, &mut data2).unwrap();
+        let status2 =
+            cursor.get_current(&mut sec_key2, &mut p_key2, &mut data2).unwrap();
         assert_eq!(status2, OperationStatus::Success);
         assert_eq!(data2.get_data().unwrap(), b"Mango");
         assert_eq!(p_key2.get_data(), p_key.get_data());
@@ -762,7 +816,8 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(p_key.get_data().unwrap(), b"mypk");
         assert_eq!(data.get_data().unwrap(), b"Kiwi");
@@ -790,7 +845,8 @@ mod tests {
         // Move to first (the only record)
         cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         // Next should be NotFound
-        let status = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 }

@@ -10,7 +10,7 @@ use crate::error::Result;
 ///
 /// This binding stores and retrieves byte arrays without any transformation.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ByteArrayBinding;
 

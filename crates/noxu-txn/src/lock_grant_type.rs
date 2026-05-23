@@ -6,7 +6,7 @@
 /// Indicates whether a lock was granted immediately, must wait, was promoted,
 /// or denied for non-blocking requests.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockGrantType {
     /// New lock granted immediately.

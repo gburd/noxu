@@ -20,7 +20,9 @@
 //! | `--threads` | `8`                        |
 //! | `--dir`     | temp dir under `/scratch`  |
 
-use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -121,14 +123,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     // Create working directory
     // ------------------------------------------------------------------
-    let (db_path, _cleanup_on_exit): (PathBuf, bool) = if let Some(ref p) = args.dir {
-        std::fs::create_dir_all(p)?;
-        (p.clone(), false)
-    } else {
-        let p = PathBuf::from(format!("/scratch/noxu_scale_{}", std::process::id()));
-        std::fs::create_dir_all(&p)?;
-        (p, true)
-    };
+    let (db_path, _cleanup_on_exit): (PathBuf, bool) =
+        if let Some(ref p) = args.dir {
+            std::fs::create_dir_all(p)?;
+            (p.clone(), false)
+        } else {
+            let p = PathBuf::from(format!(
+                "/scratch/noxu_scale_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&p)?;
+            (p, true)
+        };
 
     println!(
         "scale_validation: records={}, threads={}, dir={}",
@@ -140,16 +146,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     // Phase 1: parallel insert
     // ------------------------------------------------------------------
-    let env = Arc::new(
-        noxu_db::Environment::open(
-            EnvironmentConfig::new(db_path.clone())
-                .with_allow_create(true)
-                .with_transactional(true),
-        )?,
-    );
-    let db = Arc::new(
-        env.open_database(None, "scale", &DatabaseConfig::new().with_allow_create(true))?,
-    );
+    let env = Arc::new(noxu_db::Environment::open(
+        EnvironmentConfig::new(db_path.clone())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )?);
+    let db = Arc::new(env.open_database(
+        None,
+        "scale",
+        &DatabaseConfig::new().with_allow_create(true),
+    )?);
 
     let records_per_thread = args.records.div_ceil(args.threads as u64);
     let total_inserted = Arc::new(AtomicU64::new(0));
@@ -192,7 +198,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             barrier.wait();
             let batch_size: u64 = 1_000;
             let start_key = tid as u64 * records_per_thread;
-            let end_key = ((tid as u64 + 1) * records_per_thread).min(threads * records_per_thread);
+            let end_key = ((tid as u64 + 1) * records_per_thread)
+                .min(threads * records_per_thread);
             let mut key_idx = start_key;
             while key_idx < end_key {
                 let batch_end = (key_idx + batch_size).min(end_key);
@@ -235,7 +242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir_size_after_insert = dir_size_bytes(&db_path);
     drop(db);
     drop(env);
-    println!("  Log dir size after insert: {}", human_bytes(dir_size_after_insert));
+    println!(
+        "  Log dir size after insert: {}",
+        human_bytes(dir_size_after_insert)
+    );
 
     // ------------------------------------------------------------------
     // Phase 3: reopen (WAL recovery)
@@ -247,7 +257,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_allow_create(false)
             .with_transactional(true),
     )?;
-    let db2 = env2.open_database(None, "scale", &DatabaseConfig::new().with_allow_create(false))?;
+    let db2 = env2.open_database(
+        None,
+        "scale",
+        &DatabaseConfig::new().with_allow_create(false),
+    )?;
     println!("  Recovery completed in {:?}", t_recovery.elapsed());
 
     // ------------------------------------------------------------------
@@ -268,8 +282,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if s != OperationStatus::Success {
             break;
         }
-        let cur_key = String::from_utf8_lossy(k.get_data().unwrap_or_default()).into_owned();
-        if let Some(ref p) = prev_key && cur_key < *p {
+        let cur_key = String::from_utf8_lossy(k.get_data().unwrap_or_default())
+            .into_owned();
+        if let Some(ref p) = prev_key
+            && cur_key < *p
+        {
             order_errors += 1;
         }
         prev_key = Some(cur_key);

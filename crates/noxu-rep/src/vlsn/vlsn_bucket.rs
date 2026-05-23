@@ -16,7 +16,7 @@
 /// first_vlsn=9, the bucket stores offsets for VLSNs 9, 13, 17, ... The last
 /// VLSN mapping is always stored regardless of stride alignment.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct VlsnBucket {
     /// First VLSN covered by this bucket. 0 means uninitialized.
@@ -95,7 +95,7 @@ impl VlsnBucket {
     /// If the VLSN is on a stride boundary, it is stored in the offsets
     /// array. The last VLSN/LSN pair is always tracked regardless of stride.
     ///
-    /// 
+    ///
     pub fn put(
         &mut self,
         vlsn: u64,
@@ -184,7 +184,7 @@ impl VlsnBucket {
     /// Check if this bucket owns the given VLSN (i.e., the VLSN falls
     /// within [first_vlsn, last_vlsn]).
     ///
-    /// 
+    ///
     pub fn owns(&self, vlsn: u64) -> bool {
         if vlsn == 0 || self.first_vlsn == 0 {
             return false;
@@ -453,7 +453,11 @@ mod tests {
     ///
     /// LTE(v) = the LSN for the largest stride entry whose vlsn <= v,
     ///          or the last_vlsn entry if v == last_vlsn.
-    fn check_access(bucket: &VlsnBucket, stride: u64, vals: &[(u64, u32, u32)]) {
+    fn check_access(
+        bucket: &VlsnBucket,
+        stride: u64,
+        vals: &[(u64, u32, u32)],
+    ) {
         // --- exact stride-boundary hits ---
         for i in (0..vals.len()).step_by(stride as usize) {
             let (vlsn, file, off) = vals[i];
@@ -529,7 +533,7 @@ mod tests {
         assert_eq!(bucket.get_lsn(3), Some((0, 30)));
         assert_eq!(bucket.get_lsn(4), Some((0, 30))); // stride hole → fall back to 3
         assert_eq!(bucket.get_lsn(5), Some((0, 30))); // not owned if last=6 tracks 6 only;
-                                                        // 5 is between stride 5 (empty) and last 6
+        // 5 is between stride 5 (empty) and last 6
         assert_eq!(bucket.get_lsn(6), Some((0, 60)));
     }
 

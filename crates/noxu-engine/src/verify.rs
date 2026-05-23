@@ -3,12 +3,12 @@
 //! Related verification functionality.
 
 use noxu_dbi::DatabaseImpl;
-use noxu_tree::tree::{BinStub, InNodeStub, TreeNode};
+use noxu_tree::NodeRwLock as RwLock;
 use noxu_tree::Tree;
+use noxu_tree::tree::{BinStub, InNodeStub, TreeNode};
 use noxu_util::NULL_LSN;
 use std::fmt;
 use std::sync::Arc;
-use noxu_tree::NodeRwLock as RwLock;
 
 /// Result of an environment verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,7 +266,7 @@ impl Default for VerifyConfig {
 /// Returns a `VerifyResult` with any anomalies found and the count of records
 /// verified.
 ///
-/// 
+///
 pub fn verify_tree(
     tree: &Tree,
     db_name: &str,
@@ -307,10 +307,14 @@ fn verify_node(
 
     match &*guard {
         TreeNode::Internal(in_node) => {
-            verify_internal_node(in_node, parent_key, db_name, config, result, records);
+            verify_internal_node(
+                in_node, parent_key, db_name, config, result, records,
+            );
         }
         TreeNode::Bottom(bin_stub) => {
-            verify_bin_stub(bin_stub, parent_key, db_name, config, result, records);
+            verify_bin_stub(
+                bin_stub, parent_key, db_name, config, result, records,
+            );
         }
     }
 }
@@ -355,11 +359,8 @@ fn verify_internal_node(
         // The key carried in slot 0 of an IN is the virtual -infinity key;
         // entries at i > 0 carry the first key of that child's subtree.
         // IN slot-0 special case.
-        let expected_parent_key: Option<&[u8]> = if i == 0 {
-            None
-        } else {
-            Some(entry.key.as_slice())
-        };
+        let expected_parent_key: Option<&[u8]> =
+            if i == 0 { None } else { Some(entry.key.as_slice()) };
 
         verify_node(
             child_arc,
@@ -391,19 +392,21 @@ fn verify_bin_stub(
 ) {
     // Check that the BIN's first key is >= the routing key from the parent.
     if let Some(pk) = parent_key
-        && !bin.entries.is_empty() {
-            let first_full = bin.get_full_key(0);
-            if let Some(ref first_key) = first_full
-                && first_key.as_slice() < pk {
-                    result.add_error(VerifyError::BtreeError {
+        && !bin.entries.is_empty()
+    {
+        let first_full = bin.get_full_key(0);
+        if let Some(ref first_key) = first_full
+            && first_key.as_slice() < pk
+        {
+            result.add_error(VerifyError::BtreeError {
                         db_name: db_name.to_string(),
                         description: format!(
                             "BIN (id={}) first key {:?} is less than parent routing key {:?}",
                             bin.node_id, first_key, pk
                         ),
                     });
-                }
         }
+    }
 
     // Check each slot.
     for (i, entry) in bin.entries.iter().enumerate() {
@@ -438,7 +441,7 @@ fn verify_bin_stub(
 /// live tree reference and therefore validates only configuration-level
 /// invariants; call `verify_tree()` directly to walk a B-tree.
 ///
-/// 
+///
 ///
 /// # Arguments
 ///
@@ -512,7 +515,10 @@ pub fn verify_database(db_name: &str, config: &VerifyConfig) -> VerifyResult {
 /// # Returns
 ///
 /// A `VerifyResult` with structural errors and the count of records verified.
-pub fn verify_database_impl(db_impl: &DatabaseImpl, config: &VerifyConfig) -> VerifyResult {
+pub fn verify_database_impl(
+    db_impl: &DatabaseImpl,
+    config: &VerifyConfig,
+) -> VerifyResult {
     let db_name = db_impl.get_name();
     match db_impl.get_real_tree() {
         Some(tree) => verify_tree(tree, db_name, config),
@@ -857,15 +863,23 @@ mod tests {
 
         let db_id = DatabaseId::new(1);
         let config = DatabaseConfig::default();
-        let db_impl =
-            DatabaseImpl::new(db_id, "verify_test".to_string(), DbType::User, &config);
+        let db_impl = DatabaseImpl::new(
+            db_id,
+            "verify_test".to_string(),
+            DbType::User,
+            &config,
+        );
         let db = Arc::new(RwLock::new(db_impl));
         let guard = db.read();
         let cfg = VerifyConfig::default();
 
         if let Some(t) = guard.get_real_tree() {
             let result = verify_tree(t, "verify_test", &cfg);
-            assert!(result.passed, "empty tree should pass: {:?}", result.errors);
+            assert!(
+                result.passed,
+                "empty tree should pass: {:?}",
+                result.errors
+            );
             assert_eq!(result.databases_verified, 1);
         }
         // If no real tree is present the test is a no-op.
@@ -878,7 +892,8 @@ mod tests {
     #[test]
     fn test_verify_tree_populated() {
         use noxu_dbi::{
-            CursorImpl, DatabaseConfig, DatabaseId, DatabaseImpl, DbType, PutMode,
+            CursorImpl, DatabaseConfig, DatabaseId, DatabaseImpl, DbType,
+            PutMode,
         };
         use noxu_log::{FileManager, LogManager};
         use noxu_sync::RwLock;
@@ -889,17 +904,25 @@ mod tests {
         let fm = Arc::new(
             FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
         );
-        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
 
         let db_id = DatabaseId::new(2);
         let config = DatabaseConfig::default();
-        let db_impl =
-            DatabaseImpl::new(db_id, "pop_test".to_string(), DbType::User, &config);
+        let db_impl = DatabaseImpl::new(
+            db_id,
+            "pop_test".to_string(),
+            DbType::User,
+            &config,
+        );
         let db = Arc::new(RwLock::new(db_impl));
 
         {
-            let mut cursor =
-                CursorImpl::with_log_manager(Arc::clone(&db), 1, Arc::clone(&lm));
+            let mut cursor = CursorImpl::with_log_manager(
+                Arc::clone(&db),
+                1,
+                Arc::clone(&lm),
+            );
             cursor.put(b"alpha", b"1", PutMode::Overwrite).unwrap();
             cursor.put(b"beta", b"2", PutMode::Overwrite).unwrap();
             cursor.put(b"gamma", b"3", PutMode::Overwrite).unwrap();
@@ -910,7 +933,11 @@ mod tests {
 
         if let Some(t) = guard.get_real_tree() {
             let result = verify_tree(t, "pop_test", &cfg);
-            assert!(result.passed, "populated tree should pass: {:?}", result.errors);
+            assert!(
+                result.passed,
+                "populated tree should pass: {:?}",
+                result.errors
+            );
             assert_eq!(result.databases_verified, 1);
         }
     }

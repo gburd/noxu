@@ -21,7 +21,7 @@ pub use tracing_opentelemetry;
 /// Describe all Noxu DB metrics. Call once at application startup after
 /// installing a metrics recorder.
 pub fn describe_metrics() {
-    use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+    use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
 
     describe_counter!(
         "noxu_db_operations_total",

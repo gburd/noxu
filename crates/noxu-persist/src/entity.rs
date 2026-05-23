@@ -12,7 +12,7 @@ use crate::error::{PersistError, Result};
 /// this trait can be stored in and retrieved from an `EntityStore` via a
 /// `PrimaryIndex`.
 ///
-/// 
+///
 ///
 /// # Example
 ///
@@ -55,7 +55,7 @@ pub trait Entity: Sized {
 /// types must be serializable to and from bytes, and must support equality
 /// comparison and hashing for use in indexes.
 ///
-/// 
+///
 pub trait PrimaryKey: Clone + Eq + std::hash::Hash {
     /// Encodes this key to a byte vector.
     fn to_bytes(&self) -> Vec<u8>;
@@ -423,8 +423,7 @@ mod tests {
 
     #[test]
     fn test_i64_sort_order_sequence() {
-        let values: Vec<i64> =
-            vec![i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX];
+        let values: Vec<i64> = vec![i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX];
         let encoded: Vec<Vec<u8>> =
             values.iter().map(|v| v.to_bytes()).collect();
         for i in 0..encoded.len() - 1 {

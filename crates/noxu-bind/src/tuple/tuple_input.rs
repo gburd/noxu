@@ -1,8 +1,8 @@
 //! TupleInput: reads primitive types from a byte buffer using sortable encodings.
 //!
 
-use bytes::Bytes;
 use crate::error::{BindError, Result};
+use bytes::Bytes;
 
 /// A reader for tuple-encoded byte data.
 ///
@@ -220,7 +220,7 @@ impl TupleInput {
     /// This is an unsorted variable-length encoding where values in [-119, 119]
     /// are stored in a single byte. Larger values use 2-5 bytes.
     ///
-    /// 
+    ///
     ///
     /// Reads values written by `TupleOutput::write_packed_int`.
     pub fn read_packed_int(&mut self) -> Result<i32> {
@@ -257,7 +257,7 @@ impl TupleInput {
     /// This is an unsorted variable-length encoding where values in [-119, 119]
     /// are stored in a single byte. Larger values use 2-9 bytes.
     ///
-    /// 
+    ///
     ///
     /// Reads values written by `TupleOutput::write_packed_long`.
     pub fn read_packed_long(&mut self) -> Result<i64> {
@@ -311,7 +311,7 @@ impl TupleInput {
     /// Positive multi-byte: first byte `> 0xF7`, meaning `(b1 - 0xF7)` big-endian
     /// value bytes follow; value = `raw + 121`.
     ///
-    /// 
+    ///
     pub fn read_sorted_packed_int(&mut self) -> Result<i32> {
         let b1 = self.read_fast()?;
         if b1 < 0x08 {
@@ -341,7 +341,7 @@ impl TupleInput {
     /// Uses the same header-byte scheme as `read_sorted_packed_int`, extended
     /// to up to 8 value bytes.
     ///
-    /// 
+    ///
     pub fn read_sorted_packed_long(&mut self) -> Result<i64> {
         let b1 = self.read_fast()?;
         if b1 < 0x08 {
@@ -967,11 +967,8 @@ mod tests {
     /// TupleFormatTest: packed int 119/0xFFFF+119/MAX sizes and round-trip.
     #[test]
     fn test_packed_int_specific_sizes_round_trip() {
-        let cases: &[(i32, usize)] = &[
-            (119, 1),
-            (0xFFFF + 119, 3),
-            (i32::MAX, 5),
-        ];
+        let cases: &[(i32, usize)] =
+            &[(119, 1), (0xFFFF + 119, 3), (i32::MAX, 5)];
         for &(val, expected_size) in cases {
             let mut out = TupleOutput::new();
             out.write_packed_int(val);
@@ -984,11 +981,8 @@ mod tests {
     /// TupleFormatTest: packed long 119/0xFFFFFFFF+119/MAX sizes and round-trip.
     #[test]
     fn test_packed_long_specific_sizes_round_trip() {
-        let cases: &[(i64, usize)] = &[
-            (119, 1),
-            (0xFFFF_FFFF_i64 + 119, 5),
-            (i64::MAX, 9),
-        ];
+        let cases: &[(i64, usize)] =
+            &[(119, 1), (0xFFFF_FFFF_i64 + 119, 5), (i64::MAX, 9)];
         for &(val, expected_size) in cases {
             let mut out = TupleOutput::new();
             out.write_packed_long(val);
@@ -1002,14 +996,25 @@ mod tests {
     #[test]
     fn test_sorted_packed_int_specific_sizes_round_trip() {
         let cases: &[(i32, usize)] = &[
-            (-1, 1), (0, 1), (1, 1), (-119, 1), (120, 1),
-            (121, 2), (-120, 2),
-            (i32::MAX, 5), (i32::MIN, 5),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (-119, 1),
+            (120, 1),
+            (121, 2),
+            (-120, 2),
+            (i32::MAX, 5),
+            (i32::MIN, 5),
         ];
         for &(val, expected_size) in cases {
             let mut out = TupleOutput::new();
             out.write_sorted_packed_int(val);
-            assert_eq!(out.len(), expected_size, "sorted_packed_int {} size", val);
+            assert_eq!(
+                out.len(),
+                expected_size,
+                "sorted_packed_int {} size",
+                val
+            );
             let mut inp = TupleInput::new(&out.to_vec());
             assert_eq!(inp.read_sorted_packed_int().unwrap(), val);
         }
@@ -1019,14 +1024,25 @@ mod tests {
     #[test]
     fn test_sorted_packed_long_specific_sizes_round_trip() {
         let cases: &[(i64, usize)] = &[
-            (-1, 1), (0, 1), (1, 1), (-119, 1), (120, 1),
-            (121, 2), (-120, 2),
-            (i64::MAX, 9), (i64::MIN, 9),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (-119, 1),
+            (120, 1),
+            (121, 2),
+            (-120, 2),
+            (i64::MAX, 9),
+            (i64::MIN, 9),
         ];
         for &(val, expected_size) in cases {
             let mut out = TupleOutput::new();
             out.write_sorted_packed_long(val);
-            assert_eq!(out.len(), expected_size, "sorted_packed_long {} size", val);
+            assert_eq!(
+                out.len(),
+                expected_size,
+                "sorted_packed_long {} size",
+                val
+            );
             let mut inp = TupleInput::new(&out.to_vec());
             assert_eq!(inp.read_sorted_packed_long().unwrap(), val);
         }
@@ -1180,9 +1196,16 @@ mod tests {
     #[test]
     fn test_float_special_values_round_trip() {
         let special: &[f32] = &[
-            f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
-            f32::MAX, f32::MIN, f32::MIN_POSITIVE,
-            0.0, -0.0, 1.0, -1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
         ];
         for &v in special {
             let mut out = TupleOutput::new();
@@ -1193,7 +1216,12 @@ mod tests {
             if v.is_nan() {
                 assert!(got.is_nan(), "NaN should round-trip as NaN");
             } else {
-                assert_eq!(got.to_bits(), v.to_bits(), "float {} should round-trip", v);
+                assert_eq!(
+                    got.to_bits(),
+                    v.to_bits(),
+                    "float {} should round-trip",
+                    v
+                );
             }
         }
     }
@@ -1202,9 +1230,16 @@ mod tests {
     #[test]
     fn test_double_special_values_round_trip() {
         let special: &[f64] = &[
-            f64::NAN, f64::INFINITY, f64::NEG_INFINITY,
-            f64::MAX, f64::MIN, f64::MIN_POSITIVE,
-            0.0, -0.0, 1.0, -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
         ];
         for &v in special {
             let mut out = TupleOutput::new();
@@ -1215,7 +1250,12 @@ mod tests {
             if v.is_nan() {
                 assert!(got.is_nan(), "NaN should round-trip as NaN");
             } else {
-                assert_eq!(got.to_bits(), v.to_bits(), "double {} should round-trip", v);
+                assert_eq!(
+                    got.to_bits(),
+                    v.to_bits(),
+                    "double {} should round-trip",
+                    v
+                );
             }
         }
     }
@@ -1224,9 +1264,17 @@ mod tests {
     #[test]
     fn test_sorted_float_special_values_round_trip() {
         let special: &[f32] = &[
-            f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
-            f32::MAX, f32::MIN, f32::MIN_POSITIVE,
-            0.0, -0.0, 1.0, -1.0, 123.123,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            123.123,
         ];
         for &v in special {
             let mut out = TupleOutput::new();
@@ -1237,7 +1285,12 @@ mod tests {
             if v.is_nan() {
                 assert!(got.is_nan(), "NaN should round-trip");
             } else {
-                assert_eq!(got.to_bits(), v.to_bits(), "sorted float {} should round-trip", v);
+                assert_eq!(
+                    got.to_bits(),
+                    v.to_bits(),
+                    "sorted float {} should round-trip",
+                    v
+                );
             }
         }
     }
@@ -1246,9 +1299,17 @@ mod tests {
     #[test]
     fn test_sorted_double_special_values_round_trip() {
         let special: &[f64] = &[
-            f64::NAN, f64::INFINITY, f64::NEG_INFINITY,
-            f64::MAX, f64::MIN, f64::MIN_POSITIVE,
-            0.0, -0.0, 1.0, -1.0, 123.123,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            123.123,
         ];
         for &v in special {
             let mut out = TupleOutput::new();
@@ -1259,7 +1320,12 @@ mod tests {
             if v.is_nan() {
                 assert!(got.is_nan(), "NaN should round-trip");
             } else {
-                assert_eq!(got.to_bits(), v.to_bits(), "sorted double {} should round-trip", v);
+                assert_eq!(
+                    got.to_bits(),
+                    v.to_bits(),
+                    "sorted double {} should round-trip",
+                    v
+                );
             }
         }
     }

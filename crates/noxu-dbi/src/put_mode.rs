@@ -3,7 +3,7 @@
 
 /// Distinguishes cursor put operations.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutMode {
     /// Replace data at current position.
@@ -28,10 +28,12 @@ mod tests {
 
     #[test]
     fn test_all_variants() {
-        let modes = [PutMode::Current,
+        let modes = [
+            PutMode::Current,
             PutMode::NoDupData,
             PutMode::NoOverwrite,
-            PutMode::Overwrite];
+            PutMode::Overwrite,
+        ];
 
         assert_eq!(modes.len(), 4);
     }

@@ -26,7 +26,7 @@ use super::renamer::Renamer;
 /// assert!(!m.is_empty());
 /// ```
 ///
-/// 
+///
 ///
 /// [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 #[derive(Debug, Default)]
@@ -50,9 +50,11 @@ impl Mutations {
 
     /// Returns `true` if no mutations are present.
     ///
-    /// 
+    ///
     pub fn is_empty(&self) -> bool {
-        self.renamers.is_empty() && self.deleters.is_empty() && self.converters.is_empty()
+        self.renamers.is_empty()
+            && self.deleters.is_empty()
+            && self.converters.is_empty()
     }
 
     // -----------------------------------------------------------------------
@@ -61,7 +63,7 @@ impl Mutations {
 
     /// Adds a renamer mutation.
     ///
-    /// 
+    ///
     pub fn add_renamer(&mut self, renamer: Renamer) {
         self.renamers.insert(renamer.key().clone(), renamer);
     }
@@ -70,7 +72,7 @@ impl Mutations {
     ///
     /// Pass `field_name = None` to look up a class renamer.
     ///
-    /// 
+    ///
     pub fn get_renamer(
         &self,
         class_name: &str,
@@ -83,7 +85,7 @@ impl Mutations {
 
     /// Returns an iterator over all renamer mutations.
     ///
-    /// 
+    ///
     pub fn renamers(&self) -> impl Iterator<Item = &Renamer> {
         self.renamers.values()
     }
@@ -94,7 +96,7 @@ impl Mutations {
 
     /// Adds a deleter mutation.
     ///
-    /// 
+    ///
     pub fn add_deleter(&mut self, deleter: Deleter) {
         self.deleters.insert(deleter.key().clone(), deleter);
     }
@@ -103,7 +105,7 @@ impl Mutations {
     ///
     /// Pass `field_name = None` to look up a class deleter.
     ///
-    /// 
+    ///
     pub fn get_deleter(
         &self,
         class_name: &str,
@@ -116,7 +118,7 @@ impl Mutations {
 
     /// Returns an iterator over all deleter mutations.
     ///
-    /// 
+    ///
     pub fn deleters(&self) -> impl Iterator<Item = &Deleter> {
         self.deleters.values()
     }
@@ -127,7 +129,7 @@ impl Mutations {
 
     /// Adds a converter mutation.
     ///
-    /// 
+    ///
     pub fn add_converter(&mut self, converter: Converter) {
         self.converters.insert(converter.key().clone(), converter);
     }
@@ -136,7 +138,7 @@ impl Mutations {
     ///
     /// Pass `field_name = None` to look up a class converter.
     ///
-    /// 
+    ///
     pub fn get_converter(
         &self,
         class_name: &str,
@@ -149,7 +151,7 @@ impl Mutations {
 
     /// Returns an iterator over all converter mutations.
     ///
-    /// 
+    ///
     pub fn converters(&self) -> impl Iterator<Item = &Converter> {
         self.converters.values()
     }
@@ -191,7 +193,9 @@ pub struct ClassMutations<'a> {
 impl ClassMutations<'_> {
     /// Returns `true` if no class-level mutations were found.
     pub fn is_empty(&self) -> bool {
-        self.renamer.is_none() && self.deleter.is_none() && self.converter.is_none()
+        self.renamer.is_none()
+            && self.deleter.is_none()
+            && self.converter.is_none()
     }
 }
 
@@ -223,7 +227,11 @@ impl std::fmt::Display for Mutations {
 // Helper
 // ---------------------------------------------------------------------------
 
-fn make_key(class_name: &str, class_version: u32, field_name: Option<&str>) -> MutationKey {
+fn make_key(
+    class_name: &str,
+    class_version: u32,
+    field_name: Option<&str>,
+) -> MutationKey {
     match field_name {
         Some(f) => MutationKey::for_field(class_name, class_version, f),
         None => MutationKey::for_class(class_name, class_version),
@@ -260,7 +268,9 @@ mod tests {
     #[test]
     fn test_not_empty_after_add_converter() {
         let mut m = Mutations::new();
-        m.add_converter(Converter::for_class("A", 0, |b: &[u8]| Some(b.to_vec())));
+        m.add_converter(Converter::for_class("A", 0, |b: &[u8]| {
+            Some(b.to_vec())
+        }));
         assert!(!m.is_empty());
     }
 
@@ -298,14 +308,18 @@ mod tests {
     fn test_get_deleter_field_level() {
         let mut m = Mutations::new();
         m.add_deleter(Deleter::for_field("pkg.Person", 0, "favoriteColors"));
-        assert!(m.get_deleter("pkg.Person", 0, Some("favoriteColors")).is_some());
+        assert!(
+            m.get_deleter("pkg.Person", 0, Some("favoriteColors")).is_some()
+        );
         assert!(m.get_deleter("pkg.Person", 0, None).is_none());
     }
 
     #[test]
     fn test_get_converter_class_level() {
         let mut m = Mutations::new();
-        m.add_converter(Converter::for_class("X", 0, |b: &[u8]| Some(b.to_vec())));
+        m.add_converter(Converter::for_class("X", 0, |b: &[u8]| {
+            Some(b.to_vec())
+        }));
         let c = m.get_converter("X", 0, None).unwrap();
         assert_eq!(c.convert(b"hi").as_deref(), Some(b"hi" as &[u8]));
     }
@@ -315,7 +329,9 @@ mod tests {
         let mut m = Mutations::new();
         m.add_renamer(Renamer::for_class("C", 0, "D"));
         m.add_deleter(Deleter::for_class("C", 1));
-        m.add_converter(Converter::for_class("C", 2, |b: &[u8]| Some(b.to_vec())));
+        m.add_converter(Converter::for_class("C", 2, |b: &[u8]| {
+            Some(b.to_vec())
+        }));
 
         let cm = m.get_mutations_for_class("C", 0);
         assert!(cm.renamer.is_some());
@@ -354,8 +370,12 @@ mod tests {
     #[test]
     fn test_converters_iter() {
         let mut m = Mutations::new();
-        m.add_converter(Converter::for_class("A", 0, |b: &[u8]| Some(b.to_vec())));
-        m.add_converter(Converter::for_field("A", 1, "f", |b: &[u8]| Some(b.to_vec())));
+        m.add_converter(Converter::for_class("A", 0, |b: &[u8]| {
+            Some(b.to_vec())
+        }));
+        m.add_converter(Converter::for_field("A", 1, "f", |b: &[u8]| {
+            Some(b.to_vec())
+        }));
         assert_eq!(m.converters().count(), 2);
     }
 

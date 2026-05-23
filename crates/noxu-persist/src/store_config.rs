@@ -7,7 +7,7 @@
 /// creation of new databases and whether the store operates in read-only
 /// or transactional mode.
 ///
-/// 
+///
 ///
 /// # Example
 ///

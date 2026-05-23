@@ -14,7 +14,7 @@ use crate::tuple::tuple_output::TupleOutput;
 /// Implementors define `tuple_to_object` and `object_to_tuple` to convert
 /// between a type and its tuple-encoded byte representation.
 ///
-/// 
+///
 pub trait TupleBinding<T>: EntryBinding<T> {
     /// Creates a `TupleInput` from a `DatabaseEntry`.
     fn entry_to_input(entry: &DatabaseEntry) -> TupleInput {

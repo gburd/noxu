@@ -14,6 +14,7 @@
 // ============================================================================
 
 use bytes::BytesMut;
+use hashbrown::HashMap;
 use noxu_log::{
     FileManager, LogFileReader, LogManager,
     checksum::ChecksumValidator,
@@ -25,14 +26,13 @@ use noxu_log::{
     entry::restore_required::{FailureType, RestoreRequired},
     entry::trace_log_entry::TraceLogEntry,
     entry_header::{
-        CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE, LogEntryHeader,
+        CHECKSUM_BYTES, LogEntryHeader, MAX_HEADER_SIZE, MIN_HEADER_SIZE,
     },
     entry_type::LogEntryType,
     provisional::Provisional,
 };
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_util::vlsn::{NULL_VLSN, Vlsn};
-use hashbrown::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -42,9 +42,8 @@ use tempfile::TempDir;
 
 /// Create a FileManager + LogManager pair in a fresh temp directory.
 fn make_managers(dir: &TempDir) -> (Arc<FileManager>, LogManager) {
-    let fm = Arc::new(
-        FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
-    );
+    let fm =
+        Arc::new(FileManager::new(dir.path(), false, 10_000_000, 100).unwrap());
     let lm = LogManager::new(Arc::clone(&fm), 3, 1_048_576, 4096);
     (fm, lm)
 }
@@ -92,7 +91,11 @@ fn test_entry_type_num_roundtrip() {
         }
     }
     // Ensure we have a reasonable number of entry types.
-    assert!(found > 10, "Expected at least 10 log entry types; found {}", found);
+    assert!(
+        found > 10,
+        "Expected at least 10 log entry types; found {}",
+        found
+    );
 }
 
 /// Spot-check key types.
@@ -234,7 +237,10 @@ fn test_loggable_file_header_roundtrip() {
 
         // Invariant 2
         assert_eq!(orig.file_num, decoded.file_num);
-        assert_eq!(orig.last_entry_in_prev_file, decoded.last_entry_in_prev_file);
+        assert_eq!(
+            orig.last_entry_in_prev_file,
+            decoded.last_entry_in_prev_file
+        );
         assert_eq!(orig.log_version, decoded.log_version);
         assert_eq!(orig.timestamp, decoded.timestamp);
 
@@ -335,12 +341,7 @@ fn test_loggable_txn_abort_roundtrip() {
 #[test]
 fn test_loggable_in_log_entry_roundtrip() {
     let node_data: Vec<u8> = (0u8..=15).collect();
-    let orig = InLogEntry::new(
-        42,
-        Lsn::new(5, 100),
-        NULL_LSN,
-        node_data,
-    );
+    let orig = InLogEntry::new(42, Lsn::new(5, 100), NULL_LSN, node_data);
 
     let mut buf = BytesMut::new();
     orig.write_to_log(&mut buf);
@@ -387,19 +388,19 @@ fn test_loggable_ln_log_entry_roundtrip() {
     let key = b"mykey";
 
     let orig = LnLogEntry::new(
-        1001,           // db_id
-        Some(42i64),    // txn_id
-        Lsn::new(3, 50), // abort_lsn
-        false,          // abort_known_deleted
-        None,           // abort_key
-        None,           // abort_data
-        NULL_VLSN,      // abort_vlsn
-        0,              // abort_expiration
-        false,          // embedded_ln
-        key.to_vec(),   // key
+        1001,                // db_id
+        Some(42i64),         // txn_id
+        Lsn::new(3, 50),     // abort_lsn
+        false,               // abort_known_deleted
+        None,                // abort_key
+        None,                // abort_data
+        NULL_VLSN,           // abort_vlsn
+        0,                   // abort_expiration
+        false,               // embedded_ln
+        key.to_vec(),        // key
         Some(data.to_vec()), // data
-        0,              // expiration
-        NULL_VLSN,      // vlsn
+        0,                   // expiration
+        NULL_VLSN,           // vlsn
     );
 
     let mut buf = BytesMut::new();
@@ -419,19 +420,19 @@ fn test_loggable_ln_log_entry_roundtrip() {
 #[test]
 fn test_loggable_ln_log_entry_delete_roundtrip() {
     let orig = LnLogEntry::new(
-        500,                          // db_id
-        None,                         // txn_id (non-transactional)
-        NULL_LSN,                     // abort_lsn
-        false,                        // abort_known_deleted
-        None,                         // abort_key
-        None,                         // abort_data
-        NULL_VLSN,                    // abort_vlsn
-        0,                            // abort_expiration
-        false,                        // embedded_ln
-        b"keyForDelete".to_vec(),     // key
-        None,                         // data = None means deletion
-        0,                            // expiration
-        NULL_VLSN,                    // vlsn
+        500,                      // db_id
+        None,                     // txn_id (non-transactional)
+        NULL_LSN,                 // abort_lsn
+        false,                    // abort_known_deleted
+        None,                     // abort_key
+        None,                     // abort_data
+        NULL_VLSN,                // abort_vlsn
+        0,                        // abort_expiration
+        false,                    // embedded_ln
+        b"keyForDelete".to_vec(), // key
+        None,                     // data = None means deletion
+        0,                        // expiration
+        NULL_VLSN,                // vlsn
     );
 
     let mut buf = BytesMut::new();
@@ -453,17 +454,12 @@ fn test_loggable_restore_required_roundtrip() {
     props.insert("foo".to_string(), "bar".to_string());
     props.insert("apple".to_string(), "tree".to_string());
 
-    let orig =
-        RestoreRequired::new(FailureType::NetworkRestore, props.clone());
+    let orig = RestoreRequired::new(FailureType::NetworkRestore, props.clone());
 
     let mut buf = BytesMut::new();
     orig.write_to_log(&mut buf);
 
-    assert_eq!(
-        buf.len(),
-        orig.log_size(),
-        "RestoreRequired log_size mismatch"
-    );
+    assert_eq!(buf.len(), orig.log_size(), "RestoreRequired log_size mismatch");
 
     let decoded = RestoreRequired::read_from_log(&buf).unwrap();
     assert_eq!(orig.failure_type, decoded.failure_type);
@@ -526,19 +522,11 @@ fn test_failure_type_parse_roundtrip() {
 /// Applied to LogEntryHeader (no VLSN).
 #[test]
 fn test_header_loggable_no_vlsn_roundtrip() {
-    let provisionals = [
-        Provisional::No,
-        Provisional::Yes,
-        Provisional::BeforeCkptEnd,
-    ];
+    let provisionals =
+        [Provisional::No, Provisional::Yes, Provisional::BeforeCkptEnd];
     for prov in &provisionals {
-        let header = LogEntryHeader::new(
-            LogEntryType::BIN,
-            1024,
-            *prov,
-            false,
-            None,
-        );
+        let header =
+            LogEntryHeader::new(LogEntryType::BIN, 1024, *prov, false, None);
 
         let mut buf = Vec::new();
         header.write_to_log(&mut buf).unwrap();
@@ -592,8 +580,13 @@ fn test_header_loggable_with_vlsn_roundtrip() {
 /// Invisible flag survives round-trip.
 #[test]
 fn test_header_invisible_flag_roundtrip() {
-    let mut header =
-        LogEntryHeader::new(LogEntryType::BIN, 50, Provisional::No, false, None);
+    let mut header = LogEntryHeader::new(
+        LogEntryType::BIN,
+        50,
+        Provisional::No,
+        false,
+        None,
+    );
     header.set_invisible(true);
 
     let mut buf = Vec::new();
@@ -608,8 +601,13 @@ fn test_header_invisible_flag_roundtrip() {
 /// Post-marshalling fields survive read-back.
 #[test]
 fn test_header_post_marshalling_roundtrip() {
-    let mut header =
-        LogEntryHeader::new(LogEntryType::Trace, 64, Provisional::No, false, None);
+    let mut header = LogEntryHeader::new(
+        LogEntryType::Trace,
+        64,
+        Provisional::No,
+        false,
+        None,
+    );
 
     let mut buf = Vec::new();
     header.write_to_log(&mut buf).unwrap();
@@ -691,7 +689,11 @@ fn test_fsync_manager_flush_only_no_fsync() {
         })
         .unwrap();
 
-    assert_eq!(call_count.load(Ordering::SeqCst), 1, "closure must be called once");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "closure must be called once"
+    );
 }
 
 /// Waiter is notified after leader completes.
@@ -741,11 +743,8 @@ fn test_fsync_manager_waiter_notified() {
 #[test]
 fn test_fsync_manager_flush_error_propagates() {
     let manager = FsyncManager::new(0, 0);
-    let result = manager.fsync(|| {
-        Err(std::io::Error::other(
-            "simulated flush error",
-        ))
-    });
+    let result =
+        manager.fsync(|| Err(std::io::Error::other("simulated flush error")));
     assert!(result.is_err(), "error must be propagated to caller");
 }
 
@@ -888,14 +887,11 @@ fn test_log_manager_bad_checksum_detected() {
     fm.clear_cache();
 
     // Corrupt a payload byte (not the checksum field itself).
-    let payload_byte_offset =
-        lsn.file_offset() as u64 + MIN_HEADER_SIZE as u64;
-    let file_path =
-        dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
+    let payload_byte_offset = lsn.file_offset() as u64 + MIN_HEADER_SIZE as u64;
+    let file_path = dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
 
     {
-        let mut f =
-            OpenOptions::new().write(true).open(&file_path).unwrap();
+        let mut f = OpenOptions::new().write(true).open(&file_path).unwrap();
         f.seek(SeekFrom::Start(payload_byte_offset)).unwrap();
         f.write_all(&[payload[0] ^ 0xFF]).unwrap();
         f.flush().unwrap();
@@ -908,10 +904,7 @@ fn test_log_manager_bad_checksum_detected() {
         LogFileReader::open(Arc::clone(&fm), lsn.file_number()).unwrap();
     let result = reader.read_next_strict();
 
-    assert!(
-        result.is_err(),
-        "Expected checksum error but read succeeded"
-    );
+    assert!(result.is_err(), "Expected checksum error but read succeeded");
     match result.unwrap_err() {
         noxu_log::NoxuLogError::Checksum { .. } => {} // expected
         other => panic!("Expected Checksum error, got {:?}", other),
@@ -958,9 +951,7 @@ fn test_log_manager_entry_type_preserved() {
 
     let mut lsns = Vec::new();
     for &et in &entry_types {
-        let lsn = lm
-            .log(et, b"dummy", Provisional::No, false, false)
-            .unwrap();
+        let lsn = lm.log(et, b"dummy", Provisional::No, false, false).unwrap();
         lsns.push((lsn, et));
     }
 
@@ -995,8 +986,7 @@ fn test_log_manager_lsn_stride() {
         .unwrap();
 
     if lsn0.file_number() == lsn1.file_number() {
-        let stride =
-            (lsn1.file_offset() - lsn0.file_offset()) as usize;
+        let stride = (lsn1.file_offset() - lsn0.file_offset()) as usize;
         assert_eq!(
             stride, expected_stride,
             "LSN stride must equal header_size + payload_size"
@@ -1094,10 +1084,7 @@ fn test_checksum_skips_first_four_bytes() {
         CHECKSUM_BYTES,
         buf.len() - CHECKSUM_BYTES,
     );
-    assert_ne!(
-        stored, bad_crc,
-        "checksum must differ after corruption"
-    );
+    assert_ne!(stored, bad_crc, "checksum must differ after corruption");
 }
 
 /// Modifying any individual bit
@@ -1116,8 +1103,7 @@ fn test_checksum_any_bit_flip_detected() {
     fm.clear_cache();
 
     // Read the raw bytes on disk.
-    let file_path =
-        dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
+    let file_path = dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
     let original = std::fs::read(&file_path).unwrap();
 
     // Find the start of the entry (after file header).
@@ -1167,8 +1153,7 @@ fn test_log_file_reader_empty_file_no_entries() {
     let (fm, lm) = make_managers(&dir);
 
     // Write one entry and flush to create file 0.
-    lm.log(LogEntryType::Trace, b"seed", Provisional::No, true, false)
-        .unwrap();
+    lm.log(LogEntryType::Trace, b"seed", Provisional::No, true, false).unwrap();
     lm.flush_sync().unwrap();
 
     // Open file 0 and drain it.
@@ -1222,7 +1207,8 @@ fn test_log_file_reader_sequential_forward_scan() {
         assert_eq!(et, LogEntryType::Trace, "entry type mismatch at {}", count);
         let expected = format!("Hello there, rec {}", count + 1);
         assert_eq!(
-            payload, expected.as_bytes(),
+            payload,
+            expected.as_bytes(),
             "payload mismatch at entry {}",
             count
         );
@@ -1230,7 +1216,11 @@ fn test_log_file_reader_sequential_forward_scan() {
         count += 1;
     }
 
-    assert_eq!(count, n_entries, "reader must return all {} entries", n_entries);
+    assert_eq!(
+        count, n_entries,
+        "reader must return all {} entries",
+        n_entries
+    );
 }
 
 /// / `testMedBuffers`.
@@ -1270,13 +1260,12 @@ fn test_log_file_reader_small_payloads_all_readable() {
     );
 
     for (i, ((lsn, read_payload), (expected_lsn, expected_payload))) in
-        read_entries.iter().zip(expected_lsns.iter().zip(payloads.iter())).enumerate()
+        read_entries
+            .iter()
+            .zip(expected_lsns.iter().zip(payloads.iter()))
+            .enumerate()
     {
-        assert_eq!(
-            lsn, expected_lsn,
-            "LSN mismatch at entry {}",
-            i
-        );
+        assert_eq!(lsn, expected_lsn, "LSN mismatch at entry {}", i);
         assert_eq!(
             read_payload, expected_payload,
             "payload mismatch at entry {}",
@@ -1439,14 +1428,8 @@ fn test_log_file_reader_filter_by_entry_type() {
             .unwrap();
 
         let bin_payload = vec![0x02u8; 32];
-        lm.log(
-            LogEntryType::BIN,
-            &bin_payload,
-            Provisional::No,
-            false,
-            false,
-        )
-        .unwrap();
+        lm.log(LogEntryType::BIN, &bin_payload, Provisional::No, false, false)
+            .unwrap();
     }
 
     lm.flush_no_sync().unwrap();
@@ -1535,9 +1518,8 @@ fn test_log_manager_random_access_mid_file() {
     let dir = TempDir::new().unwrap();
     let (_fm, lm) = make_managers(&dir);
 
-    let payloads: Vec<Vec<u8>> = (0..10)
-        .map(|i| format!("mid-file-entry-{}", i).into_bytes())
-        .collect();
+    let payloads: Vec<Vec<u8>> =
+        (0..10).map(|i| format!("mid-file-entry-{}", i).into_bytes()).collect();
 
     let mut lsns = Vec::new();
     for payload in &payloads {
@@ -1564,9 +1546,8 @@ fn test_log_manager_read_entries_in_reverse_order() {
     let dir = TempDir::new().unwrap();
     let (_fm, lm) = make_managers(&dir);
 
-    let payloads: Vec<Vec<u8>> = (0..10)
-        .map(|i| format!("reverse-entry-{}", i).into_bytes())
-        .collect();
+    let payloads: Vec<Vec<u8>> =
+        (0..10).map(|i| format!("reverse-entry-{}", i).into_bytes()).collect();
 
     let mut lsns = Vec::new();
     for payload in &payloads {
@@ -1597,11 +1578,8 @@ fn test_log_manager_provisional_flag_preserved() {
     let dir = TempDir::new().unwrap();
     let (fm, lm) = make_managers(&dir);
 
-    let provisionals = [
-        Provisional::No,
-        Provisional::Yes,
-        Provisional::BeforeCkptEnd,
-    ];
+    let provisionals =
+        [Provisional::No, Provisional::Yes, Provisional::BeforeCkptEnd];
 
     let mut lsns = Vec::new();
     for prov in &provisionals {
@@ -1644,8 +1622,7 @@ fn test_checksum_deterministic() {
 fn test_checksum_incremental_matches_oneshot() {
     let part1 = b"part one ";
     let part2 = b"part two";
-    let combined: Vec<u8> =
-        part1.iter().chain(part2.iter()).copied().collect();
+    let combined: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
 
     let oneshot = ChecksumValidator::compute(&combined);
 

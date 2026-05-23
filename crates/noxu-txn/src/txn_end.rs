@@ -6,7 +6,7 @@ use std::io;
 
 /// Base type for transaction end log entries (commit/abort).
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct TxnEnd {
     /// Transaction ID.

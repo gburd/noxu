@@ -3,7 +3,7 @@
 
 /// Distinguishes which variety of get operation a cursor should use.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GetMode {
     /// Get the next key/data pair.
@@ -51,12 +51,14 @@ mod tests {
     #[test]
     fn test_all_variants() {
         // Ensure all variants are tested
-        let modes = [GetMode::Next,
+        let modes = [
+            GetMode::Next,
             GetMode::Prev,
             GetMode::NextDup,
             GetMode::PrevDup,
             GetMode::NextNoDup,
-            GetMode::PrevNoDup];
+            GetMode::PrevNoDup,
+        ];
 
         assert_eq!(modes.len(), 6);
 

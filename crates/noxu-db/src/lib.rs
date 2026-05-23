@@ -75,32 +75,36 @@ pub mod transaction_config;
 pub mod write_options;
 
 // Re-export commonly used types
-pub use byte_comparator::{ByteComparator, DefaultByteComparator, compare_unsigned};
+pub use byte_comparator::{
+    ByteComparator, DefaultByteComparator, compare_unsigned,
+};
 pub use cache_mode::CacheMode;
+pub use checkpoint_config::CheckpointConfig;
 pub use cursor::Cursor;
 pub use cursor_config::CursorConfig;
 pub use database::Database;
 pub use database_config::DatabaseConfig;
 pub use database_entry::DatabaseEntry;
+pub use database_stats::{BtreeStats, DatabaseStats};
 pub use durability::{Durability, ReplicaAckPolicy, SyncPolicy};
 pub use environment::Environment;
 pub use environment_config::{EnvironmentConfig, ExceptionListenerHolder};
-pub use noxu_engine::{EnvironmentStats, VerifyConfig, VerifyError, VerifyResult};
+pub use environment_mutable_config::EnvironmentMutableConfig;
 pub use error::{
-    EnvironmentFailureReason, ExceptionEvent, ExceptionListener, ExceptionSource, NoxuError, Result,
+    EnvironmentFailureReason, ExceptionEvent, ExceptionListener,
+    ExceptionSource, NoxuError, Result,
 };
 pub use extinction_filter::{ExtinctionFilter, ExtinctionStatus};
-pub use checkpoint_config::CheckpointConfig;
-pub use database_stats::{BtreeStats, DatabaseStats};
-pub use environment_mutable_config::EnvironmentMutableConfig;
-pub use preload::{PreloadConfig, PreloadStats};
 pub use get::Get;
 pub use join_config::JoinConfig;
 pub use join_cursor::JoinCursor;
 pub use lock_mode::LockMode;
-pub use stats_config::StatsConfig;
+pub use noxu_engine::{
+    EnvironmentStats, VerifyConfig, VerifyError, VerifyResult,
+};
 pub use operation_result::OperationResult;
 pub use operation_status::OperationStatus;
+pub use preload::{PreloadConfig, PreloadStats};
 pub use put::Put;
 pub use read_options::ReadOptions;
 pub use scan_filter::{ScanFilter, ScanResult};
@@ -113,6 +117,7 @@ pub use secondary_database::SecondaryDatabase;
 pub use sequence::Sequence;
 pub use sequence_config::SequenceConfig;
 pub use sequence_stats::SequenceStats;
+pub use stats_config::StatsConfig;
 pub use transaction::Transaction;
 pub use transaction_config::TransactionConfig;
 pub use write_options::WriteOptions;

@@ -10,7 +10,7 @@ use noxu_db::{Database, DatabaseEntry, OperationStatus};
 
 /// Iterator over database records yielding (key, value) pairs.
 ///
-/// 
+///
 ///
 /// This iterator yields key-value pairs as `(Vec<u8>, Vec<u8>)`. Records
 /// are returned in sorted key order. The iterator takes a snapshot of keys

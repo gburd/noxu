@@ -14,11 +14,7 @@ pub struct PreloadConfig {
 impl PreloadConfig {
     /// Creates a new PreloadConfig with default settings (load everything).
     pub fn new() -> Self {
-        Self {
-            max_bytes: 0,
-            max_millis: 0,
-            load_lns: false,
-        }
+        Self { max_bytes: 0, max_millis: 0, load_lns: false }
     }
 
     /// Builder-style: set max_bytes.

@@ -10,7 +10,7 @@ use super::mutation::MutationKey;
 /// In this is the `Conversion` interface.  In Rust we use a trait object
 /// (`Box<dyn ConversionFn>`) so the closure can be stored.
 ///
-/// 
+///
 pub trait ConversionFn: Send + Sync {
     /// Converts old raw bytes to new raw bytes.
     ///
@@ -48,7 +48,7 @@ where
 /// );
 /// ```
 ///
-/// 
+///
 pub struct Converter {
     key: MutationKey,
     conversion: Box<dyn ConversionFn>,
@@ -58,7 +58,7 @@ impl Converter {
     /// Creates a mutation for converting all instances of the given class
     /// version to the current version.
     ///
-    /// 
+    ///
     pub fn for_class<F>(
         class_name: impl Into<String>,
         class_version: u32,
@@ -126,7 +126,9 @@ impl Converter {
 
 impl std::fmt::Debug for Converter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Converter").field("key", &self.key).finish_non_exhaustive()
+        f.debug_struct("Converter")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -142,7 +144,9 @@ mod tests {
 
     #[test]
     fn test_class_converter_identity() {
-        let c = Converter::for_class("my.pkg.Person", 0, |b: &[u8]| Some(b.to_vec()));
+        let c = Converter::for_class("my.pkg.Person", 0, |b: &[u8]| {
+            Some(b.to_vec())
+        });
         assert_eq!(c.class_name(), "my.pkg.Person");
         assert_eq!(c.class_version(), 0);
         assert_eq!(c.field_name(), None);
@@ -152,10 +156,11 @@ mod tests {
 
     #[test]
     fn test_field_converter() {
-        let c = Converter::for_field("my.pkg.Person", 1, "age", |b: &[u8]| {
-            // Example: double every byte
-            Some(b.iter().map(|x| x.wrapping_mul(2)).collect())
-        });
+        let c =
+            Converter::for_field("my.pkg.Person", 1, "age", |b: &[u8]| {
+                // Example: double every byte
+                Some(b.iter().map(|x| x.wrapping_mul(2)).collect())
+            });
         assert_eq!(c.field_name(), Some("age"));
         let out = c.convert(&[1u8, 2, 3]).unwrap();
         assert_eq!(out, vec![2u8, 4, 6]);
@@ -169,7 +174,9 @@ mod tests {
 
     #[test]
     fn test_display() {
-        let c = Converter::for_class("com.example.Foo", 3, |b: &[u8]| Some(b.to_vec()));
+        let c = Converter::for_class("com.example.Foo", 3, |b: &[u8]| {
+            Some(b.to_vec())
+        });
         let s = c.to_string();
         assert!(s.contains("Converter"));
         assert!(s.contains("com.example.Foo"));

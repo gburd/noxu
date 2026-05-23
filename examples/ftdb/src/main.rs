@@ -1,12 +1,17 @@
 //! FTDB — TigerBeetle-compatible financial transactions database server.
 
 use clap::{Parser, Subcommand};
-use noxu_ftdb::{Account, AccountFlags, Engine, Header, Operation, Server, Storage, Transfer};
+use noxu_ftdb::{
+    Account, AccountFlags, Engine, Header, Operation, Server, Storage, Transfer,
+};
 use std::path::PathBuf;
 use std::process;
 
 #[derive(Parser)]
-#[command(name = "ftdb", about = "TigerBeetle-compatible financial transactions database")]
+#[command(
+    name = "ftdb",
+    about = "TigerBeetle-compatible financial transactions database"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -94,15 +99,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("Initialized database at {}", file.display());
         }
 
-        Commands::Start {
-            file,
-            address,
-            max_connections,
-        } => {
+        Commands::Start { file, address, max_connections } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                        .unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new("info")
+                        }),
                 )
                 .init();
 
@@ -112,7 +115,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+                let (shutdown_tx, shutdown_rx) =
+                    tokio::sync::broadcast::channel::<()>(1);
 
                 tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
@@ -124,23 +128,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
 
-        Commands::Benchmark {
-            address,
-            accounts,
-            transfers,
-            batch_size,
-        } => {
+        Commands::Benchmark { address, accounts, transfers, batch_size } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_benchmark(address, accounts, transfers, batch_size))?;
+            rt.block_on(run_benchmark(
+                address, accounts, transfers, batch_size,
+            ))?;
         }
 
-        Commands::CreateAccount {
-            file,
-            id,
-            ledger,
-            code,
-            balance,
-        } => {
+        Commands::CreateAccount { file, id, ledger, code, balance } => {
             let storage = Storage::open(&file)?;
             let engine = Engine::new(storage);
             let mut acct = Account::new(id, ledger);
@@ -152,7 +147,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if results.is_empty() {
                 println!("Created account {id} on ledger {ledger}");
             } else {
-                eprintln!("Failed to create account: result code {}", results[0].result);
+                eprintln!(
+                    "Failed to create account: result code {}",
+                    results[0].result
+                );
                 process::exit(1);
             }
         }
@@ -219,7 +217,8 @@ async fn run_benchmark(
             body.extend_from_slice(&acct.to_bytes());
         }
 
-        let header = Header::new(Operation::CreateAccounts, created, batch_count);
+        let header =
+            Header::new(Operation::CreateAccounts, created, batch_count);
         send_request(&mut stream, &header, &body).await?;
         let (_resp_header, _resp_body) = recv_response(&mut stream).await?;
         created = batch_end;
@@ -248,7 +247,11 @@ async fn run_benchmark(
             body.extend_from_slice(&t.to_bytes());
         }
 
-        let header = Header::new(Operation::CreateTransfers, created_transfers, batch_count);
+        let header = Header::new(
+            Operation::CreateTransfers,
+            created_transfers,
+            batch_count,
+        );
         send_request(&mut stream, &header, &body).await?;
         let (_resp_header, _resp_body) = recv_response(&mut stream).await?;
         created_transfers = batch_end;

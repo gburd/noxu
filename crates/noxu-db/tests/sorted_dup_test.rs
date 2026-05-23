@@ -5,11 +5,11 @@
 //! PrevNoDup), delete of specific dup values, count(), transaction
 //! isolation, and round-trip recovery.
 
+use noxu_db::Environment;
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, Put,
 };
 use tempfile::TempDir;
-use noxu_db::Environment;
 
 /// Open a transactional environment in a temp dir.
 fn open_env(dir: &TempDir) -> Environment {
@@ -122,9 +122,24 @@ fn test_get_next_dup_stops_at_key_boundary() {
         .with_sorted_duplicates(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
-    db.put(None, &DatabaseEntry::from_bytes(b"key1"), &DatabaseEntry::from_bytes(b"v1")).unwrap();
-    db.put(None, &DatabaseEntry::from_bytes(b"key1"), &DatabaseEntry::from_bytes(b"v2")).unwrap();
-    db.put(None, &DatabaseEntry::from_bytes(b"key2"), &DatabaseEntry::from_bytes(b"v3")).unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"key1"),
+        &DatabaseEntry::from_bytes(b"v1"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"key1"),
+        &DatabaseEntry::from_bytes(b"v2"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"key2"),
+        &DatabaseEntry::from_bytes(b"v3"),
+    )
+    .unwrap();
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"key1");
@@ -157,10 +172,30 @@ fn test_get_next_no_dup_advances_to_next_key() {
         .with_sorted_duplicates(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
-    db.put(None, &DatabaseEntry::from_bytes(b"aa"), &DatabaseEntry::from_bytes(b"d1")).unwrap();
-    db.put(None, &DatabaseEntry::from_bytes(b"aa"), &DatabaseEntry::from_bytes(b"d2")).unwrap();
-    db.put(None, &DatabaseEntry::from_bytes(b"aa"), &DatabaseEntry::from_bytes(b"d3")).unwrap();
-    db.put(None, &DatabaseEntry::from_bytes(b"bb"), &DatabaseEntry::from_bytes(b"e1")).unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"aa"),
+        &DatabaseEntry::from_bytes(b"d1"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"aa"),
+        &DatabaseEntry::from_bytes(b"d2"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"aa"),
+        &DatabaseEntry::from_bytes(b"d3"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"bb"),
+        &DatabaseEntry::from_bytes(b"e1"),
+    )
+    .unwrap();
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut kout = DatabaseEntry::new();
@@ -210,7 +245,11 @@ fn test_dup_delete_specific_value() {
     let mut kout2 = DatabaseEntry::from_bytes(b"k");
     let mut dout2 = DatabaseEntry::new();
     cursor2.get(&mut kout2, &mut dout2, Get::Search, None).unwrap();
-    assert_eq!(cursor2.count().unwrap(), 2, "should have 2 dups after deleting v2");
+    assert_eq!(
+        cursor2.count().unwrap(),
+        2,
+        "should have 2 dups after deleting v2"
+    );
 
     // The remaining values should be v1 and v3.
     assert_eq!(dout2.get_data().unwrap(), b"v1");
@@ -370,7 +409,11 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     // Second insert with the same (key, data) pair using NoDupData.
     let mut cursor = db.open_cursor(None, None).unwrap();
     let s = cursor.put(&key, &data, Put::NoDupData).unwrap();
-    assert_eq!(s, OperationStatus::KeyExists, "NoDupData should reject exact dup");
+    assert_eq!(
+        s,
+        OperationStatus::KeyExists,
+        "NoDupData should reject exact dup"
+    );
 
     // A different data value is allowed.
     let data2 = DatabaseEntry::from_bytes(b"w");
@@ -380,5 +423,3 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     cursor.close().unwrap();
     let _ = env.close();
 }
-
-

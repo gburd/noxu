@@ -35,11 +35,19 @@ fn main() {
 
     let db1 = xa1
         .inner()
-        .open_database(None, "accounts", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "accounts",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let db2 = xa2
         .inner()
-        .open_database(None, "ledger", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "ledger",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
 
     // Create a global transaction ID
@@ -96,11 +104,17 @@ fn main() {
     let mut val = DatabaseEntry::new();
     db1.get(None, &DatabaseEntry::from_bytes(b"account_alice"), &mut val)
         .unwrap();
-    println!("          DB1 account_alice: {:?}", std::str::from_utf8(val.get_data().unwrap()));
+    println!(
+        "          DB1 account_alice: {:?}",
+        std::str::from_utf8(val.get_data().unwrap())
+    );
 
     db2.get(None, &DatabaseEntry::from_bytes(b"ledger_entry_001"), &mut val)
         .unwrap();
-    println!("          DB2 ledger_entry:  {:?}", std::str::from_utf8(val.get_data().unwrap()));
+    println!(
+        "          DB2 ledger_entry:  {:?}",
+        std::str::from_utf8(val.get_data().unwrap())
+    );
 
     println!("\n=== Success: distributed transaction committed atomically ===");
 }

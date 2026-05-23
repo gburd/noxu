@@ -11,7 +11,7 @@ use crate::error::Result;
 /// Implementations define how to serialize an object into a database entry
 /// and how to deserialize it back.
 ///
-/// 
+///
 pub trait EntryBinding<T> {
     /// Converts a `DatabaseEntry` to an object.
     ///
@@ -37,7 +37,7 @@ pub trait EntryBinding<T> {
 /// This trait is used for entity bindings where the key and data are stored
 /// separately but represent a single logical entity.
 ///
-/// 
+///
 pub trait EntityBinding<E> {
     /// Converts key and data entries to an entity object.
     ///

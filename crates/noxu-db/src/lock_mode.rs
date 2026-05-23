@@ -6,7 +6,7 @@
 /// Specifies the locking behavior for a read operation. Controls isolation
 /// level and whether locks are acquired.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LockMode {
     /// Use the default isolation level for the cursor or transaction.

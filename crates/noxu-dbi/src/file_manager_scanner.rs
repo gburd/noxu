@@ -18,7 +18,7 @@ use noxu_log::{
     file_header::FILE_HEADER_SIZE,
 };
 use noxu_recovery::{
-    CkptEndRecord, CkptStartRecord, CheckpointEnd, CheckpointStart, InRecord,
+    CheckpointEnd, CheckpointStart, CkptEndRecord, CkptStartRecord, InRecord,
     LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
     TxnAbortRecord, TxnCommitRecord,
 };
@@ -87,10 +87,7 @@ impl FileManagerLogScanner {
     ///
     /// Returns `None` for entry types recovery does not need to process
     /// (FileHeader, Trace, etc.).
-    fn parse_payload(
-        entry_type_num: u8,
-        payload: Bytes,
-    ) -> Option<LogEntry> {
+    fn parse_payload(entry_type_num: u8, payload: Bytes) -> Option<LogEntry> {
         let entry_type = LogEntryType::from_type_num(entry_type_num)?;
 
         match entry_type {
@@ -136,8 +133,9 @@ impl FileManagerLogScanner {
                     }
                     _ => LnOperation::Delete,
                 };
-                let key   = payload.slice(subslice_range(raw, r.key));
-                let data  = r.data.map(|s| payload.slice(subslice_range(raw, s)));
+                let key = payload.slice(subslice_range(raw, r.key));
+                let data =
+                    r.data.map(|s| payload.slice(subslice_range(raw, s)));
                 let mut rec = LnRecord::new(
                     r.db_id,
                     r.txn_id.map(|id| id as u64),
@@ -147,8 +145,10 @@ impl FileManagerLogScanner {
                     r.abort_lsn,
                     r.abort_known_deleted,
                 );
-                rec.abort_key  = r.abort_key.map(|s| payload.slice(subslice_range(raw, s)));
-                rec.abort_data = r.abort_data.map(|s| payload.slice(subslice_range(raw, s)));
+                rec.abort_key =
+                    r.abort_key.map(|s| payload.slice(subslice_range(raw, s)));
+                rec.abort_data =
+                    r.abort_data.map(|s| payload.slice(subslice_range(raw, s)));
                 Some(LogEntry::Ln(rec))
             }
 
@@ -166,7 +166,7 @@ impl FileManagerLogScanner {
                 Some(LogEntry::In(InRecord {
                     db_id: e.db_id,
                     node_id,
-                    level: 0,    // level not embedded in this format; 0 = BIN
+                    level: 0, // level not embedded in this format; 0 = BIN
                     is_root: false,
                     is_delta: false,
                     node_data: Some(e.node_data),
@@ -203,9 +203,7 @@ impl FileManagerLogScanner {
                     id: e.get_id(),
                     checkpoint_start_lsn: e.get_checkpoint_start_lsn(),
                     first_active_lsn: e.get_first_active_lsn(),
-                    root_lsn: e
-                        .get_root_lsn()
-                        .unwrap_or(NULL_LSN),
+                    root_lsn: e.get_root_lsn().unwrap_or(NULL_LSN),
                     last_local_node_id: e.get_last_local_node_id(),
                     last_replicated_node_id: e.get_last_replicated_node_id(),
                     last_local_db_id: e.get_last_local_db_id(),
@@ -261,7 +259,8 @@ impl FileManagerLogScanner {
         }
 
         // slice() is O(1): just bumps the Bytes Arc refcount.
-        let payload = file_bytes.slice(offset + header_size..offset + entry_size);
+        let payload =
+            file_bytes.slice(offset + header_size..offset + entry_size);
         let log_entry = Self::parse_payload(entry_type_num, payload);
 
         Some((entry_size, log_entry))
@@ -317,13 +316,13 @@ impl FileManagerLogScanner {
             // Determine where in this file to start parsing.
             // Always start at FILE_HEADER_SIZE minimum: a start offset of 0
             // would land inside the file header and break parsing.
-            let file_start_offset: usize =
-                if start_lsn != NULL_LSN && file_num == start_lsn.file_number()
-                {
-                    (start_lsn.file_offset() as usize).max(FILE_HEADER_SIZE)
-                } else {
-                    FILE_HEADER_SIZE
-                };
+            let file_start_offset: usize = if start_lsn != NULL_LSN
+                && file_num == start_lsn.file_number()
+            {
+                (start_lsn.file_offset() as usize).max(FILE_HEADER_SIZE)
+            } else {
+                FILE_HEADER_SIZE
+            };
 
             let mut offset = file_start_offset;
 
@@ -393,11 +392,10 @@ impl LogScanner for FileManagerLogScanner {
         let mut next_available_lsn = NULL_LSN;
 
         'outer: for &file_num in file_nums.iter().rev() {
-            let file_len =
-                match self.file_manager.get_file_length(file_num) {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
+            let file_len = match self.file_manager.get_file_length(file_num) {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
             if file_len == 0 {
                 continue;
             }
@@ -493,32 +491,30 @@ impl LogScanner for FileManagerLogScanner {
         }
         // scan_files_forward with end_lsn = next offset after target is
         // the cheapest way to read exactly one entry.
-        let end_lsn = Lsn::new(
-            target_lsn.file_number(),
-            target_lsn.file_offset() + 1,
-        );
+        let end_lsn =
+            Lsn::new(target_lsn.file_number(), target_lsn.file_offset() + 1);
         let entries = self.scan_files_forward(target_lsn, end_lsn);
-        entries
-            .into_iter()
-            .find(|e| e.lsn == target_lsn)
-            .map(|e| e.entry)
+        entries.into_iter().find(|e| e.lsn == target_lsn).map(|e| e.entry)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
+    use noxu_log::entry::TxnEndEntry;
     use noxu_log::{LogEntryType, LogManager, Provisional};
     use noxu_util::vlsn::NULL_VLSN;
-    use noxu_log::entry::TxnEndEntry;
-    use bytes::BytesMut;
     use tempfile::TempDir;
 
-    fn make_manager(dir: &std::path::Path) -> (Arc<FileManager>, Arc<LogManager>) {
+    fn make_manager(
+        dir: &std::path::Path,
+    ) -> (Arc<FileManager>, Arc<LogManager>) {
         let fm = Arc::new(
             FileManager::new(dir, false, 64 * 1024 * 1024, 100).unwrap(),
         );
-        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
         (fm, lm)
     }
 
@@ -573,9 +569,9 @@ mod tests {
         let entries = scanner.scan_forward(NULL_LSN, next);
         assert!(!entries.is_empty(), "should find at least one entry");
 
-        let commit = entries
-            .iter()
-            .find(|e| matches!(e.entry, LogEntry::TxnCommit(ref r) if r.txn_id == 99));
+        let commit = entries.iter().find(
+            |e| matches!(e.entry, LogEntry::TxnCommit(ref r) if r.txn_id == 99),
+        );
         assert!(commit.is_some(), "should find TxnCommit for txn 99");
     }
 

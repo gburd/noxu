@@ -44,7 +44,7 @@ pub trait Loggable: Sized {
 
 /// Extension of Loggable that supports writing in multiple log versions.
 ///
-/// 
+///
 ///
 /// Types that implement this trait can serialize themselves in earlier log
 /// formats to support replication during upgrades where the master has been
@@ -103,7 +103,7 @@ pub trait VersionedWriteLoggable: Loggable {
 /// Basic implementation of VersionedWriteLoggable that writes in a single
 /// format by default.
 ///
-/// 
+///
 ///
 /// Types can implement this trait to get default single-format behavior,
 /// then override specific methods to support multiple versions.
@@ -330,7 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn test_versioned_write_loggable_is_replication_format_worthwhile_default() {
+    fn test_versioned_write_loggable_is_replication_format_worthwhile_default()
+    {
         let e = VersionedEntry { x: 1 };
         assert!(!e.is_replication_format_worthwhile(1, 15));
     }

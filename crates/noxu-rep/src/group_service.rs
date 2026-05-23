@@ -4,10 +4,10 @@
 //! group membership, tracking which nodes are in the group, their types, and
 //! their activity status.
 
-use noxu_sync::RwLock;
 use hashbrown::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use noxu_sync::RwLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::node_type::NodeType;
@@ -130,7 +130,10 @@ impl GroupService {
         // Recompute CBVLSN = min(known_vlsn) over active electable nodes.
         let new_cbvlsn = nodes
             .values()
-            .filter(|n| n.is_active && n.node_type == crate::node_type::NodeType::Electable)
+            .filter(|n| {
+                n.is_active
+                    && n.node_type == crate::node_type::NodeType::Electable
+            })
             .map(|n| n.known_vlsn)
             .min()
             .unwrap_or(0);
@@ -158,8 +161,9 @@ impl GroupService {
             .values()
             .filter(|n| {
                 n.is_active
-                    && n.log_range
-                        .is_some_and(|(first, last)| first <= vlsn && vlsn <= last)
+                    && n.log_range.is_some_and(|(first, last)| {
+                        first <= vlsn && vlsn <= last
+                    })
             })
             .map(|n| (n.name.as_str(), n.last_seen))
             .collect();

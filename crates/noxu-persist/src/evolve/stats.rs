@@ -6,7 +6,7 @@
 /// Returned from [`EntityStore::evolve`] and also passed to progress
 /// listeners during evolution.
 ///
-/// 
+///
 ///
 /// [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,7 +25,7 @@ impl EvolveStats {
 
     /// Accumulates counts from processing one batch/class.
     ///
-    /// 
+    ///
     pub fn add(&mut self, n_read: u64, n_converted: u64) {
         self.n_read += n_read;
         self.n_converted += n_converted;
@@ -33,7 +33,7 @@ impl EvolveStats {
 
     /// Returns the total number of entities read during eager evolution.
     ///
-    /// 
+    ///
     pub fn n_read(&self) -> u64 {
         self.n_read
     }
@@ -41,7 +41,7 @@ impl EvolveStats {
     /// Returns the total number of entities converted (written) during eager
     /// evolution.
     ///
-    /// 
+    ///
     pub fn n_converted(&self) -> u64 {
         self.n_converted
     }
@@ -49,7 +49,11 @@ impl EvolveStats {
 
 impl std::fmt::Display for EvolveStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EvolveStats {{ n_read: {}, n_converted: {} }}", self.n_read, self.n_converted)
+        write!(
+            f,
+            "EvolveStats {{ n_read: {}, n_converted: {} }}",
+            self.n_read, self.n_converted
+        )
     }
 }
 

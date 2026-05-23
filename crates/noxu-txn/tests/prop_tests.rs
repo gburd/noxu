@@ -1,7 +1,7 @@
 //! Property-based tests for noxu-txn using proptest.
 
-use proptest::prelude::*;
 use hashbrown::{HashMap, HashSet};
+use proptest::prelude::*;
 
 use noxu_txn::{DeadlockDetector, LockConflict, LockType, LockUpgrade};
 

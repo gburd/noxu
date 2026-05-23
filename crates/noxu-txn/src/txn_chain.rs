@@ -85,7 +85,7 @@ impl RevertInfo {
 ///
 /// Used by `MasterTxn.rollbackOperations()` in HA.
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct TxnChain {
     /// Ordered list of revert entries (in log-chain traversal order, newest first).

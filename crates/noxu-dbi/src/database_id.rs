@@ -3,7 +3,7 @@
 
 /// Unique identifier for a database.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatabaseId(i64);
 

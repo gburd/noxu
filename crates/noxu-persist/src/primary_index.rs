@@ -9,8 +9,8 @@ use crate::entity::{Entity, PrimaryKey};
 use crate::entity_serializer::EntitySerializer;
 use crate::error::{PersistError, Result};
 use crate::secondary_index::{
-    make_secondary_index, SecondaryIndex, SecondaryIndexMaintainer,
-    SecondaryRegistration,
+    SecondaryIndex, SecondaryIndexMaintainer, SecondaryRegistration,
+    make_secondary_index,
 };
 
 /// Typed access to entities by primary key.
@@ -20,7 +20,7 @@ use crate::secondary_index::{
 /// method call rather than stored in the index, allowing different
 /// serialization strategies to be used with the same index.
 ///
-/// 
+///
 ///
 /// # Type Parameters
 ///
@@ -58,7 +58,7 @@ where
     /// `PrimaryIndex`: every `put` and `delete_with_entity` updates the
     /// secondary map.
     ///
-    /// 
+    ///
     ///
     /// # Example
     ///
@@ -93,8 +93,10 @@ where
         SK: Ord + Clone + Send + Sync + 'static,
         F: Fn(&E) -> Option<SK> + Send + Sync + 'static,
     {
-        let (index, reg): (SecondaryIndex<SK, K, E>, SecondaryRegistration<SK, K, E>) =
-            make_secondary_index(extractor);
+        let (index, reg): (
+            SecondaryIndex<SK, K, E>,
+            SecondaryRegistration<SK, K, E>,
+        ) = make_secondary_index(extractor);
         self.secondaries.push(Box::new(reg));
         index
     }
@@ -107,7 +109,7 @@ where
     ///
     /// Returns `None` if no entity with the given key exists.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the database operation fails or deserialization fails.
@@ -144,7 +146,7 @@ where
     ///
     /// All registered secondary indexes are updated automatically.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
@@ -177,7 +179,7 @@ where
     /// Returns `true` if the entity was inserted, `false` if the key already
     /// exists. Secondary indexes are updated on successful insert.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
@@ -213,7 +215,7 @@ where
     /// no entity is fetched. Use `delete_with_entity` when secondary index
     /// maintenance is required.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
@@ -241,9 +243,7 @@ where
     ) -> Result<bool> {
         let old_entity = self.get(serializer, key)?;
         let deleted = self.delete(key)?;
-        if deleted
-            && let Some(ref e) = old_entity
-        {
+        if deleted && let Some(ref e) = old_entity {
             for m in &self.secondaries {
                 m.on_delete(e);
             }
@@ -257,7 +257,7 @@ where
 
     /// Checks whether an entity with the given primary key exists.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
@@ -270,7 +270,7 @@ where
 
     /// Returns an approximate count of entities in the index.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
@@ -284,7 +284,7 @@ where
 
     /// Returns an iterator over all entities in key order.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
@@ -304,7 +304,7 @@ where
 
     /// Returns an iterator over all primary keys in key order.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
@@ -330,7 +330,7 @@ where
 
 /// Iterator over entities using a database cursor.
 ///
-/// 
+///
 pub struct EntityIterator<'a, K, E, S> {
     cursor: noxu_db::Cursor,
     serializer: &'a S,
@@ -891,7 +891,8 @@ mod tests {
         let ser = UserSerializer;
 
         // Open a secondary index on name.
-        let name_idx = index.open_secondary_index(|u: &User| Some(u.name.clone()));
+        let name_idx =
+            index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
         let user = test_user(10);
         index.put(&ser, &user).unwrap();
@@ -921,7 +922,8 @@ mod tests {
         let mut index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        let _name_idx = index.open_secondary_index(|u: &User| Some(u.name.clone()));
+        let _name_idx =
+            index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
         let deleted = index.delete_with_entity(&ser, &999u64).unwrap();
         assert!(!deleted);
@@ -934,7 +936,8 @@ mod tests {
         let mut index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        let name_idx = index.open_secondary_index(|u: &User| Some(u.name.clone()));
+        let name_idx =
+            index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
         let user = test_user(5);
         let inserted = index.put_no_overwrite(&ser, &user).unwrap();

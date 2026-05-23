@@ -130,25 +130,26 @@ impl NetworkRestoreServer {
     /// Used by both `serve_raw` and the `ServiceHandler::handle` path.
     fn send_files_to<W: IoRead + IoWrite>(&self, out: &mut W) -> Result<()> {
         // Enumerate all .ndb files in env_home, sorted by name.
-        let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(&self.env_home)
-            .map_err(|e| {
-                RepError::NetworkRestoreError(format!(
-                    "cannot read env_home {}: {}",
-                    self.env_home.display(),
-                    e
-                ))
-            })?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension()?.to_str()? == "ndb" {
-                    let name = path.file_name()?.to_str()?.to_string();
-                    Some((name, path))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut files: Vec<(String, PathBuf)> =
+            std::fs::read_dir(&self.env_home)
+                .map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "cannot read env_home {}: {}",
+                        self.env_home.display(),
+                        e
+                    ))
+                })?
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let path = entry.path();
+                    if path.extension()?.to_str()? == "ndb" {
+                        let name = path.file_name()?.to_str()?.to_string();
+                        Some((name, path))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         files.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Send file count.
@@ -261,13 +262,12 @@ impl ServiceHandler for NetworkRestoreServer {
         // Read the RESTORE magic through the channel.
         use std::time::Duration;
 
-        let magic_bytes = channel.receive(Duration::from_secs(30))?.ok_or_else(
-            || {
+        let magic_bytes =
+            channel.receive(Duration::from_secs(30))?.ok_or_else(|| {
                 RepError::NetworkRestoreError(
                     "no magic bytes received on RESTORE channel".into(),
                 )
-            },
-        )?;
+            })?;
         if magic_bytes.len() < 4 {
             return Err(RepError::NetworkRestoreError(format!(
                 "short magic: {} bytes",
@@ -413,8 +413,8 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: false,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("empty restore should succeed");
 
         let received: Vec<_> = std::fs::read_dir(restore_dir.path())
@@ -440,8 +440,8 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: false,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("single-file restore");
 
         let received = std::fs::read(restore_dir.path().join("00000001.ndb"))
@@ -454,9 +454,8 @@ mod tests {
     fn test_restore_multiple_files() {
         let file_data: Vec<(&str, Vec<u8>)> = (0u32..5)
             .map(|i| {
-                let name: &'static str = Box::leak(
-                    format!("{:08}.ndb", i).into_boxed_str(),
-                );
+                let name: &'static str =
+                    Box::leak(format!("{:08}.ndb", i).into_boxed_str());
                 let data = vec![(i & 0xFF) as u8; 1024 * (i as usize + 1)];
                 (name, data)
             })
@@ -476,13 +475,12 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: false,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("multi-file restore");
 
         for (name, expected) in &file_data {
-            let got =
-                std::fs::read(restore_dir.path().join(name)).expect(name);
+            let got = std::fs::read(restore_dir.path().join(name)).expect(name);
             assert_eq!(&got, expected, "file {} mismatch", name);
         }
         server.stop();
@@ -507,8 +505,8 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: false,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("restore");
 
         // Only the .ndb file should appear.
@@ -534,11 +532,8 @@ mod tests {
 
         // Pre-populate the destination with the original file.
         let restore_dir = tempfile::tempdir().expect("restore dir");
-        std::fs::write(
-            restore_dir.path().join("00000001.ndb"),
-            original,
-        )
-        .expect("pre-populate");
+        std::fs::write(restore_dir.path().join("00000001.ndb"), original)
+            .expect("pre-populate");
 
         let config = NetworkRestoreConfig {
             source_node: "node1".to_string(),
@@ -546,8 +541,8 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: true,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("restore with retain");
 
         // The restored file should contain the new data.
@@ -556,10 +551,8 @@ mod tests {
         assert_eq!(&got, updated);
 
         // The backup file should still contain the original.
-        let bak = std::fs::read(
-            restore_dir.path().join("00000001.ndb.bak"),
-        )
-        .unwrap();
+        let bak =
+            std::fs::read(restore_dir.path().join("00000001.ndb.bak")).unwrap();
         assert_eq!(&bak, original);
         server.stop();
     }
@@ -580,8 +573,8 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: false,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("large file restore");
 
         let got = std::fs::read(restore_dir.path().join("large.ndb")).unwrap();
@@ -613,8 +606,8 @@ mod tests {
             source_port: bound.port(),
             retain_log_files: false,
         };
-        let restore = NetworkRestore::new(config)
-            .with_local_dir(restore_dir.path());
+        let restore =
+            NetworkRestore::new(config).with_local_dir(restore_dir.path());
         restore.execute().expect("restore");
 
         let progress = restore.get_progress();

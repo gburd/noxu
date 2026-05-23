@@ -15,14 +15,14 @@
 
 use noxu_db::{Environment, EnvironmentConfig};
 use noxu_persist::{
-    entity_store::EntityStore,
     entity::Entity,
     entity_serializer::EntitySerializer,
+    entity_store::EntityStore,
     error::{PersistError, Result},
+    evolve::{Converter, Deleter, EvolveConfig, Mutations, Renamer},
     primary_index::PrimaryIndex,
     secondary_index::SecondaryIndex,
     store_config::StoreConfig,
-    evolve::{Converter, Deleter, EvolveConfig, Mutations, Renamer},
 };
 use tempfile::TempDir;
 
@@ -76,7 +76,8 @@ impl EntitySerializer<MyEntity> for MyEntitySerializer {
                 "too short for MyEntity".into(),
             ));
         }
-        let pri_key = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let pri_key =
+            i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let (sec_key, mut pos) = if bytes[4] == 0 {
             (None, 5)
         } else {
@@ -85,7 +86,8 @@ impl EntitySerializer<MyEntity> for MyEntitySerializer {
                     "too short for sec_key".into(),
                 ));
             }
-            let sk = i32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+            let sk =
+                i32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
             (Some(sk), 9)
         };
         if bytes.len() < pos + 4 {
@@ -93,9 +95,12 @@ impl EntitySerializer<MyEntity> for MyEntitySerializer {
                 "too short for label length".into(),
             ));
         }
-        let label_len =
-            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-                as usize;
+        let label_len = u32::from_be_bytes([
+            bytes[pos],
+            bytes[pos + 1],
+            bytes[pos + 2],
+            bytes[pos + 3],
+        ]) as usize;
         pos += 4;
         if bytes.len() < pos + label_len {
             return Err(PersistError::SerializationError(
@@ -185,7 +190,8 @@ fn test_put_replaces_existing() {
     index.put(&ser, &my_entity(1, Some(10))).unwrap();
 
     // Overwrite with a different sec_key and label.
-    let updated = MyEntity { pri_key: 1, sec_key: Some(99), label: "updated".into() };
+    let updated =
+        MyEntity { pri_key: 1, sec_key: Some(99), label: "updated".into() };
     index.put(&ser, &updated).unwrap();
 
     let found = index.get(&ser, &1).unwrap().unwrap();
@@ -365,25 +371,27 @@ fn test_two_entity_types_in_same_store() {
     // mutable borrows of `store` — the borrow checker requires this because
     // `get_primary_index` takes `&mut self`.
     {
-        let idx1: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx1: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         idx1.put(&ser1, &my_entity(1, Some(10))).unwrap();
         assert_eq!(idx1.count().unwrap(), 1);
     }
     {
-        let idx2: PrimaryIndex<u64, OtherEntity> = store.get_primary_index().unwrap();
-        idx2.put(&ser2, &OtherEntity { key: 100, value: "hello".into() }).unwrap();
+        let idx2: PrimaryIndex<u64, OtherEntity> =
+            store.get_primary_index().unwrap();
+        idx2.put(&ser2, &OtherEntity { key: 100, value: "hello".into() })
+            .unwrap();
         assert_eq!(idx2.count().unwrap(), 1);
     }
     {
-        let idx1: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx1: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         assert_eq!(idx1.get(&ser1, &1).unwrap().unwrap().pri_key, 1);
     }
     {
-        let idx2: PrimaryIndex<u64, OtherEntity> = store.get_primary_index().unwrap();
-        assert_eq!(
-            idx2.get(&ser2, &100u64).unwrap().unwrap().value,
-            "hello"
-        );
+        let idx2: PrimaryIndex<u64, OtherEntity> =
+            store.get_primary_index().unwrap();
+        assert_eq!(idx2.get(&ser2, &100u64).unwrap().unwrap().value, "hello");
     }
 }
 
@@ -493,7 +501,8 @@ fn test_put_operations() {
     assert_eq!(index.get(&ser, &1).unwrap().unwrap().pri_key, 1);
 
     // put() update (same key)
-    let updated = MyEntity { pri_key: 1, sec_key: Some(42), label: "updated".into() };
+    let updated =
+        MyEntity { pri_key: 1, sec_key: Some(42), label: "updated".into() };
     index.put(&ser, &updated).unwrap();
     assert_eq!(index.get(&ser, &1).unwrap().unwrap().sec_key, Some(42));
 
@@ -517,7 +526,8 @@ fn test_secondary_lookup_by_key() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -550,7 +560,8 @@ fn test_secondary_many_to_one() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -588,7 +599,8 @@ fn test_secondary_iteration_in_key_order() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -620,7 +632,8 @@ fn test_secondary_iter_from_range() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -652,7 +665,8 @@ fn test_secondary_delete_cascades_to_primary() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -684,7 +698,8 @@ fn test_secondary_delete_not_found() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -709,7 +724,8 @@ fn test_secondary_contains() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -732,7 +748,8 @@ fn test_secondary_keys_index() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -761,7 +778,8 @@ fn test_secondary_updated_on_overwrite() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
     let ser = MyEntitySerializer;
 
-    let mut index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+    let mut index: PrimaryIndex<i32, MyEntity> =
+        store.get_primary_index().unwrap();
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
@@ -770,7 +788,12 @@ fn test_secondary_updated_on_overwrite() {
     assert!(!sec.contains(&20));
 
     // Update: change sec_key from 10 to 20.
-    index.put(&ser, &MyEntity { pri_key: 1, sec_key: Some(20), label: "x".into() }).unwrap();
+    index
+        .put(
+            &ser,
+            &MyEntity { pri_key: 1, sec_key: Some(20), label: "x".into() },
+        )
+        .unwrap();
     assert!(!sec.contains(&10), "old sec_key must be removed");
     assert!(sec.contains(&20), "new sec_key must be present");
 }
@@ -787,11 +810,19 @@ fn test_two_secondary_indexes_maintained_independently() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
 
     #[derive(Clone, Debug, PartialEq)]
-    struct EmpB { id: i32, dept: i32, grade: i32 }
+    struct EmpB {
+        id: i32,
+        dept: i32,
+        grade: i32,
+    }
     impl Entity for EmpB {
         type PrimaryKey = i32;
-        fn primary_key(&self) -> &i32 { &self.id }
-        fn entity_name() -> &'static str { "EmpB" }
+        fn primary_key(&self) -> &i32 {
+            &self.id
+        }
+        fn entity_name() -> &'static str {
+            "EmpB"
+        }
     }
     struct EmpBSer;
     impl EntitySerializer<EmpB> for EmpBSer {
@@ -809,7 +840,8 @@ fn test_two_secondary_indexes_maintained_independently() {
         }
     }
 
-    let mut primary: PrimaryIndex<i32, EmpB> = store.get_primary_index().unwrap();
+    let mut primary: PrimaryIndex<i32, EmpB> =
+        store.get_primary_index().unwrap();
     let dept_idx: SecondaryIndex<i32, i32, EmpB> =
         primary.open_secondary_index(|e: &EmpB| Some(e.dept));
     let grade_idx: SecondaryIndex<i32, i32, EmpB> =
@@ -882,7 +914,8 @@ fn test_deleter_mutation_removes_records_and_stats() {
 
     // Insert 3 entities.
     {
-        let idx: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         for i in 0..3i32 {
             idx.put(&ser, &my_entity(i, None)).unwrap();
         }
@@ -925,7 +958,8 @@ fn test_converter_mutation_transforms_records_and_stats() {
 
     const N: i32 = 4;
     {
-        let idx: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         for i in 0..N {
             idx.put(&ser, &my_entity(i, None)).unwrap();
         }
@@ -933,11 +967,15 @@ fn test_converter_mutation_transforms_records_and_stats() {
 
     // Converter appends a sentinel byte — trivial structural change.
     let mut mutations = Mutations::new();
-    mutations.add_converter(Converter::for_class("MyEntity", 0, |b: &[u8]| {
-        let mut out = b.to_vec();
-        out.push(0xAB);
-        Some(out)
-    }));
+    mutations.add_converter(Converter::for_class(
+        "MyEntity",
+        0,
+        |b: &[u8]| {
+            let mut out = b.to_vec();
+            out.push(0xAB);
+            Some(out)
+        },
+    ));
 
     let evolve_cfg = EvolveConfig::new();
     let stats = store.evolve(&mutations, &evolve_cfg).unwrap();
@@ -971,7 +1009,8 @@ fn test_evolve_with_empty_mutations_returns_zero() {
     let ser = MyEntitySerializer;
 
     {
-        let idx: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         idx.put(&ser, &my_entity(1, None)).unwrap();
     }
 
@@ -998,18 +1037,20 @@ fn test_evolve_config_class_filter() {
     let ser = MyEntitySerializer;
 
     {
-        let idx: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         idx.put(&ser, &my_entity(1, None)).unwrap();
     }
 
     let mut mutations = Mutations::new();
-    mutations.add_converter(Converter::for_class("MyEntity", 0, |b: &[u8]| {
-        Some(b.to_vec())
-    }));
+    mutations.add_converter(Converter::for_class(
+        "MyEntity",
+        0,
+        |b: &[u8]| Some(b.to_vec()),
+    ));
 
     // Target a *different* class → MyEntity should be skipped entirely.
-    let evolve_cfg =
-        EvolveConfig::new().with_class_to_evolve("SomeOtherClass");
+    let evolve_cfg = EvolveConfig::new().with_class_to_evolve("SomeOtherClass");
     let stats = store.evolve(&mutations, &evolve_cfg).unwrap();
 
     assert_eq!(stats.n_read(), 0);
@@ -1074,7 +1115,8 @@ fn test_evolve_full_round_trip() {
 
     // Write 2 entities.
     {
-        let idx: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
+        let idx: PrimaryIndex<i32, MyEntity> =
+            store.get_primary_index().unwrap();
         idx.put(&ser, &my_entity(1, Some(10))).unwrap();
         idx.put(&ser, &my_entity(2, Some(20))).unwrap();
     }
@@ -1083,21 +1125,25 @@ fn test_evolve_full_round_trip() {
     // Old layout for sec_key present: [pri(4)] [0x01] [sk(4)] [label...]
     // New layout: same structure but sk bytes are negated.
     let mut mutations = Mutations::new();
-    mutations.add_converter(Converter::for_class("MyEntity", 0, |bytes: &[u8]| {
-        // Only modify records that have sec_key present (byte[4] == 1).
-        if bytes.len() < 9 || bytes[4] != 1 {
-            return Some(bytes.to_vec());
-        }
-        let mut out = bytes.to_vec();
-        let sk = i32::from_be_bytes([out[5], out[6], out[7], out[8]]);
-        let new_sk = sk.wrapping_neg();
-        let nb = new_sk.to_be_bytes();
-        out[5] = nb[0];
-        out[6] = nb[1];
-        out[7] = nb[2];
-        out[8] = nb[3];
-        Some(out)
-    }));
+    mutations.add_converter(Converter::for_class(
+        "MyEntity",
+        0,
+        |bytes: &[u8]| {
+            // Only modify records that have sec_key present (byte[4] == 1).
+            if bytes.len() < 9 || bytes[4] != 1 {
+                return Some(bytes.to_vec());
+            }
+            let mut out = bytes.to_vec();
+            let sk = i32::from_be_bytes([out[5], out[6], out[7], out[8]]);
+            let new_sk = sk.wrapping_neg();
+            let nb = new_sk.to_be_bytes();
+            out[5] = nb[0];
+            out[6] = nb[1];
+            out[7] = nb[2];
+            out[8] = nb[3];
+            Some(out)
+        },
+    ));
 
     let evolve_cfg = EvolveConfig::new();
     let stats = store.evolve(&mutations, &evolve_cfg).unwrap();

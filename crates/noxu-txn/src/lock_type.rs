@@ -8,7 +8,7 @@ use crate::{LockConflict, LockUpgrade};
 /// Noxu DB uses hierarchical locking with five primary lock types.
 /// The conflict and upgrade matrices define how locks interact.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockType {
     /// Basic read lock on a record.

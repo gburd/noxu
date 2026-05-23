@@ -63,10 +63,12 @@ pub type RawMutex = NoxuRawMutex;
 // ---------------------------------------------------------------------------
 
 /// RAII guard returned by `RwLock::read`.
-pub type RwLockReadGuard<'a, T> = lock_api::RwLockReadGuard<'a, NoxuRawRwLock, T>;
+pub type RwLockReadGuard<'a, T> =
+    lock_api::RwLockReadGuard<'a, NoxuRawRwLock, T>;
 
 /// RAII guard returned by `RwLock::write`.
-pub type RwLockWriteGuard<'a, T> = lock_api::RwLockWriteGuard<'a, NoxuRawRwLock, T>;
+pub type RwLockWriteGuard<'a, T> =
+    lock_api::RwLockWriteGuard<'a, NoxuRawRwLock, T>;
 
 /// Reader-writer lock backed by a futex.
 ///
@@ -112,7 +114,10 @@ impl<T> RwLock<T> {
 
     /// Tries to acquire a shared lock within the given `timeout`.
     #[inline]
-    pub fn try_read_for(&self, timeout: std::time::Duration) -> Option<RwLockReadGuard<'_, T>> {
+    pub fn try_read_for(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<RwLockReadGuard<'_, T>> {
         self.0.try_read_for(timeout)
     }
 
@@ -181,9 +186,8 @@ mod tests {
         let m = Arc::new(Mutex::new(()));
         let g = m.lock();
         let m2 = m.clone();
-        let failed = std::thread::spawn(move || m2.try_lock().is_none())
-            .join()
-            .unwrap();
+        let failed =
+            std::thread::spawn(move || m2.try_lock().is_none()).join().unwrap();
         assert!(failed);
         drop(g);
         assert!(m.try_lock().is_some());

@@ -39,7 +39,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Core / environment lifecycle
     // -----------------------------------------------------------------------
-
     /// Home directory for the environment.
     pub home: PathBuf,
 
@@ -86,7 +85,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Memory / cache
     // -----------------------------------------------------------------------
-
     /// Maximum bytes for the B-tree cache.
     /// : `MAX_MEMORY` / `EnvironmentConfig.setCacheSize()` / default 0
     /// ( auto-sizes to 60% of heap).  Noxu default: 64 MiB.
@@ -113,7 +111,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Background daemons — run flags
     // -----------------------------------------------------------------------
-
     /// Run the background INCompressor daemon.
     /// : `ENV_RUN_IN_COMPRESSOR` / default true.
     pub run_in_compressor: bool,
@@ -141,7 +138,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Background daemons — rate limits & sleep
     // -----------------------------------------------------------------------
-
     /// Maximum read throughput for background daemons in KB/s.  0 = unlimited.
     /// : `ENV_BACKGROUND_READ_LIMIT` / default 0.
     pub env_background_read_limit_kb: u32,
@@ -158,7 +154,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Environment behaviour flags
     // -----------------------------------------------------------------------
-
     /// Check for lock leaks when databases are closed.
     /// : `ENV_CHECK_LEAKS` / default true.
     pub env_check_leaks: bool,
@@ -201,7 +196,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Log / I-O
     // -----------------------------------------------------------------------
-
     /// Maximum size of a single log file in bytes.
     /// : `LOG_FILE_MAX` / default 10 MiB.
     pub log_file_max_bytes: u64,
@@ -302,7 +296,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // B-tree
     // -----------------------------------------------------------------------
-
     /// Maximum number of entries per Internal Node (IN).
     /// : `NODE_MAX_ENTRIES` / default 128.
     pub node_max_entries: u32,
@@ -336,7 +329,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // INCompressor
     // -----------------------------------------------------------------------
-
     /// INCompressor wakeup interval in milliseconds.
     /// : `COMPRESSOR_WAKEUP_INTERVAL` / default 5_000 ms.
     pub in_compressor_wakeup_interval_ms: u64,
@@ -356,7 +348,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Cleaner
     // -----------------------------------------------------------------------
-
     /// Minimum log utilization percentage; cleaning triggers when below this.
     /// : `CLEANER_MIN_UTILIZATION` / default 50.
     pub cleaner_min_utilization: u8,
@@ -446,7 +437,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Checkpointer
     // -----------------------------------------------------------------------
-
     /// Number of bytes written between automatic checkpoints.
     /// : `CHECKPOINTER_BYTES_INTERVAL` / default 20 MiB.
     pub checkpointer_bytes_interval: u64,
@@ -470,7 +460,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Evictor
     // -----------------------------------------------------------------------
-
     /// Number of tree nodes examined per evictor pass.
     /// : `EVICTOR_NODES_PER_SCAN` / default 10.
     pub evictor_nodes_per_scan: usize,
@@ -514,7 +503,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Off-heap evictor
     // -----------------------------------------------------------------------
-
     /// Bytes to evict from the off-heap cache per pass.
     /// : `OFFHEAP_EVICT_BYTES` / default 512 KiB.
     pub offheap_evict_bytes: u64,
@@ -542,7 +530,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Locking
     // -----------------------------------------------------------------------
-
     /// Lock timeout in milliseconds.
     /// : `LOCK_TIMEOUT` / default 500 ms.
     pub lock_timeout_ms: u64,
@@ -563,7 +550,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Transactions
     // -----------------------------------------------------------------------
-
     /// Transaction timeout in milliseconds.  0 = no timeout.
     /// : `TXN_TIMEOUT` / default 0.
     pub txn_timeout_ms: u64,
@@ -595,7 +581,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Verifier daemon
     // -----------------------------------------------------------------------
-
     /// Cron-style schedule string for the background verifier.
     /// Empty string = run continuously when `run_verifier = true`.
     /// : `VERIFY_SCHEDULE` / default `""`.
@@ -636,7 +621,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Disk-ordered cursor
     // -----------------------------------------------------------------------
-
     /// Timeout for the disk-ordered cursor producer queue in milliseconds.
     /// : `DOS_PRODUCER_QUEUE_TIMEOUT` / default 10_000 ms.
     pub dos_producer_queue_timeout_ms: u64,
@@ -644,7 +628,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Recovery
     // -----------------------------------------------------------------------
-
     /// Force a checkpoint after recovery completes (alias; see
     /// `env_recovery_force_checkpoint` above).
     // (No duplicate field; already covered above.)
@@ -676,7 +659,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Logging / tracing
     // -----------------------------------------------------------------------
-
     /// Enable log-file-based tracing (uses env home as destination).
     /// : `TRACE_FILE` / default false.
     pub trace_file: bool,
@@ -733,7 +715,6 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Callbacks
     // -----------------------------------------------------------------------
-
     /// Optional callback invoked when a background daemon thread encounters
     /// an exception.  Set this to receive notifications from the Checkpointer,
     /// Cleaner, Evictor, INCompressor, and Verifier daemons.
@@ -968,7 +949,10 @@ impl EnvironmentConfig {
         self
     }
 
-    pub fn set_halt_on_commit_after_checksum_exception(&mut self, v: bool) -> &mut Self {
+    pub fn set_halt_on_commit_after_checksum_exception(
+        &mut self,
+        v: bool,
+    ) -> &mut Self {
         self.halt_on_commit_after_checksum_exception = v;
         self
     }
@@ -1052,7 +1036,10 @@ impl EnvironmentConfig {
         self.env_background_write_limit_kb = kb;
         self
     }
-    pub fn set_env_background_sleep_interval_us(&mut self, us: u64) -> &mut Self {
+    pub fn set_env_background_sleep_interval_us(
+        &mut self,
+        us: u64,
+    ) -> &mut Self {
         self.env_background_sleep_interval_us = us;
         self
     }
@@ -1162,7 +1149,10 @@ impl EnvironmentConfig {
         self.log_detect_file_delete = v;
         self
     }
-    pub fn set_log_detect_file_delete_interval_ms(&mut self, ms: u64) -> &mut Self {
+    pub fn set_log_detect_file_delete_interval_ms(
+        &mut self,
+        ms: u64,
+    ) -> &mut Self {
         self.log_detect_file_delete_interval_ms = ms;
         self
     }
@@ -1194,7 +1184,11 @@ impl EnvironmentConfig {
         self.log_group_commit_interval_ms = ms;
         self
     }
-    pub fn with_log_group_commit(mut self, threshold: usize, interval_ms: u64) -> Self {
+    pub fn with_log_group_commit(
+        mut self,
+        threshold: usize,
+        interval_ms: u64,
+    ) -> Self {
         self.log_group_commit_threshold = threshold;
         self.log_group_commit_interval_ms = interval_ms;
         self
@@ -1237,7 +1231,10 @@ impl EnvironmentConfig {
     // INCompressor setters
     // -----------------------------------------------------------------------
 
-    pub fn set_in_compressor_wakeup_interval_ms(&mut self, ms: u64) -> &mut Self {
+    pub fn set_in_compressor_wakeup_interval_ms(
+        &mut self,
+        ms: u64,
+    ) -> &mut Self {
         self.in_compressor_wakeup_interval_ms = ms;
         self
     }
@@ -1322,7 +1319,10 @@ impl EnvironmentConfig {
         self.cleaner_read_size = bytes;
         self
     }
-    pub fn set_cleaner_detail_max_memory_percentage(&mut self, pct: u32) -> &mut Self {
+    pub fn set_cleaner_detail_max_memory_percentage(
+        &mut self,
+        pct: u32,
+    ) -> &mut Self {
         self.cleaner_detail_max_memory_percentage = pct;
         self
     }
@@ -1330,11 +1330,17 @@ impl EnvironmentConfig {
         self.cleaner_look_ahead_cache_size = n;
         self
     }
-    pub fn set_cleaner_foreground_proactive_migration(&mut self, v: bool) -> &mut Self {
+    pub fn set_cleaner_foreground_proactive_migration(
+        &mut self,
+        v: bool,
+    ) -> &mut Self {
         self.cleaner_foreground_proactive_migration = v;
         self
     }
-    pub fn set_cleaner_background_proactive_migration(&mut self, v: bool) -> &mut Self {
+    pub fn set_cleaner_background_proactive_migration(
+        &mut self,
+        v: bool,
+    ) -> &mut Self {
         self.cleaner_background_proactive_migration = v;
         self
     }
@@ -1359,11 +1365,17 @@ impl EnvironmentConfig {
         self.checkpointer_bytes_interval = bytes;
         self
     }
-    pub fn set_checkpointer_wakeup_interval_ms(&mut self, ms: u64) -> &mut Self {
+    pub fn set_checkpointer_wakeup_interval_ms(
+        &mut self,
+        ms: u64,
+    ) -> &mut Self {
         self.checkpointer_wakeup_interval_ms = ms;
         self
     }
-    pub fn set_checkpointer_min_interval_secs(&mut self, secs: u64) -> &mut Self {
+    pub fn set_checkpointer_min_interval_secs(
+        &mut self,
+        secs: u64,
+    ) -> &mut Self {
         self.checkpointer_min_interval_secs = secs;
         self
     }
@@ -2089,7 +2101,10 @@ mod tests {
         assert_eq!(c.stats_collect_interval_secs, 60);
         assert_eq!(c.stats_max_files, 50);
         assert_eq!(c.stats_file_row_count, 2000);
-        assert_eq!(c.stats_file_directory, Some(PathBuf::from("/var/log/noxu")));
+        assert_eq!(
+            c.stats_file_directory,
+            Some(PathBuf::from("/var/log/noxu"))
+        );
     }
 
     #[test]

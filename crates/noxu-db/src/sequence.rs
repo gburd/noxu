@@ -71,7 +71,7 @@ struct CacheState {
 
 /// A handle for manipulating a sequence record stored in a `Database`.
 ///
-/// 
+///
 ///
 /// Multiple threads may share a single `Sequence` handle safely; all cache
 /// manipulation is protected by an internal `Mutex`.  For higher throughput
@@ -140,8 +140,8 @@ impl<'db> Sequence<'db> {
 
         // ── try to read an existing record ────────────────────────────────
         let mut data_entry = DatabaseEntry::new();
-        let found =
-            db.get(None, &key_entry, &mut data_entry)? == OperationStatus::Success;
+        let found = db.get(None, &key_entry, &mut data_entry)?
+            == OperationStatus::Success;
 
         if found {
             if config.allow_create && config.exclusive_create {
@@ -209,7 +209,8 @@ impl<'db> Sequence<'db> {
         };
 
         let cache_size = config.cache_size;
-        let (cache_value, cache_last) = Self::init_cache(&final_rec, cache_size);
+        let (cache_value, cache_last) =
+            Self::init_cache(&final_rec, cache_size);
         Ok(Sequence {
             db,
             key: key_bytes,
@@ -235,7 +236,7 @@ impl<'db> Sequence<'db> {
     /// Returns the next available element in the sequence and advances by
     /// `delta`.
     ///
-    /// 
+    ///
     ///
     /// `delta` must be > 0 and must fit within the configured range.
     ///
@@ -327,7 +328,8 @@ impl<'db> Sequence<'db> {
                     // range_max - stored_value ≥ 0 and fits in i64 because
                     // both are within i64; +1 may overflow only if the diff
                     // is already i64::MAX (range is the full i64 span).
-                    state.range_max
+                    state
+                        .range_max
                         .saturating_sub(state.stored_value)
                         .saturating_add(1)
                 }
@@ -335,7 +337,8 @@ impl<'db> Sequence<'db> {
                 if state.stored_value < state.range_min {
                     0
                 } else {
-                    state.stored_value
+                    state
+                        .stored_value
                         .saturating_sub(state.range_min)
                         .saturating_add(1)
                 }
@@ -356,9 +359,15 @@ impl<'db> Sequence<'db> {
                             // range_max - range_min + 1 = full range size
                             // Approximate with checked arithmetic; for extremes
                             // the range must be small (validated at open time).
-                            state.range_max.saturating_sub(state.stored_value).saturating_add(1)
+                            state
+                                .range_max
+                                .saturating_sub(state.stored_value)
+                                .saturating_add(1)
                         } else {
-                            state.stored_value.saturating_sub(state.range_min).saturating_add(1)
+                            state
+                                .stored_value
+                                .saturating_sub(state.range_min)
+                                .saturating_add(1)
                         };
                         full_avail.min(adjust)
                     } else {
@@ -382,11 +391,8 @@ impl<'db> Sequence<'db> {
             // For increment: the batch covers [batch_start, batch_start + actual_adjust - 1].
             // For decrement: the batch covers [batch_start - actual_adjust + 1, batch_start].
             let batch_start = state.stored_value;
-            let signed_adjust = if state.increment {
-                actual_adjust
-            } else {
-                -actual_adjust
-            };
+            let signed_adjust =
+                if state.increment { actual_adjust } else { -actual_adjust };
             // Use checked add: if the new stored_value would overflow i64 (only
             // possible when range_max == i64::MAX or range_min == i64::MIN), we
             // mark overflow immediately so the NEXT get returns an error.
@@ -395,11 +401,8 @@ impl<'db> Sequence<'db> {
                 None => {
                     // Overflow past i64 bounds — mark it and use a sentinel.
                     state.overflow = true;
-                    state.stored_value = if state.increment {
-                        i64::MAX
-                    } else {
-                        i64::MIN
-                    };
+                    state.stored_value =
+                        if state.increment { i64::MAX } else { i64::MIN };
                 }
             }
 
@@ -449,7 +452,7 @@ impl<'db> Sequence<'db> {
 
     /// Returns a snapshot of statistics for this handle.
     ///
-    /// 
+    ///
     pub fn get_stats(&self) -> SequenceStats {
         let state = self.state.lock().unwrap();
         SequenceStats {
@@ -469,7 +472,7 @@ impl<'db> Sequence<'db> {
     /// After calling this method the handle must not be used again.  Unused
     /// cached values are discarded.
     ///
-    /// 
+    ///
     pub fn close(&self) -> Result<()> {
         // Nothing to flush; the DB record already holds the batch boundary.
         Ok(())
@@ -675,7 +678,8 @@ mod tests {
         let seq = db.open_sequence(&key, config).unwrap();
 
         // Consume all 5 values (0, 1, 2, 3, 4).
-        let mut values: Vec<i64> = (0..5).map(|_| seq.get(None, 1).unwrap()).collect();
+        let mut values: Vec<i64> =
+            (0..5).map(|_| seq.get(None, 1).unwrap()).collect();
 
         // Next call should wrap to 0 again.
         let after_wrap = seq.get(None, 1).unwrap();
@@ -731,8 +735,10 @@ mod tests {
         let db = open_db(&env);
 
         let key = DatabaseEntry::from_bytes(b"missing");
-        let result =
-            db.open_sequence(&key, SequenceConfig::new().with_allow_create(false));
+        let result = db.open_sequence(
+            &key,
+            SequenceConfig::new().with_allow_create(false),
+        );
         assert!(result.is_err(), "should fail without allow_create");
     }
 

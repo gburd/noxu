@@ -63,7 +63,7 @@ const IN_SUBTREE_SLOTS_REFLECT_LEAST_VALUE: u32 = 0x400;
 
 /// Entry state flags (persistent).
 ///
-/// 
+///
 /// These constants mirror `crate::entry_states` but are kept here for
 /// in-module use so that methods inside `InNode` can reference them without
 /// a long path.
@@ -81,7 +81,7 @@ pub mod entry_states {
     pub const TOMBSTONE_BIT: u8 = 0x80;
 
     /// Bits that are transient (cleared before persisting to disk).
-    /// 
+    ///
     pub const TRANSIENT_BITS: u8 = MIGRATE_BIT | UPDATE_KEY_WHEN_LOGGED;
 }
 
@@ -90,7 +90,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 128;
 
 /// An Internal Node in the B+tree.
 ///
-/// 
+///
 ///
 /// INs hold references to child INs or (for BINs) to LNs/embedded data.
 /// Slot data is stored in parallel arrays for memory compactness.
@@ -340,7 +340,7 @@ impl InNode {
 
     /// Returns true if this node is in the priority-2 LRU list.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_in_pri2_lru(&self) -> bool {
         (self.flags & IN_PRI2_LRU_BIT) != 0
@@ -348,7 +348,7 @@ impl InNode {
 
     /// Sets or clears the priority-2 LRU flag.
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_in_pri2_lru(&mut self, value: bool) {
         if value {
@@ -361,7 +361,7 @@ impl InNode {
     /// Returns true if this node was fetched with CacheMode::Unchanged and
     /// has not been accessed with any other mode since.
     ///
-    /// 
+    ///
     #[inline]
     pub fn get_fetched_cold(&self) -> bool {
         (self.flags & IN_FETCHED_COLD_BIT) != 0
@@ -369,7 +369,7 @@ impl InNode {
 
     /// Sets or clears the fetched-cold flag.
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_fetched_cold(&mut self, val: bool) {
         if val {
@@ -382,7 +382,7 @@ impl InNode {
     /// Returns true if the next log write of this BIN must be a full BIN
     /// (not a delta).
     ///
-    /// 
+    ///
     #[inline]
     pub fn get_prohibit_next_delta(&self) -> bool {
         (self.flags & IN_PROHIBIT_NEXT_DELTA_BIT) != 0
@@ -394,7 +394,7 @@ impl InNode {
     /// to be a full BIN. This is set (a) when deleting a slot and (b) when
     /// the cleaner marks a BIN dirty for migration.
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_prohibit_next_delta(&mut self, val: bool) {
         if !self.is_bin() {
@@ -409,7 +409,7 @@ impl InNode {
 
     /// Returns true if expiration values for this BIN are in hours.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_expiration_in_hours(&self) -> bool {
         (self.flags & IN_EXPIRATION_IN_HOURS) != 0
@@ -428,7 +428,7 @@ impl InNode {
     /// Returns true if this node is registered on the INList (resident in
     /// the cache).
     ///
-    /// 
+    ///
     #[inline]
     pub fn get_in_list_resident(&self) -> bool {
         self.in_list_resident
@@ -436,7 +436,7 @@ impl InNode {
 
     /// Sets whether this node is registered on the INList.
     ///
-    /// 
+    ///
     #[inline]
     pub fn set_in_list_resident(&mut self, resident: bool) {
         self.in_list_resident = resident;
@@ -681,7 +681,7 @@ impl InNode {
 
     /// Clears the known-deleted flag on the slot at `index` and marks it dirty.
     ///
-    /// 
+    ///
     pub fn clear_known_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::KNOWN_DELETED_BIT;
@@ -691,7 +691,7 @@ impl InNode {
 
     /// Sets the pending-deleted flag on the slot at `index` and marks dirty.
     ///
-    /// 
+    ///
     pub fn set_pending_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::PENDING_DELETED_BIT;
@@ -701,7 +701,7 @@ impl InNode {
 
     /// Clears the pending-deleted flag on the slot at `index` and marks dirty.
     ///
-    /// 
+    ///
     pub fn clear_pending_deleted(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::PENDING_DELETED_BIT;
@@ -711,7 +711,7 @@ impl InNode {
 
     /// Sets the embedded LN bit on the entry at the given index and marks dirty.
     ///
-    /// 
+    ///
     pub fn set_embedded_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::EMBEDDED_LN_BIT;
@@ -721,7 +721,7 @@ impl InNode {
 
     /// Clears the embedded LN bit on the entry at the given index and marks dirty.
     ///
-    /// 
+    ///
     pub fn clear_embedded_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::EMBEDDED_LN_BIT;
@@ -731,7 +731,7 @@ impl InNode {
 
     /// Sets the no-data-LN bit on the entry at the given index and marks dirty.
     ///
-    /// 
+    ///
     pub fn set_no_data_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::NO_DATA_LN_BIT;
@@ -741,7 +741,7 @@ impl InNode {
 
     /// Clears the no-data-LN bit on the entry at the given index and marks dirty.
     ///
-    /// 
+    ///
     pub fn clear_no_data_ln(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] &= !entry_states::NO_DATA_LN_BIT;
@@ -763,7 +763,7 @@ impl InNode {
 
     /// Returns true if the slot has a tombstone flag set.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_tombstone(&self, index: usize) -> bool {
         debug_assert!(index < self.n_entries);
@@ -773,7 +773,7 @@ impl InNode {
     /// Sets or clears the tombstone flag for the slot at `index`.
     ///
     /// Also marks the slot and node dirty.
-    /// 
+    ///
     pub fn set_tombstone(&mut self, index: usize, tombstone: bool) {
         debug_assert!(index < self.n_entries);
         if tombstone {
@@ -787,7 +787,7 @@ impl InNode {
 
     /// Returns true if the slot has the update-key-when-logged transient flag.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_update_key_when_logged(&self, index: usize) -> bool {
         debug_assert!(index < self.n_entries);
@@ -797,7 +797,7 @@ impl InNode {
     /// Sets the update-key-when-logged flag on the slot at `index`.
     ///
     /// This transient flag tells the logger to re-encode the key when writing.
-    /// 
+    ///
     pub fn set_update_key_when_logged(&mut self, index: usize) {
         debug_assert!(index < self.n_entries);
         self.entry_states[index] |= entry_states::UPDATE_KEY_WHEN_LOGGED;
@@ -807,7 +807,7 @@ impl InNode {
     ///
     /// Returns `false` if the data is zero-length even though EMBEDDED_LN_BIT
     /// is set (NO_DATA_LN_BIT is set in that case).
-    /// 
+    ///
     #[inline]
     pub fn have_embedded_data(&self, index: usize) -> bool {
         self.is_entry_embedded_ln(index) && !self.is_entry_no_data_ln(index)
@@ -815,11 +815,9 @@ impl InNode {
 
     /// Returns the number of slots with the EMBEDDED_LN_BIT set.
     ///
-    /// 
+    ///
     pub fn get_num_embedded_lns(&self) -> usize {
-        (0..self.n_entries)
-            .filter(|&i| self.is_entry_embedded_ln(i))
-            .count()
+        (0..self.n_entries).filter(|&i| self.is_entry_embedded_ln(i)).count()
     }
 
     // ========================================================================
@@ -828,14 +826,14 @@ impl InNode {
 
     /// Increments the pin count, preventing this node from being evicted.
     ///
-    /// 
+    ///
     pub fn pin(&mut self) {
         self.pin_count += 1;
     }
 
     /// Decrements the pin count.
     ///
-    /// 
+    ///
     ///
     /// # Panics
     ///
@@ -847,7 +845,7 @@ impl InNode {
 
     /// Returns true if this node is pinned (pin_count > 0).
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_pinned(&self) -> bool {
         self.pin_count > 0
@@ -858,7 +856,7 @@ impl InNode {
     /// An upper-IN is always evictable (the evictor decides whether to do so).
     /// BINs override this logic in `Bin::is_evictable`.
     ///
-    /// 
+    ///
     #[inline]
     pub fn is_evictable(&self) -> bool {
         // Upper INs are always considered evictable at the IN level.
@@ -872,7 +870,7 @@ impl InNode {
 
     /// Returns the cached in-memory size of this node (bytes).
     ///
-    /// 
+    ///
     #[inline]
     pub fn get_in_memory_size(&self) -> usize {
         self.in_memory_size
@@ -887,7 +885,7 @@ impl InNode {
     /// Returns the memory size that has been reported to the budget.
     ///
     /// This is the cached size minus the accumulated (un-reported) delta.
-    /// 
+    ///
     #[inline]
     pub fn get_budgeted_memory_size(&self) -> i64 {
         self.in_memory_size as i64 - self.accumulated_delta
@@ -896,7 +894,7 @@ impl InNode {
     /// Resets the accumulated delta and returns the total memory size.
     ///
     /// Called during a checkpoint to flush pending memory-budget updates.
-    /// 
+    ///
     pub fn reset_and_get_memory_size(&mut self) -> usize {
         self.accumulated_delta = 0;
         self.in_memory_size
@@ -930,7 +928,7 @@ impl InNode {
     /// For a BIN this always returns true (BINs have no sub-tree to validate).
     /// For upper INs we conservatively check the slot count.
     ///
-    /// 
+    ///
     pub fn validate_subtree_before_delete(&self, index: usize) -> bool {
         if index >= self.n_entries {
             // No entry here — trivially deletable.
@@ -953,7 +951,7 @@ impl InNode {
     /// 2. The key might already be present in the full BIN (blind insertions
     ///    skip the check, so they never need to mutate just for that reason).
     ///
-    /// 
+    ///
     pub fn insert_must_mutate_to_full_bin(
         &self,
         key: &[u8],
@@ -1183,7 +1181,7 @@ impl InNode {
 
     /// Updates only the LSN at the given slot index.
     ///
-    /// 
+    ///
     ///
     /// # Panics
     ///
@@ -1227,7 +1225,7 @@ impl InNode {
     /// approximate: it counts the parallel slot arrays plus the key bytes held
     /// in each occupied slot.
     ///
-    /// 
+    ///
     pub fn get_memory_size(&self) -> usize {
         // Fixed-size fields: node_id (8), flags (4), last_full_lsn (8),
         // last_delta_lsn (8), level (4), n_entries (8), max_entries (8),
@@ -1925,14 +1923,16 @@ mod tests {
 
         // Test exclusive latch (RAII guard)
         {
-            let _guard = in_node.latch().acquire_exclusive().expect("acquire_exclusive");
+            let _guard =
+                in_node.latch().acquire_exclusive().expect("acquire_exclusive");
             // Latch is held here
         }
         // Latch is released when guard goes out of scope
 
         // For a BIN (level 1), shared and exclusive are the same (exclusive-only mode)
         {
-            let _guard = in_node.latch().acquire_shared().expect("acquire_shared");
+            let _guard =
+                in_node.latch().acquire_shared().expect("acquire_shared");
             // Latch is held here (as exclusive since BINs are exclusive-only)
         }
     }
@@ -1978,15 +1978,9 @@ mod tests {
         let mut node_small = InNode::new(1, BIN_LEVEL, 32);
         let mut node_large = InNode::new(1, BIN_LEVEL, 32);
 
-        node_small
-            .insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0)
-            .unwrap();
+        node_small.insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0).unwrap();
         node_large
-            .insert_entry(
-                b"very_long_key_here".to_vec(),
-                Lsn::from_u64(1),
-                0,
-            )
+            .insert_entry(b"very_long_key_here".to_vec(), Lsn::from_u64(1), 0)
             .unwrap();
 
         assert!(
@@ -2016,8 +2010,7 @@ mod tests {
     #[test]
     fn test_insert_into_empty_node() {
         let mut node = InNode::new(1, BIN_LEVEL, 4);
-        let result =
-            node.insert_entry(b"only".to_vec(), Lsn::from_u64(1), 0);
+        let result = node.insert_entry(b"only".to_vec(), Lsn::from_u64(1), 0);
         assert!(result.is_ok());
         let idx = result.unwrap();
         assert_ne!(idx & INSERT_SUCCESS, 0);
@@ -2029,8 +2022,7 @@ mod tests {
         let mut node = InNode::new(1, BIN_LEVEL, 4);
         node.insert_entry(b"dup".to_vec(), Lsn::from_u64(1), 0).unwrap();
 
-        let result =
-            node.insert_entry(b"dup".to_vec(), Lsn::from_u64(2), 0);
+        let result = node.insert_entry(b"dup".to_vec(), Lsn::from_u64(2), 0);
         assert!(result.is_ok());
         let idx = result.unwrap();
         // No INSERT_SUCCESS flag on duplicate.
@@ -2118,12 +2110,8 @@ mod tests {
     fn test_split_index_and_split_key() {
         let mut node = InNode::new(1, BIN_LEVEL, 8);
         for i in 0u8..6 {
-            node.insert_entry(
-                vec![b'a' + i],
-                Lsn::from_u64(i as u64),
-                0,
-            )
-            .unwrap();
+            node.insert_entry(vec![b'a' + i], Lsn::from_u64(i as u64), 0)
+                .unwrap();
         }
         // n_entries == 6, split_index == 3
         assert_eq!(node.split_index(), 3);
@@ -2211,17 +2199,17 @@ mod tests {
         let node = InNode::new(1, BIN_LEVEL, 6);
 
         let zero_key = [0x00u8; 3];
-        let max_key  = [0xFFu8; 3];
+        let max_key = [0xFFu8; 3];
 
         // All four (indicate_if_duplicate × exact) combinations must return -1.
         assert_eq!(node.find_entry(&zero_key, false, false), -1);
-        assert_eq!(node.find_entry(&max_key,  false, false), -1);
-        assert_eq!(node.find_entry(&zero_key, false, true),  -1);
-        assert_eq!(node.find_entry(&max_key,  false, true),  -1);
-        assert_eq!(node.find_entry(&zero_key, true,  false), -1);
-        assert_eq!(node.find_entry(&max_key,  true,  false), -1);
-        assert_eq!(node.find_entry(&zero_key, true,  true),  -1);
-        assert_eq!(node.find_entry(&max_key,  true,  true),  -1);
+        assert_eq!(node.find_entry(&max_key, false, false), -1);
+        assert_eq!(node.find_entry(&zero_key, false, true), -1);
+        assert_eq!(node.find_entry(&max_key, false, true), -1);
+        assert_eq!(node.find_entry(&zero_key, true, false), -1);
+        assert_eq!(node.find_entry(&max_key, true, false), -1);
+        assert_eq!(node.find_entry(&zero_key, true, true), -1);
+        assert_eq!(node.find_entry(&max_key, true, true), -1);
     }
 
     ///
@@ -2237,17 +2225,22 @@ mod tests {
         let mut node = InNode::new(1, BIN_LEVEL, CAP);
 
         let zero_key = [0x00u8; 3];
-        let max_key  = [0xFFu8; 3];
+        let max_key = [0xFFu8; 3];
 
         for i in 0u8..CAP as u8 {
             // Key pattern: [0x01, i, 0x10]
             let key_bytes = vec![0x01u8, i, 0x10u8];
-            let result = node.insert_entry(key_bytes, Lsn::from_u64(i as u64), 0);
+            let result =
+                node.insert_entry(key_bytes, Lsn::from_u64(i as u64), 0);
             assert!(result.is_ok());
             let flags = result.unwrap();
             assert_ne!(flags & INSERT_SUCCESS, 0, "INSERT_SUCCESS must be set");
             // The slot index returned must equal i (keys inserted in order).
-            assert_eq!((flags & !INSERT_SUCCESS) as u8, i, "slot index must equal i");
+            assert_eq!(
+                (flags & !INSERT_SUCCESS) as u8,
+                i,
+                "slot index must equal i"
+            );
 
             // zero_key is below all inserted keys → -1 (no slot at or below it).
             // semantics: inexact returns the largest slot index whose key ≤
@@ -2258,7 +2251,7 @@ mod tests {
 
             // exact=true for keys not present → -1.
             assert_eq!(node.find_entry(&zero_key, false, true), -1);
-            assert_eq!(node.find_entry(&max_key,  false, true), -1);
+            assert_eq!(node.find_entry(&max_key, false, true), -1);
 
             // Each present key finds itself with and without EXACT_MATCH.
             // Note: slot 0 is virtual for upper INs but this is a BIN, so
@@ -2266,15 +2259,25 @@ mod tests {
             for j in 0..=i as usize {
                 let k = node.get_key(j);
                 let idx_inexact = node.find_entry(k, false, false);
-                assert_eq!(idx_inexact, j as i32, "inexact: key at {} must return {}", j, j);
+                assert_eq!(
+                    idx_inexact, j as i32,
+                    "inexact: key at {} must return {}",
+                    j, j
+                );
 
                 let idx_exact = node.find_entry(k, false, true);
-                assert_eq!(idx_exact, j as i32, "exact: key at {} must return {}", j, j);
+                assert_eq!(
+                    idx_exact, j as i32,
+                    "exact: key at {} must return {}",
+                    j, j
+                );
 
                 let idx_dup = node.find_entry(k, true, false);
                 assert_eq!(
-                    idx_dup & !EXACT_MATCH, j as i32,
-                    "indicate_dup: slot must be {}", j
+                    idx_dup & !EXACT_MATCH,
+                    j as i32,
+                    "indicate_dup: slot must be {}",
+                    j
                 );
                 assert_ne!(idx_dup & EXACT_MATCH, 0, "EXACT_MATCH must be set");
 
@@ -2322,9 +2325,8 @@ mod tests {
         let mut node = InNode::new(1, BIN_LEVEL, CAP);
 
         // Insert CAP keys (sorted, so we know their indices).
-        let keys: Vec<Vec<u8>> = (0..CAP as u8)
-            .map(|i| vec![0x01u8, i, 0x10u8])
-            .collect();
+        let keys: Vec<Vec<u8>> =
+            (0..CAP as u8).map(|i| vec![0x01u8, i, 0x10u8]).collect();
         for k in &keys {
             node.insert_entry(k.clone(), Lsn::from_u64(0), 0).unwrap();
         }
@@ -2359,8 +2361,11 @@ mod tests {
     /// `MAIN_LEVEL | 2` and above; dbmap INs live in `DBMAP_LEVEL` space.
     #[test]
     fn test_je_level_constants() {
-        assert_eq!(BIN_LEVEL, MAIN_LEVEL | 1,
-            "BIN_LEVEL must equal MAIN_LEVEL | 1");
+        assert_eq!(
+            BIN_LEVEL,
+            MAIN_LEVEL | 1,
+            "BIN_LEVEL must equal MAIN_LEVEL | 1"
+        );
 
         let bin = InNode::new(1, BIN_LEVEL, 4);
         assert!(bin.is_bin(), "BIN_LEVEL node must be is_bin()");
@@ -2373,7 +2378,10 @@ mod tests {
         assert_eq!(upper.normalized_level(), 2);
 
         let dbmap = InNode::new(1, DBMAP_LEVEL | 1, 4);
-        assert!(dbmap.is_dbmap_level(), "DBMAP_LEVEL node must be is_dbmap_level()");
+        assert!(
+            dbmap.is_dbmap_level(),
+            "DBMAP_LEVEL node must be is_dbmap_level()"
+        );
     }
 
     /// Virtual slot-0 key in an upper IN.
@@ -2398,31 +2406,45 @@ mod tests {
 
         // A key less than "bbb" routes to slot 0 (virtual key wins).
         let idx_below = node.find_entry(b"aaa", false, false);
-        assert_eq!(idx_below, 0,
-            "key < first real key must route to slot 0 (virtual)");
+        assert_eq!(
+            idx_below, 0,
+            "key < first real key must route to slot 0 (virtual)"
+        );
 
         // A key between "bbb" and "ddd" routes to slot 0.
         let idx_mid = node.find_entry(b"ccc", false, false);
-        assert_eq!(idx_mid, 0,
-            "key between slot-0 and slot-1 must stay at slot 0");
+        assert_eq!(
+            idx_mid, 0,
+            "key between slot-0 and slot-1 must stay at slot 0"
+        );
 
         // A key between "ddd" and "fff" routes to slot 1.
         let idx_hi = node.find_entry(b"eee", false, false);
-        assert_eq!(idx_hi, 1,
-            "key between slot-1 and slot-2 must route to slot 1");
+        assert_eq!(
+            idx_hi, 1,
+            "key between slot-1 and slot-2 must route to slot 1"
+        );
 
         // A key greater than all routes to the last slot.
         let idx_max = node.find_entry(b"zzz", false, false);
-        assert_eq!(idx_max, 2,
-            "key greater than all entries must route to last slot");
+        assert_eq!(
+            idx_max, 2,
+            "key greater than all entries must route to last slot"
+        );
 
         // With indicate_if_duplicate=true the virtual path is disabled:
         // exact match on the real key at slot 0 must be found.
         let idx_dup = node.find_entry(b"bbb", true, false);
-        assert_eq!(idx_dup & !EXACT_MATCH, 0,
-            "indicate_dup: exact match at slot 0 must return slot 0");
-        assert_ne!(idx_dup & EXACT_MATCH, 0,
-            "indicate_dup: EXACT_MATCH must be set for 'bbb'");
+        assert_eq!(
+            idx_dup & !EXACT_MATCH,
+            0,
+            "indicate_dup: exact match at slot 0 must return slot 0"
+        );
+        assert_ne!(
+            idx_dup & EXACT_MATCH,
+            0,
+            "indicate_dup: EXACT_MATCH must be set for 'bbb'"
+        );
     }
 
     /// Node-full error.
@@ -2439,7 +2461,8 @@ mod tests {
         }
         assert_eq!(node.n_entries(), CAP);
 
-        let result = node.insert_entry(b"overflow".to_vec(), Lsn::from_u64(99), 0);
+        let result =
+            node.insert_entry(b"overflow".to_vec(), Lsn::from_u64(99), 0);
         assert!(
             matches!(result, Err(InError::NodeFull(n, m)) if n == CAP && m == CAP),
             "inserting into a full node must return InError::NodeFull"
@@ -2473,7 +2496,10 @@ mod tests {
         let mut node = InNode::new(1, BIN_LEVEL, 4);
         node.insert_entry(b"k".to_vec(), Lsn::from_u64(1), 0).unwrap();
         node.set_known_deleted(0);
-        assert!(node.is_valid_for_delete(), "all KD without delta flag => true");
+        assert!(
+            node.is_valid_for_delete(),
+            "all KD without delta flag => true"
+        );
 
         node.set_bin_delta(true);
         assert!(!node.is_valid_for_delete(), "bin-delta flag => always false");

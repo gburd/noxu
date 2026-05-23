@@ -21,7 +21,7 @@ use crate::store_config::StoreConfig;
 /// Each entity type gets its own database, named using the store name as a
 /// prefix and the entity name as a suffix.
 ///
-/// 
+///
 ///
 /// # Example
 ///
@@ -73,7 +73,7 @@ impl<'env> EntityStore<'env> {
     /// in the store configuration, it will be created. The database name is
     /// formed as `"{store_name}_{entity_name}"`.
     ///
-    /// 
+    ///
     ///
     /// # Type Parameters
     /// * `K` - The primary key type
@@ -118,7 +118,7 @@ impl<'env> EntityStore<'env> {
     /// type and must pass the resulting `PrimaryIndex` here so the secondary
     /// index registration can be deposited into it.
     ///
-    /// 
+    ///
     ///
     /// # Type Parameters
     /// * `SK` - The secondary key type
@@ -146,14 +146,14 @@ impl<'env> EntityStore<'env> {
 
     /// Returns the store name.
     ///
-    /// 
+    ///
     pub fn get_store_name(&self) -> &str {
         &self.config.store_name
     }
 
     /// Returns the store configuration.
     ///
-    /// 
+    ///
     pub fn get_config(&self) -> &StoreConfig {
         &self.config
     }
@@ -190,7 +190,7 @@ impl<'env> EntityStore<'env> {
     /// The method returns cumulative [`EvolveStats`] describing how many
     /// records were read and how many were re-written.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the store is not open or if any database operation
@@ -213,11 +213,12 @@ impl<'env> EntityStore<'env> {
 
         for db_name in &db_names {
             // Derive the entity class name from the database name.
-            let entity_class = if let Some(suffix) = db_name.strip_prefix(&store_prefix) {
-                suffix.to_string()
-            } else {
-                db_name.clone()
-            };
+            let entity_class =
+                if let Some(suffix) = db_name.strip_prefix(&store_prefix) {
+                    suffix.to_string()
+                } else {
+                    db_name.clone()
+                };
 
             // Skip classes not targeted by the config.
             if !config.should_evolve(&entity_class) {
@@ -239,7 +240,7 @@ impl<'env> EntityStore<'env> {
 
     /// Closes the entity store and all of its databases.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the store is already closed or if any database
@@ -776,7 +777,12 @@ mod tests {
         let ser = UserSerializer;
 
         let index: PrimaryIndex<u64, User> = store.get_primary_index().unwrap();
-        index.put(&ser, &User { id: 1, name: "A".into(), email: "a@a.com".into() }).unwrap();
+        index
+            .put(
+                &ser,
+                &User { id: 1, name: "A".into(), email: "a@a.com".into() },
+            )
+            .unwrap();
         drop(index);
 
         let mutations = crate::evolve::Mutations::new();
@@ -798,7 +804,8 @@ mod tests {
 
         // Insert three users.
         {
-            let index: PrimaryIndex<u64, User> = store.get_primary_index().unwrap();
+            let index: PrimaryIndex<u64, User> =
+                store.get_primary_index().unwrap();
             for i in 1u64..=3 {
                 index
                     .put(
@@ -816,11 +823,15 @@ mod tests {
         // Register a converter for "User" at version 0 that appends a zero byte
         // (a trivial structural change for test purposes).
         let mut mutations = Mutations::new();
-        mutations.add_converter(Converter::for_class("User", 0, |b: &[u8]| {
-            let mut out = b.to_vec();
-            out.push(0xFF); // append sentinel to detect conversion
-            Some(out)
-        }));
+        mutations.add_converter(Converter::for_class(
+            "User",
+            0,
+            |b: &[u8]| {
+                let mut out = b.to_vec();
+                out.push(0xFF); // append sentinel to detect conversion
+                Some(out)
+            },
+        ));
 
         let evolve_cfg = EvolveConfig::new();
         let stats = store.evolve(&mutations, &evolve_cfg).unwrap();
@@ -838,7 +849,8 @@ mod tests {
         let ser = UserSerializer;
 
         {
-            let index: PrimaryIndex<u64, User> = store.get_primary_index().unwrap();
+            let index: PrimaryIndex<u64, User> =
+                store.get_primary_index().unwrap();
             for i in 1u64..=2 {
                 index
                     .put(
@@ -863,7 +875,8 @@ mod tests {
 
         // Records should be gone.
         {
-            let index: PrimaryIndex<u64, User> = store.get_primary_index().unwrap();
+            let index: PrimaryIndex<u64, User> =
+                store.get_primary_index().unwrap();
             assert_eq!(index.count().unwrap(), 0);
         }
     }
@@ -878,7 +891,8 @@ mod tests {
         let ser = UserSerializer;
 
         {
-            let index: PrimaryIndex<u64, User> = store.get_primary_index().unwrap();
+            let index: PrimaryIndex<u64, User> =
+                store.get_primary_index().unwrap();
             index
                 .put(
                     &ser,
@@ -888,10 +902,15 @@ mod tests {
         }
 
         let mut mutations = Mutations::new();
-        mutations.add_converter(Converter::for_class("User", 0, |b: &[u8]| Some(b.to_vec())));
+        mutations.add_converter(Converter::for_class(
+            "User",
+            0,
+            |b: &[u8]| Some(b.to_vec()),
+        ));
 
         // Config targets a *different* class → User should be skipped.
-        let evolve_cfg = EvolveConfig::new().with_class_to_evolve("SomeOtherClass");
+        let evolve_cfg =
+            EvolveConfig::new().with_class_to_evolve("SomeOtherClass");
         let stats = store.evolve(&mutations, &evolve_cfg).unwrap();
         assert_eq!(stats.n_read(), 0);
         assert_eq!(stats.n_converted(), 0);

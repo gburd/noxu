@@ -119,7 +119,8 @@ mod tests {
     #[test]
     fn test_validation_rejects_out_of_range() {
         let mut mgr = ConfigManager::new();
-        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(95), false);
+        let result =
+            mgr.set("noxu.maxMemoryPercent", ParamValue::Int(95), false);
         assert!(result.is_err());
     }
 
@@ -225,12 +226,21 @@ mod tests {
         assert_eq!(mgr.get_int(&params::MAX_MEMORY_PERCENT), 80);
 
         // Long
-        mgr.set("noxu.maxMemory", ParamValue::Long(512 * 1024 * 1024), false).unwrap();
+        mgr.set("noxu.maxMemory", ParamValue::Long(512 * 1024 * 1024), false)
+            .unwrap();
         assert_eq!(mgr.get_long(&params::MAX_MEMORY), 512 * 1024 * 1024);
 
         // Duration
-        mgr.set("noxu.lock.timeout", ParamValue::Duration(Duration::from_secs(2)), false).unwrap();
-        assert_eq!(mgr.get_duration(&params::LOCK_TIMEOUT), Duration::from_secs(2));
+        mgr.set(
+            "noxu.lock.timeout",
+            ParamValue::Duration(Duration::from_secs(2)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.get_duration(&params::LOCK_TIMEOUT),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -241,7 +251,8 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::TypeMismatch { .. })));
 
         // Int param given bool
-        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Bool(true), false);
+        let result =
+            mgr.set("noxu.maxMemoryPercent", ParamValue::Bool(true), false);
         assert!(matches!(result, Err(ConfigError::TypeMismatch { .. })));
 
         // Long param given int
@@ -253,7 +264,8 @@ mod tests {
     fn test_int_out_of_range_min() {
         let mut mgr = ConfigManager::new();
         // MAX_MEMORY_PERCENT min is 1
-        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(0), false);
+        let result =
+            mgr.set("noxu.maxMemoryPercent", ParamValue::Int(0), false);
         assert!(matches!(result, Err(ConfigError::OutOfRange { .. })));
     }
 
@@ -261,7 +273,8 @@ mod tests {
     fn test_int_out_of_range_max() {
         let mut mgr = ConfigManager::new();
         // MAX_MEMORY_PERCENT max is 90
-        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(91), false);
+        let result =
+            mgr.set("noxu.maxMemoryPercent", ParamValue::Int(91), false);
         assert!(matches!(result, Err(ConfigError::OutOfRange { .. })));
     }
 
@@ -277,7 +290,8 @@ mod tests {
     fn test_mutable_param_can_be_changed_when_open() {
         let mut mgr = ConfigManager::new();
         // MAX_MEMORY_PERCENT is mutable
-        let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(75), true);
+        let result =
+            mgr.set("noxu.maxMemoryPercent", ParamValue::Int(75), true);
         assert!(result.is_ok());
         assert_eq!(mgr.get_int(&params::MAX_MEMORY_PERCENT), 75);
     }
@@ -318,8 +332,14 @@ mod tests {
     fn test_new_checkpointer_params_defaults() {
         let mgr = ConfigManager::new();
         use std::time::Duration;
-        assert_eq!(mgr.get_long(&params::CHECKPOINTER_BYTES_INTERVAL), 20_000_000);
-        assert_eq!(mgr.get_duration(&params::CHECKPOINTER_WAKEUP_INTERVAL), Duration::ZERO);
+        assert_eq!(
+            mgr.get_long(&params::CHECKPOINTER_BYTES_INTERVAL),
+            20_000_000
+        );
+        assert_eq!(
+            mgr.get_duration(&params::CHECKPOINTER_WAKEUP_INTERVAL),
+            Duration::ZERO
+        );
         assert_eq!(mgr.get_int(&params::CHECKPOINTER_DEADLOCK_RETRY), 3);
         assert!(!mgr.get_bool(&params::CHECKPOINTER_HIGH_PRIORITY));
     }

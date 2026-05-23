@@ -39,7 +39,11 @@ pub struct InDeleteInfoEntry {
 
 impl InDeleteInfoEntry {
     /// Creates a new INDeleteInfo entry.
-    pub fn new(deleted_node_id: u64, deleted_id_key: Vec<u8>, database_id: u64) -> Self {
+    pub fn new(
+        deleted_node_id: u64,
+        deleted_id_key: Vec<u8>,
+        database_id: u64,
+    ) -> Self {
         Self { deleted_node_id, deleted_id_key, database_id }
     }
 
@@ -47,7 +51,7 @@ impl InDeleteInfoEntry {
     pub fn log_size(&self) -> usize {
         8 + // deleted_node_id
         4 + self.deleted_id_key.len() + // deleted_id_key (len prefix + data)
-        8   // database_id
+        8 // database_id
     }
 
     /// Writes this entry to a buffer.

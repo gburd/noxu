@@ -48,8 +48,8 @@ use crate::fsync_manager::FsyncManager;
 use crate::log_buffer_pool::LogBufferPool;
 use crate::provisional::Provisional;
 use crate::write_observer::LogWriteObserver;
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_sync::Mutex;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -193,7 +193,14 @@ impl LogManager {
         fsync_required: bool,
         old_lsn: Option<Lsn>,
     ) -> Result<Lsn> {
-        self.log_internal(entry_type, payload, provisional, flush_required, fsync_required, old_lsn)
+        self.log_internal(
+            entry_type,
+            payload,
+            provisional,
+            flush_required,
+            fsync_required,
+            old_lsn,
+        )
     }
 
     /// Logs a raw entry (header + payload already serialised) to the WAL.
@@ -225,7 +232,14 @@ impl LogManager {
         flush_required: bool,
         fsync_required: bool,
     ) -> Result<Lsn> {
-        self.log_internal(entry_type, payload, provisional, flush_required, fsync_required, None)
+        self.log_internal(
+            entry_type,
+            payload,
+            provisional,
+            flush_required,
+            fsync_required,
+            None,
+        )
     }
 
     fn log_internal(
@@ -248,14 +262,14 @@ impl LogManager {
 
         // Fill in the header fields (checksum and prev_offset filled later).
         // Layout: [checksum:4][type:1][flags:1][prev_offset:4][item_size:4]
-        entry_buf[4] = entry_type.type_num();                // type
+        entry_buf[4] = entry_type.type_num(); // type
 
         let flags: u8 = match provisional {
             Provisional::Yes => 0x80,
             Provisional::BeforeCkptEnd => 0x40,
             Provisional::No => 0x00,
         };
-        entry_buf[5] = flags;                               // flags
+        entry_buf[5] = flags; // flags
         // prev_offset at [6..10] filled after we know it
         entry_buf[10..14].copy_from_slice(&item_size.to_le_bytes()); // item_size
         // payload
@@ -289,14 +303,13 @@ impl LogManager {
             // prev_offset: offset of the last used LSN in the same file, or 0
             // when this is the first entry in the file (the: advanceLsn).
             let last_used = self.file_manager.get_last_used_lsn();
-            let prev_offset: u32 = if last_used.is_null()
-                || last_used.file_number() != file_num
-            {
-                // Either first ever entry, or first entry in this new file.
-                0
-            } else {
-                last_used.file_offset()
-            };
+            let prev_offset: u32 =
+                if last_used.is_null() || last_used.file_number() != file_num {
+                    // Either first ever entry, or first entry in this new file.
+                    0
+                } else {
+                    last_used.file_offset()
+                };
 
             // Patch prev_offset into the header buffer.
             entry_buf[6..10].copy_from_slice(&prev_offset.to_le_bytes());
@@ -457,9 +470,7 @@ impl LogManager {
 
         let fm = &self.file_manager;
         self.fsync_manager.fsync(|| {
-            fm.sync_log_end().map_err(|e| {
-                std::io::Error::other(e.to_string())
-            })
+            fm.sync_log_end().map_err(|e| std::io::Error::other(e.to_string()))
         })?;
 
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
@@ -564,7 +575,7 @@ impl LogManager {
 
     /// Reads a single log entry from the given LSN.
     ///
-    /// 
+    ///
     ///
     /// Procedure:
     /// 1. Check the write-buffer pool first (hot path).
@@ -577,10 +588,7 @@ impl LogManager {
     ///
     /// # Returns
     /// `(entry_type, payload_bytes)` for the entry at `lsn`.
-    pub fn read_entry(
-        &self,
-        lsn: Lsn,
-    ) -> Result<(LogEntryType, Vec<u8>)> {
+    pub fn read_entry(&self, lsn: Lsn) -> Result<(LogEntryType, Vec<u8>)> {
         // ------------------------------------------------------------------
         // Hot path: check whether the entry is still in a write buffer.
         // ------------------------------------------------------------------
@@ -597,25 +605,28 @@ impl LogManager {
                         slice[10], slice[11], slice[12], slice[13],
                     ]) as usize;
                     let flags = slice[5];
-                    let vlsn_present = (flags & 0x08) != 0
-                        || (flags & 0x20) != 0; // VLSN_PRESENT | REPLICATED
-                    let header_size =
-                        if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
+                    let vlsn_present =
+                        (flags & 0x08) != 0 || (flags & 0x20) != 0; // VLSN_PRESENT | REPLICATED
+                    let header_size = if vlsn_present {
+                        MAX_HEADER_SIZE
+                    } else {
+                        MIN_HEADER_SIZE
+                    };
                     let entry_size = header_size + item_size;
 
                     if slice.len() >= entry_size {
                         let entry_type_num = slice[4];
-                        let payload =
-                            slice[header_size..entry_size].to_vec();
+                        let payload = slice[header_size..entry_size].to_vec();
                         buf.release();
                         drop(buf);
 
                         let entry_type =
-                            LogEntryType::from_type_num(entry_type_num)
-                                .ok_or(NoxuLogError::InvalidEntryType {
+                            LogEntryType::from_type_num(entry_type_num).ok_or(
+                                NoxuLogError::InvalidEntryType {
                                     type_num: entry_type_num,
                                     lsn,
-                                })?;
+                                },
+                            )?;
                         return Ok((entry_type, payload));
                     }
                 }
@@ -673,13 +684,20 @@ impl LogManager {
         }
 
         // Step 2: Parse header fields.
-        let stored_checksum =
-            u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let stored_checksum = u32::from_le_bytes([
+            header_buf[0],
+            header_buf[1],
+            header_buf[2],
+            header_buf[3],
+        ]);
         let entry_type_num = header_buf[4];
         let flags = header_buf[5];
-        let item_size =
-            u32::from_le_bytes([header_buf[10], header_buf[11], header_buf[12], header_buf[13]])
-                as usize;
+        let item_size = u32::from_le_bytes([
+            header_buf[10],
+            header_buf[11],
+            header_buf[12],
+            header_buf[13],
+        ]) as usize;
 
         // Sanity check item_size before allocating.
         if item_size > 100_000_000 {
@@ -731,10 +749,9 @@ impl LogManager {
         }
 
         // Step 6: Validate and return the entry type and payload.
-        let entry_type =
-            LogEntryType::from_type_num(entry_type_num).ok_or(
-                NoxuLogError::InvalidEntryType { type_num: entry_type_num, lsn },
-            )?;
+        let entry_type = LogEntryType::from_type_num(entry_type_num).ok_or(
+            NoxuLogError::InvalidEntryType { type_num: entry_type_num, lsn },
+        )?;
 
         let payload = full_buf[header_size..].to_vec();
         Ok((entry_type, payload))
@@ -827,8 +844,8 @@ pub struct LogManagerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_manager::FileManager;
     use crate::entry_type::LogEntryType;
+    use crate::file_manager::FileManager;
     use crate::provisional::Provisional;
     use noxu_util::lsn::Lsn;
     use std::sync::Arc;
@@ -908,8 +925,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
-        let result =
-            lm.log(LogEntryType::BIN, b"provisional_data", Provisional::Yes, false, false);
+        let result = lm.log(
+            LogEntryType::BIN,
+            b"provisional_data",
+            Provisional::Yes,
+            false,
+            false,
+        );
         assert!(result.is_ok());
     }
 
@@ -937,7 +959,7 @@ mod tests {
             LogEntryType::Trace,
             b"flush_me",
             Provisional::No,
-            true,  // flush_required
+            true, // flush_required
             false,
         );
         assert!(result.is_ok());
@@ -1029,7 +1051,9 @@ mod tests {
         let after = lm.get_last_flush_lsn();
 
         // After flushing the last_flush_lsn should advance.
-        assert!(after.as_u64() > before.as_u64() || after == lm.get_end_of_log());
+        assert!(
+            after.as_u64() > before.as_u64() || after == lm.get_end_of_log()
+        );
     }
 
     #[test]
@@ -1042,8 +1066,10 @@ mod tests {
             .unwrap();
         let eol_after = lm.get_end_of_log();
 
-        assert!(eol_after.file_offset() > eol_before.file_offset()
-            || eol_after.file_number() > eol_before.file_number());
+        assert!(
+            eol_after.file_offset() > eol_before.file_offset()
+                || eol_after.file_number() > eol_before.file_number()
+        );
     }
 
     #[test]
@@ -1061,8 +1087,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
-        lm.log(LogEntryType::Trace, b"stats_test", Provisional::No, false, false)
-            .unwrap();
+        lm.log(
+            LogEntryType::Trace,
+            b"stats_test",
+            Provisional::No,
+            false,
+            false,
+        )
+        .unwrap();
 
         let stats = lm.get_stats();
         // n_repeat_fault_reads starts at 0 and n_temp_buffer_writes at 0
