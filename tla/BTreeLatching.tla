@@ -336,11 +336,17 @@ NoLostWrites ==
 \* corresponds to NoLostWrites failing at a reachable state where a
 \* PUT raced with a split.
 
-\* Safety conjunction.
+\* Safety conjunction (kept for documentation; the .cfg names the
+\* individual invariants directly so they can be inspected in the
+\* TLC report). Adding `Safety` to the .cfg's INVARIANTS list is a
+\* convenient shorthand for a future spec that wants the conjunction.
 Safety == TypeOK /\ LockInvariant /\ AtMostOneSplit /\ NoLostWrites
 
 \* Liveness: every started PUT eventually finishes (no permanent stuck
-\* state). With WF_vars(Next) above, TLC checks this.
+\* state). This temporal property is *not* checked by the default cfg
+\* because adding it tips the model into a state space that exhausts
+\* TLC's heap; the `_Liveness.cfg` companion (currently disabled) is
+\* the place to enable it for an exploratory run.
 EventuallyDone ==
     \A t \in ThreadId :
         (phase[t] \in {"want_root_read", "have_root_read",

@@ -1,5 +1,7 @@
 --------------------------- MODULE BTreeLatchingBuggy ---------------------------
 (* MODELS: crates/noxu-tree/src/tree.rs *)
+(* MODELS: crates/noxu-tree/src/in_node.rs *)
+(* MODELS: crates/noxu-tree/src/bin.rs *)
 (*
 A *deliberately buggy* variant of `BTreeLatching` that models the pre-fix
 behaviour of `Tree::insert_recursive` — the descender drops the parent's
