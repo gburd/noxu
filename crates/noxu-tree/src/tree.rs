@@ -2225,40 +2225,52 @@ impl Tree {
         key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
     ) -> bool {
-        let (is_bin, child_arc) = {
-            let g = node_arc.read();
-            let is_bin = g.is_bin();
-            let child = if !is_bin {
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        // Find child slot with largest key <= search key
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
+        // Latch coupling, mirroring `insert_recursive`. Without this,
+        // delete has the same "BIN split out from under us" race: thread
+        // A finds child_arc as the target BIN under parent.read(), drops
+        // the lock, and another thread runs split_child(parent, …) that
+        // moves the target key into the new sibling. A then takes
+        // child_arc.write(), looks for the key in the (now left-half)
+        // BIN, doesn't find it, and returns `false`. The caller treats
+        // the `false` as "key was not present", but the key is actually
+        // still in the tree (in the sibling). Subsequent operations
+        // observe a stale record that should have been deleted —
+        // semantically a lost delete.
+        let parent_guard = node_arc.read();
+        let is_bin = parent_guard.is_bin();
+        let child_arc = if !is_bin {
+            match &*parent_guard {
+                TreeNode::Internal(n) => {
+                    // Find child slot with largest key <= search key
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else {
+                            let ord = match key_comparator {
+                                Some(cmp) => cmp(entry.key.as_slice(), key),
+                                None => entry.key.as_slice().cmp(key),
+                            };
+                            if ord != std::cmp::Ordering::Greater {
+                                idx = i;
                             } else {
-                                let ord = match key_comparator {
-                                    Some(cmp) => cmp(entry.key.as_slice(), key),
-                                    None => entry.key.as_slice().cmp(key),
-                                };
-                                if ord != std::cmp::Ordering::Greater {
-                                    idx = i;
-                                } else {
-                                    break;
-                                }
+                                break;
                             }
                         }
-                        n.entries.get(idx).and_then(|e| e.child.clone())
                     }
-                    _ => None,
+                    n.entries.get(idx).and_then(|e| e.child.clone())
                 }
-            } else {
-                None
-            };
-            (is_bin, child)
+                _ => None,
+            }
+        } else {
+            None
         };
 
         if is_bin {
+            // Drop the read lock before taking the write lock; the outer
+            // call frame still holds the parent read lock so a concurrent
+            // split_child cannot run on this BIN's parent until we unwind.
+            drop(parent_guard);
             let mut g = node_arc.write();
             match &mut *g {
                 TreeNode::Bottom(bin) => {
@@ -2284,12 +2296,16 @@ impl Tree {
                 _ => false,
             }
         } else {
-            match child_arc {
+            // Descend with parent_guard still held; the recursion will
+            // hold its own read lock and drop ours after it returns.
+            let r = match child_arc {
                 Some(child) => {
                     Self::delete_recursive(&child, key, key_comparator)
                 }
                 None => false,
-            }
+            };
+            drop(parent_guard);
+            r
         }
     }
 
