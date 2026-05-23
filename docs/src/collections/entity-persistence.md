@@ -42,25 +42,37 @@ impl Entity for User {
     }
 
     /// Stable name used to derive the underlying database name
-    /// (`<entity_name>:primary`) inside an `EntityStore`. Each entity
-    /// type should return a unique, never-changing string.
+    /// (`<store_name>_<entity_name>`, e.g. `user_store_User`) inside an
+    /// `EntityStore`. Each entity type should return a unique,
+    /// never-changing string.
     fn entity_name() -> &'static str {
         "User"
     }
 }
 
-/// Choose your own wire format. The example below uses
-/// `bincode::serialize`, but any byte-in / byte-out scheme works.
+/// Choose your own wire format. The example below uses a length-prefixed
+/// scheme via `noxu_persist::SimpleSerializer`, which avoids pulling in
+/// `serde` for one-off projects. Any byte-in / byte-out scheme is fine —
+/// e.g. `bincode`, `serde_json`, manual `byteorder`.
 struct UserSerializer;
 
 impl EntitySerializer<User> for UserSerializer {
     fn serialize(&self, u: &User) -> Result<Vec<u8>> {
-        bincode::serialize(u)
-            .map_err(|e| PersistError::SerializationError(e.to_string()))
+        use noxu_persist::FieldEncoder;
+        let mut enc = FieldEncoder::new();
+        enc.write_u64(u.id);
+        enc.write_string(&u.email);
+        enc.write_string(&u.name);
+        Ok(enc.finish())
     }
     fn deserialize(&self, bytes: &[u8]) -> Result<User> {
-        bincode::deserialize(bytes)
-            .map_err(|e| PersistError::SerializationError(e.to_string()))
+        use noxu_persist::FieldDecoder;
+        let mut dec = FieldDecoder::new(bytes);
+        Ok(User {
+            id: dec.read_u64()?,
+            email: dec.read_string()?,
+            name: dec.read_string()?,
+        })
     }
 }
 ```
@@ -88,7 +100,9 @@ let store_config = StoreConfig::new("user_store").with_allow_create(true);
 let mut store = EntityStore::open(&env, store_config)?;
 
 // Open the primary index for the User entity type.
-let index: PrimaryIndex<u64, User> = store.get_primary_index()?;
+// `get_primary_index` returns a `&mut`-borrowed `PrimaryIndex`, so bind
+// it as `let mut` if you also want to register secondary indexes below.
+let mut index: PrimaryIndex<u64, User> = store.get_primary_index()?;
 let ser = UserSerializer;
 ```
 
@@ -105,7 +119,7 @@ let user: Option<User> = index.get(&ser, &1u64)?;
 let removed: bool = index.delete(&1u64)?;
 
 // Iterate in primary-key order.
-for user in index.iter(&ser) {
+for user in index.entities(&ser)? {
     let u: User = user?;
     println!("{u:?}");
 }
@@ -157,9 +171,13 @@ helpers in `noxu_persist::evolve`:
 | `Renamer` | Rename a field, leaving its bytes in place. |
 | `Deleter` | Delete a field (its bytes are skipped on read). |
 | `Converter` | Run a user-supplied closure on the deserialized old form to produce the new form. |
-| `Mutations` / `EvolveConfig` | Compose the above into a single migration plan; pass to `EntityStore::open_evolved`. |
+| `Mutations` / `EvolveConfig` | Compose the above into a single migration plan. |
 
-See `crates/noxu-persist/src/evolve/` for the concrete API.
+Migrations are applied via `EntityStore::evolve(&mut self,
+&mutations, &config)`, which walks the store's databases and rewrites
+each record through the registered `Renamer` / `Deleter` /
+`Converter` mutations. See `crates/noxu-persist/src/evolve/` for the
+concrete API.
 
 ## Sequences
 
