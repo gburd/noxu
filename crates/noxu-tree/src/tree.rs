@@ -1683,34 +1683,34 @@ impl Tree {
     /// 5. Replace tree root with newRoot.
     /// ```
     fn split_root_if_needed(&self, lsn: Lsn) -> Result<(), TreeError> {
-        // TODO: this read-then-write pattern on `self.root` is structurally
-        // similar to the first-key TOCTOU that was fixed in the parent
-        // function. Two concurrent splitters can each observe needs_split
-        // == true under the read lock, then take().unwrap() in turn, each
-        // wrapping the other's already-promoted root in its own new IN,
-        // producing an unnecessarily deep tree. This is NOT a data-loss
-        // bug (every entry is still reachable) but it can over-grow the
-        // tree under heavy concurrent insertion. Fix is to hold a write
-        // lock across the needs_split check and the take()+install. The
-        // first-key fix took the simple route; this one needs a slightly
-        // larger refactor and a test that times two splits within the
-        // same root node, which has not been written yet.
-        let needs_split = {
-            let root_arc = self.root.read().clone().unwrap();
-            let guard =
-                root_arc.read();
-            guard.get_n_entries() >= self.max_entries_per_node
+        // Hold `self.root.write()` across the needs_split check and the
+        // root promotion, mirroring the first-key path fix and matching
+        // the broader insert/split serialisation discipline.
+        //
+        // With the previous read-then-write pattern, two concurrent
+        // splitters could each observe needs_split == true, then take()
+        // and install in turn, with the second wrapping the first's
+        // already-promoted root in its own new IN. Each level wraps the
+        // previous, producing a chain of one-child internal nodes. No
+        // data is lost (every entry is still reachable) but the tree
+        // becomes unnecessarily deep, and the imbalance can compound
+        // under heavy concurrent insertion.
+        let mut root_guard = self.root.write();
+        let needs_split = match root_guard.as_ref() {
+            Some(arc) => {
+                let g = arc.read();
+                g.get_n_entries() >= self.max_entries_per_node
+            }
+            None => false,
         };
-
         if !needs_split {
             return Ok(());
         }
 
         // Create a fresh new root one level above the current root.
-        let old_root_arc = self.root.write().take().unwrap();
+        let old_root_arc = root_guard.take().expect("checked Some above");
         let old_root_level = {
-            let g =
-                old_root_arc.read();
+            let g = old_root_arc.read();
             g.level()
         };
 
@@ -1733,9 +1733,15 @@ impl Tree {
         )));
 
         // Update the old root's parent pointer to the new root.
-        { let mut g = old_root_arc.write();
+        {
+            let mut g = old_root_arc.write();
             g.set_parent(Some(Arc::downgrade(&new_root_arc)));
         }
+
+        // Install the new root before calling split_child so split_child
+        // (which itself takes parent.write()) can run unencumbered.
+        *root_guard = Some(new_root_arc.clone());
+        drop(root_guard);
 
         // Now split the old root (which is now child at slot 0 in new_root).
         Self::split_child(
@@ -1745,7 +1751,6 @@ impl Tree {
             lsn,
         )?;
 
-        *self.root.write() = Some(new_root_arc);
         self.root_splits.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1773,50 +1778,73 @@ impl Tree {
         _max_entries: usize,
         lsn: Lsn,
     ) -> Result<(), TreeError> {
+        // The split is performed under `parent.write()` for the entire
+        // duration. This is a deliberate choice for correctness:
+        //
+        // - Without it, between dropping `child.write()` (after installing
+        //   the left half) and acquiring `parent.write()` (to install the
+        //   sibling), a concurrent descender can pick `child_arc` from the
+        //   parent (still pointing at it), descend, take `child.write()`
+        //   and insert a key. Whether the descender's key belongs in the
+        //   left half (now in `child`) or the right half (which will be
+        //   in the new sibling) is determined by the parent's split key —
+        //   but the parent doesn't know about the split key yet, so the
+        //   descender's routing decision is based on stale data. If the
+        //   descender's key falls in the right half, it lands in `child`
+        //   (left half) where a future search will not find it: the
+        //   future search descends from the root, the parent now has the
+        //   sibling installed, the search routes the key to the sibling,
+        //   the sibling does not contain the key — silently lost.
+        //
+        // - Holding `parent.write()` throughout serialises split_child
+        //   against every descender that wants `parent.read()`. A
+        //   descender already holding `parent.read()` (latch coupling
+        //   from above) keeps split_child waiting at this lock until it
+        //   has finished its own work. Combined, the split + sibling
+        //   install is atomic with respect to descents.
+        //
+        // - Splits are infrequent compared to inserts (~ once per
+        //   max_entries new keys) so the extra serialisation here does
+        //   not dominate.
+        //
+        // Reproducer that exercises this race:
+        // crates/noxu-db/tests/concurrent_commits_stress.rs.
+        let mut parent_write_guard = parent.write();
+
         // Extract the child Arc from the parent slot.
-        let child_arc = {
-            let parent_guard =
-                parent.read();
-            match &*parent_guard {
-                TreeNode::Internal(p) => {
-                    p.entries
-                        .get(child_index)
-                        .and_then(|e| e.child.clone())
-                        .ok_or(TreeError::SplitRequired)?
-                }
-                TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
-            }
+        let child_arc = match &*parent_write_guard {
+            TreeNode::Internal(p) => p
+                .entries
+                .get(child_index)
+                .and_then(|e| e.child.clone())
+                .ok_or(TreeError::SplitRequired)?,
+            TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
         };
 
-        // Gather all entries from the child plus split metadata.
-        // For BIN nodes we decompress every key to full form so that each
-        // split half can independently establish its own optimal prefix.
-        // Split decompresses before dividing, then calls
-        // recalcKeyPrefix on each half independently.
-        let (child_level, all_entries, bin_old_prefix) = {
-            let child_guard =
-                child_arc.read();
-            let level = child_guard.level();
-            let (entries, old_prefix) = match &*child_guard {
-                TreeNode::Internal(n) => {
-                    (SplitEntries::Internal(n.entries.clone()), Vec::new())
-                }
-                TreeNode::Bottom(b) => {
-                    // Decompress to full keys.
-                    let full: Vec<BinEntry> = (0..b.entries.len())
-                        .map(|i| BinEntry {
-                            key: b.get_full_key(i).unwrap_or_default(),
-                            lsn: b.entries[i].lsn,
-                            data: b.entries[i].data.clone(),
-                            known_deleted: b.entries[i].known_deleted,
-                            dirty: b.entries[i].dirty,
-                            expiration_time: b.entries[i].expiration_time,
-                        })
-                        .collect();
-                    (SplitEntries::Bottom(full), b.key_prefix.clone())
-                }
-            };
-            (level, entries, old_prefix)
+        // Gather all entries from the child plus split metadata, AND
+        // perform the in-place left-half install, all under a single
+        // write lock on the child. See the earlier comment on the race
+        // this avoids inside split_child.
+        let mut child_guard = child_arc.write();
+        let child_level = child_guard.level();
+        let (all_entries, bin_old_prefix) = match &*child_guard {
+            TreeNode::Internal(n) => {
+                (SplitEntries::Internal(n.entries.clone()), Vec::new())
+            }
+            TreeNode::Bottom(b) => {
+                // Decompress to full keys.
+                let full: Vec<BinEntry> = (0..b.entries.len())
+                    .map(|i| BinEntry {
+                        key: b.get_full_key(i).unwrap_or_default(),
+                        lsn: b.entries[i].lsn,
+                        data: b.entries[i].data.clone(),
+                        known_deleted: b.entries[i].known_deleted,
+                        dirty: b.entries[i].dirty,
+                        expiration_time: b.entries[i].expiration_time,
+                    })
+                    .collect();
+                (SplitEntries::Bottom(full), b.key_prefix.clone())
+            }
         };
 
         // Determine split point.
@@ -1834,26 +1862,25 @@ impl Tree {
         let left_entries = all_entries.slice(0, split_index);
         let right_entries = all_entries.slice(split_index, n_entries);
 
-        // Update the original child with the left half and recompute prefix.
-        {
-            let mut child_guard =
-                child_arc.write();
-            match (&mut *child_guard, &left_entries) {
-                (TreeNode::Internal(n), SplitEntries::Internal(le)) => {
-                    n.entries = le.clone();
-                }
-                (TreeNode::Bottom(b), SplitEntries::Bottom(le)) => {
-                    // Reset prefix; entries are full keys.
-                    b.key_prefix = Vec::new();
-                    b.entries = le.clone();
-                    // Recompute prefix on each half after split.
-                    if b.entries.len() >= 2 {
-                        b.recompute_key_prefix();
-                    }
-                }
-                _ => return Err(TreeError::SplitRequired),
+        // Install the left half into `child_arc` (still under the same
+        // write lock) and mark the node dirty.
+        match (&mut *child_guard, &left_entries) {
+            (TreeNode::Internal(n), SplitEntries::Internal(le)) => {
+                n.entries = le.clone();
             }
+            (TreeNode::Bottom(b), SplitEntries::Bottom(le)) => {
+                // Reset prefix; entries are full keys.
+                b.key_prefix = Vec::new();
+                b.entries = le.clone();
+                // Recompute prefix on each half after split.
+                if b.entries.len() >= 2 {
+                    b.recompute_key_prefix();
+                }
+            }
+            _ => return Err(TreeError::SplitRequired),
         }
+        child_guard.set_dirty(true);
+        drop(child_guard);
 
         // Create the new right-half sibling.
         // Parent pointer will be wired in when it is inserted into the parent.
@@ -1892,39 +1919,39 @@ impl Tree {
             }
         };
 
-        // Mark the child (left half) dirty as well.
-        { let mut g = child_arc.write();
-            g.set_dirty(true);
-        }
+        // Note: the child (left half) was marked dirty earlier under the
+        // same write lock that installed left_entries; no need to re-take
+        // the write lock here.
 
         // Insert the new sibling into the parent after child_index.
-        // Parent.insertEntry(newSibling, newIdKey, newSiblingLsn)
-        // Also wire the sibling's parent pointer and mark the parent dirty.
-        {
-            let mut parent_guard =
-                parent.write();
-            match &mut *parent_guard {
-                TreeNode::Internal(p) => {
-                    let insert_pos = child_index + 1;
-                    p.entries.insert(
-                        insert_pos,
-                        InEntry {
-                            key: new_id_key,
-                            lsn,
-                            child: Some(new_sibling.clone()),
-                        },
-                    );
-                    // Parent is dirty because it gained a new entry.
-                    p.dirty = true;
-                }
-                TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
+        // We already hold `parent.write()` (taken at the top of the
+        // function); operate on it directly rather than re-acquiring.
+        match &mut *parent_write_guard {
+            TreeNode::Internal(p) => {
+                let insert_pos = child_index + 1;
+                p.entries.insert(
+                    insert_pos,
+                    InEntry {
+                        key: new_id_key,
+                        lsn,
+                        child: Some(new_sibling.clone()),
+                    },
+                );
+                // Parent is dirty because it gained a new entry.
+                p.dirty = true;
             }
+            TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
         }
 
-        // Wire the new sibling's parent pointer to the parent node.
-        { let mut g = new_sibling.write();
+        // Wire the new sibling's parent pointer to the parent node
+        // before releasing parent_write_guard, so a future descent that
+        // takes parent.read() and finds the sibling immediately sees a
+        // fully-wired parent pointer.
+        {
+            let mut g = new_sibling.write();
             g.set_parent(Some(Arc::downgrade(parent)));
         }
+        drop(parent_write_guard);
 
         Ok(())
     }
@@ -1950,17 +1977,42 @@ impl Tree {
         key_comparator: Option<&KeyComparatorFn>,
     ) -> Result<bool, TreeError> {
         // Determine if this is a BIN (leaf level).
-        let is_bin = {
-            let g = node_arc.read();
-            g.is_bin()
-        };
+        //
+        // We hold a read lock on `node_arc` (the parent of any descent we
+        // do below) for the duration of this call, releasing it just
+        // before returning. That achieves *latch coupling*: a concurrent
+        // `split_child(parent, …)` that wants to reorganise our subtree
+        // ultimately needs `parent.write()` to install the new sibling,
+        // and that write blocks until our read lock is dropped. Without
+        // this, the descender-vs-splitter race goes:
+        //
+        //   T_X: at root, picks child_arc (BIN), drops root read lock.
+        //   T_Y: at root, runs split_child(root, …): takes child_arc.write(),
+        //        installs left half [E1..E5], creates sibling [E6..E10],
+        //        takes root.write() and inserts the sibling.
+        //   T_X: now takes child_arc.write() and inserts a key whose
+        //        sort order falls in the right half. The key lands in
+        //        child_arc (left half) but a future search descending
+        //        from the root routes that key to the new sibling and
+        //        does not find it — silently lost.
+        //
+        // Reproducer: noxu-db/tests/concurrent_commits_stress.rs
+        // (32 threads × 100 keys, ~1–6 lost writes per run before this fix;
+        // occasionally hundreds when an entire BIN is orphaned).
+        let parent_guard = node_arc.read();
+        let is_bin = parent_guard.is_bin();
 
         if is_bin {
-            // BIN: insert the key using prefix-aware insertion.
-            // Tree.insertLN(): after modifying a BIN, call
-            // bin.setDirty(true) so the checkpointer logs it.
-            let mut guard =
-                node_arc.write();
+            // BIN: drop the read lock and take the write lock; this is
+            // safe because the *outer* call frame still holds a read
+            // lock on this BIN's parent (or this is the root, in which
+            // case the first-key path has already initialised it). A
+            // concurrent split_child(parent, …) cannot run while the
+            // outer parent.read() is held, so the BIN cannot be
+            // restructured between dropping our read lock and acquiring
+            // our write lock.
+            drop(parent_guard);
+            let mut guard = node_arc.write();
             match &mut *guard {
                 TreeNode::Bottom(bin) => {
                     let is_new = if let Some(cmp) = key_comparator {
@@ -1988,54 +2040,49 @@ impl Tree {
             // Index = parent.findEntry(key, false, false)
             // Entry zero in an upper IN has a virtual key (-infinity), so
             // any real key is routed to at least slot 0.
-            let (child_index, child_arc) = {
-                let guard =
-                    node_arc.read();
-                match &*guard {
-                    TreeNode::Internal(n) => {
-                        // Binary search for the largest key <= search key.
-                        // Slot 0 always matches (virtual key = -infinity).
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
-                            } else {
-                                let ord = match key_comparator {
-                                    Some(cmp) => {
-                                        cmp(entry.key.as_slice(), key.as_slice())
-                                    }
-                                    None => entry.key.as_slice().cmp(key.as_slice()),
-                                };
-                                if ord != std::cmp::Ordering::Greater {
-                                    idx = i;
-                                } else {
-                                    break;
+            let (child_index, child_arc) = match &*parent_guard {
+                TreeNode::Internal(n) => {
+                    // Binary search for the largest key <= search key.
+                    // Slot 0 always matches (virtual key = -infinity).
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else {
+                            let ord = match key_comparator {
+                                Some(cmp) => {
+                                    cmp(entry.key.as_slice(), key.as_slice())
                                 }
+                                None => entry.key.as_slice().cmp(key.as_slice()),
+                            };
+                            if ord != std::cmp::Ordering::Greater {
+                                idx = i;
+                            } else {
+                                break;
                             }
                         }
-                        let child = n
-                            .entries
-                            .get(idx)
-                            .and_then(|e| e.child.clone())
-                            .ok_or(TreeError::SplitRequired)?;
-                        (idx, child)
                     }
-                    TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
+                    let child = n
+                        .entries
+                        .get(idx)
+                        .and_then(|e| e.child.clone())
+                        .ok_or(TreeError::SplitRequired)?;
+                    (idx, child)
                 }
+                TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
             };
 
             // Proactively split the child if it is full.
             // If (child.needsSplitting()) child.split(parent, ...)
             let child_full = {
-                let g =
-                    child_arc.read();
+                let g = child_arc.read();
                 g.get_n_entries() >= max_entries
             };
 
             if child_full {
-                // The parent must have room for the new split key.  Because
-                // we called split_root_if_needed before descending, and we
-                // split proactively on every level, there is always room.
+                // split_child(parent, …) needs parent.write(); we must
+                // drop our parent read lock before calling it.
+                drop(parent_guard);
                 Self::split_child(node_arc, child_index, max_entries, lsn)?;
 
                 // After the split, re-find which child now covers key.
@@ -2044,10 +2091,16 @@ impl Tree {
                 );
             }
 
-            // Descend into the child.
-            Self::insert_recursive(
+            // Descend into the child while still holding parent_guard.
+            // The recursive call will hold child.read() before this
+            // returns, then drop it; combined with our parent_guard,
+            // the latch coupling chain is preserved on the way down and
+            // unwound on the way back up.
+            let r = Self::insert_recursive(
                 &child_arc, key, data, lsn, max_entries, key_comparator,
-            )
+            );
+            drop(parent_guard);
+            r
         }
     }
 
@@ -2172,40 +2225,52 @@ impl Tree {
         key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
     ) -> bool {
-        let (is_bin, child_arc) = {
-            let g = node_arc.read();
-            let is_bin = g.is_bin();
-            let child = if !is_bin {
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        // Find child slot with largest key <= search key
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
+        // Latch coupling, mirroring `insert_recursive`. Without this,
+        // delete has the same "BIN split out from under us" race: thread
+        // A finds child_arc as the target BIN under parent.read(), drops
+        // the lock, and another thread runs split_child(parent, …) that
+        // moves the target key into the new sibling. A then takes
+        // child_arc.write(), looks for the key in the (now left-half)
+        // BIN, doesn't find it, and returns `false`. The caller treats
+        // the `false` as "key was not present", but the key is actually
+        // still in the tree (in the sibling). Subsequent operations
+        // observe a stale record that should have been deleted —
+        // semantically a lost delete.
+        let parent_guard = node_arc.read();
+        let is_bin = parent_guard.is_bin();
+        let child_arc = if !is_bin {
+            match &*parent_guard {
+                TreeNode::Internal(n) => {
+                    // Find child slot with largest key <= search key
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else {
+                            let ord = match key_comparator {
+                                Some(cmp) => cmp(entry.key.as_slice(), key),
+                                None => entry.key.as_slice().cmp(key),
+                            };
+                            if ord != std::cmp::Ordering::Greater {
+                                idx = i;
                             } else {
-                                let ord = match key_comparator {
-                                    Some(cmp) => cmp(entry.key.as_slice(), key),
-                                    None => entry.key.as_slice().cmp(key),
-                                };
-                                if ord != std::cmp::Ordering::Greater {
-                                    idx = i;
-                                } else {
-                                    break;
-                                }
+                                break;
                             }
                         }
-                        n.entries.get(idx).and_then(|e| e.child.clone())
                     }
-                    _ => None,
+                    n.entries.get(idx).and_then(|e| e.child.clone())
                 }
-            } else {
-                None
-            };
-            (is_bin, child)
+                _ => None,
+            }
+        } else {
+            None
         };
 
         if is_bin {
+            // Drop the read lock before taking the write lock; the outer
+            // call frame still holds the parent read lock so a concurrent
+            // split_child cannot run on this BIN's parent until we unwind.
+            drop(parent_guard);
             let mut g = node_arc.write();
             match &mut *g {
                 TreeNode::Bottom(bin) => {
@@ -2231,12 +2296,16 @@ impl Tree {
                 _ => false,
             }
         } else {
-            match child_arc {
+            // Descend with parent_guard still held; the recursion will
+            // hold its own read lock and drop ours after it returns.
+            let r = match child_arc {
                 Some(child) => {
                     Self::delete_recursive(&child, key, key_comparator)
                 }
                 None => false,
-            }
+            };
+            drop(parent_guard);
+            r
         }
     }
 
