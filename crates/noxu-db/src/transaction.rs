@@ -245,6 +245,16 @@ impl Transaction {
         // leave the outer in `Open`, and a retried `commit()` would
         // append a *second* `TxnCommit` record to the WAL. We then
         // propagate the inner error so the caller can react.
+        //
+        // TODO(noxu-txn): both early-return paths in
+        // `noxu-txn::Txn::commit_with_durability` (`check_state()?` and
+        // `has_open_cursors` → `InvalidTransaction`) return without
+        // draining `self.read_locks` / `self.write_locks`, leaking the
+        // entries in `lock_manager` until environment close. The fix
+        // is to release the locks unconditionally even on the
+        // state-check failure path; out of scope here because we are
+        // closing the existing silent-failure defect, not redesigning
+        // Txn::commit's error path.
         let inner_err = if let Some(inner) = &self.inner_txn {
             match inner.lock().unwrap().commit() {
                 Ok(_) => None,
