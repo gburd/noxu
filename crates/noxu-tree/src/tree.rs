@@ -1584,55 +1584,64 @@ impl Tree {
         let key_len = key.len();
         let data_len = data.len();
 
-        if self.root.read().is_none() {
-            // Tree.insert() first-key path:
-            // Create the initial BIN, then a level-2 upper IN as root, and
-            // make the upper IN point to the BIN (mirroring rootIN with
-            // a single BIN child at slot 0).
-            let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
-                node_id: generate_node_id(),
-                level: BIN_LEVEL,
-                entries: vec![BinEntry { key, lsn, data: Some(data), known_deleted: false, dirty: false, expiration_time: 0 }],
-                key_prefix: Vec::new(), // single entry — no common prefix yet
-                dirty: true,
-                is_delta: false,
-                last_full_lsn: NULL_LSN,
-                last_delta_lsn: NULL_LSN,
-                generation: 0,
-                parent: None, // set below after root_in is created
-                expiration_in_hours: false,
-                cursor_count: 0,
-            })));
-
-            // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
-            let root_arc = Arc::new(RwLock::new(TreeNode::Internal(
-                InNodeStub {
+        // First-key path. We MUST hold the write lock while testing
+        // root.is_none() and replacing the root, otherwise N threads can all
+        // observe an empty tree, each build a fresh single-entry root, and
+        // the last writer's `*self.root.write() = Some(...)` silently
+        // discards the others' inserts. (Reproducer:
+        // xa_protocol_test::test_concurrent_independent_xids — 8 threads
+        // each inserting their own key into an empty tree lost ~30% of
+        // inserts before this lock change.)
+        {
+            let mut root_guard = self.root.write();
+            if root_guard.is_none() {
+                let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
                     node_id: generate_node_id(),
-                    level: MAIN_LEVEL | 2,
-                    entries: vec![InEntry {
-                        key: vec![], // virtual key for slot 0 in upper IN
-                        lsn,
-                        child: Some(bin.clone()),
-                    }],
+                    level: BIN_LEVEL,
+                    entries: vec![BinEntry { key, lsn, data: Some(data), known_deleted: false, dirty: false, expiration_time: 0 }],
+                    key_prefix: Vec::new(), // single entry — no common prefix yet
                     dirty: true,
+                    is_delta: false,
+                    last_full_lsn: NULL_LSN,
+                    last_delta_lsn: NULL_LSN,
                     generation: 0,
-                    parent: None,
-                },
-            )));
+                    parent: None, // set below after root_in is created
+                    expiration_in_hours: false,
+                    cursor_count: 0,
+                })));
 
-            // Wire the BIN's parent pointer back to the root IN.
-            { let mut g = bin.write();
-                g.set_parent(Some(Arc::downgrade(&root_arc)));
+                // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
+                let root_arc = Arc::new(RwLock::new(TreeNode::Internal(
+                    InNodeStub {
+                        node_id: generate_node_id(),
+                        level: MAIN_LEVEL | 2,
+                        entries: vec![InEntry {
+                            key: vec![], // virtual key for slot 0 in upper IN
+                            lsn,
+                            child: Some(bin.clone()),
+                        }],
+                        dirty: true,
+                        generation: 0,
+                        parent: None,
+                    },
+                )));
+
+                // Wire the BIN's parent pointer back to the root IN.
+                { let mut g = bin.write();
+                    g.set_parent(Some(Arc::downgrade(&root_arc)));
+                }
+
+                *root_guard = Some(root_arc);
+
+                // Count the first entry.
+                if let Some(counter) = &self.memory_counter {
+                    let delta = (key_len + data_len + 48) as i64;
+                    counter.fetch_add(delta, Ordering::Relaxed);
+                }
+                return Ok(true);
             }
-
-            *self.root.write() = Some(root_arc);
-
-            // Count the first entry.
-            if let Some(counter) = &self.memory_counter {
-                let delta = (key_len + data_len + 48) as i64;
-                counter.fetch_add(delta, Ordering::Relaxed);
-            }
-            return Ok(true);
+            // Another thread initialized the root while we were waiting for
+            // the write lock; fall through and insert into the existing tree.
         }
 
         // Check whether the root itself needs to be split before descending.

@@ -2,7 +2,6 @@
 
 | Limitation | Status | Workaround |
 |-----------|--------|------------|
-| **Concurrent multi-XID commit visibility race** | Known — `xa_protocol_test::test_concurrent_independent_xids` is `#[ignore]`d. Under 8 concurrent xa_commit() calls on independent XIDs, ~10–20% of runs see a freshly committed key disappear from a non-transactional read. Suspected: swallowed inner-txn commit `Result` in `noxu-db::Transaction::commit_with_durability` (transaction.rs:220 — `let _ = inner.lock().unwrap().commit();`). | Avoid heavily concurrent XA commit fan-out on a shared `Database` until the underlying race is fixed. See FIXME in `crates/noxu-xa/tests/xa_protocol_test.rs::test_concurrent_independent_xids`. |
 | **Concurrent write throughput gap** | Known — Noxu LockManager uses 64 shards; alternative implementations using per-slot lock designs scale better at 16+ concurrent writers | Keep writer concurrency ≤ 8 threads per environment for optimal throughput; use disjoint key ranges when possible |
 | **TiB-scale validation not automated** | `examples/scale_validation.rs` is a manual pre-production check; not run in CI | Run manually: `cargo run --example scale_validation -- --records 10000000 --threads 8` |
 | **Sustained slow-test suite not in default CI** | P4/P5 tests marked `#[ignore]` to avoid CI timeouts | Run explicitly: `cargo nextest run -p noxu-db --profile slow --run-ignored all` |

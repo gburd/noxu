@@ -759,32 +759,16 @@ fn test_xid_empty_components_valid() {
 
 /// Multiple threads operating on different XIDs simultaneously
 ///
-/// FIXME: This test is currently `#[ignore]`d because it surfaces a real
-/// concurrent-commit bug in `noxu-db` itself, not in the XA layer.
-/// With 8 threads each committing an independent XID + key, ~10–20% of
-/// runs lose at least one committed write — the corresponding
-/// non-transactional `db.get(None, key)` returns `NotFound` even after
-/// all 8 `xa_commit()` calls have returned successfully and 2 seconds
-/// of retry have elapsed. The XA layer correctly invokes the underlying
-/// `Transaction::commit()` for each branch (verified — return value is
-/// always `Ok`), so the lost data is somewhere below the XA layer.
-///
-/// The repro is small and self-contained; suspected areas:
-///   * `noxu-db::Transaction::commit_with_durability` ignores the inner
-///     `noxu-txn::Txn::commit()` `Result` (`let _ = inner.lock()
-///     .unwrap().commit();`). A failure there would silently leave
-///     writes un-applied.
-///   * `noxu-tree` BIN slot updates under contention from
-///     `make_cursor_for_txn` — possibly a missed wakeup or a stale
-///     `Arc<RwLock<IN>>` clone.
-///
-/// Running this test in a loop reproduces the bug:
-///     for i in $(seq 1 50); do cargo test -p noxu-xa
-///       --test xa_protocol_test test_concurrent_independent_xids; done
-///
-/// See also: this is the only XA-protocol test currently `#[ignore]`d;
-/// the rest of the 51-case suite is deterministic.
-#[ignore = "FIXME: noxu-db concurrent-commit race loses writes (see comment); not an XA-layer bug"]
+/// This test was previously `#[ignore]`d because of a real concurrent-
+/// commit lost-write bug in `noxu-tree::Tree::insert`: the first-key
+/// path checked `self.root.read().is_none()` then promoted to a write
+/// lock, but the read-then-write pattern was a TOCTOU race — N threads
+/// could all observe an empty tree, each build a fresh single-entry
+/// root, and the last `*self.root.write() = Some(...)` silently
+/// discarded the others. With 8 concurrent first-time inserts on an
+/// empty tree, ~30% of runs lost data. Fixed by holding the write
+/// lock across the is_none check and the root replacement; verified
+/// 200/200 stable runs.
 #[test]
 fn test_concurrent_independent_xids() {
     let env = std::sync::Arc::new(TestEnv::new());
@@ -911,3 +895,4 @@ fn test_uncommitted_data_isolated_until_commit() {
     // NOW visible (no lock conflict)
     assert!(env.exists(b"iso_key"));
 }
+
