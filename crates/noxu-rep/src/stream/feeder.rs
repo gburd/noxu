@@ -657,6 +657,18 @@ mod tests {
         assert_eq!(received[2], (3, 30, vec![]));
 
         // Verify ack was tracked.
+        //
+        // The receiver thread sends one ack per frame and exits as soon as
+        // the third ack is queued — but `FeederRunner::run()` is on a
+        // separate thread that polls the channel with a 1 ms timeout and
+        // then sleeps 5 ms between polls. By the time `recv_handle.join()`
+        // returns, the runner may not yet have drained all three acks
+        // from the queue. Poll briefly (≤ 200 ms) for the runner to catch
+        // up; this is plenty of time for three queued reads.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while runner_arc.known_replica_vlsn() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert_eq!(runner_arc.known_replica_vlsn(), 3);
 
         // Close the channel to terminate the run loop.
