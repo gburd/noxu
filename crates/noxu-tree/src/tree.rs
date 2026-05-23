@@ -1504,73 +1504,80 @@ impl Tree {
         // promoted from a single BIN to a level-2 IN between our read
         // detect and our write — handled by the `is_bin` re-check
         // inside the write lock.
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = root.read_arc();
-        let bin_arc;
-        loop {
-            if guard.is_bin() {
-                bin_arc = parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
-                drop(guard);
-                break;
-            }
-            let next_arc = match &*guard {
-                TreeNode::Internal(n) => {
-                    if n.entries.is_empty() {
-                        return false;
-                    }
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if self.key_cmp(entry.key.as_slice(), key)
-                            != std::cmp::Ordering::Greater
+        //
+        // We retry the descent up to a small bound to absorb the rare
+        // case where a concurrent split moved this key into the new
+        // sibling between the read-chain release and the write-lock
+        // acquisition. Without the retry, the sole caller
+        // (`Database::put_with_options`) would silently lose the TTL
+        // for the affected key. Three attempts is generous: each
+        // retry only races a single split and splits are infrequent.
+        for _ in 0..3 {
+            let mut guard: parking_lot::ArcRwLockReadGuard<
+                parking_lot::RawRwLock,
+                TreeNode,
+            > = root.read_arc();
+            let bin_arc;
+            loop {
+                if guard.is_bin() {
+                    bin_arc =
+                        parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+                    drop(guard);
+                    break;
+                }
+                let next_arc = match &*guard {
+                    TreeNode::Internal(n) => {
+                        if n.entries.is_empty() {
+                            return false;
+                        }
+                        let mut idx = 0usize;
+                        for (i, entry) in n.entries.iter().enumerate() {
+                            if i == 0 {
+                                idx = 0;
+                            } else if self.key_cmp(entry.key.as_slice(), key)
+                                != std::cmp::Ordering::Greater
+                            {
+                                idx = i;
+                            } else {
+                                break;
+                            }
+                        }
+                        match n.entries.get(idx).and_then(|e| e.child.clone())
                         {
-                            idx = i;
-                        } else {
-                            break;
+                            Some(c) => c,
+                            None => return false,
                         }
                     }
-                    match n.entries.get(idx).and_then(|e| e.child.clone()) {
-                        Some(c) => c,
-                        None => return false,
-                    }
-                }
-                TreeNode::Bottom(_) => unreachable!(),
-            };
-            // Take child read lock BEFORE releasing parent's.
-            let next_guard = next_arc.read_arc();
-            drop(guard);
-            guard = next_guard;
-        }
-
-        // Now take the write lock on the BIN we descended to. Note: it
-        // is possible (though rare) for a concurrent split to have moved
-        // some of the BIN's keys to a new sibling between our read-lock
-        // chain release and our write lock acquisition. We handle that
-        // by re-checking key membership in the BIN under the write lock
-        // and returning `false` if our key is no longer here — the
-        // caller is responsible for retrying. This is conservative but
-        // correct, mirroring the optimistic-then-verify pattern used in
-        // some database TTL paths.
-        let mut wguard = bin_arc.write();
-        if let TreeNode::Bottom(bin) = &mut *wguard {
-            let slot = if let Some(cmp) = &self.key_comparator {
-                let (idx, exact) = bin.find_entry_cmp(key, cmp.as_ref());
-                if exact { Some(idx) } else { None }
-            } else {
-                let (idx, exact) = bin.find_entry_compressed(key);
-                if exact { Some(idx) } else { None }
-            };
-            if let Some(slot_idx) = slot
-                && let Some(entry) = bin.entries.get_mut(slot_idx)
-            {
-                entry.expiration_time = expiration_hours;
-                bin.expiration_in_hours = true;
-                bin.dirty = true;
-                return true;
+                    TreeNode::Bottom(_) => unreachable!(),
+                };
+                let next_guard = next_arc.read_arc();
+                drop(guard);
+                guard = next_guard;
             }
+
+            // Now take the write lock on the BIN we descended to.
+            let mut wguard = bin_arc.write();
+            if let TreeNode::Bottom(bin) = &mut *wguard {
+                let slot = if let Some(cmp) = &self.key_comparator {
+                    let (idx, exact) = bin.find_entry_cmp(key, cmp.as_ref());
+                    if exact { Some(idx) } else { None }
+                } else {
+                    let (idx, exact) = bin.find_entry_compressed(key);
+                    if exact { Some(idx) } else { None }
+                };
+                if let Some(slot_idx) = slot
+                    && let Some(entry) = bin.entries.get_mut(slot_idx)
+                {
+                    entry.expiration_time = expiration_hours;
+                    bin.expiration_in_hours = true;
+                    bin.dirty = true;
+                    return true;
+                }
+            }
+            // Key not in this BIN — either it was never present or a
+            // concurrent split moved it. Retry the descent; at most a
+            // few iterations are needed to follow the key into its new
+            // BIN.
         }
         false
     }
@@ -2877,6 +2884,13 @@ impl Tree {
     ///
     /// Returns a `SearchResult` if the key is (or should be) in the tree,
     /// `None` if the tree is empty.
+    ///
+    /// TODO(latch-coupling): this is the optimistic alternative to
+    /// `Tree::search`. It still uses the old drop-then-take descent
+    /// pattern and relies on `validate_parent_child` to detect a race
+    /// post-hoc and restart from root. Currently used only by tests.
+    /// Convert to `read_arc()` hand-over-hand to remove the restart
+    /// path entirely if/when this method is wired to production.
     pub fn search_with_coupling(&self, key: &[u8]) -> Option<SearchResult> {
         let root = self.get_root()?;
         let mut current = root.clone();
@@ -3611,6 +3625,11 @@ impl Tree {
     /// .  Descends the tree
     /// exactly like `search()` and returns the leaf-level BIN arc, or `None`
     /// if the tree is empty.
+    ///
+    /// TODO(latch-coupling): same dormant-API race as
+    /// `find_bin_for_insert` — still uses the old drop-then-take
+    /// pattern. Convert to `read_arc()` hand-over-hand if a
+    /// production caller is added.
     pub fn get_parent_bin_for_child_ln(
         &self,
         key: &[u8],
@@ -3663,6 +3682,14 @@ impl Tree {
     /// .  Semantically identical to
     /// `get_parent_bin_for_child_ln` — expressed as a separate method to match
     /// API surface.
+    ///
+    /// TODO(latch-coupling): this method still uses the old
+    /// `read()` + `latch_coupling_release(guard)` drop-then-take pattern
+    /// on the descent. Currently dormant (no in-tree callers outside
+    /// tests), so it is not data-losing in practice, but it inherits
+    /// the same descender-vs-splitter race window as the pre-fix
+    /// `Tree::search`. Convert to `read_arc()` hand-over-hand if a
+    /// production caller is added.
     pub fn find_bin_for_insert(
         &self,
         key: &[u8],
