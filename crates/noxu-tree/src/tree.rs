@@ -1542,8 +1542,7 @@ impl Tree {
                                 break;
                             }
                         }
-                        match n.entries.get(idx).and_then(|e| e.child.clone())
-                        {
+                        match n.entries.get(idx).and_then(|e| e.child.clone()) {
                             Some(c) => c,
                             None => return false,
                         }
@@ -3213,7 +3212,8 @@ impl Tree {
         let bin_arc;
         loop {
             if guard.is_bin() {
-                bin_arc = parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+                bin_arc =
+                    parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
                 break;
             }
 
