@@ -3,7 +3,7 @@
 
 /// Reasons why an environment might fail and become invalid.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvironmentFailureReason {
     /// Environment is locked by another process.

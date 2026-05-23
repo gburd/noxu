@@ -20,7 +20,11 @@ fn test_phi_zero_with_insufficient_samples() {
 
     // One heartbeat recorded but still only 0 inter-arrival samples.
     det.record_heartbeat();
-    assert_eq!(det.phi(), 0.0, "phi must be 0.0 after first heartbeat (no interval yet)");
+    assert_eq!(
+        det.phi(),
+        0.0,
+        "phi must be 0.0 after first heartbeat (no interval yet)"
+    );
     assert!(det.is_available());
 }
 
@@ -132,7 +136,10 @@ fn test_master_tracker_phi_mode() {
     }
 
     // Immediately after heartbeats: should be alive.
-    assert!(tracker.is_master_alive(), "master must be alive right after heartbeats");
+    assert!(
+        tracker.is_master_alive(),
+        "master must be alive right after heartbeats"
+    );
 
     // Silence for 200 ms → phi rises above 1.0 → suspected.
     thread::sleep(Duration::from_millis(200));
@@ -168,9 +175,17 @@ fn test_suggested_timeout_adapts_to_high_latency() {
     let timeout = det.suggested_phase_timeout(3.0, Duration::from_millis(500));
     // Should be >= 50ms floor (mean ~80ms + 3*sigma >= 80ms) and <= 5s
     // Must differ from fallback (500ms) — proves adaptation is working
-    assert!(timeout >= Duration::from_millis(50), "timeout={:?} must be >= 50ms floor", timeout);
+    assert!(
+        timeout >= Duration::from_millis(50),
+        "timeout={:?} must be >= 50ms floor",
+        timeout
+    );
     assert!(timeout <= Duration::from_secs(5));
-    assert_ne!(timeout, Duration::from_millis(500), "timeout should differ from fallback");
+    assert_ne!(
+        timeout,
+        Duration::from_millis(500),
+        "timeout should differ from fallback"
+    );
 }
 
 #[test]
@@ -190,7 +205,11 @@ fn test_suggested_timeout_floor_clamp() {
         det.record_heartbeat();
     }
     let timeout = det.suggested_phase_timeout(3.0, Duration::from_millis(500));
-    assert!(timeout >= Duration::from_millis(50), "timeout={:?} must be >= 50ms floor", timeout);
+    assert!(
+        timeout >= Duration::from_millis(50),
+        "timeout={:?} must be >= 50ms floor",
+        timeout
+    );
 }
 
 #[test]
@@ -226,7 +245,11 @@ fn test_master_tracker_timeout_mode_unchanged() {
     assert!(tracker.is_master_alive(), "must be alive right after heartbeat");
 
     // phi() returns None in timeout mode.
-    assert_eq!(tracker.phi(), None, "phi() must be None in binary timeout mode");
+    assert_eq!(
+        tracker.phi(),
+        None,
+        "phi() must be None in binary timeout mode"
+    );
 
     // After 150 ms (> timeout), master should be considered dead.
     thread::sleep(Duration::from_millis(150));

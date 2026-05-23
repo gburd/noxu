@@ -3,7 +3,7 @@
 
 /// Specifies the attributes of a sequence.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct SequenceConfig {
     /// Number of elements cached in the sequence handle (default 20).
@@ -212,9 +212,8 @@ mod tests {
 
     #[test]
     fn test_with_decrement_false() {
-        let cfg = SequenceConfig::new()
-            .with_decrement(true)
-            .with_decrement(false);
+        let cfg =
+            SequenceConfig::new().with_decrement(true).with_decrement(false);
         assert!(!cfg.decrement);
     }
 
@@ -240,9 +239,7 @@ mod tests {
 
     #[test]
     fn test_with_wrap_false() {
-        let cfg = SequenceConfig::new()
-            .with_wrap(true)
-            .with_wrap(false);
+        let cfg = SequenceConfig::new().with_wrap(true).with_wrap(false);
         assert!(!cfg.wrap);
     }
 

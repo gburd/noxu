@@ -310,9 +310,7 @@ pub fn connect_to_service(
     stream
         .write_all(name_bytes)
         .map_err(|e| RepError::NetworkError(e.to_string()))?;
-    stream
-        .flush()
-        .map_err(|e| RepError::NetworkError(e.to_string()))?;
+    stream.flush().map_err(|e| RepError::NetworkError(e.to_string()))?;
 
     Ok(TcpChannel::new(stream))
 }
@@ -482,10 +480,8 @@ mod tests {
 
     #[test]
     fn test_tcp_service_dispatcher_register_and_dispatch() {
-        let sd = TcpServiceDispatcher::new(
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let sd =
+            TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
         sd.register("echo", Arc::new(EchoHandler { name: "echo".into() }));
         let bound_addr = sd.start().unwrap();
 
@@ -502,10 +498,8 @@ mod tests {
 
     #[test]
     fn test_tcp_service_dispatcher_multiple_clients() {
-        let sd = TcpServiceDispatcher::new(
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let sd =
+            TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
         sd.register("echo", Arc::new(EchoHandler { name: "echo".into() }));
         let bound_addr = sd.start().unwrap();
 

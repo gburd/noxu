@@ -98,7 +98,11 @@ impl EnvironmentStats {
     /// Bin fetch miss ratio (0.0 – 1.0).
     pub fn bin_fetch_miss_ratio(&self) -> f64 {
         let total = self.evictor.bin_fetch;
-        if total == 0 { 0.0 } else { self.evictor.bin_fetch_miss as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.evictor.bin_fetch_miss as f64 / total as f64
+        }
     }
 }
 
@@ -248,9 +252,15 @@ impl From<&EvictorStats> for EvictorStatsSnapshot {
             nodes_mutated: stats.nodes_mutated.load(Ordering::Relaxed),
             nodes_stripped: stats.nodes_stripped.load(Ordering::Relaxed),
             nodes_put_back: stats.nodes_put_back.load(Ordering::Relaxed),
-            nodes_moved_to_pri2_lru: stats.nodes_moved_to_pri2_lru.load(Ordering::Relaxed),
-            root_nodes_evicted: stats.root_nodes_evicted.load(Ordering::Relaxed),
-            dirty_nodes_evicted: stats.dirty_nodes_evicted.load(Ordering::Relaxed),
+            nodes_moved_to_pri2_lru: stats
+                .nodes_moved_to_pri2_lru
+                .load(Ordering::Relaxed),
+            root_nodes_evicted: stats
+                .root_nodes_evicted
+                .load(Ordering::Relaxed),
+            dirty_nodes_evicted: stats
+                .dirty_nodes_evicted
+                .load(Ordering::Relaxed),
             lns_evicted: stats.lns_evicted.load(Ordering::Relaxed),
             bytes_evicted_daemon: d,
             bytes_evicted_critical: c,
@@ -262,20 +272,34 @@ impl From<&EvictorStats> for EvictorStatsSnapshot {
             ln_fetch: stats.ln_fetch.load(Ordering::Relaxed),
             ln_fetch_miss: stats.ln_fetch_miss.load(Ordering::Relaxed),
             upper_in_fetch: stats.upper_in_fetch.load(Ordering::Relaxed),
-            upper_in_fetch_miss: stats.upper_in_fetch_miss.load(Ordering::Relaxed),
-            bin_delta_fetch_miss: stats.bin_delta_fetch_miss.load(Ordering::Relaxed),
+            upper_in_fetch_miss: stats
+                .upper_in_fetch_miss
+                .load(Ordering::Relaxed),
+            bin_delta_fetch_miss: stats
+                .bin_delta_fetch_miss
+                .load(Ordering::Relaxed),
             full_bin_miss: stats.full_bin_miss.load(Ordering::Relaxed),
-            bin_delta_blind_ops: stats.bin_delta_blind_ops.load(Ordering::Relaxed),
+            bin_delta_blind_ops: stats
+                .bin_delta_blind_ops
+                .load(Ordering::Relaxed),
             pri1_lru_size: p1,
             pri2_lru_size: p2,
             lru_size: p1 + p2,
-            thread_unavailable: stats.thread_unavailable.load(Ordering::Relaxed),
+            thread_unavailable: stats
+                .thread_unavailable
+                .load(Ordering::Relaxed),
             cached_upper_ins: stats.cached_upper_ins.load(Ordering::Relaxed),
             cached_bins: stats.cached_bins.load(Ordering::Relaxed),
             cached_bin_deltas: stats.cached_bin_deltas.load(Ordering::Relaxed),
-            cached_in_sparse_target: stats.cached_in_sparse_target.load(Ordering::Relaxed),
-            cached_in_no_target: stats.cached_in_no_target.load(Ordering::Relaxed),
-            cached_in_compact_key: stats.cached_in_compact_key.load(Ordering::Relaxed),
+            cached_in_sparse_target: stats
+                .cached_in_sparse_target
+                .load(Ordering::Relaxed),
+            cached_in_no_target: stats
+                .cached_in_no_target
+                .load(Ordering::Relaxed),
+            cached_in_compact_key: stats
+                .cached_in_compact_key
+                .load(Ordering::Relaxed),
         }
     }
 }

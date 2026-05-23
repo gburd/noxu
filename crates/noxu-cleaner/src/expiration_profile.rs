@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn test_expired_fraction_mixed_never_and_ttl() {
         let mut ep = ExpirationProfile::new();
-        ep.add(0, 400);  // never expires
+        ep.add(0, 400); // never expires
         ep.add(10, 600); // expires at hour 10
         assert_eq!(ep.total_bytes(), 1000);
         // At time 10: 600 bytes expired, 400 never expire.

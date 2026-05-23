@@ -141,11 +141,21 @@ fn database_impl_new() {
 fn database_impl_sorted_duplicates_flag() {
     let mut config = DatabaseConfig::default();
     config.sorted_duplicates = false;
-    let db1 = DatabaseImpl::new(DatabaseId::new(1), "a".into(), DbType::User, &config);
+    let db1 = DatabaseImpl::new(
+        DatabaseId::new(1),
+        "a".into(),
+        DbType::User,
+        &config,
+    );
     assert!(!db1.get_sorted_duplicates());
 
     config.sorted_duplicates = true;
-    let db2 = DatabaseImpl::new(DatabaseId::new(2), "b".into(), DbType::User, &config);
+    let db2 = DatabaseImpl::new(
+        DatabaseId::new(2),
+        "b".into(),
+        DbType::User,
+        &config,
+    );
     assert!(db2.get_sorted_duplicates());
 }
 
@@ -153,7 +163,12 @@ fn database_impl_sorted_duplicates_flag() {
 fn database_impl_temporary_flag() {
     let mut config = DatabaseConfig::default();
     config.temporary = true;
-    let db = DatabaseImpl::new(DatabaseId::new(1), "t".into(), DbType::User, &config);
+    let db = DatabaseImpl::new(
+        DatabaseId::new(1),
+        "t".into(),
+        DbType::User,
+        &config,
+    );
     assert!(db.is_temporary());
 }
 
@@ -161,7 +176,12 @@ fn database_impl_temporary_flag() {
 fn database_impl_key_prefixing_flag() {
     let mut config = DatabaseConfig::default();
     config.key_prefixing = true;
-    let db = DatabaseImpl::new(DatabaseId::new(1), "p".into(), DbType::User, &config);
+    let db = DatabaseImpl::new(
+        DatabaseId::new(1),
+        "p".into(),
+        DbType::User,
+        &config,
+    );
     assert!(db.get_key_prefixing());
 }
 
@@ -430,7 +450,8 @@ fn cursor_impl_search_positions_cursor() {
 
     // Insert into the tree first, then search.
     cursor.put(b"key1", b"val1", PutMode::Overwrite).unwrap();
-    let status = cursor.search(b"key1", Some(b"val1"), SearchMode::Set).unwrap();
+    let status =
+        cursor.search(b"key1", Some(b"val1"), SearchMode::Set).unwrap();
     assert_eq!(status, OperationStatus::Success);
     assert!(cursor.is_initialized());
     assert_eq!(cursor.get_current_key(), Some(b"key1".as_slice()));
@@ -610,10 +631,20 @@ fn cursor_impl_search_modes_all_succeed() {
         let mut cursor = CursorImpl::new(db.clone(), 1);
         cursor.put(b"key", b"val", PutMode::Overwrite).unwrap();
     }
-    for mode in [SearchMode::Set, SearchMode::Both, SearchMode::SetRange, SearchMode::BothRange] {
+    for mode in [
+        SearchMode::Set,
+        SearchMode::Both,
+        SearchMode::SetRange,
+        SearchMode::BothRange,
+    ] {
         let mut cursor = CursorImpl::new(db.clone(), 1);
         let status = cursor.search(b"key", Some(b"val"), mode).unwrap();
-        assert_eq!(status, OperationStatus::Success, "mode {:?} should succeed", mode);
+        assert_eq!(
+            status,
+            OperationStatus::Success,
+            "mode {:?} should succeed",
+            mode
+        );
     }
 }
 

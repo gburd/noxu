@@ -3,7 +3,10 @@
 use crate::account::Account;
 use crate::error::FtdbError;
 use crate::transfer::Transfer;
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, OperationStatus, Transaction};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    OperationStatus, Transaction,
+};
 use std::path::Path;
 
 /// Persistent storage backed by two Noxu DB databases (accounts + transfers).
@@ -57,7 +60,11 @@ impl Storage {
     }
 
     /// Retrieves an account by ID within a transaction.
-    pub fn get_account_txn(&self, txn: &Transaction, id: u128) -> Result<Option<Account>, FtdbError> {
+    pub fn get_account_txn(
+        &self,
+        txn: &Transaction,
+        id: u128,
+    ) -> Result<Option<Account>, FtdbError> {
         let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
         let mut data = DatabaseEntry::new();
         match self.accounts_db.get(Some(txn), &key, &mut data)? {
@@ -82,7 +89,11 @@ impl Storage {
     }
 
     /// Stores an account within a transaction.
-    pub fn put_account_txn(&self, txn: &Transaction, account: &Account) -> Result<(), FtdbError> {
+    pub fn put_account_txn(
+        &self,
+        txn: &Transaction,
+        account: &Account,
+    ) -> Result<(), FtdbError> {
         let key = DatabaseEntry::from_vec(account.id.to_le_bytes().to_vec());
         let val = DatabaseEntry::from_vec(account.to_bytes().to_vec());
         self.accounts_db.put(Some(txn), &key, &val)?;
@@ -92,7 +103,10 @@ impl Storage {
     // ── Transfer operations ─────────────────────────────────────────────────
 
     /// Retrieves a transfer by ID (no explicit transaction).
-    pub fn get_transfer(&self, id: u128) -> Result<Option<Transfer>, FtdbError> {
+    pub fn get_transfer(
+        &self,
+        id: u128,
+    ) -> Result<Option<Transfer>, FtdbError> {
         let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
         let mut data = DatabaseEntry::new();
         match self.transfers_db.get(None, &key, &mut data)? {
@@ -109,7 +123,11 @@ impl Storage {
     }
 
     /// Retrieves a transfer by ID within a transaction.
-    pub fn get_transfer_txn(&self, txn: &Transaction, id: u128) -> Result<Option<Transfer>, FtdbError> {
+    pub fn get_transfer_txn(
+        &self,
+        txn: &Transaction,
+        id: u128,
+    ) -> Result<Option<Transfer>, FtdbError> {
         let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
         let mut data = DatabaseEntry::new();
         match self.transfers_db.get(Some(txn), &key, &mut data)? {
@@ -126,7 +144,11 @@ impl Storage {
     }
 
     /// Stores a transfer within a transaction.
-    pub fn put_transfer_txn(&self, txn: &Transaction, transfer: &Transfer) -> Result<(), FtdbError> {
+    pub fn put_transfer_txn(
+        &self,
+        txn: &Transaction,
+        transfer: &Transfer,
+    ) -> Result<(), FtdbError> {
         let key = DatabaseEntry::from_vec(transfer.id.to_le_bytes().to_vec());
         let val = DatabaseEntry::from_vec(transfer.to_bytes().to_vec());
         self.transfers_db.put(Some(txn), &key, &val)?;

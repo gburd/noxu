@@ -21,9 +21,9 @@
 //!   USENIX FAST 2004.
 
 use crate::policy::EvictionPolicy;
-use crate::slab::{SlabList, SENTINEL};
-use noxu_sync::Mutex;
+use crate::slab::{SENTINEL, SlabList};
 use hashbrown::HashMap;
+use noxu_sync::Mutex;
 
 const MAX_GHOST_RATIO: usize = 2;
 const MIN_GHOST_CAP: usize = 64;
@@ -46,7 +46,9 @@ impl ClockList {
     }
 
     fn add(&mut self, id: u64, hot: bool) {
-        if self.list.contains(id) { return; }
+        if self.list.contains(id) {
+            return;
+        }
         self.list.add_back(id);
         self.ref_bits.insert(id, hot);
         if self.hand == u64::MAX {
@@ -56,7 +58,9 @@ impl ClockList {
 
     /// True if the hand's node has a set reference bit.
     fn hand_ref(&self) -> bool {
-        if self.hand == u64::MAX { return false; }
+        if self.hand == u64::MAX {
+            return false;
+        }
         *self.ref_bits.get(&self.hand).unwrap_or(&false)
     }
 
@@ -71,7 +75,9 @@ impl ClockList {
     /// Returns the evicted node_id, or None if empty.
     fn evict_hand(&mut self) -> Option<u64> {
         let id = self.hand;
-        if id == u64::MAX { return None; }
+        if id == u64::MAX {
+            return None;
+        }
         self.advance(id);
         self.list.remove(id);
         self.ref_bits.remove(&id);
@@ -95,9 +101,15 @@ impl ClockList {
 
     /// Move the hand's node from this list into `other`, setting its ref bit
     /// to `hot`.  Returns the moved node_id, or None if empty.
-    fn move_hand_to(&mut self, other: &mut ClockList, hot: bool) -> Option<u64> {
+    fn move_hand_to(
+        &mut self,
+        other: &mut ClockList,
+        hot: bool,
+    ) -> Option<u64> {
         let id = self.hand;
-        if id == u64::MAX { return None; }
+        if id == u64::MAX {
+            return None;
+        }
         self.advance(id);
         self.list.remove(id);
         self.ref_bits.remove(&id);
@@ -115,7 +127,9 @@ impl ClockList {
     }
 
     fn remove(&mut self, id: u64) -> bool {
-        if self.hand == id { self.advance(id); }
+        if self.hand == id {
+            self.advance(id);
+        }
         if self.list.remove(id) {
             self.ref_bits.remove(&id);
             true
@@ -124,9 +138,15 @@ impl ClockList {
         }
     }
 
-    fn contains(&self, id: u64) -> bool { self.list.contains(id) }
-    fn len(&self) -> usize { self.list.len }
-    fn peek_front(&self) -> Option<u64> { self.list.peek_front() }
+    fn contains(&self, id: u64) -> bool {
+        self.list.contains(id)
+    }
+    fn len(&self) -> usize {
+        self.list.len
+    }
+    fn peek_front(&self) -> Option<u64> {
+        self.list.peek_front()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,22 +164,34 @@ struct CarState {
 
 impl CarState {
     fn new() -> Self {
-        Self { t1: ClockList::new(), t2: ClockList::new(), b1: SlabList::new(), b2: SlabList::new(), p: 0.0 }
+        Self {
+            t1: ClockList::new(),
+            t2: ClockList::new(),
+            b1: SlabList::new(),
+            b2: SlabList::new(),
+            p: 0.0,
+        }
     }
 
-    fn live_len(&self) -> usize { self.t1.len() + self.t2.len() }
+    fn live_len(&self) -> usize {
+        self.t1.len() + self.t2.len()
+    }
 
     fn ghost_cap(&self) -> usize {
         (self.live_len() * MAX_GHOST_RATIO).max(MIN_GHOST_CAP)
     }
 
     fn trim_ghost(b: &mut SlabList, cap: usize) {
-        while b.len > cap { b.remove_front(); }
+        while b.len > cap {
+            b.remove_front();
+        }
     }
 
     /// Core replacement: find a victim page.
     fn replace(&mut self) -> Option<u64> {
-        if self.t1.len() == 0 && self.t2.len() == 0 { return None; }
+        if self.t1.len() == 0 && self.t2.len() == 0 {
+            return None;
+        }
         let max_iters = (self.t1.len() + self.t2.len()) * 4 + 2;
         for _ in 0..max_iters {
             // --- Inspect T1 hand ---
@@ -183,7 +215,9 @@ impl CarState {
                         // Defensive: skip duplicate ghost add (can occur
                         // when replace() is re-entered during ghost-hit
                         // adaptation in insert()).
-                        if !self.b1.contains(id) { self.b1.add_back(id); }
+                        if !self.b1.contains(id) {
+                            self.b1.add_back(id);
+                        }
                         let cap = self.ghost_cap();
                         Self::trim_ghost(&mut self.b1, cap);
                         return Some(id);
@@ -203,17 +237,23 @@ impl CarState {
                 } else {
                     // Evict from T2.
                     let id = self.t2.evict_hand().unwrap();
-                    if !self.b2.contains(id) { self.b2.add_back(id); }
+                    if !self.b2.contains(id) {
+                        self.b2.add_back(id);
+                    }
                     let cap = self.ghost_cap();
                     Self::trim_ghost(&mut self.b2, cap);
                     return Some(id);
                 }
             }
 
-            if self.t1.len() == 0 && self.t2.len() == 0 { break; }
+            if self.t1.len() == 0 && self.t2.len() == 0 {
+                break;
+            }
         }
         // Fallback: evict whatever is at the front of T1 or T2.
-        if let Some(id) = self.t1.evict_hand() { return Some(id); }
+        if let Some(id) = self.t1.evict_hand() {
+            return Some(id);
+        }
         self.t2.evict_hand()
     }
 
@@ -227,7 +267,8 @@ impl CarState {
             let b1 = self.b1.len as f64;
             let b2 = self.b2.len as f64;
             let delta = if b1 >= b2 { 1.0 } else { b2 / b1.max(1.0) };
-            self.p = (self.p + delta).min((self.t1.len() + self.t2.len() + 1) as f64);
+            self.p = (self.p + delta)
+                .min((self.t1.len() + self.t2.len() + 1) as f64);
             self.replace();
             self.b1.remove(id);
             self.t2.add(id, false);
@@ -249,8 +290,10 @@ impl CarState {
     }
 
     fn on_hit(&mut self, id: u64) {
-        if self.t1.set_ref(id, true) { /* ref bit set in T1 */ }
-        else { self.t2.set_ref(id, true); /* ref bit set in T2 */ }
+        if self.t1.set_ref(id, true) { /* ref bit set in T1 */
+        } else {
+            self.t2.set_ref(id, true); /* ref bit set in T2 */
+        }
     }
 }
 
@@ -271,7 +314,9 @@ impl CarPolicy {
 }
 
 impl Default for CarPolicy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EvictionPolicy for CarPolicy {
@@ -307,9 +352,15 @@ impl EvictionPolicy for CarPolicy {
 
     fn remove(&self, node_id: u64) -> bool {
         let mut s = self.state.lock();
-        if s.t1.remove(node_id) { return true; }
-        if s.t2.remove(node_id) { return true; }
-        if s.b1.remove(node_id) { return true; }
+        if s.t1.remove(node_id) {
+            return true;
+        }
+        if s.t2.remove(node_id) {
+            return true;
+        }
+        if s.b1.remove(node_id) {
+            return true;
+        }
         s.b2.remove(node_id)
     }
 
@@ -334,7 +385,9 @@ impl EvictionPolicy for CarPolicy {
         s.t1.len() + s.t2.len()
     }
 
-    fn name(&self) -> &'static str { "CAR" }
+    fn name(&self) -> &'static str {
+        "CAR"
+    }
 }
 
 #[cfg(test)]
@@ -345,7 +398,9 @@ mod tests {
     #[test]
     fn test_car_evicts_all() {
         let p = CarPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         let mut evicted = Vec::new();
         for _ in 0..3 {
             evicted.push(p.evict_candidate().unwrap());
@@ -358,16 +413,21 @@ mod tests {
     #[test]
     fn test_car_touch_promotes() {
         let p = CarPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         // Touch 1 twice to set ref_bit.
-        p.touch(1); p.touch(1);
+        p.touch(1);
+        p.touch(1);
         assert_eq!(p.len(), 3);
     }
 
     #[test]
     fn test_car_remove() {
         let p = CarPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         assert!(p.remove(2));
         assert!(!p.remove(2));
         assert_eq!(p.len(), 2);

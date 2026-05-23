@@ -16,7 +16,7 @@ use crate::{LockResult, LockType, TxnError};
 /// BasicLocker is used for non-transactional database operations where
 /// locks only need to be held for the duration of a single API call.
 ///
-/// 
+///
 pub struct BasicLocker {
     /// Unique locker ID.
     id: i64,
@@ -42,7 +42,7 @@ pub struct BasicLocker {
     /// When false, the DummyLockManager grants locks without consulting
     /// the underlying lock table.
     ///
-    /// 
+    ///
     locking_required: bool,
 }
 
@@ -100,7 +100,7 @@ impl BasicLocker {
     /// !cursor.isInternalDbCursor()`.  Internal-DB cursors (e.g. the utilization
     /// DB cursor) bypass the lock table entirely.
     ///
-    /// 
+    ///
     pub fn register_cursor(&mut self, is_internal_db_cursor: bool) {
         self.locking_required = !is_internal_db_cursor;
     }

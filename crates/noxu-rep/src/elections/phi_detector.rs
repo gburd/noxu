@@ -40,8 +40,10 @@ fn phi_cdf(x: f64) -> f64 {
     let poly = t
         * (0.319_381_53
             + t * (-0.356_563_78
-                + t * (1.781_477_94 + t * (-1.821_255_978 + t * 1.330_274_429))));
-    let base = 1.0 - ((-0.5 * x * x).exp()) / (2.0 * std::f64::consts::PI).sqrt() * poly;
+                + t * (1.781_477_94
+                    + t * (-1.821_255_978 + t * 1.330_274_429))));
+    let base = 1.0
+        - ((-0.5 * x * x).exp()) / (2.0 * std::f64::consts::PI).sqrt() * poly;
     if x >= 0.0 { base } else { 1.0 - base }
 }
 
@@ -128,7 +130,8 @@ impl PhiAccrualDetector {
 
         let n = samples.len() as f64;
         let mean = samples.iter().sum::<f64>() / n;
-        let variance = samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        let variance =
+            samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
         let std_dev = variance.sqrt();
 
         let elapsed = last.elapsed().as_secs_f64();
@@ -169,13 +172,18 @@ impl PhiAccrualDetector {
             return None;
         }
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+            / samples.len() as f64;
         Some(variance.sqrt())
     }
 
     /// Recommended election phase timeout: mean + k * stddev, clamped to [50ms, 5s].
     /// Returns the configured fallback duration if window has < 2 samples.
-    pub fn suggested_phase_timeout(&self, k: f64, fallback: Duration) -> Duration {
+    pub fn suggested_phase_timeout(
+        &self,
+        k: f64,
+        fallback: Duration,
+    ) -> Duration {
         let mean = match self.mean_interval() {
             Some(m) => m,
             None => return fallback,

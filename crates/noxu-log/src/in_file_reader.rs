@@ -12,8 +12,8 @@ use crate::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::entry_type::LogEntryType;
 use crate::error::{NoxuLogError, Result};
 use crate::file_reader::LogFileAccess;
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use hashbrown::HashSet;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 
 // Maximum plausible payload size (64 MiB).
 const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;
@@ -41,7 +41,7 @@ impl CurrentEntry {
 
 /// Scans log files for IN/BIN/BINDelta entries during recovery.
 ///
-/// 
+///
 ///
 /// ## Usage
 ///
@@ -96,14 +96,13 @@ impl<F: LogFileAccess> INFileReader<F> {
         start_lsn: Lsn,
         finish_lsn: Lsn,
     ) -> Result<Self> {
-        let (current_file_num, current_offset, eof) =
-            if !start_lsn.is_null() {
-                (start_lsn.file_number(), start_lsn.file_offset() as u64, false)
-            } else if let Some(first) = file_access.get_first_file_num() {
-                (first, 0u64, false)
-            } else {
-                (0u32, 0u64, true)
-            };
+        let (current_file_num, current_offset, eof) = if !start_lsn.is_null() {
+            (start_lsn.file_number(), start_lsn.file_offset() as u64, false)
+        } else if let Some(first) = file_access.get_first_file_num() {
+            (first, 0u64, false)
+        } else {
+            (0u32, 0u64, true)
+        };
 
         Ok(INFileReader {
             file_access,
@@ -122,7 +121,7 @@ impl<F: LogFileAccess> INFileReader<F> {
 
     /// Register a log entry type that this reader should return.
     ///
-    /// 
+    ///
     pub fn add_target_type(&mut self, entry_type: LogEntryType) {
         self.target_types.insert(entry_type);
     }
@@ -170,18 +169,12 @@ impl<F: LogFileAccess> INFileReader<F> {
 
     /// Returns the database ID from the current IN entry.
     pub fn get_database_id(&self) -> u64 {
-        self.current_entry
-            .as_ref()
-            .map(|e| e.db_id())
-            .unwrap_or(0)
+        self.current_entry.as_ref().map(|e| e.db_id()).unwrap_or(0)
     }
 
     /// Returns `true` if the current entry is a BIN delta.
     pub fn is_bin_delta(&self) -> bool {
-        self.current_entry
-            .as_ref()
-            .map(|e| e.is_bin_delta())
-            .unwrap_or(false)
+        self.current_entry.as_ref().map(|e| e.is_bin_delta()).unwrap_or(false)
     }
 
     /// Returns the maximum node ID seen across all scanned IN/BIN entries.
@@ -252,17 +245,16 @@ impl<F: LogFileAccess> INFileReader<F> {
 
             let entry_type_num = hdr[4];
             let flags = hdr[5];
-            let item_size = u32::from_le_bytes([
-                hdr[10], hdr[11], hdr[12], hdr[13],
-            ]) as usize;
+            let item_size =
+                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
+                    as usize;
 
             if item_size > MAX_SANE_ITEM_SIZE {
                 self.eof = true;
                 return Ok(None);
             }
 
-            let vlsn_present =
-                (flags & 0x08) != 0 || (flags & 0x20) != 0;
+            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
             let header_size =
                 if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
             let entry_size = header_size + item_size;
@@ -304,17 +296,19 @@ impl<F: LogFileAccess> INFileReader<F> {
         match entry_type {
             LogEntryType::IN | LogEntryType::BIN => {
                 if let Ok(e) = InLogEntry::read_from_log(payload)
-                    && e.db_id > self.max_db_id {
-                        self.max_db_id = e.db_id;
-                    }
-                    // node_id is embedded in opaque node_data; we cannot
-                    // extract it without noxu-tree, so max_node_id stays 0.
+                    && e.db_id > self.max_db_id
+                {
+                    self.max_db_id = e.db_id;
+                }
+                // node_id is embedded in opaque node_data; we cannot
+                // extract it without noxu-tree, so max_node_id stays 0.
             }
             LogEntryType::BINDelta => {
                 if let Ok(e) = BinDeltaLogEntry::read_from_log(payload)
-                    && e.db_id > self.max_db_id {
-                        self.max_db_id = e.db_id;
-                    }
+                    && e.db_id > self.max_db_id
+                {
+                    self.max_db_id = e.db_id;
+                }
             }
             _ => {}
         }
@@ -335,10 +329,13 @@ impl<F: LogFileAccess> INFileReader<F> {
                 Ok(CurrentEntry::In { entry: e, is_bin_delta: is_delta })
             }
             LogEntryType::BINDelta => {
-                let e =
-                    BinDeltaLogEntry::read_from_log(payload).map_err(|err| {
-                        NoxuLogError::Internal(format!("BINDelta parse error: {err}"))
-                    })?;
+                let e = BinDeltaLogEntry::read_from_log(payload).map_err(
+                    |err| {
+                        NoxuLogError::Internal(format!(
+                            "BINDelta parse error: {err}"
+                        ))
+                    },
+                )?;
                 Ok(CurrentEntry::BinDelta(e))
             }
             _ => Err(NoxuLogError::LogCorrupt(format!(
@@ -402,13 +399,9 @@ mod tests {
         }
 
         fn get_file_length(&self, file_num: u32) -> Result<u64> {
-            self.files
-                .get(&file_num)
-                .map(|d| d.len() as u64)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "File not found")
-                        .into()
-                })
+            self.files.get(&file_num).map(|d| d.len() as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "File not found").into()
+            })
         }
 
         fn get_first_file_num(&self) -> Option<u32> {
@@ -448,7 +441,8 @@ mod tests {
     }
 
     fn make_in_payload(db_id: u64) -> Vec<u8> {
-        let e = InLogEntry::new(db_id, NULL_LSN, NULL_LSN, b"node_data".to_vec());
+        let e =
+            InLogEntry::new(db_id, NULL_LSN, NULL_LSN, b"node_data".to_vec());
         let mut buf = BytesMut::new();
         e.write_to_log(&mut buf);
         buf.to_vec()
@@ -508,7 +502,8 @@ mod tests {
         for &buf_size in &[64usize, 512, 2048, 8192] {
             let mut mock = MockFileAccess::new();
             mock.add_file(0, vec![0u8; 50]);
-            let result = INFileReader::new(mock, buf_size, Lsn::new(0, 0), NULL_LSN);
+            let result =
+                INFileReader::new(mock, buf_size, Lsn::new(0, 0), NULL_LSN);
             assert!(result.is_ok(), "failed for buf_size {}", buf_size);
         }
     }
@@ -656,8 +651,7 @@ mod tests {
     #[test]
     fn test_get_max_node_id_initial_zero() {
         let mock = MockFileAccess::new();
-        let reader =
-            INFileReader::new(mock, 512, NULL_LSN, NULL_LSN).unwrap();
+        let reader = INFileReader::new(mock, 512, NULL_LSN, NULL_LSN).unwrap();
         assert_eq!(reader.get_max_node_id(), 0);
     }
 

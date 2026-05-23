@@ -13,8 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&env_dir);
 
     // --- Setup ---
-    let env_config = EnvironmentConfig::new(env_dir.clone())
-        .with_allow_create(true);
+    let env_config =
+        EnvironmentConfig::new(env_dir.clone()).with_allow_create(true);
     let env = Environment::open(env_config)?;
 
     let db_config = DatabaseConfig::new().with_allow_create(true);
@@ -77,14 +77,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut search_key = DatabaseEntry::from_bytes(b"cherry");
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut search_key, &mut data, Get::Search, None)?;
+        let status =
+            cursor.get(&mut search_key, &mut data, Get::Search, None)?;
         if status == OperationStatus::Success {
             let v = std::str::from_utf8(data.data()).unwrap_or("?");
             println!("  Found cherry: {}", v);
 
             // Continue iterating from current position
             let mut key = DatabaseEntry::new();
-            let mut status = cursor.get(&mut key, &mut data, Get::Next, None)?;
+            let mut status =
+                cursor.get(&mut key, &mut data, Get::Next, None)?;
             while status == OperationStatus::Success {
                 let v = std::str::from_utf8(data.data()).unwrap_or("?");
                 println!("  Next: {}", v);
@@ -103,7 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut search_key = DatabaseEntry::from_bytes(b"banana");
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut search_key, &mut data, Get::Search, None)?;
+        let status =
+            cursor.get(&mut search_key, &mut data, Get::Search, None)?;
         if status == OperationStatus::Success {
             println!("  Found banana, deleting...");
             let del_status = cursor.delete()?;

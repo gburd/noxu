@@ -7,8 +7,7 @@
 //! All tests use `tempfile::TempDir` for isolation.
 
 use noxu_log::{
-    FileManager, LogFileReader, LogManager,
-    entry_type::LogEntryType,
+    FileManager, LogFileReader, LogManager, entry_type::LogEntryType,
     provisional::Provisional,
 };
 use std::sync::Arc;
@@ -18,9 +17,8 @@ use tempfile::TempDir;
 
 /// Create a FileManager + LogManager pair in a fresh temp directory.
 fn make_managers(dir: &TempDir) -> (Arc<FileManager>, LogManager) {
-    let fm = Arc::new(
-        FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
-    );
+    let fm =
+        Arc::new(FileManager::new(dir.path(), false, 10_000_000, 100).unwrap());
     let lm = LogManager::new(Arc::clone(&fm), 3, 1_048_576, 4096);
     (fm, lm)
 }
@@ -125,19 +123,13 @@ fn test_crc_validation_on_read() {
     // Corrupt a payload byte inside the entry.
     // The entry starts at lsn.file_offset(); the payload begins after the
     // 14-byte fixed header.
-    let payload_byte_offset =
-        lsn.file_offset() as u64
-            + noxu_log::entry_header::MIN_HEADER_SIZE as u64;
+    let payload_byte_offset = lsn.file_offset() as u64
+        + noxu_log::entry_header::MIN_HEADER_SIZE as u64;
 
-    let file_path = dir
-        .path()
-        .join(format!("{:08x}.ndb", lsn.file_number()));
+    let file_path = dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
 
     {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .open(&file_path)
-            .unwrap();
+        let mut f = OpenOptions::new().write(true).open(&file_path).unwrap();
         f.seek(SeekFrom::Start(payload_byte_offset)).unwrap();
         // Flip the first payload byte - this invalidates the CRC.
         let original = payload[0];
@@ -192,8 +184,7 @@ fn test_sequential_read() {
 
     // All entries land in file 0 (payload is small).
     let file_num = lsns[0].file_number();
-    let mut reader =
-        LogFileReader::open(Arc::clone(&fm), file_num).unwrap();
+    let mut reader = LogFileReader::open(Arc::clone(&fm), file_num).unwrap();
 
     let mut count = 0usize;
     while let Some((_lsn, entry_type, _payload)) = reader.read_next() {

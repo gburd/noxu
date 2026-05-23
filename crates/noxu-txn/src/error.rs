@@ -15,7 +15,7 @@ pub enum TxnError {
 
     /// Lock timeout occurred while waiting for a lock.
     ///
-    /// 
+    ///
     #[error(
         "lock timeout after {timeout_ms}ms on LSN {lsn}: held by {owner}, requested {requested_type:?} by locker {requester}"
     )]
@@ -34,7 +34,7 @@ pub enum TxnError {
 
     /// Transaction timeout occurred.
     ///
-    /// 
+    ///
     #[error("transaction timeout after {timeout_ms}ms for txn {txn_id}")]
     TransactionTimeout {
         /// Timeout duration in milliseconds.
@@ -45,7 +45,7 @@ pub enum TxnError {
 
     /// Deadlock detected during lock acquisition.
     ///
-    /// 
+    ///
     #[error("deadlock detected: {0}")]
     Deadlock(String),
 
@@ -67,7 +67,7 @@ pub enum TxnError {
 
     /// Range restart required due to range lock conflict.
     ///
-    /// 
+    ///
     #[error("range restart required")]
     RangeRestart,
 

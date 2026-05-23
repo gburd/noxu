@@ -50,7 +50,7 @@
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use noxu_rep::elections::{run_acceptor, run_election, NodeId};
+use noxu_rep::elections::{NodeId, run_acceptor, run_election};
 use noxu_rep::net::{Channel, LocalChannelPair};
 use noxu_rep::{NodeType, RepGroup, RepNode};
 
@@ -61,7 +61,9 @@ fn rss_kb() -> u64 {
     let text = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: u64 = rest.split_whitespace().next()
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             return kb;
@@ -91,12 +93,14 @@ fn phase_a_memory() {
     println!("\n╔══════════════════════════════════════════════════════════╗");
     println!("║  Phase A — RepNode / RepGroup memory overhead           ║");
     println!("╚══════════════════════════════════════════════════════════╝");
-    println!("  {:>10}  {:>12}  {:>14}  {:>14}", "nodes", "rss_kb", "delta_kb", "bytes/node");
+    println!(
+        "  {:>10}  {:>12}  {:>14}  {:>14}",
+        "nodes", "rss_kb", "delta_kb", "bytes/node"
+    );
 
     let milestones: &[usize] = &[
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024,
-        2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072,
-        262_144, 524_288, 1_048_576,
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192,
+        16_384, 32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576,
     ];
 
     let mut prev_rss = rss_kb();
@@ -123,7 +127,10 @@ fn phase_a_memory() {
         let added = (n - prev_n) as u64;
         let bytes_per_node = (delta * 1024).checked_div(added).unwrap_or(0);
 
-        println!("  {:>10}  {:>12}  {:>14}  {:>14}", n, rss, delta, bytes_per_node);
+        println!(
+            "  {:>10}  {:>12}  {:>14}  {:>14}",
+            n, rss, delta, bytes_per_node
+        );
 
         // Stop if we are using more than 4 GB RSS.
         if rss > 4 * 1024 * 1024 {
@@ -137,7 +144,10 @@ fn phase_a_memory() {
     }
 
     if !reached_limit {
-        println!("  [phase-a] Completed all milestones up to {} nodes.", milestones.last().unwrap());
+        println!(
+            "  [phase-a] Completed all milestones up to {} nodes.",
+            milestones.last().unwrap()
+        );
     }
 
     println!("  [phase-a] Final group size: {}", group.node_count());
@@ -150,9 +160,11 @@ fn phase_b_election(n_total: usize) -> Option<Duration> {
     let n_peers = n_total - 1;
     let group = make_group(n_total);
 
-    let pairs: Vec<LocalChannelPair> = (0..n_peers).map(|_| LocalChannelPair::new()).collect();
+    let pairs: Vec<LocalChannelPair> =
+        (0..n_peers).map(|_| LocalChannelPair::new()).collect();
 
-    let mut proposer_channels: Vec<Arc<dyn Channel>> = Vec::with_capacity(n_peers);
+    let mut proposer_channels: Vec<Arc<dyn Channel>> =
+        Vec::with_capacity(n_peers);
     let mut acceptor_handles = Vec::with_capacity(n_peers);
 
     for pair in pairs {
@@ -195,8 +207,13 @@ fn run_phase_b() {
     for &n in sizes {
         let result = phase_b_election(n);
         match result {
-            Some(d) => println!("  {:>8}  {:>12.2}  {:>12}", n, d.as_secs_f64() * 1000.0, "WIN"),
-            None    => println!("  {:>8}  {:>12}  {:>12}", n, "—", "FAIL"),
+            Some(d) => println!(
+                "  {:>8}  {:>12.2}  {:>12}",
+                n,
+                d.as_secs_f64() * 1000.0,
+                "WIN"
+            ),
+            None => println!("  {:>8}  {:>12}  {:>12}", n, "—", "FAIL"),
         }
     }
 }
@@ -216,7 +233,8 @@ fn phase_c_stream(n_replicas: usize) -> (f64, bool) {
     let mut replica_handles = Vec::with_capacity(n_replicas);
 
     // channel_a → master (sender); channel_b → replica thread (receiver).
-    let mut master_channels: Vec<Arc<dyn Channel>> = Vec::with_capacity(n_replicas);
+    let mut master_channels: Vec<Arc<dyn Channel>> =
+        Vec::with_capacity(n_replicas);
 
     for _ in 0..n_replicas {
         let pair = LocalChannelPair::new();
@@ -238,7 +256,7 @@ fn phase_c_stream(n_replicas: usize) -> (f64, bool) {
                         }
                     }
                     Ok(None) => continue,
-                    Err(_)   => break, // channel closed by master
+                    Err(_) => break, // channel closed by master
                 }
             }
             received
@@ -274,7 +292,10 @@ fn run_phase_c() {
     println!("║  Phase C — Channel throughput vs replica count          ║");
     println!("║  (sequential master push, parallel replica drain)       ║");
     println!("╚══════════════════════════════════════════════════════════╝");
-    println!("  {:>10}  {:>14}  {:>16}  {:>8}", "replicas", "elapsed_ms", "msgs_total", "ok");
+    println!(
+        "  {:>10}  {:>14}  {:>16}  {:>8}",
+        "replicas", "elapsed_ms", "msgs_total", "ok"
+    );
 
     let sizes: &[usize] = &[1, 10, 100, 500, 1_000, 5_000, 10_000];
 
@@ -283,12 +304,16 @@ fn run_phase_c() {
         let total_msgs = n as u64 * PHASE_C_MSGS;
         println!(
             "  {:>10}  {:>14.2}  {:>16}  {:>8}",
-            n, ms, total_msgs,
+            n,
+            ms,
+            total_msgs,
             if ok { "PASS" } else { "FAIL" },
         );
 
         if !ok {
-            println!("  [phase-c] Stopping at n={n} — some replicas missed messages.");
+            println!(
+                "  [phase-c] Stopping at n={n} — some replicas missed messages."
+            );
             break;
         }
     }
@@ -340,7 +365,10 @@ fn replica_scale_smoke() {
 
     // Phase B: 3-node election completes quickly.
     let elapsed = phase_b_election(3).expect("3-node election should succeed");
-    assert!(elapsed < Duration::from_secs(5), "election took too long: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "election took too long: {elapsed:?}"
+    );
 
     // Phase C: 10 replicas, PHASE_C_MSGS messages each.
     let (ms, ok) = phase_c_stream(10);

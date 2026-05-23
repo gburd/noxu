@@ -13,9 +13,9 @@
 //! Rep.impl.node.Feeder.MasterFeederSource`.
 
 use noxu_dbi::EnvironmentImpl;
-use noxu_log::file_manager::FileManager;
 use noxu_log::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use noxu_log::file_header::FILE_HEADER_SIZE;
+use noxu_log::file_manager::FileManager;
 use noxu_sync::Mutex;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
@@ -41,8 +41,7 @@ use crc32fast;
 pub trait LogScanner: Send {
     /// Return the next available entry with VLSN >= `from_vlsn`, or `None` if
     /// no new entry is available at this moment.
-    fn next_entry(&mut self, from_vlsn: u64)
-        -> Option<(u64, u8, Vec<u8>)>;
+    fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +56,7 @@ pub trait LogScanner: Send {
 /// the current end of the log it returns `None` (the `FeederRunner` will
 /// call again after a brief poll interval).
 ///
-/// 
+///
 pub struct EnvironmentLogScanner {
     /// The log `FileManager` used for raw byte-level reads.
     file_manager: Arc<FileManager>,
@@ -79,10 +78,7 @@ impl EnvironmentLogScanner {
     /// a `get_log_manager()` returning `Option<Arc<LogManager>>`.  For the
     /// scanner we need the `FileManager` underneath it; the simplest approach
     /// is to construct the scanner directly from a `FileManager` Arc.
-    pub fn new(
-        env: &EnvironmentImpl,
-        start_lsn: Option<Lsn>,
-    ) -> Option<Self> {
+    pub fn new(env: &EnvironmentImpl, start_lsn: Option<Lsn>) -> Option<Self> {
         // We need the FileManager to do raw byte reads.  It is not directly
         // exposed on EnvironmentImpl, so we access it via the LogManager.
         // LogManager::file_manager is private, so we carry it separately.
@@ -180,10 +176,7 @@ impl LogScanner for EnvironmentLogScanner {
     /// Scans forward one entry at a time.  Returns `None` when the cursor
     /// reaches the end of the currently-written log.  The feeder will sleep
     /// briefly and call again.
-    fn next_entry(
-        &mut self,
-        from_vlsn: u64,
-    ) -> Option<(u64, u8, Vec<u8>)> {
+    fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
         // Collect file numbers once per call; cheap (directory listing).
         let file_nums = self.file_manager.list_file_numbers().ok()?;
         if file_nums.is_empty() {
@@ -194,10 +187,8 @@ impl LogScanner for EnvironmentLogScanner {
             // Skip files before the current cursor file.
             if !file_nums.contains(&self.cursor_file) {
                 // Advance to the next known file.
-                let next = file_nums
-                    .iter()
-                    .find(|&&n| n > self.cursor_file)
-                    .copied();
+                let next =
+                    file_nums.iter().find(|&&n| n > self.cursor_file).copied();
                 match next {
                     Some(n) => {
                         self.cursor_file = n;
@@ -207,17 +198,13 @@ impl LogScanner for EnvironmentLogScanner {
                 }
             }
 
-            let file_len = self
-                .file_manager
-                .get_file_length(self.cursor_file)
-                .ok()?;
+            let file_len =
+                self.file_manager.get_file_length(self.cursor_file).ok()?;
 
             if self.cursor_offset >= file_len {
                 // End of current file: move to next file.
-                let next = file_nums
-                    .iter()
-                    .find(|&&n| n > self.cursor_file)
-                    .copied();
+                let next =
+                    file_nums.iter().find(|&&n| n > self.cursor_file).copied();
                 match next {
                     Some(n) => {
                         self.cursor_file = n;
@@ -311,11 +298,7 @@ impl FeederRunner {
     /// * `channel` - The channel to the replica.
     /// * `vlsn_start` - The VLSN from which to begin streaming.
     pub fn new(channel: Arc<dyn Channel>, vlsn_start: u64) -> Self {
-        Self {
-            channel,
-            vlsn_start,
-            known_replica_vlsn: Mutex::new(0),
-        }
+        Self { channel, vlsn_start, known_replica_vlsn: Mutex::new(0) }
     }
 
     /// Return the last VLSN acknowledged by the replica.
@@ -419,7 +402,7 @@ pub enum FeederState {
 /// maintains a queue of outbound messages and tracks which VLSNs have been
 /// sent vs. acknowledged.
 ///
-/// 
+///
 pub struct Feeder {
     /// Name of the replica this feeder is serving.
     replica_name: String,
@@ -573,14 +556,12 @@ mod tests {
     }
 
     impl LogScanner for VecLogScanner {
-        fn next_entry(
-            &mut self,
-            from_vlsn: u64,
-        ) -> Option<(u64, u8, Vec<u8>)> {
+        fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
             if let Some(&(vlsn, _, _)) = self.entries.front()
-                && vlsn >= from_vlsn {
-                    return self.entries.pop_front();
-                }
+                && vlsn >= from_vlsn
+            {
+                return self.entries.pop_front();
+            }
             None
         }
     }
@@ -614,15 +595,17 @@ mod tests {
                     let vlsn =
                         u64::from_le_bytes(frame[0..8].try_into().unwrap());
                     let entry_type = frame[8];
-                    let payload_len = u32::from_le_bytes(
-                        frame[9..13].try_into().unwrap(),
-                    ) as usize;
-                    let expected_crc = u32::from_le_bytes(
-                        frame[13..17].try_into().unwrap(),
-                    );
+                    let payload_len =
+                        u32::from_le_bytes(frame[9..13].try_into().unwrap())
+                            as usize;
+                    let expected_crc =
+                        u32::from_le_bytes(frame[13..17].try_into().unwrap());
                     let payload = frame[17..17 + payload_len].to_vec();
                     let actual_crc = crc32fast::hash(&payload);
-                    assert_eq!(actual_crc, expected_crc, "CRC mismatch for vlsn={vlsn}");
+                    assert_eq!(
+                        actual_crc, expected_crc,
+                        "CRC mismatch for vlsn={vlsn}"
+                    );
                     received.push((vlsn, entry_type, payload));
 
                     // Send ack.
@@ -644,10 +627,8 @@ mod tests {
         let runner_arc = Arc::new(runner);
         let runner_ref = Arc::clone(&runner_arc);
         let sender_ref = Arc::clone(&sender);
-        let run_handle = std::thread::spawn(move || {
-            
-            runner_ref.run(&mut scanner)
-        });
+        let run_handle =
+            std::thread::spawn(move || runner_ref.run(&mut scanner));
 
         // Wait for receiver to collect all 3 entries.
         let received = recv_handle.join().unwrap();
@@ -703,7 +684,11 @@ mod tests {
 
         let mut scanner = VecLogScanner::new(vec![]);
         let result = runner.run(&mut scanner);
-        assert!(result.is_ok(), "expected Ok on channel close, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected Ok on channel close, got {:?}",
+            result
+        );
         close_handle.join().unwrap();
     }
 

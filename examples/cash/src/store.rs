@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use noxu_db::{
-    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, OperationStatus,
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    OperationStatus,
 };
 use parking_lot::RwLock;
 
@@ -121,9 +122,7 @@ struct TtlTracker {
 
 impl TtlTracker {
     fn new() -> Self {
-        Self {
-            expiries: HashMap::new(),
-        }
+        Self { expiries: HashMap::new() }
     }
 
     fn set(&mut self, key: Vec<u8>, exptime: i64) {
@@ -150,14 +149,11 @@ impl TtlTracker {
             // Negative exptime: expire immediately
             Duration::from_secs(0)
         };
-        self.expiries
-            .insert(key, Instant::now() + duration);
+        self.expiries.insert(key, Instant::now() + duration);
     }
 
     fn is_expired(&self, key: &[u8]) -> bool {
-        self.expiries
-            .get(key)
-            .is_some_and(|&exp| Instant::now() >= exp)
+        self.expiries.get(key).is_some_and(|&exp| Instant::now() >= exp)
     }
 
     fn remove(&mut self, key: &[u8]) {
@@ -255,8 +251,9 @@ pub struct CashStore {
 impl CashStore {
     /// Open (or create) the store at the configured data directory.
     pub fn open(config: &CashConfig) -> Result<Arc<Self>, StoreError> {
-        std::fs::create_dir_all(&config.data_dir)
-            .map_err(|e| StoreError::Init(format!("cannot create data dir: {e}")))?;
+        std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+            StoreError::Init(format!("cannot create data dir: {e}"))
+        })?;
 
         let env_cfg = EnvironmentConfig::new(config.data_dir.clone())
             .with_allow_create(true)
@@ -323,7 +320,9 @@ impl CashStore {
             match self.db.get(None, &db_key, &mut db_val) {
                 Ok(OperationStatus::Success) => {
                     if let Some(raw) = db_val.get_data() {
-                        if let Some((flags, cas_token, data)) = decode_value(raw) {
+                        if let Some((flags, cas_token, data)) =
+                            decode_value(raw)
+                        {
                             // Populate LRU cache
                             let expiry = self.ttl.read().get_expiry(key);
                             let entry = CacheEntry {
@@ -335,9 +334,16 @@ impl CashStore {
                             let data_clone = entry.data.clone();
                             self.cache.write().insert(key.clone(), entry);
                             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-                            results.push((key.clone(), flags, cas_token, data_clone));
+                            results.push((
+                                key.clone(),
+                                flags,
+                                cas_token,
+                                data_clone,
+                            ));
                         } else {
-                            self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
+                            self.stats
+                                .get_misses
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
                         self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
@@ -502,12 +508,20 @@ impl CashStore {
     }
 
     /// Increment a numeric value.
-    pub fn incr(&self, key: &[u8], delta: u64) -> Result<Option<u64>, StoreError> {
+    pub fn incr(
+        &self,
+        key: &[u8],
+        delta: u64,
+    ) -> Result<Option<u64>, StoreError> {
         self.delta_op(key, delta, true)
     }
 
     /// Decrement a numeric value.
-    pub fn decr(&self, key: &[u8], delta: u64) -> Result<Option<u64>, StoreError> {
+    pub fn decr(
+        &self,
+        key: &[u8],
+        delta: u64,
+    ) -> Result<Option<u64>, StoreError> {
         self.delta_op(key, delta, false)
     }
 
@@ -548,24 +562,78 @@ impl CashStore {
         let stats = &self.stats;
         vec![
             ("uptime".into(), stats.uptime_secs().to_string()),
-            ("cmd_get".into(), stats.cmd_get.load(Ordering::Relaxed).to_string()),
-            ("cmd_set".into(), stats.cmd_set.load(Ordering::Relaxed).to_string()),
-            ("get_hits".into(), stats.get_hits.load(Ordering::Relaxed).to_string()),
-            ("get_misses".into(), stats.get_misses.load(Ordering::Relaxed).to_string()),
-            ("delete_hits".into(), stats.delete_hits.load(Ordering::Relaxed).to_string()),
-            ("delete_misses".into(), stats.delete_misses.load(Ordering::Relaxed).to_string()),
-            ("incr_hits".into(), stats.incr_hits.load(Ordering::Relaxed).to_string()),
-            ("incr_misses".into(), stats.incr_misses.load(Ordering::Relaxed).to_string()),
-            ("decr_hits".into(), stats.decr_hits.load(Ordering::Relaxed).to_string()),
-            ("decr_misses".into(), stats.decr_misses.load(Ordering::Relaxed).to_string()),
-            ("cas_hits".into(), stats.cas_hits.load(Ordering::Relaxed).to_string()),
-            ("cas_misses".into(), stats.cas_misses.load(Ordering::Relaxed).to_string()),
-            ("cas_badval".into(), stats.cas_badval.load(Ordering::Relaxed).to_string()),
-            ("bytes_read".into(), stats.bytes_read.load(Ordering::Relaxed).to_string()),
-            ("bytes_written".into(), stats.bytes_written.load(Ordering::Relaxed).to_string()),
-            ("total_items".into(), stats.total_items.load(Ordering::Relaxed).to_string()),
-            ("curr_connections".into(), stats.curr_connections.load(Ordering::Relaxed).to_string()),
-            ("total_connections".into(), stats.total_connections.load(Ordering::Relaxed).to_string()),
+            (
+                "cmd_get".into(),
+                stats.cmd_get.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "cmd_set".into(),
+                stats.cmd_set.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "get_hits".into(),
+                stats.get_hits.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "get_misses".into(),
+                stats.get_misses.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "delete_hits".into(),
+                stats.delete_hits.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "delete_misses".into(),
+                stats.delete_misses.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "incr_hits".into(),
+                stats.incr_hits.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "incr_misses".into(),
+                stats.incr_misses.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "decr_hits".into(),
+                stats.decr_hits.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "decr_misses".into(),
+                stats.decr_misses.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "cas_hits".into(),
+                stats.cas_hits.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "cas_misses".into(),
+                stats.cas_misses.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "cas_badval".into(),
+                stats.cas_badval.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "bytes_read".into(),
+                stats.bytes_read.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "bytes_written".into(),
+                stats.bytes_written.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "total_items".into(),
+                stats.total_items.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "curr_connections".into(),
+                stats.curr_connections.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "total_connections".into(),
+                stats.total_connections.load(Ordering::Relaxed).to_string(),
+            ),
         ]
     }
 
@@ -613,10 +681,21 @@ impl CashStore {
                     if Instant::now() >= exp {
                         return None;
                     }
-                    let remaining = exp.duration_since(Instant::now()).as_secs() as i64;
-                    return Some((entry.flags, entry.cas_token, entry.data.clone(), remaining));
+                    let remaining =
+                        exp.duration_since(Instant::now()).as_secs() as i64;
+                    return Some((
+                        entry.flags,
+                        entry.cas_token,
+                        entry.data.clone(),
+                        remaining,
+                    ));
                 }
-                return Some((entry.flags, entry.cas_token, entry.data.clone(), 0));
+                return Some((
+                    entry.flags,
+                    entry.cas_token,
+                    entry.data.clone(),
+                    0,
+                ));
             }
         }
 
@@ -644,7 +723,12 @@ impl CashStore {
     }
 
     /// Increment or decrement a numeric value stored as ASCII digits.
-    fn delta_op(&self, key: &[u8], delta: u64, is_incr: bool) -> Result<Option<u64>, StoreError> {
+    fn delta_op(
+        &self,
+        key: &[u8],
+        delta: u64,
+        is_incr: bool,
+    ) -> Result<Option<u64>, StoreError> {
         let existing = self.get_raw(key);
         match existing {
             Some((flags, _cas, data, exptime_remaining)) => {

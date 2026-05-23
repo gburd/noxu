@@ -5,7 +5,7 @@
 ///
 /// Specifies the configuration parameters used to open a cursor on a database.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorConfig {
     /// Use read-committed isolation.
@@ -106,7 +106,10 @@ impl CursorConfig {
     }
 
     /// Sets the prefix constraint for bounded scans.
-    pub fn set_prefix_constraint(&mut self, prefix: Option<Vec<u8>>) -> &mut Self {
+    pub fn set_prefix_constraint(
+        &mut self,
+        prefix: Option<Vec<u8>>,
+    ) -> &mut Self {
         self.prefix_constraint = prefix;
         self
     }

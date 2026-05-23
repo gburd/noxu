@@ -10,7 +10,7 @@
 /// The `DatabaseNamer` controls the naming convention used to map entity
 /// types and key names to underlying database names.
 ///
-/// 
+///
 pub trait DatabaseNamer {
     /// Generate a database name for a primary index.
     ///

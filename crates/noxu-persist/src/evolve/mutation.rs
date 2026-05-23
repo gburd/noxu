@@ -7,7 +7,7 @@
 /// `field_name` is `None` when the mutation targets the class itself rather
 /// than a specific field.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MutationKey {
     /// The fully-qualified class (entity) name.
@@ -20,12 +20,11 @@ pub struct MutationKey {
 
 impl MutationKey {
     /// Creates a class-level key (no field).
-    pub fn for_class(class_name: impl Into<String>, class_version: u32) -> Self {
-        Self {
-            class_name: class_name.into(),
-            class_version,
-            field_name: None,
-        }
+    pub fn for_class(
+        class_name: impl Into<String>,
+        class_version: u32,
+    ) -> Self {
+        Self { class_name: class_name.into(), class_version, field_name: None }
     }
 
     /// Creates a field-level key.
@@ -59,7 +58,11 @@ impl MutationKey {
 
 impl std::fmt::Display for MutationKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Class: {} Version: {}", self.class_name, self.class_version)?;
+        write!(
+            f,
+            "Class: {} Version: {}",
+            self.class_name, self.class_version
+        )?;
         if let Some(ref fname) = self.field_name {
             write!(f, " Field: {}", fname)?;
         }
@@ -108,7 +111,10 @@ mod tests {
     #[test]
     fn test_display_field_level() {
         let k = MutationKey::for_field("com.example.Person", 1, "fullName");
-        assert_eq!(k.to_string(), "Class: com.example.Person Version: 1 Field: fullName");
+        assert_eq!(
+            k.to_string(),
+            "Class: com.example.Person Version: 1 Field: fullName"
+        );
     }
 
     #[test]

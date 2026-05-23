@@ -12,7 +12,7 @@ use std::time::Duration;
 
 /// Background daemon that periodically flushes log buffers.
 ///
-/// 
+///
 pub struct LogFlusher {
     /// The flush daemon thread (with fsync).
     flush_sync_daemon: Option<DaemonThread>,

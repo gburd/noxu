@@ -68,7 +68,7 @@ impl_primitive_binding!(
     ///
     /// Encodes as a single byte: 1 for true, 0 for false.
     ///
-    /// 
+    ///
     BoolBinding, bool,
     write: write_bool,
     read: read_bool
@@ -90,7 +90,7 @@ impl_primitive_binding!(
     ///
     /// Uses big-endian encoding with sign bit flipped for sortable ordering.
     ///
-    /// 
+    ///
     ShortBinding, i16,
     write: write_i16,
     read: read_i16
@@ -101,7 +101,7 @@ impl_primitive_binding!(
     ///
     /// Uses big-endian encoding with sign bit flipped for sortable ordering.
     ///
-    /// 
+    ///
     IntBinding, i32,
     write: write_i32,
     read: read_i32
@@ -112,7 +112,7 @@ impl_primitive_binding!(
     ///
     /// Uses big-endian encoding with sign bit flipped for sortable ordering.
     ///
-    /// 
+    ///
     LongBinding, i64,
     write: write_i64,
     read: read_i64
@@ -125,7 +125,7 @@ impl_primitive_binding!(
     /// sort in the same order as the float values. Use `SortedFloatBinding` for
     /// sortable keys.
     ///
-    /// 
+    ///
     FloatBinding, f32,
     write: write_float,
     read: read_float
@@ -138,7 +138,7 @@ impl_primitive_binding!(
     /// sort in the same order as the double values. Use `SortedDoubleBinding` for
     /// sortable keys.
     ///
-    /// 
+    ///
     DoubleBinding, f64,
     write: write_double,
     read: read_double
@@ -150,7 +150,7 @@ impl_primitive_binding!(
     /// Uses sign-bit manipulation so the byte representation sorts in the
     /// same order as the float values.
     ///
-    /// 
+    ///
     SortedFloatBinding, f32,
     write: write_sorted_float,
     read: read_sorted_float
@@ -162,7 +162,7 @@ impl_primitive_binding!(
     /// Uses sign-bit manipulation so the byte representation sorts in the
     /// same order as the double values.
     ///
-    /// 
+    ///
     SortedDoubleBinding, f64,
     write: write_sorted_double,
     read: read_sorted_double
@@ -174,7 +174,7 @@ impl_primitive_binding!(
     /// Values in [-119, 119] are stored in a single byte. Larger values use
     /// 2-5 bytes. This encoding is compact but NOT sortable.
     ///
-    /// 
+    ///
     PackedIntBinding, i32,
     write: write_packed_int,
     read: read_packed_int
@@ -186,7 +186,7 @@ impl_primitive_binding!(
     /// Values in [-119, 119] are stored in a single byte. Larger values use
     /// 2-9 bytes. This encoding is compact but NOT sortable.
     ///
-    /// 
+    ///
     PackedLongBinding, i64,
     write: write_packed_long,
     read: read_packed_long
@@ -201,7 +201,7 @@ impl_primitive_binding!(
     /// sort in the same order as the integer values, making this suitable for
     /// database keys when compactness is also desired.
     ///
-    /// 
+    ///
     SortedPackedIntBinding, i32,
     write: write_sorted_packed_int,
     read: read_sorted_packed_int
@@ -216,7 +216,7 @@ impl_primitive_binding!(
     /// sort in the same order as the integer values, making this suitable for
     /// database keys when compactness is also desired.
     ///
-    /// 
+    ///
     SortedPackedLongBinding, i64,
     write: write_sorted_packed_long,
     read: read_sorted_packed_long
@@ -233,7 +233,7 @@ impl_primitive_binding!(
     /// Java `char` covers the full [0, 65535] range including surrogate halves
     /// which are not valid Unicode scalar values in Rust.
     ///
-    /// 
+    ///
     CharBinding, u16,
     write: write_char,
     read: read_char
@@ -247,7 +247,7 @@ impl_primitive_binding!(
 ///
 /// Strings are stored as their UTF-8 bytes followed by a null terminator byte.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StringBinding;
 
@@ -914,7 +914,9 @@ mod tests {
     #[test]
     fn test_char_binding_round_trip() {
         let binding = CharBinding::new();
-        for val in [0u16, 1, 'A' as u16, 'a' as u16, 0x00FF, 0x0100, 0xD800, 0xFFFF] {
+        for val in
+            [0u16, 1, 'A' as u16, 'a' as u16, 0x00FF, 0x0100, 0xD800, 0xFFFF]
+        {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
             let result = binding.entry_to_object(&entry).unwrap();
@@ -927,7 +929,11 @@ mod tests {
         let binding = CharBinding::new();
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&(b'A' as u16), &mut entry).unwrap();
-        assert_eq!(entry.data().len(), 2, "char should always encode to 2 bytes");
+        assert_eq!(
+            entry.data().len(),
+            2,
+            "char should always encode to 2 bytes"
+        );
     }
 
     #[test]
@@ -962,7 +968,9 @@ mod tests {
     fn test_char_binding_sort_order() {
         // u16 sort order should match byte-wise comparison (big-endian is unsigned)
         let binding = CharBinding::new();
-        let values: Vec<u16> = vec![0x0000, 0x0041, 0x007F, 0x0080, 0x00FF, 0x0100, 0xD800, 0xFFFF];
+        let values: Vec<u16> = vec![
+            0x0000, 0x0041, 0x007F, 0x0080, 0x00FF, 0x0100, 0xD800, 0xFFFF,
+        ];
         let encoded: Vec<Vec<u8>> =
             values.iter().map(|v| encoded_bytes(&binding, v)).collect();
         for i in 0..encoded.len() - 1 {
@@ -990,12 +998,14 @@ mod tests {
             assert!(
                 sp_encoded[i] < sp_encoded[i + 1],
                 "SortedPackedIntBinding sort order violated for {} < {}",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
             assert!(
                 i_encoded[i] < i_encoded[i + 1],
                 "IntBinding sort order violated for {} < {}",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -1032,7 +1042,12 @@ mod tests {
         for val in [true, false] {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 1, "bool {} should encode to 1 byte", val);
+            assert_eq!(
+                entry.data().len(),
+                1,
+                "bool {} should encode to 1 byte",
+                val
+            );
         }
     }
 
@@ -1043,7 +1058,12 @@ mod tests {
         for val in [0u8, 1, 123, 255] {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 1, "u8 {} should encode to 1 byte", val);
+            assert_eq!(
+                entry.data().len(),
+                1,
+                "u8 {} should encode to 1 byte",
+                val
+            );
         }
     }
 
@@ -1054,7 +1074,12 @@ mod tests {
         for val in [i16::MIN, -1i16, 0, 1, 123, i16::MAX] {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 2, "i16 {} should encode to 2 bytes", val);
+            assert_eq!(
+                entry.data().len(),
+                2,
+                "i16 {} should encode to 2 bytes",
+                val
+            );
         }
     }
 
@@ -1065,7 +1090,12 @@ mod tests {
         for val in [0.0f32, 1.0, -1.0, 123.123, f32::MAX, f32::MIN, f32::NAN] {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 4, "f32 {} should encode to 4 bytes", val);
+            assert_eq!(
+                entry.data().len(),
+                4,
+                "f32 {} should encode to 4 bytes",
+                val
+            );
         }
     }
 
@@ -1076,7 +1106,12 @@ mod tests {
         for val in [0.0f64, 1.0, -1.0, 123.123, f64::MAX, f64::MIN, f64::NAN] {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 8, "f64 {} should encode to 8 bytes", val);
+            assert_eq!(
+                entry.data().len(),
+                8,
+                "f64 {} should encode to 8 bytes",
+                val
+            );
         }
     }
 
@@ -1084,10 +1119,17 @@ mod tests {
     #[test]
     fn test_sorted_float_binding_encoded_size() {
         let binding = SortedFloatBinding::new();
-        for val in [0.0f32, 1.0, -1.0, 123.123, f32::MAX, f32::NEG_INFINITY, f32::NAN] {
+        for val in
+            [0.0f32, 1.0, -1.0, 123.123, f32::MAX, f32::NEG_INFINITY, f32::NAN]
+        {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 4, "sorted_f32 {} should encode to 4 bytes", val);
+            assert_eq!(
+                entry.data().len(),
+                4,
+                "sorted_f32 {} should encode to 4 bytes",
+                val
+            );
         }
     }
 
@@ -1095,10 +1137,17 @@ mod tests {
     #[test]
     fn test_sorted_double_binding_encoded_size() {
         let binding = SortedDoubleBinding::new();
-        for val in [0.0f64, 1.0, -1.0, 123.123, f64::MAX, f64::NEG_INFINITY, f64::NAN] {
+        for val in
+            [0.0f64, 1.0, -1.0, 123.123, f64::MAX, f64::NEG_INFINITY, f64::NAN]
+        {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 8, "sorted_f64 {} should encode to 8 bytes", val);
+            assert_eq!(
+                entry.data().len(),
+                8,
+                "sorted_f64 {} should encode to 8 bytes",
+                val
+            );
         }
     }
 
@@ -1109,7 +1158,12 @@ mod tests {
         for val in [0u16, b'a' as u16, 0x7F, 0x00FF, 0x0100, 0xFFFF] {
             let mut entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut entry).unwrap();
-            assert_eq!(entry.data().len(), 2, "char U+{:04X} should encode to 2 bytes", val);
+            assert_eq!(
+                entry.data().len(),
+                2,
+                "char U+{:04X} should encode to 2 bytes",
+                val
+            );
         }
     }
 
@@ -1274,7 +1328,11 @@ mod tests {
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&1234i32, &mut entry).unwrap();
         // Our signed variable-length format: 1234 - 119 = 1115, fits in 2 bytes → 3 bytes
-        assert_eq!(entry.data().len(), 3, "1234 should encode to 3 bytes (header + 2 value bytes)");
+        assert_eq!(
+            entry.data().len(),
+            3,
+            "1234 should encode to 3 bytes (header + 2 value bytes)"
+        );
         // Round-trip correctness
         let got = binding.entry_to_object(&entry).unwrap();
         assert_eq!(got, 1234i32);
@@ -1291,7 +1349,11 @@ mod tests {
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&1234i64, &mut entry).unwrap();
         // Our signed variable-length format: 1234 - 119 = 1115, fits in 2 bytes → 3 bytes
-        assert_eq!(entry.data().len(), 3, "1234L should encode to 3 bytes (header + 2 value bytes)");
+        assert_eq!(
+            entry.data().len(),
+            3,
+            "1234L should encode to 3 bytes (header + 2 value bytes)"
+        );
         let got = binding.entry_to_object(&entry).unwrap();
         assert_eq!(got, 1234i64);
     }
@@ -1308,7 +1370,11 @@ mod tests {
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&1234i32, &mut entry).unwrap();
         // 1234 > 0xFF + 121 = 376, so needs 3 bytes in sorted packed format
-        assert_eq!(entry.data().len(), 3, "1234 should encode to 3 bytes in SortedPackedIntBinding");
+        assert_eq!(
+            entry.data().len(),
+            3,
+            "1234 should encode to 3 bytes in SortedPackedIntBinding"
+        );
         let got = binding.entry_to_object(&entry).unwrap();
         assert_eq!(got, 1234i32);
     }
@@ -1320,7 +1386,11 @@ mod tests {
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&1234i64, &mut entry).unwrap();
         // 1234 > 0xFF + 121 = 376, so needs 3 bytes in sorted packed format
-        assert_eq!(entry.data().len(), 3, "1234L should encode to 3 bytes in SortedPackedLongBinding");
+        assert_eq!(
+            entry.data().len(),
+            3,
+            "1234L should encode to 3 bytes in SortedPackedLongBinding"
+        );
         let got = binding.entry_to_object(&entry).unwrap();
         assert_eq!(got, 1234i64);
     }
@@ -1427,7 +1497,8 @@ mod tests {
             assert!(
                 encoded[i] < encoded[i + 1],
                 "string ordering violated: {:?} should sort before {:?}",
-                data[i], data[i + 1]
+                data[i],
+                data[i + 1]
             );
         }
     }
@@ -1444,7 +1515,8 @@ mod tests {
             assert!(
                 encoded[i] < encoded[i + 1],
                 "u8 binding ordering violated: {} should sort before {}",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }

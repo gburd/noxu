@@ -272,10 +272,16 @@ mod tests {
             |_key, data| data,
         );
         for id in [0u64, 1, 2, 10, 100, u64::MAX] {
-            let emp = Employee { id, name: String::new(), department: String::new() };
+            let emp =
+                Employee { id, name: String::new(), department: String::new() };
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&emp, &mut key_entry).unwrap();
-            assert_eq!(key_entry.data().len(), 8, "u64 key must be 8 bytes (id={})", id);
+            assert_eq!(
+                key_entry.data().len(),
+                8,
+                "u64 key must be 8 bytes (id={})",
+                id
+            );
         }
     }
 
@@ -289,20 +295,21 @@ mod tests {
         );
 
         let key_bytes = |id: u64| {
-            let emp = Employee { id, name: String::new(), department: String::new() };
+            let emp =
+                Employee { id, name: String::new(), department: String::new() };
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&emp, &mut key_entry).unwrap();
             key_entry.get_data().unwrap().to_vec()
         };
 
-        let b0  = key_bytes(0);
-        let b1  = key_bytes(1);
-        let b2  = key_bytes(2);
+        let b0 = key_bytes(0);
+        let b1 = key_bytes(1);
+        let b2 = key_bytes(2);
         let b10 = key_bytes(10);
         let bmax = key_bytes(u64::MAX);
 
-        assert!(b0 < b1,  "0 < 1");
-        assert!(b1 < b2,  "1 < 2");
+        assert!(b0 < b1, "0 < 1");
+        assert!(b1 < b2, "1 < 2");
         assert!(b2 < b10, "2 < 10");
         assert!(b10 < bmax, "10 < MAX");
     }
@@ -331,7 +338,8 @@ mod tests {
             assert!(
                 key_bytes(w[0]) < key_bytes(w[1]),
                 "i64 sort order: {} should be < {}",
-                w[0], w[1]
+                w[0],
+                w[1]
             );
         }
     }
@@ -345,7 +353,11 @@ mod tests {
         );
 
         let key_bytes = |name: &str| {
-            let emp = Employee { id: 0, name: name.to_string(), department: String::new() };
+            let emp = Employee {
+                id: 0,
+                name: name.to_string(),
+                department: String::new(),
+            };
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&emp, &mut key_entry).unwrap();
             key_entry.get_data().unwrap().to_vec()
@@ -386,8 +398,12 @@ mod tests {
 
         let vals = [0u32, 1, 2, 10, 100, 1000, u32::MAX];
         for w in vals.windows(2) {
-            assert!(key_bytes(w[0]) < key_bytes(w[1]),
-                "{} should sort before {}", w[0], w[1]);
+            assert!(
+                key_bytes(w[0]) < key_bytes(w[1]),
+                "{} should sort before {}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -514,7 +530,12 @@ mod tests {
             let entity = (k, String::new());
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&entity, &mut key_entry).unwrap();
-            assert_eq!(key_entry.data().len(), 4, "u32 key must be 4 bytes (k={})", k);
+            assert_eq!(
+                key_entry.data().len(),
+                4,
+                "u32 key must be 4 bytes (k={})",
+                k
+            );
         }
     }
 }

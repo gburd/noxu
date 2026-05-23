@@ -82,7 +82,16 @@ fn bench_lock_acquire_single_no_contention(c: &mut Criterion) {
 
     c.bench_function("lock_acquire_single_no_contention", |b| {
         b.iter(|| {
-            black_box(mgr.lock(black_box(1000), black_box(1), LockType::Read, false, false).unwrap());
+            black_box(
+                mgr.lock(
+                    black_box(1000),
+                    black_box(1),
+                    LockType::Read,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            );
         })
     });
 }
@@ -95,8 +104,14 @@ fn bench_lock_acquire_release_new_lsn(c: &mut Criterion) {
         b.iter(|| {
             lsn_counter += 1;
             black_box(
-                mgr.lock(black_box(lsn_counter), black_box(1), LockType::Write, false, false)
-                    .unwrap(),
+                mgr.lock(
+                    black_box(lsn_counter),
+                    black_box(1),
+                    LockType::Write,
+                    false,
+                    false,
+                )
+                .unwrap(),
             );
         })
     });
@@ -108,7 +123,14 @@ fn bench_lock_acquire_write(c: &mut Criterion) {
     c.bench_function("lock_acquire_write_same_locker", |b| {
         b.iter(|| {
             black_box(
-                mgr.lock(black_box(2000), black_box(1), LockType::Write, false, false).unwrap(),
+                mgr.lock(
+                    black_box(2000),
+                    black_box(1),
+                    LockType::Write,
+                    false,
+                    false,
+                )
+                .unwrap(),
             );
         })
     });

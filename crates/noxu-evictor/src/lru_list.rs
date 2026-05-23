@@ -1,8 +1,8 @@
 //! LRU list tracking for eviction candidates.
 //!
 
-use noxu_sync::Mutex;
 use hashbrown::HashMap;
+use noxu_sync::Mutex;
 
 // Sentinel index value used as the list head/tail marker.
 const SENTINEL: usize = usize::MAX;
@@ -62,11 +62,16 @@ impl LruListImpl {
     /// Allocate a new slab slot and return its index.
     fn alloc_slot(&mut self, node_id: u64) -> usize {
         if let Some(slot) = self.free.pop() {
-            self.slab[slot] = Some(Node { id: node_id, prev: SENTINEL, next: SENTINEL });
+            self.slab[slot] =
+                Some(Node { id: node_id, prev: SENTINEL, next: SENTINEL });
             slot
         } else {
             let slot = self.slab.len();
-            self.slab.push(Some(Node { id: node_id, prev: SENTINEL, next: SENTINEL }));
+            self.slab.push(Some(Node {
+                id: node_id,
+                prev: SENTINEL,
+                next: SENTINEL,
+            }));
             slot
         }
     }

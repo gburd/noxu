@@ -26,7 +26,7 @@ pub enum TransactionState {
 
 /// A transaction handle.
 ///
-/// 
+///
 ///
 /// Transaction handles are used to protect database operations.
 /// A single Transaction may be used for operations on multiple databases
@@ -137,7 +137,10 @@ impl Transaction {
     /// `Transaction`.
     ///
     /// Wiring in the equivalent `Txn` constructor.
-    pub fn with_env_impl(mut self, env_impl: Arc<SyncMutex<EnvironmentImpl>>) -> Self {
+    pub fn with_env_impl(
+        mut self,
+        env_impl: Arc<SyncMutex<EnvironmentImpl>>,
+    ) -> Self {
         self.env_impl = Some(env_impl);
         self
     }
@@ -170,8 +173,7 @@ impl Transaction {
         observe_span!("txn_commit", txn_id = self.id);
         let _obs_timer = observe_timer_start!();
         observe_counter!("noxu_db_operations_total", "op" => "commit");
-        let durability =
-            self.durability.unwrap_or(Durability::COMMIT_SYNC);
+        let durability = self.durability.unwrap_or(Durability::COMMIT_SYNC);
         let result = self.commit_with_durability(durability);
         observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "commit");
         observe_gauge_dec!("noxu_db_active_transactions");
@@ -191,14 +193,15 @@ impl Transaction {
         // Write TxnCommit to the WAL before marking committed.
         // Durability controls whether we fsync, flush, or just buffer.
         if !self.read_only
-            && let Some(lm) = &self.log_manager {
-                let (fsync, flush) = match durability.local_sync {
-                    SyncPolicy::Sync => (true, true),
-                    SyncPolicy::WriteNoSync => (false, true),
-                    SyncPolicy::NoSync => (false, false),
-                };
-                self.write_txn_end(lm, true, fsync, flush)?;
-            }
+            && let Some(lm) = &self.log_manager
+        {
+            let (fsync, flush) = match durability.local_sync {
+                SyncPolicy::Sync => (true, true),
+                SyncPolicy::WriteNoSync => (false, true),
+                SyncPolicy::NoSync => (false, false),
+            };
+            self.write_txn_end(lm, true, fsync, flush)?;
+        }
 
         // Apply cleaner write-path backpressure: if the log write rate exceeds
         // the cleaner's capacity, sleep briefly to let cleaning catch up.
@@ -209,7 +212,9 @@ impl Transaction {
             && let Some(ref env) = self.env_impl
         {
             let throttle = env.lock().get_cleaner_throttle();
-            if let Some(delay) = throttle.and_then(|t| t.should_throttle_writer()) {
+            if let Some(delay) =
+                throttle.and_then(|t| t.should_throttle_writer())
+            {
                 std::thread::sleep(delay);
             }
         }
@@ -263,9 +268,10 @@ impl Transaction {
 
         // Write TxnAbort to WAL before marking aborted (no fsync needed).
         if !self.read_only
-            && let Some(lm) = &self.log_manager {
-                self.write_txn_end(lm, false, false, false)?;
-            }
+            && let Some(lm) = &self.log_manager
+        {
+            self.write_txn_end(lm, false, false, false)?;
+        }
 
         // Apply undo records to the B-tree to restore before-images, then
         // release write locks.  The two steps must happen in this order: while
@@ -274,11 +280,8 @@ impl Transaction {
         // already see the restored before-image.
         if let Some(inner) = &self.inner_txn {
             // Phase 1: collect undo records without releasing write locks.
-            let undo_records = inner
-                .lock()
-                .unwrap()
-                .abort_collect_undo()
-                .unwrap_or_default();
+            let undo_records =
+                inner.lock().unwrap().abort_collect_undo().unwrap_or_default();
 
             // Phase 2: apply undo to the B-tree (write locks still held).
             if let Some(env) = &self.env_impl {
@@ -286,7 +289,8 @@ impl Transaction {
                 for undo in undo_records {
                     let Some(abort_key) = undo.abort_key else { continue };
                     let db_id = DatabaseId::new(undo.database_id as i64);
-                    let Some(db_arc) = env_guard.get_database_by_id(db_id) else {
+                    let Some(db_arc) = env_guard.get_database_by_id(db_id)
+                    else {
                         continue;
                     };
                     let db_guard = db_arc.read();
@@ -333,11 +337,19 @@ impl Transaction {
 
         let entry = if is_commit {
             TxnEndEntry::new_commit(
-                self.id as i64, NULL_LSN, timestamp, 0, NULL_VLSN,
+                self.id as i64,
+                NULL_LSN,
+                timestamp,
+                0,
+                NULL_VLSN,
             )
         } else {
             TxnEndEntry::new_abort(
-                self.id as i64, NULL_LSN, timestamp, 0, NULL_VLSN,
+                self.id as i64,
+                NULL_LSN,
+                timestamp,
+                0,
+                NULL_VLSN,
             )
         };
 
@@ -352,10 +364,12 @@ impl Transaction {
 
         lm.log(entry_type, &buf, Provisional::No, flush, fsync)
             .map(|_| ())
-            .map_err(|e| NoxuError::environment_with_reason(
-                crate::error::EnvironmentFailureReason::LogWrite,
-                e.to_string(),
-            ))
+            .map_err(|e| {
+                NoxuError::environment_with_reason(
+                    crate::error::EnvironmentFailureReason::LogWrite,
+                    e.to_string(),
+                )
+            })
     }
 
     /// Get the transaction ID.

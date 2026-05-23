@@ -10,11 +10,13 @@ pub mod peer_feeder;
 pub mod reconnect;
 pub mod replica_stream;
 
-pub use feeder::{EnvironmentLogScanner, Feeder, FeederRunner, FeederState, LogScanner};
+pub use feeder::{
+    EnvironmentLogScanner, Feeder, FeederRunner, FeederState, LogScanner,
+};
 pub use output_thread::OutputQueue;
 pub use peer_feeder::{
-    PeerFeederRunner, PeerFeederSource, PeerLogScanner, PeerScannerAdapter, SyncupResult,
-    negotiate_syncup,
+    PeerFeederRunner, PeerFeederSource, PeerLogScanner, PeerScannerAdapter,
+    SyncupResult, negotiate_syncup,
 };
 pub use reconnect::{ReconnectConfig, ReconnectOutcome, catch_up_with_retry};
 pub use replica_stream::{

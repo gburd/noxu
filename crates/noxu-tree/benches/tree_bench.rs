@@ -3,8 +3,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use noxu_tree::{
-    BIN_LEVEL, DEFAULT_MAX_ENTRIES, InNode, MAIN_LEVEL,
-    entry_states::DIRTY_BIT,
+    BIN_LEVEL, DEFAULT_MAX_ENTRIES, InNode, MAIN_LEVEL, entry_states::DIRTY_BIT,
 };
 use noxu_util::{Lsn, NULL_LSN};
 
@@ -87,11 +86,8 @@ fn bench_in_node_insert(c: &mut Criterion) {
             let mut node = InNode::new(1, BIN_LEVEL, 16 * 1024);
             for i in 0..16usize {
                 counter += 1;
-                let key =
-                    format!("k_{:016}", counter + i as u64).into_bytes();
-                black_box(
-                    node.insert_entry(key, NULL_LSN, DIRTY_BIT).unwrap(),
-                );
+                let key = format!("k_{:016}", counter + i as u64).into_bytes();
+                black_box(node.insert_entry(key, NULL_LSN, DIRTY_BIT).unwrap());
             }
         })
     });
@@ -105,12 +101,8 @@ fn bench_in_node_insert_sorted(c: &mut Criterion) {
             for i in 0..128usize {
                 let key = format!("key_{:06}", i).into_bytes();
                 black_box(
-                    node.insert_entry(
-                        black_box(key),
-                        NULL_LSN,
-                        DIRTY_BIT,
-                    )
-                    .unwrap(),
+                    node.insert_entry(black_box(key), NULL_LSN, DIRTY_BIT)
+                        .unwrap(),
                 );
             }
         })

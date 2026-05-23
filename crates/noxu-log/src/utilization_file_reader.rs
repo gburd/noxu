@@ -16,8 +16,8 @@ use crate::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::entry_type::LogEntryType;
 use crate::error::Result;
 use crate::file_reader::LogFileAccess;
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use hashbrown::HashMap;
+use noxu_util::lsn::{Lsn, NULL_LSN};
 
 // Maximum plausible payload size (64 MiB).
 const MAX_SANE_ITEM_SIZE: usize = 64 * 1024 * 1024;
@@ -61,7 +61,7 @@ impl FileSummary {
 
 /// Scans the log and builds a per-file utilization map.
 ///
-/// 
+///
 ///
 /// The simplest way to use this reader:
 ///
@@ -99,14 +99,13 @@ impl<F: LogFileAccess> UtilizationFileReader<F> {
         _read_buffer_size: usize,
         start_lsn: Lsn,
     ) -> Result<Self> {
-        let (current_file_num, current_offset, eof) =
-            if !start_lsn.is_null() {
-                (start_lsn.file_number(), start_lsn.file_offset() as u64, false)
-            } else if let Some(first) = file_access.get_first_file_num() {
-                (first, 0u64, false)
-            } else {
-                (0u32, 0u64, true)
-            };
+        let (current_file_num, current_offset, eof) = if !start_lsn.is_null() {
+            (start_lsn.file_number(), start_lsn.file_offset() as u64, false)
+        } else if let Some(first) = file_access.get_first_file_num() {
+            (first, 0u64, false)
+        } else {
+            (0u32, 0u64, true)
+        };
 
         Ok(UtilizationFileReader {
             file_access,
@@ -190,17 +189,16 @@ impl<F: LogFileAccess> UtilizationFileReader<F> {
 
             let entry_type_num = hdr[4];
             let flags = hdr[5];
-            let item_size = u32::from_le_bytes([
-                hdr[10], hdr[11], hdr[12], hdr[13],
-            ]) as usize;
+            let item_size =
+                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
+                    as usize;
 
             if item_size > MAX_SANE_ITEM_SIZE {
                 self.eof = true;
                 return Ok(false);
             }
 
-            let vlsn_present =
-                (flags & 0x08) != 0 || (flags & 0x20) != 0;
+            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
             let header_size =
                 if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
             let entry_size = header_size + item_size;
@@ -231,10 +229,8 @@ impl<F: LogFileAccess> UtilizationFileReader<F> {
             }
 
             // Accumulate into the per-file summary.
-            let summary = self
-                .summaries
-                .entry(self.current_file_num)
-                .or_default();
+            let summary =
+                self.summaries.entry(self.current_file_num).or_default();
 
             let size = entry_size as i32;
             summary.total_count += 1;
@@ -296,8 +292,8 @@ fn is_ln_type(t: LogEntryType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::ln_log_entry::LnLogEntry;
     use crate::entry::in_log_entry::InLogEntry;
+    use crate::entry::ln_log_entry::LnLogEntry;
     use crate::entry_header::MIN_HEADER_SIZE;
     use crate::entry_type::LogEntryType;
     use bytes::BytesMut;
@@ -347,13 +343,9 @@ mod tests {
         }
 
         fn get_file_length(&self, file_num: u32) -> Result<u64> {
-            self.files
-                .get(&file_num)
-                .map(|d| d.len() as u64)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "File not found")
-                        .into()
-                })
+            self.files.get(&file_num).map(|d| d.len() as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "File not found").into()
+            })
         }
 
         fn get_first_file_num(&self) -> Option<u32> {
@@ -394,8 +386,19 @@ mod tests {
 
     fn make_ln_payload() -> Vec<u8> {
         let e = LnLogEntry::new(
-            1, None, NULL_LSN, false, None, None, NULL_VLSN, 0, false,
-            b"k".to_vec(), Some(b"v".to_vec()), 0, NULL_VLSN,
+            1,
+            None,
+            NULL_LSN,
+            false,
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            false,
+            b"k".to_vec(),
+            Some(b"v".to_vec()),
+            0,
+            NULL_VLSN,
         );
         let mut buf = BytesMut::new();
         e.write_to_log(&mut buf);
@@ -611,7 +614,10 @@ mod tests {
 
         let map = reader.get_file_summary_map();
         let summary = map.get(&0).unwrap();
-        assert_eq!(summary.total_count, 1, "only first entry should be counted");
+        assert_eq!(
+            summary.total_count, 1,
+            "only first entry should be counted"
+        );
     }
 
     #[test]

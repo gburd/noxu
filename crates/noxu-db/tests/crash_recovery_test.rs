@@ -21,7 +21,9 @@
 //!
 //! The worker binary path is injected by cargo as `CARGO_BIN_EXE_crash_worker`.
 
-use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
+};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -99,9 +101,7 @@ fn crash_worker_exe() -> &'static str {
     env!("CARGO_BIN_EXE_crash_worker")
 }
 
-fn reopen_db(
-    dir: &Path,
-) -> (noxu_db::Environment, noxu_db::Database) {
+fn reopen_db(dir: &Path) -> (noxu_db::Environment, noxu_db::Database) {
     let env_config = EnvironmentConfig::new(dir.to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
@@ -171,10 +171,15 @@ fn test_committed_writes_survive_sigkill() {
             OperationStatus::NotFound => {
                 missing += 1;
             }
-            other => panic!("unexpected status {other:?} for committed key {i}"),
+            other => {
+                panic!("unexpected status {other:?} for committed key {i}")
+            }
         }
     }
-    assert_eq!(missing, 0, "{missing} committed keys were lost after crash recovery");
+    assert_eq!(
+        missing, 0,
+        "{missing} committed keys were lost after crash recovery"
+    );
 
     // None of the 50 uncommitted keys may be visible.
     let mut leaked = 0u32;
@@ -220,7 +225,11 @@ fn test_uncommitted_transaction_leaves_no_trace() {
 
     // Wait for the uncommitted batch to begin.
     assert!(
-        wait_for_flag(&dir_path, "uncommitted_started", Duration::from_secs(10)),
+        wait_for_flag(
+            &dir_path,
+            "uncommitted_started",
+            Duration::from_secs(10)
+        ),
         "worker did not start uncommitted batch within timeout"
     );
 
@@ -317,7 +326,10 @@ fn test_repeated_crash_recovery_is_idempotent() {
             missing += 1;
         }
     }
-    assert_eq!(missing, 0, "{missing} committed keys missing after 3 crash rounds");
+    assert_eq!(
+        missing, 0,
+        "{missing} committed keys missing after 3 crash rounds"
+    );
 
     let mut leaked = 0u32;
     for i in 1000u32..1050 {
@@ -379,7 +391,11 @@ fn test_commit_ordering_preserved_after_sigkill() {
         let mut val = DatabaseEntry::new();
         match db.get(None, &key, &mut val).unwrap() {
             OperationStatus::Success => {
-                assert_eq!(val.data(), b"t1", "key {i} has wrong value after recovery");
+                assert_eq!(
+                    val.data(),
+                    b"t1",
+                    "key {i} has wrong value after recovery"
+                );
             }
             OperationStatus::NotFound => missing += 1,
             s => panic!("unexpected status {s:?} for T1 key {i}"),
@@ -437,10 +453,8 @@ fn test_torn_write_truncated_entry_recovered() {
     let file_len = std::fs::metadata(last_file).unwrap().len();
     if file_len > complete_end {
         let torn_len = complete_end + 1;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(last_file)
-            .unwrap();
+        let file =
+            std::fs::OpenOptions::new().write(true).open(last_file).unwrap();
         file.set_len(torn_len).expect("truncate to torn boundary");
     }
 

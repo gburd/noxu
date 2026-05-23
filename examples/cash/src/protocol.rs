@@ -110,7 +110,11 @@ pub enum StorageKind {
 pub fn parse_command_line(line: &[u8]) -> ParseResult {
     let line_str = match std::str::from_utf8(line) {
         Ok(s) => s,
-        Err(_) => return ParseResult::Error("CLIENT_ERROR bad command line encoding\r\n".into()),
+        Err(_) => {
+            return ParseResult::Error(
+                "CLIENT_ERROR bad command line encoding\r\n".into(),
+            );
+        }
     };
 
     let parts: Vec<&str> = line_str.split_whitespace().collect();
@@ -228,17 +232,9 @@ fn parse_incr_decr(parts: &[&str], is_incr: bool) -> ParseResult {
     };
     let noreply = parts.get(3).is_some_and(|&s| s == "noreply");
     if is_incr {
-        ParseResult::Complete(Command::Incr {
-            key,
-            value,
-            noreply,
-        })
+        ParseResult::Complete(Command::Incr { key, value, noreply })
     } else {
-        ParseResult::Complete(Command::Decr {
-            key,
-            value,
-            noreply,
-        })
+        ParseResult::Complete(Command::Decr { key, value, noreply })
     }
 }
 
@@ -252,30 +248,48 @@ fn parse_storage(parts: &[&str], kind: StorageKind) -> ParseResult {
     // Format: <cmd> <key> <flags> <exptime> <bytes> [cas_token] [noreply]\r\n
     let min_parts = if kind == StorageKind::Cas { 6 } else { 5 };
     if parts.len() < min_parts {
-        return ParseResult::Error("CLIENT_ERROR bad command line format\r\n".into());
+        return ParseResult::Error(
+            "CLIENT_ERROR bad command line format\r\n".into(),
+        );
     }
 
     let key = parts[1].as_bytes().to_vec();
 
     let flags = match parts[2].parse::<u32>() {
         Ok(v) => v,
-        Err(_) => return ParseResult::Error("CLIENT_ERROR bad flags value\r\n".into()),
+        Err(_) => {
+            return ParseResult::Error(
+                "CLIENT_ERROR bad flags value\r\n".into(),
+            );
+        }
     };
 
     let exptime = match parts[3].parse::<i64>() {
         Ok(v) => v,
-        Err(_) => return ParseResult::Error("CLIENT_ERROR bad exptime value\r\n".into()),
+        Err(_) => {
+            return ParseResult::Error(
+                "CLIENT_ERROR bad exptime value\r\n".into(),
+            );
+        }
     };
 
     let bytes = match parts[4].parse::<usize>() {
         Ok(v) => v,
-        Err(_) => return ParseResult::Error("CLIENT_ERROR bad data length\r\n".into()),
+        Err(_) => {
+            return ParseResult::Error(
+                "CLIENT_ERROR bad data length\r\n".into(),
+            );
+        }
     };
 
     let (cas_token, noreply) = if kind == StorageKind::Cas {
         let cas = match parts[5].parse::<u64>() {
             Ok(v) => v,
-            Err(_) => return ParseResult::Error("CLIENT_ERROR bad cas value\r\n".into()),
+            Err(_) => {
+                return ParseResult::Error(
+                    "CLIENT_ERROR bad cas value\r\n".into(),
+                );
+            }
         };
         let nr = parts.get(6).is_some_and(|&s| s == "noreply");
         (Some(cas), nr)
@@ -352,11 +366,7 @@ mod tests {
     #[test]
     fn test_parse_incr() {
         match parse_command_line(b"incr counter 10") {
-            ParseResult::Complete(Command::Incr {
-                key,
-                value,
-                noreply,
-            }) => {
+            ParseResult::Complete(Command::Incr { key, value, noreply }) => {
                 assert_eq!(key, b"counter");
                 assert_eq!(value, 10);
                 assert!(!noreply);

@@ -51,7 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let status = db.get(None, &key, &mut data)?;
         match status {
             OperationStatus::Success => {
-                let value = std::str::from_utf8(data.data()).unwrap_or("<binary>");
+                let value =
+                    std::str::from_utf8(data.data()).unwrap_or("<binary>");
                 println!("  {} -> {}", key_str, value);
             }
             OperationStatus::NotFound => {

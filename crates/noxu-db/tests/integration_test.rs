@@ -8,9 +8,7 @@ use noxu_db::{
 };
 use tempfile::TempDir;
 
-fn open_env_and_db(
-    dir: &TempDir,
-) -> (noxu_db::Environment, noxu_db::Database) {
+fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
@@ -49,7 +47,10 @@ fn test_put_delete_get() {
     assert_eq!(db.delete(None, &key).unwrap(), OperationStatus::Success);
 
     let mut out = DatabaseEntry::new();
-    assert_eq!(db.get(None, &key, &mut out).unwrap(), OperationStatus::NotFound);
+    assert_eq!(
+        db.get(None, &key, &mut out).unwrap(),
+        OperationStatus::NotFound
+    );
 }
 
 /// Last put wins (overwrite semantics).
@@ -112,10 +113,12 @@ fn test_cursor_scan_sorted() {
 
     // Collect values in iteration order
     let mut values: Vec<Vec<u8>> = Vec::new();
-    let mut status = cursor.get(&mut dummy_key, &mut data, Get::First, None).unwrap();
+    let mut status =
+        cursor.get(&mut dummy_key, &mut data, Get::First, None).unwrap();
     while status == OperationStatus::Success {
         values.push(data.data().to_vec());
-        status = cursor.get(&mut dummy_key, &mut data, Get::Next, None).unwrap();
+        status =
+            cursor.get(&mut dummy_key, &mut data, Get::Next, None).unwrap();
     }
 
     assert_eq!(values, vec![b"1", b"2", b"3"]);
@@ -142,10 +145,12 @@ fn test_cursor_scan_reverse() {
     let mut data = DatabaseEntry::new();
 
     let mut values: Vec<Vec<u8>> = Vec::new();
-    let mut status = cursor.get(&mut dummy_key, &mut data, Get::Last, None).unwrap();
+    let mut status =
+        cursor.get(&mut dummy_key, &mut data, Get::Last, None).unwrap();
     while status == OperationStatus::Success {
         values.push(data.data().to_vec());
-        status = cursor.get(&mut dummy_key, &mut data, Get::Prev, None).unwrap();
+        status =
+            cursor.get(&mut dummy_key, &mut data, Get::Prev, None).unwrap();
     }
 
     assert_eq!(values, vec![b"3", b"2", b"1"]);
@@ -201,7 +206,10 @@ fn test_cursor_delete() {
 
     // Verify gone via Database::get
     let mut out = DatabaseEntry::new();
-    assert_eq!(db.get(None, &key, &mut out).unwrap(), OperationStatus::NotFound);
+    assert_eq!(
+        db.get(None, &key, &mut out).unwrap(),
+        OperationStatus::NotFound
+    );
 }
 
 /// Database::count() returns the right number of records.
@@ -395,15 +403,23 @@ fn cursor_first_returns_smallest_key() {
     let (_env, db) = open_env_and_db(&dir);
 
     // Insert out-of-order; keys sort lexicographically.
-    for (k, v) in [(b"dog".as_ref(), b"3".as_ref()), (b"ant", b"1"), (b"bee", b"2")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+    for (k, v) in
+        [(b"dog".as_ref(), b"3".as_ref()), (b"ant", b"1"), (b"bee", b"2")]
+    {
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::First, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::First, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(key.data(), b"ant");
     assert_eq!(data.data(), b"1");
@@ -417,15 +433,23 @@ fn cursor_last_returns_largest_key() {
     let dir = tempfile::TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    for (k, v) in [(b"dog".as_ref(), b"3".as_ref()), (b"ant", b"1"), (b"bee", b"2")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+    for (k, v) in
+        [(b"dog".as_ref(), b"3".as_ref()), (b"ant", b"1"), (b"bee", b"2")]
+    {
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::Last, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Last, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(key.data(), b"dog");
     assert_eq!(data.data(), b"3");
@@ -441,11 +465,21 @@ fn cursor_next_traverses_sorted_order() {
 
     // Insert seven single-byte keys — same alphabet used in CursorTest.dataStrings.
     let pairs: &[(&[u8], &[u8])] = &[
-        (b"A", b"1"), (b"B", b"2"), (b"C", b"3"),
-        (b"F", b"4"), (b"G", b"5"), (b"H", b"6"), (b"I", b"7"),
+        (b"A", b"1"),
+        (b"B", b"2"),
+        (b"C", b"3"),
+        (b"F", b"4"),
+        (b"G", b"5"),
+        (b"H", b"6"),
+        (b"I", b"7"),
     ];
     for (k, v) in pairs {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -453,10 +487,12 @@ fn cursor_next_traverses_sorted_order() {
     let mut data = noxu_db::DatabaseEntry::new();
 
     let mut keys_seen: Vec<Vec<u8>> = Vec::new();
-    let mut status = cursor.get(&mut key, &mut data, noxu_db::Get::First, None).unwrap();
+    let mut status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::First, None).unwrap();
     while status == noxu_db::OperationStatus::Success {
         keys_seen.push(key.data().to_vec());
-        status = cursor.get(&mut key, &mut data, noxu_db::Get::Next, None).unwrap();
+        status =
+            cursor.get(&mut key, &mut data, noxu_db::Get::Next, None).unwrap();
     }
 
     let expected: Vec<&[u8]> = vec![b"A", b"B", b"C", b"F", b"G", b"H", b"I"];
@@ -471,11 +507,14 @@ fn cursor_prev_traverses_reverse_sorted_order() {
     let dir = tempfile::TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    let pairs: &[(&[u8], &[u8])] = &[
-        (b"A", b"1"), (b"B", b"2"), (b"C", b"3"),
-    ];
+    let pairs: &[(&[u8], &[u8])] = &[(b"A", b"1"), (b"B", b"2"), (b"C", b"3")];
     for (k, v) in pairs {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -483,10 +522,12 @@ fn cursor_prev_traverses_reverse_sorted_order() {
     let mut data = noxu_db::DatabaseEntry::new();
 
     let mut keys_seen: Vec<Vec<u8>> = Vec::new();
-    let mut status = cursor.get(&mut key, &mut data, noxu_db::Get::Last, None).unwrap();
+    let mut status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Last, None).unwrap();
     while status == noxu_db::OperationStatus::Success {
         keys_seen.push(key.data().to_vec());
-        status = cursor.get(&mut key, &mut data, noxu_db::Get::Prev, None).unwrap();
+        status =
+            cursor.get(&mut key, &mut data, noxu_db::Get::Prev, None).unwrap();
     }
 
     let expected: Vec<&[u8]> = vec![b"C", b"B", b"A"];
@@ -501,15 +542,23 @@ fn cursor_search_finds_exact_key() {
     let dir = tempfile::TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    for (k, v) in [(b"A".as_ref(), b"v1".as_ref()), (b"F", b"v2"), (b"G", b"v3")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+    for (k, v) in
+        [(b"A".as_ref(), b"v1".as_ref()), (b"F", b"v2"), (b"G", b"v3")]
+    {
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"F");
     let mut data = noxu_db::DatabaseEntry::new();
 
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::Search, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Search, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(data.data(), b"v2");
     // Key written back after search must equal the searched key.
@@ -524,13 +573,19 @@ fn cursor_search_missing_key_returns_not_found() {
     let dir = tempfile::TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    db.put(None, &noxu_db::DatabaseEntry::from_bytes(b"A"), &noxu_db::DatabaseEntry::from_bytes(b"v")).unwrap();
+    db.put(
+        None,
+        &noxu_db::DatabaseEntry::from_bytes(b"A"),
+        &noxu_db::DatabaseEntry::from_bytes(b"v"),
+    )
+    .unwrap();
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"Z");
     let mut data = noxu_db::DatabaseEntry::new();
 
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::Search, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Search, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::NotFound);
     cursor.close().unwrap();
 }
@@ -549,7 +604,8 @@ fn cursor_search_gte_finds_first_ge_key() {
             None,
             &noxu_db::DatabaseEntry::from_bytes(&[k]),
             &noxu_db::DatabaseEntry::from_bytes(&[k]),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -557,25 +613,29 @@ fn cursor_search_gte_finds_first_ge_key() {
     // SearchGte(0) → first key >= 0 is 1.
     let mut key = noxu_db::DatabaseEntry::from_bytes(&[0u8]);
     let mut data = noxu_db::DatabaseEntry::new();
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(key.data(), &[1u8]);
 
     // SearchGte(3) → exact match, returns 3.
     let mut key = noxu_db::DatabaseEntry::from_bytes(&[3u8]);
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(key.data(), &[3u8]);
 
     // SearchGte(4) → first key >= 4 is 5.
     let mut key = noxu_db::DatabaseEntry::from_bytes(&[4u8]);
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(key.data(), &[5u8]);
 
     // SearchGte(6) → no key >= 6, returns NotFound.
     let mut key = noxu_db::DatabaseEntry::from_bytes(&[6u8]);
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::SearchGte, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::NotFound);
 
     cursor.close().unwrap();
@@ -589,7 +649,12 @@ fn cursor_delete_removes_record_next_skips_it() {
     let (_env, db) = open_env_and_db(&dir);
 
     for (k, v) in [(b"A".as_ref(), b"1".as_ref()), (b"B", b"2"), (b"C", b"3")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -597,7 +662,8 @@ fn cursor_delete_removes_record_next_skips_it() {
     let mut data = noxu_db::DatabaseEntry::new();
 
     // Position on "B".
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::Search, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Search, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
 
     // Delete "B".
@@ -609,11 +675,13 @@ fn cursor_delete_removes_record_next_skips_it() {
     // Here we re-position at "A" and advance past where "B" was.
     let mut key2 = noxu_db::DatabaseEntry::new();
     let mut data2 = noxu_db::DatabaseEntry::new();
-    let status = cursor.get(&mut key2, &mut data2, noxu_db::Get::First, None).unwrap();
+    let status =
+        cursor.get(&mut key2, &mut data2, noxu_db::Get::First, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(key2.data(), b"A");
 
-    let status = cursor.get(&mut key2, &mut data2, noxu_db::Get::Next, None).unwrap();
+    let status =
+        cursor.get(&mut key2, &mut data2, noxu_db::Get::Next, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     // "B" was deleted; next key must be "C".
     assert_eq!(key2.data(), b"C");
@@ -629,25 +697,34 @@ fn cursor_put_overwrite_and_no_overwrite() {
     let dir = tempfile::TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    db.put(None, &noxu_db::DatabaseEntry::from_bytes(b"K"), &noxu_db::DatabaseEntry::from_bytes(b"v1")).unwrap();
+    db.put(
+        None,
+        &noxu_db::DatabaseEntry::from_bytes(b"K"),
+        &noxu_db::DatabaseEntry::from_bytes(b"v1"),
+    )
+    .unwrap();
 
     let mut cursor = db.open_cursor(None, None).unwrap();
 
     // NoOverwrite on existing key → KeyExists.
     let kentry = noxu_db::DatabaseEntry::from_bytes(b"K");
     let v2entry = noxu_db::DatabaseEntry::from_bytes(b"v2");
-    let status = cursor.put(&kentry, &v2entry, noxu_db::Put::NoOverwrite).unwrap();
+    let status =
+        cursor.put(&kentry, &v2entry, noxu_db::Put::NoOverwrite).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::KeyExists);
 
     // Overwrite on existing key → Success and value replaced.
     let v3entry = noxu_db::DatabaseEntry::from_bytes(b"v3");
-    let status = cursor.put(&kentry, &v3entry, noxu_db::Put::Overwrite).unwrap();
+    let status =
+        cursor.put(&kentry, &v3entry, noxu_db::Put::Overwrite).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
 
     // Verify value is now v3.
     let mut read_key = noxu_db::DatabaseEntry::from_bytes(b"K");
     let mut read_data = noxu_db::DatabaseEntry::new();
-    cursor.get(&mut read_key, &mut read_data, noxu_db::Get::Search, None).unwrap();
+    cursor
+        .get(&mut read_key, &mut read_data, noxu_db::Get::Search, None)
+        .unwrap();
     assert_eq!(read_data.data(), b"v3");
 
     cursor.close().unwrap();
@@ -661,7 +738,12 @@ fn two_cursors_independent_positions() {
     let (_env, db) = open_env_and_db(&dir);
 
     for (k, v) in [(b"A".as_ref(), b"1".as_ref()), (b"B", b"2"), (b"C", b"3")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut c1 = db.open_cursor(None, None).unwrap();
@@ -682,7 +764,7 @@ fn two_cursors_independent_positions() {
     // Advancing c1 does not move c2.
     c1.get(&mut k1, &mut d1, noxu_db::Get::Next, None).unwrap();
     assert_eq!(k1.data(), b"B");
-    assert_eq!(k2.data(), b"C");  // c2 still at C
+    assert_eq!(k2.data(), b"C"); // c2 still at C
 
     c1.close().unwrap();
     c2.close().unwrap();
@@ -695,7 +777,12 @@ fn cursor_get_current_after_search() {
     let dir = tempfile::TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    db.put(None, &noxu_db::DatabaseEntry::from_bytes(b"key"), &noxu_db::DatabaseEntry::from_bytes(b"val")).unwrap();
+    db.put(
+        None,
+        &noxu_db::DatabaseEntry::from_bytes(b"key"),
+        &noxu_db::DatabaseEntry::from_bytes(b"val"),
+    )
+    .unwrap();
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"key");
@@ -706,7 +793,9 @@ fn cursor_get_current_after_search() {
     // Get::Current should re-return the same record without moving the cursor.
     let mut cur_key = noxu_db::DatabaseEntry::new();
     let mut cur_data = noxu_db::DatabaseEntry::new();
-    let status = cursor.get(&mut cur_key, &mut cur_data, noxu_db::Get::Current, None).unwrap();
+    let status = cursor
+        .get(&mut cur_key, &mut cur_data, noxu_db::Get::Current, None)
+        .unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
     assert_eq!(cur_key.data(), b"key");
     assert_eq!(cur_data.data(), b"val");
@@ -722,16 +811,22 @@ fn cursor_next_from_uninitialized_is_first() {
     let (_env, db) = open_env_and_db(&dir);
 
     for (k, v) in [(b"X".as_ref(), b"1".as_ref()), (b"Y", b"2")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::Next, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Next, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
-    assert_eq!(key.data(), b"X");  // First key
+    assert_eq!(key.data(), b"X"); // First key
     cursor.close().unwrap();
 }
 
@@ -743,16 +838,22 @@ fn cursor_prev_from_uninitialized_is_last() {
     let (_env, db) = open_env_and_db(&dir);
 
     for (k, v) in [(b"X".as_ref(), b"1".as_ref()), (b"Y", b"2")] {
-        db.put(None, &noxu_db::DatabaseEntry::from_bytes(k), &noxu_db::DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &noxu_db::DatabaseEntry::from_bytes(k),
+            &noxu_db::DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
-    let status = cursor.get(&mut key, &mut data, noxu_db::Get::Prev, None).unwrap();
+    let status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::Prev, None).unwrap();
     assert_eq!(status, noxu_db::OperationStatus::Success);
-    assert_eq!(key.data(), b"Y");  // Last key
+    assert_eq!(key.data(), b"Y"); // Last key
     cursor.close().unwrap();
 }
 
@@ -781,8 +882,14 @@ fn db_double_delete_second_is_not_found() {
     let val = noxu_db::DatabaseEntry::from_bytes(b"v");
     db.put(None, &key, &val).unwrap();
 
-    assert_eq!(db.delete(None, &key).unwrap(), noxu_db::OperationStatus::Success);
-    assert_eq!(db.delete(None, &key).unwrap(), noxu_db::OperationStatus::NotFound);
+    assert_eq!(
+        db.delete(None, &key).unwrap(),
+        noxu_db::OperationStatus::Success
+    );
+    assert_eq!(
+        db.delete(None, &key).unwrap(),
+        noxu_db::OperationStatus::NotFound
+    );
 }
 
 /// put_no_overwrite() succeeds for a new key, returns KeyExists on the second call,
@@ -797,8 +904,14 @@ fn db_put_no_overwrite_semantics() {
     let v1 = noxu_db::DatabaseEntry::from_bytes(b"first");
     let v2 = noxu_db::DatabaseEntry::from_bytes(b"second");
 
-    assert_eq!(db.put_no_overwrite(None, &key, &v1).unwrap(), noxu_db::OperationStatus::Success);
-    assert_eq!(db.put_no_overwrite(None, &key, &v2).unwrap(), noxu_db::OperationStatus::KeyExists);
+    assert_eq!(
+        db.put_no_overwrite(None, &key, &v1).unwrap(),
+        noxu_db::OperationStatus::Success
+    );
+    assert_eq!(
+        db.put_no_overwrite(None, &key, &v2).unwrap(),
+        noxu_db::OperationStatus::KeyExists
+    );
 
     // Original value must be unchanged.
     let mut out = noxu_db::DatabaseEntry::new();
@@ -821,7 +934,8 @@ fn db_count_tracks_live_records() {
             None,
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
-        ).unwrap();
+        )
+        .unwrap();
     }
     assert_eq!(db.count().unwrap(), 10);
 
@@ -898,7 +1012,8 @@ fn db_multiple_concurrent_cursors_scan_same_records() {
             None,
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
             &noxu_db::DatabaseEntry::from_bytes(&[i * 10]),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let mut c1 = db.open_cursor(None, None).unwrap();
@@ -938,7 +1053,9 @@ fn db_get_not_found_for_missing_key() {
     let (_env, db) = open_env_and_db(&dir);
 
     let mut out = noxu_db::DatabaseEntry::new();
-    let status = db.get(None, &noxu_db::DatabaseEntry::from_bytes(b"missing"), &mut out).unwrap();
+    let status = db
+        .get(None, &noxu_db::DatabaseEntry::from_bytes(b"missing"), &mut out)
+        .unwrap();
     assert_eq!(status, noxu_db::OperationStatus::NotFound);
 }
 
@@ -955,7 +1072,8 @@ fn db_remove_all_records_via_scan() {
             None,
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
-        ).unwrap();
+        )
+        .unwrap();
     }
     assert_eq!(db.count().unwrap(), 20);
 
@@ -985,7 +1103,8 @@ fn db_large_record_set_sorted_iteration() {
             None,
             &noxu_db::DatabaseEntry::from_bytes(&key_bytes),
             &noxu_db::DatabaseEntry::from_bytes(&val_bytes),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     assert_eq!(db.count().unwrap(), N as u64);
@@ -997,17 +1116,24 @@ fn db_large_record_set_sorted_iteration() {
 
     let mut prev_key_val: Option<u32> = None;
     let mut count = 0u32;
-    let mut status = cursor.get(&mut key, &mut data, noxu_db::Get::First, None).unwrap();
+    let mut status =
+        cursor.get(&mut key, &mut data, noxu_db::Get::First, None).unwrap();
     while status == noxu_db::OperationStatus::Success {
         let k_val = u32::from_be_bytes(key.data().try_into().unwrap());
         let d_val = u32::from_be_bytes(data.data().try_into().unwrap());
         assert_eq!(k_val, d_val, "key and data must match");
         if let Some(prev) = prev_key_val {
-            assert!(k_val > prev, "keys must be strictly ascending: {} <= {}", k_val, prev);
+            assert!(
+                k_val > prev,
+                "keys must be strictly ascending: {} <= {}",
+                k_val,
+                prev
+            );
         }
         prev_key_val = Some(k_val);
         count += 1;
-        status = cursor.get(&mut key, &mut data, noxu_db::Get::Next, None).unwrap();
+        status =
+            cursor.get(&mut key, &mut data, noxu_db::Get::Next, None).unwrap();
     }
     assert_eq!(count, N);
     cursor.close().unwrap();
@@ -1022,7 +1148,11 @@ fn open_seq_env_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .with_transactional(false);
     let env = noxu_db::Environment::open(env_config).unwrap();
     let db = env
-        .open_database(None, "seqdb", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "seqdb",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     (env, db)
 }
@@ -1085,7 +1215,11 @@ fn seq_stats_n_gets_and_cache_hits() {
     let s = seq.get_stats();
     assert_eq!(s.n_gets, 3);
     // At least 2 of the 3 gets were cache hits (first one was a refill).
-    assert!(s.n_cache_hits >= 2, "expected >= 2 cache hits, got {}", s.n_cache_hits);
+    assert!(
+        s.n_cache_hits >= 2,
+        "expected >= 2 cache hits, got {}",
+        s.n_cache_hits
+    );
 
     seq.close().unwrap();
 }
@@ -1228,7 +1362,10 @@ fn seq_wrap_resets_to_min() {
 
     // After wrap the value should be back at min=0.
     let wrapped = seq.get(None, 1).unwrap();
-    assert_eq!(wrapped, min, "after wrap should return min={min}, got {wrapped}");
+    assert_eq!(
+        wrapped, min,
+        "after wrap should return min={min}, got {wrapped}"
+    );
 
     seq.close().unwrap();
 }
@@ -1261,7 +1398,11 @@ fn seq_cache_refill_pattern() {
     }
     let s1 = seq.get_stats();
     assert_eq!(s1.n_gets, cache as u64);
-    assert_eq!(s1.n_cache_hits, (cache - 1) as u64, "gets 2..cache should be cache hits");
+    assert_eq!(
+        s1.n_cache_hits,
+        (cache - 1) as u64,
+        "gets 2..cache should be cache hits"
+    );
 
     seq.close().unwrap();
 }
@@ -1311,12 +1452,19 @@ fn seq_no_create_fails_when_missing() {
     let (_env, db) = open_seq_env_db(&dir);
 
     let key = DatabaseEntry::from_bytes(b"missing_seq");
-    let result =
-        db.open_sequence(&key, noxu_db::SequenceConfig::new().with_allow_create(false));
-    assert!(result.is_err(), "should fail with allow_create=false on missing key");
+    let result = db.open_sequence(
+        &key,
+        noxu_db::SequenceConfig::new().with_allow_create(false),
+    );
+    assert!(
+        result.is_err(),
+        "should fail with allow_create=false on missing key"
+    );
     let msg = format!("{}", result.err().unwrap());
     assert!(
-        msg.contains("does not exist") || msg.contains("NotFound") || msg.to_lowercase().contains("not found"),
+        msg.contains("does not exist")
+            || msg.contains("NotFound")
+            || msg.to_lowercase().contains("not found"),
         "unexpected error: {msg}"
     );
 }
@@ -1558,7 +1706,8 @@ fn seq_extreme_range_i64_max() {
 // ─── Secondary database tests ───────────────
 
 use noxu_db::{
-    SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator, SecondaryMultiKeyCreator,
+    SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator,
+    SecondaryMultiKeyCreator,
 };
 use noxu_sync::Mutex;
 use std::sync::Arc;
@@ -1576,10 +1725,11 @@ impl SecondaryKeyCreator for FirstByteCreator {
         result: &mut DatabaseEntry,
     ) -> bool {
         if let Some(d) = data.get_data()
-            && !d.is_empty() {
-                result.set_data(&d[..1]);
-                return true;
-            }
+            && !d.is_empty()
+        {
+            result.set_data(&d[..1]);
+            return true;
+        }
         false
     }
 }
@@ -1607,11 +1757,7 @@ impl SecondaryMultiKeyCreator for EachByteCreator {
 /// Helper: set up a primary + secondary for integration tests.
 fn open_pri_sec(
     dir: &TempDir,
-) -> (
-    noxu_db::Environment,
-    Arc<Mutex<noxu_db::Database>>,
-    SecondaryDatabase,
-) {
+) -> (noxu_db::Environment, Arc<Mutex<noxu_db::Database>>, SecondaryDatabase) {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
@@ -1622,12 +1768,18 @@ fn open_pri_sec(
     let primary = Arc::new(Mutex::new(primary_db));
 
     let sec_db = env
-        .open_database(None, "secondary", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "secondary",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let sec_config = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator));
-    let secondary = SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config).unwrap();
+    let secondary =
+        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+            .unwrap();
 
     (env, primary, secondary)
 }
@@ -1736,7 +1888,11 @@ fn sec_update_primary_changes_secondary_key() {
     let mut pk = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let status = secondary.get(None, &sec_key_b, &mut pk, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::NotFound, "old sec key 'B' should be removed");
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "old sec key 'B' should be removed"
+    );
 
     // New sec key 'C' must be present.
     let sec_key_c = DatabaseEntry::from_bytes(b"C");
@@ -1797,7 +1953,8 @@ fn sec_cursor_first_next_sorted_order() {
     let mut data = DatabaseEntry::new();
 
     let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut status = cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
+    let mut status =
+        cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
     while status == OperationStatus::Success {
         got.push((
             sec_key.get_data().unwrap().to_vec(),
@@ -1828,11 +1985,8 @@ fn sec_cursor_last_prev_reverse_order() {
     let dir = TempDir::new().unwrap();
     let (_env, primary, secondary) = open_pri_sec(&dir);
 
-    let records: &[(&[u8], &[u8])] = &[
-        (b"pk1", b"Apple"),
-        (b"pk2", b"Banana"),
-        (b"pk3", b"Cherry"),
-    ];
+    let records: &[(&[u8], &[u8])] =
+        &[(b"pk1", b"Apple"), (b"pk2", b"Banana"), (b"pk3", b"Cherry")];
     for (k, v) in records {
         pri_put_and_index(&primary, &secondary, k, v, None);
     }
@@ -1843,7 +1997,8 @@ fn sec_cursor_last_prev_reverse_order() {
     let mut data = DatabaseEntry::new();
 
     let mut got_data: Vec<Vec<u8>> = Vec::new();
-    let mut status = cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
+    let mut status =
+        cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
     while status == OperationStatus::Success {
         got_data.push(data.get_data().unwrap().to_vec());
         status = cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
@@ -1863,11 +2018,8 @@ fn sec_cursor_search_key_returns_tuple() {
     let dir = TempDir::new().unwrap();
     let (_env, primary, secondary) = open_pri_sec(&dir);
 
-    let records: &[(&[u8], &[u8])] = &[
-        (b"pk0", b"Apricot"),
-        (b"pk1", b"Banana"),
-        (b"pk2", b"Citrus"),
-    ];
+    let records: &[(&[u8], &[u8])] =
+        &[(b"pk0", b"Apricot"), (b"pk1", b"Banana"), (b"pk2", b"Citrus")];
     for (k, v) in records {
         pri_put_and_index(&primary, &secondary, k, v, None);
     }
@@ -1987,18 +2139,27 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
     let env = noxu_db::Environment::open(env_config).unwrap();
 
     let primary_db = env
-        .open_database(None, "pri_mk", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "pri_mk",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
 
     let sec_db = env
-        .open_database(None, "sec_mk", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "sec_mk",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let sec_config = SecondaryConfig::new()
         .with_allow_create(true)
         .with_multi_key_creator(Box::new(EachByteCreator));
     let secondary =
-        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config).unwrap();
+        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+            .unwrap();
 
     // Primary record: key="pk1", data=[0x41, 0x42] = "AB"
     let pk = DatabaseEntry::from_bytes(b"pk1");
@@ -2028,9 +2189,8 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
     let sec_key_c = DatabaseEntry::from_bytes(b"C");
     let mut pk_out = DatabaseEntry::new();
     let mut data_out = DatabaseEntry::new();
-    let status = secondary
-        .get(None, &sec_key_c, &mut pk_out, &mut data_out)
-        .unwrap();
+    let status =
+        secondary.get(None, &sec_key_c, &mut pk_out, &mut data_out).unwrap();
     assert_eq!(status, OperationStatus::NotFound);
 }
 
@@ -2046,12 +2206,20 @@ fn sec_auto_populate_on_open() {
     let env = noxu_db::Environment::open(env_config).unwrap();
 
     let primary_db = env
-        .open_database(None, "pri_pop", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "pri_pop",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
 
     // Pre-populate primary with 3 records.
-    for (k, v) in [(b"pk1" as &[u8], b"Grape" as &[u8]), (b"pk2", b"Kiwi"), (b"pk3", b"Lemon")] {
+    for (k, v) in [
+        (b"pk1" as &[u8], b"Grape" as &[u8]),
+        (b"pk2", b"Kiwi"),
+        (b"pk3", b"Lemon"),
+    ] {
         primary
             .lock()
             .put(
@@ -2064,17 +2232,24 @@ fn sec_auto_populate_on_open() {
 
     // Open secondary with allow_populate=true.
     let sec_db = env
-        .open_database(None, "sec_pop", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "sec_pop",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let sec_config = SecondaryConfig::new()
         .with_allow_create(true)
         .with_allow_populate(true)
         .with_key_creator(Box::new(FirstByteCreator));
     let secondary =
-        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config).unwrap();
+        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+            .unwrap();
 
     // All three records should be indexed.
-    for (sec_b, expected_data) in [(b"G" as &[u8], b"Grape" as &[u8]), (b"K", b"Kiwi"), (b"L", b"Lemon")] {
+    for (sec_b, expected_data) in
+        [(b"G" as &[u8], b"Grape" as &[u8]), (b"K", b"Kiwi"), (b"L", b"Lemon")]
+    {
         let sec_key = DatabaseEntry::from_bytes(sec_b);
         let mut pk = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -2115,27 +2290,37 @@ fn sec_num_recs_put_get_round_trip() {
             result: &mut DatabaseEntry,
         ) -> bool {
             if let Some(d) = data.get_data()
-                && d.len() >= 8 {
-                    result.set_data(&d[4..8]);
-                    return true;
-                }
+                && d.len() >= 8
+            {
+                result.set_data(&d[4..8]);
+                return true;
+            }
             false
         }
     }
 
     let primary_db = env
-        .open_database(None, "pri_nr", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "pri_nr",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
 
     let sec_db = env
-        .open_database(None, "sec_nr", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "sec_nr",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let sec_config = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(SecondU32Creator));
     let secondary =
-        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config).unwrap();
+        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+            .unwrap();
 
     // Insert records: pri_key = i (be_u32), data = i ++ (i+KEY_OFFSET) packed as 8 bytes.
     for i in 0u32..NUM_RECS {
@@ -2158,10 +2343,15 @@ fn sec_num_recs_put_get_round_trip() {
         let sec_key = DatabaseEntry::from_bytes(&sec_key_val);
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success, "i={i}: sec get failed");
         // Primary key should be i
-        assert_eq!(p_key.get_data().unwrap(), &i.to_be_bytes(), "i={i}: wrong pri key");
+        assert_eq!(
+            p_key.get_data().unwrap(),
+            &i.to_be_bytes(),
+            "i={i}: wrong pri key"
+        );
     }
 
     // Look up sec_key = NUM_RECS + KEY_OFFSET → NotFound.
@@ -2188,10 +2378,16 @@ fn sec_num_recs_put_get_round_trip() {
     let mut prev_sec_key: Option<u32> = None;
     let mut status = cursor.get_first(&mut sk, &mut pk, &mut d).unwrap();
     while status == OperationStatus::Success {
-        let sk_val = u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
-        let pk_val = u32::from_be_bytes(pk.get_data().unwrap().try_into().unwrap());
+        let sk_val =
+            u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
+        let pk_val =
+            u32::from_be_bytes(pk.get_data().unwrap().try_into().unwrap());
         // sec_key = pri_key + KEY_OFFSET
-        assert_eq!(sk_val, pk_val + KEY_OFFSET, "count={count}: sec key mismatch");
+        assert_eq!(
+            sk_val,
+            pk_val + KEY_OFFSET,
+            "count={count}: sec key mismatch"
+        );
         if let Some(prev) = prev_sec_key {
             assert!(sk_val > prev, "count={count}: sec keys not ascending");
         }
@@ -2206,9 +2402,13 @@ fn sec_num_recs_put_get_round_trip() {
     let mut prev_sk_val: Option<u32> = None;
     let mut status = cursor.get_last(&mut sk, &mut pk, &mut d).unwrap();
     while status == OperationStatus::Success {
-        let sk_val = u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
+        let sk_val =
+            u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
         if let Some(prev) = prev_sk_val {
-            assert!(sk_val < prev, "count_rev={count_rev}: sec keys not descending");
+            assert!(
+                sk_val < prev,
+                "count_rev={count_rev}: sec keys not descending"
+            );
         }
         prev_sk_val = Some(sk_val);
         count_rev += 1;
@@ -2259,25 +2459,33 @@ fn cursor_search_simple_exact_match() {
     let (_env, db) = open_env_and_db(&dir);
 
     let pairs: &[(&[u8], &[u8])] = &[
-        (b"bar",  b"two"),
-        (b"baz",  b"three"),
-        (b"foo",  b"one"),
+        (b"bar", b"two"),
+        (b"baz", b"three"),
+        (b"foo", b"one"),
         (b"quux", b"four"),
     ];
 
     for (k, v) in pairs {
-        db.put(None,
-               &DatabaseEntry::from_bytes(k),
-               &DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
     for (k, v) in pairs {
-        let mut key  = DatabaseEntry::from_bytes(k);
+        let mut key = DatabaseEntry::from_bytes(k);
         let mut data = DatabaseEntry::new();
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(status, OperationStatus::Success,
-            "Get::Search must succeed for key {:?}", k);
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        assert_eq!(
+            status,
+            OperationStatus::Success,
+            "Get::Search must succeed for key {:?}",
+            k
+        );
         assert_eq!(data.data(), *v, "data must match for key {:?}", k);
     }
     cursor.close().unwrap();
@@ -2291,36 +2499,46 @@ fn cursor_search_after_delete_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    let pairs: &[(&[u8], &[u8])] = &[
-        (b"alpha", b"1"),
-        (b"beta",  b"2"),
-        (b"gamma", b"3"),
-    ];
+    let pairs: &[(&[u8], &[u8])] =
+        &[(b"alpha", b"1"), (b"beta", b"2"), (b"gamma", b"3")];
 
     for (k, v) in pairs {
-        db.put(None,
-               &DatabaseEntry::from_bytes(k),
-               &DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
 
     for (k, _v) in pairs {
         // Search must succeed before deletion.
-        let mut key  = DatabaseEntry::from_bytes(k);
+        let mut key = DatabaseEntry::from_bytes(k);
         let mut data = DatabaseEntry::new();
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(status, OperationStatus::Success,
-            "Get::Search must succeed before deletion for {:?}", k);
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        assert_eq!(
+            status,
+            OperationStatus::Success,
+            "Get::Search must succeed before deletion for {:?}",
+            k
+        );
 
         cursor.delete().unwrap();
 
         // Searching again must return NotFound.
-        let mut key2  = DatabaseEntry::from_bytes(k);
+        let mut key2 = DatabaseEntry::from_bytes(k);
         let mut data2 = DatabaseEntry::new();
-        let status2 = cursor.get(&mut key2, &mut data2, Get::Search, None).unwrap();
-        assert_eq!(status2, OperationStatus::NotFound,
-            "Get::Search must return NotFound after deletion for {:?}", k);
+        let status2 =
+            cursor.get(&mut key2, &mut data2, Get::Search, None).unwrap();
+        assert_eq!(
+            status2,
+            OperationStatus::NotFound,
+            "Get::Search must return NotFound after deletion for {:?}",
+            k
+        );
     }
 
     cursor.close().unwrap();
@@ -2339,9 +2557,12 @@ fn cursor_search_large_tree_exact_match() {
     for i in 0..N_KEYS {
         let key_bytes = format!("{:08}", i).into_bytes();
         let val_bytes = i.to_be_bytes().to_vec();
-        db.put(None,
-               &DatabaseEntry::from_vec(key_bytes),
-               &DatabaseEntry::from_vec(val_bytes)).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(key_bytes),
+            &DatabaseEntry::from_vec(val_bytes),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -2349,13 +2570,22 @@ fn cursor_search_large_tree_exact_match() {
         let key_bytes = format!("{:08}", i).into_bytes();
         let expected_val = i.to_be_bytes().to_vec();
 
-        let mut key  = DatabaseEntry::from_vec(key_bytes.clone());
+        let mut key = DatabaseEntry::from_vec(key_bytes.clone());
         let mut data = DatabaseEntry::new();
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(status, OperationStatus::Success,
-            "Get::Search must succeed for key {:?} in large tree", key_bytes);
-        assert_eq!(data.data(), expected_val.as_slice(),
-            "data must match for key {:?}", key_bytes);
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        assert_eq!(
+            status,
+            OperationStatus::Success,
+            "Get::Search must succeed for key {:?} in large tree",
+            key_bytes
+        );
+        assert_eq!(
+            data.data(),
+            expected_val.as_slice(),
+            "data must match for key {:?}",
+            key_bytes
+        );
     }
 
     cursor.close().unwrap();
@@ -2374,9 +2604,12 @@ fn cursor_search_large_tree_delete_and_search() {
     for i in 0..N_KEYS {
         let key_bytes = format!("{:08}", i).into_bytes();
         let val_bytes = i.to_be_bytes().to_vec();
-        db.put(None,
-               &DatabaseEntry::from_vec(key_bytes),
-               &DatabaseEntry::from_vec(val_bytes)).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(key_bytes),
+            &DatabaseEntry::from_vec(val_bytes),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
@@ -2384,19 +2617,27 @@ fn cursor_search_large_tree_delete_and_search() {
     for i in 0..N_KEYS {
         let key_bytes = format!("{:08}", i).into_bytes();
 
-        let mut key  = DatabaseEntry::from_vec(key_bytes.clone());
+        let mut key = DatabaseEntry::from_vec(key_bytes.clone());
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(s, OperationStatus::Success,
-            "Get::Search must succeed for key {:?} before deletion", key_bytes);
+        assert_eq!(
+            s,
+            OperationStatus::Success,
+            "Get::Search must succeed for key {:?} before deletion",
+            key_bytes
+        );
 
         cursor.delete().unwrap();
 
-        let mut key2  = DatabaseEntry::from_vec(key_bytes.clone());
+        let mut key2 = DatabaseEntry::from_vec(key_bytes.clone());
         let mut data2 = DatabaseEntry::new();
         let s2 = cursor.get(&mut key2, &mut data2, Get::Search, None).unwrap();
-        assert_eq!(s2, OperationStatus::NotFound,
-            "Get::Search must return NotFound after deletion for key {:?}", key_bytes);
+        assert_eq!(
+            s2,
+            OperationStatus::NotFound,
+            "Get::Search must return NotFound after deletion for key {:?}",
+            key_bytes
+        );
     }
 
     cursor.close().unwrap();
@@ -2413,35 +2654,47 @@ fn cursor_search_range_finds_first_gte_key() {
     let (_env, db) = open_env_and_db(&dir);
 
     for k in [b"a".as_ref(), b"c", b"e", b"g"] {
-        db.put(None,
-               &DatabaseEntry::from_bytes(k),
-               &DatabaseEntry::from_bytes(b"val")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(b"val"),
+        )
+        .unwrap();
     }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
 
     // Exact match: SearchRange on "a" must find "a".
-    let mut key  = DatabaseEntry::from_bytes(b"a");
+    let mut key = DatabaseEntry::from_bytes(b"a");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
     assert_eq!(key.data(), b"a");
 
     // Range miss: "b" not in tree → should find "c".
-    let mut key  = DatabaseEntry::from_bytes(b"b");
+    let mut key = DatabaseEntry::from_bytes(b"b");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
-    assert_eq!(s, OperationStatus::Success,
-        "SearchRange must find the first key >= 'b'");
-    assert_eq!(key.data(), b"c",
-        "SearchRange on 'b' must return 'c' (the next present key)");
+    assert_eq!(
+        s,
+        OperationStatus::Success,
+        "SearchRange must find the first key >= 'b'"
+    );
+    assert_eq!(
+        key.data(),
+        b"c",
+        "SearchRange on 'b' must return 'c' (the next present key)"
+    );
 
     // Range beyond all keys: "z" → NotFound.
-    let mut key  = DatabaseEntry::from_bytes(b"z");
+    let mut key = DatabaseEntry::from_bytes(b"z");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
-    assert_eq!(s, OperationStatus::NotFound,
-        "SearchRange beyond all keys must return NotFound");
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "SearchRange beyond all keys must return NotFound"
+    );
 
     cursor.close().unwrap();
 }
@@ -2453,12 +2706,15 @@ fn cursor_search_empty_database_returns_not_found() {
     let (_env, db) = open_env_and_db(&dir);
 
     let mut cursor = db.open_cursor(None, None).unwrap();
-    let mut key  = DatabaseEntry::from_bytes(b"anything");
+    let mut key = DatabaseEntry::from_bytes(b"anything");
     let mut data = DatabaseEntry::new();
 
     let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-    assert_eq!(status, OperationStatus::NotFound,
-        "Get::Search on an empty database must return NotFound");
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "Get::Search on an empty database must return NotFound"
+    );
 
     cursor.close().unwrap();
 }
@@ -2470,12 +2726,15 @@ fn cursor_search_range_empty_database_returns_not_found() {
     let (_env, db) = open_env_and_db(&dir);
 
     let mut cursor = db.open_cursor(None, None).unwrap();
-    let mut key  = DatabaseEntry::from_bytes(b"anything");
+    let mut key = DatabaseEntry::from_bytes(b"anything");
     let mut data = DatabaseEntry::new();
 
     let status = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
-    assert_eq!(status, OperationStatus::NotFound,
-        "Get::SearchGte on an empty database must return NotFound");
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "Get::SearchGte on an empty database must return NotFound"
+    );
 
     cursor.close().unwrap();
 }
@@ -2495,9 +2754,12 @@ fn cursor_search_after_tree_splits_all_keys_findable() {
     for i in 0..N {
         let key_bytes = i.to_be_bytes().to_vec();
         let val_bytes = (i * 2).to_be_bytes().to_vec();
-        db.put(None,
-               &DatabaseEntry::from_vec(key_bytes),
-               &DatabaseEntry::from_vec(val_bytes)).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(key_bytes),
+            &DatabaseEntry::from_vec(val_bytes),
+        )
+        .unwrap();
     }
 
     assert_eq!(db.count().unwrap(), N as u64);
@@ -2508,13 +2770,22 @@ fn cursor_search_after_tree_splits_all_keys_findable() {
         let key_bytes = i.to_be_bytes().to_vec();
         let expected_val = (i * 2).to_be_bytes().to_vec();
 
-        let mut key  = DatabaseEntry::from_vec(key_bytes.clone());
+        let mut key = DatabaseEntry::from_vec(key_bytes.clone());
         let mut data = DatabaseEntry::new();
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(status, OperationStatus::Success,
-            "Get::Search must find key {:?} after tree splits", key_bytes);
-        assert_eq!(data.data(), expected_val.as_slice(),
-            "data must match for key {:?}", key_bytes);
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        assert_eq!(
+            status,
+            OperationStatus::Success,
+            "Get::Search must find key {:?} after tree splits",
+            key_bytes
+        );
+        assert_eq!(
+            data.data(),
+            expected_val.as_slice(),
+            "data must match for key {:?}",
+            key_bytes
+        );
     }
 
     cursor.close().unwrap();
@@ -2547,16 +2818,27 @@ fn recovery_committed_records_survive_reopen() {
     // Phase 2: reopen (runs recovery) and verify all N records.
     {
         let (env, db) = open_env_and_db(&dir);
-        assert_eq!(db.count().unwrap(), N as u64,
-            "all committed records must survive reopen");
+        assert_eq!(
+            db.count().unwrap(),
+            N as u64,
+            "all committed records must survive reopen"
+        );
         for i in 0..N {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
             let status = db.get(None, &k, &mut v).unwrap();
-            assert_eq!(status, OperationStatus::Success,
-                "key {} must be present after recovery", i);
-            assert_eq!(v.data(), (i * 3 + 7).to_be_bytes(),
-                "value for key {} must be correct after recovery", i);
+            assert_eq!(
+                status,
+                OperationStatus::Success,
+                "key {} must be present after recovery",
+                i
+            );
+            assert_eq!(
+                v.data(),
+                (i * 3 + 7).to_be_bytes(),
+                "value for key {} must be correct after recovery",
+                i
+            );
         }
         drop(db);
         drop(env);
@@ -2580,21 +2862,29 @@ fn recovery_concurrent_writes_all_survive_reopen() {
     {
         let (env, db) = open_env_and_db(&dir);
         let env = Arc::new(env);
-        let db  = Arc::new(db);
+        let db = Arc::new(db);
 
-        let handles: Vec<_> = (0..THREADS).map(|t| {
-            let db = Arc::clone(&db);
-            thread::spawn(move || {
-                for i in 0..PER_THREAD {
-                    let global_key = (t as u32) * PER_THREAD + i;
-                    let k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
-                    let v = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
-                    db.put(None, &k, &v).unwrap();
-                }
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let db = Arc::clone(&db);
+                thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let global_key = (t as u32) * PER_THREAD + i;
+                        let k = DatabaseEntry::from_vec(
+                            global_key.to_be_bytes().to_vec(),
+                        );
+                        let v = DatabaseEntry::from_vec(
+                            global_key.to_be_bytes().to_vec(),
+                        );
+                        db.put(None, &k, &v).unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         drop(db);
         drop(env);
     }
@@ -2602,26 +2892,45 @@ fn recovery_concurrent_writes_all_survive_reopen() {
     // Phase 2: reopen and verify all THREADS*PER_THREAD records.
     {
         let env_config = noxu_db::EnvironmentConfig::new(dir_path)
-            .with_allow_create(false)  // Must already exist.
+            .with_allow_create(false) // Must already exist.
             .with_transactional(true);
         let env = noxu_db::Environment::open(env_config).unwrap();
         // allow_create=true: the database name is not persisted in the log yet;
         // recovery transplants the recovered tree into the newly opened handle.
-        let db = env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true)).unwrap();
+        let db = env
+            .open_database(
+                None,
+                "test",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
 
         let total = THREADS as u32 * PER_THREAD;
-        assert_eq!(db.count().unwrap(), total as u64,
-            "all {} records from {} threads must survive reopen", total, THREADS);
+        assert_eq!(
+            db.count().unwrap(),
+            total as u64,
+            "all {} records from {} threads must survive reopen",
+            total,
+            THREADS
+        );
 
         for global_key in 0..total {
             let k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
             let status = db.get(None, &k, &mut v).unwrap();
-            assert_eq!(status, OperationStatus::Success,
+            assert_eq!(
+                status,
+                OperationStatus::Success,
                 "key {} (from thread {}) must be present after recovery",
-                global_key, global_key / PER_THREAD);
-            assert_eq!(v.data(), global_key.to_be_bytes(),
-                "value for key {} must be correct (no corruption)", global_key);
+                global_key,
+                global_key / PER_THREAD
+            );
+            assert_eq!(
+                v.data(),
+                global_key.to_be_bytes(),
+                "value for key {} must be correct (no corruption)",
+                global_key
+            );
         }
     }
 }
@@ -2665,24 +2974,36 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
     // Phase 2: reopen and verify only N_COMMITTED records.
     {
         let (_, db) = open_env_and_db(&dir);
-        assert_eq!(db.count().unwrap(), N_COMMITTED as u64,
+        assert_eq!(
+            db.count().unwrap(),
+            N_COMMITTED as u64,
             "only {} committed records must be present; {} uncommitted must be absent",
-            N_COMMITTED, M_UNCOMMITTED);
+            N_COMMITTED,
+            M_UNCOMMITTED
+        );
 
         // Committed records must be present.
         for i in 0..N_COMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            assert_eq!(db.get(None, &k, &mut v).unwrap(), OperationStatus::Success,
-                "committed key {} must be present", i);
+            assert_eq!(
+                db.get(None, &k, &mut v).unwrap(),
+                OperationStatus::Success,
+                "committed key {} must be present",
+                i
+            );
         }
 
         // Uncommitted records must be absent.
         for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            assert_eq!(db.get(None, &k, &mut v).unwrap(), OperationStatus::NotFound,
-                "aborted key {} must NOT be present after recovery", i);
+            assert_eq!(
+                db.get(None, &k, &mut v).unwrap(),
+                OperationStatus::NotFound,
+                "aborted key {} must NOT be present after recovery",
+                i
+            );
         }
     }
 }
@@ -2705,12 +3026,12 @@ fn recovery_multi_db_both_databases_survive_reopen() {
         let env = noxu_db::Environment::open(env_config).unwrap();
         let db_cfg = DatabaseConfig::new().with_allow_create(true);
         let db_alpha = env.open_database(None, "alpha", &db_cfg).unwrap();
-        let db_beta  = env.open_database(None, "beta",  &db_cfg).unwrap();
+        let db_beta = env.open_database(None, "beta", &db_cfg).unwrap();
 
         for i in 0u32..N {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v_alpha = DatabaseEntry::from_vec(b"alpha".to_vec());
-            let v_beta  = DatabaseEntry::from_vec(b"beta".to_vec());
+            let v_beta = DatabaseEntry::from_vec(b"beta".to_vec());
             db_alpha.put(None, &k, &v_alpha).unwrap();
             db_beta.put(None, &k, &v_beta).unwrap();
         }
@@ -2730,7 +3051,7 @@ fn recovery_multi_db_both_databases_survive_reopen() {
         let env = noxu_db::Environment::open(env_config).unwrap();
         let db_cfg = DatabaseConfig::new().with_allow_create(true);
         let db_alpha = env.open_database(None, "alpha", &db_cfg).unwrap();
-        let db_beta  = env.open_database(None, "beta",  &db_cfg).unwrap();
+        let db_beta = env.open_database(None, "beta", &db_cfg).unwrap();
 
         for i in 0u32..N {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
@@ -2739,20 +3060,22 @@ fn recovery_multi_db_both_databases_survive_reopen() {
             assert_eq!(
                 db_alpha.get(None, &k, &mut v).unwrap(),
                 OperationStatus::Success,
-                "alpha: key {} missing after recovery", i
+                "alpha: key {} missing after recovery",
+                i
             );
             assert_eq!(v.data(), b"alpha", "alpha: key {} has wrong value", i);
 
             assert_eq!(
                 db_beta.get(None, &k, &mut v).unwrap(),
                 OperationStatus::Success,
-                "beta: key {} missing after recovery", i
+                "beta: key {} missing after recovery",
+                i
             );
             assert_eq!(v.data(), b"beta", "beta: key {} has wrong value", i);
         }
 
         assert_eq!(db_alpha.count().unwrap(), N as u64, "alpha count mismatch");
-        assert_eq!(db_beta.count().unwrap(),  N as u64, "beta count mismatch");
+        assert_eq!(db_beta.count().unwrap(), N as u64, "beta count mismatch");
     }
 }
 

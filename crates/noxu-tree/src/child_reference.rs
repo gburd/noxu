@@ -255,8 +255,7 @@ mod tests {
     fn test_clone() {
         let key = b"clone_key".to_vec();
         let lsn = Lsn::new(10, 10000);
-        let mut child_ref =
-            ChildReference::new_with_key_and_lsn(key, lsn);
+        let mut child_ref = ChildReference::new_with_key_and_lsn(key, lsn);
         child_ref.set_dirty();
 
         let cloned = child_ref.clone();

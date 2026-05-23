@@ -8,7 +8,7 @@ use crate::LockGrantType;
 /// This is a simple tuple returned by the low-level Lock.lock() method
 /// to indicate whether the lock attempt succeeded and what grant type resulted.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockAttemptResult {
     /// Whether the lock attempt succeeded.

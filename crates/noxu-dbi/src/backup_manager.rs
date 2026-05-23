@@ -18,8 +18,8 @@
 //!
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ pub struct BackupDestination {
 
 /// Manages automatic periodic backup of closed log files.
 ///
-/// 
+///
 pub struct BackupManager {
     /// Whether the backup manager is currently running.
     active: bool,
@@ -54,7 +54,7 @@ pub struct BackupManager {
 impl BackupManager {
     /// Creates a new (stopped) BackupManager.
     ///
-    /// 
+    ///
     pub fn new() -> Self {
         BackupManager {
             active: false,
@@ -67,7 +67,7 @@ impl BackupManager {
 
     /// Starts the background backup thread.
     ///
-    /// 
+    ///
     pub fn start(&mut self, _destination: BackupDestination) {
         let shutdown = Arc::clone(&self.shutdown);
 
@@ -85,7 +85,9 @@ impl BackupManager {
                     // EnvironmentImpl layer. The BackupManager thread framework
                     // is in place here.
 
-                    thread::sleep(Duration::from_secs(DEFAULT_BACKUP_INTERVAL_SEC));
+                    thread::sleep(Duration::from_secs(
+                        DEFAULT_BACKUP_INTERVAL_SEC,
+                    ));
                 }
             })
             .expect("failed to spawn noxu-backup-manager thread");
@@ -96,7 +98,7 @@ impl BackupManager {
 
     /// Returns whether the backup manager is running.
     ///
-    /// 
+    ///
     pub fn is_running(&self) -> bool {
         self.active
     }
@@ -117,7 +119,7 @@ impl BackupManager {
 
     /// Shuts down the background thread.
     ///
-    /// 
+    ///
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -155,9 +157,7 @@ mod tests {
     #[test]
     fn test_start_and_shutdown() {
         let mut mgr = BackupManager::new();
-        mgr.start(BackupDestination {
-            path: PathBuf::from("/tmp"),
-        });
+        mgr.start(BackupDestination { path: PathBuf::from("/tmp") });
         assert!(mgr.is_running());
         mgr.shutdown();
         assert!(!mgr.is_running());

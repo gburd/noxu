@@ -4,8 +4,8 @@
 //! Tracks transaction commit acknowledgments from replicas to determine when
 //! a transaction's durability requirements have been satisfied.
 
-use noxu_sync::Mutex;
 use hashbrown::HashMap;
+use noxu_sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Tracks transaction commit acknowledgments from replicas.

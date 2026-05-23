@@ -4,8 +4,8 @@ use crate::engine_config::EngineConfig;
 use noxu_cleaner::Cleaner;
 use noxu_evictor::{EvictionSource, Evictor};
 use noxu_recovery::Checkpointer;
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -141,7 +141,8 @@ impl DaemonManager {
                 log::info!("Evictor daemon started");
                 while !shutdown.load(Ordering::Relaxed) {
                     // Sleep for the wakeup interval, but return early on shutdown.
-                    let notified = wake.wait_timeout(Duration::from_millis(wakeup_ms));
+                    let notified =
+                        wake.wait_timeout(Duration::from_millis(wakeup_ms));
                     if notified || shutdown.load(Ordering::Relaxed) {
                         break;
                     }
@@ -171,7 +172,8 @@ impl DaemonManager {
                 log::info!("Cleaner daemon started");
                 while !shutdown.load(Ordering::Relaxed) {
                     // Sleep for the wakeup interval, but return early on shutdown.
-                    let notified = wake.wait_timeout(Duration::from_millis(wakeup_ms));
+                    let notified =
+                        wake.wait_timeout(Duration::from_millis(wakeup_ms));
                     if notified || shutdown.load(Ordering::Relaxed) {
                         break;
                     }
@@ -207,7 +209,8 @@ impl DaemonManager {
                 log::info!("Checkpointer daemon started");
                 while !shutdown.load(Ordering::Relaxed) {
                     // Sleep for the wakeup interval, but return early on shutdown.
-                    let notified = wake.wait_timeout(Duration::from_millis(wakeup_ms));
+                    let notified =
+                        wake.wait_timeout(Duration::from_millis(wakeup_ms));
                     if notified || shutdown.load(Ordering::Relaxed) {
                         break;
                     }

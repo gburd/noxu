@@ -200,7 +200,12 @@ pub fn w08_delete_insert(db: &Database, n: usize, value: &[u8]) -> usize {
 ///
 /// Assumes the database has been pre-populated with keys 0..n.
 /// Returns 5*n (3 gets + 2 puts per transaction).
-pub fn w09_txn_multi(env: &Environment, db: &Database, n: usize, value: &[u8]) -> usize {
+pub fn w09_txn_multi(
+    env: &Environment,
+    db: &Database,
+    n: usize,
+    value: &[u8],
+) -> usize {
     let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let txn = env.begin_transaction(None, None).unwrap();

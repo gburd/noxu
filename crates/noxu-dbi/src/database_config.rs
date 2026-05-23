@@ -3,7 +3,7 @@
 
 /// Configuration for a database.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     /// Allow database creation if it doesn't exist.
@@ -22,7 +22,7 @@ pub struct DatabaseConfig {
     pub node_max_entries: i32,
     /// Deferred write: skip WAL logging; flush only at eviction/checkpoint.
     ///
-    /// 
+    ///
     pub deferred_write: bool,
 }
 

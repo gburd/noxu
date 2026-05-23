@@ -13,8 +13,8 @@
 //!   - Retrieve those records back by their auto-assigned IDs
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, OperationStatus,
-    SequenceConfig,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    OperationStatus, SequenceConfig,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,13 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_cache_size(5);
     let rec_seq = db.open_sequence(&rec_seq_key, rec_seq_config)?;
 
-    let items = [
-        "apple",
-        "banana",
-        "cherry",
-        "date",
-        "elderberry",
-    ];
+    let items = ["apple", "banana", "cherry", "date", "elderberry"];
     println!("  Storing {} items with auto-assigned IDs:", items.len());
     let mut assigned_ids: Vec<i64> = Vec::new();
     for item in &items {
@@ -154,7 +148,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\nDemonstrating delta=3 (reserve a block of 3 IDs at once):");
     let block_start = seq.get(None, 3)?;
-    println!("  Reserved IDs: {}, {}, {}", block_start, block_start + 1, block_start + 2);
+    println!(
+        "  Reserved IDs: {}, {}, {}",
+        block_start,
+        block_start + 1,
+        block_start + 2
+    );
     println!("  Next single get:");
     let next_id = seq.get(None, 1)?;
     println!("  id={}", next_id);

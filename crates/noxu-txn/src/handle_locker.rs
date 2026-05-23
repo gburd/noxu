@@ -20,7 +20,7 @@ use crate::{LockResult, LockType, TxnError};
 /// HandleLocker can share locks with another locker (the one used to open
 /// the database) to avoid conflicts during the open operation.
 ///
-/// 
+///
 pub struct HandleLocker {
     /// Unique locker ID.
     id: i64,
@@ -132,7 +132,7 @@ impl Locker for HandleLocker {
     /// HandleLocker shares with its buddy transaction (if any), allowing the
     /// database-open locker and the handle locker to co-own NameLN locks.
     ///
-    /// 
+    ///
     fn shares_locks_with(&self, other_locker_id: i64) -> bool {
         if let Some(buddy_id) = self.share_with_txn_id {
             buddy_id == other_locker_id

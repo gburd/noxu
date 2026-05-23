@@ -6,8 +6,8 @@
 
 use crate::error::{NoxuLogError, Result};
 use crate::file_reader::{FileReader, LogFileAccess};
-use noxu_util::lsn::{Lsn, NULL_LSN};
 use hashbrown::{HashMap, HashSet};
+use noxu_util::lsn::{Lsn, NULL_LSN};
 
 /// Tracks the last occurrence of specific log entry types.
 ///

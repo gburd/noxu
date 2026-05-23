@@ -73,7 +73,7 @@ impl FileSummaryLnEntry {
         8 + // total_size
         8 + // obsolete_count
         8 + // obsolete_size
-        1   // obsolete_size_counted (bool as u8)
+        1 // obsolete_size_counted (bool as u8)
     }
 
     /// Writes this entry to a buffer.

@@ -53,16 +53,16 @@ pub enum Durability {
     /// Flush and fsync before returning from commit.  Guarantees data is on
     /// durable storage.  This is the default.
     ///
-    /// 
+    ///
     CommitSync,
     /// Flush write buffers (OS page cache) but do not fsync.  Data survives
     /// process crash but not OS/power failure.
     ///
-    /// 
+    ///
     CommitWriteNoSync,
     /// Do not flush or fsync.  Fastest; data may be lost on crash.
     ///
-    /// 
+    ///
     CommitNoSync,
 }
 
@@ -76,7 +76,7 @@ const IMPORTUNATE: u8 = 8;
 /// This class must support multi-threaded use. A single Txn can be used
 /// by multiple threads via cursor operations.
 ///
-/// 
+///
 pub struct Txn {
     /// Transaction ID.
     id: i64,
@@ -159,14 +159,14 @@ pub struct Txn {
     /// Used by replication (`MasterTxn`) to pre-register the commit in VLSN
     /// tracking before it becomes durable.
     ///
-    /// 
+    ///
     pre_commit_hook: Option<Box<dyn Fn() + Send + Sync>>,
 
     /// Hook called immediately after the TxnCommit log entry is written.
     ///
     /// Used by replication to queue the commit LSN for ACK tracking.
     ///
-    /// 
+    ///
     post_commit_hook: Option<Box<dyn Fn(Lsn) + Send + Sync>>,
 
     /// Optional group-commit handler (Master or Replica).
@@ -262,12 +262,15 @@ impl Txn {
 
     /// Commits with an explicit durability policy.
     ///
-    /// 
+    ///
     ///
     /// - `CommitSync` (default): flush and fsync before returning.
     /// - `CommitWriteNoSync`: write to OS page cache but don't fsync.
     /// - `CommitNoSync`: don't flush; fastest but least durable.
-    pub fn commit_with_durability(&mut self, durability: Durability) -> Result<Lsn, TxnError> {
+    pub fn commit_with_durability(
+        &mut self,
+        durability: Durability,
+    ) -> Result<Lsn, TxnError> {
         self.check_state()?;
         if self.has_open_cursors() {
             return Err(TxnError::InvalidTransaction {
@@ -291,7 +294,8 @@ impl Txn {
             // here so that group commit can decide whether to coalesce it.
             // Txn.commit() writes the entry then calls flushTo(commitLsn)
             // separately, which is how GroupCommit intercepts the fsync.
-            let commit_lsn = self.log_entry(LogEntryType::TxnCommit, &payload, false)?;
+            let commit_lsn =
+                self.log_entry(LogEntryType::TxnCommit, &payload, false)?;
 
             if let Some(ref hook) = self.post_commit_hook {
                 hook(commit_lsn);
@@ -325,8 +329,7 @@ impl Txn {
             } else if matches!(durability, Durability::CommitWriteNoSync)
                 && let Some(ref lm) = self.log_manager
             {
-                lm.flush_no_sync()
-                    .map_err(TxnError::LogError)?;
+                lm.flush_no_sync().map_err(TxnError::LogError)?;
             }
             // CommitNoSync: neither flush nor fsync.
 
@@ -375,7 +378,7 @@ impl Txn {
     /// After this call the transaction can only be aborted; any further
     /// operation attempt except abort() will return an error.
     ///
-    /// 
+    ///
     pub fn set_only_abortable(&mut self) {
         if self.state == TxnState::Open {
             self.state = TxnState::MustAbort;
@@ -499,13 +502,8 @@ impl Txn {
                 //   NO_SYNC (default) -> flush_required=false, fsync_required=false
                 // We default to SYNC (safest) and expose `fsync` to callers.
                 let flush = true; // always at least flush on commit (fsync implies flush)
-                let lsn = lm.log(
-                    entry_type,
-                    payload,
-                    Provisional::No,
-                    flush,
-                    fsync,
-                )?;
+                let lsn =
+                    lm.log(entry_type, payload, Provisional::No, flush, fsync)?;
                 Ok(lsn)
             }
         }
@@ -513,7 +511,7 @@ impl Txn {
 
     /// Returns true if there are open cursors on this transaction.
     ///
-    /// 
+    ///
     pub fn has_open_cursors(&self) -> bool {
         self.cursor_count.load(Ordering::Relaxed) > 0
     }
@@ -565,14 +563,22 @@ impl Txn {
                 hook();
             }
 
-            let commit =
-                TxnCommit::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
+            let commit = TxnCommit::new(
+                self.id,
+                self.last_lsn,
+                0, /* master_id */
+                0, /* dtvlsn */
+            );
             let mut payload = Vec::with_capacity(commit.log_size());
             commit.write_to_log(&mut payload);
 
             // Write the TxnCommit entry without fsync; we decide below
             // whether to fsync based on the GroupCommit handler.
-            let commit_lsn = self.log_entry(LogEntryType::TxnCommit, &payload, false /* fsync deferred */)?;
+            let commit_lsn = self.log_entry(
+                LogEntryType::TxnCommit,
+                &payload,
+                false, /* fsync deferred */
+            )?;
 
             // Post-commit hook (the: postLogCommitHook).
             if let Some(ref hook) = self.post_commit_hook {
@@ -586,8 +592,7 @@ impl Txn {
                 _ => false,
             };
             if !should_skip_fsync && let Some(ref lm) = self.log_manager {
-                lm.flush_sync()
-                    .map_err(TxnError::LogError)?;
+                lm.flush_sync().map_err(TxnError::LogError)?;
             }
 
             commit_lsn
@@ -651,11 +656,19 @@ impl Txn {
         // SyncPolicy.SYNC), or logManager.log() otherwise.  We write with
         // fsync=false (NO_SYNC default for aborts) to match default.
         let assigned_lsn = if self.has_logged_entries() {
-            let abort =
-                TxnAbort::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
+            let abort = TxnAbort::new(
+                self.id,
+                self.last_lsn,
+                0, /* master_id */
+                0, /* dtvlsn */
+            );
             let mut payload = Vec::with_capacity(abort.log_size());
             abort.write_to_log(&mut payload);
-            self.log_entry(LogEntryType::TxnAbort, &payload, false /* fsync */)?
+            self.log_entry(
+                LogEntryType::TxnAbort,
+                &payload,
+                false, /* fsync */
+            )?
         } else {
             NULL_LSN
         };
@@ -714,11 +727,19 @@ impl Txn {
         self.state = TxnState::Aborted;
 
         let assigned_lsn = if self.has_logged_entries() {
-            let abort =
-                TxnAbort::new(self.id, self.last_lsn, 0 /* master_id */, 0 /* dtvlsn */);
+            let abort = TxnAbort::new(
+                self.id,
+                self.last_lsn,
+                0, /* master_id */
+                0, /* dtvlsn */
+            );
             let mut payload = Vec::with_capacity(abort.log_size());
             abort.write_to_log(&mut payload);
-            self.log_entry(LogEntryType::TxnAbort, &payload, false /* fsync */)?
+            self.log_entry(
+                LogEntryType::TxnAbort,
+                &payload,
+                false, /* fsync */
+            )?
         } else {
             NULL_LSN
         };
@@ -816,11 +837,17 @@ impl Txn {
     /// 3. Acquires a write lock on `new_lsn` at the `LockManager` level.
     /// 4. Moves the `WriteLockInfo` into `write_locks[new_lsn]`.
     ///
-    /// 
+    ///
     pub fn move_write_lock_to_new_lsn(&mut self, old_lsn: u64, new_lsn: u64) {
         if let Some(wli) = self.write_locks.remove(&old_lsn) {
             let _ = self.lock_manager.release(old_lsn, self.id);
-            let _ = self.lock_manager.lock(new_lsn, self.id, LockType::Write, false, false);
+            let _ = self.lock_manager.lock(
+                new_lsn,
+                self.id,
+                LockType::Write,
+                false,
+                false,
+            );
             self.write_locks.insert(new_lsn, wli);
         }
     }
@@ -846,7 +873,16 @@ impl Txn {
         if let Some(wli) = self.write_locks.get_mut(&lsn)
             && wli.never_locked
         {
-            wli.set_abort_info(abort_lsn, abort_key, abort_data, -1, 0, abort_known_deleted, 0, false);
+            wli.set_abort_info(
+                abort_lsn,
+                abort_key,
+                abort_data,
+                -1,
+                0,
+                abort_known_deleted,
+                0,
+                false,
+            );
             wli.never_locked = false;
             wli.database_id = database_id;
         }
@@ -1000,12 +1036,24 @@ impl Locker for Txn {
         // If we hold a write lock on old_lsn, migrate it to new_lsn.
         if let Some(wli) = self.write_locks.remove(&old_lsn) {
             let _ = self.lock_manager.release(old_lsn, self.id);
-            let _ = self.lock_manager.lock(new_lsn, self.id, LockType::Write, false, false);
+            let _ = self.lock_manager.lock(
+                new_lsn,
+                self.id,
+                LockType::Write,
+                false,
+                false,
+            );
             self.write_locks.insert(new_lsn, wli);
         } else if self.read_locks.remove(&old_lsn) {
             // Migrate read lock.
             let _ = self.lock_manager.release(old_lsn, self.id);
-            let _ = self.lock_manager.lock(new_lsn, self.id, LockType::Read, false, false);
+            let _ = self.lock_manager.lock(
+                new_lsn,
+                self.id,
+                LockType::Read,
+                false,
+                false,
+            );
             self.read_locks.insert(new_lsn);
         }
         Ok(())
@@ -1166,7 +1214,7 @@ mod tests {
     #[test]
     fn test_operations_on_aborted_fail() {
         let mut txn = create_test_txn();
-        txn.abort().unwrap();  // returns Lsn
+        txn.abort().unwrap(); // returns Lsn
 
         let result = txn.lock(100, LockType::Write, false);
         assert!(result.is_err());

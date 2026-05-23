@@ -3,7 +3,7 @@
 
 /// States of the environment lifecycle.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvState {
     /// Environment is being initialized.

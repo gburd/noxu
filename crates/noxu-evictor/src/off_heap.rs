@@ -195,11 +195,7 @@ impl OffHeapCache {
             None
         };
         let actually_enabled = store.is_some();
-        Self {
-            enabled: actually_enabled,
-            max_bytes,
-            inner: Mutex::new(store),
-        }
+        Self { enabled: actually_enabled, max_bytes, inner: Mutex::new(store) }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -539,7 +535,7 @@ mod tests {
         assert!(cache.store_node(2, vec![0u8; 8]));
         // Node 3 is 8 bytes; total would be 24 > 20, so LRU (node 1) is evicted.
         assert!(cache.store_node(3, vec![0u8; 8]));
-        assert_eq!(cache.len(), 2);         // nodes 2 and 3
+        assert_eq!(cache.len(), 2); // nodes 2 and 3
         assert_eq!(cache.used_bytes(), 16); // 8 + 8
         assert!(cache.load_node(1).is_none());
         assert!(cache.load_node(2).is_some());

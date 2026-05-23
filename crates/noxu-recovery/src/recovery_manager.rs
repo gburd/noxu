@@ -35,8 +35,8 @@ use crate::error::Result;
 use crate::log_scanner::{LnOperation, LnRecord, LogEntry, LogScanner};
 use crate::recovery_info::RecoveryInfo;
 use crate::rollback_tracker::RollbackTracker;
-use noxu_util::{Lsn, NULL_LSN};
 use hashbrown::HashMap;
+use noxu_util::{Lsn, NULL_LSN};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -46,7 +46,7 @@ use std::thread;
 
 /// Recovery progress stages.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecoveryProgress {
     /// Finding the last valid entry in the log.
@@ -159,7 +159,7 @@ pub struct RecoveryStats {
 
 /// Performs 3-phase recovery when an Environment is opened.
 ///
-/// 
+///
 ///
 /// The manager is generic over a `LogScanner` implementation so that the real
 /// log-reading path and in-memory test fixtures share the same logic.
@@ -424,7 +424,8 @@ impl RecoveryManager {
         // Auto-insert trees for any db_id encountered in the redo entries.
         // DbTree.dbIdToDb is populated during analysis.
         for (_lsn, rec) in &self.redo_entries {
-            trees.entry(rec.db_id)
+            trees
+                .entry(rec.db_id)
                 .or_insert_with(|| noxu_tree::Tree::new(rec.db_id, 256));
         }
 
@@ -463,7 +464,8 @@ impl RecoveryManager {
 
         for (lsn, rec) in &redo_entries {
             self.stats.lns_read_redo += 1;
-            let action = self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
+            let action =
+                self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
             if let RedoAction::Apply = action {
                 if let Some(t) = trees.get_mut(&rec.db_id) {
                     Self::redo_ln(t, rec, *lsn);
@@ -522,20 +524,33 @@ impl RecoveryManager {
                             if rec.abort_known_deleted {
                                 t.delete(&rec.key);
                             } else if let Some(abort_data) = &rec.abort_data {
-                                let key = rec.abort_key
+                                let key = rec
+                                    .abort_key
                                     .clone()
                                     .unwrap_or_else(|| rec.key.clone())
                                     .to_vec();
-                                let _ = t.insert(key, abort_data.to_vec(), *abort_lsn);
+                                let _ = t.insert(
+                                    key,
+                                    abort_data.to_vec(),
+                                    *abort_lsn,
+                                );
                             } else {
                                 // Non-embedded: read before-image from log.
-                                let before_image = scanner.read_at_lsn(*abort_lsn);
-                                if let Some(LogEntry::Ln(before_rec)) = before_image {
+                                let before_image =
+                                    scanner.read_at_lsn(*abort_lsn);
+                                if let Some(LogEntry::Ln(before_rec)) =
+                                    before_image
+                                {
                                     if let Some(before_data) = before_rec.data {
-                                        let key = before_rec.abort_key
+                                        let key = before_rec
+                                            .abort_key
                                             .unwrap_or(before_rec.key)
                                             .to_vec();
-                                        let _ = t.insert(key, before_data.to_vec(), *abort_lsn);
+                                        let _ = t.insert(
+                                            key,
+                                            before_data.to_vec(),
+                                            *abort_lsn,
+                                        );
                                     } else {
                                         t.delete(&rec.key);
                                     }
@@ -622,7 +637,8 @@ impl RecoveryManager {
                     }
                 }
                 LogEntry::CkptStart(_)
-                    if partial_start_lsn == NULL_LSN && ckpt_end_lsn != NULL_LSN =>
+                    if partial_start_lsn == NULL_LSN
+                        && ckpt_end_lsn != NULL_LSN =>
                 {
                     // First CkptStart after the last CkptEnd is the partial one.
                     partial_start_lsn = pe.lsn;
@@ -843,7 +859,7 @@ impl RecoveryManager {
     /// - **LN in an aborted txn**: skip.
     /// - **LN in an active (uncommitted) txn**: skip (will be undone).
     ///
-    /// 
+    ///
     fn run_redo(
         &mut self,
         _scanner: &dyn LogScanner,
@@ -913,12 +929,8 @@ impl RecoveryManager {
         for (lsn, rec) in &redo_entries {
             self.stats.lns_read_redo += 1;
 
-            let action = self.eligible_for_redo(
-                *lsn,
-                rec,
-                ckpt_start,
-                analysis,
-            );
+            let action =
+                self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
 
             if let RedoAction::Apply = action {
                 // RecoveryManager.redoOneLN / redo().
@@ -974,7 +986,8 @@ impl RecoveryManager {
                 // still safe here because recovery runs before any new
                 // transactions are admitted.
                 // Materialise Bytes → Vec<u8> at the tree boundary.
-                let data = rec.data.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
+                let data =
+                    rec.data.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
                 let _ = tree.insert(rec.key.to_vec(), data, lsn);
             }
             LnOperation::Delete => {
@@ -988,7 +1001,7 @@ impl RecoveryManager {
 
     /// Decide whether an LN should be redone.
     ///
-    /// 
+    ///
     ///
     /// Categories (from comments):
     /// - LNs from committed txns between ckpt start and end of log → redo.
@@ -1017,8 +1030,7 @@ impl RecoveryManager {
         //
         // AfterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
         //           DbLsn.compareTo(reader.getLastLsn(), checkpointStartLsn) >= 0)
-        let after_ckpt_start =
-            ckpt_start == NULL_LSN || lsn >= ckpt_start;
+        let after_ckpt_start = ckpt_start == NULL_LSN || lsn >= ckpt_start;
 
         match rec.txn_id {
             None => {
@@ -1156,43 +1168,57 @@ impl RecoveryManager {
                         //      `fetchTarget(db, bin, idx, abortLsn, ...)` for
                         //      this case.  We call scanner.read_at_lsn().
                         if let Some(t) = tree.as_deref_mut()
-                            && t.get_database_id() == rec.db_id {
-                                if rec.abort_known_deleted {
-                                    // Before this write the slot was deleted.
-                                    t.delete(&rec.key);
-                                } else if let Some(abort_data) = &rec.abort_data {
-                                    // Embedded before-image: re-insert prior value.
-                                    let key = rec.abort_key
-                                        .clone()
-                                        .unwrap_or_else(|| rec.key.clone())
-                                        .to_vec();
-                                    let _ = t.insert(key, abort_data.to_vec(), *abort_lsn);
-                                } else {
-                                    // Non-embedded LN: fetch before-image from log.
-                                    //
-                                    // `fetchTarget(db, bin, idx, abortLsn)`:
-                                    // read the LN at abort_lsn and apply its key/data.
-                                    // If the log read fails (e.g. the file was cleaned
-                                    // away), fall back to deleting the slot — a safe
-                                    // conservative action that avoids exposing a stale
-                                    // value.
-                                    let before_image = scanner.read_at_lsn(*abort_lsn);
-                                    if let Some(LogEntry::Ln(before_rec)) = before_image {
-                                        if let Some(before_data) = before_rec.data {
-                                            let key = before_rec.abort_key
-                                                .unwrap_or(before_rec.key)
-                                                .to_vec();
-                                            let _ = t.insert(key, before_data.to_vec(), *abort_lsn);
-                                        } else {
-                                            // Before-image was itself a delete.
-                                            t.delete(&rec.key);
-                                        }
+                            && t.get_database_id() == rec.db_id
+                        {
+                            if rec.abort_known_deleted {
+                                // Before this write the slot was deleted.
+                                t.delete(&rec.key);
+                            } else if let Some(abort_data) = &rec.abort_data {
+                                // Embedded before-image: re-insert prior value.
+                                let key = rec
+                                    .abort_key
+                                    .clone()
+                                    .unwrap_or_else(|| rec.key.clone())
+                                    .to_vec();
+                                let _ = t.insert(
+                                    key,
+                                    abort_data.to_vec(),
+                                    *abort_lsn,
+                                );
+                            } else {
+                                // Non-embedded LN: fetch before-image from log.
+                                //
+                                // `fetchTarget(db, bin, idx, abortLsn)`:
+                                // read the LN at abort_lsn and apply its key/data.
+                                // If the log read fails (e.g. the file was cleaned
+                                // away), fall back to deleting the slot — a safe
+                                // conservative action that avoids exposing a stale
+                                // value.
+                                let before_image =
+                                    scanner.read_at_lsn(*abort_lsn);
+                                if let Some(LogEntry::Ln(before_rec)) =
+                                    before_image
+                                {
+                                    if let Some(before_data) = before_rec.data {
+                                        let key = before_rec
+                                            .abort_key
+                                            .unwrap_or(before_rec.key)
+                                            .to_vec();
+                                        let _ = t.insert(
+                                            key,
+                                            before_data.to_vec(),
+                                            *abort_lsn,
+                                        );
                                     } else {
-                                        // Before-image unavailable (log cleaned).
+                                        // Before-image was itself a delete.
                                         t.delete(&rec.key);
                                     }
+                                } else {
+                                    // Before-image unavailable (log cleaned).
+                                    t.delete(&rec.key);
                                 }
                             }
+                        }
                         self.stats.lns_undone += 1;
                         self.stats.active_txns_undone += 1;
                     }
@@ -1262,13 +1288,13 @@ impl Default for RecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::dirty_in_map::CheckpointReference;
     use crate::log_scanner::{
         CkptEndRecord, CkptStartRecord, DbTreeRecord, InMemoryLogScanner,
-        InRecord, LnRecord, LnOperation, LogEntry, RollbackEndRecord,
+        InRecord, LnOperation, LnRecord, LogEntry, RollbackEndRecord,
         RollbackStartRecord, TxnAbortRecord, TxnCommitRecord,
     };
+    use bytes::Bytes;
 
     // ------------------------------------------------------------------ helpers
 
@@ -1316,7 +1342,14 @@ mod tests {
         level: i32,
         is_root: bool,
     ) -> InRecord {
-        InRecord { db_id, node_id, level, is_root, is_delta: false, node_data: None }
+        InRecord {
+            db_id,
+            node_id,
+            level,
+            is_root,
+            is_delta: false,
+            node_data: None,
+        }
     }
 
     // ------------------------------------------------------------------ RecoveryProgress
@@ -1351,7 +1384,11 @@ mod tests {
         ];
         for stage in stages {
             let desc = stage.description();
-            assert!(!desc.is_empty(), "stage {:?} has empty description", stage);
+            assert!(
+                !desc.is_empty(),
+                "stage {:?} has empty description",
+                stage
+            );
         }
     }
 
@@ -1453,13 +1490,13 @@ mod tests {
         // CkptStart
         scanner.push(
             lsn(0, 50),
-            LogEntry::CkptStart(CkptStartRecord {
-                id: 1,
-                lsn: lsn(0, 50),
-            }),
+            LogEntry::CkptStart(CkptStartRecord { id: 1, lsn: lsn(0, 50) }),
         );
         // DbTree root
-        scanner.push(lsn(0, 60), LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 60) }));
+        scanner.push(
+            lsn(0, 60),
+            LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 60) }),
+        );
         // CkptEnd
         scanner.push(
             lsn(0, 200),
@@ -1490,7 +1527,10 @@ mod tests {
     fn test_find_last_checkpoint_no_ckpt_end() {
         let mut scanner = InMemoryLogScanner::new();
         // Only a DbTree, no checkpoint
-        scanner.push(lsn(0, 10), LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 10) }));
+        scanner.push(
+            lsn(0, 10),
+            LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 10) }),
+        );
         scanner.push(
             lsn(0, 100),
             LogEntry::TxnCommit(TxnCommitRecord {
@@ -1514,8 +1554,10 @@ mod tests {
         let mut scanner = InMemoryLogScanner::new();
 
         // Two INs (BINs at level 0)
-        scanner.push(lsn(0, 100), LogEntry::In(make_in_record(1, 10, 0, false)));
-        scanner.push(lsn(0, 200), LogEntry::In(make_in_record(1, 20, 0, false)));
+        scanner
+            .push(lsn(0, 100), LogEntry::In(make_in_record(1, 10, 0, false)));
+        scanner
+            .push(lsn(0, 200), LogEntry::In(make_in_record(1, 20, 0, false)));
         // One upper IN at level 1
         scanner.push(lsn(0, 300), LogEntry::In(make_in_record(1, 30, 1, true)));
         scanner.push(
@@ -1761,15 +1803,28 @@ mod tests {
         let mut scanner = InMemoryLogScanner::new();
 
         // txn 1 LN + commit
-        scanner.push(lsn(0, 10), LogEntry::Ln(make_insert(1, Some(1), b"k1", NULL_LSN)));
-        scanner.push(lsn(0, 20), LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }));
+        scanner.push(
+            lsn(0, 10),
+            LogEntry::Ln(make_insert(1, Some(1), b"k1", NULL_LSN)),
+        );
+        scanner.push(
+            lsn(0, 20),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+        );
 
         // txn 2 LN + abort
-        scanner.push(lsn(0, 30), LogEntry::Ln(make_insert(1, Some(2), b"k2", NULL_LSN)));
-        scanner.push(lsn(0, 40), LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2 }));
+        scanner.push(
+            lsn(0, 30),
+            LogEntry::Ln(make_insert(1, Some(2), b"k2", NULL_LSN)),
+        );
+        scanner
+            .push(lsn(0, 40), LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2 }));
 
         // txn 3 LN — no commit/abort (active at crash)
-        scanner.push(lsn(0, 50), LogEntry::Ln(make_insert(1, Some(3), b"k3", NULL_LSN)));
+        scanner.push(
+            lsn(0, 50),
+            LogEntry::Ln(make_insert(1, Some(3), b"k3", NULL_LSN)),
+        );
 
         let mut mgr = RecoveryManager::new();
         let _info = mgr.recover(&mut scanner, None, false).unwrap();
@@ -1811,34 +1866,46 @@ mod tests {
         let mut scanner = InMemoryLogScanner::new();
 
         // First complete checkpoint
-        scanner.push(lsn(0, 10), LogEntry::CkptStart(CkptStartRecord { id: 1, lsn: lsn(0, 10) }));
-        scanner.push(lsn(0, 100), LogEntry::CkptEnd(CkptEndRecord {
-            id: 1,
-            checkpoint_start_lsn: lsn(0, 10),
-            first_active_lsn: lsn(0, 5),
-            root_lsn: lsn(0, 20),
-            last_local_node_id: 5,
-            last_replicated_node_id: -1,
-            last_local_db_id: 1,
-            last_replicated_db_id: -1,
-            last_local_txn_id: 3,
-            last_replicated_txn_id: -1,
-        }));
+        scanner.push(
+            lsn(0, 10),
+            LogEntry::CkptStart(CkptStartRecord { id: 1, lsn: lsn(0, 10) }),
+        );
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::CkptEnd(CkptEndRecord {
+                id: 1,
+                checkpoint_start_lsn: lsn(0, 10),
+                first_active_lsn: lsn(0, 5),
+                root_lsn: lsn(0, 20),
+                last_local_node_id: 5,
+                last_replicated_node_id: -1,
+                last_local_db_id: 1,
+                last_replicated_db_id: -1,
+                last_local_txn_id: 3,
+                last_replicated_txn_id: -1,
+            }),
+        );
 
         // Second (later) complete checkpoint
-        scanner.push(lsn(0, 200), LogEntry::CkptStart(CkptStartRecord { id: 2, lsn: lsn(0, 200) }));
-        scanner.push(lsn(0, 500), LogEntry::CkptEnd(CkptEndRecord {
-            id: 2,
-            checkpoint_start_lsn: lsn(0, 200),
-            first_active_lsn: lsn(0, 150),
-            root_lsn: lsn(0, 250),
-            last_local_node_id: 20,
-            last_replicated_node_id: -1,
-            last_local_db_id: 3,
-            last_replicated_db_id: -1,
-            last_local_txn_id: 10,
-            last_replicated_txn_id: -1,
-        }));
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::CkptStart(CkptStartRecord { id: 2, lsn: lsn(0, 200) }),
+        );
+        scanner.push(
+            lsn(0, 500),
+            LogEntry::CkptEnd(CkptEndRecord {
+                id: 2,
+                checkpoint_start_lsn: lsn(0, 200),
+                first_active_lsn: lsn(0, 150),
+                root_lsn: lsn(0, 250),
+                last_local_node_id: 20,
+                last_replicated_node_id: -1,
+                last_local_db_id: 3,
+                last_replicated_db_id: -1,
+                last_local_txn_id: 10,
+                last_replicated_txn_id: -1,
+            }),
+        );
 
         let mut mgr = RecoveryManager::new();
         let info = mgr.recover(&mut scanner, None, true).unwrap();
@@ -1912,7 +1979,10 @@ mod tests {
         scanner.push(lsn(0, 100), LogEntry::Ln(ln));
         scanner.push(
             lsn(0, 200),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 200) }),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 1,
+                lsn: lsn(0, 200),
+            }),
         );
 
         let mut mgr = RecoveryManager::new();
@@ -2142,7 +2212,10 @@ mod tests {
         mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
 
         // After undo: key must be removed.
-        let found = tree.search(b"delta").map(|r| r.exact_parent_found).unwrap_or(false);
+        let found = tree
+            .search(b"delta")
+            .map(|r| r.exact_parent_found)
+            .unwrap_or(false);
         assert!(!found, "undo must remove the uncommitted insert");
 
         // Verify stats
@@ -2180,7 +2253,10 @@ mod tests {
         let mut mgr = RecoveryManager::new();
         mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
 
-        let found = tree.search(b"epsilon").map(|r| r.exact_parent_found).unwrap_or(false);
+        let found = tree
+            .search(b"epsilon")
+            .map(|r| r.exact_parent_found)
+            .unwrap_or(false);
         assert!(!found, "committed delete must remove the key from the tree");
         assert_eq!(mgr.get_stats().lns_redone, 1);
     }
@@ -2209,7 +2285,11 @@ mod tests {
 
         // All 3 redone, zero scanned for undo (fast path).
         assert_eq!(mgr.get_stats().lns_redone, 3);
-        assert_eq!(mgr.get_stats().lns_read_undo, 0, "undo pass must be skipped when no active txns");
+        assert_eq!(
+            mgr.get_stats().lns_read_undo,
+            0,
+            "undo pass must be skipped when no active txns"
+        );
     }
 
     /// Multiple keys: committed inserts visible, uncommitted insert absent.
@@ -2220,8 +2300,13 @@ mod tests {
         scanner.push(
             lsn(0, 10),
             LogEntry::Ln(LnRecord::new(
-                1, Some(1), LnOperation::Insert,
-                Bytes::from_static(b"key1"), Some(Bytes::from_static(b"v1")), NULL_LSN, false,
+                1,
+                Some(1),
+                LnOperation::Insert,
+                Bytes::from_static(b"key1"),
+                Some(Bytes::from_static(b"v1")),
+                NULL_LSN,
+                false,
             )),
         );
         scanner.push(
@@ -2232,8 +2317,13 @@ mod tests {
         scanner.push(
             lsn(0, 30),
             LogEntry::Ln(LnRecord::new(
-                1, Some(2), LnOperation::Insert,
-                Bytes::from_static(b"key2"), Some(Bytes::from_static(b"v2")), NULL_LSN, false,
+                1,
+                Some(2),
+                LnOperation::Insert,
+                Bytes::from_static(b"key2"),
+                Some(Bytes::from_static(b"v2")),
+                NULL_LSN,
+                false,
             )),
         );
 
@@ -2248,7 +2338,10 @@ mod tests {
         );
         // key2: uncommitted → must NOT be in tree
         assert!(
-            !tree.search(b"key2").map(|r| r.exact_parent_found).unwrap_or(false),
+            !tree
+                .search(b"key2")
+                .map(|r| r.exact_parent_found)
+                .unwrap_or(false),
             "uncommitted key2 must not be in tree"
         );
     }

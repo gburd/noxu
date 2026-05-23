@@ -10,7 +10,7 @@ use noxu_db::Database;
 
 /// A list-like view of a database.
 ///
-/// 
+///
 ///
 /// Elements are stored with their zero-based index encoded as a big-endian
 /// 8-byte key so that iteration order matches insertion order and keys
@@ -244,7 +244,7 @@ mod tests {
         // no re-indexing / compaction.  Gaps remain at the removed index.
         // StoredContainer.removeKey() is a cursor delete only.
         assert_eq!(list.get(0).unwrap(), Some(b"alpha".to_vec()));
-        assert_eq!(list.get(1).unwrap(), None);   // gap — not compacted
+        assert_eq!(list.get(1).unwrap(), None); // gap — not compacted
         assert_eq!(list.get(2).unwrap(), Some(b"gamma".to_vec()));
         assert_eq!(list.len().unwrap(), 2);
     }

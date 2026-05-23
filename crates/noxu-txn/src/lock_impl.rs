@@ -22,7 +22,7 @@ use crate::{
 /// firstWaiter are used for the first owner or waiter of the lock, and the
 /// corresponding collection is instantiated and used only if more owners arrive.
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct LockImpl {
     /// First owner (optimization for single-owner case).
@@ -599,7 +599,8 @@ impl LockImpl {
                             if w.lock_type != LockType::Restart
                                 && locker_id != w.locker_id
                             {
-                                let conflict = w.lock_type.get_conflict(request_type);
+                                let conflict =
+                                    w.lock_type.get_conflict(request_type);
                                 if conflict == LockConflict::Restart {
                                     grant = LockGrantType::WaitRestart;
                                     break;
@@ -741,7 +742,8 @@ impl LockImpl {
                             // They share — act as if this owner does not exist
                             // for conflict purposes.
                         } else {
-                            let conflict = owner_type.get_conflict(request_type);
+                            let conflict =
+                                owner_type.get_conflict(request_type);
                             if conflict == LockConflict::Restart {
                                 return LockGrantType::WaitRestart;
                             } else {
@@ -1106,13 +1108,25 @@ mod tests {
     fn test_je_two_readers_then_write_promotion_waits() {
         let mut lock = LockImpl::new();
         // txn1 read
-        assert_eq!(lock.lock(LockType::Read, 1, false, false).grant_type, LockGrantType::New);
+        assert_eq!(
+            lock.lock(LockType::Read, 1, false, false).grant_type,
+            LockGrantType::New
+        );
         // txn2 read
-        assert_eq!(lock.lock(LockType::Read, 2, false, false).grant_type, LockGrantType::New);
+        assert_eq!(
+            lock.lock(LockType::Read, 2, false, false).grant_type,
+            LockGrantType::New
+        );
         // txn1 requests write — conflict with txn2's read → WAIT_PROMOTION
-        assert_eq!(lock.lock(LockType::Write, 1, false, false).grant_type, LockGrantType::WaitPromotion);
+        assert_eq!(
+            lock.lock(LockType::Write, 1, false, false).grant_type,
+            LockGrantType::WaitPromotion
+        );
         // txn2 requests write — conflict with txn1's read → WAIT_PROMOTION
-        assert_eq!(lock.lock(LockType::Write, 2, false, false).grant_type, LockGrantType::WaitPromotion);
+        assert_eq!(
+            lock.lock(LockType::Write, 2, false, false).grant_type,
+            LockGrantType::WaitPromotion
+        );
         assert_eq!(lock.n_owners(), 2);
         assert_eq!(lock.n_waiters(), 2);
     }
@@ -1153,8 +1167,14 @@ mod tests {
     #[test]
     fn test_je_write_then_read_existing() {
         let mut lock = LockImpl::new();
-        assert_eq!(lock.lock(LockType::Write, 1, false, false).grant_type, LockGrantType::New);
-        assert_eq!(lock.lock(LockType::Read, 1, false, false).grant_type, LockGrantType::Existing);
+        assert_eq!(
+            lock.lock(LockType::Write, 1, false, false).grant_type,
+            LockGrantType::New
+        );
+        assert_eq!(
+            lock.lock(LockType::Read, 1, false, false).grant_type,
+            LockGrantType::Existing
+        );
         assert_eq!(lock.n_owners(), 1);
         assert_eq!(lock.n_waiters(), 0);
         lock.release(1);
@@ -1165,8 +1185,14 @@ mod tests {
     #[test]
     fn test_je_read_then_write_promotion() {
         let mut lock = LockImpl::new();
-        assert_eq!(lock.lock(LockType::Read, 1, false, false).grant_type, LockGrantType::New);
-        assert_eq!(lock.lock(LockType::Write, 1, false, false).grant_type, LockGrantType::Promotion);
+        assert_eq!(
+            lock.lock(LockType::Read, 1, false, false).grant_type,
+            LockGrantType::New
+        );
+        assert_eq!(
+            lock.lock(LockType::Write, 1, false, false).grant_type,
+            LockGrantType::Promotion
+        );
         assert_eq!(lock.n_owners(), 1);
         assert_eq!(lock.n_waiters(), 0);
         lock.release(1);
@@ -1190,8 +1216,14 @@ mod tests {
     #[test]
     fn test_je_double_write_existing() {
         let mut lock = LockImpl::new();
-        assert_eq!(lock.lock(LockType::Write, 1, false, false).grant_type, LockGrantType::New);
-        assert_eq!(lock.lock(LockType::Write, 1, false, false).grant_type, LockGrantType::Existing);
+        assert_eq!(
+            lock.lock(LockType::Write, 1, false, false).grant_type,
+            LockGrantType::New
+        );
+        assert_eq!(
+            lock.lock(LockType::Write, 1, false, false).grant_type,
+            LockGrantType::Existing
+        );
         assert_eq!(lock.n_owners(), 1);
         assert_eq!(lock.n_waiters(), 0);
         lock.release(1);
@@ -1239,9 +1271,18 @@ mod tests {
     #[test]
     fn test_je_three_concurrent_readers() {
         let mut lock = LockImpl::new();
-        assert_eq!(lock.lock(LockType::Read, 1, false, false).grant_type, LockGrantType::New);
-        assert_eq!(lock.lock(LockType::Read, 2, false, false).grant_type, LockGrantType::New);
-        assert_eq!(lock.lock(LockType::Read, 3, false, false).grant_type, LockGrantType::New);
+        assert_eq!(
+            lock.lock(LockType::Read, 1, false, false).grant_type,
+            LockGrantType::New
+        );
+        assert_eq!(
+            lock.lock(LockType::Read, 2, false, false).grant_type,
+            LockGrantType::New
+        );
+        assert_eq!(
+            lock.lock(LockType::Read, 3, false, false).grant_type,
+            LockGrantType::New
+        );
         assert_eq!(lock.n_owners(), 3);
         assert_eq!(lock.n_waiters(), 0);
         lock.release(1);
@@ -1307,9 +1348,18 @@ mod tests {
         let mut lock = LockImpl::new();
         lock.lock(LockType::Write, 1, false, false);
         // Three readers wait
-        assert_eq!(lock.lock(LockType::Read, 2, false, false).grant_type, LockGrantType::WaitNew);
-        assert_eq!(lock.lock(LockType::Read, 3, false, false).grant_type, LockGrantType::WaitNew);
-        assert_eq!(lock.lock(LockType::Read, 4, false, false).grant_type, LockGrantType::WaitNew);
+        assert_eq!(
+            lock.lock(LockType::Read, 2, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
+        assert_eq!(
+            lock.lock(LockType::Read, 3, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
+        assert_eq!(
+            lock.lock(LockType::Read, 4, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
         assert_eq!(lock.n_owners(), 1);
         assert_eq!(lock.n_waiters(), 3);
 
@@ -1338,8 +1388,14 @@ mod tests {
         let mut lock = LockImpl::new();
         lock.lock(LockType::Read, 1, false, false);
         lock.lock(LockType::Read, 2, false, false);
-        assert_eq!(lock.lock(LockType::Write, 3, false, false).grant_type, LockGrantType::WaitNew);
-        assert_eq!(lock.lock(LockType::Write, 4, false, false).grant_type, LockGrantType::WaitNew);
+        assert_eq!(
+            lock.lock(LockType::Write, 3, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
+        assert_eq!(
+            lock.lock(LockType::Write, 4, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
         assert_eq!(lock.n_waiters(), 2);
 
         lock.flush_waiter(4);
@@ -1356,9 +1412,15 @@ mod tests {
         lock.lock(LockType::Read, 1, false, false);
         lock.lock(LockType::Read, 2, false, false);
         // txn3 (new txn) adds a write waiter
-        assert_eq!(lock.lock(LockType::Write, 3, false, false).grant_type, LockGrantType::WaitNew);
+        assert_eq!(
+            lock.lock(LockType::Write, 3, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
         // txn1 (existing reader) upgrades — should be WAIT_PROMOTION at head
-        assert_eq!(lock.lock(LockType::Write, 1, false, false).grant_type, LockGrantType::WaitPromotion);
+        assert_eq!(
+            lock.lock(LockType::Write, 1, false, false).grant_type,
+            LockGrantType::WaitPromotion
+        );
 
         let waiters = lock.get_waiters_clone();
         // The first waiter in line must be the WAIT_PROMOTION (txn1), not the
@@ -1418,9 +1480,15 @@ mod tests {
     fn test_je_range_insert_waiter_causes_restart() {
         let mut lock = LockImpl::new();
         // txn1 holds RANGE_READ
-        assert_eq!(lock.lock(LockType::RangeRead, 1, false, false).grant_type, LockGrantType::New);
+        assert_eq!(
+            lock.lock(LockType::RangeRead, 1, false, false).grant_type,
+            LockGrantType::New
+        );
         // txn2 waits with RANGE_INSERT
-        assert_eq!(lock.lock(LockType::RangeInsert, 2, false, false).grant_type, LockGrantType::WaitNew);
+        assert_eq!(
+            lock.lock(LockType::RangeInsert, 2, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
         // txn3 requests RANGE_READ — sees txn2's RANGE_INSERT waiter → WAIT_RESTART
         let r = lock.lock(LockType::RangeRead, 3, false, false);
         assert_eq!(r.grant_type, LockGrantType::WaitRestart);

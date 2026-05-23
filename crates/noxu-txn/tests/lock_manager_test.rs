@@ -21,11 +21,21 @@ fn lm_no_timeout() -> Arc<LockManager> {
     Arc::new(LockManager::with_lock_timeout(0))
 }
 
-fn acquire(lm: &LockManager, lsn: u64, locker: i64, ty: LockType) -> LockGrantType {
+fn acquire(
+    lm: &LockManager,
+    lsn: u64,
+    locker: i64,
+    ty: LockType,
+) -> LockGrantType {
     lm.lock(lsn, locker, ty, false, false).unwrap()
 }
 
-fn acquire_nb(lm: &LockManager, lsn: u64, locker: i64, ty: LockType) -> Result<LockGrantType, TxnError> {
+fn acquire_nb(
+    lm: &LockManager,
+    lsn: u64,
+    locker: i64,
+    ty: LockType,
+) -> Result<LockGrantType, TxnError> {
     lm.lock(lsn, locker, ty, true, false)
 }
 

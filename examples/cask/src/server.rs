@@ -24,11 +24,7 @@ impl CaskServer {
     pub fn new(config: CaskConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let store = CaskStore::open(&config.data_dir)?;
         let connection_limit = Arc::new(Semaphore::new(config.max_connections));
-        Ok(Self {
-            config,
-            store: Arc::new(store),
-            connection_limit,
-        })
+        Ok(Self { config, store: Arc::new(store), connection_limit })
     }
 
     /// Run the server, accepting connections until shutdown is signaled.
@@ -70,7 +66,9 @@ async fn handle_connection(
                     // Queue the command.
                     if let Some(cmd) = parse_command(&frame) {
                         if cmd.name == "MULTI" {
-                            RespValue::error("ERR MULTI calls can not be nested")
+                            RespValue::error(
+                                "ERR MULTI calls can not be nested",
+                            )
                         } else {
                             multi_queue.as_mut().unwrap().push(cmd);
                             RespValue::simple("QUEUED")
@@ -115,7 +113,9 @@ fn parse_command(frame: &RespValue) -> Option<QueuedCommand> {
     };
 
     let name = match &parts[0] {
-        RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_uppercase(),
+        RespValue::BulkString(Some(b)) => {
+            String::from_utf8_lossy(b).to_uppercase()
+        }
         _ => return None,
     };
 
@@ -173,11 +173,18 @@ fn handle_multi_control(
 }
 
 /// Execute all queued commands in a single Noxu transaction.
-fn exec_transaction(commands: Vec<QueuedCommand>, store: &Arc<CaskStore>) -> RespValue {
+fn exec_transaction(
+    commands: Vec<QueuedCommand>,
+    store: &Arc<CaskStore>,
+) -> RespValue {
     // Begin a transaction.
     let txn = match store.begin_transaction() {
         Ok(t) => t,
-        Err(e) => return RespValue::error(format!("ERR transaction begin failed: {e}")),
+        Err(e) => {
+            return RespValue::error(format!(
+                "ERR transaction begin failed: {e}"
+            ));
+        }
     };
 
     let mut results: Vec<RespValue> = Vec::with_capacity(commands.len());
@@ -192,16 +199,24 @@ fn exec_transaction(commands: Vec<QueuedCommand>, store: &Arc<CaskStore>) -> Res
     // so we always commit.
     match txn.commit() {
         Ok(()) => RespValue::Array(results),
-        Err(e) => RespValue::error(format!("ERR transaction commit failed: {e}")),
+        Err(e) => {
+            RespValue::error(format!("ERR transaction commit failed: {e}"))
+        }
     }
 }
 
 /// Execute a single command within a transaction context.
-fn execute_in_txn(cmd: &QueuedCommand, store: &Arc<CaskStore>, txn: &noxu_db::Transaction) -> RespValue {
+fn execute_in_txn(
+    cmd: &QueuedCommand,
+    store: &Arc<CaskStore>,
+    txn: &noxu_db::Transaction,
+) -> RespValue {
     match cmd.name.as_str() {
         "SET" => {
             if cmd.args.len() < 2 {
-                return RespValue::error("ERR wrong number of arguments for 'SET' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'SET' command",
+                );
             }
             match store.set_in_txn(txn, &cmd.args[0], &cmd.args[1]) {
                 Ok(()) => RespValue::ok(),
@@ -210,7 +225,9 @@ fn execute_in_txn(cmd: &QueuedCommand, store: &Arc<CaskStore>, txn: &noxu_db::Tr
         }
         "DEL" => {
             if cmd.args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'DEL' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'DEL' command",
+                );
             }
             let mut count = 0i64;
             for key in &cmd.args {
@@ -250,7 +267,11 @@ fn dispatch_command(
 }
 
 /// Execute a command and return the response.
-fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespValue {
+fn execute_command(
+    name: &str,
+    args: &[Bytes],
+    store: &Arc<CaskStore>,
+) -> RespValue {
     match name {
         "PING" => {
             if args.is_empty() {
@@ -261,13 +282,17 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "ECHO" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'echo' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'echo' command",
+                );
             }
             RespValue::bulk(args[0].clone())
         }
         "SET" => {
             if args.len() < 2 {
-                return RespValue::error("ERR wrong number of arguments for 'set' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'set' command",
+                );
             }
             match store.set(&args[0], &args[1]) {
                 Ok(()) => RespValue::ok(),
@@ -276,7 +301,9 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "GET" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'get' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'get' command",
+                );
             }
             match store.get(&args[0]) {
                 Ok(Some(val)) => RespValue::bulk(val),
@@ -286,7 +313,9 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "DEL" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'del' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'del' command",
+                );
             }
             let mut count = 0i64;
             for key in args {
@@ -300,7 +329,9 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "MSET" => {
             if args.len() < 2 || !args.len().is_multiple_of(2) {
-                return RespValue::error("ERR wrong number of arguments for 'mset' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'mset' command",
+                );
             }
             let pairs: Vec<(Bytes, Bytes)> = args
                 .chunks(2)
@@ -313,7 +344,9 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "MGET" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'mget' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'mget' command",
+                );
             }
             match store.mget(args) {
                 Ok(values) => {
@@ -331,22 +364,26 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "INCR" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'incr' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'incr' command",
+                );
             }
             match store.incr(&args[0], 1) {
                 Ok(val) => RespValue::integer(val),
-                Err(StoreError::NotAnInteger) => {
-                    RespValue::error("ERR value is not an integer or out of range")
-                }
-                Err(StoreError::Overflow) => {
-                    RespValue::error("ERR increment or decrement would overflow")
-                }
+                Err(StoreError::NotAnInteger) => RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ),
+                Err(StoreError::Overflow) => RespValue::error(
+                    "ERR increment or decrement would overflow",
+                ),
                 Err(e) => RespValue::error(format!("ERR {e}")),
             }
         }
         "INCRBY" => {
             if args.len() < 2 {
-                return RespValue::error("ERR wrong number of arguments for 'incrby' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'incrby' command",
+                );
             }
             let by = match std::str::from_utf8(&args[1])
                 .ok()
@@ -354,38 +391,44 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
             {
                 Some(n) => n,
                 None => {
-                    return RespValue::error("ERR value is not an integer or out of range");
+                    return RespValue::error(
+                        "ERR value is not an integer or out of range",
+                    );
                 }
             };
             match store.incr(&args[0], by) {
                 Ok(val) => RespValue::integer(val),
-                Err(StoreError::NotAnInteger) => {
-                    RespValue::error("ERR value is not an integer or out of range")
-                }
-                Err(StoreError::Overflow) => {
-                    RespValue::error("ERR increment or decrement would overflow")
-                }
+                Err(StoreError::NotAnInteger) => RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ),
+                Err(StoreError::Overflow) => RespValue::error(
+                    "ERR increment or decrement would overflow",
+                ),
                 Err(e) => RespValue::error(format!("ERR {e}")),
             }
         }
         "DECR" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'decr' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'decr' command",
+                );
             }
             match store.incr(&args[0], -1) {
                 Ok(val) => RespValue::integer(val),
-                Err(StoreError::NotAnInteger) => {
-                    RespValue::error("ERR value is not an integer or out of range")
-                }
-                Err(StoreError::Overflow) => {
-                    RespValue::error("ERR increment or decrement would overflow")
-                }
+                Err(StoreError::NotAnInteger) => RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ),
+                Err(StoreError::Overflow) => RespValue::error(
+                    "ERR increment or decrement would overflow",
+                ),
                 Err(e) => RespValue::error(format!("ERR {e}")),
             }
         }
         "DECRBY" => {
             if args.len() < 2 {
-                return RespValue::error("ERR wrong number of arguments for 'decrby' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'decrby' command",
+                );
             }
             let by = match std::str::from_utf8(&args[1])
                 .ok()
@@ -393,23 +436,27 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
             {
                 Some(n) => n,
                 None => {
-                    return RespValue::error("ERR value is not an integer or out of range");
+                    return RespValue::error(
+                        "ERR value is not an integer or out of range",
+                    );
                 }
             };
             match store.incr(&args[0], -by) {
                 Ok(val) => RespValue::integer(val),
-                Err(StoreError::NotAnInteger) => {
-                    RespValue::error("ERR value is not an integer or out of range")
-                }
-                Err(StoreError::Overflow) => {
-                    RespValue::error("ERR increment or decrement would overflow")
-                }
+                Err(StoreError::NotAnInteger) => RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ),
+                Err(StoreError::Overflow) => RespValue::error(
+                    "ERR increment or decrement would overflow",
+                ),
                 Err(e) => RespValue::error(format!("ERR {e}")),
             }
         }
         "APPEND" => {
             if args.len() < 2 {
-                return RespValue::error("ERR wrong number of arguments for 'append' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'append' command",
+                );
             }
             match store.append(&args[0], &args[1]) {
                 Ok(len) => RespValue::integer(len as i64),
@@ -418,7 +465,9 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "EXISTS" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'exists' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'exists' command",
+                );
             }
             let mut count = 0i64;
             for key in args {
@@ -432,7 +481,9 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "RENAME" => {
             if args.len() < 2 {
-                return RespValue::error("ERR wrong number of arguments for 'rename' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'rename' command",
+                );
             }
             match store.rename(&args[0], &args[1]) {
                 Ok(true) => RespValue::ok(),
@@ -442,11 +493,14 @@ fn execute_command(name: &str, args: &[Bytes], store: &Arc<CaskStore>) -> RespVa
         }
         "KEYS" => {
             if args.is_empty() {
-                return RespValue::error("ERR wrong number of arguments for 'keys' command");
+                return RespValue::error(
+                    "ERR wrong number of arguments for 'keys' command",
+                );
             }
             match store.keys(&args[0]) {
                 Ok(keys) => {
-                    let items: Vec<RespValue> = keys.into_iter().map(RespValue::bulk).collect();
+                    let items: Vec<RespValue> =
+                        keys.into_iter().map(RespValue::bulk).collect();
                     RespValue::array(items)
                 }
                 Err(e) => RespValue::error(format!("ERR {e}")),

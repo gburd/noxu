@@ -35,8 +35,10 @@ impl CashConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let contents = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-        let config: Self = toml::from_str(&contents).map_err(ConfigError::Parse)?;
+        let contents =
+            std::fs::read_to_string(path).map_err(ConfigError::Io)?;
+        let config: Self =
+            toml::from_str(&contents).map_err(ConfigError::Parse)?;
         Ok(config)
     }
 }

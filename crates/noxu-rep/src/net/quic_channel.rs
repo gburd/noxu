@@ -109,18 +109,19 @@ impl rustls::client::danger::ServerCertVerifier for SkipCertVerification {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
 /// Generate a fresh self-signed certificate for "localhost".
-fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+fn self_signed_cert()
+-> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let ck = generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|e| RepError::NetworkError(format!("rcgen: {e}")))?;
     let cert = CertificateDer::from(ck.cert.der().to_vec());
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        ck.key_pair.serialize_der(),
+    ));
     Ok((vec![cert], key))
 }
 
@@ -132,7 +133,9 @@ pub fn default_server_config() -> Result<quinn::ServerConfig> {
         .with_single_cert(certs, key)
         .map_err(|e| RepError::NetworkError(format!("TLS: {e}")))?;
     let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-        .map_err(|e| RepError::NetworkError(format!("QUIC server config: {e}")))?;
+        .map_err(|e| {
+            RepError::NetworkError(format!("QUIC server config: {e}"))
+        })?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
     // Disable PMTUD: on loopback the MTU is fixed at 65535, and quinn-proto's
     // MTUD state machine can assert under netem duplicate/corrupt injection.
@@ -222,16 +225,24 @@ impl QuicChannel {
     /// Happy Eyeballs: IPv6 addresses are tried before IPv4. The first
     /// address that accepts a QUIC connection wins.  `server_name` is passed
     /// as the TLS SNI; use `"localhost"` when connecting to a self-signed cert.
-    pub fn connect_host(host: &str, port: u16, server_name: &str) -> Result<Self> {
+    pub fn connect_host(
+        host: &str,
+        port: u16,
+        server_name: &str,
+    ) -> Result<Self> {
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|e| RepError::NetworkError(
-                format!("DNS resolution failed for {host}:{port}: {e}")))?
+            .map_err(|e| {
+                RepError::NetworkError(format!(
+                    "DNS resolution failed for {host}:{port}: {e}"
+                ))
+            })?
             .collect();
 
         if addrs.is_empty() {
-            return Err(RepError::NetworkError(
-                format!("no addresses resolved for {host}:{port}")));
+            return Err(RepError::NetworkError(format!(
+                "no addresses resolved for {host}:{port}"
+            )));
         }
 
         // Happy Eyeballs: prefer IPv6.
@@ -245,8 +256,11 @@ impl QuicChannel {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| RepError::NetworkError(
-            format!("could not connect to {host}:{port}"))))
+        Err(last_err.unwrap_or_else(|| {
+            RepError::NetworkError(format!(
+                "could not connect to {host}:{port}"
+            ))
+        }))
     }
 
     /// Connect to a QUIC endpoint with a caller-supplied `ClientConfig`.
@@ -256,7 +270,8 @@ impl QuicChannel {
         client_cfg: quinn::ClientConfig,
     ) -> Result<Self> {
         let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread().worker_threads(2)
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .map_err(|e| RepError::NetworkError(format!("tokio: {e}")))?,
@@ -302,7 +317,9 @@ impl Channel for QuicChannel {
     /// Send a message.  Writes `[len: u32 LE][payload]` atomically.
     fn send(&self, data: &[u8]) -> Result<()> {
         if !self.is_open() {
-            return Err(RepError::ChannelClosed("QuicChannel is closed".into()));
+            return Err(RepError::ChannelClosed(
+                "QuicChannel is closed".into(),
+            ));
         }
         let len_prefix = (data.len() as u32).to_le_bytes();
         let payload = data.to_vec();
@@ -326,14 +343,18 @@ impl Channel for QuicChannel {
     /// peer closed the stream cleanly (EOF).
     fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         if !self.is_open() {
-            return Err(RepError::ChannelClosed("QuicChannel is closed".into()));
+            return Err(RepError::ChannelClosed(
+                "QuicChannel is closed".into(),
+            ));
         }
         self.runtime.block_on(async {
             let mut stream = self.recv.lock().await;
 
             // Read the 4-byte length prefix, with a timeout.
             let mut len_buf = [0u8; 4];
-            match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await {
+            match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf))
+                .await
+            {
                 Err(_elapsed) => return Ok(None),
                 Ok(Ok(_n)) => {}
                 Ok(Err(ReadExactError::FinishedEarly(_))) => {
@@ -348,15 +369,14 @@ impl Channel for QuicChannel {
 
             let payload_len = u32::from_le_bytes(len_buf) as usize;
             let mut payload = vec![0u8; payload_len];
-            stream
-                .read_exact(&mut payload)
-                .await
-                .map_err(|e| match e {
-                    ReadExactError::FinishedEarly(_) => {
-                        RepError::ChannelClosed("QUIC stream closed mid-payload".into())
-                    }
-                    ReadExactError::ReadError(re) => RepError::NetworkError(re.to_string()),
-                })?;
+            stream.read_exact(&mut payload).await.map_err(|e| match e {
+                ReadExactError::FinishedEarly(_) => RepError::ChannelClosed(
+                    "QUIC stream closed mid-payload".into(),
+                ),
+                ReadExactError::ReadError(re) => {
+                    RepError::NetworkError(re.to_string())
+                }
+            })?;
             Ok(Some(payload))
         })
     }
@@ -422,7 +442,8 @@ impl QuicChannelListener {
     /// Bind to `addr` using a freshly-generated self-signed certificate.
     pub fn bind(addr: SocketAddr) -> Result<Self> {
         let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread().worker_threads(2)
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .map_err(|e| RepError::NetworkError(format!("tokio: {e}")))?,
@@ -441,7 +462,8 @@ impl QuicChannelListener {
         server_cfg: quinn::ServerConfig,
     ) -> Result<Self> {
         let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread().worker_threads(2)
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .map_err(|e| RepError::NetworkError(format!("tokio: {e}")))?,
@@ -469,10 +491,9 @@ impl QuicChannelListener {
         // Rust 2024: self.endpoint and self.runtime are separate field borrows.
         // Clone runtime once inside the future (instead of twice outside).
         self.runtime.block_on(async {
-            let incoming = self.endpoint
-                .accept()
-                .await
-                .ok_or_else(|| RepError::NetworkError("QUIC endpoint closed".into()))?;
+            let incoming = self.endpoint.accept().await.ok_or_else(|| {
+                RepError::NetworkError("QUIC endpoint closed".into())
+            })?;
             let conn = incoming
                 .await
                 .map_err(|e| RepError::NetworkError(e.to_string()))?;
@@ -482,15 +503,20 @@ impl QuicChannelListener {
                 .map_err(|e| RepError::NetworkError(e.to_string()))?;
             // Read and validate the 4-byte connection handshake.
             let mut magic = [0u8; 4];
-            recv.read_exact(&mut magic)
-                .await
-                .map_err(|e| RepError::NetworkError(format!("handshake read: {e}")))?;
+            recv.read_exact(&mut magic).await.map_err(|e| {
+                RepError::NetworkError(format!("handshake read: {e}"))
+            })?;
             if &magic != MAGIC {
                 return Err(RepError::NetworkError(format!(
                     "invalid QUIC handshake magic: {magic:02x?}"
                 )));
             }
-            Ok(QuicChannel::from_streams(conn, send, recv, Arc::clone(&self.runtime)))
+            Ok(QuicChannel::from_streams(
+                conn,
+                send,
+                recv,
+                Arc::clone(&self.runtime),
+            ))
         })
     }
 }

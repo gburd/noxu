@@ -7,7 +7,7 @@
 /// Allows applications to optimize caching behavior based on
 /// access patterns.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {
     /// Use the default caching behavior.

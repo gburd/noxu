@@ -97,7 +97,8 @@ mod tests {
 
     #[test]
     fn test_old_ln_roundtrip_with_data() {
-        let entry = OldLnEntry::new(b"mykey".to_vec(), Some(b"mydata".to_vec()));
+        let entry =
+            OldLnEntry::new(b"mykey".to_vec(), Some(b"mydata".to_vec()));
 
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);

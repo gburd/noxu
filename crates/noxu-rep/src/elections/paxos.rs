@@ -65,7 +65,7 @@ pub type NodeId = u32;
 /// `Some(node_id)` of the elected master (may be a different node if a better
 /// candidate was discovered in Phase 1), or `None` if quorum was not reached.
 ///
-/// 
+///
 pub fn run_election(
     node_id: NodeId,
     node_name: &str,
@@ -75,7 +75,17 @@ pub fn run_election(
     priority: u32,
     term: u64,
 ) -> Option<NodeId> {
-    run_election_with_phi(node_id, node_name, group, channels, proposed_vlsn, priority, term, None, Duration::from_millis(500))
+    run_election_with_phi(
+        node_id,
+        node_name,
+        group,
+        channels,
+        proposed_vlsn,
+        priority,
+        term,
+        None,
+        Duration::from_millis(500),
+    )
 }
 
 /// Run a two-phase Paxos election with an optional phi accrual detector for
@@ -178,10 +188,8 @@ pub fn run_election_with_phi(
     // -------------------------------------------------------------------------
     // We propose the best value seen ("Value" mechanism).
     let winner_name = best_proposal.node_name;
-    let accept_msg = ProtocolMessage::ElectionResult {
-        master: winner_name.clone(),
-        term,
-    };
+    let accept_msg =
+        ProtocolMessage::ElectionResult { master: winner_name.clone(), term };
 
     let mut accepts = 0usize;
     let phase2_timeout = phase_timeout;
@@ -189,8 +197,7 @@ pub fn run_election_with_phi(
     for ch in &promises {
         if send_message(ch.as_ref(), &accept_msg).is_ok()
             && let Ok(Some(ProtocolMessage::ElectionVote {
-                granted: true,
-                ..
+                granted: true, ..
             })) = receive_message(ch.as_ref(), phase2_timeout)
         {
             accepts += 1;
@@ -205,10 +212,7 @@ pub fn run_election_with_phi(
         let winner_id = if winner_name == node_name {
             node_id
         } else {
-            group
-                .get_node(&winner_name)
-                .map(|n| n.node_id())
-                .unwrap_or(node_id)
+            group.get_node(&winner_name).map(|n| n.node_id()).unwrap_or(node_id)
         };
         Some(winner_id)
     } else {
@@ -271,8 +275,8 @@ pub fn run_acceptor(
             // already promised. Accept/promise the first proposal regardless
             // of the proposer's VLSN — the VLSN comparison happens at the
             // proposer level when it collects suggestions.
-            let should_promise = promised_term
-                .is_none_or(|promised| term >= promised);
+            let should_promise =
+                promised_term.is_none_or(|promised| term >= promised);
 
             if should_promise {
                 promised_term = Some(term);
@@ -305,7 +309,7 @@ pub fn run_acceptor(
         _ => {
             return Err(RepError::ProtocolError(
                 "acceptor: expected ElectionProposal in phase 1".into(),
-            ))
+            ));
         }
     }
 
@@ -455,9 +459,7 @@ mod tests {
         let winner = run_election(
             1,       // node_id
             "node1", // node_name
-            &group,
-            &channels,
-            100, // vlsn (higher than peers)
+            &group, &channels, 100, // vlsn (higher than peers)
             1,   // priority
             1,   // term
         );
@@ -485,9 +487,7 @@ mod tests {
         let winner = run_election(
             1,       // node_id
             "node1", // node_name
-            &group,
-            &channels,
-            200, // vlsn (highest)
+            &group, &channels, 200, // vlsn (highest)
             1,   // priority
             1,   // term
         );
@@ -523,8 +523,15 @@ mod tests {
             1,
         ));
 
-        let winner =
-            run_election(1, "node1", &group, &[], /* no peers */ 100, 1, 1);
+        let winner = run_election(
+            1,
+            "node1",
+            &group,
+            &[],
+            /* no peers */ 100,
+            1,
+            1,
+        );
         assert_eq!(winner, Some(1));
     }
 
@@ -544,10 +551,18 @@ mod tests {
 
         let mut group = RepGroup::new("g".into(), 1);
         group.add_node(RepNode::new(
-            "node1".into(), NodeType::Electable, "127.0.0.1".into(), 5001, 1,
+            "node1".into(),
+            NodeType::Electable,
+            "127.0.0.1".into(),
+            5001,
+            1,
         ));
         group.add_node(RepNode::new(
-            "node2".into(), NodeType::Electable, "127.0.0.1".into(), 5002, 2,
+            "node2".into(),
+            NodeType::Electable,
+            "127.0.0.1".into(),
+            5002,
+            2,
         ));
 
         // Proposer (node1, vlsn=10) sends to one peer.
@@ -572,10 +587,18 @@ mod tests {
         let group = {
             let mut g = RepGroup::new("g".into(), 1);
             g.add_node(RepNode::new(
-                "node1".into(), NodeType::Electable, "127.0.0.1".into(), 5001, 1,
+                "node1".into(),
+                NodeType::Electable,
+                "127.0.0.1".into(),
+                5001,
+                1,
             ));
             g.add_node(RepNode::new(
-                "node2".into(), NodeType::Electable, "127.0.0.1".into(), 5002, 2,
+                "node2".into(),
+                NodeType::Electable,
+                "127.0.0.1".into(),
+                5002,
+                2,
             ));
             g
         };
@@ -593,8 +616,7 @@ mod tests {
         // With quorum=2 and self-vote counted, node1 reaches quorum with
         // node2's promise. The elected master is the *best* proposal seen
         // in phase 1 (node2, vlsn=999).
-        let winner =
-            run_election(1, "node1", &group, &[proposer_ch], 10, 1, 1);
+        let winner = run_election(1, "node1", &group, &[proposer_ch], 10, 1, 1);
 
         let accepted = handle.join().unwrap();
         // node2 accepted the phase2 result.

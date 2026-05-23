@@ -5,13 +5,13 @@ use crate::cursor::Cursor;
 use crate::cursor_config::CursorConfig;
 use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
-use crate::error::{NoxuError, Result};
 use crate::database_stats::{BtreeStats, DatabaseStats};
-use crate::preload::{PreloadConfig, PreloadStats};
+use crate::error::{NoxuError, Result};
 use crate::join_config::JoinConfig;
 use crate::join_cursor::JoinCursor;
 use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
+use crate::preload::{PreloadConfig, PreloadStats};
 use crate::read_options::ReadOptions;
 use crate::secondary_cursor::SecondaryCursor;
 use crate::sequence::Sequence;
@@ -19,17 +19,20 @@ use crate::sequence_config::SequenceConfig;
 use crate::stats_config::StatsConfig;
 use crate::transaction::Transaction;
 use crate::write_options::WriteOptions;
-use noxu_dbi::{CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode, ThroughputStats};
-use noxu_util::lsn::Lsn;
+use noxu_dbi::{
+    CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode,
+    ThroughputStats,
+};
 use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
 use noxu_txn::LockManager;
+use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A database handle.
 ///
-/// 
+///
 ///
 /// Database handles provide methods for inserting, retrieving, and
 /// deleting records. A database belongs to a single environment.
@@ -91,7 +94,7 @@ pub struct Database {
 
 /// State of a database handle.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbState {
     /// Database is open and operational
@@ -110,10 +113,12 @@ impl Database {
     /// `env_impl.lock()` on every operation.
     fn make_cursor(&self) -> CursorImpl {
         match &self.log_manager {
-            Some(lm) => {
-                CursorImpl::with_log_manager(Arc::clone(&self.db_impl), 0, Arc::clone(lm))
-                    .with_lock_manager(Arc::clone(&self.lock_manager))
-            }
+            Some(lm) => CursorImpl::with_log_manager(
+                Arc::clone(&self.db_impl),
+                0,
+                Arc::clone(lm),
+            )
+            .with_lock_manager(Arc::clone(&self.lock_manager)),
             None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
         }
@@ -126,9 +131,11 @@ impl Database {
     /// without blocking on write locks — mirrors 's read-uncommitted cursor.
     fn make_cursor_no_lock(&self) -> CursorImpl {
         match &self.log_manager {
-            Some(lm) => {
-                CursorImpl::with_log_manager(Arc::clone(&self.db_impl), 0, Arc::clone(lm))
-            }
+            Some(lm) => CursorImpl::with_log_manager(
+                Arc::clone(&self.db_impl),
+                0,
+                Arc::clone(lm),
+            ),
             None => CursorImpl::new(Arc::clone(&self.db_impl), 0),
         }
     }
@@ -158,7 +165,11 @@ impl Database {
     /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
     /// natural many:1 fsync coalescing under concurrent write load with no
     /// explicit group-commit configuration required.
-    fn auto_commit_sync(&self, txn: Option<&Transaction>, write_lsn: Lsn) -> Result<()> {
+    fn auto_commit_sync(
+        &self,
+        txn: Option<&Transaction>,
+        write_lsn: Lsn,
+    ) -> Result<()> {
         if txn.is_some() {
             return Ok(()); // explicit txn handles its own commit/fsync
         }
@@ -168,12 +179,14 @@ impl Database {
         if let Some(lm) = &self.log_manager {
             if self.write_no_sync {
                 // : TXN_WRITE_NO_SYNC — flush to OS buffer, no fdatasync
-                lm.flush_no_sync()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                lm.flush_no_sync().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
             } else {
                 // : flushTo(lsn) — skip if already covered by another flush.
-                lm.flush_sync_if_needed(write_lsn)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                lm.flush_sync_if_needed(write_lsn).map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
             }
         }
         Ok(())
@@ -226,7 +239,7 @@ impl Database {
 
     /// Retrieves a record by key.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -245,7 +258,8 @@ impl Database {
         data: &mut DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
-        observe_span!("db_get",
+        observe_span!(
+            "db_get",
             db_name = self.name.as_str(),
             key_size = key.get_data().map_or(0, |k| k.len()),
         );
@@ -266,16 +280,17 @@ impl Database {
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) = cursor
-                    .get_current()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                let (_, value) = cursor.get_current().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
                 // Partial get: return only the requested slice.
                 // DatabaseEntry partial-read logic.
                 if data.is_partial() {
                     let off = data.get_partial_offset();
                     let len = data.get_partial_length();
                     let end = (off + len).min(value.len());
-                    let slice = if off < value.len() { &value[off..end] } else { &[] };
+                    let slice =
+                        if off < value.len() { &value[off..end] } else { &[] };
                     data.set_data(slice);
                 } else {
                     data.set_data(&value);
@@ -285,7 +300,9 @@ impl Database {
                 Ok(OperationStatus::Success)
             }
             _ => {
-                self.throughput.n_pri_search_fails.fetch_add(1, Ordering::Relaxed);
+                self.throughput
+                    .n_pri_search_fails
+                    .fetch_add(1, Ordering::Relaxed);
                 observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "get");
                 Ok(OperationStatus::NotFound)
             }
@@ -337,14 +354,15 @@ impl Database {
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) = cursor
-                    .get_current()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                let (_, value) = cursor.get_current().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
                 if data.is_partial() {
                     let off = data.get_partial_offset();
                     let len = data.get_partial_length();
                     let end = (off + len).min(value.len());
-                    let slice = if off < value.len() { &value[off..end] } else { &[] };
+                    let slice =
+                        if off < value.len() { &value[off..end] } else { &[] };
                     data.set_data(slice);
                 } else {
                     data.set_data(&value);
@@ -353,7 +371,9 @@ impl Database {
                 Ok(OperationStatus::Success)
             }
             _ => {
-                self.throughput.n_pri_search_fails.fetch_add(1, Ordering::Relaxed);
+                self.throughput
+                    .n_pri_search_fails
+                    .fetch_add(1, Ordering::Relaxed);
                 Ok(OperationStatus::NotFound)
             }
         }
@@ -381,7 +401,8 @@ impl Database {
     ) -> Result<OperationStatus> {
         self.check_open()?;
         self.check_writable()?;
-        observe_span!("db_put",
+        observe_span!(
+            "db_put",
             db_name = self.name.as_str(),
             key_size = key.get_data().map_or(0, |k| k.len()),
             data_size = data.get_data().map_or(0, |d| d.len()),
@@ -403,12 +424,15 @@ impl Database {
             let existing = {
                 let mut tmp_entry = DatabaseEntry::new();
                 let mut tmp_cursor = self.make_cursor();
-                match tmp_cursor.search(key_bytes, None, noxu_dbi::SearchMode::Set)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
-                {
+                match tmp_cursor
+                    .search(key_bytes, None, noxu_dbi::SearchMode::Set)
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })? {
                     noxu_dbi::OperationStatus::Success => {
-                        let (_, v) = tmp_cursor.get_current()
-                            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                        let (_, v) = tmp_cursor.get_current().map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
                         tmp_entry.set_data(&v);
                         tmp_entry.get_data().unwrap_or(&[]).to_vec()
                     }
@@ -419,7 +443,8 @@ impl Database {
             let mut patched = existing;
             patched.resize(total_len, 0);
             let copy_len = new_bytes.len().min(len);
-            patched[off..off + copy_len].copy_from_slice(&new_bytes[..copy_len]);
+            patched[off..off + copy_len]
+                .copy_from_slice(&new_bytes[..copy_len]);
             write_bytes = patched;
             &write_bytes
         } else {
@@ -487,9 +512,11 @@ impl Database {
         // Apply TTL to the just-written BIN slot when requested.
         if opts.ttl > 0 {
             let key_bytes = key.get_data().unwrap_or(&[]);
-            let expiration_hours = noxu_util::current_time_hours()
-                .saturating_add(opts.ttl as u32);
-            self.db_impl.read().update_key_expiration(key_bytes, expiration_hours);
+            let expiration_hours =
+                noxu_util::current_time_hours().saturating_add(opts.ttl as u32);
+            self.db_impl
+                .read()
+                .update_key_expiration(key_bytes, expiration_hours);
         }
 
         Ok(result)
@@ -545,7 +572,7 @@ impl Database {
 
     /// Deletes a record by key.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -563,7 +590,8 @@ impl Database {
     ) -> Result<OperationStatus> {
         self.check_open()?;
         self.check_writable()?;
-        observe_span!("db_delete",
+        observe_span!(
+            "db_delete",
             db_name = self.name.as_str(),
             key_size = key.get_data().map_or(0, |k| k.len()),
         );
@@ -585,9 +613,9 @@ impl Database {
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
             noxu_dbi::OperationStatus::Success => {
-                cursor
-                    .delete()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                cursor.delete().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
                 OperationStatus::Success
             }
             _ => OperationStatus::NotFound,
@@ -606,7 +634,7 @@ impl Database {
 
     /// Opens a cursor for iterating over database records.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle (currently ignored)
@@ -638,7 +666,7 @@ impl Database {
 
     /// Opens (and optionally creates) a sequence backed by this database.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `key`    - The database key under which the sequence record is stored.
@@ -658,7 +686,7 @@ impl Database {
 
     /// Closes the database handle.
     ///
-    /// 
+    ///
     ///
     /// # Errors
     /// Returns an error if the database is already closed
@@ -668,20 +696,23 @@ impl Database {
         }
 
         self.open.store(false, Ordering::Release);
-        let _ = self.env_impl.lock().close_database(noxu_dbi::DatabaseId::new(self.id as i64));
+        let _ = self
+            .env_impl
+            .lock()
+            .close_database(noxu_dbi::DatabaseId::new(self.id as i64));
         Ok(())
     }
 
     /// Returns the database name.
     ///
-    /// 
+    ///
     pub fn get_database_name(&self) -> &str {
         &self.name
     }
 
     /// Returns the database configuration.
     ///
-    /// 
+    ///
     pub fn get_config(&self) -> &DatabaseConfig {
         &self.config
     }
@@ -742,7 +773,7 @@ impl Database {
 
     /// Returns whether the database handle is valid.
     ///
-    /// 
+    ///
     pub fn is_valid(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }
@@ -783,11 +814,8 @@ impl Database {
     pub fn preload(&self, config: &PreloadConfig) -> Result<PreloadStats> {
         self.check_open()?;
         let start = std::time::Instant::now();
-        let mut stats = PreloadStats {
-            bins_loaded: 0,
-            lns_loaded: 0,
-            elapsed_ms: 0,
-        };
+        let mut stats =
+            PreloadStats { bins_loaded: 0, lns_loaded: 0, elapsed_ms: 0 };
 
         let guard = self.db_impl.read();
         if let Some(tree_stats) = guard.collect_btree_stats() {
@@ -814,7 +842,10 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error if the database is closed.
-    pub fn get_stats(&self, config: Option<&StatsConfig>) -> Result<DatabaseStats> {
+    pub fn get_stats(
+        &self,
+        config: Option<&StatsConfig>,
+    ) -> Result<DatabaseStats> {
         self.check_open()?;
         let fast = config.map(|c| c.fast).unwrap_or(false);
 
@@ -863,7 +894,10 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error if the database is closed.
-    pub fn verify(&self, config: &noxu_engine::VerifyConfig) -> Result<noxu_engine::VerifyResult> {
+    pub fn verify(
+        &self,
+        config: &noxu_engine::VerifyConfig,
+    ) -> Result<noxu_engine::VerifyResult> {
         self.check_open()?;
         let guard = self.db_impl.read();
         Ok(noxu_engine::verify_database_impl(&guard, config))
@@ -921,7 +955,6 @@ impl Drop for Database {
         let _ = self.close();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1210,8 +1243,18 @@ mod tests {
     #[test]
     fn test_scan_all_kv_returns_records() {
         let (_temp_dir, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_vec(vec![1]), &DatabaseEntry::from_vec(vec![10])).unwrap();
-        db.put(None, &DatabaseEntry::from_vec(vec![2]), &DatabaseEntry::from_vec(vec![20])).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(vec![1]),
+            &DatabaseEntry::from_vec(vec![10]),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(vec![2]),
+            &DatabaseEntry::from_vec(vec![20]),
+        )
+        .unwrap();
         let kv = db.scan_all_kv().unwrap();
         assert_eq!(kv.len(), 2);
     }
@@ -1219,14 +1262,25 @@ mod tests {
     #[test]
     fn test_scan_all_kv_then_delete() {
         let (_temp_dir, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_vec(vec![1]), &DatabaseEntry::from_vec(vec![10])).unwrap();
-        db.put(None, &DatabaseEntry::from_vec(vec![2]), &DatabaseEntry::from_vec(vec![20])).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(vec![1]),
+            &DatabaseEntry::from_vec(vec![10]),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_vec(vec![2]),
+            &DatabaseEntry::from_vec(vec![20]),
+        )
+        .unwrap();
 
         let kv = db.scan_all_kv().unwrap();
         assert_eq!(kv.len(), 2);
 
         for (k, _v) in &kv {
-            let status = db.delete(None, &DatabaseEntry::from_vec(k.clone())).unwrap();
+            let status =
+                db.delete(None, &DatabaseEntry::from_vec(k.clone())).unwrap();
             assert_eq!(
                 status,
                 OperationStatus::Success,
@@ -1259,7 +1313,8 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         for (k, _v) in records {
-            let status = db.delete(None, &DatabaseEntry::from_vec(k.clone())).unwrap();
+            let status =
+                db.delete(None, &DatabaseEntry::from_vec(k.clone())).unwrap();
             assert_eq!(
                 status,
                 OperationStatus::Success,
@@ -1333,7 +1388,8 @@ mod tests {
             .with_allow_create(true);
         let env = Environment::open(env_config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true).with_read_only(true);
+        let db_config =
+            DatabaseConfig::new().with_allow_create(true).with_read_only(true);
         let db = env.open_database(None, "ro_db", &db_config).unwrap();
 
         let key = DatabaseEntry::from_bytes(b"k");
@@ -1365,7 +1421,12 @@ mod tests {
     fn test_get_get_current_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
         // Insert a key so search can succeed.
-        db.put(None, &DatabaseEntry::from_bytes(b"k"), &DatabaseEntry::from_bytes(b"v")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
         // fail on the 2nd check (check_initialized inside get_current).
         noxu_dbi::set_cursor_fail_after(2);
         let key = DatabaseEntry::from_bytes(b"k");
@@ -1414,7 +1475,12 @@ mod tests {
     #[test]
     fn test_delete_delete_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_bytes(b"k"), &DatabaseEntry::from_bytes(b"v")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
         // fail on the 2nd check_state (the delete() call, after search succeeds).
         noxu_dbi::set_cursor_fail_after(2);
         let key = DatabaseEntry::from_bytes(b"k");
@@ -1433,13 +1499,33 @@ mod tests {
         assert_eq!(db.count().unwrap(), 0);
 
         // Insert three distinct keys.
-        db.put(None, &DatabaseEntry::from_bytes(b"a"), &DatabaseEntry::from_bytes(b"1")).unwrap();
-        db.put(None, &DatabaseEntry::from_bytes(b"b"), &DatabaseEntry::from_bytes(b"2")).unwrap();
-        db.put(None, &DatabaseEntry::from_bytes(b"c"), &DatabaseEntry::from_bytes(b"3")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"a"),
+            &DatabaseEntry::from_bytes(b"1"),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"b"),
+            &DatabaseEntry::from_bytes(b"2"),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"c"),
+            &DatabaseEntry::from_bytes(b"3"),
+        )
+        .unwrap();
         assert_eq!(db.count().unwrap(), 3);
 
         // Overwrite an existing key — count must NOT change.
-        db.put(None, &DatabaseEntry::from_bytes(b"a"), &DatabaseEntry::from_bytes(b"updated")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"a"),
+            &DatabaseEntry::from_bytes(b"updated"),
+        )
+        .unwrap();
         assert_eq!(db.count().unwrap(), 3);
 
         // Delete one key — count decrements.
@@ -1452,7 +1538,12 @@ mod tests {
     #[test]
     fn test_count_unaffected_by_cursor_fail_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_bytes(b"k"), &DatabaseEntry::from_bytes(b"v")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
         noxu_dbi::set_cursor_fail_after(1);
         // count() must succeed (no cursor used).
         let result = db.count();
@@ -1475,7 +1566,12 @@ mod tests {
     #[test]
     fn test_scan_all_kv_get_current_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_bytes(b"k"), &DatabaseEntry::from_bytes(b"v")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
         // fail on the 2nd check (check_initialized inside get_current, after get_first succeeds).
         noxu_dbi::set_cursor_fail_after(2);
         let result = db.scan_all_kv();
@@ -1487,7 +1583,12 @@ mod tests {
     #[test]
     fn test_scan_all_kv_retrieve_next_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_bytes(b"k"), &DatabaseEntry::from_bytes(b"v")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
         // fail on the 3rd check (retrieve_next, after get_first and get_current succeed).
         noxu_dbi::set_cursor_fail_after(3);
         let result = db.scan_all_kv();
@@ -1498,7 +1599,12 @@ mod tests {
     #[test]
     fn test_sync_on_open_database_succeeds() {
         let (_tmp, _env, db) = temp_env_and_db();
-        db.put(None, &DatabaseEntry::from_bytes(b"key"), &DatabaseEntry::from_bytes(b"val")).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"key"),
+            &DatabaseEntry::from_bytes(b"val"),
+        )
+        .unwrap();
         assert!(db.sync().is_ok());
     }
 
@@ -1629,5 +1735,4 @@ mod tests {
         let opts = WriteOptions::new();
         assert!(db.put_with_options(None, &key, &val, &opts).is_err());
     }
-
 }

@@ -427,8 +427,7 @@ mod tests {
         // empty string (Some("")) and null (None) must be distinguishable
         let mut buf_empty = Vec::new();
         write_string(&mut buf_empty, Some("")).unwrap();
-        let result_empty =
-            read_string(&mut Cursor::new(&buf_empty)).unwrap();
+        let result_empty = read_string(&mut Cursor::new(&buf_empty)).unwrap();
         assert_eq!(result_empty, Some(String::new()));
 
         let mut buf_null = Vec::new();

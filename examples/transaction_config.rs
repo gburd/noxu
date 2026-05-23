@@ -6,7 +6,8 @@
 //! Run with: cargo run --example transaction_config
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, TransactionConfig,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    TransactionConfig,
 };
 use tempfile::TempDir;
 
@@ -22,7 +23,11 @@ fn main() {
     .unwrap();
 
     let db = env
-        .open_database(None, "config_demo", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "config_demo",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
 
     // ── 1. Default transaction ────────────────────────────────────────────────

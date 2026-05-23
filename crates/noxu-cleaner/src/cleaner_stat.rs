@@ -271,7 +271,9 @@ impl CleanerStats {
             min_utilization: self.min_utilization.load(Ordering::Relaxed),
             max_utilization: self.max_utilization.load(Ordering::Relaxed),
             probe_runs: self.probe_runs.load(Ordering::Relaxed),
-            repeat_iterator_reads: self.repeat_iterator_reads.load(Ordering::Relaxed),
+            repeat_iterator_reads: self
+                .repeat_iterator_reads
+                .load(Ordering::Relaxed),
         }
     }
 }

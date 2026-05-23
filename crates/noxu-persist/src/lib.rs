@@ -79,6 +79,6 @@ pub use store_config::StoreConfig;
 
 // Schema evolution re-exports
 pub use evolve::{
-    ClassMutations, ConversionFn, Converter, Deleter, EvolveConfig, EvolveListener, EvolveStats,
-    Mutations, MutationKey, Renamer,
+    ClassMutations, ConversionFn, Converter, Deleter, EvolveConfig,
+    EvolveListener, EvolveStats, MutationKey, Mutations, Renamer,
 };
