@@ -71,7 +71,9 @@ impl FileHandle {
     /// Returns `Ok(guard)` on success, or `Err(LogError::LatchTimeout)` if the
     /// latch acquisition times out. The latch is released when the guard drops.
     pub fn acquire(&self) -> Result<FileHandleGuard<'_>> {
-        let _latch_guard = self.latch.acquire()
+        let _latch_guard = self
+            .latch
+            .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
         Ok(FileHandleGuard { handle: self, _latch_guard })
     }
@@ -136,11 +138,7 @@ impl<'a> FileHandleGuard<'a> {
     ///
     /// Uses `pread64` in a retry loop.
     /// Returns an error if fewer bytes are available.
-    pub fn read_exact_at(
-        &mut self,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<()> {
+    pub fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let file_guard = self.handle.file.lock();
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())

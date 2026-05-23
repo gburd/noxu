@@ -49,12 +49,12 @@ use std::time::Duration;
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 
-use noxu_rep::{NodeType, RepGroup, RepNode};
 use noxu_rep::commit_durability::{CommitDurability, ReplicaAckPolicy};
 use noxu_rep::elections::{run_acceptor, run_election};
 use noxu_rep::net::Channel;
 use noxu_rep::net::channel::LocalChannelPair;
 use noxu_rep::stream::{FeederRunner, LogScanner};
+use noxu_rep::{NodeType, RepGroup, RepNode};
 
 // ============================================================================
 // FaultConfig — controls the type and rate of faults to inject
@@ -78,17 +78,32 @@ struct FaultConfig {
 impl FaultConfig {
     /// No faults at all — transparent passthrough.
     fn clean() -> Self {
-        Self { drop_rate: 0.0, delay_range_ms: (0, 0), partitioned: false, duplicate_messages: false }
+        Self {
+            drop_rate: 0.0,
+            delay_range_ms: (0, 0),
+            partitioned: false,
+            duplicate_messages: false,
+        }
     }
 
     /// Drop every message — simulates a hard network partition.
     fn hard_partition() -> Self {
-        Self { drop_rate: 1.0, delay_range_ms: (0, 0), partitioned: true, duplicate_messages: false }
+        Self {
+            drop_rate: 1.0,
+            delay_range_ms: (0, 0),
+            partitioned: true,
+            duplicate_messages: false,
+        }
     }
 
     /// Lossy network with the given drop rate and random delay up to `max_delay_ms`.
     fn lossy(drop_rate: f64, max_delay_ms: u64) -> Self {
-        Self { drop_rate, delay_range_ms: (0, max_delay_ms), partitioned: false, duplicate_messages: false }
+        Self {
+            drop_rate,
+            delay_range_ms: (0, max_delay_ms),
+            partitioned: false,
+            duplicate_messages: false,
+        }
     }
 }
 
@@ -118,7 +133,10 @@ impl FaultChannel {
     fn new(inner: Box<dyn Channel>, config: FaultConfig, seed: u64) -> Self {
         Self {
             inner,
-            state: Mutex::new(FaultState { config, rng: StdRng::seed_from_u64(seed) }),
+            state: Mutex::new(FaultState {
+                config,
+                rng: StdRng::seed_from_u64(seed),
+            }),
         }
     }
 
@@ -139,11 +157,8 @@ impl Channel for FaultChannel {
             let (min_ms, max_ms) = st.config.delay_range_ms;
             let dup = st.config.duplicate_messages;
             let should_drop = st.rng.gen_range(0.0_f64..1.0) < drop_rate;
-            let delay_ms = if max_ms > 0 {
-                st.rng.gen_range(min_ms..=max_ms)
-            } else {
-                0
-            };
+            let delay_ms =
+                if max_ms > 0 { st.rng.gen_range(min_ms..=max_ms) } else { 0 };
             (should_drop, delay_ms, dup)
         };
 
@@ -165,7 +180,10 @@ impl Channel for FaultChannel {
         Ok(())
     }
 
-    fn receive(&self, timeout: Duration) -> noxu_rep::error::Result<Option<Vec<u8>>> {
+    fn receive(
+        &self,
+        timeout: Duration,
+    ) -> noxu_rep::error::Result<Option<Vec<u8>>> {
         self.inner.receive(timeout)
     }
 
@@ -314,7 +332,8 @@ fn test_no_split_brain_concurrent_elections() {
         });
 
         // Node1 has the highest VLSN — it should win every clean election.
-        let result = run_election(1, "chaos_node1", &g, &[ch1_2, ch1_3], 200, 1, term);
+        let result =
+            run_election(1, "chaos_node1", &g, &[ch1_2, ch1_3], 200, 1, term);
 
         let _ = h2.join();
         let _ = h3.join();
@@ -378,7 +397,15 @@ fn test_election_tolerates_message_drops() {
             })
         };
 
-        let result = run_election(1, "chaos_node1", &grp2, &[ch1_2, ch1_3], 100, 1, term);
+        let result = run_election(
+            1,
+            "chaos_node1",
+            &grp2,
+            &[ch1_2, ch1_3],
+            100,
+            1,
+            term,
+        );
 
         let _ = h2.join();
         let _ = h3.join();
@@ -426,12 +453,13 @@ fn test_vlsn_monotone_under_message_drops() {
             loop {
                 match receiver.receive(Duration::from_millis(200)) {
                     Ok(Some(frame)) if frame.len() >= 13 => {
-                        let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+                        let vlsn =
+                            u64::from_le_bytes(frame[0..8].try_into().unwrap());
                         seen.push(vlsn);
                     }
                     Ok(Some(_)) => {} // malformed / padding frame, skip
-                    Ok(None) => break,  // timeout — feeder done
-                    Err(_) => break,    // channel closed
+                    Ok(None) => break, // timeout — feeder done
+                    Err(_) => break,  // channel closed
                 }
             }
             seen
@@ -550,7 +578,8 @@ fn test_quorum_unreachable_election_fails_gracefully() {
         run_acceptor(acc3.as_ref(), "chaos_node3", 50, 1, 1)
     });
 
-    let result = run_election(1, "chaos_node1", &group, &[ch1_2, ch1_3], 100, 1, 1);
+    let result =
+        run_election(1, "chaos_node1", &group, &[ch1_2, ch1_3], 100, 1, 1);
 
     let _ = h2.join();
     let _ = h3.join();
@@ -611,7 +640,15 @@ fn test_multi_round_elections_monotone_terms() {
             run_acceptor(acc3.as_ref(), "chaos_node3", 50, 1, term)
         });
 
-        let result = run_election(1, "chaos_node1", &g2, &[ch1_2, ch1_3], 100 + round, 1, term);
+        let result = run_election(
+            1,
+            "chaos_node1",
+            &g2,
+            &[ch1_2, ch1_3],
+            100 + round,
+            1,
+            term,
+        );
         winners.push(result);
 
         let _ = h2.join();
@@ -642,21 +679,35 @@ fn test_multi_round_elections_monotone_terms() {
 fn test_commit_durability_ack_requirements_all_policies() {
     // Policy: None — always 0 acks required regardless of cluster size.
     for n in 0u32..=10 {
-        let cd = CommitDurability::new(ReplicaAckPolicy::None, Duration::from_secs(5));
-        assert_eq!(cd.required_acks(n), 0, "None policy must require 0 acks for n={n}");
+        let cd = CommitDurability::new(
+            ReplicaAckPolicy::None,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            cd.required_acks(n),
+            0,
+            "None policy must require 0 acks for n={n}"
+        );
     }
 
     // Policy: All — requires n-1 acks (all replicas except master).
     let cases_all = [(0, 0), (1, 0), (2, 1), (3, 2), (5, 4)];
     for (n, expected) in cases_all {
-        let cd = CommitDurability::new(ReplicaAckPolicy::All, Duration::from_secs(5));
+        let cd = CommitDurability::new(
+            ReplicaAckPolicy::All,
+            Duration::from_secs(5),
+        );
         assert_eq!(cd.required_acks(n), expected, "All policy, n={n}");
     }
 
     // Policy: SimpleMajority — requires majority minus the master itself.
-    let cases_majority = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 2), (7, 3)];
+    let cases_majority =
+        [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 2), (7, 3)];
     for (n, expected) in cases_majority {
-        let cd = CommitDurability::new(ReplicaAckPolicy::SimpleMajority, Duration::from_secs(5));
+        let cd = CommitDurability::new(
+            ReplicaAckPolicy::SimpleMajority,
+            Duration::from_secs(5),
+        );
         assert_eq!(
             cd.required_acks(n),
             expected,
@@ -700,7 +751,12 @@ fn test_partition_and_recovery_vlsn_delivery() {
             let r = Arc::clone(&receiver);
             std::thread::spawn(move || {
                 let mut frames = 0usize;
-                while r.receive(Duration::from_millis(50)).ok().flatten().is_some() {
+                while r
+                    .receive(Duration::from_millis(50))
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
                     frames += 1;
                 }
                 frames
@@ -746,7 +802,9 @@ fn test_partition_and_recovery_vlsn_delivery() {
                 loop {
                     match r.receive(Duration::from_millis(200)) {
                         Ok(Some(frame)) if frame.len() >= 13 => {
-                            let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+                            let vlsn = u64::from_le_bytes(
+                                frame[0..8].try_into().unwrap(),
+                            );
                             rcv_clone.lock().unwrap().push(vlsn);
                         }
                         Ok(Some(_)) => {}
@@ -819,7 +877,8 @@ fn test_highest_vlsn_wins_election() {
         run_acceptor(acc3.as_ref(), "chaos_node3", 50, 1, 1)
     });
 
-    let result = run_election(1, "chaos_node1", &group, &[ch1_2, ch1_3], 200, 1, 1);
+    let result =
+        run_election(1, "chaos_node1", &group, &[ch1_2, ch1_3], 200, 1, 1);
 
     let _ = h2.join();
     let _ = h3.join();
@@ -893,7 +952,8 @@ fn test_duplicate_messages_vlsn_nondecreasing() {
             loop {
                 match receiver.receive(Duration::from_millis(300)) {
                     Ok(Some(frame)) if frame.len() >= 13 => {
-                        let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+                        let vlsn =
+                            u64::from_le_bytes(frame[0..8].try_into().unwrap());
                         vlsns.push(vlsn);
                     }
                     Ok(Some(_)) => {}
@@ -939,7 +999,10 @@ fn test_partition_matrix_isolation_and_reconnection() {
     // All pairs reachable initially.
     for i in 0..5 {
         for j in 0..5 {
-            assert!(pm.reachable(i, j), "all pairs should be reachable initially");
+            assert!(
+                pm.reachable(i, j),
+                "all pairs should be reachable initially"
+            );
         }
     }
 
@@ -947,7 +1010,10 @@ fn test_partition_matrix_isolation_and_reconnection() {
     pm.isolate(2);
     for other in 0..5 {
         if other != 2 {
-            assert!(!pm.reachable(2, other), "node2 must be unreachable after isolation");
+            assert!(
+                !pm.reachable(2, other),
+                "node2 must be unreachable after isolation"
+            );
             assert!(!pm.reachable(other, 2), "isolation is symmetric");
         }
     }
@@ -957,7 +1023,10 @@ fn test_partition_matrix_isolation_and_reconnection() {
     // Reconnect node 2.
     pm.reconnect(2);
     for other in 0..5 {
-        assert!(pm.reachable(2, other), "node2 must be reachable after reconnection");
+        assert!(
+            pm.reachable(2, other),
+            "node2 must be reachable after reconnection"
+        );
     }
 }
 
@@ -991,10 +1060,16 @@ fn test_large_scale_random_chaos() {
         let pair13 = LocalChannelPair::new();
         let seed = rng.next_u64();
 
-        let ch1_2: Arc<dyn Channel> =
-            Arc::new(FaultChannel::new(Box::new(pair12.channel_a), config.clone(), seed));
-        let ch1_3: Arc<dyn Channel> =
-            Arc::new(FaultChannel::new(Box::new(pair13.channel_a), config.clone(), seed + 1));
+        let ch1_2: Arc<dyn Channel> = Arc::new(FaultChannel::new(
+            Box::new(pair12.channel_a),
+            config.clone(),
+            seed,
+        ));
+        let ch1_3: Arc<dyn Channel> = Arc::new(FaultChannel::new(
+            Box::new(pair13.channel_a),
+            config.clone(),
+            seed + 1,
+        ));
         let acc2 = Arc::new(pair12.channel_b);
         let acc3 = Arc::new(pair13.channel_b);
 
@@ -1007,8 +1082,15 @@ fn test_large_scale_random_chaos() {
         });
 
         // Must not panic regardless of fault configuration.
-        let result =
-            run_election(1, "chaos_node1", &g, &[ch1_2, ch1_3], 100 + round, 1, term);
+        let result = run_election(
+            1,
+            "chaos_node1",
+            &g,
+            &[ch1_2, ch1_3],
+            100 + round,
+            1,
+            term,
+        );
 
         // Valid winners are in range [1, 3] or None.
         if let Some(winner_id) = result {
@@ -1046,7 +1128,8 @@ fn test_feeder_runner_ack_tracking_under_drops() {
             loop {
                 match receiver.receive(Duration::from_millis(300)) {
                     Ok(Some(frame)) if frame.len() >= 8 => {
-                        let vlsn = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+                        let vlsn =
+                            u64::from_le_bytes(frame[0..8].try_into().unwrap());
                         // Send ack.
                         let _ = receiver.send(&vlsn.to_le_bytes());
                         count += 1;
@@ -1131,7 +1214,8 @@ fn test_shared_vlsn_counter_monotone_concurrent() {
 
     // The counter must have reached at least the max value (THREADS-1)*OPS_PER_THREAD.
     let final_val = counter.load(Ordering::SeqCst);
-    let expected_max = (THREADS as u64 - 1) * OPS_PER_THREAD + (OPS_PER_THREAD - 1);
+    let expected_max =
+        (THREADS as u64 - 1) * OPS_PER_THREAD + (OPS_PER_THREAD - 1);
     assert_eq!(final_val, expected_max, "VLSN counter must reach global max");
 
     assert_eq!(

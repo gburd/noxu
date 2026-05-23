@@ -254,21 +254,49 @@ mod tests {
     }
 
     #[test]
-    fn test_u8_round_trip() { assert_eq!(round_trip(0u8), 0); assert_eq!(round_trip(255u8), 255); }
+    fn test_u8_round_trip() {
+        assert_eq!(round_trip(0u8), 0);
+        assert_eq!(round_trip(255u8), 255);
+    }
     #[test]
-    fn test_i8_round_trip() { assert_eq!(round_trip(i8::MIN), i8::MIN); assert_eq!(round_trip(0i8), 0); assert_eq!(round_trip(i8::MAX), i8::MAX); }
+    fn test_i8_round_trip() {
+        assert_eq!(round_trip(i8::MIN), i8::MIN);
+        assert_eq!(round_trip(0i8), 0);
+        assert_eq!(round_trip(i8::MAX), i8::MAX);
+    }
     #[test]
-    fn test_u16_round_trip() { assert_eq!(round_trip(0u16), 0); assert_eq!(round_trip(u16::MAX), u16::MAX); }
+    fn test_u16_round_trip() {
+        assert_eq!(round_trip(0u16), 0);
+        assert_eq!(round_trip(u16::MAX), u16::MAX);
+    }
     #[test]
-    fn test_i16_round_trip() { assert_eq!(round_trip(i16::MIN), i16::MIN); assert_eq!(round_trip(0i16), 0); assert_eq!(round_trip(i16::MAX), i16::MAX); }
+    fn test_i16_round_trip() {
+        assert_eq!(round_trip(i16::MIN), i16::MIN);
+        assert_eq!(round_trip(0i16), 0);
+        assert_eq!(round_trip(i16::MAX), i16::MAX);
+    }
     #[test]
-    fn test_u32_round_trip() { assert_eq!(round_trip(0u32), 0); assert_eq!(round_trip(u32::MAX), u32::MAX); }
+    fn test_u32_round_trip() {
+        assert_eq!(round_trip(0u32), 0);
+        assert_eq!(round_trip(u32::MAX), u32::MAX);
+    }
     #[test]
-    fn test_i32_round_trip() { assert_eq!(round_trip(i32::MIN), i32::MIN); assert_eq!(round_trip(0i32), 0); assert_eq!(round_trip(i32::MAX), i32::MAX); }
+    fn test_i32_round_trip() {
+        assert_eq!(round_trip(i32::MIN), i32::MIN);
+        assert_eq!(round_trip(0i32), 0);
+        assert_eq!(round_trip(i32::MAX), i32::MAX);
+    }
     #[test]
-    fn test_u64_round_trip() { assert_eq!(round_trip(0u64), 0); assert_eq!(round_trip(u64::MAX), u64::MAX); }
+    fn test_u64_round_trip() {
+        assert_eq!(round_trip(0u64), 0);
+        assert_eq!(round_trip(u64::MAX), u64::MAX);
+    }
     #[test]
-    fn test_i64_round_trip() { assert_eq!(round_trip(i64::MIN), i64::MIN); assert_eq!(round_trip(0i64), 0); assert_eq!(round_trip(i64::MAX), i64::MAX); }
+    fn test_i64_round_trip() {
+        assert_eq!(round_trip(i64::MIN), i64::MIN);
+        assert_eq!(round_trip(0i64), 0);
+        assert_eq!(round_trip(i64::MAX), i64::MAX);
+    }
     #[test]
     fn test_f32_round_trip() {
         for &v in &[0.0f32, 1.5, -1.5, f32::MAX, f32::MIN] {
@@ -294,7 +322,10 @@ mod tests {
     fn test_vec_u8_round_trip() {
         assert_eq!(round_trip(vec![]), Vec::<u8>::new());
         assert_eq!(round_trip(vec![1u8, 2, 3]), vec![1, 2, 3]);
-        assert_eq!(round_trip(vec![0x00u8, 0x01, 0x00]), vec![0x00, 0x01, 0x00]);
+        assert_eq!(
+            round_trip(vec![0x00u8, 0x01, 0x00]),
+            vec![0x00, 0x01, 0x00]
+        );
     }
 
     // --- sort-order tests ---
@@ -310,14 +341,18 @@ mod tests {
 
     #[test]
     fn test_sort_order_u64() {
-        for (a, b) in [(0u64, 1), (1, 10), (100, 1000), (u64::MAX - 1, u64::MAX)] {
+        for (a, b) in
+            [(0u64, 1), (1, 10), (100, 1000), (u64::MAX - 1, u64::MAX)]
+        {
             assert_order(a, b);
         }
     }
     #[test]
     fn test_sort_order_i64() {
         let vals = [i64::MIN, -1000i64, -1, 0, 1, 1000, i64::MAX];
-        for w in vals.windows(2) { assert_order(w[0], w[1]); }
+        for w in vals.windows(2) {
+            assert_order(w[0], w[1]);
+        }
     }
     #[test]
     fn test_sort_order_u32() {
@@ -328,7 +363,9 @@ mod tests {
     #[test]
     fn test_sort_order_i32() {
         let vals = [i32::MIN, -1i32, 0, 1, i32::MAX];
-        for w in vals.windows(2) { assert_order(w[0], w[1]); }
+        for w in vals.windows(2) {
+            assert_order(w[0], w[1]);
+        }
     }
     #[test]
     fn test_sort_order_string() {
@@ -345,12 +382,16 @@ mod tests {
     #[test]
     fn test_sort_order_f64() {
         let vals = [f64::NEG_INFINITY, -1.0f64, 0.0, 1.0, f64::INFINITY];
-        for w in vals.windows(2) { assert_order(w[0], w[1]); }
+        for w in vals.windows(2) {
+            assert_order(w[0], w[1]);
+        }
     }
     #[test]
     fn test_sort_order_i8() {
         let vals = [i8::MIN, -1i8, 0, 1, i8::MAX];
-        for w in vals.windows(2) { assert_order(w[0], w[1]); }
+        for w in vals.windows(2) {
+            assert_order(w[0], w[1]);
+        }
     }
     #[test]
     fn test_sort_order_bool() {

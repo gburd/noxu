@@ -309,12 +309,12 @@ mod tests {
         // Write a header with version 1 (below MIN_LOG_VERSION).
         let mut buf = Vec::new();
         buf.extend_from_slice(FILE_MAGIC);
-        buf.extend_from_slice(&1u32.to_be_bytes());   // version 1
+        buf.extend_from_slice(&1u32.to_be_bytes()); // version 1
         buf.push(BYTE_ORDER_BIG_ENDIAN);
-        buf.extend_from_slice(&[0u8; 3]);             // reserved
-        buf.extend_from_slice(&42u64.to_be_bytes());  // timestamp
-        buf.extend_from_slice(&0u32.to_be_bytes());   // file_number
-        buf.extend_from_slice(&0u32.to_be_bytes());   // last_entry
+        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&42u64.to_be_bytes()); // timestamp
+        buf.extend_from_slice(&0u32.to_be_bytes()); // file_number
+        buf.extend_from_slice(&0u32.to_be_bytes()); // last_entry
         let mut cursor = Cursor::new(buf);
         assert!(FileHeader::read_from(&mut cursor).is_err());
     }

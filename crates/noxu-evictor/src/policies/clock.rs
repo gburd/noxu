@@ -9,9 +9,9 @@
 //! (`freelist`).
 
 use crate::policy::EvictionPolicy;
-use crate::slab::{SlabList, SENTINEL};
-use noxu_sync::Mutex;
+use crate::slab::{SENTINEL, SlabList};
 use hashbrown::HashMap;
+use noxu_sync::Mutex;
 
 #[derive(Debug)]
 struct ClockState {
@@ -29,7 +29,9 @@ impl ClockState {
 
     /// Add node at back with the given reference bit.
     fn add(&mut self, id: u64, hot: bool) {
-        if self.list.contains(id) { return; }
+        if self.list.contains(id) {
+            return;
+        }
         self.list.add_back(id);
         self.ref_bits.insert(id, hot);
         // Point hand at the first node if this is the first insertion.
@@ -56,13 +58,17 @@ impl ClockState {
     }
 
     fn evict(&mut self) -> Option<u64> {
-        if self.list.len == 0 { return None; }
+        if self.list.len == 0 {
+            return None;
+        }
         // Scan at most 2 × list length (one full pass clears all bits; second
         // pass evicts the first 0-bit node).
         let max_iters = self.list.len * 2 + 1;
         for _ in 0..max_iters {
             let candidate = self.hand;
-            if candidate == u64::MAX { break; }
+            if candidate == u64::MAX {
+                break;
+            }
             let bit = *self.ref_bits.get(&candidate).unwrap_or(&false);
             if bit {
                 // Give second chance: clear bit and advance.
@@ -103,7 +109,9 @@ impl ClockPolicy {
 }
 
 impl Default for ClockPolicy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EvictionPolicy for ClockPolicy {
@@ -159,7 +167,9 @@ impl EvictionPolicy for ClockPolicy {
         self.state.lock().list.len
     }
 
-    fn name(&self) -> &'static str { "Clock" }
+    fn name(&self) -> &'static str {
+        "Clock"
+    }
 }
 
 #[cfg(test)]
@@ -182,7 +192,9 @@ mod tests {
     fn test_clock_second_chance() {
         let p = ClockPolicy::new();
         // All inserted hot (ref_bit=1).
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         // First evict_candidate: clears ref bits of all on first pass,
         // then evicts the first one (1) on second pass.
         let v = p.evict_candidate().unwrap();
@@ -194,7 +206,9 @@ mod tests {
     #[test]
     fn test_clock_touch_resets_bit() {
         let p = ClockPolicy::new();
-        p.insert_cold(1); p.insert_cold(2); p.insert_cold(3);
+        p.insert_cold(1);
+        p.insert_cold(2);
+        p.insert_cold(3);
         // Touch node 2 → ref_bit = 1.
         p.touch(2);
         // 1 has ref_bit=0 → evicted first.
@@ -209,7 +223,9 @@ mod tests {
     #[test]
     fn test_clock_remove_hand_node() {
         let p = ClockPolicy::new();
-        p.insert_cold(1); p.insert_cold(2); p.insert_cold(3);
+        p.insert_cold(1);
+        p.insert_cold(2);
+        p.insert_cold(3);
         // Remove the current hand node (1 = head = cold end).
         assert!(p.remove(1));
         assert_eq!(p.len(), 2);

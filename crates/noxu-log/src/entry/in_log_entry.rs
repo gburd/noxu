@@ -104,12 +104,8 @@ mod tests {
     #[test]
     fn test_in_log_entry_roundtrip() {
         let node_data = b"fake_serialized_IN_node_data".to_vec();
-        let entry = InLogEntry::new(
-            42,
-            Lsn::new(10, 5000),
-            NULL_LSN,
-            node_data,
-        );
+        let entry =
+            InLogEntry::new(42, Lsn::new(10, 5000), NULL_LSN, node_data);
 
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);

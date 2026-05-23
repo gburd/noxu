@@ -1556,8 +1556,15 @@ mod tests {
             id: 99999,
             name: "test record".to_string(),
             value: std::f64::consts::PI,
-            tags: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
-            parent: Some(Box::new(SerialSimple { x: -42, label: "parent".to_string() })),
+            tags: vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+            ],
+            parent: Some(Box::new(SerialSimple {
+                x: -42,
+                label: "parent".to_string(),
+            })),
         };
         round_trip(&record);
     }
@@ -1576,19 +1583,24 @@ mod tests {
 
     /// SerialBindingTest: round-trip for deeply nested struct.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Level3 { z: u8 }
+    struct Level3 {
+        z: u8,
+    }
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Level2 { inner: Level3, s: String }
+    struct Level2 {
+        inner: Level3,
+        s: String,
+    }
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Level1 { mid: Level2, count: u32 }
+    struct Level1 {
+        mid: Level2,
+        count: u32,
+    }
 
     #[test]
     fn test_serial_deeply_nested_struct() {
         let v = Level1 {
-            mid: Level2 {
-                inner: Level3 { z: 255 },
-                s: "deep".to_string(),
-            },
+            mid: Level2 { inner: Level3 { z: 255 }, s: "deep".to_string() },
             count: 1_000_000,
         };
         round_trip(&v);

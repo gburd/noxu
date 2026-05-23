@@ -21,7 +21,7 @@ use super::mutation::MutationKey;
 /// let field_renamer = Renamer::for_field("my.package.Human", 0, "name", "fullName");
 /// ```
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Renamer {
     key: MutationKey,
@@ -31,7 +31,7 @@ pub struct Renamer {
 impl Renamer {
     /// Creates a mutation for renaming the class itself.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `from_class` - Fully-qualified name of the class being renamed.
@@ -77,7 +77,7 @@ impl Renamer {
 
     /// Returns the new class or field name.
     ///
-    /// 
+    ///
     pub fn new_name(&self) -> &str {
         &self.new_name
     }
@@ -142,7 +142,8 @@ mod tests {
 
     #[test]
     fn test_display_class() {
-        let r = Renamer::for_class("com.example.Person", 0, "com.example.Human");
+        let r =
+            Renamer::for_class("com.example.Person", 0, "com.example.Human");
         let s = r.to_string();
         assert!(s.contains("Renamer"));
         assert!(s.contains("com.example.Person"));

@@ -4,41 +4,41 @@
 /// Result returned by [`ScanFilter::check_key`] to control scan inclusion
 /// and termination.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanResult {
     /// Include the key and continue scanning.
     ///
-    /// 
+    ///
     Include,
 
     /// Exclude the key but continue scanning.
     ///
-    /// 
+    ///
     Exclude,
 
     /// Include the key and stop scanning.
     ///
-    /// 
+    ///
     IncludeStop,
 
     /// Exclude the key and stop scanning.
     ///
-    /// 
+    ///
     ExcludeStop,
 }
 
 impl ScanResult {
     /// Returns `true` for [`ScanResult::Include`] and [`ScanResult::IncludeStop`].
     ///
-    /// 
+    ///
     pub fn get_include(self) -> bool {
         matches!(self, ScanResult::Include | ScanResult::IncludeStop)
     }
 
     /// Returns `true` for [`ScanResult::IncludeStop`] and [`ScanResult::ExcludeStop`].
     ///
-    /// 
+    ///
     pub fn get_stop(self) -> bool {
         matches!(self, ScanResult::IncludeStop | ScanResult::ExcludeStop)
     }
@@ -46,7 +46,7 @@ impl ScanResult {
 
 /// Interface for filtering and optionally stopping a sequential scan.
 ///
-/// 
+///
 ///
 /// Passed to scan operations (e.g. `Database::scan_with_filter`) to control
 /// which records are returned and whether the scan continues.
@@ -75,7 +75,7 @@ pub trait ScanFilter: Send + Sync {
     /// Called for each key to determine whether it should be included and
     /// whether the scan should continue.
     ///
-    /// 
+    ///
     fn check_key(&self, key: &[u8]) -> ScanResult;
 }
 
@@ -109,7 +109,9 @@ mod tests {
 
     struct AlwaysInclude;
     impl ScanFilter for AlwaysInclude {
-        fn check_key(&self, _key: &[u8]) -> ScanResult { ScanResult::Include }
+        fn check_key(&self, _key: &[u8]) -> ScanResult {
+            ScanResult::Include
+        }
     }
 
     #[test]

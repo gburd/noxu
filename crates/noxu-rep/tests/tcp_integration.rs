@@ -75,7 +75,8 @@ fn test_tcp_loopback_echo() {
 fn test_tcp_multiple_messages_sequence() {
     let listener = loopback_listener();
     let addr = listener.local_addr().unwrap();
-    let messages: Vec<Vec<u8>> = (0u8..8).map(|i| vec![i; (i as usize) + 1]).collect();
+    let messages: Vec<Vec<u8>> =
+        (0u8..8).map(|i| vec![i; (i as usize) + 1]).collect();
     let expected = messages.clone();
 
     let server = std::thread::spawn(move || {
@@ -335,7 +336,9 @@ fn test_tcp_multiple_concurrent_clients() {
         for i in 0..N_CLIENTS {
             let ch = listener.accept().expect("accept failed");
             // Echo the message back.
-            if let Some(data) = ch.receive(RECV_TIMEOUT).expect("receive failed") {
+            if let Some(data) =
+                ch.receive(RECV_TIMEOUT).expect("receive failed")
+            {
                 ch.send(&data).unwrap_or_else(|e| {
                     panic!("server send to client {i} failed: {e}")
                 });
@@ -517,7 +520,8 @@ fn test_channel_drop_on_sender_side_is_detected_by_receiver() {
     let result = replica_ch.receive(SHORT_TIMEOUT);
     assert!(
         result.is_err() || matches!(result, Ok(None)),
-        "replica must detect sender disconnect; got: {:?}", result
+        "replica must detect sender disconnect; got: {:?}",
+        result
     );
 }
 
@@ -566,8 +570,8 @@ fn test_channel_drop_on_receiver_side_is_detected_by_sender() {
 /// Replica after a leadership change.
 #[test]
 fn test_replicated_env_state_machine_survives_re_election() {
-    let config = RepConfig::builder("fault_group", "re_elect_node", "127.0.0.1")
-        .build();
+    let config =
+        RepConfig::builder("fault_group", "re_elect_node", "127.0.0.1").build();
     let env = ReplicatedEnvironment::new(config).expect("env creation failed");
 
     // Starts Detached.
@@ -581,8 +585,11 @@ fn test_replicated_env_state_machine_survives_re_election() {
     // becomes master directly from Replica (allows Master ↔ Replica direct
     // transitions via ensure_unknown_state).
     env.become_master(2).expect("become_master (re-election) failed");
-    assert_eq!(env.get_state(), NodeState::Master,
-        "state must be Master after winning re-election, not stuck at Replica");
+    assert_eq!(
+        env.get_state(),
+        NodeState::Master,
+        "state must be Master after winning re-election, not stuck at Replica"
+    );
 
     env.close().unwrap();
 }
@@ -705,7 +712,9 @@ fn test_32_concurrent_tcp_channels() {
         for ch in server_channels {
             let t = std::thread::spawn(move || {
                 for _ in 0..MSGS_PER_CHANNEL {
-                    let msg = ch.receive(RECV_TIMEOUT).expect("server recv failed")
+                    let msg = ch
+                        .receive(RECV_TIMEOUT)
+                        .expect("server recv failed")
                         .expect("server got None");
                     ch.send(&msg).expect("server send failed");
                 }
@@ -725,14 +734,18 @@ fn test_32_concurrent_tcp_channels() {
             let b = Arc::clone(&start);
             std::thread::spawn(move || {
                 b.wait();
-                let ch = TcpChannel::connect(addr)
-                    .expect("connect failed");
+                let ch = TcpChannel::connect(addr).expect("connect failed");
                 for j in 0..MSGS_PER_CHANNEL {
                     let payload = format!("ch{i}_msg{j}").into_bytes();
                     ch.send(&payload).expect("client send failed");
-                    let echo = ch.receive(RECV_TIMEOUT).expect("client recv failed")
+                    let echo = ch
+                        .receive(RECV_TIMEOUT)
+                        .expect("client recv failed")
                         .expect("client got None");
-                    assert_eq!(echo, payload, "echo mismatch on channel {i} msg {j}");
+                    assert_eq!(
+                        echo, payload,
+                        "echo mismatch on channel {i} msg {j}"
+                    );
                 }
             })
         })
@@ -753,9 +766,10 @@ fn test_master_crash_detected_by_32_replicas() {
     const REPLICAS: usize = 31;
 
     // Master node.
-    let master_config = RepConfig::builder("cascade_group", "master_node", "127.0.0.1")
-        .build();
-    let master = ReplicatedEnvironment::new(master_config).expect("master creation");
+    let master_config =
+        RepConfig::builder("cascade_group", "master_node", "127.0.0.1").build();
+    let master =
+        ReplicatedEnvironment::new(master_config).expect("master creation");
     master.become_master(1).expect("become_master failed");
     assert_eq!(master.get_state(), NodeState::Master);
 
@@ -771,7 +785,8 @@ fn test_master_crash_detected_by_32_replicas() {
                 .build();
                 let env = ReplicatedEnvironment::new(config)
                     .expect("replica creation failed");
-                env.become_replica("master_node").expect("become_replica failed");
+                env.become_replica("master_node")
+                    .expect("become_replica failed");
                 assert_eq!(env.get_state(), NodeState::Replica);
                 env
             })
@@ -788,8 +803,11 @@ fn test_master_crash_detected_by_32_replicas() {
 
     // All replicas must be able to detect master loss and transition to Unknown.
     for (i, r) in replicas.iter_mut().enumerate() {
-        r.ensure_unknown_state()
-            .unwrap_or_else(|_| panic!("replica {i} failed to transition to Unknown after master crash"));
+        r.ensure_unknown_state().unwrap_or_else(|_| {
+            panic!(
+                "replica {i} failed to transition to Unknown after master crash"
+            )
+        });
         assert_eq!(
             r.get_state(),
             NodeState::Unknown,
@@ -866,8 +884,12 @@ fn test_split_brain_minority_group_cannot_elect_master() {
         );
     }
 
-    for n in majority { n.close().unwrap(); }
-    for n in minority { n.close().unwrap(); }
+    for n in majority {
+        n.close().unwrap();
+    }
+    for n in minority {
+        n.close().unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -894,10 +916,7 @@ fn test_vlsn_monotonically_increasing_on_master() {
     }
 
     let current = env.get_current_vlsn();
-    assert_eq!(
-        current, N,
-        "current VLSN must equal the last registered VLSN"
-    );
+    assert_eq!(current, N, "current VLSN must equal the last registered VLSN");
 
     let range = env.get_vlsn_range();
     assert_eq!(range.get_last(), N, "range.last must equal N");
@@ -983,7 +1002,10 @@ fn test_replica_to_master_failover_preserves_vlsn() {
         node.register_vlsn(vlsn, 0, vlsn as u32 * 16);
     }
     let vlsn_as_replica = node.get_current_vlsn();
-    assert_eq!(vlsn_as_replica, 30, "replica must track all 30 registered VLSNs");
+    assert_eq!(
+        vlsn_as_replica, 30,
+        "replica must track all 30 registered VLSNs"
+    );
 
     // Failover: node becomes master (old master crashed).
     node.become_master(2).unwrap();

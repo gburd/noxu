@@ -59,10 +59,7 @@ impl Entity for Person {
 struct PersonSerializer;
 
 impl EntitySerializer<Person> for PersonSerializer {
-    fn serialize(
-        &self,
-        entity: &Person,
-    ) -> noxu_persist::Result<Vec<u8>> {
+    fn serialize(&self, entity: &Person) -> noxu_persist::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&entity.person_id.to_be_bytes());
         buf.extend_from_slice(&entity.age.to_be_bytes());
@@ -85,9 +82,8 @@ impl EntitySerializer<Person> for PersonSerializer {
             ));
         }
 
-        let person_id = u32::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]);
+        let person_id =
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let age = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
 
         let mut pos = 8usize;
@@ -152,8 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env = Environment::open(env_config)?;
 
     // 2. Open an entity store.
-    let store_config =
-        StoreConfig::new("PersonStore").with_allow_create(true);
+    let store_config = StoreConfig::new("PersonStore").with_allow_create(true);
     let mut store = EntityStore::open(&env, store_config)?;
 
     // 3. Obtain the primary index for Person entities.
@@ -225,16 +220,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     index.put(&ser, &updated_bob)?;
     let bob = index.get(&ser, &2u32)?.expect("Bob should exist");
-    println!("  Updated: {} {}, age={}", bob.first_name, bob.last_name, bob.age);
+    println!(
+        "  Updated: {} {}, age={}",
+        bob.first_name, bob.last_name, bob.age
+    );
 
     // 7. Check entity count.
     println!("\nEntity count: {}", index.count()?);
 
     // 8. Iterate over all entities in key order.
     println!("\nAll persons in key order:");
-    let all: Vec<Person> = index
-        .entities(&ser)?
-        .collect::<noxu_persist::Result<Vec<_>>>()?;
+    let all: Vec<Person> =
+        index.entities(&ser)?.collect::<noxu_persist::Result<Vec<_>>>()?;
     for p in &all {
         println!(
             "  id={}: {} {}, age={}",
@@ -256,9 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 10. Verify all remaining entities are accessible.
     println!("\nFinal scan:");
-    let remaining: Vec<Person> = index
-        .entities(&ser)?
-        .collect::<noxu_persist::Result<Vec<_>>>()?;
+    let remaining: Vec<Person> =
+        index.entities(&ser)?.collect::<noxu_persist::Result<Vec<_>>>()?;
     for p in &remaining {
         println!(
             "  id={}: {} {}, age={}",

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A secondary (index) database handle.
 ///
-/// 
+///
 ///
 /// Secondary databases are always associated with a primary database.
 /// Key characteristics:
@@ -71,7 +71,7 @@ pub struct SecondaryDatabase {
 impl SecondaryDatabase {
     /// Opens or creates a secondary database associated with `primary`.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `primary` - The primary database handle, shared via `Arc<Mutex<_>>`.
@@ -118,7 +118,7 @@ impl SecondaryDatabase {
 
     /// Returns the secondary configuration.
     ///
-    /// 
+    ///
     pub fn get_config(&self) -> &SecondaryConfig {
         &self.config
     }
@@ -130,14 +130,14 @@ impl SecondaryDatabase {
 
     /// Closes the secondary database handle.
     ///
-    /// 
+    ///
     pub fn close(&self) -> Result<()> {
         self.inner.close()
     }
 
     /// Retrieves a primary record by secondary key.
     ///
-    /// 
+    ///
     ///
     /// Looks up `key` in the secondary index, obtains the primary key stored
     /// there, then fetches the corresponding record from the primary database.
@@ -189,7 +189,7 @@ impl SecondaryDatabase {
 
     /// Deletes all primary records whose secondary key equals `key`.
     ///
-    /// 
+    ///
     ///
     /// All duplicate secondary index entries with the given secondary key are
     /// found and their corresponding primary records deleted.  Each primary
@@ -244,7 +244,8 @@ impl SecondaryDatabase {
             // this should return NotFound when no more duplicates exist.
             p_key = DatabaseEntry::new();
             data = DatabaseEntry::new();
-            let next_status = sec_cursor.get_search_key(key, &mut p_key, &mut data)?;
+            let next_status =
+                sec_cursor.get_search_key(key, &mut p_key, &mut data)?;
             if next_status != OperationStatus::Success {
                 break;
             }
@@ -255,7 +256,7 @@ impl SecondaryDatabase {
 
     /// Opens a cursor on the secondary database.
     ///
-    /// 
+    ///
     ///
     /// # Returns
     /// A `SecondaryCursor` that iterates secondary index entries and returns
@@ -272,21 +273,21 @@ impl SecondaryDatabase {
 
     /// Starts incremental population mode.
     ///
-    /// 
+    ///
     pub fn start_incremental_population(&self) {
         self.is_fully_populated.store(false, Ordering::Release);
     }
 
     /// Ends incremental population mode.
     ///
-    /// 
+    ///
     pub fn end_incremental_population(&self) {
         self.is_fully_populated.store(true, Ordering::Release);
     }
 
     /// Returns whether incremental population is currently enabled.
     ///
-    /// 
+    ///
     pub fn is_incremental_population_enabled(&self) -> bool {
         !self.is_fully_populated.load(Ordering::Acquire)
     }
@@ -297,7 +298,7 @@ impl SecondaryDatabase {
 
     /// Updates the secondary index when a primary record is inserted or updated.
     ///
-    /// 
+    ///
     ///
     /// Called from `Database::put_and_update_secondaries` (see database.rs
     /// integration layer) and from application code that manages secondary
@@ -327,7 +328,12 @@ impl SecondaryDatabase {
                 let mut sk = DatabaseEntry::new();
                 // The inner.* borrow requires a temporary Database borrow.
                 // We use &self.inner directly, which satisfies the lifetime.
-                if creator.create_secondary_key(&self.inner, pri_key, od, &mut sk) {
+                if creator.create_secondary_key(
+                    &self.inner,
+                    pri_key,
+                    od,
+                    &mut sk,
+                ) {
                     Some(sk)
                 } else {
                     None
@@ -336,7 +342,12 @@ impl SecondaryDatabase {
 
             let new_sec_key = new_data.and_then(|nd| {
                 let mut sk = DatabaseEntry::new();
-                if creator.create_secondary_key(&self.inner, pri_key, nd, &mut sk) {
+                if creator.create_secondary_key(
+                    &self.inner,
+                    pri_key,
+                    nd,
+                    &mut sk,
+                ) {
                     Some(sk)
                 } else {
                     None
@@ -360,7 +371,12 @@ impl SecondaryDatabase {
 
             let old_keys: Vec<DatabaseEntry> = if let Some(od) = old_data {
                 let mut keys = Vec::new();
-                multi_creator.create_secondary_keys(&self.inner, pri_key, od, &mut keys);
+                multi_creator.create_secondary_keys(
+                    &self.inner,
+                    pri_key,
+                    od,
+                    &mut keys,
+                );
                 keys
             } else {
                 empty.clone()
@@ -368,7 +384,12 @@ impl SecondaryDatabase {
 
             let new_keys: Vec<DatabaseEntry> = if let Some(nd) = new_data {
                 let mut keys = Vec::new();
-                multi_creator.create_secondary_keys(&self.inner, pri_key, nd, &mut keys);
+                multi_creator.create_secondary_keys(
+                    &self.inner,
+                    pri_key,
+                    nd,
+                    &mut keys,
+                );
                 keys
             } else {
                 empty
@@ -452,15 +473,20 @@ impl SecondaryDatabase {
         // Clone sec_key because Cursor::get requires &mut but key is input-only for Search.
         let mut sec_key_mut = sec_key.clone();
         let status = cursor
-            .get(&mut sec_key_mut, &mut stored_pk, crate::get::Get::Search, None)
+            .get(
+                &mut sec_key_mut,
+                &mut stored_pk,
+                crate::get::Get::Search,
+                None,
+            )
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
 
         if status == OperationStatus::Success {
             // Verify the stored primary key matches before deleting.
             if stored_pk.get_data() == pri_key.get_data() {
-                cursor
-                    .delete()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                cursor.delete().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
             }
         }
         // If not found, the secondary may already have been cleaned up; ignore.
@@ -516,7 +542,12 @@ impl SecondaryDatabase {
             // Create secondary key(s) and insert them.
             if let Some(creator) = &self.config.key_creator {
                 let mut sec_key = DatabaseEntry::new();
-                if creator.create_secondary_key(&self.inner, &pri_key, &pri_data, &mut sec_key) {
+                if creator.create_secondary_key(
+                    &self.inner,
+                    &pri_key,
+                    &pri_data,
+                    &mut sec_key,
+                ) {
                     self.insert_sec_key(&sec_key, &pri_key)?;
                 }
             } else if let Some(multi_creator) = &self.config.multi_key_creator {
@@ -587,10 +618,11 @@ mod tests {
             result: &mut DatabaseEntry,
         ) -> bool {
             if let Some(d) = data.get_data()
-                && !d.is_empty() {
-                    result.set_data(&d[..1]);
-                    return true;
-                }
+                && !d.is_empty()
+            {
+                result.set_data(&d[..1]);
+                return true;
+            }
             false
         }
     }
@@ -648,15 +680,14 @@ mod tests {
         }
 
         // Update the secondary index manually (mimics the integration layer).
-        secondary
-            .update_secondary(&pri_key, None, Some(&pri_data))
-            .unwrap();
+        secondary.update_secondary(&pri_key, None, Some(&pri_data)).unwrap();
 
         // Retrieve by secondary key (first byte of "Avalon" = 'A' = 0x41).
         let sec_key = DatabaseEntry::from_bytes(b"A");
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
 
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -670,11 +701,8 @@ mod tests {
         let secondary = open_secondary(Arc::clone(&primary), &env, "secondary");
 
         // Insert primary records and index them.
-        let records: &[(&[u8], &[u8])] = &[
-            (b"pk1", b"Apple"),
-            (b"pk2", b"Banana"),
-            (b"pk3", b"Avocado"),
-        ];
+        let records: &[(&[u8], &[u8])] =
+            &[(b"pk1", b"Apple"), (b"pk2", b"Banana"), (b"pk3", b"Avocado")];
 
         for (k, v) in records {
             let pk = DatabaseEntry::from_bytes(k);
@@ -689,14 +717,16 @@ mod tests {
         let sec_key = DatabaseEntry::from_bytes(b"B");
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
+        let status =
+            secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
 
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Banana");
 
         // Search for non-existent secondary key.
         let missing = DatabaseEntry::from_bytes(b"Z");
-        let status = secondary.get(None, &missing, &mut p_key, &mut data).unwrap();
+        let status =
+            secondary.get(None, &missing, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -711,9 +741,7 @@ mod tests {
         {
             primary.lock().put(None, &pri_key, &pri_data).unwrap();
         }
-        secondary
-            .update_secondary(&pri_key, None, Some(&pri_data))
-            .unwrap();
+        secondary.update_secondary(&pri_key, None, Some(&pri_data)).unwrap();
 
         // Delete via secondary key.
         let sec_key = DatabaseEntry::from_bytes(b"C");
@@ -739,9 +767,7 @@ mod tests {
         {
             primary.lock().put(None, &pri_key, &old_data).unwrap();
         }
-        secondary
-            .update_secondary(&pri_key, None, Some(&old_data))
-            .unwrap();
+        secondary.update_secondary(&pri_key, None, Some(&old_data)).unwrap();
 
         // Now update the primary; the secondary key 'M' should be replaced by 'P'.
         {
@@ -772,11 +798,8 @@ mod tests {
         let secondary = open_secondary(Arc::clone(&primary), &env, "secondary");
 
         // Insert records with distinct first bytes.
-        let records: &[(&[u8], &[u8])] = &[
-            (b"pk1", b"Banana"),
-            (b"pk2", b"Cherry"),
-            (b"pk3", b"Apple"),
-        ];
+        let records: &[(&[u8], &[u8])] =
+            &[(b"pk1", b"Banana"), (b"pk2", b"Cherry"), (b"pk3", b"Apple")];
         for (k, v) in records {
             let pk = DatabaseEntry::from_bytes(k);
             let pv = DatabaseEntry::from_bytes(v);
@@ -791,17 +814,15 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
-        let status = cursor
-            .get_first(&mut sec_key, &mut p_key, &mut data)
-            .unwrap();
+        let status =
+            cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         let mut current = status;
         while current == OperationStatus::Success {
             if let Some(k) = sec_key.get_data() {
                 sec_keys_seen.push(k.to_vec());
             }
-            current = cursor
-                .get_next(&mut sec_key, &mut p_key, &mut data)
-                .unwrap();
+            current =
+                cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         }
 
         // We expect 3 entries (A, B, C in secondary key order).
@@ -852,19 +873,22 @@ mod tests {
 
         // Open secondary with allow_populate=true.
         let sec_db_config = DatabaseConfig::new().with_allow_create(true);
-        let sec_db = env.open_database(None, "secondary_pop", &sec_db_config).unwrap();
+        let sec_db =
+            env.open_database(None, "secondary_pop", &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()
             .with_allow_create(true)
             .with_allow_populate(true)
             .with_key_creator(Box::new(FirstByteKeyCreator));
         let secondary =
-            SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config).unwrap();
+            SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+                .unwrap();
 
         // The secondary should have been populated.
         let sec_key_g = DatabaseEntry::from_bytes(b"G");
         let mut pk = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = secondary.get(None, &sec_key_g, &mut pk, &mut data).unwrap();
+        let status =
+            secondary.get(None, &sec_key_g, &mut pk, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Grape");
     }

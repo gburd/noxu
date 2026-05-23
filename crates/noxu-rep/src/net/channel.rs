@@ -84,7 +84,10 @@ impl ChannelQueue {
     /// Pop a message, blocking until data arrives, the timeout expires, or
     /// the writer closes the queue. Returns `None` on timeout; returns
     /// `Err(ChannelClosed)` if the writer was closed.
-    fn pop(&self, timeout: Duration) -> std::result::Result<Option<Vec<u8>>, ()> {
+    fn pop(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<Option<Vec<u8>>, ()> {
         let mut q = self.queue.lock();
         if q.is_empty() {
             if self.writer_closed.load(Ordering::SeqCst) {
@@ -138,9 +141,9 @@ impl Channel for LocalChannel {
         if !self.is_open() {
             return Err(RepError::ChannelClosed("channel is closed".into()));
         }
-        self.recv_queue
-            .pop(timeout)
-            .map_err(|()| RepError::ChannelClosed("peer closed the channel".into()))
+        self.recv_queue.pop(timeout).map_err(|()| {
+            RepError::ChannelClosed("peer closed the channel".into())
+        })
     }
 
     fn close(&self) -> Result<()> {
@@ -218,7 +221,10 @@ impl TcpChannel {
     /// The stream must be in a connected state. The caller is responsible for
     /// configuring any socket options (e.g. `TCP_NODELAY`) before wrapping.
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream: Arc::new(Mutex::new(stream)), open: AtomicBool::new(true) }
+        Self {
+            stream: Arc::new(Mutex::new(stream)),
+            open: AtomicBool::new(true),
+        }
     }
 
     /// Connect to a remote address and return a `TcpChannel`.
@@ -242,11 +248,17 @@ impl TcpChannel {
     pub fn connect_host(host: &str, port: u16) -> Result<Self> {
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|e| RepError::NetworkError(format!("DNS resolution failed for {host}:{port}: {e}")))?
+            .map_err(|e| {
+                RepError::NetworkError(format!(
+                    "DNS resolution failed for {host}:{port}: {e}"
+                ))
+            })?
             .collect();
 
         if addrs.is_empty() {
-            return Err(RepError::NetworkError(format!("no addresses resolved for {host}:{port}")));
+            return Err(RepError::NetworkError(format!(
+                "no addresses resolved for {host}:{port}"
+            )));
         }
 
         // Happy Eyeballs: prefer IPv6 over IPv4 when both are available.
@@ -275,13 +287,14 @@ impl TcpChannel {
     /// or the kernel has IPv6 disabled).
     pub fn bind_dual_stack(port: u16) -> Result<TcpChannelListener> {
         // Try IPv6 wildcard first (accepts both IPv4-mapped and native IPv6 on Linux).
-        if let Ok(listener) = TcpListener::bind(format!("[::]:{}",  port)) {
+        if let Ok(listener) = TcpListener::bind(format!("[::]:{}", port)) {
             return Ok(TcpChannelListener { listener });
         }
         // Fall back to IPv4 wildcard.
-        let addr: SocketAddr = format!("0.0.0.0:{port}")
-            .parse()
-            .map_err(|e| RepError::NetworkError(format!("invalid bind addr: {e}")))?;
+        let addr: SocketAddr =
+            format!("0.0.0.0:{port}").parse().map_err(|e| {
+                RepError::NetworkError(format!("invalid bind addr: {e}"))
+            })?;
         TcpChannelListener::bind(addr)
     }
 }
@@ -305,9 +318,7 @@ impl Channel for TcpChannel {
         stream
             .write_all(data)
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
-        stream
-            .flush()
-            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        stream.flush().map_err(|e| RepError::NetworkError(e.to_string()))?;
         Ok(())
     }
 
@@ -431,7 +442,7 @@ impl TcpChannelListener {
             let fd = self.listener.as_raw_fd();
             let tv = match timeout {
                 Some(d) => libc::timeval {
-                    tv_sec:  d.as_secs() as libc::time_t,
+                    tv_sec: d.as_secs() as libc::time_t,
                     tv_usec: d.subsec_micros() as libc::suseconds_t,
                 },
                 None => libc::timeval { tv_sec: 0, tv_usec: 0 },
@@ -452,7 +463,9 @@ impl TcpChannelListener {
             }
         }
         #[cfg(not(unix))]
-        { let _ = timeout; }
+        {
+            let _ = timeout;
+        }
         Ok(())
     }
 }
@@ -473,8 +486,14 @@ trait TlsStreamOps: Send + 'static {
     fn read_exact_buf(&mut self, buf: &mut [u8]) -> std::io::Result<()>;
     fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()>;
     fn flush_buf(&mut self) -> std::io::Result<()>;
-    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
-    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn set_read_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()>;
+    fn set_write_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()>;
     fn shutdown_inner(&self) -> std::io::Result<()>;
 }
 
@@ -491,10 +510,16 @@ impl TlsStreamOps for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
     fn flush_buf(&mut self) -> std::io::Result<()> {
         IoWrite::flush(self)
     }
-    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    fn set_read_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()> {
         self.sock.set_read_timeout(dur)
     }
-    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    fn set_write_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()> {
         self.sock.set_write_timeout(dur)
     }
     fn shutdown_inner(&self) -> std::io::Result<()> {
@@ -513,10 +538,16 @@ impl TlsStreamOps for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     fn flush_buf(&mut self) -> std::io::Result<()> {
         IoWrite::flush(self)
     }
-    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    fn set_read_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()> {
         self.sock.set_read_timeout(dur)
     }
-    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    fn set_write_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()> {
         self.sock.set_write_timeout(dur)
     }
     fn shutdown_inner(&self) -> std::io::Result<()> {
@@ -537,10 +568,16 @@ impl TlsStreamOps for native_tls::TlsStream<TcpStream> {
     fn flush_buf(&mut self) -> std::io::Result<()> {
         IoWrite::flush(self)
     }
-    fn set_read_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    fn set_read_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()> {
         self.get_ref().set_read_timeout(dur)
     }
-    fn set_write_timeout_inner(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    fn set_write_timeout_inner(
+        &mut self,
+        dur: Option<Duration>,
+    ) -> std::io::Result<()> {
         self.get_ref().set_write_timeout(dur)
     }
     fn shutdown_inner(&self) -> std::io::Result<()> {
@@ -610,11 +647,15 @@ impl TlsTcpChannel {
         use rustls::pki_types::ServerName;
         let cfg = tls.to_rustls_client_config()?;
         let server_name = ServerName::try_from(tls.server_name.clone())
-            .map_err(|e| RepError::NetworkError(format!("invalid server name: {e}")))?;
+            .map_err(|e| {
+                RepError::NetworkError(format!("invalid server name: {e}"))
+            })?;
         let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
-        let conn = rustls::ClientConnection::new(cfg, server_name)
-            .map_err(|e| RepError::NetworkError(format!("TLS client init: {e}")))?;
+        let conn =
+            rustls::ClientConnection::new(cfg, server_name).map_err(|e| {
+                RepError::NetworkError(format!("TLS client init: {e}"))
+            })?;
         let stream = rustls::StreamOwned::new(conn, tcp);
         Ok(Self::wrap(Box::new(stream)))
     }
@@ -624,9 +665,9 @@ impl TlsTcpChannel {
         let connector = tls.to_native_connector()?;
         let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
-        let stream = connector
-            .connect(&tls.server_name, tcp)
-            .map_err(|e| RepError::NetworkError(format!("TLS handshake: {e}")))?;
+        let stream = connector.connect(&tls.server_name, tcp).map_err(|e| {
+            RepError::NetworkError(format!("TLS handshake: {e}"))
+        })?;
         Ok(Self::wrap(Box::new(stream)))
     }
 }
@@ -635,32 +676,33 @@ impl TlsTcpChannel {
 impl Channel for TlsTcpChannel {
     fn send(&self, data: &[u8]) -> Result<()> {
         if !self.is_open() {
-            return Err(RepError::ChannelClosed("TlsTcpChannel is closed".into()));
+            return Err(RepError::ChannelClosed(
+                "TlsTcpChannel is closed".into(),
+            ));
         }
         let len = data.len() as u32;
-        let mut s = self
-            .stream
-            .lock()
-            .map_err(|_| RepError::NetworkError("TLS stream lock poisoned".into()))?;
+        let mut s = self.stream.lock().map_err(|_| {
+            RepError::NetworkError("TLS stream lock poisoned".into())
+        })?;
         s.set_write_timeout_inner(Some(Duration::from_secs(30)))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
         s.write_all_buf(&len.to_le_bytes())
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
         s.write_all_buf(data)
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
-        s.flush_buf()
-            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        s.flush_buf().map_err(|e| RepError::NetworkError(e.to_string()))?;
         Ok(())
     }
 
     fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         if !self.is_open() {
-            return Err(RepError::ChannelClosed("TlsTcpChannel is closed".into()));
+            return Err(RepError::ChannelClosed(
+                "TlsTcpChannel is closed".into(),
+            ));
         }
-        let mut s = self
-            .stream
-            .lock()
-            .map_err(|_| RepError::NetworkError("TLS stream lock poisoned".into()))?;
+        let mut s = self.stream.lock().map_err(|_| {
+            RepError::NetworkError("TLS stream lock poisoned".into())
+        })?;
         s.set_read_timeout_inner(Some(timeout))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
         let mut len_buf = [0u8; 4];
@@ -692,12 +734,10 @@ impl Channel for TlsTcpChannel {
 
     fn close(&self) -> Result<()> {
         self.open.store(false, Ordering::SeqCst);
-        let s = self
-            .stream
-            .lock()
-            .map_err(|_| RepError::NetworkError("TLS stream lock poisoned".into()))?;
-        s.shutdown_inner()
-            .map_err(|e| RepError::NetworkError(e.to_string()))
+        let s = self.stream.lock().map_err(|_| {
+            RepError::NetworkError("TLS stream lock poisoned".into())
+        })?;
+        s.shutdown_inner().map_err(|e| RepError::NetworkError(e.to_string()))
     }
 
     fn is_open(&self) -> bool {
@@ -765,15 +805,17 @@ impl TlsTcpChannelListener {
             #[cfg(feature = "tls-rustls")]
             TlsAcceptorImpl::Rustls(cfg) => {
                 let conn = rustls::ServerConnection::new(Arc::clone(cfg))
-                    .map_err(|e| RepError::NetworkError(format!("TLS server init: {e}")))?;
+                    .map_err(|e| {
+                        RepError::NetworkError(format!("TLS server init: {e}"))
+                    })?;
                 let stream = rustls::StreamOwned::new(conn, tcp);
                 Ok(TlsTcpChannel::wrap(Box::new(stream)))
             }
             #[cfg(feature = "tls-native")]
             TlsAcceptorImpl::Native(acceptor) => {
-                let stream = acceptor
-                    .accept(tcp)
-                    .map_err(|e| RepError::NetworkError(format!("TLS handshake: {e}")))?;
+                let stream = acceptor.accept(tcp).map_err(|e| {
+                    RepError::NetworkError(format!("TLS handshake: {e}"))
+                })?;
                 Ok(TlsTcpChannel::wrap(Box::new(stream)))
             }
         }
@@ -1056,9 +1098,11 @@ mod tests {
         #[test]
         fn test_tls_tcp_send_receive() {
             let tls = TlsConfig::insecure("localhost");
-            let listener =
-                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
-                    .unwrap();
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
 
             let handle = std::thread::spawn(move || {
@@ -1079,15 +1123,18 @@ mod tests {
         #[test]
         fn test_tls_tcp_multiple_messages() {
             let tls = TlsConfig::insecure("localhost");
-            let listener =
-                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
-                    .unwrap();
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
 
             let handle = std::thread::spawn(move || {
                 let ch = listener.accept().unwrap();
                 for i in 0u8..4 {
-                    let msg = ch.receive(Duration::from_secs(5)).unwrap().unwrap();
+                    let msg =
+                        ch.receive(Duration::from_secs(5)).unwrap().unwrap();
                     assert_eq!(msg, vec![i]);
                 }
             });
@@ -1102,11 +1149,14 @@ mod tests {
         #[test]
         fn test_tls_tcp_large_payload() {
             let tls = TlsConfig::insecure("localhost");
-            let listener =
-                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
-                    .unwrap();
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
-            let payload: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
+            let payload: Vec<u8> =
+                (0..65536).map(|i| (i % 256) as u8).collect();
             let expected = payload.clone();
 
             let handle = std::thread::spawn(move || {
@@ -1123,9 +1173,11 @@ mod tests {
         #[test]
         fn test_tls_tcp_receive_timeout() {
             let tls = TlsConfig::insecure("localhost");
-            let listener =
-                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
-                    .unwrap();
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
 
             // Server accepts but never sends.
@@ -1146,9 +1198,11 @@ mod tests {
         #[test]
         fn test_tls_tcp_close() {
             let tls = TlsConfig::insecure("localhost");
-            let listener =
-                TlsTcpChannelListener::bind_with_tls("127.0.0.1:0".parse().unwrap(), &tls)
-                    .unwrap();
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
 
             let handle = std::thread::spawn(move || {

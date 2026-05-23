@@ -22,7 +22,7 @@ pub enum CursorState {
 
 /// A database cursor for iterating over records.
 ///
-/// 
+///
 ///
 /// Cursors are used for operating on collections of records,
 /// for iterating over a database, and for saving handles to individual
@@ -60,11 +60,7 @@ impl Cursor {
     ///
     /// Called by `Database::open_cursor`.
     pub(crate) fn from_impl(inner: CursorImpl, read_only: bool) -> Self {
-        Self {
-            inner,
-            state: CursorState::NotInitialized,
-            read_only,
-        }
+        Self { inner, state: CursorState::NotInitialized, read_only }
     }
 
     /// Retrieve a record using the cursor.
@@ -97,9 +93,9 @@ impl Cursor {
                     Some(k) if !k.is_empty() => k,
                     _ => return Ok(OperationStatus::NotFound),
                 };
-                self.inner
-                    .search(key_bytes, None, SearchMode::Set)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                self.inner.search(key_bytes, None, SearchMode::Set).map_err(
+                    |e| NoxuError::OperationNotAllowed(e.to_string()),
+                )?
             }
             Get::SearchGte | Get::SearchRange => {
                 let key_bytes = match key.get_data() {
@@ -108,7 +104,9 @@ impl Cursor {
                 };
                 self.inner
                     .search(key_bytes, None, SearchMode::SetRange)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
             }
             Get::First => self
                 .inner
@@ -121,59 +119,59 @@ impl Cursor {
             Get::Next => {
                 if self.state == CursorState::NotInitialized {
                     // Next from uninitialized positions at the first record.
-                    self.inner
-                        .get_first()
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.get_first().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
                 } else {
-                    self.inner
-                        .retrieve_next(GetMode::Next)
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.retrieve_next(GetMode::Next).map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
                 }
             }
             Get::Prev => {
                 if self.state == CursorState::NotInitialized {
                     // Prev from uninitialized positions at the last record.
-                    self.inner
-                        .get_last()
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.get_last().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
                 } else {
-                    self.inner
-                        .retrieve_next(GetMode::Prev)
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.retrieve_next(GetMode::Prev).map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
                 }
             }
             Get::NextDup => {
                 self.check_initialized()?;
-                self.inner
-                    .retrieve_next(GetMode::NextDup)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                self.inner.retrieve_next(GetMode::NextDup).map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?
             }
             Get::PrevDup => {
                 self.check_initialized()?;
-                self.inner
-                    .retrieve_next(GetMode::PrevDup)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                self.inner.retrieve_next(GetMode::PrevDup).map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?
             }
             Get::NextNoDup => {
                 if self.state == CursorState::NotInitialized {
-                    self.inner
-                        .get_first()
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.get_first().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
                 } else {
-                    self.inner
-                        .retrieve_next(GetMode::NextNoDup)
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.retrieve_next(GetMode::NextNoDup).map_err(
+                        |e| NoxuError::OperationNotAllowed(e.to_string()),
+                    )?
                 }
             }
             Get::PrevNoDup => {
                 if self.state == CursorState::NotInitialized {
-                    self.inner
-                        .get_last()
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.get_last().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
                 } else {
-                    self.inner
-                        .retrieve_next(GetMode::PrevNoDup)
-                        .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    self.inner.retrieve_next(GetMode::PrevNoDup).map_err(
+                        |e| NoxuError::OperationNotAllowed(e.to_string()),
+                    )?
                 }
             }
             Get::SearchBoth => {
@@ -181,7 +179,9 @@ impl Cursor {
                 let data_bytes = data.get_data();
                 self.inner
                     .search(key_bytes, data_bytes, SearchMode::Both)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
             }
             Get::Current => {
                 // Already checked initialized above.
@@ -191,10 +191,9 @@ impl Cursor {
                 if self.inner.is_current_slot_deleted() {
                     return Ok(OperationStatus::NotFound);
                 }
-                let (k, v) = self
-                    .inner
-                    .get_current()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                let (k, v) = self.inner.get_current().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
                 data.set_data(&v);
                 key.set_data(&k);
                 self.state = CursorState::Initialized;
@@ -205,10 +204,9 @@ impl Cursor {
 
         match status {
             noxu_dbi::OperationStatus::Success => {
-                let (k, v) = self
-                    .inner
-                    .get_current()
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+                let (k, v) = self.inner.get_current().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
                 data.set_data(&v);
                 // Write back the current key for navigation operations.
                 // `key` is always an output parameter for positioning ops.
@@ -219,7 +217,11 @@ impl Cursor {
             _ => {
                 if matches!(
                     get_type,
-                    Get::First | Get::Last | Get::Search | Get::SearchGte | Get::SearchRange
+                    Get::First
+                        | Get::Last
+                        | Get::Search
+                        | Get::SearchGte
+                        | Get::SearchRange
                 ) {
                     self.state = CursorState::NotInitialized;
                 }
@@ -274,7 +276,9 @@ impl Cursor {
             .put(key_bytes, data_bytes, put_mode)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
-            noxu_dbi::OperationStatus::KeyExist => Ok(OperationStatus::KeyExists),
+            noxu_dbi::OperationStatus::KeyExist => {
+                Ok(OperationStatus::KeyExists)
+            }
             _ => {
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
@@ -442,7 +446,8 @@ mod tests {
         let mut key = DatabaseEntry::from_bytes(b"key1");
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"value1");
         assert_eq!(cursor.get_state(), CursorState::Initialized);
@@ -454,7 +459,8 @@ mod tests {
         let mut key = DatabaseEntry::from_bytes(b"key2");
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -549,7 +555,8 @@ mod tests {
 
         cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
 
-        let status = cursor.get(&mut key, &mut data, Get::Current, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::Current, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"value1");
     }
@@ -748,7 +755,8 @@ mod tests {
 
         let mut values = Vec::new();
 
-        let mut status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
+        let mut status =
+            cursor.get(&mut key, &mut data, Get::First, None).unwrap();
         while status == OperationStatus::Success {
             values.push(data.get_data().unwrap().to_vec());
             status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
@@ -759,10 +767,8 @@ mod tests {
 
     #[test]
     fn test_next_from_uninitialized() {
-        let mut cursor = make_cursor_with(vec![
-            (b"key1", b"value1"),
-            (b"key2", b"value2"),
-        ]);
+        let mut cursor =
+            make_cursor_with(vec![(b"key1", b"value1"), (b"key2", b"value2")]);
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -774,10 +780,8 @@ mod tests {
 
     #[test]
     fn test_prev_from_uninitialized() {
-        let mut cursor = make_cursor_with(vec![
-            (b"key1", b"value1"),
-            (b"key2", b"value2"),
-        ]);
+        let mut cursor =
+            make_cursor_with(vec![(b"key1", b"value1"), (b"key2", b"value2")]);
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -815,7 +819,8 @@ mod tests {
         let mut key = DatabaseEntry::new(); // no data
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -826,7 +831,8 @@ mod tests {
         let mut key = DatabaseEntry::new(); // no data
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -841,7 +847,8 @@ mod tests {
         cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
 
         // Get::NextDup and other variants fall through to the `_ =>` arm.
-        let status = cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
 
@@ -929,7 +936,8 @@ mod tests {
 
         // Now search for a missing key — state must go back to NotInitialized.
         let mut key_miss = DatabaseEntry::from_bytes(b"missing");
-        let status = cursor.get(&mut key_miss, &mut data, Get::Search, None).unwrap();
+        let status =
+            cursor.get(&mut key_miss, &mut data, Get::Search, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
         assert_eq!(cursor.get_state(), CursorState::NotInitialized);
     }
@@ -944,7 +952,8 @@ mod tests {
         cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
 
         let mut key_big = DatabaseEntry::from_bytes(b"zzz");
-        let status = cursor.get(&mut key_big, &mut data, Get::SearchGte, None).unwrap();
+        let status =
+            cursor.get(&mut key_big, &mut data, Get::SearchGte, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
         assert_eq!(cursor.get_state(), CursorState::NotInitialized);
     }
@@ -976,7 +985,8 @@ mod tests {
         let mut key = DatabaseEntry::from_bytes(b"apple"); // < "mango"
         let mut data = DatabaseEntry::new();
 
-        let status = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+        let status =
+            cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"yellow");
         assert_eq!(cursor.get_state(), CursorState::Initialized);

@@ -15,14 +15,14 @@ use crate::error::{RepError, Result};
 pub enum ConsistencyPolicy {
     /// No consistency requirement -- read from any state.
     ///
-    /// 
+    ///
     #[default]
     NoConsistency,
 
     /// Time-based consistency: the replica must be within `max_lag` of
     /// the master's commit point.
     ///
-    /// 
+    ///
     TimeConsistency {
         /// Maximum permissible lag behind the master.
         max_lag: Duration,
@@ -33,7 +33,7 @@ pub enum ConsistencyPolicy {
     /// Commit-point consistency: the replica must have applied up to
     /// a specific VLSN before the read can proceed.
     ///
-    /// 
+    ///
     CommitPointConsistency {
         /// The VLSN sequence that must be applied on the replica.
         vlsn: i64,

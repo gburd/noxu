@@ -19,8 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
-use noxu_xa::{PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+};
+use noxu_xa::{
+    PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid,
+};
 use tempfile::TempDir;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,7 +41,11 @@ fn make_env(dir: &std::path::Path) -> Environment {
 fn make_xa_with_log(dir: &std::path::Path) -> (XaEnvironment, Database) {
     let env = make_env(dir);
     let db = env
-        .open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let xa = XaEnvironment::new(env).with_prepared_log().unwrap();
     (xa, db)
@@ -46,7 +54,11 @@ fn make_xa_with_log(dir: &std::path::Path) -> (XaEnvironment, Database) {
 fn make_xa(dir: &std::path::Path) -> (XaEnvironment, Database) {
     let env = make_env(dir);
     let db = env
-        .open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let xa = XaEnvironment::new(env);
     (xa, db)
@@ -71,7 +83,8 @@ fn test_crash_recovery_prepared_log_persists() {
         for (i, xid) in [&xid1, &xid2, &xid3].iter().enumerate() {
             xa.xa_start(xid, XaFlags::NOFLAGS).unwrap();
             let txn = xa.get_transaction(xid).unwrap();
-            let key = DatabaseEntry::from_vec(format!("crash_k{i}").into_bytes());
+            let key =
+                DatabaseEntry::from_vec(format!("crash_k{i}").into_bytes());
             let val = DatabaseEntry::from_bytes(b"crash_value");
             db.put(Some(txn), &key, &val).unwrap();
             xa.mark_write(xid).unwrap();
@@ -126,7 +139,10 @@ fn test_crash_recovery_committed_not_recovered() {
     {
         let (xa, _db) = make_xa_with_log(dir.path());
         let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
-        assert!(recovered.is_empty(), "committed branch should not be recovered");
+        assert!(
+            recovered.is_empty(),
+            "committed branch should not be recovered"
+        );
     }
 }
 
@@ -258,7 +274,8 @@ fn test_rapid_fire_10k_cycles() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            let key = DatabaseEntry::from_vec(format!("rapid_{i:08}").into_bytes());
+            let key =
+                DatabaseEntry::from_vec(format!("rapid_{i:08}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
             db.put(Some(txn), &key, &val).unwrap();
             xa.mark_write(&xid).unwrap();
@@ -289,7 +306,8 @@ fn test_rapid_fire_10k_with_prepared_log() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            let key = DatabaseEntry::from_vec(format!("plog_{i:08}").into_bytes());
+            let key =
+                DatabaseEntry::from_vec(format!("plog_{i:08}").into_bytes());
             let val = DatabaseEntry::from_bytes(b"v");
             db.put(Some(txn), &key, &val).unwrap();
             xa.mark_write(&xid).unwrap();
@@ -317,14 +335,17 @@ fn test_prepared_log_500_branches() {
     let n = 500;
 
     let xids: Vec<Xid> = (0..n)
-        .map(|i| Xid::new(1, format!("stress_{i:04}").as_bytes(), b"br").unwrap())
+        .map(|i| {
+            Xid::new(1, format!("stress_{i:04}").as_bytes(), b"br").unwrap()
+        })
         .collect();
 
     // Start, write, end, prepare all
     for (i, xid) in xids.iter().enumerate() {
         xa.xa_start(xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(xid).unwrap();
-        let key = DatabaseEntry::from_vec(format!("stress_k{i:04}").into_bytes());
+        let key =
+            DatabaseEntry::from_vec(format!("stress_k{i:04}").into_bytes());
         let val = DatabaseEntry::from_bytes(b"stress_val");
         db.put(Some(txn), &key, &val).unwrap();
         xa.mark_write(xid).unwrap();
@@ -352,7 +373,8 @@ fn test_prepared_log_500_branches() {
 
     // Verify: first half data present, second half absent
     for i in 0..n {
-        let key = DatabaseEntry::from_vec(format!("stress_k{i:04}").into_bytes());
+        let key =
+            DatabaseEntry::from_vec(format!("stress_k{i:04}").into_bytes());
         let mut val = DatabaseEntry::new();
         let status = db.get(None, &key, &mut val).unwrap();
         if i < n / 2 {
@@ -412,13 +434,11 @@ fn test_onephase_after_suspend_resume() {
     // Both writes visible
     let mut val = DatabaseEntry::new();
     assert_eq!(
-        db.get(None, &DatabaseEntry::from_bytes(b"s1pc_k1"), &mut val)
-            .unwrap(),
+        db.get(None, &DatabaseEntry::from_bytes(b"s1pc_k1"), &mut val).unwrap(),
         noxu_db::OperationStatus::Success
     );
     assert_eq!(
-        db.get(None, &DatabaseEntry::from_bytes(b"s1pc_k2"), &mut val)
-            .unwrap(),
+        db.get(None, &DatabaseEntry::from_bytes(b"s1pc_k2"), &mut val).unwrap(),
         noxu_db::OperationStatus::Success
     );
 }
@@ -451,13 +471,10 @@ fn test_prepared_log_binary_max_length_xids() {
         for (i, xid_ref) in [&xid, &xid2].iter().enumerate() {
             xa.xa_start(xid_ref, XaFlags::NOFLAGS).unwrap();
             let txn = xa.get_transaction(xid_ref).unwrap();
-            let key = DatabaseEntry::from_vec(format!("bin_key_{i}").into_bytes());
-            db.put(
-                Some(txn),
-                &key,
-                &DatabaseEntry::from_bytes(b"bin_val"),
-            )
-            .unwrap();
+            let key =
+                DatabaseEntry::from_vec(format!("bin_key_{i}").into_bytes());
+            db.put(Some(txn), &key, &DatabaseEntry::from_bytes(b"bin_val"))
+                .unwrap();
             xa.mark_write(xid_ref).unwrap();
             xa.xa_end(xid_ref, XaFlags::TMSUCCESS).unwrap();
             xa.xa_prepare(xid_ref, XaFlags::NOFLAGS).unwrap();
@@ -661,8 +678,14 @@ fn test_concurrent_branches_disjoint_keys() {
     // End and prepare both
     xa.xa_end(&xid1, XaFlags::TMSUCCESS).unwrap();
     xa.xa_end(&xid2, XaFlags::TMSUCCESS).unwrap();
-    assert_eq!(xa.xa_prepare(&xid1, XaFlags::NOFLAGS).unwrap(), PrepareResult::Ok);
-    assert_eq!(xa.xa_prepare(&xid2, XaFlags::NOFLAGS).unwrap(), PrepareResult::Ok);
+    assert_eq!(
+        xa.xa_prepare(&xid1, XaFlags::NOFLAGS).unwrap(),
+        PrepareResult::Ok
+    );
+    assert_eq!(
+        xa.xa_prepare(&xid2, XaFlags::NOFLAGS).unwrap(),
+        PrepareResult::Ok
+    );
 
     // Commit both
     xa.xa_commit(&xid1, XaFlags::NOFLAGS).unwrap();
@@ -861,7 +884,10 @@ fn test_adversarial_mixed_operations_timed() {
     }
 
     let total_ops = ops.load(Ordering::Relaxed);
-    eprintln!("adversarial mixed: {total_ops} ops in 5s ({:.0} ops/s)", total_ops as f64 / 5.0);
+    eprintln!(
+        "adversarial mixed: {total_ops} ops in 5s ({:.0} ops/s)",
+        total_ops as f64 / 5.0
+    );
 
     // Invariant: no unresolved branches remain
     let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();

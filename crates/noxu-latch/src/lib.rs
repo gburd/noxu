@@ -94,7 +94,8 @@ mod tests {
     #[test]
     fn test_latch_context_with_timeout() {
         use std::time::Duration;
-        let ctx = LatchContext::with_timeout("custom", Duration::from_millis(100));
+        let ctx =
+            LatchContext::with_timeout("custom", Duration::from_millis(100));
         assert_eq!(ctx.name, "custom");
         assert_eq!(ctx.timeout, Duration::from_millis(100));
     }
@@ -108,13 +109,22 @@ mod tests {
     #[test]
     fn test_latch_error_display() {
         let e1 = LatchError::AlreadyHeld("foo".to_string());
-        assert!(format!("{}", e1).contains("already held") || format!("{}", e1).contains("Latch already held"));
+        assert!(
+            format!("{}", e1).contains("already held")
+                || format!("{}", e1).contains("Latch already held")
+        );
 
         let e2 = LatchError::NotHeld("bar".to_string());
-        assert!(format!("{}", e2).contains("not held") || format!("{}", e2).contains("Latch not held"));
+        assert!(
+            format!("{}", e2).contains("not held")
+                || format!("{}", e2).contains("Latch not held")
+        );
 
         let e3 = LatchError::Timeout("baz".to_string());
-        assert!(format!("{}", e3).contains("timeout") || format!("{}", e3).contains("Latch timeout"));
+        assert!(
+            format!("{}", e3).contains("timeout")
+                || format!("{}", e3).contains("Latch timeout")
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::{LockResult, LockType, TxnError};
 /// This is used for auto-commit operations where a transaction context
 /// is not explicitly provided.
 ///
-/// 
+///
 pub struct ThreadLocker {
     /// Unique locker ID.
     id: i64,

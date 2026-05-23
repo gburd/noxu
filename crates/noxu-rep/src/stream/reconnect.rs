@@ -6,8 +6,8 @@
 //! exponential backoff and jitter.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::error::RepError;
@@ -111,7 +111,8 @@ pub fn catch_up_with_retry(
                 if attempt > 0 {
                     log::info!(
                         "reconnect: successfully caught up from {} after {} retries",
-                        peer_addr, attempt
+                        peer_addr,
+                        attempt
                     );
                 }
                 return ReconnectOutcome::CaughtUp;
@@ -119,7 +120,8 @@ pub fn catch_up_with_retry(
             Ok(false) => {
                 log::warn!(
                     "reconnect: peer {} requires full restore (VLSN {} too old)",
-                    peer_addr, start_vlsn
+                    peer_addr,
+                    start_vlsn
                 );
                 return ReconnectOutcome::NeedsRestore;
             }
@@ -128,7 +130,8 @@ pub fn catch_up_with_retry(
                 if !is_retryable(&e) {
                     log::error!(
                         "reconnect: non-retryable error from {}: {}",
-                        peer_addr, e
+                        peer_addr,
+                        e
                     );
                     // Treat non-retryable errors like max retries exceeded.
                     return ReconnectOutcome::MaxRetriesExceeded;
@@ -138,7 +141,9 @@ pub fn catch_up_with_retry(
                 if config.max_retries > 0 && attempt >= config.max_retries {
                     log::warn!(
                         "reconnect: max retries ({}) exceeded for {}; last error: {}",
-                        config.max_retries, peer_addr, e
+                        config.max_retries,
+                        peer_addr,
+                        e
                     );
                     return ReconnectOutcome::MaxRetriesExceeded;
                 }
@@ -146,18 +151,26 @@ pub fn catch_up_with_retry(
                 let backoff = config.next_backoff(attempt);
                 log::warn!(
                     "reconnect: attempt {} to {} failed ({}); retrying in {:?}",
-                    attempt, peer_addr, e, backoff
+                    attempt,
+                    peer_addr,
+                    e,
+                    backoff
                 );
 
                 // Sleep in small increments to allow shutdown detection.
                 let sleep_end = std::time::Instant::now() + backoff;
                 while std::time::Instant::now() < sleep_end {
                     if shutdown.load(Ordering::Acquire) {
-                        log::info!("reconnect: shutdown signalled during backoff");
+                        log::info!(
+                            "reconnect: shutdown signalled during backoff"
+                        );
                         return ReconnectOutcome::Shutdown;
                     }
-                    let remaining = sleep_end.saturating_duration_since(std::time::Instant::now());
-                    std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                    let remaining = sleep_end
+                        .saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(
+                        remaining.min(Duration::from_millis(100)),
+                    );
                 }
 
                 attempt = attempt.saturating_add(1);
@@ -170,7 +183,9 @@ pub fn catch_up_with_retry(
 fn is_retryable(err: &RepError) -> bool {
     matches!(
         err,
-        RepError::NetworkError(_) | RepError::ChannelClosed(_) | RepError::FrameCorrupted { .. }
+        RepError::NetworkError(_)
+            | RepError::ChannelClosed(_)
+            | RepError::FrameCorrupted { .. }
     )
 }
 
@@ -282,7 +297,8 @@ mod tests {
         let cfg = ReconnectConfig::default();
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-        let outcome = catch_up_with_retry(addr, 0, &mut NeverWriter, &cfg, &shutdown);
+        let outcome =
+            catch_up_with_retry(addr, 0, &mut NeverWriter, &cfg, &shutdown);
         assert_eq!(outcome, ReconnectOutcome::Shutdown);
     }
 
@@ -306,7 +322,8 @@ mod tests {
         // Use an address that will fail to connect (nothing listening on port 1).
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-        let outcome = catch_up_with_retry(addr, 0, &mut NeverWriter, &cfg, &shutdown);
+        let outcome =
+            catch_up_with_retry(addr, 0, &mut NeverWriter, &cfg, &shutdown);
         assert_eq!(outcome, ReconnectOutcome::MaxRetriesExceeded);
     }
 

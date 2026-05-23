@@ -5,7 +5,7 @@ use crate::{LockResult, LockType, TxnError};
 
 /// Null transaction ID — used by non-transactional lockers (BasicLocker, etc.).
 ///
-/// 
+///
 pub const NULL_TXN_ID: i64 = -1;
 
 /// A Locker is route to locking and transactional support.
@@ -17,7 +17,7 @@ pub const NULL_TXN_ID: i64 = -1;
 /// Only Txn (and its subclasses like MasterTxn, ReadonlyTxn) instances are
 /// truly transactional with commit/abort semantics.
 ///
-/// 
+///
 pub trait Locker: Send + Sync {
     /// Returns the unique ID of this locker.
     ///
@@ -214,7 +214,6 @@ pub trait Locker: Send + Sync {
     fn is_open(&self) -> bool;
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,7 +388,9 @@ mod tests {
     struct CustomDefaultsLocker;
 
     impl Locker for CustomDefaultsLocker {
-        fn id(&self) -> i64 { 99 }
+        fn id(&self) -> i64 {
+            99
+        }
 
         fn lock(
             &mut self,
@@ -404,22 +405,40 @@ mod tests {
             Ok(())
         }
 
-        fn owns_write_lock(&self, _lsn: u64) -> bool { false }
+        fn owns_write_lock(&self, _lsn: u64) -> bool {
+            false
+        }
 
-        fn is_transactional(&self) -> bool { true }
+        fn is_transactional(&self) -> bool {
+            true
+        }
 
-        fn lock_timeout_ms(&self) -> u64 { 0 }
+        fn lock_timeout_ms(&self) -> u64 {
+            0
+        }
 
         fn close(&mut self) {}
 
-        fn is_open(&self) -> bool { true }
+        fn is_open(&self) -> bool {
+            true
+        }
 
         // Override all the default methods to non-default values
-        fn retains_locks_on_commit(&self) -> bool { true }
-        fn default_no_wait(&self) -> bool { true }
-        fn is_preemptable(&self) -> bool { false }
-        fn is_importunate(&self) -> bool { true }
-        fn is_read_uncommitted_default(&self) -> bool { true }
+        fn retains_locks_on_commit(&self) -> bool {
+            true
+        }
+        fn default_no_wait(&self) -> bool {
+            true
+        }
+        fn is_preemptable(&self) -> bool {
+            false
+        }
+        fn is_importunate(&self) -> bool {
+            true
+        }
+        fn is_read_uncommitted_default(&self) -> bool {
+            true
+        }
     }
 
     #[test]

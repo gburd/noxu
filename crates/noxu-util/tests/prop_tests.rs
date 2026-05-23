@@ -2,8 +2,8 @@
 
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_util::packed::{
-    read_packed_i32, read_packed_i64, read_sorted_i32, read_sorted_i64, write_packed_i32,
-    write_packed_i64, write_sorted_i32, write_sorted_i64,
+    read_packed_i32, read_packed_i64, read_sorted_i32, read_sorted_i64,
+    write_packed_i32, write_packed_i64, write_sorted_i32, write_sorted_i64,
 };
 use noxu_util::vlsn::Vlsn;
 use proptest::prelude::*;

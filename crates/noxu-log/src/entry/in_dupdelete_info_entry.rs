@@ -40,7 +40,11 @@ pub struct InDupDeleteInfoEntry {
 
 impl InDupDeleteInfoEntry {
     /// Creates a new INDupDeleteInfo entry.
-    pub fn new(deleted_node_id: u64, deleted_id_key: Vec<u8>, database_id: u64) -> Self {
+    pub fn new(
+        deleted_node_id: u64,
+        deleted_id_key: Vec<u8>,
+        database_id: u64,
+    ) -> Self {
         Self { deleted_node_id, deleted_id_key, database_id }
     }
 
@@ -48,7 +52,7 @@ impl InDupDeleteInfoEntry {
     pub fn log_size(&self) -> usize {
         8 + // deleted_node_id
         4 + self.deleted_id_key.len() + // deleted_id_key (len prefix + data)
-        8   // database_id
+        8 // database_id
     }
 
     /// Writes this entry to a buffer.
@@ -60,7 +64,9 @@ impl InDupDeleteInfoEntry {
     }
 
     /// Reads an entry from a buffer.
-    pub fn read_from_log(buf: &[u8]) -> Result<Self, InDupDeleteInfoEntryError> {
+    pub fn read_from_log(
+        buf: &[u8],
+    ) -> Result<Self, InDupDeleteInfoEntryError> {
         let mut cursor = Cursor::new(buf);
         let deleted_node_id = cursor.read_u64::<BigEndian>()?;
         let key_len = cursor.read_u32::<BigEndian>()? as usize;

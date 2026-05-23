@@ -350,12 +350,8 @@ mod tests {
             Vlsn::new(0),
         );
 
-        let entry = NameLnLogEntry::new(
-            ln_entry,
-            DbOperationType::Rename,
-            None,
-            None,
-        );
+        let entry =
+            NameLnLogEntry::new(ln_entry, DbOperationType::Rename, None, None);
 
         assert_eq!(entry.operation_type, DbOperationType::Rename);
         assert!(entry.replicated_create_config.is_none());
@@ -366,7 +362,8 @@ mod tests {
 
     #[test]
     fn test_log_size_remove_entry() {
-        let entry = NameLnLogEntry::new_remove(10, None, NULL_LSN, b"db".to_vec());
+        let entry =
+            NameLnLogEntry::new_remove(10, None, NULL_LSN, b"db".to_vec());
         let size = entry.log_size();
         // Must be at least ln_entry size + 1 byte for op type.
         assert!(size > 1);
@@ -403,8 +400,12 @@ mod tests {
             None,
             Some(42),
         );
-        let entry_remove =
-            NameLnLogEntry::new(make_base_ln(), DbOperationType::Remove, None, None);
+        let entry_remove = NameLnLogEntry::new(
+            make_base_ln(),
+            DbOperationType::Remove,
+            None,
+            None,
+        );
 
         // Truncate adds 8 bytes for old_db_id over the same base.
         assert_eq!(entry_trunc.log_size(), entry_remove.log_size() + 8);
@@ -442,11 +443,18 @@ mod tests {
             Some(config.clone()),
             None,
         );
-        let entry_remove =
-            NameLnLogEntry::new(make_base_ln(), DbOperationType::Remove, None, None);
+        let entry_remove = NameLnLogEntry::new(
+            make_base_ln(),
+            DbOperationType::Remove,
+            None,
+            None,
+        );
 
         // Create adds 4 bytes (length prefix) + config.len() over the same base.
-        assert_eq!(entry_create.log_size(), entry_remove.log_size() + 4 + config.len());
+        assert_eq!(
+            entry_create.log_size(),
+            entry_remove.log_size() + 4 + config.len()
+        );
     }
 
     // ── write_to_log / read_from_log for all operation types ─────────────────
@@ -472,7 +480,8 @@ mod tests {
             Vlsn::new(0),
         );
 
-        let entry = NameLnLogEntry::new(ln_entry, DbOperationType::Rename, None, None);
+        let entry =
+            NameLnLogEntry::new(ln_entry, DbOperationType::Rename, None, None);
 
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
@@ -542,7 +551,8 @@ mod tests {
             Vlsn::new(0),
         );
 
-        let entry = NameLnLogEntry::new(ln_entry, DbOperationType::None, None, None);
+        let entry =
+            NameLnLogEntry::new(ln_entry, DbOperationType::None, None, None);
 
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
@@ -557,14 +567,16 @@ mod tests {
 
     #[test]
     fn test_name_ln_log_entry_debug() {
-        let entry = NameLnLogEntry::new_remove(1, None, NULL_LSN, b"x".to_vec());
+        let entry =
+            NameLnLogEntry::new_remove(1, None, NULL_LSN, b"x".to_vec());
         let s = format!("{:?}", entry);
         assert!(s.contains("NameLnLogEntry"));
     }
 
     #[test]
     fn test_name_ln_log_entry_clone() {
-        let original = NameLnLogEntry::new_remove(1, None, NULL_LSN, b"y".to_vec());
+        let original =
+            NameLnLogEntry::new_remove(1, None, NULL_LSN, b"y".to_vec());
         let cloned = original.clone();
         assert_eq!(original.operation_type, cloned.operation_type);
         assert_eq!(original.ln_entry.db_id, cloned.ln_entry.db_id);
@@ -590,7 +602,8 @@ mod tests {
 
     #[test]
     fn test_new_remove_sets_fields() {
-        let entry = NameLnLogEntry::new_remove(77, Some(5), NULL_LSN, b"rdb".to_vec());
+        let entry =
+            NameLnLogEntry::new_remove(77, Some(5), NULL_LSN, b"rdb".to_vec());
 
         assert_eq!(entry.operation_type, DbOperationType::Remove);
         assert_eq!(entry.ln_entry.db_id, 77);

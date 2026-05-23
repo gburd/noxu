@@ -10,8 +10,8 @@ use noxu_log::LogManager;
 use noxu_txn::{LockManager, LockType, TxnError};
 use noxu_util::Lsn;
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// The number of LN log entries after which we process pending LNs.
 ///
@@ -113,7 +113,10 @@ impl RealTreeLookup {
     /// Creates a new `RealTreeLookup` from a shared tree reference.
     ///
     /// M-5: accepts `Arc<RwLock<Tree>>` so the cleaner shares the live tree.
-    pub fn new(tree: Arc<RwLock<noxu_tree::Tree>>, lock_manager: Arc<LockManager>) -> Self {
+    pub fn new(
+        tree: Arc<RwLock<noxu_tree::Tree>>,
+        lock_manager: Arc<LockManager>,
+    ) -> Self {
         Self { tree, lock_manager }
     }
 }
@@ -121,7 +124,7 @@ impl RealTreeLookup {
 impl TreeLookup for RealTreeLookup {
     /// Search the tree for `key` and return the slot's current LSN.
     ///
-    /// 
+    ///
     fn lookup_parent_bin(
         &self,
         _db_id: i64,
@@ -134,9 +137,12 @@ impl TreeLookup for RealTreeLookup {
         };
         match tree.search(key) {
             None => BinLookupResult::NotFound,
-            Some(result) if !result.exact_parent_found => BinLookupResult::NotFound,
+            Some(result) if !result.exact_parent_found => {
+                BinLookupResult::NotFound
+            }
             Some(_) => {
-                let slot_lsn = Self::get_slot_lsn_from_root(tree.get_root(), key);
+                let slot_lsn =
+                    Self::get_slot_lsn_from_root(tree.get_root(), key);
                 match slot_lsn {
                     Some(lsn) => BinLookupResult::Found { tree_lsn: lsn },
                     None => BinLookupResult::NotFound,
@@ -218,7 +224,8 @@ impl TreeLookup for RealTreeLookup {
                     return MigrationOutcome::Obsolete;
                 }
             };
-            Self::get_slot_data_from_root(tree.get_root(), key).unwrap_or_default()
+            Self::get_slot_data_from_root(tree.get_root(), key)
+                .unwrap_or_default()
         };
 
         let outcome = {
@@ -257,7 +264,12 @@ impl TreeLookup for RealTreeLookup {
     /// "Marking dirty" here means `node.set_dirty(true)`, which causes the
     /// checkpointer to re-log the node in the next checkpoint, making the old
     /// log position obsolete and allowing the cleaned file to be deleted.
-    fn lookup_in(&self, _db_id: i64, node_id: i64, log_lsn: Lsn) -> InLookupResult {
+    fn lookup_in(
+        &self,
+        _db_id: i64,
+        node_id: i64,
+        log_lsn: Lsn,
+    ) -> InLookupResult {
         use noxu_tree::TreeNode;
 
         let node_id_u64 = node_id as u64;
@@ -340,7 +352,8 @@ impl TreeLookup for RealTreeLookup {
             // Step 4 — tree_lsn == log_lsn: mark dirty.
             // `inInTree.setDirty(true); inInTree.setProhibitNextDelta(true)`.
             drop(tree_guard);
-            { let mut child_write = child_arc.write();
+            {
+                let mut child_write = child_arc.write();
                 child_write.set_dirty(true);
             }
             return InLookupResult::Found;
@@ -351,22 +364,31 @@ impl TreeLookup for RealTreeLookup {
         let root_arc_opt = tree_guard.get_root();
         drop(tree_guard);
         if let Some(root) = root_arc_opt {
-            let root_node_id = { let g = root.read(); match &*g {
+            let root_node_id = {
+                let g = root.read();
+                match &*g {
                     TreeNode::Bottom(b) => b.node_id,
                     TreeNode::Internal(n) => n.node_id,
-                } };
+                }
+            };
 
             if root_node_id == node_id_u64 {
-                let root_lsn = { let g = root.read(); match &*g {
+                let root_lsn = {
+                    let g = root.read();
+                    match &*g {
                         TreeNode::Bottom(b) => b.last_full_lsn,
-                        TreeNode::Internal(_) => return InLookupResult::Obsolete,
-                    } };
+                        TreeNode::Internal(_) => {
+                            return InLookupResult::Obsolete;
+                        }
+                    }
+                };
 
                 if root_lsn == noxu_util::NULL_LSN || root_lsn != log_lsn {
                     return InLookupResult::Obsolete;
                 }
 
-                { let mut w = root.write();
+                {
+                    let mut w = root.write();
                     w.set_dirty(true);
                 }
                 return InLookupResult::Found;
@@ -381,7 +403,9 @@ impl RealTreeLookup {
     /// Helper: returns the current LSN of the slot for `key` in the tree,
     /// or `None` if the key is not present.
     pub(crate) fn get_slot_lsn_from_root(
-        root: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>>,
+        root: Option<
+            std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>,
+        >,
         key: &[u8],
     ) -> Option<Lsn> {
         let arc = root?;
@@ -390,7 +414,9 @@ impl RealTreeLookup {
 
     /// Helper: returns a copy of the data stored in the slot for `key`.
     pub(crate) fn get_slot_data_from_root(
-        root: Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>>,
+        root: Option<
+            std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::TreeNode>>,
+        >,
         key: &[u8],
     ) -> Option<Vec<u8>> {
         let arc = root?;
@@ -518,7 +544,7 @@ impl SharedTreeLookup {
 impl TreeLookup for SharedTreeLookup {
     /// Look up the parent BIN slot for `key` in the shared tree.
     ///
-    /// 
+    ///
     fn lookup_parent_bin(
         &self,
         _db_id: i64,
@@ -531,7 +557,9 @@ impl TreeLookup for SharedTreeLookup {
         };
         match tree.search(key) {
             None => BinLookupResult::NotFound,
-            Some(result) if !result.exact_parent_found => BinLookupResult::NotFound,
+            Some(result) if !result.exact_parent_found => {
+                BinLookupResult::NotFound
+            }
             Some(_) => {
                 let slot_lsn = RealTreeLookup::get_slot_lsn_from_root(
                     tree.get_root(),
@@ -565,7 +593,9 @@ impl TreeLookup for SharedTreeLookup {
             true,  // non_blocking
             false, // jump_ahead_of_waiters
         ) {
-            Err(TxnError::LockNotAvailable { .. }) => return MigrationOutcome::Locked,
+            Err(TxnError::LockNotAvailable { .. }) => {
+                return MigrationOutcome::Locked;
+            }
             Err(_) => return MigrationOutcome::Locked,
             Ok(_) => {}
         }
@@ -605,9 +635,8 @@ impl TreeLookup for SharedTreeLookup {
                 .unwrap_or_default()
         };
 
-        let result = self.tree.read().map(|t| {
-            t.insert(key.to_vec(), data, new_lsn)
-        });
+        let result =
+            self.tree.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
 
         // H-4: release lock.
         let _ = self.lock_manager.release(lock_lsn, locker_id);
@@ -621,7 +650,12 @@ impl TreeLookup for SharedTreeLookup {
     /// Look up an IN node by `node_id` and mark it dirty if its LSN matches.
     ///
     /// H-3 fix: delegates to `RealTreeLookup::lookup_in`.
-    fn lookup_in(&self, db_id: i64, node_id: i64, log_lsn: Lsn) -> InLookupResult {
+    fn lookup_in(
+        &self,
+        db_id: i64,
+        node_id: i64,
+        log_lsn: Lsn,
+    ) -> InLookupResult {
         let delegate = RealTreeLookup::new(
             Arc::clone(&self.tree),
             Arc::clone(&self.lock_manager),
@@ -692,7 +726,12 @@ pub trait TreeLookup {
     /// 2. Compare the tree's stored LSN with `log_lsn`.
     /// 3. If equal, call `in_node.set_dirty(true)` and return `Found`.
     /// 4. Otherwise return `Obsolete`.
-    fn lookup_in(&self, db_id: i64, node_id: i64, log_lsn: Lsn) -> InLookupResult;
+    fn lookup_in(
+        &self,
+        db_id: i64,
+        node_id: i64,
+        log_lsn: Lsn,
+    ) -> InLookupResult;
 }
 
 // ─── IN lookup result ────────────────────────────────────────────────────────
@@ -828,7 +867,7 @@ impl LookAheadCache {
 
     /// Adds an entry to the cache.
     ///
-    /// 
+    ///
     pub fn add(&mut self, lsn_offset: u32, info: LnInfo) {
         const TREEMAP_ENTRY_OVERHEAD: usize = 48;
         self.used_mem += info.memory_size() + TREEMAP_ENTRY_OVERHEAD;
@@ -838,7 +877,7 @@ impl LookAheadCache {
     /// Returns the smallest LSN offset currently in the cache, or `None` if
     /// the cache is empty.
     ///
-    /// 
+    ///
     pub fn next_offset(&self) -> Option<u32> {
         self.map.keys().next().copied()
     }
@@ -847,12 +886,13 @@ impl LookAheadCache {
     ///
     /// Returns `None` if the offset is not present.
     ///
-    /// 
+    ///
     pub fn remove(&mut self, offset: u32) -> Option<LnInfo> {
         if let Some(info) = self.map.remove(&offset) {
             const TREEMAP_ENTRY_OVERHEAD: usize = 48;
-            self.used_mem =
-                self.used_mem.saturating_sub(info.memory_size() + TREEMAP_ENTRY_OVERHEAD);
+            self.used_mem = self
+                .used_mem
+                .saturating_sub(info.memory_size() + TREEMAP_ENTRY_OVERHEAD);
             Some(info)
         } else {
             None
@@ -893,7 +933,7 @@ pub enum MigrateLnResult {
 /// obsolete or active. Active LNs are migrated (re-logged). Active INs
 /// are marked dirty for the next checkpoint.
 ///
-/// 
+///
 pub struct FileProcessor {
     /// Reference to cleaner statistics.
     stats: Arc<CleanerStats>,
@@ -1015,7 +1055,10 @@ impl FileProcessor {
     ) -> Result<FileProcessResult, String> {
         // Check if we should stop before even starting.
         if self.shutdown.load(Ordering::Relaxed) {
-            return Ok(FileProcessResult { completed: false, ..Default::default() });
+            return Ok(FileProcessResult {
+                completed: false,
+                ..Default::default()
+            });
         }
 
         let mut result = FileProcessResult::new();
@@ -1072,12 +1115,19 @@ impl FileProcessor {
 
                     // Process the cache when full (the: lookAheadCache.isFull()).
                     if look_ahead_cache.is_full() {
-                        self.process_ln(file_number, &mut look_ahead_cache, tree, &mut result);
+                        self.process_ln(
+                            file_number,
+                            &mut look_ahead_cache,
+                            tree,
+                            &mut result,
+                        );
                     }
 
                     // Periodically drain pending LNs (the: cleaner.processPending()).
                     n_processed_lns += 1;
-                    if n_processed_lns.is_multiple_of(self.process_pending_interval) {
+                    if n_processed_lns
+                        .is_multiple_of(self.process_pending_interval)
+                    {
                         // In the future: call cleaner.process_pending() here.
                         // For now we drain the cache every interval to bound memory.
                         while !look_ahead_cache.is_empty() {
@@ -1085,7 +1135,12 @@ impl FileProcessor {
                                 result.completed = false;
                                 return Ok(result);
                             }
-                            self.process_ln(file_number, &mut look_ahead_cache, tree, &mut result);
+                            self.process_ln(
+                                file_number,
+                                &mut look_ahead_cache,
+                                tree,
+                                &mut result,
+                            );
                         }
                     }
                 }
@@ -1099,7 +1154,13 @@ impl FileProcessor {
                 // `FileProcessor.processBINDelta()` — mark parent BIN dirty
                 // so the next checkpoint re-logs the full node.
                 LogEntryType::BinDelta { db_id, node_id } => {
-                    self.process_bin_delta(*db_id, *node_id, lsn, tree, &mut result);
+                    self.process_bin_delta(
+                        *db_id,
+                        *node_id,
+                        lsn,
+                        tree,
+                        &mut result,
+                    );
                 }
 
                 // ── Other / unknown entries ────────────────────────────────
@@ -1119,7 +1180,12 @@ impl FileProcessor {
                 result.completed = false;
                 return Ok(result);
             }
-            self.process_ln(file_number, &mut look_ahead_cache, tree, &mut result);
+            self.process_ln(
+                file_number,
+                &mut look_ahead_cache,
+                tree,
+                &mut result,
+            );
         }
 
         result.completed = true;
@@ -1138,10 +1204,21 @@ impl FileProcessor {
         // Use a no-op tree so the signature compiles.
         struct NoopTree;
         impl TreeLookup for NoopTree {
-            fn lookup_parent_bin(&self, _: i64, _: &[u8], _: Lsn) -> BinLookupResult {
+            fn lookup_parent_bin(
+                &self,
+                _: i64,
+                _: &[u8],
+                _: Lsn,
+            ) -> BinLookupResult {
                 BinLookupResult::NotFound
             }
-            fn migrate_ln_slot(&self, _: i64, _: &[u8], _: Lsn, _: Lsn) -> MigrationOutcome {
+            fn migrate_ln_slot(
+                &self,
+                _: i64,
+                _: &[u8],
+                _: Lsn,
+                _: Lsn,
+            ) -> MigrationOutcome {
                 MigrationOutcome::Obsolete
             }
             fn lookup_in(&self, _: i64, _: i64, _: Lsn) -> InLookupResult {
@@ -1154,7 +1231,7 @@ impl FileProcessor {
     /// Processes a batch of LN entries from the look-ahead cache against the
     /// tree, performing migration for active entries.
     ///
-    /// 
+    ///
     ///
     /// The algorithm (correct):
     /// 1. Dequeue the lowest-offset LN from `cache`.
@@ -1194,7 +1271,8 @@ impl FileProcessor {
         result.lns_cleaned += 1;
 
         // Step 2 — look up parent BIN slot in the tree.
-        let bin_result = tree.lookup_parent_bin(info.db_id, info.key(), log_lsn);
+        let bin_result =
+            tree.lookup_parent_bin(info.db_id, info.key(), log_lsn);
 
         match bin_result {
             // Step 3a — parent not found → LN has been deleted.
@@ -1211,9 +1289,8 @@ impl FileProcessor {
 
             // Step 4 — BIN slot found; attempt migration.
             BinLookupResult::Found { tree_lsn } => {
-                let outcome = self.process_found_ln(
-                    &info, log_lsn, tree_lsn, tree,
-                );
+                let outcome =
+                    self.process_found_ln(&info, log_lsn, tree_lsn, tree);
                 match outcome {
                     MigrateLnResult::Dead => {
                         result.lns_dead += 1;
@@ -1234,7 +1311,7 @@ impl FileProcessor {
 
     /// Processes an LN that was found in the tree.
     ///
-    /// 
+    ///
     ///
     /// Decision tree (correct):
     ///
@@ -1290,7 +1367,7 @@ impl FileProcessor {
 
     /// Processes an IN log entry.
     ///
-    /// 
+    ///
     ///
     /// If the IN is still the current version in the tree, marks it dirty so
     /// the next checkpoint will re-log it (making the cleaned file's copy
@@ -1338,7 +1415,7 @@ impl FileProcessor {
 
     /// Processes a BIN-delta entry.
     ///
-    /// 
+    ///
     ///
     /// Marks the parent BIN dirty by delegating to `process_in()`.  This
     /// causes the next checkpoint to re-log the full BIN, making the
@@ -1446,7 +1523,12 @@ mod tests {
             MigrationOutcome::Obsolete
         }
 
-        fn lookup_in(&self, _db_id: i64, _node_id: i64, _log_lsn: Lsn) -> InLookupResult {
+        fn lookup_in(
+            &self,
+            _db_id: i64,
+            _node_id: i64,
+            _log_lsn: Lsn,
+        ) -> InLookupResult {
             InLookupResult::Obsolete
         }
     }
@@ -1474,7 +1556,12 @@ mod tests {
             MigrationOutcome::Obsolete
         }
 
-        fn lookup_in(&self, _db_id: i64, _node_id: i64, _log_lsn: Lsn) -> InLookupResult {
+        fn lookup_in(
+            &self,
+            _db_id: i64,
+            _node_id: i64,
+            _log_lsn: Lsn,
+        ) -> InLookupResult {
             InLookupResult::Obsolete
         }
     }
@@ -1504,7 +1591,12 @@ mod tests {
             MigrationOutcome::Migrated
         }
 
-        fn lookup_in(&self, _db_id: i64, _node_id: i64, _log_lsn: Lsn) -> InLookupResult {
+        fn lookup_in(
+            &self,
+            _db_id: i64,
+            _node_id: i64,
+            _log_lsn: Lsn,
+        ) -> InLookupResult {
             InLookupResult::Found
         }
     }
@@ -1536,7 +1628,12 @@ mod tests {
             MigrationOutcome::Obsolete
         }
 
-        fn lookup_in(&self, _db_id: i64, _node_id: i64, _log_lsn: Lsn) -> InLookupResult {
+        fn lookup_in(
+            &self,
+            _db_id: i64,
+            _node_id: i64,
+            _log_lsn: Lsn,
+        ) -> InLookupResult {
             InLookupResult::Obsolete
         }
     }
@@ -1564,7 +1661,12 @@ mod tests {
             MigrationOutcome::Locked
         }
 
-        fn lookup_in(&self, _db_id: i64, _node_id: i64, _log_lsn: Lsn) -> InLookupResult {
+        fn lookup_in(
+            &self,
+            _db_id: i64,
+            _node_id: i64,
+            _log_lsn: Lsn,
+        ) -> InLookupResult {
             InLookupResult::Obsolete
         }
     }
@@ -1593,7 +1695,12 @@ mod tests {
             MigrationOutcome::Obsolete
         }
 
-        fn lookup_in(&self, _db_id: i64, _node_id: i64, _log_lsn: Lsn) -> InLookupResult {
+        fn lookup_in(
+            &self,
+            _db_id: i64,
+            _node_id: i64,
+            _log_lsn: Lsn,
+        ) -> InLookupResult {
             InLookupResult::Obsolete
         }
     }
@@ -1602,10 +1709,21 @@ mod tests {
     struct ObsoleteInTree;
 
     impl TreeLookup for ObsoleteInTree {
-        fn lookup_parent_bin(&self, _: i64, _: &[u8], _: Lsn) -> BinLookupResult {
+        fn lookup_parent_bin(
+            &self,
+            _: i64,
+            _: &[u8],
+            _: Lsn,
+        ) -> BinLookupResult {
             BinLookupResult::NotFound
         }
-        fn migrate_ln_slot(&self, _: i64, _: &[u8], _: Lsn, _: Lsn) -> MigrationOutcome {
+        fn migrate_ln_slot(
+            &self,
+            _: i64,
+            _: &[u8],
+            _: Lsn,
+            _: Lsn,
+        ) -> MigrationOutcome {
             MigrationOutcome::Obsolete
         }
         fn lookup_in(&self, _: i64, _: i64, _: Lsn) -> InLookupResult {
@@ -1622,7 +1740,10 @@ mod tests {
         let processor = FileProcessor::new(stats, shutdown);
 
         assert!(!processor.is_shutdown());
-        assert_eq!(processor.process_pending_interval, PROCESS_PENDING_EVERY_N_LNS);
+        assert_eq!(
+            processor.process_pending_interval,
+            PROCESS_PENDING_EVERY_N_LNS
+        );
     }
 
     #[test]
@@ -1912,7 +2033,8 @@ mod tests {
         let info = make_ln_info(file_num, offset, 42);
 
         // MigratingTree returns tree_lsn == log_lsn and MigrationOutcome::Migrated
-        let result = proc.process_found_ln(&info, log_lsn, log_lsn, &MigratingTree);
+        let result =
+            proc.process_found_ln(&info, log_lsn, log_lsn, &MigratingTree);
 
         assert_eq!(result, MigrateLnResult::Migrated);
     }
@@ -1927,7 +2049,8 @@ mod tests {
         let info = make_ln_info(file_num, 1000, 42);
 
         let obsolete_tree = ObsoleteTree { current_lsn: tree_lsn };
-        let result = proc.process_found_ln(&info, log_lsn, tree_lsn, &obsolete_tree);
+        let result =
+            proc.process_found_ln(&info, log_lsn, tree_lsn, &obsolete_tree);
 
         assert_eq!(result, MigrateLnResult::Dead);
     }
@@ -1940,8 +2063,12 @@ mod tests {
         let log_lsn = Lsn::new(file_num, 1000);
         let info = make_ln_info(file_num, 1000, 42);
 
-        let result =
-            proc.process_found_ln(&info, log_lsn, noxu_util::NULL_LSN, &NullLsnTree);
+        let result = proc.process_found_ln(
+            &info,
+            log_lsn,
+            noxu_util::NULL_LSN,
+            &NullLsnTree,
+        );
 
         assert_eq!(result, MigrateLnResult::Dead);
     }
@@ -1954,7 +2081,8 @@ mod tests {
         let log_lsn = Lsn::new(file_num, 1000);
         let info = make_ln_info(file_num, 1000, 42);
 
-        let result = proc.process_found_ln(&info, log_lsn, log_lsn, &LockedTree);
+        let result =
+            proc.process_found_ln(&info, log_lsn, log_lsn, &LockedTree);
 
         assert_eq!(result, MigrateLnResult::Locked);
     }
@@ -2150,9 +2278,17 @@ mod tests {
         let log_lsn = Lsn::new(file_num, 100);
         let info = make_ln_info(file_num, 100, 99);
 
-        let result = proc.process_found_ln(&info, log_lsn, noxu_util::NULL_LSN, &NullLsnTree);
-        assert_eq!(result, MigrateLnResult::Dead,
-            "NULL_LSN in tree slot must yield Dead (case 4 in the equivalent processFoundLN)");
+        let result = proc.process_found_ln(
+            &info,
+            log_lsn,
+            noxu_util::NULL_LSN,
+            &NullLsnTree,
+        );
+        assert_eq!(
+            result,
+            MigrateLnResult::Dead,
+            "NULL_LSN in tree slot must yield Dead (case 4 in the equivalent processFoundLN)"
+        );
     }
 
     #[test]
@@ -2219,7 +2355,12 @@ mod tests {
 
     // ── process_file loop tests ────────────────────────────────────────────────
 
-    fn make_ln_entry(file_num: u32, offset: u32, db_id: i64, key: &[u8]) -> LogEntry {
+    fn make_ln_entry(
+        file_num: u32,
+        offset: u32,
+        db_id: i64,
+        key: &[u8],
+    ) -> LogEntry {
         LogEntry {
             lsn: Lsn::new(file_num, offset),
             entry_type: LogEntryType::Ln {
@@ -2232,7 +2373,11 @@ mod tests {
         }
     }
 
-    fn make_deleted_ln_entry(file_num: u32, offset: u32, db_id: i64) -> LogEntry {
+    fn make_deleted_ln_entry(
+        file_num: u32,
+        offset: u32,
+        db_id: i64,
+    ) -> LogEntry {
         LogEntry {
             lsn: Lsn::new(file_num, offset),
             entry_type: LogEntryType::Ln {
@@ -2245,7 +2390,12 @@ mod tests {
         }
     }
 
-    fn make_in_entry(file_num: u32, offset: u32, db_id: i64, node_id: i64) -> LogEntry {
+    fn make_in_entry(
+        file_num: u32,
+        offset: u32,
+        db_id: i64,
+        node_id: i64,
+    ) -> LogEntry {
         LogEntry {
             lsn: Lsn::new(file_num, offset),
             entry_type: LogEntryType::In { db_id, node_id },
@@ -2264,7 +2414,8 @@ mod tests {
     fn test_process_file_empty() {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
-        let result = proc.process_file(1, &summary, &[], &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &[], &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 0);
@@ -2278,7 +2429,8 @@ mod tests {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
         let entries = vec![make_ln_entry(1, 100, 42, &[1, 2, 3])];
-        let result = proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 1);
@@ -2293,7 +2445,8 @@ mod tests {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
         let entries = vec![make_deleted_ln_entry(1, 100, 42)];
-        let result = proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 1);
@@ -2307,7 +2460,8 @@ mod tests {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
         let entries = vec![make_in_entry(1, 200, 1, 77)];
-        let result = proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 1);
@@ -2321,7 +2475,8 @@ mod tests {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
         let entries = vec![make_in_entry(1, 200, 1, 77)];
-        let result = proc.process_file(1, &summary, &entries, &ObsoleteInTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &ObsoleteInTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.ins_cleaned, 1);
@@ -2334,7 +2489,8 @@ mod tests {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
         let entries = vec![make_other_entry(1, 300)];
-        let result = proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 1);
@@ -2348,14 +2504,15 @@ mod tests {
         let proc = make_processor();
         let summary = crate::FileSummary::new();
         let entries = vec![
-            make_ln_entry(2, 100, 1, &[1]),   // active LN → migrated
-            make_ln_entry(2, 200, 1, &[2]),   // active LN → migrated
+            make_ln_entry(2, 100, 1, &[1]), // active LN → migrated
+            make_ln_entry(2, 200, 1, &[2]), // active LN → migrated
             make_deleted_ln_entry(2, 300, 1), // deleted → obsolete
-            make_in_entry(2, 400, 1, 10),     // active IN → migrated
-            make_other_entry(2, 500),         // other → skipped
+            make_in_entry(2, 400, 1, 10),   // active IN → migrated
+            make_other_entry(2, 500),       // other → skipped
         ];
 
-        let result = proc.process_file(2, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(2, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 5);
@@ -2373,7 +2530,8 @@ mod tests {
         let summary = crate::FileSummary::new();
         let entries = vec![make_ln_entry(1, 100, 1, &[0xAB])];
 
-        let result = proc.process_file(1, &summary, &entries, &DeletedTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &DeletedTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.lns_cleaned, 1);
@@ -2388,7 +2546,8 @@ mod tests {
         let summary = crate::FileSummary::new();
         let entries = vec![make_ln_entry(1, 100, 1, &[0x01])];
 
-        let result = proc.process_file(1, &summary, &entries, &LockedTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &LockedTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.lns_locked, 1);
@@ -2410,7 +2569,8 @@ mod tests {
             make_ln_entry(1, 200, 1, &[2]),
         ];
 
-        let result = proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
         assert!(!result.completed);
     }
 
@@ -2424,9 +2584,8 @@ mod tests {
             .map(|i| make_ln_entry(3, i * 100, 1, &[i as u8]))
             .collect();
 
-        let result = proc
-            .process_file(3, &summary, &entries, &MigratingTree)
-            .unwrap();
+        let result =
+            proc.process_file(3, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 500);
@@ -2483,7 +2642,8 @@ mod tests {
         // The entry-loop shutdown check fires before reading entry 0.
         shutdown.store(true, Ordering::Relaxed);
 
-        let result = proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
         assert!(!result.completed);
     }
 
@@ -2515,7 +2675,8 @@ mod tests {
         ];
 
         shutdown.store(true, Ordering::Relaxed);
-        let result = proc.process_file(5, &summary, &entries, &MigratingTree).unwrap();
+        let result =
+            proc.process_file(5, &summary, &entries, &MigratingTree).unwrap();
         assert!(!result.completed);
     }
 
@@ -2580,7 +2741,8 @@ mod tests {
 
     #[test]
     fn test_result_merge_both_incomplete() {
-        let mut r1 = FileProcessResult { completed: false, ..Default::default() };
+        let mut r1 =
+            FileProcessResult { completed: false, ..Default::default() };
         let r2 = FileProcessResult { completed: false, ..Default::default() };
         r1.merge(&r2);
         assert!(!r1.completed);
@@ -2603,9 +2765,8 @@ mod tests {
             .map(|i| make_ln_entry(1, i * 100, 1, &[i as u8]))
             .collect();
 
-        let result = proc
-            .process_file(1, &summary, &entries, &MigratingTree)
-            .unwrap();
+        let result =
+            proc.process_file(1, &summary, &entries, &MigratingTree).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.entries_read, 10);
@@ -2735,7 +2896,10 @@ mod tests {
 
         match lookup.lookup_parent_bin(1, key, lsn) {
             BinLookupResult::Found { tree_lsn } => {
-                assert_eq!(tree_lsn, lsn, "slot LSN should match what was inserted");
+                assert_eq!(
+                    tree_lsn, lsn,
+                    "slot LSN should match what was inserted"
+                );
             }
             other => panic!("expected Found, got {:?}", other),
         }
@@ -2781,8 +2945,11 @@ mod tests {
 
         let new_lsn = Lsn::new(3, 400);
         let outcome = lookup.migrate_ln_slot(1, key, new_lsn, lsn);
-        assert_eq!(outcome, MigrationOutcome::Migrated,
-            "slot LSN matches tree_lsn so migration should succeed");
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated,
+            "slot LSN matches tree_lsn so migration should succeed"
+        );
     }
 
     /// migrate_ln_slot returns Obsolete when tree_lsn has moved on since lookup.
@@ -2800,9 +2967,13 @@ mod tests {
         );
 
         // Caller passes tree_lsn = original_lsn; current slot is newer_lsn.
-        let outcome = lookup.migrate_ln_slot(1, key, original_lsn, original_lsn);
-        assert_eq!(outcome, MigrationOutcome::Obsolete,
-            "slot has moved on — should be obsolete");
+        let outcome =
+            lookup.migrate_ln_slot(1, key, original_lsn, original_lsn);
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Obsolete,
+            "slot has moved on — should be obsolete"
+        );
     }
 
     /// migrate_ln_slot returns Obsolete when key is absent.
@@ -2814,9 +2985,17 @@ mod tests {
             Arc::new(LockManager::new()),
         );
 
-        let outcome = lookup.migrate_ln_slot(1, b"absent", Lsn::new(1, 20), Lsn::new(1, 20));
-        assert_eq!(outcome, MigrationOutcome::Obsolete,
-            "key not in tree — should be obsolete");
+        let outcome = lookup.migrate_ln_slot(
+            1,
+            b"absent",
+            Lsn::new(1, 20),
+            Lsn::new(1, 20),
+        );
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Obsolete,
+            "key not in tree — should be obsolete"
+        );
     }
 
     /// lookup_in returns Obsolete for a node not found (empty tree).

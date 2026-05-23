@@ -20,18 +20,24 @@ impl LruPolicy {
 }
 
 impl Default for LruPolicy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EvictionPolicy for LruPolicy {
     fn insert(&self, node_id: u64) {
         let mut s = self.state.lock();
-        if !s.contains(node_id) { s.add_back(node_id); }
+        if !s.contains(node_id) {
+            s.add_back(node_id);
+        }
     }
 
     fn insert_cold(&self, node_id: u64) {
         let mut s = self.state.lock();
-        if !s.contains(node_id) { s.add_front(node_id); }
+        if !s.contains(node_id) {
+            s.add_front(node_id);
+        }
     }
 
     fn touch(&self, node_id: u64) -> bool {
@@ -48,7 +54,9 @@ impl EvictionPolicy for LruPolicy {
 
     fn put_back(&self, node_id: u64) {
         let mut s = self.state.lock();
-        if !s.contains(node_id) { s.add_back(node_id); }
+        if !s.contains(node_id) {
+            s.add_back(node_id);
+        }
     }
 
     fn contains(&self, node_id: u64) -> bool {
@@ -59,7 +67,9 @@ impl EvictionPolicy for LruPolicy {
         self.state.lock().len
     }
 
-    fn name(&self) -> &'static str { "LRU" }
+    fn name(&self) -> &'static str {
+        "LRU"
+    }
 }
 
 #[cfg(test)]
@@ -70,7 +80,9 @@ mod tests {
     #[test]
     fn test_lru_basic_order() {
         let p = LruPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         assert_eq!(p.evict_candidate(), Some(1));
         assert_eq!(p.evict_candidate(), Some(2));
         assert_eq!(p.evict_candidate(), Some(3));
@@ -80,7 +92,9 @@ mod tests {
     #[test]
     fn test_lru_touch_promotes() {
         let p = LruPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         p.touch(1);
         assert_eq!(p.evict_candidate(), Some(2));
         assert_eq!(p.evict_candidate(), Some(3));
@@ -90,7 +104,8 @@ mod tests {
     #[test]
     fn test_lru_insert_cold() {
         let p = LruPolicy::new();
-        p.insert(1); p.insert(2);
+        p.insert(1);
+        p.insert(2);
         p.insert_cold(0);
         assert_eq!(p.evict_candidate(), Some(0));
         assert_eq!(p.evict_candidate(), Some(1));
@@ -99,7 +114,8 @@ mod tests {
     #[test]
     fn test_lru_put_back() {
         let p = LruPolicy::new();
-        p.insert(1); p.insert(2);
+        p.insert(1);
+        p.insert(2);
         let v = p.evict_candidate().unwrap();
         p.put_back(v);
         // put_back re-inserts at hot end
@@ -110,7 +126,9 @@ mod tests {
     #[test]
     fn test_lru_remove() {
         let p = LruPolicy::new();
-        p.insert(1); p.insert(2); p.insert(3);
+        p.insert(1);
+        p.insert(2);
+        p.insert(3);
         assert!(p.remove(2));
         assert!(!p.remove(2));
         assert_eq!(p.len(), 2);

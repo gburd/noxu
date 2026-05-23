@@ -103,9 +103,14 @@ impl CleanerThrottle {
     ///   (from `LogManagerStats::n_sequential_write_bytes`).
     /// * `cleaning_needed` – `true` when at least one file is below the
     ///   minimum utilisation threshold; forces a shorter sleep interval.
-    pub fn update(&self, current_bytes_written: u64, cleaning_needed: bool) -> (u64, u32) {
+    pub fn update(
+        &self,
+        current_bytes_written: u64,
+        cleaning_needed: bool,
+    ) -> (u64, u32) {
         let now = now_ms();
-        let prev_bytes = self.last_bytes.swap(current_bytes_written, Ordering::Relaxed);
+        let prev_bytes =
+            self.last_bytes.swap(current_bytes_written, Ordering::Relaxed);
         let prev_time = self.last_time_ms.swap(now, Ordering::Relaxed);
 
         let elapsed_ms = now.saturating_sub(prev_time).max(1);
@@ -116,7 +121,8 @@ impl CleanerThrottle {
 
         // Update EWMA.
         let rate = {
-            let mut ewma = self.write_rate_ewma.lock().unwrap_or_else(|p| p.into_inner());
+            let mut ewma =
+                self.write_rate_ewma.lock().unwrap_or_else(|p| p.into_inner());
             *ewma = *ewma * (1.0 - EWMA_ALPHA) + instant_rate * EWMA_ALPHA;
             *ewma
         };
@@ -142,7 +148,8 @@ impl CleanerThrottle {
         // Compute recommended file count:
         //   n_files = 1 + rate / BYTES_PER_SEC_PER_EXTRA_FILE, clamped.
         let n_files = (1 + rate_u64 / BYTES_PER_SEC_PER_EXTRA_FILE.max(1))
-            .clamp(MIN_FILES_PER_PASS as u64, MAX_FILES_PER_PASS as u64) as u32;
+            .clamp(MIN_FILES_PER_PASS as u64, MAX_FILES_PER_PASS as u64)
+            as u32;
 
         self.sleep_interval_ms.store(sleep_ms, Ordering::Relaxed);
         self.recommended_n_files.store(n_files as u64, Ordering::Relaxed);
@@ -240,7 +247,10 @@ mod tests {
         let t = CleanerThrottle::new(0);
         // No new bytes but cleaning is needed.
         let (sleep_ms, n_files) = t.update(0, true);
-        assert_eq!(sleep_ms, BASE_SLEEP_MS, "cleaning needed caps sleep at BASE");
+        assert_eq!(
+            sleep_ms, BASE_SLEEP_MS,
+            "cleaning needed caps sleep at BASE"
+        );
         assert_eq!(n_files, MIN_FILES_PER_PASS);
     }
 

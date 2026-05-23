@@ -8,7 +8,7 @@ use crate::cache_mode::CacheMode;
 /// Specifies optional parameters that control write behavior, including
 /// caching and time-to-live (TTL) expiration.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOptions {
     /// Cache mode for the write operation.

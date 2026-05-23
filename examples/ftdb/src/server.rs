@@ -3,7 +3,7 @@
 use crate::account::Account;
 use crate::engine::Engine;
 use crate::error::FtdbError;
-use crate::protocol::{self, Header, Operation, MAX_BATCH_SIZE};
+use crate::protocol::{self, Header, MAX_BATCH_SIZE, Operation};
 use crate::transfer::Transfer;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,16 +18,19 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(engine: Engine, address: String, max_connections: usize) -> Self {
-        Self {
-            engine: Arc::new(engine),
-            address,
-            max_connections,
-        }
+    pub fn new(
+        engine: Engine,
+        address: String,
+        max_connections: usize,
+    ) -> Self {
+        Self { engine: Arc::new(engine), address, max_connections }
     }
 
     /// Runs the server until a shutdown signal is received.
-    pub async fn run(&self, mut shutdown: tokio::sync::broadcast::Receiver<()>) -> Result<(), FtdbError> {
+    pub async fn run(
+        &self,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<(), FtdbError> {
         let listener = TcpListener::bind(&self.address).await?;
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
 
@@ -61,7 +64,10 @@ impl Server {
 }
 
 /// Handles a single client connection.
-async fn handle_connection(mut stream: TcpStream, engine: Arc<Engine>) -> Result<(), FtdbError> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    engine: Arc<Engine>,
+) -> Result<(), FtdbError> {
     loop {
         // Read message size (4 bytes)
         let mut size_buf = [0u8; 4];
@@ -108,7 +114,8 @@ async fn handle_connection(mut stream: TcpStream, engine: Arc<Engine>) -> Result
             }
         };
 
-        let response_body = dispatch(&engine, operation, &body, header.batch_count)?;
+        let response_body =
+            dispatch(&engine, operation, &body, header.batch_count)?;
 
         // Send response
         let resp_batch_count = match operation {
@@ -120,12 +127,8 @@ async fn handle_connection(mut stream: TcpStream, engine: Arc<Engine>) -> Result
             }
         };
 
-        let resp_header = Header::response(
-            operation,
-            header.request_id,
-            resp_batch_count,
-            0,
-        );
+        let resp_header =
+            Header::response(operation, header.request_id, resp_batch_count, 0);
 
         let resp_size = (Header::SIZE + response_body.len()) as u32;
         stream.write_all(&resp_size.to_le_bytes()).await?;
@@ -190,25 +193,37 @@ fn dispatch(
     }
 }
 
-fn parse_accounts(body: &[u8], count: usize) -> Result<Vec<Account>, FtdbError> {
+fn parse_accounts(
+    body: &[u8],
+    count: usize,
+) -> Result<Vec<Account>, FtdbError> {
     if body.len() != count * 128 {
-        return Err(FtdbError::Protocol("body size mismatch for accounts".into()));
+        return Err(FtdbError::Protocol(
+            "body size mismatch for accounts".into(),
+        ));
     }
     let mut accounts = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk: &[u8; 128] = body[i * 128..(i + 1) * 128].try_into().unwrap();
+        let chunk: &[u8; 128] =
+            body[i * 128..(i + 1) * 128].try_into().unwrap();
         accounts.push(Account::from_bytes(chunk));
     }
     Ok(accounts)
 }
 
-fn parse_transfers(body: &[u8], count: usize) -> Result<Vec<Transfer>, FtdbError> {
+fn parse_transfers(
+    body: &[u8],
+    count: usize,
+) -> Result<Vec<Transfer>, FtdbError> {
     if body.len() != count * 128 {
-        return Err(FtdbError::Protocol("body size mismatch for transfers".into()));
+        return Err(FtdbError::Protocol(
+            "body size mismatch for transfers".into(),
+        ));
     }
     let mut transfers = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk: &[u8; 128] = body[i * 128..(i + 1) * 128].try_into().unwrap();
+        let chunk: &[u8; 128] =
+            body[i * 128..(i + 1) * 128].try_into().unwrap();
         transfers.push(Transfer::from_bytes(chunk));
     }
     Ok(transfers)

@@ -8,7 +8,7 @@ use crate::cache_mode::CacheMode;
 /// Specifies the configuration parameters used to open a database within
 /// an environment. Use the builder pattern to configure individual parameters.
 ///
-/// 
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseConfig {
     /// Allow creation of a new database if it doesn't exist.

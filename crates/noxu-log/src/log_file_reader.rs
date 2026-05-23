@@ -101,9 +101,7 @@ impl LogFileReader {
     ///   of log), logs a warning and returns `None` - this matches the
     ///   behaviour in `LastFileReader` where bad-CRC entries are treated as
     ///   the log boundary rather than a hard error.
-    pub fn read_next(
-        &mut self,
-    ) -> Option<(Lsn, LogEntryType, Vec<u8>)> {
+    pub fn read_next(&mut self) -> Option<(Lsn, LogEntryType, Vec<u8>)> {
         // Check for EOF before attempting a read.
         if self.current_offset >= self.file_length {
             return None;
@@ -318,10 +316,9 @@ impl LogFileReader {
             });
         }
 
-        let entry_type =
-            LogEntryType::from_type_num(entry_type_num).ok_or(
-                NoxuLogError::InvalidEntryType { type_num: entry_type_num, lsn },
-            )?;
+        let entry_type = LogEntryType::from_type_num(entry_type_num).ok_or(
+            NoxuLogError::InvalidEntryType { type_num: entry_type_num, lsn },
+        )?;
 
         self.current_offset += entry_size as u64;
         self.entries_read += 1;
@@ -358,8 +355,8 @@ mod tests {
             .log(LogEntryType::Trace, payload, Provisional::No, true, false)
             .unwrap();
 
-        let mut reader = LogFileReader::open(Arc::clone(&fm), lsn.file_number())
-            .unwrap();
+        let mut reader =
+            LogFileReader::open(Arc::clone(&fm), lsn.file_number()).unwrap();
         let result = reader.read_next();
         assert!(result.is_some(), "expected an entry");
         let (read_lsn, entry_type, read_payload) = result.unwrap();
@@ -374,19 +371,12 @@ mod tests {
         let (fm, lm) = make_log_manager(&dir);
 
         for i in 0u8..5 {
-            lm.log(
-                LogEntryType::Trace,
-                &[i],
-                Provisional::No,
-                false,
-                false,
-            )
-            .unwrap();
+            lm.log(LogEntryType::Trace, &[i], Provisional::No, false, false)
+                .unwrap();
         }
         lm.flush_no_sync().unwrap();
 
-        let file_num =
-            fm.get_current_file_num();
+        let file_num = fm.get_current_file_num();
         let mut reader =
             LogFileReader::open(Arc::clone(&fm), file_num).unwrap();
 

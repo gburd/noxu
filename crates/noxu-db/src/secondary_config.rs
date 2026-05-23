@@ -7,7 +7,7 @@ use crate::database_entry::DatabaseEntry;
 
 /// Callback trait for creating a single secondary key from a primary record.
 ///
-/// 
+///
 ///
 /// Implement this trait to extract one secondary key per primary record.
 /// The implementation must be thread-safe because it is called from multiple
@@ -35,7 +35,7 @@ pub trait SecondaryKeyCreator: Send + Sync {
 
 /// Callback trait for creating multiple secondary keys from a primary record.
 ///
-/// 
+///
 ///
 /// Implement this trait to extract zero or more secondary keys per primary
 /// record. The implementation must be thread-safe because it is called from
@@ -59,7 +59,7 @@ pub trait SecondaryMultiKeyCreator: Send + Sync {
 
 /// Action taken when a record in a foreign key database is deleted.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForeignKeyDeleteAction {
     /// Abort the operation if a secondary record refers to the deleted foreign key.
@@ -78,7 +78,7 @@ pub enum ForeignKeyDeleteAction {
 
 /// Callback trait for nullifying a single foreign key reference in primary data.
 ///
-/// 
+///
 pub trait ForeignKeyNullifier: Send + Sync {
     /// Called when a referenced foreign key record is deleted.
     ///
@@ -96,7 +96,7 @@ pub trait ForeignKeyNullifier: Send + Sync {
 
 /// Callback trait for nullifying multi-valued foreign key references.
 ///
-/// 
+///
 pub trait ForeignMultiKeyNullifier: Send + Sync {
     /// Called when a referenced foreign key record is deleted.
     ///
@@ -116,7 +116,7 @@ pub trait ForeignMultiKeyNullifier: Send + Sync {
 
 /// Configuration for a secondary database.
 ///
-/// 
+///
 ///
 /// SecondaryConfig extends DatabaseConfig with additional fields required to
 /// open a secondary (index) database:
@@ -250,7 +250,7 @@ impl SecondaryConfig {
 
     /// Sets whether automatic population of the secondary is allowed on open.
     ///
-    /// 
+    ///
     pub fn with_allow_populate(mut self, allow_populate: bool) -> Self {
         self.allow_populate = allow_populate;
         self
@@ -261,15 +261,18 @@ impl SecondaryConfig {
     /// Either `key_creator` or `multi_key_creator` must be set (not both),
     /// unless the primary database is read-only.
     ///
-    /// 
-    pub fn with_key_creator(mut self, key_creator: Box<dyn SecondaryKeyCreator>) -> Self {
+    ///
+    pub fn with_key_creator(
+        mut self,
+        key_creator: Box<dyn SecondaryKeyCreator>,
+    ) -> Self {
         self.key_creator = Some(key_creator);
         self
     }
 
     /// Sets the multi-key creator callback.
     ///
-    /// 
+    ///
     pub fn with_multi_key_creator(
         mut self,
         multi_key_creator: Box<dyn SecondaryMultiKeyCreator>,
@@ -280,7 +283,7 @@ impl SecondaryConfig {
 
     /// Sets whether the secondary key is immutable.
     ///
-    /// 
+    ///
     pub fn with_immutable_secondary_key(mut self, immutable: bool) -> Self {
         self.immutable_secondary_key = immutable;
         self
@@ -288,8 +291,11 @@ impl SecondaryConfig {
 
     /// Sets whether to derive the secondary key from the primary key only.
     ///
-    /// 
-    pub fn with_extract_from_primary_key_only(mut self, extract_only: bool) -> Self {
+    ///
+    pub fn with_extract_from_primary_key_only(
+        mut self,
+        extract_only: bool,
+    ) -> Self {
         self.extract_from_primary_key_only = extract_only;
         self
     }
@@ -300,7 +306,7 @@ impl SecondaryConfig {
     /// The pointer must remain valid for the lifetime of this config and the
     /// secondary database that uses it.
     ///
-    /// 
+    ///
     pub fn with_foreign_key_database(mut self, db: &Database) -> Self {
         self.foreign_key_database = Some(db as *const Database);
         self
@@ -308,15 +314,18 @@ impl SecondaryConfig {
 
     /// Sets the action to take when a referenced foreign key is deleted.
     ///
-    /// 
-    pub fn with_foreign_key_delete_action(mut self, action: ForeignKeyDeleteAction) -> Self {
+    ///
+    pub fn with_foreign_key_delete_action(
+        mut self,
+        action: ForeignKeyDeleteAction,
+    ) -> Self {
         self.foreign_key_delete_action = action;
         self
     }
 
     /// Sets the foreign key nullifier (single-value variant).
     ///
-    /// 
+    ///
     pub fn with_foreign_key_nullifier(
         mut self,
         nullifier: Box<dyn ForeignKeyNullifier>,
@@ -327,7 +336,7 @@ impl SecondaryConfig {
 
     /// Sets the foreign key nullifier (multi-value variant).
     ///
-    /// 
+    ///
     pub fn with_foreign_multi_key_nullifier(
         mut self,
         nullifier: Box<dyn ForeignMultiKeyNullifier>,
@@ -345,13 +354,19 @@ impl SecondaryConfig {
     /// Returns an error description if the configuration is invalid.
     ///
     /// Constructor validation in `SecondaryDatabase`.
-    pub(crate) fn validate(&self, primary_read_only: bool) -> Result<(), String> {
+    pub(crate) fn validate(
+        &self,
+        primary_read_only: bool,
+    ) -> Result<(), String> {
         if self.key_creator.is_some() && self.multi_key_creator.is_some() {
             return Err(
-                "key_creator and multi_key_creator may not both be non-null".to_string(),
+                "key_creator and multi_key_creator may not both be non-null"
+                    .to_string(),
             );
         }
-        if self.foreign_key_nullifier.is_some() && self.foreign_multi_key_nullifier.is_some() {
+        if self.foreign_key_nullifier.is_some()
+            && self.foreign_multi_key_nullifier.is_some()
+        {
             return Err(
                 "foreign_key_nullifier and foreign_multi_key_nullifier may not both be non-null"
                     .to_string(),
@@ -367,14 +382,19 @@ impl SecondaryConfig {
                     .to_string(),
             );
         }
-        if self.foreign_key_nullifier.is_some() && self.multi_key_creator.is_some() {
+        if self.foreign_key_nullifier.is_some()
+            && self.multi_key_creator.is_some()
+        {
             return Err(
                 "ForeignKeyNullifier may not be used with SecondaryMultiKeyCreator; \
                  use ForeignMultiKeyNullifier instead"
                     .to_string(),
             );
         }
-        if !primary_read_only && self.key_creator.is_none() && self.multi_key_creator.is_none() {
+        if !primary_read_only
+            && self.key_creator.is_none()
+            && self.multi_key_creator.is_none()
+        {
             return Err(
                 "key_creator or multi_key_creator must be set when the primary database \
                  is not read-only"
@@ -386,7 +406,7 @@ impl SecondaryConfig {
 
     /// Returns whether an update to the primary may change the secondary key.
     ///
-    /// 
+    ///
     pub(crate) fn update_may_change_secondary(&self) -> bool {
         !self.immutable_secondary_key && !self.extract_from_primary_key_only
     }
@@ -427,7 +447,10 @@ mod tests {
         assert!(!config.allow_populate);
         assert!(!config.immutable_secondary_key);
         assert!(!config.extract_from_primary_key_only);
-        assert_eq!(config.foreign_key_delete_action, ForeignKeyDeleteAction::Abort);
+        assert_eq!(
+            config.foreign_key_delete_action,
+            ForeignKeyDeleteAction::Abort
+        );
         assert!(config.key_creator.is_none());
         assert!(config.multi_key_creator.is_none());
         assert!(config.foreign_key_nullifier.is_none());
@@ -454,8 +477,8 @@ mod tests {
 
     #[test]
     fn test_validate_ok() {
-        let config = SecondaryConfig::new()
-            .with_key_creator(Box::new(SimpleKeyCreator));
+        let config =
+            SecondaryConfig::new().with_key_creator(Box::new(SimpleKeyCreator));
         assert!(config.validate(false).is_ok());
     }
 
@@ -466,9 +489,12 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let env = Environment::open(
-            EnvironmentConfig::new(temp_dir.path().to_path_buf()).with_allow_create(true)
-        ).unwrap();
-        let db_cfg = crate::database_config::DatabaseConfig::new().with_allow_create(true);
+            EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true),
+        )
+        .unwrap();
+        let db_cfg = crate::database_config::DatabaseConfig::new()
+            .with_allow_create(true);
         let db = env.open_database(None, "vbc_db", &db_cfg).unwrap();
 
         struct MkCreator;
@@ -516,7 +542,8 @@ mod tests {
         let config = SecondaryConfig::new();
         assert!(config.update_may_change_secondary());
 
-        let config_imm = SecondaryConfig::new().with_immutable_secondary_key(true);
+        let config_imm =
+            SecondaryConfig::new().with_immutable_secondary_key(true);
         assert!(!config_imm.update_may_change_secondary());
 
         let config_key_only =
@@ -528,14 +555,20 @@ mod tests {
     fn test_foreign_key_delete_action() {
         let config = SecondaryConfig::new()
             .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
-        assert_eq!(config.foreign_key_delete_action, ForeignKeyDeleteAction::Cascade);
+        assert_eq!(
+            config.foreign_key_delete_action,
+            ForeignKeyDeleteAction::Cascade
+        );
     }
 
     #[test]
     fn test_foreign_key_delete_action_nullify() {
         let config = SecondaryConfig::new()
             .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify);
-        assert_eq!(config.foreign_key_delete_action, ForeignKeyDeleteAction::Nullify);
+        assert_eq!(
+            config.foreign_key_delete_action,
+            ForeignKeyDeleteAction::Nullify
+        );
     }
 
     #[test]
@@ -543,14 +576,21 @@ mod tests {
         // Default value is Abort; also verify explicit set
         let config = SecondaryConfig::new()
             .with_foreign_key_delete_action(ForeignKeyDeleteAction::Abort);
-        assert_eq!(config.foreign_key_delete_action, ForeignKeyDeleteAction::Abort);
+        assert_eq!(
+            config.foreign_key_delete_action,
+            ForeignKeyDeleteAction::Abort
+        );
     }
 
     #[test]
     fn test_with_foreign_key_nullifier() {
         struct SimpleNullifier;
         impl ForeignKeyNullifier for SimpleNullifier {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }
@@ -591,7 +631,8 @@ mod tests {
             ) {
             }
         }
-        let config = SecondaryConfig::new().with_multi_key_creator(Box::new(MkCreator));
+        let config =
+            SecondaryConfig::new().with_multi_key_creator(Box::new(MkCreator));
         assert!(config.multi_key_creator.is_some());
         assert!(config.key_creator.is_none());
     }
@@ -603,14 +644,21 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let env = Environment::open(
-            EnvironmentConfig::new(temp_dir.path().to_path_buf()).with_allow_create(true)
-        ).unwrap();
-        let db_cfg = crate::database_config::DatabaseConfig::new().with_allow_create(true);
+            EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true),
+        )
+        .unwrap();
+        let db_cfg = crate::database_config::DatabaseConfig::new()
+            .with_allow_create(true);
         let db = env.open_database(None, "bnf_db", &db_cfg).unwrap();
 
         struct SimpleNullifier;
         impl ForeignKeyNullifier for SimpleNullifier {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }
@@ -644,7 +692,10 @@ mod tests {
         };
         assert!(config.validate(false).is_err());
         let err = config.validate(false).unwrap_err();
-        assert!(err.contains("foreign_key_nullifier") && err.contains("foreign_multi_key_nullifier"));
+        assert!(
+            err.contains("foreign_key_nullifier")
+                && err.contains("foreign_multi_key_nullifier")
+        );
     }
 
     #[test]
@@ -664,14 +715,21 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let env = Environment::open(
-            EnvironmentConfig::new(temp_dir.path().to_path_buf()).with_allow_create(true)
-        ).unwrap();
-        let db_cfg = crate::database_config::DatabaseConfig::new().with_allow_create(true);
+            EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true),
+        )
+        .unwrap();
+        let db_cfg = crate::database_config::DatabaseConfig::new()
+            .with_allow_create(true);
         let db = env.open_database(None, "vnano_db", &db_cfg).unwrap();
 
         struct SimpleNullifier;
         impl ForeignKeyNullifier for SimpleNullifier {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }
@@ -695,9 +753,12 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let env = Environment::open(
-            EnvironmentConfig::new(temp_dir.path().to_path_buf()).with_allow_create(true)
-        ).unwrap();
-        let db_cfg = crate::database_config::DatabaseConfig::new().with_allow_create(true);
+            EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true),
+        )
+        .unwrap();
+        let db_cfg = crate::database_config::DatabaseConfig::new()
+            .with_allow_create(true);
         let db = env.open_database(None, "vnamo_db", &db_cfg).unwrap();
 
         struct MultiNullifier;
@@ -734,9 +795,12 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let env = Environment::open(
-            EnvironmentConfig::new(temp_dir.path().to_path_buf()).with_allow_create(true)
-        ).unwrap();
-        let db_cfg = crate::database_config::DatabaseConfig::new().with_allow_create(true);
+            EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true),
+        )
+        .unwrap();
+        let db_cfg = crate::database_config::DatabaseConfig::new()
+            .with_allow_create(true);
         let db = env.open_database(None, "vfnmkc_db", &db_cfg).unwrap();
 
         struct MkCreator;
@@ -752,7 +816,11 @@ mod tests {
         }
         struct SimpleNullifier;
         impl ForeignKeyNullifier for SimpleNullifier {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }
@@ -775,7 +843,11 @@ mod tests {
         };
         // multi_key_creator + foreign_key_nullifier => error
         let err = config.validate(false).unwrap_err();
-        assert!(err.contains("ForeignKeyNullifier") || err.contains("ForeignMultiKeyNullifier") || err.contains("multi"));
+        assert!(
+            err.contains("ForeignKeyNullifier")
+                || err.contains("ForeignMultiKeyNullifier")
+                || err.contains("multi")
+        );
     }
 
     #[test]
@@ -808,8 +880,8 @@ mod tests {
             }
         }
         // primary_read_only=true with multi_key_creator should be ok
-        let config = SecondaryConfig::new()
-            .with_multi_key_creator(Box::new(MkCreator));
+        let config =
+            SecondaryConfig::new().with_multi_key_creator(Box::new(MkCreator));
         assert!(config.validate(true).is_ok());
     }
 
@@ -826,8 +898,8 @@ mod tests {
             ) {
             }
         }
-        let config = SecondaryConfig::new()
-            .with_multi_key_creator(Box::new(MkCreator));
+        let config =
+            SecondaryConfig::new().with_multi_key_creator(Box::new(MkCreator));
         assert!(config.validate(false).is_ok());
     }
 
@@ -858,14 +930,16 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"k");
         let data_with = DatabaseEntry::from_bytes(b"some_data");
         let mut result = DatabaseEntry::new();
-        let got = creator.create_secondary_key(&db, &key, &data_with, &mut result);
+        let got =
+            creator.create_secondary_key(&db, &key, &data_with, &mut result);
         assert!(got);
         assert_eq!(result.get_data().unwrap(), b"some_data");
 
         // Branch: data is empty/None → false
         let data_none = DatabaseEntry::new();
         let mut result2 = DatabaseEntry::new();
-        let got2 = creator.create_secondary_key(&db, &key, &data_none, &mut result2);
+        let got2 =
+            creator.create_secondary_key(&db, &key, &data_none, &mut result2);
         assert!(!got2);
     }
 
@@ -875,7 +949,11 @@ mod tests {
     fn test_foreign_key_nullifier_impl_covered() {
         struct SimpleNullifier;
         impl ForeignKeyNullifier for SimpleNullifier {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }
@@ -983,7 +1061,8 @@ mod tests {
         let env = Environment::open(env_config).unwrap();
         let db_config = crate::database_config::DatabaseConfig::new()
             .with_allow_create(true);
-        let foreign_db = env.open_database(None, "foreign_db", &db_config).unwrap();
+        let foreign_db =
+            env.open_database(None, "foreign_db", &db_config).unwrap();
 
         let config = SecondaryConfig::new()
             .with_key_creator(Box::new(SimpleKeyCreator))
@@ -1035,7 +1114,11 @@ mod tests {
         // ---- SimpleNullifier (like in test_with_foreign_key_nullifier) ----
         struct Nul;
         impl ForeignKeyNullifier for Nul {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }
@@ -1084,7 +1167,11 @@ mod tests {
         // ---- Another SimpleNullifier for test_validate_foreign_nullifier path ----
         struct Nul2;
         impl ForeignKeyNullifier for Nul2 {
-            fn nullify_foreign_key(&self, _db: &Database, _data: &mut DatabaseEntry) -> bool {
+            fn nullify_foreign_key(
+                &self,
+                _db: &Database,
+                _data: &mut DatabaseEntry,
+            ) -> bool {
                 false
             }
         }

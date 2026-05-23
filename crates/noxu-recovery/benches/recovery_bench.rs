@@ -16,13 +16,16 @@ use noxu_util::Lsn;
 fn bench_checkpoint_start_serialize_short(c: &mut Criterion) {
     let ckpt = CheckpointStart::new(1, "daemon");
 
-    c.bench_function("checkpoint_start_serialize_short (invoker=daemon)", |b| {
-        b.iter(|| {
-            let mut buf = Vec::with_capacity(32);
-            black_box(ckpt.write_to_log(&mut buf).unwrap());
-            black_box(buf.len());
-        })
-    });
+    c.bench_function(
+        "checkpoint_start_serialize_short (invoker=daemon)",
+        |b| {
+            b.iter(|| {
+                let mut buf = Vec::with_capacity(32);
+                black_box(ckpt.write_to_log(&mut buf).unwrap());
+                black_box(buf.len());
+            })
+        },
+    );
 }
 
 fn bench_checkpoint_start_serialize_long(c: &mut Criterion) {
@@ -48,8 +51,7 @@ fn bench_checkpoint_start_roundtrip(c: &mut Criterion) {
     c.bench_function("checkpoint_start_roundtrip", |b| {
         b.iter(|| {
             let decoded =
-                CheckpointStart::read_from_log(black_box(&serialized))
-                    .unwrap();
+                CheckpointStart::read_from_log(black_box(&serialized)).unwrap();
             black_box(decoded.get_id());
         })
     });
@@ -100,23 +102,26 @@ fn bench_dirty_in_map_insert_100(c: &mut Criterion) {
 
 fn bench_dirty_in_map_multi_level(c: &mut Criterion) {
     // Simulate a tree with 4 levels: BINs at 1, INs at 2, 3, 4.
-    c.bench_function("dirty_in_map_insert_multi_level (4 levels, 50 nodes)", |b| {
-        b.iter(|| {
-            let mut map = DirtyINMap::new();
-            for level in 1i32..=4 {
-                for i in 0u64..50 {
-                    let r = CheckpointReference::new(
-                        i + (level as u64 * 1000),
-                        1,
-                        false,
-                        level,
-                    );
-                    map.add_dirty_in(r);
+    c.bench_function(
+        "dirty_in_map_insert_multi_level (4 levels, 50 nodes)",
+        |b| {
+            b.iter(|| {
+                let mut map = DirtyINMap::new();
+                for level in 1i32..=4 {
+                    for i in 0u64..50 {
+                        let r = CheckpointReference::new(
+                            i + (level as u64 * 1000),
+                            1,
+                            false,
+                            level,
+                        );
+                        map.add_dirty_in(r);
+                    }
                 }
-            }
-            black_box(map.get_num_entries());
-        })
-    });
+                black_box(map.get_num_entries());
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -59,9 +59,9 @@ use bytes::Bytes;
 use quinn::{Connection, Endpoint, ReadExactError, RecvStream, SendStream};
 use tokio::runtime::Runtime;
 
+use super::quic_channel::{default_server_config, insecure_client_config};
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
-use super::quic_channel::{default_server_config, insecure_client_config};
 
 // ---------------------------------------------------------------------------
 // Wire protocol constants
@@ -141,7 +141,9 @@ impl QuicSubChannel {
 impl Channel for QuicSubChannel {
     fn send(&self, data: &[u8]) -> Result<()> {
         if !self.is_open() {
-            return Err(RepError::ChannelClosed("QuicSubChannel is closed".into()));
+            return Err(RepError::ChannelClosed(
+                "QuicSubChannel is closed".into(),
+            ));
         }
         let len_prefix = (data.len() as u32).to_le_bytes();
         let payload = data.to_vec();
@@ -162,13 +164,17 @@ impl Channel for QuicSubChannel {
 
     fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         if !self.is_open() {
-            return Err(RepError::ChannelClosed("QuicSubChannel is closed".into()));
+            return Err(RepError::ChannelClosed(
+                "QuicSubChannel is closed".into(),
+            ));
         }
         self.runtime.block_on(async {
             let mut stream = self.recv.lock().await;
 
             let mut len_buf = [0u8; 4];
-            match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await {
+            match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf))
+                .await
+            {
                 Err(_elapsed) => return Ok(None),
                 Ok(Ok(_)) => {}
                 Ok(Err(ReadExactError::FinishedEarly(_))) => {
@@ -183,15 +189,14 @@ impl Channel for QuicSubChannel {
 
             let payload_len = u32::from_le_bytes(len_buf) as usize;
             let mut payload = vec![0u8; payload_len];
-            stream
-                .read_exact(&mut payload)
-                .await
-                .map_err(|e| match e {
-                    ReadExactError::FinishedEarly(_) => {
-                        RepError::ChannelClosed("QUIC stream closed mid-payload".into())
-                    }
-                    ReadExactError::ReadError(re) => RepError::NetworkError(re.to_string()),
-                })?;
+            stream.read_exact(&mut payload).await.map_err(|e| match e {
+                ReadExactError::FinishedEarly(_) => RepError::ChannelClosed(
+                    "QUIC stream closed mid-payload".into(),
+                ),
+                ReadExactError::ReadError(re) => {
+                    RepError::NetworkError(re.to_string())
+                }
+            })?;
             Ok(Some(payload))
         })
     }
@@ -309,7 +314,13 @@ impl QuicMultiplexedChannel {
     /// the self-signed cert from [`mux_server_config`]).
     pub fn connect(addr: SocketAddr, server_name: &str) -> Result<Self> {
         let runtime = Self::build_runtime()?;
-        Self::connect_inner(addr, server_name, mux_insecure_client_config(), runtime, None)
+        Self::connect_inner(
+            addr,
+            server_name,
+            mux_insecure_client_config(),
+            runtime,
+            None,
+        )
     }
 
     /// Connect using a caller-supplied `ClientConfig`.
@@ -326,16 +337,24 @@ impl QuicMultiplexedChannel {
     ///
     /// Happy Eyeballs: IPv6 addresses are tried before IPv4. The first address
     /// that completes the QUIC handshake wins.
-    pub fn connect_host(host: &str, port: u16, server_name: &str) -> Result<Self> {
+    pub fn connect_host(
+        host: &str,
+        port: u16,
+        server_name: &str,
+    ) -> Result<Self> {
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|e| RepError::NetworkError(
-                format!("DNS resolution failed for {host}:{port}: {e}")))?
+            .map_err(|e| {
+                RepError::NetworkError(format!(
+                    "DNS resolution failed for {host}:{port}: {e}"
+                ))
+            })?
             .collect();
 
         if addrs.is_empty() {
-            return Err(RepError::NetworkError(
-                format!("no addresses resolved for {host}:{port}")));
+            return Err(RepError::NetworkError(format!(
+                "no addresses resolved for {host}:{port}"
+            )));
         }
 
         // Happy Eyeballs: prefer IPv6.
@@ -349,8 +368,11 @@ impl QuicMultiplexedChannel {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| RepError::NetworkError(
-            format!("could not connect to {host}:{port}"))))
+        Err(last_err.unwrap_or_else(|| {
+            RepError::NetworkError(format!(
+                "could not connect to {host}:{port}"
+            ))
+        }))
     }
 
     /// Reconnect using a [`ReconnectToken`] produced by
@@ -417,8 +439,10 @@ impl QuicMultiplexedChannel {
         ) = runtime.block_on(async move {
             let mut endpoint = match existing_endpoint {
                 Some(ep) => ep,
-                None => Endpoint::client("0.0.0.0:0".parse().expect("valid bind addr"))
-                    .map_err(|e| RepError::NetworkError(e.to_string()))?,
+                None => Endpoint::client(
+                    "0.0.0.0:0".parse().expect("valid bind addr"),
+                )
+                .map_err(|e| RepError::NetworkError(e.to_string()))?,
             };
             endpoint.set_default_client_config(client_cfg);
             let conn = endpoint
@@ -428,7 +452,8 @@ impl QuicMultiplexedChannel {
                 .map_err(|e| RepError::NetworkError(e.to_string()))?;
 
             // Open streams in canonical order: heartbeat, log, ack, restore.
-            let stream_types = [STREAM_HEARTBEAT, STREAM_LOG, STREAM_ACK, STREAM_RESTORE];
+            let stream_types =
+                [STREAM_HEARTBEAT, STREAM_LOG, STREAM_ACK, STREAM_RESTORE];
             let mut map: HashMap<u8, (SendStream, RecvStream)> =
                 HashMap::with_capacity(NUM_STREAMS);
 
@@ -452,18 +477,22 @@ impl QuicMultiplexedChannel {
             Ok::<_, RepError>((endpoint, conn, map))
         })?;
 
-        let (hb_s, hb_r) = stream_map
-            .remove(&STREAM_HEARTBEAT)
-            .ok_or_else(|| RepError::NetworkError("missing heartbeat stream".into()))?;
-        let (log_s, log_r) = stream_map
-            .remove(&STREAM_LOG)
-            .ok_or_else(|| RepError::NetworkError("missing log stream".into()))?;
-        let (ack_s, ack_r) = stream_map
-            .remove(&STREAM_ACK)
-            .ok_or_else(|| RepError::NetworkError("missing ack stream".into()))?;
-        let (rst_s, rst_r) = stream_map
-            .remove(&STREAM_RESTORE)
-            .ok_or_else(|| RepError::NetworkError("missing restore stream".into()))?;
+        let (hb_s, hb_r) =
+            stream_map.remove(&STREAM_HEARTBEAT).ok_or_else(|| {
+                RepError::NetworkError("missing heartbeat stream".into())
+            })?;
+        let (log_s, log_r) =
+            stream_map.remove(&STREAM_LOG).ok_or_else(|| {
+                RepError::NetworkError("missing log stream".into())
+            })?;
+        let (ack_s, ack_r) =
+            stream_map.remove(&STREAM_ACK).ok_or_else(|| {
+                RepError::NetworkError("missing ack stream".into())
+            })?;
+        let (rst_s, rst_r) =
+            stream_map.remove(&STREAM_RESTORE).ok_or_else(|| {
+                RepError::NetworkError("missing restore stream".into())
+            })?;
 
         let (hb_rt, log_rt, ack_rt, rst_rt) = (
             Arc::clone(&runtime),
@@ -564,7 +593,9 @@ impl ReplicationChannel for QuicMultiplexedChannel {
 
     fn recv_vlsn_datagram(&self, timeout: Duration) -> Result<Option<i64>> {
         self.runtime.block_on(async {
-            match tokio::time::timeout(timeout, self.connection.read_datagram()).await {
+            match tokio::time::timeout(timeout, self.connection.read_datagram())
+                .await
+            {
                 Err(_elapsed) => Ok(None),
                 Ok(Ok(data)) => {
                     if data.len() != 8 {
@@ -573,10 +604,13 @@ impl ReplicationChannel for QuicMultiplexedChannel {
                             data.len()
                         )));
                     }
-                    let bytes: [u8; 8] = data[..8].try_into().expect("length checked above");
+                    let bytes: [u8; 8] =
+                        data[..8].try_into().expect("length checked above");
                     Ok(Some(i64::from_le_bytes(bytes)))
                 }
-                Ok(Err(e)) => Err(RepError::NetworkError(format!("datagram recv: {e}"))),
+                Ok(Err(e)) => {
+                    Err(RepError::NetworkError(format!("datagram recv: {e}")))
+                }
             }
         })
     }
@@ -656,10 +690,9 @@ impl QuicMultiplexedChannelListener {
         // Rust 2024: borrow self.endpoint and self.runtime as separate fields;
         // the runtime Arc is cloned once inside the future (not twice outside).
         self.runtime.block_on(async {
-            let incoming = self.endpoint
-                .accept()
-                .await
-                .ok_or_else(|| RepError::NetworkError("QUIC endpoint closed".into()))?;
+            let incoming = self.endpoint.accept().await.ok_or_else(|| {
+                RepError::NetworkError("QUIC endpoint closed".into())
+            })?;
             let conn = incoming
                 .await
                 .map_err(|e| RepError::NetworkError(e.to_string()))?;
@@ -677,11 +710,9 @@ impl QuicMultiplexedChannelListener {
                     .map_err(|e| RepError::NetworkError(e.to_string()))?;
 
                 let mut handshake = [0u8; 5];
-                recv.read_exact(&mut handshake)
-                    .await
-                    .map_err(|e| {
-                        RepError::NetworkError(format!("mux handshake: {e}"))
-                    })?;
+                recv.read_exact(&mut handshake).await.map_err(|e| {
+                    RepError::NetworkError(format!("mux handshake: {e}"))
+                })?;
 
                 if &handshake[..4] != MULTIPLEXED_MAGIC {
                     return Err(RepError::NetworkError(format!(
@@ -698,18 +729,22 @@ impl QuicMultiplexedChannelListener {
                 stream_map.insert(stream_type, (send, recv));
             }
 
-            let (hb_s, hb_r) = stream_map
-                .remove(&STREAM_HEARTBEAT)
-                .ok_or_else(|| RepError::NetworkError("missing heartbeat stream".into()))?;
-            let (log_s, log_r) = stream_map
-                .remove(&STREAM_LOG)
-                .ok_or_else(|| RepError::NetworkError("missing log stream".into()))?;
-            let (ack_s, ack_r) = stream_map
-                .remove(&STREAM_ACK)
-                .ok_or_else(|| RepError::NetworkError("missing ack stream".into()))?;
-            let (rst_s, rst_r) = stream_map
-                .remove(&STREAM_RESTORE)
-                .ok_or_else(|| RepError::NetworkError("missing restore stream".into()))?;
+            let (hb_s, hb_r) =
+                stream_map.remove(&STREAM_HEARTBEAT).ok_or_else(|| {
+                    RepError::NetworkError("missing heartbeat stream".into())
+                })?;
+            let (log_s, log_r) =
+                stream_map.remove(&STREAM_LOG).ok_or_else(|| {
+                    RepError::NetworkError("missing log stream".into())
+                })?;
+            let (ack_s, ack_r) =
+                stream_map.remove(&STREAM_ACK).ok_or_else(|| {
+                    RepError::NetworkError("missing ack stream".into())
+                })?;
+            let (rst_s, rst_r) =
+                stream_map.remove(&STREAM_RESTORE).ok_or_else(|| {
+                    RepError::NetworkError("missing restore stream".into())
+                })?;
 
             // One clone of the runtime Arc, distributed to each sub-channel and
             // to the channel itself (five Arc::clone total, down from six before).
@@ -757,7 +792,8 @@ mod tests {
             // Server drops naturally, which calls close_all().
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         assert!(client.is_open());
         client.close_all().unwrap();
         assert!(!client.is_open());
@@ -776,14 +812,17 @@ mod tests {
 
         let server_thread = std::thread::spawn(move || {
             let ch = listener.accept().unwrap();
-            let msg = ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
+            let msg =
+                ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
             assert_eq!(msg, Some(b"hb-ping".to_vec()));
             ch.heartbeat_channel().send(b"hb-pong").unwrap();
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         client.heartbeat_channel().send(b"hb-ping").unwrap();
-        let reply = client.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
+        let reply =
+            client.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
         assert_eq!(reply, Some(b"hb-pong".to_vec()));
 
         server_thread.join().unwrap();
@@ -800,7 +839,8 @@ mod tests {
             assert_eq!(msg, Some(b"log-entry".to_vec()));
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         client.log_channel().send(b"log-entry").unwrap();
 
         server_thread.join().unwrap();
@@ -817,7 +857,8 @@ mod tests {
             assert_eq!(msg, Some(b"ack-42".to_vec()));
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         client.ack_channel().send(b"ack-42").unwrap();
 
         server_thread.join().unwrap();
@@ -830,11 +871,13 @@ mod tests {
 
         let server_thread = std::thread::spawn(move || {
             let ch = listener.accept().unwrap();
-            let msg = ch.restore_channel().receive(Duration::from_secs(5)).unwrap();
+            let msg =
+                ch.restore_channel().receive(Duration::from_secs(5)).unwrap();
             assert_eq!(msg, Some(b"restore-block".to_vec()));
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         client.restore_channel().send(b"restore-block").unwrap();
 
         server_thread.join().unwrap();
@@ -853,14 +896,17 @@ mod tests {
 
         let server_thread = std::thread::spawn(move || {
             let ch = listener.accept().unwrap();
-            let hb = ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
+            let hb =
+                ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
             let log = ch.log_channel().receive(Duration::from_secs(5)).unwrap();
             let ack = ch.ack_channel().receive(Duration::from_secs(5)).unwrap();
-            let rst = ch.restore_channel().receive(Duration::from_secs(5)).unwrap();
+            let rst =
+                ch.restore_channel().receive(Duration::from_secs(5)).unwrap();
             (hb, log, ack, rst)
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         client.heartbeat_channel().send(b"heartbeat").unwrap();
         client.log_channel().send(b"log").unwrap();
         client.ack_channel().send(b"ack").unwrap();
@@ -888,11 +934,13 @@ mod tests {
                 ch.log_channel().receive(Duration::from_secs(5)).unwrap();
             }
             // Confirm heartbeat arrives promptly.
-            let hb = ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
+            let hb =
+                ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
             assert_eq!(hb, Some(b"hb".to_vec()));
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         // Send 10 large log messages.
         for _ in 0..10 {
             client.log_channel().send(&large_payload).unwrap();
@@ -918,7 +966,8 @@ mod tests {
             assert_eq!(vlsn, Some(42_i64));
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
         client.send_vlsn_datagram(42).unwrap();
 
         server_thread.join().unwrap();
@@ -935,8 +984,10 @@ mod tests {
             // channel held alive for the duration of the test
         });
 
-        let client = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
-        let result = client.recv_vlsn_datagram(Duration::from_millis(300)).unwrap();
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let result =
+            client.recv_vlsn_datagram(Duration::from_millis(300)).unwrap();
         assert_eq!(result, None, "expected timeout → None");
 
         drop(server_thread.join().unwrap());
@@ -952,13 +1003,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server_thread = std::thread::spawn(move || {
-            let ch: Box<dyn ReplicationChannel> = Box::new(listener.accept().unwrap());
-            let msg = ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
+            let ch: Box<dyn ReplicationChannel> =
+                Box::new(listener.accept().unwrap());
+            let msg =
+                ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
             assert_eq!(msg, Some(b"trait test".to_vec()));
         });
 
-        let client: Box<dyn ReplicationChannel> =
-            Box::new(QuicMultiplexedChannel::connect(addr, "localhost").unwrap());
+        let client: Box<dyn ReplicationChannel> = Box::new(
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap(),
+        );
         client.heartbeat_channel().send(b"trait test").unwrap();
 
         server_thread.join().unwrap();
@@ -976,14 +1030,10 @@ mod tests {
         // Server: accept two connections in sequence.
         let server_thread = std::thread::spawn(move || {
             let ch = listener.accept().unwrap();
-            ch.heartbeat_channel()
-                .receive(Duration::from_secs(5))
-                .unwrap();
+            ch.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
             // Second connection on the same listener.
             let ch2 = listener.accept().unwrap();
-            ch2.heartbeat_channel()
-                .receive(Duration::from_secs(5))
-                .unwrap();
+            ch2.heartbeat_channel().receive(Duration::from_secs(5)).unwrap();
         });
 
         let first = QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
@@ -995,7 +1045,12 @@ mod tests {
 
         // Second connection reusing the endpoint + runtime — Quinn will use the
         // cached TLS session ticket for 0-RTT when the server supports it.
-        let second = QuicMultiplexedChannel::connect_with_token(token, addr, "localhost").unwrap();
+        let second = QuicMultiplexedChannel::connect_with_token(
+            token,
+            addr,
+            "localhost",
+        )
+        .unwrap();
         second.heartbeat_channel().send(b"second-conn").unwrap();
 
         server_thread.join().unwrap();

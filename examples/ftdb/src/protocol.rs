@@ -62,7 +62,11 @@ pub struct Header {
 impl Header {
     pub const SIZE: usize = 32;
 
-    pub fn new(operation: Operation, request_id: u32, batch_count: u32) -> Self {
+    pub fn new(
+        operation: Operation,
+        request_id: u32,
+        batch_count: u32,
+    ) -> Self {
         Self {
             operation: operation as u8,
             status: 0,
@@ -74,7 +78,12 @@ impl Header {
         }
     }
 
-    pub fn response(operation: Operation, request_id: u32, batch_count: u32, status: u8) -> Self {
+    pub fn response(
+        operation: Operation,
+        request_id: u32,
+        batch_count: u32,
+        status: u8,
+    ) -> Self {
         Self {
             operation: operation as u8,
             status,

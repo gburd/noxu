@@ -44,7 +44,7 @@ impl MatchpointEntry {
     /// Returns the serialized size in bytes.
     pub fn log_size(&self) -> usize {
         8 + // lsn
-        8   // vlsn (i64 sequence number)
+        8 // vlsn (i64 sequence number)
     }
 
     /// Writes this entry to a buffer.

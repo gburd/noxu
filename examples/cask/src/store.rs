@@ -2,12 +2,12 @@
 
 use bytes::Bytes;
 use noxu_db::{
-    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get, OperationStatus,
-    Transaction,
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    Get, OperationStatus, Transaction,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 /// Errors from the storage layer.
@@ -49,11 +49,7 @@ impl CaskStore {
         let db_cfg = DatabaseConfig::new().with_allow_create(true);
         let db = env.open_database(None, "cask_store", &db_cfg)?;
 
-        Ok(Self {
-            env,
-            db,
-            stats: Arc::new(StoreStats::default()),
-        })
+        Ok(Self { env, db, stats: Arc::new(StoreStats::default()) })
     }
 
     /// Get a value by key.
@@ -113,7 +109,8 @@ impl CaskStore {
         let mut key_out = DatabaseEntry::new();
         let mut val_out = DatabaseEntry::new();
 
-        let status = cursor.get(&mut key_out, &mut val_out, Get::First, None)?;
+        let status =
+            cursor.get(&mut key_out, &mut val_out, Get::First, None)?;
         if status != OperationStatus::Success {
             return Ok(results);
         }
@@ -124,7 +121,8 @@ impl CaskStore {
             {
                 results.push(Bytes::copy_from_slice(k));
             }
-            if cursor.get(&mut key_out, &mut val_out, Get::Next, None)? != OperationStatus::Success
+            if cursor.get(&mut key_out, &mut val_out, Get::Next, None)?
+                != OperationStatus::Success
             {
                 break;
             }
@@ -139,19 +137,24 @@ impl CaskStore {
         let current = self.get(key)?;
         let current_val: i64 = match &current {
             Some(data) => {
-                let s = std::str::from_utf8(data).map_err(|_| StoreError::NotAnInteger)?;
+                let s = std::str::from_utf8(data)
+                    .map_err(|_| StoreError::NotAnInteger)?;
                 s.parse::<i64>().map_err(|_| StoreError::NotAnInteger)?
             }
             None => 0,
         };
-        let new_val = current_val.checked_add(by).ok_or(StoreError::Overflow)?;
+        let new_val =
+            current_val.checked_add(by).ok_or(StoreError::Overflow)?;
         let new_bytes = new_val.to_string().into_bytes();
         self.set(key, &new_bytes)?;
         Ok(new_val)
     }
 
     /// Get multiple keys at once.
-    pub fn mget(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>, StoreError> {
+    pub fn mget(
+        &self,
+        keys: &[Bytes],
+    ) -> Result<Vec<Option<Bytes>>, StoreError> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
             results.push(self.get(key)?);
@@ -180,7 +183,11 @@ impl CaskStore {
 
     /// Append a value to an existing key (or set it if the key does not exist).
     /// Returns the length of the resulting value.
-    pub fn append(&self, key: &[u8], value: &[u8]) -> Result<usize, StoreError> {
+    pub fn append(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<usize, StoreError> {
         let existing = self.get(key)?;
         let new_val = match existing {
             Some(existing_data) => {
@@ -219,7 +226,11 @@ impl CaskStore {
     }
 
     /// Delete within a transaction.
-    pub fn del_in_txn(&self, txn: &Transaction, key: &[u8]) -> Result<bool, StoreError> {
+    pub fn del_in_txn(
+        &self,
+        txn: &Transaction,
+        key: &[u8],
+    ) -> Result<bool, StoreError> {
         let k = DatabaseEntry::from_bytes(key);
         match self.db.delete(Some(txn), &k)? {
             OperationStatus::Success => Ok(true),
@@ -274,7 +285,9 @@ fn glob_match_recursive(pattern: &[u8], value: &[u8]) -> bool {
     let mut star_vi: usize = 0;
 
     while vi < value.len() {
-        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == value[vi]) {
+        if pi < pattern.len()
+            && (pattern[pi] == b'?' || pattern[pi] == value[vi])
+        {
             pi += 1;
             vi += 1;
         } else if pi < pattern.len() && pattern[pi] == b'*' {

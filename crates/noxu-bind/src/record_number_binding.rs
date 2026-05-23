@@ -8,7 +8,7 @@ use crate::error::{BindError, Result};
 
 /// A binding for u64 record numbers stored as big-endian 8-byte arrays.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecordNumberBinding;
 

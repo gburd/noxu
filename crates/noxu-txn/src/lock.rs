@@ -181,10 +181,7 @@ impl Lock {
     ///
     /// Used by deadlock detection to build the waits-for graph before waiting.
     pub fn get_owner_ids(&self) -> Vec<i64> {
-        self.get_owners_clone()
-            .into_iter()
-            .map(|info| info.locker_id)
-            .collect()
+        self.get_owners_clone().into_iter().map(|info| info.locker_id).collect()
     }
 
     /// Return true if locker is an owner of this Lock for lockType.

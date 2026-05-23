@@ -69,7 +69,8 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     unsafe fn unlock_shared(&self) {
         let prev = self.state.fetch_sub(ONE_READER, Ordering::Release);
         // If we were the last reader and writers are waiting, wake one writer.
-        if prev == ONE_READER && self.write_waiters.load(Ordering::Relaxed) > 0 {
+        if prev == ONE_READER && self.write_waiters.load(Ordering::Relaxed) > 0
+        {
             futex_wake(&self.state, 1);
         }
     }
@@ -82,7 +83,12 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     fn lock_exclusive(&self) {
         if self
             .state
-            .compare_exchange(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                0,
+                WRITE_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.exclusive_owner
@@ -96,7 +102,12 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     fn try_lock_exclusive(&self) -> bool {
         if self
             .state
-            .compare_exchange(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                0,
+                WRITE_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.exclusive_owner
@@ -153,7 +164,12 @@ unsafe impl lock_api::RawRwLockTimed for NoxuRawRwLock {
     fn try_lock_exclusive_for(&self, timeout: Duration) -> bool {
         if self
             .state
-            .compare_exchange(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                0,
+                WRITE_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.exclusive_owner
@@ -166,7 +182,12 @@ unsafe impl lock_api::RawRwLockTimed for NoxuRawRwLock {
     fn try_lock_exclusive_until(&self, deadline: Instant) -> bool {
         if self
             .state
-            .compare_exchange(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                0,
+                WRITE_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.exclusive_owner
@@ -187,7 +208,12 @@ impl NoxuRawRwLock {
         }
         // No overflow check: WRITE_LOCKED bit acts as sentinel.
         self.state
-            .compare_exchange(state, state + ONE_READER, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                state,
+                state + ONE_READER,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
     }
 
@@ -227,7 +253,8 @@ impl NoxuRawRwLock {
 
             self.read_waiters.fetch_add(1, Ordering::Relaxed);
             futex_wait(&self.state, state, timeout);
-            let did_timeout = deadline.map(|dl| Instant::now() >= dl).unwrap_or(false);
+            let did_timeout =
+                deadline.map(|dl| Instant::now() >= dl).unwrap_or(false);
             self.read_waiters.fetch_sub(1, Ordering::Relaxed);
 
             if did_timeout {
@@ -255,8 +282,10 @@ impl NoxuRawRwLock {
                     )
                     .is_ok()
                 {
-                    self.exclusive_owner
-                        .store(crate::raw_mutex::thread_id(), Ordering::Relaxed);
+                    self.exclusive_owner.store(
+                        crate::raw_mutex::thread_id(),
+                        Ordering::Relaxed,
+                    );
                     self.write_waiters.fetch_sub(1, Ordering::Relaxed);
                     return true;
                 }

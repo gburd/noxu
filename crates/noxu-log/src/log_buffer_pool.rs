@@ -17,13 +17,13 @@
 use crate::error::{LogError, Result};
 use crate::log_buffer::LogBuffer;
 use noxu_latch::ExclusiveLatch;
-use noxu_util::lsn::Lsn;
 use noxu_sync::Mutex;
+use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 
 /// Manages a circular pool of LogBuffers.
 ///
-/// 
+///
 pub struct LogBufferPool {
     /// The pool of buffers (typically 3 buffers).
     buffers: Vec<Arc<Mutex<LogBuffer>>>,
@@ -159,7 +159,9 @@ impl LogBufferPool {
     /// Returns false when the buffer needs flushing but there are no free buffers.
     /// Returns true when the buffer is empty or when the buffer is non-empty and is bumped.
     fn bump_current(&mut self, _size_needed: usize) -> Result<bool> {
-        let _guard = self.buffer_pool_latch.acquire()
+        let _guard = self
+            .buffer_pool_latch
+            .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         let current = self.buffers[self.current_write_buffer_index].lock();
@@ -224,7 +226,9 @@ impl LogBufferPool {
     /// FileManager write queue.
     /// .
     fn write_dirty(&mut self, _flush_write_queue: bool) -> Result<()> {
-        let _guard = self.buffer_pool_latch.acquire()
+        let _guard = self
+            .buffer_pool_latch
+            .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         if self.dirty_start < 0 {
@@ -273,7 +277,9 @@ impl LogBufferPool {
         }
 
         // Latch and check the buffer pool
-        let _guard = self.buffer_pool_latch.acquire()
+        let _guard = self
+            .buffer_pool_latch
+            .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         for buffer_arc in &self.buffers {
@@ -334,7 +340,8 @@ mod tests {
     #[test]
     fn test_get_write_buffer() {
         let mut pool = LogBufferPool::new(3, 1024);
-        let buffer = pool.get_write_buffer(100, false).expect("get_write_buffer");
+        let buffer =
+            pool.get_write_buffer(100, false).expect("get_write_buffer");
         let buf = buffer.lock();
         assert!(buf.has_room(100));
     }
@@ -345,7 +352,8 @@ mod tests {
 
         // Fill first buffer
         {
-            let buffer = pool.get_write_buffer(50, false).expect("get_write_buffer");
+            let buffer =
+                pool.get_write_buffer(50, false).expect("get_write_buffer");
             let mut buf = buffer.lock();
             buf.latch_for_write();
             buf.register_lsn(Lsn::new(0, 0));
@@ -355,7 +363,8 @@ mod tests {
 
         // Request more space, should bump to next buffer
         {
-            let buffer = pool.get_write_buffer(60, false).expect("get_write_buffer");
+            let buffer =
+                pool.get_write_buffer(60, false).expect("get_write_buffer");
             let buf = buffer.lock();
             assert!(buf.has_room(60));
         }
@@ -387,7 +396,8 @@ mod tests {
         // searched. We force a cache miss by searching for a high LSN
         // in a pool whose buffers have no registered LSNs yet.
         let lsn = Lsn::new(99, 5000);
-        let result = pool.get_read_buffer_by_lsn(lsn).expect("get_read_buffer_by_lsn");
+        let result =
+            pool.get_read_buffer_by_lsn(lsn).expect("get_read_buffer_by_lsn");
         assert!(result.is_none());
         assert_eq!(pool.get_stats().n_cache_miss, 1);
     }

@@ -11,8 +11,10 @@ use std::time::Duration;
 
 use noxu_sync::{Condvar, Mutex};
 
-use crate::{DeadlockDetector, Lock, LockGrantType, LockStats, LockType, TxnError};
 use crate::lock_info::WaiterNotify;
+use crate::{
+    DeadlockDetector, Lock, LockGrantType, LockStats, LockType, TxnError,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Number of lock table shards.
@@ -49,7 +51,7 @@ const N_LOCK_TABLES: usize = 64;
 ///
 /// This mirrors the flow in `LockManager.lock()` / `waitForLock()`.
 ///
-/// 
+///
 pub struct LockManager {
     /// Sharded lock tables, keyed by LSN.
     lock_tables: Vec<Mutex<HashMap<u64, Lock>>>,
@@ -63,7 +65,7 @@ pub struct LockManager {
     /// Configured at open time from `EnvironmentConfig`; can be overridden
     /// per-call via `lock_with_timeout()`.
     ///
-    /// 
+    ///
     lock_timeout_ms: AtomicU64,
 
     /// Locker sharing registry: maps locker_id → share_group_id.
@@ -136,7 +138,7 @@ impl LockManager {
     /// Updates the default lock timeout.
     ///
     /// Thread-safe; takes effect for subsequent `lock()` calls.
-    /// 
+    ///
     pub fn set_lock_timeout(&self, timeout_ms: u64) {
         self.lock_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
@@ -194,7 +196,7 @@ impl LockManager {
     /// Like `lock()` but the caller supplies the timeout in milliseconds.
     /// `timeout_ms == 0` means wait forever.
     ///
-    /// 
+    ///
     pub fn lock_with_timeout(
         &self,
         lsn: u64,
@@ -280,9 +282,9 @@ impl LockManager {
         // are entering the wait path simultaneously.  We therefore also
         // perform a deadlock check after each spurious wakeup inside the
         // wait loop (Phase 3).
-        if let Some(deadlock_err) = self.check_deadlock_for_waiter(
-            lsn, locker_id, lock_type, &owner_ids,
-        ) {
+        if let Some(deadlock_err) = self
+            .check_deadlock_for_waiter(lsn, locker_id, lock_type, &owner_ids)
+        {
             // We are the chosen victim.  Flush from waiter list and throw.
             self.clear_wait(locker_id);
             let mut table = self.lock_tables[table_idx].lock();
@@ -344,17 +346,11 @@ impl LockManager {
             // Use a short slice (up to 50 ms) so we can re-check for
             // deadlocks that may form after we entered the wait path.
             // uses a "deadlock detection delay" for the same purpose.
-            let slice_ms = if remaining_ms == 0 {
-                50
-            } else {
-                remaining_ms.min(50)
-            };
+            let slice_ms =
+                if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
 
             let timed_out = condvar
-                .wait_for(
-                    &mut granted_guard,
-                    Duration::from_millis(slice_ms),
-                )
+                .wait_for(&mut granted_guard, Duration::from_millis(slice_ms))
                 .timed_out();
 
             if *granted_guard {
@@ -368,10 +364,16 @@ impl LockManager {
             {
                 let cur_owner_ids = {
                     let table = self.lock_tables[table_idx].lock();
-                    table.get(&lsn).map(|l| l.get_owner_ids()).unwrap_or_default()
+                    table
+                        .get(&lsn)
+                        .map(|l| l.get_owner_ids())
+                        .unwrap_or_default()
                 };
                 if let Some(deadlock_err) = self.check_deadlock_for_waiter(
-                    lsn, locker_id, lock_type, &cur_owner_ids,
+                    lsn,
+                    locker_id,
+                    lock_type,
+                    &cur_owner_ids,
                 ) {
                     self.clear_wait(locker_id);
                     let mut table = self.lock_tables[table_idx].lock();
@@ -439,7 +441,7 @@ impl LockManager {
     /// Promotes compatible waiters to owners, signals their condvars so they
     /// wake up, and removes the lock entry when it becomes empty.
     ///
-    /// 
+    ///
     pub fn release(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
@@ -461,7 +463,7 @@ impl LockManager {
 
     /// Downgrades a write lock to a read lock.
     ///
-    /// 
+    ///
     pub fn demote(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
@@ -478,7 +480,7 @@ impl LockManager {
     /// Used by the HA replayer to forcibly acquire locks, removing all other
     /// preemptable owners.
     ///
-    /// 
+    ///
     pub fn steal_lock(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
@@ -491,7 +493,7 @@ impl LockManager {
 
     /// Returns true if the given locker owns a write lock on the LSN.
     ///
-    /// 
+    ///
     pub fn is_owned_write_lock(&self, lsn: u64, locker_id: i64) -> bool {
         let table_idx = self.get_table_index(lsn);
         let table = self.lock_tables[table_idx].lock();
@@ -505,7 +507,7 @@ impl LockManager {
 
     /// Returns the lock type owned by the locker, or None.
     ///
-    /// 
+    ///
     pub fn get_owned_lock_type(
         &self,
         lsn: u64,
@@ -535,7 +537,7 @@ impl LockManager {
 
     /// Returns current lock statistics.
     ///
-    /// 
+    ///
     pub fn get_stats(&self) -> LockStats {
         LockStats {
             lock_requests: self.stats.lock_requests.load(Ordering::Relaxed),
@@ -570,19 +572,16 @@ impl LockManager {
     /// Called by `ThreadLocker::new()` (group = thread_id) and by
     /// `HandleLocker::with_buddy()` (group = buddy_locker_id).
     ///
-    /// 
+    ///
     pub fn register_locker_sharing(&self, locker_id: i64, group_id: i64) {
-        self.share_registry
-            .write()
-            .unwrap()
-            .insert(locker_id, group_id);
+        self.share_registry.write().unwrap().insert(locker_id, group_id);
     }
 
     /// Removes a locker from the sharing registry.
     ///
     /// Called by `ThreadLocker::drop()` and `HandleLocker::drop()`.
     ///
-    /// 
+    ///
     pub fn unregister_locker_sharing(&self, locker_id: i64) {
         self.share_registry.write().unwrap().remove(&locker_id);
     }
@@ -663,7 +662,9 @@ impl LockManager {
                 None
             };
         let shares = move |owner_id: i64| -> bool {
-            if let (Some(req_group), Some(reg)) = (requester_group, &registry_snapshot) {
+            if let (Some(req_group), Some(reg)) =
+                (requester_group, &registry_snapshot)
+            {
                 reg.get(&owner_id).copied() == Some(req_group)
             } else {
                 false
@@ -692,7 +693,8 @@ impl LockManager {
 
             self.stats.lock_waits.fetch_add(1, Ordering::Relaxed);
             let owner_ids = lock.get_owner_ids();
-            let pair: WaiterNotify = Arc::new((Mutex::new(false), Condvar::new()));
+            let pair: WaiterNotify =
+                Arc::new((Mutex::new(false), Condvar::new()));
             lock.set_waiter_notify(locker_id, pair.clone());
             (result.lock_grant, owner_ids, pair)
         };
@@ -701,9 +703,9 @@ impl LockManager {
         self.record_wait(locker_id, &owner_ids);
 
         // Phase 2: deadlock check.
-        if let Some(deadlock_err) = self.check_deadlock_for_waiter(
-            lsn, locker_id, lock_type, &owner_ids,
-        ) {
+        if let Some(deadlock_err) = self
+            .check_deadlock_for_waiter(lsn, locker_id, lock_type, &owner_ids)
+        {
             self.clear_wait(locker_id);
             let mut table = self.lock_tables[table_idx].lock();
             if let Some(lock) = table.get_mut(&lsn) {
@@ -748,15 +750,15 @@ impl LockManager {
                 }
                 timeout_ms - elapsed
             };
-            let slice_ms = if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
-            let timed_out = condvar.wait_for(
-                &mut granted_guard,
-                Duration::from_millis(slice_ms),
-            );
+            let slice_ms =
+                if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
+            let timed_out = condvar
+                .wait_for(&mut granted_guard, Duration::from_millis(slice_ms));
             if timed_out.timed_out()
                 && let Some(dl_err) = self.check_deadlock_for_waiter(
                     lsn, locker_id, lock_type, &owner_ids,
-                ) {
+                )
+            {
                 drop(granted_guard);
                 self.clear_wait(locker_id);
                 let mut table = self.lock_tables[table_idx].lock();
@@ -1068,10 +1070,8 @@ mod tests {
                 cv.notify_all();
             }
             // Block until A releases (5 s timeout so test doesn't hang).
-            
-            lm_b.lock_with_timeout(
-                LSN, 2, LockType::Write, false, false, 5000,
-            )
+
+            lm_b.lock_with_timeout(LSN, 2, LockType::Write, false, false, 5000)
         });
 
         // Wait until B has at least started, then give it a moment to block.
@@ -1090,11 +1090,7 @@ mod tests {
 
         // B should wake up and get the lock.
         let result = b.join().unwrap();
-        assert!(
-            result.is_ok(),
-            "thread B expected Ok, got {:?}",
-            result
-        );
+        assert!(result.is_ok(), "thread B expected Ok, got {:?}", result);
         assert_eq!(result.unwrap(), LockGrantType::New);
     }
 
@@ -1146,14 +1142,28 @@ mod tests {
         // deadlock.  Use a generous timeout so the deadlock detector fires
         // rather than the timeout.
         let a = thread::spawn(move || {
-            lm_a.lock_with_timeout(LSN_Y, 1, LockType::Write, false, false, 3000)
+            lm_a.lock_with_timeout(
+                LSN_Y,
+                1,
+                LockType::Write,
+                false,
+                false,
+                3000,
+            )
         });
 
         // Give A a moment to register as waiter.
         thread::sleep(Duration::from_millis(50));
 
         let b = thread::spawn(move || {
-            lm_b.lock_with_timeout(LSN_X, 2, LockType::Write, false, false, 3000)
+            lm_b.lock_with_timeout(
+                LSN_X,
+                2,
+                LockType::Write,
+                false,
+                false,
+                3000,
+            )
         });
 
         let res_a = a.join().unwrap();
@@ -1223,11 +1233,7 @@ mod tests {
         // All readers should have been granted.
         for h in handles {
             let result = h.join().unwrap();
-            assert!(
-                result.is_ok(),
-                "reader expected Ok, got {:?}",
-                result
-            );
+            assert!(result.is_ok(), "reader expected Ok, got {:?}", result);
             assert_eq!(result.unwrap(), LockGrantType::New);
         }
     }
@@ -1353,7 +1359,10 @@ mod tests {
             let ready2 = Arc::clone(&ready);
             let h = thread::spawn(move || {
                 lm2.lock(LSN, locker_id, LockType::Read, false, false).unwrap();
-                assert_eq!(lm2.get_owned_lock_type(LSN, locker_id), Some(LockType::Read));
+                assert_eq!(
+                    lm2.get_owned_lock_type(LSN, locker_id),
+                    Some(LockType::Read)
+                );
                 {
                     let (m, cv) = &*ready2;
                     let mut g = m.lock();
@@ -1491,7 +1500,11 @@ mod tests {
         lm.release(LSN, 2).unwrap();
 
         let result = writer.join().unwrap();
-        assert!(result.is_ok(), "writer should have been granted, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "writer should have been granted, got {:?}",
+            result
+        );
         assert!(lm.is_owned_write_lock(LSN, 3));
         lm.release(LSN, 3).unwrap();
     }
@@ -1672,7 +1685,11 @@ mod tests {
         // Now release locker 2's write; locker 3 gets it.
         lm.release(LSN, 2).unwrap();
         let r3 = t3.join().unwrap();
-        assert!(r3.is_ok(), "locker 3 should succeed after locker 2, got {:?}", r3);
+        assert!(
+            r3.is_ok(),
+            "locker 3 should succeed after locker 2, got {:?}",
+            r3
+        );
         lm.release(LSN, 3).unwrap();
     }
 }

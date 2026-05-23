@@ -78,9 +78,7 @@ fn test_flexible_classic_majority_is_valid() {
 #[test]
 fn test_quoracle_choose_expression() {
     // 5-node names.
-    let names: Vec<String> = (1u8..=5)
-        .map(|i| format!("node{i}"))
-        .collect();
+    let names: Vec<String> = (1u8..=5).map(|i| format!("node{i}")).collect();
 
     // choose(4 of 5) reads × choose(2 of 5) writes: 4+2=6>5, valid.
     let policy = QuorumPolicy::build_expression(&names, 4, 2)
@@ -99,9 +97,7 @@ fn test_quoracle_choose_expression() {
 fn test_quoracle_choose_invalid_rejected() {
     // choose(1 of 3) reads × choose(1 of 3) writes: 1+1=2 NOT > 3 → quoracle
     // must reject at QuorumSystem::new() time (not intersection property).
-    let names: Vec<String> = (1u8..=3)
-        .map(|i| format!("node{i}"))
-        .collect();
+    let names: Vec<String> = (1u8..=3).map(|i| format!("node{i}")).collect();
 
     let result = QuorumPolicy::build_expression(&names, 1, 1);
     assert!(
@@ -112,9 +108,7 @@ fn test_quoracle_choose_invalid_rejected() {
 
 #[test]
 fn test_build_majority_expression() {
-    let names: Vec<String> = (1u8..=5)
-        .map(|i| format!("node{i}"))
-        .collect();
+    let names: Vec<String> = (1u8..=5).map(|i| format!("node{i}")).collect();
 
     let policy = QuorumPolicy::build_majority_expression(&names)
         .expect("majority expression must be constructible");

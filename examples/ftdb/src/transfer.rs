@@ -73,7 +73,12 @@ impl Transfer {
     pub const SIZE: usize = 128;
 
     /// Creates an immediate (non-pending) transfer.
-    pub fn new(id: u128, debit_account_id: u128, credit_account_id: u128, amount: u128) -> Self {
+    pub fn new(
+        id: u128,
+        debit_account_id: u128,
+        credit_account_id: u128,
+        amount: u128,
+    ) -> Self {
         Self {
             id,
             debit_account_id,
@@ -174,8 +179,12 @@ impl Transfer {
     pub fn from_bytes(buf: &[u8; 128]) -> Self {
         Self {
             id: u128::from_le_bytes(buf[0..16].try_into().unwrap()),
-            debit_account_id: u128::from_le_bytes(buf[16..32].try_into().unwrap()),
-            credit_account_id: u128::from_le_bytes(buf[32..48].try_into().unwrap()),
+            debit_account_id: u128::from_le_bytes(
+                buf[16..32].try_into().unwrap(),
+            ),
+            credit_account_id: u128::from_le_bytes(
+                buf[32..48].try_into().unwrap(),
+            ),
             amount: u128::from_le_bytes(buf[48..64].try_into().unwrap()),
             pending_id: u128::from_le_bytes(buf[64..80].try_into().unwrap()),
             user_data_128: u128::from_le_bytes(buf[80..96].try_into().unwrap()),
@@ -184,7 +193,9 @@ impl Transfer {
             timeout: u32::from_le_bytes(buf[108..112].try_into().unwrap()),
             ledger: u32::from_le_bytes(buf[112..116].try_into().unwrap()),
             code: u16::from_le_bytes(buf[116..118].try_into().unwrap()),
-            flags: TransferFlags(u16::from_le_bytes(buf[118..120].try_into().unwrap())),
+            flags: TransferFlags(u16::from_le_bytes(
+                buf[118..120].try_into().unwrap(),
+            )),
             timestamp: u64::from_le_bytes(buf[120..128].try_into().unwrap()),
         }
     }

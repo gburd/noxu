@@ -7,11 +7,11 @@
 use crate::error::{LogError, Result};
 use crate::file_handle::FileHandle;
 use crate::file_header::{FILE_HEADER_SIZE, FileHeader, LOG_VERSION};
+use hashbrown::HashMap;
 use memmap2::Mmap;
 use noxu_latch::ExclusiveLatch;
-use noxu_util::lsn::Lsn;
 use noxu_sync::{Mutex, RwLock};
-use hashbrown::HashMap;
+use noxu_util::lsn::Lsn;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -183,8 +183,11 @@ impl FileManager {
         let lock_path = self.env_dir.join(LOCK_FILE_NAME);
 
         // Try to create/open the lock file
-        let lock_file =
-            OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)?;
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
 
         // Try to acquire an exclusive lock.
         // fs2::FileExt is supported on unix and windows; on other platforms
@@ -359,7 +362,9 @@ impl FileManager {
     ///
     /// Writes the file header with a link to the previous file.
     pub fn create_file(&self, file_num: u32) -> Result<Arc<FileHandle>> {
-        let _guard = self.file_latch.acquire()
+        let _guard = self
+            .file_latch
+            .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
         self.create_file_internal(file_num)
     }
@@ -368,7 +373,9 @@ impl FileManager {
     ///
     /// Called when the current file reaches its maximum size.
     pub fn flip_file(&self) -> Result<u32> {
-        let _guard = self.file_latch.acquire()
+        let _guard = self
+            .file_latch
+            .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
         let current = self.current_file_num.load(Ordering::Acquire);
@@ -483,11 +490,7 @@ impl FileManager {
     ///
     /// # Returns
     /// The file number that was actually written to.
-    pub fn write_buffer(
-        &self,
-        data: &[u8],
-        file_offset: u64,
-    ) -> Result<u32> {
+    pub fn write_buffer(&self, data: &[u8], file_offset: u64) -> Result<u32> {
         if self.read_only {
             return Err(LogError::WriteFailed(
                 "Cannot write in read-only mode".to_string(),
@@ -498,10 +501,7 @@ impl FileManager {
 
         // Obtain (or create) the file handle for the current file.
         // If no log file exists yet, create the first one.
-        let handle = if self
-            .file_path(file_num)
-            .exists()
-        {
+        let handle = if self.file_path(file_num).exists() {
             self.get_file_handle(file_num)?
         } else {
             self.create_file(file_num)?
@@ -522,7 +522,8 @@ impl FileManager {
 
         // Track sequential-write stats.
         self.n_sequential_writes.fetch_add(1, Ordering::Relaxed);
-        self.n_sequential_write_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.n_sequential_write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         // Check whether we need to flip to a new file.
         let path = self.file_path(file_num);
@@ -536,7 +537,7 @@ impl FileManager {
 
     /// Reads bytes from a log file at a given offset.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `file_num` - The log file number to read from.
@@ -612,7 +613,10 @@ impl FileManager {
         // active write file) during recovery, so the underlying bytes do
         // not change while the mapping is alive.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            LogError::Io(std::io::Error::other(format!("mmap {:?}: {}", path, e)))
+            LogError::Io(std::io::Error::other(format!(
+                "mmap {:?}: {}",
+                path, e
+            )))
         })?;
         Ok(mmap)
     }
@@ -622,17 +626,25 @@ impl FileManager {
         FileManagerIoStats {
             n_file_opens: self.n_file_opens.load(Ordering::Relaxed),
             n_sequential_reads: self.n_sequential_reads.load(Ordering::Relaxed),
-            n_sequential_read_bytes: self.n_sequential_read_bytes.load(Ordering::Relaxed),
-            n_sequential_writes: self.n_sequential_writes.load(Ordering::Relaxed),
-            n_sequential_write_bytes: self.n_sequential_write_bytes.load(Ordering::Relaxed),
+            n_sequential_read_bytes: self
+                .n_sequential_read_bytes
+                .load(Ordering::Relaxed),
+            n_sequential_writes: self
+                .n_sequential_writes
+                .load(Ordering::Relaxed),
+            n_sequential_write_bytes: self
+                .n_sequential_write_bytes
+                .load(Ordering::Relaxed),
             n_random_reads: self.n_random_reads.load(Ordering::Relaxed),
-            n_random_read_bytes: self.n_random_read_bytes.load(Ordering::Relaxed),
+            n_random_read_bytes: self
+                .n_random_read_bytes
+                .load(Ordering::Relaxed),
         }
     }
 
     /// Fsyncs the current log file to stable storage.
     ///
-    /// 
+    ///
     pub fn sync_log_end(&self) -> Result<()> {
         if self.read_only {
             return Ok(());
@@ -815,8 +827,12 @@ mod tests {
 
     #[test]
     fn test_nonexistent_directory_fails() {
-        let result =
-            FileManager::new("/tmp/does_not_exist_noxu_xyz", false, 10_000_000, 100);
+        let result = FileManager::new(
+            "/tmp/does_not_exist_noxu_xyz",
+            false,
+            10_000_000,
+            100,
+        );
         assert!(result.is_err());
         match result {
             Err(LogError::InvalidDirectory(_)) => (),

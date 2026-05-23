@@ -230,7 +230,10 @@ mod tests {
     #[test]
     fn test_context_name_and_timeout() {
         use std::time::Duration;
-        let ctx = crate::LatchContext::with_timeout("my-latch", Duration::from_secs(1));
+        let ctx = crate::LatchContext::with_timeout(
+            "my-latch",
+            Duration::from_secs(1),
+        );
         let latch = ExclusiveLatch::new(ctx);
         assert_eq!(latch.context().name, "my-latch");
         assert_eq!(latch.context().timeout, Duration::from_secs(1));
@@ -266,28 +269,36 @@ mod tests {
         let concurrent = Arc::new(AtomicUsize::new(0));
         let violations = Arc::new(AtomicUsize::new(0));
 
-        let threads: Vec<_> = (0..4).map(|_| {
-            let latch = latch.clone();
-            let counter = counter.clone();
-            let concurrent = concurrent.clone();
-            let violations = violations.clone();
-            std::thread::spawn(move || {
-                for _ in 0..25 {
-                    let _guard = latch.acquire().expect("acquire");
-                    // We should be the only thread in this section
-                    let prev = concurrent.fetch_add(1, Ordering::SeqCst);
-                    if prev != 0 {
-                        violations.fetch_add(1, Ordering::SeqCst);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let latch = latch.clone();
+                let counter = counter.clone();
+                let concurrent = concurrent.clone();
+                let violations = violations.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let _guard = latch.acquire().expect("acquire");
+                        // We should be the only thread in this section
+                        let prev = concurrent.fetch_add(1, Ordering::SeqCst);
+                        if prev != 0 {
+                            violations.fetch_add(1, Ordering::SeqCst);
+                        }
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        concurrent.fetch_sub(1, Ordering::SeqCst);
                     }
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    concurrent.fetch_sub(1, Ordering::SeqCst);
-                }
+                })
             })
-        }).collect();
+            .collect();
 
-        for t in threads { t.join().unwrap(); }
+        for t in threads {
+            t.join().unwrap();
+        }
         assert_eq!(counter.load(Ordering::SeqCst), 100);
-        assert_eq!(violations.load(Ordering::SeqCst), 0, "mutual exclusion violated");
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "mutual exclusion violated"
+        );
     }
 
     #[test]
@@ -369,7 +380,10 @@ mod tests {
         // try_acquire should fail while thread 1 holds it.
         assert!(!latch.is_owner(), "main thread should not be owner");
         let r = latch.try_acquire();
-        assert!(r.is_none(), "try_acquire should fail while other thread holds it");
+        assert!(
+            r.is_none(),
+            "try_acquire should fail while other thread holds it"
+        );
         assert!(latch.is_locked());
 
         // Signal thread to release.
@@ -430,7 +444,9 @@ mod tests {
             let order2 = order.clone();
             let h = std::thread::spawn(move || {
                 // Stagger entry slightly so they queue up in order.
-                std::thread::sleep(std::time::Duration::from_millis(5 * (i as u64 + 1)));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    5 * (i as u64 + 1),
+                ));
                 let _g = latch2.acquire().expect("acquire in spawned thread");
                 order2.fetch_add(1, Ordering::SeqCst);
             });
@@ -445,6 +461,10 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(order.load(Ordering::SeqCst), N, "all waiters should have been granted");
+        assert_eq!(
+            order.load(Ordering::SeqCst),
+            N,
+            "all waiters should have been granted"
+        );
     }
 }

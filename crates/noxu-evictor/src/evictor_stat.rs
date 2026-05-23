@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// These statistics provide insight into cache behavior, eviction patterns,
 /// and performance. All counters use atomic operations for thread-safe updates.
 ///
-/// 
+///
 #[derive(Debug)]
 pub struct EvictorStats {
     // Eviction runs and targeting

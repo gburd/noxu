@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Generates unique node IDs and transient LSNs.
 ///
-/// 
+///
 pub struct NodeSequence {
     last_local_node_id: AtomicI64,
     last_replicated_node_id: AtomicI64,

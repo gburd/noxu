@@ -16,7 +16,11 @@ use std::time::Duration;
 /// Returns `true` if we slept (or the value was already different).
 /// Returns `false` only if the timeout expired without a notification.
 #[cfg(target_os = "linux")]
-pub(crate) fn futex_wait(futex_word: &AtomicU32, expected: u32, timeout: Option<Duration>) -> bool {
+pub(crate) fn futex_wait(
+    futex_word: &AtomicU32,
+    expected: u32,
+    timeout: Option<Duration>,
+) -> bool {
     use std::sync::atomic::Ordering;
 
     // FUTEX_WAIT | FUTEX_PRIVATE_FLAG = 0 | 128
@@ -86,13 +90,19 @@ pub(crate) fn futex_wake(futex_word: &AtomicU32, count: u32) {
 /// This is correct but not as efficient as futex. Threads will be woken
 /// by a combination of `park_timeout` expiry and spurious wakeups.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn futex_wait(futex_word: &AtomicU32, expected: u32, timeout: Option<Duration>) -> bool {
+pub(crate) fn futex_wait(
+    futex_word: &AtomicU32,
+    expected: u32,
+    timeout: Option<Duration>,
+) -> bool {
     use std::sync::atomic::Ordering;
 
     if futex_word.load(Ordering::Relaxed) != expected {
         return true;
     }
-    let sleep = timeout.unwrap_or(Duration::from_millis(1)).min(Duration::from_millis(1));
+    let sleep = timeout
+        .unwrap_or(Duration::from_millis(1))
+        .min(Duration::from_millis(1));
     std::thread::park_timeout(sleep);
     let timed_out = timeout.map(|d| sleep >= d).unwrap_or(false);
     !timed_out

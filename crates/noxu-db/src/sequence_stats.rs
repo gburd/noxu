@@ -3,7 +3,7 @@
 
 /// Statistics for a `Sequence` handle.
 ///
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct SequenceStats {
     /// Total number of successful `get` calls on this handle.

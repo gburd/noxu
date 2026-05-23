@@ -233,7 +233,7 @@ impl LogEntryType {
 
     /// Returns true if this is an LN type (any leaf node, user or internal).
     ///
-    /// 
+    ///
     pub fn is_ln_type(self) -> bool {
         matches!(
             self,

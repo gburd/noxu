@@ -57,14 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Check containment ---
     println!("\n=== Contains key checks ===");
-    println!(
-        "  contains 'bob': {}",
-        map.contains_key(b"bob")?
-    );
-    println!(
-        "  contains 'frank': {}",
-        map.contains_key(b"frank")?
-    );
+    println!("  contains 'bob': {}", map.contains_key(b"bob")?);
+    println!("  contains 'frank': {}", map.contains_key(b"frank")?);
 
     // --- Size ---
     println!("\n=== Map size ===");

@@ -8,18 +8,18 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use noxu_sync::RwLock;
 use noxu_util::lsn::NULL_LSN;
 
-use crate::group_commit::GroupCommit;
 use crate::LockManager;
+use crate::group_commit::GroupCommit;
 use crate::txn::Txn;
 
 /// Null transaction ID for non-transactional lockers.
 ///
-/// 
+///
 pub const NULL_TXN_ID: i64 = -1;
 
 /// Manages all active transactions.
 ///
-/// 
+///
 pub struct TxnManager {
     /// All active transactions, keyed by txn ID.
     ///
@@ -27,7 +27,7 @@ pub struct TxnManager {
     /// `get_first_active_lsn()`).  Starts as `NULL_LSN` until the txn writes
     /// its first log entry.
     ///
-    /// 
+    ///
     all_txns: RwLock<HashMap<i64, u64>>,
 
     /// Next local transaction ID generator (positive, incrementing).
@@ -124,7 +124,7 @@ impl TxnManager {
     /// Acquires `allTxnsLatch` and
     /// iterates all active Txns to find the minimum `firstLoggedLsn`.
     ///
-    /// 
+    ///
     pub fn get_first_active_lsn(&self) -> u64 {
         let guard = self.all_txns.read();
         let mut min_lsn = u64::MAX;
@@ -133,11 +133,7 @@ impl TxnManager {
                 min_lsn = lsn;
             }
         }
-        if min_lsn == u64::MAX {
-            NULL_LSN.as_u64()
-        } else {
-            min_lsn
-        }
+        if min_lsn == u64::MAX { NULL_LSN.as_u64() } else { min_lsn }
     }
 
     /// Sets the last local txn ID — called during recovery to restore the counter.

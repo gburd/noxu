@@ -133,7 +133,7 @@ impl NetworkRestore {
     ///                    [data: file_size bytes]
     /// ```
     ///
-    /// 
+    ///
     pub fn execute(&self) -> Result<()> {
         // Validate state: must be NotStarted.
         {
@@ -150,10 +150,8 @@ impl NetworkRestore {
         self.start()?;
 
         let started_at = Instant::now();
-        let addr = format!(
-            "{}:{}",
-            self.config.source_host, self.config.source_port
-        );
+        let addr =
+            format!("{}:{}", self.config.source_host, self.config.source_port);
 
         // Connect to the source node.
         let mut stream = TcpStream::connect(&addr).map_err(|e| {
@@ -164,26 +162,20 @@ impl NetworkRestore {
         })?;
 
         // Set a generous read timeout so we don't hang forever on a dead peer.
-        let _ = stream
-            .set_read_timeout(Some(Duration::from_secs(120)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
 
         // Send the restore-request magic.
-        stream
-            .write_all(&RESTORE_MAGIC.to_le_bytes())
-            .map_err(|e| {
-                RepError::NetworkRestoreError(format!(
-                    "sending restore magic: {}",
-                    e
-                ))
-            })?;
+        stream.write_all(&RESTORE_MAGIC.to_le_bytes()).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "sending restore magic: {}",
+                e
+            ))
+        })?;
 
         // Read the file count.
         let mut count_buf = [0u8; 4];
         stream.read_exact(&mut count_buf).map_err(|e| {
-            RepError::NetworkRestoreError(format!(
-                "reading file count: {}",
-                e
-            ))
+            RepError::NetworkRestoreError(format!("reading file count: {}", e))
         })?;
         let file_count = u32::from_le_bytes(count_buf);
 
@@ -212,13 +204,12 @@ impl NetworkRestore {
                     e
                 ))
             })?;
-            let filename =
-                String::from_utf8(name_buf).map_err(|e| {
-                    RepError::NetworkRestoreError(format!(
-                        "non-UTF8 filename: {}",
-                        e
-                    ))
-                })?;
+            let filename = String::from_utf8(name_buf).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "non-UTF8 filename: {}",
+                    e
+                ))
+            })?;
 
             // Read file size.
             let mut size_buf = [0u8; 8];
@@ -252,14 +243,12 @@ impl NetworkRestore {
             let mut chunk = vec![0u8; 65536];
             while remaining > 0 {
                 let to_read = (remaining as usize).min(chunk.len());
-                stream
-                    .read_exact(&mut chunk[..to_read])
-                    .map_err(|e| {
-                        RepError::NetworkRestoreError(format!(
-                            "reading data for '{}': {}",
-                            filename, e
-                        ))
-                    })?;
+                stream.read_exact(&mut chunk[..to_read]).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "reading data for '{}': {}",
+                        filename, e
+                    ))
+                })?;
                 out.write_all(&chunk[..to_read]).map_err(|e| {
                     RepError::NetworkRestoreError(format!(
                         "writing '{}': {}",

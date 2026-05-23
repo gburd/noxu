@@ -52,7 +52,7 @@ pub enum ReplicaAckPolicy {
 /// - Replica sync policy: how replica nodes synchronize
 /// - Replica acknowledgment policy: how many replicas must acknowledge
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Durability {
     /// Sync policy for the local (master) node.

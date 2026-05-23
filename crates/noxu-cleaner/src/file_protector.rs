@@ -3,8 +3,8 @@
 //! protects log files from deletion while they
 //! are being read or processed by various subsystems (backup, replication, etc.).
 
-use noxu_sync::Mutex;
 use hashbrown::HashMap;
+use noxu_sync::Mutex;
 
 /// Protects log files from deletion while they are being read or processed.
 ///
@@ -53,7 +53,10 @@ impl FileProtector {
                     info.reason = format!("{}, {}", info.reason, reason);
                 }
             })
-            .or_insert_with(|| ProtectionInfo { count: 1, reason: reason.to_string() });
+            .or_insert_with(|| ProtectionInfo {
+                count: 1,
+                reason: reason.to_string(),
+            });
     }
 
     /// Removes one level of protection from a file.

@@ -21,7 +21,7 @@ use super::mutation::MutationKey;
 /// let field_deleter = Deleter::for_field("my.package.Person", 0, "favoriteColors");
 /// ```
 ///
-/// 
+///
 ///
 /// [`Converter`]: super::converter::Converter
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,12 +32,15 @@ pub struct Deleter {
 impl Deleter {
     /// Creates a mutation for deleting an entire entity class.
     ///
-    /// 
+    ///
     ///
     /// # Arguments
     /// * `class_name` - Fully-qualified name of the class to delete.
     /// * `class_version` - Version of the class this mutation applies to.
-    pub fn for_class(class_name: impl Into<String>, class_version: u32) -> Self {
+    pub fn for_class(
+        class_name: impl Into<String>,
+        class_version: u32,
+    ) -> Self {
         Self { key: MutationKey::for_class(class_name, class_version) }
     }
 
@@ -55,7 +58,9 @@ impl Deleter {
         class_version: u32,
         field_name: impl Into<String>,
     ) -> Self {
-        Self { key: MutationKey::for_field(class_name, class_version, field_name) }
+        Self {
+            key: MutationKey::for_field(class_name, class_version, field_name),
+        }
     }
 
     /// Returns the mutation key (class name, version, optional field name).

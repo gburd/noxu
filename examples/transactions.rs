@@ -35,7 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // isolate operations by transaction, but we demonstrate the API
     // pattern that will work with the full implementation.
     for i in 0..5 {
-        let key = DatabaseEntry::from_bytes(format!("committed_{}", i).as_bytes());
+        let key =
+            DatabaseEntry::from_bytes(format!("committed_{}", i).as_bytes());
         let data = DatabaseEntry::from_bytes(format!("value_{}", i).as_bytes());
         let status = db.put(Some(&txn1), &key, &data)?;
         assert_eq!(status, OperationStatus::Success);
@@ -51,9 +52,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Started transaction {}", txn2.get_id());
 
     for i in 0..3 {
-        let key = DatabaseEntry::from_bytes(format!("aborted_{}", i).as_bytes());
-        let data =
-            DatabaseEntry::from_bytes(format!("should_not_exist_{}", i).as_bytes());
+        let key =
+            DatabaseEntry::from_bytes(format!("aborted_{}", i).as_bytes());
+        let data = DatabaseEntry::from_bytes(
+            format!("should_not_exist_{}", i).as_bytes(),
+        );
         db.put(Some(&txn2), &key, &data)?;
         println!("  Put aborted_{} -> should_not_exist_{}", i, i);
     }
@@ -76,9 +79,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // aborted transaction data may still be visible because the store
     // does not yet implement true MVCC isolation. With the full B-tree
     // and WAL implementation, aborted data would not be visible.
-    println!("\nChecking aborted data (should not exist with full implementation):");
+    println!(
+        "\nChecking aborted data (should not exist with full implementation):"
+    );
     for i in 0..3 {
-        let key = DatabaseEntry::from_bytes(format!("aborted_{}", i).as_bytes());
+        let key =
+            DatabaseEntry::from_bytes(format!("aborted_{}", i).as_bytes());
         let mut data = DatabaseEntry::new();
         let status = db.get(None, &key, &mut data)?;
         let found = status == OperationStatus::Success;

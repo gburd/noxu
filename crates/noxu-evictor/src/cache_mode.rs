@@ -8,7 +8,7 @@
 /// the record is subsequently retained in the in-memory cache, relative to
 /// other records in the cache.
 ///
-/// 
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {
     /// The record's hotness is changed to "most recently used" by the operation.

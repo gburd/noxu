@@ -68,7 +68,10 @@ impl EntryBinding<Vendor> for VendorBinding {
         Ok(())
     }
 
-    fn entry_to_object(&self, entry: &DatabaseEntry) -> noxu_bind::Result<Vendor> {
+    fn entry_to_object(
+        &self,
+        entry: &DatabaseEntry,
+    ) -> noxu_bind::Result<Vendor> {
         let mut input = TupleInput::new(entry.data());
         let name = input.read_string()?;
         let street = input.read_string()?;
@@ -101,7 +104,10 @@ impl EntryBinding<Item> for ItemBinding {
         Ok(())
     }
 
-    fn entry_to_object(&self, entry: &DatabaseEntry) -> noxu_bind::Result<Item> {
+    fn entry_to_object(
+        &self,
+        entry: &DatabaseEntry,
+    ) -> noxu_bind::Result<Item> {
         let mut input = TupleInput::new(entry.data());
         let sku = input.read_string()?;
         let item_name = input.read_string()?;
@@ -227,7 +233,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(status, OperationStatus::Success);
         println!(
             "  SKU={} name='{}' vendor='{}' price={:.2} qty={}",
-            item.sku, item.item_name, item.vendor_name, item.price, item.inventory
+            item.sku,
+            item.item_name,
+            item.vendor_name,
+            item.price,
+            item.inventory
         );
     }
 
@@ -260,7 +270,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let item = item_binding.entry_to_object(&data)?;
             println!(
                 "  sku={} name='{}' vendor='{}' price={:.2} qty={}",
-                item.sku, item.item_name, item.vendor_name, item.price, item.inventory
+                item.sku,
+                item.item_name,
+                item.vendor_name,
+                item.price,
+                item.inventory
             );
         }
     }
@@ -365,7 +379,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             status = cursor.get(&mut key, &mut data, Get::Next, None)?;
         }
         cursor.close()?;
-        println!("  {} items verified (serialize -> deserialize -> compare)", verified);
+        println!(
+            "  {} items verified (serialize -> deserialize -> compare)",
+            verified
+        );
     }
 
     // --- Cleanup ---

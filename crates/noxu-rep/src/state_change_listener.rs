@@ -6,7 +6,7 @@ use crate::node_state::NodeState;
 
 /// Callback for replication state change events.
 ///
-/// 
+///
 ///
 /// An asynchronous mechanism for tracking the state of the replicated
 /// environment and choosing how to route database operations. State determines
@@ -33,7 +33,7 @@ pub trait StateChangeListener: Send + Sync {
 
 /// Describes a state change event.
 ///
-/// 
+///
 ///
 /// Communicates the state change at a node to the StateChangeListener.
 /// There is a distinct instance of this event representing each state

@@ -308,7 +308,10 @@ fn select_victim_tie_break_by_larger_id() {
     lock_counts.insert(20, 2usize);
 
     let victim = DeadlockDetector::select_victim(&cycle, &lock_counts);
-    assert_eq!(victim, 20, "tie broken by largest locker ID (youngest transaction)");
+    assert_eq!(
+        victim, 20,
+        "tie broken by largest locker ID (youngest transaction)"
+    );
 }
 
 #[test]
@@ -608,7 +611,16 @@ fn write_lock_info_copy_all_info_restores_state() {
 #[test]
 fn write_lock_info_set_abort_info() {
     let mut wli = WriteLockInfo::new();
-    wli.set_abort_info(12345, Some(b"k".to_vec()), None, 10, 64, true, 0, false);
+    wli.set_abort_info(
+        12345,
+        Some(b"k".to_vec()),
+        None,
+        10,
+        64,
+        true,
+        0,
+        false,
+    );
     assert_eq!(wli.abort_lsn, 12345);
     assert!(wli.abort_known_deleted);
     assert_eq!(wli.abort_key, Some(b"k".to_vec()));
@@ -644,7 +656,12 @@ fn lock_manager_range_write_covers_all_weaker_requests() {
     let locker = 1i64;
 
     lm.lock(lsn, locker, LockType::RangeWrite, false, false).unwrap();
-    for req in [LockType::Read, LockType::Write, LockType::RangeRead, LockType::RangeWrite] {
+    for req in [
+        LockType::Read,
+        LockType::Write,
+        LockType::RangeRead,
+        LockType::RangeWrite,
+    ] {
         let g = lm.lock(lsn, locker, req, false, false).unwrap();
         assert_eq!(
             g,

@@ -210,10 +210,7 @@ impl TlsConfig {
         server_name: impl Into<String>,
     ) -> Self {
         TlsConfig {
-            identity: TlsIdentity::Pkcs12 {
-                der,
-                password: password.into(),
-            },
+            identity: TlsIdentity::Pkcs12 { der, password: password.into() },
             trusted_certs: TrustedCerts::CaBytes(vec![ca_pem]),
             server_name: server_name.into(),
         }
@@ -235,7 +232,9 @@ impl TlsConfig {
         let cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| RepError::NetworkError(format!("TLS server config: {e}")))?;
+            .map_err(|e| {
+                RepError::NetworkError(format!("TLS server config: {e}"))
+            })?;
         Ok(std::sync::Arc::new(cfg))
     }
 
@@ -248,9 +247,9 @@ impl TlsConfig {
         if matches!(&self.trusted_certs, TrustedCerts::SkipVerification) {
             let cfg = rustls::ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(
-                    std::sync::Arc::new(SkipCertVerification::new()),
-                )
+                .with_custom_certificate_verifier(std::sync::Arc::new(
+                    SkipCertVerification::new(),
+                ))
                 .with_no_client_auth();
             return Ok(std::sync::Arc::new(cfg));
         }
@@ -279,8 +278,11 @@ impl TlsConfig {
         let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(
             rustls::ServerConfig::clone(&rustls_cfg),
         )
-        .map_err(|e| RepError::NetworkError(format!("QUIC server config: {e}")))?;
-        let mut cfg = quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_cfg));
+        .map_err(|e| {
+            RepError::NetworkError(format!("QUIC server config: {e}"))
+        })?;
+        let mut cfg =
+            quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_cfg));
         let mut transport = quinn::TransportConfig::default();
         transport.mtu_discovery_config(None);
         transport.datagram_receive_buffer_size(Some(64 * 1024));
@@ -298,7 +300,9 @@ impl TlsConfig {
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(
             rustls::ClientConfig::clone(&rustls_cfg),
         )
-        .map_err(|e| RepError::NetworkError(format!("QUIC client config: {e}")))?;
+        .map_err(|e| {
+            RepError::NetworkError(format!("QUIC client config: {e}"))
+        })?;
         let mut cfg = quinn::ClientConfig::new(std::sync::Arc::new(quic_cfg));
         let mut transport = quinn::TransportConfig::default();
         transport.mtu_discovery_config(None);
@@ -315,25 +319,34 @@ impl TlsConfig {
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
     )> {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::pki_types::{
+            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
+        };
 
         match &self.identity {
             TlsIdentity::SelfSigned { subject_alt_names } => {
-                let ck = rcgen::generate_simple_self_signed(subject_alt_names.clone())
-                    .map_err(|e| RepError::NetworkError(format!("rcgen: {e}")))?;
+                let ck = rcgen::generate_simple_self_signed(
+                    subject_alt_names.clone(),
+                )
+                .map_err(|e| RepError::NetworkError(format!("rcgen: {e}")))?;
                 let cert = CertificateDer::from(ck.cert.der().to_vec());
-                let key =
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
+                let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    ck.key_pair.serialize_der(),
+                ));
                 Ok((vec![cert], key))
             }
             TlsIdentity::PemFiles { cert, key } => {
-                let cert_bytes = std::fs::read(cert)
-                    .map_err(|e| RepError::NetworkError(format!("cert file: {e}")))?;
-                let key_bytes = std::fs::read(key)
-                    .map_err(|e| RepError::NetworkError(format!("key file: {e}")))?;
+                let cert_bytes = std::fs::read(cert).map_err(|e| {
+                    RepError::NetworkError(format!("cert file: {e}"))
+                })?;
+                let key_bytes = std::fs::read(key).map_err(|e| {
+                    RepError::NetworkError(format!("key file: {e}"))
+                })?;
                 Self::parse_pem_cert_and_key(&cert_bytes, &key_bytes)
             }
-            TlsIdentity::PemBytes { cert, key } => Self::parse_pem_cert_and_key(cert, key),
+            TlsIdentity::PemBytes { cert, key } => {
+                Self::parse_pem_cert_and_key(cert, key)
+            }
             TlsIdentity::Pkcs12 { .. } => Err(RepError::NetworkError(
                 "Pkcs12 identity is not supported by the tls-rustls backend; \
                  use PemFiles or PemBytes instead"
@@ -356,12 +369,16 @@ impl TlsConfig {
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| RepError::NetworkError(format!("cert parse: {e}")))?;
         if cert_chain.is_empty() {
-            return Err(RepError::NetworkError("no certificates found in PEM".into()));
+            return Err(RepError::NetworkError(
+                "no certificates found in PEM".into(),
+            ));
         }
 
         let key = private_key(&mut BufReader::new(key_pem))
             .map_err(|e| RepError::NetworkError(format!("key parse: {e}")))?
-            .ok_or_else(|| RepError::NetworkError("no private key found in PEM".into()))?;
+            .ok_or_else(|| {
+                RepError::NetworkError("no private key found in PEM".into())
+            })?;
 
         Ok((cert_chain, key))
     }
@@ -381,15 +398,18 @@ impl TlsConfig {
             }
             TrustedCerts::CaFiles(paths) => {
                 for path in paths {
-                    let pem = std::fs::read(path)
-                        .map_err(|e| RepError::NetworkError(format!("CA file: {e}")))?;
+                    let pem = std::fs::read(path).map_err(|e| {
+                        RepError::NetworkError(format!("CA file: {e}"))
+                    })?;
                     for cert in certs(&mut BufReader::new(pem.as_slice()))
                         .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| RepError::NetworkError(format!("CA parse: {e}")))?
+                        .map_err(|e| {
+                            RepError::NetworkError(format!("CA parse: {e}"))
+                        })?
                     {
-                        store
-                            .add(cert)
-                            .map_err(|e| RepError::NetworkError(format!("CA add: {e}")))?;
+                        store.add(cert).map_err(|e| {
+                            RepError::NetworkError(format!("CA add: {e}"))
+                        })?;
                     }
                 }
             }
@@ -397,11 +417,13 @@ impl TlsConfig {
                 for pem in pems {
                     for cert in certs(&mut BufReader::new(pem.as_slice()))
                         .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| RepError::NetworkError(format!("CA parse: {e}")))?
+                        .map_err(|e| {
+                            RepError::NetworkError(format!("CA parse: {e}"))
+                        })?
                     {
-                        store
-                            .add(cert)
-                            .map_err(|e| RepError::NetworkError(format!("CA add: {e}")))?;
+                        store.add(cert).map_err(|e| {
+                            RepError::NetworkError(format!("CA add: {e}"))
+                        })?;
                     }
                 }
             }
@@ -420,7 +442,9 @@ impl TlsConfig {
 /// implicitly trusted (authenticated at the Paxos / VLSN layer).
 #[cfg(feature = "tls-rustls")]
 #[derive(Debug)]
-pub(crate) struct SkipCertVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
+pub(crate) struct SkipCertVerification(
+    std::sync::Arc<rustls::crypto::CryptoProvider>,
+);
 
 #[cfg(feature = "tls-rustls")]
 impl SkipCertVerification {
@@ -524,7 +548,9 @@ impl TlsConfig {
     }
 
     /// Build a `native_tls::TlsConnector` for TCP client use.
-    pub(crate) fn to_native_connector(&self) -> Result<native_tls::TlsConnector> {
+    pub(crate) fn to_native_connector(
+        &self,
+    ) -> Result<native_tls::TlsConnector> {
         let mut builder = native_tls::TlsConnector::builder();
 
         // Install identity if present (optional for client-only auth).
@@ -569,17 +595,21 @@ impl TlsConfig {
             }
             TrustedCerts::CaFiles(paths) => {
                 for path in paths {
-                    let pem = std::fs::read(path)
-                        .map_err(|e| RepError::NetworkError(format!("CA file: {e}")))?;
+                    let pem = std::fs::read(path).map_err(|e| {
+                        RepError::NetworkError(format!("CA file: {e}"))
+                    })?;
                     let cert = native_tls::Certificate::from_pem(&pem)
-                        .map_err(|e| RepError::NetworkError(format!("CA parse: {e}")))?;
+                        .map_err(|e| {
+                            RepError::NetworkError(format!("CA parse: {e}"))
+                        })?;
                     builder.add_root_certificate(cert);
                 }
             }
             TrustedCerts::CaBytes(pems) => {
                 for pem in pems {
-                    let cert = native_tls::Certificate::from_pem(pem)
-                        .map_err(|e| RepError::NetworkError(format!("CA parse: {e}")))?;
+                    let cert = native_tls::Certificate::from_pem(pem).map_err(
+                        |e| RepError::NetworkError(format!("CA parse: {e}")),
+                    )?;
                     builder.add_root_certificate(cert);
                 }
             }

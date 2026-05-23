@@ -326,8 +326,18 @@ mod tests {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
         for &v in values {
             let lsn = Lsn::new(v, v);
-            assert_eq!(lsn.file_number(), v, "file_number mismatch for 0x{:x}", v);
-            assert_eq!(lsn.file_offset(), v, "file_offset mismatch for 0x{:x}", v);
+            assert_eq!(
+                lsn.file_number(),
+                v,
+                "file_number mismatch for 0x{:x}",
+                v
+            );
+            assert_eq!(
+                lsn.file_offset(),
+                v,
+                "file_offset mismatch for 0x{:x}",
+                v
+            );
         }
     }
 
@@ -492,7 +502,11 @@ mod tests {
         let offset = 0x0000_0042_u32;
         let lsn = Lsn::new(large_file, offset);
         assert_eq!(lsn.file_number(), large_file, "file_number corrupted");
-        assert_eq!(lsn.file_offset(), offset, "offset corrupted by large file number");
+        assert_eq!(
+            lsn.file_offset(),
+            offset,
+            "offset corrupted by large file number"
+        );
     }
 
     #[test]
@@ -501,7 +515,11 @@ mod tests {
         let file = 0x0000_0001_u32;
         let large_offset = 0x7FFF_FFFF_u32;
         let lsn = Lsn::new(file, large_offset);
-        assert_eq!(lsn.file_number(), file, "file_number corrupted by large offset");
+        assert_eq!(
+            lsn.file_number(),
+            file,
+            "file_number corrupted by large offset"
+        );
         assert_eq!(lsn.file_offset(), large_offset, "offset corrupted");
     }
 

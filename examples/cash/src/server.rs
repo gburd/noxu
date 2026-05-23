@@ -7,7 +7,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 use crate::config::CashConfig;
-use crate::protocol::{Command, ParseResult, complete_storage, parse_command_line};
+use crate::protocol::{
+    Command, ParseResult, complete_storage, parse_command_line,
+};
 use crate::store::{CasResult, CashStore};
 
 /// The Cash TCP server.
@@ -23,7 +25,10 @@ impl CashServer {
     }
 
     /// Run the server, listening for connections until the shutdown signal fires.
-    pub async fn run(self, mut shutdown: tokio::sync::broadcast::Receiver<()>) -> std::io::Result<()> {
+    pub async fn run(
+        self,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.config.address).await?;
         tracing::info!("cash listening on {}", self.config.address);
 
@@ -33,7 +38,8 @@ impl CashServer {
         // Spawn background TTL sweeper
         let sweep_store = store.clone();
         let sweep_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
                 let flushed = sweep_store.flush_expired();
@@ -82,7 +88,10 @@ impl CashServer {
 }
 
 /// Handle a single client connection.
-async fn handle_connection(mut socket: TcpStream, store: Arc<CashStore>) -> std::io::Result<()> {
+async fn handle_connection(
+    mut socket: TcpStream,
+    store: Arc<CashStore>,
+) -> std::io::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -115,7 +124,9 @@ async fn handle_connection(mut socket: TcpStream, store: Arc<CashStore>) -> std:
                 }
             }
             ParseResult::NeedData(pending) => {
-                let data = read_data_block(&mut socket, &mut buf, pending.bytes).await?;
+                let data =
+                    read_data_block(&mut socket, &mut buf, pending.bytes)
+                        .await?;
                 store
                     .stats
                     .bytes_read
@@ -149,7 +160,12 @@ async fn execute_command(
             let mut response = String::new();
             for (key, flags, _cas, data) in &results {
                 let key_str = String::from_utf8_lossy(key);
-                response.push_str(&format!("VALUE {} {} {}\r\n", key_str, flags, data.len()));
+                response.push_str(&format!(
+                    "VALUE {} {} {}\r\n",
+                    key_str,
+                    flags,
+                    data.len()
+                ));
                 // Data as raw bytes — we need to handle this carefully
                 response.push_str(&String::from_utf8_lossy(data));
                 response.push_str("\r\n");
@@ -177,13 +193,7 @@ async fn execute_command(
             Ok(Some(response))
         }
 
-        Command::Set {
-            key,
-            flags,
-            exptime,
-            data,
-            noreply,
-        } => {
+        Command::Set { key, flags, exptime, data, noreply } => {
             match store.set(&key, flags, exptime, &data) {
                 Ok(()) => {
                     if noreply {
@@ -199,13 +209,7 @@ async fn execute_command(
             }
         }
 
-        Command::Add {
-            key,
-            flags,
-            exptime,
-            data,
-            noreply,
-        } => {
+        Command::Add { key, flags, exptime, data, noreply } => {
             match store.add(&key, flags, exptime, &data) {
                 Ok(true) => {
                     if noreply {
@@ -228,13 +232,7 @@ async fn execute_command(
             }
         }
 
-        Command::Replace {
-            key,
-            flags,
-            exptime,
-            data,
-            noreply,
-        } => {
+        Command::Replace { key, flags, exptime, data, noreply } => {
             match store.replace(&key, flags, exptime, &data) {
                 Ok(true) => {
                     if noreply {
@@ -257,13 +255,7 @@ async fn execute_command(
             }
         }
 
-        Command::Append {
-            key,
-            flags: _,
-            exptime: _,
-            data,
-            noreply,
-        } => {
+        Command::Append { key, flags: _, exptime: _, data, noreply } => {
             match store.append(&key, &data) {
                 Ok(true) => {
                     if noreply {
@@ -286,13 +278,7 @@ async fn execute_command(
             }
         }
 
-        Command::Prepend {
-            key,
-            flags: _,
-            exptime: _,
-            data,
-            noreply,
-        } => {
+        Command::Prepend { key, flags: _, exptime: _, data, noreply } => {
             match store.prepend(&key, &data) {
                 Ok(true) => {
                     if noreply {
@@ -315,14 +301,7 @@ async fn execute_command(
             }
         }
 
-        Command::Cas {
-            key,
-            flags,
-            exptime,
-            data,
-            cas_token,
-            noreply,
-        } => {
+        Command::Cas { key, flags, exptime, data, cas_token, noreply } => {
             match store.cas(&key, flags, exptime, &data, cas_token) {
                 Ok(CasResult::Stored) => {
                     if noreply {
@@ -352,16 +331,37 @@ async fn execute_command(
             }
         }
 
-        Command::Delete { key, noreply } => {
-            match store.delete(&key) {
-                Ok(true) => {
+        Command::Delete { key, noreply } => match store.delete(&key) {
+            Ok(true) => {
+                if noreply {
+                    Ok(Some(String::new()))
+                } else {
+                    Ok(Some("DELETED\r\n".into()))
+                }
+            }
+            Ok(false) => {
+                if noreply {
+                    Ok(Some(String::new()))
+                } else {
+                    Ok(Some("NOT_FOUND\r\n".into()))
+                }
+            }
+            Err(e) => {
+                tracing::error!("delete error: {e}");
+                Ok(Some(format!("SERVER_ERROR {e}\r\n")))
+            }
+        },
+
+        Command::Incr { key, value, noreply } => {
+            match store.incr(&key, value) {
+                Ok(Some(new_val)) => {
                     if noreply {
                         Ok(Some(String::new()))
                     } else {
-                        Ok(Some("DELETED\r\n".into()))
+                        Ok(Some(format!("{new_val}\r\n")))
                     }
                 }
-                Ok(false) => {
+                Ok(None) => {
                     if noreply {
                         Ok(Some(String::new()))
                     } else {
@@ -369,61 +369,34 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    tracing::error!("delete error: {e}");
+                    tracing::error!("incr error: {e}");
                     Ok(Some(format!("SERVER_ERROR {e}\r\n")))
                 }
             }
         }
 
-        Command::Incr {
-            key,
-            value,
-            noreply,
-        } => match store.incr(&key, value) {
-            Ok(Some(new_val)) => {
-                if noreply {
-                    Ok(Some(String::new()))
-                } else {
-                    Ok(Some(format!("{new_val}\r\n")))
+        Command::Decr { key, value, noreply } => {
+            match store.decr(&key, value) {
+                Ok(Some(new_val)) => {
+                    if noreply {
+                        Ok(Some(String::new()))
+                    } else {
+                        Ok(Some(format!("{new_val}\r\n")))
+                    }
+                }
+                Ok(None) => {
+                    if noreply {
+                        Ok(Some(String::new()))
+                    } else {
+                        Ok(Some("NOT_FOUND\r\n".into()))
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("decr error: {e}");
+                    Ok(Some(format!("SERVER_ERROR {e}\r\n")))
                 }
             }
-            Ok(None) => {
-                if noreply {
-                    Ok(Some(String::new()))
-                } else {
-                    Ok(Some("NOT_FOUND\r\n".into()))
-                }
-            }
-            Err(e) => {
-                tracing::error!("incr error: {e}");
-                Ok(Some(format!("SERVER_ERROR {e}\r\n")))
-            }
-        },
-
-        Command::Decr {
-            key,
-            value,
-            noreply,
-        } => match store.decr(&key, value) {
-            Ok(Some(new_val)) => {
-                if noreply {
-                    Ok(Some(String::new()))
-                } else {
-                    Ok(Some(format!("{new_val}\r\n")))
-                }
-            }
-            Ok(None) => {
-                if noreply {
-                    Ok(Some(String::new()))
-                } else {
-                    Ok(Some("NOT_FOUND\r\n".into()))
-                }
-            }
-            Err(e) => {
-                tracing::error!("decr error: {e}");
-                Ok(Some(format!("SERVER_ERROR {e}\r\n")))
-            }
-        },
+        }
 
         Command::Stats => {
             let lines = store.stats_lines();

@@ -111,7 +111,9 @@ impl Account {
     /// Returns true if the account can sustain a debit of `amount`.
     pub fn can_debit(&self, amount: u128) -> bool {
         if self.flags.debits_must_not_exceed_credits() {
-            let total = self.debits_posted as i128 + self.debits_pending as i128 + amount as i128;
+            let total = self.debits_posted as i128
+                + self.debits_pending as i128
+                + amount as i128;
             total <= self.credits_posted as i128
         } else {
             true
@@ -121,8 +123,9 @@ impl Account {
     /// Returns true if the account can sustain a credit of `amount`.
     pub fn can_credit(&self, amount: u128) -> bool {
         if self.flags.credits_must_not_exceed_debits() {
-            let total =
-                self.credits_posted as i128 + self.credits_pending as i128 + amount as i128;
+            let total = self.credits_posted as i128
+                + self.credits_pending as i128
+                + amount as i128;
             total <= self.debits_posted as i128
         } else {
             true
@@ -184,17 +187,25 @@ impl Account {
     pub fn from_bytes(buf: &[u8; 128]) -> Self {
         Self {
             id: u128::from_le_bytes(buf[0..16].try_into().unwrap()),
-            debits_pending: u128::from_le_bytes(buf[16..32].try_into().unwrap()),
+            debits_pending: u128::from_le_bytes(
+                buf[16..32].try_into().unwrap(),
+            ),
             debits_posted: u128::from_le_bytes(buf[32..48].try_into().unwrap()),
-            credits_pending: u128::from_le_bytes(buf[48..64].try_into().unwrap()),
-            credits_posted: u128::from_le_bytes(buf[64..80].try_into().unwrap()),
+            credits_pending: u128::from_le_bytes(
+                buf[48..64].try_into().unwrap(),
+            ),
+            credits_posted: u128::from_le_bytes(
+                buf[64..80].try_into().unwrap(),
+            ),
             user_data_128: u128::from_le_bytes(buf[80..96].try_into().unwrap()),
             user_data_64: u64::from_le_bytes(buf[96..104].try_into().unwrap()),
             user_data_32: u32::from_le_bytes(buf[104..108].try_into().unwrap()),
             reserved: u32::from_le_bytes(buf[108..112].try_into().unwrap()),
             ledger: u32::from_le_bytes(buf[112..116].try_into().unwrap()),
             code: u16::from_le_bytes(buf[116..118].try_into().unwrap()),
-            flags: AccountFlags(u16::from_le_bytes(buf[118..120].try_into().unwrap())),
+            flags: AccountFlags(u16::from_le_bytes(
+                buf[118..120].try_into().unwrap(),
+            )),
             timestamp: u64::from_le_bytes(buf[120..128].try_into().unwrap()),
         }
     }

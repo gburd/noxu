@@ -77,8 +77,10 @@ mod tests {
 
     #[test]
     fn test_del_dup_ln_roundtrip() {
-        let entry =
-            DelDupLnEntry::new(b"primary_key".to_vec(), b"dup_key_value".to_vec());
+        let entry = DelDupLnEntry::new(
+            b"primary_key".to_vec(),
+            b"dup_key_value".to_vec(),
+        );
 
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);

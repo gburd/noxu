@@ -109,7 +109,11 @@ impl Get {
     pub fn requires_key(&self) -> bool {
         matches!(
             self,
-            Get::Search | Get::SearchBoth | Get::SearchGte | Get::SearchLte | Get::SearchRange
+            Get::Search
+                | Get::SearchBoth
+                | Get::SearchGte
+                | Get::SearchLte
+                | Get::SearchRange
         )
     }
 

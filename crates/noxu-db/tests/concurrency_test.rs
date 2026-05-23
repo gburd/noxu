@@ -21,12 +21,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
+};
 use tempfile::TempDir;
 
-fn open_env_and_db(
-    dir: &TempDir,
-) -> (noxu_db::Environment, noxu_db::Database) {
+fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
@@ -113,7 +113,12 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
     let key_bytes = b"key1";
 
     // Pre-populate with "initial" (committed).
-    db.put(None, &DatabaseEntry::from_bytes(key_bytes), &DatabaseEntry::from_bytes(b"initial")).unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(key_bytes),
+        &DatabaseEntry::from_bytes(b"initial"),
+    )
+    .unwrap();
 
     // Barrier: writer signals when it holds the write lock.
     let barrier = Arc::new(Barrier::new(2));
@@ -128,7 +133,8 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
             Some(&txn),
             &DatabaseEntry::from_bytes(key_bytes),
             &DatabaseEntry::from_bytes(b"new"),
-        ).unwrap();
+        )
+        .unwrap();
         // Notify the reader that we hold the write lock.
         b_w.wait();
         // Hold the lock for long enough that the reader definitely blocks.
@@ -142,17 +148,25 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
     barrier.wait();
     let start = std::time::Instant::now();
     let mut out = DatabaseEntry::new();
-    let status = db.get(None, &DatabaseEntry::from_bytes(key_bytes), &mut out).unwrap();
+    let status =
+        db.get(None, &DatabaseEntry::from_bytes(key_bytes), &mut out).unwrap();
     let elapsed = start.elapsed();
 
     writer_handle.join().unwrap();
 
     // The reader unblocked after the writer committed — sees the committed value.
     assert_eq!(status, OperationStatus::Success);
-    assert_eq!(out.data(), b"new", "reader should see committed value after writer commits");
+    assert_eq!(
+        out.data(),
+        b"new",
+        "reader should see committed value after writer commits"
+    );
     // The reader should have blocked for a meaningful amount of time (the
     // writer held the lock for ~80 ms; allow generous margin for slow CI).
-    assert!(elapsed.as_millis() >= 10, "reader should have blocked on the write lock");
+    assert!(
+        elapsed.as_millis() >= 10,
+        "reader should have blocked on the write lock"
+    );
 }
 
 /// Aborting a transaction must roll back all its writes.
@@ -204,8 +218,9 @@ fn test_atomic_commit_all_keys_visible() {
     for i in 0..N {
         let k = format!("batch_key_{:03}", i).into_bytes();
         let mut out = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_vec(k.clone()), &mut out).unwrap();
+        let status = db
+            .get(None, &DatabaseEntry::from_vec(k.clone()), &mut out)
+            .unwrap();
         assert_eq!(
             status,
             OperationStatus::Success,
@@ -271,9 +286,9 @@ fn test_concurrent_writes_disjoint_keys() {
             let key_num = t * KEYS_PER_THREAD + k;
             let key = format!("disjoint_{:06}", key_num).into_bytes();
             let mut out = DatabaseEntry::new();
-            let status =
-                db.get(None, &DatabaseEntry::from_vec(key.clone()), &mut out)
-                    .unwrap();
+            let status = db
+                .get(None, &DatabaseEntry::from_vec(key.clone()), &mut out)
+                .unwrap();
             assert_eq!(
                 status,
                 OperationStatus::Success,
@@ -364,11 +379,9 @@ fn test_concurrent_inserts_then_full_scan() {
     let total = N_THREADS * KEYS_PER_THREAD;
     let count = db.count().unwrap();
     assert_eq!(
-        count,
-        total as u64,
+        count, total as u64,
         "expected {} entries after concurrent inserts, got {}",
-        total,
-        count
+        total, count
     );
 
     // Scan all and verify sorted order.
@@ -400,12 +413,8 @@ fn test_utilization_tracker_counts_writes() {
     for i in 0..n {
         let k = format!("util_{:04}", i).into_bytes();
         let v = format!("vutil_{}", i).into_bytes();
-        db.put(
-            None,
-            &DatabaseEntry::from_vec(k),
-            &DatabaseEntry::from_vec(v),
-        )
-        .unwrap();
+        db.put(None, &DatabaseEntry::from_vec(k), &DatabaseEntry::from_vec(v))
+            .unwrap();
     }
 
     // Verify all writes are durably recorded via the public count() API.

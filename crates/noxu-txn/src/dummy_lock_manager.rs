@@ -15,7 +15,7 @@ use crate::{LockGrantType, LockManager, LockStats, LockType, TxnError};
 /// `superiorLockManager`.  `attemptLock()` delegates to the real LM when
 /// `locker.lockingRequired()` is true; otherwise returns `NEW` immediately.
 ///
-/// 
+///
 pub struct DummyLockManager {
     /// The real lock manager, used when `locking_required` is true.
     ///
@@ -25,7 +25,7 @@ pub struct DummyLockManager {
 impl DummyLockManager {
     /// Creates a new DummyLockManager backed by the given real lock manager.
     ///
-    /// 
+    ///
     pub fn new(superior: Arc<LockManager>) -> Self {
         DummyLockManager { superior }
     }
@@ -43,7 +43,7 @@ impl DummyLockManager {
     ///
     /// The `locking_required` parameter mirrors `locker.lockingRequired()`.
     ///
-    /// 
+    ///
     pub fn lock(
         &self,
         lsn: u64,
@@ -62,7 +62,13 @@ impl DummyLockManager {
 
         if locking_required {
             // Delegate to the real lock manager for internal-DB cursors.
-            self.superior.lock(lsn, locker_id, lock_type, non_blocking, jump_ahead_of_waiters)
+            self.superior.lock(
+                lsn,
+                locker_id,
+                lock_type,
+                non_blocking,
+                jump_ahead_of_waiters,
+            )
         } else {
             Ok(LockGrantType::New)
         }
@@ -87,7 +93,7 @@ impl DummyLockManager {
 
     /// Demotes a write lock to read, delegating when `locking_required`.
     ///
-    /// 
+    ///
     pub fn demote(
         &self,
         lsn: u64,
@@ -103,7 +109,7 @@ impl DummyLockManager {
 
     /// Steals a lock, delegating when `locking_required`.
     ///
-    /// 
+    ///
     pub fn steal_lock(
         &self,
         lsn: u64,
@@ -119,7 +125,7 @@ impl DummyLockManager {
 
     /// Returns write-lock ownership, delegating when `locking_required`.
     ///
-    /// 
+    ///
     pub fn is_owned_write_lock(
         &self,
         lsn: u64,
@@ -135,7 +141,7 @@ impl DummyLockManager {
 
     /// Returns owned lock type, delegating when `locking_required`.
     ///
-    /// 
+    ///
     pub fn get_owned_lock_type(
         &self,
         lsn: u64,
@@ -150,17 +156,17 @@ impl DummyLockManager {
     }
 
     /// Returns lock info from superior when `locking_required`, else (0,0).
-    pub fn get_lock_info(&self, lsn: u64, locking_required: bool) -> (usize, usize) {
-        if locking_required {
-            self.superior.get_lock_info(lsn)
-        } else {
-            (0, 0)
-        }
+    pub fn get_lock_info(
+        &self,
+        lsn: u64,
+        locking_required: bool,
+    ) -> (usize, usize) {
+        if locking_required { self.superior.get_lock_info(lsn) } else { (0, 0) }
     }
 
     /// Returns stats from the superior lock manager.
     ///
-    /// 
+    ///
     pub fn get_stats(&self) -> LockStats {
         self.superior.get_stats()
     }
@@ -197,11 +203,13 @@ mod tests {
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 4, LockType::RangeWrite, false, false, false).unwrap(),
+            dlm.lock(100, 4, LockType::RangeWrite, false, false, false)
+                .unwrap(),
             LockGrantType::New
         );
         assert_eq!(
-            dlm.lock(100, 5, LockType::RangeInsert, false, false, false).unwrap(),
+            dlm.lock(100, 5, LockType::RangeInsert, false, false, false)
+                .unwrap(),
             LockGrantType::New
         );
     }

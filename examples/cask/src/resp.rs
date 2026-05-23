@@ -229,7 +229,8 @@ fn parse_array(buf: &mut BytesMut) -> Option<RespValue> {
 
 /// Find the position of `\r\n` in the buffer, returning the index of `\r`.
 fn find_crlf(buf: &[u8]) -> Option<usize> {
-    (0..buf.len().saturating_sub(1)).find(|&i| buf[i] == b'\r' && buf[i + 1] == b'\n')
+    (0..buf.len().saturating_sub(1))
+        .find(|&i| buf[i] == b'\r' && buf[i + 1] == b'\n')
 }
 
 #[cfg(test)]
@@ -312,7 +313,9 @@ mod tests {
         let val = parse_resp(&mut buf).unwrap();
         assert_eq!(
             val,
-            RespValue::Array(vec![RespValue::BulkString(Some(Bytes::from("PING")))])
+            RespValue::Array(vec![RespValue::BulkString(Some(Bytes::from(
+                "PING"
+            )))])
         );
     }
 }

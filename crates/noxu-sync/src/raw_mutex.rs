@@ -64,7 +64,12 @@ unsafe impl lock_api::RawMutex for NoxuRawMutex {
         // Fast path: CAS UNLOCKED → LOCKED (no waiters yet).
         if self
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.owner.store(thread_id(), Ordering::Relaxed);
@@ -77,7 +82,12 @@ unsafe impl lock_api::RawMutex for NoxuRawMutex {
     fn try_lock(&self) -> bool {
         if self
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.owner.store(thread_id(), Ordering::Relaxed);
@@ -110,7 +120,12 @@ unsafe impl lock_api::RawMutexTimed for NoxuRawMutex {
     fn try_lock_for(&self, timeout: Duration) -> bool {
         if self
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.owner.store(thread_id(), Ordering::Relaxed);
@@ -123,7 +138,12 @@ unsafe impl lock_api::RawMutexTimed for NoxuRawMutex {
     fn try_lock_until(&self, deadline: Instant) -> bool {
         if self
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.owner.store(thread_id(), Ordering::Relaxed);

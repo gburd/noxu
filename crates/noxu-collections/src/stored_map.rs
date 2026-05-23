@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 /// A map-like view of a database.
 ///
-/// 
+///
 ///
 /// Provides a familiar map interface over a Noxu DB database. Keys and
 /// values are raw byte vectors (`Vec<u8>`). Records can be inserted,

@@ -8,7 +8,7 @@ use thiserror::Error;
 pub enum RepError {
     /// The node is not the master. Thrown when a write operation is attempted
     /// on a replica node.
-    /// 
+    ///
     #[error("node is not master: current master is {master:?}")]
     NotMaster {
         /// The name of the current master, if known.
@@ -26,17 +26,17 @@ pub enum RepError {
     GroupNotFound(String),
 
     /// A node was not found in the replication group.
-    /// 
+    ///
     #[error("node {0} not found in group")]
     NodeNotFound(String),
 
     /// An election failed to produce a master.
-    /// 
+    ///
     #[error("election failed: {0}")]
     ElectionFailed(String),
 
     /// Insufficient replica acknowledgments for a commit.
-    /// 
+    ///
     #[error("insufficient acks: needed {needed}, got {received}")]
     InsufficientAcks {
         /// Number of acks required by the durability policy.
@@ -46,7 +46,7 @@ pub enum RepError {
     },
 
     /// A replica consistency policy timed out.
-    /// 
+    ///
     #[error("replica consistency timeout after {0:?}")]
     ConsistencyTimeout(std::time::Duration),
 
@@ -60,7 +60,7 @@ pub enum RepError {
     },
 
     /// A hard rollback is required on the replica.
-    /// 
+    ///
     #[error("rollback required: from VLSN {from} to {to}")]
     RollbackRequired {
         /// The VLSN sequence to roll back from.
@@ -77,12 +77,10 @@ pub enum RepError {
     ///
     /// Indicates in-flight corruption (hardware error, kernel bug, or an
     /// adversarial sender). The receiver closes the channel when this occurs.
-    #[error("frame corrupted: vlsn={vlsn} expected_crc={expected:#010x} actual_crc={actual:#010x}")]
-    FrameCorrupted {
-        vlsn: u64,
-        expected: u32,
-        actual: u32,
-    },
+    #[error(
+        "frame corrupted: vlsn={vlsn} expected_crc={expected:#010x} actual_crc={actual:#010x}"
+    )]
+    FrameCorrupted { vlsn: u64, expected: u32, actual: u32 },
 
     /// A replication protocol error occurred (unexpected message, version
     /// mismatch, etc.).

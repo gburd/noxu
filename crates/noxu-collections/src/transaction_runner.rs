@@ -6,7 +6,7 @@ use noxu_db::{Environment, Transaction};
 
 /// Runs a closure within a transaction with automatic commit/abort.
 ///
-/// 
+///
 ///
 /// The `TransactionRunner` provides a convenient way to execute database
 /// operations within a transaction. It handles:

@@ -33,8 +33,8 @@
 
 use crate::policy::EvictionPolicy;
 use crate::slab::SlabList;
-use noxu_sync::Mutex;
 use hashbrown::HashSet;
+use noxu_sync::Mutex;
 
 /// LIR set target fraction of total tracked pages.
 const LIR_RATIO: f64 = 0.99;
@@ -140,13 +140,18 @@ impl LirsState {
         self.hir_res.remove(&id);
         self.q.remove(id);
         // Add to LIR set and move to top of S.
-        if !self.s.contains(id) { self.s.add_back(id); }
-        else { self.s.move_back(id); }
+        if !self.s.contains(id) {
+            self.s.add_back(id);
+        } else {
+            self.s.move_back(id);
+        }
         self.lir.insert(id);
         // LIR set now potentially over-sized: demote the bottom LIR page.
         while self.lir.len() > self.lir_cap() {
             // The bottom of S should be a LIR page (after pruning).
-            if let Some(bottom) = self.s.peek_front().filter(|b| self.lir.contains(b)) {
+            if let Some(bottom) =
+                self.s.peek_front().filter(|b| self.lir.contains(b))
+            {
                 self.lir.remove(&bottom);
                 // Demoted page becomes resident HIR.
                 self.hir_res.insert(bottom);
@@ -156,7 +161,12 @@ impl LirsState {
             }
             // Prune non-resident HIR from bottom and retry.
             self.prune_stack();
-            if self.s.peek_front().map(|id| self.lir.contains(&id)).unwrap_or(false) {
+            if self
+                .s
+                .peek_front()
+                .map(|id| self.lir.contains(&id))
+                .unwrap_or(false)
+            {
                 continue;
             }
             break;
@@ -189,7 +199,9 @@ impl LirsPolicy {
 }
 
 impl Default for LirsPolicy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EvictionPolicy for LirsPolicy {
@@ -201,8 +213,13 @@ impl EvictionPolicy for LirsPolicy {
         // Cold insert: add directly to resident HIR (evictable) regardless of
         // LIR capacity, bypassing the recency promotion path.
         let mut s = self.state.lock();
-        if !s.lir.contains(&node_id) && !s.hir_res.contains(&node_id) && !s.non_res.contains(&node_id) {
-            if !s.s.contains(node_id) { s.s.add_back(node_id); }
+        if !s.lir.contains(&node_id)
+            && !s.hir_res.contains(&node_id)
+            && !s.non_res.contains(&node_id)
+        {
+            if !s.s.contains(node_id) {
+                s.s.add_back(node_id);
+            }
             if !s.q.contains(node_id) {
                 s.q.add_front(node_id); // cold end of Q — first to be evicted
                 s.hir_res.insert(node_id);
@@ -212,7 +229,10 @@ impl EvictionPolicy for LirsPolicy {
 
     fn touch(&self, node_id: u64) -> bool {
         let mut s = self.state.lock();
-        if s.lir.contains(&node_id) || s.hir_res.contains(&node_id) || s.non_res.contains(&node_id) {
+        if s.lir.contains(&node_id)
+            || s.hir_res.contains(&node_id)
+            || s.non_res.contains(&node_id)
+        {
             s.on_hit(node_id);
             true
         } else {
@@ -237,7 +257,8 @@ impl EvictionPolicy for LirsPolicy {
         if s.q.is_empty() && !s.lir.is_empty() {
             // Prune S until we find the bottom LIR page.
             s.prune_stack();
-            if let Some(bottom) = s.s.peek_front().filter(|b| s.lir.contains(b)) {
+            if let Some(bottom) = s.s.peek_front().filter(|b| s.lir.contains(b))
+            {
                 s.lir.remove(&bottom);
                 s.hir_res.insert(bottom);
                 s.q.add_back(bottom);
@@ -251,7 +272,9 @@ impl EvictionPolicy for LirsPolicy {
         let mut s = self.state.lock();
         if !s.lir.contains(&node_id) && !s.hir_res.contains(&node_id) {
             s.non_res.remove(&node_id);
-            if !s.s.contains(node_id) { s.s.add_back(node_id); }
+            if !s.s.contains(node_id) {
+                s.s.add_back(node_id);
+            }
             if !s.q.contains(node_id) {
                 s.q.add_back(node_id);
                 s.hir_res.insert(node_id);
@@ -269,7 +292,9 @@ impl EvictionPolicy for LirsPolicy {
         s.lir.len() + s.hir_res.len()
     }
 
-    fn name(&self) -> &'static str { "LIRS" }
+    fn name(&self) -> &'static str {
+        "LIRS"
+    }
 }
 
 #[cfg(test)]
@@ -281,7 +306,9 @@ mod tests {
     fn test_lirs_basic_eviction() {
         let p = LirsPolicy::new();
         // Fill with enough pages to have both LIR and HIR.
-        for i in 0u64..20 { p.insert(i); }
+        for i in 0u64..20 {
+            p.insert(i);
+        }
         assert_eq!(p.len(), 20);
         let v = p.evict_candidate().unwrap();
         assert!(v < 20);
@@ -292,8 +319,12 @@ mod tests {
     fn test_lirs_frequently_accessed_page_survives() {
         let p = LirsPolicy::new();
         // Insert 20 pages; repeatedly touch page 0 to keep it hot.
-        for i in 0u64..20 { p.insert(i); }
-        for _ in 0..5 { p.touch(0); }
+        for i in 0u64..20 {
+            p.insert(i);
+        }
+        for _ in 0..5 {
+            p.touch(0);
+        }
         // Evict until only a few remain.
         let mut evicted = Vec::new();
         while p.len() > 2 {
@@ -310,7 +341,8 @@ mod tests {
     fn test_lirs_insert_cold() {
         let p = LirsPolicy::new();
         // Insert normally.
-        p.insert(1); p.insert(2);
+        p.insert(1);
+        p.insert(2);
         // Insert cold — should be evicted first.
         p.insert_cold(99);
         // 99 goes to cold end of Q.
@@ -320,7 +352,9 @@ mod tests {
     #[test]
     fn test_lirs_remove() {
         let p = LirsPolicy::new();
-        for i in 0u64..5 { p.insert(i); }
+        for i in 0u64..5 {
+            p.insert(i);
+        }
         assert!(p.remove(2));
         assert!(!p.remove(2));
         assert_eq!(p.len(), 4);
@@ -329,7 +363,9 @@ mod tests {
     #[test]
     fn test_lirs_put_back() {
         let p = LirsPolicy::new();
-        for i in 0u64..10 { p.insert(i); }
+        for i in 0u64..10 {
+            p.insert(i);
+        }
         let v = p.evict_candidate().unwrap();
         p.put_back(v);
         assert!(p.contains(v) || p.len() >= 9);
@@ -340,7 +376,9 @@ mod tests {
         let p = LirsPolicy::new();
         // With 10 pages and LIR_RATIO=0.99, LIR cap = max(floor(10*0.99),1) = 9.
         // So approximately 9 LIR + 1 HIR.
-        for i in 0u64..10 { p.insert(i); }
+        for i in 0u64..10 {
+            p.insert(i);
+        }
         // The first page evicted must be an HIR page (Q member), not a LIR page.
         let state = p.state.lock();
         let q_len = state.q.len;

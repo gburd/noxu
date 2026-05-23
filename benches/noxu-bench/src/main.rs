@@ -20,7 +20,9 @@ mod metrics;
 mod workloads;
 
 use metrics::{cpu_time_ms, dir_size_kb, proc_io, rss_kb};
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+};
 use noxu_xa::XaEnvironment;
 use std::fs;
 use std::io::Write as IoWrite;
@@ -49,7 +51,9 @@ struct RealDir {
 }
 
 impl RealDir {
-    fn path(&self) -> &Path { &self.path }
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for RealDir {
@@ -83,7 +87,12 @@ impl BenchDir {
 ///
 /// When `NOXU_BENCH_CLEANUP=1` the returned `RealDir` deletes itself on drop,
 /// keeping peak disk consumption to ~2× the per-workload dataset size.
-fn new_bench_dir(base: &Option<PathBuf>, tag: &str, n: usize, cleanup: bool) -> BenchDir {
+fn new_bench_dir(
+    base: &Option<PathBuf>,
+    tag: &str,
+    n: usize,
+    cleanup: bool,
+) -> BenchDir {
     let root = match base {
         Some(r) => r.clone(),
         None => {
@@ -112,7 +121,11 @@ fn open_db(dir: &Path) -> (Environment, Database) {
         .with_transactional(true);
     let env = Environment::open(cfg).unwrap();
     let db = env
-        .open_database(None, "bench", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "bench",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     (env, db)
 }
@@ -131,7 +144,11 @@ fn open_db_group_commit(dir: &Path) -> (Environment, Database) {
         .with_log_group_commit(4, 5);
     let env = Environment::open(cfg).unwrap();
     let db = env
-        .open_database(None, "bench", &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            "bench",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     (env, db)
 }
@@ -192,15 +209,24 @@ fn run_timed<F: FnOnce() -> usize>(
     let disk_kb = dir_size_kb(data_dir);
     let fsync1 = env.map(|e| e.stat_fsync_count()).unwrap_or(0);
 
-    let disk_bytes_per_op = if ops > 0 { (disk_kb * 1024) as f64 / ops as f64 } else { 0.0 };
+    let disk_bytes_per_op =
+        if ops > 0 { (disk_kb * 1024) as f64 / ops as f64 } else { 0.0 };
 
     WorkloadResult {
         workload: workload_name.into(),
         scale,
         threads,
         elapsed_ms,
-        ns_per_op: if ops > 0 { elapsed_ms * 1_000_000.0 / ops as f64 } else { 0.0 },
-        ops_per_sec: if elapsed_ms > 0.0 { ops as f64 / (elapsed_ms / 1000.0) } else { 0.0 },
+        ns_per_op: if ops > 0 {
+            elapsed_ms * 1_000_000.0 / ops as f64
+        } else {
+            0.0
+        },
+        ops_per_sec: if elapsed_ms > 0.0 {
+            ops as f64 / (elapsed_ms / 1000.0)
+        } else {
+            0.0
+        },
         cpu_ms: cpu1.saturating_sub(cpu0),
         rss_delta_kb: rss1 - rss0,
         read_kb: io1.0.saturating_sub(io0.0) / 1024,
@@ -267,8 +293,11 @@ fn main() {
         "TempDir (tmpfs — FSyncManager coalescing window is zero)".to_string()
     };
     println!("  Storage:    {}", storage_label);
-    println!("  ValueSize:  {} bytes  ({:.1} MB per 1M records)",
-        value_size, value_size as f64 * 1_000_000.0 / 1_073_741_824.0 * 1024.0);
+    println!(
+        "  ValueSize:  {} bytes  ({:.1} MB per 1M records)",
+        value_size,
+        value_size as f64 * 1_000_000.0 / 1_073_741_824.0 * 1024.0
+    );
     println!("  Cleanup:    {}", cleanup);
 
     let all_scales: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000];
@@ -281,12 +310,12 @@ fn main() {
 
     // W10 concurrent configurations: (label, reader_threads, writer_threads)
     let concurrent_configs: &[(&str, usize, usize)] = &[
-        ("w10_conc_1r0w", 1, 0),  // read-only,  1 thread
-        ("w10_conc_0r1w", 0, 1),  // write-only, 1 thread
-        ("w10_conc_4r0w", 4, 0),  // read-only,  4 threads
-        ("w10_conc_0r4w", 0, 4),  // write-only, 4 threads
-        ("w10_conc_4r4w", 4, 4),  // mixed,      8 threads
-        ("w10_conc_8r8w", 8, 8),  // heavy,     16 threads
+        ("w10_conc_1r0w", 1, 0), // read-only,  1 thread
+        ("w10_conc_0r1w", 0, 1), // write-only, 1 thread
+        ("w10_conc_4r0w", 4, 0), // read-only,  4 threads
+        ("w10_conc_0r4w", 0, 4), // write-only, 4 threads
+        ("w10_conc_4r4w", 4, 4), // mixed,      8 threads
+        ("w10_conc_8r8w", 8, 8), // heavy,     16 threads
     ];
 
     let mut results: Vec<WorkloadResult> = Vec::new();
@@ -298,24 +327,36 @@ fn main() {
         {
             let dir = new_bench_dir(&bench_base, "bench_2", n, cleanup);
             let (env, db) = open_db(dir.path());
-            let r = run_timed("w01_seq_write", n, 1, dir.path(), Some(&env), || {
-                workloads::w01_seq_write(&db, n, &value_bytes)
-            });
+            let r = run_timed(
+                "w01_seq_write",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w01_seq_write(&db, n, &value_bytes),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W02: random write
         {
             let dir = new_bench_dir(&bench_base, "bench_3", n, cleanup);
             let (env, db) = open_db(dir.path());
-            let r = run_timed("w02_rand_write", n, 1, dir.path(), Some(&env), || {
-                workloads::w02_rand_write(&db, n, &value_bytes)
-            });
+            let r = run_timed(
+                "w02_rand_write",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w02_rand_write(&db, n, &value_bytes),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W03: sequential read (pre-populate)
@@ -323,12 +364,14 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_4", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, n, &value_bytes);
-            let r = run_timed("w03_seq_read", n, 1, dir.path(), Some(&env), || {
-                workloads::w03_seq_read(&db, n)
-            });
+            let r =
+                run_timed("w03_seq_read", n, 1, dir.path(), Some(&env), || {
+                    workloads::w03_seq_read(&db, n)
+                });
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W04: random read
@@ -336,12 +379,18 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_5", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, n, &value_bytes);
-            let r = run_timed("w04_rand_read", n, 1, dir.path(), Some(&env), || {
-                workloads::w04_rand_read(&db, n)
-            });
+            let r = run_timed(
+                "w04_rand_read",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w04_rand_read(&db, n),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W05: range scan
@@ -349,12 +398,18 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_6", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, n, &value_bytes);
-            let r = run_timed("w05_range_scan", n, 1, dir.path(), Some(&env), || {
-                workloads::w05_range_scan(&db, n)
-            });
+            let r = run_timed(
+                "w05_range_scan",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w05_range_scan(&db, n),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W06: write-heavy mixed (90% write / 10% read)
@@ -362,12 +417,18 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_7", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, n, &value_bytes);
-            let r = run_timed("w06_write_heavy", n, 1, dir.path(), Some(&env), || {
-                workloads::w06_write_heavy(&db, n, &value_bytes)
-            });
+            let r = run_timed(
+                "w06_write_heavy",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w06_write_heavy(&db, n, &value_bytes),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W07: read-heavy mixed (90% read / 10% write)
@@ -375,12 +436,18 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_8", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, n, &value_bytes);
-            let r = run_timed("w07_read_heavy", n, 1, dir.path(), Some(&env), || {
-                workloads::w07_read_heavy(&db, n, &value_bytes)
-            });
+            let r = run_timed(
+                "w07_read_heavy",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w07_read_heavy(&db, n, &value_bytes),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W08: delete + insert pairs
@@ -388,12 +455,18 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_9", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, n, &value_bytes);
-            let r = run_timed("w08_delete_insert", n, 1, dir.path(), Some(&env), || {
-                workloads::w08_delete_insert(&db, n, &value_bytes)
-            });
+            let r = run_timed(
+                "w08_delete_insert",
+                n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w08_delete_insert(&db, n, &value_bytes),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W09: transactional multi-op (3 gets + 2 puts per txn)
@@ -406,12 +479,18 @@ fn main() {
             let dir = new_bench_dir(&bench_base, "bench_10", n, cleanup);
             let (env, db) = open_db(dir.path());
             populate(&db, w09_n, &value_bytes);
-            let r = run_timed("w09_txn_multi", w09_n, 1, dir.path(), Some(&env), || {
-                workloads::w09_txn_multi(&env, &db, w09_n, &value_bytes)
-            });
+            let r = run_timed(
+                "w09_txn_multi",
+                w09_n,
+                1,
+                dir.path(),
+                Some(&env),
+                || workloads::w09_txn_multi(&env, &db, w09_n, &value_bytes),
+            );
             print_progress(&r);
             results.push(r);
-            drop(db); drop(env);
+            drop(db);
+            drop(env);
         }
 
         // W10: concurrent — six thread configurations
@@ -456,7 +535,9 @@ fn main() {
                 elapsed_ms: conc.elapsed_ms,
                 ns_per_op: if total_ops > 0 {
                     conc.elapsed_ms * 1_000_000.0 / total_ops as f64
-                } else { 0.0 },
+                } else {
+                    0.0
+                },
                 ops_per_sec: conc.ops_per_sec,
                 cpu_ms: cpu1.saturating_sub(cpu0),
                 rss_delta_kb: rss1 - rss0,
@@ -465,7 +546,9 @@ fn main() {
                 disk_kb,
                 disk_bytes_per_op: if total_ops > 0 {
                     (disk_kb * 1024) as f64 / total_ops as f64
-                } else { 0.0 },
+                } else {
+                    0.0
+                },
                 fsync_count: env.stat_fsync_count().saturating_sub(fsync0),
             };
             print_progress(&r);
@@ -486,64 +569,98 @@ fn main() {
 
             // No group commit variant: each commit does its own fsync.
             {
-                let dir = new_bench_dir(&bench_base, "bench_txn_no_gc", n, cleanup);
+                let dir =
+                    new_bench_dir(&bench_base, "bench_txn_no_gc", n, cleanup);
                 let (env, db) = open_db(dir.path());
                 let fsync0 = env.stat_fsync_count();
                 let cpu0 = cpu_time_ms();
                 let io0 = proc_io();
-                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread, value_size);
+                let conc = concurrent::run_concurrent_txn(
+                    &env,
+                    &db,
+                    wthreads,
+                    ops_per_thread,
+                    value_size,
+                );
                 let cpu1 = cpu_time_ms();
                 let io1 = proc_io();
                 let disk_kb = dir_size_kb(dir.path());
                 let total_ops = conc.total_ops as usize;
                 let r = WorkloadResult {
                     workload: "w10_txn_no_gc".to_string(),
-                    scale: n, threads: wthreads,
+                    scale: n,
+                    threads: wthreads,
                     elapsed_ms: conc.elapsed_ms,
-                    ns_per_op: if total_ops > 0 { conc.elapsed_ms * 1_000_000.0 / total_ops as f64 } else { 0.0 },
+                    ns_per_op: if total_ops > 0 {
+                        conc.elapsed_ms * 1_000_000.0 / total_ops as f64
+                    } else {
+                        0.0
+                    },
                     ops_per_sec: conc.ops_per_sec,
                     cpu_ms: cpu1.saturating_sub(cpu0),
                     rss_delta_kb: 0,
                     read_kb: io1.0.saturating_sub(io0.0) / 1024,
                     write_kb: io1.1.saturating_sub(io0.1) / 1024,
                     disk_kb,
-                    disk_bytes_per_op: if total_ops > 0 { (disk_kb * 1024) as f64 / total_ops as f64 } else { 0.0 },
+                    disk_bytes_per_op: if total_ops > 0 {
+                        (disk_kb * 1024) as f64 / total_ops as f64
+                    } else {
+                        0.0
+                    },
                     fsync_count: env.stat_fsync_count().saturating_sub(fsync0),
                 };
                 print_progress(&r);
                 results.push(r);
-                drop(db); drop(env);
+                drop(db);
+                drop(env);
             }
 
             // Group commit variant: leader coalesces fsyncs from concurrent committers.
             {
-                let dir = new_bench_dir(&bench_base, "bench_txn_gc", n, cleanup);
+                let dir =
+                    new_bench_dir(&bench_base, "bench_txn_gc", n, cleanup);
                 let (env, db) = open_db_group_commit(dir.path());
                 let fsync0 = env.stat_fsync_count();
                 let cpu0 = cpu_time_ms();
                 let io0 = proc_io();
-                let conc = concurrent::run_concurrent_txn(&env, &db, wthreads, ops_per_thread, value_size);
+                let conc = concurrent::run_concurrent_txn(
+                    &env,
+                    &db,
+                    wthreads,
+                    ops_per_thread,
+                    value_size,
+                );
                 let cpu1 = cpu_time_ms();
                 let io1 = proc_io();
                 let disk_kb = dir_size_kb(dir.path());
                 let total_ops = conc.total_ops as usize;
                 let r = WorkloadResult {
                     workload: "w10_txn_group_commit".to_string(),
-                    scale: n, threads: wthreads,
+                    scale: n,
+                    threads: wthreads,
                     elapsed_ms: conc.elapsed_ms,
-                    ns_per_op: if total_ops > 0 { conc.elapsed_ms * 1_000_000.0 / total_ops as f64 } else { 0.0 },
+                    ns_per_op: if total_ops > 0 {
+                        conc.elapsed_ms * 1_000_000.0 / total_ops as f64
+                    } else {
+                        0.0
+                    },
                     ops_per_sec: conc.ops_per_sec,
                     cpu_ms: cpu1.saturating_sub(cpu0),
                     rss_delta_kb: 0,
                     read_kb: io1.0.saturating_sub(io0.0) / 1024,
                     write_kb: io1.1.saturating_sub(io0.1) / 1024,
                     disk_kb,
-                    disk_bytes_per_op: if total_ops > 0 { (disk_kb * 1024) as f64 / total_ops as f64 } else { 0.0 },
+                    disk_bytes_per_op: if total_ops > 0 {
+                        (disk_kb * 1024) as f64 / total_ops as f64
+                    } else {
+                        0.0
+                    },
                     fsync_count: env.stat_fsync_count().saturating_sub(fsync0),
                 };
                 print_progress(&r);
                 results.push(r);
-                drop(db); drop(env);
+                drop(db);
+                drop(env);
             }
         }
 
@@ -558,12 +675,14 @@ fn main() {
             {
                 let (env_pre, db_pre) = open_db(dir.path());
                 populate(&db_pre, n, &value_bytes);
-                drop(db_pre); drop(env_pre);
+                drop(db_pre);
+                drop(env_pre);
             }
             // Time only the re-open; env is closed before and after — no file-lock conflict.
             let r = run_timed("w11_recovery", n, 1, dir.path(), None, || {
                 let (env2, db2) = open_db(dir.path());
-                drop(db2); drop(env2);
+                drop(db2);
+                drop(env2);
                 1
             });
             print_progress(&r);
@@ -577,12 +696,18 @@ fn main() {
 
             // W12a: full 2PC (start → end → prepare → commit)
             {
-                let dir = new_bench_dir(&bench_base, "bench_xa_2pc", n, cleanup);
+                let dir =
+                    new_bench_dir(&bench_base, "bench_xa_2pc", n, cleanup);
                 let (env, db) = open_db(dir.path());
                 let xa = XaEnvironment::new(env);
-                let r = run_timed("w12_xa_2pc", xa_n, 1, dir.path(), Some(xa.inner()), || {
-                    workloads::w12_xa_2pc(&xa, &db, xa_n, &value_bytes)
-                });
+                let r = run_timed(
+                    "w12_xa_2pc",
+                    xa_n,
+                    1,
+                    dir.path(),
+                    Some(xa.inner()),
+                    || workloads::w12_xa_2pc(&xa, &db, xa_n, &value_bytes),
+                );
                 print_progress(&r);
                 results.push(r);
                 drop(db);
@@ -590,12 +715,18 @@ fn main() {
 
             // W12b: single-phase commit (ONEPHASE optimization)
             {
-                let dir = new_bench_dir(&bench_base, "bench_xa_1pc", n, cleanup);
+                let dir =
+                    new_bench_dir(&bench_base, "bench_xa_1pc", n, cleanup);
                 let (env, db) = open_db(dir.path());
                 let xa = XaEnvironment::new(env);
-                let r = run_timed("w12_xa_1pc", xa_n, 1, dir.path(), Some(xa.inner()), || {
-                    workloads::w12_xa_1pc(&xa, &db, xa_n, &value_bytes)
-                });
+                let r = run_timed(
+                    "w12_xa_1pc",
+                    xa_n,
+                    1,
+                    dir.path(),
+                    Some(xa.inner()),
+                    || workloads::w12_xa_1pc(&xa, &db, xa_n, &value_bytes),
+                );
                 print_progress(&r);
                 results.push(r);
                 drop(db);
@@ -603,15 +734,22 @@ fn main() {
 
             // W12c: plain txn baseline (for comparison)
             {
-                let dir = new_bench_dir(&bench_base, "bench_xa_baseline", n, cleanup);
+                let dir =
+                    new_bench_dir(&bench_base, "bench_xa_baseline", n, cleanup);
                 let (env, db) = open_db(dir.path());
                 populate(&db, xa_n, &value_bytes);
-                let r = run_timed("w12_plain_txn", xa_n, 1, dir.path(), Some(&env), || {
-                    workloads::w09_txn_multi(&env, &db, xa_n, &value_bytes)
-                });
+                let r = run_timed(
+                    "w12_plain_txn",
+                    xa_n,
+                    1,
+                    dir.path(),
+                    Some(&env),
+                    || workloads::w09_txn_multi(&env, &db, xa_n, &value_bytes),
+                );
                 print_progress(&r);
                 results.push(r);
-                drop(db); drop(env);
+                drop(db);
+                drop(env);
             }
         }
     }
@@ -619,9 +757,19 @@ fn main() {
     // ── Print table ───────────────────────────────────────────────────────────
     let hdr = format!(
         "{:<26} {:>8} {:>7} {:>10} {:>12} {:>12} {:>8} {:>9} {:>8} {:>8} {:>8} {:>9} {:>8}",
-        "Workload", "Scale", "Threads", "Time(ms)",
-        "ns/op", "ops/sec", "CPU(ms)", "RSS_d(KB)",
-        "rIO(KB)", "wIO(KB)", "Disk(KB)", "B/op", "Fsyncs"
+        "Workload",
+        "Scale",
+        "Threads",
+        "Time(ms)",
+        "ns/op",
+        "ops/sec",
+        "CPU(ms)",
+        "RSS_d(KB)",
+        "rIO(KB)",
+        "wIO(KB)",
+        "Disk(KB)",
+        "B/op",
+        "Fsyncs"
     );
     println!("\n{}", "=".repeat(hdr.len()));
     println!("{hdr}");
@@ -629,11 +777,19 @@ fn main() {
     for r in &results {
         println!(
             "{:<26} {:>8} {:>7} {:>10.1} {:>12.0} {:>12.0} {:>8} {:>9} {:>8} {:>8} {:>8} {:>9.1} {:>8}",
-            r.workload, r.scale, r.threads,
-            r.elapsed_ms, r.ns_per_op, r.ops_per_sec,
-            r.cpu_ms, r.rss_delta_kb,
-            r.read_kb, r.write_kb, r.disk_kb,
-            r.disk_bytes_per_op, r.fsync_count
+            r.workload,
+            r.scale,
+            r.threads,
+            r.elapsed_ms,
+            r.ns_per_op,
+            r.ops_per_sec,
+            r.cpu_ms,
+            r.rss_delta_kb,
+            r.read_kb,
+            r.write_kb,
+            r.disk_kb,
+            r.disk_bytes_per_op,
+            r.fsync_count
         );
     }
     println!("{}", "=".repeat(hdr.len()));
@@ -652,11 +808,19 @@ fn main() {
         writeln!(
             f,
             "noxu,{},{},{},{:.3},{:.1},{:.0},{},{},{},{},{},{:.2},{}",
-            r.workload, r.scale, r.threads,
-            r.elapsed_ms, r.ns_per_op, r.ops_per_sec,
-            r.cpu_ms, r.rss_delta_kb,
-            r.read_kb, r.write_kb, r.disk_kb,
-            r.disk_bytes_per_op, r.fsync_count
+            r.workload,
+            r.scale,
+            r.threads,
+            r.elapsed_ms,
+            r.ns_per_op,
+            r.ops_per_sec,
+            r.cpu_ms,
+            r.rss_delta_kb,
+            r.read_kb,
+            r.write_kb,
+            r.disk_kb,
+            r.disk_bytes_per_op,
+            r.fsync_count
         )
         .unwrap();
     }

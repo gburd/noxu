@@ -30,8 +30,8 @@
 //! threshold and always returns the best file.
 
 use crate::file_summary::FileSummary;
-use std::collections::{BTreeMap, VecDeque};
 use hashbrown::{HashMap, HashSet};
+use std::collections::{BTreeMap, VecDeque};
 
 /// Status of a file in the cleaning pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,12 +83,12 @@ pub struct FileSelector {
     /// raises this threshold and sets `force_cleaning=true` to force a second pass
     /// targeting lower-utilization files.
     ///
-    /// 
+    ///
     required_util: Option<i32>,
     /// Two-pass cleaning: if true, bypass normal utilization threshold and
     /// always select the best candidate file.
     ///
-    /// 
+    ///
     force_cleaning: bool,
 }
 
@@ -113,8 +113,12 @@ impl FileSelector {
     /// above `target_util`, raises `required_util` by the gap and enables
     /// `force_cleaning` for the next pass.
     ///
-    /// 
-    pub fn check_for_required_util(&mut self, actual_util: i32, target_util: i32) {
+    ///
+    pub fn check_for_required_util(
+        &mut self,
+        actual_util: i32,
+        target_util: i32,
+    ) {
         if actual_util > target_util {
             // Raise the threshold by the shortfall, capped at 100.
             let gap = actual_util - target_util;
@@ -129,7 +133,7 @@ impl FileSelector {
 
     /// Returns the current required utilization threshold (`None` if none set).
     ///
-    /// 
+    ///
     pub fn required_util(&self) -> Option<i32> {
         self.required_util
     }
@@ -217,7 +221,8 @@ impl FileSelector {
         let last_file_to_clean = newest_file.saturating_sub(min_age);
 
         // Collect all in-progress file numbers (not eligible for re-selection).
-        let in_progress: HashSet<u32> = self.file_info.keys().copied().collect();
+        let in_progress: HashSet<u32> =
+            self.file_info.keys().copied().collect();
 
         // Step 2 — find the file with lowest TTL-adjusted utilization.
         // `UtilizationCalculator.getBestFile()`: rank by
@@ -254,12 +259,16 @@ impl FileSelector {
             // FileSelector picks files below requiredUtil when
             // forceCleaning is active.
             let effective_threshold = if self.force_cleaning {
-                self.required_util.unwrap_or(min_utilization_pct as i32)
+                self.required_util
+                    .unwrap_or(min_utilization_pct as i32)
                     .min(min_utilization_pct as i32)
             } else {
                 min_utilization_pct as i32
             };
-            if !force_cleaning && !self.force_cleaning && avg_util >= effective_threshold {
+            if !force_cleaning
+                && !self.force_cleaning
+                && avg_util >= effective_threshold
+            {
                 continue;
             }
 
@@ -283,7 +292,7 @@ impl FileSelector {
 
     /// Returns the raw (non-TTL-adjusted) utilization as an integer percentage 0–100.
     ///
-    /// 
+    ///
     /// A file at 100% utilization has no obsolete bytes; 0% means all bytes
     /// are obsolete.
     pub fn utilization_pct(summary: &FileSummary) -> i32 {
@@ -312,7 +321,8 @@ impl FileSelector {
             return 0;
         }
         let adjusted = summary.get_adjusted_active_size();
-        ((adjusted as i64 * 100) / summary.total_size as i64).clamp(0, 100) as i32
+        ((adjusted as i64 * 100) / summary.total_size as i64).clamp(0, 100)
+            as i32
     }
 
     /// Adds a file to the cleaning queue.
@@ -752,8 +762,7 @@ mod tests {
 
         let mut selector = FileSelector::new();
         let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            60, // min_utilization_pct
+            &profile, 60, // min_utilization_pct
             1,  // min_age
             false,
         );
@@ -771,12 +780,8 @@ mod tests {
 
         let mut selector = FileSelector::new();
         // Threshold 50% — no file is below 50%.
-        let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            50,
-            0,
-            false,
-        );
+        let result = selector
+            .select_file_for_cleaning_with_profile(&profile, 50, 0, false);
 
         assert_eq!(result, None);
     }
@@ -796,10 +801,7 @@ mod tests {
         // file 1 has 100 obsolete / 1000 total → active = 900 → util = 90%.
         // Lower util = file 2 (80%) wins.
         let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            50,
-            0,
-            true, // force
+            &profile, 50, 0, true, // force
         );
 
         assert_eq!(result.map(|(f, _)| f), Some(2));
@@ -820,9 +822,7 @@ mod tests {
 
         let mut selector = FileSelector::new();
         let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            60,
-            2, // min_age
+            &profile, 60, 2, // min_age
             false,
         );
 
@@ -844,18 +844,11 @@ mod tests {
         selector.being_cleaned.insert(1);
         selector.file_info.insert(
             1,
-            FileInfo {
-                status: FileStatus::BeingCleaned,
-                required_util: None,
-            },
+            FileInfo { status: FileStatus::BeingCleaned, required_util: None },
         );
 
-        let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            60,
-            1,
-            false,
-        );
+        let result = selector
+            .select_file_for_cleaning_with_profile(&profile, 60, 1, false);
 
         assert_eq!(result.map(|(f, _)| f), Some(2));
     }
@@ -865,12 +858,8 @@ mod tests {
         let profile: BTreeMap<u32, FileSummary> = BTreeMap::new();
 
         let mut selector = FileSelector::new();
-        let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            50,
-            0,
-            false,
-        );
+        let result = selector
+            .select_file_for_cleaning_with_profile(&profile, 50, 0, false);
 
         assert_eq!(result, None);
     }
@@ -881,12 +870,8 @@ mod tests {
         let profile = make_profile(&[(1, 1000, 800)]); // 20% util
 
         let mut selector = FileSelector::new();
-        let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            50,
-            0,
-            false,
-        );
+        let result = selector
+            .select_file_for_cleaning_with_profile(&profile, 50, 0, false);
 
         assert_eq!(result.map(|(f, _)| f), Some(1));
     }
@@ -896,12 +881,8 @@ mod tests {
         let profile = make_profile(&[(1, 1000, 800), (2, 1000, 100)]);
 
         let mut selector = FileSelector::new();
-        let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            50,
-            0,
-            false,
-        );
+        let result = selector
+            .select_file_for_cleaning_with_profile(&profile, 50, 0, false);
 
         assert!(result.is_some());
         let (file_num, _) = result.unwrap();
@@ -923,12 +904,8 @@ mod tests {
         // Manually queue file 2.
         selector.add_file_to_clean(2);
 
-        let result = selector.select_file_for_cleaning_with_profile(
-            &profile,
-            60,
-            0,
-            false,
-        );
+        let result = selector
+            .select_file_for_cleaning_with_profile(&profile, 60, 0, false);
 
         // Should return file 2 (the queued file), not file 1 (best by score).
         assert_eq!(result.map(|(f, _)| f), Some(2));
@@ -1028,41 +1005,51 @@ mod tests {
         // File 2: 30% raw util, no expired records → adj = 30%
         // File 3: newest — skipped by age filter (min_age=1)
         let mut map = BTreeMap::new();
-        map.insert(1u32, FileSummary {
-            total_count: 10,
-            total_size: 1000,
-            total_ln_count: 10,
-            total_ln_size: 1000,
-            obsolete_ln_count: 7,
-            obsolete_ln_size: 700,
-            obsolete_ln_size_counted: 7,
-            obsolete_expired_lns: 2,
-            obsolete_expired_size: 200,
-            ..Default::default()
-        });
-        map.insert(2u32, FileSummary {
-            total_count: 10,
-            total_size: 1000,
-            total_ln_count: 10,
-            total_ln_size: 1000,
-            obsolete_ln_count: 7,
-            obsolete_ln_size: 700,
-            obsolete_ln_size_counted: 7,
-            obsolete_expired_lns: 0,
-            obsolete_expired_size: 0,
-            ..Default::default()
-        });
-        map.insert(3u32, FileSummary {
-            total_count: 1,
-            total_size: 100,
-            total_ln_count: 1,
-            total_ln_size: 100,
-            ..Default::default()
-        });
+        map.insert(
+            1u32,
+            FileSummary {
+                total_count: 10,
+                total_size: 1000,
+                total_ln_count: 10,
+                total_ln_size: 1000,
+                obsolete_ln_count: 7,
+                obsolete_ln_size: 700,
+                obsolete_ln_size_counted: 7,
+                obsolete_expired_lns: 2,
+                obsolete_expired_size: 200,
+                ..Default::default()
+            },
+        );
+        map.insert(
+            2u32,
+            FileSummary {
+                total_count: 10,
+                total_size: 1000,
+                total_ln_count: 10,
+                total_ln_size: 1000,
+                obsolete_ln_count: 7,
+                obsolete_ln_size: 700,
+                obsolete_ln_size_counted: 7,
+                obsolete_expired_lns: 0,
+                obsolete_expired_size: 0,
+                ..Default::default()
+            },
+        );
+        map.insert(
+            3u32,
+            FileSummary {
+                total_count: 1,
+                total_size: 100,
+                total_ln_count: 1,
+                total_ln_size: 100,
+                ..Default::default()
+            },
+        );
 
         let mut selector = FileSelector::new();
         // threshold 50% → both files qualify (both adj < 50%); file 1 wins (10% < 30%)
-        let result = selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
+        let result =
+            selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
         assert_eq!(
             result.map(|(f, _)| f),
             Some(1),
@@ -1081,7 +1068,10 @@ mod tests {
 
         // First pass: actual utilization 70%, target 50% — goal not met.
         selector.check_for_required_util(70, 50);
-        assert!(selector.is_force_cleaning(), "force_cleaning must be set after shortfall");
+        assert!(
+            selector.is_force_cleaning(),
+            "force_cleaning must be set after shortfall"
+        );
         assert!(
             selector.required_util().is_some(),
             "required_util must be set after shortfall"
@@ -1099,36 +1089,47 @@ mod tests {
         // File 1: 75% util (above normal threshold of 50%).
         // File 2 (newest): skipped by age filter.
         let mut map = BTreeMap::new();
-        map.insert(1u32, FileSummary {
-            total_count: 10,
-            total_size: 1000,
-            total_ln_count: 10,
-            total_ln_size: 1000,
-            obsolete_ln_count: 2,
-            obsolete_ln_size: 250,
-            obsolete_ln_size_counted: 2,
-            ..Default::default()
-        });
-        map.insert(2u32, FileSummary {
-            total_count: 1,
-            total_size: 100,
-            total_ln_count: 1,
-            total_ln_size: 100,
-            ..Default::default()
-        });
+        map.insert(
+            1u32,
+            FileSummary {
+                total_count: 10,
+                total_size: 1000,
+                total_ln_count: 10,
+                total_ln_size: 1000,
+                obsolete_ln_count: 2,
+                obsolete_ln_size: 250,
+                obsolete_ln_size_counted: 2,
+                ..Default::default()
+            },
+        );
+        map.insert(
+            2u32,
+            FileSummary {
+                total_count: 1,
+                total_size: 100,
+                total_ln_count: 1,
+                total_ln_size: 100,
+                ..Default::default()
+            },
+        );
 
         let mut selector = FileSelector::new();
 
         // Normal first pass: file 1 at 75% util is above the 50% threshold.
-        let no_result = selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
-        assert_eq!(no_result, None, "file at 75% util should not qualify in first pass");
+        let no_result =
+            selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
+        assert_eq!(
+            no_result, None,
+            "file at 75% util should not qualify in first pass"
+        );
 
         // First pass fell short; trigger second-pass mode.
         selector.check_for_required_util(75, 50);
         assert!(selector.is_force_cleaning());
 
         // Second pass: force_cleaning active — file 1 should now be selected.
-        let result = selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
+        let result =
+            selector.select_file_for_cleaning_with_profile(&map, 50, 1, false);
         assert_eq!(
             result.map(|(f, _)| f),
             Some(1),
@@ -1147,7 +1148,14 @@ mod tests {
 
         // Next pass meets the target: clear force_cleaning.
         selector.check_for_required_util(45, 50);
-        assert!(!selector.is_force_cleaning(), "force_cleaning should clear when target is met");
-        assert_eq!(selector.required_util(), None, "required_util should be None when target is met");
+        assert!(
+            !selector.is_force_cleaning(),
+            "force_cleaning should clear when target is met"
+        );
+        assert_eq!(
+            selector.required_util(),
+            None,
+            "required_util should be None when target is met"
+        );
     }
 }

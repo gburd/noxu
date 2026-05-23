@@ -19,7 +19,7 @@ use super::vlsn_range::VlsnRange;
 /// VLSN-to-LSN mappings. New buckets are created automatically when a
 /// VLSN falls outside the range of the current (last) bucket.
 ///
-/// 
+///
 pub struct VlsnIndex {
     /// The overall range of VLSNs tracked by this index.
     range: RwLock<VlsnRange>,
@@ -127,7 +127,7 @@ impl VlsnIndex {
     /// Removes all buckets whose first VLSN is greater than the truncation
     /// point, and truncates the range accordingly.
     ///
-    /// 
+    ///
     pub fn truncate_after(&self, vlsn: u64) {
         let mut buckets = self.buckets.write();
         let mut range = self.range.write();
@@ -335,11 +335,12 @@ mod tests {
 
     /// Helper: build expected (vlsn → (file, offset)) from a slice of vlsn
     /// values. All use the same file_num and base offset.
-    fn make_expected(vlsns: &[u64], file_num: u32, offset: u32) -> Vec<(u64, u32, u32)> {
-        vlsns
-            .iter()
-            .map(|&v| (v, file_num, v as u32 * offset))
-            .collect()
+    fn make_expected(
+        vlsns: &[u64],
+        file_num: u32,
+        offset: u32,
+    ) -> Vec<(u64, u32, u32)> {
+        vlsns.iter().map(|&v| (v, file_num, v as u32 * offset)).collect()
     }
 
     ///
@@ -587,13 +588,10 @@ mod tests {
 
         // Expected stride-boundary mappings (from the Java test):
         //   1, 4, 7, 10, 11, 13, 16, 19, 22, 23, 25, 28, 30
-        let expected_vlsns: &[u64] = &[1, 4, 7, 10, 11, 13, 16, 19, 22, 23, 25, 28, 30];
+        let expected_vlsns: &[u64] =
+            &[1, 4, 7, 10, 11, 13, 16, 19, 22, 23, 25, 28, 30];
         for &v in expected_vlsns {
-            assert!(
-                index.get_lsn(v).is_some(),
-                "expected Some for vlsn {}",
-                v
-            );
+            assert!(index.get_lsn(v).is_some(), "expected Some for vlsn {}", v);
         }
 
         // Hole vlsns should also return Some via LTE fall-back
@@ -631,13 +629,10 @@ mod tests {
 
         // Stride-boundary mappings expected:
         //   1, 6, 11, 16, 17, 21, 26, 31, 36, 37, 41, 46, 50
-        let expected_vlsns: &[u64] = &[1, 6, 11, 16, 17, 21, 26, 31, 36, 37, 41, 46, 50];
+        let expected_vlsns: &[u64] =
+            &[1, 6, 11, 16, 17, 21, 26, 31, 36, 37, 41, 46, 50];
         for &v in expected_vlsns {
-            assert!(
-                index.get_lsn(v).is_some(),
-                "expected Some for vlsn {}",
-                v
-            );
+            assert!(index.get_lsn(v).is_some(), "expected Some for vlsn {}", v);
         }
     }
 
@@ -704,7 +699,10 @@ mod tests {
 
         // vlsn 22 is still in the range and must still be found.
         let lsn_after = index.get_lsn(22);
-        assert!(lsn_after.is_some(), "vlsn 22 must still be findable after batch 2");
+        assert!(
+            lsn_after.is_some(),
+            "vlsn 22 must still be findable after batch 2"
+        );
 
         // The lsn for vlsn 22 did not change.
         assert_eq!(lsn_for_22, lsn_after);
@@ -759,15 +757,15 @@ mod tests {
         // After truncation the invariants must still hold.
         index.truncate_after(18);
         let range = index.get_range();
-        assert!(range.get_first() <= range.get_last(), "first <= last after truncate");
+        assert!(
+            range.get_first() <= range.get_last(),
+            "first <= last after truncate"
+        );
         assert!(
             range.get_commit_vlsn() <= range.get_last(),
             "commit vlsn clamped"
         );
-        assert!(
-            range.get_sync_vlsn() <= range.get_last(),
-            "sync vlsn clamped"
-        );
+        assert!(range.get_sync_vlsn() <= range.get_last(), "sync vlsn clamped");
     }
 
     /// Verify that inserting the same vlsn twice

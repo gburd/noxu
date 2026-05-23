@@ -14,7 +14,10 @@
 //! Many tests use `no_wait = true` to turn lock conflicts into immediate errors
 //! rather than blocking indefinitely, keeping the tests deterministic.
 
-use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus, TransactionConfig};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
+    TransactionConfig,
+};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -35,7 +38,12 @@ fn setup() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
     (dir, env, db)
 }
 
-fn put_committed(env: &noxu_db::Environment, db: &noxu_db::Database, key: &[u8], val: &[u8]) {
+fn put_committed(
+    env: &noxu_db::Environment,
+    db: &noxu_db::Database,
+    key: &[u8],
+    val: &[u8],
+) {
     let txn = env.begin_transaction(None, None).unwrap();
     let k = DatabaseEntry::from_bytes(key);
     let v = DatabaseEntry::from_bytes(val);
@@ -109,8 +117,15 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     drop(reader_txn);
     let txn2 = env.begin_transaction(None, Some(&rc_config)).unwrap();
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&txn2), b"key", &mut out2), OperationStatus::Success);
-    assert_eq!(out2.data(), b"v2", "committed write must be visible after commit");
+    assert_eq!(
+        get_val(&db, Some(&txn2), b"key", &mut out2),
+        OperationStatus::Success
+    );
+    assert_eq!(
+        out2.data(),
+        b"v2",
+        "committed write must be visible after commit"
+    );
     txn2.commit().unwrap();
 
     // Suppress unused status warning — the real assertions are above.
@@ -132,12 +147,16 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     // Serializable reader acquires and holds a read lock on "k".
     let ser_txn = env.begin_transaction(None, None).unwrap(); // serializable by default
     let mut out = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&ser_txn), b"k", &mut out), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, Some(&ser_txn), b"k", &mut out),
+        OperationStatus::Success
+    );
     assert_eq!(out.data(), b"v1");
 
     // Concurrent writer with no_wait tries to write "k" — must conflict.
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let writer_txn = env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let writer_txn =
+        env.begin_transaction(None, Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     let write_result = db.put(Some(&writer_txn), &k, &v2);
@@ -151,7 +170,8 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     // Once the serializable reader commits, a new writer can succeed.
     ser_txn.commit().unwrap();
 
-    let writer_txn2 = env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let writer_txn2 =
+        env.begin_transaction(None, Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert_eq!(
@@ -178,13 +198,17 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
     let rc_config = TransactionConfig::read_committed();
     let reader_txn = env.begin_transaction(None, Some(&rc_config)).unwrap();
     let mut out = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&reader_txn), b"k", &mut out), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, Some(&reader_txn), b"k", &mut out),
+        OperationStatus::Success
+    );
     assert_eq!(out.data(), b"v1");
 
     // After the read operation the lock is released, so a no_wait writer
     // must succeed (no lock conflict).
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let writer_txn = env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let writer_txn =
+        env.begin_transaction(None, Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert_eq!(
@@ -268,7 +292,10 @@ fn test_read_committed_allows_non_repeatable_read() {
 
     // First read: sees v1.
     let mut out = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&reader), b"nr", &mut out), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, Some(&reader), b"nr", &mut out),
+        OperationStatus::Success
+    );
     assert_eq!(out.data(), b"v1");
 
     // Another transaction commits v2.
@@ -277,7 +304,10 @@ fn test_read_committed_allows_non_repeatable_read() {
     // Second read within the same read-committed transaction: must see v2
     // because the read lock was released after the first operation.
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&reader), b"nr", &mut out2), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, Some(&reader), b"nr", &mut out2),
+        OperationStatus::Success
+    );
     assert_eq!(
         out2.data(),
         b"v2",
@@ -304,7 +334,10 @@ fn test_serializable_prevents_non_repeatable_read() {
 
     // First read: sees v1, acquires read lock.
     let mut out = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&ser_txn), b"rr", &mut out), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, Some(&ser_txn), b"rr", &mut out),
+        OperationStatus::Success
+    );
     assert_eq!(out.data(), b"v1");
 
     // Another writer tries to commit v2 with no_wait — must fail (read lock held).
@@ -320,7 +353,10 @@ fn test_serializable_prevents_non_repeatable_read() {
 
     // Second read within the serializable transaction: still sees v1.
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(get_val(&db, Some(&ser_txn), b"rr", &mut out2), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, Some(&ser_txn), b"rr", &mut out2),
+        OperationStatus::Success
+    );
     assert_eq!(
         out2.data(),
         b"v1",
@@ -356,7 +392,9 @@ fn test_atomic_commit_all_or_nothing_visibility() {
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut v = DatabaseEntry::new();
-        if db.get(Some(&read_txn), &k, &mut v).unwrap() != OperationStatus::Success {
+        if db.get(Some(&read_txn), &k, &mut v).unwrap()
+            != OperationStatus::Success
+        {
             missing += 1;
         }
     }
@@ -390,7 +428,10 @@ fn test_aborted_transaction_full_rollback() {
 
     // Existing key must revert to "original".
     let mut out = DatabaseEntry::new();
-    assert_eq!(get_val(&db, None, b"existing", &mut out), OperationStatus::Success);
+    assert_eq!(
+        get_val(&db, None, b"existing", &mut out),
+        OperationStatus::Success
+    );
     assert_eq!(out.data(), b"original", "abort must restore before-image");
 
     // New key must not exist.
@@ -409,14 +450,14 @@ fn scratch_dir(prefix: &str) -> TempDir {
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix);
     match std::env::var_os("NOXU_TEST_SCRATCH") {
-        Some(p) => builder
-            .tempdir_in(std::path::Path::new(&p))
-            .unwrap_or_else(|e| {
+        Some(p) => {
+            builder.tempdir_in(std::path::Path::new(&p)).unwrap_or_else(|e| {
                 panic!(
                     "create temp dir under NOXU_TEST_SCRATCH={}: {e}",
                     std::path::Path::new(&p).display()
                 )
-            }),
+            })
+        }
         None => builder.tempdir().expect("create temp dir"),
     }
 }
@@ -603,8 +644,12 @@ fn test_64_thread_concurrent_readers() {
         .with_transactional(true);
     let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
     let db = Arc::new(
-        env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
-            .unwrap(),
+        env.open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap(),
     );
 
     // Pre-populate KEYS records.
@@ -638,7 +683,9 @@ fn test_64_thread_concurrent_readers() {
                         let idx = (tid as u32 * LOOKUPS_PER_TXN + j) % KEYS;
                         let k = DatabaseEntry::from_bytes(&idx.to_be_bytes());
                         let mut v = DatabaseEntry::new();
-                        if db.get(Some(&txn), &k, &mut v).unwrap() != OperationStatus::Success {
+                        if db.get(Some(&txn), &k, &mut v).unwrap()
+                            != OperationStatus::Success
+                        {
                             errors += 1;
                         }
                     }
@@ -655,9 +702,12 @@ fn test_64_thread_concurrent_readers() {
         .sum();
 
     let elapsed = start.get().map(|t| t.elapsed()).unwrap_or_default();
-    let total_ops = THREADS as u64 * TXNS_PER_THREAD as u64 * LOOKUPS_PER_TXN as u64;
+    let total_ops =
+        THREADS as u64 * TXNS_PER_THREAD as u64 * LOOKUPS_PER_TXN as u64;
     let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
-    println!("64-thread readers: {total_ops} lookups in {elapsed:?} ({ops_per_sec:.0} ops/s)");
+    println!(
+        "64-thread readers: {total_ops} lookups in {elapsed:?} ({ops_per_sec:.0} ops/s)"
+    );
 
     assert_eq!(
         total_errors, 0,
@@ -687,8 +737,12 @@ fn test_32r32w_concurrent() {
         .with_transactional(true);
     let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
     let db = Arc::new(
-        env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
-            .unwrap(),
+        env.open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap(),
     );
 
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -727,7 +781,8 @@ fn test_32r32w_concurrent() {
                     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
                     let mut k = DatabaseEntry::new();
                     let mut v = DatabaseEntry::new();
-                    let _ = cursor.get(&mut k, &mut v, noxu_db::Get::First, None);
+                    let _ =
+                        cursor.get(&mut k, &mut v, noxu_db::Get::First, None);
                     while cursor
                         .get(&mut k, &mut v, noxu_db::Get::Next, None)
                         .unwrap()
@@ -795,8 +850,12 @@ fn test_200_thread_disjoint_writers() {
         .with_transactional(true);
     let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
     let db = Arc::new(
-        env.open_database(None, "test", &DatabaseConfig::new().with_allow_create(true))
-            .unwrap(),
+        env.open_database(
+            None,
+            "test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap(),
     );
 
     let barrier = Arc::new(Barrier::new(THREADS));
@@ -861,11 +920,16 @@ fn test_200_thread_disjoint_writers() {
     let mut checked = 0u32;
     let mut op = noxu_db::Get::First;
     loop {
-        if cursor.get(&mut k, &mut v, op, None).unwrap() != OperationStatus::Success {
+        if cursor.get(&mut k, &mut v, op, None).unwrap()
+            != OperationStatus::Success
+        {
             break;
         }
-        let cur = String::from_utf8_lossy(k.get_data().unwrap_or_default()).into_owned();
-        if let Some(ref p) = prev && cur < *p {
+        let cur = String::from_utf8_lossy(k.get_data().unwrap_or_default())
+            .into_owned();
+        if let Some(ref p) = prev
+            && cur < *p
+        {
             order_errors += 1;
         }
         prev = Some(cur);
