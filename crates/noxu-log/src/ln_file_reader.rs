@@ -34,7 +34,7 @@ enum CurrentEntry {
 /// 
 ///
 /// The reader maintains a set of *target* `LogEntryType` values registered via
-/// [`add_target_type`].  Each call to [`read_next_entry`] advances to the next
+/// `add_target_type`.  Each call to `read_next_entry` advances to the next
 /// log entry that matches one of those types and parses it.  Accessor methods
 /// then expose the fields of the parsed entry.
 pub struct LNFileReader<F: LogFileAccess> {

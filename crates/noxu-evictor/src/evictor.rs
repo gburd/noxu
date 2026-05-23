@@ -163,8 +163,8 @@ pub struct Evictor {
 impl Evictor {
     /// Create a new Evictor with LRU as both primary and scan policy.
     ///
-    /// Use the builder methods [`with_algorithm`], [`with_scan_algorithm`],
-    /// [`with_log_manager`], and [`with_tree`] to configure further.
+    /// Use the builder methods `with_algorithm`, `with_scan_algorithm`,
+    /// `with_log_manager`, and `with_tree` to configure further.
     pub fn new(arbiter: Arbiter, max_batch_size: usize, lru_only: bool) -> Self {
         let primary = EvictionAlgorithm::Lru.new_policy();
         let scan    = EvictionAlgorithm::Lru.new_policy();
@@ -319,7 +319,7 @@ impl Evictor {
     ///
     /// Called when a clean node becomes dirty — the node waits in pri2 until
     /// the checkpointer logs it, after which
-    /// [`complete_checkpoint_for_node`] moves it back to primary.
+    /// `complete_checkpoint_for_node` moves it back to primary.
     pub fn move_to_pri2(&self, node_id: u64) -> bool {
         let removed = self.primary_policy.remove(node_id) || self.scan_policy.remove(node_id);
         if removed {

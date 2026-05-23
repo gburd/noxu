@@ -5,7 +5,7 @@
 //!
 //! Record extinction is an optimized deletion mechanism for large sets of
 //! records that are known to be permanently unused. Instead of logging a
-//! delete entry per record, a single [`Environment::discard_extinct_records`]
+//! delete entry per record, a single `Environment::discard_extinct_records`
 //! call logs one entry covering the entire key range, and the cleaner
 //! asynchronously removes the records and reclaims disk space.
 //!
@@ -44,7 +44,7 @@ pub enum ExtinctionStatus {
 /// 
 ///
 /// Implement this trait and register it with `EnvironmentConfig` before
-/// calling [`crate::Environment::discard_extinct_records`].
+/// calling `crate::Environment::discard_extinct_records`.
 ///
 /// # Requirements
 ///
