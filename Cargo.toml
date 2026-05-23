@@ -144,7 +144,7 @@ metrics = "0.24"
 hashbrown = "0.15"
 lock_api = "0.4"
 libc = "0.2"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 thiserror = "2"
 log = "0.4"
 bytes = "1"

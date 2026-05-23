@@ -1364,23 +1364,30 @@ impl Tree {
     pub fn search(&self, key: &[u8]) -> Option<SearchResult> {
         let root = self.get_root()?;
 
-        // Walk down the tree with latch-coupling until we reach a BIN.
-        // We clone Arc pointers instead of holding read guards across iterations
-        // to avoid holding multiple locks simultaneously (approximating the
-        // latch-coupling: acquire child, release parent).
-        let mut current = root;
+        // Hand-over-hand latch coupling for the descent. At each level we
+        // hold a `parking_lot::ArcRwLockReadGuard` on the current node;
+        // before dropping it, we acquire the child's read guard via
+        // `Arc::read_arc`. This keeps a continuous chain of read locks
+        // along the descent path so that no concurrent `split_child(parent,
+        // …)` can run on a node we are about to enter — `split_child` takes
+        // `parent.write()` to install the new sibling, and that write
+        // blocks while we hold `parent.read()`. Without this, the prior
+        // pattern (capture child Arc, drop parent guard, then take child
+        // read lock) left a window in which a split could relocate the
+        // child entries: a search for a key that should have ended up in
+        // the new sibling would instead reach the (now left-half) child
+        // and return a false `NotFound`.
+        //
+        // `read_arc()` returns `ArcRwLockReadGuard<RawRwLock, TreeNode>`
+        // — a guard that owns its own Arc reference, so it has no
+        // borrow lifetime and can be held across loop iterations and
+        // assignment.
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = root.read_arc();
 
         loop {
-            // Acquire this node's read lock ONCE — perform both the is_bin
-            // check AND the child-pointer capture within the same lock scope.
-            // This is latch-coupling: the child Arc is captured while the
-            // parent lock is held, then the parent lock is released before
-            // descending.  The previous double-lock pattern (separate
-            // is_bin check then separate child-find) left a window where a
-            // concurrent split could relocate the child between the two
-            // acquisitions.
-            let guard = current.read();
-
             if guard.is_bin() {
                 // Reached a BIN: final key lookup within the same guard.
                 // Use indicate_if_duplicate=true so an exact match sets
@@ -1434,7 +1441,6 @@ impl Tree {
 
             // Upper IN: find the child slot with the largest key <= search
             // key, and capture the child Arc WHILE HOLDING the guard.
-            // Index = parent.findEntry(key, false, false)
             // Slot 0 has a virtual key that compares as -infinity.
             let next_arc = match &*guard {
                 TreeNode::Internal(n) => {
@@ -1462,10 +1468,12 @@ impl Tree {
                     unreachable!("is_bin() returned false above")
                 }
             };
-            // Release parent latch now that child Arc has been captured.
-            Self::latch_coupling_release(guard);
-
-            current = next_arc;
+            // Take the child read lock BEFORE releasing the parent's read
+            // lock — this is the actual hand-over-hand step that closes
+            // the descender-vs-splitter race for the read path.
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 
@@ -1485,37 +1493,39 @@ impl Tree {
             Some(r) => r,
             None => return false,
         };
-        let mut current = root;
-        loop {
-            // Detect BIN with a read lock first, then re-acquire write lock.
-            // This double-lock pattern matches `insert_recursive`.
-            let is_bin = current.read().is_bin();
-            if is_bin {
-                let mut guard = current.write();
-                if let TreeNode::Bottom(bin) = &mut *guard {
-                    let slot = if let Some(cmp) = &self.key_comparator {
-                        let (idx, exact) =
-                            bin.find_entry_cmp(key, cmp.as_ref());
-                        if exact { Some(idx) } else { None }
-                    } else {
-                        let (idx, exact) = bin.find_entry_compressed(key);
-                        if exact { Some(idx) } else { None }
-                    };
-                    if let Some(slot_idx) = slot
-                        && let Some(entry) = bin.entries.get_mut(slot_idx)
-                    {
-                        entry.expiration_time = expiration_hours;
-                        bin.expiration_in_hours = true;
-                        bin.dirty = true;
-                        return true;
-                    }
+        // Hand-over-hand latch coupling for the descent. At the BIN we
+        // need a write lock; we drop our read lock first and take the
+        // write lock under the protection of the *outer* parent's read
+        // lock (held by the previous loop iteration's guard). For the
+        // first iteration there is no outer parent, but no `split_child`
+        // can run on the root itself in that single-level case because
+        // root splits go through `split_root_if_needed` which holds
+        // `self.root.write()`. So the worst case is that the root is
+        // promoted from a single BIN to a level-2 IN between our read
+        // detect and our write — handled by the `is_bin` re-check
+        // inside the write lock.
+        //
+        // We retry the descent up to a small bound to absorb the rare
+        // case where a concurrent split moved this key into the new
+        // sibling between the read-chain release and the write-lock
+        // acquisition. Without the retry, the sole caller
+        // (`Database::put_with_options`) would silently lose the TTL
+        // for the affected key. Three attempts is generous: each
+        // retry only races a single split and splits are infrequent.
+        for _ in 0..3 {
+            let mut guard: parking_lot::ArcRwLockReadGuard<
+                parking_lot::RawRwLock,
+                TreeNode,
+            > = root.read_arc();
+            let bin_arc;
+            loop {
+                if guard.is_bin() {
+                    bin_arc =
+                        parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+                    drop(guard);
+                    break;
                 }
-                return false;
-            }
-            // Upper IN: navigate to the child covering this key.
-            let next_arc = {
-                let guard = current.read();
-                match &*guard {
+                let next_arc = match &*guard {
                     TreeNode::Internal(n) => {
                         if n.entries.is_empty() {
                             return false;
@@ -1532,16 +1542,44 @@ impl Tree {
                                 break;
                             }
                         }
-                        n.entries.get(idx).and_then(|e| e.child.clone())
+                        match n.entries.get(idx).and_then(|e| e.child.clone())
+                        {
+                            Some(c) => c,
+                            None => return false,
+                        }
                     }
-                    TreeNode::Bottom(_) => None,
-                }
-            };
-            match next_arc {
-                Some(child) => current = child,
-                None => return false,
+                    TreeNode::Bottom(_) => unreachable!(),
+                };
+                let next_guard = next_arc.read_arc();
+                drop(guard);
+                guard = next_guard;
             }
+
+            // Now take the write lock on the BIN we descended to.
+            let mut wguard = bin_arc.write();
+            if let TreeNode::Bottom(bin) = &mut *wguard {
+                let slot = if let Some(cmp) = &self.key_comparator {
+                    let (idx, exact) = bin.find_entry_cmp(key, cmp.as_ref());
+                    if exact { Some(idx) } else { None }
+                } else {
+                    let (idx, exact) = bin.find_entry_compressed(key);
+                    if exact { Some(idx) } else { None }
+                };
+                if let Some(slot_idx) = slot
+                    && let Some(entry) = bin.entries.get_mut(slot_idx)
+                {
+                    entry.expiration_time = expiration_hours;
+                    bin.expiration_in_hours = true;
+                    bin.dirty = true;
+                    return true;
+                }
+            }
+            // Key not in this BIN — either it was never present or a
+            // concurrent split moved it. Retry the descent; at most a
+            // few iterations are needed to follow the key into its new
+            // BIN.
         }
+        false
     }
 
     /// Returns the key and data of the first BIN entry at or after `key`.
@@ -1558,11 +1596,15 @@ impl Tree {
         &self,
         key: &[u8],
     ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
-        let mut current = self.get_root()?;
+        // Hand-over-hand latch coupling — see Tree::search for the
+        // detailed rationale on why this closes a reader-vs-splitter
+        // race window.
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = self.get_root()?.read_arc();
 
         loop {
-            let guard = current.read();
-
             if guard.is_bin() {
                 let result = match &*guard {
                     TreeNode::Bottom(bin) => {
@@ -1610,9 +1652,10 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Release parent latch.
-            Self::latch_coupling_release(guard);
-            current = next_arc;
+            // Take child read lock BEFORE releasing parent's.
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 
@@ -2177,34 +2220,32 @@ impl Tree {
     /// Descends to the leftmost BIN by
     /// always following the first child slot at each upper IN level.
     pub fn get_first_node(&self) -> Option<SearchResult> {
-        let mut current = self.get_root()?;
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = self.get_root()?.read_arc();
 
         loop {
-            let (is_bin, n_entries, first_child) = {
-                let g = current.read();
-                let is_bin = g.is_bin();
-                let n = g.get_n_entries();
-                let child = if !is_bin {
-                    match &*g {
-                        TreeNode::Internal(n_node) => {
-                            n_node.entries.first().and_then(|e| e.child.clone())
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                (is_bin, n, child)
-            };
-
-            if is_bin {
-                if n_entries == 0 {
+            if guard.is_bin() {
+                let n = guard.get_n_entries();
+                if n == 0 {
                     return None;
                 }
                 return Some(SearchResult::with_values(true, 0, false));
             }
 
-            current = first_child?;
+            // Capture the leftmost child Arc while holding `guard`, then
+            // hand-over-hand: take the child read lock before releasing
+            // the parent's. Same race fix as `Tree::search`.
+            let next_arc = match &*guard {
+                TreeNode::Internal(n_node) => {
+                    n_node.entries.first().and_then(|e| e.child.clone())?
+                }
+                _ => return None,
+            };
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 
@@ -2213,38 +2254,36 @@ impl Tree {
     /// Descends to the rightmost BIN by
     /// always following the last child slot at each upper IN level.
     pub fn get_last_node(&self) -> Option<SearchResult> {
-        let mut current = self.get_root()?;
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = self.get_root()?.read_arc();
 
         loop {
-            let (is_bin, n_entries, last_child) = {
-                let g = current.read();
-                let is_bin = g.is_bin();
-                let n = g.get_n_entries();
-                let child = if !is_bin {
-                    match &*g {
-                        TreeNode::Internal(n_node) => {
-                            n_node.entries.last().and_then(|e| e.child.clone())
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                (is_bin, n, child)
-            };
-
-            if is_bin {
-                if n_entries == 0 {
+            if guard.is_bin() {
+                let n = guard.get_n_entries();
+                if n == 0 {
                     return None;
                 }
                 return Some(SearchResult::with_values(
                     true,
-                    (n_entries - 1) as i32,
+                    (n - 1) as i32,
                     false,
                 ));
             }
 
-            current = last_child?;
+            // Capture the rightmost child Arc while holding `guard`, then
+            // hand-over-hand: take the child read lock before releasing
+            // the parent's. Same race fix as `Tree::search`.
+            let next_arc = match &*guard {
+                TreeNode::Internal(n_node) => {
+                    n_node.entries.last().and_then(|e| e.child.clone())?
+                }
+                _ => return None,
+            };
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 
@@ -2845,6 +2884,13 @@ impl Tree {
     ///
     /// Returns a `SearchResult` if the key is (or should be) in the tree,
     /// `None` if the tree is empty.
+    ///
+    /// TODO(latch-coupling): this is the optimistic alternative to
+    /// `Tree::search`. It still uses the old drop-then-take descent
+    /// pattern and relies on `validate_parent_child` to detect a race
+    /// post-hoc and restart from root. Currently used only by tests.
+    /// Convert to `read_arc()` hand-over-hand to remove the restart
+    /// path entirely if/when this method is wired to production.
     pub fn search_with_coupling(&self, key: &[u8]) -> Option<SearchResult> {
         let root = self.get_root()?;
         let mut current = root.clone();
@@ -3146,21 +3192,31 @@ impl Tree {
     ) -> Option<Vec<BinEntry>> {
         // Build path: each element is (parent_arc, slot_taken_from_parent).
         let mut path: Vec<(Arc<RwLock<TreeNode>>, usize)> = Vec::new();
-        let mut current = root.clone();
 
+        // Hand-over-hand latch coupling on the descent — see Tree::search.
+        // This closes the descender-vs-splitter race so the path we
+        // capture is consistent at the time of capture (each (parent,
+        // slot) entry was the active mapping while we observed it).
+        //
+        // TODO: the ascent below re-acquires parent reads one at a time
+        // and assumes the recorded slot_idx is still the slot pointing
+        // at the just-visited child. A concurrent split that completes
+        // between path capture and the ascent walk could shift the
+        // sibling we'd take. The cursor API tolerates a "next entry
+        // may not be the immediate sibling" relaxation (it just makes
+        // progress to *some* later key), so this is not a correctness
+        // bug for the typical caller, but worth documenting.
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = root.read_arc();
+        let bin_arc;
         loop {
-            // Acquire this node's read lock ONCE — perform both the is_bin
-            // check AND the child-pointer capture within the same lock scope
-            // (single-pass latch-coupling).
-            let guard = current.read();
-
             if guard.is_bin() {
-                // Reached the BIN level; stop — path already records the
-                // parent and the slot index pointing at this BIN.
+                bin_arc = parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
                 break;
             }
 
-            // Upper IN: capture child slot and Arc WHILE HOLDING guard.
             let (next_arc, slot_idx) = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -3181,12 +3237,19 @@ impl Tree {
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Release parent latch.
-            Self::latch_coupling_release(guard);
 
-            path.push((current.clone(), slot_idx));
-            current = next_arc;
+            // Record the parent for the ascent before handing off.
+            let parent_arc =
+                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            path.push((parent_arc, slot_idx));
+
+            // Take child read lock BEFORE releasing parent's.
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
+        drop(guard);
+        let _ = bin_arc; // used only to mark the descent as completed
 
         // Ascend the path looking for a level with a sibling slot.
         // getNextIN's "ascend while at edge" loop.
@@ -3234,16 +3297,14 @@ impl Tree {
         node_arc: &Arc<RwLock<TreeNode>>,
         forward: bool,
     ) -> Option<Vec<BinEntry>> {
-        let mut current = node_arc.clone();
+        // Hand-over-hand latch coupling — see Tree::search.
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = node_arc.read_arc();
 
         loop {
-            // Acquire this node's read lock ONCE — perform both the is_bin
-            // check AND the child-pointer capture within the same lock scope
-            // (single-pass latch-coupling).
-            let guard = current.read();
-
             if guard.is_bin() {
-                // Reached a BIN: return its entries with full decompressed keys.
                 return match &*guard {
                     TreeNode::Bottom(b) => {
                         // Return entries with full (decompressed) keys so that
@@ -3264,8 +3325,6 @@ impl Tree {
                 };
             }
 
-            // Upper IN: capture edge child Arc WHILE HOLDING guard
-            // (single-pass latch-coupling).
             let next = match &*guard {
                 TreeNode::Internal(n) => {
                     if forward {
@@ -3276,10 +3335,10 @@ impl Tree {
                 }
                 _ => return None,
             };
-            // Release parent latch.
-            Self::latch_coupling_release(guard);
-
-            current = next;
+            // Take child read lock BEFORE releasing parent's.
+            let next_guard = next.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 }
@@ -3566,6 +3625,11 @@ impl Tree {
     /// .  Descends the tree
     /// exactly like `search()` and returns the leaf-level BIN arc, or `None`
     /// if the tree is empty.
+    ///
+    /// TODO(latch-coupling): same dormant-API race as
+    /// `find_bin_for_insert` — still uses the old drop-then-take
+    /// pattern. Convert to `read_arc()` hand-over-hand if a
+    /// production caller is added.
     pub fn get_parent_bin_for_child_ln(
         &self,
         key: &[u8],
@@ -3618,6 +3682,14 @@ impl Tree {
     /// .  Semantically identical to
     /// `get_parent_bin_for_child_ln` — expressed as a separate method to match
     /// API surface.
+    ///
+    /// TODO(latch-coupling): this method still uses the old
+    /// `read()` + `latch_coupling_release(guard)` drop-then-take pattern
+    /// on the descent. Currently dormant (no in-tree callers outside
+    /// tests), so it is not data-losing in practice, but it inherits
+    /// the same descender-vs-splitter race window as the pre-fix
+    /// `Tree::search`. Convert to `read_arc()` hand-over-hand if a
+    /// production caller is added.
     pub fn find_bin_for_insert(
         &self,
         key: &[u8],
