@@ -406,7 +406,7 @@ Two bugs fixed: (1) `lock_ln()` now releases read lock immediately after acquisi
 10 new isolation tests: dirty-read prevention, serializable read-lock conflict, read-committed lock release, write-write conflict, non-repeatable reads (RC), repeatable reads (serializable), atomic commit, abort rollback, 32-thread readers, 8r+8w mixed workload.
 
 ### S32-6 — Attribution cleanup
-297 .rs files across all 16 crates: removed all "Port of", "ported from", "noxu-ref" internal labels phrases. No behavioral changes.
+297 .rs files across all crates: removed all "Port of", "ported from", "noxu-ref" internal labels phrases. No behavioral changes.
 
 ### S32-7 — 32-participant replication fault injection tests
 **File**: `crates/noxu-rep/tests/tcp_integration.rs`

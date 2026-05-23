@@ -10,7 +10,7 @@ Run any of these with `cargo run --example <name>`:
 
 | Example | Description |
 |---------|-------------|
-| `simple` | Basic open/put/get/delete operations |
+| `quickstart` | Basic open/put/get/delete operations |
 | `transactions` | ACID transactions with commit/abort |
 | `cursor_scan` | Cursor-based range scans and iteration |
 | `binding` | Type-safe bindings with `noxu-bind` |
@@ -81,5 +81,5 @@ cargo run --release -- balance --file bank.db --id 1
 cargo build --release -p noxu-cash -p noxu-cask -p noxu-ftdb
 
 # Run single-file examples from the workspace root
-cargo run --example simple
+cargo run --example quickstart
 ```

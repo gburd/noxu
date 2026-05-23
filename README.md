@@ -64,23 +64,24 @@ fn main() -> noxu_db::Result<()> {
 - **Cache Eviction** -- LRU-based evictor with dual-priority queues and per-operation cache mode control (Default, KeepHot, EvictLn, EvictBin, MakeEvictable). Explicit memory budget tracking.
 - **Log Cleaning** -- Background garbage collection of obsolete log entries with per-file utilization tracking and configurable thresholds.
 - **Replication & HA** -- Master-replica replication with automatic elections, VLSN-based log streaming, network restore, master transfer, and configurable consistency/durability policies.
-- **Serialization Bindings** -- Tuple and entry bindings for structured data, including derive-macro entity persistence (Direct Persistence Layer).
+- **Serialization Bindings** -- Tuple and entry bindings for structured data, plus a trait-based entity persistence layer (Direct Persistence Layer). Users implement `Entity` and an `EntitySerializer` for their types; entries are stored in typed `PrimaryIndex` and `SecondaryIndex` collections.
 - **Collection Views** -- Iterator-based collection abstractions over databases, with sorted map and sorted set semantics.
 - **400+ Configuration Parameters** -- Fine-grained tuning of every subsystem through a validated, typed configuration framework.
 
 ## Workspace Structure
 
-Noxu DB is organized as a Cargo workspace of 16 crates:
+Noxu DB is organized as a Cargo workspace of 19 crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
+| `noxu-sync` | Internal sync primitives (raw mutex/rwlock, condvar, futex) |
 | `noxu-latch` | Exclusive and shared/exclusive latches (`parking_lot`) |
 | `noxu-config` | 400+ typed configuration parameters with validation |
 | `noxu-log` | Write-ahead log: file manager, log manager, entry I/O |
 | `noxu-tree` | B+tree: IN, BIN, LN, key prefixing, splits |
 | `noxu-txn` | Transactions, record-level locking, deadlock detection |
-| `noxu-evictor` | LRU cache eviction with memory budget |
+| `noxu-evictor` | LRU/CLOCK/LIRS/ARC/CAR cache eviction with memory budget |
 | `noxu-cleaner` | Log file garbage collection, utilization tracking |
 | `noxu-recovery` | Checkpoint-based crash recovery |
 | `noxu-dbi` | Internal implementations: EnvironmentImpl, DatabaseImpl, CursorImpl |
@@ -88,27 +89,38 @@ Noxu DB is organized as a Cargo workspace of 16 crates:
 | `noxu-db` | Public API: Environment, Database, Cursor, Transaction |
 | `noxu-bind` | Serialization bindings (tuple, entry, serial) |
 | `noxu-collections` | Iterator-based collection views over databases |
-| `noxu-persist` | Derive-macro entity persistence (DPL) |
+| `noxu-persist` | Trait-based entity persistence (DPL) |
+| `noxu-xa` | XA distributed transactions (X/Open XA two-phase commit) |
 | `noxu-rep` | Master-replica HA, elections, VLSN tracking |
+| `noxu-observe` | Optional `tracing`/`metrics` observability glue |
 
 ## Building
 
 ```bash
+# First-time setup: initialize the quoracle submodule (used by noxu-rep).
+git submodule update --init --recursive
+
 cargo build          # Build all crates
-cargo test           # Run all tests (2200+)
+cargo test           # Run all tests
 cargo test -p noxu-db    # Test a single crate
 cargo clippy         # Lint
 cargo fmt            # Format
 ```
 
-Requires Rust 1.85+ (2024 edition).
+Requires Rust 1.85+ (2024 edition); the workspace pins a specific stable
+toolchain in `rust-toolchain.toml`.
 
 ## Design Principles
 
 - **Correctness first.** Algorithms and invariants are implemented to match their specifications. Divergence from intended behaviour is a bug.
 - **Idiomatic Rust.** RAII latches, `Result<T, NoxuError>` error handling, enums for closed hierarchies, traits for open extension points.
-- **Minimal dependencies.** Core set: `parking_lot`, `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`.
-- **No unsafe.** Target zero `unsafe` in core crates. Exceptions only for memory-mapped I/O and off-heap cache.
+- **Minimal core dependencies.** The core engine pulls in only `parking_lot`,
+  `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`,
+  plus `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Replication
+  (`noxu-rep`) and observability (`noxu-observe`) pull in additional
+  dependencies (`tokio`, `quinn`, `rustls`/`native-tls`, `tracing`,
+  `metrics`, `opentelemetry`) only when their features are enabled.
+- **Limited unsafe.** Core data-path crates (`noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`, `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw locking), `noxu-log` (memory-mapped I/O), `noxu-evictor::off_heap` (off-heap cache), `noxu-rep` (network I/O glue), and a small number of single-line `unsafe` blocks in `noxu-latch`, `noxu-db`, and `noxu-xa` documented inline.
 - **No async.** Core engine uses blocking I/O with explicit threading. Only replication networking may use async.
 - **Own log format.** Noxu DB uses a Rust-native on-disk format — `.ndb` files — not compatible with any other database.
 

@@ -8,7 +8,7 @@ Noxu DB uses [Semantic Versioning](https://semver.org/):
 - **MINOR**: new backwards-compatible functionality
 - **PATCH**: backwards-compatible bug fix
 
-All 16 crates share a single version number. The workspace root `Cargo.toml`
+All 19 crates share a single version number. The workspace root `Cargo.toml`
 sets the version; each crate inherits it.
 
 ## Pre-Release Gates

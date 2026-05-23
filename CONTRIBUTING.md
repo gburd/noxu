@@ -9,7 +9,10 @@
 ## Building
 
 ```bash
-cargo build              # Build all 16 crates
+# First-time setup: initialize the quoracle submodule used by noxu-rep.
+git submodule update --init --recursive
+
+cargo build              # Build all crates
 cargo build -p noxu-util # Build a single crate
 ```
 
@@ -36,23 +39,33 @@ When modifying or extending Noxu DB subsystems:
 - **Use enums** for closed class hierarchies (node types, log entry types).
 - **Use traits** for open extension points (comparators, key creators).
 - **Update MemoryBudget** explicitly — do not rely on the allocator.
-- **No unsafe** in core code. Exceptions only for memmap2 and off-heap cache.
+- **Limit unsafe**: core data-path crates target zero `unsafe`. New `unsafe`
+  blocks need review and an inline comment explaining why they are sound.
 - **No async** in the core engine. Only `noxu-rep` networking may use tokio.
 
-Reference archives live in `_/je/` and `_/nosql/` (read-only).
+If you have a local checkout of the upstream Java reference sources at
+`_/je/` and `_/nosql/`, treat them as read-only. They are gitignored and
+not required to build, test, or contribute.
 
 ## External Dependencies
 
-Keep the dependency set minimal. The approved core set is: parking_lot, thiserror, log, bytes, crc32fast, byteorder, memmap2, fs2, serde. Adding new external crates requires discussion.
+The core engine pulls in only `parking_lot`, `thiserror`, `log`, `bytes`,
+`crc32fast`, `byteorder`, `memmap2`, `fs2`, `serde`, `hashbrown`,
+`lock_api`, `lru`, and `libc`. Replication (`noxu-rep`) and observability
+(`noxu-observe`) pull in extra dependencies (`tokio`, `quinn`, `rustls` /
+`native-tls`, `tracing`, `metrics`, `opentelemetry`) only when their
+features are enabled. Adding new external crates requires discussion.
 
 ## Architecture
 
-The workspace contains 16 crates under `crates/`:
+The workspace contains 19 crates under `crates/`:
 
-- **Foundation**: noxu-util, noxu-latch, noxu-config
+- **Foundation**: noxu-util, noxu-sync, noxu-latch, noxu-config
 - **Core Engine**: noxu-log, noxu-tree, noxu-txn, noxu-evictor, noxu-cleaner, noxu-recovery, noxu-dbi, noxu-engine, noxu-db
 - **Higher-Level APIs**: noxu-bind, noxu-collections, noxu-persist
+- **Distributed Transactions**: noxu-xa
 - **Replication**: noxu-rep
+- **Observability**: noxu-observe (optional)
 
 ## PR Process
 

@@ -1,6 +1,6 @@
 # Crate Guide
 
-All 16 crates in the Noxu DB workspace, with purpose, key files, critical
+All 19 crates in the Noxu DB workspace, with purpose, key files, critical
 types, and crate purpose.
 
 ## Phase 0 — Foundation
@@ -26,6 +26,21 @@ Re-exports: `Lsn`, `Vlsn`, `NULL_LSN` at crate root.
 Thin wrappers around `parking_lot`:
 - `ExclusiveLatch<T>` — RAII exclusive latch (wraps `Mutex<T>`)
 - `SharedLatch<T>` — RAII reader-writer latch (wraps `RwLock<T>`)
+
+### `noxu-sync`
+ the corresponding Noxu type
+
+Internal sync primitives that sit below `noxu-latch` and replication
+networking. Provides:
+- `RawMutex` / `RawRwLock` — pluggable raw locking that can be swapped for
+  parking_lot or libc futexes
+- `Condvar` — condition variable that cooperates with the raw locks
+- `Futex` — Linux futex wrappers (FFI to libc) used as a fallback path
+- `Mutex<T>` / `RwLock<T>` — typed wrappers over the raw primitives
+
+This crate hosts the bulk of the workspace's `unsafe` because it is the
+syscall / raw-API boundary; everything above it consumes the safe
+`Mutex` / `RwLock` types.
 
 ### `noxu-config`
  the corresponding Noxu type
@@ -148,7 +163,13 @@ Serialization bindings:
 ### `noxu-persist`
  `noxu_persist`
 
-DPL derive macros: `#[derive(Entity)]`, `#[primary_key]`, `#[secondary_key]`.
+Trait-based entity persistence layer (Direct Persistence Layer). Users
+implement `Entity` (declaring the primary-key type and entity name) and
+an `EntitySerializer` (manual byte serialization) for their types.
+`PrimaryIndex<K, E>` and `SecondaryIndex<K, E>` provide typed CRUD and
+range scans on top of `Database`. Schema evolution mutations live in
+`src/evolve/` (`Renamer`, `Deleter`, `Converter`). There are no derive
+macros today — all wiring is by trait impl.
 Key type: `EntityStore`.
 
 ## Phase 7b — Distributed Transactions
@@ -194,3 +215,15 @@ Master-replica HA. Key files:
 - `src/stream/peer_feeder.rs` — `PeerFeederService`, `MultiPeerCatchUp`
 - `src/stream/replica_stream.rs` — `ReplicaStream`, frame parsing + CRC32 verification
 - `tests/torture_test.rs` — chaos/soak test harness
+
+## Cross-cutting
+
+### `noxu-observe`
+ the corresponding Noxu type
+
+Optional observability glue. Re-exports a small set of helpers so other
+crates can opt in to `tracing` spans, `metrics` counters/gauges, and
+OpenTelemetry export without each crate growing its own observability
+dependency tree. Off by default — only pulled in when the consuming
+crate enables the `observability` (or `otel`) feature. No public API
+beyond a few thin wrappers; see `crates/noxu-observe/src/lib.rs`.

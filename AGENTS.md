@@ -1,8 +1,9 @@
 # Noxu DB Agent Guide
 
-<!-- This file is the canonical agent instruction document for the lamdb repo.
-     It re-exports the content of .agent/AGENT.md and adds the Documentation
-     section below. Keep both files in sync when updating agent instructions. -->
+<!-- This file is the canonical agent instruction document for the Noxu DB
+     repo. It re-exports the content of .agent/AGENT.md and adds the
+     Documentation section below. Keep both files in sync when updating agent
+     instructions. -->
 
 ## Project Overview
 
@@ -11,18 +12,19 @@ It provides ACID transactions, a log-structured B+tree, checkpoint-based crash
 recovery, and optional master-replica replication — all in a single library with
 no external database process required.
 
-The project lives at `/home/gburd/ws/lamdb/` and uses a Cargo workspace with 16
+The project lives at the repository root and uses a Cargo workspace with 19
 crates under `crates/`.
 
 ## Crate Map
 
-The 16 crates are organized by implementation layer:
+The 19 crates are organized by implementation layer:
 
 ### Phase 0 — Foundation (complete)
 
 | Crate | Purpose |
 |---|---|
 | `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
+| `noxu-sync` | Internal sync primitives (raw mutex/rwlock, condvar, futex) |
 | `noxu-latch` | Exclusive and shared/exclusive latches (parking_lot) |
 | `noxu-config` | 400+ configuration parameters with validation |
 
@@ -34,7 +36,7 @@ The 16 crates are organized by implementation layer:
 | `noxu-tree` | B-tree: IN, BIN, LN, key prefixing, BIN-deltas |
 | `noxu-txn` | Transactions, record-level locking, deadlock detection |
 | `noxu-dbi` | EnvironmentImpl, DatabaseImpl, CursorImpl |
-| `noxu-evictor` | LRU cache eviction, off-heap support |
+| `noxu-evictor` | LRU/CLOCK/LIRS/ARC/CAR cache eviction, off-heap support |
 | `noxu-cleaner` | Log file garbage collection, utilization tracking |
 | `noxu-recovery` | Checkpoint-based crash recovery |
 | `noxu-engine` | Engine orchestration, daemon lifecycle |
@@ -46,7 +48,13 @@ The 16 crates are organized by implementation layer:
 |---|---|
 | `noxu-bind` | Serialization bindings (tuple, entry, serial) |
 | `noxu-collections` | Iterator-based collection views |
-| `noxu-persist` | Derive-macro entity persistence (DPL) |
+| `noxu-persist` | Trait-based entity persistence (DPL) |
+
+### Phase 7b — Distributed Transactions (complete)
+
+| Crate | Purpose |
+|---|---|
+| `noxu-xa` | XA distributed transactions (X/Open XA two-phase commit) |
 
 ### Phase 8 — Replication (complete)
 
@@ -54,9 +62,18 @@ The 16 crates are organized by implementation layer:
 |---|---|
 | `noxu-rep` | Master-replica HA, elections, VLSN tracking |
 
+### Cross-cutting
+
+| Crate | Purpose |
+|---|---|
+| `noxu-observe` | Optional `tracing` / `metrics` / OpenTelemetry glue (off by default) |
+
 ## Build, Test, and Lint Commands
 
 ```bash
+# First-time setup: initialize the quoracle submodule used by noxu-rep.
+git submodule update --init --recursive
+
 cargo build                    # Build all crates
 cargo nextest run --workspace  # Run all tests (preferred)
 cargo test                     # Run all tests (fallback)
@@ -73,28 +90,49 @@ make docs-serve   # Live-reload docs at http://localhost:3000
 ## Key Design Decisions
 
 - **Log format**: Rust-native `.ndb` format. Not compatible with other database formats.
-- **External crates**: Minimal — parking_lot, thiserror, log, bytes, crc32fast,
-  byteorder, memmap2, fs2.
-- **Concurrency**: `parking_lot::Mutex/RwLock` for latches, `std::sync::atomic`
-  for volatile fields, `Arc<RwLock<IN>>` for tree nodes.
+- **External crates**: Core engine pulls in only `parking_lot`, `thiserror`,
+  `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`, plus
+  `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Replication
+  (`noxu-rep`) and observability (`noxu-observe`) pull in extra dependencies
+  (`tokio`, `quinn`, `rustls` / `native-tls`, `tracing`, `metrics`,
+  `opentelemetry`) only when their features are enabled.
+- **Concurrency**: `parking_lot::Mutex/RwLock` and `noxu-sync` primitives for
+  latches, `std::sync::atomic` for volatile fields, `Arc<RwLock<IN>>` for
+  tree nodes.
 - **Isolation model**: Lock-based, NOT MVCC. Writers lock BIN slots; readers
   block on write-locked records.
 - **Error handling**: `thiserror` enums, `Result<T, NoxuError>` everywhere.
-  No `unwrap()` in library code.
+  `unwrap()` is permitted only on invariants the caller has already
+  verified or on lock-acquisition results where mutex poisoning is treated
+  as fatal; new code should prefer `?` and `.expect("invariant: …")` with
+  a justification.
 - **No async**: Core engine uses blocking I/O with explicit threading. Only
   `noxu-rep` networking uses tokio.
-- **No unsafe**: Target zero unsafe in core. Exceptions only for memmap2 and
-  off-heap cache.
+- **Limited unsafe**: Core data-path crates (`noxu-tree`, `noxu-txn`,
+  `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`,
+  `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`,
+  `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are
+  `noxu-sync` (FFI to `libc` futex / `parking_lot` raw locking),
+  `noxu-log` (memory-mapped I/O), `noxu-evictor::off_heap` (off-heap
+  cache), `noxu-rep` (network I/O glue), and a couple of single-line
+  `unsafe` blocks in `noxu-latch`, `noxu-db`, and `noxu-xa` documented
+  inline. Adding new `unsafe` requires review.
 - **CRC32**: Uses `crc32fast` (CLMUL/PCLMULQDQ hardware acceleration, 15.8
   GiB/s at 1KiB). Not CRC32C — see `docs/src/internal/checksum-selection.md`.
 
 ## Reference Archives
 
 When auditing or extending subsystems, compare against the archived reference
-source (read-only — do not modify):
+source if you have a local checkout (read-only — do not modify, and do not
+commit them; the `_/` path is gitignored):
 
 - **Core archive**: `_/je/src/`
 - **Extended-fork archive**: `_/nosql/kvmain/src/main/java/`
+
+These archives are not part of the repository. Contributors who do not have
+them can still build, test, and run Noxu DB; references to them in this
+document and in `docs/src/contributing/porting-guidelines.md` are guidance
+for porting work, not a build prerequisite.
 
 ## Development Guidelines
 
@@ -141,7 +179,8 @@ make docs-check
 
 ## Environment Notes
 
-- NixOS system, Rust 1.94 via nix-profile.
+- Build with the toolchain pinned in `rust-toolchain.toml` (currently
+  stable 1.95).
 - `ThreadId::as_u64()` is unstable — use hash-based thread ID instead.
 - noxu-util re-exports `Lsn`/`Vlsn`/`NULL_LSN` at crate root.
 - `Lsn::new(file_number: u32, file_offset: u32)` or `Lsn::from_u64(val: u64)`.
