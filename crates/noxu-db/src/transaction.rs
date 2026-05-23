@@ -216,6 +216,16 @@ impl Transaction {
 
         // Release per-record locks held by the inner Txn.
         // The inner Txn has no log_manager so it won't write duplicate WAL records.
+        //
+        // TODO: this swallows any error from the inner Txn::commit (e.g. a
+        // lock_manager.release() failure or a stale state check). It was
+        // initially suspected of being the noxu-tree first-key TOCTOU
+        // race repro (`xa_protocol_test::test_concurrent_independent_xids`),
+        // but instrumentation showed inner.commit() always returned Ok on
+        // failing runs — the actual bug was upstream in noxu-tree and is
+        // fixed. The swallowed Result here remains a latent silent-
+        // failure defect; surface it (return / log) once a deterministic
+        // failure path is available to test against.
         if let Some(inner) = &self.inner_txn {
             let _ = inner.lock().unwrap().commit();
         }
