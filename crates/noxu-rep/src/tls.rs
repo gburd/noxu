@@ -28,7 +28,7 @@
 //!   constructors on the QUIC channel types.
 //!
 //! - **TCP channels**: Unencrypted by default (`TcpChannel`). Use
-//!   [`TlsTcpChannel`](crate::net::channel::TlsTcpChannel) for encrypted TCP
+//!   `TlsTcpChannel` (in `crate::net::channel`) for encrypted TCP
 //!   connections. Enable at least one TLS feature (`tls-rustls` or
 //!   `tls-native`) to make those types available.
 //!
@@ -143,10 +143,10 @@ pub enum TrustedCerts {
 /// A `TlsConfig` bundles this node's identity (certificate + key) with the
 /// policy for verifying remote peers.  Pass it to:
 ///
-/// - [`TlsTcpChannelListener::bind_with_tls`] — encrypted TCP server
-/// - [`TlsTcpChannel::connect_with_tls`] — encrypted TCP client
-/// - [`TlsConfig::to_quinn_server_config`] — QUIC server with real certs
-/// - [`TlsConfig::to_quinn_client_config`] — QUIC client with real certs
+/// - `TlsTcpChannelListener::bind_with_tls` — encrypted TCP server
+/// - `TlsTcpChannel::connect_with_tls` — encrypted TCP client
+/// - `TlsConfig::to_quinn_server_config` — QUIC server with real certs
+/// - `TlsConfig::to_quinn_client_config` — QUIC client with real certs
 #[derive(Clone)]
 pub struct TlsConfig {
     /// This node's certificate and private key.
@@ -496,8 +496,28 @@ impl TlsConfig {
     /// ```
     pub(crate) fn to_native_acceptor(&self) -> Result<native_tls::TlsAcceptor> {
         let identity = self.native_identity()?;
-        let mut builder = native_tls::TlsAcceptor::builder(identity);
-        self.apply_native_trust(&mut builder)?;
+        let builder = native_tls::TlsAcceptor::builder(identity);
+        // Note: `native_tls::TlsAcceptorBuilder` does not expose CA-root
+        // installation or "accept invalid client certs" knobs; mTLS-style
+        // client-certificate verification is a `tls-rustls`-only feature
+        // on this transport. Warn loudly only when the user has expressed
+        // intent to do mTLS by populating CA roots — `SkipVerification`
+        // and an empty `CaFiles(vec![])` are both already what a
+        // native_tls server would do, so they're silent.
+        let mtls_intent = match &self.trusted_certs {
+            TrustedCerts::CaFiles(v) => !v.is_empty(),
+            TrustedCerts::CaBytes(v) => !v.is_empty(),
+            TrustedCerts::SkipVerification => false,
+        };
+        if mtls_intent {
+            log::warn!(
+                "TlsConfig.trusted_certs is configured with CA roots on a \
+                 server transport, but native_tls::TlsAcceptorBuilder does \
+                 not expose mTLS trust configuration — the setting is \
+                 ignored on this transport. Use the tls-rustls feature for \
+                 mTLS."
+            );
+        }
         builder
             .build()
             .map_err(|e| RepError::NetworkError(format!("TLS acceptor: {e}")))
@@ -539,13 +559,13 @@ impl TlsConfig {
         }
     }
 
-    fn apply_native_trust<B: NativeTlsBuilderExt>(
+    fn apply_native_trust(
         &self,
-        builder: &mut B,
+        builder: &mut native_tls::TlsConnectorBuilder,
     ) -> Result<()> {
         match &self.trusted_certs {
             TrustedCerts::SkipVerification => {
-                builder.set_danger_accept_invalid_certs(true);
+                builder.danger_accept_invalid_certs(true);
             }
             TrustedCerts::CaFiles(paths) => {
                 for path in paths {
@@ -568,30 +588,9 @@ impl TlsConfig {
     }
 }
 
-/// Internal trait to share trust-configuration code between
-/// `TlsAcceptorBuilder` and `TlsConnectorBuilder`.
-#[cfg(feature = "tls-native")]
-trait NativeTlsBuilderExt {
-    fn set_danger_accept_invalid_certs(&mut self, val: bool);
-    fn add_root_certificate(&mut self, cert: native_tls::Certificate);
-}
-
-#[cfg(feature = "tls-native")]
-impl NativeTlsBuilderExt for native_tls::TlsAcceptorBuilder {
-    fn set_danger_accept_invalid_certs(&mut self, val: bool) {
-        self.danger_accept_invalid_certs(val);
-    }
-    fn add_root_certificate(&mut self, cert: native_tls::Certificate) {
-        self.add_root_certificate(cert);
-    }
-}
-
-#[cfg(feature = "tls-native")]
-impl NativeTlsBuilderExt for native_tls::TlsConnectorBuilder {
-    fn set_danger_accept_invalid_certs(&mut self, val: bool) {
-        self.danger_accept_invalid_certs(val);
-    }
-    fn add_root_certificate(&mut self, cert: native_tls::Certificate) {
-        self.add_root_certificate(cert);
-    }
-}
+// `apply_native_trust` is a `TlsConnectorBuilder`-only helper. The
+// previous shared trait `NativeTlsBuilderExt` was removed because the
+// `native_tls::TlsAcceptorBuilder` does not expose `add_root_certificate`
+// or `danger_accept_invalid_certs`, and the trait impls for it were
+// unconditionally recursive (a real bug — they would have stack-
+// overflowed on first call).

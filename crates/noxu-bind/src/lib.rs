@@ -17,7 +17,7 @@
 //! - [`entry_binding`]  -  Core `EntryBinding` and `EntityBinding` traits.
 //! - [`byte_array_binding`]  -  Pass-through binding for raw byte arrays.
 //! - [`record_number_binding`]  -  Big-endian u64 record number binding.
-//! - [`tuple`]  -  Tuple (compact binary) bindings for sortable keys.
+//! - [`tuple`][mod@tuple]  -  Tuple (compact binary) bindings for sortable keys.
 
 pub mod byte_array_binding;
 pub mod entry_binding;

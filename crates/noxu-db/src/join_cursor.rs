@@ -1,8 +1,8 @@
 //! Join cursor for multi-secondary-index intersection queries.
 //!
 //! Implements `JoinCursor`.  A join cursor is obtained by calling
-//! [`Database::join`][crate::database::Database::join] with an array of
-//! [`SecondaryCursor`][crate::secondary_cursor::SecondaryCursor] objects,
+//! [`Database::join`] with an array of
+//! [`SecondaryCursor`] objects,
 //! each pre-positioned at the desired secondary key value.
 //!
 //! # Algorithm

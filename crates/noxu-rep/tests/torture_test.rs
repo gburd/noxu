@@ -503,7 +503,10 @@ impl TcNetemGuard {
         // tc netem is Linux-only.  On other platforms chaos falls back to
         // software-only fault injection (TcNetemGuard::active == false).
         #[cfg(not(target_os = "linux"))]
-        { let _ = args; return false; }
+        {
+            let _ = args;
+            false
+        }
 
         #[cfg(target_os = "linux")]
         {
