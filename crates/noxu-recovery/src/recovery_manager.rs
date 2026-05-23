@@ -988,6 +988,15 @@ impl RecoveryManager {
                 // Materialise Bytes → Vec<u8> at the tree boundary.
                 let data =
                     rec.data.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
+                // TODO(recovery): tree.insert returns Result<bool, TreeError>
+                // and we currently swallow the error. The TreeError variants
+                // (SplitRequired, Lookup, MemoryAllocFailure) all indicate a
+                // recovery failure that would silently leave the recovered
+                // tree inconsistent. Decide between (a) propagate the error
+                // and abort recovery, (b) log + mark recovery degraded,
+                // (c) panic — and apply the same treatment to the four other
+                // `let _ = t.insert(...)` / `let _ = tree.insert(...)` sites
+                // in this file.
                 let _ = tree.insert(rec.key.to_vec(), data, lsn);
             }
             LnOperation::Delete => {

@@ -840,6 +840,16 @@ impl Txn {
     ///
     pub fn move_write_lock_to_new_lsn(&mut self, old_lsn: u64, new_lsn: u64) {
         if let Some(wli) = self.write_locks.remove(&old_lsn) {
+            // TODO(noxu-txn): both `release` and `lock` swallow their
+            // errors. release() failing here would leak the old lock in
+            // the lock_manager; lock() failing would leave the txn
+            // tracking a write_lock entry for `new_lsn` that no one
+            // actually holds in the lock_manager. The migration is
+            // expected to succeed (we just released old_lsn, and new_lsn
+            // is freshly allocated by the caller), but propagating the
+            // error to the caller would let it abort the operation
+            // instead of silently desynchronising the per-txn and
+            // lock-manager views.
             let _ = self.lock_manager.release(old_lsn, self.id);
             let _ = self.lock_manager.lock(
                 new_lsn,

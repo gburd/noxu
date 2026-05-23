@@ -74,7 +74,12 @@ impl LogFlusher {
                     // Only flush if there have been new commits
                     if current_commits > last {
                         if let Err(e) = lm.flush_sync() {
-                            eprintln!("LogFlusher sync error: {:?}", e);
+                            log::error!(
+                                "LogFlusher (sync) flush failed: {e}; commits \
+                                 between {last} and {current_commits} are not \
+                                 yet durable on disk and will be retried on \
+                                 the next tick"
+                            );
                         } else {
                             last_commits
                                 .store(current_commits, Ordering::Relaxed);
@@ -105,7 +110,12 @@ impl LogFlusher {
                     // Only flush if there have been new commits
                     if current_commits > last {
                         if let Err(e) = lm.flush_no_sync() {
-                            eprintln!("LogFlusher no-sync error: {:?}", e);
+                            log::error!(
+                                "LogFlusher (no-sync) flush failed: {e}; \
+                                 commits between {last} and {current_commits} \
+                                 are not yet flushed and will be retried on \
+                                 the next tick"
+                            );
                         } else {
                             last_commits
                                 .store(current_commits, Ordering::Relaxed);
