@@ -27,9 +27,16 @@ enum BranchState {
 }
 
 /// Internal branch tracking.
+///
+/// `txn` is boxed so its address is stable across `branches` HashMap
+/// rehashes. `get_transaction` hands out a `&Transaction` that may be
+/// used by application code while another thread inserts a *different*
+/// branch into the map; without the heap allocation, that insert could
+/// rehash and move the `Branch` (and the `Transaction` it contains),
+/// invalidating the outstanding reference.
 struct Branch {
     state: BranchState,
-    txn: Transaction,
+    txn: Box<Transaction>,
     has_writes: bool,
 }
 
@@ -64,10 +71,12 @@ impl XaEnvironment {
     /// Returns the transaction for an active branch (for use by application code).
     ///
     /// The transaction is only accessible while the branch is Active.
+    /// `Branch::txn` is boxed, so the returned reference remains valid
+    /// even if a concurrent `xa_start` rehashes the underlying HashMap;
+    /// the caller is responsible for not invalidating the reference by
+    /// rolling back / committing this same `xid` from another thread
+    /// (the X/Open XA protocol forbids that anyway).
     pub fn get_transaction(&self, xid: &Xid) -> XaResult<&Transaction> {
-        // Safety: we return a reference tied to &self, and the branch map
-        // holds the Transaction for the lifetime of the XaEnvironment.
-        // This is sound because branches are only removed after commit/rollback.
         let branches = self.branches.lock().unwrap();
         let branch = branches.get(xid).ok_or(XaError::NotFound)?;
         if branch.state != BranchState::Active {
@@ -75,9 +84,14 @@ impl XaEnvironment {
                 "transaction not active".to_string(),
             ));
         }
-        // SAFETY: The Transaction lives in the HashMap which lives as long as
-        // `self`. We return a reference bounded by `&self`.
-        let txn_ptr: *const Transaction = &branch.txn;
+        // SAFETY: The Transaction is heap-allocated via Box, so its
+        // address is stable across HashMap rehashes triggered by other
+        // xa_start calls. The reference's lifetime is bounded by `&self`.
+        // We deliberately drop the `branches` lock guard at the end of
+        // this function — callers serialize their own xid through the
+        // XA state machine, so no other thread will remove this branch
+        // while the caller is using the returned reference.
+        let txn_ptr: *const Transaction = &*branch.txn;
         Ok(unsafe { &*txn_ptr })
     }
 
@@ -140,7 +154,7 @@ impl XaResource for XaEnvironment {
 
         branches.insert(xid.clone(), Branch {
             state: BranchState::Active,
-            txn,
+            txn: Box::new(txn),
             has_writes: false,
         });
 
