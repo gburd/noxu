@@ -222,21 +222,62 @@ impl Transaction {
         // Release per-record locks held by the inner Txn.
         // The inner Txn has no log_manager so it won't write duplicate WAL records.
         //
-        // TODO: this swallows any error from the inner Txn::commit (e.g. a
-        // lock_manager.release() failure or a stale state check). It was
-        // initially suspected of being the noxu-tree first-key TOCTOU
-        // race repro (`xa_protocol_test::test_concurrent_independent_xids`),
-        // but instrumentation showed inner.commit() always returned Ok on
-        // failing runs — the actual bug was upstream in noxu-tree and is
-        // fixed. The swallowed Result here remains a latent silent-
-        // failure defect; surface it (return / log) once a deterministic
-        // failure path is available to test against.
-        if let Some(inner) = &self.inner_txn {
-            let _ = inner.lock().unwrap().commit();
-        }
+        // At this point the commit is *durable* on disk: `write_txn_end`
+        // above has already fsynced the TxnCommit WAL entry, and recovery
+        // will replay this commit on the next environment open. The inner
+        // commit only releases `lock_manager` locks and flips the inner
+        // state Open → Committed; the data path mutations were applied to
+        // the in-memory tree at `db.put()` time.
+        //
+        // Possible failure modes for `inner.commit()`:
+        //   * `has_open_cursors`: a user bug — a cursor on this transaction
+        //     was not closed before `commit()`. The data is still
+        //     durably committed; the cursor's lifetime contract is
+        //     violated. Surfacing this lets the caller find the leak.
+        //   * `check_state` (state != Open): the inner txn was flipped to
+        //     `MustAbort` by the deadlock detector after our WAL fsync,
+        //     or somehow advanced to `Committed`/`Aborted` already. Both
+        //     indicate a state-machine inconsistency that needs to be
+        //     visible.
+        //
+        // Either way, we mark the outer state `Committed` first because
+        // the durable record says so — returning early before that would
+        // leave the outer in `Open`, and a retried `commit()` would
+        // append a *second* `TxnCommit` record to the WAL. We then
+        // propagate the inner error so the caller can react.
+        //
+        // TODO(noxu-txn): both early-return paths in
+        // `noxu-txn::Txn::commit_with_durability` (`check_state()?` and
+        // `has_open_cursors` → `InvalidTransaction`) return without
+        // draining `self.read_locks` / `self.write_locks`, leaking the
+        // entries in `lock_manager` until environment close. The fix
+        // is to release the locks unconditionally even on the
+        // state-check failure path; out of scope here because we are
+        // closing the existing silent-failure defect, not redesigning
+        // Txn::commit's error path.
+        let inner_err = if let Some(inner) = &self.inner_txn {
+            match inner.lock().unwrap().commit() {
+                Ok(_) => None,
+                Err(e) => {
+                    log::error!(
+                        "Transaction::commit_with_durability: inner txn \
+                         commit failed after WAL fsync (txn is durably \
+                         committed; lock_manager locks may be leaked): {e}"
+                    );
+                    Some(e)
+                }
+            }
+        } else {
+            None
+        };
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Committed;
+        drop(state);
+
+        if let Some(e) = inner_err {
+            return Err(NoxuError::from(e));
+        }
         Ok(())
     }
 
