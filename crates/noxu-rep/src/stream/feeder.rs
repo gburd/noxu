@@ -663,13 +663,22 @@ mod tests {
         // separate thread that polls the channel with a 1 ms timeout and
         // then sleeps 5 ms between polls. By the time `recv_handle.join()`
         // returns, the runner may not yet have drained all three acks
-        // from the queue. Poll briefly (≤ 200 ms) for the runner to catch
-        // up; this is plenty of time for three queued reads.
-        let deadline = Instant::now() + Duration::from_millis(200);
+        // from the queue. Poll briefly (≤ 100 ms) for the runner to catch
+        // up. 100 ms is ~6× the worst-case three-ack drain time on a
+        // healthy machine, so a real perf regression on the runner's
+        // ack-handling path will still surface as a test failure.
+        let deadline = Instant::now() + Duration::from_millis(100);
         while runner_arc.known_replica_vlsn() < 3 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(runner_arc.known_replica_vlsn(), 3);
+        assert!(
+            runner_arc.known_replica_vlsn() == 3,
+            "FeederRunner did not drain all 3 acks within 100 ms; \
+             known_replica_vlsn() == {}, expected 3 (the receiver thread \
+             sent 3 acks before exiting; the runner reads them one at a \
+             time with a 1 ms timeout + 5 ms sleep cycle)",
+            runner_arc.known_replica_vlsn()
+        );
 
         // Close the channel to terminate the run loop.
         sender_ref.close().unwrap();
