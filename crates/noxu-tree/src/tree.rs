@@ -1683,6 +1683,18 @@ impl Tree {
     /// 5. Replace tree root with newRoot.
     /// ```
     fn split_root_if_needed(&self, lsn: Lsn) -> Result<(), TreeError> {
+        // TODO: this read-then-write pattern on `self.root` is structurally
+        // similar to the first-key TOCTOU that was fixed in the parent
+        // function. Two concurrent splitters can each observe needs_split
+        // == true under the read lock, then take().unwrap() in turn, each
+        // wrapping the other's already-promoted root in its own new IN,
+        // producing an unnecessarily deep tree. This is NOT a data-loss
+        // bug (every entry is still reachable) but it can over-grow the
+        // tree under heavy concurrent insertion. Fix is to hold a write
+        // lock across the needs_split check and the take()+install. The
+        // first-key fix took the simple route; this one needs a slightly
+        // larger refactor and a test that times two splits within the
+        // same root node, which has not been written yet.
         let needs_split = {
             let root_arc = self.root.read().clone().unwrap();
             let guard =
