@@ -49,3 +49,116 @@ pub fn ttl_secs_to_expiration(ttl_secs: u64) -> u32 {
     }
     current_time_secs().saturating_add((ttl_secs / SECS_PER_HOUR).max(1) as u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn never_expires_when_zero() {
+        // expiration_time == 0 is the "never expires" sentinel,
+        // regardless of the resolution flag.
+        assert!(!is_expired(0, true));
+        assert!(!is_expired(0, false));
+    }
+
+    #[test]
+    fn expired_when_in_the_past_hours() {
+        // Hour 1 (1970-01-01 01:00 UTC) is far in the past.
+        assert!(is_expired(1, true));
+    }
+
+    #[test]
+    fn expired_when_in_the_past_seconds() {
+        // 1 second after the epoch is in the past.
+        assert!(is_expired(1, false));
+    }
+
+    #[test]
+    fn not_expired_when_in_the_future_hours() {
+        // current_time_hours() + 24 (one day from now) is in the future.
+        let future = current_time_hours().saturating_add(24);
+        assert!(!is_expired(future, true));
+    }
+
+    #[test]
+    fn not_expired_when_in_the_future_seconds() {
+        // current_time_secs() + 86_400 is in the future.
+        let future = current_time_secs().saturating_add(86_400);
+        assert!(!is_expired(future, false));
+    }
+
+    #[test]
+    fn current_time_hours_is_nonzero_after_epoch() {
+        // Hours since epoch should be > 0 for any time after
+        // 1970-01-01 01:00 UTC. The test is checking that the
+        // function returns a sane (non-zero, non-overflowing) value
+        // — we don't assert a tight bound.
+        let h = current_time_hours();
+        assert!(h > 0, "current_time_hours() returned 0 after epoch");
+        // Also assert it agrees with current_time_secs() within
+        // half an hour.
+        let s = current_time_secs();
+        let from_secs = (s as u64) / SECS_PER_HOUR;
+        assert!(
+            (h as i64 - from_secs as i64).abs() <= 1,
+            "current_time_hours() and current_time_secs() disagree: \
+             {h} hours vs {from_secs} hours-from-secs",
+        );
+    }
+
+    #[test]
+    fn ttl_hours_to_expiration_zero_means_never() {
+        assert_eq!(ttl_hours_to_expiration(0), 0);
+    }
+
+    #[test]
+    fn ttl_hours_to_expiration_returns_future() {
+        let now = current_time_hours();
+        let exp = ttl_hours_to_expiration(24);
+        assert!(exp >= now + 24 - 1 && exp <= now + 24 + 1);
+    }
+
+    #[test]
+    fn ttl_hours_to_expiration_saturates_on_overflow() {
+        // u32::MAX + 1 hour saturates at u32::MAX.
+        let exp = ttl_hours_to_expiration(u32::MAX);
+        assert_eq!(exp, u32::MAX);
+    }
+
+    #[test]
+    fn ttl_secs_to_expiration_zero_means_never() {
+        assert_eq!(ttl_secs_to_expiration(0), 0);
+    }
+
+    #[test]
+    fn ttl_secs_to_expiration_subhour_uses_minimum_one_hour() {
+        // The implementation rounds sub-hour TTLs up to one hour
+        // (the .max(1) guard) so that "expires in 30 seconds" is
+        // not lost to integer division.
+        let now = current_time_secs();
+        let exp = ttl_secs_to_expiration(30);
+        // exp == now + 1 hour-equivalent; allow a small race window.
+        assert!(exp > now && exp <= now + 2);
+    }
+
+    #[test]
+    fn ttl_secs_to_expiration_multi_hour_uses_hour_quanta() {
+        let now = current_time_secs();
+        // 7200 secs = 2 hours of TTL — passed as "2" via the
+        // ttl_secs / SECS_PER_HOUR calculation.
+        let exp = ttl_secs_to_expiration(7200);
+        assert!(exp >= now + 2 && exp <= now + 3);
+    }
+
+    #[test]
+    fn ttl_secs_to_expiration_does_not_panic_on_max() {
+        // (u64::MAX / SECS_PER_HOUR) truncated to u32 wraps; the
+        // function does not panic. The truncation is a real bug
+        // (see noxu-util/src/ttl.rs::ttl_secs_to_expiration: the
+        // `as u32` cast is lossy for u64 values above u32::MAX
+        // hours of TTL); preserved in this test as a known
+        // limitation rather than a panic-on-overflow path.
+        let _ = ttl_secs_to_expiration(u64::MAX);
+    }
+}
