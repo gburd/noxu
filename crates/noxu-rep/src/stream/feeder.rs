@@ -939,7 +939,7 @@ mod tests {
                 got
             })
         };
-        let mut scanner_a = VecLogScanner::new(entries.clone()[0..3].to_vec());
+        let mut scanner_a = VecLogScanner::new(entries[0..3].to_vec());
         runner_a.run(&mut scanner_a).unwrap();
         close_a.join().unwrap();
         let frames_a = received_a.join().unwrap();
