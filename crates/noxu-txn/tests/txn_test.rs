@@ -381,6 +381,51 @@ fn cursor_count_tracks_register_unregister() {
     assert_eq!(txn.cursor_count(), 1);
 }
 
+#[test]
+fn commit_with_open_cursor_preserves_retry_semantics() {
+    // Contract: a commit() that fails with `has_open_cursors` leaves
+    // the txn in Open state and its locks held, so the caller can
+    // close the cursor and retry commit. (Unlike the
+    // `MustAbort`/`Aborted`/`Committed` state-check paths, where
+    // commit() drains locks and returns Err.)
+    let lm = lm();
+    let lm2 = Arc::clone(&lm);
+    let mut txn = noxu_txn::Txn::new(1, lm);
+    txn.lock(100, LockType::Read, false).unwrap();
+    txn.lock(200, LockType::Write, false).unwrap();
+    assert_eq!(lm2.n_total_locks(), 2);
+    txn.register_cursor();
+    let r = txn.commit();
+    assert!(matches!(r, Err(TxnError::InvalidTransaction { .. })));
+    // Locks still held — caller can retry after closing cursors.
+    assert_eq!(
+        lm2.n_total_locks(),
+        2,
+        "has_open_cursors path must NOT drain locks (retry semantics)"
+    );
+    txn.unregister_cursor();
+    txn.commit().unwrap();
+    // Successful commit drains everything.
+    assert_eq!(lm2.n_total_locks(), 0);
+}
+
+#[test]
+fn commit_on_aborted_txn_keeps_locks_drained() {
+    // Regression: commit_with_durability's check_state() Err path
+    // must drain locks before returning. (Aborted txns have
+    // already drained, so this asserts release_all_locks is
+    // idempotent.)
+    let lm = lm();
+    let lm2 = Arc::clone(&lm);
+    let mut txn = noxu_txn::Txn::new(1, lm);
+    txn.lock(100, LockType::Read, false).unwrap();
+    txn.abort().unwrap();
+    assert_eq!(lm2.n_total_locks(), 0);
+    let r = txn.commit();
+    assert!(matches!(r, Err(TxnError::InvalidTransaction { .. })));
+    assert_eq!(lm2.n_total_locks(), 0);
+}
+
 // ─── 12. Undo records ─────────────────────────────────────────────────────────
 
 #[test]

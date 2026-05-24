@@ -271,17 +271,81 @@ impl Txn {
         &mut self,
         durability: Durability,
     ) -> Result<Lsn, TxnError> {
-        self.check_state()?;
+        // Drain locks on every error return path so that an early
+        // return (state-check failure, open cursors, log fsync error)
+        // never leaves entries in `lock_manager` until environment
+        // close. `release_all_locks` is idempotent.
+        if let Err(e) = self.check_state() {
+            // State-check failure means the txn is no longer in
+            // `Open` (typically `MustAbort` flipped by the deadlock
+            // detector). Drain so we don't leak the held locks until
+            // environment close — `release_all_locks` is idempotent.
+            self.release_all_locks();
+            return Err(e);
+        }
         if self.has_open_cursors() {
+            // Caller's bug: at least one cursor outlived this
+            // commit() call. Preserve retry semantics — the caller
+            // can close cursors and call `commit()` again — by NOT
+            // draining locks here. The locks are still held by this
+            // (Open) txn, and will be released by the eventual
+            // successful commit() or abort(). Since the txn stays in
+            // `Open`, no lock leak occurs as long as the caller
+            // either retries or aborts.
             return Err(TxnError::InvalidTransaction {
                 txn_id: self.id,
                 state: "has open cursors".into(),
             });
         }
         for lsn in self.read_locks.drain().collect::<Vec<_>>() {
-            let _ = self.lock_manager.release(lsn, self.id);
+            if let Err(e) = self.lock_manager.release(lsn, self.id) {
+                log::error!(
+                    "noxu-txn: lock_manager.release({lsn}, txn={}) failed \
+                     during commit_with_durability read-lock drain: {e}",
+                    self.id
+                );
+            }
         }
         let want_sync = matches!(durability, Durability::CommitSync);
+        // The body that can fail with `?` is wrapped in a closure
+        // so that any Err from log_entry / flush_sync_if_needed /
+        // flush_no_sync goes through the lock-drain epilogue rather
+        // than leaking write locks to environment close.
+        let assigned_lsn: Lsn =
+            match self.commit_inner_after_read_drain(durability, want_sync) {
+                Ok(lsn) => lsn,
+                Err(e) => {
+                    self.release_all_locks();
+                    return Err(e);
+                }
+            };
+        self.commit_lsn = assigned_lsn.as_u64();
+        // Release write locks AFTER the log flush (so lock holders are
+        // not visible to readers until the commit is durable). Read
+        // locks were already drained pre-flush.
+        for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
+            if let Err(e) = self.lock_manager.release(lsn, self.id) {
+                log::error!(
+                    "noxu-txn: lock_manager.release({lsn}, txn={}) failed \
+                     during commit_with_durability write-lock drain: {e}",
+                    self.id
+                );
+            }
+        }
+        self.write_locks.clear();
+        self.state = TxnState::Committed;
+        Ok(assigned_lsn)
+    }
+
+    /// The fallible inner section of `commit_with_durability` that
+    /// runs after the read-lock drain. Extracted so that any `?`
+    /// failure goes through `release_all_locks` rather than leaking
+    /// the still-held write locks.
+    fn commit_inner_after_read_drain(
+        &mut self,
+        durability: Durability,
+        want_sync: bool,
+    ) -> Result<Lsn, TxnError> {
         let assigned_lsn = if self.has_logged_entries() {
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
@@ -337,14 +401,6 @@ impl Txn {
         } else {
             NULL_LSN
         };
-        self.commit_lsn = assigned_lsn.as_u64();
-        // Release write locks AFTER the log flush (so lock holders are
-        // not visible to readers until the commit is durable).
-        for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
-            let _ = self.lock_manager.release(lsn, self.id);
-        }
-        self.write_locks.clear();
-        self.state = TxnState::Committed;
         Ok(assigned_lsn)
     }
 
@@ -536,82 +592,12 @@ impl Txn {
     /// # Errors
     /// Returns `TxnError::LogError` if the log write fails.
     pub fn commit(&mut self) -> Result<Lsn, TxnError> {
-        self.check_state()?;
-
-        if self.has_open_cursors() {
-            return Err(TxnError::InvalidTransaction {
-                txn_id: self.id,
-                state: "has open cursors".into(),
-            });
-        }
-
-        // Step 2: release read locks first (the: clearReadLocks).
-        for lsn in self.read_locks.drain().collect::<Vec<_>>() {
-            let _ = self.lock_manager.release(lsn, self.id);
-        }
-
-        // Step 3: log TxnCommit if this txn made any writes.
-        //
-        // Per the: "If nothing was written to log for this txn, no need to
-        // log a commit." (Txn.commit lines 764-785)
-        //
-        // logCommitEntry() calls preLogCommitHook() before and
-        // postLogCommitHook() after writing the TxnCommit entry.
-        let assigned_lsn = if self.has_logged_entries() {
-            // Pre-commit hook (the: preLogCommitHook).
-            if let Some(ref hook) = self.pre_commit_hook {
-                hook();
-            }
-
-            let commit = TxnCommit::new(
-                self.id,
-                self.last_lsn,
-                0, /* master_id */
-                0, /* dtvlsn */
-            );
-            let mut payload = Vec::with_capacity(commit.log_size());
-            commit.write_to_log(&mut payload);
-
-            // Write the TxnCommit entry without fsync; we decide below
-            // whether to fsync based on the GroupCommit handler.
-            let commit_lsn = self.log_entry(
-                LogEntryType::TxnCommit,
-                &payload,
-                false, /* fsync deferred */
-            )?;
-
-            // Post-commit hook (the: postLogCommitHook).
-            if let Some(ref hook) = self.post_commit_hook {
-                hook(commit_lsn);
-            }
-
-            // Decide whether to fsync now or defer to GroupCommit.
-            // commit() defaults to CommitSync (default durability).
-            let should_skip_fsync = match &self.group_commit {
-                Some(gc) if gc.is_enabled() => gc.buffer_commit(self.id),
-                _ => false,
-            };
-            if !should_skip_fsync && let Some(ref lm) = self.log_manager {
-                lm.flush_sync().map_err(TxnError::LogError)?;
-            }
-
-            commit_lsn
-        } else {
-            NULL_LSN
-        };
-
-        self.commit_lsn = assigned_lsn.as_u64();
-
-        // Step 4: release write locks AFTER the log flush (the: clearLocks
-        // is called after logManager.flushTo(commitLsn)).
-        for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
-            let _ = self.lock_manager.release(lsn, self.id);
-        }
-        self.write_locks.clear();
-
-        // Step 5: mark committed.
-        self.state = TxnState::Committed;
-        Ok(assigned_lsn)
+        // Delegate to `commit_with_durability` with the default
+        // policy. The historical inline body was nearly identical
+        // and shared every silent-lock-leak defect; consolidating
+        // means new error-path improvements only have to be applied
+        // once.
+        self.commit_with_durability(Durability::CommitSync)
     }
 
     /// Aborts the transaction.
@@ -768,14 +754,39 @@ impl Txn {
     ///
     /// Called by `abort()` and by the higher-level `Transaction::abort()` after
     /// tree undo has been applied.
+    /// Release every read and write lock the txn is currently
+    /// holding in the lock manager and clear the per-txn maps.
+    ///
+    /// Called from `commit_with_durability` on every Ok and Err
+    /// return path, and from `abort` after applying undo records.
+    /// Idempotent — a second call after a successful first call is
+    /// a no-op because `write_locks` has been cleared and
+    /// `read_locks` drained.
+    ///
+    /// Per-lock release failures are logged via `log::error!` but do
+    /// not abort the drain — losing one lock release leaks a single
+    /// lock-manager entry, but losing the *whole* drain leaks every
+    /// lock the txn ever held until the environment is closed.
     pub fn release_all_locks(&mut self) {
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
-            let _ = self.lock_manager.release(lsn, self.id);
+            if let Err(e) = self.lock_manager.release(lsn, self.id) {
+                log::error!(
+                    "noxu-txn: lock_manager.release({lsn}, txn={}) failed \
+                     during release_all_locks (write lock): {e}",
+                    self.id
+                );
+            }
         }
         self.write_locks.clear();
 
         for lsn in self.read_locks.drain().collect::<Vec<_>>() {
-            let _ = self.lock_manager.release(lsn, self.id);
+            if let Err(e) = self.lock_manager.release(lsn, self.id) {
+                log::error!(
+                    "noxu-txn: lock_manager.release({lsn}, txn={}) failed \
+                     during release_all_locks (read lock): {e}",
+                    self.id
+                );
+            }
         }
     }
 
