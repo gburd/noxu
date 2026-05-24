@@ -1,0 +1,21 @@
+[package]
+name = "noxu-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stateright executable specifications for noxu protocols"
+publish = false
+
+[dependencies]
+# Stateright is the core; everything else is just shared types so the
+# specs can talk about the same enums (LockType, OperationStatus, …)
+# the production code uses.
+stateright = { workspace = true }
+
+[dev-dependencies]
+# Specs are validated as ordinary `cargo test` cases — no external
+# runner. The state spaces are bounded in code so a `cargo test
+# --release` finishes the whole suite in seconds.
+
+[lints]
+workspace = true
