@@ -1207,6 +1207,27 @@ impl SplitEntries {
     }
 }
 
+/// Tri-state outcome from one attempt at
+/// `Tree::get_adjacent_bin_attempt`.
+///
+/// Distinguishes "the tree genuinely has no BIN in the requested
+/// direction" (→ propagate as end-of-iteration) from "the path we
+/// captured was invalidated by a concurrent split" (→ caller
+/// retries from root). This split is necessary because the cursor
+/// translates a `None` from `get_adjacent_bin` into
+/// `OperationStatus::NotFound`, which is indistinguishable from a
+/// real end-of-tree.
+#[derive(Debug)]
+enum AdjacentBinOutcome {
+    /// A BIN was found in the requested direction.
+    Found(Vec<BinEntry>),
+    /// The tree genuinely has no BIN in the requested direction.
+    NoAdjacent,
+    /// A concurrent split invalidated our captured path; the
+    /// caller should retry from root.
+    SplitRaceRetry,
+}
+
 impl Tree {
     /// Creates a new empty tree.
     ///
@@ -2884,43 +2905,28 @@ impl Tree {
     /// Returns a `SearchResult` if the key is (or should be) in the tree,
     /// `None` if the tree is empty.
     ///
-    /// TODO(latch-coupling): this is the optimistic alternative to
-    /// `Tree::search`. It still uses the old drop-then-take descent
-    /// pattern and relies on `validate_parent_child` to detect a race
-    /// post-hoc and restart from root. Currently used only by tests.
-    /// Convert to `read_arc()` hand-over-hand to remove the restart
-    /// path entirely if/when this method is wired to production.
+    /// Same as [`Tree::search`] but exposes the hand-over-hand latch
+    /// coupling explicitly. Kept as a public, equivalent API for
+    /// callers (today only tests) that want to verify the
+    /// latch-coupling behaviour against `search()` itself.
+    ///
+    /// Both `search()` and this method use the same `read_arc()`
+    /// hand-over-hand: take the child read guard *before* dropping
+    /// the parent guard, so a concurrent `split_child(parent, ..)`
+    /// (which takes `parent.write()`) cannot run between when we
+    /// captured the child Arc and when we entered the child. There
+    /// is no validate-and-restart loop because the coupling makes
+    /// the race unreachable.
     pub fn search_with_coupling(&self, key: &[u8]) -> Option<SearchResult> {
         let root = self.get_root()?;
-        let mut current = root.clone();
-        let mut parent: Option<Arc<RwLock<TreeNode>>> = None;
-        let mut child_index_in_parent: usize = 0;
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = root.read_arc();
 
         loop {
-            // Acquire this node's read lock ONCE — perform both the is_bin
-            // check AND the child-pointer capture within the same lock scope
-            // (single-pass latch-coupling, matching the pattern in search()).
-            let guard = current.read();
-
             if guard.is_bin() {
-                // Validate parent → child link before trusting the BIN.
-                // Drop the guard first to avoid holding it across the
-                // validate call (which acquires the parent's read lock).
-                drop(guard);
-                if let Some(ref par) = parent
-                    && !Self::validate_parent_child(
-                        par,
-                        child_index_in_parent,
-                        &current,
-                    )
-                {
-                    // Link changed; restart from root.
-                    parent = None;
-                    current = root.clone();
-                    continue;
-                }
-                let g = current.read();
-                let index = g.find_entry(key, true, true);
+                let index = guard.find_entry(key, true, true);
                 let found = index >= 0 && (index & EXACT_MATCH != 0);
                 return Some(SearchResult::with_values(
                     found,
@@ -2929,9 +2935,7 @@ impl Tree {
                 ));
             }
 
-            // Upper IN: find child slot covering key AND capture child Arc
-            // WHILE HOLDING the guard (single-pass latch-coupling).
-            let (next_arc, next_idx) = match &*guard {
+            let next_arc = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
@@ -2946,31 +2950,20 @@ impl Tree {
                             break;
                         }
                     }
-                    let child = n.entries.get(idx)?.child.clone()?;
-                    (child, idx)
+                    n.entries.get(idx)?.child.clone()?
                 }
-                TreeNode::Bottom(_) => unreachable!(),
+                TreeNode::Bottom(_) => {
+                    unreachable!("is_bin() returned false above")
+                }
             };
-            // Release parent latch.
-            Self::latch_coupling_release(guard);
-
-            // Validate parent → current link before descending.
-            if let Some(ref par) = parent
-                && !Self::validate_parent_child(
-                    par,
-                    child_index_in_parent,
-                    &current,
-                )
-            {
-                // Link changed; restart from root.
-                parent = None;
-                current = root.clone();
-                continue;
-            }
-
-            parent = Some(current.clone());
-            child_index_in_parent = next_idx;
-            current = next_arc;
+            // Hand-over-hand: take the child read guard before
+            // releasing the parent guard. Closes the
+            // descender-vs-splitter window: a concurrent
+            // split_child(parent, ..) takes parent.write(), which
+            // blocks while we still hold parent.read().
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 
@@ -3180,47 +3173,79 @@ impl Tree {
     /// Core implementation shared by `get_next_bin` and `get_prev_bin`.
     ///
     /// Builds the path from `root` down to the BIN for `current_key`
-    /// (each element records the parent arc and the slot index taken).
-    /// Then walks the path backwards (ascending) looking for the first
-    /// level that has a sibling slot in the requested direction.  Once
-    /// found it descends to the edge BIN of that sibling subtree.
+    /// (each element records the parent arc, the slot index taken,
+    /// and the child Arc reached) using `read_arc()` hand-over-hand
+    /// latch coupling.
+    ///
+    /// The ascent re-acquires the parent's read lock one level at a
+    /// time. To handle a concurrent split that completes between
+    /// path capture and ascent, we validate that the slot still
+    /// holds the child Arc we descended through. If the slot
+    /// mismatches we retry the whole operation from root with a
+    /// short pause between attempts. The retry budget is generous
+    /// (`MAX_ASCENT_ATTEMPTS`) so that the typical case of a few
+    /// cascading splits between two BIN-level cursor steps is
+    /// absorbed without surfacing as a false end-of-iteration.
+    /// After exhausting the budget we conservatively return `None`,
+    /// signalling "no adjacent BIN found"; the cursor will then
+    /// either restart its scan or report end-of-iteration. The
+    /// budget is finite so a pathological workload (a thread
+    /// permanently splitting under us) cannot livelock the lookup.
     fn get_adjacent_bin(
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
     ) -> Option<Vec<BinEntry>> {
-        // Build path: each element is (parent_arc, slot_taken_from_parent).
-        let mut path: Vec<(Arc<RwLock<TreeNode>>, usize)> = Vec::new();
+        const MAX_ASCENT_ATTEMPTS: u32 = 8;
+        for attempt in 0..MAX_ASCENT_ATTEMPTS {
+            match Self::get_adjacent_bin_attempt(root, current_key, forward) {
+                AdjacentBinOutcome::Found(v) => return Some(v),
+                AdjacentBinOutcome::NoAdjacent => return None,
+                AdjacentBinOutcome::SplitRaceRetry => {
+                    // Brief pause to let the splitter finish.
+                    if attempt + 1 < MAX_ASCENT_ATTEMPTS {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        // Exhausted retry budget. Signal "no adjacent" so the
+        // cursor can fall back to its end-of-iteration path.
+        None
+    }
 
-        // Hand-over-hand latch coupling on the descent — see Tree::search.
-        // This closes the descender-vs-splitter race so the path we
-        // capture is consistent at the time of capture (each (parent,
-        // slot) entry was the active mapping while we observed it).
-        //
-        // TODO: the ascent below re-acquires parent reads one at a time
-        // and assumes the recorded slot_idx is still the slot pointing
-        // at the just-visited child. A concurrent split that completes
-        // between path capture and the ascent walk could shift the
-        // sibling we'd take. The cursor API tolerates a "next entry
-        // may not be the immediate sibling" relaxation (it just makes
-        // progress to *some* later key), so this is not a correctness
-        // bug for the typical caller, but worth documenting.
+    /// One attempt at `get_adjacent_bin`. The tri-state return
+    /// value distinguishes "no adjacent BIN exists" (which the
+    /// caller should propagate as end-of-iteration) from "a
+    /// concurrent split invalidated our path" (which the caller
+    /// should retry from root).
+    fn get_adjacent_bin_attempt(
+        root: &Arc<RwLock<TreeNode>>,
+        current_key: &[u8],
+        forward: bool,
+    ) -> AdjacentBinOutcome {
+        // Path entry: (parent_arc, slot_idx_taken, child_arc_reached).
+        // The child Arc lets the ascent validate that the slot still
+        // points to the same node we descended through.
+        let mut path: Vec<(
+            Arc<RwLock<TreeNode>>,
+            usize,
+            Arc<RwLock<TreeNode>>,
+        )> = Vec::new();
+
         let mut guard: parking_lot::ArcRwLockReadGuard<
             parking_lot::RawRwLock,
             TreeNode,
         > = root.read_arc();
-        let bin_arc;
         loop {
             if guard.is_bin() {
-                bin_arc =
-                    parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
                 break;
             }
 
             let (next_arc, slot_idx) = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
-                        return None;
+                        return AdjacentBinOutcome::NoAdjacent;
                     }
                     let mut idx = 0usize;
                     for (i, entry) in n.entries.iter().enumerate() {
@@ -3232,29 +3257,55 @@ impl Tree {
                             break;
                         }
                     }
-                    let child = n.entries.get(idx)?.child.clone()?;
+                    let child = match n
+                        .entries
+                        .get(idx)
+                        .and_then(|e| e.child.clone())
+                    {
+                        Some(c) => c,
+                        None => return AdjacentBinOutcome::NoAdjacent,
+                    };
                     (child, idx)
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
 
-            // Record the parent for the ascent before handing off.
+            // Record the parent and the child we are about to enter
+            // — the child Arc lets the ascent validate the slot.
             let parent_arc =
                 parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
-            path.push((parent_arc, slot_idx));
+            path.push((parent_arc, slot_idx, Arc::clone(&next_arc)));
 
-            // Take child read lock BEFORE releasing parent's.
+            // Hand-over-hand: take child read lock BEFORE releasing parent.
             let next_guard = next_arc.read_arc();
             drop(guard);
             guard = next_guard;
         }
         drop(guard);
-        let _ = bin_arc; // used only to mark the descent as completed
 
-        // Ascend the path looking for a level with a sibling slot.
-        // getNextIN's "ascend while at edge" loop.
-        while let Some((parent_arc, taken_idx)) = path.pop() {
-            let n_entries = { parent_arc.read().get_n_entries() };
+        // Ascend the path. At each level, validate that
+        // `parent.entries[taken_idx].child == descended_child` before
+        // trusting `taken_idx` as a coordinate. If not, return
+        // `SplitRaceRetry` so the caller restarts from root.
+        while let Some((parent_arc, taken_idx, descended_child)) = path.pop() {
+            let parent_guard = parent_arc.read();
+            let (n_entries, slot_still_valid) = match &*parent_guard {
+                TreeNode::Internal(p) => {
+                    let n = p.entries.len();
+                    let valid = p
+                        .entries
+                        .get(taken_idx)
+                        .and_then(|e| e.child.as_ref())
+                        .is_some_and(|c| Arc::ptr_eq(c, &descended_child));
+                    (n, valid)
+                }
+                _ => return AdjacentBinOutcome::NoAdjacent,
+            };
+            drop(parent_guard);
+
+            if !slot_still_valid {
+                return AdjacentBinOutcome::SplitRaceRetry;
+            }
 
             let sibling_idx = if forward {
                 taken_idx + 1
@@ -3274,19 +3325,27 @@ impl Tree {
             let sibling_arc = {
                 let g = parent_arc.read();
                 match &*g {
-                    TreeNode::Internal(p) => {
-                        p.entries.get(sibling_idx)?.child.clone()?
-                    }
-                    _ => return None,
+                    TreeNode::Internal(p) => match p
+                        .entries
+                        .get(sibling_idx)
+                        .and_then(|e| e.child.clone())
+                    {
+                        Some(c) => c,
+                        None => return AdjacentBinOutcome::NoAdjacent,
+                    },
+                    _ => return AdjacentBinOutcome::NoAdjacent,
                 }
             };
 
             // Descend to the leftmost (forward) or rightmost (!forward) BIN.
-            return Self::descend_to_edge_bin(&sibling_arc, forward);
+            return match Self::descend_to_edge_bin(&sibling_arc, forward) {
+                Some(v) => AdjacentBinOutcome::Found(v),
+                None => AdjacentBinOutcome::NoAdjacent,
+            };
         }
 
         // Exhausted path without finding a sibling → no adjacent BIN.
-        None
+        AdjacentBinOutcome::NoAdjacent
     }
 
     /// Descend to the leftmost BIN (`forward = true`) or rightmost BIN
@@ -3626,28 +3685,28 @@ impl Tree {
     /// exactly like `search()` and returns the leaf-level BIN arc, or `None`
     /// if the tree is empty.
     ///
-    /// TODO(latch-coupling): same dormant-API race as
-    /// `find_bin_for_insert` — still uses the old drop-then-take
-    /// pattern. Convert to `read_arc()` hand-over-hand if a
-    /// production caller is added.
+    /// Uses `read_arc()` hand-over-hand on the descent — the child
+    /// guard is taken before the parent guard is dropped, matching
+    /// `search()`. Returns the BIN Arc with no read lock held; the
+    /// caller must take whatever lock it needs to operate on the
+    /// returned BIN.
     pub fn get_parent_bin_for_child_ln(
         &self,
         key: &[u8],
     ) -> Option<Arc<RwLock<TreeNode>>> {
-        let mut current = self.get_root()?;
+        let root = self.get_root()?;
+        let mut current_arc: Arc<RwLock<TreeNode>> = root.clone();
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = root.read_arc();
 
         loop {
-            // Single-pass latch-coupling: check is_bin AND capture child Arc
-            // within the same lock scope.
-            let guard = current.read();
-
             if guard.is_bin() {
-                // Drop guard, return the BIN Arc we are currently holding.
                 drop(guard);
-                return Some(current);
+                return Some(current_arc);
             }
 
-            // Upper IN: find child slot whose key is the largest <= search key.
             let next_arc = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -3671,9 +3730,11 @@ impl Tree {
                     unreachable!("is_bin() returned false above")
                 }
             };
-            // Release parent latch.
-            Self::latch_coupling_release(guard);
-            current = next_arc;
+            // Hand-over-hand: take child guard before dropping parent.
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            current_arc = next_arc;
+            guard = next_guard;
         }
     }
 
@@ -3683,13 +3744,8 @@ impl Tree {
     /// `get_parent_bin_for_child_ln` — expressed as a separate method to match
     /// API surface.
     ///
-    /// TODO(latch-coupling): this method still uses the old
-    /// `read()` + `latch_coupling_release(guard)` drop-then-take pattern
-    /// on the descent. Currently dormant (no in-tree callers outside
-    /// tests), so it is not data-losing in practice, but it inherits
-    /// the same descender-vs-splitter race window as the pre-fix
-    /// `Tree::search`. Convert to `read_arc()` hand-over-hand if a
-    /// production caller is added.
+    /// Implemented as a delegation to `get_parent_bin_for_child_ln`,
+    /// which uses `read_arc()` hand-over-hand on the descent.
     pub fn find_bin_for_insert(
         &self,
         key: &[u8],

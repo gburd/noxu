@@ -383,7 +383,9 @@ impl CursorImpl {
             let mut guard = txn.lock().unwrap();
             if old_lsn != noxu_util::NULL_LSN.as_u64() {
                 // Move the existing write lock from old slot to new slot.
-                guard.move_write_lock_to_new_lsn(old_lsn, new_lsn_u64);
+                guard
+                    .move_write_lock_to_new_lsn(old_lsn, new_lsn_u64)
+                    .map_err(DbiError::TxnError)?;
             } else {
                 // New insert: no old lock to move — acquire a fresh write lock.
                 guard

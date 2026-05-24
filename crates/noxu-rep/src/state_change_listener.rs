@@ -132,4 +132,53 @@ mod tests {
         listener.on_state_change(event);
         assert_eq!(listener.call_count.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn test_event_time_advances() {
+        let e1 =
+            StateChangeEvent::new(NodeState::Unknown, NodeState::Master, None);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let e2 = StateChangeEvent::new(
+            NodeState::Master,
+            NodeState::Replica,
+            Some("m".into()),
+        );
+        assert!(
+            e2.get_event_time() > e1.get_event_time(),
+            "later event must have a later timestamp"
+        );
+    }
+
+    #[test]
+    fn test_event_clone_and_debug() {
+        let e = StateChangeEvent::new(
+            NodeState::Replica,
+            NodeState::Master,
+            Some("self".into()),
+        );
+        let c = e.clone();
+        assert_eq!(c.old_state, e.old_state);
+        assert_eq!(c.new_state, e.new_state);
+        assert_eq!(c.master_name, e.master_name);
+        // Debug should print something non-empty.
+        let dbg = format!("{e:?}");
+        assert!(!dbg.is_empty());
+        assert!(dbg.contains("StateChangeEvent"));
+    }
+
+    #[test]
+    fn test_listener_never_called_until_event() {
+        let listener = Arc::new(TestListener { call_count: AtomicU32::new(0) });
+        assert_eq!(listener.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_listener_multiple_events() {
+        let listener = Arc::new(TestListener { call_count: AtomicU32::new(0) });
+        for ns in [NodeState::Unknown, NodeState::Master, NodeState::Replica] {
+            let e = StateChangeEvent::new(NodeState::Unknown, ns, None);
+            listener.on_state_change(e);
+        }
+        assert_eq!(listener.call_count.load(Ordering::SeqCst), 3);
+    }
 }

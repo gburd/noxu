@@ -34,6 +34,12 @@ artifacts
 cargo-timing*
 .memelord
 .agent
+# Agent skill files are tracked even though everything else under
+# .agent/ is private — they are referenced from AGENTS.md and need
+# to be visible to every contributor.
+!.agent/
+!.agent/skills/
+!.agent/skills/*.md
 _
 .jdb
 # TLA+ TLC scratch directories and logs

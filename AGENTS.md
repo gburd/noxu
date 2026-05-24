@@ -67,6 +67,7 @@ The 19 crates are organized by implementation layer:
 | Crate | Purpose |
 |---|---|
 | `noxu-observe` | Optional `tracing` / `metrics` / OpenTelemetry glue (off by default) |
+| `noxu-spec` | Stateright executable specifications for the protocols the engine implements (B+tree latching, Flexible Paxos, WAL group-commit, recovery, lock manager + deadlock, VLSN streaming, master transfer, network restore, XA 2PC, cleaner safety, cache↔cleaner ordering). Each spec is a `cargo test` case; failures print a counterexample trace. Run with `make spec`. |
 
 ## Build, Test, and Lint Commands
 
