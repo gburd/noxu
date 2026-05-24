@@ -397,6 +397,19 @@ mod tests {
     use stateright::Checker;
 
     /// Fixed protocol must satisfy every safety property.
+    ///
+    /// Cross-reference: this is the abstract counterpart to the
+    /// production stress tests
+    /// `crates/noxu-db/tests/concurrent_commits_stress.rs`
+    /// (`concurrent_commits_no_lost_writes` and the `_smoke`
+    /// variant) and
+    /// `crates/noxu-db/tests/concurrent_reads_during_splits.rs`
+    /// (`concurrent_reads_during_inserts_no_false_not_found`),
+    /// which drive the real `Tree::insert` / `split_child` /
+    /// `search` code under enough threads to reach the same race
+    /// windows the model explores. If this spec test passes and
+    /// either stress test fails, the implementation has diverged
+    /// from the protocol the spec is verifying.
     #[test]
     fn hand_over_hand_is_safe() {
         let model = BTreeLatchingModel::new(Variant::HandOverHand);
@@ -405,8 +418,20 @@ mod tests {
     }
 
     /// Buggy protocol must produce at least one NoLostWrites
-    /// counterexample. If this stops failing, the regression bait is
-    /// no longer alive — flag immediately.
+    /// counterexample. If this stops failing, the regression bait
+    /// is no longer alive — flag immediately.
+    ///
+    /// Cross-reference: the production code closed the
+    /// descender-vs-splitter race in Stream F (commit `ee688aa`,
+    /// `fix(tree): close descender-vs-splitter races; serialize
+    /// splits with descents`) and the post-v1.2.0 read_arc
+    /// hand-over-hand conversions in `6cf14e0`. The action
+    /// sequence this spec test discovers (`StartPut → take parent
+    /// read → DropParentEarly → split runs → write to stale
+    /// target_bin`) is exactly the bug those commits closed. A
+    /// regression that re-introduces drop-then-take in any
+    /// descent path would be caught by the production stress
+    /// tests cited on `hand_over_hand_is_safe` above.
     #[test]
     fn buggy_protocol_loses_writes() {
         let model = BTreeLatchingModel::new(Variant::DropParentEarly);

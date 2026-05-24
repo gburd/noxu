@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Transaction management and locking for Noxu DB"
+publish = false  # internal implementation detail; consume via noxu-db
 
 [dependencies]
 hashbrown = { workspace = true }

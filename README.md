@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/noxu-db.svg)](https://crates.io/crates/noxu-db)
 [![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
-[![license](https://img.shields.io/badge/license-Apache--2.0%2FMIT-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 
 An embedded transactional key-value database engine, written in Rust. Noxu DB provides ACID transactions, a log-structured B+tree, checkpoint-based crash recovery, and optional master-replica replication — all in a single library with no external database process required.
 
@@ -120,7 +120,7 @@ toolchain in `rust-toolchain.toml`.
   (`noxu-rep`) and observability (`noxu-observe`) pull in additional
   dependencies (`tokio`, `quinn`, `rustls`/`native-tls`, `tracing`,
   `metrics`, `opentelemetry`) only when their features are enabled.
-- **Limited unsafe.** Core data-path crates (`noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`, `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw locking), `noxu-log` (memory-mapped I/O), `noxu-evictor::off_heap` (off-heap cache), `noxu-rep` (network I/O glue), and a small number of single-line `unsafe` blocks in `noxu-latch`, `noxu-db`, and `noxu-xa` documented inline.
+- **Limited unsafe.** Core data-path crates (`noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`, `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O glue and `parking_lot` raw locking), and a single-line `unsafe` block each in `noxu-latch`, `noxu-db`, and `noxu-xa` documented inline. `noxu-evictor::off_heap` is implemented entirely through safe `memmap2` and `lru` wrappers.
 - **No async.** Core engine uses blocking I/O with explicit threading. Only replication networking may use async.
 - **Own log format.** Noxu DB uses a Rust-native on-disk format — `.ndb` files — not compatible with any other database.
 

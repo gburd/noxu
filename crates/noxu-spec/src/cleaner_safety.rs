@@ -13,11 +13,10 @@
 //!
 //! Properties:
 //!   - `NoLiveDelete` — a log file is never deleted while any reader
-//!     still has an outstanding reference to it.
-//!   - `ConservativeLiveCheck` — a "no live readers" decision is
-//!     correct at the time it is made (reads that arrive AFTER the
-//!     decision are not the cleaner's problem; they get a "file gone"
-//!     error from the LogManager and retry).
+//!     still has an outstanding reference to it. (Modelled by the
+//!     `AcquireRef` action invalidating any prior
+//!     `cleared_for_delete` decision and the `Delete` action
+//!     pre-checking `reader_refs`.)
 
 use stateright::{Model, Property};
 
