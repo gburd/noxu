@@ -1354,21 +1354,6 @@ impl Tree {
         }
     }
 
-    /// Release a parent node latch after capturing the child Arc pointer.
-    ///
-    /// Implements hand-over-hand (latch-coupling) protocol:
-    /// acquire the child Arc while holding the parent latch, then call this
-    /// to release the parent before descending.
-    ///
-    /// `IN.releaseLatch()` / the explicit release in
-    /// `Tree.searchSubTree()`.
-    #[inline]
-    fn latch_coupling_release<G>(_guard: G) {
-        // Moving `_guard` into this function drops it, releasing the lock.
-        // Named helper rather than bare `drop()` to make the coupling
-        // semantics explicit and match IN.releaseLatch() call sites.
-    }
-
     /// Search for a BIN that should contain the given key.
     ///
     /// This is the core tree traversal operation. It walks from root to BIN

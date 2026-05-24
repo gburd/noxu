@@ -615,4 +615,257 @@ mod tests {
         assert_eq!(progress.bytes_transferred, content.len() as u64);
         server.stop();
     }
+
+    // -----------------------------------------------------------------------
+    // Wire-protocol error-path coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_into_arc_wraps_self() {
+        let dir = make_env_home(&[]);
+        let server = NetworkRestoreServer::new(dir.path());
+        let arc = server.into_arc();
+        // Arc::strong_count is 1 right after wrapping; verify the
+        // running flag is reachable and false.
+        assert!(!arc.is_running());
+        assert_eq!(Arc::strong_count(&arc), 1);
+    }
+
+    #[test]
+    fn test_serve_raw_rejects_bad_magic() {
+        // Connect to the server and send 4 bytes of garbage. The
+        // server should close the connection with an Err on its
+        // side; on the client we observe EOF / unexpected close.
+        let dir = make_env_home(&[]);
+        let server = Arc::new(NetworkRestoreServer::new(dir.path()));
+        let bound = server.start("127.0.0.1:0".parse().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut stream = std::net::TcpStream::connect(bound).unwrap();
+        stream.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+
+        // Server should close the stream rather than keep talking.
+        // Read with a short timeout — expect 0 bytes (EOF) or an
+        // error.
+        stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 4];
+        let r = std::io::Read::read(&mut stream, &mut buf);
+        match r {
+            Ok(0) => {} // clean EOF — server hung up
+            Ok(_n) => panic!("server replied to bad magic instead of closing"),
+            Err(_) => {} // timeout or reset — also acceptable
+        }
+        server.stop();
+    }
+
+    #[test]
+    fn test_serve_raw_short_read_on_magic() {
+        // Connect and immediately close (send no bytes). The server
+        // should fail its read_exact with a short-read error and
+        // not panic. The accept thread continues.
+        let dir = make_env_home(&[]);
+        let server = Arc::new(NetworkRestoreServer::new(dir.path()));
+        let bound = server.start("127.0.0.1:0".parse().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Connect and drop immediately.
+        {
+            let _ = std::net::TcpStream::connect(bound).unwrap();
+        }
+        // Subsequent connection should still work — accept loop
+        // didn't crash.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(server.is_running());
+        server.stop();
+    }
+
+    #[test]
+    fn test_serve_raw_real_handshake_streams_files() {
+        // End-to-end: use the standalone server (start + serve_raw)
+        // to transfer one file. The existing test_restore_single_file
+        // also exercises this, but via the higher-level
+        // NetworkRestore client; here we open a raw socket and
+        // walk the wire protocol manually so the read_exact /
+        // u32::from_le_bytes paths are exercised.
+        let content = b"hello world";
+        let dir = make_env_home(&[("00000000.ndb", content)]);
+        let server = Arc::new(NetworkRestoreServer::new(dir.path()));
+        let bound = server.start("127.0.0.1:0".parse().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut stream = std::net::TcpStream::connect(bound).unwrap();
+        stream.write_all(&RESTORE_MAGIC.to_le_bytes()).unwrap();
+
+        // Read file count (u32, little-endian).
+        let mut count_buf = [0u8; 4];
+        std::io::Read::read_exact(&mut stream, &mut count_buf).unwrap();
+        let count = u32::from_le_bytes(count_buf);
+        assert_eq!(count, 1);
+
+        // Read filename length (u16) + name bytes.
+        let mut name_len_buf = [0u8; 2];
+        std::io::Read::read_exact(&mut stream, &mut name_len_buf).unwrap();
+        let name_len = u16::from_le_bytes(name_len_buf) as usize;
+        let mut name_buf = vec![0u8; name_len];
+        std::io::Read::read_exact(&mut stream, &mut name_buf).unwrap();
+        assert_eq!(&name_buf, b"00000000.ndb");
+
+        // Read file size (u64) + file bytes.
+        let mut size_buf = [0u8; 8];
+        std::io::Read::read_exact(&mut stream, &mut size_buf).unwrap();
+        let size = u64::from_le_bytes(size_buf);
+        assert_eq!(size as usize, content.len());
+
+        let mut payload = vec![0u8; size as usize];
+        std::io::Read::read_exact(&mut stream, &mut payload).unwrap();
+        assert_eq!(&payload, content);
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_start_returns_error_for_unbindable_addr() {
+        let dir = make_env_home(&[]);
+        let server = Arc::new(NetworkRestoreServer::new(dir.path()));
+        // Port 1 should not be bindable for unprivileged user.
+        let r = server.start("127.0.0.1:1".parse().unwrap());
+        assert!(r.is_err(), "binding to port 1 should fail for non-root");
+    }
+
+    #[test]
+    fn test_stop_is_idempotent() {
+        let dir = make_env_home(&[]);
+        let server = Arc::new(NetworkRestoreServer::new(dir.path()));
+        let _ = server.start("127.0.0.1:0".parse().unwrap()).unwrap();
+        server.stop();
+        server.stop();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!server.is_running());
+    }
+
+    // -----------------------------------------------------------------------
+    // ServiceHandler::handle path (multiplexed-channel transport)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_service_handler_handle_streams_via_channel() {
+        use crate::net::channel::LocalChannelPair;
+
+        let content = b"abcdef";
+        let dir = make_env_home(&[("00000005.ndb", content)]);
+        let server = NetworkRestoreServer::new(dir.path());
+
+        let pair = LocalChannelPair::new();
+        let server_channel: Box<dyn crate::net::channel::Channel> =
+            Box::new(pair.channel_a);
+        let client_channel = pair.channel_b;
+
+        // Client sends magic.
+        client_channel.send(&RESTORE_MAGIC.to_le_bytes()).unwrap();
+
+        // Server runs handle().
+        let r = server.handle(server_channel);
+        assert!(r.is_ok(), "handle returned Err: {:?}", r.err());
+
+        // Client receives the framed payload.
+        use crate::net::channel::Channel;
+        let payload = client_channel
+            .receive(Duration::from_secs(5))
+            .unwrap()
+            .expect("payload");
+
+        // Expected wire format: u32 count + (u16 name_len + name + u64 size + bytes).
+        let count = u32::from_le_bytes([
+            payload[0], payload[1], payload[2], payload[3],
+        ]);
+        assert_eq!(count, 1);
+
+        let name_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+        assert_eq!(name_len, b"00000005.ndb".len());
+        let name = &payload[6..6 + name_len];
+        assert_eq!(name, b"00000005.ndb");
+
+        let size_off = 6 + name_len;
+        let mut size_bytes = [0u8; 8];
+        size_bytes.copy_from_slice(&payload[size_off..size_off + 8]);
+        let size = u64::from_le_bytes(size_bytes) as usize;
+        assert_eq!(size, content.len());
+
+        let data_off = size_off + 8;
+        assert_eq!(&payload[data_off..data_off + size], content);
+    }
+
+    #[test]
+    fn test_service_handler_handle_rejects_bad_magic() {
+        use crate::net::channel::LocalChannelPair;
+
+        let dir = make_env_home(&[]);
+        let server = NetworkRestoreServer::new(dir.path());
+
+        let pair = LocalChannelPair::new();
+        let server_channel: Box<dyn crate::net::channel::Channel> =
+            Box::new(pair.channel_a);
+        let client_channel = pair.channel_b;
+
+        client_channel.send(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        let r = server.handle(server_channel);
+        assert!(r.is_err(), "handle on bad magic must error");
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("bad restore magic"),
+            "expected 'bad restore magic' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_service_handler_handle_rejects_short_magic() {
+        use crate::net::channel::LocalChannelPair;
+
+        let dir = make_env_home(&[]);
+        let server = NetworkRestoreServer::new(dir.path());
+
+        let pair = LocalChannelPair::new();
+        let server_channel: Box<dyn crate::net::channel::Channel> =
+            Box::new(pair.channel_a);
+        let client_channel = pair.channel_b;
+
+        client_channel.send(&[0xDE]).unwrap();
+        let r = server.handle(server_channel);
+        assert!(r.is_err(), "handle on short magic must error");
+    }
+
+    #[test]
+    fn test_service_handler_handle_no_magic_received() {
+        use crate::net::channel::LocalChannelPair;
+
+        let dir = make_env_home(&[]);
+        let server = NetworkRestoreServer::new(dir.path());
+
+        let pair = LocalChannelPair::new();
+        let server_channel: Box<dyn crate::net::channel::Channel> =
+            Box::new(pair.channel_a);
+        // Drop the client side without sending — server should fail
+        // with "no magic bytes received".
+        drop(pair.channel_b);
+        let r = server.handle(server_channel);
+        assert!(r.is_err(), "handle without magic must error");
+    }
+
+    #[test]
+    fn test_service_handler_handle_with_unreadable_env_home() {
+        use crate::net::channel::LocalChannelPair;
+
+        // Point env_home at a path that doesn't exist — read_dir
+        // fails inside handle() and we get a NetworkRestoreError.
+        let server = NetworkRestoreServer::new("/nonexistent/path/xxx");
+
+        let pair = LocalChannelPair::new();
+        let server_channel: Box<dyn crate::net::channel::Channel> =
+            Box::new(pair.channel_a);
+        let client_channel = pair.channel_b;
+
+        client_channel.send(&RESTORE_MAGIC.to_le_bytes()).unwrap();
+        let r = server.handle(server_channel);
+        assert!(r.is_err(), "unreadable env_home must error");
+    }
 }

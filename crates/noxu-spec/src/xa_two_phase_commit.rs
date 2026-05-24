@@ -10,15 +10,44 @@
 //!   - `crates/noxu-xa/src/types.rs`
 //!
 //! Properties:
-//!   - `PreparedImpliesDecided` — once an RM has voted "yes" to
-//!     prepare, the TM must eventually decide commit-or-abort and
-//!     the RM must follow that decision.
-//!   - `RecoveryConsistent` — after a TM crash, recovery yields the
-//!     same global decision (all-commit or all-abort) for every RM.
-//!   - `NoUnilateralCommit` — an RM that has voted "yes" never
-//!     unilaterally commits or aborts.
+//!   - `PreparedImpliesDecided` — an RM in the `Committed` state
+//!     can only exist when the TM is in `CommitDecided`.
+//!   - `NoMixedDecision` — once decided, RMs follow the same
+//!     outcome: not "one Committed, one Aborted" under
+//!     `CommitDecided`.
+//!   - `NoUnilateralCommit` — an RM never reaches `Committed`
+//!     while the TM is in any state other than `CommitDecided`.
+//!
+//! TODO: a `RecoveryConsistent` property — that after a TM crash,
+//! recovery yields the same global decision for every RM — would
+//! benefit from a 2-state predicate (compare pre-crash and
+//! post-recovery decision); currently the model handles recovery
+//! but only the per-state safety invariants above are checked.
 
 use stateright::{Model, Property};
+
+/// Compile-time anchor: the XA spec relies on the existence of
+/// these production [`noxu_xa::XaFlags`] constants. Removing or
+/// renaming any of them on the production side breaks the
+/// `noxu-spec` build, which is the whole point of taking a hard
+/// dep on `noxu-xa` from this crate. The constants themselves are
+/// not used at runtime by the model — the model is a state
+/// machine over `RmState`/`TmState`, not a wire-format check —
+/// but a refactor that, say, renamed `ONEPHASE` to `OnePhase`
+/// would currently land silently with no spec response. The
+/// `_FLAG_ANCHOR` const below makes that a build break.
+#[allow(dead_code)]
+const _FLAG_ANCHOR: [noxu_xa::XaFlags; 9] = [
+    noxu_xa::XaFlags::NOFLAGS,
+    noxu_xa::XaFlags::JOIN,
+    noxu_xa::XaFlags::RESUME,
+    noxu_xa::XaFlags::TMSUCCESS,
+    noxu_xa::XaFlags::TMFAIL,
+    noxu_xa::XaFlags::TMSUSPEND,
+    noxu_xa::XaFlags::ONEPHASE,
+    noxu_xa::XaFlags::STARTRSCAN,
+    noxu_xa::XaFlags::ENDRSCAN,
+];
 
 pub const N_RMS: usize = 2;
 

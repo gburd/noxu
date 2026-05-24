@@ -9,7 +9,7 @@ use crate::{LockConflict, LockUpgrade};
 /// The conflict and upgrade matrices define how locks interact.
 ///
 ///
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LockType {
     /// Basic read lock on a record.
     ///

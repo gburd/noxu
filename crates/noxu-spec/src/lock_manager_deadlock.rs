@@ -15,21 +15,53 @@
 //!     never both a writer and a reader on the same LSN.
 //!   - `NoFalsePositiveAbort` — a transaction is only aborted if
 //!     there is a *real* wait-for cycle including it.
-//!   - `DeadlockEventuallyResolved` — every reachable state with a
-//!     wait-for cycle either has the cycle broken (a participant
-//!     aborts) or has not yet been examined by the detector. (Modeled
-//!     by an explicit `RunDetector` action; we assert no cycle
-//!     persists across a detector run.)
 
 use stateright::{Model, Property};
 
 pub const N_TXNS: usize = 3;
 pub const N_LSNS: usize = 2;
 
+/// The lock kind held in this model. We bridge the spec's two-state
+/// model (read / write) to the production [`noxu_txn::LockType`]
+/// enum: every spec action either tags itself `LockType::Read` or
+/// `LockType::Write`, and the exhaustive matches in `compatible` /
+/// the action emitter below force the spec to be re-validated if a
+/// new variant is ever added to `LockType`. That coupling is the
+/// whole point of taking a hard dep on `noxu-txn` from this crate.
+pub use noxu_txn::LockType as HeldKind;
+
+/// At compile time, assert that the spec's two-kind world is
+/// derivable from the production type. Adding a new lock kind
+/// (e.g. `RangeRead`) breaks this when reviewers try to pick a
+/// spec representative — see the exhaustive match in
+/// [`spec_lock_kind`] below.
+const _: fn(HeldKind) = |kind| {
+    let _ = spec_lock_kind(kind);
+};
+
+/// Project a [`HeldKind`] (which is [`noxu_txn::LockType`]) onto
+/// the spec's read-vs-write alphabet. The exhaustive match means
+/// a new variant of `LockType` (RangeRead, RangeWrite, …)
+/// requires an explicit spec-level decision: either map it onto
+/// the existing alphabet, or extend the spec.
+pub fn spec_lock_kind(kind: HeldKind) -> SpecLockKind {
+    match kind {
+        HeldKind::Read => SpecLockKind::Read,
+        HeldKind::Write => SpecLockKind::Write,
+        HeldKind::RangeRead => SpecLockKind::Read,
+        HeldKind::RangeWrite => SpecLockKind::Write,
+        HeldKind::RangeInsert => SpecLockKind::Write,
+        HeldKind::Restart => SpecLockKind::None,
+        HeldKind::None => SpecLockKind::None,
+    }
+}
+
+/// The two-kind alphabet the model actually explores.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub enum HeldKind {
+pub enum SpecLockKind {
     Read,
     Write,
+    None,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Default)]

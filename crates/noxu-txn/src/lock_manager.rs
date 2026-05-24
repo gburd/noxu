@@ -461,6 +461,67 @@ impl LockManager {
         Ok(())
     }
 
+    /// Releases every lock currently held by `locker_id`, across all
+    /// shards. Returns the number of (lsn, lock) entries the locker
+    /// actually owned and released.
+    ///
+    /// Equivalent to a manual `for lsn in lockers_locks(id): release(lsn, id)`,
+    /// but does not require the caller to track which LSNs the locker
+    /// has touched. The cleaner uses this in three situations:
+    ///
+    ///   - **Reaping abandoned cleaner-locker IDs.** `migrate_ln_slot`
+    ///     allocates a fresh locker id per migration attempt
+    ///     (`next_cleaner_locker_id`), takes a non-blocking read
+    ///     lock, and releases. If `release()` fails for any reason
+    ///     the entry would otherwise leak, since the locker id is
+    ///     never reused. The cleaner can call this method when its
+    ///     run terminates to sweep up anything its short-lived
+    ///     locker ids left behind.
+    ///   - **Catastrophic per-locker abort.** When a deadlock-detector
+    ///     victim is too far along to drain its own per-txn write_locks
+    ///     map (e.g. it is in the middle of `commit_inner_after_read_drain`
+    ///     and the panic handler needs to clean up), this method
+    ///     guarantees the lock-manager view drops the locker even if
+    ///     the per-txn view is corrupt.
+    ///   - **Test cleanup.** Many integration tests hold a `LockManager`
+    ///     across multiple txns and need a quick "drop everything for
+    ///     locker N" without re-creating the manager.
+    ///
+    /// Errors from individual `Lock::release` calls are logged and
+    /// the sweep continues; the count returned is the number of
+    /// release attempts (each removing the locker from one Lock),
+    /// not the number that succeeded — losing one lock release leaks
+    /// one entry, but losing the whole sweep would defeat the
+    /// purpose.
+    pub fn release_all_for_locker(&self, locker_id: i64) -> usize {
+        let mut released = 0usize;
+        for table in &self.lock_tables {
+            let mut table = table.lock();
+            // Collect target LSNs first to avoid mutating the map
+            // while iterating it.
+            let target_lsns: Vec<u64> = table
+                .iter()
+                .filter_map(|(lsn, lock)| {
+                    if lock.get_owned_lock_type(locker_id).is_some() {
+                        Some(*lsn)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for lsn in target_lsns {
+                if let Some(lock) = table.get_mut(&lsn) {
+                    let _notify_ids = lock.release(locker_id);
+                    released += 1;
+                    if lock.n_owners() == 0 && lock.n_waiters() == 0 {
+                        table.remove(&lsn);
+                    }
+                }
+            }
+        }
+        released
+    }
+
     /// Downgrades a write lock to a read lock.
     ///
     ///
@@ -1691,5 +1752,84 @@ mod tests {
             r3
         );
         lm.release(LSN, 3).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // release_all_for_locker
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn release_all_for_locker_returns_count() {
+        let lm = LockManager::new();
+        // Locker 7 takes 5 locks, locker 8 takes 2.
+        for lsn in [10u64, 20, 30, 40, 50] {
+            lm.lock(lsn, 7, LockType::Read, false, false).unwrap();
+        }
+        for lsn in [100u64, 200] {
+            lm.lock(lsn, 8, LockType::Write, false, false).unwrap();
+        }
+        assert_eq!(lm.n_total_locks(), 7);
+
+        let released = lm.release_all_for_locker(7);
+        assert_eq!(released, 5);
+        // Only locker 8's 2 locks remain.
+        assert_eq!(lm.n_total_locks(), 2);
+
+        let released2 = lm.release_all_for_locker(8);
+        assert_eq!(released2, 2);
+        assert_eq!(lm.n_total_locks(), 0);
+    }
+
+    #[test]
+    fn release_all_for_locker_unknown_id_is_zero() {
+        let lm = LockManager::new();
+        lm.lock(1, 1, LockType::Read, false, false).unwrap();
+        let released = lm.release_all_for_locker(999);
+        assert_eq!(released, 0);
+        assert_eq!(lm.n_total_locks(), 1);
+        lm.release(1, 1).unwrap();
+    }
+
+    #[test]
+    fn release_all_for_locker_idempotent() {
+        // Calling twice is safe — second call reaps zero entries.
+        let lm = LockManager::new();
+        lm.lock(1, 1, LockType::Read, false, false).unwrap();
+        lm.lock(2, 1, LockType::Write, false, false).unwrap();
+        assert_eq!(lm.release_all_for_locker(1), 2);
+        assert_eq!(lm.release_all_for_locker(1), 0);
+    }
+
+    #[test]
+    fn release_all_for_locker_preserves_other_owners() {
+        // Multiple lockers sharing a read lock at the same LSN: releasing
+        // one locker leaves the others' entry intact.
+        let lm = LockManager::new();
+        lm.lock(1, 1, LockType::Read, false, false).unwrap();
+        lm.lock(1, 2, LockType::Read, false, false).unwrap();
+        lm.lock(1, 3, LockType::Read, false, false).unwrap();
+
+        let released = lm.release_all_for_locker(2);
+        assert_eq!(released, 1);
+        // Lock entry persists because lockers 1 and 3 still own it.
+        assert_eq!(lm.n_total_locks(), 1);
+
+        // Verify locker 2 no longer has it.
+        let released_again = lm.release_all_for_locker(2);
+        assert_eq!(released_again, 0);
+
+        lm.release(1, 1).unwrap();
+        lm.release(1, 3).unwrap();
+        assert_eq!(lm.n_total_locks(), 0);
+    }
+
+    #[test]
+    fn release_all_for_locker_clears_lock_when_last_owner_leaves() {
+        let lm = LockManager::new();
+        lm.lock(42, 1, LockType::Write, false, false).unwrap();
+        assert_eq!(lm.n_total_locks(), 1);
+        lm.release_all_for_locker(1);
+        // Lock entry was the last owner of LSN 42 — entry removed.
+        assert_eq!(lm.n_total_locks(), 0);
     }
 }
