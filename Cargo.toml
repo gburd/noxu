@@ -123,6 +123,7 @@ noxu-db = { path = "crates/noxu-db" }
 noxu-bind = { path = "crates/noxu-bind" }
 noxu-collections = { path = "crates/noxu-collections" }
 noxu-persist = { path = "crates/noxu-persist" }
+noxu-xa = { path = "crates/noxu-xa" }
 noxu-rep = { path = "crates/noxu-rep" }
 noxu-observe = { path = "crates/noxu-observe" }
 

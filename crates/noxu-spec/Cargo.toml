@@ -7,10 +7,16 @@ description = "Stateright executable specifications for noxu protocols"
 publish = false
 
 [dependencies]
-# Stateright is the core; everything else is just shared types so the
-# specs can talk about the same enums (LockType, OperationStatus, …)
-# the production code uses.
+# Stateright is the core model checker.
 stateright = { workspace = true }
+
+# Production crates whose public types the specs import. The point is
+# coupling: a refactor that changes a variant of LockType, removes an
+# XaFlags constant, etc. will break the noxu-spec build via the
+# exhaustive matches inside each spec module. Without this, the
+# specs would silently model a stale version of the enum.
+noxu-txn = { workspace = true }
+noxu-xa = { workspace = true }
 
 [dev-dependencies]
 # Specs are validated as ordinary `cargo test` cases — no external

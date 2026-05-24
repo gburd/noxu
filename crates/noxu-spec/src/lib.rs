@@ -36,11 +36,27 @@
 //!   - Reviewers are expected to update the relevant spec module
 //!     when changing a protocol's state-transition shape.
 //!
-//! Note: each spec defines its own state/action enums rather than
-//! re-using the production ones. This keeps `noxu-spec` decoupled
-//! from the rest of the workspace (no transitive dep cycles, no
-//! visibility leaks for internal types) at the cost of having to
-//! manually keep the two views in sync.
+//! Beyond CI, two spec modules take a *direct* dep on the
+//! production crates so a refactor of the relevant types breaks
+//! the spec build:
+//!
+//!   - [`lock_manager_deadlock`] re-exports
+//!     [`noxu_txn::LockType`] as `HeldKind`. Its
+//!     `spec_lock_kind()` projection uses an exhaustive `match`
+//!     over every `LockType` variant — adding a new variant
+//!     forces a build break and a spec-level decision (extend
+//!     the alphabet, or map onto the existing read/write set).
+//!   - [`xa_two_phase_commit`] declares a compile-time anchor
+//!     `_FLAG_ANCHOR` referencing every public constant on
+//!     [`noxu_xa::XaFlags`]. Removing or renaming any of them on
+//!     the production side breaks the spec build.
+//!
+//! For specs whose state/action types have no direct production
+//! analogue (`master_transfer::NodeRole`,
+//! `recovery_three_phase::Phase`, …) the type stays
+//! spec-internal; reviewers are responsible for keeping the
+//! abstract model in sync with the implementation when the
+//! protocol's shape changes.
 //!
 //! See the `tests` module inside [`btree_latching`] for the
 //! convention used to keep regression bait alive after the
