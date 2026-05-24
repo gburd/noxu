@@ -43,9 +43,11 @@ This document is a code-verified review of Noxu DB's design and implementation c
 
 ## Session 20: Implemented Gaps
 
-### G1 — Latch coupling named helper (CRITICAL → RESOLVED)
+### G1 — Latch coupling named helper (CRITICAL → RESOLVED, then SUPERSEDED)
 **File**: `crates/noxu-tree/src/tree.rs`
-**Resolution**: Added `Tree::latch_coupling_release<G>(_guard: G)` helper (implements `latch_coupling_release`). All five traversal paths — `search()`, `first_entry_at_or_after()`, `search_with_coupling()`, `get_parent_bin_for_child_ln()` / `descend_to_edge_bin()`, and `get_parent_bin_for_child_ln()` (second impl block) — now call `Self::latch_coupling_release(guard)` instead of bare `drop(guard)`. The hand-over-hand semantics (child Arc captured while parent guard is held, parent released before descent) were already structurally correct; the named helper makes the coupling explicit and matches the intended coupling semantics.
+**Initial resolution (Stream H)**: Added `Tree::latch_coupling_release<G>(_guard: G)` helper. The first wave of traversal conversions called it instead of bare `drop(guard)` to make the hand-over-hand intent explicit at the call site.
+
+**Superseding resolution (Streams F/J + post-v1.2.0 cleanup)**: All traversal paths were subsequently converted to `parking_lot::Arc::read_arc()` hand-over-hand, where the child read guard is taken **before** the parent guard goes out of scope. The compiler's lexical drop order is now what enforces the coupling, not a named helper. The `latch_coupling_release` helper became dead code (zero callers) and has been removed. The current converted call sites are: `search()`, `first_entry_at_or_after()`, `search_with_coupling()`, `get_parent_bin_for_child_ln()` / `find_bin_for_insert()`, `get_adjacent_bin_attempt()`, `descend_to_edge_bin()`. Each takes `next_guard = next_arc.read_arc(); drop(guard); guard = next_guard;` so the parent latch is held until after the child latch is acquired.
 
 ---
 
