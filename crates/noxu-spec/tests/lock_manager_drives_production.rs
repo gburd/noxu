@@ -91,7 +91,7 @@ fn check_write_locks_exclusive(lm: &LockManager, step_idx: usize) {
             writers.len()
         );
         assert!(
-            !(writers.len() == 1 && !readers.is_empty()),
+            writers.len() != 1 || readers.is_empty(),
             "step {step_idx}: lsn {lsn} has writer {writers:?} \
              AND readers {readers:?} — violates WriteLocksExclusive \
              (writer excludes readers)",
