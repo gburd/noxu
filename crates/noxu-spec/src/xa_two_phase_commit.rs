@@ -26,6 +26,29 @@
 
 use stateright::{Model, Property};
 
+/// Compile-time anchor: the XA spec relies on the existence of
+/// these production [`noxu_xa::XaFlags`] constants. Removing or
+/// renaming any of them on the production side breaks the
+/// `noxu-spec` build, which is the whole point of taking a hard
+/// dep on `noxu-xa` from this crate. The constants themselves are
+/// not used at runtime by the model — the model is a state
+/// machine over `RmState`/`TmState`, not a wire-format check —
+/// but a refactor that, say, renamed `ONEPHASE` to `OnePhase`
+/// would currently land silently with no spec response. The
+/// `_FLAG_ANCHOR` const below makes that a build break.
+#[allow(dead_code)]
+const _FLAG_ANCHOR: [noxu_xa::XaFlags; 9] = [
+    noxu_xa::XaFlags::NOFLAGS,
+    noxu_xa::XaFlags::JOIN,
+    noxu_xa::XaFlags::RESUME,
+    noxu_xa::XaFlags::TMSUCCESS,
+    noxu_xa::XaFlags::TMFAIL,
+    noxu_xa::XaFlags::TMSUSPEND,
+    noxu_xa::XaFlags::ONEPHASE,
+    noxu_xa::XaFlags::STARTRSCAN,
+    noxu_xa::XaFlags::ENDRSCAN,
+];
+
 pub const N_RMS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
