@@ -307,15 +307,21 @@ impl Txn {
             }
         }
         let want_sync = matches!(durability, Durability::CommitSync);
-        // The body that can fail with `?` is wrapped in a closure
+        // The body that can fail with `?` is wrapped in a helper
         // so that any Err from log_entry / flush_sync_if_needed /
-        // flush_no_sync goes through the lock-drain epilogue rather
-        // than leaking write locks to environment close.
+        // flush_no_sync goes through the lock-drain epilogue
+        // rather than leaking write locks to environment close.
+        // The txn is also flipped to `MustAbort` on Err so a
+        // caller who ignores the error and re-calls commit() does
+        // NOT silently write a second TxnCommit record — instead
+        // they hit `check_state` and get a clear
+        // `InvalidTransaction` Err.
         let assigned_lsn: Lsn =
             match self.commit_inner_after_read_drain(durability, want_sync) {
                 Ok(lsn) => lsn,
                 Err(e) => {
                     self.release_all_locks();
+                    self.state = TxnState::MustAbort;
                     return Err(e);
                 }
             };
@@ -843,10 +849,10 @@ impl Txn {
     /// Moves the write lock from `old_lsn` to `new_lsn`.
     ///
     /// Called after logging a new LN entry for an existing record:
-    /// 1. Removes the `WriteLockInfo` from `write_locks[old_lsn]`.
-    /// 2. Releases the old LSN lock at the `LockManager` level.
-    /// 3. Acquires a write lock on `new_lsn` at the `LockManager` level.
-    /// 4. Moves the `WriteLockInfo` into `write_locks[new_lsn]`.
+    /// 1. Releases the old LSN lock at the `LockManager` level.
+    /// 2. Acquires a write lock on `new_lsn` at the `LockManager` level.
+    /// 3. Atomically moves the `WriteLockInfo` entry from
+    ///    `write_locks[old_lsn]` to `write_locks[new_lsn]`.
     ///
     /// Returns `Ok(())` if the txn held no write lock on `old_lsn`
     /// (a no-op).
@@ -854,53 +860,67 @@ impl Txn {
     /// # Errors
     ///
     /// Either the `release(old_lsn)` or the `lock(new_lsn)` step can
-    /// fail. If `release` fails, the per-txn `WriteLockInfo` is *not*
-    /// reinserted at `old_lsn`: the caller has logged a new LN at
-    /// `new_lsn` and from the engine's perspective `old_lsn` is dead;
-    /// the lock-manager bookkeeping for it will be reaped via the
-    /// owner-txn pruning path on abort/commit. If `lock(new_lsn)`
-    /// fails, the txn ends up with no write lock for the row at all,
-    /// which is detected on the next `set_write_lock_abort_info` (no
-    /// matching `WriteLockInfo`). In both cases the error is
-    /// surfaced so the caller can abort the cursor operation rather
-    /// than silently desync the per-txn and lock-manager views.
+    /// fail. The `WriteLockInfo` (which holds the abort image used
+    /// by `abort()` to undo the write) is NEVER dropped on the error
+    /// path — losing it would silently break rollback for the row:
+    ///
+    ///   - `release(old_lsn)` failure: WLI is still at `old_lsn`,
+    ///     and the lock_manager still holds the old lock. A
+    ///     subsequent `abort()` re-attempts `release(old_lsn)`,
+    ///     which is logged again but does not corrupt state.
+    ///   - `lock(new_lsn)` failure (after release succeeded): WLI
+    ///     remains at `old_lsn` even though the lock_manager
+    ///     released old_lsn. `abort()` will iterate `write_locks`,
+    ///     generate the undo record, then attempt `release(old_lsn)`
+    ///     which logs (lock_manager has nothing there) and
+    ///     continues.
+    ///
+    /// In both cases the error is surfaced so the caller can abort
+    /// the cursor operation rather than silently desynchronise the
+    /// per-txn and lock-manager views.
     pub fn move_write_lock_to_new_lsn(
         &mut self,
         old_lsn: u64,
         new_lsn: u64,
     ) -> Result<(), TxnError> {
-        if let Some(wli) = self.write_locks.remove(&old_lsn) {
-            // Release the old slot first; if this fails the slot is
-            // still in `lock_manager` but no longer in our per-txn
-            // map, so it will be reaped via the owner-txn pruning
-            // path on abort/commit.
-            if let Err(e) = self.lock_manager.release(old_lsn, self.id) {
-                log::error!(
-                    "noxu-txn: lock_manager.release({old_lsn}, txn={}) failed \
-                     during move_write_lock_to_new_lsn: {e}",
-                    self.id
-                );
-                return Err(e);
-            }
-            // Acquire on the new slot. If this fails the txn has no
-            // write lock for the row at all; surface so the caller
-            // can abort the cursor operation.
-            if let Err(e) = self.lock_manager.lock(
-                new_lsn,
-                self.id,
-                LockType::Write,
-                false,
-                false,
-            ) {
-                log::error!(
-                    "noxu-txn: lock_manager.lock({new_lsn}, txn={}, Write) \
-                     failed during move_write_lock_to_new_lsn: {e}",
-                    self.id
-                );
-                return Err(e);
-            }
-            self.write_locks.insert(new_lsn, wli);
+        // No-op if the txn doesn't hold a write lock at `old_lsn`.
+        if !self.write_locks.contains_key(&old_lsn) {
+            return Ok(());
         }
+        // Phase 1: release old. WLI stays in write_locks until both
+        // phases succeed, so an Err leaves abort info reachable.
+        if let Err(e) = self.lock_manager.release(old_lsn, self.id) {
+            log::error!(
+                "noxu-txn: lock_manager.release({old_lsn}, txn={}) failed \
+                 during move_write_lock_to_new_lsn (WLI preserved at \
+                 old_lsn so abort can roll back): {e}",
+                self.id
+            );
+            return Err(e);
+        }
+        // Phase 2: acquire new.
+        if let Err(e) = self.lock_manager.lock(
+            new_lsn,
+            self.id,
+            LockType::Write,
+            false,
+            false,
+        ) {
+            log::error!(
+                "noxu-txn: lock_manager.lock({new_lsn}, txn={}, Write) \
+                 failed during move_write_lock_to_new_lsn (WLI preserved \
+                 at old_lsn so abort can roll back; lock_manager no \
+                 longer holds old_lsn): {e}",
+                self.id
+            );
+            return Err(e);
+        }
+        // Both phases succeeded — atomic move.
+        let wli = self
+            .write_locks
+            .remove(&old_lsn)
+            .expect("contains_key check above guarantees Some");
+        self.write_locks.insert(new_lsn, wli);
         Ok(())
     }
 

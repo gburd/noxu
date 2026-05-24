@@ -42,12 +42,22 @@ pub fn ttl_hours_to_expiration(ttl_hours: u32) -> u32 {
     current_time_hours().saturating_add(ttl_hours)
 }
 
-/// Converts a TTL duration in seconds to a packed expiration_time (second resolution).
+/// Converts a TTL duration in seconds to a packed `expiration_time`
+/// (seconds since the Unix epoch).
+///
+/// The returned value is comparable to [`current_time_secs`] and
+/// works with [`is_expired`] when `in_hours = false`.
+///
+/// `ttl_secs == 0` is the "never expires" sentinel and returns 0.
+///
+/// Saturates at `u32::MAX` if either `ttl_secs` itself or
+/// `current_time_secs() + ttl_secs` would not fit in `u32`.
 pub fn ttl_secs_to_expiration(ttl_secs: u64) -> u32 {
     if ttl_secs == 0 {
         return 0;
     }
-    current_time_secs().saturating_add((ttl_secs / SECS_PER_HOUR).max(1) as u32)
+    let ttl_u32: u32 = ttl_secs.try_into().unwrap_or(u32::MAX);
+    current_time_secs().saturating_add(ttl_u32)
 }
 
 #[cfg(test)]
@@ -132,33 +142,44 @@ mod tests {
     }
 
     #[test]
-    fn ttl_secs_to_expiration_subhour_uses_minimum_one_hour() {
-        // The implementation rounds sub-hour TTLs up to one hour
-        // (the .max(1) guard) so that "expires in 30 seconds" is
-        // not lost to integer division.
+    fn ttl_secs_to_expiration_30_seconds_in_30_seconds() {
+        // Adding 30 seconds to current_time_secs() yields a value
+        // 30 ahead — exact down to the second-resolution.
         let now = current_time_secs();
         let exp = ttl_secs_to_expiration(30);
-        // exp == now + 1 hour-equivalent; allow a small race window.
-        assert!(exp > now && exp <= now + 2);
+        assert!(
+            exp >= now + 30 && exp <= now + 31,
+            "exp={exp} not in [{}, {}]",
+            now + 30,
+            now + 31
+        );
     }
 
     #[test]
-    fn ttl_secs_to_expiration_multi_hour_uses_hour_quanta() {
+    fn ttl_secs_to_expiration_two_hours_uses_seconds() {
+        // 7200 seconds == 2 hours. The expiration must be ~7200s in
+        // the future, NOT 2s — that would be the legacy buggy
+        // behaviour where the function divided by SECS_PER_HOUR.
         let now = current_time_secs();
-        // 7200 secs = 2 hours of TTL — passed as "2" via the
-        // ttl_secs / SECS_PER_HOUR calculation.
         let exp = ttl_secs_to_expiration(7200);
-        assert!(exp >= now + 2 && exp <= now + 3);
+        assert!(
+            exp >= now + 7200 && exp <= now + 7201,
+            "expected ~now+7200 seconds, got exp={exp} (now={now})"
+        );
     }
 
     #[test]
-    fn ttl_secs_to_expiration_does_not_panic_on_max() {
-        // (u64::MAX / SECS_PER_HOUR) truncated to u32 wraps; the
-        // function does not panic. The truncation is a real bug
-        // (see noxu-util/src/ttl.rs::ttl_secs_to_expiration: the
-        // `as u32` cast is lossy for u64 values above u32::MAX
-        // hours of TTL); preserved in this test as a known
-        // limitation rather than a panic-on-overflow path.
-        let _ = ttl_secs_to_expiration(u64::MAX);
+    fn ttl_secs_to_expiration_saturates_on_u64_overflow() {
+        // u64::MAX > u32::MAX, so the inner try_into clamps to
+        // u32::MAX and the saturating_add then clamps again.
+        assert_eq!(ttl_secs_to_expiration(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn ttl_secs_to_expiration_saturates_on_addition_overflow() {
+        // A TTL one less than u32::MAX always overflows when added
+        // to any non-zero current_time_secs.
+        let exp = ttl_secs_to_expiration(u32::MAX as u64 - 1);
+        assert_eq!(exp, u32::MAX);
     }
 }

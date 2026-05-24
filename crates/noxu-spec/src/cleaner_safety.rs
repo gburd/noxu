@@ -118,27 +118,14 @@ impl Model for CleanerSafetyModel {
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
-        vec![
-            Property::<Self>::always("NoLiveDelete", |_, s: &State| {
-                for f in 0..N_FILES {
-                    if s.file_deleted[f] && s.reader_refs.contains(&Some(f)) {
-                        return false;
-                    }
+        vec![Property::<Self>::always("NoLiveDelete", |_, s: &State| {
+            for f in 0..N_FILES {
+                if s.file_deleted[f] && s.reader_refs.contains(&Some(f)) {
+                    return false;
                 }
-                true
-            }),
-            Property::<Self>::always(
-                "ClearedThenDeletedConsistent",
-                |_, s: &State| {
-                    // A deleted file must have had cleared_for_delete set
-                    // at some point (we can't observe history; weaker
-                    // local check: a deleted file has no outstanding
-                    // refs, captured by NoLiveDelete).
-                    let _ = s;
-                    true
-                },
-            ),
-        ]
+            }
+            true
+        })]
     }
 }
 

@@ -158,8 +158,6 @@ serde = { version = "1", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 stateright = "0.31"
-hegeltest = "0.14"
-hegeltest-macros = "0.14"
 
 [workspace.lints.clippy]
 or_fun_call = "warn"

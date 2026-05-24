@@ -28,14 +28,19 @@
 //! # How to keep specs in sync with the implementation
 //!
 //! Each spec module's preamble lists the Rust files it models. When
-//! one of those files changes the spec must be re-validated; this is
-//! enforced two ways:
+//! one of those files changes the spec must be re-validated; this
+//! is enforced by:
 //!
-//!   1. The spec exposes the Rust enum / struct the model uses (e.g.
-//!      `LockType`, `OperationStatus`, `XaFlags`) directly from the
-//!      production crates — refactors break the build.
-//!   2. The CI workflow `.github/workflows/spec.yml` runs
-//!      `cargo test -p noxu-spec --release` on every PR.
+//!   - The CI workflow `.github/workflows/spec.yml` runs
+//!     `cargo test -p noxu-spec --release` on every PR.
+//!   - Reviewers are expected to update the relevant spec module
+//!     when changing a protocol's state-transition shape.
+//!
+//! Note: each spec defines its own state/action enums rather than
+//! re-using the production ones. This keeps `noxu-spec` decoupled
+//! from the rest of the workspace (no transitive dep cycles, no
+//! visibility leaks for internal types) at the cost of having to
+//! manually keep the two views in sync.
 //!
 //! See the `tests` module inside [`btree_latching`] for the
 //! convention used to keep regression bait alive after the

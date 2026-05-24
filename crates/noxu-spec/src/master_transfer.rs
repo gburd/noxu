@@ -12,8 +12,11 @@
 //! Properties:
 //!   - `AtMostOneMaster` — across all reachable states, at most one
 //!     node is in `MasterActive` at any time.
-//!   - `CommitPointMonotone` — the global commit-point only ever
-//!     advances.
+//!   - `AtMostOneDraining` — likewise for `MasterDraining`; rules
+//!     out a split-brain hand-off race.
+//!   - `MasterTermsMonotone` — `current_master_term` is at least
+//!     the highest per-node `master_term` ever recorded, so terms
+//!     never re-use earlier values.
 
 use stateright::{Model, Property};
 

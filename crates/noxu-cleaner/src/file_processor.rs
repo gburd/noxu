@@ -16,12 +16,13 @@ use std::sync::{Arc, RwLock};
 /// Release a cleaner read-lock and log any failure.
 ///
 /// The cleaner is best-effort by design: failing to release a
-/// non-blocking read lock on `tree_lsn` after a slot inspection means
-/// a small leak in the `LockManager` (the lock will be reaped via
-/// the owner-locker pruning path), not data corruption. This helper
-/// centralises the `log::error!` call so the operator can see when a
-/// `LockManager::release` is failing — that would point to a bug in
-/// the lock-manager bookkeeping.
+/// non-blocking read lock on `tree_lsn` after a slot inspection
+/// means a small leak in the `LockManager` (the cleaner-locker id
+/// is short-lived and abandoned after the migration attempt
+/// returns), not data corruption. This helper centralises the
+/// `log::error!` call so the operator can see when a
+/// `LockManager::release` is failing — that would point to a bug
+/// in the lock-manager bookkeeping.
 fn release_cleaner_lock(
     lock_manager: &LockManager,
     lock_lsn: u64,

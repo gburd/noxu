@@ -1207,6 +1207,27 @@ impl SplitEntries {
     }
 }
 
+/// Tri-state outcome from one attempt at
+/// `Tree::get_adjacent_bin_attempt`.
+///
+/// Distinguishes "the tree genuinely has no BIN in the requested
+/// direction" (→ propagate as end-of-iteration) from "the path we
+/// captured was invalidated by a concurrent split" (→ caller
+/// retries from root). This split is necessary because the cursor
+/// translates a `None` from `get_adjacent_bin` into
+/// `OperationStatus::NotFound`, which is indistinguishable from a
+/// real end-of-tree.
+#[derive(Debug)]
+enum AdjacentBinOutcome {
+    /// A BIN was found in the requested direction.
+    Found(Vec<BinEntry>),
+    /// The tree genuinely has no BIN in the requested direction.
+    NoAdjacent,
+    /// A concurrent split invalidated our captured path; the
+    /// caller should retry from root.
+    SplitRaceRetry,
+}
+
 impl Tree {
     /// Creates a new empty tree.
     ///
@@ -3158,39 +3179,51 @@ impl Tree {
     ///
     /// The ascent re-acquires the parent's read lock one level at a
     /// time. To handle a concurrent split that completes between
-    /// path capture and ascent, we *validate* that the slot still
+    /// path capture and ascent, we validate that the slot still
     /// holds the child Arc we descended through. If the slot
-    /// mismatches we retry the whole operation from root once
-    /// (a single-retry budget — concurrent splits are bounded per
-    /// commit, so two attempts is sufficient under any realistic
-    /// workload). After two consecutive failures we conservatively
-    /// return `None`, signalling "no adjacent BIN found"; the
-    /// cursor's caller will then either restart its scan or report
-    /// end-of-iteration.
+    /// mismatches we retry the whole operation from root with a
+    /// short pause between attempts. The retry budget is generous
+    /// (`MAX_ASCENT_ATTEMPTS`) so that the typical case of a few
+    /// cascading splits between two BIN-level cursor steps is
+    /// absorbed without surfacing as a false end-of-iteration.
+    /// After exhausting the budget we conservatively return `None`,
+    /// signalling "no adjacent BIN found"; the cursor will then
+    /// either restart its scan or report end-of-iteration. The
+    /// budget is finite so a pathological workload (a thread
+    /// permanently splitting under us) cannot livelock the lookup.
     fn get_adjacent_bin(
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
     ) -> Option<Vec<BinEntry>> {
-        for _attempt in 0..2 {
-            if let Some(result) =
-                Self::get_adjacent_bin_attempt(root, current_key, forward)
-            {
-                return Some(result);
+        const MAX_ASCENT_ATTEMPTS: u32 = 8;
+        for attempt in 0..MAX_ASCENT_ATTEMPTS {
+            match Self::get_adjacent_bin_attempt(root, current_key, forward) {
+                AdjacentBinOutcome::Found(v) => return Some(v),
+                AdjacentBinOutcome::NoAdjacent => return None,
+                AdjacentBinOutcome::SplitRaceRetry => {
+                    // Brief pause to let the splitter finish.
+                    if attempt + 1 < MAX_ASCENT_ATTEMPTS {
+                        std::thread::yield_now();
+                    }
+                }
             }
         }
+        // Exhausted retry budget. Signal "no adjacent" so the
+        // cursor can fall back to its end-of-iteration path.
         None
     }
 
-    /// One attempt at `get_adjacent_bin`. Returns `None` either when
-    /// there genuinely is no adjacent BIN, or when a concurrent
-    /// split has invalidated the captured path; the caller decides
-    /// whether to retry.
+    /// One attempt at `get_adjacent_bin`. The tri-state return
+    /// value distinguishes "no adjacent BIN exists" (which the
+    /// caller should propagate as end-of-iteration) from "a
+    /// concurrent split invalidated our path" (which the caller
+    /// should retry from root).
     fn get_adjacent_bin_attempt(
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
-    ) -> Option<Vec<BinEntry>> {
+    ) -> AdjacentBinOutcome {
         // Path entry: (parent_arc, slot_idx_taken, child_arc_reached).
         // The child Arc lets the ascent validate that the slot still
         // points to the same node we descended through.
@@ -3212,7 +3245,7 @@ impl Tree {
             let (next_arc, slot_idx) = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
-                        return None;
+                        return AdjacentBinOutcome::NoAdjacent;
                     }
                     let mut idx = 0usize;
                     for (i, entry) in n.entries.iter().enumerate() {
@@ -3224,7 +3257,14 @@ impl Tree {
                             break;
                         }
                     }
-                    let child = n.entries.get(idx)?.child.clone()?;
+                    let child = match n
+                        .entries
+                        .get(idx)
+                        .and_then(|e| e.child.clone())
+                    {
+                        Some(c) => c,
+                        None => return AdjacentBinOutcome::NoAdjacent,
+                    };
                     (child, idx)
                 }
                 TreeNode::Bottom(_) => unreachable!(),
@@ -3245,8 +3285,8 @@ impl Tree {
 
         // Ascend the path. At each level, validate that
         // `parent.entries[taken_idx].child == descended_child` before
-        // trusting `taken_idx` as a coordinate. If not, return None
-        // — the caller's retry will rebuild the path from root.
+        // trusting `taken_idx` as a coordinate. If not, return
+        // `SplitRaceRetry` so the caller restarts from root.
         while let Some((parent_arc, taken_idx, descended_child)) = path.pop() {
             let parent_guard = parent_arc.read();
             let (n_entries, slot_still_valid) = match &*parent_guard {
@@ -3259,15 +3299,12 @@ impl Tree {
                         .is_some_and(|c| Arc::ptr_eq(c, &descended_child));
                     (n, valid)
                 }
-                _ => return None,
+                _ => return AdjacentBinOutcome::NoAdjacent,
             };
             drop(parent_guard);
 
             if !slot_still_valid {
-                // The slot no longer refers to the child we
-                // descended through (a split must have run between
-                // descent and ascent). Caller retries.
-                return None;
+                return AdjacentBinOutcome::SplitRaceRetry;
             }
 
             let sibling_idx = if forward {
@@ -3288,19 +3325,27 @@ impl Tree {
             let sibling_arc = {
                 let g = parent_arc.read();
                 match &*g {
-                    TreeNode::Internal(p) => {
-                        p.entries.get(sibling_idx)?.child.clone()?
-                    }
-                    _ => return None,
+                    TreeNode::Internal(p) => match p
+                        .entries
+                        .get(sibling_idx)
+                        .and_then(|e| e.child.clone())
+                    {
+                        Some(c) => c,
+                        None => return AdjacentBinOutcome::NoAdjacent,
+                    },
+                    _ => return AdjacentBinOutcome::NoAdjacent,
                 }
             };
 
             // Descend to the leftmost (forward) or rightmost (!forward) BIN.
-            return Self::descend_to_edge_bin(&sibling_arc, forward);
+            return match Self::descend_to_edge_bin(&sibling_arc, forward) {
+                Some(v) => AdjacentBinOutcome::Found(v),
+                None => AdjacentBinOutcome::NoAdjacent,
+            };
         }
 
         // Exhausted path without finding a sibling → no adjacent BIN.
-        None
+        AdjacentBinOutcome::NoAdjacent
     }
 
     /// Descend to the leftmost BIN (`forward = true`) or rightmost BIN
