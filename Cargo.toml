@@ -99,11 +99,16 @@ name = "transaction_config"
 path = "examples/transaction_config.rs"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.2.0"
 edition = "2024"
-license = "Apache-2.0"
-repository = "https://github.com/gburd/lamdb"
-description = "Noxu DB - An embedded transactional database engine"
+license = "Apache-2.0 OR MIT"
+repository = "https://codeberg.org/gregburd/noxu"
+homepage = "https://codeberg.org/gregburd/noxu"
+documentation = "https://docs.rs/noxu-db"
+description = "Noxu DB — An embedded transactional key-value database engine in Rust"
+keywords = ["database", "embedded", "transactional", "btree", "wal"]
+categories = ["database-implementations", "data-structures", "concurrency"]
+readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
