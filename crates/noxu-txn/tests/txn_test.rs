@@ -421,10 +421,22 @@ fn move_write_lock_migrates_lock_to_new_lsn() {
     let lm2 = Arc::clone(&lm);
     let mut txn = noxu_txn::Txn::new(1, lm);
     txn.lock(50, LockType::Write, false).unwrap();
-    txn.move_write_lock_to_new_lsn(50, 99);
+    txn.move_write_lock_to_new_lsn(50, 99).unwrap();
     // Old lsn should no longer be locked; new lsn should be.
     assert!(lm2.is_owned_write_lock(99, 1), "new lsn should be write-locked");
     assert!(!lm2.is_owned_write_lock(50, 1), "old lsn should be released");
+    txn.commit().unwrap();
+}
+
+#[test]
+fn move_write_lock_no_op_when_no_old_lock() {
+    // Calling on an LSN this txn does not hold a write lock for is
+    // a no-op and returns Ok — preserves the pre-Result behaviour
+    // for callers that don't track which LSNs have moved.
+    let lm = lm();
+    let mut txn = noxu_txn::Txn::new(1, lm);
+    let r = txn.move_write_lock_to_new_lsn(7777, 8888);
+    assert!(r.is_ok());
     txn.commit().unwrap();
 }
 
