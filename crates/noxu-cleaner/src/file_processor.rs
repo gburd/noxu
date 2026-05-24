@@ -23,6 +23,11 @@ use std::sync::{Arc, RwLock};
 /// `log::error!` call so the operator can see when a
 /// `LockManager::release` is failing — that would point to a bug
 /// in the lock-manager bookkeeping.
+///
+/// For catastrophic cleanup, the cleaner's panic handler or a
+/// shutdown path can call
+/// `LockManager::release_all_for_locker(locker_id)` to sweep
+/// every entry held by an abandoned locker id at once.
 fn release_cleaner_lock(
     lock_manager: &LockManager,
     lock_lsn: u64,
