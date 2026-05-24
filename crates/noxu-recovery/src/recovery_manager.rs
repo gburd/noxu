@@ -529,11 +529,22 @@ impl RecoveryManager {
                                     .clone()
                                     .unwrap_or_else(|| rec.key.clone())
                                     .to_vec();
-                                let _ = t.insert(
+                                if let Err(e) = t.insert(
                                     key,
                                     abort_data.to_vec(),
                                     *abort_lsn,
-                                );
+                                ) {
+                                    log::error!(
+                                        "noxu-recovery: undo (embedded \
+                                         before-image) failed at lsn={:?}, \
+                                         abort_lsn={abort_lsn:?}, \
+                                         db={}: {e:?}; recovery will \
+                                         continue but this slot may be \
+                                         inconsistent",
+                                        pe.lsn,
+                                        rec.db_id,
+                                    );
+                                }
                             } else {
                                 // Non-embedded: read before-image from log.
                                 let before_image =
@@ -546,11 +557,23 @@ impl RecoveryManager {
                                             .abort_key
                                             .unwrap_or(before_rec.key)
                                             .to_vec();
-                                        let _ = t.insert(
+                                        if let Err(e) = t.insert(
                                             key,
                                             before_data.to_vec(),
                                             *abort_lsn,
-                                        );
+                                        ) {
+                                            log::error!(
+                                                "noxu-recovery: undo \
+                                                 (non-embedded before-image) \
+                                                 failed at lsn={:?}, \
+                                                 abort_lsn={abort_lsn:?}, \
+                                                 db={}: {e:?}; recovery will \
+                                                 continue but this slot may \
+                                                 be inconsistent",
+                                                pe.lsn,
+                                                rec.db_id,
+                                            );
+                                        }
                                     } else {
                                         t.delete(&rec.key);
                                     }
@@ -988,16 +1011,25 @@ impl RecoveryManager {
                 // Materialise Bytes → Vec<u8> at the tree boundary.
                 let data =
                     rec.data.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
-                // TODO(recovery): tree.insert returns Result<bool, TreeError>
-                // and we currently swallow the error. The TreeError variants
-                // (SplitRequired, Lookup, MemoryAllocFailure) all indicate a
-                // recovery failure that would silently leave the recovered
-                // tree inconsistent. Decide between (a) propagate the error
-                // and abort recovery, (b) log + mark recovery degraded,
-                // (c) panic — and apply the same treatment to the four other
-                // `let _ = t.insert(...)` / `let _ = tree.insert(...)` sites
-                // in this file.
-                let _ = tree.insert(rec.key.to_vec(), data, lsn);
+                // Recovery design call: tree.insert errors during redo
+                // are logged and we continue. The TreeError variants
+                // (SplitRequired, Lookup, MemoryAllocFailure) on a
+                // single key indicate a failure to materialise that
+                // entry, but the rest of the log replay is still
+                // valid; aborting recovery on the first failed redo
+                // would leave the entire database unrecoverable. The
+                // operator sees the failure via log::error! and can
+                // decide whether to escalate (e.g. restore from
+                // backup) based on the breadth of failures.
+                if let Err(e) = tree.insert(rec.key.to_vec(), data, lsn) {
+                    log::error!(
+                        "noxu-recovery: redo failed at lsn={lsn:?}, db={}, \
+                         op={:?}: {e:?}; recovery will continue but this \
+                         slot may be missing",
+                        rec.db_id,
+                        rec.operation,
+                    );
+                }
             }
             LnOperation::Delete => {
                 // Bin.deleteEntry(index) / slot KD-flag set.
@@ -1189,11 +1221,21 @@ impl RecoveryManager {
                                     .clone()
                                     .unwrap_or_else(|| rec.key.clone())
                                     .to_vec();
-                                let _ = t.insert(
+                                if let Err(e) = t.insert(
                                     key,
                                     abort_data.to_vec(),
                                     *abort_lsn,
-                                );
+                                ) {
+                                    log::error!(
+                                        "noxu-recovery: undo (embedded \
+                                         before-image, post-analysis) failed \
+                                         at abort_lsn={abort_lsn:?}, \
+                                         db={}: {e:?}; recovery will \
+                                         continue but this slot may be \
+                                         inconsistent",
+                                        rec.db_id,
+                                    );
+                                }
                             } else {
                                 // Non-embedded LN: fetch before-image from log.
                                 //
@@ -1213,11 +1255,22 @@ impl RecoveryManager {
                                             .abort_key
                                             .unwrap_or(before_rec.key)
                                             .to_vec();
-                                        let _ = t.insert(
+                                        if let Err(e) = t.insert(
                                             key,
                                             before_data.to_vec(),
                                             *abort_lsn,
-                                        );
+                                        ) {
+                                            log::error!(
+                                                "noxu-recovery: undo \
+                                                 (non-embedded before-image, \
+                                                 post-analysis) failed at \
+                                                 abort_lsn={abort_lsn:?}, \
+                                                 db={}: {e:?}; recovery \
+                                                 will continue but this slot \
+                                                 may be inconsistent",
+                                                rec.db_id,
+                                            );
+                                        }
                                     } else {
                                         // Before-image was itself a delete.
                                         t.delete(&rec.key);
