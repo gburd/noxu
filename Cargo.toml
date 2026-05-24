@@ -29,6 +29,7 @@ members = [
     "crates/noxu-rep",
     "crates/noxu-xa",
     "crates/noxu-observe",
+    "crates/noxu-spec",
     "benches/comparison",
     "benches/noxu-bench",
     "examples/cash",
@@ -156,6 +157,9 @@ fs2 = "0.4"
 serde = { version = "1", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+stateright = "0.31"
+hegeltest = "0.14"
+hegeltest-macros = "0.14"
 
 [workspace.lints.clippy]
 or_fun_call = "warn"
