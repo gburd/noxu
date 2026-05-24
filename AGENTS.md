@@ -112,12 +112,16 @@ make docs-serve   # Live-reload docs at http://localhost:3000
 - **Limited unsafe**: Core data-path crates (`noxu-tree`, `noxu-txn`,
   `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`,
   `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`,
-  `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are
-  `noxu-sync` (FFI to `libc` futex / `parking_lot` raw locking),
-  `noxu-log` (memory-mapped I/O), `noxu-evictor::off_heap` (off-heap
-  cache), `noxu-rep` (network I/O glue), and a couple of single-line
-  `unsafe` blocks in `noxu-latch`, `noxu-db`, and `noxu-xa` documented
-  inline. Adding new `unsafe` requires review.
+  `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions
+  are `noxu-sync` (FFI to `libc` futex and `parking_lot` raw
+  locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O
+  glue and `parking_lot` raw locking in elections), and a single
+  `unsafe` block each in `noxu-latch` (RAII force-unlock),
+  `noxu-db` (`unsafe impl Send for SecondaryConfig`), and `noxu-xa`
+  (transaction-pointer dereference); each is documented inline.
+  `noxu-evictor::off_heap` originally used raw `mmap` ops but has
+  been refactored to go through `memmap2` and `lru` safe wrappers
+  and now contains no `unsafe`. Adding new `unsafe` requires review.
 - **CRC32**: Uses `crc32fast` (CLMUL/PCLMULQDQ hardware acceleration, 15.8
   GiB/s at 1KiB). Not CRC32C — see `docs/src/internal/checksum-selection.md`.
 

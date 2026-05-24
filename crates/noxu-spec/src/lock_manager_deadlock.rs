@@ -15,11 +15,6 @@
 //!     never both a writer and a reader on the same LSN.
 //!   - `NoFalsePositiveAbort` — a transaction is only aborted if
 //!     there is a *real* wait-for cycle including it.
-//!   - `DeadlockEventuallyResolved` — every reachable state with a
-//!     wait-for cycle either has the cycle broken (a participant
-//!     aborts) or has not yet been examined by the detector. (Modeled
-//!     by an explicit `RunDetector` action; we assert no cycle
-//!     persists across a detector run.)
 
 use stateright::{Model, Property};
 
