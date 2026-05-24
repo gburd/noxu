@@ -71,6 +71,7 @@
   - [Performance Tuning](operations/tuning.md)
   - [Backup](operations/backup.md)
   - [Recovery Procedures](operations/recovery-ops.md)
+  - [Operational Runbooks](operations/runbooks.md)
   - [Known Limitations](operations/known-limitations.md)
 
 ---
