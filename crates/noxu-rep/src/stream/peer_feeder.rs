@@ -891,4 +891,194 @@ mod tests {
         gs.update_node_log_range("r1", 100, 800);
         assert_eq!(gs.get_node("r1").unwrap().log_range, Some((100, 800)));
     }
+
+    // -----------------------------------------------------------------------
+    // PeerFeederService::handle paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_feeder_service_can_serve() {
+        use crate::net::channel::LocalChannelPair;
+
+        // Source has range [10, 20]. Client requests start_vlsn=15
+        // (in range). Service should respond with CAN_SERVE then
+        // stream entries until close.
+        let source = Arc::new(PeerLogScanner::new());
+        for v in 10u64..=20 {
+            source.push(v, 0, format!("e{}", v).into_bytes());
+        }
+        let svc = PeerFeederService::new(Arc::clone(&source));
+
+        let pair = LocalChannelPair::new();
+        let server_ch: Box<dyn Channel> = Box::new(pair.channel_a);
+        let client_ch = pair.channel_b;
+
+        // Client sends start_vlsn=15.
+        client_ch.send(&15u64.to_le_bytes()).unwrap();
+
+        // Service runs in another thread so we can observe the
+        // streaming side.
+        let svc_handle = std::thread::spawn(move || svc.handle(server_ch));
+
+        // Read the 1-byte response.
+        let resp = client_ch.receive(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(
+            resp,
+            vec![PEER_FEEDER_CAN_SERVE],
+            "service should reply CAN_SERVE for in-range start_vlsn"
+        );
+
+        // Drain a few frames then close to terminate the runner.
+        let mut frames = 0;
+        while let Ok(Some(_)) = client_ch.receive(Duration::from_millis(80)) {
+            frames += 1;
+            if frames >= 3 {
+                break;
+            }
+        }
+        // Close client side so runner returns.
+        client_ch.close().unwrap();
+        let _ = svc_handle.join().unwrap();
+        assert!(frames >= 1, "service must have streamed at least one frame");
+    }
+
+    #[test]
+    fn test_peer_feeder_service_needs_restore() {
+        use crate::net::channel::LocalChannelPair;
+
+        // Source has range [10, 20]. Client requests start_vlsn=5
+        // (too early). Service replies NEEDS_RESTORE and errors.
+        let source = Arc::new(PeerLogScanner::new());
+        for v in 10u64..=20 {
+            source.push(v, 0, vec![]);
+        }
+        let svc = PeerFeederService::new(Arc::clone(&source));
+
+        let pair = LocalChannelPair::new();
+        let server_ch: Box<dyn Channel> = Box::new(pair.channel_a);
+        let client_ch = pair.channel_b;
+
+        client_ch.send(&5u64.to_le_bytes()).unwrap();
+
+        let r = svc.handle(server_ch);
+        assert!(r.is_err(), "service must return Err on NEEDS_RESTORE");
+        let resp = client_ch.receive(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(
+            resp,
+            vec![PEER_FEEDER_NEEDS_RESTORE],
+            "service should reply NEEDS_RESTORE for out-of-range start_vlsn"
+        );
+    }
+
+    #[test]
+    fn test_peer_feeder_service_short_handshake_errors() {
+        use crate::net::channel::LocalChannelPair;
+
+        let source = Arc::new(PeerLogScanner::new());
+        let svc = PeerFeederService::new(Arc::clone(&source));
+
+        let pair = LocalChannelPair::new();
+        let server_ch: Box<dyn Channel> = Box::new(pair.channel_a);
+        let client_ch = pair.channel_b;
+
+        // Send only 4 bytes — too short to be a valid u64
+        // start_vlsn. Service must Err with "short handshake".
+        client_ch.send(&[0u8; 4]).unwrap();
+
+        let r = svc.handle(server_ch);
+        assert!(r.is_err(), "short handshake must error");
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("short handshake"),
+            "expected 'short handshake' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_peer_feeder_service_no_handshake_errors() {
+        use crate::net::channel::LocalChannelPair;
+
+        let source = Arc::new(PeerLogScanner::new());
+        let svc = PeerFeederService::new(Arc::clone(&source));
+
+        let pair = LocalChannelPair::new();
+        let server_ch: Box<dyn Channel> = Box::new(pair.channel_a);
+        // Drop client side so receive returns None (no message).
+        drop(pair.channel_b);
+
+        let r = svc.handle(server_ch);
+        assert!(r.is_err(), "no-handshake must error");
+    }
+
+    #[test]
+    fn test_peer_feeder_service_name() {
+        let source = Arc::new(PeerLogScanner::new());
+        let svc = PeerFeederService::new(source);
+        assert_eq!(
+            svc.service_name(),
+            PEER_FEEDER_SERVICE_NAME,
+            "service_name must match the protocol const"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerFeederSource and adapter constructors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_feeder_source_default_and_clone_scanner() {
+        let src1 = PeerFeederSource::new();
+        // default() and new() produce the same shape.
+        let src2 = PeerFeederSource::default();
+        let s1 = src1.clone_scanner();
+        let s2 = src2.clone_scanner();
+        // Distinct underlying scanners (each PeerFeederSource owns
+        // its own Arc).
+        s1.push(1, 0, b"a".to_vec());
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s2.len(), 0);
+    }
+
+    #[test]
+    fn test_peer_log_scanner_default_is_empty() {
+        let s = PeerLogScanner::default();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(s.log_range().is_none());
+    }
+
+    #[test]
+    fn test_peer_feeder_runner_known_replica_vlsn_initial_zero() {
+        use crate::net::channel::LocalChannelPair;
+
+        let pair = LocalChannelPair::new();
+        let channel: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let source = Arc::new(PeerLogScanner::new());
+        let runner = PeerFeederRunner::new(channel, source, 1);
+        assert_eq!(runner.known_replica_vlsn(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerScannerAdapter: stale-entry skipping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_scanner_adapter_skips_stale_via_pop_front() {
+        // After a known_replica_vlsn advance, push some entries
+        // that are below the new floor — the adapter should
+        // discard them via pop_front().
+        let source = Arc::new(PeerLogScanner::new());
+        for v in 1u64..=5 {
+            source.push(v, 0, vec![]);
+        }
+        let mut adapter = PeerScannerAdapter::new(Arc::clone(&source), 3);
+        // First call returns vlsn=3, skipping 1 and 2.
+        let r = adapter.next_entry(3);
+        assert!(r.is_some());
+        let (vlsn, _, _) = r.unwrap();
+        assert_eq!(vlsn, 3);
+        // 4 next.
+        let (vlsn, _, _) = adapter.next_entry(4).unwrap();
+        assert_eq!(vlsn, 4);
+    }
 }
