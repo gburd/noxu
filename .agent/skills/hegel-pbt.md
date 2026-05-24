@@ -27,13 +27,16 @@ properties are worth testing**.
 ## Setup
 
 The `hegeltest` crate (the published name of `hegel-rust`, see
-<https://hegel.dev>) is a workspace dev-dependency. Pull it into a
-crate that needs property tests:
+<https://hegel.dev>) is added as a dev-dependency to whichever
+crate needs property tests. Prefer the latest 0.14.x release on
+crates.io. There is intentionally no workspace-level dev-dep entry
+— Hegel is opt-in per crate.
 
 ```toml
+# In crates/<crate>/Cargo.toml
 [dev-dependencies]
-hegeltest = { workspace = true }
-hegeltest-macros = { workspace = true }
+hegeltest = "0.14"
+hegeltest-macros = "0.14"
 ```
 
 Tests live alongside existing tests in `tests/` or `src/`:

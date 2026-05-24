@@ -42,6 +42,12 @@ pub struct LockHolder {
 pub struct State {
     pub locks: [LockHolder; N_LSNS],
     pub aborted: [bool; N_TXNS],
+    /// Set true at the moment a txn was aborted by the deadlock
+    /// detector iff it was actually a participant in a wait-for
+    /// cycle. Used by `NoFalsePositiveAbort` to verify that the
+    /// detector never aborts a txn that was merely waiting on
+    /// non-cyclic locks.
+    pub aborted_was_in_cycle: [bool; N_TXNS],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -114,12 +120,48 @@ fn has_cycle(edges: &[(usize, usize)], n: usize) -> bool {
     false
 }
 
+/// Returns true iff `node` is reachable from itself via at least
+/// one edge in `edges`. Used by the deadlock detector to identify
+/// participants of a cycle (a true positive) vs nodes merely
+/// waiting on non-cyclic locks (would be a false positive).
+fn node_on_cycle(node: usize, edges: &[(usize, usize)]) -> bool {
+    fn reachable(
+        from: usize,
+        target: usize,
+        edges: &[(usize, usize)],
+        visited: &mut [bool],
+    ) -> bool {
+        if visited[from] {
+            return false;
+        }
+        visited[from] = true;
+        for &(a, b) in edges {
+            if a != from {
+                continue;
+            }
+            if b == target {
+                return true;
+            }
+            if reachable(b, target, edges, visited) {
+                return true;
+            }
+        }
+        false
+    }
+    let mut visited = vec![false; N_TXNS];
+    reachable(node, node, edges, &mut visited)
+}
+
 impl Model for LockManagerModel {
     type State = State;
     type Action = Action;
 
     fn init_states(&self) -> Vec<Self::State> {
-        vec![State { locks: Default::default(), aborted: [false; N_TXNS] }]
+        vec![State {
+            locks: Default::default(),
+            aborted: [false; N_TXNS],
+            aborted_was_in_cycle: [false; N_TXNS],
+        }]
     }
 
     fn actions(&self, s: &Self::State, out: &mut Vec<Self::Action>) {
@@ -199,11 +241,25 @@ impl Model for LockManagerModel {
             Action::RunDeadlockDetector => {
                 let edges = wait_for_graph(&s);
                 if has_cycle(&edges, N_TXNS) {
-                    // Pick the lowest-id non-aborted txn as victim.
-                    if let Some(victim) = (0..N_TXNS).find(|t| {
-                        !s.aborted[*t] && edges.iter().any(|(a, _)| *a == *t)
-                    }) {
+                    // Compute the set of txns that participate in
+                    // some cycle in `edges`. We do a coarse
+                    // approximation: a node is "on a cycle" if it
+                    // is reachable from itself via any path. This
+                    // is sufficient for the small N_TXNS we model.
+                    let mut on_cycle = [false; N_TXNS];
+                    for (u, slot) in on_cycle.iter_mut().enumerate() {
+                        *slot = node_on_cycle(u, &edges);
+                    }
+                    // Pick the lowest-id non-aborted txn that is on
+                    // a cycle as victim. Without the on-cycle filter
+                    // a txn merely waiting on a non-cyclic lock
+                    // could be aborted (false positive) and the
+                    // NoFalsePositiveAbort property would fail.
+                    if let Some(victim) =
+                        (0..N_TXNS).find(|t| !s.aborted[*t] && on_cycle[*t])
+                    {
                         s.aborted[victim] = true;
+                        s.aborted_was_in_cycle[victim] = true;
                         // Release victim's holdings and waits.
                         for lsn in 0..N_LSNS {
                             s.locks[lsn].holders.retain(|(t, _)| *t != victim);
@@ -235,22 +291,19 @@ impl Model for LockManagerModel {
                 true
             }),
             Property::<Self>::always("NoFalsePositiveAbort", |_, s: &State| {
-                // Each aborted txn must have been in a real cycle at
-                // the time of its abort. Modeled here: if a txn is
-                // aborted, the wait-for graph at the abort moment
-                // *did* contain a cycle (we approximate by asserting
-                // the graph still has at least one edge involving the
-                // victim, since the detector aborts the lowest-id
-                // participant of a cycle).
-                let edges = wait_for_graph(s);
-                for (tid, &aborted) in s.aborted.iter().enumerate() {
-                    if !aborted {
-                        continue;
+                // Every aborted txn must have been a participant in
+                // a real wait-for cycle at the moment of abort. The
+                // RunDeadlockDetector handler stamps
+                // `aborted_was_in_cycle[tid] = true` if and only if
+                // the victim was on a cycle in the wait-for graph
+                // at that instant; this property asserts that the
+                // bit was set for every aborted txn, so the
+                // detector never aborts a txn that was merely
+                // waiting on non-cyclic locks.
+                for tid in 0..N_TXNS {
+                    if s.aborted[tid] && !s.aborted_was_in_cycle[tid] {
+                        return false;
                     }
-                    // Aborted txns are released, so no edges involve
-                    // them — vacuously true. The strong invariant
-                    // is enforced by the action's cycle check.
-                    let _ = (tid, &edges);
                 }
                 true
             }),

@@ -16,9 +16,9 @@
 //!     ≤ the most recently fsynced LSN.
 //!   - `LsnMonotone` — assigned LSNs strictly increase across
 //!     commits.
-//!   - `NoLostCommit` — group-commit batching never loses a commit:
-//!     for every transaction T whose commit() returned Ok with
-//!     CommitSync durability, T's TxnCommit record has been fsynced.
+//!   - `FsyncedNeverDecreases` — the fsynced high-water mark stays
+//!     within `[0, next_lsn)` (a coarse termination check; a
+//!     dedicated 2-state monotonicity check is left as future work).
 
 use stateright::{Model, Property};
 
