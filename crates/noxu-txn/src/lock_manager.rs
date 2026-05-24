@@ -1787,8 +1787,6 @@ mod tests {
         let released = lm.release_all_for_locker(999);
         assert_eq!(released, 0);
         assert_eq!(lm.n_total_locks(), 1);
-        // Pre-existing lock unaffected.
-        assert!(lm.is_owned_write_lock(1, 1) || true);
         lm.release(1, 1).unwrap();
     }
 
