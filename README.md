@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/noxu-db.svg)](https://crates.io/crates/noxu-db)
 [![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
-[![license](https://img.shields.io/badge/license-Apache--2.0%2FMIT-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 
 An embedded transactional key-value database engine, written in Rust. Noxu DB provides ACID transactions, a log-structured B+tree, checkpoint-based crash recovery, and optional master-replica replication — all in a single library with no external database process required.
 
