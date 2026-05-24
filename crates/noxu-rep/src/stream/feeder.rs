@@ -908,7 +908,7 @@ mod tests {
     fn test_feeder_runner_restart_resumes_from_provided_vlsn() {
         // First run: send entries 1..=3. Stop. New runner starts at
         // vlsn=4. Verify it sends 4..=5 and stops cleanly.
-        let entries = vec![
+        let entries: [(u64, u8, Vec<u8>); 5] = [
             (1u64, 0u8, b"e1".to_vec()),
             (2, 0, b"e2".to_vec()),
             (3, 0, b"e3".to_vec()),
