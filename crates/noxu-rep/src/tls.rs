@@ -624,3 +624,221 @@ impl TlsConfig {
 // or `danger_accept_invalid_certs`, and the trait impls for it were
 // unconditionally recursive (a real bug — they would have stack-
 // overflowed on first call).
+
+// ─── tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Constructors (no feature gate; pure data shape) ──────────────
+
+    #[test]
+    fn insecure_constructor_uses_self_signed_localhost() {
+        let cfg = TlsConfig::insecure("node-a");
+        assert_eq!(cfg.server_name, "node-a");
+        match cfg.identity {
+            TlsIdentity::SelfSigned { subject_alt_names } => {
+                assert_eq!(subject_alt_names, vec!["localhost".to_string()]);
+            }
+            _ => panic!("insecure should produce SelfSigned identity"),
+        }
+        assert!(matches!(cfg.trusted_certs, TrustedCerts::SkipVerification));
+    }
+
+    #[test]
+    fn from_pem_files_constructor_records_paths() {
+        let cfg = TlsConfig::from_pem_files(
+            "/tmp/cert.pem",
+            "/tmp/key.pem",
+            "/tmp/ca.pem",
+            "node-b",
+        );
+        assert_eq!(cfg.server_name, "node-b");
+        match cfg.identity {
+            TlsIdentity::PemFiles { cert, key } => {
+                assert_eq!(cert, std::path::PathBuf::from("/tmp/cert.pem"));
+                assert_eq!(key, std::path::PathBuf::from("/tmp/key.pem"));
+            }
+            _ => panic!("from_pem_files should produce PemFiles identity"),
+        }
+        match cfg.trusted_certs {
+            TrustedCerts::CaFiles(paths) => {
+                assert_eq!(
+                    paths,
+                    vec![std::path::PathBuf::from("/tmp/ca.pem")]
+                );
+            }
+            _ => panic!("from_pem_files should produce CaFiles trust"),
+        }
+    }
+
+    #[test]
+    fn from_pkcs12_constructor_holds_bytes_and_password() {
+        let der = vec![0x30, 0x82, 0x00, 0x10]; // dummy DER prefix
+        let ca_pem = b"-----BEGIN CERTIFICATE-----\n".to_vec();
+        let cfg = TlsConfig::from_pkcs12(
+            der.clone(),
+            "secret".to_string(),
+            ca_pem.clone(),
+            "node-c",
+        );
+        assert_eq!(cfg.server_name, "node-c");
+        match cfg.identity {
+            TlsIdentity::Pkcs12 { der: d, password } => {
+                assert_eq!(d, der);
+                assert_eq!(password, "secret");
+            }
+            _ => panic!("from_pkcs12 should produce Pkcs12 identity"),
+        }
+        match cfg.trusted_certs {
+            TrustedCerts::CaBytes(pems) => {
+                assert_eq!(pems, vec![ca_pem]);
+            }
+            _ => panic!("from_pkcs12 should produce CaBytes trust"),
+        }
+    }
+
+    // ── rustls path (requires tls-rustls feature) ────────────────────
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn rustls_server_config_from_self_signed_succeeds() {
+        // SelfSigned + SkipVerification is the "insecure" config; the
+        // rustls server side generates a fresh self-signed cert at
+        // build time. Should produce a valid ServerConfig.
+        let cfg = TlsConfig::insecure("node-self");
+        let sc = cfg.to_rustls_server_config();
+        assert!(
+            sc.is_ok(),
+            "to_rustls_server_config from insecure() should succeed: {:?}",
+            sc.err()
+        );
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn rustls_client_config_skip_verification_succeeds() {
+        // SkipVerification is the trust mode for development clusters;
+        // the client config should be built using the
+        // SkipCertVerification verifier.
+        let cfg = TlsConfig::insecure("any-name");
+        let cc = cfg.to_rustls_client_config();
+        assert!(
+            cc.is_ok(),
+            "to_rustls_client_config with SkipVerification should succeed: \
+             {:?}",
+            cc.err()
+        );
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn rustls_client_config_with_empty_ca_succeeds() {
+        // Empty CaBytes list is a valid (if useless) input — produces
+        // a ClientConfig with an empty root store. No certs will
+        // validate, but the build itself should not error.
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::CaBytes(vec![]),
+            server_name: "x".into(),
+        };
+        // rustls_root_store on empty CaBytes returns an empty
+        // RootCertStore.
+        let cc = cfg.to_rustls_client_config();
+        assert!(cc.is_ok(), "{:?}", cc.err());
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn rustls_client_config_with_malformed_ca_bytes_returns_empty_store() {
+        // rustls_pemfile silently skips non-certificate PEM blocks, so
+        // CaBytes containing garbage produces an empty root store
+        // rather than an error. This is documented (silent skip
+        // behaviour) and the calling test asserts it: client config
+        // builds, but no certs will validate.
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::CaBytes(vec![b"not-a-pem".to_vec()]),
+            server_name: "x".into(),
+        };
+        let cc = cfg.to_rustls_client_config();
+        assert!(
+            cc.is_ok(),
+            "malformed CaBytes silently produces an empty root store; \
+             a real cert will fail to verify but the config itself \
+             builds. got Err: {:?}",
+            cc.err()
+        );
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn skip_cert_verification_returns_ok_for_any_cert() {
+        use rustls::client::danger::ServerCertVerifier;
+        let v = SkipCertVerification::new();
+        let cert = rustls::pki_types::CertificateDer::from(vec![0u8; 8]);
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        let r = v.verify_server_cert(&cert, &[], &server_name, &[], now);
+        assert!(r.is_ok(), "SkipCertVerification must return Ok for any cert");
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn skip_cert_verification_supports_some_schemes() {
+        use rustls::client::danger::ServerCertVerifier;
+        let v = SkipCertVerification::new();
+        let schemes = v.supported_verify_schemes();
+        assert!(
+            !schemes.is_empty(),
+            "SkipCertVerification must report at least one signature scheme"
+        );
+    }
+
+    // ── native-tls path (requires tls-native feature) ────────────────
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn native_acceptor_requires_pkcs12_identity() {
+        // SelfSigned identity is rejected because native_tls cannot
+        // generate certs at runtime (only Pkcs12 is supported).
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::SkipVerification,
+            server_name: "x".into(),
+        };
+        let r = cfg.to_native_acceptor();
+        assert!(
+            r.is_err(),
+            "SelfSigned identity with native-tls must error, got Ok"
+        );
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn native_connector_skip_verification_succeeds() {
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::SkipVerification,
+            server_name: "any".into(),
+        };
+        // The client side does not need to load the local identity
+        // (clients without a cert is normal).
+        let r = cfg.to_native_connector();
+        assert!(
+            r.is_ok(),
+            "native_tls client with SkipVerification should succeed: {:?}",
+            r.err()
+        );
+    }
+}
