@@ -39,11 +39,11 @@ const _: fn(HeldKind) = |kind| {
     let _ = spec_lock_kind(kind);
 };
 
-/// Project a [`LockType`] onto the spec's read-vs-write
-/// alphabet. The exhaustive match means a new variant of
-/// `LockType` (RangeRead, RangeWrite, …) requires an explicit
-/// spec-level decision: either map it onto the existing
-/// alphabet, or extend the spec.
+/// Project a [`HeldKind`] (which is [`noxu_txn::LockType`]) onto
+/// the spec's read-vs-write alphabet. The exhaustive match means
+/// a new variant of `LockType` (RangeRead, RangeWrite, …)
+/// requires an explicit spec-level decision: either map it onto
+/// the existing alphabet, or extend the spec.
 pub fn spec_lock_kind(kind: HeldKind) -> SpecLockKind {
     match kind {
         HeldKind::Read => SpecLockKind::Read,
