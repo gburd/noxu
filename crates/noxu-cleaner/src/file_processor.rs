@@ -13,6 +13,30 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Release a cleaner read-lock and log any failure.
+///
+/// The cleaner is best-effort by design: failing to release a
+/// non-blocking read lock on `tree_lsn` after a slot inspection means
+/// a small leak in the `LockManager` (the lock will be reaped via
+/// the owner-locker pruning path), not data corruption. This helper
+/// centralises the `log::error!` call so the operator can see when a
+/// `LockManager::release` is failing — that would point to a bug in
+/// the lock-manager bookkeeping.
+fn release_cleaner_lock(
+    lock_manager: &LockManager,
+    lock_lsn: u64,
+    locker_id: i64,
+    site: &'static str,
+) {
+    if let Err(e) = lock_manager.release(lock_lsn, locker_id) {
+        log::error!(
+            "noxu-cleaner: lock_manager.release(lsn={lock_lsn}, \
+             locker={locker_id}) failed at {site}: {e}; cleaner will \
+             continue but a small lock leak may occur",
+        );
+    }
+}
+
 /// The number of LN log entries after which we process pending LNs.
 ///
 /// Ported from `FileProcessor.PROCESS_PENDING_EVERY_N_LNS`.
@@ -169,19 +193,6 @@ impl TreeLookup for RealTreeLookup {
         log_lsn: Lsn,
         tree_lsn: Lsn,
     ) -> MigrationOutcome {
-        // TODO(noxu-cleaner): the multiple `let _ = self.lock_manager
-        // .release(lock_lsn, locker_id)` sites in this file (lines
-        // 200, 213, 223, 235, 246, 608, 619, 630, 642 as of 2759090)
-        // share the same swallow-error pattern called out in
-        // crates/noxu-db/src/transaction.rs::commit_with_durability
-        // and crates/noxu-txn/src/txn.rs::move_write_lock_to_new_lsn.
-        // They are intentionally best-effort here because the cleaner
-        // releases locks during cleanup and a release failure means a
-        // small leak in the lock_manager rather than data corruption,
-        // but a uniform decision (propagate / log+continue / panic)
-        // across all three sites would be preferable. Tracked
-        // alongside those.
-
         // H-4: attempt a non-blocking read lock on tree_lsn.
         // `locker.nonBlockingLock(treeLsn, LockType.READ, ...)`.
         let locker_id = next_cleaner_locker_id();
@@ -210,7 +221,12 @@ impl TreeLookup for RealTreeLookup {
             let tree = match self.tree.read() {
                 Ok(g) => g,
                 Err(_) => {
-                    let _ = self.lock_manager.release(lock_lsn, locker_id);
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "RealTreeLookup::migrate_ln_slot:tree_poisoned_pre_check",
+                    );
                     return MigrationOutcome::Obsolete;
                 }
             };
@@ -223,7 +239,12 @@ impl TreeLookup for RealTreeLookup {
         };
 
         if !slot_matches {
-            let _ = self.lock_manager.release(lock_lsn, locker_id);
+            release_cleaner_lock(
+                &self.lock_manager,
+                lock_lsn,
+                locker_id,
+                "RealTreeLookup::migrate_ln_slot:slot_mismatch",
+            );
             return MigrationOutcome::Obsolete;
         }
 
@@ -233,7 +254,12 @@ impl TreeLookup for RealTreeLookup {
             let tree = match self.tree.read() {
                 Ok(g) => g,
                 Err(_) => {
-                    let _ = self.lock_manager.release(lock_lsn, locker_id);
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "RealTreeLookup::migrate_ln_slot:tree_poisoned_data",
+                    );
                     return MigrationOutcome::Obsolete;
                 }
             };
@@ -245,7 +271,12 @@ impl TreeLookup for RealTreeLookup {
             let tree = match self.tree.read() {
                 Ok(g) => g,
                 Err(_) => {
-                    let _ = self.lock_manager.release(lock_lsn, locker_id);
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "RealTreeLookup::migrate_ln_slot:tree_poisoned_insert",
+                    );
                     return MigrationOutcome::Obsolete;
                 }
             };
@@ -256,7 +287,12 @@ impl TreeLookup for RealTreeLookup {
         };
 
         // H-4: release lock.
-        let _ = self.lock_manager.release(lock_lsn, locker_id);
+        release_cleaner_lock(
+            &self.lock_manager,
+            lock_lsn,
+            locker_id,
+            "RealTreeLookup::migrate_ln_slot:done",
+        );
         outcome
     }
 
@@ -618,7 +654,12 @@ impl TreeLookup for SharedTreeLookup {
             let tree = match self.tree.read() {
                 Ok(g) => g,
                 Err(_) => {
-                    let _ = self.lock_manager.release(lock_lsn, locker_id);
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "SharedTreeLookup::migrate_ln_slot:tree_poisoned_pre_check",
+                    );
                     return MigrationOutcome::Obsolete;
                 }
             };
@@ -629,7 +670,12 @@ impl TreeLookup for SharedTreeLookup {
             None => false,
         };
         if !slot_matches {
-            let _ = self.lock_manager.release(lock_lsn, locker_id);
+            release_cleaner_lock(
+                &self.lock_manager,
+                lock_lsn,
+                locker_id,
+                "SharedTreeLookup::migrate_ln_slot:slot_mismatch",
+            );
             return MigrationOutcome::Obsolete;
         }
 
@@ -640,7 +686,12 @@ impl TreeLookup for SharedTreeLookup {
             let tree = match self.tree.read() {
                 Ok(g) => g,
                 Err(_) => {
-                    let _ = self.lock_manager.release(lock_lsn, locker_id);
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "SharedTreeLookup::migrate_ln_slot:tree_poisoned_data",
+                    );
                     return MigrationOutcome::Obsolete;
                 }
             };
@@ -652,7 +703,12 @@ impl TreeLookup for SharedTreeLookup {
             self.tree.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
 
         // H-4: release lock.
-        let _ = self.lock_manager.release(lock_lsn, locker_id);
+        release_cleaner_lock(
+            &self.lock_manager,
+            lock_lsn,
+            locker_id,
+            "SharedTreeLookup::migrate_ln_slot:done",
+        );
 
         match result {
             Ok(Ok(_)) => MigrationOutcome::Migrated,
