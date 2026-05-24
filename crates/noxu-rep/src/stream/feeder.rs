@@ -829,4 +829,222 @@ mod tests {
         assert!(debug.contains("replica_debug"));
         assert!(debug.contains("Streaming"));
     }
+
+    // -----------------------------------------------------------------------
+    // FeederRunner edge cases (acks, runner restart)
+    // -----------------------------------------------------------------------
+
+    /// Build a sender + receiver channel pair and a runner that sends
+    /// no entries (used by ack-handling edge cases that don't care about
+    /// the entry stream).
+    fn make_runner_with_pair(
+        vlsn_start: u64,
+    ) -> (Arc<dyn Channel>, Arc<dyn Channel>, FeederRunner) {
+        let pair = LocalChannelPair::new();
+        let sender: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let receiver: Arc<dyn Channel> = Arc::new(pair.channel_b);
+        let runner = FeederRunner::new(Arc::clone(&sender), vlsn_start);
+        (sender, receiver, runner)
+    }
+
+    #[test]
+    fn test_feeder_runner_short_ack_is_ignored_then_close() {
+        // Send a 4-byte "ack" (less than 8 bytes) — the runner must
+        // not crash, must not advance known_replica_vlsn, and must
+        // continue until the channel closes.
+        let (sender, receiver, runner) = make_runner_with_pair(1);
+        let receiver_clone = Arc::clone(&receiver);
+
+        let close_handle = std::thread::spawn(move || {
+            // Send a malformed (too-short) ack first.
+            std::thread::sleep(Duration::from_millis(20));
+            receiver_clone.send(&[0xAA, 0xBB, 0xCC]).unwrap();
+            // Then close.
+            std::thread::sleep(Duration::from_millis(40));
+            sender.close().unwrap();
+            receiver_clone.close().unwrap();
+        });
+
+        let mut scanner = VecLogScanner::new(vec![]);
+        let r = runner.run(&mut scanner);
+        assert!(r.is_ok(), "short-ack path should not error: {:?}", r);
+        assert_eq!(
+            runner.known_replica_vlsn(),
+            0,
+            "short ack must NOT advance known_replica_vlsn"
+        );
+        close_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_feeder_runner_ack_advances_known_replica_vlsn() {
+        let (sender, receiver, runner) = make_runner_with_pair(1);
+        let receiver_clone = Arc::clone(&receiver);
+
+        let close_handle = std::thread::spawn(move || {
+            // Send ack vlsn=42, then ack vlsn=10 (must NOT regress
+            // the watermark), then close.
+            std::thread::sleep(Duration::from_millis(20));
+            receiver_clone.send(&42u64.to_le_bytes()).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            receiver_clone.send(&10u64.to_le_bytes()).unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            sender.close().unwrap();
+            receiver_clone.close().unwrap();
+        });
+
+        let mut scanner = VecLogScanner::new(vec![]);
+        let r = runner.run(&mut scanner);
+        assert!(r.is_ok(), "ack path should not error: {:?}", r);
+        assert_eq!(
+            runner.known_replica_vlsn(),
+            42,
+            "ack must advance to highest, never regress"
+        );
+        close_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_feeder_runner_restart_resumes_from_provided_vlsn() {
+        // First run: send entries 1..=3. Stop. New runner starts at
+        // vlsn=4. Verify it sends 4..=5 and stops cleanly.
+        let entries = vec![
+            (1u64, 0u8, b"e1".to_vec()),
+            (2, 0, b"e2".to_vec()),
+            (3, 0, b"e3".to_vec()),
+            (4, 0, b"e4".to_vec()),
+            (5, 0, b"e5".to_vec()),
+        ];
+
+        // First runner: vlsn_start = 1
+        let (sender_a, receiver_a, runner_a) = make_runner_with_pair(1);
+        let close_a = {
+            let s = Arc::clone(&sender_a);
+            let r = Arc::clone(&receiver_a);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                s.close().unwrap();
+                r.close().unwrap();
+            })
+        };
+        let received_a = {
+            let r = Arc::clone(&receiver_a);
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while let Ok(Some(frame)) =
+                    r.receive(Duration::from_millis(100))
+                {
+                    got.push(frame);
+                }
+                got
+            })
+        };
+        let mut scanner_a = VecLogScanner::new(entries.clone()[0..3].to_vec());
+        runner_a.run(&mut scanner_a).unwrap();
+        close_a.join().unwrap();
+        let frames_a = received_a.join().unwrap();
+        assert_eq!(
+            frames_a.len(),
+            3,
+            "first runner must send 3 entries, got {}",
+            frames_a.len()
+        );
+
+        // Second runner: vlsn_start = 4 — resumes where the first
+        // runner left off (with a fresh channel).
+        let (sender_b, receiver_b, runner_b) = make_runner_with_pair(4);
+        let close_b = {
+            let s = Arc::clone(&sender_b);
+            let r = Arc::clone(&receiver_b);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                s.close().unwrap();
+                r.close().unwrap();
+            })
+        };
+        let received_b = {
+            let r = Arc::clone(&receiver_b);
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while let Ok(Some(frame)) =
+                    r.receive(Duration::from_millis(100))
+                {
+                    got.push(frame);
+                }
+                got
+            })
+        };
+        let mut scanner_b = VecLogScanner::new(entries[3..].to_vec());
+        runner_b.run(&mut scanner_b).unwrap();
+        close_b.join().unwrap();
+        let frames_b = received_b.join().unwrap();
+        assert_eq!(
+            frames_b.len(),
+            2,
+            "second runner must send 2 entries (4 and 5), got {}",
+            frames_b.len()
+        );
+    }
+
+    #[test]
+    fn test_feeder_runner_known_replica_vlsn_initial_zero() {
+        let (_sender, _receiver, runner) = make_runner_with_pair(1);
+        assert_eq!(runner.known_replica_vlsn(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // EnvironmentLogScanner — exercised against a real EnvironmentImpl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_environment_log_scanner_new_with_empty_env() {
+        // Open a fresh environment and construct a scanner. Because
+        // no log entries have been written, next_entry should return
+        // None on the first call.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+
+        let scanner = EnvironmentLogScanner::new(&env, None);
+        assert!(scanner.is_some(), "scanner construction should succeed");
+        let mut scanner = scanner.unwrap();
+
+        // Empty log → no entries.
+        let r = scanner.next_entry(0);
+        assert!(
+            r.is_none(),
+            "next_entry on empty log must return None, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_environment_log_scanner_with_explicit_null_lsn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+
+        // NULL_LSN should be treated the same as None (start from
+        // file 0, FILE_HEADER_SIZE offset).
+        let scanner = EnvironmentLogScanner::new(&env, Some(NULL_LSN));
+        assert!(scanner.is_some());
+    }
+
+    #[test]
+    fn test_environment_log_scanner_with_explicit_start_lsn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+
+        // Non-null start LSN — the scanner should record file=5,
+        // offset=128 as its cursor (no actual file at that offset
+        // exists, so subsequent reads return None — tests the
+        // initialisation path).
+        let lsn = Lsn::new(5, 128);
+        let scanner = EnvironmentLogScanner::new(&env, Some(lsn));
+        assert!(scanner.is_some());
+        let mut scanner = scanner.unwrap();
+        // No file exists at this LSN — next_entry returns None.
+        assert!(scanner.next_entry(0).is_none());
+    }
 }
