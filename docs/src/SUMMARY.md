@@ -73,6 +73,7 @@
   - [Recovery Procedures](operations/recovery-ops.md)
   - [Operational Runbooks](operations/runbooks.md)
   - [Power-Loss Testing](operations/power-loss.md)
+  - [Numerical Baseline](operations/numerical-baseline.md)
   - [Known Limitations](operations/known-limitations.md)
 
 ---
