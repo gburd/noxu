@@ -379,6 +379,8 @@ impl Environment {
     /// - The environment is closed
     /// - The database name is invalid
     /// - The database does not exist and `allow_create` is false
+    /// - A handle for `name` is already open in this `Environment`
+    ///   (`DatabaseAlreadyExists`)
     pub fn open_database(
         &self,
         _txn: Option<&Transaction>,

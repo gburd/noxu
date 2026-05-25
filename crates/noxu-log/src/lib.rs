@@ -61,6 +61,22 @@ pub mod ln_file_reader;
 pub mod search_file_reader;
 pub mod utilization_file_reader;
 
+// ---------------------------------------------------------------------------
+// Public constants
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed payload size for a single log entry (header excluded).
+///
+/// Centralised so every reader/scanner uses the same upper bound when
+/// validating an `item_size` field decoded from disk or off the wire.
+/// A larger value would imply tens-of-MiB attacker-controlled allocations
+/// during recovery / replication and is rejected as corruption.
+///
+/// 100 MiB is generous enough for any well-formed entry produced by the
+/// engine (the largest synthetic entries seen in tests are ≤ a few MiB)
+/// while still bounding memory consumed by a single bad header.
+pub const MAX_ITEM_SIZE: usize = 100 * 1024 * 1024;
+
 // Re-export main types
 pub use checksum::ChecksumValidator;
 pub use entry_header::LogEntryHeader;

@@ -132,10 +132,15 @@ impl RepGroup {
         self.quorum_policy.validate(self.electable_count() as usize)
     }
 
-    /// Returns the quorum size: a simple majority of electable nodes.
+    /// Returns the phase-2 quorum size for the configured quorum policy.
     ///
-    /// This is a compatibility shim that returns [`phase2_quorum`](Self::phase2_quorum)
-    /// cast to `u32`.  New code should call `phase2_quorum()` directly.
+    /// This is a compatibility shim that returns
+    /// [`phase2_quorum`](Self::phase2_quorum) cast to `u32`. The result is
+    /// **policy-dependent**: under the default `Majority` policy this is a
+    /// simple majority of electable nodes, but under `Flexible` or
+    /// `Expression` policies it may be larger or smaller than a simple
+    /// majority. New code should call [`phase2_quorum`](Self::phase2_quorum)
+    /// directly.
     pub fn quorum_size(&self) -> u32 {
         self.phase2_quorum() as u32
     }
