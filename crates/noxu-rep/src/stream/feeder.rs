@@ -13,6 +13,7 @@
 //! Rep.impl.node.Feeder.MasterFeederSource`.
 
 use noxu_dbi::EnvironmentImpl;
+use noxu_log::MAX_ITEM_SIZE;
 use noxu_log::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use noxu_log::file_header::FILE_HEADER_SIZE;
 use noxu_log::file_manager::FileManager;
@@ -140,8 +141,10 @@ impl EnvironmentLogScanner {
         let header_size =
             if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
 
-        // Sanity cap: 64 MiB.
-        if item_size > 64 * 1024 * 1024 {
+        // Sanity cap: same shared MAX_ITEM_SIZE used by every log reader
+        // so that an attacker who flips item_size cannot cause a 100 MiB
+        // allocation here while passing other readers' bounds.
+        if item_size > MAX_ITEM_SIZE {
             return None;
         }
 
@@ -160,7 +163,23 @@ impl EnvironmentLogScanner {
             let raw = i64::from_le_bytes(
                 full[MIN_HEADER_SIZE..MAX_HEADER_SIZE].try_into().ok()?,
             );
-            if raw > 0 { Some(raw as u64) } else { None }
+            if raw > 0 {
+                Some(raw as u64)
+            } else {
+                // Negative or zero i64 with vlsn_present flag set is a
+                // contradiction (NULL VLSN should not have the flag set).
+                // Surface it but keep the legacy "treat as missing" behaviour
+                // so a single corrupt entry does not stall the feeder.
+                // LOG-9.
+                log::warn!(
+                    "EnvironmentLogScanner: implausible VLSN value {} at \
+                     file {:08x} offset {:#x}; treating as no-VLSN",
+                    raw,
+                    file_num,
+                    offset,
+                );
+                None
+            }
         } else {
             None
         };
@@ -279,7 +298,10 @@ const FRAME_HEADER_LEN: usize = 8 + 1 + 4 + 4; // vlsn + type + len + crc32
 ///   3. Reads ack messages back from the replica and advances `acked_vlsn`.
 ///   4. Returns when the channel is closed or an I/O error occurs.
 ///
-/// Output and input thread pair inside the feeder.
+/// The runner is single-threaded: log scanning, framing, sending, and ack
+/// polling all interleave inside the one `run()` loop on the caller's
+/// thread. There is no separate output/input thread pair; the same loop
+/// handles both directions.
 pub struct FeederRunner {
     /// Channel to the replica.
     channel: Arc<dyn Channel>,
@@ -460,8 +482,10 @@ impl Feeder {
     /// Queue a log entry for sending to the replica.
     ///
     /// The entry is serialized into a byte vector containing the VLSN,
-    /// entry type, and raw data. The current VLSN is advanced to one
-    /// past the queued VLSN.
+    /// entry type, and raw data. The current VLSN is advanced to one past
+    /// the queued VLSN **only when `vlsn >= current_vlsn`**; if `vlsn`
+    /// is older than the current position the entry is still queued but
+    /// `current_vlsn` is left unchanged.
     pub fn queue_entry(&self, vlsn: u64, entry_type: u8, data: Vec<u8>) {
         let mut msg = Vec::with_capacity(9 + data.len());
         msg.extend_from_slice(&vlsn.to_le_bytes());

@@ -368,6 +368,13 @@ impl Channel for QuicChannel {
             }
 
             let payload_len = u32::from_le_bytes(len_buf) as usize;
+            if payload_len > crate::net::channel::MAX_FRAME_PAYLOAD {
+                return Err(RepError::ProtocolError(format!(
+                    "frame payload too large: {} > {}",
+                    payload_len,
+                    crate::net::channel::MAX_FRAME_PAYLOAD
+                )));
+            }
             let mut payload = vec![0u8; payload_len];
             stream.read_exact(&mut payload).await.map_err(|e| match e {
                 ReadExactError::FinishedEarly(_) => RepError::ChannelClosed(
@@ -704,5 +711,42 @@ mod tests {
         ch.send(b"trait test").unwrap();
         let msg = server_thread.join().unwrap();
         assert_eq!(msg, Some(b"trait test".to_vec()));
+    }
+
+    /// LOG-2: QuicChannel must reject a peer-supplied `payload_len` that
+    /// exceeds [`crate::net::channel::MAX_FRAME_PAYLOAD`] before allocating the
+    /// payload buffer.
+    #[test]
+    fn test_quic_rejects_oversize_frame() {
+        let listener = loopback_listener();
+        let addr = listener.local_addr().unwrap();
+
+        // Server sends an oversized payload via the normal `send` path,
+        // which writes a length prefix that exceeds the cap.  The client
+        // must reject after reading the 4-byte header.
+        let server_thread = std::thread::spawn(move || {
+            let ch = listener.accept().unwrap();
+            let oversized =
+                vec![0u8; crate::net::channel::MAX_FRAME_PAYLOAD + 1];
+            // Result is intentionally ignored: when the client tears the
+            // stream down after rejecting the header, this `send` may fail.
+            let _ = ch.send(&oversized);
+        });
+
+        let client = QuicChannel::connect(addr, "localhost").unwrap();
+        let result = client.receive(Duration::from_secs(10));
+        let _ = client.close();
+        let err = result.expect_err("oversize QUIC frame must be rejected");
+        match err {
+            RepError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("frame payload too large"),
+                    "unexpected protocol-error message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        let _ = server_thread.join();
     }
 }

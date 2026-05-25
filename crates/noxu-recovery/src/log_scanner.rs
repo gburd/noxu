@@ -64,6 +64,14 @@ pub struct LnRecord {
     pub is_invisible: bool,
     /// Whether this entry belongs to a replicated transaction.
     pub is_replicated: bool,
+    /// VLSN of this LN if the original log entry header carried one.
+    ///
+    /// Populated by the file-backed `LogScanner` from the entry header.
+    /// `None` for entries that were never replicated, or for in-memory
+    /// test fixtures that do not synthesise VLSNs.  Used by the redo
+    /// phase to verify that VLSNs of replicated entries are observed in
+    /// strictly-increasing order (security review LOG-6).
+    pub vlsn: Option<u64>,
 }
 
 impl LnRecord {
@@ -89,6 +97,7 @@ impl LnRecord {
             abort_data: None,
             is_invisible: false,
             is_replicated: false,
+            vlsn: None,
         }
     }
 }

@@ -273,8 +273,22 @@ impl DaemonManager {
         }
     }
 
-    /// Returns true if any daemon threads are running.
+    /// Returns `true` while this manager has not been shut down.
+    ///
+    /// Specifically, this returns `true` from construction until
+    /// [`shutdown`](Self::shutdown) is invoked. It does **not** prove that
+    /// any daemon thread is currently alive: a freshly-constructed manager
+    /// (before [`start_daemons`](Self::start_daemons) is called) reports
+    /// `true` here while [`running_count`](Self::running_count) returns 0.
+    ///
+    /// This semantic is codified by `test_daemon_manager_creation`, which
+    /// asserts both `is_running() == true` and `running_count() == 0`
+    /// before any daemons are started. Use `running_count()` if you need
+    /// the actual count of spawned daemon threads.
     pub fn is_running(&self) -> bool {
+        // NB: name is historical. We return `!shutdown_requested` rather
+        // than checking the JoinHandles so that the post-`new`/pre-`start`
+        // contract above remains stable.
         !self.shutdown.load(Ordering::Relaxed)
     }
 

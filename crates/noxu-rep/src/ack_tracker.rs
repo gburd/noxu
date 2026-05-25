@@ -134,6 +134,9 @@ impl AckTracker {
     ///
     /// An ack is considered timed out if it was registered more than
     /// `timeout` ago and has not yet been satisfied.
+    ///
+    /// **Side effect:** for each unsatisfied, timed-out pending ack found
+    /// during this scan, `total_timeouts` is incremented by one.
     pub fn check_timeouts(&self, timeout: Duration) -> Vec<u64> {
         let pending = self.pending_acks.lock();
         let now = Instant::now();

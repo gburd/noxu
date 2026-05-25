@@ -79,6 +79,58 @@ pub struct NetworkRestore {
     local_log_dir: Option<PathBuf>,
 }
 
+/// Validate a server-supplied filename before it is joined with the local
+/// log directory.
+///
+/// The wire protocol carries arbitrary UTF-8 strings, so a malicious or
+/// compromised peer can otherwise direct writes outside `local_log_dir` via
+/// path traversal (`../../etc/passwd`), absolute paths
+/// (`/etc/cron.d/evil`), embedded NULs, or hidden dotfiles
+/// (`.bashrc`).  We reject any of those here and only allow plain
+/// log-file basenames.
+///
+/// # Rejection rules
+///
+/// - empty string
+/// - `.` or `..`
+/// - any byte equal to `/`, `\\`, or `\0`
+/// - leading `.` (hidden file)
+fn validate_restore_filename(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(RepError::ProtocolError("unsafe filename: empty".into()));
+    }
+    if name == "." || name == ".." {
+        return Err(RepError::ProtocolError(format!(
+            "unsafe filename: {:?}",
+            name
+        )));
+    }
+    if name.starts_with('.') {
+        return Err(RepError::ProtocolError(format!(
+            "unsafe filename: hidden dotfile {:?}",
+            name
+        )));
+    }
+    for b in name.as_bytes() {
+        match *b {
+            b'/' | b'\\' => {
+                return Err(RepError::ProtocolError(format!(
+                    "unsafe filename: path separator in {:?}",
+                    name
+                )));
+            }
+            0 => {
+                return Err(RepError::ProtocolError(format!(
+                    "unsafe filename: null byte in {:?}",
+                    name
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl NetworkRestore {
     /// Create a new network restore with the given configuration.
     pub fn new(config: NetworkRestoreConfig) -> Self {
@@ -210,6 +262,7 @@ impl NetworkRestore {
                     e
                 ))
             })?;
+            validate_restore_filename(&filename)?;
 
             // Read file size.
             let mut size_buf = [0u8; 8];
@@ -285,11 +338,16 @@ impl NetworkRestore {
         Ok(())
     }
 
-    /// Start the network restore.
+    /// Mark the restore as in-progress.
     ///
-    /// Transitions from `NotStarted` to `InProgress`. In the full
-    /// implementation, this would initiate the network connection and
-    /// begin transferring files.
+    /// State-transition helper that moves the restore from
+    /// `RestoreState::NotStarted` to `RestoreState::InProgress` and
+    /// updates the public `progress` snapshot to match. It performs no
+    /// I/O — the actual file transfer is driven by [`execute`](Self::execute).
+    ///
+    /// Callers that drive the restore via `execute()` do not need to
+    /// invoke this directly; `execute()` performs the same state
+    /// transition internally before any work begins.
     pub fn start(&self) -> Result<()> {
         let mut state = self.state.lock();
         match *state {
@@ -527,5 +585,67 @@ mod tests {
         let progress = restore.get_progress();
         assert_eq!(progress.bytes_transferred, 256);
         assert_eq!(progress.files_transferred, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LOG-4: server-supplied filename validation
+    // -----------------------------------------------------------------------
+
+    fn assert_unsafe(name: &str) {
+        let err = validate_restore_filename(name)
+            .expect_err(&format!("expected rejection for {:?}", name));
+        match err {
+            RepError::ProtocolError(msg) => assert!(
+                msg.contains("unsafe filename"),
+                "unexpected message for {:?}: {}",
+                name,
+                msg
+            ),
+            other => {
+                panic!("expected ProtocolError for {:?}, got {:?}", name, other)
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_filename_rejects_empty() {
+        assert_unsafe("");
+    }
+
+    #[test]
+    fn test_validate_filename_rejects_dot_and_dotdot() {
+        assert_unsafe(".");
+        assert_unsafe("..");
+    }
+
+    #[test]
+    fn test_validate_filename_rejects_hidden_dotfile() {
+        assert_unsafe(".bashrc");
+        assert_unsafe(".hidden");
+    }
+
+    #[test]
+    fn test_validate_filename_rejects_path_separators() {
+        assert_unsafe("../etc/passwd");
+        assert_unsafe("/etc/passwd");
+        assert_unsafe("subdir/file.ndb");
+        assert_unsafe("dir\\file.ndb");
+        assert_unsafe("..\\windows\\system32");
+    }
+
+    #[test]
+    fn test_validate_filename_rejects_null_byte() {
+        assert_unsafe("good\0name.ndb");
+        assert_unsafe("\0");
+    }
+
+    #[test]
+    fn test_validate_filename_accepts_normal_log_files() {
+        validate_restore_filename("00000000.ndb").unwrap();
+        validate_restore_filename("00000001.ndb").unwrap();
+        validate_restore_filename("ffffffff.ndb").unwrap();
+        validate_restore_filename("data.bin").unwrap();
+        validate_restore_filename("name-with-dashes_and_underscores.ndb")
+            .unwrap();
     }
 }
