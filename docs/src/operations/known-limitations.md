@@ -1,5 +1,46 @@
 # 7. Known Limitations
 
+## Replication security — **deploy only on a trusted network**
+
+The May-2026 security review (see
+`docs/src/internal/security-review-2026-05.md`) identified
+six blocker-class security gaps in the replication wire
+protocol. Until those are closed, **the replication
+subsystem must not be deployed across an untrusted network
+boundary**:
+
+- The replication wire protocol has no authentication. A peer
+  identity (`group_name`, `node_name`) is self-claimed
+  plaintext and not verified.
+- `NetworkRestoreServer` streams the entire on-disk
+  environment to anyone who connects to its port.
+- `PeerFeederService` streams the WAL to anyone who connects.
+- Election proposals and votes are unsigned and unauthenticated.
+  An on-path attacker can flip the cluster master.
+- `NetworkRestore` (client) trusts server-supplied filenames —
+  a malicious peer can write attacker-controlled bytes to any
+  filesystem path the noxu process can write
+  (path traversal).
+- TCP frame `payload_len` (32-bit) is unbounded — a single
+  attacker frame can trigger a 4 GiB allocation.
+- The QUIC channel's ergonomic constructor (`QuicChannel::connect`)
+  installs a no-op `ServerCertVerifier`. The user must
+  explicitly opt OUT of skip-verification by using
+  `connect_with_config` to get authenticated TLS.
+
+Recommended deployment until these are remediated:
+
+- Replicate only across a host-firewalled or
+  VPC-segmented network where every peer IP is statically
+  known and the firewall blocks all other inbound traffic.
+- Do not expose the replication port on any
+  internet-reachable interface.
+- Treat the replication network as trusted: if a peer is
+  compromised, the entire replication group is
+  compromised.
+
+## Other limitations
+
 | Limitation | Status | Workaround |
 |-----------|--------|------------|
 | **Concurrent write throughput gap** | Known — Noxu LockManager uses 64 shards; alternative implementations using per-slot lock designs scale better at 16+ concurrent writers | Keep writer concurrency ≤ 8 threads per environment for optimal throughput; use disjoint key ranges when possible |
@@ -8,6 +49,10 @@
 | **`TupleSerdeBinding` sort order** | Uses `serde` binary encoding, not sort-preserving tuple encoding | Use raw `DatabaseEntry` with manually constructed sort-preserving keys for range scans on tuples |
 | **Property-based tests timeout in fast nextest runs** | `noxu-db::prop_tests` and `noxu-collections::prop_tests` may timeout under default 60 s limit | Run with `--profile slow` or increase timeout in `.config/nextest.toml` |
 | **Replication: server-side network restore** | TCP file transfer implemented; client-side `NetworkRestore::execute()` complete | Full production hardening of restore protocol is recommended before use in HA deployments |
+| **`Engine::close` does not close `EnvironmentImpl`** | Identified by May-2026 claim audit. The doc lists "3. Close EnvironmentImpl" but the body skips that step with an inline TODO comment. | Drop the `Engine` and rely on the `Environment`'s own RAII close; or call `env.close()` directly. |
+| **`verify_environment` / `verify_database` are stubs** | Identified by May-2026 claim audit. Both functions return an empty passing `VerifyResult{}` without performing verification work. | Treat their `Ok` result as "no errors detected by this stub" — not as a guarantee of consistency. |
+| **`ReplicatedEnvironment::new` does not start the replication group** | Identified by May-2026 claim audit. The doc claims `new()` initiates an election and contacts peers; the body only constructs state and starts the TCP service dispatcher. | The replication subsystem requires further wiring (election trigger, peer contact) before it provides the documented behaviour. |
+| **`become_master`, `transfer_master`, `shutdown_group` are partially or entirely stubbed** | Identified by May-2026 claim audit. None of these run the full HA semantics described in their docs. | These APIs should be considered design placeholders, not functional in v1.3.0. |
 | **No built-in metrics export** | `env.get_stats()` returns a snapshot; there is no Prometheus/OpenTelemetry integration | Wrap `get_stats()` in your own scraper thread |
 
 ---
