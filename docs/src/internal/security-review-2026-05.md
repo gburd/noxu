@@ -354,3 +354,40 @@ release. Until the **NA-1 / NA-2 / NA-3 / NA-5 / NA-6 / LOG-4 /
 LOG-2** items are closed, replication should not be deployed
 across an untrusted network boundary, and the README's
 documentation has been updated to call this out explicitly.
+
+### Update — v1.4.1
+
+`v1.4.1` (commit `f2ba3d5`) closes the bug-class subset of
+this review:
+
+- **LOG-2 closed**: `MAX_FRAME_PAYLOAD = 64 MiB` enforced
+  across every `Channel` impl. A single attacker frame can no
+  longer trigger a 4 GiB allocation.
+- **LOG-3, LOG-5, LOG-6, LOG-7 closed**: item-size cap
+  centralised, unknown entry types logged at error,
+  recovery + replica reject out-of-order VLSNs.
+- **LOG-4 closed**: `validate_restore_filename` rejects
+  empty / `.` / `..` / dotfile / path-separator / NUL.
+- **TLS-2, TLS-3, TLS-4 closed**: silent empty trust-store,
+  malformed PEM, and mTLS-on-tls-native are now `Err`s.
+- **LOG-8, LOG-9, LOG-10 closed**: VLSN sentinel rejection,
+  feeder warns on negative VLSN, replica skips unknown entry
+  types.
+
+Still open (the auth-class blockers — see
+`auth-mtls-design-2026-05.md` for the in-flight plan):
+
+- **NA-1, NA-2, NA-3, NA-5, NA-6**: replication wire still
+  has no authentication. The `chore/auth-mtls-by-default`
+  branch starts the foundation: `RepConfig::peer_allowlist`,
+  `TlsConfig::for_replication` (a stricter constructor that
+  rejects `SelfSigned` identity and `SkipVerification`
+  trust), and the `noxu_rep::auth::PeerAllowlist` matching
+  primitive. Phase 2 (dispatcher integration) is not landed.
+- **NA-4, NA-7, NA-8**: subsumed by the same plan.
+- **TLS-1**: addressed by Phase 3 of the same plan
+  (deprecate the silent skip-verify default).
+
+The deployment guidance in `known-limitations.md` is
+unchanged — replication still must NOT be deployed across an
+untrusted network boundary in v1.4.x.

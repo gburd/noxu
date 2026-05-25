@@ -84,6 +84,22 @@ pub struct RepConfig {
     pub election_phase_timeout: Duration,
     /// Reconnection backoff configuration for replica partition recovery.
     pub reconnect_config: ReconnectConfig,
+    /// Allowlist of peer subject names authorised to participate in
+    /// the replication group.
+    ///
+    /// When the dispatcher's mTLS path is in use (planned for v1.5.0,
+    /// see `docs/src/internal/auth-mtls-design-2026-05.md`),
+    /// incoming connections are accepted only if the peer's leaf
+    /// certificate carries a Subject Common Name or Subject
+    /// Alternative Name DNS entry that matches one of these strings
+    /// case-insensitively.
+    ///
+    /// An empty allowlist (the default) means "no peers authorised";
+    /// in v1.5.0 this becomes a hard error at dispatcher
+    /// construction time. In v1.4.x this field is *unused* — the
+    /// dispatcher does not yet enforce mTLS — so an empty list is
+    /// the documented temporary default.
+    pub peer_allowlist: Vec<String>,
 }
 
 impl RepConfig {
@@ -113,6 +129,7 @@ impl RepConfig {
             initial_peers: Vec::new(),
             election_phase_timeout: DEFAULT_ELECTION_PHASE_TIMEOUT,
             reconnect_config: ReconnectConfig::default(),
+            peer_allowlist: Vec::new(),
         }
     }
 
@@ -144,6 +161,7 @@ pub struct RepConfigBuilder {
     initial_peers: Vec<RepNode>,
     election_phase_timeout: Duration,
     reconnect_config: ReconnectConfig,
+    peer_allowlist: Vec<String>,
 }
 
 impl RepConfigBuilder {
@@ -253,6 +271,22 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Set the allowlist of peer subject names authorised to
+    /// participate in the replication group. Each entry is
+    /// matched case-insensitively against the peer cert's
+    /// Subject Common Name and Subject Alternative Name DNS
+    /// entries during the mTLS handshake.
+    ///
+    /// Phase 1 of the mTLS-by-default plan (v1.5.0+) — see
+    /// `docs/src/internal/auth-mtls-design-2026-05.md`. In
+    /// v1.4.x this field is plumbed through the config but
+    /// not enforced; the dispatcher does not yet require
+    /// mTLS.
+    pub fn peer_allowlist(mut self, names: Vec<String>) -> Self {
+        self.peer_allowlist = names;
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -275,6 +309,7 @@ impl RepConfigBuilder {
             initial_peers: self.initial_peers,
             election_phase_timeout: self.election_phase_timeout,
             reconnect_config: self.reconnect_config,
+            peer_allowlist: self.peer_allowlist,
         }
     }
 }
