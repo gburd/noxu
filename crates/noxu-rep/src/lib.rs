@@ -53,6 +53,7 @@
 //! ```
 
 // Foundation modules
+pub mod auth;
 pub mod commit_durability;
 pub mod consistency;
 pub mod error;
