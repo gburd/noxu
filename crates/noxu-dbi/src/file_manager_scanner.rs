@@ -78,16 +78,27 @@ impl FileManagerLogScanner {
         Some(Bytes::from(buf))
     }
 
-    /// Convert a raw (entry_type_num, payload_bytes) pair to a `LogEntry`.
+    /// Convert a raw (entry_type_num, payload_bytes, vlsn) triple to a
+    /// `LogEntry`.
     ///
     /// `payload` is a `Bytes` slice pointing into the file buffer.  For LN
     /// entries the key/data fields are created as sub-slices of `payload`
     /// via `Bytes::slice` — zero heap allocation until the bytes are
     /// materialised into the B-tree at the redo/undo boundary.
     ///
+    /// `vlsn` is `Some` when the original log entry header carried a VLSN
+    /// (`vlsn_present` flag set) and the value is plausible.  It is
+    /// attached to the resulting `LnRecord` so that recovery can verify
+    /// VLSN ordering on the replicated-entry stream (security review
+    /// LOG-6).
+    ///
     /// Returns `None` for entry types recovery does not need to process
     /// (FileHeader, Trace, etc.).
-    fn parse_payload(entry_type_num: u8, payload: Bytes) -> Option<LogEntry> {
+    fn parse_payload(
+        entry_type_num: u8,
+        payload: Bytes,
+        vlsn: Option<u64>,
+    ) -> Option<LogEntry> {
         let entry_type = LogEntryType::from_type_num(entry_type_num)?;
 
         match entry_type {
@@ -149,6 +160,7 @@ impl FileManagerLogScanner {
                     r.abort_key.map(|s| payload.slice(subslice_range(raw, s)));
                 rec.abort_data =
                     r.abort_data.map(|s| payload.slice(subslice_range(raw, s)));
+                rec.vlsn = vlsn;
                 Some(LogEntry::Ln(rec))
             }
 
@@ -258,10 +270,26 @@ impl FileManagerLogScanner {
             return None; // Truncated write at end of log.
         }
 
+        // Extract VLSN from the header extension (8-byte LE i64) so the
+        // recovery redo pass can verify VLSN ordering on replicated
+        // entries (security review LOG-6).  A negative or zero raw value
+        // with vlsn_present set is a contradiction; treat as no-VLSN
+        // rather than poisoning the scan.
+        let vlsn_opt = if vlsn_present {
+            let raw = i64::from_le_bytes(
+                data[offset + MIN_HEADER_SIZE..offset + MAX_HEADER_SIZE]
+                    .try_into()
+                    .ok()?,
+            );
+            if raw > 0 { Some(raw as u64) } else { None }
+        } else {
+            None
+        };
+
         // slice() is O(1): just bumps the Bytes Arc refcount.
         let payload =
             file_bytes.slice(offset + header_size..offset + entry_size);
-        let log_entry = Self::parse_payload(entry_type_num, payload);
+        let log_entry = Self::parse_payload(entry_type_num, payload, vlsn_opt);
 
         Some((entry_size, log_entry))
     }

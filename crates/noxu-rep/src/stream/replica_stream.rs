@@ -173,8 +173,34 @@ impl ReplicaReceiver {
     /// Blocks until the channel is closed or an unrecoverable error occurs.
     /// Each successfully received entry is passed to `log_writer`; then an
     /// ack `[vlsn: 8 bytes LE]` is sent back to the master.
+    ///
+    /// # Anti-replay / VLSN-ordering enforcement (LOG-7)
+    ///
+    /// The replica MUST observe strictly-increasing VLSNs across the
+    /// connection.  Without this check the master could (accidentally
+    /// or maliciously) replay an old frame, causing the replica to ack a
+    /// VLSN it had already applied and silently overwrite a more-recent
+    /// committed value.  We track a `received_vlsn` high-water mark and
+    /// reject any incoming frame whose VLSN is `<= high-water` with a
+    /// [`RepError::ProtocolError`].  Gaps above the high-water mark are
+    /// allowed because the master is permitted to skip non-replicated
+    /// entries.
+    ///
+    /// # Entry-type validation (LOG-10)
+    ///
+    /// The wire-format entry-type byte is also validated against the set
+    /// of known [`LogEntryType`] variants before forwarding to
+    /// `log_writer`.  An unknown byte indicates either a protocol-version
+    /// skew or an attacker who flipped a header bit, and is logged at
+    /// `error` level then skipped (the connection is kept open so the
+    /// stream can recover from a single bad frame; a repeated stream of
+    /// unknowns will surface via the operator alerting on the error log).
     pub fn run(&self, log_writer: &mut dyn LogWriter) -> Result<()> {
         let recv_timeout = Duration::from_secs(30);
+        // LOG-7: strictly-increasing VLSN high-water mark.  0 == NULL_VLSN
+        // (never assigned by the master), so "<= high-water" rejects 0
+        // too once a real VLSN has arrived.
+        let mut received_vlsn_high_water: u64 = 0;
 
         loop {
             // ----------------------------------------------------------------
@@ -235,9 +261,49 @@ impl ReplicaReceiver {
             }
 
             // ----------------------------------------------------------------
+            // LOG-7: enforce strictly-increasing VLSN order.
+            //
+            // VLSN 0 from the master is the NULL VLSN sentinel and is not
+            // checked against the high-water mark (the feeder sends 0 for
+            // entries that do not carry a VLSN).  All non-zero VLSNs MUST
+            // strictly exceed the previous high-water; otherwise we have
+            // either a replayed frame or a master that re-used a sequence
+            // number — both are protocol-fatal.
+            // ----------------------------------------------------------------
+            if vlsn != 0 && vlsn <= received_vlsn_high_water {
+                return Err(RepError::ProtocolError(format!(
+                    "replica: VLSN ordering violation: incoming vlsn={vlsn} \
+                     <= received high-water {received_vlsn_high_water}; \
+                     possible replay attack or master clock-skew"
+                )));
+            }
+
+            // ----------------------------------------------------------------
+            // LOG-10: validate the entry-type byte against the catalog
+            // before forwarding to the log writer.  An unknown type is
+            // logged and the frame is skipped — but the connection stays
+            // open so a single corrupt frame does not stall replication.
+            // ----------------------------------------------------------------
+            if LogEntryType::from_type_num(entry_type).is_none() {
+                log::error!(
+                    "replica: unknown entry_type byte {entry_type} on frame \
+                     vlsn={vlsn}; skipping (LOG-10)"
+                );
+                // Skip this frame: do not advance high-water, do not ack.
+                // The master will retransmit if the replica disconnects;
+                // for now we just continue to the next frame.
+                continue;
+            }
+
+            // ----------------------------------------------------------------
             // Apply the entry to the local log.
             // ----------------------------------------------------------------
             log_writer.write_entry(vlsn, entry_type, payload)?;
+
+            // Advance the high-water mark only after a successful apply.
+            if vlsn != 0 {
+                received_vlsn_high_water = vlsn;
+            }
 
             // ----------------------------------------------------------------
             // Send ack: [vlsn: 8 bytes LE]
@@ -399,8 +465,13 @@ impl ReplicaStream {
 
     /// Check if the replica is caught up with the master.
     ///
-    /// Returns `true` if the applied VLSN equals or exceeds the master's
-    /// latest known VLSN and there are no pending entries.
+    /// Returns `true` if **all** of the following are true:
+    /// - the master VLSN is non-zero (i.e. at least one master VLSN has
+    ///   been observed; a stream that has never received a master VLSN
+    ///   reports `false`),
+    /// - the applied VLSN equals or exceeds the master's latest known
+    ///   VLSN, and
+    /// - there are no pending entries.
     pub fn is_caught_up(&self) -> bool {
         let applied = *self.applied_vlsn.lock();
         let master = *self.master_vlsn.lock();
@@ -562,9 +633,16 @@ mod tests {
         let master_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
         let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
-        // Entries to replicate.
-        let entries: Vec<(u64, u8, Vec<u8>)> =
-            (1..=5).map(|i| (i, i as u8, vec![i as u8; i as usize])).collect();
+        // Entries to replicate.  Entry-type bytes must be valid
+        // `LogEntryType` variants (validated by LOG-10 enforcement); pick
+        // FileHeader/IN/BIN/BINDelta/InsertLN.
+        let valid_types: [u8; 5] = [1, 2, 3, 4, 10];
+        let entries: Vec<(u64, u8, Vec<u8>)> = (1..=5)
+            .map(|i| {
+                let etype = valid_types[(i - 1) as usize];
+                (i, etype, vec![i as u8; i as usize])
+            })
+            .collect();
 
         // Replica thread.
         let replica_ch_clone = Arc::clone(&replica_ch);
@@ -597,10 +675,163 @@ mod tests {
         for (i, (vlsn, etype, payload)) in written.iter().enumerate() {
             let expected_vlsn = (i + 1) as u64;
             assert_eq!(*vlsn, expected_vlsn);
-            assert_eq!(*etype, expected_vlsn as u8);
+            assert_eq!(*etype, valid_types[i]);
             assert_eq!(payload.len(), expected_vlsn as usize);
         }
         assert_eq!(last_acked, 5);
+    }
+
+    /// LOG-7: a replayed (or out-of-order) frame whose VLSN is `<=` the
+    /// already-received high-water mark must be rejected with
+    /// [`RepError::ProtocolError`].  Without this check the master could
+    /// re-send a previously-acked frame and the replica would silently
+    /// overwrite a more-recent committed value.
+    #[test]
+    fn test_replica_rejects_replayed_vlsn() {
+        let pair = LocalChannelPair::new();
+        let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // Send VLSN=5 then VLSN=3 (replay).  Entry-type 10 = InsertLN.
+        let frames =
+            vec![make_frame(5, 10, b"first"), make_frame(3, 10, b"replay")];
+
+        let master_clone = Arc::clone(&master_side);
+        let _send_handle = std::thread::spawn(move || {
+            for f in &frames {
+                let _ = master_clone.send(f);
+            }
+            // Drain the ack for the first frame so the receiver can advance.
+            let _ = master_clone.receive(Duration::from_secs(2));
+        });
+
+        let receiver = ReplicaReceiver::new(replica_side);
+        let mut writer = RecordingWriter::new();
+        let res = receiver.run(&mut writer);
+
+        match res {
+            Err(RepError::ProtocolError(msg)) => {
+                assert!(
+                    msg.contains("VLSN ordering violation"),
+                    "expected VLSN-ordering protocol error, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected ProtocolError on replay, got {other:?}")
+            }
+        }
+
+        // The first (in-order) frame should have been applied; the
+        // replayed one MUST NOT be.
+        assert_eq!(writer.entries.len(), 1);
+        assert_eq!(writer.entries[0].0, 5);
+    }
+
+    /// LOG-7: equal VLSNs are also rejected (the rule is *strictly*
+    /// increasing).
+    #[test]
+    fn test_replica_rejects_duplicate_vlsn() {
+        let pair = LocalChannelPair::new();
+        let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        let frames = vec![make_frame(7, 10, b"a"), make_frame(7, 10, b"b")];
+
+        let master_clone = Arc::clone(&master_side);
+        let _send_handle = std::thread::spawn(move || {
+            for f in &frames {
+                let _ = master_clone.send(f);
+            }
+            let _ = master_clone.receive(Duration::from_secs(2));
+        });
+
+        let receiver = ReplicaReceiver::new(replica_side);
+        let mut writer = RecordingWriter::new();
+        let res = receiver.run(&mut writer);
+        assert!(
+            matches!(res, Err(RepError::ProtocolError(_))),
+            "expected ProtocolError on duplicate VLSN, got {res:?}"
+        );
+        assert_eq!(writer.entries.len(), 1);
+    }
+
+    /// LOG-7: a gap in the VLSN sequence (`vlsn > high-water + 1`) is
+    /// allowed — the master may legitimately skip VLSNs (non-replicated
+    /// entries reuse the same connection).
+    #[test]
+    fn test_replica_allows_vlsn_gap() {
+        let pair = LocalChannelPair::new();
+        let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // VLSN gap: 1 → 5 → 100.
+        let frames = vec![
+            make_frame(1, 10, b"a"),
+            make_frame(5, 10, b"b"),
+            make_frame(100, 10, b"c"),
+        ];
+
+        let master_clone = Arc::clone(&master_side);
+        let send_handle = std::thread::spawn(move || {
+            for f in &frames {
+                master_clone.send(f).unwrap();
+            }
+            for _ in 0..3 {
+                let _ = master_clone.receive(Duration::from_secs(2));
+            }
+            master_clone.close().unwrap();
+        });
+
+        let receiver = ReplicaReceiver::new(replica_side);
+        let mut writer = RecordingWriter::new();
+        receiver.run(&mut writer).unwrap();
+        send_handle.join().unwrap();
+
+        assert_eq!(writer.entries.len(), 3);
+        assert_eq!(writer.entries[0].0, 1);
+        assert_eq!(writer.entries[1].0, 5);
+        assert_eq!(writer.entries[2].0, 100);
+    }
+
+    /// LOG-10: an unknown entry-type byte is logged and the frame is
+    /// skipped.  The connection stays open; subsequent valid frames are
+    /// applied normally.
+    #[test]
+    fn test_replica_skips_unknown_entry_type() {
+        let pair = LocalChannelPair::new();
+        let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // VLSN=1: bogus entry_type=200 (no LogEntryType::from_type_num).
+        // VLSN=2: valid InsertLN (10).  After my high-water bookkeeping,
+        // VLSN=2 must still be accepted because the bogus frame did NOT
+        // advance the high-water.
+        let frames =
+            vec![make_frame(1, 200, b"bogus"), make_frame(2, 10, b"good")];
+
+        let master_clone = Arc::clone(&master_side);
+        let send_handle = std::thread::spawn(move || {
+            for f in &frames {
+                master_clone.send(f).unwrap();
+            }
+            // Only the second (valid) frame produces an ack.
+            let ack = master_clone.receive(Duration::from_secs(2)).unwrap();
+            master_clone.close().unwrap();
+            ack
+        });
+
+        let receiver = ReplicaReceiver::new(replica_side);
+        let mut writer = RecordingWriter::new();
+        receiver.run(&mut writer).unwrap();
+
+        let ack = send_handle.join().unwrap();
+        let acked_vlsn =
+            u64::from_le_bytes(ack.unwrap()[..8].try_into().unwrap());
+
+        assert_eq!(writer.entries.len(), 1, "bogus frame must be skipped");
+        assert_eq!(writer.entries[0].0, 2);
+        assert_eq!(writer.entries[0].1, 10);
+        assert_eq!(acked_vlsn, 2);
     }
 
     // -----------------------------------------------------------------------

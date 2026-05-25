@@ -151,6 +151,11 @@ pub struct RecoveryStats {
     pub aborted_txns: u64,
     /// Number of active (uncommitted) transactions that were undone.
     pub active_txns_undone: u64,
+    /// Number of LNs skipped during redo because of out-of-order VLSN
+    /// (security review LOG-6).  A non-zero count means the log appears
+    /// to have been reordered or an attacker injected stale frames; the
+    /// operator should investigate before relying on the recovered DB.
+    pub vlsn_ordering_violations: u64,
 }
 
 // ============================================================================
@@ -949,6 +954,19 @@ impl RecoveryManager {
         let redo_entries: Vec<(Lsn, LnRecord)> =
             std::mem::take(&mut self.redo_entries);
 
+        // LOG-6: VLSN-ordering tracker.
+        //
+        // Every replicated LN carries a VLSN in its log entry header.  As
+        // the redo pass replays committed LNs in forward log order, the
+        // VLSNs of the *replicated* entries we apply must be strictly
+        // increasing — anything else means the local log was reordered or
+        // an attacker inserted an out-of-order frame.  We do NOT abort
+        // recovery on a violation (a partial recovery is preferable to a
+        // refusal to mount); instead we log::error! and skip the offending
+        // entry so the operator sees the corruption.
+        let mut last_redone_vlsn: Option<u64> = None;
+        let mut vlsn_violations: u64 = 0;
+
         for (lsn, rec) in &redo_entries {
             self.stats.lns_read_redo += 1;
 
@@ -956,6 +974,23 @@ impl RecoveryManager {
                 self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
 
             if let RedoAction::Apply = action {
+                // VLSN-ordering check before we touch the tree.
+                if let Some(curr) = rec.vlsn {
+                    if let Some(prev) = last_redone_vlsn
+                        && curr <= prev
+                    {
+                        log::error!(
+                            "noxu-recovery: out-of-order VLSN during redo \
+                             at lsn={lsn:?}: current vlsn={curr} <= previous \
+                             vlsn={prev}; skipping this entry to keep the \
+                             rest of recovery viable (LOG-6)"
+                        );
+                        vlsn_violations += 1;
+                        continue;
+                    }
+                    last_redone_vlsn = Some(curr);
+                }
+
                 // RecoveryManager.redoOneLN / redo().
                 //
                 // decision:
@@ -971,6 +1006,15 @@ impl RecoveryManager {
                 }
                 self.stats.lns_redone += 1;
             }
+        }
+
+        if vlsn_violations > 0 {
+            log::error!(
+                "noxu-recovery: {vlsn_violations} VLSN-ordering violation(s) \
+                 detected during redo; database may be missing replicated \
+                 updates"
+            );
+            self.stats.vlsn_ordering_violations += vlsn_violations;
         }
 
         // Put the entries back (they may be needed for undo diagnostics).
@@ -1769,6 +1813,87 @@ mod tests {
         mgr.recover(&mut scanner, None, false).unwrap();
 
         assert_eq!(mgr.get_stats().lns_redone, 0);
+    }
+
+    /// LOG-6: when two committed replicated LNs appear with VLSNs that
+    /// are *not* strictly increasing, the redo phase logs an error and
+    /// skips the offending entry rather than silently applying it.  The
+    /// number of skips is recorded in `RecoveryStats`.
+    #[test]
+    fn test_redo_skips_out_of_order_vlsn() {
+        let ckpt_start = lsn(0, 50);
+
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::CkptEnd(CkptEndRecord {
+                id: 1,
+                checkpoint_start_lsn: ckpt_start,
+                first_active_lsn: lsn(0, 40),
+                root_lsn: NULL_LSN,
+                last_local_node_id: 0,
+                last_replicated_node_id: -1,
+                last_local_db_id: 0,
+                last_replicated_db_id: -1,
+                last_local_txn_id: 0,
+                last_replicated_txn_id: -1,
+            }),
+        );
+
+        // Two LNs with the same committed txn — the second has a *smaller*
+        // VLSN than the first, simulating either log reorder corruption or
+        // an attacker who replayed an old replication frame.
+        let mut rec1 = make_insert(1, Some(42), b"a", NULL_LSN);
+        rec1.vlsn = Some(100);
+        scanner.push(lsn(0, 300), LogEntry::Ln(rec1));
+
+        let mut rec2 = make_insert(1, Some(42), b"b", NULL_LSN);
+        rec2.vlsn = Some(50); // < 100 → out of order
+        scanner.push(lsn(0, 350), LogEntry::Ln(rec2));
+
+        scanner.push(
+            lsn(0, 400),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 42,
+                lsn: lsn(0, 400),
+            }),
+        );
+
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, None, false).unwrap();
+
+        let stats = mgr.get_stats();
+        assert_eq!(
+            stats.lns_redone, 1,
+            "only the first (in-order VLSN) entry should be redone"
+        );
+        assert_eq!(
+            stats.vlsn_ordering_violations, 1,
+            "exactly one VLSN-ordering violation should have been recorded"
+        );
+    }
+
+    /// LOG-6: equal VLSNs are also rejected — the invariant is *strictly*
+    /// increasing, not non-decreasing.  An attacker who replays the
+    /// previously-acked frame would otherwise slip through.
+    #[test]
+    fn test_redo_rejects_duplicate_vlsn() {
+        let mut scanner = InMemoryLogScanner::new();
+
+        let mut rec1 = make_insert(1, None, b"a", NULL_LSN);
+        rec1.vlsn = Some(7);
+        scanner.push(lsn(0, 100), LogEntry::Ln(rec1));
+
+        let mut rec2 = make_insert(1, None, b"b", NULL_LSN);
+        rec2.vlsn = Some(7); // duplicate
+        scanner.push(lsn(0, 200), LogEntry::Ln(rec2));
+
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, None, false).unwrap();
+
+        let stats = mgr.get_stats();
+        assert_eq!(stats.lns_redone, 1);
+        assert_eq!(stats.vlsn_ordering_violations, 1);
     }
 
     // ------------------------------------------------------------------ Phase 3: Undo

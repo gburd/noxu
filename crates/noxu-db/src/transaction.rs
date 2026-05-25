@@ -168,7 +168,15 @@ impl Transaction {
     /// and visible to other transactions.
     ///
     /// # Errors
-    /// Returns error if the transaction is not in Open state.
+    /// Returns an error if:
+    /// - The transaction is not in `Open` state.
+    /// - Writing the `TxnCommit` WAL entry fails (`EnvironmentFailure`
+    ///   with reason `LogWrite`, propagated from `write_txn_end`).
+    /// - The inner-`Txn` commit fails after the WAL entry has been
+    ///   fsynced (e.g. open cursors held against this transaction, or
+    ///   inner-state inconsistency surfaced by `check_state`). When
+    ///   this happens the transaction is still durably committed; the
+    ///   error is propagated so the caller can react to the leak.
     pub fn commit(&self) -> Result<()> {
         observe_span!("txn_commit", txn_id = self.id);
         let _obs_timer = observe_timer_start!();
@@ -186,7 +194,15 @@ impl Transaction {
     /// * `durability` - Durability settings for this commit
     ///
     /// # Errors
-    /// Returns error if the transaction is not in Open state.
+    /// Returns an error if:
+    /// - The transaction is not in `Open` state.
+    /// - Writing the `TxnCommit` WAL entry fails (`EnvironmentFailure`
+    ///   with reason `LogWrite`, propagated from `write_txn_end`).
+    /// - The inner-`Txn` commit fails after the WAL entry has been
+    ///   fsynced (e.g. open cursors held against this transaction, or
+    ///   inner-state inconsistency surfaced by `check_state`). When
+    ///   this happens the transaction is still durably committed; the
+    ///   error is propagated so the caller can react to the leak.
     pub fn commit_with_durability(&self, durability: Durability) -> Result<()> {
         self.check_open()?;
 
@@ -283,7 +299,12 @@ impl Transaction {
     /// All operations performed under this transaction are rolled back.
     ///
     /// # Errors
-    /// Returns error if the transaction is already committed or aborted.
+    /// Returns an error if:
+    /// - The transaction is already committed or aborted.
+    /// - Writing the `TxnAbort` WAL entry fails (`EnvironmentFailure`
+    ///   with reason `LogWrite`, propagated from `write_txn_end`).
+    ///   This path is taken only when the transaction is not read-only
+    ///   and a `LogManager` is configured on the environment.
     pub fn abort(&self) -> Result<()> {
         observe_span!("txn_abort", txn_id = self.id);
         observe_counter!("noxu_db_operations_total", "op" => "abort");

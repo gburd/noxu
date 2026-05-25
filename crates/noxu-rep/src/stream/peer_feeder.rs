@@ -78,8 +78,12 @@ impl PeerLogScanner {
     /// Push a log entry into the scanner's queue.
     ///
     /// Called by the `ReplicaReceiver` each time an entry is applied.
-    /// Entries must be pushed in VLSN order; out-of-order pushes update
-    /// only the bounds if the new VLSN falls within or extends the range.
+    /// Entries are expected to be pushed in VLSN order, but this method is
+    /// not enforcing: every entry is appended to the queue unconditionally
+    /// and the cached `(first_vlsn, last_vlsn)` range is widened to cover
+    /// the new VLSN. Out-of-order or duplicate entries are filtered later
+    /// by [`LogScanner::next_entry`](crate::stream::feeder::LogScanner),
+    /// which skips entries with `vlsn < from_vlsn`.
     pub fn push(&self, vlsn: u64, entry_type: u8, payload: Vec<u8>) {
         let mut first = self.first_vlsn.lock();
         let mut last = self.last_vlsn.lock();

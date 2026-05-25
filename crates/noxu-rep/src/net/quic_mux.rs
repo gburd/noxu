@@ -188,6 +188,13 @@ impl Channel for QuicSubChannel {
             }
 
             let payload_len = u32::from_le_bytes(len_buf) as usize;
+            if payload_len > crate::net::channel::MAX_FRAME_PAYLOAD {
+                return Err(RepError::ProtocolError(format!(
+                    "frame payload too large: {} > {}",
+                    payload_len,
+                    crate::net::channel::MAX_FRAME_PAYLOAD
+                )));
+            }
             let mut payload = vec![0u8; payload_len];
             stream.read_exact(&mut payload).await.map_err(|e| match e {
                 ReadExactError::FinishedEarly(_) => RepError::ChannelClosed(
@@ -1054,5 +1061,47 @@ mod tests {
         second.heartbeat_channel().send(b"second-conn").unwrap();
 
         server_thread.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // LOG-2 hardening
+    // -----------------------------------------------------------------------
+
+    /// Each multiplexed sub-channel must enforce the same payload bound as
+    /// the single-stream `QuicChannel`.  We exercise the heartbeat
+    /// sub-channel; the same `receive` implementation is shared by all
+    /// four streams.
+    #[test]
+    fn test_quic_mux_rejects_oversize_frame() {
+        let listener = loopback_mux_listener();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let ch = listener.accept().unwrap();
+            let oversized =
+                vec![0u8; crate::net::channel::MAX_FRAME_PAYLOAD + 1];
+            // Send through the heartbeat stream.  The send may fail when
+            // the client tears down the connection after rejecting the
+            // header — that's expected.
+            let _ = ch.heartbeat_channel().send(&oversized);
+        });
+
+        let client =
+            QuicMultiplexedChannel::connect(addr, "localhost").unwrap();
+        let result =
+            client.heartbeat_channel().receive(Duration::from_secs(10));
+        let _ = client.heartbeat_channel().close();
+        let err = result.expect_err("oversize QUIC mux frame must be rejected");
+        match err {
+            RepError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("frame payload too large"),
+                    "unexpected protocol-error message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        let _ = server_thread.join();
     }
 }
