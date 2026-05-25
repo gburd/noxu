@@ -397,16 +397,39 @@ impl TlsConfig {
                 // will install SkipCertVerification when this variant is set.
             }
             TrustedCerts::CaFiles(paths) => {
+                // TLS-2: an empty CaFiles list is a misconfiguration. It
+                // would silently produce an empty trust store, which validates
+                // nothing without the explicit `SkipVerification` opt-out.
+                if paths.is_empty() {
+                    return Err(RepError::ConfigError(
+                        "TrustedCerts::CaFiles configured with no paths; \
+                         this is a misconfiguration. Use \
+                         TrustedCerts::SkipVerification to explicitly opt \
+                         out of CA verification."
+                            .into(),
+                    ));
+                }
                 for path in paths {
                     let pem = std::fs::read(path).map_err(|e| {
                         RepError::NetworkError(format!("CA file: {e}"))
                     })?;
-                    for cert in certs(&mut BufReader::new(pem.as_slice()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| {
-                            RepError::NetworkError(format!("CA parse: {e}"))
-                        })?
-                    {
+                    let parsed: Vec<_> =
+                        certs(&mut BufReader::new(pem.as_slice()))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .map_err(|e| {
+                                RepError::NetworkError(format!("CA parse: {e}"))
+                            })?;
+                    // TLS-3: rustls_pemfile silently skips non-cert PEM blocks
+                    // (and any non-PEM bytes). If the file had bytes but
+                    // produced zero certificates, treat that as a parse error
+                    // rather than silently building an empty trust store.
+                    if !pem.is_empty() && parsed.is_empty() {
+                        return Err(RepError::ConfigError(format!(
+                            "CA file {} parsed but contained 0 certificates",
+                            path.display()
+                        )));
+                    }
+                    for cert in parsed {
                         store.add(cert).map_err(|e| {
                             RepError::NetworkError(format!("CA add: {e}"))
                         })?;
@@ -414,13 +437,32 @@ impl TlsConfig {
                 }
             }
             TrustedCerts::CaBytes(pems) => {
-                for pem in pems {
-                    for cert in certs(&mut BufReader::new(pem.as_slice()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| {
-                            RepError::NetworkError(format!("CA parse: {e}"))
-                        })?
-                    {
+                // TLS-2: empty CaBytes list — same misconfiguration as
+                // empty CaFiles. Reject explicitly.
+                if pems.is_empty() {
+                    return Err(RepError::ConfigError(
+                        "TrustedCerts::CaBytes configured with no PEM blobs; \
+                         this is a misconfiguration. Use \
+                         TrustedCerts::SkipVerification to explicitly opt \
+                         out of CA verification."
+                            .into(),
+                    ));
+                }
+                for (idx, pem) in pems.iter().enumerate() {
+                    let parsed: Vec<_> =
+                        certs(&mut BufReader::new(pem.as_slice()))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .map_err(|e| {
+                                RepError::NetworkError(format!("CA parse: {e}"))
+                            })?;
+                    // TLS-3: bytes provided but no certs decoded.
+                    if !pem.is_empty() && parsed.is_empty() {
+                        return Err(RepError::ConfigError(format!(
+                            "CA bytes (index {idx}) parsed but contained 0 \
+                             certificates"
+                        )));
+                    }
+                    for cert in parsed {
                         store.add(cert).map_err(|e| {
                             RepError::NetworkError(format!("CA add: {e}"))
                         })?;
@@ -519,29 +561,31 @@ impl TlsConfig {
     /// openssl pkcs12 -export -out identity.p12 -inkey key.pem -in cert.pem
     /// ```
     pub(crate) fn to_native_acceptor(&self) -> Result<native_tls::TlsAcceptor> {
-        let identity = self.native_identity()?;
-        let builder = native_tls::TlsAcceptor::builder(identity);
-        // Note: `native_tls::TlsAcceptorBuilder` does not expose CA-root
-        // installation or "accept invalid client certs" knobs; mTLS-style
-        // client-certificate verification is a `tls-rustls`-only feature
-        // on this transport. Warn loudly only when the user has expressed
-        // intent to do mTLS by populating CA roots — `SkipVerification`
-        // and an empty `CaFiles(vec![])` are both already what a
-        // native_tls server would do, so they're silent.
+        // TLS-4: `native_tls::TlsAcceptorBuilder` exposes no CA-root or
+        // accept-invalid-client-cert knobs, so any non-empty CA list on
+        // this server transport is an mTLS configuration the runtime
+        // cannot honour. A `log::warn!` here is not a security boundary;
+        // proceeding silently would build an acceptor with NO client-cert
+        // verification despite the operator's expressed intent. Refuse
+        // up front (before identity parsing) so the misconfiguration is
+        // loud and surfaces independently of any identity-format errors.
         let mtls_intent = match &self.trusted_certs {
             TrustedCerts::CaFiles(v) => !v.is_empty(),
             TrustedCerts::CaBytes(v) => !v.is_empty(),
             TrustedCerts::SkipVerification => false,
         };
         if mtls_intent {
-            log::warn!(
-                "TlsConfig.trusted_certs is configured with CA roots on a \
-                 server transport, but native_tls::TlsAcceptorBuilder does \
-                 not expose mTLS trust configuration — the setting is \
-                 ignored on this transport. Use the tls-rustls feature for \
-                 mTLS."
-            );
+            return Err(RepError::ConfigError(
+                "mTLS is configured (TrustedCerts has CA roots) but the \
+                 tls-native server transport does not support it: \
+                 native_tls::TlsAcceptorBuilder exposes no client-cert \
+                 verification knobs. Use the tls-rustls feature for mTLS, \
+                 or set TrustedCerts::SkipVerification on this transport."
+                    .into(),
+            ));
         }
+        let identity = self.native_identity()?;
+        let builder = native_tls::TlsAcceptor::builder(identity);
         builder
             .build()
             .map_err(|e| RepError::NetworkError(format!("TLS acceptor: {e}")))
@@ -734,10 +778,10 @@ mod tests {
 
     #[cfg(feature = "tls-rustls")]
     #[test]
-    fn rustls_client_config_with_empty_ca_succeeds() {
-        // Empty CaBytes list is a valid (if useless) input — produces
-        // a ClientConfig with an empty root store. No certs will
-        // validate, but the build itself should not error.
+    fn rustls_client_config_with_empty_ca_bytes_errors() {
+        // TLS-2: empty CaBytes is a misconfiguration. Without an explicit
+        // SkipVerification opt-out, an empty trust store would validate
+        // nothing — refuse at config-build time.
         let cfg = TlsConfig {
             identity: TlsIdentity::SelfSigned {
                 subject_alt_names: vec!["localhost".into()],
@@ -745,20 +789,23 @@ mod tests {
             trusted_certs: TrustedCerts::CaBytes(vec![]),
             server_name: "x".into(),
         };
-        // rustls_root_store on empty CaBytes returns an empty
-        // RootCertStore.
         let cc = cfg.to_rustls_client_config();
-        assert!(cc.is_ok(), "{:?}", cc.err());
+        assert!(
+            cc.is_err(),
+            "empty CaBytes must be a misconfiguration error, got Ok"
+        );
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("CaBytes") && msg.contains("misconfiguration"),
+            "error should mention CaBytes/misconfiguration, got: {msg}"
+        );
     }
 
     #[cfg(feature = "tls-rustls")]
     #[test]
-    fn rustls_client_config_with_malformed_ca_bytes_returns_empty_store() {
-        // rustls_pemfile silently skips non-certificate PEM blocks, so
-        // CaBytes containing garbage produces an empty root store
-        // rather than an error. This is documented (silent skip
-        // behaviour) and the calling test asserts it: client config
-        // builds, but no certs will validate.
+    fn rustls_client_config_with_malformed_ca_bytes_errors() {
+        // TLS-3: bytes were provided but rustls_pemfile produced 0 certs.
+        // Refuse rather than silently build an empty trust store.
         let cfg = TlsConfig {
             identity: TlsIdentity::SelfSigned {
                 subject_alt_names: vec!["localhost".into()],
@@ -768,11 +815,14 @@ mod tests {
         };
         let cc = cfg.to_rustls_client_config();
         assert!(
-            cc.is_ok(),
-            "malformed CaBytes silently produces an empty root store; \
-             a real cert will fail to verify but the config itself \
-             builds. got Err: {:?}",
-            cc.err()
+            cc.is_err(),
+            "malformed CaBytes must error rather than build an empty store, \
+             got Ok"
+        );
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("0 certificates"),
+            "error should mention 0 certificates, got: {msg}"
         );
     }
 
@@ -974,8 +1024,9 @@ mod tests {
     #[cfg(feature = "tls-rustls")]
     #[test]
     fn rustls_root_store_with_malformed_ca_file_errors() {
-        // Garbage file content (non-PEM) — rustls_root_store should
-        // surface the parse error.
+        // TLS-3: the file has bytes but rustls_pemfile decodes 0
+        // certificates. Surface this as a structured error rather
+        // than silently producing an empty trust store.
         let dir = tempfile::tempdir().unwrap();
         let bad_ca = dir.path().join("bad.pem");
         std::fs::write(&bad_ca, b"this is not a PEM file\n").unwrap();
@@ -987,11 +1038,16 @@ mod tests {
             trusted_certs: TrustedCerts::CaFiles(vec![bad_ca]),
             server_name: "x".into(),
         };
-        // rustls_pemfile silently skips garbage, returning an empty
-        // root store. Build is OK; the Ok-path covers the
-        // CaFiles loop body where no certs to add exist.
         let cc = cfg.to_rustls_client_config();
-        assert!(cc.is_ok());
+        assert!(
+            cc.is_err(),
+            "garbage CA file must error rather than yield empty trust"
+        );
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("0 certificates"),
+            "error should mention 0 certificates, got: {msg}"
+        );
     }
 
     #[cfg(feature = "tls-rustls")]
@@ -1093,32 +1149,222 @@ mod tests {
 
     #[cfg(feature = "tls-rustls")]
     #[test]
-    fn rustls_skip_verification_root_store_is_empty_but_ok() {
-        // The SkipVerification arm of rustls_root_store returns an
-        // empty store (the caller is expected to install a custom
-        // verifier instead). Calling to_rustls_client_config goes
-        // through the dangerous() path so this branch is not reached
-        // during normal client-config build; we exercise it directly
-        // via a hand-crafted code path: build a config with
-        // SkipVerification and explicitly compare to the
-        // rustls_root_store result for an empty CaBytes config.
+    fn rustls_skip_verification_client_config_succeeds() {
+        // SkipVerification is the explicit "skip-verify" opt-out; it must
+        // continue to build a client config without requiring CA roots.
+        // (TLS-2 enforces the empty-CaBytes/CaFiles path errors instead.)
         let skip_cfg = TlsConfig::insecure("localhost");
-        // Indirectly exercises rustls_root_store via the
-        // dangerous-skip branch.
         let cc = skip_cfg.to_rustls_client_config();
         assert!(cc.is_ok());
+    }
 
-        // Also build with explicit CaBytes(empty) so the loop body
-        // (no PEMs) exercises the second branch.
-        let empty_cfg = TlsConfig {
+    // ── Security-review hardening: TLS-2, TLS-3, TLS-4 ──
+    //
+    // Each test below targets a specific finding from
+    // docs/src/internal/security-review-2026-05.md. They fail before the
+    // hardening change and pass after it.
+
+    // TLS-2: empty `CaFiles(vec![])` is a misconfiguration, not a silent
+    // empty trust store.
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn tls2_empty_ca_files_errors() {
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::CaFiles(vec![]),
+            server_name: "x".into(),
+        };
+        let cc = cfg.to_rustls_client_config();
+        assert!(
+            cc.is_err(),
+            "empty CaFiles must be a misconfiguration error, got Ok"
+        );
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("CaFiles") && msg.contains("misconfiguration"),
+            "error should mention CaFiles/misconfiguration, got: {msg}"
+        );
+    }
+
+    // TLS-2: empty `CaBytes(vec![])` is a misconfiguration.
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn tls2_empty_ca_bytes_errors() {
+        let cfg = TlsConfig {
             identity: TlsIdentity::SelfSigned {
                 subject_alt_names: vec!["localhost".into()],
             },
             trusted_certs: TrustedCerts::CaBytes(vec![]),
             server_name: "x".into(),
         };
-        let cc2 = empty_cfg.to_rustls_client_config();
-        assert!(cc2.is_ok());
+        let cc = cfg.to_rustls_client_config();
+        assert!(
+            cc.is_err(),
+            "empty CaBytes must be a misconfiguration error, got Ok"
+        );
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("CaBytes") && msg.contains("misconfiguration"),
+            "error should mention CaBytes/misconfiguration, got: {msg}"
+        );
+    }
+
+    // TLS-2: `SkipVerification` is preserved as the explicit opt-out.
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn tls2_skip_verification_still_works() {
+        let cfg = TlsConfig::insecure("localhost");
+        let cc = cfg.to_rustls_client_config();
+        assert!(
+            cc.is_ok(),
+            "SkipVerification must remain the supported opt-out, got Err: \
+             {:?}",
+            cc.err()
+        );
+    }
+
+    // TLS-3: a non-empty PEM byte-blob that decodes to zero certificates
+    // is a parse error, not a silent empty trust store.
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn tls3_ca_bytes_with_zero_decoded_certs_errors() {
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::CaBytes(vec![
+                b"this looks like text but is not a PEM certificate\n".to_vec(),
+            ]),
+            server_name: "x".into(),
+        };
+        let cc = cfg.to_rustls_client_config();
+        assert!(
+            cc.is_err(),
+            "non-empty PEM with zero certs must error, got Ok"
+        );
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("0 certificates"),
+            "error should mention 0 certificates, got: {msg}"
+        );
+    }
+
+    // TLS-3: a non-empty CA file that decodes to zero certificates errors.
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn tls3_ca_file_with_zero_decoded_certs_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_ca = dir.path().join("bad.pem");
+        // PEM-shaped wrapper around a non-cert label — rustls_pemfile
+        // accepts no certificates.
+        std::fs::write(
+            &bad_ca,
+            b"-----BEGIN GARBAGE-----\nAAAA\n-----END GARBAGE-----\n",
+        )
+        .unwrap();
+
+        let cfg = TlsConfig {
+            identity: TlsIdentity::SelfSigned {
+                subject_alt_names: vec!["localhost".into()],
+            },
+            trusted_certs: TrustedCerts::CaFiles(vec![bad_ca.clone()]),
+            server_name: "x".into(),
+        };
+        let cc = cfg.to_rustls_client_config();
+        assert!(cc.is_err(), "CA file with 0 certificates must error");
+        let msg = format!("{}", cc.err().unwrap());
+        assert!(
+            msg.contains("0 certificates")
+                && msg.contains(&bad_ca.display().to_string()),
+            "error should mention 0 certificates and the file path, got: \
+             {msg}"
+        );
+    }
+
+    // TLS-4: a `tls-native` server with mTLS intent (non-empty CA roots)
+    // must error with an mTLS-specific message, since
+    // native_tls::TlsAcceptorBuilder cannot enforce client-cert
+    // verification. A warning is not a security boundary. The check
+    // runs before identity parsing so that the misconfiguration
+    // surfaces independently of any identity-format issues.
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn tls4_native_acceptor_with_ca_files_intent_errors() {
+        let cfg = TlsConfig {
+            identity: TlsIdentity::Pkcs12 {
+                der: vec![0x30, 0x82, 0x00, 0x10],
+                password: "x".into(),
+            },
+            trusted_certs: TrustedCerts::CaFiles(vec![
+                std::path::PathBuf::from("/etc/ssl/certs/ca.pem"),
+            ]),
+            server_name: "x".into(),
+        };
+        let r = cfg.to_native_acceptor();
+        assert!(
+            r.is_err(),
+            "mTLS intent on tls-native server must error rather than warn"
+        );
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("mTLS")
+                && msg.contains("tls-native")
+                && msg.contains("tls-rustls"),
+            "error must point at mTLS / tls-native / tls-rustls remediation, \
+             got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn tls4_native_acceptor_with_ca_bytes_intent_errors() {
+        let cfg = TlsConfig {
+            identity: TlsIdentity::Pkcs12 {
+                der: vec![0x30, 0x82, 0x00, 0x10],
+                password: "x".into(),
+            },
+            trusted_certs: TrustedCerts::CaBytes(vec![
+                b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+                    .to_vec(),
+            ]),
+            server_name: "x".into(),
+        };
+        let r = cfg.to_native_acceptor();
+        assert!(
+            r.is_err(),
+            "non-empty CaBytes on tls-native server must error"
+        );
+        let msg = format!("{}", r.err().unwrap());
+        assert!(msg.contains("mTLS"), "error must mention mTLS, got: {msg}");
+    }
+
+    // TLS-4: SkipVerification (no mTLS intent) must remain functional on
+    // the tls-native server path — the Refusal is conditional on intent.
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn tls4_native_acceptor_skip_verification_unaffected() {
+        // SkipVerification = no mTLS intent, so the new TLS-4 check
+        // must not fire. The dummy DER will fail at native_identity,
+        // but the failure must NOT come from the mTLS misconfiguration
+        // check (verified by message).
+        let cfg = TlsConfig {
+            identity: TlsIdentity::Pkcs12 {
+                der: vec![0x30, 0x82, 0x00, 0x10],
+                password: "x".into(),
+            },
+            trusted_certs: TrustedCerts::SkipVerification,
+            server_name: "x".into(),
+        };
+        let r = cfg.to_native_acceptor();
+        if let Err(e) = r {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("mTLS"),
+                "SkipVerification must not trigger mTLS check, got: {msg}"
+            );
+        }
     }
 
     // ── QUIC config builders (under quic feature) ──

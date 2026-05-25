@@ -26,6 +26,19 @@ use noxu_sync::{Condvar, Mutex};
 
 use crate::error::{RepError, Result};
 
+/// Maximum size in bytes of any single replication frame's payload, applied
+/// to all length-prefixed channel implementations (TCP, TLS, QUIC, and QUIC
+/// sub-channels).
+///
+/// The wire format prefixes every message with a 4-byte little-endian
+/// `payload_len`.  Without an upper bound, a malicious or corrupt peer can
+/// send `0xFFFFFFFF` and force the receiver to allocate ~4 GiB before any
+/// of the payload has actually arrived, trivially OOM-killing the process.
+/// 64 MiB is well above the largest legitimate replication message
+/// (log records are at most a few MiB after `MAX_GROUP_COMMIT_SIZE`) while
+/// keeping the worst-case allocation bounded.
+pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+
 /// Trait for bidirectional communication channels.
 ///
 /// Corresponds to `DataChannel` interface which wraps a SocketChannel
@@ -361,6 +374,12 @@ impl Channel for TcpChannel {
         }
 
         let payload_len = u32::from_le_bytes(len_buf) as usize;
+        if payload_len > MAX_FRAME_PAYLOAD {
+            return Err(RepError::ProtocolError(format!(
+                "frame payload too large: {} > {}",
+                payload_len, MAX_FRAME_PAYLOAD
+            )));
+        }
 
         // Use a generous timeout for the payload read: the caller's `timeout`
         // may be as short as 1 ms (FeederRunner ACK polling), which is far too
@@ -723,6 +742,12 @@ impl Channel for TlsTcpChannel {
             }
         }
         let payload_len = u32::from_le_bytes(len_buf) as usize;
+        if payload_len > MAX_FRAME_PAYLOAD {
+            return Err(RepError::ProtocolError(format!(
+                "frame payload too large: {} > {}",
+                payload_len, MAX_FRAME_PAYLOAD
+            )));
+        }
         let payload_timeout = timeout.max(Duration::from_secs(30));
         s.set_read_timeout_inner(Some(payload_timeout))
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
@@ -1086,6 +1111,47 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// LOG-2: A peer-supplied `payload_len` greater than
+    /// `super::MAX_FRAME_PAYLOAD` must be rejected before the receiver
+    /// allocates the payload buffer, otherwise a single 4-byte header
+    /// can force a multi-GiB allocation.
+    #[test]
+    fn test_tcp_channel_rejects_oversize_frame() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server writes a length prefix that claims more than the cap, then
+        // closes without sending the payload.  A vulnerable receiver would
+        // allocate the buffer before discovering EOF.
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let oversized = (crate::net::channel::MAX_FRAME_PAYLOAD as u32)
+                .saturating_add(1);
+            stream.write_all(&oversized.to_le_bytes()).unwrap();
+            // Hold the connection briefly so the client can read the header.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let client = TcpChannel::connect(addr).unwrap();
+        let err = client
+            .receive(Duration::from_secs(5))
+            .expect_err("oversize frame must be rejected");
+        match err {
+            RepError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("frame payload too large"),
+                    "unexpected protocol-error message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+
+        handle.join().unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // TlsTcpChannel tests (tls-rustls backend)
     // -----------------------------------------------------------------------
@@ -1216,6 +1282,49 @@ mod tests {
             assert!(!client.is_open());
 
             handle.join().unwrap();
+        }
+
+        /// LOG-2: TlsTcpChannel must enforce the same payload bound as
+        /// TcpChannel even though the bytes flow through a TLS session.
+        #[test]
+        fn test_tls_tcp_rejects_oversize_frame() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Server side: accept the TLS connection, then attempt to send
+            // an oversized payload.  `send` writes the 4-byte length header
+            // first, which is what the client must reject.  The send call
+            // itself will fail once the client tears down the connection.
+            let handle = std::thread::spawn(move || {
+                let ch = listener.accept().unwrap();
+                let oversized =
+                    vec![0u8; crate::net::channel::MAX_FRAME_PAYLOAD + 1];
+                let _ = ch.send(&oversized);
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            let result = client.receive(Duration::from_secs(10));
+            // Close the client immediately so the server-side `send` returns
+            // (otherwise it will block on the TCP send buffer for the full
+            // 30 s write timeout).
+            let _ = client.close();
+            let err = result.expect_err("oversize TLS frame must be rejected");
+            match err {
+                RepError::ProtocolError(msg) => {
+                    assert!(
+                        msg.contains("frame payload too large"),
+                        "unexpected protocol-error message: {}",
+                        msg
+                    );
+                }
+                other => panic!("expected ProtocolError, got {:?}", other),
+            }
+            let _ = handle.join();
         }
     }
 }

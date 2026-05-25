@@ -27,6 +27,7 @@
 //! - Checksum validation via `ChecksumValidator`
 //! - Skip invalid (bad-CRC) entries with a warning, stop at true EOF
 
+use crate::MAX_ITEM_SIZE;
 use crate::checksum::ChecksumValidator;
 use crate::entry_header::{CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::entry_type::LogEntryType;
@@ -101,6 +102,28 @@ impl LogFileReader {
     ///   of log), logs a warning and returns `None` - this matches the
     ///   behaviour in `LastFileReader` where bad-CRC entries are treated as
     ///   the log boundary rather than a hard error.
+    ///
+    /// # Security rationale (lenient end-of-log detection)
+    ///
+    /// On crash, the tail of the WAL frequently contains a partial record
+    /// (truncated header, half-written payload, or zero-fill).  The legacy
+    /// `LastFileReader` semantics treat any such corruption at the tail as
+    /// the true end of the log so that a clean recovery can complete.  A
+    /// hard error here would refuse to mount any database that took an
+    /// untimely crash.
+    ///
+    /// This same leniency is also a corruption oracle: a single flipped bit
+    /// in an `entry_type_num` byte will silently truncate the rest of the
+    /// log.  Recovery callers that need to distinguish "clean EOF" from
+    /// "corruption mid-log" MUST use [`LogFileReader::read_next_strict`]
+    /// instead — that method returns explicit errors for bad checksums,
+    /// unknown entry types, or oversized item_size fields.
+    ///
+    /// **DEPRECATION NOTE (LOG-5)**: callers that participate in recovery
+    /// or replication are required to use `read_next_strict`.  This
+    /// `read_next` method is retained only for cleaner / log-dump tools
+    /// where stopping at the first suspicious byte is acceptable, and may
+    /// be removed in a future major version.
     pub fn read_next(&mut self) -> Option<(Lsn, LogEntryType, Vec<u8>)> {
         // Check for EOF before attempting a read.
         if self.current_offset >= self.file_length {
@@ -145,11 +168,16 @@ impl LogFileReader {
         let entry_type = match LogEntryType::from_type_num(entry_type_num) {
             Some(t) => t,
             None => {
-                // Unknown type - could be garbage at end of a partial write.
-                // Treat as end-of-log (approach).
-                log::warn!(
+                // Unknown type byte - could be garbage at end of a partial
+                // write OR a corruption oracle that hides later valid entries.
+                // We log at error level so the operator sees it; then return
+                // None for backwards-compatibility with the legacy
+                // truncate-at-corruption behaviour (LOG-5).  Strict callers
+                // must use `read_next_strict`.
+                log::error!(
                     "LogFileReader: unknown entry type {} at file {:08x} \
-                     offset {:#x}; treating as end of log",
+                     offset {:#x}; treating as end of log (this may hide \
+                     later valid entries — use read_next_strict to surface)",
                     entry_type_num,
                     self.file_num,
                     self.current_offset,
@@ -159,11 +187,12 @@ impl LogFileReader {
         };
 
         // Sanity-check item_size before allocating.
-        if item_size > 100_000_000 {
-            log::warn!(
-                "LogFileReader: implausible item_size {} at file {:08x} \
-                 offset {:#x}; treating as end of log",
+        if item_size > MAX_ITEM_SIZE {
+            log::error!(
+                "LogFileReader: implausible item_size {} (cap {}) at file \
+                 {:08x} offset {:#x}; treating as end of log",
                 item_size,
+                MAX_ITEM_SIZE,
                 self.file_num,
                 self.current_offset,
             );
@@ -277,7 +306,16 @@ impl LogFileReader {
             header_buf[13],
         ]) as usize;
 
-        if item_size > 100_000_000 {
+        // Validate entry_type early — before any allocation or full-entry
+        // read — so an unknown type byte is reported distinctly from a
+        // checksum mismatch.  LOG-5: the strict reader is the recommended
+        // API for recovery callers precisely because this distinction is
+        // visible.
+        let entry_type = LogEntryType::from_type_num(entry_type_num).ok_or(
+            NoxuLogError::InvalidEntryType { type_num: entry_type_num, lsn },
+        )?;
+
+        if item_size > MAX_ITEM_SIZE {
             return Err(NoxuLogError::InvalidEntrySize {
                 lsn,
                 size: item_size as i32,
@@ -315,10 +353,6 @@ impl LogFileReader {
                 ),
             });
         }
-
-        let entry_type = LogEntryType::from_type_num(entry_type_num).ok_or(
-            NoxuLogError::InvalidEntryType { type_num: entry_type_num, lsn },
-        )?;
 
         self.current_offset += entry_size as u64;
         self.entries_read += 1;
@@ -385,5 +419,77 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 5);
+    }
+
+    /// LOG-3: All readers in the crate use the same `MAX_ITEM_SIZE`
+    /// constant when validating `item_size`.
+    #[test]
+    fn test_max_item_size_is_centralised() {
+        // The constant lives in the crate root and is the single source of
+        // truth.  Any future change must update only this one place.
+        assert_eq!(crate::MAX_ITEM_SIZE, 100 * 1024 * 1024);
+    }
+
+    /// LOG-5: `read_next_strict` reports an explicit
+    /// `InvalidEntryType` error when the type byte is unknown, rather
+    /// than silently truncating like the legacy `read_next`.
+    #[test]
+    fn test_read_next_strict_rejects_unknown_entry_type() {
+        use crate::error::NoxuLogError;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_log_manager(&dir);
+
+        // Write at least one valid entry first so the file is well-formed.
+        lm.log(LogEntryType::Trace, b"valid", Provisional::No, false, false)
+            .unwrap();
+        lm.flush_sync().unwrap();
+
+        let file_num = fm.get_current_file_num();
+        let len_before_append = fm.get_file_length(file_num).unwrap();
+
+        // Append a hand-crafted header with an out-of-range entry_type byte
+        // (255 is not a valid LogEntryType variant) directly to the file.
+        let path = dir.path().join(format!("{:08x}.ndb", file_num));
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        // 14-byte header: checksum (4) | type (1) | flags (1) | prev (4) | size (4)
+        // Only the type byte matters for this test; we set item_size = 0.
+        let mut hdr = [0u8; MIN_HEADER_SIZE];
+        hdr[4] = 255; // Invalid entry_type.
+        file.write_all(&hdr).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut reader =
+            LogFileReader::open(Arc::clone(&fm), file_num).unwrap();
+
+        // Skip past the well-formed entries first.
+        loop {
+            if reader.current_offset() >= len_before_append {
+                break;
+            }
+            match reader.read_next_strict() {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    panic!("unexpected EOF before reaching injected header")
+                }
+                Err(e) => panic!("unexpected error parsing valid entry: {e:?}"),
+            }
+        }
+
+        // Now we should be at our injected corrupt header.  read_next_strict
+        // must surface the unknown entry type as an explicit error rather
+        // than silently returning Ok(None).
+        match reader.read_next_strict() {
+            Err(NoxuLogError::InvalidEntryType { type_num, .. }) => {
+                assert_eq!(type_num, 255);
+            }
+            other => panic!(
+                "expected InvalidEntryType error from strict reader, got {:?}",
+                other
+            ),
+        }
     }
 }

@@ -134,6 +134,16 @@ impl LogEntryHeader {
         let item_size =
             u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as usize;
 
+        // Reject implausibly large item_size before any allocation downstream.
+        // Mirrors the cap enforced in entry_header.rs and log_file_reader.rs
+        // so all readers agree on the upper bound (security review LOG-3).
+        if item_size > crate::MAX_ITEM_SIZE {
+            return Err(NoxuLogError::InvalidEntrySize {
+                lsn: NULL_LSN,
+                size: item_size as i32,
+            });
+        }
+
         let vlsn_present =
             (flags & VLSN_PRESENT_MASK) != 0 || (flags & REPLICATED_MASK) != 0;
         let replicated = (flags & REPLICATED_MASK) != 0;
@@ -147,6 +157,33 @@ impl LogEntryHeader {
                     MAX_HEADER_SIZE
                 ),
             });
+        }
+
+        // VLSN sanity check (security review LOG-8): when the VLSN flag is
+        // set, the 8-byte VLSN field must form a plausible value.  An
+        // attacker who can flip a flag bit could otherwise direct readers
+        // to interpret arbitrary bytes as a VLSN.  We reject zero (NULL
+        // VLSN with the flag set is a contradiction) and the all-ones
+        // sentinel (i64::MAX / 0xFFFF... is reserved as "not yet assigned"
+        // and never appears in well-formed entries).
+        if vlsn_present {
+            let raw_vlsn =
+                i64::from_le_bytes(buf[14..22].try_into().unwrap_or([0u8; 8]));
+            if raw_vlsn == 0 || raw_vlsn == i64::MAX || raw_vlsn == -1 {
+                log::error!(
+                    "FileReader::LogEntryHeader::from_bytes: implausible \
+                     VLSN bytes {:#018x} with vlsn_present flag set; \
+                     treating as corruption / end of log",
+                    raw_vlsn,
+                );
+                return Err(NoxuLogError::UnexpectedEof {
+                    lsn: NULL_LSN,
+                    message: format!(
+                        "implausible VLSN value {:#018x}",
+                        raw_vlsn
+                    ),
+                });
+            }
         }
 
         let header_size =
@@ -1089,6 +1126,9 @@ mod tests {
         let mut buf = [0u8; 22];
         buf[5] = VLSN_PRESENT_MASK; // VLSN present
         buf[10..14].copy_from_slice(&(10u32).to_le_bytes()); // item_size = 10
+        // LOG-8: a plausible (non-sentinel) VLSN value is required when
+        // the vlsn_present flag is set.
+        buf[14..22].copy_from_slice(&(7i64).to_le_bytes());
 
         let hdr = LogEntryHeader::from_bytes(&buf).unwrap();
         assert_eq!(hdr.header_size, 22);
@@ -1104,10 +1144,51 @@ mod tests {
         let mut buf = [0u8; 22];
         buf[5] = REPLICATED_MASK;
         buf[10..14].copy_from_slice(&(0u32).to_le_bytes());
+        // LOG-8: a plausible (non-sentinel) VLSN value is required when
+        // the replicated/vlsn_present flag is set.
+        buf[14..22].copy_from_slice(&(11i64).to_le_bytes());
 
         let hdr = LogEntryHeader::from_bytes(&buf).unwrap();
         assert_eq!(hdr.header_size, 22);
         assert!(hdr.replicated);
+    }
+
+    /// LOG-8: a header that claims VLSN-present but stores an implausible
+    /// sentinel value (zero, i64::MAX, -1) is rejected as corruption.
+    #[test]
+    fn test_from_bytes_rejects_implausible_vlsn_sentinel() {
+        for sentinel in [0i64, i64::MAX, -1i64] {
+            let mut buf = [0u8; 22];
+            buf[5] = VLSN_PRESENT_MASK;
+            buf[10..14].copy_from_slice(&(0u32).to_le_bytes());
+            buf[14..22].copy_from_slice(&sentinel.to_le_bytes());
+
+            let result = LogEntryHeader::from_bytes(&buf);
+            assert!(
+                result.is_err(),
+                "expected error for sentinel VLSN {sentinel:#018x}"
+            );
+        }
+    }
+
+    /// LOG-3: `from_bytes` rejects an item_size that exceeds the shared
+    /// `MAX_ITEM_SIZE` cap (used to be silently parsed by this reader).
+    #[test]
+    fn test_from_bytes_rejects_oversized_item_size() {
+        let mut buf = [0u8; 14];
+        // Encode item_size > MAX_ITEM_SIZE; entry_type/flag values do not
+        // matter because the size check rejects first.
+        let oversize: u32 = (crate::MAX_ITEM_SIZE as u32) + 1;
+        buf[10..14].copy_from_slice(&oversize.to_le_bytes());
+
+        let result = LogEntryHeader::from_bytes(&buf);
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::NoxuLogError::InvalidEntrySize { .. })
+            ),
+            "expected InvalidEntrySize, got {result:?}",
+        );
     }
 
     /// Buffer shorter than MIN_HEADER_SIZE must return an error.

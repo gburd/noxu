@@ -734,10 +734,9 @@ impl Database {
 
     /// Returns all records as `(key_bytes, data_bytes)` pairs in key order.
     ///
-    /// This is a helper for schema evolution: the public `Cursor` interface
-    /// does not expose key bytes during iteration, so this method uses the
-    /// lower-level `CursorImpl` directly to collect both halves of every
-    /// record in a single pass.
+    /// This is a helper for schema evolution: it uses the lower-level
+    /// `CursorImpl` directly so each iteration yields raw `Vec<u8>` pairs
+    /// without allocating a pair of `DatabaseEntry` values per record.
     ///
     /// # Errors
     /// Returns an error if the database is closed or a cursor operation fails.
@@ -792,6 +791,14 @@ impl Database {
     /// Implements `Database.sync()` — issues an fdatasync on the log file,
     /// ensuring that all writes made by non-transactional or deferred-sync
     /// operations are durable before returning.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Acts as a no-op for non-transactional /
+    /// in-memory environments where no log manager is configured.
+    ///
+    /// # Errors
+    /// Returns an error if the database is closed or the underlying
+    /// log-manager flush fails.
     pub fn sync(&self) -> Result<()> {
         self.check_open()?;
         if let Some(lm) = &self.log_manager {

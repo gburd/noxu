@@ -97,7 +97,11 @@ impl PhiAccrualDetector {
 
     /// Record a heartbeat from the monitored process.
     ///
-    /// Updates the inter-arrival sample window.
+    /// On the **first** call there is no previous heartbeat, so only the
+    /// `last_heartbeat` timestamp is set and the inter-arrival sample
+    /// window is left untouched. On every **subsequent** call the
+    /// elapsed time since the previous heartbeat is appended to the
+    /// sample window (older samples are evicted once the window is full).
     pub fn record_heartbeat(&self) {
         let now = Instant::now();
         let mut last = self.last_heartbeat.write();

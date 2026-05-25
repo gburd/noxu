@@ -236,6 +236,12 @@ impl Engine {
     ///
     /// # Returns
     /// Information about the checkpoint that was performed.
+    ///
+    /// # Errors
+    /// * [`EngineError::EnvironmentClosed`] if the engine has been closed.
+    /// * [`EngineError::InvalidConfig`] if the engine is opened read-only.
+    /// * Any error returned by the underlying checkpointer
+    ///   (e.g. [`EngineError::DatabaseError`] propagated from log/tree I/O).
     pub fn checkpoint(&self, invoker: &str) -> Result<CheckpointResult> {
         if !self.is_open() {
             return Err(EngineError::EnvironmentClosed);
@@ -258,6 +264,12 @@ impl Engine {
     ///
     /// # Returns
     /// Information about the cleaning operation.
+    ///
+    /// # Errors
+    /// * [`EngineError::EnvironmentClosed`] if the engine has been closed.
+    /// * [`EngineError::InvalidConfig`] if the engine is opened read-only.
+    /// * [`EngineError::DatabaseError`] for any I/O or tree error returned
+    ///   by the underlying cleaner.
     pub fn clean(&self, n_files: u32) -> Result<CleanResult> {
         if !self.is_open() {
             return Err(EngineError::EnvironmentClosed);
@@ -283,6 +295,12 @@ impl Engine {
     ///
     /// Returns `(CleanResult, sleep_ms)` — the daemon should sleep
     /// `sleep_ms` milliseconds before its next pass.
+    ///
+    /// # Errors
+    /// * [`EngineError::EnvironmentClosed`] if the engine has been closed.
+    /// * [`EngineError::InvalidConfig`] if the engine is opened read-only.
+    /// * [`EngineError::DatabaseError`] for any I/O or tree error returned
+    ///   by the underlying cleaner.
     pub fn clean_adaptive(&self) -> Result<(CleanResult, u64)> {
         if !self.is_open() {
             return Err(EngineError::EnvironmentClosed);
@@ -321,6 +339,9 @@ impl Engine {
     ///
     /// # Returns
     /// Information about the eviction operation.
+    ///
+    /// # Errors
+    /// * [`EngineError::EnvironmentClosed`] if the engine has been closed.
     pub fn evict(&self) -> Result<EvictResult> {
         if !self.is_open() {
             return Err(EngineError::EnvironmentClosed);

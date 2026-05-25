@@ -146,8 +146,8 @@ impl LogEntryHeader {
         )?;
 
         // Validate item size
-        if item_size > 100_000_000 {
-            // Sanity check: 100MB limit
+        if (item_size as usize) > crate::MAX_ITEM_SIZE {
+            // Sanity check: see crate::MAX_ITEM_SIZE.
             return Err(NoxuLogError::InvalidEntrySize {
                 lsn,
                 size: item_size as i32,
@@ -547,12 +547,12 @@ mod tests {
 
     #[test]
     fn test_oversized_entry_rejected() {
-        // Build a buffer with item_size > 100_000_000.
+        // Build a buffer with item_size > MAX_ITEM_SIZE.
         let mut buf = vec![0u8; MIN_HEADER_SIZE];
         // entry_type byte must be valid
         buf[ENTRY_TYPE_OFFSET] = LogEntryType::BIN.type_num();
         // item_size at ITEM_SIZE_OFFSET (offset 10), little-endian
-        let big: u32 = 100_000_001;
+        let big: u32 = (crate::MAX_ITEM_SIZE as u32) + 1;
         buf[ITEM_SIZE_OFFSET] = (big & 0xFF) as u8;
         buf[ITEM_SIZE_OFFSET + 1] = ((big >> 8) & 0xFF) as u8;
         buf[ITEM_SIZE_OFFSET + 2] = ((big >> 16) & 0xFF) as u8;
