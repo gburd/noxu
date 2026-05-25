@@ -8,6 +8,10 @@ publish = false
 name = "noxu-workload-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "noxu-sustained-baseline"
+path = "src/sustained_main.rs"
+
 [dependencies]
 noxu-db = { workspace = true }
 noxu-xa = { path = "../../crates/noxu-xa" }
