@@ -51,11 +51,19 @@ pub struct EnvironmentMutableConfig {
     /// Enable or disable the evictor daemon.  `None` means unchanged.
     pub run_evictor: Option<bool>,
 
-    /// Lock timeout in milliseconds.  `0` means unchanged.
-    pub lock_timeout_ms: u64,
+    /// Lock timeout in milliseconds.  `None` means unchanged.
+    ///
+    /// To explicitly clear a previously-configured timeout, set
+    /// `Some(0)` (which JE interprets as "no timeout").  v1.5.0 used a
+    /// `u64` with `0` as the unchanged sentinel which made it
+    /// impossible to clear a timeout — see Wave 1C audit-cleanup
+    /// (Transaction-Env F19/F20).
+    pub lock_timeout_ms: Option<u64>,
 
-    /// Transaction timeout in milliseconds.  `0` means unchanged.
-    pub txn_timeout_ms: u64,
+    /// Transaction timeout in milliseconds.  `None` means unchanged.
+    ///
+    /// `Some(0)` clears any previously-configured timeout.
+    pub txn_timeout_ms: Option<u64>,
 }
 
 impl EnvironmentMutableConfig {
@@ -107,14 +115,49 @@ impl EnvironmentMutableConfig {
     }
 
     /// Sets the lock timeout (milliseconds).
-    pub fn with_lock_timeout_ms(mut self, ms: u64) -> Self {
+    ///
+    /// Pass `Some(0)` to clear a previously-configured timeout, or
+    /// `None` to leave it unchanged.
+    pub fn with_lock_timeout_ms(mut self, ms: Option<u64>) -> Self {
         self.lock_timeout_ms = ms;
         self
     }
 
     /// Sets the transaction timeout (milliseconds).
-    pub fn with_txn_timeout_ms(mut self, ms: u64) -> Self {
+    ///
+    /// Pass `Some(0)` to clear a previously-configured timeout, or
+    /// `None` to leave it unchanged.
+    pub fn with_txn_timeout_ms(mut self, ms: Option<u64>) -> Self {
         self.txn_timeout_ms = ms;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_leaves_timeouts_unchanged() {
+        let cfg = EnvironmentMutableConfig::new();
+        assert_eq!(cfg.lock_timeout_ms, None);
+        assert_eq!(cfg.txn_timeout_ms, None);
+    }
+
+    #[test]
+    fn with_lock_timeout_some_zero_means_clear() {
+        // Wave 1C audit cleanup (Transaction-Env F19/F20): the
+        // previous `u64` shape used 0 as the unchanged sentinel and
+        // could not distinguish "clear the timeout" from "unchanged".
+        let cfg = EnvironmentMutableConfig::new().with_lock_timeout_ms(Some(0));
+        assert_eq!(cfg.lock_timeout_ms, Some(0));
+    }
+
+    #[test]
+    fn with_txn_timeout_none_means_unchanged() {
+        let cfg = EnvironmentMutableConfig::new()
+            .with_txn_timeout_ms(Some(1_000))
+            .with_txn_timeout_ms(None);
+        assert_eq!(cfg.txn_timeout_ms, None);
     }
 }

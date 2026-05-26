@@ -38,7 +38,6 @@ mod observe;
 #[cfg(feature = "observability")]
 pub use noxu_observe as observe_crate;
 
-pub mod byte_comparator;
 pub mod cache_mode;
 pub mod checkpoint_config;
 pub mod cursor;
@@ -75,9 +74,6 @@ pub mod transaction_config;
 pub mod write_options;
 
 // Re-export commonly used types
-pub use byte_comparator::{
-    ByteComparator, DefaultByteComparator, compare_unsigned,
-};
 pub use cache_mode::CacheMode;
 pub use checkpoint_config::CheckpointConfig;
 pub use cursor::Cursor;

@@ -803,8 +803,8 @@ impl Environment {
             run_cleaner: Some(self.config.run_cleaner),
             run_checkpointer: Some(self.config.run_checkpointer),
             run_evictor: Some(self.config.run_evictor),
-            lock_timeout_ms: self.config.lock_timeout_ms,
-            txn_timeout_ms: self.config.txn_timeout_ms,
+            lock_timeout_ms: Some(self.config.lock_timeout_ms),
+            txn_timeout_ms: Some(self.config.txn_timeout_ms),
         })
     }
 
@@ -812,7 +812,8 @@ impl Environment {
     ///
     /// : `Environment.setMutableConfig(EnvironmentMutableConfig)`.
     /// Only the fields that differ from their sentinel "no-change" values are
-    /// applied (`None` / `0` means unchanged).
+    /// applied (`None` means unchanged).  `Some(0)` for a timeout clears it
+    /// (matches JE: 0 = no timeout).
     ///
     /// # Errors
     /// Returns an error if the environment is closed or invalidated.
@@ -824,11 +825,11 @@ impl Environment {
         if let Some(sz) = cfg.cache_size {
             self.config.cache_size = sz as u64;
         }
-        if cfg.lock_timeout_ms > 0 {
-            self.config.lock_timeout_ms = cfg.lock_timeout_ms;
+        if let Some(ms) = cfg.lock_timeout_ms {
+            self.config.lock_timeout_ms = ms;
         }
-        if cfg.txn_timeout_ms > 0 {
-            self.config.txn_timeout_ms = cfg.txn_timeout_ms;
+        if let Some(ms) = cfg.txn_timeout_ms {
+            self.config.txn_timeout_ms = ms;
         }
         self.config.txn_no_sync = cfg.txn_no_sync;
         self.config.txn_write_no_sync = cfg.txn_write_no_sync;
@@ -1593,28 +1594,31 @@ mod tests {
         let (_tmp, config) = temp_env_config();
         let mut env = Environment::open(config).unwrap();
         let mc = EnvironmentMutableConfig {
-            lock_timeout_ms: 5_000,
-            txn_timeout_ms: 10_000,
+            lock_timeout_ms: Some(5_000),
+            txn_timeout_ms: Some(10_000),
             ..EnvironmentMutableConfig::default()
         };
         env.set_mutable_config(mc).unwrap();
         // After setting, values should be reflected (lock_timeout_ms is advisory at
         // the config layer; verify via get_mutable_config).
         let updated = env.get_mutable_config().unwrap();
-        assert_eq!(updated.lock_timeout_ms, 5_000);
-        assert_eq!(updated.txn_timeout_ms, 10_000);
+        assert_eq!(updated.lock_timeout_ms, Some(5_000));
+        assert_eq!(updated.txn_timeout_ms, Some(10_000));
         env.close().unwrap();
     }
 
     #[test]
-    fn test_set_mutable_config_zero_timeout_unchanged() {
+    fn test_set_mutable_config_none_timeout_unchanged() {
         let (_tmp, config) = temp_env_config();
         let mut env = Environment::open(config).unwrap();
         let original = env.get_mutable_config().unwrap();
-        // Setting 0 for timeouts means "unchanged".
+        // None means "unchanged".  See Wave 1C audit cleanup
+        // (Transaction-Env F19/F20): the previous implementation used
+        // 0 as the sentinel which prevented users from clearing a
+        // timeout.
         let mc = EnvironmentMutableConfig {
-            lock_timeout_ms: 0,
-            txn_timeout_ms: 0,
+            lock_timeout_ms: None,
+            txn_timeout_ms: None,
             ..EnvironmentMutableConfig::default()
         };
         env.set_mutable_config(mc).unwrap();

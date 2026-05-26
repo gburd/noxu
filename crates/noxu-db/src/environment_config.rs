@@ -566,7 +566,14 @@ pub struct EnvironmentConfig {
     /// : `TXN_WRITE_NO_SYNC` / default false.
     pub txn_write_no_sync: bool,
 
-    /// All transactions use serializable (degree-3) isolation by default.
+    /// When `true`, all transactions default to **serializable**
+    /// (degree-3) isolation: read locks are retained through commit.
+    /// When `false` (the default), transactions use
+    /// **repeatable-read** isolation — read locks are still held for
+    /// the lifetime of the txn but predicate / phantom protection is
+    /// not provided.  Per-transaction overrides are available via
+    /// [`crate::transaction_config::TransactionConfig::set_serializable_isolation`]
+    /// and [`crate::transaction_config::TransactionConfig::set_read_committed`].
     /// : `TXN_SERIALIZABLE_ISOLATION` / default false.
     pub txn_serializable_isolation: bool,
 
