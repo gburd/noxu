@@ -15,12 +15,15 @@ use crate::stream::reconnect::ReconnectConfig;
 const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default heartbeat interval.
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-/// Default replica ack timeout.
-const DEFAULT_REPLICA_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Default feeder timeout (how long master waits for replica to respond).
-const DEFAULT_FEEDER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default replication port.
-const DEFAULT_NODE_PORT: u16 = 5001;
+///
+/// Wave 1C audit cleanup (rep low "default port collision"):
+/// changed from `5001` (which collides with PostgreSQL's REPMGR
+/// default and various Cisco services) to `14_001`, an unprivileged
+/// IANA-unassigned default.  Most production deployments override
+/// this; the new default is just intended to fail closed during
+/// development rather than silently bind on something else's port.
+const DEFAULT_NODE_PORT: u16 = 14_001;
 /// Default per-phase election message timeout.
 const DEFAULT_ELECTION_PHASE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Default phi accrual sample window size.
@@ -42,19 +45,17 @@ pub struct RepConfig {
     pub node_port: u16,
     /// Type of this node.
     pub node_type: NodeType,
-    /// Helper hosts for joining the group ("host:port" strings).
-    pub helper_hosts: Vec<String>,
     /// Timeout for elections.
     pub election_timeout: Duration,
     /// Interval between heartbeat messages.
     pub heartbeat_interval: Duration,
-    /// How long to wait for replica acknowledgments.
-    pub replica_ack_timeout: Duration,
-    /// How long the master waits for a replica feeder response.
-    pub feeder_timeout: Duration,
     /// Default consistency policy for read operations.
     pub consistency_policy: ConsistencyPolicy,
     /// Default commit durability for replicated transactions.
+    ///
+    /// The `ack_timeout` field on `commit_durability` governs the
+    /// commit-side wait for replica acks; there is no separate
+    /// per-RepConfig replica-ack timeout.
     pub commit_durability: CommitDurability,
     /// Path to the local environment home directory (`.ndb` files).
     ///
@@ -76,8 +77,7 @@ pub struct RepConfig {
     pub phi_window_size: usize,
     /// Fully-described peers added to the replication group at startup.
     ///
-    /// Useful for pre-populating quoracle capacity/latency metadata beyond
-    /// what can be inferred from `helper_hosts`.
+    /// Useful for pre-populating quoracle capacity/latency metadata.
     pub initial_peers: Vec<RepNode>,
     /// Timeout per peer message exchange during Phase 1 and Phase 2 of an
     /// election.  Default: 500 ms.
@@ -99,11 +99,8 @@ impl RepConfig {
             node_host: node_host.to_string(),
             node_port: DEFAULT_NODE_PORT,
             node_type: NodeType::Electable,
-            helper_hosts: Vec::new(),
             election_timeout: DEFAULT_ELECTION_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
-            replica_ack_timeout: DEFAULT_REPLICA_ACK_TIMEOUT,
-            feeder_timeout: DEFAULT_FEEDER_TIMEOUT,
             consistency_policy: ConsistencyPolicy::default(),
             commit_durability: CommitDurability::default(),
             env_home: None,
@@ -114,6 +111,24 @@ impl RepConfig {
             election_phase_timeout: DEFAULT_ELECTION_PHASE_TIMEOUT,
             reconnect_config: ReconnectConfig::default(),
         }
+    }
+
+    /// Convenience constructor matching the original v1.4 shape.
+    ///
+    /// Equivalent to `builder(group, node, host).node_port(port).build()`.
+    /// Provided so doc snippets and short tests don't need to write the
+    /// full builder chain.  Wave 1C audit cleanup (rep low
+    /// "`RepConfig::new` example").
+    pub fn new(
+        group_name: impl Into<String>,
+        node_name: impl Into<String>,
+        node_host: impl Into<String>,
+        node_port: u16,
+    ) -> RepConfig {
+        let g = group_name.into();
+        let n = node_name.into();
+        let h = node_host.into();
+        RepConfig::builder(&g, &n, &h).node_port(node_port).build()
     }
 
     /// Returns the socket address string for this node.
@@ -130,11 +145,8 @@ pub struct RepConfigBuilder {
     node_host: String,
     node_port: u16,
     node_type: NodeType,
-    helper_hosts: Vec<String>,
     election_timeout: Duration,
     heartbeat_interval: Duration,
-    replica_ack_timeout: Duration,
-    feeder_timeout: Duration,
     consistency_policy: ConsistencyPolicy,
     commit_durability: CommitDurability,
     env_home: Option<PathBuf>,
@@ -159,18 +171,6 @@ impl RepConfigBuilder {
         self
     }
 
-    /// Sets the helper hosts for joining the group.
-    pub fn helper_hosts(mut self, hosts: Vec<String>) -> Self {
-        self.helper_hosts = hosts;
-        self
-    }
-
-    /// Adds a single helper host.
-    pub fn add_helper_host(mut self, host: String) -> Self {
-        self.helper_hosts.push(host);
-        self
-    }
-
     /// Sets the election timeout.
     pub fn election_timeout(mut self, timeout: Duration) -> Self {
         self.election_timeout = timeout;
@@ -180,18 +180,6 @@ impl RepConfigBuilder {
     /// Sets the heartbeat interval.
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
-        self
-    }
-
-    /// Sets the replica ack timeout.
-    pub fn replica_ack_timeout(mut self, timeout: Duration) -> Self {
-        self.replica_ack_timeout = timeout;
-        self
-    }
-
-    /// Sets the feeder timeout.
-    pub fn feeder_timeout(mut self, timeout: Duration) -> Self {
-        self.feeder_timeout = timeout;
         self
     }
 
@@ -261,11 +249,8 @@ impl RepConfigBuilder {
             node_host: self.node_host,
             node_port: self.node_port,
             node_type: self.node_type,
-            helper_hosts: self.helper_hosts,
             election_timeout: self.election_timeout,
             heartbeat_interval: self.heartbeat_interval,
-            replica_ack_timeout: self.replica_ack_timeout,
-            feeder_timeout: self.feeder_timeout,
             consistency_policy: self.consistency_policy,
             commit_durability: self.commit_durability,
             env_home: self.env_home,
@@ -292,12 +277,32 @@ mod tests {
         assert_eq!(config.node_host, "localhost");
         assert_eq!(config.node_port, DEFAULT_NODE_PORT);
         assert_eq!(config.node_type, NodeType::Electable);
-        assert!(config.helper_hosts.is_empty());
         assert_eq!(config.election_timeout, DEFAULT_ELECTION_TIMEOUT);
         assert_eq!(config.heartbeat_interval, DEFAULT_HEARTBEAT_INTERVAL);
-        assert_eq!(config.replica_ack_timeout, DEFAULT_REPLICA_ACK_TIMEOUT);
-        assert_eq!(config.feeder_timeout, DEFAULT_FEEDER_TIMEOUT);
         assert_eq!(config.consistency_policy, ConsistencyPolicy::NoConsistency);
+    }
+
+    #[test]
+    fn test_default_port_is_unprivileged() {
+        // Wave 1C audit cleanup (rep low "default port collision"): the
+        // default port must be in the IANA unassigned range and is not
+        // shared with another well-known service we might collide with
+        // (5001 was the v1.5.0 default; it overlaps with REPMGR among
+        // others).
+        let config = RepConfig::builder("g", "n", "h").build();
+        assert_eq!(config.node_port, 14_001);
+    }
+
+    #[test]
+    fn test_new_constructor_matches_builder() {
+        let a = RepConfig::new("g", "n", "h", 6000);
+        let b = RepConfig::builder("g", "n", "h").node_port(6000).build();
+        // The two paths must produce the same on-the-wire identity.
+        assert_eq!(a.group_name, b.group_name);
+        assert_eq!(a.node_name, b.node_name);
+        assert_eq!(a.node_host, b.node_host);
+        assert_eq!(a.node_port, b.node_port);
+        assert_eq!(a.node_type, b.node_type);
     }
 
     #[test]
@@ -315,38 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_helper_hosts() {
-        let config = RepConfig::builder("g", "n", "h")
-            .helper_hosts(vec![
-                "host1:5001".to_string(),
-                "host2:5002".to_string(),
-            ])
-            .build();
-        assert_eq!(config.helper_hosts.len(), 2);
-    }
-
-    #[test]
-    fn test_builder_add_helper_host() {
-        let config = RepConfig::builder("g", "n", "h")
-            .add_helper_host("host1:5001".to_string())
-            .add_helper_host("host2:5002".to_string())
-            .build();
-        assert_eq!(config.helper_hosts.len(), 2);
-        assert_eq!(config.helper_hosts[0], "host1:5001");
-    }
-
-    #[test]
     fn test_builder_timeouts() {
         let config = RepConfig::builder("g", "n", "h")
             .election_timeout(Duration::from_secs(20))
             .heartbeat_interval(Duration::from_millis(500))
-            .replica_ack_timeout(Duration::from_secs(10))
-            .feeder_timeout(Duration::from_secs(60))
             .build();
         assert_eq!(config.election_timeout, Duration::from_secs(20));
         assert_eq!(config.heartbeat_interval, Duration::from_millis(500));
-        assert_eq!(config.replica_ack_timeout, Duration::from_secs(10));
-        assert_eq!(config.feeder_timeout, Duration::from_secs(60));
     }
 
     #[test]
@@ -389,7 +369,6 @@ mod tests {
         let config = RepConfig::builder("mygroup", "node1", "10.0.0.1")
             .node_port(5555)
             .node_type(NodeType::Arbiter)
-            .add_helper_host("10.0.0.2:5555".to_string())
             .election_timeout(Duration::from_secs(30))
             .build();
         assert_eq!(config.group_name, "mygroup");
@@ -397,7 +376,6 @@ mod tests {
         assert_eq!(config.node_host, "10.0.0.1");
         assert_eq!(config.node_port, 5555);
         assert_eq!(config.node_type, NodeType::Arbiter);
-        assert_eq!(config.helper_hosts.len(), 1);
         assert_eq!(config.election_timeout, Duration::from_secs(30));
     }
 
