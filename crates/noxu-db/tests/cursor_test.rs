@@ -997,3 +997,63 @@ fn cursor_prev_dup_on_non_dup_db_returns_not_found() {
         key.get_data()
     );
 }
+
+#[test]
+fn cursor_search_both_on_non_dup_db_validates_data() {
+    // Audit Finding 4: `Get::SearchBoth` on a non-sorted-dup DB must
+    // validate the slot's data against the user-supplied data.  Pre-fix
+    // the `data` argument was silently dropped and Success was returned
+    // for any matching key.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_both_non_dup");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"k"),
+        &DatabaseEntry::from_bytes(b"stored"),
+    )
+    .unwrap();
+
+    // Probe with the wrong data.
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut k = DatabaseEntry::from_bytes(b"k");
+    let mut d = DatabaseEntry::from_bytes(b"different");
+    let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "SearchBoth on non-dup DB must return NotFound when data mismatches"
+    );
+
+    // Probe with the right data — must still succeed.
+    let mut k = DatabaseEntry::from_bytes(b"k");
+    let mut d = DatabaseEntry::from_bytes(b"stored");
+    let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::Success,
+        "SearchBoth on non-dup DB must succeed when data matches"
+    );
+    assert_eq!(k.data(), b"k");
+    assert_eq!(d.data(), b"stored");
+}
+
+#[test]
+fn cursor_search_both_on_non_dup_db_missing_key_still_not_found() {
+    // Sanity: a missing key still returns NotFound regardless of data.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_both_missing_key");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"k"),
+        &DatabaseEntry::from_bytes(b"v"),
+    )
+    .unwrap();
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut k = DatabaseEntry::from_bytes(b"missing");
+    let mut d = DatabaseEntry::from_bytes(b"anything");
+    let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+}

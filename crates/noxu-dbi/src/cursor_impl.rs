@@ -574,6 +574,21 @@ impl CursorImpl {
                     } else {
                         slot_data
                     };
+                    // Audit Finding 4: BDB-JE's SearchBoth is exact-match on
+                    // (key, data) regardless of duplicate-set membership; on a
+                    // non-dup DB it must still validate that the slot's data
+                    // equals the user-supplied data.  Pre-fix the `data`
+                    // argument was silently dropped and `Success` was
+                    // returned for any matching key, contradicting the
+                    // documented contract on `Get::SearchBoth`.  See
+                    // `docs/src/internal/api-audit-2026-05-cursor.md`.
+                    if matches!(search_mode, SearchMode::Both) {
+                        let user_data = data.unwrap_or(&[]);
+                        let stored = final_data.as_deref().unwrap_or(&[]);
+                        if stored != user_data {
+                            return Ok(OperationStatus::NotFound);
+                        }
+                    }
                     self.current_key = Some(key.to_vec());
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
