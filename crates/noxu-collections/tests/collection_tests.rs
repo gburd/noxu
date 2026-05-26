@@ -27,7 +27,8 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-type ByteMap<'db> = StoredMap<'db, Vec<u8>, Vec<u8>, ByteArrayBinding, ByteArrayBinding>;
+type ByteMap<'db> =
+    StoredMap<'db, Vec<u8>, Vec<u8>, ByteArrayBinding, ByteArrayBinding>;
 type ByteSortedMap<'db> =
     StoredSortedMap<'db, Vec<u8>, Vec<u8>, ByteArrayBinding, ByteArrayBinding>;
 type ByteKeySet<'db> = StoredKeySet<'db, Vec<u8>, ByteArrayBinding>;
@@ -271,11 +272,8 @@ fn test_stored_map_iter_after_partial_remove() {
     for i in [1u64, 3, 5] {
         map.remove(None, &key_bytes(i)).unwrap();
     }
-    let keys: Vec<_> = map
-        .keys(None)
-        .unwrap()
-        .map(|r| key_u64(&r.unwrap()))
-        .collect();
+    let keys: Vec<_> =
+        map.keys(None).unwrap().map(|r| key_u64(&r.unwrap())).collect();
     assert_eq!(keys, vec![2u64, 4, 6]);
 }
 
@@ -414,10 +412,7 @@ fn test_sorted_map_as_map() {
     let sorted = make_byte_sorted_map(&db);
     sorted.put(None, &b"x".to_vec(), &b"y".to_vec()).unwrap();
     let inner = sorted.as_map();
-    assert_eq!(
-        inner.get(None, &b"x".to_vec()).unwrap(),
-        Some(b"y".to_vec()),
-    );
+    assert_eq!(inner.get(None, &b"x".to_vec()).unwrap(), Some(b"y".to_vec()),);
 }
 
 // ---------------------------------------------------------------------------

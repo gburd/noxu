@@ -74,8 +74,7 @@ impl RetryConfig {
         // pulling in `f64` non-determinism: take the salt's low bits
         // mod 2N+1, subtract N, scale to capped*jitter.
         let nanos_capped = capped.as_nanos();
-        let jitter_window =
-            (nanos_capped as f64 * self.jitter).round() as i128;
+        let jitter_window = (nanos_capped as f64 * self.jitter).round() as i128;
         if jitter_window <= 0 {
             return capped;
         }
@@ -175,11 +174,7 @@ impl<'env> TransactionRunner<'env> {
 
     /// Variant of [`Self::run`] that lets tests inject a fake sleep
     /// to avoid stalling CI.
-    pub fn run_with_sleep<F, R, S>(
-        &self,
-        f: &mut F,
-        mut sleep: S,
-    ) -> Result<R>
+    pub fn run_with_sleep<F, R, S>(&self, f: &mut F, mut sleep: S) -> Result<R>
     where
         F: FnMut(&Transaction) -> Result<R>,
         S: FnMut(Duration),
@@ -194,14 +189,12 @@ impl<'env> TransactionRunner<'env> {
                 }
                 Err(err) => {
                     let _ = txn.abort();
-                    if attempt >= self.retry.max_retries
-                        || !is_retryable(&err)
+                    if attempt >= self.retry.max_retries || !is_retryable(&err)
                     {
                         return Err(err);
                     }
                     let nanos = jitter_salt();
-                    let sleep_dur =
-                        self.retry.backoff_for(attempt, nanos);
+                    let sleep_dur = self.retry.backoff_for(attempt, nanos);
                     sleep(sleep_dur);
                     attempt = attempt.saturating_add(1);
                 }
@@ -244,8 +237,8 @@ fn jitter_salt() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use noxu_db::{DatabaseConfig, EnvironmentConfig, NoxuError};
     use tempfile::TempDir;
@@ -316,9 +309,8 @@ mod tests {
     fn run_aborts_on_error() {
         let (_td, env) = setup_env();
         let runner = TransactionRunner::new(&env);
-        let result: Result<()> = runner.run(|_txn| {
-            Err(CollectionError::IllegalState("nope".to_string()))
-        });
+        let result: Result<()> = runner
+            .run(|_txn| Err(CollectionError::IllegalState("nope".to_string())));
         assert!(matches!(result, Err(CollectionError::IllegalState(_))));
     }
 
@@ -335,9 +327,7 @@ mod tests {
         let mut closure = move |_t: &Transaction| -> Result<&'static str> {
             let n = calls_clone.fetch_add(1, Ordering::SeqCst);
             if n < 2 {
-                Err(CollectionError::DatabaseError(
-                    NoxuError::DeadlockDetected,
-                ))
+                Err(CollectionError::DatabaseError(NoxuError::DeadlockDetected))
             } else {
                 Ok("ok")
             }
@@ -361,9 +351,7 @@ mod tests {
 
         let mut closure = move |_t: &Transaction| -> Result<()> {
             calls_clone.fetch_add(1, Ordering::SeqCst);
-            Err(CollectionError::DatabaseError(
-                NoxuError::DeadlockDetected,
-            ))
+            Err(CollectionError::DatabaseError(NoxuError::DeadlockDetected))
         };
 
         let result = runner.run_with_sleep(&mut closure, |_d| {});
@@ -464,9 +452,8 @@ mod tests {
     #[test]
     fn with_jitter_clamps_to_unit_range() {
         let (_td, env) = setup_env();
-        let runner = TransactionRunner::new(&env)
-            .with_jitter(2.0)
-            .with_jitter(-1.0);
+        let runner =
+            TransactionRunner::new(&env).with_jitter(2.0).with_jitter(-1.0);
         // Last setter wins; clamped to 0.0.
         assert!((runner.retry_config().jitter - 0.0).abs() < f64::EPSILON);
     }
@@ -479,9 +466,7 @@ mod tests {
         assert!(is_retryable(&CollectionError::DatabaseError(
             NoxuError::LockConflict("x".to_string())
         )));
-        assert!(!is_retryable(&CollectionError::IllegalState(
-            "x".to_string()
-        )));
+        assert!(!is_retryable(&CollectionError::IllegalState("x".to_string())));
         assert!(!is_retryable(&CollectionError::ReadOnly));
     }
 }

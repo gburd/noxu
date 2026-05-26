@@ -35,22 +35,12 @@ where
 {
     /// Creates a new typed key-set view of the given database.
     pub fn new(db: &'db Database, key_binding: KB) -> Self {
-        StoredKeySet {
-            db,
-            key_binding,
-            read_only: false,
-            _marker: PhantomData,
-        }
+        StoredKeySet { db, key_binding, read_only: false, _marker: PhantomData }
     }
 
     /// Creates a new read-only typed key-set view.
     pub fn new_read_only(db: &'db Database, key_binding: KB) -> Self {
-        StoredKeySet {
-            db,
-            key_binding,
-            read_only: true,
-            _marker: PhantomData,
-        }
+        StoredKeySet { db, key_binding, read_only: true, _marker: PhantomData }
     }
 
     /// Returns whether the view is read-only.
@@ -89,11 +79,7 @@ where
     }
 
     /// Returns whether `key` is in the set.
-    pub fn contains(
-        &self,
-        txn: Option<&Transaction>,
-        key: &K,
-    ) -> Result<bool> {
+    pub fn contains(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_entry = encode_key(&self.key_binding, key)?;
         let mut data_entry = noxu_db::DatabaseEntry::new();
         match self.db.get(txn, &key_entry, &mut data_entry)? {
@@ -104,11 +90,7 @@ where
 
     /// Removes `key` from the set.  Returns whether the key was
     /// present before the call.
-    pub fn remove(
-        &self,
-        txn: Option<&Transaction>,
-        key: &K,
-    ) -> Result<bool> {
+    pub fn remove(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
@@ -136,15 +118,12 @@ where
     }
 
     /// Returns a snapshot iterator over every key.
-    pub fn iter(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<K>> {
+    pub fn iter(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
         // We don't care about values here — use `ByteArrayBinding` for
         // the value side and discard it.  Decoding the empty payload
         // through the byte-array binding is a single-allocation
         // no-op.
-        use crate::internal::{scan_records, ScanDirection, StartKey};
+        use crate::internal::{ScanDirection, StartKey, scan_records};
         use noxu_bind::ByteArrayBinding;
 
         let value_binding = ByteArrayBinding;
@@ -168,12 +147,9 @@ where
         let mut cursor = self.db.open_cursor(txn, None)?;
         let mut key = noxu_db::DatabaseEntry::new();
         let mut data = noxu_db::DatabaseEntry::new();
-        while let OperationStatus::Success = cursor.get(
-            &mut key,
-            &mut data,
-            noxu_db::Get::First,
-            None,
-        )? {
+        while let OperationStatus::Success =
+            cursor.get(&mut key, &mut data, noxu_db::Get::First, None)?
+        {
             cursor.delete()?;
         }
         cursor.close()?;
@@ -270,10 +246,7 @@ mod tests {
         let set: StoredKeySet<'_, i32, _> =
             StoredKeySet::new_read_only(&db, IntBinding);
         assert!(matches!(set.add(None, &1), Err(CollectionError::ReadOnly)));
-        assert!(matches!(
-            set.remove(None, &1),
-            Err(CollectionError::ReadOnly)
-        ));
+        assert!(matches!(set.remove(None, &1), Err(CollectionError::ReadOnly)));
         assert!(matches!(set.clear(None), Err(CollectionError::ReadOnly)));
     }
 }

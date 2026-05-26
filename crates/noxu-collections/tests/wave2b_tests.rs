@@ -75,10 +75,7 @@ fn stored_map_methods_take_optional_txn() {
     // Explicit-txn form (txn = Some(&t)).
     let txn = env.begin_transaction(None, None).unwrap();
     map.put(Some(&txn), &2, &"beta".to_string()).unwrap();
-    assert_eq!(
-        map.get(Some(&txn), &2).unwrap(),
-        Some("beta".to_string()),
-    );
+    assert_eq!(map.get(Some(&txn), &2).unwrap(), Some("beta".to_string()),);
     assert!(map.contains_key(Some(&txn), &2).unwrap());
     txn.commit().unwrap();
 
@@ -178,8 +175,7 @@ fn runner_retries_lock_conflict_with_jittered_backoff() {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let calls_clone = calls.clone();
     let result = runner.run(move |_txn| {
-        let n =
-            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n < 3 {
             Err(CollectionError::DatabaseError(
                 noxu_db::NoxuError::LockConflict("simulated".into()),
@@ -204,8 +200,7 @@ fn stored_list_remove_compacts_no_gaps() {
     let (_td, path) = fresh_env_dir();
     let env = open_env(&path, false);
     let db = open_db(&env, "compact_list");
-    let list: StoredList<'_, String, _> =
-        StoredList::new(&db, StringBinding);
+    let list: StoredList<'_, String, _> = StoredList::new(&db, StringBinding);
 
     for i in 0..5 {
         list.push(None, &format!("v{i}")).unwrap();
@@ -353,8 +348,7 @@ fn typed_storedlist_round_trip_by_value() {
     let (_td, path) = fresh_env_dir();
     let env = open_env(&path, true);
     let db = open_db(&env, "typed_list_round_trip");
-    let list: StoredList<'_, String, _> =
-        StoredList::new(&db, StringBinding);
+    let list: StoredList<'_, String, _> = StoredList::new(&db, StringBinding);
 
     list.push(None, &"hello".to_string()).unwrap();
     list.push(None, &"world".to_string()).unwrap();

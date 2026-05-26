@@ -63,11 +63,7 @@ where
     ///
     /// This is `O(N)`: it walks every record under `txn`, decoding
     /// values until it finds a match (or exhausts the database).
-    pub fn contains(
-        &self,
-        txn: Option<&Transaction>,
-        value: &V,
-    ) -> Result<bool>
+    pub fn contains(&self, txn: Option<&Transaction>, value: &V) -> Result<bool>
     where
         V: PartialEq,
     {
@@ -78,12 +74,9 @@ where
             cursor.get(&mut key, &mut data, noxu_db::Get::First, None)?;
         let mut found = false;
         while matches!(status, OperationStatus::Success) {
-            let v = self
-                .value_binding
-                .entry_to_object(&data)
-                .map_err(|e| {
-                    crate::error::CollectionError::BindingError(e.to_string())
-                })?;
+            let v = self.value_binding.entry_to_object(&data).map_err(|e| {
+                crate::error::CollectionError::BindingError(e.to_string())
+            })?;
             if &v == value {
                 found = true;
                 break;
@@ -96,24 +89,20 @@ where
     }
 
     /// Returns a snapshot iterator over every value.
-    pub fn iter(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<V>> {
-        use crate::internal::{scan_records, ScanDirection, StartKey};
+    pub fn iter(&self, txn: Option<&Transaction>) -> Result<StoredIterator<V>> {
+        use crate::internal::{ScanDirection, StartKey, scan_records};
         use noxu_bind::ByteArrayBinding;
 
         let key_binding = ByteArrayBinding;
-        let items =
-            scan_records::<Vec<u8>, V, ByteArrayBinding, VB, V, _>(
-                self.db,
-                txn,
-                StartKey::None,
-                ScanDirection::Forward,
-                &key_binding,
-                &self.value_binding,
-                |_k, v| v,
-            )?;
+        let items = scan_records::<Vec<u8>, V, ByteArrayBinding, VB, V, _>(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &key_binding,
+            &self.value_binding,
+            |_k, v| v,
+        )?;
         Ok(StoredIterator::from_vec(items))
     }
 }

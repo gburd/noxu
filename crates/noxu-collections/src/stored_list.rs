@@ -327,24 +327,20 @@ where
     }
 
     /// Returns a snapshot iterator over every value, in index order.
-    pub fn iter(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<V>> {
-        use crate::internal::{scan_records, ScanDirection, StartKey};
+    pub fn iter(&self, txn: Option<&Transaction>) -> Result<StoredIterator<V>> {
+        use crate::internal::{ScanDirection, StartKey, scan_records};
         use noxu_bind::ByteArrayBinding;
 
         let key_binding = ByteArrayBinding;
-        let items =
-            scan_records::<Vec<u8>, V, ByteArrayBinding, VB, V, _>(
-                self.db,
-                txn,
-                StartKey::None,
-                ScanDirection::Forward,
-                &key_binding,
-                &self.value_binding,
-                |_k, v| v,
-            )?;
+        let items = scan_records::<Vec<u8>, V, ByteArrayBinding, VB, V, _>(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &key_binding,
+            &self.value_binding,
+            |_k, v| v,
+        )?;
         Ok(StoredIterator::from_vec(items))
     }
 
@@ -454,9 +450,8 @@ mod tests {
         assert_eq!(list.next_index(), 5);
 
         // No gaps: every index 0..5 has a value.
-        let collected: Vec<Option<String>> = (0..5)
-            .map(|i| list.get(None, i).unwrap())
-            .collect();
+        let collected: Vec<Option<String>> =
+            (0..5).map(|i| list.get(None, i).unwrap()).collect();
         assert!(
             collected.iter().all(|v| v.is_some()),
             "expected dense list, got {:?}",
@@ -547,8 +542,8 @@ mod tests {
         // Process-local next_index was decremented inside `remove`;
         // the reopen path (`StoredList::open`) is the way to recover
         // the on-disk truth after an abort.
-        let recovered = StoredList::<String, _>::open(&db, StringBinding)
-            .unwrap();
+        let recovered =
+            StoredList::<String, _>::open(&db, StringBinding).unwrap();
         assert_eq!(recovered.next_index(), 5);
         assert_eq!(recovered.get(None, 1).unwrap(), Some("v1".to_string()));
     }
@@ -561,8 +556,7 @@ mod tests {
         // First session: write 3 entries, close.
         {
             let env = Environment::open(
-                EnvironmentConfig::new(path.clone())
-                    .with_allow_create(true),
+                EnvironmentConfig::new(path.clone()).with_allow_create(true),
             )
             .unwrap();
             let db = env
@@ -583,8 +577,7 @@ mod tests {
         // Second session: open with `open` and confirm recovery.
         {
             let env = Environment::open(
-                EnvironmentConfig::new(path)
-                    .with_allow_create(true),
+                EnvironmentConfig::new(path).with_allow_create(true),
             )
             .unwrap();
             let db = env
@@ -624,17 +617,14 @@ mod tests {
     #[test]
     fn read_only_rejects_writes() {
         let (_td, _env, db) = setup();
-        let list = StoredList::<String, _>::new(&db, StringBinding)
-            .into_read_only();
+        let list =
+            StoredList::<String, _>::new(&db, StringBinding).into_read_only();
         assert!(matches!(
             list.push(None, &"x".to_string()),
             Err(CollectionError::ReadOnly)
         ));
         assert!(matches!(list.pop(None), Err(CollectionError::ReadOnly)));
-        assert!(matches!(
-            list.remove(None, 0),
-            Err(CollectionError::ReadOnly)
-        ));
+        assert!(matches!(list.remove(None, 0), Err(CollectionError::ReadOnly)));
         assert!(matches!(list.clear(None), Err(CollectionError::ReadOnly)));
     }
 
