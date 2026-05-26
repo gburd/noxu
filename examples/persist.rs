@@ -230,8 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. Iterate over all entities in key order.
     println!("\nAll persons in key order:");
-    let all: Vec<Person> =
-        index.entities(None, &ser)?.collect::<noxu_persist::Result<Vec<_>>>()?;
+    let all: Vec<Person> = index
+        .entities(None, &ser)?
+        .collect::<noxu_persist::Result<Vec<_>>>()?;
     for p in &all {
         println!(
             "  id={}: {} {}, age={}",
@@ -253,8 +254,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 10. Verify all remaining entities are accessible.
     println!("\nFinal scan:");
-    let remaining: Vec<Person> =
-        index.entities(None, &ser)?.collect::<noxu_persist::Result<Vec<_>>>()?;
+    let remaining: Vec<Person> = index
+        .entities(None, &ser)?
+        .collect::<noxu_persist::Result<Vec<_>>>()?;
     for p in &remaining {
         println!(
             "  id={}: {} {}, age={}",
