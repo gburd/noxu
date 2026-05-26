@@ -82,6 +82,10 @@ to the auto-commit-vs-txn distinction and were exposed only by F1).
 
 ## What remains (deferred, not blocking v1.5.0)
 
+*Both residuals listed in this section were closed in Wave 1A of the
+v1.5.1 polish work; see [Resolution (Wave 1A)](#resolution-wave-1a)
+below.*
+
 There are two genuine gaps Sprint 1 did **not** address:
 
 1. **NULL-LSN insert race.** `lock_write_before_log` returns early
@@ -107,7 +111,86 @@ There are two genuine gaps Sprint 1 did **not** address:
 Neither gap changes user-visible isolation in the JE sense; they are
 diagnostic / corner-case quality issues.
 
+## Resolution (Wave 1A)
+
+Both residuals were closed on branch `fix/wave1a-f12-residuals` (merged
+as part of v1.5.1).  The fix follows exactly the suggested approach
+below:
+
+* `TxnManager::begin_auto_txn(env_log_manager)` allocates a transient
+  synthetic `Txn` from the same `next_txn_id` counter as explicit
+  transactions.  The auto-txn carries a new `IS_AUTO_TXN` flag so
+  `Txn::commit_with_durability` and `Txn::abort` skip the
+  `TxnCommit` / `TxnAbort` WAL entries (the underlying LN was logged
+  as auto-commit `InsertLN` / `DeleteLN` with `txn_id = 0`, so the
+  on-disk WAL format is unchanged); the auto-commit fsync formerly
+  in `Database::auto_commit_sync` is folded into
+  `Txn::commit_with_durability` so explicit and synthetic-auto txns
+  share one durability path.
+* `Database::with_auto_txn` wraps every `txn = None` write
+  (`put`, `put_no_overwrite`, `delete`) in such a synthetic auto-txn
+  attached to the cursor via `CursorImpl::attach_txn`.  On `Ok` the
+  auto-txn commits; on `Err` it calls `abort_collect_undo` and
+  `apply_auto_txn_undo` rolls the in-memory tree write back through
+  `WriteLockInfo` before locks are released — so a forced mid-write
+  failure in auto-commit cannot leave a partial in-memory write.
+* `CursorImpl::lock_write_before_log` now takes the key as a second
+  argument and, when `old_lsn == NULL_LSN` (a brand-new insert),
+  acquires a write lock on a synthetic key-coordination LSN derived
+  from `(database_id, key)` via the new
+  `noxu_util::Lsn::synthetic_key_lock_id(db_id, key)`.  The encoding
+  uses the reserved `MAX_FILE_NUM` (`0xFFFFFFFF`) as the high 32
+  bits, so a synthetic key lock id can never collide with a real
+  WAL LSN.  Two concurrent auto-commit inserts of the same
+  brand-new key now serialise through the lock manager and the
+  loser observes `KeyExist` after re-checking `key_exists_in_view`
+  under the held lock.  `CursorImpl::put`'s
+  `PutMode::NoOverwrite` / `PutMode::NoDupData` paths run that
+  re-check unconditionally so the loser also bails when it lost on
+  a real-LSN write lock (i.e. the winner had already populated the
+  slot before the loser captured `old_lsn`).
+* `LockManager` grows a typed-label registry
+  (`register_locker_label`, `unregister_locker_label`,
+  `format_locker`, `format_lockers`) populated by
+  `TxnManager::begin_txn` (label `"txn"`) and
+  `TxnManager::begin_auto_txn` (label `"auto-txn"`).  The deadlock
+  cycle list and the `LockTimeout::owner` / `LockTimeout::requester`
+  fields now render typed identifiers like `"auto-txn:42"` and
+  `"txn:17"` instead of opaque integers — closing the
+  locker-id-collision-space residual.
+
+### Verification
+
+New tests in
+[`crates/noxu-db/tests/wave1a_f12_residuals_test.rs`](../../../../crates/noxu-db/tests/wave1a_f12_residuals_test.rs):
+
+1. `null_lsn_insert_race_two_auto_commit_inserts_serialise_through_lock_manager`
+   — 64 rounds of two-thread brand-new-key races assert that exactly
+   one thread sees `Success`, the other sees `KeyExists`, and the
+   stored value is the winner's.
+2. `null_lsn_insert_race_recovery_has_no_phantom_keys` — the same
+   race followed by `Environment::close()` + reopen verifies the
+   winners persist across recovery and no phantom keys appear.
+3. `auto_commit_rollback_on_forced_failure_undoes_in_memory_write`
+   — uses the `set_cursor_fail_after` test hook to inject a
+   mid-write failure during auto-commit and asserts the in-memory
+   tree is rolled back via the synthetic auto-txn's abort-undo.
+4. `auto_commit_single_thread_performance_regression_check` — 1024
+   sequential auto-commit puts and round-trips, a liveness check
+   that the synthetic-auto-txn rewrite did not catastrophically
+   regress single-thread auto-commit.
+5. `lock_timeout_message_uses_typed_locker_ids` — deterministically
+   provokes a `LockTimeout` between an explicit txn and an
+   auto-commit op and asserts the error message body contains both
+   `"auto-txn:"` and `"txn:"`.
+
+All tests pass; the existing F12 wiring tests in
+`crates/noxu-db/tests/txn_wiring_test.rs` continue to pass
+unchanged.
+
 ## Suggested follow-up for v1.5.x
+
+*Closed in Wave 1A.  Retained for historical context.*
 
 * Wrap auto-commit writes in a synthetic transient `Txn` from
   `TxnManager::begin_auto_txn(...)`, releasing all locks (and undoing
