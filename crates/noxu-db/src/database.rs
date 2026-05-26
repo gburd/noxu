@@ -607,18 +607,29 @@ impl Database {
             Some(t) => self.make_cursor_for_txn(t),
             None => self.make_cursor(),
         };
-        // First search to position the cursor
-        let status = match cursor
+        // For sorted-duplicate databases the BDB-JE contract for
+        // `Database.delete(key)` is to remove EVERY (key, data) pair
+        // sharing the supplied key, not just the first duplicate.  We
+        // implement that by re-positioning the cursor with `Set` after
+        // each successful delete: the search uses the primary-key prefix
+        // so it finds the next surviving dup until the duplicate set is
+        // empty.  For non-dup databases the loop runs at most once (the
+        // second iteration is a single `NotFound` search) so the
+        // single-record fast path is preserved.
+        let mut deleted_any = false;
+        while let noxu_dbi::OperationStatus::Success = cursor
             .search(key_bytes, None, SearchMode::Set)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
-            noxu_dbi::OperationStatus::Success => {
-                cursor.delete().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-                OperationStatus::Success
-            }
-            _ => OperationStatus::NotFound,
+            cursor
+                .delete()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            deleted_any = true;
+        }
+        let status = if deleted_any {
+            OperationStatus::Success
+        } else {
+            OperationStatus::NotFound
         };
         let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
         // Auto-commit: fsync before returning (skip if already covered).
