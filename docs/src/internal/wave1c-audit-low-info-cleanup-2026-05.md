@@ -44,12 +44,13 @@ deferral.
   B-tree comparison goes through `noxu-tree::InNode::compare_keys`
   and never consulted any of these.
 * **Stale BDB-JE template fragments in rustdoc**: closed.
-  Hundreds of `/// : \`Foo.bar()\`` lines (a sed pass had stripped
-  the leading "Mirrors" / "Implements" verb) in
+  Hundreds of doc-comments of the form `/// : Foo.bar()` (a sed pass
+  had stripped the leading "Mirrors" / "Implements" verb) in
   `environment.rs`, `environment_config.rs`, `error.rs`,
-  `environment_impl.rs`, and `tree.rs` are now spelled
-  `/// Mirrors \`Foo.bar()\`` consistently.  A few `Mirrors X
-  from .` trailing-period typos in `database.rs` were also fixed.
+  `environment_impl.rs`, `tree.rs` are now spelled
+  `/// Mirrors Foo.bar()` consistently.  A few trailing-period
+  typos of the form `Mirrors X from .` in `database.rs` were also
+  fixed.
 * **Partial-put length-mismatch silent truncation**: closed.
   `Database::put` now returns `NoxuError::IllegalArgument` when a
   partial put's `data` length does not match
