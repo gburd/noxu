@@ -10,11 +10,16 @@ use noxu_db::Database;
 
 /// A sorted map view of a database.
 ///
-///
-///
 /// Provides all the operations of `StoredMap` plus sorted-map operations
 /// like `first_key()`, `last_key()`, and range iteration. Keys are
 /// maintained in their natural byte order.
+///
+/// # v1.5 limitations
+///
+/// `StoredSortedMap` inherits the auto-commit-only contract from
+/// [`StoredMap`].  Every operation issues the underlying `Database` call
+/// with `txn = None`.  Threading `Option<&Transaction>` through every
+/// method is tracked for v1.6 (audit findings #1, #3, #4).
 ///
 /// # Example
 /// ```ignore

@@ -13,10 +13,24 @@ MD033: false
 # Chapter intro pages don't always start with an H1; mdBook provides the title
 MD041: false
 
-# Allow duplicate heading text in different sections (e.g., multiple "Overview" headings)
+# Allow duplicate heading text across non-sibling sections (e.g.,
+# 'Symptoms', 'Diagnose', 'Mitigate' repeat per runbook; 'What it
+# does', 'Alternatives considered', 'References' repeat per concept).
 MD024:
-  allow_different_nesting: true
+  siblings_only: true
 
 # Ordered lists: allow any starting number (1. 1. 1. style is valid)
 MD029:
   style: "ordered"
+
+# MD060 (table pipe spacing) was added in markdownlint-cli2 0.18+;
+# the noxu DB doc set was authored to a pre-0.18 ruleset where pipe
+# spacing was not enforced.  Disable to keep the existing tables
+# unchanged.
+MD060: false
+
+# mdBook SUMMARY.md uses multiple H1 headings as part separators
+# (see https://rust-lang.github.io/mdBook/format/summary.html).
+# All content pages have a single H1; the rule cannot be applied
+# selectively from .markdownlint.yaml, so it is disabled globally.
+MD025: false

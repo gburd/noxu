@@ -35,7 +35,7 @@ fidelity, and operational characteristics as Noxu DB — without a JVM.
 
 **Where does the code live?**
 
-```
+```text
 <repo-root>/                 ← this repository (your local clone)
 <repo-root>/_/je/            ← core reference archive (read-only, optional)
 <repo-root>/_/nosql/         ← extended fork reference (read-only, optional)
@@ -46,6 +46,7 @@ to the repository; they are guidance for porting work, not a build
 prerequisite.
 
 **Current fidelity** (as of the last audit):
+
 - Named-algorithm fidelity: ~92%
 - Operational completeness: ~85%
 - Production hardening: ~100% (all EnvironmentConfig parameters, ExceptionListener, is_valid())

@@ -2,9 +2,11 @@
 
 ## The DatabaseEntry Type
 
-Every Noxu DB record consists of two parts: a key and a data value. Both are represented as `DatabaseEntry` objects, which are essentially wrappers around a byte slice (`&[u8]`).
+Every Noxu DB record consists of two parts: a key and a data value. Both are represented as
+`DatabaseEntry` objects, which are essentially wrappers around a byte slice (`&[u8]`).
 
-`DatabaseEntry` is the universal container for moving data in and out of the database. Any type that can be serialized to bytes can be stored in Noxu DB.
+`DatabaseEntry` is the universal container for moving data in and out of the database. Any type
+that can be serialized to bytes can be stored in Noxu DB.
 
 ## Creating DatabaseEntry Objects
 
@@ -54,7 +56,7 @@ Because `DatabaseEntry` stores raw bytes, you must decide how to encode your app
 
 - **UTF-8 strings** — human-readable, easy for debugging.
 - **`bincode` or `serde` serialization** — compact, works with any `Serialize`/`Deserialize` type.
-- **Noxu bind APIs** — sort-preserving encodings for integers, floats, and strings (described in [Section 8](#8-the-binding-layer)).
+- **Noxu bind APIs** — sort-preserving encodings for integers, floats, and strings (described in [The Binding Layer](bindings.md)).
 - **Custom encoding** — write fields in a fixed order for maximum control over sort order.
 
 Example using `bincode` for a structured value:
@@ -84,9 +86,10 @@ let decoded: Employee = bincode::deserialize(bytes)?;
 
 Key design has a direct impact on performance and sort order. Because records are sorted lexicographically by key bytes:
 
-- Numeric keys encoded as big-endian integers sort correctly as unsigned values. The Noxu bind APIs provide sort-preserving encodings for signed integers and floating-point numbers.
+- Numeric keys encoded as big-endian integers sort correctly as unsigned values. The Noxu bind
+  APIs provide sort-preserving encodings for signed integers and floating-point numbers.
 - String keys in UTF-8 sort in lexicographic order, which is usually correct for text data.
-- Composite keys (e.g., `namespace:id`) enable prefix scans: iterate all records in a namespace by seeking to `namespace:` and reading forward.
+- Composite keys (e.g., `namespace:id`) enable prefix scans: iterate all records in a namespace
+  by seeking to `namespace:` and reading forward.
 
 ---
-

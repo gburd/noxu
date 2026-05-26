@@ -22,3 +22,4 @@ adapted for Rust idioms.
 6. [Cursors](cursors.md) — sequential and positioned access
 7. [Secondary Databases](secondary-databases.md) — automatic index maintenance
 8. [Serialization Bindings](bindings.md) — typed access via `noxu-bind`
+9. [Migrating from v1.4.x](migrating.md) — breaking changes and bug fixes that surface in user code

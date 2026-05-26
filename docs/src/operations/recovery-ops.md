@@ -19,6 +19,7 @@ to the amount of data written since the last checkpoint.
    attempting any repair.
 
 4. **Attempt normal reopen**:
+
    ```rust
    let env = Environment::open(
        EnvironmentConfig::new(path)
@@ -26,6 +27,7 @@ to the amount of data written since the last checkpoint.
            .with_transactional(true),
    )?;
    ```
+
    If this succeeds, recovery is complete.
 
 5. **If reopen fails — restore from replica** (replication environments only):
@@ -46,4 +48,3 @@ returned:
    additional space automatically.
 
 ---
-

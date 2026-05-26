@@ -423,3 +423,308 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     cursor.close().unwrap();
     let _ = env.close();
 }
+
+// ---------------------------------------------------------------------------
+// v1.5 Sprint 1 — sorted-dup count + delete regressions
+// ---------------------------------------------------------------------------
+
+/// `Database::count()` reports the total number of (key, data) pairs in a
+/// sorted-duplicate database, including every duplicate.
+///
+/// Regression for v1.5 Sprint 1 finding (Group B, item 1): `put_dup`
+/// previously bypassed the per-database entry counter, so `db.count()`
+/// returned 0 even after inserting many duplicates.
+#[test]
+fn test_database_count_includes_all_dups() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
+    let db = env.open_database(None, "test", &db_cfg).unwrap();
+
+    // Empty: count is 0.
+    assert_eq!(db.count().unwrap(), 0);
+
+    // 5 dups for the same key.
+    let key = DatabaseEntry::from_bytes(b"k");
+    for i in 0u8..5 {
+        db.put(None, &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+    }
+    // Plus 3 more (key, data) pairs under a different key.
+    let key2 = DatabaseEntry::from_bytes(b"k2");
+    for i in 0u8..3 {
+        db.put(None, &key2, &DatabaseEntry::from_bytes(&[i])).unwrap();
+    }
+
+    // Per BDB-JE Database.count() contract: total = 5 + 3 = 8.
+    assert_eq!(
+        db.count().unwrap(),
+        8,
+        "db.count() must include every duplicate pair"
+    );
+
+    // Re-inserting an existing exact (key, data) pair must not double-count.
+    db.put(None, &key, &DatabaseEntry::from_bytes(&[0])).unwrap();
+    assert_eq!(db.count().unwrap(), 8);
+
+    let _ = env.close();
+}
+
+/// `Database::delete(key)` on a sorted-duplicate database removes every
+/// (key, data) pair sharing that key, matching BDB-JE's contract that
+/// `Database.delete(key)` removes EVERY record with the supplied key.
+///
+/// Regression for v1.5 Sprint 1 finding (Group B, item 2): the previous
+/// implementation positioned a cursor on the first dup and deleted only
+/// that one, leaving the rest of the duplicate set intact.
+#[test]
+fn test_database_delete_removes_all_dups() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
+    let db = env.open_database(None, "test", &db_cfg).unwrap();
+
+    // 4 dups under "target" + 2 dups under "keep" (to ensure delete is
+    // scoped to the requested key).
+    let target = DatabaseEntry::from_bytes(b"target");
+    for v in [b"a".as_ref(), b"b", b"c", b"d"] {
+        db.put(None, &target, &DatabaseEntry::from_bytes(v)).unwrap();
+    }
+    let keep = DatabaseEntry::from_bytes(b"keep");
+    for v in [b"x".as_ref(), b"y"] {
+        db.put(None, &keep, &DatabaseEntry::from_bytes(v)).unwrap();
+    }
+    assert_eq!(db.count().unwrap(), 6);
+
+    // Delete the whole "target" duplicate set in one call.
+    let s = db.delete(None, &target).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // No (target, *) record may remain.
+    let mut out = DatabaseEntry::new();
+    let s = db.get(None, &target, &mut out).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "db.delete(target) must remove every dup"
+    );
+
+    // The unrelated key's dups must remain.
+    let mut out = DatabaseEntry::new();
+    let s = db.get(None, &keep, &mut out).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // count() should now reflect only the surviving "keep" pairs.
+    assert_eq!(db.count().unwrap(), 2);
+
+    // A second delete of an absent key must report NotFound.
+    let s = db.delete(None, &target).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+
+    let _ = env.close();
+}
+
+// ─── Sprint 6 / Property 3 — SearchGte / Search / SearchBoth oracle ──────────
+//
+// Property: against a sorted-duplicate database populated with random
+// (key, data) pairs (with intentional key collisions),
+//
+//   * `Get::Search(key)` must succeed iff the oracle has at least one dup
+//     for `key`, and on success the returned data must be one of the
+//     recorded dups.  (BDB-JE allows any dup; we only assert membership.)
+//   * `Get::SearchBoth(key, data)` must succeed iff the (key, data) pair
+//     exists in the oracle, and must return NotFound otherwise.
+//   * `Get::SearchGte(seed)` must return the same key as the brute-force
+//     `oracle.range(seed..).next()` answer.
+//
+// This is the sorted-dup cousin of the v1.4.3
+// `cursor_search_gte_oracle_brute_force_small_random` test and targets
+// the bug class fixed in Sprint 1B (Get::Search/SearchBoth/SearchGte
+// disagreement with stored dups).
+
+mod prop_sorted_dup_oracle {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn sorted_dup_search_oracle_brute_force_small_random(
+            // 1..=64 (key, data) inserts with 1..=8-byte keys (high
+            // collision rate -> exercises the dup tree) and 1..=16-byte
+            // values.
+            pairs in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<u8>(), 1..=8),
+                    prop::collection::vec(any::<u8>(), 1..=16),
+                ),
+                1..=64,
+            ),
+            // 1..=32 random probes for Search / SearchGte coverage of
+            // both hits and misses.  Probes are independently random so
+            // most miss; the few that collide with inserted keys exercise
+            // the hit path.
+            probes in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 1..=8),
+                1..=32,
+            ),
+            // Random (key, data) probes for SearchBoth misses.
+            both_probes in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<u8>(), 1..=8),
+                    prop::collection::vec(any::<u8>(), 1..=16),
+                ),
+                1..=16,
+            ),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let env = open_env(&dir);
+            let db_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true);
+            let db = env
+                .open_database(None, "prop_sorted_dup", &db_cfg)
+                .unwrap();
+
+            // Oracle: key -> sorted set of dup data values.
+            let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> =
+                BTreeMap::new();
+            for (k, v) in &pairs {
+                let s = db.put(
+                    None,
+                    &DatabaseEntry::from_bytes(k),
+                    &DatabaseEntry::from_bytes(v),
+                ).unwrap();
+                // BDB-JE: a duplicate (key, data) re-insert returns
+                // KeyExist on a sorted-dup DB; otherwise Success.
+                let oracle_entry = oracle.entry(k.clone()).or_default();
+                let oracle_already = !oracle_entry.insert(v.clone());
+                let expected = if oracle_already {
+                    OperationStatus::KeyExists
+                } else {
+                    OperationStatus::Success
+                };
+                prop_assert_eq!(
+                    s, expected,
+                    "put({:?},{:?}) returned unexpected status (oracle_already={})",
+                    k, v, oracle_already,
+                );
+            }
+
+            let mut cursor = db.open_cursor(None, None).unwrap();
+
+            // Property 3a: Get::Search agrees with oracle.contains_key.
+            for probe in &probes {
+                let mut k_e = DatabaseEntry::from_bytes(probe);
+                let mut d_e = DatabaseEntry::new();
+                let s = cursor
+                    .get(&mut k_e, &mut d_e, Get::Search, None)
+                    .unwrap();
+                match (s, oracle.get(probe)) {
+                    (OperationStatus::Success, Some(dups)) => {
+                        prop_assert_eq!(
+                            k_e.data(), probe.as_slice(),
+                            "Search({:?}) returned wrong key", probe,
+                        );
+                        prop_assert!(
+                            dups.contains(d_e.data()),
+                            "Search({:?}) returned data {:?} not in oracle dup-set {:?}",
+                            probe, d_e.data(), dups,
+                        );
+                    }
+                    (OperationStatus::NotFound, None) => { /* agree */ }
+                    (got, want) => prop_assert!(
+                        false,
+                        "Search({:?}) disagreement: got={:?}, oracle={:?}",
+                        probe, got, want,
+                    ),
+                }
+            }
+
+            // Property 3b: Get::SearchGte agrees with oracle.range(probe..).
+            for probe in &probes {
+                let mut k_e = DatabaseEntry::from_bytes(probe);
+                let mut d_e = DatabaseEntry::new();
+                let s = cursor
+                    .get(&mut k_e, &mut d_e, Get::SearchGte, None)
+                    .unwrap();
+                let want = oracle
+                    .range::<Vec<u8>, _>(probe.clone()..)
+                    .next();
+                match (s, want) {
+                    (OperationStatus::Success, Some((wk, wd))) => {
+                        prop_assert_eq!(
+                            k_e.data(), wk.as_slice(),
+                            "SearchGte({:?}) returned wrong key (want {:?})",
+                            probe, wk,
+                        );
+                        prop_assert!(
+                            wd.contains(d_e.data()),
+                            "SearchGte({:?}) returned data {:?} not in oracle dup-set {:?}",
+                            probe, d_e.data(), wd,
+                        );
+                    }
+                    (OperationStatus::NotFound, None) => { /* agree */ }
+                    (got, want) => prop_assert!(
+                        false,
+                        "SearchGte({:?}) disagreement: got={:?}, oracle={:?}",
+                        probe, got, want,
+                    ),
+                }
+            }
+
+            // Property 3c: Get::SearchBoth must succeed for every (key, data)
+            // that the oracle says is present.
+            for (k, dups) in &oracle {
+                for d in dups {
+                    let mut k_e = DatabaseEntry::from_bytes(k);
+                    let mut d_e = DatabaseEntry::from_bytes(d);
+                    let s = cursor
+                        .get(&mut k_e, &mut d_e, Get::SearchBoth, None)
+                        .unwrap();
+                    prop_assert_eq!(
+                        s, OperationStatus::Success,
+                        "SearchBoth({:?},{:?}) returned NotFound for an inserted pair",
+                        k, d,
+                    );
+                    prop_assert_eq!(k_e.data(), k.as_slice());
+                    prop_assert_eq!(d_e.data(), d.as_slice());
+                }
+            }
+
+            // Property 3d: Get::SearchBoth on a (key, data) NOT in the
+            // oracle must return NotFound.
+            for (k, d) in &both_probes {
+                let oracle_has = oracle
+                    .get(k)
+                    .is_some_and(|dups| dups.contains(d));
+                let mut k_e = DatabaseEntry::from_bytes(k);
+                let mut d_e = DatabaseEntry::from_bytes(d);
+                let s = cursor
+                    .get(&mut k_e, &mut d_e, Get::SearchBoth, None)
+                    .unwrap();
+                let expected = if oracle_has {
+                    OperationStatus::Success
+                } else {
+                    OperationStatus::NotFound
+                };
+                prop_assert_eq!(
+                    s, expected,
+                    "SearchBoth({:?},{:?}) status mismatch (oracle_has={})",
+                    k, d, oracle_has,
+                );
+            }
+
+            cursor.close().unwrap();
+            let _ = env.close();
+        }
+    }
+}

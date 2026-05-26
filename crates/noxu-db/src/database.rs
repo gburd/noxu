@@ -112,14 +112,28 @@ impl Database {
     /// Uses cached `lock_manager` / `log_manager` to avoid acquiring
     /// `env_impl.lock()` on every operation.
     fn make_cursor(&self) -> CursorImpl {
+        self.make_cursor_with_locker(0)
+    }
+
+    /// Creates a CursorImpl with an explicit `locker_id`.
+    ///
+    /// Auto-commit cursors use `0`; transactional cursors must use the
+    /// owning `Transaction::id` so that the LN log entries written by
+    /// `cursor.put` / `cursor.delete` carry the txn id and recovery's
+    /// commit/abort tracking can correctly skip aborted txns.  Without
+    /// this, every LN entry was written with `txn_id = None` (the
+    /// auto-commit form) and recovery treated aborted-txn writes as
+    /// committed once `env_impl.close()` started running on `env.close()`
+    /// after a successful commit/abort (F1).
+    fn make_cursor_with_locker(&self, locker_id: i64) -> CursorImpl {
         match &self.log_manager {
             Some(lm) => CursorImpl::with_log_manager(
                 Arc::clone(&self.db_impl),
-                0,
+                locker_id,
                 Arc::clone(lm),
             )
             .with_lock_manager(Arc::clone(&self.lock_manager)),
-            None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
+            None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
         }
     }
@@ -149,7 +163,14 @@ impl Database {
     /// In which passes the
     /// transaction's `Locker` to the new `CursorImpl`.
     fn make_cursor_for_txn(&self, txn: &Transaction) -> CursorImpl {
-        let cursor = self.make_cursor();
+        // Use the transaction id as the cursor's locker_id so that LN
+        // log entries written under this cursor carry the txn id
+        // (recovery's analysis pass uses LN.txn_id together with
+        // TxnCommit / TxnAbort records to decide whether to redo or
+        // undo the LN). Pre-fix this was hardcoded to 0, which made
+        // every txn-LN look like an auto-commit LN and caused
+        // recovery to redo aborted writes.
+        let cursor = self.make_cursor_with_locker(txn.get_id() as i64);
         if let Some(inner) = txn.get_inner_txn() {
             cursor.with_txn(inner)
         } else {
@@ -607,18 +628,29 @@ impl Database {
             Some(t) => self.make_cursor_for_txn(t),
             None => self.make_cursor(),
         };
-        // First search to position the cursor
-        let status = match cursor
+        // For sorted-duplicate databases the BDB-JE contract for
+        // `Database.delete(key)` is to remove EVERY (key, data) pair
+        // sharing the supplied key, not just the first duplicate.  We
+        // implement that by re-positioning the cursor with `Set` after
+        // each successful delete: the search uses the primary-key prefix
+        // so it finds the next surviving dup until the duplicate set is
+        // empty.  For non-dup databases the loop runs at most once (the
+        // second iteration is a single `NotFound` search) so the
+        // single-record fast path is preserved.
+        let mut deleted_any = false;
+        while let noxu_dbi::OperationStatus::Success = cursor
             .search(key_bytes, None, SearchMode::Set)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
         {
-            noxu_dbi::OperationStatus::Success => {
-                cursor.delete().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-                OperationStatus::Success
-            }
-            _ => OperationStatus::NotFound,
+            cursor
+                .delete()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            deleted_any = true;
+        }
+        let status = if deleted_any {
+            OperationStatus::Success
+        } else {
+            OperationStatus::NotFound
         };
         let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
         // Auto-commit: fsync before returning (skip if already covered).
@@ -634,10 +666,19 @@ impl Database {
 
     /// Opens a cursor for iterating over database records.
     ///
+    /// When a `Some(&txn)` is passed, the cursor binds to the transaction's
+    /// `Locker`: every cursor `get` acquires shared locks tracked by the txn,
+    /// every cursor `put`/`delete` acquires exclusive locks and is rolled
+    /// back if the txn aborts.  When `txn` is `None` the cursor runs in
+    /// auto-commit mode — each write is its own transaction and is fsynced
+    /// before returning.
     ///
+    /// **You must close the cursor before committing or aborting the
+    /// transaction it was opened under.**
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle that the cursor should
+    ///   participate in.
     /// * `config` - Optional cursor configuration
     ///
     /// # Returns
@@ -647,7 +688,7 @@ impl Database {
     /// Returns an error if the database is closed
     pub fn open_cursor(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         config: Option<&CursorConfig>,
     ) -> Result<Cursor> {
         self.check_open()?;
@@ -658,7 +699,15 @@ impl Database {
         let cursor_impl = if read_only {
             CursorImpl::new(Arc::clone(&self.db_impl), 0)
         } else {
-            self.make_cursor()
+            // Plumb the caller's txn through to the cursor so that
+            // cursor reads acquire shared locks via the txn's locker and
+            // cursor writes acquire exclusive locks (and roll back on
+            // txn.abort()) rather than auto-committing.  See API audit
+            // 2026-05 cursor finding C1.
+            match txn {
+                Some(t) => self.make_cursor_for_txn(t),
+                None => self.make_cursor(),
+            }
         };
 
         Ok(Cursor::from_impl(cursor_impl, read_only))

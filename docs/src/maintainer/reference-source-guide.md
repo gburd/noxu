@@ -9,7 +9,7 @@ during porting work. It is gitignored — these files are not committed and
 are not required to build, test, or contribute. Place them at the
 repository root if you have local copies. Do NOT modify them.
 
-```
+```text
 <repo-root>/_/je/            embedded transactional database reference (Java, read-only)
 <repo-root>/_/nosql/         extended variant with 10 additional features (Java, read-only)
 ```

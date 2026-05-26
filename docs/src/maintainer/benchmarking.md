@@ -58,6 +58,7 @@ SCALES="1K 10K 100K" scripts/run_benchmarks.sh
 | group commit/8t | 100K | 2010 ops/s | 1437 ops/s (no GC) | Noxu +40% |
 
 **Key observations**:
+
 - Read throughput advantage: no JVM warmup (12x at 1K, 12% at 100K)
 - Write throughput advantage: fsync coalescing on NVMe
 - Concurrency gap (w10_conc): Noxu's LM is 3.7x faster at 16 threads — known gap
@@ -66,7 +67,7 @@ SCALES="1K 10K 100K" scripts/run_benchmarks.sh
 
 ## Interpreting Criterion Output
 
-```
+```text
 write_bench/seq_write/1K
     time:   [632.45 µs 634.12 µs 636.23 µs]
     thrpt:  [1572.8 /s 1576.7 /s 1581.8 /s]

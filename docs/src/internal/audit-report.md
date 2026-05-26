@@ -27,6 +27,7 @@ findings from three independent audits:
 3. **API & Extensions Audit**  -  noxu-db, noxu-bind, noxu-collections, noxu-persist, noxu-rep, noxu-engine
 
 See also:
+
 - `docs/RUST_REVIEW.md`  -  Idiomatic Rust quality review (B+ overall)
 - `docs/JE_FIDELITY_REVIEW.md`  -  Algorithm fidelity review with Noxu code comparisons
 
@@ -40,6 +41,7 @@ to the API, and replication is stubbed.
 
 **Fidelity Assessment:** *(snapshot — current numbers are higher; see
 `docs/src/maintainer/testing.md` and `ARCHITECTURE.md`)*
+
 - Data Structures: 95%
 - Read-Only Operations: 80%
 - Modification Operations: 40% (split/commit gaps)
@@ -149,32 +151,32 @@ to the API, and replication is stubbed.
 
 ### P1  -  Transaction & Recovery
 
-7. **Implement LockManager thread blocking** with parking_lot Condvar + timeout
-8. **Add deadlock victim selection**  -  choose by txn priority, abort youngest
-9. **Implement CursorImpl** with real B-tree traversal via latch coupling
-10. **Implement RecoveryManager**  -  3-phase recovery with undo processing
-11. **Implement checkpoint dirty IN tracking**
-12. **Fix Lsn::cmp() to reject NULL_LSN**
-13. **Fix SharedLatch read-to-write deadlock detection**
+1. **Implement LockManager thread blocking** with parking_lot Condvar + timeout
+2. **Add deadlock victim selection**  -  choose by txn priority, abort youngest
+3. **Implement CursorImpl** with real B-tree traversal via latch coupling
+4. **Implement RecoveryManager**  -  3-phase recovery with undo processing
+5. **Implement checkpoint dirty IN tracking**
+6. **Fix Lsn::cmp() to reject NULL_LSN**
+7. **Fix SharedLatch read-to-write deadlock detection**
 
 ### P2  -  Feature Completion
 
-14. **Implement cleaner LN migration** and cost/benefit file selection
-15. **Add key prefix compression** to reduce memory 25-40%
-16. **Add SecondaryDatabase support**
-17. **Add VLSN serialization** for log entries
-18. **Implement group commit** for write throughput
-19. **Add file handle caching** to FileManager
-20. **Fix string encoding** to handle embedded nulls
-21. **Fix PrimaryKey sorted encoding** for signed integers
+1. **Implement cleaner LN migration** and cost/benefit file selection
+2. **Add key prefix compression** to reduce memory 25-40%
+3. **Add SecondaryDatabase support**
+4. **Add VLSN serialization** for log entries
+5. **Implement group commit** for write throughput
+6. **Add file handle caching** to FileManager
+7. **Fix string encoding** to handle embedded nulls
+8. **Fix PrimaryKey sorted encoding** for signed integers
 
 ### P3  -  Polish
 
-22. Port remaining ~143 config parameters
-23. Add schema evolution to noxu-persist
-24. Add StoredList to noxu-collections
-25. Add Sequence support
-26. Implement evictor with real LRU (O(1) operations)
-27. Add INCompressor for empty BIN pruning
-28. Port remaining Noxu exception types
-29. Replace sleep loops with condvar-based daemon wakeup
+1. Port remaining ~143 config parameters
+2. Add schema evolution to noxu-persist
+3. Add StoredList to noxu-collections
+4. Add Sequence support
+5. Implement evictor with real LRU (O(1) operations)
+6. Add INCompressor for empty BIN pruning
+7. Port remaining Noxu exception types
+8. Replace sleep loops with condvar-based daemon wakeup

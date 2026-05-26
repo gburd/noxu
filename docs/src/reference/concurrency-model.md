@@ -16,7 +16,7 @@ Two distinct levels of concurrency control apply:
 
 ### Latch Hierarchy (acquire outer before inner)
 
-```
+```text
 LogManager write latch
     └── TreeRoot latch (per-database)
             └── IN shared/exclusive latch
