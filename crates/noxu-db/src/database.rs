@@ -645,10 +645,19 @@ impl Database {
 
     /// Opens a cursor for iterating over database records.
     ///
+    /// When a `Some(&txn)` is passed, the cursor binds to the transaction's
+    /// `Locker`: every cursor `get` acquires shared locks tracked by the txn,
+    /// every cursor `put`/`delete` acquires exclusive locks and is rolled
+    /// back if the txn aborts.  When `txn` is `None` the cursor runs in
+    /// auto-commit mode — each write is its own transaction and is fsynced
+    /// before returning.
     ///
+    /// **You must close the cursor before committing or aborting the
+    /// transaction it was opened under.**
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle that the cursor should
+    ///   participate in.
     /// * `config` - Optional cursor configuration
     ///
     /// # Returns
@@ -658,7 +667,7 @@ impl Database {
     /// Returns an error if the database is closed
     pub fn open_cursor(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         config: Option<&CursorConfig>,
     ) -> Result<Cursor> {
         self.check_open()?;
@@ -669,7 +678,15 @@ impl Database {
         let cursor_impl = if read_only {
             CursorImpl::new(Arc::clone(&self.db_impl), 0)
         } else {
-            self.make_cursor()
+            // Plumb the caller's txn through to the cursor so that
+            // cursor reads acquire shared locks via the txn's locker and
+            // cursor writes acquire exclusive locks (and roll back on
+            // txn.abort()) rather than auto-committing.  See API audit
+            // 2026-05 cursor finding C1.
+            match txn {
+                Some(t) => self.make_cursor_for_txn(t),
+                None => self.make_cursor(),
+            }
         };
 
         Ok(Cursor::from_impl(cursor_impl, read_only))
