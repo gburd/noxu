@@ -256,19 +256,27 @@ impl SecondaryDatabase {
 
     /// Opens a cursor on the secondary database.
     ///
+    /// When `txn` is `Some(_)`, the inner cursor over the secondary index
+    /// participates in the supplied transaction — reads acquire shared
+    /// locks via the txn's locker and any writes (currently only the
+    /// primary delete cascade triggered by `SecondaryCursor::delete`) are
+    /// rolled back when the txn aborts.  When `txn` is `None` the inner
+    /// cursor runs in auto-commit mode.
     ///
+    /// `config` is forwarded to the inner `Database::open_cursor` call so
+    /// `read_uncommitted` and other cursor-level flags propagate correctly.
     ///
     /// # Returns
     /// A `SecondaryCursor` that iterates secondary index entries and returns
     /// primary data.
     pub fn open_cursor(
         &self,
-        _txn: Option<&Transaction>,
-        _config: Option<&CursorConfig>,
+        txn: Option<&Transaction>,
+        config: Option<&CursorConfig>,
     ) -> Result<SecondaryCursor<'_>> {
         self.check_open()?;
         self.check_readable()?;
-        Ok(SecondaryCursor::new(self))
+        SecondaryCursor::new(self, txn, config)
     }
 
     /// Starts incremental population mode.
@@ -499,8 +507,13 @@ impl SecondaryDatabase {
     }
 
     /// Builds a `SecondaryCursor` on this secondary database (internal).
+    ///
+    /// Called from auto-commit code paths that do not have a transaction
+    /// handle (e.g. `SecondaryDatabase::delete`, which currently runs
+    /// secondary cleanup auto-committed; see audit finding F5 for the
+    /// follow-up work to plumb the txn through these paths).
     fn open_cursor_internal(&self) -> Result<SecondaryCursor<'_>> {
-        Ok(SecondaryCursor::new(self))
+        SecondaryCursor::new(self, None, None)
     }
 
     /// Populates the secondary index from the primary if the secondary is empty.
