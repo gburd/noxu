@@ -59,6 +59,14 @@ pub struct Transaction {
     start_time: Instant,
     /// Whether this is read-only
     read_only: bool,
+    /// Optional caller-supplied transaction name (JE
+    /// `Transaction.setName(String)`).
+    ///
+    /// The name is purely diagnostic: it is included in `Debug`
+    /// output and structured logs, and may be queried via
+    /// [`Transaction::get_name`].  Wave 1C audit cleanup
+    /// (transaction-env F22 `setName/getName missing`).
+    name: Mutex<Option<String>>,
     /// Durability override (None = use environment default)
     durability: Option<Durability>,
     /// Lock timeout in milliseconds (0 = use environment default)
@@ -106,6 +114,7 @@ impl Transaction {
             state: Mutex::new(TransactionState::Open),
             start_time: Instant::now(),
             read_only: config.read_only,
+            name: Mutex::new(None),
             durability: Some(config.durability),
             lock_timeout_ms: Mutex::new(config.lock_timeout_ms),
             txn_timeout_ms: Mutex::new(config.txn_timeout_ms),
@@ -131,6 +140,7 @@ impl Transaction {
             state: Mutex::new(TransactionState::Open),
             start_time: Instant::now(),
             read_only: config.read_only,
+            name: Mutex::new(None),
             durability: Some(config.durability),
             lock_timeout_ms: Mutex::new(config.lock_timeout_ms),
             txn_timeout_ms: Mutex::new(config.txn_timeout_ms),
@@ -472,6 +482,59 @@ impl Transaction {
         self.id
     }
 
+    /// Set the human-readable name of this transaction.
+    ///
+    /// Mirrors `Transaction.setName(String)`.  The name is purely
+    /// diagnostic — it appears in `Debug` output, structured log
+    /// records, and lock-conflict reports.  Wave 1C audit cleanup
+    /// (transaction-env F22).
+    pub fn set_name<S: Into<String>>(&self, name: S) {
+        *self.name.lock().unwrap() = Some(name.into());
+    }
+
+    /// Returns the caller-supplied transaction name, if any.
+    ///
+    /// Mirrors `Transaction.getName()`.
+    pub fn get_name(&self) -> Option<String> {
+        self.name.lock().unwrap().clone()
+    }
+
+    /// Returns the number of locks currently held by this transaction.
+    ///
+    /// Mirrors `Transaction.getLockStat()` / `Transaction.getNumWriteLocks() +
+    /// getNumReadLocks()` (the JE API exposes both counts; we return
+    /// the sum because the lock manager partitions reads / writes per
+    /// LSN rather than per record).  Returns `0` for transactions that
+    /// have not acquired any locks (or for read-only transactions
+    /// running with read-uncommitted isolation, which skip lock
+    /// acquisition entirely).  Wave 1C audit cleanup
+    /// (transaction-env F23 "lock-stat reporting missing").
+    pub fn lock_count(&self) -> usize {
+        match &self.inner_txn {
+            Some(txn) => {
+                let g = txn.lock().unwrap();
+                g.read_lock_count() + g.write_lock_count()
+            }
+            None => 0,
+        }
+    }
+
+    /// Returns `(read_lock_count, write_lock_count)` for this
+    /// transaction's lock set.
+    ///
+    /// Mirrors JE's `Transaction.getNumReadLocks()` /
+    /// `getNumWriteLocks()` accessors.  Returns `(0, 0)` for a
+    /// transaction that has not acquired any locks.
+    pub fn lock_counts(&self) -> (usize, usize) {
+        match &self.inner_txn {
+            Some(txn) => {
+                let g = txn.lock().unwrap();
+                (g.read_lock_count(), g.write_lock_count())
+            }
+            None => (0, 0),
+        }
+    }
+
     /// Get the current transaction state.
     pub fn get_state(&self) -> TransactionState {
         *self.state.lock().unwrap()
@@ -570,6 +633,35 @@ mod tests {
         assert_eq!(txn.get_state(), TransactionState::Open);
         assert!(txn.is_valid());
         assert!(!txn.is_read_only());
+    }
+
+    /// Wave 1C audit cleanup (transaction-env F22): set_name / get_name
+    /// round-trip and survives commit (the JE shape stays valid until
+    /// the txn is dropped).
+    #[test]
+    fn test_set_name_get_name_round_trip() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(1, config);
+        assert_eq!(txn.get_name(), None);
+
+        txn.set_name("workload-import");
+        assert_eq!(txn.get_name().as_deref(), Some("workload-import"));
+
+        // Setting again replaces.
+        txn.set_name("workload-import-2");
+        assert_eq!(txn.get_name().as_deref(), Some("workload-import-2"));
+    }
+
+    /// Wave 1C audit cleanup (transaction-env F23): lock_count and
+    /// lock_counts return zero when there is no inner Txn (i.e., the
+    /// transaction is decorative — unit-test mode without an
+    /// EnvironmentImpl wired in).
+    #[test]
+    fn test_lock_counts_without_inner_txn_are_zero() {
+        let config = TransactionConfig::default();
+        let txn = Transaction::new(1, config);
+        assert_eq!(txn.lock_count(), 0);
+        assert_eq!(txn.lock_counts(), (0, 0));
     }
 
     #[test]

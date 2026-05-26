@@ -66,14 +66,31 @@ impl Cursor {
     /// Retrieve a record using the cursor.
     ///
     /// # Arguments
-    /// * `key` - Key to search for (input for Search, output for iteration)
-    /// * `data` - Output buffer for the record data
-    /// * `get_type` - Type of get operation
-    /// * `lock_mode` - Lock mode (currently ignored)
+    /// * `key` — search input (for `Get::Search` / `Get::SearchGte`) or
+    ///   the output buffer that receives the discovered key (for
+    ///   iteration / range search variants).
+    /// * `data` — output buffer for the record's value.
+    /// * `get_type` — selects the navigation primitive (see [`Get`]).
+    /// * `lock_mode` — reserved for per-operation isolation overrides
+    ///   (e.g., dirty reads inside an otherwise-serializable txn).
+    ///   The current implementation ignores this argument and uses the
+    ///   surrounding transaction's isolation level (set on
+    ///   [`crate::transaction_config::TransactionConfig`]).  Per-call
+    ///   read-uncommitted is not yet implemented; pass `None` for now.
+    ///   Wave 1C audit cleanup (cursor F17) keeps the parameter so the
+    ///   ABI is stable for the v1.6 wiring.
     ///
     /// # Returns
-    /// `OperationStatus::Success` if the operation succeeded,
-    /// `OperationStatus::NotFound` if no record was found.
+    /// * `OperationStatus::Success` if the cursor positioned on a record.
+    /// * `OperationStatus::NotFound` if no record satisfied the request.
+    ///
+    /// # Errors
+    /// * [`NoxuError::DatabaseClosed`] if the underlying database has
+    ///   been closed.
+    /// * [`NoxuError::OperationNotAllowed`] if the cursor was passed a
+    ///   `Get::Current` request before being positioned by an earlier
+    ///   call, or if an underlying B-tree operation rejected the
+    ///   request.
     pub fn get(
         &mut self,
         key: &mut DatabaseEntry,
@@ -258,9 +275,28 @@ impl Cursor {
     /// * `data` - Data to store
     /// * `put_type` - Type of put operation
     ///
+    /// Store a record using the cursor.
+    ///
+    /// # Arguments
+    /// * `key` — the record's key.  Empty keys (`get_data()` returns
+    ///   `None` or an empty slice) are forwarded to the underlying
+    ///   B-tree which rejects them on writable databases.
+    /// * `data` — the record's value.
+    /// * `put_type` — see [`Put`] for the per-mode semantics.
+    ///
     /// # Returns
-    /// `OperationStatus::Success` if the operation succeeded,
-    /// `OperationStatus::KeyExists` if the key already exists (for NoOverwrite).
+    /// * `OperationStatus::Success` if the record was inserted or updated.
+    /// * `OperationStatus::KeyExists` for `Put::NoOverwrite` /
+    ///   `Put::NoDupData` when the key (or `(key, data)` pair under
+    ///   sorted-dup) already exists.
+    ///
+    /// # Errors
+    /// * [`NoxuError::DatabaseClosed`] if the underlying database has
+    ///   been closed.
+    /// * [`NoxuError::OperationNotAllowed`] if the cursor was opened
+    ///   read-only (Wave 1C audit cleanup, cursor F18 — typed error
+    ///   instead of the previous bare boolean), or if the call uses
+    ///   `Put::Current` before the cursor was positioned.
     pub fn put(
         &mut self,
         key: &DatabaseEntry,
@@ -331,10 +367,20 @@ impl Cursor {
 
     /// Count the number of records with the same key.
     ///
-    /// For databases without duplicates, this always returns 1 if positioned.
+    /// For non-duplicate databases this returns `1` when positioned and
+    /// `0` otherwise.  For sorted-dup databases it returns the number
+    /// of duplicate values stored under the cursor's current key.
     ///
     /// # Returns
-    /// The count of records, or 0 if the cursor is not positioned.
+    /// The count of records, or `0` if the cursor is not currently
+    /// positioned on a record.
+    ///
+    /// # Errors
+    /// * [`NoxuError::DatabaseClosed`] if the underlying database has
+    ///   been closed.
+    /// * [`NoxuError::OperationNotAllowed`] if the underlying B-tree
+    ///   count operation fails (e.g., the cursor was invalidated by a
+    ///   concurrent close).
     pub fn count(&self) -> Result<u64> {
         self.check_open()?;
 
@@ -350,7 +396,15 @@ impl Cursor {
 
     /// Close the cursor.
     ///
-    /// The cursor handle may not be used again after this call.
+    /// The cursor handle may not be used again after this call — every
+    /// subsequent operation returns [`NoxuError::OperationNotAllowed`].
+    ///
+    /// # Errors
+    /// Returns [`NoxuError::OperationNotAllowed`] if the cursor was
+    /// already closed.  Closing twice is treated as an application
+    /// error rather than a no-op so callers do not lose the signal
+    /// when a closed cursor is reused (Wave 1C audit cleanup,
+    /// cursor F19).
     pub fn close(&mut self) -> Result<()> {
         if self.state == CursorState::Closed {
             return Err(NoxuError::OperationNotAllowed(

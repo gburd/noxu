@@ -44,11 +44,11 @@ pub enum EnvironmentFailureReason {
     LogWrite,
 
     /// A log file was not found during read (truncation or deletion).
-    /// : `LOG_FILE_NOT_FOUND`.
+    /// Mirrors `LOG_FILE_NOT_FOUND`.
     LogFileNotFound,
 
     /// The log is incomplete or internally inconsistent.
-    /// : `LOG_INTEGRITY`.
+    /// Mirrors `LOG_INTEGRITY`.
     LogIntegrity,
 
     // ── B-tree ──────────────────────────────────────────────────────────────
@@ -58,19 +58,19 @@ pub enum EnvironmentFailureReason {
 
     // ── Unexpected internal state ──────────────────────────────────────────
     /// An unexpected internal state was reached (non-fatal; env still valid).
-    /// : `UNEXPECTED_STATE`.
+    /// Mirrors `UNEXPECTED_STATE`.
     UnexpectedState,
 
     /// An unexpected internal state was reached (fatal; env is invalidated).
-    /// : `UNEXPECTED_STATE_FATAL`.
+    /// Mirrors `UNEXPECTED_STATE_FATAL`.
     UnexpectedStateFatal,
 
     /// An unexpected exception was caught internally (non-fatal).
-    /// : `UNEXPECTED_EXCEPTION`.
+    /// Mirrors `UNEXPECTED_EXCEPTION`.
     UnexpectedException,
 
     /// An unexpected exception was caught internally (fatal; env invalidated).
-    /// : `UNEXPECTED_EXCEPTION_FATAL`.
+    /// Mirrors `UNEXPECTED_EXCEPTION_FATAL`.
     UnexpectedExceptionFatal,
 
     // ── Resource limits ─────────────────────────────────────────────────────
@@ -83,35 +83,46 @@ pub enum EnvironmentFailureReason {
 
     // ── Thread lifecycle ────────────────────────────────────────────────────
     /// The calling thread was interrupted while performing a
-    /// : `THREAD_INTERRUPTED`.
+    /// Mirrors `THREAD_INTERRUPTED`.
     ThreadInterrupted,
 
     // ── Replication ─────────────────────────────────────────────────────────
     /// The master transitioned to a replica while a transaction was active.
-    /// : `MASTER_TO_REPLICA_TRANSITION`.
+    /// Mirrors `MASTER_TO_REPLICA_TRANSITION`.
     MasterToReplicaTransition,
 
     /// The replica was fenced by the master.
-    /// : `REPLICA_FENCING`.
+    /// Mirrors `REPLICA_FENCING`.
     ReplicaFencing,
 
     /// A replication handshake error occurred.
-    /// : `HANDSHAKE_ERROR`.
+    /// Mirrors `HANDSHAKE_ERROR`.
     HandshakeError,
 
     /// Replication protocol version mismatch.
-    /// : `PROTOCOL_VERSION_MISMATCH`.
+    /// Mirrors `PROTOCOL_VERSION_MISMATCH`.
     ProtocolVersionMismatch,
 
     /// An uncaught exception in a background replication thread.
-    /// : `UNCAUGHT_EXCEPTION`.
+    /// Mirrors `UNCAUGHT_EXCEPTION`.
     UncaughtException,
 
     /// Forced shutdown was requested.
-    /// : `FORCED_SHUTDOWN`.
+    /// Mirrors `FORCED_SHUTDOWN`.
     ForcedShutdown,
 
     // ── Catch-all ──────────────────────────────────────────────────────────
+    /// Recovery (WAL replay during environment open) failed.
+    ///
+    /// Wave 1C audit cleanup (transaction-env F22): the v1.5.0 layer
+    /// surfaced every recovery failure as `UnexpectedState`, which
+    /// forced callers to string-match the prefix "recovery failed:"
+    /// to distinguish it from other unexpected-state errors.  This
+    /// variant is now produced specifically when WAL replay aborts
+    /// the open path; if `invalidates_environment` returns `true` the
+    /// environment is unusable and a fresh open is required.
+    RecoveryFailure,
+
     /// The specific reason is not mapped to a named variant.
     Other(String),
 }
@@ -132,6 +143,7 @@ impl EnvironmentFailureReason {
                 | EnvironmentFailureReason::BtreeCorruption
                 | EnvironmentFailureReason::UnexpectedStateFatal
                 | EnvironmentFailureReason::UnexpectedExceptionFatal
+                | EnvironmentFailureReason::RecoveryFailure
                 | EnvironmentFailureReason::DiskLimit
                 | EnvironmentFailureReason::LatchTimeout
                 | EnvironmentFailureReason::ReplicaFencing
@@ -202,6 +214,9 @@ impl std::fmt::Display for EnvironmentFailureReason {
             }
             EnvironmentFailureReason::ForcedShutdown => {
                 write!(f, "FORCED_SHUTDOWN")
+            }
+            EnvironmentFailureReason::RecoveryFailure => {
+                write!(f, "RECOVERY_FAILURE")
             }
             EnvironmentFailureReason::Other(s) => write!(f, "{s}"),
         }
@@ -735,6 +750,18 @@ impl From<noxu_dbi::DbiError> for NoxuError {
             DbiError::EnvironmentFailure { reason } => {
                 NoxuError::EnvironmentFailure {
                     reason: EnvironmentFailureReason::UnexpectedState,
+                    msg: reason,
+                }
+            }
+            // Wave 1C audit cleanup (transaction-env F22): map
+            // recovery failures to a typed `EnvironmentFailure` whose
+            // `reason` carries the recovery-specific
+            // `HardRecovery`/`LogIntegrity` distinction so callers can
+            // branch on the failure shape (corrupt log vs.
+            // unexpected state) without parsing the message string.
+            DbiError::RecoveryFailure { reason } => {
+                NoxuError::EnvironmentFailure {
+                    reason: EnvironmentFailureReason::RecoveryFailure,
                     msg: reason,
                 }
             }

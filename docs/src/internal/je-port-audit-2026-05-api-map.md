@@ -343,11 +343,14 @@ JE exposes ~80 string-keyed parameters with paired setters; Noxu's
 
 | JE parameter (string key) | Noxu fluent setter | Status |
 |---|---|---|
-| `GROUP_NAME` / `NODE_NAME` / `NODE_TYPE` / `HELPER_HOSTS` | builder args / `node_type` / `helper_hosts` | EQUIVALENT |
+| `GROUP_NAME` / `NODE_NAME` / `NODE_TYPE` | builder args / `node_type` | EQUIVALENT |
+| `HELPER_HOSTS` | (removed v1.5.1; never consumed) | MISSING-INTENTIONAL |
 | `DEFAULT_PORT` / `NODE_HOST_PORT` | `node_port` | EQUIVALENT |
 | `BIND_INADDR_ANY` | (none) | MISSING |
 | `CONSISTENCY_POLICY` | `consistency_policy` | EQUIVALENT |
-| `REP_STREAM_TIMEOUT` / `REPLICA_ACK_TIMEOUT` / `FEEDER_TIMEOUT` | `feeder_timeout` / `replica_ack_timeout` | EQUIVALENT |
+| `REP_STREAM_TIMEOUT` | (none) | MISSING |
+| `REPLICA_ACK_TIMEOUT` | `commit_durability.ack_timeout` | EQUIVALENT (renamed) |
+| `FEEDER_TIMEOUT` | (removed v1.5.1; never consumed) | MISSING-INTENTIONAL |
 | `REPLAY_*` family (cost percent, free disk percent, txn lock timeout, max open db handles, db handle timeout) | (none) | MISSING |
 | `ENV_CONSISTENCY_TIMEOUT` | (none) | MISSING |
 | `ARBITER_ACK_TIMEOUT` | (none) | MISSING — arbiter not implemented |
@@ -355,6 +358,15 @@ JE exposes ~80 string-keyed parameters with paired setters; Noxu's
 | `MAX_MESSAGE_SIZE` | (none) | MISSING |
 | `MAX_CLOCK_DELTA` | (none) | MISSING |
 | (20+ more SSL/network/heartbeat/batch tuning parameters) | partial | PRESENT-WITH-GAPS |
+
+> **v1.5.1 audit-cleanup note (Wave 1C).** `HELPER_HOSTS` and
+> `FEEDER_TIMEOUT` had Rust counterparts (`helper_hosts`,
+> `feeder_timeout` on `RepConfig`) that were stored on the builder
+> but never consulted in production code paths.  The Rust fields
+> were removed in v1.5.1; both rows are now MISSING-INTENTIONAL
+> until they are re-added with real semantics.  See
+> `api-audit-2026-05-rep.md` Lows and the matching commit on
+> `fix/wave1c-audit-low-info-cleanup`.
 
 ### `ReplicationGroup` / `ReplicationNode`
 
@@ -594,7 +606,7 @@ JE exposes ~80 string-keyed parameters with paired setters; Noxu's
 | `setAllowCreate` / `setExclusiveCreate` / `setReadOnly` / `setTransactional` / `setSecondaryBulkLoad` / `setDeferredWrite` | each present | EQUIVALENT |
 | `setMutations(Mutations)` | `with_mutations(...)` | EQUIVALENT |
 | `setModel(EntityModel)` | (none) | MISSING |
-| `setDatabaseNamer(DatabaseNamer)` | `with_database_namer(...)` | EQUIVALENT |
+| `setDatabaseNamer(DatabaseNamer)` | (removed v1.5.1; was unwired) | MISSING-INTENTIONAL |
 
 ### Annotations / model
 

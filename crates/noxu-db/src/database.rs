@@ -503,6 +503,20 @@ impl Database {
         opts: &ReadOptions,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        // Wave 1C audit cleanup (database Low "asymmetric observability
+        // between *_with_options paths and the basic ones"): mirror
+        // the span / counter / timer instrumentation that
+        // `Database::get` emits so dashboards do not lose the
+        // per-operation `op = get_with_options` slice when callers
+        // opt for the richer surface.
+        observe_span!(
+            "db_get_with_options",
+            db_name = self.name.as_str(),
+            key_size = key.get_data().map_or(0, |k| k.len()),
+            lock_mode = format!("{:?}", opts.lock_mode),
+        );
+        let _obs_timer = observe_timer_start!();
+        observe_counter!("noxu_db_operations_total", "op" => "get_with_options");
 
         let key_bytes = match key.get_data() {
             Some(k) => k,
@@ -536,12 +550,22 @@ impl Database {
                     data.set_data(&value);
                 }
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
+                observe_timer_record!(
+                    _obs_timer,
+                    "noxu_db_operation_duration_seconds",
+                    "op" => "get_with_options"
+                );
                 Ok(OperationStatus::Success)
             }
             _ => {
                 self.throughput
                     .n_pri_search_fails
                     .fetch_add(1, Ordering::Relaxed);
+                observe_timer_record!(
+                    _obs_timer,
+                    "noxu_db_operation_duration_seconds",
+                    "op" => "get_with_options"
+                );
                 Ok(OperationStatus::NotFound)
             }
         }
@@ -583,11 +607,30 @@ impl Database {
         // Partial put: read-modify-write using the partial offset/length.
         // LN.combinePuts() — existing bytes outside [offset..offset+length]
         // are preserved; only the specified range is replaced with new data.
+        //
+        // Wave 1C audit cleanup (database Low "partial-put length mismatch
+        // silent truncation"): when the user supplies a `data` value
+        // whose byte length does not match the configured partial
+        // length, JE rejects the call; the v1.5.0 implementation here
+        // silently min'd the two lengths and truncated the user's
+        // bytes.  We now return a typed [`NoxuError::IllegalArgument`]
+        // so the mismatch is visible at the call site instead of
+        // corrupting the on-disk record.
         let write_bytes: Vec<u8>;
         let data_bytes: &[u8] = if data.is_partial() {
             let new_bytes = data.get_data().unwrap_or(&[]);
             let off = data.get_partial_offset();
             let len = data.get_partial_length();
+            if new_bytes.len() != len {
+                return Err(NoxuError::IllegalArgument(format!(
+                    "partial put: data length {} does not match \
+                     partial_length {} (partial_offset={}); JE \
+                     requires exact equality",
+                    new_bytes.len(),
+                    len,
+                    off
+                )));
+            }
             // Fetch the existing record to splice into.
             let existing = {
                 let mut tmp_entry = DatabaseEntry::new();
@@ -610,9 +653,7 @@ impl Database {
             let total_len = (off + len).max(existing.len());
             let mut patched = existing;
             patched.resize(total_len, 0);
-            let copy_len = new_bytes.len().min(len);
-            patched[off..off + copy_len]
-                .copy_from_slice(&new_bytes[..copy_len]);
+            patched[off..off + len].copy_from_slice(new_bytes);
             write_bytes = patched;
             &write_bytes
         } else {
@@ -1110,8 +1151,8 @@ impl Database {
     /// - Each BIN entry that is not known-deleted has a valid (non-NULL) LSN.
     /// - The BIN's first key is >= the parent routing key (key-range containment).
     ///
-    /// Mirrors `Database.verify(VerifyConfig)` in— calls BtreeVerifier on the
-    /// underlying tree.
+    /// Mirrors `Database.verify(VerifyConfig)` — calls `BtreeVerifier` on
+    /// the underlying tree.
     ///
     /// # Arguments
     /// * `config` - Verification options (which checks to run, max errors, etc.)
@@ -1133,7 +1174,7 @@ impl Database {
     /// Creates a join cursor that returns records matching all secondary-key
     /// constraints expressed by the pre-positioned `cursors`.
     ///
-    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)` from .
+    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)`.
     ///
     /// Each cursor in `cursors` must already be positioned at the desired
     /// secondary key value (e.g. via `SecondaryCursor::get_search_key`).
@@ -1144,7 +1185,7 @@ impl Database {
     ///
     /// Unless `config.no_sort` is `true`, the cursor array is re-ordered by
     /// ascending duplicate-count estimate before the join starts, matching
-    /// 's optimisation for minimum candidate-set size.
+    /// JE's optimisation for minimum candidate-set size.
     ///
     /// The returned `JoinCursor` owns the `cursors` for its lifetime.
     ///
@@ -1234,6 +1275,59 @@ mod tests {
 
         let result = db.get(None, &key, &mut data).unwrap();
         assert_eq!(result, OperationStatus::NotFound);
+    }
+
+    /// Wave 1C audit cleanup (database Low "partial-put length
+    /// mismatch silent truncation"): a partial put whose `data` slice
+    /// differs in length from the configured partial-length must be
+    /// rejected with a typed error instead of silently truncating or
+    /// padding the splice.
+    #[test]
+    fn test_partial_put_length_mismatch_rejected() {
+        let (_temp_dir, _env, db) = temp_env_and_db();
+
+        let key = DatabaseEntry::from_bytes(b"k");
+        db.put(None, &key, &DatabaseEntry::from_bytes(b"hello world")).unwrap();
+
+        // Partial offset=6, partial_length=5 ("world"), but only 3 bytes
+        // supplied.  Used to silently truncate; now rejected.
+        let mut patch = DatabaseEntry::from_bytes(b"abc");
+        patch.set_partial(6, 5, true);
+        let err = db.put(None, &key, &patch).unwrap_err();
+        assert!(
+            matches!(err, NoxuError::IllegalArgument(_)),
+            "expected IllegalArgument, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("partial"),
+            "expected partial-related message, got {}",
+            err
+        );
+
+        // The on-disk record is unchanged because the call returned
+        // before any write.
+        let mut buf = DatabaseEntry::new();
+        let status = db.get(None, &key, &mut buf).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+        assert_eq!(buf.get_data().unwrap(), b"hello world");
+    }
+
+    /// Companion: when data.len() == partial_length the partial put
+    /// patches the slice in place and other bytes are preserved.
+    #[test]
+    fn test_partial_put_exact_length_patches_in_place() {
+        let (_temp_dir, _env, db) = temp_env_and_db();
+
+        let key = DatabaseEntry::from_bytes(b"k");
+        db.put(None, &key, &DatabaseEntry::from_bytes(b"hello world")).unwrap();
+
+        let mut patch = DatabaseEntry::from_bytes(b"WORLD");
+        patch.set_partial(6, 5, true);
+        db.put(None, &key, &patch).unwrap();
+
+        let mut buf = DatabaseEntry::new();
+        db.get(None, &key, &mut buf).unwrap();
+        assert_eq!(buf.get_data().unwrap(), b"hello WORLD");
     }
 
     #[test]
