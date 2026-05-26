@@ -235,3 +235,164 @@ fn f3_explicit_txn_durability_overrides_env_default() {
     db.close().unwrap();
     env.close().unwrap();
 }
+
+// ─── F12: auto-commit writes coordinate with explicit-txn locks ──────
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+#[test]
+fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
+    // Begin txn A, A.put(K, V) (write lock held).
+    // From a second thread, db.put(None, K, V2) (auto-commit write).
+    // The auto-commit write must block until A commits/aborts.
+    let tmp = TempDir::new().unwrap();
+    let env = Arc::new(open_env(&tmp, Durability::COMMIT_NO_SYNC));
+    let db = Arc::new(open_db(&env, "f12"));
+
+    // Seed the key so it has a non-NULL old_lsn — the auto-commit
+    // cursor's `lock_write_before_log` takes the write lock against the
+    // existing record's LSN, which is what the explicit txn's put just
+    // pinned.  (A brand-new insert with no prior version would not
+    // coordinate; that is a separate corner case noted as deferred F12
+    // follow-up work.)
+    let key = DatabaseEntry::from_data(b"k");
+    let val0 = DatabaseEntry::from_data(b"v0");
+    db.put(None, &key, &val0).unwrap();
+
+    // Writer txn: take the write lock by issuing a put.
+    let writer_txn = env.begin_transaction(None, None).unwrap();
+    let val1 = DatabaseEntry::from_data(b"v1");
+    db.put(Some(&writer_txn), &key, &val1).unwrap();
+
+    // Auto-commit thread tries to write the same key.
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let started_t = Arc::clone(&started);
+    let finished_t = Arc::clone(&finished);
+    let db_t = Arc::clone(&db);
+    let handle = thread::spawn(move || {
+        started_t.store(true, Ordering::SeqCst);
+        let key = DatabaseEntry::from_data(b"k");
+        let val2 = DatabaseEntry::from_data(b"v2");
+        db_t.put(None, &key, &val2).unwrap();
+        finished_t.store(true, Ordering::SeqCst);
+    });
+
+    // Wait for the writer thread to start and try to acquire the lock.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !started.load(Ordering::SeqCst)
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Give the put() time to actually attempt the lock and block.
+    thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "auto-commit write must block while explicit txn holds the write lock"
+    );
+
+    // Commit the writer; the auto-commit write should now proceed.
+    writer_txn.commit().unwrap();
+    handle.join().expect("auto-commit thread must finish without panic");
+    assert!(finished.load(Ordering::SeqCst));
+
+    // Final value is whatever the auto-commit thread wrote.
+    let mut data = DatabaseEntry::new();
+    let key_lookup = DatabaseEntry::from_data(b"k");
+    let status = db.get(None, &key_lookup, &mut data).unwrap();
+    assert_eq!(status, OperationStatus::Success);
+    assert_eq!(data.get_data(), Some(b"v2".as_slice()));
+
+    drop(db);
+    Arc::try_unwrap(env).ok().unwrap().close().unwrap();
+}
+
+#[test]
+fn f12_auto_commit_does_not_block_on_unrelated_key() {
+    // Sanity: auto-commit on a different key must NOT block on an
+    // explicit txn's write lock for a different key.
+    let tmp = TempDir::new().unwrap();
+    let env = Arc::new(open_env(&tmp, Durability::COMMIT_NO_SYNC));
+    let db = Arc::new(open_db(&env, "f12b"));
+
+    let k1 = DatabaseEntry::from_data(b"k1");
+    let v0 = DatabaseEntry::from_data(b"v0");
+    db.put(None, &k1, &v0).unwrap();
+
+    let writer_txn = env.begin_transaction(None, None).unwrap();
+    let v1 = DatabaseEntry::from_data(b"v1");
+    db.put(Some(&writer_txn), &k1, &v1).unwrap();
+
+    // Different key — must not block.
+    let k2 = DatabaseEntry::from_data(b"k2");
+    let v2 = DatabaseEntry::from_data(b"v2");
+    db.put(None, &k2, &v2)
+        .expect("auto-commit on unrelated key must not block");
+
+    writer_txn.commit().unwrap();
+
+    drop(db);
+    Arc::try_unwrap(env).ok().unwrap().close().unwrap();
+}
+
+#[test]
+fn f12_explicit_txn_read_blocks_auto_commit_write() {
+    // Belt-and-braces variant of the F12 scenario: an explicit txn
+    // takes a Read lock on K, and a concurrent auto-commit write to
+    // K must block until the explicit txn releases its read lock.
+    let tmp = TempDir::new().unwrap();
+    let env = Arc::new(open_env(&tmp, Durability::COMMIT_NO_SYNC));
+    let db = Arc::new(open_db(&env, "f12c"));
+
+    // Seed K so a read can land on a real (non-NULL) LSN.
+    let key = DatabaseEntry::from_data(b"k");
+    let val0 = DatabaseEntry::from_data(b"v0");
+    db.put(None, &key, &val0).unwrap();
+
+    // Explicit txn under serializable isolation: read locks are held
+    // until commit/abort.
+    let cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let reader_txn = env.begin_transaction(None, Some(&cfg)).unwrap();
+    let mut data = DatabaseEntry::new();
+    let key_lookup = DatabaseEntry::from_data(b"k");
+    let status = db.get(Some(&reader_txn), &key_lookup, &mut data).unwrap();
+    assert_eq!(status, OperationStatus::Success);
+    assert_eq!(data.get_data(), Some(b"v0".as_slice()));
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let started_t = Arc::clone(&started);
+    let finished_t = Arc::clone(&finished);
+    let db_t = Arc::clone(&db);
+    let handle = thread::spawn(move || {
+        started_t.store(true, Ordering::SeqCst);
+        let key = DatabaseEntry::from_data(b"k");
+        let val1 = DatabaseEntry::from_data(b"v1");
+        db_t.put(None, &key, &val1).unwrap();
+        finished_t.store(true, Ordering::SeqCst);
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !started.load(Ordering::SeqCst)
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "auto-commit write must block while explicit txn holds the read lock"
+    );
+
+    reader_txn.commit().unwrap();
+    handle.join().unwrap();
+    assert!(finished.load(Ordering::SeqCst));
+
+    drop(db);
+    Arc::try_unwrap(env).ok().unwrap().close().unwrap();
+}

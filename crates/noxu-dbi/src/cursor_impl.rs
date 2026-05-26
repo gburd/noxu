@@ -2003,7 +2003,13 @@ impl CursorImpl {
         entry.write_to_log(&mut buf);
 
         let entry_type = if data.is_some() {
-            LogEntryType::InsertLN
+            if txn_id_opt.is_some() {
+                LogEntryType::InsertLNTxn
+            } else {
+                LogEntryType::InsertLN
+            }
+        } else if txn_id_opt.is_some() {
+            LogEntryType::DeleteLNTxn
         } else {
             LogEntryType::DeleteLN
         };
