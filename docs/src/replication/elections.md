@@ -1,5 +1,13 @@
 # Leader Elections
 
+> **v1.5 status — preview.** See
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> and [the chapter overview](README.md). The election driver is **not**
+> wired into `ReplicatedEnvironment::new` in v1.5: a fresh node sits in
+> `Detached` until `become_master()` is called manually, and the
+> acceptor's promise state is not persisted across restart (so the
+> Stateright safety proof does not apply to the production binary).
+
 Noxu DB uses **Flexible Paxos (FPaxos)** for leader election, augmented by
 the **phi accrual failure detector** for adaptive master failure detection.
 

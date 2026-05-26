@@ -1,5 +1,15 @@
 # Entity Persistence (DPL)
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+>
+> **v1.5 limitations** are detailed in the
+> ["v1.5 limitations" section below](#v15-limitations) and in
+> [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md).
+> Headlines: secondary indexes are in-memory only; secondary updates
+> are not atomic with the user txn; primary writes do thread `txn`
+> through correctly (Sprint 3B).
+
 The Direct Persistence Layer (`noxu-persist`) lets you store and retrieve
 Rust structs through a typed primary index instead of writing
 `DatabaseEntry` byte slices by hand. It is a trait-based layer: you opt
