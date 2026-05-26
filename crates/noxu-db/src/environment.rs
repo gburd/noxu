@@ -653,7 +653,19 @@ impl Environment {
         }
 
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
-        let txn_config = config.cloned().unwrap_or_default();
+        // F3: when the caller does not supply a TransactionConfig, the
+        // environment-level `Durability` default (`EnvironmentConfig::durability`,
+        // settable via `EnvironmentConfig::with_durability`) must be
+        // honoured.  Pre-fix `unwrap_or_default()` produced a config with
+        // `Durability::COMMIT_SYNC` regardless of the env setting, so a
+        // user opening with `.with_durability(COMMIT_NO_SYNC)` and then
+        // calling `begin_transaction(None, None)` still fsynced on every
+        // commit.
+        let txn_config = match config.cloned() {
+            Some(c) => c,
+            None => TransactionConfig::default()
+                .with_durability(self.config.durability),
+        };
 
         let txn_state = Arc::new(TransactionState {
             id: txn_id,
