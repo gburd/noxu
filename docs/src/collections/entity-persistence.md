@@ -9,61 +9,62 @@
 > Headlines: secondary indexes are in-memory only; secondary updates
 > are not atomic with the user txn; primary writes do thread `txn`
 > through correctly (Sprint 3B).
+>
+> **v1.6 (Wave 2C-1) update:** the `#[derive(Entity)]`,
+> `#[derive(PrimaryKey)]`, and `#[derive(SecondaryKey)]` proc-macros
+> are now implemented in the `noxu-persist-derive` crate (re-exported
+> from `noxu-persist`). The annotation-style API documented in this
+> chapter is therefore live; the manual trait-impl path is preserved
+> as the [legacy/no-derive shape](#legacy-manual-trait-impl-path) for
+> users that need to opt out (e.g. for crate-graph reasons or to write
+> a custom `Entity` impl).
 
 The Direct Persistence Layer (`noxu-persist`) lets you store and retrieve
 Rust structs through a typed primary index instead of writing
-`DatabaseEntry` byte slices by hand. It is a trait-based layer: you opt
-your type in by implementing two traits — `Entity` and an
-`EntitySerializer<E>` — and then use `PrimaryIndex<K, E>` and
-`SecondaryIndex<SK, PK, E>` for typed reads and writes.
+`DatabaseEntry` byte slices by hand. You opt your type in by deriving
+the `Entity` macro (and optionally `SecondaryKey`) and supplying an
+`EntitySerializer<E>` impl that turns the struct into bytes and back.
 
-> **Note — no derive macros.** Earlier drafts of this chapter described
-> `#[derive(Entity)]`, `#[primary_key]`, `#[secondary_key]`, and
-> `#[transient]` annotations. Those macros are **not implemented**. The
-> trait-based API documented here is the entire public surface.
-> A proc-macro crate that generates the boilerplate may be added in the
-> future; until then, all wiring is by trait impl.
+## Defining an entity (with derive macros)
 
-## Defining an entity
-
-Implement `Entity` for your struct, and provide an `EntitySerializer`
-that turns the struct into bytes and back. The serializer is supplied
-explicitly to every read/write call — the persistence layer does not
-prescribe a wire format.
+Annotate your struct with `#[derive(Entity)]` and (if it has secondary
+indexes) `#[derive(SecondaryKey)]`. Mark the primary-key field with
+`#[primary_key]` and each secondary-keyed field with
+`#[secondary_key(name = "...", relate = ..., …)]`:
 
 ```rust
-use noxu_persist::{Entity, EntitySerializer, PersistError, Result};
+use noxu_persist::{Entity, EntitySerializer, PersistError, Result, SecondaryKey};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Entity, SecondaryKey)]
 struct User {
+    /// Primary key.  Field type must implement `noxu_persist::PrimaryKey`
+    /// (built-in for all common scalars + `String` / `Vec<u8>`).
+    #[primary_key]
     id: u64,
+
+    /// Unique secondary index — each user has exactly one email and the
+    /// email is unique across the store.
+    #[secondary_key(name = "by_email", relate = OneToOne)]
     email: String,
+
+    /// Many-to-one foreign-key secondary index.  `Option<u64>` is
+    /// auto-unwrapped: the secondary key type is `u64`, and entities
+    /// with `dept_id == None` are simply omitted from the index
+    /// (think SQL `NULL`).
+    #[secondary_key(
+        name = "by_dept",
+        relate = ManyToOne,
+        related_entity = "Department",
+        on_related_entity_delete = NULLIFY
+    )]
+    dept_id: Option<u64>,
+
     name: String,
 }
 
-impl Entity for User {
-    /// Primary-key type; must implement `noxu_persist::PrimaryKey`.
-    /// Built-in implementations cover all common scalars (`u32`, `u64`,
-    /// `i32`, `i64`, `String`, `Vec<u8>`, …).
-    type PrimaryKey = u64;
-
-    fn primary_key(&self) -> &u64 {
-        &self.id
-    }
-
-    /// Stable name used to derive the underlying database name
-    /// (`<store_name>_<entity_name>`, e.g. `user_store_User`) inside an
-    /// `EntityStore`. Each entity type should return a unique,
-    /// never-changing string.
-    fn entity_name() -> &'static str {
-        "User"
-    }
-}
-
-/// Choose your own wire format. The example below uses a length-prefixed
-/// scheme via `noxu_persist::SimpleSerializer`, which avoids pulling in
-/// `serde` for one-off projects. Any byte-in / byte-out scheme is fine —
-/// e.g. `bincode`, `serde_json`, manual `byteorder`.
+/// You still write the serializer by hand — serialization format is
+/// orthogonal to the entity declaration.  Length-prefixed binary,
+/// `bincode`, `serde_json`, etc. are all valid.
 struct UserSerializer;
 
 impl EntitySerializer<User> for UserSerializer {
@@ -72,25 +73,70 @@ impl EntitySerializer<User> for UserSerializer {
         let mut enc = FieldEncoder::new();
         enc.write_u64(u.id);
         enc.write_string(&u.email);
+        match u.dept_id {
+            None => enc.write_u8(0),
+            Some(d) => { enc.write_u8(1); enc.write_u64(d); }
+        }
         enc.write_string(&u.name);
         Ok(enc.finish())
     }
     fn deserialize(&self, bytes: &[u8]) -> Result<User> {
         use noxu_persist::FieldDecoder;
         let mut dec = FieldDecoder::new(bytes);
-        Ok(User {
-            id: dec.read_u64()?,
-            email: dec.read_string()?,
-            name: dec.read_string()?,
-        })
+        let id = dec.read_u64()?;
+        let email = dec.read_string()?;
+        let has_dept = dec.read_u8()?;
+        let dept_id = if has_dept == 0 { None } else { Some(dec.read_u64()?) };
+        let name = dec.read_string()?;
+        Ok(User { id, email, dept_id, name })
     }
 }
 ```
 
-For one-off projects, `noxu-persist::SimpleSerializer` is a
-length-prefixed format that handles common scalar / `String` /
-`Vec<u8>` field types via a `FieldEncoder` / `FieldDecoder` builder
-pattern; see `crates/noxu-persist/src/simple_serializer.rs`.
+### Attribute reference
+
+| Attribute | Where | Purpose |
+|---|---|---|
+| `#[derive(Entity)]` | struct | Implements `noxu_persist::Entity`. Requires exactly one `#[primary_key]` field. |
+| `#[entity(name = "...")]` | struct | Overrides the entity-name (default = struct name). Used as part of the underlying database name. |
+| `#[primary_key]` | field | Marks the primary-key field. The field's type becomes `Entity::PrimaryKey`. |
+| `#[derive(PrimaryKey)]` | struct | Implements `noxu_persist::PrimaryKey` for a custom newtype or composite key struct. |
+| `#[derive(SecondaryKey)]` | struct | For each `#[secondary_key(...)]` field, emits a typed `Foo::open_<name>_index` helper plus a `pub const SECONDARY_INDEXES` metadata table. |
+| `#[secondary_key(name = "...", relate = ...)]` | field | Declares a secondary index over the field. `relate` is one of `OneToOne`, `ManyToOne`, `OneToMany`, `ManyToMany`. |
+| `#[secondary_key(..., related_entity = "Foo")]` | field | Optional foreign-key reference to another entity class name. |
+| `#[secondary_key(..., on_related_entity_delete = ...)]` | field | One of `Abort` (default), `Cascade`, `Nullify`. BDB-JE-style `ABORT` / `CASCADE` / `NULLIFY` upper-case spellings are also accepted. |
+
+### Composite primary keys
+
+A composite key is just a struct with `#[derive(PrimaryKey)]` whose
+field types each already implement `PrimaryKey`:
+
+```rust
+use noxu_persist::PrimaryKey;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
+struct OrderKey {
+    region: String,
+    customer_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, noxu_persist::Entity)]
+struct Order {
+    #[primary_key]
+    key: OrderKey,
+    total_cents: u64,
+}
+```
+
+`PartialOrd + Ord` are required because the `PrimaryIndex` API
+constrains the key type to `Ord`. The derive emits a length-prefixed
+concatenation of each field's `to_bytes()`; field order in the struct
+is the byte-lex sort order of the resulting key.
+
+A **newtype** primary key (`struct UserId(u64);`) delegates directly
+to the inner type's `PrimaryKey` impl, so the on-disk bytes are
+identical to using `u64` directly — useful when you want type-safety
+without a sort-order penalty.
 
 ## Opening an `EntityStore` and a `PrimaryIndex`
 
@@ -109,11 +155,20 @@ let env = Environment::open(
 let store_config = StoreConfig::new("user_store").with_allow_create(true);
 let mut store = EntityStore::open(&env, store_config)?;
 
-// Open the primary index for the User entity type.
-// `get_primary_index` returns a `&mut`-borrowed `PrimaryIndex`, so bind
-// it as `let mut` if you also want to register secondary indexes below.
+// Open the primary index for the User entity type.  Bind as `let mut`
+// so we can later register secondary indexes against it.
 let mut index: PrimaryIndex<u64, User> = store.get_primary_index()?;
 let ser = UserSerializer;
+
+// Open every secondary index declared by `#[derive(SecondaryKey)]`
+// in one line each — the helpers carry the typed `SK` parameter.
+let by_email = User::open_by_email_index(&mut index);
+let by_dept  = User::open_by_dept_index(&mut index);
+
+// Inspect the compile-time metadata if you want to introspect schemas.
+for spec in User::SECONDARY_INDEXES {
+    println!("{}: relate={:?}, fk={:?}", spec.name, spec.relate, spec.related_entity);
+}
 ```
 
 ## Reading and writing entities
@@ -131,87 +186,44 @@ auto-commit behaviour. This mirrors the
 index.put(
     None,
     &ser,
-    &User { id: 1, email: "a@b.com".into(), name: "Alice".into() },
+    &User { id: 1, email: "a@b.com".into(), dept_id: Some(10), name: "Alice".into() },
 )?;
 
 // Lookup by primary key (auto-commit).
 let user: Option<User> = index.get(None, &ser, &1u64)?;
 
-// Delete (auto-commit).  Does not fetch the entity — see
-// `delete_with_entity` below.
-let removed: bool = index.delete(None, &1u64)?;
+// Lookup by secondary key.  The lookup goes through the registered
+// PrimaryIndex to materialise the entity, so the call takes both, plus
+// the optional transaction.
+let alice: Option<User> = by_email.get(None, &ser, &index, &"a@b.com".into())?;
 
-// Iterate in primary-key order (auto-commit).
+// Range scan by secondary key (ManyToOne).
+let dept10: Vec<u64> = by_dept.sub_index(&10u64);
+
+// Iterate primaries in primary-key order.
 for user in index.entities(None, &ser)? {
     let u: User = user?;
     println!("{u:?}");
 }
 ```
 
-To participate in an explicit transaction:
+To participate in an explicit transaction, pass `Some(&txn)`:
 
 ```rust
-use noxu_db::Environment;
-# fn doc(env: &Environment) -> noxu_persist::Result<()> {
-# use noxu_persist::{EntityStore, PrimaryIndex, StoreConfig, EntitySerializer};
-# let mut store = EntityStore::open(env, StoreConfig::new("s").with_allow_create(true))?;
-# let index: PrimaryIndex<u64, User> = store.get_primary_index()?;
-# struct UserSerializer;
-# impl EntitySerializer<User> for UserSerializer {
-#     fn serialize(&self, _: &User) -> noxu_persist::Result<Vec<u8>> { Ok(vec![]) }
-#     fn deserialize(&self, _: &[u8]) -> noxu_persist::Result<User> { unimplemented!() }
-# }
-# struct User { id: u64, email: String, name: String }
-# impl noxu_persist::Entity for User {
-#     type PrimaryKey = u64;
-#     fn primary_key(&self) -> &u64 { &self.id }
-#     fn entity_name() -> &'static str { "User" }
-# }
-# let ser = UserSerializer;
 let txn = env.begin_transaction(None, None)?;
 index.put(
     Some(&txn),
     &ser,
-    &User { id: 2, email: "b@c.com".into(), name: "Bob".into() },
+    &User { id: 2, email: "b@c.com".into(), dept_id: None, name: "Bob".into() },
 )?;
-if /* application predicate */ true {
-    txn.commit()?;
-} else {
-    txn.abort()?; // primary write is rolled back
-}
-# Ok(())
-# }
+txn.commit()?;
 ```
 
 The `index.put` and `index.delete_with_entity` calls automatically
 update every secondary index that has been registered against this
-primary index (see below). The plain `index.delete(txn, &pk)` does not
-fetch the entity and therefore cannot maintain secondary indexes; use
+primary index. The plain `index.delete(txn, &pk)` does not fetch the
+entity and therefore cannot maintain secondary indexes; use
 `delete_with_entity` whenever secondary maintenance is required.
-
-## Secondary indexes
-
-Secondary indexes are opened from the `PrimaryIndex` using a
-*key-extractor* closure. The extractor is plain Rust — there is no
-derive macro generating it.
-
-```rust
-use noxu_persist::SecondaryIndex;
-
-// Open a secondary index keyed by email.
-let by_email: SecondaryIndex<String, u64, User> =
-    index.open_secondary_index(|u: &User| Some(u.email.clone()));
-
-// Lookup by secondary key. The lookup goes through the registered
-// PrimaryIndex to materialise the entity, so the call takes both, plus
-// the optional transaction.
-let user: Option<User> =
-    by_email.get(None, &ser, &index, &"a@b.com".to_string())?;
-```
-
-The extractor returns `Option<SK>`: `None` means "this entity has no
-secondary key for this index" (think SQL `NULL`), and the entity is
-omitted from that index without error.
 
 `SecondaryIndex` supports the same shape of operations as the Java
 Edition's `SecondaryDatabase`: `get`, `contains`, `delete`,
@@ -246,13 +258,12 @@ For numeric primary keys you don't want to assign by hand,
 that is persisted in the same environment. `MemorySequence` is an
 in-memory variant for tests.
 
-## Limitations and roadmap
-
-### v1.5 limitations
+## v1.5 limitations
 
 - **Secondary indexes are in-memory only.** Entities with secondary
-  keys (registered via `index.open_secondary_index(|e| ...)`) maintain
-  the `secondary_key → primary_key` mapping in a process-local
+  keys (registered via `User::open_<name>_index(...)` or the manual
+  `index.open_secondary_index(|e| ...)` path) maintain the
+  `secondary_key → primary_key` mapping in a process-local
   `BTreeMap<SK, BTreeSet<PK>>`. The mapping is **not** written to the
   underlying log and **does not survive a process restart** — it must
   be rebuilt by re-registering the index and replaying the primaries
@@ -268,16 +279,58 @@ in-memory variant for tests.
   `PersistError::SecondariesNotTransactional` warning so the
   limitation is operator-visible. v1.6 closes this gap together with
   the durability work above.
+- **Foreign-key actions are metadata only.** The
+  `on_related_entity_delete = ABORT | CASCADE | NULLIFY` attribute is
+  recorded in `User::SECONDARY_INDEXES[].on_related_entity_delete`
+  but is **not** enforced by the engine in v1.5/v1.6 (the secondary
+  layer is in-memory and has no access to a foreign-key constraint
+  graph). v2.0 will wire the actions into the cascade path.
 - See [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md)
   for the full audit context, the rationale for shipping the
   in-memory secondaries unchanged in v1.5, and the v1.6 plan.
+- See [`docs/src/internal/wave-2c-1-derive-macro.md`](../internal/wave-2c-1-derive-macro.md)
+  for the design of the v1.6 derive-macro layer.
 
-### Other roadmap items
+## Other roadmap items
 
-- No `#[derive(Entity)]` macro yet; each type needs explicit `Entity`
-  and `EntitySerializer<E>` impls.
 - The serializer is a runtime parameter on every read/write call; it
   is not stored alongside the data. Replacing the serializer for a
   given entity type requires a schema-evolution migration.
 - `delete(txn, &pk)` cannot maintain secondary indexes; prefer
   `delete_with_entity(txn, &ser, &pk)`.
+
+## Legacy: manual trait-impl path
+
+The derive macros are syntactic sugar over the same traits the engine
+exposes. If you cannot use them — for example, if you need to
+implement `Entity` for a foreign type via a wrapper, or you want to
+keep `noxu-persist-derive` out of your dependency graph — you can
+still write the impls by hand. This is the shape every Noxu DB
+release before v1.6 supported:
+
+```rust
+use noxu_persist::{Entity, PrimaryKey, Result};
+
+#[derive(Clone, Debug, PartialEq)]
+struct User { id: u64, email: String, name: String }
+
+impl Entity for User {
+    type PrimaryKey = u64;
+    fn primary_key(&self) -> &u64 { &self.id }
+    fn entity_name() -> &'static str { "User" }
+}
+
+// Open a secondary index by hand.
+# fn doc(env: &noxu_db::Environment) -> Result<()> {
+# use noxu_persist::{EntityStore, PrimaryIndex, SecondaryIndex, StoreConfig};
+# let mut store = EntityStore::open(env, StoreConfig::new("s").with_allow_create(true))?;
+let mut index: PrimaryIndex<u64, User> = store.get_primary_index()?;
+let by_email: SecondaryIndex<String, u64, User> =
+    index.open_secondary_index(|u: &User| Some(u.email.clone()));
+# Ok(())
+# }
+```
+
+Internally the derive emits exactly this shape — the only difference
+is that the derive does the typing for you and maintains a compile-
+time `SECONDARY_INDEXES` metadata table.
