@@ -33,8 +33,10 @@
 //!
 //! [`EntityStore::evolve`]: crate::entity_store::EntityStore::evolve
 
+pub mod catalog;
 pub mod converter;
 pub mod deleter;
+pub mod envelope;
 pub mod evolve_config;
 pub mod mutation;
 pub mod mutations;
@@ -42,8 +44,10 @@ pub mod renamer;
 pub mod stats;
 
 // Re-export the most commonly used types at the module root.
+pub use catalog::{CatalogEntry, ClassCatalog, catalog_db_name};
 pub use converter::{ConversionFn, Converter};
 pub use deleter::Deleter;
+pub use envelope::{DecodedRecord, MAX_CLASS_TAG_LEN};
 pub use evolve_config::{EvolveConfig, EvolveListener};
 pub use mutation::MutationKey;
 pub use mutations::{ClassMutations, Mutations};

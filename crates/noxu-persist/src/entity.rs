@@ -47,6 +47,24 @@ pub trait Entity: Sized {
     /// Returns the entity class name, used for database naming within an
     /// `EntityStore`. Each entity type should return a unique, stable name.
     fn entity_name() -> &'static str;
+
+    /// Returns the current schema version of this entity class.
+    ///
+    /// This is the version that newly written records will be tagged with on
+    /// disk.  The default is `0` so existing entity definitions need no
+    /// changes.  Bump this whenever you change the on-disk shape of the
+    /// entity (e.g. add / remove / rename fields, or change the way an
+    /// existing field is serialized) and supply matching
+    /// [`crate::evolve::Mutations`] via
+    /// [`crate::store_config::StoreConfig::with_mutations`] so that older
+    /// records can be read or rewritten on store open.
+    ///
+    /// Wave 2C-2: per-record class versions are persisted in a 2-byte BE
+    /// prefix on every entity record (see
+    /// [`crate::evolve::envelope`]).
+    fn class_version() -> u16 {
+        0
+    }
 }
 
 /// Trait for types that can serve as primary keys.
