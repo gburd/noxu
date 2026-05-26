@@ -15,7 +15,7 @@ from physical files. It handles:
 
 Files are named with 8-digit lowercase hex numbers and the `.ndb` extension:
 
-```
+```text
 00000000.ndb    # log file 0
 00000001.ndb    # log file 1
 0000002a.ndb    # log file 42
@@ -39,7 +39,7 @@ multiple concurrent `commit_with_durability()` callers share a single `fsync`.
 An `Lsn` uniquely identifies any log entry as a `(file_number: u32, offset: u32)`
 pair packed into a `u64`:
 
-```
+```text
 bits 63..32  →  file_number (u32)
 bits 31..0   →  byte offset within the file (u32)
 ```
@@ -50,7 +50,7 @@ bits 31..0   →  byte offset within the file (u32)
 
 Every log entry begins with a header:
 
-```
+```text
 Offset  Size  Field
 ------  ----  -----
 0       4     CRC32 checksum (covers bytes 4..end, little-endian)

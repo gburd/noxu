@@ -7,6 +7,7 @@ Every named algorithm in Noxu DB, with source locations and academic references.
 **Source**: `crates/noxu-tree/src/tree.rs`, `bin.rs`, `in_node.rs`
 
 Standard B+tree with latch coupling traversal:
+
 1. Acquire root with shared latch
 2. Find correct child; acquire child latch; release parent latch
 3. Repeat until BIN reached
@@ -78,10 +79,12 @@ Classic Paxos relaxed to use different quorum sizes for Phase 1 and Phase 2.
 Safety theorem: ∀ Q1 ∈ QS1, ∀ Q2 ∈ QS2: Q1 ∩ Q2 ≠ ∅.
 
 For n=5: phase1=4, phase2=2 satisfies 4+2>5.
+
 - Phase 1 uses `phase1_quorum` promises
 - Phase 2 uses `phase2_quorum` accepts (broadcasted only to Phase 1 promisers)
 
 **References**:
+
 - Howard, H. (2019). *Distributed Consensus Revised*. UCAM-CL-TR-935.
 - Howard, H. et al. (2016). *Flexible Paxos*. PaPoC 2016.
 - Lamport, L. (1998). *Paxos Made Simple*. ACM SIGACT News.
@@ -93,7 +96,7 @@ For n=5: phase1=4, phase2=2 satisfies 4+2>5.
 Inter-arrival time distribution maintained as a sliding window of size N
 (default 1000 samples). Mean μ and variance σ² computed from the window.
 
-```
+```text
 φ(t) = -log10(1 - Φ((t - μ) / σ))
 ```
 
@@ -121,7 +124,7 @@ Naor & Wool's load and availability metrics computed for each candidate
 quorum to guide LP objective.
 
 **Reference**: Naor, M. & Wool, A. (1998). *The Load, Capacity, and
-Availability of Quorum Systems*. SIAM J. Comput.
+Availability of Quorum Systems*. SIAM J. Computing.
 
 ## CBVLSN — Committed Barrier VLSN
 

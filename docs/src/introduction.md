@@ -123,14 +123,15 @@ fn main() -> noxu_db::Result<()> {
 - **Crash recovery** via checkpoint-based 3-phase recovery
 - **Replication / High Availability** via FPaxos leader election over TCP or QUIC
 - **Collections API** (`StoredMap`, `StoredSet`, `StoredList`) and **DPL** entity persistence
-- **Extended capabilities**: TTL record expiry, ByteComparator, ExtinctionFilter, GroupCommit, BackupManager, DataEraser, and more
+- **Extended capabilities**: TTL record expiry, ByteComparator, ExtinctionFilter, GroupCommit,
+  BackupManager, DataEraser, and more
 
 ## Reference Archives
 
 Reference source archives used during development are kept read-only in the
 development tree:
 
-```
+```text
 _/je/       embedded database reference — Java, read-only
 _/nosql/    extended fork with 10 additional capabilities — Java, read-only
 ```

@@ -2,11 +2,15 @@
 
 ## What is a Database?
 
-A Noxu DB database is a named B-tree stored within an environment. Each database holds a collection of key/data records. You can think of it as a sorted map from byte-array keys to byte-array values.
+A Noxu DB database is a named B-tree stored within an environment. Each database holds a
+collection of key/data records. You can think of it as a sorted map from byte-array keys to
+byte-array values.
 
-Multiple databases can coexist in the same environment. They share the environment's cache and background threads but are otherwise independent B-trees.
+Multiple databases can coexist in the same environment. They share the environment's cache and
+background threads but are otherwise independent B-trees.
 
-On disk, all databases in an environment are stored together in the environment's log files — there are no separate per-database files.
+On disk, all databases in an environment are stored together in the environment's log files —
+there are no separate per-database files.
 
 ## Opening a Database
 
@@ -24,11 +28,13 @@ let db_config = DatabaseConfig::new().with_allow_create(true);
 let db = env.open_database(None, "my_database", &db_config)?;
 ```
 
-The first argument to `open_database` is an optional transaction handle. When `None` is passed the open is non-transactional (the most common case for database opens).
+The first argument to `open_database` is an optional transaction handle. When `None` is passed
+the open is non-transactional (the most common case for database opens).
 
 The second argument is the database name. Names are arbitrary strings. An empty name is an error.
 
-By default Noxu DB will not create a database that does not exist. You must set `with_allow_create(true)` on the `DatabaseConfig` for the first open.
+By default Noxu DB will not create a database that does not exist. You must set
+`with_allow_create(true)` on the `DatabaseConfig` for the first open.
 
 ## Database Configuration
 
@@ -56,8 +62,8 @@ Key configuration fields:
 
 ```rust
 let customers = env.open_database(None, "customers", &DatabaseConfig::new().with_allow_create(true))?;
-let orders    = env.open_database(None, "orders",    &DatabaseConfig::new().with_allow_create(true))?;
-let products  = env.open_database(None, "products",  &DatabaseConfig::new().with_allow_create(true))?;
+let orders    = env.open_database(None, "orders", &DatabaseConfig::new().with_allow_create(true))?;
+let products  = env.open_database(None, "products", &DatabaseConfig::new().with_allow_create(true))?;
 ```
 
 All three databases share the environment's cache and can participate in the same transactions.
@@ -68,7 +74,8 @@ All three databases share the environment's cache and can participate in the sam
 db.close()?;
 ```
 
-After calling `close`, the handle can no longer be used. Any active cursors on the database are invalidated. Always close all cursors before closing the database.
+After calling `close`, the handle can no longer be used. Any active cursors on the database are
+invalidated. Always close all cursors before closing the database.
 
 ## Checking Whether a Database Handle is Valid
 
@@ -86,4 +93,3 @@ println!("{} records in database", count);
 ```
 
 ---
-

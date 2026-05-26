@@ -14,6 +14,7 @@
 "PMTUD"     = "PMTUD"      # Path MTU Discovery
 "crc32fast" = "crc32fast"  # crate name
 "nextest"   = "nextest"    # cargo-nextest
+"ser"       = "ser"        # EntitySerializer variable name in code samples
 
 [files]
 extend-exclude = [

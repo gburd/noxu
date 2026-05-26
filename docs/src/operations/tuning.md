@@ -25,13 +25,17 @@ env.checkpoint(Some(CheckpointConfig::new().with_force(true)))?;
 
 ## Recommended production settings
 
-- **OLTP workloads**: `checkpointer_bytes_interval = 64 MiB` (default is fine; tighten to 16 MiB if crash recovery must be < 5 s).
-- **Bulk load**: disable automatic checkpointing (`set_run_checkpointer(false)`), call `env.checkpoint(...)` manually between batches, re-enable afterwards.
-- **Before shutdown**: always call `env.checkpoint(Some(CheckpointConfig::new().with_minimize_recovery_time(true)))` to avoid a full recovery on next open.
+- **OLTP workloads**: `checkpointer_bytes_interval = 64 MiB` (default is fine; tighten to 16 MiB
+  if crash recovery must be < 5 s).
+- **Bulk load**: disable automatic checkpointing (`set_run_checkpointer(false)`), call
+  `env.checkpoint(...)` manually between batches, re-enable afterwards.
+- **Before shutdown**: always call
+  `env.checkpoint(Some(CheckpointConfig::new().with_minimize_recovery_time(true)))` to avoid a
+  full recovery on next open.
 
 ---
 
-# 4. Cleaner Tuning
+## 4. Cleaner Tuning
 
 The log cleaner reclaims disk space by copying live records out of
 under-utilized log files and then deleting those files.
@@ -68,9 +72,9 @@ pinning log files).  Keep transactions short-lived to unpin files promptly.
 When the cleaner falls behind, it signals writer threads to pause briefly
 via `CleanerThrottle`.  This is automatic and transparent.  If you observe
 sustained write latency spikes:
+
 1. Check `s.cleaner.runs` — if it is not climbing, the cleaner may be disabled.
 2. Lower `cleaner_min_utilization` (e.g., 60) to trigger cleaning sooner.
 3. Increase log file size so each file takes longer to fill, giving the cleaner more time.
 
 ---
-

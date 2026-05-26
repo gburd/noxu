@@ -81,7 +81,8 @@ This decoupling is valuable in practice:
 ### References
 
 - Lamport, L. (1998). Paxos Made Simple. *ACM SIGACT News*, 32(4), 18-25.
-- Howard, H., Schwarzkopf, M., Madhavapeddy, A., & Crowcroft, J. (2016). Flexible Paxos: Quorum Intersection Revisited. arXiv:1608.06696.
+- Howard, H., Schwarzkopf, M., Madhavapeddy, A., & Crowcroft, J. (2016). Flexible Paxos: Quorum
+  Intersection Revisited. arXiv:1608.06696.
 - Howard, H. (2019). Distributed Consensus Revised. UCAM-CL-TR-935. University of Cambridge.
 - Ongaro, D., & Ousterhout, J. (2014). In Search of an Understandable Consensus Algorithm. *USENIX ATC 2014*.
 
@@ -94,7 +95,7 @@ This decoupling is valuable in practice:
 The phi accrual failure detector (`crates/noxu-rep/src/elections/phi_detector.rs`)
 outputs a continuous suspicion level rather than a binary alive/dead decision:
 
-```
+```text
 phi(t) = -log10(P_later(t - T_last))
 ```
 
@@ -113,6 +114,7 @@ Implementation details:
 - **Thread safety:** All state protected by `noxu_sync::RwLock`.
 
 **Production defaults** (from the paper):
+
 - `threshold = 8.0` — mistake rate approximately 10^-8 per heartbeat interval
 - `window_size = 200` for LAN; `1000` for WAN
 
@@ -153,8 +155,10 @@ orders of magnitude.
 
 - Hayashibara, N., Defago, X., Yared, R., & Katayama, T. (2004). The Phi Accrual Failure Detector. *SRDS 2004*, 66-78.
 - Abramowitz, M., & Stegun, I. A. (1964). *Handbook of Mathematical Functions*. Formula 26.2.17.
-- Das, A., Gupta, I., & Motivala, A. (2002). SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol. *DSN 2002*.
-- Satzger, B., Pietzowski, A., Trumler, W., & Ungerer, T. (2007). A New Adaptive Accrual Failure Detector for Dependable Distributed Systems. *SAC 2007*.
+- Das, A., Gupta, I., & Motivala, A. (2002). SWIM: Scalable Weakly-consistent Infection-style
+  Process Group Membership Protocol. *DSN 2002*.
+- Satzger, B., Pietzowski, A., Trumler, W., & Ungerer, T. (2007). A New Adaptive Accrual Failure
+  Detector for Dependable Distributed Systems. *SAC 2007*.
 
 ---
 
@@ -203,9 +207,9 @@ load-optimal selection.
 
 ### References
 
-- Naor, M., & Wool, A. (1998). The Load, Capacity, and Availability of Quorum Systems. *SIAM J. Comput.*, 27(2), 423-447.
+- Naor, M., & Wool, A. (1998). The Load, Capacity, and Availability of Quorum Systems. *SIAM J. Computing*, 27(2), 423-447.
 - Thomas, R. H. (1979). A Majority Consensus Approach to Concurrency Control. *ACM TODS*, 4(2), 180-209.
-- Burd, G. rs-quoracle. https://codeberg.org/gregburd/rs-quoracle
+- Burd, G. rs-quoracle. <https://codeberg.org/gregburd/rs-quoracle>
 
 ---
 
@@ -257,6 +261,7 @@ length-prefixed byte vector. The receiver reads exactly 4 bytes for the length, 
 reads exactly that many payload bytes.
 
 **Timeouts:**
+
 - `TcpStream::connect_timeout(30s)` — prevents indefinite blocking from OS SYN backoff
   (Linux default can reach ~127s under packet loss).
 - `set_write_timeout(Some(30s))` — caps send stalls under congestion.
@@ -264,6 +269,7 @@ reads exactly that many payload bytes.
   WouldBlock/TimedOut returns `Ok(None)`.
 
 **Bugs found and fixed in 6-hour soak testing:**
+
 - Bug 1: Setting `set_read_timeout(None)` before payload read caused hangs under packet
   loss. Fixed: read timeout is always set.
 - Bug 3: `TcpStream::connect()` (no timeout) blocked indefinitely under SYN loss with
@@ -353,6 +359,7 @@ Log entries below CBVLSN are safe to reclaim by the log cleaner. Broadcast via
 unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 
 **Log shipping architecture:**
+
 - **EnvironmentLogScanner** (master side): Implements the `LogScanner` trait. Reads
   committed log entries from the master's log files starting at a given VLSN and feeds
   them to `Feeder` threads — one per connected replica.

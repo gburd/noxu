@@ -34,7 +34,7 @@ Key terms:
 
 ## Locks, Blocks, and Deadlocks
 
-**Locks**
+### Locks
 
 Noxu DB uses a lock manager to provide transactional isolation. There are two
 kinds of locks:
@@ -49,7 +49,7 @@ In a transactional application, the locker is the transaction handle. Locks are
 held for the lifetime of the transaction: they are released when the transaction
 commits or aborts.
 
-**Blocks**
+### Blocks
 
 A thread is blocked when it tries to obtain a lock on a record, but another thread
 already holds a conflicting lock. The blocked thread cannot make forward progress
@@ -66,11 +66,11 @@ Blocking has performance implications. Strategies to reduce blocking:
 - Keep transactions short so locks are held for less time.
 - Access heavily-contended records near the end of a transaction.
 - Use lower isolation levels (e.g., uncommitted reads or committed reads) where
-  correctness allows. See [Isolation Levels](#7-isolation-levels).
+  correctness allows. See [Isolation Levels](isolation.md).
 - Arrange threads so they access records in the same order, reducing the chance of
   conflicting lock requests.
 
-**Deadlocks**
+### Deadlocks
 
 A deadlock occurs when two or more threads are each blocked waiting for a lock held
 by the other. Neither thread can make progress.
@@ -125,7 +125,7 @@ txn2.set_lock_timeout(1000); // 1 second
 
 ---
 
-# Read-Modify-Write Pattern
+## Read-Modify-Write Pattern
 
 If you are reading a record for the purpose of modifying or deleting it, use the
 **read-modify-write** (RMW) pattern. This causes Noxu DB to acquire a **write lock
@@ -193,4 +193,3 @@ loop {
 ```
 
 ---
-

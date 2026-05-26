@@ -299,8 +299,8 @@ at the level JE devotes to it. The closest analogue is
 which is a single integration test of ~30 seconds.
 
 **Severity: MEDIUM**. The data-structure correctness is well covered,
-but the integration-level invariants (cleaner + checkpoint + eviction
-+ external-fs-events) are not.
+but the integration-level invariants (cleaner + checkpoint + eviction +
+external-fs-events) are not.
 
 ---
 
