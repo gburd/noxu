@@ -677,6 +677,13 @@ impl Environment {
                 if txn_config.read_committed {
                     t.set_read_committed_isolation(true);
                 }
+                if txn_config.read_uncommitted {
+                    // F2: previously this branch was missing, so the
+                    // user-set `with_read_uncommitted(true)` flag was
+                    // silently dropped and dirty reads were impossible
+                    // at the txn level.
+                    t.set_read_uncommitted_default(true);
+                }
                 if txn_config.serializable_isolation {
                     t.set_serializable_isolation(true);
                 }

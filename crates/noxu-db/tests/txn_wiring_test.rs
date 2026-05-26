@@ -8,8 +8,9 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Durability, Environment,
-    EnvironmentConfig,
+    EnvironmentConfig, OperationStatus, TransactionConfig,
 };
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn open_env(temp_dir: &TempDir, durability: Durability) -> Environment {
@@ -83,4 +84,49 @@ fn f1_env_close_with_one_active_txn_still_fails() {
 
     let result = env.close();
     assert!(result.is_err(), "close() must fail with active txn");
+}
+
+// ─── F2: read_uncommitted on TransactionConfig is honoured ───────────
+
+#[test]
+fn f2_read_uncommitted_sees_uncommitted_writes() {
+    // A txn with `with_read_uncommitted(true)` must observe writes from
+    // a concurrent uncommitted transaction (dirty read).  Pre-fix the
+    // flag was silently dropped by `Environment::begin_transaction`, so
+    // the reader took a normal read lock and either blocked on the
+    // writer or timed out.
+    let tmp = TempDir::new().unwrap();
+    let env = Arc::new(open_env(&tmp, Durability::COMMIT_NO_SYNC));
+    let db = Arc::new(open_db(&env, "f2"));
+
+    // Seed the key so there is a "before" value to read.
+    let key = DatabaseEntry::from_data(b"k");
+    let val_before = DatabaseEntry::from_data(b"before");
+    db.put(None, &key, &val_before).unwrap();
+
+    // Writer txn: writes a new value but does NOT commit yet.
+    let writer_txn = env.begin_transaction(None, None).unwrap();
+    let val_after = DatabaseEntry::from_data(b"after");
+    db.put(Some(&writer_txn), &key, &val_after).unwrap();
+
+    // Reader txn: read-uncommitted, should see the dirty write.
+    let read_cfg = TransactionConfig::new().with_read_uncommitted(true);
+    let reader_txn = env.begin_transaction(None, Some(&read_cfg)).unwrap();
+
+    let mut data = DatabaseEntry::new();
+    let key_lookup = DatabaseEntry::from_data(b"k");
+    let status = db
+        .get(Some(&reader_txn), &key_lookup, &mut data)
+        .expect("dirty read must not block / error");
+    assert_eq!(status, OperationStatus::Success);
+    assert_eq!(
+        data.get_data(),
+        Some(b"after".as_slice()),
+        "read-uncommitted txn must see the writer's dirty value"
+    );
+
+    reader_txn.commit().unwrap();
+    writer_txn.abort().unwrap();
+    drop(db);
+    Arc::try_unwrap(env).ok().unwrap().close().unwrap();
 }
