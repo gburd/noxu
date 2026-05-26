@@ -259,6 +259,13 @@ impl CursorImpl {
         self
     }
 
+    /// Setter equivalent of [`Self::with_txn`] for callers that need to
+    /// attach a `Txn` to an already-built cursor (e.g. `Database::with_auto_txn`
+    /// which constructs the cursor first, then wires the synthetic auto-txn).
+    pub fn attach_txn(&mut self, txn: Arc<Mutex<Txn>>) {
+        self.txn_ref = Some(txn);
+    }
+
     /// Gets the before-image (old_data, old_lsn) for `key` from the tree.
     ///
     /// Returns `(None, NULL_LSN)` if the key does not exist (new insert).
@@ -329,25 +336,69 @@ impl CursorImpl {
         }
     }
 
-    /// Acquires a WRITE lock on `old_lsn` before writing to the log.
+    /// Acquires a WRITE lock for an upcoming write to `key` whose current
+    /// slot LSN is `old_lsn`.
     ///
     /// For txn-backed cursors, calls `Txn::lock()` (lock persists until commit/abort).
-    /// For auto-commit cursors (lock_manager only), uses cursor `id` as locker.
-    /// A NULL_LSN (new insert with no prior version) does not need a pre-log lock.
+    /// For auto-commit cursors (lock_manager only, no txn), uses cursor `id`
+    /// as the locker.
     ///
+    /// # NULL-LSN insert race coordination
     ///
-    fn lock_write_before_log(&self, old_lsn: u64) -> Result<(), DbiError> {
-        if old_lsn == noxu_util::NULL_LSN.as_u64() {
-            return Ok(());
-        }
+    /// When `old_lsn == NULL_LSN` the record does not yet exist (a brand-new
+    /// insert).  Pre-Wave-1A this method returned early in that case, so two
+    /// concurrent auto-commit inserts of the same brand-new key did not
+    /// coordinate through the lock manager — the underlying B+tree latching
+    /// in `noxu-tree` serialised them safely but the deadlock detector could
+    /// not reason about the conflict, and `put_no_overwrite` reported
+    /// `KeyExist` instead of a typed lock-conflict.  This is the first F12
+    /// residual.
+    ///
+    /// We now acquire a write lock on a synthetic, key-coordination LSN
+    /// derived from `(db_id, key)` via [`noxu_util::Lsn::synthetic_key_lock_id`].
+    /// The lock lives in the reserved transient-LSN space so it cannot
+    /// collide with a real WAL LSN, and is held until the wrapping txn
+    /// (synthetic auto-txn or explicit txn) commits or aborts — at which
+    /// point a second concurrent inserter for the same key unblocks and
+    /// observes the result of the first insert.
+    ///
+    /// Auto-commit cursors without a `txn_ref` (legacy callers that have
+    /// not been ported to `TxnManager::begin_auto_txn` yet) acquire and
+    /// immediately release the synthetic lock; this still serialises them
+    /// through the lock manager but does not record the conflict on a
+    /// locker for deadlock-detector reasoning.  Database::put / delete on
+    /// `txn = None` always wraps in a synthetic auto-txn, so this fallback
+    /// is exercised only by the legacy direct-CursorImpl construction.
+    fn lock_write_before_log(
+        &self,
+        old_lsn: u64,
+        key: &[u8],
+    ) -> Result<(), DbiError> {
+        let null = noxu_util::NULL_LSN.as_u64();
+        let lsn_to_lock = if old_lsn == null {
+            // Brand-new insert: coordinate via a synthetic key lock so
+            // concurrent inserts of the same key serialise through the
+            // lock manager.
+            let db_id = self.db_impl.read().get_id().id() as u64;
+            Lsn::synthetic_key_lock_id(db_id, key)
+        } else {
+            old_lsn
+        };
         if let Some(txn) = &self.txn_ref {
             txn.lock()
                 .unwrap()
-                .lock(old_lsn, LockType::Write, false)
+                .lock(lsn_to_lock, LockType::Write, false)
                 .map_err(DbiError::TxnError)?;
         } else if let Some(lm) = &self.lock_manager {
-            lm.lock(old_lsn, self.id, LockType::Write, false, false)
+            lm.lock(lsn_to_lock, self.id, LockType::Write, false, false)
                 .map_err(DbiError::TxnError)?;
+            // Legacy auto-commit (no synthetic auto-txn): release the
+            // synthetic key-coordination lock immediately for new inserts
+            // so subsequent inserts can proceed.  For real (non-NULL)
+            // old_lsn, `finalize_write_lock` releases below.
+            if old_lsn == null {
+                let _ = lm.release(lsn_to_lock, self.id);
+            }
         }
         Ok(())
     }
@@ -1790,7 +1841,7 @@ impl CursorImpl {
                     .ok_or(DbiError::CursorNotInitialized)?;
                 let (old_data, old_lsn) =
                     self.get_slot_before_image(&current_key);
-                self.lock_write_before_log(old_lsn)?;
+                self.lock_write_before_log(old_lsn, &current_key)?;
                 let new_lsn = self.log_ln_write(
                     &current_key,
                     Some(data),
@@ -1813,7 +1864,7 @@ impl CursorImpl {
                 }
                 // New insert: old_lsn is NULL (abort_known_deleted=true).
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
-                self.lock_write_before_log(old_lsn)?;
+                self.lock_write_before_log(old_lsn, key)?;
                 let new_lsn =
                     self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(
@@ -1838,7 +1889,7 @@ impl CursorImpl {
                     return Ok(OperationStatus::KeyExist);
                 }
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
-                self.lock_write_before_log(old_lsn)?;
+                self.lock_write_before_log(old_lsn, key)?;
                 let new_lsn =
                     self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(
@@ -1857,7 +1908,7 @@ impl CursorImpl {
             }
             PutMode::Overwrite => {
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
-                self.lock_write_before_log(old_lsn)?;
+                self.lock_write_before_log(old_lsn, key)?;
                 let new_lsn =
                     self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(
@@ -2078,7 +2129,7 @@ impl CursorImpl {
         // In both cases current_key is the correct tree-delete key.
         if let Some(tree_key) = self.current_key.clone() {
             let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
-            self.lock_write_before_log(old_lsn)?;
+            self.lock_write_before_log(old_lsn, &tree_key)?;
             let del_lsn = self.log_ln_write(&tree_key, None, self.locker_id)?;
             self.finalize_write_lock(
                 old_lsn,

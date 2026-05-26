@@ -51,7 +51,7 @@ pub struct EnvironmentImpl {
     /// The lock manager (shared across all lockers/txns).
     lock_manager: Arc<LockManager>,
     /// The transaction manager.
-    txn_manager: TxnManager,
+    txn_manager: Arc<TxnManager>,
 
     /// All open databases, keyed by DatabaseId.
     db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>>,
@@ -267,7 +267,7 @@ impl EnvironmentImpl {
         let env_home = env_home.into();
         let lock_manager = Arc::new(LockManager::new());
         lock_manager.set_lock_timeout(cfg.lock_timeout_ms);
-        let txn_manager = TxnManager::new(lock_manager.clone());
+        let txn_manager = Arc::new(TxnManager::new(lock_manager.clone()));
 
         // Ensure the environment directory exists (create if needed).
         if !env_home.exists() {
@@ -909,7 +909,7 @@ impl EnvironmentImpl {
     }
 
     /// Returns a reference to the txn manager.
-    pub fn get_txn_manager(&self) -> &TxnManager {
+    pub fn get_txn_manager(&self) -> &Arc<TxnManager> {
         &self.txn_manager
     }
 
