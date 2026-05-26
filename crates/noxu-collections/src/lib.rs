@@ -1,8 +1,7 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Iterator-based collection views for Noxu DB.
 //!
-//! provides standard Rust Iterator
-//! and collection-style access to databases.
+//! Provides standard Rust Iterator and collection-style access to databases.
 //!
 //! This crate provides map, set, and iterator views over Noxu DB databases,
 //! allowing database records to be accessed through familiar Rust collection
@@ -18,6 +17,7 @@
 //! - [`StoredKeyIterator`]  -  Iterator over keys only
 //! - [`StoredValueIterator`]  -  Iterator over values only
 //! - [`TransactionRunner`]  -  Transaction execution helper with retry
+//!   *(see v1.5 limitations below)*
 //!
 //! # Key Index
 //!
@@ -26,6 +26,44 @@
 //! are inserted through the collection views (e.g., `StoredMap::put()`).
 //! For databases with pre-existing data, use `register_key()` or
 //! `register_keys()` to populate the index.
+//!
+//! # v1.5 limitations
+//!
+//! The collections surface in v1.5 is intentionally narrower than the
+//! BDB-JE `com.sleepycat.collections` contract.  These constraints are
+//! tracked by the May 2026 collections/bind API audit and are scheduled
+//! for revisit in v1.6.
+//!
+//! 1. **`Stored*` operations are auto-commit only.**  Every `get` /
+//!    `put` / `remove` / `iter` call on `StoredMap`, `StoredSortedMap`,
+//!    `StoredList`, `StoredKeySet`, and `StoredValueSet` issues the
+//!    underlying `Database` call with `txn = None`.  There is no way to
+//!    thread an externally-begun [`noxu_db::Transaction`] into a
+//!    collection method in v1.5.  If you need transactional semantics
+//!    across several writes, use the raw `Database::put` / `delete` API
+//!    with an explicit txn.  Threading
+//!    `Option<&Transaction>` through every collection method is on the
+//!    v1.6 roadmap (audit findings #1, #3, #4).
+//!
+//! 2. **[`TransactionRunner`] cannot drive `Stored*` calls.**  The
+//!    runner returns a `&Transaction` that no `Stored*` method accepts
+//!    in v1.5.  It is still useful for sequencing raw
+//!    `Database`/`Cursor` calls with deadlock retry, but treat its
+//!    "runs Stored* operations in a transaction" rustdoc as aspirational
+//!    (planned for v1.6).
+//!
+//! 3. **[`StoredList::new`] does not recover the next-index counter.**
+//!    Use [`StoredList::open`] when reopening an existing list — `new`
+//!    starts at index 0 and will overwrite existing records on
+//!    subsequent pushes.  See the [`StoredList`] docs for details.
+//!
+//! 4. **[`StoredList::remove`] does not compact.**  It is a single-key
+//!    delete; it leaves a hole at the removed index and does not
+//!    re-number higher indices.  See the [`StoredList::remove`] docs.
+//!
+//! See `docs/src/collections/` for the user-facing v1.5 limitations
+//! summary and `docs/src/internal/sprint-3-collections-restriction.md`
+//! for the full audit-finding bookkeeping.
 //!
 //! # Example
 //!

@@ -10,11 +10,28 @@ use noxu_db::Database;
 
 /// A list-like view of a database.
 ///
-///
-///
 /// Elements are stored with their zero-based index encoded as a big-endian
 /// 8-byte key so that iteration order matches insertion order and keys
 /// sort numerically in byte-lexicographic order.
+///
+/// # v1.5 limitations
+///
+/// 1. **Auto-commit only.**  All operations issue the underlying
+///    `Database` call with `txn = None`.  Threading
+///    `Option<&Transaction>` through `push` / `pop` / `get` / `remove`
+///    is on the v1.6 roadmap (audit findings #1, #3, #4).
+///
+/// 2. **`new` does not recover the next-index counter.**  See
+///    [`StoredList::open`] for the reopen-safe constructor.  Calling
+///    `StoredList::new` against a database that already contains
+///    records will start `next_index` at 0 and overwrite existing data
+///    on subsequent `push` calls.  This is documented as the
+///    fast/empty-database path; `open` is the correct path for any
+///    persistent list (audit finding #6).
+///
+/// 3. **`remove` does not compact.**  It is a single-key delete; the
+///    removed index becomes a hole and `next_index` is unchanged
+///    (audit finding #5).
 ///
 /// # Implementation notes
 /// Index gaps created by `remove()` are not compacted; subsequent `push()`
@@ -25,10 +42,15 @@ use noxu_db::Database;
 /// ```ignore
 /// use noxu_collections::StoredList;
 ///
+/// // For a brand-new (or known-empty) database, `new` is fine:
 /// let list = StoredList::new(&db);
 /// list.push(b"first").unwrap();
 /// list.push(b"second").unwrap();
 /// assert_eq!(list.get(0).unwrap(), Some(b"first".to_vec()));
+///
+/// // When reopening a database with existing entries, use `open`:
+/// let list = StoredList::open(&db).unwrap();
+/// // `list.next_index()` is recovered from the largest existing key.
 /// ```
 pub struct StoredList<'db> {
     /// The underlying StoredMap providing key-value storage.
