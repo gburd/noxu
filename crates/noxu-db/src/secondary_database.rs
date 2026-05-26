@@ -15,6 +15,28 @@
 //! On every primary `put` the secondary is updated via `update_secondary`.
 //! On every primary `delete` the secondary entry is removed.
 //!
+//! # Atomicity with the primary write (Sprint 4½)
+//!
+//! [`SecondaryDatabase::update_secondary`] takes an explicit
+//! `Option<&Transaction>` parameter that is forwarded to every
+//! [`Database`] operation it performs against the inner secondary index.
+//! When the caller threads the *same* `txn` through
+//! [`Database::put`] / [`Database::delete`] **and**
+//! [`SecondaryDatabase::update_secondary`], the primary write and the
+//! secondary index update are atomic — committing or aborting the txn
+//! commits or rolls back **both** sides together.  See
+//! `docs/src/transactions/secondary-with-txn.md` for the canonical
+//! pattern.
+//!
+//! Pre-Sprint-4½ (v1.4 / v1.5.0-rc1 / v1.5.0-rc2) `update_secondary` ran
+//! auto-committed regardless of any caller transaction, leaving a
+//! partial-atomicity gap (see audit Theme 2 / finding F5): an aborted
+//! primary `put` could leave the secondary entry behind on disk.  The
+//! gap is closed for the manual-update pattern.  Automatic
+//! `associate()`-style maintenance — where `Database::put` itself
+//! drives all attached secondaries inside the same txn — remains v1.6
+//! work.
+//!
 //! # v1.5 limitations
 //!
 //! See [`docs/src/internal/v1.5-decisions-2026-05.md`].
@@ -29,6 +51,9 @@
 //!   [`SecondaryDatabase::open`] rejects any [`SecondaryConfig`] whose
 //!   foreign-key fields are set with [`NoxuError::Unsupported`] (closes
 //!   audit findings C2, F1, F16).  Full FK support is planned for v1.6.
+//! - **Automatic secondary maintenance** is not implemented in v1.5;
+//!   callers must invoke `update_secondary` manually after each primary
+//!   `put` / `delete` (planned for v1.6).
 
 use crate::cursor::Cursor;
 use crate::cursor_config::CursorConfig;
@@ -66,8 +91,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// - **Foreign-key constraints not enforced** (Decision 2C):
 ///   [`SecondaryDatabase::open`] rejects [`SecondaryConfig`]s whose
 ///   foreign-key fields are set.  Full FK support is planned for v1.6.
+/// - **No automatic maintenance**: callers manually invoke
+///   [`update_secondary`](Self::update_secondary) after each primary
+///   `put` / `delete`.  An automatic `associate()`-style hook is planned
+///   for v1.6.
 ///
-/// See `docs/src/internal/v1.5-decisions-2026-05.md`.
+/// # Atomicity with the primary write
+///
+/// As of v1.5 (Sprint 4½) `update_secondary` participates in the
+/// caller's transaction when one is supplied.  Threading the same
+/// `txn` through both [`Database::put`] and
+/// [`update_secondary`](Self::update_secondary) makes the primary +
+/// secondary update **atomic**: aborting the txn rolls both back,
+/// committing the txn persists both.  Passing `None` runs each call
+/// auto-committed, which restores the v1.4 behaviour and is acceptable
+/// when the caller does not need cross-database atomicity.
+///
+/// See `docs/src/internal/v1.5-decisions-2026-05.md` and
+/// `docs/src/transactions/secondary-with-txn.md`.
 ///
 /// # Example
 /// ```ignore
@@ -280,9 +321,11 @@ impl SecondaryDatabase {
 
             // 1. Remove all secondary entries for this primary record first.
             //    This includes the current secondary key entry we found.
-            //    UpdateSecondaryOnDelete calls updateSecondary.
+            //    UpdateSecondaryOnDelete calls updateSecondary.  Sprint 4½
+            //    forwards `txn` so the cleanup is atomic with the primary
+            //    delete below.
             let old_data = data.clone();
-            self.delete_all_for_primary(&pri_key_entry, Some(&old_data))?;
+            self.delete_all_for_primary(txn, &pri_key_entry, Some(&old_data))?;
 
             // 2. Delete the primary record.
             {
@@ -357,18 +400,41 @@ impl SecondaryDatabase {
 
     /// Updates the secondary index when a primary record is inserted or updated.
     ///
+    /// Called from application code that manages secondary index updates
+    /// manually (v1.5 has no automatic `associate()`-style hook — that is
+    /// v1.6 work).
     ///
+    /// # Atomicity (Sprint 4½)
     ///
-    /// Called from `Database::put_and_update_secondaries` (see database.rs
-    /// integration layer) and from application code that manages secondary
-    /// index updates manually (i.e., without integrated auto-update support).
+    /// When `txn` is `Some(&t)`, **all** I/O performed by this method
+    /// (cursor opens, `insert_sec_key`, `delete_sec_key`) is executed
+    /// under `t`.  If the caller used the same `t` for the primary
+    /// [`Database::put`] / [`Database::delete`] that prompted this
+    /// update, the primary write and every affected secondary index
+    /// entry commit or abort together.  This is the recommended
+    /// pattern; see `docs/src/transactions/secondary-with-txn.md`.
+    ///
+    /// When `txn` is `None`, every inner secondary write runs
+    /// auto-committed (v1.4 behaviour).  This is intentionally
+    /// available so callers that do not need cross-database atomicity
+    /// — e.g. one-shot population or single-threaded scripts — do not
+    /// need to allocate a transaction.
+    ///
+    /// **Idempotent re-insert** (Decision 1B): if `update_secondary` is
+    /// invoked twice with the same `(sec_key, pri_key)` pair (whether
+    /// auto-commit or under the same `txn`), the second call is a
+    /// no-op rather than a [`NoxuError::Unsupported`] collision — see
+    /// [`Self::insert_sec_key`].
     ///
     /// # Arguments
+    /// * `txn` - Optional transaction.  Pass the same handle that
+    ///   drives the primary write to make both updates atomic.
     /// * `pri_key` - The primary key.
     /// * `old_data` - The previous primary data, or `None` on insert.
     /// * `new_data` - The new primary data, or `None` on delete.
     pub fn update_secondary(
         &self,
+        txn: Option<&Transaction>,
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
         new_data: Option<&DatabaseEntry>,
@@ -419,10 +485,18 @@ impl SecondaryDatabase {
                 && new_sec_key.as_ref() != old_sec_key.as_ref();
 
             if do_delete {
-                self.delete_sec_key(old_sec_key.as_ref().unwrap(), pri_key)?;
+                self.delete_sec_key(
+                    txn,
+                    old_sec_key.as_ref().unwrap(),
+                    pri_key,
+                )?;
             }
             if do_insert {
-                self.insert_sec_key(new_sec_key.as_ref().unwrap(), pri_key)?;
+                self.insert_sec_key(
+                    txn,
+                    new_sec_key.as_ref().unwrap(),
+                    pri_key,
+                )?;
             }
         } else if let Some(multi_creator) = multi_key_creator {
             // Multi-key creator path.
@@ -457,13 +531,13 @@ impl SecondaryDatabase {
             // Delete keys that are no longer present.
             for old_key in &old_keys {
                 if !new_keys.contains(old_key) {
-                    self.delete_sec_key(old_key, pri_key)?;
+                    self.delete_sec_key(txn, old_key, pri_key)?;
                 }
             }
             // Insert keys that were not present before.
             for new_key in &new_keys {
                 if !old_keys.contains(new_key) {
-                    self.insert_sec_key(new_key, pri_key)?;
+                    self.insert_sec_key(txn, new_key, pri_key)?;
                 }
             }
         }
@@ -473,13 +547,16 @@ impl SecondaryDatabase {
 
     /// Removes all secondary index entries for the given primary key.
     ///
-    /// Called when a primary record is deleted.
+    /// Called when a primary record is deleted.  `txn` is forwarded to
+    /// [`Self::update_secondary`] so the cleanup participates in the
+    /// caller's transaction (Sprint 4½).
     pub(crate) fn delete_all_for_primary(
         &self,
+        txn: Option<&Transaction>,
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
     ) -> Result<()> {
-        self.update_secondary(pri_key, old_data, None)
+        self.update_secondary(txn, pri_key, old_data, None)
     }
 
     /// Returns a reference to the inner index `Database`.
@@ -512,10 +589,11 @@ impl SecondaryDatabase {
     /// supports.
     fn insert_sec_key(
         &self,
+        txn: Option<&Transaction>,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        let mut cursor = self.make_inner_cursor()?;
+        let mut cursor = self.make_inner_cursor(txn)?;
         let status = cursor
             .put(sec_key, pri_key, crate::put::Put::NoOverwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
@@ -535,7 +613,7 @@ impl SecondaryDatabase {
                 // [`NoxuError::Unsupported`].
                 let mut probe_key = sec_key.clone();
                 let mut existing_pk = DatabaseEntry::new();
-                let mut probe_cursor = self.make_inner_cursor()?;
+                let mut probe_cursor = self.make_inner_cursor(txn)?;
                 let probe_status = probe_cursor
                     .get(
                         &mut probe_key,
@@ -584,8 +662,12 @@ impl SecondaryDatabase {
     }
 
     /// Deletes a secondary index entry: (sec_key -> pri_key).
+    ///
+    /// `txn` is forwarded to the inner cursor so the delete participates
+    /// in the caller's transaction (Sprint 4½).
     fn delete_sec_key(
         &self,
+        txn: Option<&Transaction>,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
@@ -595,7 +677,7 @@ impl SecondaryDatabase {
         // database is always configured as a simple key->value store in our
         // implementation (sec_key->pri_key, no dup support at the b-tree level),
         // a key search is correct.
-        let mut cursor = self.make_inner_cursor()?;
+        let mut cursor = self.make_inner_cursor(txn)?;
         let mut stored_pk = DatabaseEntry::new();
         // Clone sec_key because Cursor::get requires &mut but key is input-only for Search.
         let mut sec_key_mut = sec_key.clone();
@@ -621,8 +703,11 @@ impl SecondaryDatabase {
     }
 
     /// Builds a writable `Cursor` on the inner secondary index `Database`.
-    fn make_inner_cursor(&self) -> Result<Cursor> {
-        self.inner.open_cursor(None, None)
+    ///
+    /// `txn` is forwarded to [`Database::open_cursor`] so writes through
+    /// the cursor participate in the caller's transaction (Sprint 4½).
+    fn make_inner_cursor(&self, txn: Option<&Transaction>) -> Result<Cursor> {
+        self.inner.open_cursor(txn, None)
     }
 
     /// Builds a `SecondaryCursor` on this secondary database (internal).
@@ -671,7 +756,9 @@ impl SecondaryDatabase {
             let pri_key = DatabaseEntry::from_bytes(&k);
             let pri_data = DatabaseEntry::from_bytes(&v);
 
-            // Create secondary key(s) and insert them.
+            // Create secondary key(s) and insert them.  Population runs
+            // at `SecondaryDatabase::open` time, before any user txn
+            // exists, so we auto-commit each insert (`txn = None`).
             if let Some(creator) = &self.config.key_creator {
                 let mut sec_key = DatabaseEntry::new();
                 if creator.create_secondary_key(
@@ -680,7 +767,7 @@ impl SecondaryDatabase {
                     &pri_data,
                     &mut sec_key,
                 ) {
-                    self.insert_sec_key(&sec_key, &pri_key)?;
+                    self.insert_sec_key(None, &sec_key, &pri_key)?;
                 }
             } else if let Some(multi_creator) = &self.config.multi_key_creator {
                 let mut sec_keys = Vec::new();
@@ -691,7 +778,7 @@ impl SecondaryDatabase {
                     &mut sec_keys,
                 );
                 for sec_key in sec_keys {
-                    self.insert_sec_key(&sec_key, &pri_key)?;
+                    self.insert_sec_key(None, &sec_key, &pri_key)?;
                 }
             }
 
@@ -812,7 +899,9 @@ mod tests {
         }
 
         // Update the secondary index manually (mimics the integration layer).
-        secondary.update_secondary(&pri_key, None, Some(&pri_data)).unwrap();
+        secondary
+            .update_secondary(None, &pri_key, None, Some(&pri_data))
+            .unwrap();
 
         // Retrieve by secondary key (first byte of "Avalon" = 'A' = 0x41).
         let sec_key = DatabaseEntry::from_bytes(b"A");
@@ -844,7 +933,7 @@ mod tests {
             {
                 primary.lock().put(None, &pk, &pv).unwrap();
             }
-            secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+            secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
         }
 
         // Search by secondary key 'B'.
@@ -875,7 +964,9 @@ mod tests {
         {
             primary.lock().put(None, &pri_key, &pri_data).unwrap();
         }
-        secondary.update_secondary(&pri_key, None, Some(&pri_data)).unwrap();
+        secondary
+            .update_secondary(None, &pri_key, None, Some(&pri_data))
+            .unwrap();
 
         // Delete via secondary key.
         let sec_key = DatabaseEntry::from_bytes(b"C");
@@ -901,14 +992,16 @@ mod tests {
         {
             primary.lock().put(None, &pri_key, &old_data).unwrap();
         }
-        secondary.update_secondary(&pri_key, None, Some(&old_data)).unwrap();
+        secondary
+            .update_secondary(None, &pri_key, None, Some(&old_data))
+            .unwrap();
 
         // Now update the primary; the secondary key 'M' should be replaced by 'P'.
         {
             primary.lock().put(None, &pri_key, &new_data).unwrap();
         }
         secondary
-            .update_secondary(&pri_key, Some(&old_data), Some(&new_data))
+            .update_secondary(None, &pri_key, Some(&old_data), Some(&new_data))
             .unwrap();
 
         // Old key 'M' should no longer be in the secondary.
@@ -938,7 +1031,7 @@ mod tests {
             let pk = DatabaseEntry::from_bytes(k);
             let pv = DatabaseEntry::from_bytes(v);
             primary.lock().put(None, &pk, &pv).unwrap();
-            secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+            secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
         }
 
         // Iterate via SecondaryCursor and collect all secondary keys encountered.

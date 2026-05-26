@@ -99,7 +99,7 @@ fn d1b_secondary_collision_returns_unsupported() {
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let v1 = DatabaseEntry::from_bytes(b"Apple");
     primary.lock().put(None, &pk1, &v1).unwrap();
-    sec.update_secondary(&pk1, None, Some(&v1)).unwrap();
+    sec.update_secondary(None, &pk1, None, Some(&v1)).unwrap();
 
     // Sanity: lookup by 'A' returns pk1.
     let mut p_key = DatabaseEntry::new();
@@ -114,7 +114,7 @@ fn d1b_secondary_collision_returns_unsupported() {
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
     let v2 = DatabaseEntry::from_bytes(b"Apricot");
     primary.lock().put(None, &pk2, &v2).unwrap();
-    let result = sec.update_secondary(&pk2, None, Some(&v2));
+    let result = sec.update_secondary(None, &pk2, None, Some(&v2));
 
     match result {
         Err(NoxuError::Unsupported(msg)) => {
@@ -174,7 +174,7 @@ fn d1b_one_to_one_happy_path() {
         let pk = DatabaseEntry::from_bytes(pk);
         let v = DatabaseEntry::from_bytes(val);
         primary.lock().put(None, &pk, &v).unwrap();
-        sec.update_secondary(&pk, None, Some(&v)).unwrap();
+        sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
     }
 
     // Each maps back to its primary.
@@ -215,10 +215,10 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
     primary.lock().put(None, &pk, &v).unwrap();
 
     // First insert into secondary.
-    sec.update_secondary(&pk, None, Some(&v)).unwrap();
+    sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
 
     // Same (pk, sec_key) again — must be a no-op, not a collision error.
-    sec.update_secondary(&pk, None, Some(&v))
+    sec.update_secondary(None, &pk, None, Some(&v))
         .expect("re-inserting the same primary key for the same sec key must be idempotent");
 
     // Lookup still succeeds.
