@@ -21,13 +21,15 @@
 
 ## What is a Cursor?
 
-A cursor is a position marker that can move through a database's records in sorted key order. Cursors allow you to:
+A cursor is a position marker that can move through a database's records in sorted key order.
+Cursors allow you to:
 
 * Iterate forward or backward through all records.
 * Seek to a specific key or to the nearest key that is greater-than-or-equal to a target.
 * Insert, update, or delete records at the current cursor position.
 
-Cursors are the primary tool for bulk reads, range scans, and operating on databases that allow duplicate keys.
+Cursors are the primary tool for bulk reads, range scans, and operating on databases that allow
+duplicate keys.
 
 ## Opening and Closing Cursors
 
@@ -39,7 +41,8 @@ let mut cursor = db.open_cursor(None, None)?;
 cursor.close()?;
 ```
 
-The first argument is an optional transaction. The second is an optional `CursorConfig`. Both are typically `None` for simple use cases.
+The first argument is an optional transaction. The second is an optional `CursorConfig`. Both are
+typically `None` for simple use cases.
 
 The transaction argument **is honoured** in v1.5 (Sprint 1C): passing
 `Some(&txn)` causes the cursor's reads and writes to acquire locks on
@@ -48,7 +51,8 @@ behalf of `txn`, and the cursor must be closed before `txn.commit()` /
 still go through the lock manager (Sprint 1 / F12) but whose locks are
 released per-operation.
 
-Cursors must be closed before the database they belong to is closed. Failing to close cursors before closing a database returns an error.
+Cursors must be closed before the database they belong to is closed. Failing to close cursors
+before closing a database returns an error.
 
 ## Navigating with Get
 
@@ -80,7 +84,10 @@ The `Get` variants:
 | `Get::SearchLte` | Largest key <= search key | ❌ v1.5: `NoxuError::Unsupported` (planned for v1.6) |
 | `Get::FirstDup` / `Get::LastDup` | First / last duplicate of the current key | ❌ v1.5: `NoxuError::Unsupported` (planned for v1.6) |
 
-For `Search`, `SearchGte`, and `SearchRange`, the key to search for must be placed in the key `DatabaseEntry` before calling `get`. After a successful `Search` the key entry holds the found key; after `SearchGte` the key entry holds the actual key found (which may be greater than the search key).
+For `Search`, `SearchGte`, and `SearchRange`, the key to search for must be placed in the key
+`DatabaseEntry` before calling `get`. After a successful `Search` the key entry holds the found
+key; after `SearchGte` the key entry holds the actual key found (which may be greater than the
+search key).
 
 ## Forward Iteration
 
@@ -134,7 +141,9 @@ cursor.close()?;
 
 ## Range Scan (Greater-Than-Or-Equal Search)
 
-`Get::SearchGte` (or its alias `Get::SearchRange`) positions the cursor at the first record with a key that is greater than or equal to the search key. This is the key primitive for prefix and range scans:
+`Get::SearchGte` (or its alias `Get::SearchRange`) positions the cursor at the first record with
+a key that is greater than or equal to the search key. This is the key primitive for prefix and
+range scans:
 
 ```rust
 let mut cursor = db.open_cursor(None, None)?;
@@ -155,7 +164,8 @@ cursor.close()?;
 
 ## Deleting via Cursor
 
-`cursor.delete()` removes the record at the current cursor position. The cursor must have been successfully positioned (i.e., the most recent `get` returned `Success`) before calling `delete`.
+`cursor.delete()` removes the record at the current cursor position. The cursor must have been
+successfully positioned (i.e., the most recent `get` returned `Success`) before calling `delete`.
 
 ```rust
 let mut cursor = db.open_cursor(None, None)?;
@@ -170,7 +180,8 @@ cursor.close()?;
 
 ## Writing via Cursor
 
-`cursor.put` inserts or overwrites the record at the current cursor position. Use the `Put` enum to control overwrite behavior:
+`cursor.put` inserts or overwrites the record at the current cursor position. Use the `Put` enum
+to control overwrite behavior:
 
 ```rust
 use noxu_db::Put;
@@ -180,7 +191,8 @@ let data = DatabaseEntry::from_bytes(b"Dave Brown, Finance");
 cursor.put(&key, &data, Put::Overwrite)?;
 ```
 
-`Put::Overwrite` replaces any existing record with the given key. `Put::NoOverwrite` returns `OperationStatus::KeyExists` if the key already exists.
+`Put::Overwrite` replaces any existing record with the given key. `Put::NoOverwrite` returns
+`OperationStatus::KeyExists` if the key already exists.
 
 ## Replacing Data via Cursor
 
@@ -199,6 +211,8 @@ cursor.put(&search_key, &new_data, Put::Overwrite)?;
 
 ## Important: Always Close Cursors
 
-Cursors hold page locks. Open cursors consume resources and can block other threads. Always close cursors as soon as you are done with them — preferably in a `defer`-style pattern or at the end of a lexical scope using Rust's RAII.
+Cursors hold page locks. Open cursors consume resources and can block other threads. Always close
+cursors as soon as you are done with them — preferably in a `defer`-style pattern or at the end of
+a lexical scope using Rust's RAII.
 
 ---

@@ -81,7 +81,8 @@ This decoupling is valuable in practice:
 ### References
 
 - Lamport, L. (1998). Paxos Made Simple. *ACM SIGACT News*, 32(4), 18-25.
-- Howard, H., Schwarzkopf, M., Madhavapeddy, A., & Crowcroft, J. (2016). Flexible Paxos: Quorum Intersection Revisited. arXiv:1608.06696.
+- Howard, H., Schwarzkopf, M., Madhavapeddy, A., & Crowcroft, J. (2016). Flexible Paxos: Quorum
+  Intersection Revisited. arXiv:1608.06696.
 - Howard, H. (2019). Distributed Consensus Revised. UCAM-CL-TR-935. University of Cambridge.
 - Ongaro, D., & Ousterhout, J. (2014). In Search of an Understandable Consensus Algorithm. *USENIX ATC 2014*.
 
@@ -154,8 +155,10 @@ orders of magnitude.
 
 - Hayashibara, N., Defago, X., Yared, R., & Katayama, T. (2004). The Phi Accrual Failure Detector. *SRDS 2004*, 66-78.
 - Abramowitz, M., & Stegun, I. A. (1964). *Handbook of Mathematical Functions*. Formula 26.2.17.
-- Das, A., Gupta, I., & Motivala, A. (2002). SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol. *DSN 2002*.
-- Satzger, B., Pietzowski, A., Trumler, W., & Ungerer, T. (2007). A New Adaptive Accrual Failure Detector for Dependable Distributed Systems. *SAC 2007*.
+- Das, A., Gupta, I., & Motivala, A. (2002). SWIM: Scalable Weakly-consistent Infection-style
+  Process Group Membership Protocol. *DSN 2002*.
+- Satzger, B., Pietzowski, A., Trumler, W., & Ungerer, T. (2007). A New Adaptive Accrual Failure
+  Detector for Dependable Distributed Systems. *SAC 2007*.
 
 ---
 

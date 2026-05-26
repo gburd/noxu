@@ -5,9 +5,13 @@
 
 ## What is a Secondary Database?
 
-A secondary database is an index over a primary database. While the primary database stores your canonical records keyed by a primary key (e.g., employee ID), a secondary database stores an additional mapping from some derived key (e.g., department name) to the primary key.
+A secondary database is an index over a primary database. While the primary database stores your
+canonical records keyed by a primary key (e.g., employee ID), a secondary database stores an
+additional mapping from some derived key (e.g., department name) to the primary key.
 
-Secondary databases are read-only from your application's perspective — you do not insert into them directly. Instead, whenever you update the primary database, you update the secondary index to reflect the change.
+Secondary databases are read-only from your application's perspective — you do not insert into
+them directly. Instead, whenever you update the primary database, you update the secondary index
+to reflect the change.
 
 ## v1.5 limitations
 
@@ -76,7 +80,8 @@ impl SecondaryKeyCreator for DepartmentKeyCreator {
 }
 ```
 
-The method returns `true` if a secondary key was produced, or `false` if this primary record should have no entry in the secondary database.
+The method returns `true` if a secondary key was produced, or `false` if this primary record
+should have no entry in the secondary database.
 
 ## Opening a Secondary Database
 
