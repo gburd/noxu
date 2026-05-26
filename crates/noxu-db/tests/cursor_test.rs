@@ -1451,7 +1451,7 @@ mod secondary_cursor_txn {
         let pk = DatabaseEntry::from_bytes(b"pk1");
         let pv = DatabaseEntry::from_bytes(b"Apple");
         primary.lock().put(None, &pk, &pv).unwrap();
-        secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+        secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
 
         // Open a secondary cursor under a txn with a non-default config.
         let txn = env.begin_transaction(None, None).unwrap();
@@ -1497,12 +1497,13 @@ mod secondary_cursor_txn {
     }
 
     // NOTE: A deeper test that asserts the secondary cursor's reads engage
-    // the supplied txn's lock set is deferred as a follow-up.  The natural
-    // observation point is "another writer to the same sec record blocks
-    // or fails", but `SecondaryDatabase::update_secondary` /
-    // `insert_sec_key` / `delete_sec_key` themselves do not take a
-    // `Transaction` argument (audit findings F4/F5), so they auto-commit
-    // and will hit the `Locker` synchronously without a `no_wait` knob.
-    // Wiring those helpers through a txn is the next sprint's work; the
-    // lock-set test moves with it.
+    // the supplied txn's lock set is deferred as a follow-up.  As of
+    // Sprint 4½, `SecondaryDatabase::update_secondary` /
+    // `insert_sec_key` / `delete_sec_key` *do* take a `Transaction`
+    // argument and forward it to the inner cursor (closing audit finding
+    // F5 for the manual-update path), so a write-conflict probe is now
+    // straightforward to author.  The remaining gap is that
+    // `SecondaryCursor::delete` itself does not yet thread the cursor's
+    // owning txn into the cascading primary-delete + secondary cleanup;
+    // wiring that path moves with the v1.6 automatic-association work.
 }

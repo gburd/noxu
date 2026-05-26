@@ -120,10 +120,19 @@ impl<'a> SecondaryCursor<'a> {
             let s = primary.get(None, &pri_key, &mut pri_data)?;
             if s == OperationStatus::Success {
                 // Remove all secondary index entries for this primary key.
+                // Sprint 4½ plumbed `txn` through `delete_all_for_primary`,
+                // but `SecondaryCursor` does not currently store its txn
+                // handle (the inner `Cursor` already participates in it),
+                // so the cascade still runs auto-committed.  Wiring the
+                // txn into `SecondaryCursor::delete` is tracked as audit
+                // finding F5 follow-up work.
                 let old_data = pri_data.clone();
                 drop(primary);
-                self.secondary_db
-                    .delete_all_for_primary(&pri_key, Some(&old_data))?;
+                self.secondary_db.delete_all_for_primary(
+                    None,
+                    &pri_key,
+                    Some(&old_data),
+                )?;
             }
         }
 
@@ -540,7 +549,7 @@ mod tests {
         let pk = DatabaseEntry::from_bytes(key);
         let pv = DatabaseEntry::from_bytes(value);
         primary.lock().put(None, &pk, &pv).unwrap();
-        secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+        secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
     }
 
     #[test]
