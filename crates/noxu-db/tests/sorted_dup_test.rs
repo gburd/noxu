@@ -423,3 +423,50 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     cursor.close().unwrap();
     let _ = env.close();
 }
+
+// ---------------------------------------------------------------------------
+// v1.5 Sprint 1 — sorted-dup count + delete regressions
+// ---------------------------------------------------------------------------
+
+/// `Database::count()` reports the total number of (key, data) pairs in a
+/// sorted-duplicate database, including every duplicate.
+///
+/// Regression for v1.5 Sprint 1 finding (Group B, item 1): `put_dup`
+/// previously bypassed the per-database entry counter, so `db.count()`
+/// returned 0 even after inserting many duplicates.
+#[test]
+fn test_database_count_includes_all_dups() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
+    let db = env.open_database(None, "test", &db_cfg).unwrap();
+
+    // Empty: count is 0.
+    assert_eq!(db.count().unwrap(), 0);
+
+    // 5 dups for the same key.
+    let key = DatabaseEntry::from_bytes(b"k");
+    for i in 0u8..5 {
+        db.put(None, &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+    }
+    // Plus 3 more (key, data) pairs under a different key.
+    let key2 = DatabaseEntry::from_bytes(b"k2");
+    for i in 0u8..3 {
+        db.put(None, &key2, &DatabaseEntry::from_bytes(&[i])).unwrap();
+    }
+
+    // Per BDB-JE Database.count() contract: total = 5 + 3 = 8.
+    assert_eq!(
+        db.count().unwrap(),
+        8,
+        "db.count() must include every duplicate pair"
+    );
+
+    // Re-inserting an existing exact (key, data) pair must not double-count.
+    db.put(None, &key, &DatabaseEntry::from_bytes(&[0])).unwrap();
+    assert_eq!(db.count().unwrap(), 8);
+
+    let _ = env.close();
+}
