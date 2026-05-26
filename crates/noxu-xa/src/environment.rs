@@ -92,6 +92,21 @@ impl XaEnvironment {
     }
 
     /// Mark the branch as having performed writes.
+    ///
+    /// Historically, this had to be called before `xa_prepare` for any
+    /// branch that performed writes; otherwise `xa_prepare` would take the
+    /// read-only optimisation and silently abort the inner transaction.
+    ///
+    /// As of v1.5, `xa_prepare` auto-detects writes by inspecting the inner
+    /// `Transaction`'s log-entry chain via `Txn::has_logged_entries()`, so
+    /// calling `mark_write` is **no longer required** for correctness when
+    /// writes go through `get_transaction(&xid)`'s `Transaction`.
+    ///
+    /// `mark_write` remains supported as a backwards-compatible no-op
+    /// override: callers who plan to perform writes through some side
+    /// channel that `Txn::has_logged_entries()` cannot observe (today
+    /// there is no such channel in the public API) can still force the
+    /// branch into the writes-present prepare path.
     pub fn mark_write(&self, xid: &Xid) -> XaResult<()> {
         let mut branches = self.branches.lock().unwrap();
         let branch = branches.get_mut(xid).ok_or(XaError::NotFound)?;
@@ -226,7 +241,23 @@ impl XaResource for XaEnvironment {
             )));
         }
 
-        if !branch.has_writes {
+        // Auto-detect writes performed via the inner Transaction. Resolves
+        // the `mark_write` footgun (Sprint 3, audit Finding 3): if the
+        // application performs writes through the inner Transaction but
+        // forgets to call `mark_write`, we must NOT take the read-only
+        // optimisation — doing so silently aborts those writes.
+        //
+        // `Txn::has_logged_entries()` returns true as soon as any LN log
+        // record was emitted under this transaction id, which is exactly
+        // the condition that makes the read-only optimisation unsafe.
+        let inner_has_writes = branch
+            .txn
+            .get_inner_txn()
+            .map(|t| t.lock().unwrap().has_logged_entries())
+            .unwrap_or(false);
+        let has_writes = branch.has_writes || inner_has_writes;
+
+        if !has_writes {
             // Read-only optimization: no need for second phase.
             // Abort the internal transaction (releases locks) and remove branch.
             let _ = branch.txn.abort();
