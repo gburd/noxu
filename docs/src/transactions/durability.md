@@ -16,7 +16,7 @@ most durable option but also the slowest. If you can tolerate the possibility of
 losing the most recent committed transactions in the event of an OS crash, use
 `SyncPolicy::WriteNoSync`. If you can tolerate losing committed transactions on
 application crash as well, use `SyncPolicy::NoSync`. See
-[Non-Durable Transactions](#non-durable-transactions).
+[Non-Durable Transactions](basics.md#non-durable-transactions).
 
 **Reduce Lock Contention**
 
@@ -58,7 +58,7 @@ key ranges to different threads where possible.
 - Use the read-modify-write pattern (`LockMode::Rmw`) when you know a read will be
   followed by a write, to avoid read-lock-to-write-lock upgrades that can deadlock.
 - Expect deadlocks when using secondary databases in a concurrent application.
-  Always implement the retry loop shown in [Aborting a Transaction](#aborting-a-transaction).
+  Always implement the retry loop shown in [Aborting a Transaction](basics.md#aborting-a-transaction).
 
 **Checkpointing**
 

@@ -42,7 +42,7 @@ Blocking has performance implications. Strategies to reduce blocking:
 - Keep transactions short so locks are held for less time.
 - Access heavily-contended records near the end of a transaction.
 - Use lower isolation levels (e.g., uncommitted reads or committed reads) where
-  correctness allows. See [Isolation Levels](#7-isolation-levels).
+  correctness allows. See [Isolation Levels](isolation.md).
 - Arrange threads so they access records in the same order, reducing the chance of
   conflicting lock requests.
 

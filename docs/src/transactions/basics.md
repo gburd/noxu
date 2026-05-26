@@ -55,7 +55,7 @@ While a transaction is in progress, the database appears to that transaction as 
 no other operations are occurring outside of it. Operations wrapped inside a
 transaction always have a clean and consistent view and never see updates in
 progress under another transaction. Isolation guarantees can be relaxed for
-performance; see [Isolation Levels](#7-isolation-levels).
+performance; see [Isolation Levels](isolation.md).
 
 **Durability**
 
@@ -96,7 +96,7 @@ application intervention.
 
 Noxu DB also supports archival backup and recovery in the case of catastrophic
 failure such as the loss of a physical disk drive. See
-[Backup and Recovery](#9-backup-and-recovery).
+[Backup and Recovery](backup-recovery.md).
 
 ## Performance Tuning Overview
 
@@ -104,7 +104,7 @@ The use of transactions is not free. Transaction commits usually require disk I/
 that non-transactional applications do not perform. For multi-threaded applications,
 transactions can increase lock contention due to extra locking required by
 transactional isolation guarantees. Performance tuning considerations are discussed
-throughout this guide and are summarized in [Performance Tuning](#10-performance-tuning).
+throughout this guide and are summarized in [Performance Tuning](durability.md).
 
 ---
 
@@ -209,6 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Key rules:
+
 * Obtain a transaction with `env.begin_transaction(parent, config)`. Pass `None`
   for the parent. Nested (child) transactions are **not supported in v1.5**;
   passing `Some(&parent)` returns a typed `NoxuError::Unsupported` error.
@@ -427,7 +428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 > against an unrelated key do not block on an explicit txn's locks.
 > Earlier wording suggested auto-commit was unavailable for cursors;
 > that referred to a v1.4.x bug that has been fixed.
-
+>
 > **Warning:** Never have more than one active explicit transaction
 > in your thread at a time. Mixing an explicit transaction with an
 > auto-commit operation in the same thread can result in undetectable

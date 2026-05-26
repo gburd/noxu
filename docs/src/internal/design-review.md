@@ -679,7 +679,7 @@ Added warmup pass (all workloads at scale=1000, results discarded) before measur
 | Item | Status | Notes |
 |------|--------|-------|
 | Entry state flags (KD, PD, EMBEDDED_LN, etc.) | ✓ Correct | `in_node.rs:55–66`: all flag bits present |
-| Binary search (findEntry) with EXACT_MATCH | ✓ Correct | `InNode::find_entry()` returns `idx | 0x1_0000` on match |
+| Binary search (findEntry) with EXACT_MATCH | ✓ Correct | `InNode::find_entry()` returns `idx \| 0x1_0000` on match |
 | Level encoding (DBMAP, MAIN, LEVEL_MASK) | ✓ Correct | `tree.rs:32–37`: constants are correct |
 | BIN-delta should_log_delta() (25% threshold) | ✓ Correct | `bin.rs:399–407`: `dirty_count <= total / 4` |
 | Embedded LN slot data | ✓ Correct | `BinEntry` carries embedded data separately from key |
@@ -995,6 +995,7 @@ The auto-commit path wraps the operation in an implicit `AutoTxn` that commits w
 | w01 seq write/1t (100K) | 1,437 | 1,349 | Noxu ~7% faster — consistent at scale |
 | w02 rand write/1t (100K) | 1,445 | 1,344 | Noxu ~8% faster |
 | w03 seq read/1t (1K) | 1,038,000 | 40,976 | Noxu **25×** faster (no JVM warmup) |
+
 **Session 33 benchmark data (2026-05-09 — G1GC, 1K/10K, NVMe /scratch, canonical):**
 
 Both benchmarks run on `/scratch` (NVMe, 3.6TB encrypted). Baseline: `-Djava.io.tmpdir=/scratch/bench-tmp`.

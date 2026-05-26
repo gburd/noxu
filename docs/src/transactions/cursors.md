@@ -73,6 +73,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 If you need to iterate in a concurrent application and want to allow other writers
 to proceed, consider using a lower isolation level for the cursor (see
-[Isolation Levels](#7-isolation-levels)).
+[Isolation Levels](isolation.md)).
 
 ---
