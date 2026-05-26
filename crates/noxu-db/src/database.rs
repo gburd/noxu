@@ -112,14 +112,28 @@ impl Database {
     /// Uses cached `lock_manager` / `log_manager` to avoid acquiring
     /// `env_impl.lock()` on every operation.
     fn make_cursor(&self) -> CursorImpl {
+        self.make_cursor_with_locker(0)
+    }
+
+    /// Creates a CursorImpl with an explicit `locker_id`.
+    ///
+    /// Auto-commit cursors use `0`; transactional cursors must use the
+    /// owning `Transaction::id` so that the LN log entries written by
+    /// `cursor.put` / `cursor.delete` carry the txn id and recovery's
+    /// commit/abort tracking can correctly skip aborted txns.  Without
+    /// this, every LN entry was written with `txn_id = None` (the
+    /// auto-commit form) and recovery treated aborted-txn writes as
+    /// committed once `env_impl.close()` started running on `env.close()`
+    /// after a successful commit/abort (F1).
+    fn make_cursor_with_locker(&self, locker_id: i64) -> CursorImpl {
         match &self.log_manager {
             Some(lm) => CursorImpl::with_log_manager(
                 Arc::clone(&self.db_impl),
-                0,
+                locker_id,
                 Arc::clone(lm),
             )
             .with_lock_manager(Arc::clone(&self.lock_manager)),
-            None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
+            None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
         }
     }
@@ -149,7 +163,14 @@ impl Database {
     /// In which passes the
     /// transaction's `Locker` to the new `CursorImpl`.
     fn make_cursor_for_txn(&self, txn: &Transaction) -> CursorImpl {
-        let cursor = self.make_cursor();
+        // Use the transaction id as the cursor's locker_id so that LN
+        // log entries written under this cursor carry the txn id
+        // (recovery's analysis pass uses LN.txn_id together with
+        // TxnCommit / TxnAbort records to decide whether to redo or
+        // undo the LN). Pre-fix this was hardcoded to 0, which made
+        // every txn-LN look like an auto-commit LN and caused
+        // recovery to redo aborted writes.
+        let cursor = self.make_cursor_with_locker(txn.get_id() as i64);
         if let Some(inner) = txn.get_inner_txn() {
             cursor.with_txn(inner)
         } else {

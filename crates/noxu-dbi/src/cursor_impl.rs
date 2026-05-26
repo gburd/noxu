@@ -785,6 +785,13 @@ impl CursorImpl {
         }
         if let Some(txn) = &self.txn_ref {
             let mut guard = txn.lock().unwrap();
+            // F2: read-uncommitted txns skip read-lock acquisition
+            // entirely.  This mirrors the per-operation
+            // `LockMode::ReadUncommitted` path but applies to every
+            // read on the txn.
+            if guard.is_read_uncommitted_default() {
+                return Ok(false);
+            }
             // Try non-blocking first to detect write contention without waiting.
             let contended = match guard.lock(lsn, LockType::Read, true) {
                 Ok(_) => false, // granted immediately — no concurrent writer
@@ -2016,7 +2023,13 @@ impl CursorImpl {
         entry.write_to_log(&mut buf);
 
         let entry_type = if data.is_some() {
-            LogEntryType::InsertLN
+            if txn_id_opt.is_some() {
+                LogEntryType::InsertLNTxn
+            } else {
+                LogEntryType::InsertLN
+            }
+        } else if txn_id_opt.is_some() {
+            LogEntryType::DeleteLNTxn
         } else {
             LogEntryType::DeleteLN
         };
