@@ -19,6 +19,12 @@
 //!
 //! See [`docs/src/internal/v1.5-decisions-2026-05.md`].
 //!
+//! - **Decision 1B** — v1.5 secondaries are honestly **one-to-one**: a given
+//!   secondary key may map to at most one primary key.  Two distinct
+//!   primaries that produce the same secondary key cause the second
+//!   `update_secondary` (or `populate_if_empty`) to fail with a typed
+//!   [`NoxuError::Unsupported`] (closes audit finding C4).  Sorted-dup
+//!   secondaries are planned for v1.6.
 //! - **Decision 2C** — foreign-key constraints are not enforced in v1.5.
 //!   [`SecondaryDatabase::open`] rejects any [`SecondaryConfig`] whose
 //!   foreign-key fields are set with [`NoxuError::Unsupported`] (closes
@@ -52,6 +58,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// # v1.5 limitations
 ///
+/// - **One-to-one only** (Decision 1B): a given secondary key may map to
+///   at most one primary record.  Sorted-dup secondaries are planned for
+///   v1.6.  Two distinct primaries that produce the same secondary key
+///   cause the second `update_secondary` to fail with
+///   [`NoxuError::Unsupported`].
 /// - **Foreign-key constraints not enforced** (Decision 2C):
 ///   [`SecondaryDatabase::open`] rejects [`SecondaryConfig`]s whose
 ///   foreign-key fields are set.  Full FK support is planned for v1.6.
@@ -486,22 +497,90 @@ impl SecondaryDatabase {
     // ------------------------------------------------------------------
 
     /// Inserts a secondary index entry: (sec_key -> pri_key).
+    ///
+    /// Decision 1B (`docs/src/internal/v1.5-decisions-2026-05.md`):
+    /// v1.5 secondaries are one-to-one.  We use
+    /// [`crate::put::Put::NoOverwrite`] so a collision — two distinct
+    /// primary keys mapping to the same secondary key — returns
+    /// [`OperationStatus::KeyExists`] from the cursor, which we surface
+    /// as a typed [`NoxuError::Unsupported`] explaining that sorted-dup
+    /// secondaries are planned for v1.6.
+    ///
+    /// Pre-Sprint-3 this used `Put::Overwrite`, which let the second
+    /// primary silently destroy the first primary's mapping (audit
+    /// finding C4).  The new behaviour is honest about what v1.5
+    /// supports.
     fn insert_sec_key(
         &self,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        // The secondary database stores sec_key -> pri_key.
-        // If the secondary allows duplicates, use NoOverwrite-equivalent
-        // (NO_DUP_DATA).  If unique, use NoOverwrite.
-        // For this implementation we use Overwrite (idempotent), which is
-        // safe for the fully-populated path since insert_sec_key is only
-        // called when the key did not previously exist.
         let mut cursor = self.make_inner_cursor()?;
-        cursor
-            .put(sec_key, pri_key, crate::put::Put::Overwrite)
+        let status = cursor
+            .put(sec_key, pri_key, crate::put::Put::NoOverwrite)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        Ok(())
+        match status {
+            OperationStatus::Success => Ok(()),
+            OperationStatus::KeyExists => {
+                // Decision 1B: distinguish idempotent re-insert of the
+                // *same* (sec_key, pri_key) pair from a true cross-primary
+                // collision.  An idempotent re-insert is a misuse the
+                // documented manual-`update_secondary` pattern can produce
+                // (calling `update_secondary(pk, None, Some(data))` twice
+                // for the same primary instead of
+                // `update_secondary(pk, Some(old), Some(new))`); we treat
+                // it as a no-op so existing v1.4 callers do not break.
+                // A *cross-primary* collision is the v1.6-feature
+                // (sorted-dup secondaries) gap and is reported as
+                // [`NoxuError::Unsupported`].
+                let mut probe_key = sec_key.clone();
+                let mut existing_pk = DatabaseEntry::new();
+                let mut probe_cursor = self.make_inner_cursor()?;
+                let probe_status = probe_cursor
+                    .get(
+                        &mut probe_key,
+                        &mut existing_pk,
+                        crate::get::Get::Search,
+                        None,
+                    )
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                if probe_status == OperationStatus::Success
+                    && existing_pk.get_data() == pri_key.get_data()
+                {
+                    // Same primary key already mapped here — idempotent.
+                    return Ok(());
+                }
+                let sec_hex = sec_key
+                    .get_data()
+                    .map(|b| {
+                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let existing_hex = existing_pk
+                    .get_data()
+                    .map(|b| {
+                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let pri_hex = pri_key
+                    .get_data()
+                    .map(|b| {
+                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    })
+                    .unwrap_or_default();
+                Err(NoxuError::Unsupported(format!(
+                    "v1.5 secondaries are one-to-one; primary key 0x{existing_hex} \
+                     already maps to secondary key 0x{sec_hex} (cannot also \
+                     map primary key 0x{pri_hex}; sorted-dup secondaries are \
+                     planned for v1.6)"
+                )))
+            }
+            other => Err(NoxuError::OperationNotAllowed(format!(
+                "unexpected put status from secondary index insert: {other:?}"
+            ))),
+        }
     }
 
     /// Deletes a secondary index entry: (sec_key -> pri_key).
@@ -753,9 +832,11 @@ mod tests {
         let primary = Arc::new(Mutex::new(open_primary(&env, "primary")));
         let secondary = open_secondary(Arc::clone(&primary), &env, "secondary");
 
-        // Insert primary records and index them.
+        // Insert primary records and index them.  Each record uses a
+        // distinct first byte so the v1.5 one-to-one secondary contract
+        // (Decision 1B) is satisfied.
         let records: &[(&[u8], &[u8])] =
-            &[(b"pk1", b"Apple"), (b"pk2", b"Banana"), (b"pk3", b"Avocado")];
+            &[(b"pk1", b"Apple"), (b"pk2", b"Banana"), (b"pk3", b"Cherry")];
 
         for (k, v) in records {
             let pk = DatabaseEntry::from_bytes(k);
