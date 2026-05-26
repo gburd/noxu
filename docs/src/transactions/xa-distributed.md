@@ -269,14 +269,15 @@ data in place — use with caution.
 
 The `noxu-xa` crate includes comprehensive test suites:
 
-- **Unit tests** (16): cover each `XaResource` method individually
-- **Protocol tests** (51): deterministic coverage of every valid/invalid state
+* **Unit tests** (16): cover each `XaResource` method individually
+* **Protocol tests** (51): deterministic coverage of every valid/invalid state
   transition, flag combination, and edge case
-- **Chaos tests**: concurrent random XA operations across multiple clusters
-- **Scale tests**: 1000 concurrent branches, 8-thread contention
-- **Performance tests**: 2PC vs 1PC vs plain transaction throughput comparison
+* **Chaos tests**: concurrent random XA operations across multiple clusters
+* **Scale tests**: 1000 concurrent branches, 8-thread contention
+* **Performance tests**: 2PC vs 1PC vs plain transaction throughput comparison
 
 Run with:
+
 ```bash
 cargo test -p noxu-xa                                    # unit + protocol + scale
 cargo test -p noxu-xa -- --ignored --nocapture           # + chaos + perf

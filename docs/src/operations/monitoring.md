@@ -58,4 +58,3 @@ After an invalidating exception the environment becomes unusable.
 close the environment and reopen (which triggers WAL replay).
 
 ---
-

@@ -100,7 +100,7 @@ chapter:
 
 Plus user-facing docs:
 
-4. `docs(xa): document v1.5 in-process-only limitation`
+1. `docs(xa): document v1.5 in-process-only limitation`
    `docs/src/transactions/xa-distributed.md` now opens with a
    prominent admonition about the v1.5 limitation, drops the
    `mark_write` calls from the quick-start example, and replaces

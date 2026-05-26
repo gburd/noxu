@@ -76,7 +76,7 @@ are abbreviations or acronyms):
 
 Reference code lives in the repository:
 
-```
+```text
 _/je/  ← reference archive (read-only)
 _/nosql/  ← extended fork reference (read-only)
 ```

@@ -24,6 +24,7 @@ noxu-rep = { version = "0.1", features = [] }
 ## Group Topology
 
 A replication group consists of:
+
 - **One master** — accepts all writes, feeds log to replicas
 - **Zero or more replicas** — receive the log stream, serve reads
 

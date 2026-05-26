@@ -15,6 +15,7 @@ decisions doc
 (`docs/src/internal/v1.5-decisions-2026-05.md`) approved a
 *smaller-but-honest* v1.5: ship the auto-commit-only Stored*
 surface, document the limitations loudly, and move the typed-API
+
 + transactional redesign to v1.6.
 
 Sprint 3C is the implementation of that decision.
@@ -99,15 +100,15 @@ Full schema evolution remains v1.6 work.
 `docs/src/collections/{stored-map,stored-set,stored-list}.md` were
 rewritten:
 
-* The unimplemented `StoredMap<K, V>` / `StoredSet<K>` /
++ The unimplemented `StoredMap<K, V>` / `StoredSet<K>` /
   `StoredList<V>` typed surface was removed; examples now show the
   actual `&[u8]`-keyed API.
-* Each chapter gained a "v1.5 limitations" section pointing at the
++ Each chapter gained a "v1.5 limitations" section pointing at the
   closed/deferred audit findings.
-* `docs/src/collections/README.md` got a top-level "v1.5
++ `docs/src/collections/README.md` got a top-level "v1.5
   collections — what's in scope" summary so users see all five
   restrictions in one place.
-* `docs/src/getting-started/bindings.md` got the
++ `docs/src/getting-started/bindings.md` got the
   `SerdeBinding` version-prefix format and migration story.
 
 `TransactionRunner` was *not* removed — it remains useful for
@@ -121,44 +122,44 @@ API.
 
 Added under `crates/noxu-collections/tests/sprint3c_tests.rs`:
 
-* `stored_map_ops_succeed_without_txn_argument` — auto-commit API
++ `stored_map_ops_succeed_without_txn_argument` — auto-commit API
   shape guard for findings #1, #3, #4.  When v1.6 redesigns the
   signatures this test will need to be updated, which is the
   signal we want.
-* `stored_list_ops_succeed_without_txn_argument` — same for
++ `stored_list_ops_succeed_without_txn_argument` — same for
   `StoredList`.
-* `stored_list_open_recovers_next_index_after_reopen` — finding
++ `stored_list_open_recovers_next_index_after_reopen` — finding
   #6 fix.  Two-session test: write 3 entries, close, reopen with
   `open`, assert recovered `next_index` and a non-clobbering push.
-* `stored_list_new_does_not_recover_and_overwrites_on_reopen` —
++ `stored_list_new_does_not_recover_and_overwrites_on_reopen` —
   finding #6 hazard pin.  Documents what `new` actually does so a
   future change to `new`'s contract is a deliberate, visible API
   change.
-* `stored_list_open_on_empty_database_starts_at_zero` —
++ `stored_list_open_on_empty_database_starts_at_zero` —
   empty-database parity with `new`.
-* `stored_list_open_rejects_mixed_use_database` — non-8-byte
++ `stored_list_open_rejects_mixed_use_database` — non-8-byte
   largest key returns `IllegalState`.
 
 Added under `crates/noxu-bind/src/serial/serde_binding.rs`:
 
-* `test_encoded_payload_starts_with_version_header` — wire-format
++ `test_encoded_payload_starts_with_version_header` — wire-format
   guard.
-* `test_decode_unprefixed_payload_returns_version_mismatch` — the
++ `test_decode_unprefixed_payload_returns_version_mismatch` — the
   audit-asked-for regression test: an old payload decodes to a
   typed error, not a wrong-shaped value.
-* `test_decode_short_payload_returns_version_mismatch` — 0/1-byte
++ `test_decode_short_payload_returns_version_mismatch` — 0/1-byte
   payloads also surface as `VersionMismatch`.
-* `test_decode_wrong_version_returns_version_mismatch` — right
++ `test_decode_wrong_version_returns_version_mismatch` — right
   magic, wrong version still fails.
-* `test_version_mismatch_display` — formatted error names both
++ `test_version_mismatch_display` — formatted error names both
   expected and found bytes.
 
 In-module test fixed in `stored_list.rs`:
 
-* `test_remove` extended to assert `next_index() == 3` after
++ `test_remove` extended to assert `next_index() == 3` after
   `remove(1)` on a 3-element list (the existing test was silent
   about this).
-* New `test_remove_does_not_reclaim_slot_on_push` documents the
++ New `test_remove_does_not_reclaim_slot_on_push` documents the
   "remove leaves a hole, push uses next_index" contract.
 
 Tightened `BindError` test surface lives in the new
@@ -177,30 +178,30 @@ still pass because round-trip exercises the new prefix transparently.
 
 ## 5. Files touched
 
-* `crates/noxu-collections/src/lib.rs` — crate-level v1.5
++ `crates/noxu-collections/src/lib.rs` — crate-level v1.5
   limitations rustdoc.
-* `crates/noxu-collections/src/stored_map.rs` — type-level v1.5
++ `crates/noxu-collections/src/stored_map.rs` — type-level v1.5
   limitations.
-* `crates/noxu-collections/src/stored_sorted_map.rs` — same.
-* `crates/noxu-collections/src/stored_key_set.rs` — same.
-* `crates/noxu-collections/src/stored_value_set.rs` — same.
-* `crates/noxu-collections/src/stored_list.rs` — type-level
++ `crates/noxu-collections/src/stored_sorted_map.rs` — same.
++ `crates/noxu-collections/src/stored_key_set.rs` — same.
++ `crates/noxu-collections/src/stored_value_set.rs` — same.
++ `crates/noxu-collections/src/stored_list.rs` — type-level
   limitations + `open` constructor + `remove` rustdoc fix +
   in-module tests.
-* `crates/noxu-collections/src/transaction_runner.rs` — runner
++ `crates/noxu-collections/src/transaction_runner.rs` — runner
   v1.5 limitations + example update.
-* `crates/noxu-collections/tests/sprint3c_tests.rs` — new.
-* `crates/noxu-bind/src/error.rs` — new
++ `crates/noxu-collections/tests/sprint3c_tests.rs` — new.
++ `crates/noxu-bind/src/error.rs` — new
   `BindError::VersionMismatch` variant.
-* `crates/noxu-bind/src/serial/serde_binding.rs` — version-prefix
++ `crates/noxu-bind/src/serial/serde_binding.rs` — version-prefix
   encode/decode + tests.
-* `docs/src/collections/README.md` — top-level v1.5 summary.
-* `docs/src/collections/stored-map.md` — rewrite to actual API.
-* `docs/src/collections/stored-set.md` — same.
-* `docs/src/collections/stored-list.md` — same + `open` example.
-* `docs/src/getting-started/bindings.md` — `SerdeBinding` version
++ `docs/src/collections/README.md` — top-level v1.5 summary.
++ `docs/src/collections/stored-map.md` — rewrite to actual API.
++ `docs/src/collections/stored-set.md` — same.
++ `docs/src/collections/stored-list.md` — same + `open` example.
++ `docs/src/getting-started/bindings.md` — `SerdeBinding` version
   prefix format + migration.
-* `docs/src/internal/sprint-3-collections-restriction.md` — this
++ `docs/src/internal/sprint-3-collections-restriction.md` — this
   document.
 
 Out of scope (per the sprint plan): `noxu-db`, `noxu-persist`,

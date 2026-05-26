@@ -48,14 +48,17 @@ serving" state.
 
 2. **Check the file integrity.** Each `.ndb` file in the
    environment directory has its own integrity. List file sizes:
+
    ```sh
    ls -lS /path/to/env/*.ndb
    ```
+
    A file truncated to 0 bytes or much smaller than its peers is
    the most common cause.
 
 3. **Check the file's checksum directly** using the standalone
    tool (when shipped):
+
    ```sh
    noxu-fsck /path/to/env/00000042.ndb
    ```
@@ -133,9 +136,11 @@ environment will fail with
 
 2. **Inspect file utilisation.** Each `.ndb` file's utilisation is
    logged at cleaner-run boundaries:
+
    ```text
    cleaner: file 00000042.ndb utilisation = 87.3%, threshold = 50%, skip
    ```
+
    If most files are above the threshold but the disk is filling,
    the cleaner is correctly idle and the writer rate is the
    problem.
@@ -204,21 +209,25 @@ constantly being re-acquired.
 ### Diagnose
 
 1. **Identify whether the network is the cause.**
+
    ```sh
    for peer in node1 node2 node3; do
      ping -c 5 $peer
    done
    ```
+
    Sustained packet loss > 5% or RTT variance > 100ms is enough to
    trip phi_detector at default thresholds.
 
 2. **Check phi values directly.** The `MasterTracker` exposes
    `phi(peer_name)`:
+
    ```rust
    for peer in cluster.peers() {
        eprintln!("{}: phi = {:.2}", peer, tracker.phi(peer));
    }
    ```
+
    If most pairs show phi > 8 (default suspicion threshold), the
    network is the problem.
 
@@ -290,6 +299,7 @@ from minutes to hours.
 ### Diagnose
 
 1. **Read recent checkpoint stats.**
+
    ```rust
    let s = env.get_stats()?;
    eprintln!("last={}ms, count={}, dirty_in_count={}",
@@ -297,6 +307,7 @@ from minutes to hours.
        s.checkpoint.checkpoints,
        s.evictor.in_count_at_last_checkpoint);
    ```
+
    `in_count_at_last_checkpoint` is the size of the in-memory IN
    set the checkpointer had to walk. If this is growing while
    throughput is steady, evictor isn't keeping up with cache

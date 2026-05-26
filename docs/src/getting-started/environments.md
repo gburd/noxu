@@ -2,7 +2,9 @@
 
 ## What is an Environment?
 
-An environment is a directory on disk plus an in-memory handle that manages everything in that directory. Every application using Noxu DB must use an environment — it is not optional. The environment:
+An environment is a directory on disk plus an in-memory handle that manages everything in that
+directory. Every application using Noxu DB must use an environment — it is not optional. The
+environment:
 
 - Provides the in-memory cache shared by all databases opened through it.
 - Runs background threads (cleaner, checkpointer, evictor).
@@ -24,11 +26,13 @@ let config = EnvironmentConfig::new(PathBuf::from("/var/data/myapp"))
 let env = Environment::open(config)?;
 ```
 
-If `with_allow_create(false)` (the default) and the directory does not exist, `open` returns an error. The directory must exist, or `allow_create` must be `true`.
+If `with_allow_create(false)` (the default) and the directory does not exist, `open` returns an
+error. The directory must exist, or `allow_create` must be `true`.
 
 ## Environment Configuration
 
-`EnvironmentConfig` uses a builder pattern. All configuration is set before opening; it cannot be changed while the environment is open.
+`EnvironmentConfig` uses a builder pattern. All configuration is set before opening; it cannot be
+changed while the environment is open.
 
 ```rust
 use noxu_db::{Environment, EnvironmentConfig};
@@ -68,7 +72,9 @@ let env = Environment::open(config)?;
 
 ## Read-Only Environments
 
-A read-only environment can be opened against an environment directory that is currently being written by another process. No write operations are permitted. Background threads do not run in a read-only environment.
+A read-only environment can be opened against an environment directory that is currently being
+written by another process. No write operations are permitted. Background threads do not run in
+a read-only environment.
 
 ```rust
 let config = EnvironmentConfig::new(PathBuf::from("/var/data/myapp"))
@@ -79,7 +85,8 @@ assert!(env.is_read_only());
 
 ## Closing an Environment
 
-Always close the environment when you are finished. All open database handles must be closed first, and there must be no active transactions.
+Always close the environment when you are finished. All open database handles must be closed
+first, and there must be no active transactions.
 
 ```rust
 // Close databases first
@@ -89,7 +96,9 @@ db.close()?;
 env.close()?;
 ```
 
-If the environment handle goes out of scope without being explicitly closed, the `Drop` implementation performs a best-effort close. Relying on `Drop` is acceptable for simple applications but explicit close is recommended to propagate any errors.
+If the environment handle goes out of scope without being explicitly closed, the `Drop`
+implementation performs a best-effort close. Relying on `Drop` is acceptable for simple
+applications but explicit close is recommended to propagate any errors.
 
 ## Listing Databases in an Environment
 
@@ -111,4 +120,3 @@ env.remove_database(None, "db_name")?;
 ```
 
 ---
-

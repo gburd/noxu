@@ -16,10 +16,12 @@ during checkpoint.
 ### BIN — Bottom Internal Node
 
 The leaf-level internal nodes. Each slot holds a key and either:
+
 - A pointer to a separate `LN` node (for larger values), or
 - An **embedded LN** (small values stored directly in the BIN slot)
 
 BINs carry per-slot metadata:
+
 - `dirty: bool` — set on insert/update, cleared after checkpoint
 - `modification_times: Vec<u64>` — TTL write timestamps
 - `creation_times: Vec<u64>` — TTL insert timestamps
@@ -35,7 +37,7 @@ directly in their parent BIN slot.
 ## Key Prefix Compression
 
 When BIN keys share a common prefix, the prefix is stored once in the BIN
-header; individual slots store only the suffix. `recompute_key_prefix()` 
+header; individual slots store only the suffix. `recompute_key_prefix()`
 rebuilds the prefix when a BIN is deserialized. This reduces memory for
 structured keys (e.g., UUIDs, hierarchical paths).
 
