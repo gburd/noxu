@@ -44,11 +44,11 @@ pub enum EnvironmentFailureReason {
     LogWrite,
 
     /// A log file was not found during read (truncation or deletion).
-    /// : `LOG_FILE_NOT_FOUND`.
+    /// Mirrors `LOG_FILE_NOT_FOUND`.
     LogFileNotFound,
 
     /// The log is incomplete or internally inconsistent.
-    /// : `LOG_INTEGRITY`.
+    /// Mirrors `LOG_INTEGRITY`.
     LogIntegrity,
 
     // ── B-tree ──────────────────────────────────────────────────────────────
@@ -58,19 +58,19 @@ pub enum EnvironmentFailureReason {
 
     // ── Unexpected internal state ──────────────────────────────────────────
     /// An unexpected internal state was reached (non-fatal; env still valid).
-    /// : `UNEXPECTED_STATE`.
+    /// Mirrors `UNEXPECTED_STATE`.
     UnexpectedState,
 
     /// An unexpected internal state was reached (fatal; env is invalidated).
-    /// : `UNEXPECTED_STATE_FATAL`.
+    /// Mirrors `UNEXPECTED_STATE_FATAL`.
     UnexpectedStateFatal,
 
     /// An unexpected exception was caught internally (non-fatal).
-    /// : `UNEXPECTED_EXCEPTION`.
+    /// Mirrors `UNEXPECTED_EXCEPTION`.
     UnexpectedException,
 
     /// An unexpected exception was caught internally (fatal; env invalidated).
-    /// : `UNEXPECTED_EXCEPTION_FATAL`.
+    /// Mirrors `UNEXPECTED_EXCEPTION_FATAL`.
     UnexpectedExceptionFatal,
 
     // ── Resource limits ─────────────────────────────────────────────────────
@@ -83,32 +83,32 @@ pub enum EnvironmentFailureReason {
 
     // ── Thread lifecycle ────────────────────────────────────────────────────
     /// The calling thread was interrupted while performing a
-    /// : `THREAD_INTERRUPTED`.
+    /// Mirrors `THREAD_INTERRUPTED`.
     ThreadInterrupted,
 
     // ── Replication ─────────────────────────────────────────────────────────
     /// The master transitioned to a replica while a transaction was active.
-    /// : `MASTER_TO_REPLICA_TRANSITION`.
+    /// Mirrors `MASTER_TO_REPLICA_TRANSITION`.
     MasterToReplicaTransition,
 
     /// The replica was fenced by the master.
-    /// : `REPLICA_FENCING`.
+    /// Mirrors `REPLICA_FENCING`.
     ReplicaFencing,
 
     /// A replication handshake error occurred.
-    /// : `HANDSHAKE_ERROR`.
+    /// Mirrors `HANDSHAKE_ERROR`.
     HandshakeError,
 
     /// Replication protocol version mismatch.
-    /// : `PROTOCOL_VERSION_MISMATCH`.
+    /// Mirrors `PROTOCOL_VERSION_MISMATCH`.
     ProtocolVersionMismatch,
 
     /// An uncaught exception in a background replication thread.
-    /// : `UNCAUGHT_EXCEPTION`.
+    /// Mirrors `UNCAUGHT_EXCEPTION`.
     UncaughtException,
 
     /// Forced shutdown was requested.
-    /// : `FORCED_SHUTDOWN`.
+    /// Mirrors `FORCED_SHUTDOWN`.
     ForcedShutdown,
 
     // ── Catch-all ──────────────────────────────────────────────────────────
