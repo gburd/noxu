@@ -1,5 +1,24 @@
 # Cursors
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+>
+> **v1.5 cursor contract — highlights:**
+>
+> * `Database::open_cursor(Some(&txn), …)` and
+>   `SecondaryDatabase::open_cursor(Some(&txn), …)` correctly thread
+>   the supplied transaction through to the underlying cursor in v1.5
+>   (Sprint 1C). Pre-1.5 release candidates silently ignored the
+>   transaction; if you are upgrading, see
+>   [Migrating from v1.4.x](migrating.md) for the lock-conflict
+>   surface that change can expose.
+> * `Get::SearchLte`, `Get::FirstDup`, and `Get::LastDup` return
+>   `NoxuError::Unsupported` in v1.5; planned for v1.6.
+> * `Get::NextDup` and `Get::PrevDup` on a non-duplicates database
+>   return `NotFound` (consistent with the no-dups invariant).
+> * `Get::SearchBoth` on a non-duplicates database now validates the
+>   data argument (a non-matching data returns `NotFound`).
+
 ## What is a Cursor?
 
 A cursor is a position marker that can move through a database's records in sorted key order. Cursors allow you to:
@@ -22,6 +41,13 @@ cursor.close()?;
 
 The first argument is an optional transaction. The second is an optional `CursorConfig`. Both are typically `None` for simple use cases.
 
+The transaction argument **is honoured** in v1.5 (Sprint 1C): passing
+`Some(&txn)` causes the cursor's reads and writes to acquire locks on
+behalf of `txn`, and the cursor must be closed before `txn.commit()` /
+`txn.abort()`. Passing `None` opens an auto-commit cursor whose writes
+still go through the lock manager (Sprint 1 / F12) but whose locks are
+released per-operation.
+
 Cursors must be closed before the database they belong to is closed. Failing to close cursors before closing a database returns an error.
 
 ## Navigating with Get
@@ -39,16 +65,20 @@ let status = cursor.get(&mut key, &mut data, Get::First, None)?;
 
 The `Get` variants:
 
-| Variant | Behavior |
-|---|---|
-| `Get::First` | Move to the first record (smallest key) |
-| `Get::Last` | Move to the last record (largest key) |
-| `Get::Next` | Move to the next record |
-| `Get::Prev` | Move to the previous record |
-| `Get::Search` | Move to the record with exactly the given key |
-| `Get::SearchGte` | Move to the first record with key >= the given key |
-| `Get::SearchRange` | Alias for `SearchGte`  |
-| `Get::Current` | Re-read the record at the current position |
+| Variant | Behavior | v1.5 |
+|---|---|---|
+| `Get::First` | Move to the first record (smallest key) | ✅ |
+| `Get::Last` | Move to the last record (largest key) | ✅ |
+| `Get::Next` | Move to the next record | ✅ |
+| `Get::Prev` | Move to the previous record | ✅ |
+| `Get::Search` | Move to the record with exactly the given key | ✅ |
+| `Get::SearchBoth` | Position to the exact `(key, data)` pair (validates data on non-dup DBs) | ✅ |
+| `Get::SearchGte` | Move to the first record with key >= the given key | ✅ |
+| `Get::SearchRange` | Alias for `SearchGte` | ✅ |
+| `Get::Current` | Re-read the record at the current position | ✅ |
+| `Get::NextDup` / `Get::PrevDup` | Next/previous duplicate of the current key | ✅ on sorted-dup DBs; on non-dup DBs they return `NotFound` |
+| `Get::SearchLte` | Largest key <= search key | ❌ v1.5: `NoxuError::Unsupported` (planned for v1.6) |
+| `Get::FirstDup` / `Get::LastDup` | First / last duplicate of the current key | ❌ v1.5: `NoxuError::Unsupported` (planned for v1.6) |
 
 For `Search`, `SearchGte`, and `SearchRange`, the key to search for must be placed in the key `DatabaseEntry` before calling `get`. After a successful `Search` the key entry holds the found key; after `SearchGte` the key entry holds the actual key found (which may be greater than the search key).
 
