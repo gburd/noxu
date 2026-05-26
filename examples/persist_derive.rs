@@ -161,10 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let by_email = Person::open_by_email_index(&mut primary);
     let by_dept = Person::open_by_dept_index(&mut primary);
 
-    println!(
-        "\nDeclared secondary indexes: {:?}",
-        Person::SECONDARY_INDEXES
-    );
+    println!("\nDeclared secondary indexes: {:?}", Person::SECONDARY_INDEXES);
 
     // 3. Insert a few people.
     let people = [
@@ -231,7 +228,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bob = primary.get(None, &ser, &2u32)?.unwrap();
     bob.email = "bob@new.example.com".into();
     primary.put(None, &ser, &bob)?;
-    assert!(by_email.get(None, &ser, &primary, &"bob@example.com".into())?.is_none());
+    assert!(
+        by_email
+            .get(None, &ser, &primary, &"bob@example.com".into())?
+            .is_none()
+    );
     assert!(
         by_email
             .get(None, &ser, &primary, &"bob@new.example.com".into())?

@@ -186,11 +186,7 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
             // Tuple struct with N>1 fields: composite by index.
             let n = unnamed.unnamed.len();
             let idxs = (0..n).map(syn::Index::from).collect::<Vec<_>>();
-            let tys = unnamed
-                .unnamed
-                .iter()
-                .map(|f| &f.ty)
-                .collect::<Vec<_>>();
+            let tys = unnamed.unnamed.iter().map(|f| &f.ty).collect::<Vec<_>>();
             let to_bytes = composite_to_bytes_tuple(&idxs, &tys);
             let from_bytes = composite_from_bytes_tuple(&idxs, &tys);
             (to_bytes, from_bytes)
@@ -375,7 +371,10 @@ fn composite_from_bytes_named(
 ///
 /// Also emits `pub const SECONDARY_INDEXES: &'static [SecondarySpec]` on
 /// the struct, suitable for runtime introspection.
-#[proc_macro_derive(SecondaryKey, attributes(secondary_key, primary_key, entity))]
+#[proc_macro_derive(
+    SecondaryKey,
+    attributes(secondary_key, primary_key, entity)
+)]
 pub fn derive_secondary_key(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand_secondary_key(&input) {
@@ -418,7 +417,8 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     for s in &specs {
         let field_ident = &s.field_ident;
-        let helper_name = format_ident!("open_{}_index", sanitise_ident(&s.name));
+        let helper_name =
+            format_ident!("open_{}_index", sanitise_ident(&s.name));
         let sk_ty = &s.sk_inner_ty;
         let extractor = if s.is_optional {
             quote! { |__e: &Self| __e.#field_ident.clone() }
@@ -478,7 +478,9 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
 // Shared helpers
 // ============================================================================
 
-fn struct_fields(input: &DeriveInput) -> syn::Result<&syn::punctuated::Punctuated<Field, Token![,]>> {
+fn struct_fields(
+    input: &DeriveInput,
+) -> syn::Result<&syn::punctuated::Punctuated<Field, Token![,]>> {
     match &input.data {
         Data::Struct(DataStruct { fields: Fields::Named(named), .. }) => {
             Ok(&named.named)
@@ -542,8 +544,10 @@ fn entity_name_from_attrs(
                 name = Some(lit.value());
                 Ok(())
             } else {
-                Err(meta.error("unrecognised attribute on `#[entity(...)]`; \
-                                only `name = \"...\"` is supported"))
+                Err(meta.error(
+                    "unrecognised attribute on `#[entity(...)]`; \
+                                only `name = \"...\"` is supported",
+                ))
             }
         })?;
         if let Some(n) = name {
@@ -739,13 +743,12 @@ fn unwrap_option_type(ty: &Type) -> (bool, Type) {
             segs.as_slice(),
             [a, b, c] if (a == "std" || a == "core") && b == "option" && c == "Option"
         );
-        if is_option {
-            if let Some(last) = path.segments.last()
-                && let PathArguments::AngleBracketed(args) = &last.arguments
-                && let Some(GenericArgument::Type(inner)) = args.args.first()
-            {
-                return (true, inner.clone());
-            }
+        if is_option
+            && let Some(last) = path.segments.last()
+            && let PathArguments::AngleBracketed(args) = &last.arguments
+            && let Some(GenericArgument::Type(inner)) = args.args.first()
+        {
+            return (true, inner.clone());
         }
     }
     (false, ty.clone())
