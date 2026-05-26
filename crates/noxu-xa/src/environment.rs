@@ -105,10 +105,38 @@ impl XaEnvironment {
     /// and `xa_commit`/`xa_rollback`/`xa_forget` remove it. After a crash,
     /// `xa_recover` returns XIDs from both the in-memory map and the
     /// persistent log.
+    ///
+    /// # v1.5 limitation
+    ///
+    /// In v1.5, the persistent log records that an XID was prepared but the
+    /// engine does not durably record the underlying `Transaction`'s state
+    /// (write locks, undo chain, dirty pages). On a fresh process, XIDs from
+    /// the persistent log appear in `xa_recover` but cannot be committed or
+    /// rolled back — attempting to do so returns
+    /// [`XaError::CrashDurabilityNotSupported`]. Use `xa_forget` to clear
+    /// the persistent record. Crash-durable XA is planned for v2.0.
     pub fn with_prepared_log(mut self) -> Result<Self, noxu_db::NoxuError> {
         let log = PreparedLog::open(&self.env)?;
         self.prepared_log = Some(log);
         Ok(self)
+    }
+
+    /// Classify the cause of a `branches.get(xid) == None` lookup.
+    ///
+    /// If the XID also appears in the persistent prepared log, the caller is
+    /// trying to operate on a branch that was prepared in a previous process
+    /// and lost on restart; surface the v1.5 limitation as a typed error
+    /// instead of the generic `NotFound`. Otherwise the XID was simply never
+    /// seen — return `NotFound`.
+    fn classify_missing_branch(&self, xid: &Xid) -> XaError {
+        if let Some(ref log) = self.prepared_log {
+            if let Ok(persisted) = log.recover_all() {
+                if persisted.contains(xid) {
+                    return XaError::CrashDurabilityNotSupported;
+                }
+            }
+        }
+        XaError::NotFound
     }
 }
 
@@ -218,7 +246,15 @@ impl XaResource for XaEnvironment {
 
     fn xa_commit(&self, xid: &Xid, flags: XaFlags) -> XaResult<()> {
         let mut branches = self.branches.lock().unwrap();
-        let branch = branches.get_mut(xid).ok_or(XaError::NotFound)?;
+        let branch = match branches.get_mut(xid) {
+            Some(b) => b,
+            None => {
+                // Not in memory — distinguish "never seen this XID" from
+                // "prepared in a previous process and lost on restart".
+                drop(branches);
+                return Err(self.classify_missing_branch(xid));
+            }
+        };
 
         if flags.contains(XaFlags::ONEPHASE) {
             // One-phase commit: skip prepare.
@@ -248,7 +284,13 @@ impl XaResource for XaEnvironment {
     fn xa_rollback(&self, xid: &Xid, flags: XaFlags) -> XaResult<()> {
         let _ = flags;
         let mut branches = self.branches.lock().unwrap();
-        let branch = branches.get(xid).ok_or(XaError::NotFound)?;
+        let branch = match branches.get(xid) {
+            Some(b) => b,
+            None => {
+                drop(branches);
+                return Err(self.classify_missing_branch(xid));
+            }
+        };
 
         match branch.state {
             BranchState::Idle
@@ -280,7 +322,17 @@ impl XaResource for XaEnvironment {
             .map(|(xid, _)| xid.clone())
             .collect();
 
-        // Add any from persistent log (crash recovery — not in memory)
+        // Add any from persistent log (crash recovery — not in memory).
+        //
+        // NOTE (v1.5): XIDs returned here that are NOT also in the in-memory
+        // `branches` map cannot actually be committed or rolled back — the
+        // engine has no `TxnPrepare` WAL record yet, so on a fresh process
+        // the underlying `Transaction` (locks, undo chain) does not exist.
+        // We still report them so the operator can see what is in doubt and
+        // call `xa_forget` to clear the persistent record. Attempting
+        // `xa_commit` / `xa_rollback` on such an XID returns
+        // `XaError::CrashDurabilityNotSupported`. Crash-durable XA is
+        // planned for v2.0.
         if let Some(ref log) = self.prepared_log {
             if let Ok(persisted) = log.recover_all() {
                 for xid in persisted {
