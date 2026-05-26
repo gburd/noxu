@@ -1,0 +1,598 @@
+<!DOCTYPE HTML>
+<html lang="en" class="rust" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Operational Runbooks - Noxu DB Documentation</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="An embedded transactional key-value database engine written in Rust.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="../highlight.css">
+        <link rel="stylesheet" href="../tomorrow-night.css">
+        <link rel="stylesheet" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "../";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "ayu" : "rust";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('rust')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded affix "><a href="../introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><a href="../acknowledgements.html">Acknowledgements</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="../getting-started/index.html"><strong aria-hidden="true">1.</strong> Getting Started</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../getting-started/installation.html"><strong aria-hidden="true">1.1.</strong> Installation</a></li><li class="chapter-item "><a href="../getting-started/environments.html"><strong aria-hidden="true">1.2.</strong> Environments</a></li><li class="chapter-item "><a href="../getting-started/databases.html"><strong aria-hidden="true">1.3.</strong> Databases</a></li><li class="chapter-item "><a href="../getting-started/records.html"><strong aria-hidden="true">1.4.</strong> Records</a></li><li class="chapter-item "><a href="../getting-started/reading-writing.html"><strong aria-hidden="true">1.5.</strong> Reading and Writing</a></li><li class="chapter-item "><a href="../getting-started/cursors.html"><strong aria-hidden="true">1.6.</strong> Cursors</a></li><li class="chapter-item "><a href="../getting-started/secondary-databases.html"><strong aria-hidden="true">1.7.</strong> Secondary Databases</a></li><li class="chapter-item "><a href="../getting-started/bindings.html"><strong aria-hidden="true">1.8.</strong> Serialization Bindings</a></li><li class="chapter-item "><a href="../getting-started/migrating.html"><strong aria-hidden="true">1.9.</strong> Migrating from v1.4.x</a></li></ol></li><li class="chapter-item expanded "><a href="../transactions/index.html"><strong aria-hidden="true">2.</strong> Transaction Processing</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../transactions/basics.html"><strong aria-hidden="true">2.1.</strong> Transaction Basics</a></li><li class="chapter-item "><a href="../transactions/transaction-config.html"><strong aria-hidden="true">2.2.</strong> Transaction Configuration</a></li><li class="chapter-item "><a href="../transactions/cursors.html"><strong aria-hidden="true">2.3.</strong> Cursors and Transactions</a></li><li class="chapter-item "><a href="../transactions/secondary-with-txn.html"><strong aria-hidden="true">2.4.</strong> Secondary Indexes with Transactions</a></li><li class="chapter-item "><a href="../transactions/concurrency.html"><strong aria-hidden="true">2.5.</strong> Concurrency</a></li><li class="chapter-item "><a href="../transactions/isolation.html"><strong aria-hidden="true">2.6.</strong> Isolation Levels</a></li><li class="chapter-item "><a href="../transactions/deadlocks.html"><strong aria-hidden="true">2.7.</strong> Deadlock Handling</a></li><li class="chapter-item "><a href="../transactions/durability.html"><strong aria-hidden="true">2.8.</strong> Durability Policies</a></li><li class="chapter-item "><a href="../transactions/backup-recovery.html"><strong aria-hidden="true">2.9.</strong> Backup and Recovery</a></li><li class="chapter-item "><a href="../transactions/xa-distributed.html"><strong aria-hidden="true">2.10.</strong> XA Distributed Transactions</a></li></ol></li><li class="chapter-item expanded "><a href="../replication/index.html"><strong aria-hidden="true">3.</strong> High Availability</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../replication/concepts.html"><strong aria-hidden="true">3.1.</strong> Concepts</a></li><li class="chapter-item "><a href="../replication/setup.html"><strong aria-hidden="true">3.2.</strong> Setup and Configuration</a></li><li class="chapter-item "><a href="../replication/elections.html"><strong aria-hidden="true">3.3.</strong> Leader Elections</a></li><li class="chapter-item "><a href="../replication/consistency.html"><strong aria-hidden="true">3.4.</strong> Consistency Policies</a></li><li class="chapter-item "><a href="../replication/durability.html"><strong aria-hidden="true">3.5.</strong> Durability Policies</a></li><li class="chapter-item "><a href="../replication/network-restore.html"><strong aria-hidden="true">3.6.</strong> Network Restore</a></li><li class="chapter-item "><a href="../replication/master-transfer.html"><strong aria-hidden="true">3.7.</strong> Master Transfer</a></li><li class="chapter-item "><a href="../replication/dynamic-membership.html"><strong aria-hidden="true">3.8.</strong> Dynamic Membership</a></li><li class="chapter-item "><a href="../replication/transport.html"><strong aria-hidden="true">3.9.</strong> Transport Layer</a></li></ol></li><li class="chapter-item expanded "><a href="../collections/index.html"><strong aria-hidden="true">4.</strong> Collections and Persistence</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../collections/stored-map.html"><strong aria-hidden="true">4.1.</strong> StoredMap</a></li><li class="chapter-item "><a href="../collections/stored-set.html"><strong aria-hidden="true">4.2.</strong> StoredSet</a></li><li class="chapter-item "><a href="../collections/stored-list.html"><strong aria-hidden="true">4.3.</strong> StoredList</a></li><li class="chapter-item "><a href="../collections/entity-persistence.html"><strong aria-hidden="true">4.4.</strong> Entity Persistence (DPL)</a></li></ol></li><li class="chapter-item expanded "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Programmer's Reference</li><li class="chapter-item expanded "><a href="../reference/index.html"><strong aria-hidden="true">5.</strong> Reference Overview</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../reference/architecture.html"><strong aria-hidden="true">5.1.</strong> Architecture</a></li><li class="chapter-item "><a href="../reference/log-format.html"><strong aria-hidden="true">5.2.</strong> Write-Ahead Log Format</a></li><li class="chapter-item "><a href="../reference/btree.html"><strong aria-hidden="true">5.3.</strong> B-tree Internals</a></li><li class="chapter-item "><a href="../reference/concurrency-model.html"><strong aria-hidden="true">5.4.</strong> Concurrency Model</a></li><li class="chapter-item "><a href="../reference/recovery.html"><strong aria-hidden="true">5.5.</strong> Recovery Protocol</a></li><li class="chapter-item "><a href="../reference/cache-eviction.html"><strong aria-hidden="true">5.6.</strong> Cache Eviction</a></li><li class="chapter-item "><a href="../reference/log-cleaning.html"><strong aria-hidden="true">5.7.</strong> Log Cleaning</a></li><li class="chapter-item "><a href="../reference/configuration.html"><strong aria-hidden="true">5.8.</strong> Configuration Reference</a></li><li class="chapter-item "><a href="../reference/on-disk-format.html"><strong aria-hidden="true">5.9.</strong> On-Disk Format</a></li></ol></li><li class="chapter-item expanded "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Operations</li><li class="chapter-item expanded "><a href="../operations/index.html"><strong aria-hidden="true">6.</strong> Operations Guide</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../operations/sizing.html"><strong aria-hidden="true">6.1.</strong> Sizing</a></li><li class="chapter-item "><a href="../operations/monitoring.html"><strong aria-hidden="true">6.2.</strong> Monitoring</a></li><li class="chapter-item "><a href="../operations/tuning.html"><strong aria-hidden="true">6.3.</strong> Performance Tuning</a></li><li class="chapter-item "><a href="../operations/backup.html"><strong aria-hidden="true">6.4.</strong> Backup</a></li><li class="chapter-item "><a href="../operations/recovery-ops.html"><strong aria-hidden="true">6.5.</strong> Recovery Procedures</a></li><li class="chapter-item expanded "><a href="../operations/runbooks.html" class="active"><strong aria-hidden="true">6.6.</strong> Operational Runbooks</a></li><li class="chapter-item "><a href="../operations/power-loss.html"><strong aria-hidden="true">6.7.</strong> Power-Loss Testing</a></li><li class="chapter-item "><a href="../operations/numerical-baseline.html"><strong aria-hidden="true">6.8.</strong> Numerical Baseline</a></li><li class="chapter-item "><a href="../operations/known-limitations.html"><strong aria-hidden="true">6.9.</strong> Known Limitations</a></li></ol></li><li class="chapter-item expanded "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Contributing</li><li class="chapter-item expanded "><a href="../contributing/index.html"><strong aria-hidden="true">7.</strong> Contributing</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../contributing/build-and-test.html"><strong aria-hidden="true">7.1.</strong> Build and Test</a></li><li class="chapter-item "><a href="../contributing/porting-guidelines.html"><strong aria-hidden="true">7.2.</strong> Porting Guidelines</a></li><li class="chapter-item "><a href="../contributing/testing-guide.html"><strong aria-hidden="true">7.3.</strong> Testing Guide</a></li><li class="chapter-item "><a href="../contributing/pr-process.html"><strong aria-hidden="true">7.4.</strong> PR Process</a></li><li class="chapter-item "><a href="../contributing/release.html"><strong aria-hidden="true">7.5.</strong> Release Process</a></li></ol></li><li class="chapter-item expanded "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Maintainer's Guide</li><li class="chapter-item expanded "><a href="../maintainer/index.html"><strong aria-hidden="true">8.</strong> For Future Maintainers</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../maintainer/project-history.html"><strong aria-hidden="true">8.1.</strong> Project History</a></li><li class="chapter-item "><a href="../maintainer/crate-guide.html"><strong aria-hidden="true">8.2.</strong> Crate Guide</a></li><li class="chapter-item "><a href="../maintainer/algorithms.html"><strong aria-hidden="true">8.3.</strong> Algorithms</a></li><li class="chapter-item "><a href="../maintainer/design-decisions.html"><strong aria-hidden="true">8.4.</strong> Design Decisions</a></li><li class="chapter-item "><a href="../maintainer/reference-source-guide.html"><strong aria-hidden="true">8.5.</strong> Reference Source Navigation</a></li><li class="chapter-item "><a href="../maintainer/development.html"><strong aria-hidden="true">8.6.</strong> Development Workflow</a></li><li class="chapter-item "><a href="../maintainer/testing.html"><strong aria-hidden="true">8.7.</strong> Testing</a></li><li class="chapter-item "><a href="../maintainer/chaos-soak-testing.html"><strong aria-hidden="true">8.8.</strong> Chaos and Soak Testing</a></li><li class="chapter-item "><a href="../maintainer/benchmarking.html"><strong aria-hidden="true">8.9.</strong> Benchmarking</a></li></ol></li><li class="chapter-item expanded "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Internal Documents</li><li class="chapter-item expanded "><a href="../internal/index.html"><strong aria-hidden="true">9.</strong> Internal Overview</a><a class="toggle"><div>❱</div></a></li><li><ol class="section"><li class="chapter-item "><a href="../internal/design-review.html"><strong aria-hidden="true">9.1.</strong> Design Review</a></li><li class="chapter-item "><a href="../internal/audit-report.html"><strong aria-hidden="true">9.2.</strong> Audit Report</a></li><li class="chapter-item "><a href="../internal/rust-review.html"><strong aria-hidden="true">9.3.</strong> Rust Code Review</a></li><li class="chapter-item "><a href="../internal/serialization-research.html"><strong aria-hidden="true">9.4.</strong> Serialization Research</a></li><li class="chapter-item "><a href="../internal/checksum-selection.html"><strong aria-hidden="true">9.5.</strong> Checksum Selection</a></li><li class="chapter-item "><a href="../internal/wave1c-audit-low-info-cleanup-2026-05.html"><strong aria-hidden="true">9.6.</strong> Wave 1C — audit Low/Info cleanup</a></li><li class="chapter-item "><a href="../internal/wave-2c-2-dpl-evolution.html"><strong aria-hidden="true">9.7.</strong> Wave 2C-2 — DPL schema evolution</a></li></ol></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Noxu DB Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://codeberg.org/gregburd/noxu" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://codeberg.org/gregburd/noxu/src/branch/main/docs/src/src/operations/runbooks.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="operational-runbooks"><a class="header" href="#operational-runbooks">Operational Runbooks</a></h1>
+<p>Actionable procedures for the four most common production-incident shapes
+in a deployed Noxu DB. Each runbook follows the same structure:</p>
+<ul>
+<li><strong>Symptoms</strong> — what triggers attention (alerts, log lines, metric trends)</li>
+<li><strong>Diagnose</strong> — commands and queries to confirm the diagnosis</li>
+<li><strong>Mitigate</strong> — immediate intervention to stop the bleeding</li>
+<li><strong>Resolve</strong> — follow-up to remove the underlying cause</li>
+<li><strong>Escalate</strong> — when to wake another human up</li>
+</ul>
+<p>The runbooks assume you have the standard monitoring set up
+(<a href="monitoring.html">Monitoring</a>) and have configured the
+<code>ExceptionListener</code> to forward <code>NoxuError::EnvironmentFailure</code> events
+to your alerting system.</p>
+<hr />
+<h2 id="runbook-1--recovery-loop"><a class="header" href="#runbook-1--recovery-loop">Runbook 1 — Recovery loop</a></h2>
+<p>The environment opens, runs WAL recovery, then panics or returns a
+fatal error during the redo/undo phase. On the operator's reopen the
+same thing happens. The environment never reaches the "open and
+serving" state.</p>
+<h3 id="symptoms"><a class="header" href="#symptoms">Symptoms</a></h3>
+<ul>
+<li><code>Environment::open()</code> returns <code>NoxuError::EnvironmentFailure { reason: LogChecksum | BtreeCorruption | LogReadError, .. }</code></li>
+<li>Process restart loop (systemd, k8s) is restarting the service every
+few seconds with the same error in the log</li>
+<li><code>log::error!</code> lines from <code>noxu-recovery</code> saying "redo failed at
+lsn=…" or "undo … failed at abort_lsn=…", repeatedly, in the same
+region of the log</li>
+<li>Disk free space is OK (recovery is not running out of room)</li>
+</ul>
+<h3 id="diagnose"><a class="header" href="#diagnose">Diagnose</a></h3>
+<ol>
+<li>
+<p><strong>Capture the corruption scope.</strong> Tail the recovery log and
+identify the first failing LSN and the last successful LSN. If
+the failures cluster around a single file number, the corruption
+is localised to one log file.</p>
+<pre><code class="language-text">noxu-recovery: redo failed at lsn=Lsn(file=42, offset=…), …
+noxu-recovery: undo (embedded before-image) failed at lsn=Lsn(file=42, offset=…), …
+</code></pre>
+</li>
+<li>
+<p><strong>Check the file integrity.</strong> Each <code>.ndb</code> file in the
+environment directory has its own integrity. List file sizes:</p>
+<pre><code class="language-sh">ls -lS /path/to/env/*.ndb
+</code></pre>
+<p>A file truncated to 0 bytes or much smaller than its peers is
+the most common cause.</p>
+</li>
+<li>
+<p><strong>Check the file's checksum directly</strong> using the standalone
+tool (when shipped):</p>
+<pre><code class="language-sh">noxu-fsck /path/to/env/00000042.ndb
+</code></pre>
+</li>
+</ol>
+<h3 id="mitigate"><a class="header" href="#mitigate">Mitigate</a></h3>
+<p>The environment is unwriteable. Stop the restart loop first
+(<code>systemctl stop noxu</code> / scale the deployment to 0) before
+attempting any repair. A restart-loop service will keep the disk
+under load and prevent forensics.</p>
+<h3 id="resolve"><a class="header" href="#resolve">Resolve</a></h3>
+<p>Three paths in order of preference:</p>
+<ol>
+<li>
+<p><strong>Restore from a replica</strong> (if you have one):</p>
+<ul>
+<li>Stop the broken node.</li>
+<li>Configure the environment for restore via
+<code>RepConfig::with_network_restore_source(source_node, addr)</code>.</li>
+<li>Start the node; it will pull the entire env_home from the
+source. Recovery time is bounded by network bandwidth × env
+size.</li>
+</ul>
+</li>
+<li>
+<p><strong>Restore from backup</strong>: replace the env directory with the
+most recent <code>BackupManager</code> snapshot. The
+<code>transaction_id_at_backup_time</code> field on the snapshot tells you
+how much committed data you're dropping.</p>
+</li>
+<li>
+<p><strong>Manual log truncation</strong> (last resort, no replica, no
+backup):</p>
+<ul>
+<li>Copy the env directory to a forensics location.</li>
+<li>Identify the first corrupted file (e.g. <code>00000042.ndb</code>).</li>
+<li>Move that file and all later files (<code>00000043.ndb</code>,
+<code>00000044.ndb</code>, …) out of the env directory.</li>
+<li>Reopen. Recovery will replay up to the boundary and start
+over. <strong>All transactions committed in the moved files are
+lost</strong>.</li>
+</ul>
+</li>
+</ol>
+<h3 id="escalate"><a class="header" href="#escalate">Escalate</a></h3>
+<ul>
+<li>If three rounds of <code>Mitigate → Resolve</code> produce different fatal
+errors each time → the environment is corrupted across multiple
+files; only restore-from-replica or restore-from-backup will
+work. Wake the on-call.</li>
+<li>If recovery succeeds but reads then return <code>BtreeCorruption</code>,
+the on-disk B-tree is inconsistent at the page level → wake
+noxu-tree's owner.</li>
+</ul>
+<hr />
+<h2 id="runbook-2--cleaner-backlog"><a class="header" href="#runbook-2--cleaner-backlog">Runbook 2 — Cleaner backlog</a></h2>
+<p>Disk usage is growing faster than the cleaner can reclaim, even
+though logical data volume is stable. Free space trends downward
+over hours/days. Without intervention the disk will fill and the
+environment will fail with
+<code>EnvironmentFailureReason::DiskLimitExceeded</code>.</p>
+<h3 id="symptoms-1"><a class="header" href="#symptoms-1">Symptoms</a></h3>
+<ul>
+<li>Disk free space dropping at a sustained rate</li>
+<li><code>s.cleaner.deletions</code> plateauing or growing slower than
+<code>s.log.n_log_writes</code></li>
+<li><code>s.cleaner.bytes_pending_to_delete</code> (when exposed) growing</li>
+<li>File count in env directory (<code>ls *.ndb | wc -l</code>) growing</li>
+<li>The cleaner's util-tracker shows the lowest-utilisation file
+staying above <code>cleaner_min_utilization</code> (no targets to clean)</li>
+</ul>
+<h3 id="diagnose-1"><a class="header" href="#diagnose-1">Diagnose</a></h3>
+<ol>
+<li>
+<p><strong>Compute the cleaner gap.</strong> Snapshot
+<code>s.log.n_log_writes</code> and <code>s.cleaner.deletions</code> 60 seconds apart;
+if writes outpace deletions by more than 2:1 sustained, the
+cleaner is behind.</p>
+</li>
+<li>
+<p><strong>Inspect file utilisation.</strong> Each <code>.ndb</code> file's utilisation is
+logged at cleaner-run boundaries:</p>
+<pre><code class="language-text">cleaner: file 00000042.ndb utilisation = 87.3%, threshold = 50%, skip
+</code></pre>
+<p>If most files are above the threshold but the disk is filling,
+the cleaner is correctly idle and the writer rate is the
+problem.</p>
+</li>
+<li>
+<p><strong>Check for cleaner shutdown / disabled state.</strong>
+<code>s.cleaner.runs == 0</code> over a 5-minute window with active
+writes means the cleaner thread is dead or disabled. Check the
+environment config for <code>noxu.cleaner.enabled</code> and
+<code>noxu.cleaner.threads</code>.</p>
+</li>
+</ol>
+<h3 id="mitigate-1"><a class="header" href="#mitigate-1">Mitigate</a></h3>
+<ol>
+<li><strong>Throttle writers.</strong> If you control the writer (your
+application), back off — even briefly — so the cleaner can
+close the gap.</li>
+<li><strong>Lower <code>cleaner_min_utilization</code></strong> (e.g. from 50 → 30) at
+runtime via the environment-mutable config to make MORE files
+eligible for cleaning. The cleaner will work harder.</li>
+<li><strong>Bump <code>cleaner_threads</code></strong> if a single thread is the
+bottleneck — observable as 100% CPU on one of the cleaner
+worker threads.</li>
+</ol>
+<h3 id="resolve-1"><a class="header" href="#resolve-1">Resolve</a></h3>
+<ul>
+<li>If symptoms recur, the writer rate is sustained above the
+cleaner's throughput. Either:
+<ul>
+<li>Increase <code>cleaner_threads</code> permanently</li>
+<li>Provision a faster disk (cleaner is read-modify-write bound on
+log file I/O)</li>
+<li>Reduce write rate</li>
+</ul>
+</li>
+<li>If utilisation stays stuck at high values across all files (so
+cleaner has no targets), the data set is genuinely write-heavy
+with low overwrite — cleaner will never gain ground. Plan for a
+larger disk.</li>
+</ul>
+<h3 id="escalate-1"><a class="header" href="#escalate-1">Escalate</a></h3>
+<ul>
+<li>Disk free space below 10% <strong>and</strong> cleaner gap &gt; 5:1: page the
+on-call. Forty minutes of head room before
+<code>DiskLimitExceeded</code> triggers.</li>
+<li><code>s.cleaner.runs == 0</code> for more than 30 minutes with active
+writes: the cleaner has crashed; wake the on-call.</li>
+</ul>
+<hr />
+<h2 id="runbook-3--election-thrash"><a class="header" href="#runbook-3--election-thrash">Runbook 3 — Election thrash</a></h2>
+<p>Replicated cluster cannot settle on a master. Elections complete
+but the elected master loses its term within seconds, triggering a
+new election. Throughput is near zero because the master's role is
+constantly being re-acquired.</p>
+<h3 id="symptoms-2"><a class="header" href="#symptoms-2">Symptoms</a></h3>
+<ul>
+<li><code>s.rep.elections_initiated</code> increments every few seconds</li>
+<li><code>RepNode::get_state()</code> cycling between <code>Master</code> ↔ <code>Replica</code> /
+<code>Detached</code></li>
+<li><code>phi_detector</code> log lines reporting <code>phi &gt; suspicion_threshold</code> for the current master from multiple
+observers</li>
+<li>Group_service log messages: <code>master {} demoted by quorum, starting new election</code></li>
+<li>Application throughput collapses; commit latency spikes to
+multiple seconds</li>
+</ul>
+<h3 id="diagnose-2"><a class="header" href="#diagnose-2">Diagnose</a></h3>
+<ol>
+<li>
+<p><strong>Identify whether the network is the cause.</strong></p>
+<pre><code class="language-sh">for peer in node1 node2 node3; do
+  ping -c 5 $peer
+done
+</code></pre>
+<p>Sustained packet loss &gt; 5% or RTT variance &gt; 100ms is enough to
+trip phi_detector at default thresholds.</p>
+</li>
+<li>
+<p><strong>Check phi values directly.</strong> The <code>MasterTracker</code> exposes
+<code>phi(peer_name)</code>:</p>
+<pre><pre class="playground"><code class="language-rust edition2021"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>for peer in cluster.peers() {
+    eprintln!("{}: phi = {:.2}", peer, tracker.phi(peer));
+}
+<span class="boring">}</span></code></pre></pre>
+<p>If most pairs show phi &gt; 8 (default suspicion threshold), the
+network is the problem.</p>
+</li>
+<li>
+<p><strong>Check master CPU saturation.</strong> A master under sustained CPU
+pressure can't serve heartbeats fast enough. Look for the
+master thread at 100% CPU.</p>
+</li>
+<li>
+<p><strong>Check disk pressure on the master.</strong> A master with a slow
+fsync (full disk, slow underlying storage, encryption layer
+sync delay) will appear unresponsive. Compare
+<code>s.log.fsync_p99_us</code> between candidate masters.</p>
+</li>
+</ol>
+<h3 id="mitigate-2"><a class="header" href="#mitigate-2">Mitigate</a></h3>
+<ol>
+<li><strong>Raise the suspicion threshold</strong> (<code>phi_threshold</code>) on all
+nodes from the default 8.0 to 12.0 — buys ~2× the time before
+declaring a master suspect. Survives transient network jitter.</li>
+<li><strong>Pin the desired master</strong> by setting
+<code>RepConfig::set_designated_primary(true)</code> on one node and
+<code>false</code> on the others. The designated primary will resist
+demotion under flapping conditions.</li>
+<li><strong>Reduce replication payload</strong> by raising the master's
+<code>noxu.txn.commit_sync_buffer_size</code> so commits are batched
+harder — gives the master more headroom for heartbeats.</li>
+</ol>
+<h3 id="resolve-2"><a class="header" href="#resolve-2">Resolve</a></h3>
+<ul>
+<li>If phi values were the cause: investigate the network. Likely
+causes: a flapping switch, a misconfigured QoS rule, an MTU
+mismatch on a replication link, or a noisy neighbour saturating
+the link.</li>
+<li>If master CPU was the cause: profile what's holding the master
+thread. Common culprits: oversized commit batches, eviction
+storm, checkpoint running too long.</li>
+<li>If master disk was the cause: investigate fsync latency. Likely
+causes: filesystem barrier, backup/snapshot in progress on the
+same volume, encryption layer.</li>
+</ul>
+<h3 id="escalate-2"><a class="header" href="#escalate-2">Escalate</a></h3>
+<ul>
+<li>More than 3 elections in 60 seconds with phi values steady
+below threshold: page the noxu-rep on-call. There may be a real
+bug in the election protocol.</li>
+<li>A master is elected but cannot serve writes (commits return
+<code>MasterTransferInProgress</code> or <code>NotCurrentMaster</code>): the
+cluster's view of master is out of sync — wake on-call.</li>
+</ul>
+<hr />
+<h2 id="runbook-4--slow-checkpoints"><a class="header" href="#runbook-4--slow-checkpoints">Runbook 4 — Slow checkpoints</a></h2>
+<p>Checkpoint duration grows over time. Eventually checkpoints take
+longer than the interval between them, the dirty page set grows
+unbounded, and recovery time after an unclean shutdown explodes
+from minutes to hours.</p>
+<h3 id="symptoms-3"><a class="header" href="#symptoms-3">Symptoms</a></h3>
+<ul>
+<li><code>s.checkpoint.last_duration_ms</code> consistently increasing</li>
+<li><code>s.checkpoint.checkpoints</code> not advancing during a snapshot
+window (running long)</li>
+<li><code>EnvironmentFailureReason::CheckpointFailed</code> — checkpointer
+thread errored out</li>
+<li>Application latency spikes during checkpoint: writes block on
+flush</li>
+<li>Recovery on a recent restart took noticeably longer than the
+same workload's recovery a month ago</li>
+</ul>
+<h3 id="diagnose-3"><a class="header" href="#diagnose-3">Diagnose</a></h3>
+<ol>
+<li>
+<p><strong>Read recent checkpoint stats.</strong></p>
+<pre><pre class="playground"><code class="language-rust edition2021"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let s = env.get_stats()?;
+eprintln!("last={}ms, count={}, dirty_in_count={}",
+    s.checkpoint.last_duration_ms,
+    s.checkpoint.checkpoints,
+    s.evictor.in_count_at_last_checkpoint);
+<span class="boring">}</span></code></pre></pre>
+<p><code>in_count_at_last_checkpoint</code> is the size of the in-memory IN
+set the checkpointer had to walk. If this is growing while
+throughput is steady, evictor isn't keeping up with cache
+pressure and is leaving dirty INs in the cache.</p>
+</li>
+<li>
+<p><strong>Look at evictor pressure.</strong>
+<code>s.evictor.nodes_evicted</code> rising fast while
+<code>s.cache_utilization_percent()</code> stays above 85% means the
+evictor is constantly working but cache is full.</p>
+</li>
+<li>
+<p><strong>Check disk write throughput during the slow checkpoint.</strong>
+<code>iostat -x 1</code> on the env volume; if <code>await</code> (millis per I/O)
+spikes during checkpoint, the disk is the bottleneck.</p>
+</li>
+</ol>
+<h3 id="mitigate-3"><a class="header" href="#mitigate-3">Mitigate</a></h3>
+<ol>
+<li><strong>Reduce checkpoint scope</strong> by lowering
+<code>noxu.checkpointer.kbytes_interval</code> or
+<code>noxu.checkpointer.txn_count_interval</code>. Smaller checkpoints
+take less time but happen more often. Net effect on disk
+throughput: roughly the same. Net effect on recovery time
+after crash: shorter.</li>
+<li><strong>Bump cache size</strong> (<code>noxu.cache.size</code>). The fastest fix when
+evictor is the bottleneck.</li>
+<li><strong>Reduce write rate</strong> temporarily.</li>
+</ol>
+<h3 id="resolve-3"><a class="header" href="#resolve-3">Resolve</a></h3>
+<ul>
+<li>If <code>in_count_at_last_checkpoint</code> is the root cause: the
+evictor + checkpointer are fundamentally not keeping pace with
+the writer. Permanent fix is more cache, faster disk, or a
+lower writer rate.</li>
+<li>If disk is the root cause: investigate. Common: noisy
+neighbour on shared storage, a snapshot/backup running on the
+same volume, encryption layer pulling its weight only during
+fsync.</li>
+<li>If a single checkpoint takes hours but the next is fast: the
+workload is bursty (one tx generated MASSIVE dirty IN set).
+Either scope the workload differently or accept the burst.</li>
+</ul>
+<h3 id="escalate-3"><a class="header" href="#escalate-3">Escalate</a></h3>
+<ul>
+<li>Recovery time at the next unclean shutdown crosses your SLA
+(e.g. &gt; 5 minutes for a service that promises 99.9% uptime):
+page the noxu-engine on-call.</li>
+<li>Checkpoint duration &gt; checkpoint interval (the checkpointer
+never finishes a cycle): wake on-call. Risk of disk fill
+because the cleaner can't reclaim files held by an in-progress
+checkpoint.</li>
+</ul>
+<hr />
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="monitoring.html">Monitoring</a> — what fields to scrape and at what
+intervals</li>
+<li><a href="tuning.html">Performance Tuning</a> — config knobs referenced
+throughout these runbooks</li>
+<li><a href="recovery-ops.html">Recovery Procedures</a> — for the corruption /
+fatal-error case (Runbook 1's deepest path)</li>
+<li><a href="backup.html">Backup</a> — how to take a <code>BackupManager</code> snapshot
+for the Runbook 1 fallback</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../operations/recovery-ops.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../operations/power-loss.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../operations/recovery-ops.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../operations/power-loss.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

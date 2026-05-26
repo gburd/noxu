@@ -129,6 +129,66 @@ migration. See
   but **does not recover** `next_index`; using it against an existing
   list re-uses slot 0 and overwrites the first record.
 
+## On-disk breaking changes (Wave 2C-2 — DPL entity record envelope)
+
+* **Every entity record stored by `noxu-persist::PrimaryIndex` now
+  carries a per-record class-version envelope.**  Pre-Wave-2C-2
+  records were the raw output of
+  `EntitySerializer::serialize`; v1.6 records prepend
+
+  ```text
+  [2-byte class_version BE]
+  [1-byte entity_class_tag_len]
+  [entity_class_tag bytes]    (UTF-8, length = tag_len)
+  [payload bytes]             (your EntitySerializer's output)
+  ```
+
+  This is **not backward-compatible** with pre-v1.6 entity stores.
+  Reading a pre-v1.6 record under v1.6 fails with
+  `PersistError::SerializationError("record too short for entity
+  envelope: ...")` or `"entity class tag mismatch: on-disk '…' !=
+  expected '…'"`.
+
+  **Migration procedure (one-shot dump and reload):**
+
+  1. While still on v1.5.x, run a dump utility that walks every
+     entity database with the user's existing `EntitySerializer`
+     and writes the deserialised entities to a sidecar file (any
+     format — JSON, ndjson, custom binary; the format is local to
+     your migration).
+  2. Take the application offline and bump to v1.6.
+  3. Open the v1.6 environment with
+     `EntityStore::open(&env, StoreConfig::new(...).with_allow_create(true))`,
+     iterate the sidecar, and `index.put(None, &ser, &entity)` each
+     record.  v1.6's `put` writes the new envelope.
+  4. Drop the v1.5 entity database files.
+
+  Stores that opened the entity DBs **only** under v1.6 are
+  unaffected — the envelope is universal under v1.6.
+
+* **`Entity` trait gained a default `class_version() -> u16` method.**
+  Existing implementations need no change (the default is `0`).
+  Bump `class_version()` whenever you change the on-disk shape of an
+  entity and supply matching `noxu_persist::evolve::Mutations` via
+  `StoreConfig::with_mutations(...)` so the open path can run
+  schema evolution for older records.
+
+* **`EntitySerializer` trait gained a default `deserialize_versioned`
+  method.**  Existing implementations work as-is.  Override
+  `deserialize_versioned` when you want field-level evolution that
+  reads old records lazily without rewriting them.  See
+  [Schema evolution](../collections/entity-persistence.md#schema-evolution-wave-2c-2).
+
+* **A hidden catalog database
+  `__noxu_persist_catalog__<store_name>` is now created in every
+  environment that opens an `EntityStore`.**  It records the most
+  recent class version observed for each entity name and is
+  consulted by the open-path schema-evolution flow.  The catalog is
+  opened lazily on the first `get_primary_index<E>()` /
+  `evolve()` call, so existing pre-v1.6 environments that have
+  already had their data dump-and-reloaded will gain the catalog
+  the next time they are opened.
+
 ## Documented v1.5 limitations (no source change required)
 
 These are not breakages; they are clarifications. They affect the

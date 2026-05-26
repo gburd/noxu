@@ -219,25 +219,149 @@ Edition's `SecondaryDatabase`: `get`, `contains`, `delete`,
 modelled by having multiple primary keys map to the same secondary
 key — the underlying map is `BTreeMap<SK, BTreeSet<PK>>`.
 
-## Schema evolution
+## Schema evolution (Wave 2C-2)
 
-The persistence layer does not store a schema with each record — the
-serializer you supply is responsible for parsing whatever bytes are
-on disk. To migrate an entity type when its layout changes, use the
-helpers in `noxu_persist::evolve`:
+Noxu DB v1.6 wires schema evolution into the **open path** of
+`EntityStore`.  When you call `EntityStore::open` with a non-empty
+[`Mutations`](#mutations) attached to the [`StoreConfig`], the first
+`get_primary_index<E>()` call for each entity class compares the
+user-supplied `E::class_version()` against the persistent class
+catalog and **streams** evolution under a single transaction if they
+differ.  The streamed path opens a cursor on the entity database,
+decodes each record's per-record class-version envelope, applies the
+matching mutation, and rewrites the record — all without
+materialising the database into RAM.
 
-| Helper | Purpose |
+### On-disk record format (BREAKING)
+
+Starting with v1.6, every entity record is wrapped in a small envelope:
+
+```text
+[2-byte class_version BE]
+[1-byte entity_class_tag_len]
+[entity_class_tag bytes]    (UTF-8, length = tag_len, max 255 bytes)
+[payload bytes]             (your EntitySerializer's serialize() output)
+```
+
+The payload is the bytes your `EntitySerializer::serialize()` emits.
+The persistence layer adds and strips the envelope; user code is
+unaffected for the common case.  The envelope is **breaking** vs.
+pre-v1.6 entity stores — see [the migration
+guide](../getting-started/migrating.md) for the dump-and-reload
+procedure.
+
+### Bumping the class version
+
+Add a `class_version()` impl to your `Entity`:
+
+```rust,ignore
+impl Entity for User {
+    type PrimaryKey = u64;
+    fn primary_key(&self) -> &u64 { &self.id }
+    fn entity_name() -> &'static str { "User" }
+    fn class_version() -> u16 { 1 } // bumped from default 0
+}
+```
+
+The default is `0`, so existing definitions need no change.  Bump
+`class_version()` whenever you change the on-disk shape of the
+entity (add / remove / rename fields, or change the way an existing
+field is serialized).
+
+### Mutation primitives
+
+| Helper | What it does on the open path |
 |---|---|
-| `Renamer` | Rename a field, leaving its bytes in place. |
-| `Deleter` | Delete a field (its bytes are skipped on read). |
-| `Converter` | Run a user-supplied closure on the deserialized old form to produce the new form. |
-| `Mutations` / `EvolveConfig` | Compose the above into a single migration plan. |
+| `Renamer::for_class("OldName", v, "NewName")` | Records tagged `OldName` are read as `NewName`; the tag is rewritten on the next access (lazy). |
+| `Renamer::for_field("Class", v, "oldField", "newField")` | Advisory — your `deserialize_versioned` switches on `class_version` and consults `Mutations` to translate field names. |
+| `Deleter::for_class("Class", v)` | Every record of `Class` at version `v` is **deleted** in the streamed evolve. |
+| `Deleter::for_field("Class", v, "field")` | Advisory — your `deserialize_versioned` skips the field when reading `v` records. |
+| `Converter::for_class("Class", v, fn)` | Every record at version `v` is rewritten with `fn(old_payload) -> new_payload`. |
+| `Converter::for_field(...)` | Advisory — your `deserialize_versioned` runs the converter on the field's bytes. |
 
-Migrations are applied via `EntityStore::evolve(&mut self,
-&mutations, &config)`, which walks the store's databases and rewrites
-each record through the registered `Renamer` / `Deleter` /
-`Converter` mutations. See `crates/noxu-persist/src/evolve/` for the
-concrete API.
+Class-level Renamer / Deleter / Converter run **eagerly** during
+open-path evolution.  Field-level mutations are exposed to your
+`EntitySerializer::deserialize_versioned` so you can do **lazy**
+field-level evolution on read without rewriting records.
+
+### Mutations
+
+Compose mutations into a `Mutations` set, attach it to the
+`StoreConfig`:
+
+```rust,ignore
+use noxu_persist::evolve::{Mutations, Converter, Deleter, Renamer};
+use noxu_persist::StoreConfig;
+
+let mut mutations = Mutations::new();
+// Class-level converter: bump v0 records of "User" to the new shape.
+mutations.add_converter(Converter::for_class("User", 0, |old: &[u8]| {
+    // Run your migration on the raw payload bytes.
+    Some(transform_v0_to_v1(old))
+}));
+// Class rename: "Person" -> "User" at v0.
+mutations.add_renamer(Renamer::for_class("Person", 0, "User"));
+// Drop deprecated entity.
+mutations.add_deleter(Deleter::for_class("Obsolete", 0));
+
+let cfg = StoreConfig::new("users")
+    .with_allow_create(true)
+    .with_transactional(true)
+    .with_mutations(mutations);
+```
+
+### Field-level evolution via `deserialize_versioned`
+
+For lazy field-level evolution (renamers / deleters that don't
+require rewriting old records), override
+`EntitySerializer::deserialize_versioned`:
+
+```rust,ignore
+impl EntitySerializer<UserV1> for UserV1Ser {
+    fn serialize(&self, e: &UserV1) -> Result<Vec<u8>> { /* v1 layout */ }
+    fn deserialize(&self, b: &[u8]) -> Result<UserV1> { /* v1 layout */ }
+
+    fn deserialize_versioned(
+        &self,
+        bytes: &[u8],
+        class_version: u16,
+        mutations: &Mutations,
+    ) -> Result<UserV1> {
+        match class_version {
+            1 => self.deserialize(bytes),
+            0 => decode_v0_then_upgrade(bytes, mutations),
+            other => Err(PersistError::SerializationError(
+                format!("unknown class_version {other}")
+            )),
+        }
+    }
+}
+```
+
+The `Mutations` reference is the same set you attached to the
+`StoreConfig`; consult `mutations.get_renamer(...)` /
+`mutations.get_deleter(...)` to drive field-level transforms.
+
+### Idempotence and retries
+
+The open-path evolution is **idempotent**: re-running it after a
+successful evolve is a no-op (the catalog records `current_version`,
+so the next open finds the catalog at-target and skips the scan).
+
+If the streamed evolve fails midway — e.g. an I/O error, or a
+registered `EvolveListener` returns `false` — the wrapping
+transaction is aborted and the database is left in its pre-evolve
+state.
+
+### Explicit eager evolve
+
+`EntityStore::evolve(&mut self, &mutations, &config)` is still
+available for callers that want to drive evolution explicitly
+(matches the JE `EntityStore.evolve(EvolveConfig)` shape).  Wave 2C-2
+rewrote it to use the same streamed transactional path — it no
+longer materialises the database into RAM.  Calling it twice is
+harmless: the second call sees no records that match v0 mutations
+and returns `EvolveStats { n_read: total, n_converted: 0 }`.
 
 ## Sequences
 
