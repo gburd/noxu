@@ -89,4 +89,3 @@ Key design has a direct impact on performance and sort order. Because records ar
 - Composite keys (e.g., `namespace:id`) enable prefix scans: iterate all records in a namespace by seeking to `namespace:` and reading forward.
 
 ---
-

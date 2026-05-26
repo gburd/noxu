@@ -99,6 +99,7 @@ drop(env);  // or env.close() after drop(db)
 ## Replication Tests
 
 `crates/noxu-rep/tests/` contains:
+
 - `chaos_test.rs` — election correctness under network faults
 - `torture_test.rs` — full soak test with tc netem chaos injection
 

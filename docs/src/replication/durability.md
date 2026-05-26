@@ -48,6 +48,7 @@ write fanout causes multiple concurrent transactions to wait for acks at the
 same time.
 
 On the master, `GroupCommitMaster` buffers commits until either:
+
 - A batch size threshold is reached, or
 - A time deadline expires (default: 1ms)
 

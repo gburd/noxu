@@ -17,4 +17,3 @@ used to start a new environment. No additional tooling is required.
 
 Copy the backup directory to a new location and open it as a normal environment.
 Noxu DB will perform normal recovery on open.
-

@@ -22,6 +22,7 @@
   mirroring, log-version-conversion).
 
 **Severity** (from the overview):
+
 - HIGH = data-correctness invariant family without Noxu coverage
 - MEDIUM = entire JE test class without Noxu equivalent
 - LOW = JE test for an internal-impl edge case Noxu doesn't share

@@ -76,4 +76,3 @@ to proceed, consider using a lower isolation level for the cursor (see
 [Isolation Levels](#7-isolation-levels)).
 
 ---
-

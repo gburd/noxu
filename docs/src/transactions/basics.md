@@ -209,17 +209,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Key rules:
-- Obtain a transaction with `env.begin_transaction(parent, config)`. Pass `None`
+* Obtain a transaction with `env.begin_transaction(parent, config)`. Pass `None`
   for the parent. Nested (child) transactions are **not supported in v1.5**;
   passing `Some(&parent)` returns a typed `NoxuError::Unsupported` error.
   See [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
   Decision 3B; the `parent` parameter is scheduled for removal in v2.0.
-- Pass `Some(&txn)` as the first argument to `db.put()`, `db.get()`,
+* Pass `Some(&txn)` as the first argument to `db.put()`, `db.get()`,
   `db.delete()`, and `db.open_cursor()`.
-- Commit with `txn.commit()` or roll back with `txn.abort()`.
-- Once committed or aborted, a transaction handle must not be used again. Any
+* Commit with `txn.commit()` or roll back with `txn.abort()`.
+* Once committed or aborted, a transaction handle must not be used again. Any
   further calls will return an error.
-- All transaction handles must be committed or aborted before closing databases
+* All transaction handles must be committed or aborted before closing databases
   and the environment.
 
 ## Committing a Transaction
@@ -437,4 +437,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 > `docs/src/internal/sprint-1-followup-f12.md`).
 
 ---
-

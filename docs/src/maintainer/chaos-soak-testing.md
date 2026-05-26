@@ -12,6 +12,7 @@ commands. It runs as root (setuid) so test code can apply netem rules without
 needing sudo.
 
 Install:
+
 ```bash
 cd scripts && make tc_netem_helper
 sudo install -m 4755 tc_netem_helper /usr/local/bin/
@@ -23,6 +24,7 @@ sudo install -m 4755 tc_netem_helper /usr/local/bin/
 that applies netem rules on construction and removes them on drop.
 
 Key methods:
+
 - `overlay(opts)` — add/replace netem rules (packet loss, delay, corruption, duplicate)
 - `overlay_calm()` — remove all netem rules (clear faults)
 - `overlay_burst_loss(p13, p31)` — Gilbert-Elliott correlated loss model
@@ -36,6 +38,7 @@ Key methods:
 
 The torture test runs multi-round replication elections under continuous chaos
 injection. Each round:
+
 1. Starts a 3 or 5 node cluster
 2. Injects a `ChaosPhase`
 3. Runs a configurable number of elections
@@ -66,6 +69,7 @@ injection. Each round:
 ### Invariants Checked
 
 After every election:
+
 1. **Safety**: at most one winner per term (no split-brain)
 2. **VLSN monotonicity**: each node's applied VLSN only increases
 3. **No panic**: test runner catches `SIGABRT` and marks as violation
@@ -89,6 +93,7 @@ TRANSPORTS="tcp quic mix" scripts/torture_all.sh
 ### Interpreting Violations
 
 A violation means an invariant failed. The torture test outputs:
+
 ```
 Round 42: violations=1 (split_brain detected at term=5)
 ```

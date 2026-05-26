@@ -71,6 +71,7 @@ AArch64 (Raspberry Pi, Apple Silicon, AWS Graviton), CRC32C would be the faster 
 ## If the Decision Were Revisited
 
 CRC32C would be preferred if:
+
 - AArch64 becomes the primary deployment target (AWS Graviton, ARM servers)
 - NVMe/filesystem interoperability is required (ext4, iSCSI, NVMe all use CRC32C)
 - The `crc32c` crate gains a PCLMULQDQ path for x86-64 (closing the throughput gap)

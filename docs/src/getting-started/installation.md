@@ -24,7 +24,6 @@ Noxu DB requires Rust 1.85 or later.
 
 ## Conceptual Overview
 
-
 ## What is Noxu DB?
 
 Noxu DB is an embedded, transactional key-value store. "Embedded" means it runs inside your application process — there is no separate server to start or manage. "Transactional" means it provides full ACID guarantees: Atomicity, Consistency, Isolation, and Durability.
@@ -62,4 +61,3 @@ noxu-bind = { path = "crates/noxu-bind" }
 ```
 
 ---
-
