@@ -1797,7 +1797,7 @@ fn pri_put_and_index(
     primary.lock().put(None, &pk, &new_data).unwrap();
     let old_entry = old_v.map(DatabaseEntry::from_bytes);
     secondary
-        .update_secondary(&pk, old_entry.as_ref(), Some(&new_data))
+        .update_secondary(None, &pk, old_entry.as_ref(), Some(&new_data))
         .unwrap();
 }
 
@@ -2165,7 +2165,7 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let pv = DatabaseEntry::from_bytes(b"AB");
     primary.lock().put(None, &pk, &pv).unwrap();
-    secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+    secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
 
     // Both 'A' and 'B' should map to pk1.
     for sec_byte in [b"A" as &[u8], b"B"] {
@@ -2334,7 +2334,7 @@ fn sec_num_recs_put_get_round_trip() {
         let pk = DatabaseEntry::from_bytes(&pri_key_bytes);
         let pv = DatabaseEntry::from_bytes(&data_bytes);
         primary.lock().put(None, &pk, &pv).unwrap();
-        secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+        secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
     }
 
     // SecondaryDatabase.get(): look up by sec_key = i + KEY_OFFSET for i in 0..NUM_RECS.

@@ -68,8 +68,11 @@ fn put_employee(
     // Insert into primary.
     primary.lock().put(None, &key, &value)?;
 
-    // Update secondary index.
-    secondary.update_secondary(&key, None, Some(&value))?;
+    // Update secondary index.  Pass `None` for the txn — this example
+    // demonstrates auto-commit; see `docs/src/transactions/secondary-with-txn.md`
+    // for the atomic-with-primary pattern that threads `Some(&txn)`
+    // through both calls.
+    secondary.update_secondary(None, &key, None, Some(&value))?;
 
     println!("  Inserted: {} -> {}", name, value_str);
     Ok(())
@@ -236,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (mirrors the pattern in the test suite for the manual-update path).
     let carol_val_str = "Engineering|Staff Engineer".to_string();
     let carol_val = DatabaseEntry::from_bytes(carol_val_str.as_bytes());
-    secondary.update_secondary(&carol_key, Some(&carol_val), None)?;
+    secondary.update_secondary(None, &carol_key, Some(&carol_val), None)?;
     let del_status = primary.lock().delete(None, &carol_key)?;
     println!("  Primary delete status: {:?}", del_status);
 

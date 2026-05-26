@@ -40,7 +40,7 @@ Sprint 1–3 restriction notes
 | Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ | ✅ |
 | Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ | ✅ |
 | `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
-| Atomic primary + secondary writes under one txn | ❌ (`update_secondary` is auto-commit) | ✅ | ✅ |
+| Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ | ✅ |
 | Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter scheduled for removal) |
 | `Stored*` collections under explicit txn          | ❌ (auto-commit only; `TransactionRunner` does not drive `Stored*`) | ✅ | ✅ |
 | Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ❌ (the documented surface; never implemented — use `&[u8]`-keyed surface) | ✅ | ✅ |
