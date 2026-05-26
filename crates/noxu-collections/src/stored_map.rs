@@ -11,8 +11,6 @@ use std::sync::Mutex;
 
 /// A map-like view of a database.
 ///
-///
-///
 /// Provides a familiar map interface over a Noxu DB database. Keys and
 /// values are raw byte vectors (`Vec<u8>`). Records can be inserted,
 /// retrieved, removed, and iterated.
@@ -22,6 +20,21 @@ use std::sync::Mutex;
 /// records are inserted via `put()` and updated on `remove()`. For
 /// databases that already contain data, call `register_key()` or use
 /// `contains_key()` to populate the index.
+///
+/// # v1.5 limitations
+///
+/// All `StoredMap` operations are **auto-commit only**.  Every `get`,
+/// `put`, `remove`, `contains_key`, `len`, `clear`, and iterator
+/// fetch issues the underlying `Database` call with `txn = None`.
+/// There is no way to thread an externally-begun
+/// [`noxu_db::Transaction`] into a `StoredMap` method in v1.5.  If you
+/// need transactional semantics across several `StoredMap` writes, use
+/// the raw `Database::put` / `Database::delete` API with an explicit
+/// txn instead.
+///
+/// Threading `Option<&Transaction>` through every method is tracked
+/// for v1.6 (audit findings #1, #3, #4 — see
+/// `docs/src/internal/sprint-3-collections-restriction.md`).
 ///
 /// # Example
 /// ```ignore
