@@ -130,5 +130,56 @@ fn decode_point(entry: &DatabaseEntry) -> Point {
 
 This technique (XOR with `MIN` before big-endian encoding) is the same approach used internally by `IntBinding` and `LongBinding`.
 
+## SerdeBinding version prefix (v1.5)
+
+`SerdeBinding<T>` (and the `TupleSerdeBinding<K, V>` data side that
+layers over it) lets you store any `Serialize + DeserializeOwned`
+Rust struct in a `DatabaseEntry`.  In v1.5 every payload it produces
+carries a 2-byte header before the serde body:
+
+```text
++--------+---------+----------------+
+| 0xCB   |   0x01  |  serde payload |
+| magic  | version |   (any bytes)  |
++--------+---------+----------------+
+```
+
+On decode, `SerdeBinding::entry_to_object` validates both bytes and
+returns `BindError::VersionMismatch { expected_magic, expected_version,
+found_magic, found_version }` if either is wrong.  This is **not**
+full schema evolution — adding, removing, or reordering a struct
+field without bumping the version constant will still produce a
+wrong-shaped value silently — but it stops two specific failure modes
+that the May 2026 audit (finding #19) flagged:
+
+1. Reading a record written by an entirely different
+   `SerdeBinding<T>` (e.g. payload bytes that happened to coincide
+   with another type's encoding) and producing a wrong value.
+2. Reading a record written by a future `SerdeBinding` whose body
+   format has changed and producing garbage.
+
+### Breaking change
+
+**Records written by `SerdeBinding` in pre-3C 1.5 release candidates
+do not carry the header.**  When decoded under v1.5 they will fail
+with `BindError::VersionMismatch { found_magic: <whatever the first
+byte happened to be>, ... }` rather than producing wrong values.
+
+Migration options:
+
+* **Re-write the data.**  Drain the database under the old build, then
+  re-`put` every record under the v1.5 build.  The v1.5 build will
+  emit prefixed bytes.
+* **Use `TupleBinding` for stable on-disk format.**  The plain tuple
+  bindings (`IntBinding`, `LongBinding`, `StringBinding`,
+  `SortedDoubleBinding`) do **not** carry a header and are not
+  affected by this change — their wire format is stable.
+* **Stay on the pre-3C build** until you have a maintenance window;
+  the version-prefix work is opt-in only in the sense that you opt
+  in by upgrading `noxu-bind`.
+
+Full schema-evolution (versioned bindings that can read older
+layouts of the same struct) is on the v1.6 roadmap.
+
 ---
 
