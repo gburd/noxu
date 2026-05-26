@@ -466,3 +466,144 @@ fn cursor_keys_returned_in_lexicographic_order() {
         "iteration order must be lexicographically sorted"
     );
 }
+
+// ─── Regression: SearchGte with seed shorter than BIN's key_prefix ─────────────
+//
+// See `docs/bug-2026-05-25-compress-key-debug-assert-shortprefix-searchgte.md`.
+//
+// On a many-key tree whose BINs have learned a `key_prefix` longer than the
+// search seed (e.g. the seed is a 2-byte tag like `b"K\0"` and the BIN's
+// learned prefix is `b"K\0the-bucket\0object-0000…"`), `Cursor::get(SearchGte)`
+// previously called `bin.compress_key(seed)` unconditionally, which:
+//
+//   * `debug_assert!`-panicked in debug builds, and
+//   * panicked with a slice out-of-bounds in release builds.
+//
+// The fix lives in `noxu_dbi::cursor_impl::CursorImpl::find_range_entry`: it
+// now compares the seed against the BIN's `key_prefix` and either returns the
+// BIN's first entry (seed < key_prefix lex) or `None` (seed > key_prefix lex),
+// only delegating to `compress_key` when `seed.starts_with(key_prefix)`.
+
+fn open_env_and_db_named(
+    dir: &TempDir,
+    name: &str,
+) -> (noxu_db::Environment, noxu_db::Database) {
+    let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_config).unwrap();
+    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db = env.open_database(None, name, &db_config).unwrap();
+    (env, db)
+}
+
+#[test]
+fn cursor_search_gte_short_seed_under_long_prefix_does_not_panic() {
+    // Reproduces the panic shape from the bug report: ~1000 keys all
+    // sharing a long common prefix (`b"K\0the-bucket\0object-0000"…`),
+    // then `SearchGte(b"K\0")` (a 2-byte seed) — strictly shorter than
+    // the BIN's learned `key_prefix`.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_short_seed");
+
+    for i in 0..1000u32 {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"K\0");
+        key.extend_from_slice(b"the-bucket\0");
+        key.extend_from_slice(format!("object-{i:08}").as_bytes());
+        let value = format!("payload-{i}");
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(&key),
+            &DatabaseEntry::from_bytes(value.as_bytes()),
+        )
+        .unwrap();
+    }
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::from_bytes(b"K\0");
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+
+    assert_eq!(
+        s,
+        OperationStatus::Success,
+        "SearchGte with a short seed under a long-prefix BIN must succeed"
+    );
+    // The lexicographically smallest inserted key must be returned.
+    let want = {
+        let mut k = Vec::new();
+        k.extend_from_slice(b"K\0");
+        k.extend_from_slice(b"the-bucket\0");
+        k.extend_from_slice(b"object-00000000");
+        k
+    };
+    assert_eq!(key.data(), want.as_slice());
+}
+
+#[test]
+fn cursor_search_gte_seed_above_all_keys_returns_not_found() {
+    // Companion to the above: seed lex-greater than the BIN's key_prefix
+    // (and than every full key in the DB) must return NotFound, not panic.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_above_all");
+
+    for i in 0..200u32 {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"K\0");
+        key.extend_from_slice(b"the-bucket\0");
+        key.extend_from_slice(format!("object-{i:08}").as_bytes());
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(&key),
+            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    // `b"L\0"` is lex-greater than every inserted key, which all start
+    // with `b"K\0"`.  Pre-fix this would still panic in release on a
+    // non-leftmost BIN whose key_prefix differs from the seed.
+    let mut key = DatabaseEntry::from_bytes(b"L\0");
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+}
+
+#[test]
+fn cursor_search_gte_seed_below_all_keys_returns_first() {
+    // Seed lex-less-than every full key, and shorter than the learned
+    // BIN prefix on a many-key tree.  Must return the first key.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_below_all");
+
+    for i in 0..500u32 {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"M\0");
+        key.extend_from_slice(b"bucket\0");
+        key.extend_from_slice(format!("k-{i:06}").as_bytes());
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(&key),
+            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    // `b"A"` < every key in the DB; SearchGte must return the smallest.
+    let mut key = DatabaseEntry::from_bytes(b"A");
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    let want = {
+        let mut k = Vec::new();
+        k.extend_from_slice(b"M\0");
+        k.extend_from_slice(b"bucket\0");
+        k.extend_from_slice(b"k-000000");
+        k
+    };
+    assert_eq!(key.data(), want.as_slice());
+}
