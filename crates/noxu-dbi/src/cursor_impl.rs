@@ -1862,9 +1862,27 @@ impl CursorImpl {
                 if self.key_exists_in_view(key) {
                     return Ok(OperationStatus::KeyExist);
                 }
-                // New insert: old_lsn is NULL (abort_known_deleted=true).
+                // New insert: old_lsn may be NULL (key did not exist
+                // when we read the BIN above) OR may be a real LSN if
+                // a concurrent thread inserted between our
+                // `key_exists_in_view` check above and our
+                // `get_slot_before_image` call here.
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
                 self.lock_write_before_log(old_lsn, key)?;
+                // Re-check `key_exists_in_view` AFTER acquiring the
+                // synthetic-key / per-LSN write lock.  A concurrent
+                // inserter for the same brand-new key may have
+                // committed while we were either blocked on the
+                // synthetic key lock (NULL_LSN insert race) OR
+                // blocked on the slot's write lock that the other
+                // inserter held until commit.  In both cases we
+                // must report `KeyExist` instead of overwriting,
+                // because `NoOverwrite` semantics forbid silently
+                // replacing an existing record.  Closes the first
+                // F12 residual end-to-end.
+                if self.key_exists_in_view(key) {
+                    return Ok(OperationStatus::KeyExist);
+                }
                 let new_lsn =
                     self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(
@@ -1890,6 +1908,10 @@ impl CursorImpl {
                 }
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
                 self.lock_write_before_log(old_lsn, key)?;
+                // See the NoOverwrite re-check above for rationale.
+                if self.key_exists_in_view(key) {
+                    return Ok(OperationStatus::KeyExist);
+                }
                 let new_lsn =
                     self.log_ln_write(key, Some(data), self.locker_id)?;
                 self.finalize_write_lock(
