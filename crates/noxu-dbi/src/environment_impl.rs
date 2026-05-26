@@ -337,8 +337,8 @@ impl EnvironmentImpl {
             if let Err(e) =
                 rmgr.recover_all(&mut scanner, &mut recovery_trees, true)
             {
-                return Err(DbiError::EnvironmentFailure {
-                    reason: format!("recovery failed: {e}"),
+                return Err(DbiError::RecoveryFailure {
+                    reason: e.to_string(),
                 });
             }
 

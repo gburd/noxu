@@ -112,6 +112,17 @@ pub enum EnvironmentFailureReason {
     ForcedShutdown,
 
     // ── Catch-all ──────────────────────────────────────────────────────────
+    /// Recovery (WAL replay during environment open) failed.
+    ///
+    /// Wave 1C audit cleanup (transaction-env F22): the v1.5.0 layer
+    /// surfaced every recovery failure as `UnexpectedState`, which
+    /// forced callers to string-match the prefix "recovery failed:"
+    /// to distinguish it from other unexpected-state errors.  This
+    /// variant is now produced specifically when WAL replay aborts
+    /// the open path; if `invalidates_environment` returns `true` the
+    /// environment is unusable and a fresh open is required.
+    RecoveryFailure,
+
     /// The specific reason is not mapped to a named variant.
     Other(String),
 }
@@ -132,6 +143,7 @@ impl EnvironmentFailureReason {
                 | EnvironmentFailureReason::BtreeCorruption
                 | EnvironmentFailureReason::UnexpectedStateFatal
                 | EnvironmentFailureReason::UnexpectedExceptionFatal
+                | EnvironmentFailureReason::RecoveryFailure
                 | EnvironmentFailureReason::DiskLimit
                 | EnvironmentFailureReason::LatchTimeout
                 | EnvironmentFailureReason::ReplicaFencing
@@ -202,6 +214,9 @@ impl std::fmt::Display for EnvironmentFailureReason {
             }
             EnvironmentFailureReason::ForcedShutdown => {
                 write!(f, "FORCED_SHUTDOWN")
+            }
+            EnvironmentFailureReason::RecoveryFailure => {
+                write!(f, "RECOVERY_FAILURE")
             }
             EnvironmentFailureReason::Other(s) => write!(f, "{s}"),
         }
@@ -735,6 +750,18 @@ impl From<noxu_dbi::DbiError> for NoxuError {
             DbiError::EnvironmentFailure { reason } => {
                 NoxuError::EnvironmentFailure {
                     reason: EnvironmentFailureReason::UnexpectedState,
+                    msg: reason,
+                }
+            }
+            // Wave 1C audit cleanup (transaction-env F22): map
+            // recovery failures to a typed `EnvironmentFailure` whose
+            // `reason` carries the recovery-specific
+            // `HardRecovery`/`LogIntegrity` distinction so callers can
+            // branch on the failure shape (corrupt log vs.
+            // unexpected state) without parsing the message string.
+            DbiError::RecoveryFailure { reason } => {
+                NoxuError::EnvironmentFailure {
+                    reason: EnvironmentFailureReason::RecoveryFailure,
                     msg: reason,
                 }
             }
