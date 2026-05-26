@@ -607,3 +607,296 @@ fn cursor_search_gte_seed_below_all_keys_returns_first() {
     };
     assert_eq!(key.data(), want.as_slice());
 }
+
+// ─── Regression: SearchGte must walk to the next BIN on no-match-here ─────────
+//
+// Before this fix `find_range_entry` only inspected the BIN that
+// `find_bin_for_key` chose for the seed.  When that BIN's largest key
+// was `< seed` (a common case once the tree has more than one BIN),
+// it returned `None` even though a key `>= seed` lived in the next BIN.
+//
+// The fix calls `Tree::get_next_bin(seed)` on the no-match path; by the
+// B+tree separator invariant the first entry of the next BIN is strictly
+// greater than `seed`, so a single probe suffices.
+//
+// Default fanout is 128 entries per BIN (see `noxu-tree::DEFAULT_MAX_ENTRIES`),
+// so these tests insert ≥ 256 keys to reliably force the tree into ≥ 2 BINs.
+
+const FANOUT_DOUBLED: u32 = 256;
+
+#[test]
+fn cursor_search_gte_walks_to_next_bin_when_chosen_bin_is_below_seed() {
+    // Seed sits between two BINs: every key in BIN_L is < seed, every
+    // key in BIN_R is > seed.  Pre-fix this returned NotFound.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_cross_bin");
+
+    // Insert 0..256 as fixed-width keys.  The tree splits into ≥ 2 BINs
+    // somewhere in the middle.
+    for i in 0..FANOUT_DOUBLED {
+        let k = format!("k-{i:08}");
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k.as_bytes()),
+            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    // `k-00000099a` is between `k-00000099` and `k-00000100`, which by
+    // the natural sort straddles the most likely BIN boundary in the
+    // middle of the keyspace.  Even if the actual split point shifts,
+    // the assertion is that SearchGte returns the first key strictly
+    // greater than the seed.
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let seed = b"k-00000099a";
+    let mut key = DatabaseEntry::from_bytes(seed);
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    assert_eq!(
+        key.data(),
+        b"k-00000100",
+        "SearchGte must return the smallest key strictly greater than \
+         the seed, even if that key lives in the next BIN"
+    );
+}
+
+#[test]
+fn cursor_search_gte_past_last_key_returns_not_found_with_many_bins() {
+    // Seed is greater than every key in the tree across multiple BINs.
+    // get_next_bin returns None at the rightmost BIN, so the cursor
+    // correctly reports NotFound (rather than panicking or returning
+    // a stale entry).
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_past_last");
+
+    for i in 0..FANOUT_DOUBLED {
+        let k = format!("a-{i:08}");
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k.as_bytes()),
+            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::from_bytes(b"z-this-is-after-everything");
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+}
+
+#[test]
+fn cursor_search_gte_long_prefix_seed_above_walks_to_next_bin() {
+    // Reverse of `cursor_search_gte_short_seed_under_long_prefix_does_not_panic`:
+    // seed lex-greater than the chosen BIN's learned `key_prefix` (case 3
+    // of `find_range_entry`'s prefix analysis).  Pre-fix this would
+    // return NotFound; with the next-BIN walk it must return the first
+    // key whose value is `>= seed`.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) =
+        open_env_and_db_named(&dir, "search_gte_long_prefix_above");
+
+    // Two distinct prefix groups so the tree splits into ≥ 2 BINs with
+    // distinct learned prefixes.
+    for i in 0..FANOUT_DOUBLED {
+        let mut k = Vec::new();
+        if i < FANOUT_DOUBLED / 2 {
+            k.extend_from_slice(b"K\0");
+            k.extend_from_slice(b"alpha\0");
+        } else {
+            k.extend_from_slice(b"K\0");
+            k.extend_from_slice(b"omega\0");
+        }
+        k.extend_from_slice(format!("{i:08}").as_bytes());
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(&k),
+            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    // `K\0gamma…` is lex-greater than `K\0alpha…` (the leftmost BIN's
+    // prefix) and lex-less than `K\0omega…` (the rightmost BIN's prefix),
+    // which puts it in case 3 against the leftmost BIN.
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let seed = b"K\0gamma\0";
+    let mut key = DatabaseEntry::from_bytes(seed);
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    let want = {
+        let mut k = Vec::new();
+        k.extend_from_slice(b"K\0");
+        k.extend_from_slice(b"omega\0");
+        k.extend_from_slice(format!("{:08}", FANOUT_DOUBLED / 2).as_bytes());
+        k
+    };
+    assert_eq!(
+        key.data(),
+        want.as_slice(),
+        "SearchGte across BIN boundary with case-3 prefix must land on \
+         the first omega-prefix key"
+    );
+}
+
+#[test]
+fn cursor_search_gte_in_every_inter_key_gap_agrees_with_get_next() {
+    // White-box-ish cross-BIN regression: walk the tree with First+Next
+    // (which is known-good and uses get_next_bin internally) to harvest
+    // every pair of adjacent keys (K_a, K_b).  For each pair, open a
+    // fresh cursor and probe `SearchGte(K_a + b"\\0")`.
+    //
+    // `K_a + b"\\0"` is strictly greater than `K_a` and (since K_b is
+    // K_a's immediate successor in iteration order) strictly less than
+    // or equal to K_b, so the answer must be K_b.  Whenever K_a and
+    // K_b live in different BINs this exercises the next-BIN-walk path
+    // of `find_range_entry`; pre-fix it returns NotFound for those
+    // pairs.
+    //
+    // Inserts ≫ fanout keys to guarantee multiple BIN boundaries are
+    // exercised across the iteration.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_inter_key_gaps");
+
+    const N: u32 = 1024; // 8× default fanout — forces several BINs.
+    for i in 0..N {
+        let k = format!("k-{i:08}");
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k.as_bytes()),
+            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    // Harvest the in-order key list via Get::First + Get::Next.
+    let mut keys_in_order: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+    {
+        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut k = DatabaseEntry::new();
+        let mut v = DatabaseEntry::new();
+        let mut s = cursor.get(&mut k, &mut v, Get::First, None).unwrap();
+        while s == OperationStatus::Success {
+            keys_in_order.push(k.data().to_vec());
+            s = cursor.get(&mut k, &mut v, Get::Next, None).unwrap();
+        }
+    }
+    assert_eq!(keys_in_order.len(), N as usize);
+
+    // Probe between each pair.
+    for pair in keys_in_order.windows(2) {
+        let (k_a, k_b) = (&pair[0], &pair[1]);
+        let mut probe = k_a.clone();
+        probe.push(0); // lex-just-after k_a
+        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut key = DatabaseEntry::from_bytes(&probe);
+        let mut data = DatabaseEntry::new();
+        let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+        assert_eq!(
+            s,
+            OperationStatus::Success,
+            "SearchGte({:?}) returned NotFound; expected next key {:?}",
+            probe,
+            k_b
+        );
+        assert_eq!(
+            key.data(),
+            k_b.as_slice(),
+            "SearchGte({:?}) returned wrong next key",
+            probe
+        );
+    }
+}
+
+#[test]
+fn cursor_search_gte_oracle_brute_force_small_random() {
+    // Oracle test: against a small DB with random keys, SearchGte for
+    // every interesting probe (every full key, plus k+\\0 and k-\\0
+    // perturbations) must agree with the brute-force answer
+    // `keys.iter().filter(|k| k >= seed).min()`.
+    //
+    // This is the test that, had it existed, would have caught both the
+    // original short-seed panic and the cross-BIN no-match bug.
+    use std::collections::BTreeSet;
+
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_gte_oracle");
+
+    // Deterministic pseudo-random key set, sized to cross BIN boundaries.
+    let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut state: u64 = 0xC0FFEE_DEADBEEF_u64;
+    for _ in 0..FANOUT_DOUBLED + 50 {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // 4..16-byte key derived from the state.
+        let len = 4 + (state as usize % 13);
+        let bytes: Vec<u8> =
+            (0..len).map(|i| ((state >> (i * 4)) & 0xFF) as u8).collect();
+        keys.insert(bytes);
+    }
+
+    for k in &keys {
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+    }
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let probes: Vec<Vec<u8>> = {
+        let mut p: Vec<Vec<u8>> = Vec::new();
+        for k in &keys {
+            p.push(k.clone());
+            // k with a trailing 0x00 byte appended (lex-just-after k).
+            let mut up = k.clone();
+            up.push(0);
+            p.push(up);
+            // k truncated by one byte if possible (lex-just-before k).
+            if k.len() > 1 {
+                p.push(k[..k.len() - 1].to_vec());
+            }
+        }
+        // Note: empty seed (b"") is intentionally NOT probed.  The public
+        // `Cursor::get(SearchGte)` API short-circuits empty keys to
+        // `NotFound` (`crates/noxu-db/src/cursor.rs::Get::SearchGte`
+        // arm), so it never reaches `find_range_entry` and the oracle
+        // would diverge from the API contract.  Lex-greatest probe is
+        // a single 0xff byte.
+        p.push(b"\xff".to_vec());
+        p
+    };
+
+    for probe in probes {
+        let want = keys.iter().find(|k| k.as_slice() >= probe.as_slice());
+
+        let mut key = DatabaseEntry::from_bytes(&probe);
+        let mut data = DatabaseEntry::new();
+        let status =
+            cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+
+        match (want, status) {
+            (Some(w), OperationStatus::Success) => {
+                assert_eq!(
+                    key.data(),
+                    w.as_slice(),
+                    "SearchGte({:02x?}) returned wrong key; oracle expects {:02x?}",
+                    probe,
+                    w
+                );
+            }
+            (None, OperationStatus::NotFound) => { /* both agree */ }
+            (oracle, got) => panic!(
+                "SearchGte({:02x?}) disagreement: oracle={:?} got={:?}",
+                probe, oracle, got
+            ),
+        }
+    }
+}
