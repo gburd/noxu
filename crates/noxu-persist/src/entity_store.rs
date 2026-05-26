@@ -592,10 +592,10 @@ mod tests {
             name: "Alice".to_string(),
             email: "alice@example.com".to_string(),
         };
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
 
         // Read
-        let found = index.get(&ser, &1u64).unwrap().unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap().unwrap();
         assert_eq!(found, user);
 
         // Update
@@ -604,14 +604,14 @@ mod tests {
             name: "Alice Updated".to_string(),
             email: "alice.new@example.com".to_string(),
         };
-        index.put(&ser, &updated).unwrap();
-        let found = index.get(&ser, &1u64).unwrap().unwrap();
+        index.put(None, &ser, &updated).unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap().unwrap();
         assert_eq!(found.name, "Alice Updated");
 
         // Delete
-        let deleted = index.delete(&1u64).unwrap();
+        let deleted = index.delete(None, &1u64).unwrap();
         assert!(deleted);
-        assert_eq!(index.get(&ser, &1u64).unwrap(), None);
+        assert_eq!(index.get(None, &ser, &1u64).unwrap(), None);
     }
 
     #[test]
@@ -629,6 +629,7 @@ mod tests {
                 store.get_primary_index().unwrap();
             user_index
                 .put(
+                    None,
                     &user_ser,
                     &User {
                         id: 1,
@@ -645,6 +646,7 @@ mod tests {
                 store.get_primary_index().unwrap();
             product_index
                 .put(
+                    None,
                     &product_ser,
                     &Product {
                         sku: "SKU-001".to_string(),
@@ -659,14 +661,15 @@ mod tests {
         {
             let user_index: PrimaryIndex<u64, User> =
                 store.get_primary_index().unwrap();
-            let found_user = user_index.get(&user_ser, &1u64).unwrap().unwrap();
+            let found_user =
+                user_index.get(None, &user_ser, &1u64).unwrap().unwrap();
             assert_eq!(found_user.name, "Alice");
         }
         {
             let product_index: PrimaryIndex<String, Product> =
                 store.get_primary_index().unwrap();
             let found_product = product_index
-                .get(&product_ser, &"SKU-001".to_string())
+                .get(None, &product_ser, &"SKU-001".to_string())
                 .unwrap()
                 .unwrap();
             assert_eq!(found_product.price_cents, 999);
@@ -724,9 +727,10 @@ mod tests {
             name: "Gadget".to_string(),
             price_cents: 1999,
         };
-        index.put(&ser, &product).unwrap();
+        index.put(None, &ser, &product).unwrap();
 
-        let found = index.get(&ser, &"ABC-123".to_string()).unwrap().unwrap();
+        let found =
+            index.get(None, &ser, &"ABC-123".to_string()).unwrap().unwrap();
         assert_eq!(found, product);
     }
 
@@ -742,6 +746,7 @@ mod tests {
         for i in 1..=5 {
             index
                 .put(
+                    None,
                     &ser,
                     &User {
                         id: i,
@@ -753,7 +758,7 @@ mod tests {
         }
 
         let entities: Vec<User> = index
-            .entities(&ser)
+            .entities(None, &ser)
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
@@ -779,6 +784,7 @@ mod tests {
         let index: PrimaryIndex<u64, User> = store.get_primary_index().unwrap();
         index
             .put(
+                None,
                 &ser,
                 &User { id: 1, name: "A".into(), email: "a@a.com".into() },
             )
@@ -809,6 +815,7 @@ mod tests {
             for i in 1u64..=3 {
                 index
                     .put(
+                        None,
                         &ser,
                         &User {
                             id: i,
@@ -854,6 +861,7 @@ mod tests {
             for i in 1u64..=2 {
                 index
                     .put(
+                        None,
                         &ser,
                         &User {
                             id: i,
@@ -895,6 +903,7 @@ mod tests {
                 store.get_primary_index().unwrap();
             index
                 .put(
+                    None,
                     &ser,
                     &User { id: 1, name: "A".into(), email: "a@a.com".into() },
                 )

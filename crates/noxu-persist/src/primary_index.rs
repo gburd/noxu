@@ -2,8 +2,9 @@
 //!
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use noxu_db::{Database, DatabaseEntry, OperationStatus};
+use noxu_db::{Database, DatabaseEntry, OperationStatus, Transaction};
 
 use crate::entity::{Entity, PrimaryKey};
 use crate::entity_serializer::EntitySerializer;
@@ -35,6 +36,12 @@ pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     /// secondary maps stay in sync with the primary store — mirroring the
     /// `SecondaryDatabase` auto-maintenance.
     secondaries: Vec<Box<dyn SecondaryIndexMaintainer<K, E> + Send + Sync>>,
+    /// One-shot guard: have we already warned the operator that secondary
+    /// updates are not atomic with the user transaction?  Set the first
+    /// time `put` / `delete_with_entity` is called with `Some(&txn)` while
+    /// `secondaries` is non-empty.  See
+    /// `PersistError::SecondariesNotTransactional`.
+    warned_secondaries_non_txn: AtomicBool,
     _phantom: PhantomData<(K, E)>,
 }
 
@@ -45,7 +52,56 @@ where
 {
     /// Creates a new `PrimaryIndex` wrapping the given database.
     pub fn new(db: &'db Database) -> Self {
-        Self { db, secondaries: Vec::new(), _phantom: PhantomData }
+        Self {
+            db,
+            secondaries: Vec::new(),
+            warned_secondaries_non_txn: AtomicBool::new(false),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Emit a one-shot operator warning when a primary write occurs inside
+    /// an explicit transaction while in-memory secondary indexes are
+    /// registered.
+    ///
+    /// In v1.5 secondary mutations are applied immediately on the primary
+    /// write regardless of the transaction's commit/abort outcome (see
+    /// `PersistError::SecondariesNotTransactional`).  The warning is rate-
+    /// limited to once per `PrimaryIndex` to keep logs sane in hot paths.
+    fn warn_secondaries_not_txn_once(&self, txn: Option<&Transaction>) {
+        if txn.is_none() || self.secondaries.is_empty() {
+            return;
+        }
+        if self
+            .warned_secondaries_non_txn
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Construct the typed error so the message is the canonical one
+            // documented on PersistError, but emit it as a warning rather
+            // than returning it (the call still succeeds).
+            log::warn!(
+                target: "noxu_persist",
+                "{} (entity: {})",
+                PersistError::SecondariesNotTransactional,
+                E::entity_name(),
+            );
+            // The `debug_assert` makes the limitation surface in tests so
+            // callers reviewing entity wiring see the issue at runtime,
+            // matching the audit's request for a "warning in the
+            // secondary-update path".  Tests that legitimately exercise
+            // the txn + secondary path can opt out by setting
+            // `NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES=1`.
+            debug_assert!(
+                std::env::var("NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES").is_ok(),
+                "DPL: primary write inside an explicit transaction while \
+                 in-memory secondary indexes are registered (entity {}). \
+                 Set NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES=1 to silence \
+                 this debug assertion. v1.6 will back secondaries with a \
+                 real Database.",
+                E::entity_name(),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -109,19 +165,27 @@ where
     ///
     /// Returns `None` if no entity with the given key exists.
     ///
+    /// # Transactions
     ///
+    /// Pass `Some(&txn)` to perform the read inside a user-managed
+    /// transaction (acquires shared locks via the txn's locker).  Pass
+    /// `None` for an auto-commit read (the historical pre-v1.5 default,
+    /// which still works).  This is a breaking change vs. v1.4: the
+    /// `txn` parameter is now leading-positional to mirror the
+    /// `noxu_db::Database::{get,put,delete}` shape.
     ///
     /// # Errors
     /// Returns an error if the database operation fails or deserialization fails.
     pub fn get<S: EntitySerializer<E>>(
         &self,
+        txn: Option<&Transaction>,
         serializer: &S,
         key: &K,
     ) -> Result<Option<E>> {
         let key_entry = DatabaseEntry::from_vec(key.to_bytes());
         let mut data_entry = DatabaseEntry::new();
 
-        let status = self.db.get(None, &key_entry, &mut data_entry)?;
+        let status = self.db.get(txn, &key_entry, &mut data_entry)?;
 
         match status {
             OperationStatus::Success => {
@@ -146,27 +210,45 @@ where
     ///
     /// All registered secondary indexes are updated automatically.
     ///
+    /// # Transactions
     ///
+    /// Pass `Some(&txn)` to participate in an explicit transaction (the
+    /// primary-database write commits/aborts atomically with the txn).
+    /// Pass `None` for auto-commit.
+    ///
+    /// **v1.5 limitation:** registered secondary indexes are in-memory
+    /// only and are *not* atomic with the user transaction — the
+    /// secondary-map updates are applied immediately on this call
+    /// regardless of whether the caller later commits or aborts.  See
+    /// `PersistError::SecondariesNotTransactional`.  Calling this method
+    /// with `Some(&txn)` while at least one secondary index is
+    /// registered emits a one-shot `log::warn!`.  v1.6 backs secondary
+    /// indexes with a real `Database` to close this gap.
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
     pub fn put<S: EntitySerializer<E>>(
         &self,
+        txn: Option<&Transaction>,
         serializer: &S,
         entity: &E,
     ) -> Result<()> {
+        self.warn_secondaries_not_txn_once(txn);
+
         // Fetch the existing entity so secondary maintainers can remove the
         // stale secondary key mapping (mirrors old-value callback).
-        let old_entity = self.get(serializer, entity.primary_key())?;
+        let old_entity = self.get(txn, serializer, entity.primary_key())?;
 
         let key_bytes = entity.primary_key().to_bytes();
         let key_entry = DatabaseEntry::from_vec(key_bytes);
         let data_bytes = serializer.serialize(entity)?;
         let data_entry = DatabaseEntry::from_vec(data_bytes);
 
-        self.db.put(None, &key_entry, &data_entry)?;
+        self.db.put(txn, &key_entry, &data_entry)?;
 
         // Notify all secondary maintainers.
+        // NOTE: in v1.5 this happens *eagerly* and is NOT rolled back if
+        // `txn` is later aborted — see `SecondariesNotTransactional`.
         for m in &self.secondaries {
             m.on_put(old_entity.as_ref(), entity);
         }
@@ -179,21 +261,25 @@ where
     /// Returns `true` if the entity was inserted, `false` if the key already
     /// exists. Secondary indexes are updated on successful insert.
     ///
-    ///
+    /// See [`PrimaryIndex::put`] for the transactional semantics; the same
+    /// v1.5 secondary-index limitation applies.
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
     pub fn put_no_overwrite<S: EntitySerializer<E>>(
         &self,
+        txn: Option<&Transaction>,
         serializer: &S,
         entity: &E,
     ) -> Result<bool> {
+        self.warn_secondaries_not_txn_once(txn);
+
         let key_bytes = entity.primary_key().to_bytes();
         let key_entry = DatabaseEntry::from_vec(key_bytes);
         let data_bytes = serializer.serialize(entity)?;
         let data_entry = DatabaseEntry::from_vec(data_bytes);
 
-        let status = self.db.put_no_overwrite(None, &key_entry, &data_entry)?;
+        let status = self.db.put_no_overwrite(txn, &key_entry, &data_entry)?;
         let inserted = status == OperationStatus::Success;
 
         if inserted {
@@ -215,13 +301,16 @@ where
     /// no entity is fetched. Use `delete_with_entity` when secondary index
     /// maintenance is required.
     ///
+    /// # Transactions
     ///
+    /// Pass `Some(&txn)` to participate in an explicit transaction; `None`
+    /// for auto-commit.
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
-    pub fn delete(&self, key: &K) -> Result<bool> {
+    pub fn delete(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_entry = DatabaseEntry::from_vec(key.to_bytes());
-        let status = self.db.delete(None, &key_entry)?;
+        let status = self.db.delete(txn, &key_entry)?;
         Ok(status == OperationStatus::Success)
     }
 
@@ -234,15 +323,21 @@ where
     /// Returns `true` if an entity was deleted, `false` if the key did not
     /// exist.
     ///
+    /// See [`PrimaryIndex::put`] for the transactional semantics; the same
+    /// v1.5 secondary-index limitation applies.
+    ///
     /// # Errors
     /// Returns an error if the database operation fails or deserialization fails.
     pub fn delete_with_entity<S: EntitySerializer<E>>(
         &self,
+        txn: Option<&Transaction>,
         serializer: &S,
         key: &K,
     ) -> Result<bool> {
-        let old_entity = self.get(serializer, key)?;
-        let deleted = self.delete(key)?;
+        self.warn_secondaries_not_txn_once(txn);
+
+        let old_entity = self.get(txn, serializer, key)?;
+        let deleted = self.delete(txn, key)?;
         if deleted && let Some(ref e) = old_entity {
             for m in &self.secondaries {
                 m.on_delete(e);
@@ -257,14 +352,15 @@ where
 
     /// Checks whether an entity with the given primary key exists.
     ///
-    ///
+    /// Pass `Some(&txn)` to read inside a transaction; `None` for
+    /// auto-commit.
     ///
     /// # Errors
     /// Returns an error if the database operation fails.
-    pub fn contains(&self, key: &K) -> Result<bool> {
+    pub fn contains(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_entry = DatabaseEntry::from_vec(key.to_bytes());
         let mut data_entry = DatabaseEntry::new();
-        let status = self.db.get(None, &key_entry, &mut data_entry)?;
+        let status = self.db.get(txn, &key_entry, &mut data_entry)?;
         Ok(status == OperationStatus::Success)
     }
 
@@ -284,15 +380,17 @@ where
 
     /// Returns an iterator over all entities in key order.
     ///
-    ///
+    /// Pass `Some(&txn)` to iterate inside a transaction (cursor reads
+    /// acquire shared locks via the txn locker); `None` for auto-commit.
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
     pub fn entities<'a, S: EntitySerializer<E>>(
         &'a self,
+        txn: Option<&Transaction>,
         serializer: &'a S,
     ) -> Result<EntityIterator<'a, K, E, S>> {
-        let cursor = self.db.open_cursor(None, None)?;
+        let cursor = self.db.open_cursor(txn, None)?;
         Ok(EntityIterator {
             cursor,
             serializer,
@@ -304,12 +402,16 @@ where
 
     /// Returns an iterator over all primary keys in key order.
     ///
-    ///
+    /// Pass `Some(&txn)` to iterate inside a transaction; `None` for
+    /// auto-commit.
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
-    pub fn keys(&self) -> Result<KeyIterator<'_, K>> {
-        let cursor = self.db.open_cursor(None, None)?;
+    pub fn keys(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<KeyIterator<'_, K>> {
+        let cursor = self.db.open_cursor(txn, None)?;
         Ok(KeyIterator {
             cursor,
             started: false,
@@ -574,9 +676,9 @@ mod tests {
         let ser = UserSerializer;
 
         let user = test_user(1);
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
 
-        let found = index.get(&ser, &1u64).unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap();
         assert_eq!(found, Some(user));
     }
 
@@ -586,7 +688,7 @@ mod tests {
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        let found = index.get(&ser, &999u64).unwrap();
+        let found = index.get(None, &ser, &999u64).unwrap();
         assert_eq!(found, None);
     }
 
@@ -597,16 +699,16 @@ mod tests {
         let ser = UserSerializer;
 
         let user1 = test_user(1);
-        index.put(&ser, &user1).unwrap();
+        index.put(None, &ser, &user1).unwrap();
 
         let user1_updated = User {
             id: 1,
             name: "Updated".to_string(),
             email: "updated@example.com".to_string(),
         };
-        index.put(&ser, &user1_updated).unwrap();
+        index.put(None, &ser, &user1_updated).unwrap();
 
-        let found = index.get(&ser, &1u64).unwrap().unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap().unwrap();
         assert_eq!(found.name, "Updated");
         assert_eq!(found.email, "updated@example.com");
     }
@@ -618,7 +720,7 @@ mod tests {
         let ser = UserSerializer;
 
         let user = test_user(1);
-        let inserted = index.put_no_overwrite(&ser, &user).unwrap();
+        let inserted = index.put_no_overwrite(None, &ser, &user).unwrap();
         assert!(inserted);
     }
 
@@ -629,18 +731,18 @@ mod tests {
         let ser = UserSerializer;
 
         let user = test_user(1);
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
 
         let user2 = User {
             id: 1,
             name: "Other".to_string(),
             email: "other@example.com".to_string(),
         };
-        let inserted = index.put_no_overwrite(&ser, &user2).unwrap();
+        let inserted = index.put_no_overwrite(None, &ser, &user2).unwrap();
         assert!(!inserted);
 
         // Original should be unchanged
-        let found = index.get(&ser, &1u64).unwrap().unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap().unwrap();
         assert_eq!(found.name, "User1");
     }
 
@@ -651,12 +753,12 @@ mod tests {
         let ser = UserSerializer;
 
         let user = test_user(1);
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
 
-        let deleted = index.delete(&1u64).unwrap();
+        let deleted = index.delete(None, &1u64).unwrap();
         assert!(deleted);
 
-        let found = index.get(&ser, &1u64).unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap();
         assert_eq!(found, None);
     }
 
@@ -665,7 +767,7 @@ mod tests {
         let (_td, _env, db) = setup();
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
 
-        let deleted = index.delete(&999u64).unwrap();
+        let deleted = index.delete(None, &999u64).unwrap();
         assert!(!deleted);
     }
 
@@ -676,11 +778,11 @@ mod tests {
         let ser = UserSerializer;
 
         let user = test_user(1);
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
 
-        let deleted = index.delete_with_entity(&ser, &1u64).unwrap();
+        let deleted = index.delete_with_entity(None, &ser, &1u64).unwrap();
         assert!(deleted);
-        assert_eq!(index.get(&ser, &1u64).unwrap(), None);
+        assert_eq!(index.get(None, &ser, &1u64).unwrap(), None);
     }
 
     #[test]
@@ -689,7 +791,7 @@ mod tests {
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        let deleted = index.delete_with_entity(&ser, &999u64).unwrap();
+        let deleted = index.delete_with_entity(None, &ser, &999u64).unwrap();
         assert!(!deleted);
     }
 
@@ -699,12 +801,12 @@ mod tests {
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        assert!(!index.contains(&1u64).unwrap());
+        assert!(!index.contains(None, &1u64).unwrap());
 
         let user = test_user(1);
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
 
-        assert!(index.contains(&1u64).unwrap());
+        assert!(index.contains(None, &1u64).unwrap());
     }
 
     #[test]
@@ -722,7 +824,7 @@ mod tests {
         let ser = UserSerializer;
 
         for i in 1..=5 {
-            index.put(&ser, &test_user(i)).unwrap();
+            index.put(None, &ser, &test_user(i)).unwrap();
         }
 
         assert_eq!(index.count().unwrap(), 5);
@@ -735,11 +837,11 @@ mod tests {
         let ser = UserSerializer;
 
         for i in 1..=3 {
-            index.put(&ser, &test_user(i)).unwrap();
+            index.put(None, &ser, &test_user(i)).unwrap();
         }
 
         let entities: Vec<User> = index
-            .entities(&ser)
+            .entities(None, &ser)
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
@@ -758,7 +860,7 @@ mod tests {
         let ser = UserSerializer;
 
         let entities: Vec<User> = index
-            .entities(&ser)
+            .entities(None, &ser)
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
@@ -774,8 +876,8 @@ mod tests {
 
         // Insert, delete, re-insert
         let user = test_user(1);
-        index.put(&ser, &user).unwrap();
-        index.delete(&1u64).unwrap();
+        index.put(None, &ser, &user).unwrap();
+        index.delete(None, &1u64).unwrap();
         assert_eq!(index.count().unwrap(), 0);
 
         let user2 = User {
@@ -783,8 +885,8 @@ mod tests {
             name: "Reinserted".to_string(),
             email: "new@example.com".to_string(),
         };
-        index.put(&ser, &user2).unwrap();
-        let found = index.get(&ser, &1u64).unwrap().unwrap();
+        index.put(None, &ser, &user2).unwrap();
+        let found = index.get(None, &ser, &1u64).unwrap().unwrap();
         assert_eq!(found.name, "Reinserted");
     }
 
@@ -805,7 +907,7 @@ mod tests {
         let ser = UserSerializer;
 
         // Empty database: first `next` sets done=true, second returns None.
-        let mut iter = index.entities(&ser).unwrap();
+        let mut iter = index.entities(None, &ser).unwrap();
         assert!(iter.next().is_none()); // First call on empty db → done=true
         assert!(iter.next().is_none()); // Already done
     }
@@ -817,8 +919,8 @@ mod tests {
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        index.put(&ser, &test_user(1)).unwrap();
-        let mut iter = index.entities(&ser).unwrap();
+        index.put(None, &ser, &test_user(1)).unwrap();
+        let mut iter = index.entities(None, &ser).unwrap();
 
         // Read the single entry.
         assert!(iter.next().is_some());
@@ -835,9 +937,9 @@ mod tests {
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        index.put(&ser, &test_user(1)).unwrap();
+        index.put(None, &ser, &test_user(1)).unwrap();
 
-        let mut iter = index.keys().unwrap();
+        let mut iter = index.keys(None).unwrap();
         // First call: started=false → sets started=true, issues Get::First.
         // The current implementation sets done=true unconditionally on success.
         let first = iter.next();
@@ -853,7 +955,7 @@ mod tests {
         let (_td, _env, db) = setup();
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
 
-        let mut iter = index.keys().unwrap();
+        let mut iter = index.keys(None).unwrap();
         assert!(iter.next().is_none());
     }
 
@@ -866,11 +968,11 @@ mod tests {
         let ser = UserSerializer;
 
         for i in 1u64..=3 {
-            index.put(&ser, &test_user(i)).unwrap();
+            index.put(None, &ser, &test_user(i)).unwrap();
         }
 
         // Drain all three keys.
-        let mut iter = index.keys().unwrap();
+        let mut iter = index.keys(None).unwrap();
         let k1 = iter.next();
         let k2 = iter.next();
         let k3 = iter.next();
@@ -895,7 +997,7 @@ mod tests {
             index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
         let user = test_user(10);
-        index.put(&ser, &user).unwrap();
+        index.put(None, &ser, &user).unwrap();
         // Secondary should now contain the name.
         assert!(name_idx.contains(&"User10".to_string()));
 
@@ -905,12 +1007,12 @@ mod tests {
             name: "UpdatedUser10".to_string(),
             email: "u@x.com".to_string(),
         };
-        index.put(&ser, &updated).unwrap();
+        index.put(None, &ser, &updated).unwrap();
         assert!(!name_idx.contains(&"User10".to_string()));
         assert!(name_idx.contains(&"UpdatedUser10".to_string()));
 
         // delete_with_entity: fetches entity and calls on_delete.
-        let deleted = index.delete_with_entity(&ser, &10u64).unwrap();
+        let deleted = index.delete_with_entity(None, &ser, &10u64).unwrap();
         assert!(deleted);
         assert!(!name_idx.contains(&"UpdatedUser10".to_string()));
     }
@@ -925,7 +1027,7 @@ mod tests {
         let _name_idx =
             index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
-        let deleted = index.delete_with_entity(&ser, &999u64).unwrap();
+        let deleted = index.delete_with_entity(None, &ser, &999u64).unwrap();
         assert!(!deleted);
     }
 
@@ -940,12 +1042,12 @@ mod tests {
             index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
         let user = test_user(5);
-        let inserted = index.put_no_overwrite(&ser, &user).unwrap();
+        let inserted = index.put_no_overwrite(None, &ser, &user).unwrap();
         assert!(inserted);
         assert!(name_idx.contains(&"User5".to_string()));
 
         // Second insert with same key: not inserted, secondary unchanged.
-        let inserted2 = index.put_no_overwrite(&ser, &user).unwrap();
+        let inserted2 = index.put_no_overwrite(None, &ser, &user).unwrap();
         assert!(!inserted2);
         assert!(name_idx.contains(&"User5".to_string()));
     }
@@ -957,10 +1059,10 @@ mod tests {
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
         let ser = UserSerializer;
 
-        index.put(&ser, &test_user(7)).unwrap();
-        assert!(index.contains(&7u64).unwrap());
-        index.delete(&7u64).unwrap();
-        assert!(!index.contains(&7u64).unwrap());
+        index.put(None, &ser, &test_user(7)).unwrap();
+        assert!(index.contains(None, &7u64).unwrap());
+        index.delete(None, &7u64).unwrap();
+        assert!(!index.contains(None, &7u64).unwrap());
     }
 
     /// `count` after insertions and deletions.
@@ -971,11 +1073,11 @@ mod tests {
         let ser = UserSerializer;
 
         for i in 1u64..=4 {
-            index.put(&ser, &test_user(i)).unwrap();
+            index.put(None, &ser, &test_user(i)).unwrap();
         }
         assert_eq!(index.count().unwrap(), 4);
 
-        index.delete(&2u64).unwrap();
+        index.delete(None, &2u64).unwrap();
         assert_eq!(index.count().unwrap(), 3);
     }
 
@@ -987,11 +1089,11 @@ mod tests {
         let ser = UserSerializer;
 
         for i in 1u64..=10 {
-            index.put(&ser, &test_user(i)).unwrap();
+            index.put(None, &ser, &test_user(i)).unwrap();
         }
 
         let entities: Vec<User> = index
-            .entities(&ser)
+            .entities(None, &ser)
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
