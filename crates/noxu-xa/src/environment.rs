@@ -92,6 +92,21 @@ impl XaEnvironment {
     }
 
     /// Mark the branch as having performed writes.
+    ///
+    /// Historically, this had to be called before `xa_prepare` for any
+    /// branch that performed writes; otherwise `xa_prepare` would take the
+    /// read-only optimisation and silently abort the inner transaction.
+    ///
+    /// As of v1.5, `xa_prepare` auto-detects writes by inspecting the inner
+    /// `Transaction`'s log-entry chain via `Txn::has_logged_entries()`, so
+    /// calling `mark_write` is **no longer required** for correctness when
+    /// writes go through `get_transaction(&xid)`'s `Transaction`.
+    ///
+    /// `mark_write` remains supported as a backwards-compatible no-op
+    /// override: callers who plan to perform writes through some side
+    /// channel that `Txn::has_logged_entries()` cannot observe (today
+    /// there is no such channel in the public API) can still force the
+    /// branch into the writes-present prepare path.
     pub fn mark_write(&self, xid: &Xid) -> XaResult<()> {
         let mut branches = self.branches.lock().unwrap();
         let branch = branches.get_mut(xid).ok_or(XaError::NotFound)?;
@@ -105,10 +120,38 @@ impl XaEnvironment {
     /// and `xa_commit`/`xa_rollback`/`xa_forget` remove it. After a crash,
     /// `xa_recover` returns XIDs from both the in-memory map and the
     /// persistent log.
+    ///
+    /// # v1.5 limitation
+    ///
+    /// In v1.5, the persistent log records that an XID was prepared but the
+    /// engine does not durably record the underlying `Transaction`'s state
+    /// (write locks, undo chain, dirty pages). On a fresh process, XIDs from
+    /// the persistent log appear in `xa_recover` but cannot be committed or
+    /// rolled back — attempting to do so returns
+    /// [`XaError::CrashDurabilityNotSupported`]. Use `xa_forget` to clear
+    /// the persistent record. Crash-durable XA is planned for v2.0.
     pub fn with_prepared_log(mut self) -> Result<Self, noxu_db::NoxuError> {
         let log = PreparedLog::open(&self.env)?;
         self.prepared_log = Some(log);
         Ok(self)
+    }
+
+    /// Classify the cause of a `branches.get(xid) == None` lookup.
+    ///
+    /// If the XID also appears in the persistent prepared log, the caller is
+    /// trying to operate on a branch that was prepared in a previous process
+    /// and lost on restart; surface the v1.5 limitation as a typed error
+    /// instead of the generic `NotFound`. Otherwise the XID was simply never
+    /// seen — return `NotFound`.
+    fn classify_missing_branch(&self, xid: &Xid) -> XaError {
+        if let Some(ref log) = self.prepared_log {
+            if let Ok(persisted) = log.recover_all() {
+                if persisted.contains(xid) {
+                    return XaError::CrashDurabilityNotSupported;
+                }
+            }
+        }
+        XaError::NotFound
     }
 }
 
@@ -198,7 +241,23 @@ impl XaResource for XaEnvironment {
             )));
         }
 
-        if !branch.has_writes {
+        // Auto-detect writes performed via the inner Transaction. Resolves
+        // the `mark_write` footgun (Sprint 3, audit Finding 3): if the
+        // application performs writes through the inner Transaction but
+        // forgets to call `mark_write`, we must NOT take the read-only
+        // optimisation — doing so silently aborts those writes.
+        //
+        // `Txn::has_logged_entries()` returns true as soon as any LN log
+        // record was emitted under this transaction id, which is exactly
+        // the condition that makes the read-only optimisation unsafe.
+        let inner_has_writes = branch
+            .txn
+            .get_inner_txn()
+            .map(|t| t.lock().unwrap().has_logged_entries())
+            .unwrap_or(false);
+        let has_writes = branch.has_writes || inner_has_writes;
+
+        if !has_writes {
             // Read-only optimization: no need for second phase.
             // Abort the internal transaction (releases locks) and remove branch.
             let _ = branch.txn.abort();
@@ -218,7 +277,15 @@ impl XaResource for XaEnvironment {
 
     fn xa_commit(&self, xid: &Xid, flags: XaFlags) -> XaResult<()> {
         let mut branches = self.branches.lock().unwrap();
-        let branch = branches.get_mut(xid).ok_or(XaError::NotFound)?;
+        let branch = match branches.get_mut(xid) {
+            Some(b) => b,
+            None => {
+                // Not in memory — distinguish "never seen this XID" from
+                // "prepared in a previous process and lost on restart".
+                drop(branches);
+                return Err(self.classify_missing_branch(xid));
+            }
+        };
 
         if flags.contains(XaFlags::ONEPHASE) {
             // One-phase commit: skip prepare.
@@ -248,7 +315,13 @@ impl XaResource for XaEnvironment {
     fn xa_rollback(&self, xid: &Xid, flags: XaFlags) -> XaResult<()> {
         let _ = flags;
         let mut branches = self.branches.lock().unwrap();
-        let branch = branches.get(xid).ok_or(XaError::NotFound)?;
+        let branch = match branches.get(xid) {
+            Some(b) => b,
+            None => {
+                drop(branches);
+                return Err(self.classify_missing_branch(xid));
+            }
+        };
 
         match branch.state {
             BranchState::Idle
@@ -280,7 +353,17 @@ impl XaResource for XaEnvironment {
             .map(|(xid, _)| xid.clone())
             .collect();
 
-        // Add any from persistent log (crash recovery — not in memory)
+        // Add any from persistent log (crash recovery — not in memory).
+        //
+        // NOTE (v1.5): XIDs returned here that are NOT also in the in-memory
+        // `branches` map cannot actually be committed or rolled back — the
+        // engine has no `TxnPrepare` WAL record yet, so on a fresh process
+        // the underlying `Transaction` (locks, undo chain) does not exist.
+        // We still report them so the operator can see what is in doubt and
+        // call `xa_forget` to clear the persistent record. Attempting
+        // `xa_commit` / `xa_rollback` on such an XID returns
+        // `XaError::CrashDurabilityNotSupported`. Crash-durable XA is
+        // planned for v2.0.
         if let Some(ref log) = self.prepared_log {
             if let Ok(persisted) = log.recover_all() {
                 for xid in persisted {
