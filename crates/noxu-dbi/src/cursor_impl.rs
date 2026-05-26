@@ -574,6 +574,21 @@ impl CursorImpl {
                     } else {
                         slot_data
                     };
+                    // Audit Finding 4: BDB-JE's SearchBoth is exact-match on
+                    // (key, data) regardless of duplicate-set membership; on a
+                    // non-dup DB it must still validate that the slot's data
+                    // equals the user-supplied data.  Pre-fix the `data`
+                    // argument was silently dropped and `Success` was
+                    // returned for any matching key, contradicting the
+                    // documented contract on `Get::SearchBoth`.  See
+                    // `docs/src/internal/api-audit-2026-05-cursor.md`.
+                    if matches!(search_mode, SearchMode::Both) {
+                        let user_data = data.unwrap_or(&[]);
+                        let stored = final_data.as_deref().unwrap_or(&[]);
+                        if stored != user_data {
+                            return Ok(OperationStatus::NotFound);
+                        }
+                    }
                     self.current_key = Some(key.to_vec());
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
@@ -1282,6 +1297,19 @@ impl CursorImpl {
         }
 
         let is_dup = self.is_sorted_dup();
+
+        // BDB-JE contract: NEXT_DUP / PREV_DUP advance only within the
+        // duplicate-set of the current key.  On a non-sorted-dup database
+        // every key has exactly one record, so there can never be another
+        // duplicate of the current position — the only correct answer is
+        // NotFound.  Without this early-return, the dup-filter below is
+        // gated on `is_dup` and the cursor would silently degenerate into
+        // plain Next / Prev semantics, returning the next *different* key
+        // and violating the documented contract.  See
+        // `docs/src/internal/api-audit-2026-05-cursor.md` Finding 5.
+        if !is_dup && matches!(mode, GetMode::NextDup | GetMode::PrevDup) {
+            return Ok(OperationStatus::NotFound);
+        }
 
         // For NextDup/PrevDup/NextNoDup/PrevNoDup, capture the primary key of
         // the current position before advancing.
