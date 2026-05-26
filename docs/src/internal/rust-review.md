@@ -1,5 +1,9 @@
 # Noxu DB Rust Code Review
 
+<!-- markdownlint-disable MD013 -->
+<!-- This is a long-form code review captured verbatim from the simulated reviewer. The
+     paragraphs are intentionally not reflowed; surrounding rules continue to apply. -->
+
 **Reviewer:** Jon Gjengset (simulated)
 **Date:** 2026-05-01
 **Scope:** All crates under `crates/` (workspace covers 19 crates today;

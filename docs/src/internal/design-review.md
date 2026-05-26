@@ -1,5 +1,10 @@
 # Noxu DB — Design Implementation Review
 
+<!-- markdownlint-disable MD013 -->
+<!-- This is a long-form audit document captured verbatim with very long technical lines
+     (per-source-line citations, dense tables, multi-clause findings). It is intentionally
+     not reflowed; the surrounding `make docs-check` gate covers every other rule. -->
+
 **Last Updated**: 2026-05-13 (Session 45 — TLS encryption for TCP replication channels; Sessions 43–44: lock monomorphization, Bytes zero-copy, hashbrown, full attribution purge, async closures, const ConfigParam, trait upcasting, constant-chaos torture test overhaul)
 
 ---

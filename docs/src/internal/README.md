@@ -17,7 +17,8 @@ not end users.
   public API was still backed by an in-memory HashMap. Most of its
   "Critical" findings have since been resolved; preserved for the
   record. Do not treat its subsystem-completeness claims as current.
-- [Rust Code Review](rust-review.md) — historical Rust quality review (originally covered the 16-crate workspace state; current workspace has 19 crates). Grade: B+.
+- [Rust Code Review](rust-review.md) — historical Rust quality review (originally covered the
+  16-crate workspace state; current workspace has 19 crates). Grade: B+.
 - [Serialization Research](serialization-research.md) — zero-copy log entry
   parsing research and recommendations for `noxu-log`.
 - [Checksum Selection](checksum-selection.md) — CRC32 vs CRC32C benchmark and

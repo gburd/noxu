@@ -25,9 +25,13 @@ env.checkpoint(Some(CheckpointConfig::new().with_force(true)))?;
 
 ## Recommended production settings
 
-- **OLTP workloads**: `checkpointer_bytes_interval = 64 MiB` (default is fine; tighten to 16 MiB if crash recovery must be < 5 s).
-- **Bulk load**: disable automatic checkpointing (`set_run_checkpointer(false)`), call `env.checkpoint(...)` manually between batches, re-enable afterwards.
-- **Before shutdown**: always call `env.checkpoint(Some(CheckpointConfig::new().with_minimize_recovery_time(true)))` to avoid a full recovery on next open.
+- **OLTP workloads**: `checkpointer_bytes_interval = 64 MiB` (default is fine; tighten to 16 MiB
+  if crash recovery must be < 5 s).
+- **Bulk load**: disable automatic checkpointing (`set_run_checkpointer(false)`), call
+  `env.checkpoint(...)` manually between batches, re-enable afterwards.
+- **Before shutdown**: always call
+  `env.checkpoint(Some(CheckpointConfig::new().with_minimize_recovery_time(true)))` to avoid a
+  full recovery on next open.
 
 ---
 
