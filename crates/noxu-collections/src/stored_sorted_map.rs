@@ -1,147 +1,60 @@
-//! Sorted map view of a database.
+//! Typed sorted-map view of a database.
 //!
+//! Wave 2B redesign (v1.6).  `StoredSortedMap<K, V, KB, VB>` adds
+//! sorted-map operations (`first_key`, `last_key`, `iter_from`,
+//! `iter_reverse`) on top of [`StoredMap`].  Every operation accepts
+//! `txn: Option<&Transaction>`, matching the BDB-JE shape.
+
+use noxu_bind::EntryBinding;
+use noxu_db::{Database, Transaction};
 
 use crate::error::Result;
-use crate::stored_iterator::{
-    StoredIterator, StoredKeyIterator, StoredValueIterator,
+use crate::internal::{
+    cursor_endpoint, decode_key, encode_key, scan_records, ScanDirection,
+    StartKey,
 };
+use crate::stored_iterator::StoredIterator;
 use crate::stored_map::StoredMap;
-use noxu_db::Database;
 
-/// A sorted map view of a database.
+/// A typed sorted-map view of a database.
 ///
-/// Provides all the operations of `StoredMap` plus sorted-map operations
-/// like `first_key()`, `last_key()`, and range iteration. Keys are
-/// maintained in their natural byte order.
-///
-/// # v1.5 limitations
-///
-/// `StoredSortedMap` inherits the auto-commit-only contract from
-/// [`StoredMap`].  Every operation issues the underlying `Database` call
-/// with `txn = None`.  Threading `Option<&Transaction>` through every
-/// method is tracked for v1.6 (audit findings #1, #3, #4).
-///
-/// # Example
-/// ```ignore
-/// use noxu_collections::StoredSortedMap;
-///
-/// let map = StoredSortedMap::new(&db, false);
-/// map.put(b"banana", b"b").unwrap();
-/// map.put(b"apple", b"a").unwrap();
-/// map.put(b"cherry", b"c").unwrap();
-///
-/// assert_eq!(map.first_key().unwrap(), Some(b"apple".to_vec()));
-/// assert_eq!(map.last_key().unwrap(), Some(b"cherry".to_vec()));
-/// ```
-pub struct StoredSortedMap<'db> {
-    /// The underlying StoredMap providing basic map operations.
-    inner: StoredMap<'db>,
+/// All `StoredMap` operations are forwarded to the inner map; this
+/// type adds sorted-map navigation (`first_key`, `last_key`,
+/// `iter_from`, `iter_reverse`).
+pub struct StoredSortedMap<'db, K, V, KB, VB>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+{
+    inner: StoredMap<'db, K, V, KB, VB>,
 }
 
-impl<'db> StoredSortedMap<'db> {
-    /// Creates a new sorted map view of the given database.
-    ///
-    /// # Arguments
-    /// * `db` - The database to provide a sorted map view over
-    /// * `read_only` - If true, write operations will return `CollectionError::ReadOnly`
-    pub fn new(db: &'db Database, read_only: bool) -> Self {
-        StoredSortedMap { inner: StoredMap::new(db, read_only) }
+impl<'db, K, V, KB, VB> StoredSortedMap<'db, K, V, KB, VB>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+{
+    /// Creates a new typed sorted-map view of the given database.
+    pub fn new(db: &'db Database, key_binding: KB, value_binding: VB) -> Self {
+        StoredSortedMap {
+            inner: StoredMap::new(db, key_binding, value_binding),
+        }
     }
 
-    /// Returns the first (smallest) key in the database, or `None` if empty.
-    pub fn first_key(&self) -> Result<Option<Vec<u8>>> {
-        let keys = self.inner.known_keys();
-        Ok(keys.into_iter().next())
+    /// Creates a new read-only typed sorted-map view.
+    pub fn new_read_only(
+        db: &'db Database,
+        key_binding: KB,
+        value_binding: VB,
+    ) -> Self {
+        StoredSortedMap {
+            inner: StoredMap::new_read_only(db, key_binding, value_binding),
+        }
     }
 
-    /// Returns the last (largest) key in the database, or `None` if empty.
-    pub fn last_key(&self) -> Result<Option<Vec<u8>>> {
-        let keys = self.inner.known_keys();
-        Ok(keys.into_iter().last())
-    }
-
-    /// Returns an iterator over all key-value pairs in sorted key order.
-    pub fn iter(&self) -> Result<StoredIterator<'db>> {
-        self.inner.iter()
-    }
-
-    /// Returns an iterator starting from the given key (inclusive).
-    ///
-    /// Only entries with keys greater than or equal to `start_key` are included.
-    ///
-    /// # Arguments
-    /// * `start_key` - The lower bound (inclusive) for iteration
-    pub fn iter_from(&self, start_key: &[u8]) -> Result<StoredIterator<'db>> {
-        let keys = self.inner.known_keys();
-        Ok(StoredIterator::new_from(self.inner.database(), keys, start_key))
-    }
-
-    /// Returns a reverse iterator over all key-value pairs.
-    ///
-    /// Entries are yielded in descending key order.
-    pub fn iter_reverse(&self) -> Result<StoredIterator<'db>> {
-        let keys = self.inner.known_keys();
-        Ok(StoredIterator::new_reverse(self.inner.database(), keys))
-    }
-
-    /// Returns an iterator over all keys in sorted order.
-    pub fn keys(&self) -> Result<StoredKeyIterator> {
-        self.inner.keys()
-    }
-
-    /// Returns an iterator over all values in key-sorted order.
-    pub fn values(&self) -> Result<StoredValueIterator<'db>> {
-        self.inner.values()
-    }
-
-    /// Retrieves the value associated with the given key.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
-    }
-
-    /// Inserts or updates a key-value pair.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.put(key, value)
-    }
-
-    /// Removes a key-value pair.
-    pub fn remove(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.remove(key)
-    }
-
-    /// Tests whether the given key exists.
-    pub fn contains_key(&self, key: &[u8]) -> Result<bool> {
-        self.inner.contains_key(key)
-    }
-
-    /// Returns the number of records.
-    pub fn len(&self) -> Result<u64> {
-        self.inner.len()
-    }
-
-    /// Returns whether the database is empty.
-    pub fn is_empty(&self) -> Result<bool> {
-        self.inner.is_empty()
-    }
-
-    /// Returns whether this map view is read-only.
+    /// Returns whether this view is read-only.
     pub fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
-    }
-
-    /// Registers a key in the internal key index.
-    pub fn register_key(&self, key: &[u8]) {
-        self.inner.register_key(key);
-    }
-
-    /// Registers multiple keys in the internal key index.
-    pub fn register_keys(&self, keys: &[&[u8]]) {
-        self.inner.register_keys(keys);
-    }
-
-    /// Returns a snapshot of known keys in sorted order.
-    pub fn known_keys(&self) -> Vec<Vec<u8>> {
-        self.inner.known_keys()
     }
 
     /// Returns a reference to the underlying database.
@@ -149,235 +62,358 @@ impl<'db> StoredSortedMap<'db> {
         self.inner.database()
     }
 
-    /// Returns a reference to the inner `StoredMap`.
-    pub fn as_map(&self) -> &StoredMap<'db> {
+    /// Returns a reference to the inner [`StoredMap`].
+    pub fn as_map(&self) -> &StoredMap<'db, K, V, KB, VB> {
         &self.inner
     }
 
-    /// Clears all records.
-    pub fn clear(&self) -> Result<()> {
-        self.inner.clear()
+    /// Inserts or updates a key-value pair.  See [`StoredMap::put`].
+    pub fn put(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+        value: &V,
+    ) -> Result<Option<V>> {
+        self.inner.put(txn, key, value)
     }
 
-    /// Returns the first (smallest) key-value pair, or `None` if empty.
-    pub fn first_entry(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        match self.first_key()? {
-            Some(key) => {
-                let val = self.get(&key)?;
-                Ok(val.map(|v| (key, v)))
-            }
-            None => Ok(None),
-        }
+    /// Retrieves the value associated with the given key.
+    pub fn get(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+    ) -> Result<Option<V>> {
+        self.inner.get(txn, key)
     }
 
-    /// Returns the last (largest) key-value pair, or `None` if empty.
-    pub fn last_entry(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        match self.last_key()? {
-            Some(key) => {
-                let val = self.get(&key)?;
-                Ok(val.map(|v| (key, v)))
+    /// Removes the entry for `key`.
+    pub fn remove(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+    ) -> Result<Option<V>> {
+        self.inner.remove(txn, key)
+    }
+
+    /// Returns whether `key` is present.
+    pub fn contains_key(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+    ) -> Result<bool> {
+        self.inner.contains_key(txn, key)
+    }
+
+    /// Returns the number of records.
+    pub fn len(&self, txn: Option<&Transaction>) -> Result<usize> {
+        self.inner.len(txn)
+    }
+
+    /// Returns whether the database is empty.
+    pub fn is_empty(&self, txn: Option<&Transaction>) -> Result<bool> {
+        self.inner.is_empty(txn)
+    }
+
+    /// Removes every record.
+    pub fn clear(&self, txn: Option<&Transaction>) -> Result<()> {
+        self.inner.clear(txn)
+    }
+
+    /// Forward iterator over every (key, value) pair.
+    pub fn iter(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<(K, V)>> {
+        self.inner.iter(txn)
+    }
+
+    /// Forward iterator over keys.
+    pub fn keys(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<K>> {
+        self.inner.keys(txn)
+    }
+
+    /// Forward iterator over values.
+    pub fn values(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<V>> {
+        self.inner.values(txn)
+    }
+
+    /// Returns the smallest key, or `None` if the database is empty.
+    pub fn first_key(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<Option<K>> {
+        Ok(self.first_entry(txn)?.map(|(k, _)| k))
+    }
+
+    /// Returns the largest key, or `None` if the database is empty.
+    pub fn last_key(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<Option<K>> {
+        Ok(self.last_entry(txn)?.map(|(k, _)| k))
+    }
+
+    /// Returns the (key, value) pair with the smallest key, or `None`.
+    pub fn first_entry(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<Option<(K, V)>> {
+        cursor_endpoint(
+            self.inner.database(),
+            txn,
+            self.inner.key_binding(),
+            self.inner.value_binding(),
+            noxu_db::Get::First,
+        )
+    }
+
+    /// Returns the (key, value) pair with the largest key, or `None`.
+    pub fn last_entry(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<Option<(K, V)>> {
+        cursor_endpoint(
+            self.inner.database(),
+            txn,
+            self.inner.key_binding(),
+            self.inner.value_binding(),
+            noxu_db::Get::Last,
+        )
+    }
+
+    /// Forward iterator starting at `start_key` (inclusive lower bound).
+    ///
+    /// Encodes `start_key` via the key binding and walks the cursor
+    /// from the smallest key `>= encoded(start_key)`.
+    pub fn iter_from(
+        &self,
+        txn: Option<&Transaction>,
+        start_key: &K,
+    ) -> Result<StoredIterator<(K, V)>> {
+        let start_entry = encode_key(self.inner.key_binding(), start_key)?;
+        let bytes = start_entry.get_data().unwrap_or(&[]).to_vec();
+        let items = scan_records(
+            self.inner.database(),
+            txn,
+            Some(bytes.as_slice()),
+            ScanDirection::Forward,
+            self.inner.key_binding(),
+            self.inner.value_binding(),
+            |k, v| (k, v),
+        )?;
+        Ok(StoredIterator::from_vec(items))
+    }
+
+    /// Reverse iterator over every (key, value) pair (largest key first).
+    pub fn iter_reverse(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<(K, V)>> {
+        let items = scan_records(
+            self.inner.database(),
+            txn,
+            StartKey::None,
+            ScanDirection::Reverse,
+            self.inner.key_binding(),
+            self.inner.value_binding(),
+            |k, v| (k, v),
+        )?;
+        Ok(StoredIterator::from_vec(items))
+    }
+
+    /// Returns the smallest key strictly greater than `key`, or `None`.
+    ///
+    /// Useful for stepping through keys when only the bindings are
+    /// available.  Walks forward from `Get::First` and skips keys
+    /// `<= bound` (the `noxu-dbi` `SearchGte`-then-`Next` path is
+    /// known to mis-position; see `internal::scan_records` for the
+    /// rationale).
+    pub fn higher_key(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+    ) -> Result<Option<K>> {
+        let key_entry = encode_key(self.inner.key_binding(), key)?;
+        let bound = key_entry.get_data().unwrap_or(&[]).to_vec();
+
+        let mut cursor = self.inner.database().open_cursor(txn, None)?;
+        let mut k_buf = noxu_db::DatabaseEntry::new();
+        let mut d_buf = noxu_db::DatabaseEntry::new();
+        let mut status =
+            cursor.get(&mut k_buf, &mut d_buf, noxu_db::Get::First, None)?;
+        let mut result: Option<K> = None;
+        while matches!(status, noxu_db::OperationStatus::Success) {
+            let cur = k_buf.get_data().unwrap_or(&[]);
+            if cur > bound.as_slice() {
+                result = Some(decode_key(self.inner.key_binding(), &k_buf)?);
+                break;
             }
-            None => Ok(None),
+            status = cursor.get(
+                &mut k_buf,
+                &mut d_buf,
+                noxu_db::Get::Next,
+                None,
+            )?;
         }
+        cursor.close()?;
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::CollectionError;
+    use noxu_bind::{IntBinding, StringBinding};
     use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
     use tempfile::TempDir;
 
-    fn setup_env_and_db() -> (TempDir, Environment, Database) {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-        (temp_dir, env, db)
+    fn setup() -> (TempDir, Environment, noxu_db::Database) {
+        let td = TempDir::new().unwrap();
+        let env = Environment::open(
+            EnvironmentConfig::new(td.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let db = env
+            .open_database(
+                None,
+                "ssm",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        (td, env, db)
     }
 
-    fn populate_sorted_map<'db>(map: &StoredSortedMap<'db>) {
-        map.put(b"cherry", b"c").unwrap();
-        map.put(b"apple", b"a").unwrap();
-        map.put(b"banana", b"b").unwrap();
-        map.put(b"date", b"d").unwrap();
-        map.put(b"elderberry", b"e").unwrap();
-    }
-
-    #[test]
-    fn test_first_key() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
-
-        assert_eq!(map.first_key().unwrap(), Some(b"apple".to_vec()));
-    }
-
-    #[test]
-    fn test_last_key() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
-
-        assert_eq!(map.last_key().unwrap(), Some(b"elderberry".to_vec()));
+    fn populate(map: &StoredSortedMap<'_, i32, String, IntBinding, StringBinding>) {
+        for (k, v) in
+            [(3, "three"), (1, "one"), (2, "two"), (5, "five"), (4, "four")]
+        {
+            map.put(None, &k, &v.to_string()).unwrap();
+        }
     }
 
     #[test]
-    fn test_first_key_empty() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
+    fn first_and_last_key() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
 
-        assert_eq!(map.first_key().unwrap(), None);
+        assert_eq!(map.first_key(None).unwrap(), Some(1));
+        assert_eq!(map.last_key(None).unwrap(), Some(5));
     }
 
     #[test]
-    fn test_last_key_empty() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
+    fn first_and_last_entry() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
 
-        assert_eq!(map.last_key().unwrap(), None);
+        assert_eq!(
+            map.first_entry(None).unwrap(),
+            Some((1, "one".to_string())),
+        );
+        assert_eq!(
+            map.last_entry(None).unwrap(),
+            Some((5, "five".to_string())),
+        );
     }
 
     #[test]
-    fn test_iter_sorted() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
-
-        let items: Vec<_> = map.iter().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(items.len(), 5);
-        assert_eq!(items[0].0, b"apple");
-        assert_eq!(items[1].0, b"banana");
-        assert_eq!(items[2].0, b"cherry");
-        assert_eq!(items[3].0, b"date");
-        assert_eq!(items[4].0, b"elderberry");
+    fn first_last_empty() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        assert_eq!(map.first_key(None).unwrap(), None);
+        assert_eq!(map.last_key(None).unwrap(), None);
+        assert_eq!(map.first_entry(None).unwrap(), None);
+        assert_eq!(map.last_entry(None).unwrap(), None);
     }
 
     #[test]
-    fn test_iter_from() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
+    fn iter_reverse() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
 
         let items: Vec<_> =
-            map.iter_from(b"cherry").unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].0, b"cherry");
-        assert_eq!(items[1].0, b"date");
-        assert_eq!(items[2].0, b"elderberry");
+            map.iter_reverse(None).unwrap().map(Result::unwrap).collect();
+        let keys: Vec<i32> = items.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![5, 4, 3, 2, 1]);
     }
 
     #[test]
-    fn test_iter_from_between_keys() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
+    fn iter_from_inclusive() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
 
-        // "cat" is between "banana" and "cherry"
-        let items: Vec<_> =
-            map.iter_from(b"cat").unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].0, b"cherry");
+        let items: Vec<_> = map
+            .iter_from(None, &3)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let keys: Vec<i32> = items.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![3, 4, 5]);
     }
 
     #[test]
-    fn test_iter_from_past_all() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
-
-        let items: Vec<_> =
-            map.iter_from(b"zzz").unwrap().map(|r| r.unwrap()).collect();
-        assert!(items.is_empty());
+    fn iter_from_between_keys() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        // 1, 2, 4, 5
+        for k in [1, 2, 4, 5] {
+            map.put(None, &k, &format!("{k}")).unwrap();
+        }
+        // start key 3 → smallest key >= 3 is 4
+        let items: Vec<_> = map
+            .iter_from(None, &3)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let keys: Vec<i32> = items.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![4, 5]);
     }
 
     #[test]
-    fn test_iter_reverse() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
+    fn higher_key() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
 
-        let items: Vec<_> =
-            map.iter_reverse().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(items.len(), 5);
-        assert_eq!(items[0].0, b"elderberry");
-        assert_eq!(items[1].0, b"date");
-        assert_eq!(items[2].0, b"cherry");
-        assert_eq!(items[3].0, b"banana");
-        assert_eq!(items[4].0, b"apple");
+        assert_eq!(map.higher_key(None, &1).unwrap(), Some(2));
+        assert_eq!(map.higher_key(None, &3).unwrap(), Some(4));
+        assert_eq!(map.higher_key(None, &5).unwrap(), None);
+        // For a key not in the map, we get the smallest key strictly
+        // greater than it.  IntBinding sorts ints two's-complement so
+        // 0 < 1 < ... < 5.
+        assert_eq!(map.higher_key(None, &0).unwrap(), Some(1));
     }
 
     #[test]
-    fn test_first_entry() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
+    fn participates_in_user_txn() {
+        let (_td, env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
 
-        let entry = map.first_entry().unwrap().unwrap();
-        assert_eq!(entry.0, b"apple");
-        assert_eq!(entry.1, b"a");
-    }
+        let txn = env.begin_transaction(None, None).unwrap();
+        map.put(Some(&txn), &1, &"one".to_string()).unwrap();
+        map.put(Some(&txn), &2, &"two".to_string()).unwrap();
+        assert_eq!(map.first_key(Some(&txn)).unwrap(), Some(1));
+        txn.commit().unwrap();
 
-    #[test]
-    fn test_last_entry() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        populate_sorted_map(&map);
-
-        let entry = map.last_entry().unwrap().unwrap();
-        assert_eq!(entry.0, b"elderberry");
-        assert_eq!(entry.1, b"e");
-    }
-
-    #[test]
-    fn test_first_entry_empty() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        assert!(map.first_entry().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_delegated_operations() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-
-        // Test put/get/remove/contains_key
-        map.put(b"key", b"val").unwrap();
-        assert!(map.contains_key(b"key").unwrap());
-        assert_eq!(map.get(b"key").unwrap(), Some(b"val".to_vec()));
-        assert_eq!(map.len().unwrap(), 1);
-        assert!(!map.is_empty().unwrap());
-
-        map.remove(b"key").unwrap();
-        assert!(!map.contains_key(b"key").unwrap());
-    }
-
-    #[test]
-    fn test_as_map() {
-        let (_td, _env, db) = setup_env_and_db();
-        let sorted_map = StoredSortedMap::new(&db, false);
-        let map = sorted_map.as_map();
-        assert!(!map.is_read_only());
-    }
-
-    #[test]
-    fn test_read_only() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, true);
-        assert!(map.is_read_only());
-        assert!(matches!(map.put(b"k", b"v"), Err(CollectionError::ReadOnly)));
-    }
-
-    #[test]
-    fn test_single_entry() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredSortedMap::new(&db, false);
-        map.put(b"only", b"one").unwrap();
-
-        assert_eq!(map.first_key().unwrap(), Some(b"only".to_vec()));
-        assert_eq!(map.last_key().unwrap(), Some(b"only".to_vec()));
+        assert_eq!(map.first_key(None).unwrap(), Some(1));
     }
 }
