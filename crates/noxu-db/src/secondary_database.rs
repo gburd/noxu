@@ -302,8 +302,10 @@ impl SecondaryDatabase {
     ) -> Result<OperationStatus> {
         self.check_open()?;
 
-        // Use a secondary cursor to iterate all duplicates of the secondary key.
-        let mut sec_cursor = self.open_cursor_internal()?;
+        // Use a secondary cursor (under the caller's txn so the scan
+        // participates in the user's transaction) to iterate all
+        // duplicates of the secondary key.
+        let mut sec_cursor = self.open_cursor_internal(txn)?;
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -350,24 +352,41 @@ impl SecondaryDatabase {
 
     /// Opens a cursor on the secondary database.
     ///
-    /// When `txn` is `Some(_)`, the inner cursor over the secondary index
-    /// participates in the supplied transaction — reads acquire shared
-    /// locks via the txn's locker and any writes (currently only the
-    /// primary delete cascade triggered by `SecondaryCursor::delete`) are
-    /// rolled back when the txn aborts.  When `txn` is `None` the inner
-    /// cursor runs in auto-commit mode.
+    /// When `txn` is `Some(_)`, the inner cursor over the secondary
+    /// index participates in the supplied transaction — reads acquire
+    /// shared locks via the txn's locker and writes acquire exclusive
+    /// locks tracked by the txn.  Wave 1B (audit F5 follow-up) extends
+    /// this to the *primary* lookups and the
+    /// [`SecondaryCursor::delete`] cascade as well: the cursor stores
+    /// the txn handle and forwards it to every primary `get` /
+    /// `delete` and to `delete_all_for_primary`.  Aborting the txn
+    /// rolls back **both** the secondary entry and the primary record
+    /// removed by `SecondaryCursor::delete` (and every secondary
+    /// cleanup it triggers).  When `txn` is `None`, every operation
+    /// runs auto-committed, matching the v1.4 behaviour.
     ///
     /// `config` is forwarded to the inner `Database::open_cursor` call so
     /// `read_uncommitted` and other cursor-level flags propagate correctly.
     ///
+    /// # Lifetime contract (breaking change in Wave 1B)
+    ///
+    /// The returned [`SecondaryCursor`] borrows both the
+    /// `SecondaryDatabase` and — when supplied — the `Transaction`,
+    /// because primary deletes and cleanup writes are deferred until
+    /// `SecondaryCursor::delete` is called.  Callers must therefore
+    /// keep the `Transaction` alive at least as long as the cursor.
+    /// In practice this is the same lifetime rule that already applies
+    /// to [`Database::open_cursor`]; it is now enforced statically by
+    /// the type system.
+    ///
     /// # Returns
     /// A `SecondaryCursor` that iterates secondary index entries and returns
     /// primary data.
-    pub fn open_cursor(
-        &self,
-        txn: Option<&Transaction>,
+    pub fn open_cursor<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
         config: Option<&CursorConfig>,
-    ) -> Result<SecondaryCursor<'_>> {
+    ) -> Result<SecondaryCursor<'a>> {
         self.check_open()?;
         self.check_readable()?;
         SecondaryCursor::new(self, txn, config)
@@ -712,12 +731,16 @@ impl SecondaryDatabase {
 
     /// Builds a `SecondaryCursor` on this secondary database (internal).
     ///
-    /// Called from auto-commit code paths that do not have a transaction
-    /// handle (e.g. `SecondaryDatabase::delete`, which currently runs
-    /// secondary cleanup auto-committed; see audit finding F5 for the
-    /// follow-up work to plumb the txn through these paths).
-    fn open_cursor_internal(&self) -> Result<SecondaryCursor<'_>> {
-        SecondaryCursor::new(self, None, None)
+    /// `txn` is forwarded to [`SecondaryCursor::new`] so all inner-database
+    /// reads and the cascade primary delete participate in the caller's
+    /// transaction (Wave 1B / audit F5).  Used from
+    /// [`SecondaryDatabase::delete`] to drive the secondary scan under
+    /// the caller's txn.
+    fn open_cursor_internal<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<SecondaryCursor<'a>> {
+        SecondaryCursor::new(self, txn, None)
     }
 
     /// Populates the secondary index from the primary if the secondary is empty.
