@@ -9,7 +9,7 @@ and acknowledged. The key types are `SyncPolicy`, `DurabilityPolicy`, and
 The use of transactions introduces overhead that non-transactional applications
 do not incur. Key tuning considerations:
 
-**Durability vs. Throughput**
+### Durability vs. Throughput
 
 The default `SyncPolicy::Sync` performs a full fsync on every commit. This is the
 most durable option but also the slowest. If you can tolerate the possibility of
@@ -18,7 +18,7 @@ losing the most recent committed transactions in the event of an OS crash, use
 application crash as well, use `SyncPolicy::NoSync`. See
 [Non-Durable Transactions](basics.md#non-durable-transactions).
 
-**Reduce Lock Contention**
+### Reduce Lock Contention
 
 - Keep transactions short. Shorter transactions hold locks for less time, reducing
   the probability of blocking other threads.
@@ -32,7 +32,7 @@ application crash as well, use `SyncPolicy::NoSync`. See
 - Use uncommitted-read isolation where tolerable — this avoids taking read locks
   entirely for read operations.
 
-**Isolation Level Trade-offs**
+### Isolation Level Trade-offs
 
 | Level | Locking Cost | Anomalies Possible |
 |-------|--------------|--------------------|
@@ -44,13 +44,13 @@ application crash as well, use `SyncPolicy::NoSync`. See
 Choose the weakest isolation level that your application's correctness requirements
 allow.
 
-**Data Access Patterns**
+### Data Access Patterns
 
 If threads can be designed to operate on non-overlapping portions of the database,
 lock contention is naturally minimized. Partition your data and assign disjoint
 key ranges to different threads where possible.
 
-**Deadlock Avoidance**
+### Deadlock Avoidance
 
 - Apply the same strategies as for reducing blocking.
 - Ensure all threads lock records in the same order. Consistent lock ordering
@@ -60,14 +60,14 @@ key ranges to different threads where possible.
 - Expect deadlocks when using secondary databases in a concurrent application.
   Always implement the retry loop shown in [Aborting a Transaction](basics.md#aborting-a-transaction).
 
-**Checkpointing**
+### Checkpointing
 
 Run checkpoints regularly to bound recovery time on restart. The checkpointer
 daemon runs in the background by default (`EnvironmentConfig::with_run_checkpointer(true)`).
 For high-write workloads you can tune the checkpoint interval to balance write
 amplification against recovery time.
 
-**Summary of Key Configuration Points**
+### Summary of Key Configuration Points
 
 | Goal | Configuration |
 |------|--------------|

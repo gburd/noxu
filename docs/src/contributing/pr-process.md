@@ -63,7 +63,7 @@ All must pass with zero warnings/errors.
 
 The PR author is responsible for the following before requesting review:
 
-**Code**
+### Code
 
 - [ ] Zero clippy warnings with `-D warnings`
 - [ ] All tests pass on Linux, macOS, and Windows (CI will verify)
@@ -72,19 +72,19 @@ The PR author is responsible for the following before requesting review:
 - [ ] No `unwrap()` in library code paths (use `?` or explicit error handling)
 - [ ] No `unsafe` added without comment citing why it is sound
 
-**Tests**
+### Tests
 
 - [ ] New logic has unit tests
 - [ ] New integration behaviour has integration tests
 - [ ] Tests use `TempDir` isolation — no fixed paths or ports
 
-**Documentation**
+### Documentation
 
 - [ ] `docs/src/` updated if public API, architecture, or config changed
 - [ ] `CHANGELOG.md` entry added (for user-visible changes)
 - [ ] `make docs-check` passes if docs changed
 
-**Noxu Fidelity (porting PRs)**
+### Noxu Fidelity (porting PRs)
 
 - [ ] Java source cited in commit message or code comment
 - [ ] Preserved Noxu method names, doc comments, algorithm structure

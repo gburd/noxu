@@ -33,7 +33,7 @@ databases, and performing simple reads and writes — before reading this guide.
 Transactions protect your application's data from failures. Noxu DB transactions
 provide full **ACID** guarantees:
 
-**Atomicity**
+### Atomicity
 
 Multiple database operations are treated as a single unit of work. Once committed,
 all writes performed under the protection of the transaction are saved. If a
@@ -42,14 +42,14 @@ state it was in before the transaction began, regardless of the number or type o
 write operations performed. A single transaction may span multiple database handles
 within the same environment.
 
-**Consistency**
+### Consistency
 
 Your databases will never contain a partially completed transaction. This is true
 even if your application fails while transactions are in progress. If the
 application or OS fails, either all changes appear when the application restarts,
 or none of them do.
 
-**Isolation**
+### Isolation
 
 While a transaction is in progress, the database appears to that transaction as if
 no other operations are occurring outside of it. Operations wrapped inside a
@@ -57,7 +57,7 @@ transaction always have a clean and consistent view and never see updates in
 progress under another transaction. Isolation guarantees can be relaxed for
 performance; see [Isolation Levels](isolation.md).
 
-**Durability**
+### Durability
 
 Once committed, modifications persist even in the event of an application or OS
 failure. Like isolation, the durability guarantee can be relaxed; see
