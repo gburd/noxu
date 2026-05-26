@@ -2,6 +2,7 @@
 //!
 
 use crate::durability::{Durability, SyncPolicy};
+use crate::environment::ActiveTxns;
 use crate::error::{NoxuError, Result};
 use crate::transaction_config::TransactionConfig;
 use noxu_dbi::{DatabaseId, EnvironmentImpl};
@@ -83,6 +84,13 @@ pub struct Transaction {
     /// which is used by `Txn.undoLNs()` to call
     /// `EnvironmentImpl.getDatabase(dbId).abort(undoLsn, locker)`.
     env_impl: Option<Arc<SyncMutex<EnvironmentImpl>>>,
+    /// Shared registry of active transactions on the owning
+    /// `Environment`.  When the transaction reaches a terminal state
+    /// (`commit`, `commit_with_durability`, or `abort`) we prune our
+    /// entry here so that `Environment::close()` can succeed.
+    ///
+    /// Resolves F1 of the May 2026 API audit.
+    active_txns: Option<Arc<ActiveTxns>>,
 }
 
 impl Transaction {
@@ -104,6 +112,7 @@ impl Transaction {
             log_manager: None,
             inner_txn: None,
             env_impl: None,
+            active_txns: None,
         }
     }
 
@@ -128,6 +137,7 @@ impl Transaction {
             log_manager: Some(log_manager),
             inner_txn: None,
             env_impl: None,
+            active_txns: None,
         }
     }
 
@@ -151,6 +161,18 @@ impl Transaction {
     /// the environment's `TxnManager` / `LockManager`.
     pub fn with_inner_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
         self.inner_txn = Some(txn);
+        self
+    }
+
+    /// Wires the shared active-transactions registry so that `commit` /
+    /// `abort` can prune their own entry on completion.
+    ///
+    /// Resolves F1 of the May 2026 API audit.
+    pub(crate) fn with_active_txns(
+        mut self,
+        registry: Arc<ActiveTxns>,
+    ) -> Self {
+        self.active_txns = Some(registry);
         self
     }
 
@@ -184,7 +206,6 @@ impl Transaction {
         let durability = self.durability.unwrap_or(Durability::COMMIT_SYNC);
         let result = self.commit_with_durability(durability);
         observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "commit");
-        observe_gauge_dec!("noxu_db_active_transactions");
         result
     }
 
@@ -288,6 +309,16 @@ impl Transaction {
         *state = TransactionState::Committed;
         drop(state);
 
+        // Prune our entry from the environment's active-txns registry so
+        // that `Environment::close()` can succeed (F1).  Decrement the
+        // active-transactions gauge here (rather than in `commit()`) so
+        // that callers of `commit_with_durability` directly are also
+        // accounted for (resolves F9 as a side effect).
+        if let Some(registry) = &self.active_txns {
+            registry.mark_complete(self.id);
+        }
+        observe_gauge_dec!("noxu_db_active_transactions");
+
         if let Some(e) = inner_err {
             return Err(NoxuError::from(e));
         }
@@ -373,6 +404,11 @@ impl Transaction {
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Aborted;
+        // Prune our entry from the environment's active-txns registry so
+        // that `Environment::close()` can succeed (F1).
+        if let Some(registry) = &self.active_txns {
+            registry.mark_complete(self.id);
+        }
         observe_gauge_dec!("noxu_db_active_transactions");
         Ok(())
     }
