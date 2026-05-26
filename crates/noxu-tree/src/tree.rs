@@ -2392,6 +2392,20 @@ impl Tree {
                     } else {
                         // Entries store compressed (suffix) keys when key_prefix
                         // is non-empty.  Compress the search key before comparing.
+                        //
+                        // The caller is not required to ensure that `key`
+                        // shares this BIN's learned `key_prefix` — a stray
+                        // delete of a key that was never present (or that
+                        // sits under a different prefix) is legal and must
+                        // simply return `false`.  Calling `compress_key`
+                        // unconditionally would `debug_assert!`-panic on
+                        // such inputs, so guard it the same way the cursor
+                        // path does.
+                        if !bin.key_prefix.is_empty()
+                            && !key.starts_with(bin.key_prefix.as_slice())
+                        {
+                            return false;
+                        }
                         let suffix = bin.compress_key(key);
                         match bin.entries.binary_search_by(|e| {
                             e.key.as_slice().cmp(suffix.as_slice())

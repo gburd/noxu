@@ -849,8 +849,32 @@ impl CursorImpl {
     ///
     /// Returns `(key, data, slot_lsn)` so the caller can acquire a read lock.
     ///
-    /// returns the first key in the BIN that
-    /// compares >= the given search key.
+    /// Returns the first key in the BIN that compares >= the given search
+    /// key.  The seed `key` is *not* required to share the BIN's learned
+    /// prefix-compression layout — we explicitly handle the three legal
+    /// seed/`key_prefix` relationships:
+    ///
+    ///   1. `key.starts_with(key_prefix)` — cheap suffix comparison; the
+    ///      stored `entries[i].key` are suffixes under that prefix, so we
+    ///      compare against `&key[plen..]`.
+    ///   2. `key < key_prefix` lexicographically — every full key in this
+    ///      BIN starts with `key_prefix` and is therefore strictly greater
+    ///      than `key`; the answer is `entries[0]`.  This includes the
+    ///      common case of a short search seed (e.g. `b"K\0"`) on a BIN
+    ///      whose learned prefix has grown longer than the seed
+    ///      (`b"K\0bucket\0…"`).
+    ///   3. `key > key_prefix` lexicographically — every full key in this
+    ///      BIN is strictly less than `key`; nothing here matches.  We
+    ///      return `None` and the caller treats it as `NotFound`.
+    ///      (TODO: walk to the next BIN to handle the case where a key
+    ///      `>= seed` lives in a sibling BIN; for now this matches the
+    ///      single-BIN scope of the existing implementation.)
+    ///
+    /// Prior to this guard the function unconditionally called
+    /// `bin.compress_key(key)`, which `debug_assert!`s on case 2 and
+    /// panics with a slice out-of-bounds in release on the same shape —
+    /// see the regression test
+    /// `cursor_search_gte_short_seed_under_long_prefix_does_not_panic`.
     fn find_range_entry(
         tree: &Tree,
         key: &[u8],
@@ -862,13 +886,33 @@ impl CursorImpl {
         let guard = bin_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
-                // BIN entries use compressed (suffix) keys; range-compare
-                // against suffix and return the decompressed full key.
-                let suffix = bin.compress_key(key);
+                let plen = bin.key_prefix.len();
+
+                // Cases 2 and 3: seed does not share the BIN's full prefix.
+                // Decide by lex-comparing seed against key_prefix; do NOT
+                // call compress_key (which requires `starts_with`).
+                if plen != 0 && !key.starts_with(bin.key_prefix.as_slice()) {
+                    return if key < bin.key_prefix.as_slice() {
+                        // Case 2: every key in this BIN is > seed.
+                        let e = bin.entries.first()?;
+                        let fk = bin.get_full_key(0)?;
+                        Some((
+                            fk,
+                            e.data.clone().unwrap_or_default(),
+                            e.lsn.as_u64(),
+                        ))
+                    } else {
+                        // Case 3: every key in this BIN is < seed.
+                        None
+                    };
+                }
+
+                // Case 1: seed shares the prefix; compare suffixes.
+                let suffix = &key[plen..];
                 bin.entries
                     .iter()
                     .enumerate()
-                    .find(|(_, e)| e.key.as_slice() >= suffix.as_slice())
+                    .find(|(_, e)| e.key.as_slice() >= suffix)
                     .and_then(|(i, e)| {
                         bin.get_full_key(i).map(|fk| {
                             (
