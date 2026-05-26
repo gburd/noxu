@@ -10,6 +10,148 @@ restriction note.
 > for the canonical "what is supported in v1.5 vs planned for v1.6 /
 > v2.0" table.
 
+## Wave 2B — Collections typed API and txn threading (v1.5 → v1.6)
+
+Wave 2B closes audit findings #1, #3, #4, #5, #11, and #12 from
+the May 2026 collections / bind audit.  This is the largest user-visible
+breaking change in the v1.5 → v1.6 transition.  See
+[`docs/src/internal/wave-2b-collections-typed.md`](../internal/wave-2b-collections-typed.md)
+for the full scope.
+
+### Source-level breaking changes
+
+* **`StoredMap<'db>` is now `StoredMap<'db, K, V, KB, VB>`.**  The map
+  is parameterised by `EntryBinding` implementations for keys and
+  values.
+
+  ```rust,ignore
+  // v1.5
+  let map = StoredMap::new(&db, /* read_only = */ false);
+  map.put(b"key", b"value")?;
+
+  // v1.6
+  use noxu_bind::ByteArrayBinding;
+  let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
+      StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
+  map.put(None, &b"key".to_vec(), &b"value".to_vec())?;
+  ```
+
+  Same shape for `StoredSortedMap<K, V, KB, VB>`,
+  `StoredKeySet<K, KB>`, `StoredValueSet<V, VB>`, and
+  `StoredList<V, VB>`.
+
+* **Every `Stored*` method now takes `txn: Option<&Transaction>` as
+  the leading argument.**
+
+  ```rust,ignore
+  // v1.5
+  map.put(b"k", b"v")?;            // auto-commit
+  map.get(b"k")?;
+  map.iter()?;
+
+  // v1.6
+  map.put(None, &k, &v)?;          // auto-commit
+  map.get(None, &k)?;
+  map.iter(None)?;
+  // ...or pass Some(&txn) to participate in a user txn:
+  map.put(Some(&txn), &k, &v)?;
+  ```
+
+  This applies to `get`, `put`, `remove`, `contains_key`, `len`,
+  `is_empty`, `iter`, `keys`, `values`, `clear`, `iter_from`,
+  `iter_reverse`, `first_key`, `last_key`, `first_entry`,
+  `last_entry`, `higher_key` (StoredSortedMap), `add`, `contains`,
+  `remove` (StoredKeySet), and every `StoredList` method.
+
+* **`StoredMap::len` returns `usize` instead of `u64`.**  The on-disk
+  count is bounded by `Database::count() -> u64` but Rust callers
+  almost always want `usize` (matching `BTreeMap::len`); the
+  collections layer truncates to `usize::MAX` at the boundary.
+
+* **The internal `BTreeSet` key index is removed.**
+  `register_key`, `register_keys`, `known_keys` are deleted.  Pre-
+  existing data that was visible in v1.5 only after a
+  `register_keys` call is now visible automatically because
+  `iter` / `keys` / `values` walk the database directly via a
+  cursor:
+
+  ```rust,ignore
+  // v1.5: iteration only saw keys you'd registered.
+  let map = StoredMap::new(&db, true);
+  map.register_keys(&[b"a", b"b"]);
+  for entry in map.iter()? { /* sees a, b */ }
+
+  // v1.6: iteration sees every record in the database.
+  for entry in map.iter(None)? { /* sees every record */ }
+  ```
+
+* **`StoredList::remove` now compacts.**  Removing index `i` shifts
+  every record at index `j > i` down to `j - 1` and decrements
+  `next_index`.  Code that relied on the v1.5 "remove leaves a hole"
+  contract will see different `get(idx)` results after `remove`.
+  The whole compaction is issued under the supplied txn; pass
+  `Some(&txn)` for crash-atomic semantics.
+
+* **`StoredList::new` / `StoredList::open` now take a value
+  binding.**
+
+  ```rust,ignore
+  // v1.5
+  let list = StoredList::new(&db);
+  let list = StoredList::open(&db)?;
+
+  // v1.6
+  use noxu_bind::ByteArrayBinding;
+  let list: StoredList<Vec<u8>, _> =
+      StoredList::new(&db, ByteArrayBinding);
+  let list: StoredList<Vec<u8>, _> =
+      StoredList::open(&db, ByteArrayBinding)?;
+  ```
+
+### Behavioural breaking changes
+
+* **`TransactionRunner` now drives `Stored*` methods.**  In v1.5 the
+  `&Transaction` it supplied could not be threaded into any `Stored*`
+  call (every `Stored*` method ignored its txn argument because there
+  *was* no txn argument).  In v1.6 the runner-supplied `&Transaction`
+  is the canonical way to make a sequence of `Stored*` writes
+  transactional:
+
+  ```rust,ignore
+  let runner = TransactionRunner::new(&env);
+  runner.run(|txn| {
+      map.put(Some(txn), &k1, &v1)?;
+      map.put(Some(txn), &k2, &v2)?;
+      list.remove(Some(txn), 0)?;          // shift-compaction inside the txn
+      Ok(())
+  })?;
+  ```
+
+* **`TransactionRunner` retries on every retryable error, with
+  jittered exponential backoff.**  v1.5 retried only on
+  `DeadlockDetected`.  v1.6 retries on every variant returned by
+  `NoxuError::is_retryable()` (`LockConflict`, `DeadlockDetected`,
+  `LockTimeout`, `LockNotAvailable`, `TransactionTimeout`,
+  `LockPreempted`).  Defaults: 10 retries, 10 ms base, 1 s ceiling,
+  ±25% jitter.  Configure via:
+
+  ```rust,ignore
+  TransactionRunner::new(&env)
+      .with_max_retries(20)
+      .with_base_backoff(Duration::from_millis(5))
+      .with_max_backoff(Duration::from_secs(2))
+      .with_jitter(0.1);
+  ```
+
+* **`StoredKeySet::add` returns `bool` (newly inserted).**  v1.5 had
+  no `add` method; the v1.6 `add` matches `java.util.Set.add`
+  semantics (returns `true` on first insert, `false` if already
+  present).
+
+* **`TransactionRunner::run`'s closure signature relaxed from `Fn`
+  to `FnMut`.**  Closures may now capture mutable state (e.g. retry
+  counters).
+
 ## Behaviour changes (Sprint 1 — txn wiring)
 
 These are previously-broken paths that the engine now executes
@@ -141,11 +283,12 @@ of any method.
   take a transaction. Atomic primary + secondary writes are planned
   for v1.6 alongside Decision 1's sorted-dup + `associate` work. See
   [Secondary Indices with Transactions](../transactions/secondary-with-txn.md).
-* **`Stored*` collection methods are auto-commit only** in v1.5;
-  `TransactionRunner` cannot drive them. Use the runner with the raw
-  `Database` / `Cursor` API for now. Threading `Option<&Transaction>`
-  is planned for v1.6 alongside the typed-API redesign. See
-  [Collections and Persistence](../collections/README.md).
+* **`Stored*` collection methods now thread `Option<&Transaction>`
+  through every operation** — v1.5's auto-commit-only restriction is
+  closed by Wave 2B (see [Wave 2B — Collections typed API and txn
+  threading](#wave-2b--collections-typed-api-and-txn-threading-v15--v16)
+  above).  `TransactionRunner` is now the recommended way to drive
+  multi-statement `Stored*` sequences.
 * **Replication is preview / proof-of-concept.** Ten GA blockers are
   tracked in
   [`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md).

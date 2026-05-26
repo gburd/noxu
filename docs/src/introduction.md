@@ -42,10 +42,11 @@ Sprint 1–3 restriction notes
 | `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
 | Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ | ✅ |
 | Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter scheduled for removal) |
-| `Stored*` collections under explicit txn          | ❌ (auto-commit only; `TransactionRunner` does not drive `Stored*`) | ✅ | ✅ |
-| Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ❌ (the documented surface; never implemented — use `&[u8]`-keyed surface) | ✅ | ✅ |
+| `Stored*` collections under explicit txn          | ✅ (Wave 2B — every Stored* method takes `Option<&Transaction>`) | ✅ | ✅ |
+| Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ✅ (Wave 2B — typed views parameterised by `EntryBinding`) | ✅ | ✅ |
 | `StoredList::next_index` persistent across reopen | ✅ (via `StoredList::open`; `StoredList::new` resets) | ✅ | ✅ |
-| `StoredList::remove` compacts the freed slot      | ❌ (single-key delete; documented hole) | ✅ | ✅ |
+| `StoredList::remove` compacts the freed slot      | ✅ (Wave 2B — shift-down compaction; atomic under user txn) | ✅ | ✅ |
+| `TransactionRunner` drives Stored* methods (deadlock retry + jittered backoff) | ✅ (Wave 2B) | ✅ | ✅ |
 | `SerdeBinding` version-checking (2-byte magic + version header) | ✅ (breaking on-disk vs pre-Sprint-3 builds) | ✅ | ✅ |
 | Schema evolution for `SerdeBinding` (read older struct shapes) | ❌ (header catches inter-format drift only) | ✅ | ✅ |
 | DPL primary-index reads/writes participate in user txn (`PrimaryIndex::{put,get,delete,…}(txn, …)`) | ✅ (Sprint 3B — BREAKING source-level signature change) | ✅ | ✅ |

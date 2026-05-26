@@ -114,3 +114,4 @@
   - [Serialization Research](internal/serialization-research.md)
   - [Checksum Selection](internal/checksum-selection.md)
   - [Wave 1C — audit Low/Info cleanup](internal/wave1c-audit-low-info-cleanup-2026-05.md)
+  - [Wave 2B — Collections typed API and txn threading](internal/wave-2b-collections-typed.md)
