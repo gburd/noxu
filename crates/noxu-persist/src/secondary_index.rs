@@ -14,9 +14,16 @@
 //! sits on top of `noxu-db`'s in-memory `HashMap` store, so we replicate the
 //! same invariant in memory:
 //!
-//! * The mapping is stored in a `BTreeMap<SK, BTreeSet<PK>>` so that secondary
-//!   keys can map to *one or more* primary keys (MANY_TO_ONE / MANY_TO_MANY
-//!   patterns).
+//! * The mapping is stored in a `BTreeMap<SK, BTreeSet<PK>>` so that
+//!   secondary keys can map to *one or more* primary keys (the
+//!   **MANY_TO_ONE** pattern).  The current extractor signature is
+//!   `Fn(&E) -> Option<SK>` — one secondary key per entity — so the
+//!   **MANY_TO_MANY** pattern (a single entity contributing multiple
+//!   secondary keys) is not supported in v1.5; users that need it
+//!   should register one `SecondaryIndex` per logical secondary key
+//!   field, or wait for the v1.6 multi-key extractor (Wave 1C audit
+//!   cleanup, persist-xa Low "MANY_TO_MANY claim overstating data
+//!   structure").
 //! * The map is wrapped in `Arc<Mutex<…>>` and shared between the
 //!   `SecondaryIndex` and the `SecondaryRegistration` handle that is
 //!   registered with `PrimaryIndex`.  This way every `put`/`delete` on the

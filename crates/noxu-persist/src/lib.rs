@@ -46,13 +46,11 @@
 //! // index.put(&UserSerializer, &User { id: 1, name: "Alice".into() })?;
 //! ```
 
-pub mod database_namer;
 pub mod entity;
 pub mod entity_serializer;
 pub mod entity_store;
 pub mod error;
 pub mod evolve;
-pub mod key_selector;
 pub mod primary_index;
 pub mod secondary_index;
 pub mod sequence;
@@ -60,17 +58,10 @@ pub mod simple_serializer;
 pub mod store_config;
 
 // Re-export commonly used types
-pub use database_namer::{
-    CustomDatabaseNamer, DatabaseNamer, DefaultDatabaseNamer,
-};
 pub use entity::{Entity, PrimaryKey};
 pub use entity_serializer::EntitySerializer;
 pub use entity_store::EntityStore;
 pub use error::{PersistError, Result};
-pub use key_selector::{
-    AllKeysSelector, KeySelector, NotKeySelector, PredicateKeySelector,
-    RangeKeySelector, SetKeySelector,
-};
 pub use primary_index::{EntityIterator, KeyIterator, PrimaryIndex};
 pub use secondary_index::SecondaryIndex;
 pub use sequence::{MemorySequence, Sequence};

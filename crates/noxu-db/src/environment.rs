@@ -58,7 +58,7 @@ pub struct Environment {
     open: AtomicBool,
     /// Whether the environment is valid (not invalidated by a fatal error).
     ///
-    /// : `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
+    /// Mirrors `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
     /// Set to `false` when an `EnvironmentFailure` with `invalidates_environment() == true`
     /// is returned; all subsequent API calls check this and return `EnvironmentFailure`.
     env_valid: AtomicBool,
@@ -548,7 +548,7 @@ impl Environment {
     ///
     /// Returns the number of records that were in the database before truncation.
     ///
-    /// : `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    /// Mirrors `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(
         &self,
         _txn: Option<&Transaction>,
@@ -790,7 +790,7 @@ impl Environment {
 
     /// Returns the mutable subset of environment configuration.
     ///
-    /// : `Environment.getMutableConfig()`.  The returned struct reflects the
+    /// Mirrors `Environment.getMutableConfig()`.  The returned struct reflects the
     /// current runtime values; pass it (modified) to `set_mutable_config()` to
     /// apply changes without re-opening the environment.
     pub fn get_mutable_config(&self) -> Result<EnvironmentMutableConfig> {
@@ -803,16 +803,17 @@ impl Environment {
             run_cleaner: Some(self.config.run_cleaner),
             run_checkpointer: Some(self.config.run_checkpointer),
             run_evictor: Some(self.config.run_evictor),
-            lock_timeout_ms: self.config.lock_timeout_ms,
-            txn_timeout_ms: self.config.txn_timeout_ms,
+            lock_timeout_ms: Some(self.config.lock_timeout_ms),
+            txn_timeout_ms: Some(self.config.txn_timeout_ms),
         })
     }
 
     /// Applies a set of mutable configuration changes to the running environment.
     ///
-    /// : `Environment.setMutableConfig(EnvironmentMutableConfig)`.
+    /// Mirrors `Environment.setMutableConfig(EnvironmentMutableConfig)`.
     /// Only the fields that differ from their sentinel "no-change" values are
-    /// applied (`None` / `0` means unchanged).
+    /// applied (`None` means unchanged).  `Some(0)` for a timeout clears it
+    /// (matches JE: 0 = no timeout).
     ///
     /// # Errors
     /// Returns an error if the environment is closed or invalidated.
@@ -824,11 +825,11 @@ impl Environment {
         if let Some(sz) = cfg.cache_size {
             self.config.cache_size = sz as u64;
         }
-        if cfg.lock_timeout_ms > 0 {
-            self.config.lock_timeout_ms = cfg.lock_timeout_ms;
+        if let Some(ms) = cfg.lock_timeout_ms {
+            self.config.lock_timeout_ms = ms;
         }
-        if cfg.txn_timeout_ms > 0 {
-            self.config.txn_timeout_ms = cfg.txn_timeout_ms;
+        if let Some(ms) = cfg.txn_timeout_ms {
+            self.config.txn_timeout_ms = ms;
         }
         self.config.txn_no_sync = cfg.txn_no_sync;
         self.config.txn_write_no_sync = cfg.txn_write_no_sync;
@@ -849,7 +850,7 @@ impl Environment {
 
     /// Runs a checkpoint.
     ///
-    /// : `Environment.checkpoint(CheckpointConfig)`.  If the environment has
+    /// Mirrors `Environment.checkpoint(CheckpointConfig)`.  If the environment has
     /// no checkpointer (e.g. non-transactional or in-memory), this is a no-op.
     ///
     /// # Arguments
@@ -868,7 +869,7 @@ impl Environment {
 
     /// Returns `true` if the environment is open and has not been invalidated by a fatal error.
     ///
-    /// : `Environment.isValid()`.  Returns `false` after the environment is closed
+    /// Mirrors `Environment.isValid()`.  Returns `false` after the environment is closed
     /// or after an `EnvironmentFailure` whose `reason.invalidates_environment()` returns
     /// `true` (e.g. `LogChecksum`, `BtreeCorruption`, `DiskLimit`).
     /// Once invalidated the environment must be closed and re-opened.
@@ -903,7 +904,7 @@ impl Environment {
 
     /// Returns a snapshot of environment statistics from all subsystems.
     ///
-    /// : `Environment.getStats(StatsConfig)`.
+    /// Mirrors `Environment.getStats(StatsConfig)`.
     pub fn get_stats(&self) -> Result<EnvironmentStats> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
@@ -1593,28 +1594,31 @@ mod tests {
         let (_tmp, config) = temp_env_config();
         let mut env = Environment::open(config).unwrap();
         let mc = EnvironmentMutableConfig {
-            lock_timeout_ms: 5_000,
-            txn_timeout_ms: 10_000,
+            lock_timeout_ms: Some(5_000),
+            txn_timeout_ms: Some(10_000),
             ..EnvironmentMutableConfig::default()
         };
         env.set_mutable_config(mc).unwrap();
         // After setting, values should be reflected (lock_timeout_ms is advisory at
         // the config layer; verify via get_mutable_config).
         let updated = env.get_mutable_config().unwrap();
-        assert_eq!(updated.lock_timeout_ms, 5_000);
-        assert_eq!(updated.txn_timeout_ms, 10_000);
+        assert_eq!(updated.lock_timeout_ms, Some(5_000));
+        assert_eq!(updated.txn_timeout_ms, Some(10_000));
         env.close().unwrap();
     }
 
     #[test]
-    fn test_set_mutable_config_zero_timeout_unchanged() {
+    fn test_set_mutable_config_none_timeout_unchanged() {
         let (_tmp, config) = temp_env_config();
         let mut env = Environment::open(config).unwrap();
         let original = env.get_mutable_config().unwrap();
-        // Setting 0 for timeouts means "unchanged".
+        // None means "unchanged".  See Wave 1C audit cleanup
+        // (Transaction-Env F19/F20): the previous implementation used
+        // 0 as the sentinel which prevented users from clearing a
+        // timeout.
         let mc = EnvironmentMutableConfig {
-            lock_timeout_ms: 0,
-            txn_timeout_ms: 0,
+            lock_timeout_ms: None,
+            txn_timeout_ms: None,
             ..EnvironmentMutableConfig::default()
         };
         env.set_mutable_config(mc).unwrap();

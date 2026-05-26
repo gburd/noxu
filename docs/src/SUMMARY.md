@@ -113,3 +113,4 @@
   - [Rust Code Review](internal/rust-review.md)
   - [Serialization Research](internal/serialization-research.md)
   - [Checksum Selection](internal/checksum-selection.md)
+  - [Wave 1C — audit Low/Info cleanup](internal/wave1c-audit-low-info-cleanup-2026-05.md)

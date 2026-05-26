@@ -241,7 +241,13 @@ fn d2c_foreign_key_database_rejected_at_open() {
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
-    let foreign = env
+    // The foreign DB no longer needs to exist as a real handle: the
+    // FK setter takes a name string in v1.5.1 (Wave 1C) and
+    // SecondaryDatabase::open rejects FK config at open time per
+    // Decision 2C.  We still create the DB to keep the test honest
+    // about the v1.6 wiring — once FK is implemented the engine will
+    // resolve the name to this handle.
+    let _foreign = env
         .open_database(
             None,
             "foreign",
@@ -252,7 +258,7 @@ fn d2c_foreign_key_database_rejected_at_open() {
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
-        .with_foreign_key_database(&foreign);
+        .with_foreign_key_database("foreign");
 
     let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
     match result {
