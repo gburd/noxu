@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// Wrapper around an optional `ExceptionListener` that implements `Debug` and
 /// `Clone` so that `EnvironmentConfig` can keep those derives.
 ///
-/// : `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
+/// Mirrors `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
 #[derive(Clone, Default)]
 pub struct ExceptionListenerHolder(pub Option<Arc<dyn ExceptionListener>>);
 
@@ -43,38 +43,38 @@ pub struct EnvironmentConfig {
     pub home: PathBuf,
 
     /// Allow creation of a new environment if it does not exist.
-    /// : `EnvironmentConfig.setAllowCreate()` / default false.
+    /// Mirrors `EnvironmentConfig.setAllowCreate()` / default false.
     pub allow_create: bool,
 
     /// Open the environment for transactional use.
-    /// : `ENV_IS_TRANSACTIONAL` / default false.
+    /// Mirrors `ENV_IS_TRANSACTIONAL` / default false.
     pub transactional: bool,
 
     /// Open the environment in read-only mode.
-    /// : `ENV_READ_ONLY` / default false.
+    /// Mirrors `ENV_READ_ONLY` / default false.
     pub read_only: bool,
 
     /// Enable locking.  When false the environment runs without a lock
     /// manager (equivalent to-transactional, non-locking mode).
-    /// : `ENV_IS_LOCKING` / default true.
+    /// Mirrors `ENV_IS_LOCKING` / default true.
     pub env_is_locking: bool,
 
     /// Share the B-tree cache across multiple environments in the same JVM.
     /// In Noxu, this is a configuration hint; shared-cache pooling is
     /// accepted as a future work item.
-    /// : `SHARED_CACHE` / default false.
+    /// Mirrors `SHARED_CACHE` / default false.
     pub shared_cache: bool,
 
     /// Force a checkpoint after recovery completes.
-    /// : `ENV_RECOVERY_FORCE_CHECKPOINT` / default false.
+    /// Mirrors `ENV_RECOVERY_FORCE_CHECKPOINT` / default false.
     pub env_recovery_force_checkpoint: bool,
 
     /// Force a new log file to be started after recovery.
-    /// : `ENV_RECOVERY_FORCE_NEW_FILE` / default false.
+    /// Mirrors `ENV_RECOVERY_FORCE_NEW_FILE` / default false.
     pub env_recovery_force_new_file: bool,
 
     /// Halt the environment on commit after a `ChecksumException`.
-    /// : `HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION` / default false.
+    /// Mirrors `HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION` / default false.
     pub halt_on_commit_after_checksum_exception: bool,
 
     /// Logging level for this environment (uses Rust `log` crate levels:
@@ -86,181 +86,181 @@ pub struct EnvironmentConfig {
     // Memory / cache
     // -----------------------------------------------------------------------
     /// Maximum bytes for the B-tree cache.
-    /// : `MAX_MEMORY` / `EnvironmentConfig.setCacheSize()` / default 0
+    /// Mirrors `MAX_MEMORY` / `EnvironmentConfig.setCacheSize()` / default 0
     /// ( auto-sizes to 60% of heap).  Noxu default: 64 MiB.
     pub cache_size: u64,
 
     /// Cache size as a percentage of system memory (0 = use `cache_size`).
-    /// : `MAX_MEMORY_PERCENT` / `EnvironmentConfig.setCachePercent()` /
+    /// Mirrors `MAX_MEMORY_PERCENT` / `EnvironmentConfig.setCachePercent()` /
     /// default 60.  When non-zero, overrides `cache_size`.
     pub cache_percent: u32,
 
     /// Off-heap cache size in bytes.  0 = disabled.
-    /// : `MAX_OFF_HEAP_MEMORY` / default 0.
+    /// Mirrors `MAX_OFF_HEAP_MEMORY` / default 0.
     pub max_off_heap_memory: u64,
 
     /// Maximum disk space the environment may use in bytes.  0 = unlimited.
-    /// : `MAX_DISK` / default 0.
+    /// Mirrors `MAX_DISK` / default 0.
     pub max_disk: u64,
 
     /// Minimum free disk space in bytes; triggers `DiskLimitExceeded` if the
     /// available space on the file-system falls below this threshold.
-    /// : `FREE_DISK` / default 5 GiB.
+    /// Mirrors `FREE_DISK` / default 5 GiB.
     pub free_disk: u64,
 
     // -----------------------------------------------------------------------
     // Background daemons — run flags
     // -----------------------------------------------------------------------
     /// Run the background INCompressor daemon.
-    /// : `ENV_RUN_IN_COMPRESSOR` / default true.
+    /// Mirrors `ENV_RUN_IN_COMPRESSOR` / default true.
     pub run_in_compressor: bool,
 
     /// Run the background Checkpointer daemon.
-    /// : `ENV_RUN_CHECKPOINTER` / default true.
+    /// Mirrors `ENV_RUN_CHECKPOINTER` / default true.
     pub run_checkpointer: bool,
 
     /// Run the background Cleaner daemon.
-    /// : `ENV_RUN_CLEANER` / default true.
+    /// Mirrors `ENV_RUN_CLEANER` / default true.
     pub run_cleaner: bool,
 
     /// Run the background Evictor daemon.
-    /// : `ENV_RUN_EVICTOR` / default true.
+    /// Mirrors `ENV_RUN_EVICTOR` / default true.
     pub run_evictor: bool,
 
     /// Run the background off-heap Evictor daemon.
-    /// : `ENV_RUN_OFFHEAP_EVICTOR` / default true (when off-heap configured).
+    /// Mirrors `ENV_RUN_OFFHEAP_EVICTOR` / default true (when off-heap configured).
     pub run_offheap_evictor: bool,
 
     /// Run the background data-integrity Verifier daemon.
-    /// : `ENV_RUN_VERIFIER` / default false.
+    /// Mirrors `ENV_RUN_VERIFIER` / default false.
     pub run_verifier: bool,
 
     // -----------------------------------------------------------------------
     // Background daemons — rate limits & sleep
     // -----------------------------------------------------------------------
     /// Maximum read throughput for background daemons in KB/s.  0 = unlimited.
-    /// : `ENV_BACKGROUND_READ_LIMIT` / default 0.
+    /// Mirrors `ENV_BACKGROUND_READ_LIMIT` / default 0.
     pub env_background_read_limit_kb: u32,
 
     /// Maximum write throughput for background daemons in KB/s.  0 = unlimited.
-    /// : `ENV_BACKGROUND_WRITE_LIMIT` / default 0.
+    /// Mirrors `ENV_BACKGROUND_WRITE_LIMIT` / default 0.
     pub env_background_write_limit_kb: u32,
 
     /// Sleep interval for background daemons between work units in
     /// microseconds.  0 = no enforced sleep.
-    /// : `ENV_BACKGROUND_SLEEP_INTERVAL` / default 0.
+    /// Mirrors `ENV_BACKGROUND_SLEEP_INTERVAL` / default 0.
     pub env_background_sleep_interval_us: u64,
 
     // -----------------------------------------------------------------------
     // Environment behaviour flags
     // -----------------------------------------------------------------------
     /// Check for lock leaks when databases are closed.
-    /// : `ENV_CHECK_LEAKS` / default true.
+    /// Mirrors `ENV_CHECK_LEAKS` / default true.
     pub env_check_leaks: bool,
 
     /// Force thread yields in critical sections (useful for testing fairness).
-    /// : `ENV_FORCED_YIELD` / default false.
+    /// Mirrors `ENV_FORCED_YIELD` / default false.
     pub env_forced_yield: bool,
 
     /// Use fair (FIFO-ordered) latches.  May reduce throughput under low
     /// contention but prevents starvation.
-    /// : `ENV_FAIR_LATCHES` / default false.
+    /// Mirrors `ENV_FAIR_LATCHES` / default false.
     pub env_fair_latches: bool,
 
     /// Latch acquisition timeout in milliseconds.  0 = no timeout (block
     /// indefinitely).  A timeout causes `EnvironmentFailure`.
-    /// : `ENV_LATCH_TIMEOUT` / default 300_000 ms (5 min).
+    /// Mirrors `ENV_LATCH_TIMEOUT` / default 300_000 ms (5 min).
     pub env_latch_timeout_ms: u64,
 
     /// TTL clock tolerance — records within this many milliseconds of their
     /// expiration time are treated as expired.
-    /// : `ENV_TTL_CLOCK_TOLERANCE` / default 0.
+    /// Mirrors `ENV_TTL_CLOCK_TOLERANCE` / default 0.
     pub env_ttl_clock_tolerance_ms: u64,
 
     /// Enable TTL-based record expiration at the environment level.
-    /// : `ENV_EXPIRATION_ENABLED` / default false.
+    /// Mirrors `ENV_EXPIRATION_ENABLED` / default false.
     pub env_expiration_enabled: bool,
 
     /// Enable per-database node eviction.
-    /// : `ENV_DB_EVICTION` / default false.
+    /// Mirrors `ENV_DB_EVICTION` / default false.
     pub env_db_eviction: bool,
 
     /// Preload all duplicate-tree data before converting dup databases.
-    /// : `ENV_DUP_CONVERT_PRELOAD_ALL` / default true.
+    /// Mirrors `ENV_DUP_CONVERT_PRELOAD_ALL` / default true.
     pub env_dup_convert_preload_all: bool,
 
     /// Chunk size (bytes) for Adler32 checksums.  0 = disabled (use CRC32).
-    /// : `ADLER32_CHUNK_SIZE` / default 0.
+    /// Mirrors `ADLER32_CHUNK_SIZE` / default 0.
     pub adler32_chunk_size: usize,
 
     // -----------------------------------------------------------------------
     // Log / I-O
     // -----------------------------------------------------------------------
     /// Maximum size of a single log file in bytes.
-    /// : `LOG_FILE_MAX` / default 10 MiB.
+    /// Mirrors `LOG_FILE_MAX` / default 10 MiB.
     pub log_file_max_bytes: u64,
 
     /// Number of cached open file handles (LRU-evicted when full).
-    /// : `LOG_FILE_CACHE_SIZE` / default 100.
+    /// Mirrors `LOG_FILE_CACHE_SIZE` / default 100.
     pub log_file_cache_size: usize,
 
     /// Validate entry checksums on every log read.
-    /// : `LOG_CHECKSUM_READ` / default true.
+    /// Mirrors `LOG_CHECKSUM_READ` / default true.
     pub log_checksum_read: bool,
 
     /// Verify all checksums during log scans (more thorough than
     /// `log_checksum_read`; used by background verifier).
-    /// : `LOG_VERIFY_CHECKSUMS` / default false.
+    /// Mirrors `LOG_VERIFY_CHECKSUMS` / default false.
     pub log_verify_checksums: bool,
 
     /// Timeout for a single `fdatasync` call in milliseconds.
-    /// : `LOG_FSYNC_TIMEOUT` / default 500_000 ms.
+    /// Mirrors `LOG_FSYNC_TIMEOUT` / default 500_000 ms.
     pub log_fsync_timeout_ms: u64,
 
     /// Soft limit on fsync duration in milliseconds; logs a warning when
     /// exceeded.  0 = disabled.
-    /// : `LOG_FSYNC_TIME_LIMIT` / default 0.
+    /// Mirrors `LOG_FSYNC_TIME_LIMIT` / default 0.
     pub log_fsync_time_limit_ms: u64,
 
     /// Number of write buffers in the log buffer pool.
-    /// : `LOG_NUM_BUFFERS` / default 3.
+    /// Mirrors `LOG_NUM_BUFFERS` / default 3.
     pub log_num_buffers: usize,
 
     /// Total bytes across all log write buffers.
-    /// : `LOG_TOTAL_BUFFER_BYTES` / default 7 MiB.
+    /// Mirrors `LOG_TOTAL_BUFFER_BYTES` / default 7 MiB.
     pub log_total_buffer_bytes: u64,
 
     /// Per-buffer size override in bytes.  0 = derive from
     /// `log_total_buffer_bytes / log_num_buffers`.
-    /// : `LOG_BUFFER_SIZE` / default 0.
+    /// Mirrors `LOG_BUFFER_SIZE` / default 0.
     pub log_buffer_size: usize,
 
     /// Size of the fault-in read buffer for random BIN fetches.
-    /// : `LOG_FAULT_READ_SIZE` / default 2 KiB.
+    /// Mirrors `LOG_FAULT_READ_SIZE` / default 2 KiB.
     pub log_fault_read_size: usize,
 
     /// Log iterator read buffer in bytes.
-    /// : `LOG_ITERATOR_READ_SIZE` / default 8 KiB.
+    /// Mirrors `LOG_ITERATOR_READ_SIZE` / default 8 KiB.
     pub log_iterator_read_size: usize,
 
     /// Log iterator maximum buffer size in bytes (grows up to this limit).
-    /// : `LOG_ITERATOR_MAX_SIZE` / default 16 MiB.
+    /// Mirrors `LOG_ITERATOR_MAX_SIZE` / default 16 MiB.
     pub log_iterator_max_size: usize,
 
     /// Number of data directories for log file striping.  0 = single dir.
-    /// : `LOG_N_DATA_DIRECTORIES` / default 0.
+    /// Mirrors `LOG_N_DATA_DIRECTORIES` / default 0.
     pub log_n_data_directories: u32,
 
     /// Run in in-memory-only mode (no log files written).
-    /// : `LOG_MEM_ONLY` / default false.
+    /// Mirrors `LOG_MEM_ONLY` / default false.
     pub log_mem_only: bool,
 
     /// Detect external deletion of log files and respond gracefully.
-    /// : `LOG_DETECT_FILE_DELETE` / default false.
+    /// Mirrors `LOG_DETECT_FILE_DELETE` / default false.
     pub log_detect_file_delete: bool,
 
     /// Interval between log-file deletion detection polls in milliseconds.
-    /// : `LOG_DETECT_FILE_DELETE_INTERVAL` / default 3_000 ms.
+    /// Mirrors `LOG_DETECT_FILE_DELETE_INTERVAL` / default 3_000 ms.
     pub log_detect_file_delete_interval_ms: u64,
 
     /// Interval between periodic flush-and-sync operations in milliseconds.
@@ -269,99 +269,99 @@ pub struct EnvironmentConfig {
 
     /// Interval between periodic flush-without-sync operations in
     /// milliseconds.  0 = disabled.
-    /// : `LOG_FLUSH_NO_SYNC_INTERVAL` / default 0.
+    /// Mirrors `LOG_FLUSH_NO_SYNC_INTERVAL` / default 0.
     pub log_flush_no_sync_interval_ms: u64,
 
     /// Use `O_DSYNC` when opening log files.  Accepted deviation: on Linux
     /// Noxu passes `O_DSYNC` to `OpenOptions`; semantics are equivalent.
-    /// : `LOG_USE_ODSYNC` / default false.
+    /// Mirrors `LOG_USE_ODSYNC` / default false.
     pub log_use_odsync: bool,
 
     /// Use an asynchronous write queue between the log manager and the OS.
-    /// : `LOG_USE_WRITE_QUEUE` / default false.
+    /// Mirrors `LOG_USE_WRITE_QUEUE` / default false.
     pub log_use_write_queue: bool,
 
     /// Size of the asynchronous write queue in bytes.
-    /// : `LOG_WRITE_QUEUE_SIZE` / default 1 MiB.
+    /// Mirrors `LOG_WRITE_QUEUE_SIZE` / default 1 MiB.
     pub log_write_queue_size: usize,
 
     /// Group-commit waiter threshold.  0 = disabled.
-    /// : `LOG_GROUP_COMMIT_THRESHOLD` / default 0.
+    /// Mirrors `LOG_GROUP_COMMIT_THRESHOLD` / default 0.
     pub log_group_commit_threshold: usize,
 
     /// Group-commit interval in milliseconds.  0 = disabled.
-    /// : `LOG_GROUP_COMMIT_INTERVAL` / default 0.
+    /// Mirrors `LOG_GROUP_COMMIT_INTERVAL` / default 0.
     pub log_group_commit_interval_ms: u64,
 
     // -----------------------------------------------------------------------
     // B-tree
     // -----------------------------------------------------------------------
     /// Maximum number of entries per Internal Node (IN).
-    /// : `NODE_MAX_ENTRIES` / default 128.
+    /// Mirrors `NODE_MAX_ENTRIES` / default 128.
     pub node_max_entries: u32,
 
     /// Maximum number of entries per duplicate-tree node.
-    /// : `NODE_DUP_TREE_MAX_ENTRIES` / default 128.
+    /// Mirrors `NODE_DUP_TREE_MAX_ENTRIES` / default 128.
     pub node_dup_tree_max_entries: u32,
 
     /// Maximum value size in bytes for inline (embedded) LNs stored directly
     /// in the BIN slot.  Records larger than this are stored as separate LNs.
-    /// : `TREE_MAX_EMBEDDED_LN` / default 16.
+    /// Mirrors `TREE_MAX_EMBEDDED_LN` / default 16.
     pub tree_max_embedded_ln: u32,
 
     /// Maximum percentage of BIN entries that may be in a delta before a
     /// full BIN is written (0–100).
-    /// : `TREE_MAX_DELTA` / default 25.
+    /// Mirrors `TREE_MAX_DELTA` / default 25.
     pub tree_max_delta: u8,
 
     /// Write BIN-delta log entries (partial BIN updates).
-    /// : `TREE_BIN_DELTA` / default true.
+    /// Mirrors `TREE_BIN_DELTA` / default true.
     pub tree_bin_delta: bool,
 
     /// Minimum memory per B-tree node in bytes.  0 = no minimum.
-    /// : `TREE_MIN_MEMORY` / default 0.
+    /// Mirrors `TREE_MIN_MEMORY` / default 0.
     pub tree_min_memory: u64,
 
     /// Maximum key length for compact (prefix-compressed) key storage.
-    /// : `TREE_COMPACT_MAX_KEY_LENGTH` / default 16.
+    /// Mirrors `TREE_COMPACT_MAX_KEY_LENGTH` / default 16.
     pub tree_compact_max_key_length: u32,
 
     // -----------------------------------------------------------------------
     // INCompressor
     // -----------------------------------------------------------------------
     /// INCompressor wakeup interval in milliseconds.
-    /// : `COMPRESSOR_WAKEUP_INTERVAL` / default 5_000 ms.
+    /// Mirrors `COMPRESSOR_WAKEUP_INTERVAL` / default 5_000 ms.
     pub in_compressor_wakeup_interval_ms: u64,
 
     /// Number of deadlock retries per INCompressor pass.
-    /// : `COMPRESSOR_DEADLOCK_RETRY` / default 3.
+    /// Mirrors `COMPRESSOR_DEADLOCK_RETRY` / default 3.
     pub compressor_deadlock_retry: u32,
 
     /// Lock timeout for INCompressor operations in milliseconds.
-    /// : `COMPRESSOR_LOCK_TIMEOUT` / default 500 ms.
+    /// Mirrors `COMPRESSOR_LOCK_TIMEOUT` / default 500 ms.
     pub compressor_lock_timeout_ms: u64,
 
     /// Purge the root IN when it becomes empty after compression.
-    /// : `COMPRESSOR_PURGE_ROOT` / default false.
+    /// Mirrors `COMPRESSOR_PURGE_ROOT` / default false.
     pub compressor_purge_root: bool,
 
     // -----------------------------------------------------------------------
     // Cleaner
     // -----------------------------------------------------------------------
     /// Minimum log utilization percentage; cleaning triggers when below this.
-    /// : `CLEANER_MIN_UTILIZATION` / default 50.
+    /// Mirrors `CLEANER_MIN_UTILIZATION` / default 50.
     pub cleaner_min_utilization: u8,
 
     /// Minimum per-file utilization; files below this are always candidates.
-    /// : `CLEANER_MIN_FILE_UTILIZATION` / default 5.
+    /// Mirrors `CLEANER_MIN_FILE_UTILIZATION` / default 5.
     pub cleaner_min_file_utilization: u8,
 
     /// Number of background cleaner threads.
-    /// : `CLEANER_THREADS` / default 1.
+    /// Mirrors `CLEANER_THREADS` / default 1.
     pub cleaner_threads: u32,
 
     /// Minimum number of log files that must exist before cleaning begins.
-    /// : `CLEANER_MIN_FILES_TO_CLEAN` / default 2.
+    /// Mirrors `CLEANER_MIN_FILES_TO_CLEAN` / default 2.
     pub cleaner_min_file_count: u32,
 
     /// Minimum age of a log file (in checkpoints) before it becomes a
@@ -377,29 +377,29 @@ pub struct EnvironmentConfig {
     pub cleaner_wakeup_interval_ms: u64,
 
     /// Fetch the sizes of obsolete records when calculating utilization.
-    /// : `CLEANER_FETCH_OBSOLETE_SIZE` / default false.
+    /// Mirrors `CLEANER_FETCH_OBSOLETE_SIZE` / default false.
     pub cleaner_fetch_obsolete_size: bool,
 
     /// Adjust utilization accounting for uncommitted transactions.
-    /// : `CLEANER_ADJUST_UTILIZATION` / default false.
+    /// Mirrors `CLEANER_ADJUST_UTILIZATION` / default false.
     pub cleaner_adjust_utilization: bool,
 
     /// Number of deadlock retries per cleaner migration pass.
-    /// : `CLEANER_DEADLOCK_RETRY` / default 3.
+    /// Mirrors `CLEANER_DEADLOCK_RETRY` / default 3.
     pub cleaner_deadlock_retry: u32,
 
     /// Lock timeout for cleaner migration operations in milliseconds.
-    /// : `CLEANER_LOCK_TIMEOUT` / default 500 ms.
+    /// Mirrors `CLEANER_LOCK_TIMEOUT` / default 500 ms.
     pub cleaner_lock_timeout_ms: u64,
 
     /// Expunge (delete) cleaned log files immediately rather than keeping them
     /// in a `deleted/` sub-directory.
-    /// : `CLEANER_EXPUNGE` / default true.
+    /// Mirrors `CLEANER_EXPUNGE` / default true.
     pub cleaner_expunge: bool,
 
     /// Move cleaned log files to a `deleted/` sub-directory instead of
     /// deleting them in place.
-    /// : `CLEANER_USE_DELETED_DIR` / default false.
+    /// Mirrors `CLEANER_USE_DELETED_DIR` / default false.
     pub cleaner_use_deleted_dir: bool,
 
     /// Maximum number of log files processed per cleaner batch.
@@ -407,38 +407,38 @@ pub struct EnvironmentConfig {
     pub cleaner_max_batch_files: u32,
 
     /// Bytes read per cleaner file scan pass.
-    /// : `CLEANER_READ_SIZE` / default 8 KiB.
+    /// Mirrors `CLEANER_READ_SIZE` / default 8 KiB.
     pub cleaner_read_size: usize,
 
     /// Maximum percentage of the cache to use for cleaner utilization detail.
-    /// : `CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE` / default 2.
+    /// Mirrors `CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE` / default 2.
     pub cleaner_detail_max_memory_percentage: u32,
 
     /// Number of LN records to look ahead during file cleaning.
-    /// : `CLEANER_LOOK_AHEAD_CACHE_SIZE` / default 32.
+    /// Mirrors `CLEANER_LOOK_AHEAD_CACHE_SIZE` / default 32.
     pub cleaner_look_ahead_cache_size: usize,
 
     /// Migrate live records proactively in the foreground (user threads).
-    /// : `CLEANER_FOREGROUND_PROACTIVE_MIGRATION` / default false.
+    /// Mirrors `CLEANER_FOREGROUND_PROACTIVE_MIGRATION` / default false.
     pub cleaner_foreground_proactive_migration: bool,
 
     /// Migrate live records proactively in the background cleaner thread.
-    /// : `CLEANER_BACKGROUND_PROACTIVE_MIGRATION` / default false.
+    /// Mirrors `CLEANER_BACKGROUND_PROACTIVE_MIGRATION` / default false.
     pub cleaner_background_proactive_migration: bool,
 
     /// Lazy migration: defer LN migration until the slot is next accessed.
-    /// : `CLEANER_LAZY_MIGRATION` / default false.
+    /// Mirrors `CLEANER_LAZY_MIGRATION` / default false.
     pub cleaner_lazy_migration: bool,
 
     /// Enable TTL-based record expiration tracking in the cleaner.
-    /// : `CLEANER_EXPIRATION_ENABLED` / default false.
+    /// Mirrors `CLEANER_EXPIRATION_ENABLED` / default false.
     pub cleaner_expiration_enabled: bool,
 
     // -----------------------------------------------------------------------
     // Checkpointer
     // -----------------------------------------------------------------------
     /// Number of bytes written between automatic checkpoints.
-    /// : `CHECKPOINTER_BYTES_INTERVAL` / default 20 MiB.
+    /// Mirrors `CHECKPOINTER_BYTES_INTERVAL` / default 20 MiB.
     pub checkpointer_bytes_interval: u64,
 
     /// Time between automatic checkpoints in milliseconds.
@@ -450,120 +450,120 @@ pub struct EnvironmentConfig {
     pub checkpointer_min_interval_secs: u64,
 
     /// Number of deadlock retries per checkpoint.
-    /// : `CHECKPOINTER_DEADLOCK_RETRY` / default 3.
+    /// Mirrors `CHECKPOINTER_DEADLOCK_RETRY` / default 3.
     pub checkpointer_deadlock_retry: u32,
 
     /// Run checkpoints at high priority (flush more aggressively).
-    /// : `CHECKPOINTER_HIGH_PRIORITY` / default false.
+    /// Mirrors `CHECKPOINTER_HIGH_PRIORITY` / default false.
     pub checkpointer_high_priority: bool,
 
     // -----------------------------------------------------------------------
     // Evictor
     // -----------------------------------------------------------------------
     /// Number of tree nodes examined per evictor pass.
-    /// : `EVICTOR_NODES_PER_SCAN` / default 10.
+    /// Mirrors `EVICTOR_NODES_PER_SCAN` / default 10.
     pub evictor_nodes_per_scan: usize,
 
     /// Bytes to evict from the cache per evictor pass.
-    /// : `EVICTOR_EVICT_BYTES` / default 512 KiB.
+    /// Mirrors `EVICTOR_EVICT_BYTES` / default 512 KiB.
     pub evictor_evict_bytes: u64,
 
     /// Percentage above the cache target at which critical eviction kicks in.
-    /// : `EVICTOR_CRITICAL_PERCENTAGE` / default 5.
+    /// Mirrors `EVICTOR_CRITICAL_PERCENTAGE` / default 5.
     pub evictor_critical_percentage: u32,
 
     /// Use LRU-only eviction (no priority-1 / priority-2 split).
-    /// : `EVICTOR_LRU_ONLY` / default false.
+    /// Mirrors `EVICTOR_LRU_ONLY` / default false.
     pub evictor_lru_only: bool,
 
     /// Number of LRU lists (increases parallelism under contention).
-    /// : `EVICTOR_N_LRU_LISTS` / default 4.
+    /// Mirrors `EVICTOR_N_LRU_LISTS` / default 4.
     pub evictor_n_lru_lists: u32,
 
     /// Number of deadlock retries per evictor pass.
-    /// : `EVICTOR_DEADLOCK_RETRY` / default 3.
+    /// Mirrors `EVICTOR_DEADLOCK_RETRY` / default 3.
     pub evictor_deadlock_retry: u32,
 
     /// Minimum number of background evictor threads always kept alive.
-    /// : `EVICTOR_CORE_THREADS` / default 1.
+    /// Mirrors `EVICTOR_CORE_THREADS` / default 1.
     pub evictor_core_threads: usize,
 
     /// Maximum number of background evictor threads.
-    /// : `EVICTOR_MAX_THREADS` / default 10.
+    /// Mirrors `EVICTOR_MAX_THREADS` / default 10.
     pub evictor_max_threads: usize,
 
     /// Keep-alive time for idle evictor threads in milliseconds.
-    /// : `EVICTOR_KEEP_ALIVE` / default 60_000 ms.
+    /// Mirrors `EVICTOR_KEEP_ALIVE` / default 60_000 ms.
     pub evictor_keep_alive_ms: u64,
 
     /// Allow the evictor to write BIN-delta entries rather than full BINs.
-    /// : `EVICTOR_ALLOW_BIN_DELTAS` / default true.
+    /// Mirrors `EVICTOR_ALLOW_BIN_DELTAS` / default true.
     pub evictor_allow_bin_deltas: bool,
 
     // -----------------------------------------------------------------------
     // Off-heap evictor
     // -----------------------------------------------------------------------
     /// Bytes to evict from the off-heap cache per pass.
-    /// : `OFFHEAP_EVICT_BYTES` / default 512 KiB.
+    /// Mirrors `OFFHEAP_EVICT_BYTES` / default 512 KiB.
     pub offheap_evict_bytes: u64,
 
     /// Number of LRU lists for the off-heap cache.
-    /// : `OFFHEAP_N_LRU_LISTS` / default 4.
+    /// Mirrors `OFFHEAP_N_LRU_LISTS` / default 4.
     pub offheap_n_lru_lists: u32,
 
     /// Checksum off-heap cache entries on write and verify on read.
-    /// : `OFFHEAP_CHECKSUM` / default false.
+    /// Mirrors `OFFHEAP_CHECKSUM` / default false.
     pub offheap_checksum: bool,
 
     /// Minimum number of off-heap evictor threads always kept alive.
-    /// : `OFFHEAP_CORE_THREADS` / default 1.
+    /// Mirrors `OFFHEAP_CORE_THREADS` / default 1.
     pub offheap_core_threads: usize,
 
     /// Maximum number of off-heap evictor threads.
-    /// : `OFFHEAP_MAX_THREADS` / default 10.
+    /// Mirrors `OFFHEAP_MAX_THREADS` / default 10.
     pub offheap_max_threads: usize,
 
     /// Keep-alive time for idle off-heap evictor threads in milliseconds.
-    /// : `OFFHEAP_KEEP_ALIVE` / default 60_000 ms.
+    /// Mirrors `OFFHEAP_KEEP_ALIVE` / default 60_000 ms.
     pub offheap_keep_alive_ms: u64,
 
     // -----------------------------------------------------------------------
     // Locking
     // -----------------------------------------------------------------------
     /// Lock timeout in milliseconds.
-    /// : `LOCK_TIMEOUT` / default 500 ms.
+    /// Mirrors `LOCK_TIMEOUT` / default 500 ms.
     pub lock_timeout_ms: u64,
 
     /// Number of lock table shards.
-    /// : `LOCK_N_LOCK_TABLES` / default 1.  Noxu default: 16.
+    /// Mirrors `LOCK_N_LOCK_TABLES` / default 1.  Noxu default: 16.
     pub lock_n_lock_tables: u32,
 
     /// Run the deadlock detector on lock waits.
-    /// : `LOCK_DEADLOCK_DETECT` / default true.
+    /// Mirrors `LOCK_DEADLOCK_DETECT` / default true.
     pub lock_deadlock_detect: bool,
 
     /// Delay before deadlock detection runs (milliseconds).
     /// 0 = detect immediately on every wait.
-    /// : `LOCK_DEADLOCK_DETECT_DELAY` / default 0.
+    /// Mirrors `LOCK_DEADLOCK_DETECT_DELAY` / default 0.
     pub lock_deadlock_detect_delay_ms: u64,
 
     // -----------------------------------------------------------------------
     // Transactions
     // -----------------------------------------------------------------------
     /// Transaction timeout in milliseconds.  0 = no timeout.
-    /// : `TXN_TIMEOUT` / default 0.
+    /// Mirrors `TXN_TIMEOUT` / default 0.
     pub txn_timeout_ms: u64,
 
     /// Default durability policy for transactions.
-    /// : `TXN_DURABILITY`.
+    /// Mirrors `TXN_DURABILITY`.
     pub durability: Durability,
 
     /// Commits do not wait for the log to reach disk.
-    /// : `TXN_NO_SYNC` / default false.
+    /// Mirrors `TXN_NO_SYNC` / default false.
     pub txn_no_sync: bool,
 
     /// Commits write the log to the OS buffer but skip `fdatasync`.
-    /// : `TXN_WRITE_NO_SYNC` / default false.
+    /// Mirrors `TXN_WRITE_NO_SYNC` / default false.
     pub txn_write_no_sync: bool,
 
     /// When `true`, all transactions default to **serializable**
@@ -574,15 +574,15 @@ pub struct EnvironmentConfig {
     /// not provided.  Per-transaction overrides are available via
     /// [`crate::transaction_config::TransactionConfig::set_serializable_isolation`]
     /// and [`crate::transaction_config::TransactionConfig::set_read_committed`].
-    /// : `TXN_SERIALIZABLE_ISOLATION` / default false.
+    /// Mirrors `TXN_SERIALIZABLE_ISOLATION` / default false.
     pub txn_serializable_isolation: bool,
 
     /// Capture a stack trace at deadlock detection time (expensive).
-    /// : `TXN_DEADLOCK_STACK_TRACE` / default false.
+    /// Mirrors `TXN_DEADLOCK_STACK_TRACE` / default false.
     pub txn_deadlock_stack_trace: bool,
 
     /// Dump all lock state on deadlock detection (diagnostic, expensive).
-    /// : `TXN_DUMP_LOCKS` / default false.
+    /// Mirrors `TXN_DUMP_LOCKS` / default false.
     pub txn_dump_locks: bool,
 
     // -----------------------------------------------------------------------
@@ -590,46 +590,46 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     /// Cron-style schedule string for the background verifier.
     /// Empty string = run continuously when `run_verifier = true`.
-    /// : `VERIFY_SCHEDULE` / default `""`.
+    /// Mirrors `VERIFY_SCHEDULE` / default `""`.
     pub verify_schedule: String,
 
     /// Verify log-file checksums in the background.
-    /// : `VERIFY_LOG` / default false.
+    /// Mirrors `VERIFY_LOG` / default false.
     pub verify_log: bool,
 
     /// Delay between log verification read operations in milliseconds.
-    /// : `VERIFY_LOG_READ_DELAY` / default 0.
+    /// Mirrors `VERIFY_LOG_READ_DELAY` / default 0.
     pub verify_log_read_delay_ms: u64,
 
     /// Verify the B-tree structure in the background.
-    /// : `VERIFY_BTREE` / default false.
+    /// Mirrors `VERIFY_BTREE` / default false.
     pub verify_btree: bool,
 
     /// Verify secondary index consistency in the background.
-    /// : `VERIFY_SECONDARIES` / default true.
+    /// Mirrors `VERIFY_SECONDARIES` / default true.
     pub verify_secondaries: bool,
 
     /// Verify data records (values) in the background.
-    /// : `VERIFY_DATA_RECORDS` / default false.
+    /// Mirrors `VERIFY_DATA_RECORDS` / default false.
     pub verify_data_records: bool,
 
     /// Verify obsolete records have correct LSNs in the background.
-    /// : `VERIFY_OBSOLETE_RECORDS` / default false.
+    /// Mirrors `VERIFY_OBSOLETE_RECORDS` / default false.
     pub verify_obsolete_records: bool,
 
     /// Number of B-tree nodes verified per verifier batch.
-    /// : `VERIFY_BTREE_BATCH_SIZE` / default 1_000.
+    /// Mirrors `VERIFY_BTREE_BATCH_SIZE` / default 1_000.
     pub verify_btree_batch_size: u32,
 
     /// Delay between B-tree verification batches in milliseconds.
-    /// : `VERIFY_BTREE_BATCH_DELAY` / default 10 ms.
+    /// Mirrors `VERIFY_BTREE_BATCH_DELAY` / default 10 ms.
     pub verify_btree_batch_delay_ms: u64,
 
     // -----------------------------------------------------------------------
     // Disk-ordered cursor
     // -----------------------------------------------------------------------
     /// Timeout for the disk-ordered cursor producer queue in milliseconds.
-    /// : `DOS_PRODUCER_QUEUE_TIMEOUT` / default 10_000 ms.
+    /// Mirrors `DOS_PRODUCER_QUEUE_TIMEOUT` / default 10_000 ms.
     pub dos_producer_queue_timeout_ms: u64,
 
     // -----------------------------------------------------------------------
@@ -644,79 +644,79 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
 
     /// Collect environment statistics in the background.
-    /// : `STATS_COLLECT` / default false.
+    /// Mirrors `STATS_COLLECT` / default false.
     pub stats_collect: bool,
 
     /// Interval between background stats collection passes in seconds.
-    /// : `STATS_COLLECT_INTERVAL` / default 300 s.
+    /// Mirrors `STATS_COLLECT_INTERVAL` / default 300 s.
     pub stats_collect_interval_secs: u64,
 
     /// Maximum number of stats CSV files to retain.
-    /// : `STATS_MAX_FILES` / default 100.
+    /// Mirrors `STATS_MAX_FILES` / default 100.
     pub stats_max_files: u32,
 
     /// Rows per stats CSV file before rotation.
-    /// : `STATS_FILE_ROW_COUNT` / default 1_000.
+    /// Mirrors `STATS_FILE_ROW_COUNT` / default 1_000.
     pub stats_file_row_count: u32,
 
     /// Directory for stats CSV files.  `None` = use the environment home.
-    /// : `STATS_FILE_DIRECTORY` / default `None`.
+    /// Mirrors `STATS_FILE_DIRECTORY` / default `None`.
     pub stats_file_directory: Option<PathBuf>,
 
     // -----------------------------------------------------------------------
     // Logging / tracing
     // -----------------------------------------------------------------------
     /// Enable log-file-based tracing (uses env home as destination).
-    /// : `TRACE_FILE` / default false.
+    /// Mirrors `TRACE_FILE` / default false.
     pub trace_file: bool,
 
     /// Enable console (stderr) tracing.
-    /// : `TRACE_CONSOLE` / default false.
+    /// Mirrors `TRACE_CONSOLE` / default false.
     pub trace_console: bool,
 
     /// Enable database-record-based tracing (internal trace DB).
-    /// : `TRACE_DB` / default false.
+    /// Mirrors `TRACE_DB` / default false.
     pub trace_db: bool,
 
     /// Maximum size of each trace log file in bytes.
-    /// : `TRACE_FILE_LIMIT` / default 10 MiB.
+    /// Mirrors `TRACE_FILE_LIMIT` / default 10 MiB.
     pub trace_file_limit_bytes: u64,
 
     /// Number of rotating trace log files.
-    /// : `TRACE_FILE_COUNT` / default 10.
+    /// Mirrors `TRACE_FILE_COUNT` / default 10.
     pub trace_file_count: u32,
 
     /// Overall logging level (e.g. `"INFO"`, `"DEBUG"`).
-    /// : `TRACE_LEVEL` / default `"INFO"`.
+    /// Mirrors `TRACE_LEVEL` / default `"INFO"`.
     pub trace_level: Option<String>,
 
     /// Console-handler logging level.
-    /// : `CONSOLE_LOGGING_LEVEL` / default `"SEVERE"`.
+    /// Mirrors `CONSOLE_LOGGING_LEVEL` / default `"SEVERE"`.
     pub console_logging_level: Option<String>,
 
     /// File-handler logging level.
-    /// : `FILE_LOGGING_LEVEL` / default `"INFO"`.
+    /// Mirrors `FILE_LOGGING_LEVEL` / default `"INFO"`.
     pub file_logging_level: Option<String>,
 
     /// Lock-manager subsystem trace level.
-    /// : `TRACE_LEVEL_LOCK_MANAGER` / default `"FINE"`.
+    /// Mirrors `TRACE_LEVEL_LOCK_MANAGER` / default `"FINE"`.
     pub trace_level_lock_manager: Option<String>,
 
     /// Recovery subsystem trace level.
-    /// : `TRACE_LEVEL_RECOVERY` / default `"FINE"`.
+    /// Mirrors `TRACE_LEVEL_RECOVERY` / default `"FINE"`.
     pub trace_level_recovery: Option<String>,
 
     /// Evictor subsystem trace level.
-    /// : `TRACE_LEVEL_EVICTOR` / default `"FINE"`.
+    /// Mirrors `TRACE_LEVEL_EVICTOR` / default `"FINE"`.
     pub trace_level_evictor: Option<String>,
 
     /// Cleaner subsystem trace level.
-    /// : `TRACE_LEVEL_CLEANER` / default `"FINE"`.
+    /// Mirrors `TRACE_LEVEL_CLEANER` / default `"FINE"`.
     pub trace_level_cleaner: Option<String>,
 
     /// Startup statistics dump threshold in milliseconds.  Dump stats if
     /// startup takes longer than this.  0 = disabled.
-    /// : `STARTUP_DUMP_THRESHOLD` / default 0.
+    /// Mirrors `STARTUP_DUMP_THRESHOLD` / default 0.
     pub startup_dump_threshold_ms: u64,
 
     // -----------------------------------------------------------------------
@@ -726,7 +726,7 @@ pub struct EnvironmentConfig {
     /// an exception.  Set this to receive notifications from the Checkpointer,
     /// Cleaner, Evictor, INCompressor, and Verifier daemons.
     ///
-    /// : `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
+    /// Mirrors `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
     pub exception_listener: ExceptionListenerHolder,
 }
 
@@ -1674,7 +1674,7 @@ impl EnvironmentConfig {
     /// Registers a callback to be invoked when a background daemon thread
     /// encounters an unhandled exception.
     ///
-    /// : `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
+    /// Mirrors `EnvironmentConfig.setExceptionListener(ExceptionListener)`.
     pub fn set_exception_listener(
         &mut self,
         listener: Arc<dyn ExceptionListener>,

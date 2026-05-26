@@ -58,7 +58,7 @@ pub struct Environment {
     open: AtomicBool,
     /// Whether the environment is valid (not invalidated by a fatal error).
     ///
-    /// : `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
+    /// Mirrors `EnvironmentImpl.isValid()` / `envInvalid` AtomicBoolean.
     /// Set to `false` when an `EnvironmentFailure` with `invalidates_environment() == true`
     /// is returned; all subsequent API calls check this and return `EnvironmentFailure`.
     env_valid: AtomicBool,
@@ -548,7 +548,7 @@ impl Environment {
     ///
     /// Returns the number of records that were in the database before truncation.
     ///
-    /// : `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    /// Mirrors `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(
         &self,
         _txn: Option<&Transaction>,
@@ -790,7 +790,7 @@ impl Environment {
 
     /// Returns the mutable subset of environment configuration.
     ///
-    /// : `Environment.getMutableConfig()`.  The returned struct reflects the
+    /// Mirrors `Environment.getMutableConfig()`.  The returned struct reflects the
     /// current runtime values; pass it (modified) to `set_mutable_config()` to
     /// apply changes without re-opening the environment.
     pub fn get_mutable_config(&self) -> Result<EnvironmentMutableConfig> {
@@ -810,7 +810,7 @@ impl Environment {
 
     /// Applies a set of mutable configuration changes to the running environment.
     ///
-    /// : `Environment.setMutableConfig(EnvironmentMutableConfig)`.
+    /// Mirrors `Environment.setMutableConfig(EnvironmentMutableConfig)`.
     /// Only the fields that differ from their sentinel "no-change" values are
     /// applied (`None` means unchanged).  `Some(0)` for a timeout clears it
     /// (matches JE: 0 = no timeout).
@@ -850,7 +850,7 @@ impl Environment {
 
     /// Runs a checkpoint.
     ///
-    /// : `Environment.checkpoint(CheckpointConfig)`.  If the environment has
+    /// Mirrors `Environment.checkpoint(CheckpointConfig)`.  If the environment has
     /// no checkpointer (e.g. non-transactional or in-memory), this is a no-op.
     ///
     /// # Arguments
@@ -869,7 +869,7 @@ impl Environment {
 
     /// Returns `true` if the environment is open and has not been invalidated by a fatal error.
     ///
-    /// : `Environment.isValid()`.  Returns `false` after the environment is closed
+    /// Mirrors `Environment.isValid()`.  Returns `false` after the environment is closed
     /// or after an `EnvironmentFailure` whose `reason.invalidates_environment()` returns
     /// `true` (e.g. `LogChecksum`, `BtreeCorruption`, `DiskLimit`).
     /// Once invalidated the environment must be closed and re-opened.
@@ -904,7 +904,7 @@ impl Environment {
 
     /// Returns a snapshot of environment statistics from all subsystems.
     ///
-    /// : `Environment.getStats(StatsConfig)`.
+    /// Mirrors `Environment.getStats(StatsConfig)`.
     pub fn get_stats(&self) -> Result<EnvironmentStats> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();

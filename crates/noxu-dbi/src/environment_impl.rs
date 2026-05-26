@@ -861,7 +861,7 @@ impl EnvironmentImpl {
     ///
     /// Returns the number of records that were in the database before truncation.
     ///
-    /// : `Environment.truncateDatabase(txn, dbName, returnCount)`.
+    /// Mirrors `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(&self, name: &str) -> Result<u64, DbiError> {
         self.check_open()?;
 
