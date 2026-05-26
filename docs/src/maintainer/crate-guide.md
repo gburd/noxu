@@ -6,6 +6,7 @@ types, and crate purpose.
 ## Phase 0 — Foundation
 
 ### `noxu-util`
+
  the corresponding Noxu type
 
 Core types used across all crates.
@@ -21,17 +22,21 @@ Core types used across all crates.
 Re-exports: `Lsn`, `Vlsn`, `NULL_LSN` at crate root.
 
 ### `noxu-latch`
+
  the corresponding Noxu type
 
 Thin wrappers around `parking_lot`:
+
 - `ExclusiveLatch<T>` — RAII exclusive latch (wraps `Mutex<T>`)
 - `SharedLatch<T>` — RAII reader-writer latch (wraps `RwLock<T>`)
 
 ### `noxu-sync`
+
  the corresponding Noxu type
 
 Internal sync primitives that sit below `noxu-latch` and replication
 networking. Provides:
+
 - `RawMutex` / `RawRwLock` — pluggable raw locking that can be swapped for
   parking_lot or libc futexes
 - `Condvar` — condition variable that cooperates with the raw locks
@@ -43,9 +48,11 @@ syscall / raw-API boundary; everything above it consumes the safe
 `Mutex` / `RwLock` types.
 
 ### `noxu-config`
+
  the corresponding Noxu type
 
 400+ configuration parameters with validation. Key types:
+
 - `EnvironmentConfig` / `EnvironmentConfigBuilder` — all 150+ env parameters
 - `DatabaseConfig` — per-database options
 - `TransactionConfig` — per-transaction options
@@ -55,11 +62,13 @@ syscall / raw-API boundary; everything above it consumes the safe
 ## Phase 1 — Storage
 
 ### `noxu-log`
+
  the corresponding Noxu type
 
 The write-ahead log. All mutations go here first.
 
 Key files:
+
 - `src/file_manager.rs` — `FileManager`: file creation, rotation, handle LRU
 - `src/log_manager.rs` — `LogManager`: write serialization, group commit, CRC32
 - `src/buffer.rs` — `LogBuffer` / `LogBufferPool`: write buffering
@@ -69,9 +78,11 @@ Key files:
 ## Phase 2 — Data Structures
 
 ### `noxu-tree`
+
  the corresponding Noxu type
 
 The B+tree. Key files:
+
 - `src/tree.rs` — `Tree`: root management, `get/put/delete`, dirty node collection
 - `src/bin.rs` — `Bin` (BIN node): slots, key prefix, modification_times, delta tracking
 - `src/ln.rs` — `Ln` (LN leaf node): key/value pair
@@ -82,11 +93,13 @@ Critical: `Tree::set_comparator()` / `take_comparator()` for `TwoPartKeyComparat
 ## Phase 3 — Transactions
 
 ### `noxu-txn`
+
  the corresponding Noxu type
 
 Record-level locking and transaction lifecycle.
 
 Key files:
+
 - `src/lock_manager.rs` — `LockManager`: 64-shard lock table, waiter graph, deadlock detection
 - `src/transaction.rs` — `Transaction`: locker hierarchy, undo records, commit/abort
 - `src/locker.rs` — `Locker` trait, `BasicLocker`, `ThreadLocker`, `HandleLocker`
@@ -96,11 +109,13 @@ Key files:
 ## Phase 4 — Internals
 
 ### `noxu-dbi`
+
  the corresponding Noxu type
 
 The bridge between the public API and internal subsystems.
 
 Key files:
+
 - `src/environment_impl.rs` — `EnvironmentImpl`: coordinates all subsystems, daemon lifecycle
 - `src/database_impl.rs` — `DatabaseImpl`: tree ownership, recovered tree handling
 - `src/cursor_impl.rs` — `CursorImpl`: all cursor operations, sorted-dup routing
@@ -113,14 +128,17 @@ Key files:
 ## Phase 5 — Background Services
 
 ### `noxu-evictor`
+
  the corresponding Noxu type
 
 Dual-priority LRU cache eviction. Key type: `Evictor`.
 
 ### `noxu-cleaner`
+
  the corresponding Noxu type
 
 Log GC pipeline. Key files:
+
 - `src/cleaner.rs` — `Cleaner` daemon
 - `src/utilization_profile.rs` — `UtilizationProfile` / `FileSummary`
 - `src/file_selector.rs` — `FileSelector`
@@ -130,6 +148,7 @@ Log GC pipeline. Key files:
 - `src/extinction_scanner.rs` — `ExtinctionScanner` (Noxu)
 
 ### `noxu-recovery`
+
  the corresponding Noxu type
 
 Checkpoint and 3-phase crash recovery. Key file: `src/recovery_manager.rs`.
@@ -137,9 +156,11 @@ Checkpoint and 3-phase crash recovery. Key file: `src/recovery_manager.rs`.
 ## Phase 6 — Orchestration
 
 ### `noxu-engine`
+
 Daemon lifecycle and environment open/close coordination.
 
 ### `noxu-db`
+
  the corresponding Noxu type public API.
 
 Public types: `Environment`, `Database`, `Cursor`, `Transaction`,
@@ -148,19 +169,23 @@ Public types: `Environment`, `Database`, `Cursor`, `Transaction`,
 ## Phase 7 — Higher-Level APIs
 
 ### `noxu-bind`
+
  the corresponding Noxu type
 
 Serialization bindings:
+
 - `TupleBinding<T>` — sort-preserving tuple encoding
 - `EntryBinding<T>` — passthrough `&[u8]`
 - `SerialBinding<T>` — serde-based binary serialization
 
 ### `noxu-collections`
+
  `noxu_collections`
 
 `StoredMap<K,V>`, `StoredSet<K>`, `StoredList<V>`.
 
 ### `noxu-persist`
+
  `noxu_persist`
 
 Trait-based entity persistence layer (Direct Persistence Layer). Users
@@ -179,6 +204,7 @@ Key type: `EntityStore`.
 XA (X/Open) distributed transaction support.
 
 Key files:
+
 - `src/environment.rs` — `XaEnvironment`: wraps `Environment`, manages branch state machine
 - `src/resource.rs` — `XaResource` trait: `xa_start`/`xa_end`/`xa_prepare`/`xa_commit`/`xa_rollback`/`xa_recover`/`xa_forget`
 - `src/xid.rs` — `Xid`: format_id + global_transaction_id + branch_qualifier
@@ -188,6 +214,7 @@ Key files:
 - `tests/xa_protocol_test.rs` — deterministic protocol corner-case coverage (51 tests)
 
 State machine per Xid:
+
 ```
 [none] → xa_start → Active → xa_end(SUCCESS) → Idle → xa_prepare → Prepared → xa_commit → [done]
                            → xa_end(SUSPEND) → Suspended → xa_start(RESUME) → Active
@@ -200,9 +227,11 @@ State machine per Xid:
 ## Phase 8 — Replication
 
 ### `noxu-rep`
+
  the corresponding Noxu type
 
 Master-replica HA. Key files:
+
 - `src/replicated_environment.rs` — `ReplicatedEnvironment`
 - `src/elections/paxos.rs` — FPaxos proposer/acceptor
 - `src/elections/phi_detector.rs` — phi accrual failure detector
@@ -219,6 +248,7 @@ Master-replica HA. Key files:
 ## Cross-cutting
 
 ### `noxu-observe`
+
  the corresponding Noxu type
 
 Optional observability glue. Re-exports a small set of helpers so other

@@ -226,7 +226,7 @@
 
 ### `EnvironmentConfig` (selected)
 
-JE has 201 `public ` declarations (most are paired
+JE has 201 `public` declarations (most are paired
 `setX(value)` / `setXVoid(value)` / `getX()` plus 100+ string parameter
 constants). Noxu has 160 `pub fn`. The shape matches; the gaps are
 ~40 less-common parameters not re-exposed as fluent setters.

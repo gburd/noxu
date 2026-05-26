@@ -20,6 +20,7 @@ Gaps indicate cleaned (deleted) files.
 ## Log File Structure
 
 Each `.ndb` file:
+
 1. **File header** (fixed size): log format version (`u32`), file number (`u32`)
 2. **Log entries** (variable length, packed with no alignment padding)
 

@@ -300,7 +300,7 @@ which is a single integration test of ~30 seconds.
 
 **Severity: MEDIUM**. The data-structure correctness is well covered,
 but the integration-level invariants (cleaner + checkpoint + eviction
-+ external-fs-events) are not.
+- external-fs-events) are not.
 
 ---
 

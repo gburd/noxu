@@ -15,6 +15,7 @@ disk, which reduces the amount of log that must be replayed on the next recovery
 and thus shortens startup time.
 
 If an `EnvironmentFailure` error is returned, call `env.is_valid()`:
+
 - If it returns `true`, you can continue using the environment.
 - If it returns `false`, close and reopen all `Environment` handles so that normal
   recovery runs.
@@ -96,6 +97,7 @@ incremental backup natively.
 **Restore**
 
 To restore from backup:
+
 1. Copy the backed-up `.ndb` log files to the environment directory.
 2. Open the environment normally. Normal recovery will reconstruct the B-tree.
 
@@ -104,4 +106,3 @@ recent full backup and then apply any subsequent incremental backups in order
 before opening the environment.
 
 ---
-

@@ -113,6 +113,7 @@ Implementation details:
 - **Thread safety:** All state protected by `noxu_sync::RwLock`.
 
 **Production defaults** (from the paper):
+
 - `threshold = 8.0` — mistake rate approximately 10^-8 per heartbeat interval
 - `window_size = 200` for LAN; `1000` for WAN
 
@@ -205,7 +206,7 @@ load-optimal selection.
 
 - Naor, M., & Wool, A. (1998). The Load, Capacity, and Availability of Quorum Systems. *SIAM J. Computing*, 27(2), 423-447.
 - Thomas, R. H. (1979). A Majority Consensus Approach to Concurrency Control. *ACM TODS*, 4(2), 180-209.
-- Burd, G. rs-quoracle. https://codeberg.org/gregburd/rs-quoracle
+- Burd, G. rs-quoracle. <https://codeberg.org/gregburd/rs-quoracle>
 
 ---
 
@@ -257,6 +258,7 @@ length-prefixed byte vector. The receiver reads exactly 4 bytes for the length, 
 reads exactly that many payload bytes.
 
 **Timeouts:**
+
 - `TcpStream::connect_timeout(30s)` — prevents indefinite blocking from OS SYN backoff
   (Linux default can reach ~127s under packet loss).
 - `set_write_timeout(Some(30s))` — caps send stalls under congestion.
@@ -264,6 +266,7 @@ reads exactly that many payload bytes.
   WouldBlock/TimedOut returns `Ok(None)`.
 
 **Bugs found and fixed in 6-hour soak testing:**
+
 - Bug 1: Setting `set_read_timeout(None)` before payload read caused hangs under packet
   loss. Fixed: read timeout is always set.
 - Bug 3: `TcpStream::connect()` (no timeout) blocked indefinitely under SYN loss with
@@ -353,6 +356,7 @@ Log entries below CBVLSN are safe to reclaim by the log cleaner. Broadcast via
 unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 
 **Log shipping architecture:**
+
 - **EnvironmentLogScanner** (master side): Implements the `LogScanner` trait. Reads
   committed log entries from the master's log files starting at a given VLSN and feeds
   them to `Feeder` threads — one per connected replica.

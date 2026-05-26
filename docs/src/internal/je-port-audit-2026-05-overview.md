@@ -321,6 +321,7 @@ and that the noxu-spec Stateright models prove the abstract
 correctness of 11 of the protocols.
 
 We **DO NOT** know that:
+
 - every JE `@Test` method has a Noxu counterpart that asserts the
   same invariant — we have only checked at the class level;
 - the methods marked PARTIAL or PRESENT-WITH-GAPS in api-map.md fail

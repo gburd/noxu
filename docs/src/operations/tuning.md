@@ -68,9 +68,9 @@ pinning log files).  Keep transactions short-lived to unpin files promptly.
 When the cleaner falls behind, it signals writer threads to pause briefly
 via `CleanerThrottle`.  This is automatic and transparent.  If you observe
 sustained write latency spikes:
+
 1. Check `s.cleaner.runs` — if it is not climbing, the cleaner may be disabled.
 2. Lower `cleaner_min_utilization` (e.g., 60) to trigger cleaning sooner.
 3. Increase log file size so each file takes longer to fill, giving the cleaner more time.
 
 ---
-

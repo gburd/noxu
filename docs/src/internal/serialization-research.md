@@ -110,6 +110,7 @@ let key: &[u8] = entry.key().unwrap().bytes(); // zero-copy
 
 **Applicability to Noxu**: Flatbuffers can provide zero-copy field access and
 would eliminate key/data allocations.  However adoption requires:
+
 1. Adding `flatc` as a build-time dependency and maintaining `.fbs` schema files
 2. Changing the log on-disk format (flatbuffers has its own wire format)
 3. A migration path for existing databases

@@ -40,6 +40,7 @@ UncachedLN, BackupManager, AsyncAcks).
 ## Current Fidelity
 
 As of Session 40:
+
 - **Named-algorithm completeness: ~92% (all major algorithms implemented)
 - **Operational completeness**: ~85% (API surface coverage)
 - **Production hardening**: ~100% (EnvironmentConfig, ExceptionListener, is_valid())

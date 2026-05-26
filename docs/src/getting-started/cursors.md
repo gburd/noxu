@@ -23,9 +23,9 @@
 
 A cursor is a position marker that can move through a database's records in sorted key order. Cursors allow you to:
 
-- Iterate forward or backward through all records.
-- Seek to a specific key or to the nearest key that is greater-than-or-equal to a target.
-- Insert, update, or delete records at the current cursor position.
+* Iterate forward or backward through all records.
+* Seek to a specific key or to the nearest key that is greater-than-or-equal to a target.
+* Insert, update, or delete records at the current cursor position.
 
 Cursors are the primary tool for bulk reads, range scans, and operating on databases that allow duplicate keys.
 
@@ -202,4 +202,3 @@ cursor.put(&search_key, &new_data, Put::Overwrite)?;
 Cursors hold page locks. Open cursors consume resources and can block other threads. Always close cursors as soon as you are done with them — preferably in a `defer`-style pattern or at the end of a lexical scope using Rust's RAII.
 
 ---
-

@@ -178,4 +178,3 @@ secondary.close()?;
 The secondary must be closed before the primary database and before the environment.
 
 ---
-

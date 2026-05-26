@@ -27,6 +27,7 @@ Available bindings in `noxu_bind`:
 | `String` | `StringBinding` | UTF-8 string, null-byte safe |
 
 All bindings implement the `EntryBinding<T>` trait with two methods:
+
 - `object_to_entry(&self, value: &T, entry: &mut DatabaseEntry)` — encode value into entry
 - `entry_to_object(&self, entry: &DatabaseEntry) -> Result<T>` — decode entry back to value
 
@@ -167,14 +168,14 @@ byte happened to be>, ... }` rather than producing wrong values.
 
 Migration options:
 
-* **Re-write the data.**  Drain the database under the old build, then
+- **Re-write the data.**  Drain the database under the old build, then
   re-`put` every record under the v1.5 build.  The v1.5 build will
   emit prefixed bytes.
-* **Use `TupleBinding` for stable on-disk format.**  The plain tuple
+- **Use `TupleBinding` for stable on-disk format.**  The plain tuple
   bindings (`IntBinding`, `LongBinding`, `StringBinding`,
   `SortedDoubleBinding`) do **not** carry a header and are not
   affected by this change — their wire format is stable.
-* **Stay on the pre-3C build** until you have a maintenance window;
+- **Stay on the pre-3C build** until you have a maintenance window;
   the version-prefix work is opt-in only in the sense that you opt
   in by upgrading `noxu-bind`.
 
@@ -182,4 +183,3 @@ Full schema-evolution (versioned bindings that can read older
 layouts of the same struct) is on the v1.6 roadmap.
 
 ---
-

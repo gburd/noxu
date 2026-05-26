@@ -131,6 +131,7 @@ slot.dirty = true;
 ### rust-analyzer (VS Code / Neovim)
 
 Add to `settings.json`:
+
 ```json
 {
     "rust-analyzer.cargo.features": "all",
