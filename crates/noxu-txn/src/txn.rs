@@ -70,6 +70,19 @@ pub enum Durability {
 const IS_PREPARED: u8 = 1;
 const PAST_ROLLBACK: u8 = 4;
 const IMPORTUNATE: u8 = 8;
+/// This `Txn` was allocated by [`crate::TxnManager::begin_auto_txn`] to wrap
+/// a single auto-commit operation.
+///
+/// Auto-txns share the explicit-txn id space (allocated by
+/// `TxnManager::next_txn_id`) so the lock manager can render typed locker
+/// IDs in deadlock messages, but they intentionally **do not** write
+/// `TxnCommit` / `TxnAbort` log records on commit/abort — the underlying
+/// LN entry is logged with `txn_id = 0` (i.e. as `InsertLN` /
+/// `DeleteLN`) so the on-disk WAL format stays identical to pre-Wave-1A
+/// auto-commit and recovery does not need to look up a synthetic
+/// commit/abort record for every auto-commit op.  Closes the first F12
+/// residual.
+const IS_AUTO_TXN: u8 = 16;
 
 /// A Txn is the internal representation of a transaction.
 ///
@@ -184,11 +197,58 @@ impl Txn {
     /// Commits and aborts will not write to the persistent log.  Use this
     /// constructor in unit tests or when a LogManager is not available.
     pub fn new(id: i64, lock_manager: Arc<LockManager>) -> Self {
+        Self::new_with_flags(id, lock_manager, 0)
+    }
+
+    /// Creates a synthetic auto-commit transaction.
+    ///
+    /// Returned by [`crate::TxnManager::begin_auto_txn`] to wrap a single
+    /// auto-commit cursor operation.  The auto-txn:
+    ///
+    /// * Carries the [`IS_AUTO_TXN`] flag, so [`Self::is_auto_txn`] returns
+    ///   `true` and [`Self::commit_with_durability`] / [`Self::abort`] skip
+    ///   the `TxnCommit` / `TxnAbort` WAL entry (the underlying LN was
+    ///   logged as auto-commit by the cursor, so no synthetic commit
+    ///   record is needed for recovery).
+    /// * Tracks per-record write locks via `WriteLockInfo` exactly like an
+    ///   explicit `Txn`, so [`Self::abort`] / [`Self::abort_collect_undo`]
+    ///   can roll back the in-memory tree write on any error path —
+    ///   closing the first F12 residual.
+    /// * Allocates its locker id from the SAME counter as explicit txns,
+    ///   so deadlocks involving auto-commit and explicit txns no longer
+    ///   report opaque cursor ids.
+    pub fn new_auto(id: i64, lock_manager: Arc<LockManager>) -> Self {
+        Self::new_with_flags(id, lock_manager, IS_AUTO_TXN)
+    }
+
+    /// Returns `true` if this `Txn` was created by
+    /// [`crate::TxnManager::begin_auto_txn`].
+    ///
+    /// Used by [`Self::commit_with_durability`] and [`Self::abort`] to skip
+    /// the `TxnCommit` / `TxnAbort` WAL entry, and by
+    /// [`crate::LockManager::register_locker_label`] callers to label the
+    /// locker as `"auto-txn"` in deadlock diagnostics.
+    pub fn is_auto_txn(&self) -> bool {
+        self.txn_flags & IS_AUTO_TXN != 0
+    }
+
+    /// Returns the locker id of this `Txn`.
+    ///
+    /// Inherent helper so callers do not need the `Locker` trait in scope.
+    pub fn id_as_locker(&self) -> i64 {
+        self.id
+    }
+
+    fn new_with_flags(
+        id: i64,
+        lock_manager: Arc<LockManager>,
+        txn_flags: u8,
+    ) -> Self {
         Txn {
             id,
             lock_manager,
             state: TxnState::Open,
-            txn_flags: 0,
+            txn_flags,
             read_locks: HashSet::new(),
             write_locks: HashMap::new(),
             last_lsn: NULL_LSN.as_u64(),
@@ -246,6 +306,24 @@ impl Txn {
         log_manager: Arc<LogManager>,
     ) -> Self {
         let mut txn = Self::new(id, lock_manager);
+        txn.log_manager = Some(log_manager);
+        txn
+    }
+
+    /// Creates a synthetic auto-commit transaction wired to a LogManager.
+    ///
+    /// Like [`Self::new_auto`] but exposes the LogManager so the auto-txn
+    /// can perform the auto-commit fsync via
+    /// `LogManager::flush_sync_if_needed` from within
+    /// [`Self::commit_with_durability`].  The auto-txn still skips the
+    /// `TxnCommit` / `TxnAbort` WAL entries by virtue of the
+    /// [`IS_AUTO_TXN`] flag.
+    pub fn with_log_manager_auto(
+        id: i64,
+        lock_manager: Arc<LockManager>,
+        log_manager: Arc<LogManager>,
+    ) -> Self {
+        let mut txn = Self::new_auto(id, lock_manager);
         txn.log_manager = Some(log_manager);
         txn
     }
@@ -352,7 +430,7 @@ impl Txn {
         durability: Durability,
         want_sync: bool,
     ) -> Result<Lsn, TxnError> {
-        let assigned_lsn = if self.has_logged_entries() {
+        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
             }
@@ -404,6 +482,24 @@ impl Txn {
             // CommitNoSync: neither flush nor fsync.
 
             commit_lsn
+        } else if self.is_auto_txn() && self.has_logged_entries() {
+            // Auto-commit (synthetic auto-txn): no `TxnCommit` WAL
+            // entry is written, but we still honour the caller's
+            // durability policy for the LN entry that the cursor
+            // already wrote.  `last_lsn` is the LN's LSN.  Closes
+            // the first F12 residual: previously this fsync lived in
+            // `Database::auto_commit_sync`; folding it into
+            // `commit_with_durability` lets one code path serve both
+            // explicit and synthetic-auto txns.
+            let ln_lsn = Lsn::from_u64(self.last_lsn);
+            if want_sync && let Some(ref lm) = self.log_manager {
+                lm.flush_sync_if_needed(ln_lsn).map_err(TxnError::LogError)?;
+            } else if matches!(durability, Durability::CommitWriteNoSync)
+                && let Some(ref lm) = self.log_manager
+            {
+                lm.flush_no_sync().map_err(TxnError::LogError)?;
+            }
+            NULL_LSN
         } else {
             NULL_LSN
         };
@@ -665,7 +761,13 @@ impl Txn {
         // fsyncRequired, repContext) when forceFlush is true (i.e. durability
         // SyncPolicy.SYNC), or logManager.log() otherwise.  We write with
         // fsync=false (NO_SYNC default for aborts) to match default.
-        let assigned_lsn = if self.has_logged_entries() {
+        //
+        // Synthetic auto-txns skip the `TxnAbort` WAL entry: the underlying
+        // LN was logged as auto-commit (`InsertLN` / `DeleteLN` with
+        // `txn_id=0`), so no synthetic abort record is required and the
+        // on-disk WAL format stays identical to pre-Wave-1A auto-commit.
+        // Closes the first F12 residual.
+        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
             let abort = TxnAbort::new(
                 self.id,
                 self.last_lsn,
@@ -736,7 +838,9 @@ impl Txn {
 
         self.state = TxnState::Aborted;
 
-        let assigned_lsn = if self.has_logged_entries() {
+        // Synthetic auto-txns skip the `TxnAbort` WAL entry; see
+        // [`Self::abort`] for rationale.
+        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
             let abort = TxnAbort::new(
                 self.id,
                 self.last_lsn,
