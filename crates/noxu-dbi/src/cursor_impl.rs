@@ -1906,13 +1906,13 @@ impl CursorImpl {
                     Some(b""),
                     self.locker_id,
                 )?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ =
-                            tree.insert(two_part_key.clone(), vec![], new_lsn);
-                    }
-                }
+                // Use apply_tree_insert so the per-database entry counter
+                // is bumped on a new (key, data) pair; otherwise
+                // `Database::count()` (which reads the counter) would stay
+                // at 0 for sorted-dup databases.  BDB-JE
+                // `Database.count()` returns the total number of (key, data)
+                // pairs, including every duplicate.
+                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
@@ -1929,46 +1929,38 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
-                // Delete the old two-part key.
-                self.log_ln_write(&old_key, None, self.locker_id)?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        tree.delete(&old_key);
-                    }
-                }
+                // Delete the old two-part key.  Use apply_tree_delete so
+                // the counter is decremented (it will be re-incremented by
+                // the matching apply_tree_insert below; net change is 0,
+                // matching JE's PutCurrent semantics).
+                let del_lsn =
+                    self.log_ln_write(&old_key, None, self.locker_id)?;
+                self.apply_tree_delete(old_key, del_lsn);
                 // Insert the new two-part key.
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
                 )?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ =
-                            tree.insert(two_part_key.clone(), vec![], new_lsn);
-                    }
-                }
+                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
             }
             PutMode::Overwrite => {
-                // Insert or replace the exact (key, data) pair.
+                // Insert or replace the exact (key, data) pair.  For
+                // sorted-dup databases each unique (key, data) is a
+                // distinct logical record, so a brand-new pair must bump
+                // the per-database entry counter.  apply_tree_insert
+                // checks tree.insert's `is_new` return so an exact-match
+                // re-insert is a no-op for the counter.
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
                 )?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ =
-                            tree.insert(two_part_key.clone(), vec![], new_lsn);
-                    }
-                }
+                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
