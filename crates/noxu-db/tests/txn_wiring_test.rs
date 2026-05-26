@@ -130,3 +130,108 @@ fn f2_read_uncommitted_sees_uncommitted_writes() {
     drop(db);
     Arc::try_unwrap(env).ok().unwrap().close().unwrap();
 }
+
+// ─── F3: env-level durability default is honoured on commit ──────────
+
+#[test]
+fn f3_env_default_durability_no_sync_skips_fsync() {
+    // Open with COMMIT_NO_SYNC; commit a txn with `begin_transaction(None, None)`;
+    // assert the WAL fsync count did not increase.  Pre-fix, every commit
+    // fsynced because TransactionConfig::default().durability ==
+    // COMMIT_SYNC and the env-level durability was never consulted.
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+    let db = open_db(&env, "f3");
+
+    // Drive at least one auto-commit write so the log is initialised
+    // (this fsyncs based on db-level no_sync; we only care about the
+    // delta around the explicit-txn commit below).
+    {
+        let key = DatabaseEntry::from_data(b"warm");
+        let val = DatabaseEntry::from_data(b"up");
+        db.put(None, &key, &val).unwrap();
+    }
+
+    let fsyncs_before = env.stat_fsync_count();
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    let key = DatabaseEntry::from_data(b"k");
+    let val = DatabaseEntry::from_data(b"v");
+    db.put(Some(&txn), &key, &val).unwrap();
+    txn.commit().expect("commit must succeed");
+
+    let fsyncs_after = env.stat_fsync_count();
+    assert_eq!(
+        fsyncs_before,
+        fsyncs_after,
+        "env-level COMMIT_NO_SYNC must not fsync on commit (delta = {})",
+        fsyncs_after - fsyncs_before
+    );
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+#[test]
+fn f3_env_default_durability_sync_does_fsync() {
+    // Sanity: a COMMIT_SYNC env should fsync on commit.
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_SYNC);
+    let db = open_db(&env, "f3");
+
+    // Warm up the log.
+    let warm_key = DatabaseEntry::from_data(b"warm");
+    let warm_val = DatabaseEntry::from_data(b"up");
+    db.put(None, &warm_key, &warm_val).unwrap();
+
+    let fsyncs_before = env.stat_fsync_count();
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    let key = DatabaseEntry::from_data(b"k");
+    let val = DatabaseEntry::from_data(b"v");
+    db.put(Some(&txn), &key, &val).unwrap();
+    txn.commit().unwrap();
+
+    let fsyncs_after = env.stat_fsync_count();
+    assert!(
+        fsyncs_after > fsyncs_before,
+        "COMMIT_SYNC must fsync on commit ({} -> {})",
+        fsyncs_before,
+        fsyncs_after
+    );
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+#[test]
+fn f3_explicit_txn_durability_overrides_env_default() {
+    // When the caller supplies a TransactionConfig with an explicit
+    // durability, that wins over the env default.
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+    let db = open_db(&env, "f3");
+
+    // Warm up.
+    let warm_key = DatabaseEntry::from_data(b"warm");
+    let warm_val = DatabaseEntry::from_data(b"up");
+    db.put(None, &warm_key, &warm_val).unwrap();
+
+    let fsyncs_before = env.stat_fsync_count();
+
+    let cfg = TransactionConfig::new().with_durability(Durability::COMMIT_SYNC);
+    let txn = env.begin_transaction(None, Some(&cfg)).unwrap();
+    let key = DatabaseEntry::from_data(b"k");
+    let val = DatabaseEntry::from_data(b"v");
+    db.put(Some(&txn), &key, &val).unwrap();
+    txn.commit().unwrap();
+
+    let fsyncs_after = env.stat_fsync_count();
+    assert!(
+        fsyncs_after > fsyncs_before,
+        "explicit COMMIT_SYNC must fsync even when env default is COMMIT_NO_SYNC"
+    );
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
