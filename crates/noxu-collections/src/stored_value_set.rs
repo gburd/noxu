@@ -9,14 +9,19 @@ use std::sync::Mutex;
 
 /// A collection view of database values.
 ///
-///
-///
 /// Provides a collection interface over the values stored in a Noxu DB
 /// database. Values are yielded in key-sorted order during iteration.
 ///
 /// Like `StoredMap`, this view maintains an internal key index that
 /// must be populated for iteration support. Use `register_key()` or
 /// `register_keys()` to populate the index.
+///
+/// # v1.5 limitations
+///
+/// All `StoredValueSet` operations are **auto-commit only** — every
+/// fetch issues the underlying `Database` call with `txn = None`.
+/// Threading `Option<&Transaction>` through the API is tracked for
+/// v1.6 (audit findings #1, #3, #4).
 ///
 /// # Example
 /// ```ignore

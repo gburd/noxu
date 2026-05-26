@@ -6,8 +6,6 @@ use noxu_db::{Environment, Transaction};
 
 /// Runs a closure within a transaction with automatic commit/abort.
 ///
-///
-///
 /// The `TransactionRunner` provides a convenient way to execute database
 /// operations within a transaction. It handles:
 /// - Creating the transaction
@@ -15,13 +13,37 @@ use noxu_db::{Environment, Transaction};
 /// - Aborting on error
 /// - Retrying on deadlock (up to `max_retries` times)
 ///
+/// # v1.5 limitations
+///
+/// **The `&Transaction` supplied to the closure cannot be passed to any
+/// `Stored*` collection method in v1.5.**  Every `StoredMap` /
+/// `StoredSortedMap` / `StoredKeySet` / `StoredValueSet` / `StoredList`
+/// operation issues its underlying `Database` call with `txn = None`
+/// (auto-commit), so wrapping a `StoredMap::put` inside
+/// `TransactionRunner::run` does **not** make it transactional — the
+/// outer txn ends up empty and the put commits independently.
+///
+/// `TransactionRunner` therefore stays useful in v1.5 only for code
+/// that drives the raw `noxu_db::Database` / `Cursor` API directly
+/// (passing `Some(txn)` to `db.put` / `db.delete` / `db.open_cursor`).
+/// The runner's deadlock-retry loop and commit/abort discipline are
+/// genuine value there.
+///
+/// Threading the txn into `Stored*` operations is on the v1.6 roadmap
+/// (audit findings #3, #4 — see
+/// `docs/src/internal/sprint-3-collections-restriction.md`).
+///
 /// # Example
 /// ```ignore
 /// use noxu_collections::TransactionRunner;
+/// use noxu_db::DatabaseEntry;
 ///
+/// // v1.5: drive the raw Database API, not Stored* views.
 /// let runner = TransactionRunner::new(&env).with_max_retries(5);
 /// let result = runner.run(|txn| {
-///     // ... database operations using txn ...
+///     let key = DatabaseEntry::from_bytes(b"k");
+///     let val = DatabaseEntry::from_bytes(b"v");
+///     db.put(Some(txn), &key, &val)?;
 ///     Ok(42)
 /// });
 /// ```
