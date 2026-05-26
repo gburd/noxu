@@ -240,11 +240,23 @@ order:
    bulk export; its omission is reasonable for v1.5 but should be
    recorded in `omitted-features.md`.
 
-3. **MEDIUM**: The DPL annotation model (`@Entity`,
-   `@PrimaryKey`, …) is replaced by a manual trait-implementation
-   path. There is no proc-macro derive yet, so users cannot
-   ergonomically declare entities. Per the `noxu-persist` lib.rs
-   docstring this is acknowledged as future work.
+3. **MEDIUM** *(closed in v1.6, Wave 2C-1)*: The DPL annotation
+   model (`@Entity`, `@PrimaryKey`, …) is replaced by a manual
+   trait-implementation path. There is no proc-macro derive yet, so
+   users cannot ergonomically declare entities. Per the
+   `noxu-persist` lib.rs docstring this is acknowledged as future
+   work.
+
+   **Resolution:** the `noxu-persist-derive` crate now ships
+   `#[derive(Entity)]`, `#[derive(PrimaryKey)]`, and
+   `#[derive(SecondaryKey)]` re-exported from `noxu_persist`. Field
+   attributes `#[primary_key]` and `#[secondary_key(name = ...,
+   relate = ..., related_entity = ..., on_related_entity_delete =
+   ...)]` mirror BDB-JE one-for-one. See
+   [`docs/src/internal/wave-2c-1-derive-macro.md`](wave-2c-1-derive-macro.md)
+   for the design and
+   [`docs/src/collections/entity-persistence.md`](../collections/entity-persistence.md)
+   for the user-facing chapter.
 
 4. **HIGH**: Schema evolution (`Mutations`, `Converter`, `Renamer`,
    `Deleter`) has data structures but is not wired into the open path.
