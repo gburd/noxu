@@ -423,3 +423,106 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     cursor.close().unwrap();
     let _ = env.close();
 }
+
+// ---------------------------------------------------------------------------
+// v1.5 Sprint 1 — sorted-dup count + delete regressions
+// ---------------------------------------------------------------------------
+
+/// `Database::count()` reports the total number of (key, data) pairs in a
+/// sorted-duplicate database, including every duplicate.
+///
+/// Regression for v1.5 Sprint 1 finding (Group B, item 1): `put_dup`
+/// previously bypassed the per-database entry counter, so `db.count()`
+/// returned 0 even after inserting many duplicates.
+#[test]
+fn test_database_count_includes_all_dups() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
+    let db = env.open_database(None, "test", &db_cfg).unwrap();
+
+    // Empty: count is 0.
+    assert_eq!(db.count().unwrap(), 0);
+
+    // 5 dups for the same key.
+    let key = DatabaseEntry::from_bytes(b"k");
+    for i in 0u8..5 {
+        db.put(None, &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+    }
+    // Plus 3 more (key, data) pairs under a different key.
+    let key2 = DatabaseEntry::from_bytes(b"k2");
+    for i in 0u8..3 {
+        db.put(None, &key2, &DatabaseEntry::from_bytes(&[i])).unwrap();
+    }
+
+    // Per BDB-JE Database.count() contract: total = 5 + 3 = 8.
+    assert_eq!(
+        db.count().unwrap(),
+        8,
+        "db.count() must include every duplicate pair"
+    );
+
+    // Re-inserting an existing exact (key, data) pair must not double-count.
+    db.put(None, &key, &DatabaseEntry::from_bytes(&[0])).unwrap();
+    assert_eq!(db.count().unwrap(), 8);
+
+    let _ = env.close();
+}
+
+/// `Database::delete(key)` on a sorted-duplicate database removes every
+/// (key, data) pair sharing that key, matching BDB-JE's contract that
+/// `Database.delete(key)` removes EVERY record with the supplied key.
+///
+/// Regression for v1.5 Sprint 1 finding (Group B, item 2): the previous
+/// implementation positioned a cursor on the first dup and deleted only
+/// that one, leaving the rest of the duplicate set intact.
+#[test]
+fn test_database_delete_removes_all_dups() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
+    let db = env.open_database(None, "test", &db_cfg).unwrap();
+
+    // 4 dups under "target" + 2 dups under "keep" (to ensure delete is
+    // scoped to the requested key).
+    let target = DatabaseEntry::from_bytes(b"target");
+    for v in [b"a".as_ref(), b"b", b"c", b"d"] {
+        db.put(None, &target, &DatabaseEntry::from_bytes(v)).unwrap();
+    }
+    let keep = DatabaseEntry::from_bytes(b"keep");
+    for v in [b"x".as_ref(), b"y"] {
+        db.put(None, &keep, &DatabaseEntry::from_bytes(v)).unwrap();
+    }
+    assert_eq!(db.count().unwrap(), 6);
+
+    // Delete the whole "target" duplicate set in one call.
+    let s = db.delete(None, &target).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // No (target, *) record may remain.
+    let mut out = DatabaseEntry::new();
+    let s = db.get(None, &target, &mut out).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "db.delete(target) must remove every dup"
+    );
+
+    // The unrelated key's dups must remain.
+    let mut out = DatabaseEntry::new();
+    let s = db.get(None, &keep, &mut out).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // count() should now reflect only the surviving "keep" pairs.
+    assert_eq!(db.count().unwrap(), 2);
+
+    // A second delete of an absent key must report NotFound.
+    let s = db.delete(None, &target).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+
+    let _ = env.close();
+}
