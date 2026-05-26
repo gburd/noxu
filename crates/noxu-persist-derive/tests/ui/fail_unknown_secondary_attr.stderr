@@ -1,0 +1,5 @@
+error: unrecognised key in `#[secondary_key(...)]`; allowed keys: name, relate, related_entity, on_related_entity_delete
+ --> tests/ui/fail_unknown_secondary_attr.rs:7:52
+  |
+7 |     #[secondary_key(name = "x", relate = OneToOne, bogus_key = "wat")]
+  |                                                    ^^^^^^^^^
