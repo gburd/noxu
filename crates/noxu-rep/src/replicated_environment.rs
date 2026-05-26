@@ -822,11 +822,23 @@ impl ReplicatedEnvironment {
     ///
     /// Applies a log entry received from the master. This is called by the
     /// replica stream handler after receiving an entry from the feeder.
+    ///
+    /// `data` is the wire-encoded log-record payload.  When the
+    /// replicated environment has not been wired to a local
+    /// `noxu_db::Environment` (i.e., before `with_environment` is
+    /// called) the payload is forwarded into the in-memory peer
+    /// scanner so that downstream replicas attached to the
+    /// `PEER_FEEDER` service can re-stream it; the local log is **not**
+    /// updated.  This is documented behaviour rather than a stub — see
+    /// `api-audit-2026-05-rep.md` finding #26 (medium) for the
+    /// `with_environment`-required local-apply path.  Wave 1C audit
+    /// cleanup (rep info F35: `_data` placeholder) renames the leading
+    /// underscore so reviewers don't read it as a TODO.
     pub fn apply_entry(
         &self,
         vlsn: u64,
         entry_type: u8,
-        _data: Vec<u8>,
+        data: Vec<u8>,
     ) -> Result<()> {
         if self.is_shutdown() {
             return Err(RepError::StateError(
@@ -839,7 +851,7 @@ impl ReplicatedEnvironment {
 
         // Push into the peer log scanner so downstream replicas can
         // receive this entry via the PEER_FEEDER service.
-        self.peer_scanner.push(vlsn, entry_type, _data);
+        self.peer_scanner.push(vlsn, entry_type, data);
 
         log::trace!(
             "Applied replicated entry: vlsn={}, type={}",
