@@ -265,7 +265,14 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Searches for the first secondary key >= `search_key`.
     ///
-    ///
+    /// `search_key` is updated in place with the actual key found (which
+    /// may be strictly greater than the input).  See Wave 1C audit
+    /// cleanup (secondary-join “fragile two-step get_search_key_range”
+    /// Low) — the v1.5.0 implementation issued a redundant `Get::Current`
+    /// probe after the SearchGte to re-read the key, which silently
+    /// discarded errors and re-locked the cursor.  The underlying
+    /// `Cursor::get(Get::SearchGte)` already writes the discovered key
+    /// back into `search_key`, so a single call is sufficient.
     pub fn get_search_key_range(
         &mut self,
         search_key: &mut DatabaseEntry,
@@ -280,11 +287,9 @@ impl<'a> SecondaryCursor<'a> {
             return Ok(OperationStatus::NotFound);
         }
 
-        // Update search_key with the actual key found (GTE may advance it).
-        // The inner cursor is now positioned; read current key via a Current call.
-        let mut dummy_data = DatabaseEntry::new();
-        let _ = self.inner.get(search_key, &mut dummy_data, Get::Current, None);
-
+        // `Cursor::get` for SearchGte already wrote the discovered key
+        // back into `search_key`; copy the primary key out of the inner
+        // cursor's data slot and resolve the primary record.
         let pri_key_bytes = stored_pk.get_data().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
