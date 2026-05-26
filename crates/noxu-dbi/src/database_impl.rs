@@ -71,12 +71,6 @@ pub struct DatabaseImpl {
     /// `DatabaseImpl.count` (AtomicLong, updated in
     /// `BIN.insertEntry` / `BIN.deleteEntry`).
     entry_count: Arc<AtomicU64>,
-    /// Key comparator (None = default byte comparison).
-    bt_comparator:
-        Option<Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>>,
-    /// Duplicate comparator (None = default byte comparison).
-    dup_comparator:
-        Option<Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>>,
     /// Per-database operation throughput counters.
     ///
     /// Shared with every CursorImpl opened on this database so that insert,
@@ -164,8 +158,6 @@ impl DatabaseImpl {
             tree: Some(DatabaseTree::new()),
             real_tree: Some(real_tree),
             deferred_write: config.deferred_write,
-            bt_comparator: None,
-            dup_comparator: None,
             entry_count: Arc::new(AtomicU64::new(0)),
             throughput: ThroughputStats::new(),
         }
@@ -363,24 +355,8 @@ impl DatabaseImpl {
         self.max_tree_entries_per_node
     }
 
-    /// Sets a custom key comparator.
-    pub fn set_bt_comparator<F>(&mut self, comparator: F)
-    where
-        F: Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync + 'static,
-    {
-        self.bt_comparator = Some(Box::new(comparator));
-    }
-
-    /// Compares keys using the btree comparator or default byte comparison.
-    pub fn compare_keys(&self, key1: &[u8], key2: &[u8]) -> std::cmp::Ordering {
-        if let Some(ref cmp) = self.bt_comparator {
-            cmp(key1, key2)
-        } else {
-            key1.cmp(key2)
-        }
-    }
-
     /// Serialization.
+    ///
     pub fn log_size(&self) -> usize {
         8 + // id
         4 + self.name.len() + // name (length-prefixed)
@@ -456,8 +432,6 @@ impl DatabaseImpl {
             tree: Some(tree),
             real_tree: Some(real_tree),
             deferred_write: false, // not persisted in log record; set after open if needed
-            bt_comparator: None,
-            dup_comparator: None,
             entry_count: Arc::new(AtomicU64::new(0)),
             throughput: ThroughputStats::new(),
         })
@@ -633,45 +607,6 @@ mod tests {
 
         db.decrement_reference_count();
         assert_eq!(db.reference_count(), 0);
-    }
-
-    #[test]
-    fn test_compare_keys_default() {
-        let config = make_config();
-        let db = DatabaseImpl::new(
-            DatabaseId::new(1),
-            "db".to_string(),
-            DbType::User,
-            &config,
-        );
-
-        assert_eq!(db.compare_keys(b"aaa", b"bbb"), std::cmp::Ordering::Less);
-        assert_eq!(
-            db.compare_keys(b"bbb", b"aaa"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(db.compare_keys(b"aaa", b"aaa"), std::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn test_compare_keys_custom() {
-        let config = make_config();
-        let mut db = DatabaseImpl::new(
-            DatabaseId::new(1),
-            "db".to_string(),
-            DbType::User,
-            &config,
-        );
-
-        // Reverse comparator
-        db.set_bt_comparator(|a, b| b.cmp(a));
-
-        assert_eq!(
-            db.compare_keys(b"aaa", b"bbb"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(db.compare_keys(b"bbb", b"aaa"), std::cmp::Ordering::Less);
-        assert_eq!(db.compare_keys(b"aaa", b"aaa"), std::cmp::Ordering::Equal);
     }
 
     #[test]

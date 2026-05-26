@@ -170,11 +170,19 @@ pub struct SecondaryConfig {
     /// scanned and indexed.
     pub allow_populate: bool,
 
-    /// Foreign key database for referential integrity constraint.
+    /// Foreign key database name for referential integrity constraint.
     ///
-    /// When non-None, every inserted secondary key must exist as a key in this
-    /// database.
-    pub foreign_key_database: Option<*const Database>,
+    /// When `Some(name)`, every inserted secondary key must exist as a
+    /// key in the database with this name.  In v1.5 this field is
+    /// **stored but not enforced** — see Decision 2C and the
+    /// rejection in [`crate::secondary_database::SecondaryDatabase::open`].
+    /// The previous `Option<*const Database>` representation has been
+    /// replaced by an owned database name (Wave 1C audit cleanup,
+    /// secondary-join F16) so that the configuration carries no raw
+    /// pointer and no `unsafe impl Send`.  When v1.6 implements FK
+    /// enforcement the engine will resolve this name to the
+    /// corresponding `Database` handle at open time.
+    pub foreign_key_database_name: Option<String>,
 
     /// Action to take when a referenced foreign key record is deleted.
     pub foreign_key_delete_action: ForeignKeyDeleteAction,
@@ -196,14 +204,6 @@ pub struct SecondaryConfig {
     pub extract_from_primary_key_only: bool,
 }
 
-// SAFETY: foreign_key_database is a raw pointer to a Database whose lifetime
-// is managed by the application.  We only read it (to get the db name /
-// handle) after validating that the secondary is open, so the pointer is
-// valid for the duration of the secondary's lifetime.  SecondaryDatabase
-// itself is not Sync (interior cursor state is not shared), but
-// SecondaryConfig must be Send so it can be moved into threads.
-unsafe impl Send for SecondaryConfig {}
-
 impl SecondaryConfig {
     /// Creates a new SecondaryConfig with default settings.
     ///
@@ -220,7 +220,7 @@ impl SecondaryConfig {
             key_creator: None,
             multi_key_creator: None,
             allow_populate: false,
-            foreign_key_database: None,
+            foreign_key_database_name: None,
             foreign_key_delete_action: ForeignKeyDeleteAction::Abort,
             foreign_key_nullifier: None,
             foreign_multi_key_nullifier: None,
@@ -300,22 +300,30 @@ impl SecondaryConfig {
         self
     }
 
-    /// Sets the foreign key database.
-    ///
-    /// # Safety
-    /// The pointer must remain valid for the lifetime of this config and the
-    /// secondary database that uses it.
+    /// Sets the foreign key database (by name).
     ///
     /// # v1.5 status
     ///
     /// **Decision 2C** in `docs/src/internal/v1.5-decisions-2026-05.md`:
     /// foreign-key constraints are not enforced in v1.5.  This setter
-    /// stores the value on the config but [`SecondaryDatabase::open`]
+    /// stores the value on the config but [`crate::secondary_database::SecondaryDatabase::open`]
     /// rejects any config that has a non-default foreign-key field set.
     /// Full FK support is planned for v1.6 alongside Decision 1B's
     /// sorted-dup secondaries.  See audit findings C2 / F1 / F16.
-    pub fn with_foreign_key_database(mut self, db: &Database) -> Self {
-        self.foreign_key_database = Some(db as *const Database);
+    ///
+    /// # Wave 1C breaking change
+    ///
+    /// The previous signature was `with_foreign_key_database(&Database)`
+    /// which stored a raw `*const Database` pointer and required an
+    /// unsafe `impl Send for SecondaryConfig`.  Since FK is rejected at
+    /// open in v1.5 the pointer was unused and unsafe; the setter now
+    /// takes the foreign DB's name and stores an owned `String`.  v1.6
+    /// will resolve the name to a real handle when FK lands.
+    pub fn with_foreign_key_database<S: Into<String>>(
+        mut self,
+        name: S,
+    ) -> Self {
+        self.foreign_key_database_name = Some(name.into());
         self
     }
 
@@ -440,7 +448,7 @@ impl SecondaryConfig {
     /// for v1.6 alongside Decision 1B's sorted-dup secondaries.  Closes
     /// audit findings C2 / F1 / F16.
     pub(crate) fn has_foreign_key_config(&self) -> bool {
-        self.foreign_key_database.is_some()
+        self.foreign_key_database_name.is_some()
             || self.foreign_key_delete_action != ForeignKeyDeleteAction::Abort
             || self.foreign_key_nullifier.is_some()
             || self.foreign_multi_key_nullifier.is_some()
@@ -1086,23 +1094,17 @@ mod tests {
     /// Exercise with_foreign_key_database builder method.
     #[test]
     fn test_with_foreign_key_database() {
-        use crate::environment::Environment;
-        use crate::environment_config::EnvironmentConfig;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = crate::database_config::DatabaseConfig::new()
-            .with_allow_create(true);
-        let foreign_db =
-            env.open_database(None, "foreign_db", &db_config).unwrap();
-
         let config = SecondaryConfig::new()
             .with_key_creator(Box::new(SimpleKeyCreator))
-            .with_foreign_key_database(&foreign_db);
-        assert!(config.foreign_key_database.is_some());
+            .with_foreign_key_database("foreign_db");
+        assert_eq!(
+            config.foreign_key_database_name.as_deref(),
+            Some("foreign_db")
+        );
+        // Wave 1C audit cleanup (secondary-join F16): the FK database is
+        // now stored as an owned name; no raw pointer or `unsafe impl
+        // Send` is involved.
+        assert!(config.has_foreign_key_config());
     }
 
     /// Comprehensive test exercising ALL local test-struct trait method bodies to
