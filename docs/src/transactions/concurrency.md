@@ -125,7 +125,7 @@ txn2.set_lock_timeout(1000); // 1 second
 
 ---
 
-# Read-Modify-Write Pattern
+## Read-Modify-Write Pattern
 
 If you are reading a record for the purpose of modifying or deleting it, use the
 **read-modify-write** (RMW) pattern. This causes Noxu DB to acquire a **write lock

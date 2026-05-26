@@ -57,7 +57,7 @@ Recommended deployment until these are remediated:
 
 ---
 
-# Quick-reference: `EnvironmentConfig` production defaults
+## Quick-reference: `EnvironmentConfig` production defaults
 
 ```rust
 EnvironmentConfig::new(path)

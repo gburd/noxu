@@ -108,7 +108,7 @@ throughout this guide and are summarized in [Performance Tuning](durability.md).
 
 ---
 
-# 2. Enabling Transactions
+## 2. Enabling Transactions
 
 To use transactions you must:
 
@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-# 3. Transaction Basics
+## 3. Transaction Basics
 
 Once you have a transactional environment and database open, you protect operations
 by acquiring a transaction handle and passing it to the database methods you want
