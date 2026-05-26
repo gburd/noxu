@@ -24,7 +24,7 @@ purely behavioural and rustdoc/mdBook contract changes.
 
 ## Surface area touched
 
-```
+```text
 crates/noxu-db/src/environment.rs                       (Decision 3B)
 crates/noxu-db/src/secondary_config.rs                  (Decision 2C — setter rustdocs + has_foreign_key_config helper)
 crates/noxu-db/src/secondary_database.rs                (Decisions 1B + 2C — module/struct/impl rustdocs, open() FK rejection, insert_sec_key one-to-one)

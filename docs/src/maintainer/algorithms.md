@@ -96,7 +96,7 @@ For n=5: phase1=4, phase2=2 satisfies 4+2>5.
 Inter-arrival time distribution maintained as a sliding window of size N
 (default 1000 samples). Mean μ and variance σ² computed from the window.
 
-```
+```text
 φ(t) = -log10(1 - Φ((t - μ) / σ))
 ```
 

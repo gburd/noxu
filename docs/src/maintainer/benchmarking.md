@@ -67,7 +67,7 @@ SCALES="1K 10K 100K" scripts/run_benchmarks.sh
 
 ## Interpreting Criterion Output
 
-```
+```text
 write_bench/seq_write/1K
     time:   [632.45 µs 634.12 µs 636.23 µs]
     thrpt:  [1572.8 /s 1576.7 /s 1581.8 /s]

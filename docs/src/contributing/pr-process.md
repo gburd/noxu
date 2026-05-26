@@ -2,7 +2,7 @@
 
 ## Branch Naming
 
-```
+```text
 feat/<short-description>       # new feature
 fix/<short-description>        # bug fix
 docs/<short-description>       # documentation only
@@ -18,7 +18,7 @@ Example: `feat/group-commit-wiring`, `fix/bin-delta-chaining`
 Follow the [Conventional Commits](https://www.conventionalcommits.org/)
 specification:
 
-```
+```text
 <type>(<scope>): <short summary in imperative mood>
 
 <optional body explaining the why, not the what>
@@ -32,7 +32,7 @@ Scope (optional): crate name or subsystem, e.g. `noxu-rep`, `cleaner`, `btree`
 
 Examples:
 
-```
+```text
 feat(noxu-rep): add phi accrual failure detector (Hayashibara 2004)
 
 fix(noxu-txn): abort correctly undoes new inserts in undo log

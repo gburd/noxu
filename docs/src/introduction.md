@@ -130,7 +130,7 @@ fn main() -> noxu_db::Result<()> {
 Reference source archives used during development are kept read-only in the
 development tree:
 
-```
+```text
 _/je/       embedded database reference — Java, read-only
 _/nosql/    extended fork with 10 additional capabilities — Java, read-only
 ```
