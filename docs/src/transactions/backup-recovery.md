@@ -26,7 +26,7 @@ The fundamental backup operation is to copy Noxu DB log files (`.ndb` files) to
 safe storage. To restore, copy the files back to the environment directory and
 reopen the environment; normal recovery reconstructs the B-tree automatically.
 
-**Hot Backup (Online)**
+### Hot Backup (Online)
 
 A hot backup is taken while write operations are in progress. Copy all `.ndb` log
 files from the environment directory to your archival location. Files must be
@@ -72,7 +72,7 @@ fn hot_backup(env_dir: &Path, backup_dir: &Path) -> std::io::Result<()> {
 }
 ```
 
-**Offline Backup**
+### Offline Backup
 
 An offline backup guarantees you capture the database including all in-memory cache
 contents at the moment of the backup:
@@ -87,14 +87,14 @@ contents at the moment of the backup:
 4. Copy all `.ndb` log files to the archival location.
 5. Resume normal operations.
 
-**Incremental Backups**
+### Incremental Backups
 
 An incremental backup copies only those log files modified or created since the
 last backup. Track the last log file number included in each backup and on the next
 run copy only files with higher numbers. Most system backup tools support
 incremental backup natively.
 
-**Restore**
+### Restore
 
 To restore from backup:
 

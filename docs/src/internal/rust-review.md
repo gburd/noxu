@@ -11,7 +11,7 @@ for caveats about historical internal documents).
 
 This is a comprehensive Rust port of Noxu DB. The codebase demonstrates **strong architectural discipline** and generally follows Rust idioms well. At the time this review was written, all crates compiled and 2233 tests passed; current counts are higher (see `docs/src/maintainer/testing.md`). The code shows careful attention to concurrency primitives, error handling with `thiserror`, and appropriate use of Rust's type system.
 
-**Overall Grade: B+**
+**Overall Grade:** B+
 
 The port successfully translates complex Java concurrency patterns to Rust while maintaining correctness. However, there are opportunities to make the code more idiomatic and performant through better use of Rust's ownership system, eliminating unnecessary allocations, and leveraging zero-cost abstractions.
 
@@ -21,7 +21,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 1. noxu-util (22 tests)
 
-**Grade: A-**
+**Grade:** A-
 
 **Strengths:**
 
@@ -43,7 +43,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 2. noxu-latch (8 tests)
 
-**Grade: A**
+**Grade:** A
 
 **Strengths:**
 
@@ -67,7 +67,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 3. noxu-config (5 tests)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -90,7 +90,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 4. noxu-log (104 tests, 1 ignored)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -119,7 +119,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 5. noxu-tree (213+17 tests, 1 ignored)
 
-**Grade: B**
+**Grade:** B
 
 **Strengths:**
 
@@ -148,7 +148,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 6. noxu-txn (180 tests, 1 ignored doctest)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -176,7 +176,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 7. noxu-dbi (116 tests)
 
-**Grade: B**
+**Grade:** B
 
 **Strengths:**
 
@@ -202,7 +202,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 8. noxu-evictor (78 tests)
 
-**Grade: A-**
+**Grade:** A-
 
 **Strengths:**
 
@@ -226,7 +226,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 9. noxu-cleaner (181 tests)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -249,7 +249,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 10. noxu-recovery (108 tests)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -272,7 +272,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 11. noxu-engine (78 tests)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -296,7 +296,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 12. noxu-db (271 tests, 2 ignored)
 
-**Grade: B**
+**Grade:** B
 
 **Strengths:**
 
@@ -322,7 +322,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 13. noxu-bind (132 tests)
 
-**Grade: A-**
+**Grade:** A-
 
 **Strengths:**
 
@@ -346,7 +346,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 14. noxu-collections (92 tests)
 
-**Grade: B**
+**Grade:** B
 
 **Strengths:**
 
@@ -371,7 +371,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 15. noxu-persist (148 tests)
 
-**Grade: B+**
+**Grade:** B+
 
 **Strengths:**
 
@@ -394,7 +394,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 16. noxu-rep (445 tests, 2 ignored doctests)
 
-**Grade: B**
+**Grade:** B
 
 **Strengths:**
 
@@ -447,7 +447,7 @@ The port successfully translates complex Java concurrency patterns to Rust while
 
 ### 1. **Zero-copy data paths** (noxu-db, noxu-bind, noxu-collections)
 
-**Impact: High | Effort: Medium**
+**Impact:** High | **Effort:** Medium
 
 Replace `Vec<u8>` with `Bytes` from the bytes crate throughout the stack. This enables cheap cloning and zero-copy slicing. Key areas:
 
@@ -462,7 +462,7 @@ Replace `Vec<u8>` with `Bytes` from the bytes crate throughout the stack. This e
 
 ### 2. **Inline hot path functions** (noxu-tree, noxu-log, noxu-util)
 
-**Impact: High | Effort: Low**
+**Impact:** High | **Effort:** Low
 
 Add `#[inline]` or `#[inline(always)]` to frequently called small functions:
 
@@ -477,7 +477,7 @@ Add `#[inline]` or `#[inline(always)]` to frequently called small functions:
 
 ### 3. **Lock manager blocking** (noxu-txn)
 
-**Impact: High | Effort: High**
+**Impact:** High | **Effort:** High
 
 Implement proper condvar-based waiting in LockManager instead of returning WAIT status. Add:
 
@@ -492,7 +492,7 @@ Implement proper condvar-based waiting in LockManager instead of returning WAIT 
 
 ### 4. **Smart LRU implementation** (noxu-evictor, noxu-log)
 
-**Impact: Medium | Effort: Medium**
+**Impact:** Medium | **Effort:** Medium
 
 Replace Vec-based "LRU" with proper LRU cache:
 
@@ -506,7 +506,7 @@ Replace Vec-based "LRU" with proper LRU cache:
 
 ### 5. **Reduce InNode memory waste** (noxu-tree)
 
-**Impact: Medium | Effort: Medium**
+**Impact:** Medium | **Effort:** Medium
 
 Optimize InNode parallel array allocation:
 
@@ -520,7 +520,7 @@ Optimize InNode parallel array allocation:
 
 ### 6. **Async daemon threads** (noxu-engine)
 
-**Impact: Medium | Effort: High**
+**Impact:** Medium | **Effort:** High
 
 Convert OS thread-based daemons to tokio tasks:
 
@@ -534,7 +534,7 @@ Convert OS thread-based daemons to tokio tasks:
 
 ### 7. **Eliminate duplicate thread_id()** (noxu-latch)
 
-**Impact: Low | Effort: Low**
+**Impact:** Low | **Effort:** Low
 
 Extract thread ID computation to noxu-util and use faster hash:
 
@@ -552,7 +552,7 @@ pub fn fast_thread_id() -> u64 {
 
 ### 8. **DatabaseEntry zero-copy API** (noxu-db)
 
-**Impact: High | Effort: Medium**
+**Impact:** High | **Effort:** Medium
 
 Redesign DatabaseEntry to use Bytes and borrow data:
 
@@ -573,7 +573,7 @@ impl DatabaseEntry {
 
 ### 9. **Safe LogBuffer** (noxu-log)
 
-**Impact: Medium | Effort: High**
+**Impact:** Medium | **Effort:** High
 
 Wrap RawMutex usage in a safer abstraction:
 
@@ -595,7 +595,7 @@ impl<T> LatchHeld<T> {
 
 ### 10. **Configuration Arc-wrapping** (noxu-config)
 
-**Impact: Low | Effort: Low**
+**Impact:** Low | **Effort:** Low
 
 Wrap config values in Arc to avoid clones:
 
