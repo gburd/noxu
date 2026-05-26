@@ -562,3 +562,68 @@ mod prop_txn_visibility {
         }
     }
 }
+
+// ─── F11 / Decision 3B: nested txn rejected with typed Unsupported ────
+
+/// `Environment::begin_transaction(Some(parent), …)` previously dropped the
+/// parent on the floor (the parameter was `_parent`).  Decision 3B in
+/// `docs/src/internal/v1.5-decisions-2026-05.md` makes that case a typed
+/// error so users see a loud, documented failure instead of the silent
+/// BDB-JE-shaped behaviour the published mdBook implied.
+///
+/// The parameter is retained for v1.5 / v1.6 SemVer stability and is
+/// scheduled for removal in v2.0.
+#[test]
+fn f11_nested_transaction_returns_unsupported() {
+    use noxu_db::NoxuError;
+
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+
+    let parent = env.begin_transaction(None, None).unwrap();
+
+    let result = env.begin_transaction(Some(&parent), None);
+    match result {
+        Err(NoxuError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("nested transactions"),
+                "error message should mention nested transactions: {msg}"
+            );
+            assert!(
+                msg.contains("v1.5") && msg.contains("v2.0"),
+                "error message should reference v1.5 and v2.0: {msg}"
+            );
+            assert!(
+                msg.contains("None"),
+                "error message should tell the caller to pass None: {msg}"
+            );
+        }
+        Ok(_) => {
+            panic!("expected NoxuError::Unsupported for nested txn, got Ok")
+        }
+        Err(other) => panic!(
+            "expected NoxuError::Unsupported for nested txn, got: {other:?}"
+        ),
+    }
+
+    // Parent must still be valid (rejection must not leak any state).
+    parent.commit().expect("parent commit must succeed");
+    env.close().expect("env.close() must succeed");
+}
+
+/// `parent = None` continues to work exactly as before — the rejection is
+/// surgical and does not regress the documented happy path.
+#[test]
+fn f11_nested_transaction_none_still_works() {
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    txn.commit().unwrap();
+
+    let cfg = TransactionConfig::new();
+    let txn2 = env.begin_transaction(None, Some(&cfg)).unwrap();
+    txn2.commit().unwrap();
+
+    env.close().expect("env.close() must succeed");
+}
