@@ -1,5 +1,25 @@
 # Introduction
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+>
+> **v1.5 limitations relevant to this chapter:**
+>
+> * **Nested / child transactions are not supported.** Calling
+>   `env.begin_transaction(Some(&parent), …)` returns
+>   `NoxuError::Unsupported`. The `parent` parameter is retained for
+>   forward source compatibility and scheduled for removal in v2.0.
+>   See
+>   [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
+>   Decision 3B and `sprint-3-decisions-enforced.md`.
+> * **Auto-commit “warning” clarification.** Cursors and auto-commit
+>   *do* coexist correctly in v1.5 — auto-commit cursor writes
+>   acquire write locks via the lock manager and block on competing
+>   explicit-txn write/read locks. See
+>   [`sprint-1-followup-f12.md`](../internal/sprint-1-followup-f12.md)
+>   for the verified F12 contract and the two diagnostic gaps that
+>   remain.
+
 This guide provides a thorough introduction to transactions as used with Noxu DB,
 a Rust port of Noxu DB (Noxu DB 7.5.11). It covers the guarantees
 that transactions provide, the application infrastructure required for full
@@ -400,13 +420,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-> **Note:** Auto-commit is not available for cursors. You must always open a
-> cursor with an explicit transaction handle if you want its operations to be
-> transaction-protected.
+> **Note:** Cursors and auto-commit interoperate correctly in v1.5
+> (Sprint 1C / F12). Opening a cursor with `db.open_cursor(None, None)`
+> threads the cursor's writes through the lock manager exactly the
+> same way an explicit-txn cursor does, and auto-commit writes
+> against an unrelated key do not block on an explicit txn's locks.
+> Earlier wording suggested auto-commit was unavailable for cursors;
+> that referred to a v1.4.x bug that has been fixed.
 
-> **Warning:** Never have more than one active transaction in your thread at a
-> time. Mixing an explicit transaction with an auto-commit operation in the same
-> thread can result in undetectable deadlocks.
+> **Warning:** Never have more than one active explicit transaction
+> in your thread at a time. Mixing an explicit transaction with an
+> auto-commit operation in the same thread can result in undetectable
+> deadlocks (the auto-commit cursor's locker id and the txn id are
+> tracked in disjoint id spaces, so a deadlock involving both is
+> reported by raw integer id rather than by transaction name — see
+> `docs/src/internal/sprint-1-followup-f12.md`).
 
 ---
 

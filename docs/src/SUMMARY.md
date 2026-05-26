@@ -16,6 +16,7 @@
   - [Cursors](getting-started/cursors.md)
   - [Secondary Databases](getting-started/secondary-databases.md)
   - [Serialization Bindings](getting-started/bindings.md)
+  - [Migrating from v1.4.x](getting-started/migrating.md)
 
 - [Transaction Processing](transactions/README.md)
   - [Transaction Basics](transactions/basics.md)

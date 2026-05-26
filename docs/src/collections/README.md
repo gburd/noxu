@@ -1,5 +1,8 @@
 # Collections and Persistence
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+
 This chapter covers the higher-level APIs built on top of the core Noxu DB
 key-value store:
 

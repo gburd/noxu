@@ -1,5 +1,9 @@
 # Dynamic Membership
 
+> **v1.5 status — preview.** See
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> and [the chapter overview](README.md).
+
 Noxu DB supports adding and removing nodes from the replication group while
 the group is actively serving traffic.
 
