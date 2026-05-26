@@ -625,22 +625,28 @@ impl Environment {
 
     /// Begins a new transaction.
     ///
-    ///
-    ///
     /// # Arguments
-    /// * `parent` - Optional parent transaction (currently ignored)
+    /// * `parent` - Reserved for nested transactions in a future release.  In
+    ///   v1.5 this argument **must** be `None`; passing `Some(_)` returns a
+    ///   typed [`NoxuError::Unsupported`] error (see Decision 3B in
+    ///   `docs/src/internal/v1.5-decisions-2026-05.md`).  The parameter
+    ///   itself is scheduled for removal in v2.0; until then it is kept on
+    ///   the signature so the v1.6 / v2.0 transition does not require a
+    ///   second SemVer break.
     /// * `config` - Optional transaction configuration
     ///
     /// # Returns
-    /// A new transaction handle
+    /// A new transaction handle.
     ///
     /// # Errors
     /// Returns an error if:
     /// - The environment is closed
     /// - The environment is not transactional
+    /// - `parent` is `Some(_)` ([`NoxuError::Unsupported`]) — closes audit
+    ///   finding F11 (`_parent` was previously dropped on the floor).
     pub fn begin_transaction(
         &self,
-        _parent: Option<&Transaction>,
+        parent: Option<&Transaction>,
         config: Option<&TransactionConfig>,
     ) -> Result<Transaction> {
         self.check_open()?;
@@ -648,6 +654,22 @@ impl Environment {
         if !self.config.transactional {
             return Err(NoxuError::OperationNotAllowed(
                 "Cannot begin transaction on non-transactional environment"
+                    .to_string(),
+            ));
+        }
+
+        // Decision 3B (v1.5-decisions-2026-05.md): nested transactions are
+        // not supported.  Pre-Sprint-3 the parameter was named `_parent` and
+        // silently ignored, which is exactly the F11 audit finding.  We now
+        // reject `Some(_)` with a typed error so users see a loud,
+        // documented failure instead of the BDB-JE-shaped behaviour they
+        // would otherwise expect from the published mdBook.  The parameter
+        // is retained for v1.5 / v1.6 SemVer stability and will be removed
+        // in v2.0.
+        if parent.is_some() {
+            return Err(NoxuError::Unsupported(
+                "nested transactions are not supported in v1.5; pass None \
+                 for parent (planned for v2.0)"
                     .to_string(),
             ));
         }

@@ -1,5 +1,12 @@
 # Secondary Indices with Transactions
 
+> **v1.5 limitations:** see
+> [Getting Started → Secondary Databases → v1.5 limitations](../getting-started/secondary-databases.md#v15-limitations).
+> v1.5 secondaries are one-to-one (Decision 1B); foreign-key constraints
+> are rejected at `SecondaryDatabase::open` (Decision 2C). The chapter
+> below describes the v1.6 contract; the parts that name APIs not yet
+> wired in v1.5 will be rewritten in Sprint 4.
+
 You can use transactions with secondary databases as long as you open the secondary
 database with `with_transactional(true)` in its `SecondaryConfig`. All other
 aspects of using secondary indices with transactions are identical to using them

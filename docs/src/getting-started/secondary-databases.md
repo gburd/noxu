@@ -6,6 +6,42 @@ A secondary database is an index over a primary database. While the primary data
 
 Secondary databases are read-only from your application's perspective — you do not insert into them directly. Instead, whenever you update the primary database, you update the secondary index to reflect the change.
 
+## v1.5 limitations
+
+Noxu DB v1.5 ships **honest one-to-one secondary databases** with the
+following two limitations carried over from
+[`docs/src/internal/v1.5-decisions-2026-05.md`][decisions]:
+
+1. **One-to-one only** (Decision 1B). A given secondary key may map to at
+   most one primary record. Two distinct primary records that produce the
+   same secondary key cause the second `update_secondary` to fail with a
+   typed `NoxuError::Unsupported`. The first primary's mapping is left
+   intact, so the failure is loud and the index does not silently
+   corrupt. Sorted-dup secondaries (many primaries per secondary key, with
+   `JoinCursor` over true duplicate intersections) are planned for v1.6.
+2. **Foreign-key constraints are not enforced** (Decision 2C). Setting
+   any of `SecondaryConfig.foreign_key_database`,
+   `foreign_key_delete_action != Abort`, `foreign_key_nullifier`, or
+   `foreign_multi_key_nullifier` causes `SecondaryDatabase::open` to
+   return `NoxuError::Unsupported`. The fields are accepted by the
+   builder for forward source compatibility (v1.6 will honour them), but
+   the runtime cannot enforce them today, so we surface a typed error at
+   open time rather than silently ignoring user configuration. Full FK
+   support (Abort, Cascade, Nullify) is planned for v1.6 alongside the
+   sorted-dup work, because Cascade and Nullify both depend on the
+   associate-hook that sorted-dup secondaries introduce.
+
+The SecondaryConfig builder methods
+(`with_foreign_key_database`, `with_foreign_key_delete_action`,
+`with_foreign_key_nullifier`, `with_foreign_multi_key_nullifier`) remain
+chainable so user code can be written against the v1.6 surface and
+rejected loudly at open under v1.5 — not silently broken.
+
+See `crates/noxu-db/tests/secondary_decisions_test.rs` for the
+regression tests that demonstrate each rejection.
+
+[decisions]: ../internal/v1.5-decisions-2026-05.md
+
 ## Implementing a Key Creator
 
 A key creator extracts the secondary key from a primary record. Implement the `SecondaryKeyCreator` trait:
