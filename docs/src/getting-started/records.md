@@ -54,7 +54,7 @@ Because `DatabaseEntry` stores raw bytes, you must decide how to encode your app
 
 - **UTF-8 strings** — human-readable, easy for debugging.
 - **`bincode` or `serde` serialization** — compact, works with any `Serialize`/`Deserialize` type.
-- **Noxu bind APIs** — sort-preserving encodings for integers, floats, and strings (described in [Section 8](#8-the-binding-layer)).
+- **Noxu bind APIs** — sort-preserving encodings for integers, floats, and strings (described in [The Binding Layer](bindings.md)).
 - **Custom encoding** — write fields in a fixed order for maximum control over sort order.
 
 Example using `bincode` for a structured value:
