@@ -4,17 +4,34 @@
 //! sequential-access list interface over a Noxu DB database, using
 //! `usize` indices as keys encoded in big-endian byte order.
 
-use crate::error::Result;
+use crate::error::{CollectionError, Result};
 use crate::stored_map::StoredMap;
-use noxu_db::Database;
+use noxu_db::{Database, DatabaseEntry, Get, OperationStatus};
 
 /// A list-like view of a database.
-///
-///
 ///
 /// Elements are stored with their zero-based index encoded as a big-endian
 /// 8-byte key so that iteration order matches insertion order and keys
 /// sort numerically in byte-lexicographic order.
+///
+/// # v1.5 limitations
+///
+/// 1. **Auto-commit only.**  All operations issue the underlying
+///    `Database` call with `txn = None`.  Threading
+///    `Option<&Transaction>` through `push` / `pop` / `get` / `remove`
+///    is on the v1.6 roadmap (audit findings #1, #3, #4).
+///
+/// 2. **`new` does not recover the next-index counter.**  See
+///    [`StoredList::open`] for the reopen-safe constructor.  Calling
+///    `StoredList::new` against a database that already contains
+///    records will start `next_index` at 0 and overwrite existing data
+///    on subsequent `push` calls.  This is documented as the
+///    fast/empty-database path; `open` is the correct path for any
+///    persistent list (audit finding #6).
+///
+/// 3. **`remove` does not compact.**  It is a single-key delete; the
+///    removed index becomes a hole and `next_index` is unchanged
+///    (audit finding #5).
 ///
 /// # Implementation notes
 /// Index gaps created by `remove()` are not compacted; subsequent `push()`
@@ -25,10 +42,15 @@ use noxu_db::Database;
 /// ```ignore
 /// use noxu_collections::StoredList;
 ///
+/// // For a brand-new (or known-empty) database, `new` is fine:
 /// let list = StoredList::new(&db);
 /// list.push(b"first").unwrap();
 /// list.push(b"second").unwrap();
 /// assert_eq!(list.get(0).unwrap(), Some(b"first".to_vec()));
+///
+/// // When reopening a database with existing entries, use `open`:
+/// let list = StoredList::open(&db).unwrap();
+/// // `list.next_index()` is recovered from the largest existing key.
 /// ```
 pub struct StoredList<'db> {
     /// The underlying StoredMap providing key-value storage.
@@ -40,6 +62,13 @@ pub struct StoredList<'db> {
 impl<'db> StoredList<'db> {
     /// Creates a new list view of the given database.
     ///
+    /// **Does not recover the next-index counter.**  This constructor
+    /// is the fast path for brand-new (or known-empty) databases:
+    /// `next_index` starts at 0.  When reopening a database that may
+    /// already contain records, use [`StoredList::open`] instead —
+    /// otherwise the next `push` will overwrite existing records at
+    /// index 0, 1, 2, … silently (audit finding #6).
+    ///
     /// # Arguments
     /// * `db` - The database to provide a list view over
     pub fn new(db: &'db Database) -> Self {
@@ -47,6 +76,68 @@ impl<'db> StoredList<'db> {
             map: StoredMap::new(db, false),
             next_index: std::sync::Mutex::new(0),
         }
+    }
+
+    /// Opens a list view over an existing database, recovering the
+    /// next-index counter from the largest existing key.
+    ///
+    /// `open` walks the underlying database with a single
+    /// `Get::Last` cursor read.  If the database is empty,
+    /// `next_index` is initialised to 0 (matching [`StoredList::new`]).
+    /// If the database already contains records, the largest 8-byte
+    /// big-endian key is decoded as a `u64` and `next_index` is set to
+    /// `last + 1`, so the next `push` lands beyond every existing
+    /// record.
+    ///
+    /// This is the v1.5 fix for audit finding #6 (the previous
+    /// `Mutex<usize>` counter resided only in process memory and
+    /// reset to 0 on every reopen, causing pushes after a restart to
+    /// overwrite existing records).
+    ///
+    /// # Errors
+    ///
+    /// * Returns [`CollectionError::DatabaseError`] if the cursor
+    ///   cannot be opened or the read fails.
+    /// * Returns [`CollectionError::IllegalState`] if the largest key
+    ///   is not 8 bytes long (i.e. the database was not produced by
+    ///   `StoredList`).  In that case the caller must use
+    ///   [`StoredList::new`] explicitly to acknowledge the mixed-use
+    ///   layout, or open a different database.
+    ///
+    /// # Concurrency
+    ///
+    /// `open` is not reentrant against concurrent writers.  Callers
+    /// should ensure the underlying database is quiescent during
+    /// recovery.
+    pub fn open(db: &'db Database) -> Result<Self> {
+        let mut cursor = db.open_cursor(None, None)?;
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let next = match cursor.get(&mut key, &mut data, Get::Last, None)? {
+            OperationStatus::Success => {
+                let bytes = key.get_data().unwrap_or(&[]);
+                if bytes.len() != 8 {
+                    let _ = cursor.close();
+                    return Err(CollectionError::IllegalState(format!(
+                        "StoredList::open: largest key is {} bytes; \
+                         expected an 8-byte big-endian index. Database \
+                         was not produced by StoredList; use \
+                         StoredList::new explicitly if this is intentional.",
+                        bytes.len()
+                    )));
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                let last = u64::from_be_bytes(buf);
+                last.saturating_add(1) as usize
+            }
+            _ => 0,
+        };
+        cursor.close()?;
+        Ok(StoredList {
+            map: StoredMap::new(db, false),
+            next_index: std::sync::Mutex::new(next),
+        })
     }
 
     /// Encodes a `usize` index as an 8-byte big-endian key.
@@ -91,22 +182,32 @@ impl<'db> StoredList<'db> {
         Ok(val)
     }
 
-    /// Removes the value at the given index and re-indexes all higher-indexed
-    /// elements so the list remains contiguous.
+    /// Removes the value at the given index.
     ///
-    /// After removing the element at `index`, every element stored at indices
-    /// `index+1 .. next_index` is read and re-written at the decremented key
-    /// (`old_index - 1`), then the original key is removed.  `next_index` is
-    /// decremented by 1.
+    /// **No compaction.**  This is a single-key delete: the slot at
+    /// `index` becomes a hole, every higher index keeps its slot, and
+    /// `next_index` is unchanged.  This matches the BDB-JE
+    /// `StoredContainer.removeKey()` shape.
     ///
-    /// `StoredList.remove(int index)`: the re-numbers all higher-
-    /// indexed entries so that gaps are never left in the list.
+    /// `next_index` is *not* decremented here; subsequent `push` calls
+    /// continue from the previous high-water mark rather than re-using
+    /// the freed slot.  Use [`StoredList::pop`] if you want to remove
+    /// the highest-index element and reclaim its slot.
     ///
-    /// Returns the removed value, or `None` if no value was at that index.
+    /// # v1.5 limitation
+    ///
+    /// The compaction / re-indexing semantics described in earlier
+    /// release-candidate rustdoc were aspirational and were never
+    /// implemented; the audit (May 2026, finding #5) flagged the
+    /// rustdoc-vs-body mismatch.  Compaction moves to v1.6 alongside
+    /// the broader typed-API work.
+    ///
+    /// # Returns
+    ///
+    /// The removed value, or `None` if no value was stored at `index`.
     pub fn remove(&self, index: usize) -> Result<Option<Vec<u8>>> {
-        // remove deletes the element at the given index
-        // but does NOT compact / re-index remaining elements.  Gaps are left
-        // in the index, consistent with behaviour.
+        // Single-key delete; gaps remain in the index, matching
+        // BDB-JE StoredContainer.removeKey().  See rustdoc above.
         let key = Self::index_to_key(index);
         self.map.remove(&key)
     }
@@ -240,13 +341,40 @@ mod tests {
         let removed = list.remove(1).unwrap();
         assert_eq!(removed, Some(b"beta".to_vec()));
 
-        // StoredList.remove(int) does a simple cursor delete at the key —
-        // no re-indexing / compaction.  Gaps remain at the removed index.
-        // StoredContainer.removeKey() is a cursor delete only.
+        // remove() is a single-key delete — no re-indexing / compaction.
+        // Gaps remain at the removed index and `next_index` is unchanged.
+        // (Audit finding #5 — rustdoc was wrong before sprint 3C.)
         assert_eq!(list.get(0).unwrap(), Some(b"alpha".to_vec()));
         assert_eq!(list.get(1).unwrap(), None); // gap — not compacted
         assert_eq!(list.get(2).unwrap(), Some(b"gamma".to_vec()));
         assert_eq!(list.len().unwrap(), 2);
+        assert_eq!(
+            list.next_index(),
+            3,
+            "remove() must not decrement next_index",
+        );
+    }
+
+    #[test]
+    fn test_remove_does_not_reclaim_slot_on_push() {
+        // Regression for the audit-#5 rustdoc-vs-body mismatch.  The
+        // documented contract is that remove() leaves a hole and the
+        // next push continues at next_index, not at the freed slot.
+        let (_td, _env, db) = setup_env_and_db();
+        let list = StoredList::new(&db);
+
+        list.push(b"a").unwrap(); // 0
+        list.push(b"b").unwrap(); // 1
+        list.push(b"c").unwrap(); // 2
+        list.remove(1).unwrap();
+
+        let idx = list.push(b"d").unwrap();
+        assert_eq!(
+            idx, 3,
+            "push after remove must use next_index, not the freed slot",
+        );
+        assert_eq!(list.get(1).unwrap(), None, "gap must remain");
+        assert_eq!(list.get(3).unwrap(), Some(b"d".to_vec()));
     }
 
     #[test]
