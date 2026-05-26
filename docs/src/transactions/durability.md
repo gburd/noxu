@@ -4,7 +4,7 @@ Noxu DB provides fine-grained control over how writes are persisted to disk
 and acknowledged. The key types are `SyncPolicy`, `DurabilityPolicy`, and
 `ReplicaAckPolicy` (for replicated environments).
 
-# Performance Tuning
+## Performance Tuning
 
 The use of transactions introduces overhead that non-transactional applications
 do not incur. Key tuning considerations:

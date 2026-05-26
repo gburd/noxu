@@ -26,3 +26,9 @@ MD029:
 # spacing was not enforced.  Disable to keep the existing tables
 # unchanged.
 MD060: false
+
+# mdBook SUMMARY.md uses multiple H1 headings as part separators
+# (see https://rust-lang.github.io/mdBook/format/summary.html).
+# All content pages have a single H1; the rule cannot be applied
+# selectively from .markdownlint.yaml, so it is disabled globally.
+MD025: false

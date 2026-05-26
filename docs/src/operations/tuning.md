@@ -31,7 +31,7 @@ env.checkpoint(Some(CheckpointConfig::new().with_force(true)))?;
 
 ---
 
-# 4. Cleaner Tuning
+## 4. Cleaner Tuning
 
 The log cleaner reclaims disk space by copying live records out of
 under-utilized log files and then deleting those files.
