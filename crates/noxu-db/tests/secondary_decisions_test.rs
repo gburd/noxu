@@ -252,7 +252,7 @@ fn d2c_foreign_key_database_rejected_at_open() {
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
-        .with_foreign_key_database(&foreign);
+        .with_foreign_key_database("foreign");
 
     let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
     match result {
