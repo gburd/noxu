@@ -587,3 +587,315 @@ fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
         .unwrap();
     assert_eq!(st, OperationStatus::NotFound);
 }
+
+// ─── Wave 1B — SecondaryCursor::delete cascade honours its txn ─────
+//
+// These tests exercise the residual F5 sub-item the Sprint 4½ agent
+// flagged: `SecondaryCursor::delete` cascades both the secondary
+// cleanup *and* the primary delete, but pre-Wave-1B those two writes
+// always ran auto-committed because the cursor did not store its txn
+// handle.  An aborted user txn could therefore destroy primary +
+// secondary records that the user expected to be rolled back.
+//
+// Wave 1B threads the txn into `SecondaryCursor` and forwards it to
+// every primary `get` / `delete` and to `delete_all_for_primary`.
+
+/// Opening a `SecondaryCursor` under a txn, calling `delete()`, then
+/// aborting the txn must leave **both** the primary record and the
+/// secondary index entry intact.  Pre-Wave-1B the cascade ran
+/// auto-committed and the records were gone irrespective of the abort.
+#[test]
+fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+
+    // Seed: commit a primary + secondary record.
+    {
+        let seed = env.begin_transaction(None, None).unwrap();
+        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
+        seed.commit().unwrap();
+    }
+
+    // Sanity: the seeded record is visible.
+    {
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = sec
+            .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    }
+
+    // Open a cursor under a txn, position on the secondary entry,
+    // call delete (cascades to primary + secondary cleanup), then
+    // abort.
+    let txn = env.begin_transaction(None, None).unwrap();
+    {
+        let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = cursor
+            .get_search_key(
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+
+        let del_st = cursor.delete().unwrap();
+        assert_eq!(
+            del_st,
+            OperationStatus::Success,
+            "cursor.delete must report success while the txn is live"
+        );
+
+        // The cursor's own txn sees the cascade as already applied.
+        let mut p_key2 = DatabaseEntry::new();
+        let mut data2 = DatabaseEntry::new();
+        let probe_st = sec
+            .get(
+                Some(&txn),
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key2,
+                &mut data2,
+            )
+            .unwrap();
+        assert_eq!(
+            probe_st,
+            OperationStatus::NotFound,
+            "the cursor's own txn must observe the cascade as applied"
+        );
+
+        cursor.close().unwrap();
+    }
+
+    // Abort: both sides of the cascade must roll back.
+    txn.abort().unwrap();
+
+    // Primary record is back.
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    let mut data = DatabaseEntry::new();
+    let pri_status = primary.lock().get(None, &pk1, &mut data).unwrap();
+    assert_eq!(
+        pri_status,
+        OperationStatus::Success,
+        "primary record must survive the abort \
+         (Wave 1B: pre-fix the cascade auto-committed and \
+         destroyed the primary irrespective of the abort)"
+    );
+    assert_eq!(data.get_data().unwrap(), b"Apple");
+
+    // Secondary entry is back.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let sec_status = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(
+        sec_status,
+        OperationStatus::Success,
+        "secondary entry must survive the abort \
+         (Wave 1B: pre-fix the cascade auto-committed and \
+         destroyed the secondary irrespective of the abort)"
+    );
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Apple");
+}
+
+/// Same cascade flow but committing the txn must persist the deletes
+/// of **both** the primary record and the secondary index entry.
+#[test]
+fn wave1b_cursor_delete_cascade_commits_both_sides() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+
+    // Seed.
+    {
+        let seed = env.begin_transaction(None, None).unwrap();
+        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
+        put_under_txn(&primary, &sec, &seed, b"pk2", b"Banana");
+        seed.commit().unwrap();
+    }
+
+    // Cursor under a txn: delete the 'A' entry, commit.
+    let txn = env.begin_transaction(None, None).unwrap();
+    {
+        let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = cursor
+            .get_search_key(
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        cursor.delete().unwrap();
+        cursor.close().unwrap();
+    }
+    txn.commit().unwrap();
+
+    // 'A' / pk1 is gone on both sides.
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    let mut data = DatabaseEntry::new();
+    let pri_status = primary.lock().get(None, &pk1, &mut data).unwrap();
+    assert_eq!(pri_status, OperationStatus::NotFound);
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let sec_status = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(sec_status, OperationStatus::NotFound);
+
+    // 'B' / pk2 is untouched.
+    let pk2 = DatabaseEntry::from_bytes(b"pk2");
+    let mut data = DatabaseEntry::new();
+    let pri_status = primary.lock().get(None, &pk2, &mut data).unwrap();
+    assert_eq!(pri_status, OperationStatus::Success);
+    assert_eq!(data.get_data().unwrap(), b"Banana");
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let sec_status = sec
+        .get(None, &DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(sec_status, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk2");
+}
+
+/// While txn A holds an uncommitted `cursor.delete()`, an unrelated
+/// reader must not silently observe a *committed* state in which the
+/// cascade succeeded.  v1.5 is lock-based without MVCC, so the
+/// documented contract (mirrored in
+/// `s4h_uncommitted_secondary_write_is_not_visible_to_other_readers`)
+/// permits three outcomes for a probe against a record currently held
+/// under a write-lock: read the pre-delete committed value, surface a
+/// typed lock-conflict error, or return `NotFound` because the
+/// in-flight LN points at a tombstone.  What the engine MUST NOT do
+/// is leak a *commit* of the cascade out from under txn A — i.e.
+/// after txn A aborts, every other observer must see the original
+/// pre-delete state.  This pins the rollback semantics across the
+/// concurrency boundary.
+#[test]
+fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+
+    // Seed.
+    {
+        let seed = env.begin_transaction(None, None).unwrap();
+        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
+        seed.commit().unwrap();
+    }
+
+    // Stage the cascade under a txn but DO NOT commit.
+    let txn = env.begin_transaction(None, None).unwrap();
+    let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = cursor
+        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    cursor.delete().unwrap();
+
+    // Auto-commit reader from the outside.  The v1.5 lock-based
+    // contract permits any of: pre-delete value, NotFound (LN points
+    // at the in-flight tombstone), or typed lock-conflict error.  We
+    // tolerate all three; the *commit*-leak that would prove the
+    // cascade ran auto-committed is impossible here because we never
+    // committed the txn — but we still record the observed outcome
+    // so that the post-abort assertion below has something to compare
+    // against.
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    let mut probe_data = DatabaseEntry::new();
+    let _during_txn = primary.lock().get(None, &pk1, &mut probe_data);
+
+    cursor.close().unwrap();
+    txn.abort().unwrap();
+
+    // After abort: every other observer (auto-commit and a fresh
+    // reader txn alike) must see the seeded record intact.  This is
+    // the real isolation contract Wave 1B closes — pre-Wave-1B the
+    // cascade auto-committed during the in-flight txn, so the
+    // post-abort state could be missing the primary even though the
+    // user explicitly aborted.
+    let mut data = DatabaseEntry::new();
+    let after_pri = primary.lock().get(None, &pk1, &mut data).unwrap();
+    assert_eq!(
+        after_pri,
+        OperationStatus::Success,
+        "after abort, the primary record must be intact for every \
+         observer (Wave 1B / audit F5)"
+    );
+    assert_eq!(data.get_data().unwrap(), b"Apple");
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let after_sec = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(
+        after_sec,
+        OperationStatus::Success,
+        "after abort, the secondary entry must be intact for every \
+         observer (Wave 1B / audit F5)"
+    );
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Apple");
+}
+
+/// Happy-path regression: the existing pattern of `open_cursor(None,
+/// None)` followed by `cursor.delete()` still cascades and still
+/// auto-commits both sides, matching the v1.4 behaviour.  This pins
+/// the auto-commit branch so a future refactor of the txn plumbing
+/// does not regress it.
+#[test]
+fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+    drop(env); // env not needed for the auto-commit path
+
+    // Seed (auto-commit).
+    {
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        let v = DatabaseEntry::from_bytes(b"Apple");
+        primary.lock().put(None, &pk, &v).unwrap();
+        sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
+    }
+
+    // Auto-commit cursor delete.
+    let mut cursor = sec.open_cursor(None, None).unwrap();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = cursor
+        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    let del_st = cursor.delete().unwrap();
+    assert_eq!(del_st, OperationStatus::Success);
+    cursor.close().unwrap();
+
+    // Both sides auto-committed gone (no txn to abort).
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        primary.lock().get(None, &pk1, &mut data).unwrap(),
+        OperationStatus::NotFound
+    );
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+}
