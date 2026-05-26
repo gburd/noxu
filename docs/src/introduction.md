@@ -3,6 +3,71 @@
 Noxu DB is an embedded, transactional key-value database written in Rust. It is
 being idiomatic Rust with zero unsafe code in library logic.
 
+## v1.5 capability matrix
+
+This matrix is the canonical statement of what v1.5 actually delivers.
+It was reconciled against the May 2026 API audits
+(`docs/src/internal/api-audit-2026-05-rep.md`,
+`docs/src/internal/je-port-audit-2026-05-overview.md`) and the
+Sprint 1–3 restriction notes
+(`docs/src/internal/sprint-1-followup-f12.md`,
+`docs/src/internal/sprint-3-xa-restriction.md`,
+`docs/src/internal/sprint-3-dpl-restriction.md`,
+`docs/src/internal/sprint-3-collections-restriction.md`,
+`docs/src/internal/sprint-3-decisions-enforced.md`).
+
+| Feature | v1.5 | v1.6 (planned) | v2.0 (planned) |
+|---|---|---|---|
+| Single-process transactional KV          | ✅ | ✅ | ✅ |
+| Sorted-duplicate values (primary DB)     | ✅ | ✅ | ✅ |
+| One-to-one secondary indexes (manual maintenance) | ✅ | ✅ (auto via `associate()`) | ✅ |
+| `Cursor::get` with `Get::SearchGte` / range scans | ✅ | ✅ | ✅ |
+| `Cursor::get` with `Get::Search` / `SearchBoth` (validated on non-dup) | ✅ | ✅ | ✅ |
+| `Cursor::get` with `Get::SearchLte` / `FirstDup` / `LastDup` | ❌ (`NoxuError::Unsupported`) | ⚠️ planned | ✅ |
+| `Cursor::get` with `Get::NextDup` / `PrevDup` on non-dup DB | ❌ (`NotFound`) | ✅ | ✅ |
+| Read-uncommitted isolation (env + per-txn config) | ✅ (honoured) | ✅ | ✅ |
+| Auto-commit + explicit-txn co-existence | ✅ | ✅ | ✅ |
+| Auto-commit through cursor with proper lock manager | ✅ (Sprint 1C / F12 verified) | ✅ | ✅ |
+| Cursor on `Database` honours `Some(&txn)`         | ✅ (Sprint 1C) | ✅ | ✅ |
+| Cursor on `SecondaryDatabase` honours `Some(&txn)` | ✅ (Sprint 1C) | ✅ | ✅ |
+| `Database::count()` correct on sorted-dup         | ✅ | ✅ | ✅ |
+| `Database::delete(key)` removes all dups          | ✅ | ✅ | ✅ |
+| `Environment::close()` after `txn.commit()`       | ✅ (Sprint 1) | ✅ | ✅ |
+| `EnvironmentConfig::durability` honoured          | ✅ (Sprint 1) | ✅ | ✅ |
+| `TransactionConfig::read_uncommitted` honoured    | ✅ (Sprint 1) | ✅ | ✅ |
+| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ |
+| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ |
+| Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ | ✅ |
+| Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ | ✅ |
+| `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
+| Atomic primary + secondary writes under one txn | ❌ (`update_secondary` is auto-commit) | ✅ | ✅ |
+| Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter scheduled for removal) |
+| `Stored*` collections under explicit txn          | ❌ (auto-commit only; `TransactionRunner` does not drive `Stored*`) | ✅ | ✅ |
+| Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ❌ (the documented surface; never implemented — use `&[u8]`-keyed surface) | ✅ | ✅ |
+| `StoredList::next_index` persistent across reopen | ✅ (via `StoredList::open`; `StoredList::new` resets) | ✅ | ✅ |
+| `StoredList::remove` compacts the freed slot      | ❌ (single-key delete; documented hole) | ✅ | ✅ |
+| `SerdeBinding` version-checking (2-byte magic + version header) | ✅ (breaking on-disk vs pre-Sprint-3 builds) | ✅ | ✅ |
+| Schema evolution for `SerdeBinding` (read older struct shapes) | ❌ (header catches inter-format drift only) | ✅ | ✅ |
+| DPL primary-index reads/writes participate in user txn (`PrimaryIndex::{put,get,delete,…}(txn, …)`) | ✅ (Sprint 3B — BREAKING source-level signature change) | ✅ | ✅ |
+| DPL secondary indexes are durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ | ✅ |
+| DPL secondary updates atomic with user txn        | ❌ (`PersistError::SecondariesNotTransactional` warning) | ✅ | ✅ |
+| Replication — single-process election test, 2-node sync, FPaxos shape | preview | refined | GA |
+| `ReplicaAckPolicy` honoured on commit             | ❌ (config not plumbed; commits return after local fsync) | ⚠️ planned | ✅ |
+| Election driver wired into `ReplicatedEnvironment` | ❌ (constructor sits in `Detached` until `become_master`) | ⚠️ | ✅ |
+| Network restore via dispatcher (`ReplicatedEnvironment` bootstrap) | ❌ (broken framing; standalone path works) | ⚠️ | ✅ |
+| Acceptor promise persistent across restart        | ❌ (Stateright spec doesn’t match impl) | ⚠️ | ✅ |
+| `transfer_master` / `shutdown_group` operator APIs | ❌ (silently no-op) | ⚠️ | ✅ |
+
+Legend: ✅ supported, ❌ not supported in that release,
+⚠️ partial / preview — see the cited audit or sprint note for
+the exact scope.
+
+The replication rows reflect the May 2026 noxu-rep audit's
+[GA-blocker list (10 items)](internal/api-audit-2026-05-rep.md)
+and are unchanged by Sprints 1–3, which did not touch noxu-rep.
+Replication is **preview / proof-of-concept** in v1.5 and is not
+recommended for production.
+
 ## Quick Start
 
 Add Noxu DB to your project:
