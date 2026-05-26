@@ -1,5 +1,8 @@
 # Secondary Databases
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+
 ## What is a Secondary Database?
 
 A secondary database is an index over a primary database. While the primary database stores your canonical records keyed by a primary key (e.g., employee ID), a secondary database stores an additional mapping from some derived key (e.g., department name) to the primary key.

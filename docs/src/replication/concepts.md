@@ -1,5 +1,11 @@
 # Noxu Replication — Design and Implementation
 
+> **v1.5 status — preview.** See
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> and [the chapter overview](README.md). The design below is the
+> intended end-state and is largely correct as a specification; the
+> production binary in v1.5 has 10 GA blockers tracked in the audit.
+
 ## Overview
 
 Noxu replication provides multi-node active/passive Paxos-based replication across
