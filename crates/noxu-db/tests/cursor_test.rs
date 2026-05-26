@@ -900,3 +900,100 @@ fn cursor_search_gte_oracle_brute_force_small_random() {
         }
     }
 }
+
+// ─── Sprint 1 / Group A — Cursor non-dup hygiene ──────────────────────────────
+//
+// Regression tests for the audit findings tracked in
+// `docs/src/internal/api-audit-2026-05-cursor.md`:
+//
+//   * Finding 5 — `Get::NextDup` / `Get::PrevDup` on a non-sorted-dup DB
+//     must return `NotFound` rather than silently degenerating into plain
+//     `Next` / `Prev`.
+//   * Finding 4 — `Get::SearchBoth` on a non-sorted-dup DB must validate the
+//     stored data against the user-supplied data, not ignore it.
+//   * Finding 3 — `Get::SearchLte` / `Get::FirstDup` / `Get::LastDup` are not
+//     yet implemented and must surface a typed `Unsupported` error rather
+//     than silently returning `NotFound`.
+
+#[test]
+fn cursor_next_dup_on_non_dup_db_returns_not_found() {
+    // Audit Finding 5: `Get::NextDup` on a non-sorted-dup DB must NOT
+    // advance the cursor to the next *different* key.  BDB-JE semantics:
+    // every key has exactly one record on a non-dup DB, so there is no
+    // "next duplicate" of the current position.
+    //
+    // Pre-fix behaviour: returned `Success` with the cursor moved to
+    // ("b", "2") because `apply_dup_filter` is gated on `is_sorted_dup()`
+    // and is skipped on non-dup DBs, leaving the cursor on the next slot.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "next_dup_non_dup");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"a"),
+        &DatabaseEntry::from_bytes(b"1"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"b"),
+        &DatabaseEntry::from_bytes(b"2"),
+    )
+    .unwrap();
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::from_bytes(b"a");
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // The bug: pre-fix this returned Success with key == "b".
+    let s = cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "Get::NextDup on non-dup DB must return NotFound; got key={:?}",
+        key.get_data()
+    );
+}
+
+#[test]
+fn cursor_prev_dup_on_non_dup_db_returns_not_found() {
+    // Companion to the above: `Get::PrevDup` on a non-sorted-dup DB must
+    // also return `NotFound` rather than walking to the previous record.
+    //
+    // We position with `Get::Last` (not `Get::Search`) so the cursor sits
+    // on the second slot in the BIN — otherwise the fast-path falls off
+    // the left edge naturally and the bug is masked.
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "prev_dup_non_dup");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"a"),
+        &DatabaseEntry::from_bytes(b"1"),
+    )
+    .unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"b"),
+        &DatabaseEntry::from_bytes(b"2"),
+    )
+    .unwrap();
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let s = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    assert_eq!(key.data(), b"b");
+
+    // The bug: pre-fix this returned Success with key == "a".
+    let s = cursor.get(&mut key, &mut data, Get::PrevDup, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "Get::PrevDup on non-dup DB must return NotFound; got key={:?}",
+        key.get_data()
+    );
+}

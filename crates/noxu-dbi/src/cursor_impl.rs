@@ -1283,6 +1283,19 @@ impl CursorImpl {
 
         let is_dup = self.is_sorted_dup();
 
+        // BDB-JE contract: NEXT_DUP / PREV_DUP advance only within the
+        // duplicate-set of the current key.  On a non-sorted-dup database
+        // every key has exactly one record, so there can never be another
+        // duplicate of the current position — the only correct answer is
+        // NotFound.  Without this early-return, the dup-filter below is
+        // gated on `is_dup` and the cursor would silently degenerate into
+        // plain Next / Prev semantics, returning the next *different* key
+        // and violating the documented contract.  See
+        // `docs/src/internal/api-audit-2026-05-cursor.md` Finding 5.
+        if !is_dup && matches!(mode, GetMode::NextDup | GetMode::PrevDup) {
+            return Ok(OperationStatus::NotFound);
+        }
+
         // For NextDup/PrevDup/NextNoDup/PrevNoDup, capture the primary key of
         // the current position before advancing.
         let current_primary_key: Option<Vec<u8>> = if is_dup {
