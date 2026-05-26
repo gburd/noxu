@@ -203,7 +203,7 @@ load-optimal selection.
 
 ### References
 
-- Naor, M., & Wool, A. (1998). The Load, Capacity, and Availability of Quorum Systems. *SIAM J. Comput.*, 27(2), 423-447.
+- Naor, M., & Wool, A. (1998). The Load, Capacity, and Availability of Quorum Systems. *SIAM J. Computing*, 27(2), 423-447.
 - Thomas, R. H. (1979). A Majority Consensus Approach to Concurrency Control. *ACM TODS*, 4(2), 180-209.
 - Burd, G. rs-quoracle. https://codeberg.org/gregburd/rs-quoracle
 

@@ -121,7 +121,7 @@ Naor & Wool's load and availability metrics computed for each candidate
 quorum to guide LP objective.
 
 **Reference**: Naor, M. & Wool, A. (1998). *The Load, Capacity, and
-Availability of Quorum Systems*. SIAM J. Comput.
+Availability of Quorum Systems*. SIAM J. Computing.
 
 ## CBVLSN — Committed Barrier VLSN
 
