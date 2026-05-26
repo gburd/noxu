@@ -6,14 +6,20 @@
 > **v1.5 limitations:** see
 > [Getting Started → Secondary Databases → v1.5 limitations](../getting-started/secondary-databases.md#v15-limitations).
 > v1.5 secondaries are one-to-one (Decision 1B); foreign-key constraints
-> are rejected at `SecondaryDatabase::open` (Decision 2C); the
-> BDB-JE-style `associate()` hook and `populate_secondaries` are **not**
-> implemented in v1.5 (planned for v1.6); and `update_secondary` runs
-> auto-committed even when the primary write is under a user
-> transaction. **You cannot make a primary write and its secondary
-> update atomic in v1.5.** This chapter documents the partial-atomicity
-> contract honestly so you can decide whether v1.5 secondaries are
-> acceptable for your workload.
+> are rejected at `SecondaryDatabase::open` (Decision 2C); and the
+> BDB-JE-style automatic `associate()` hook plus the matching
+> `populate_secondaries` helper are **not** implemented in v1.5
+> (planned for v1.6).
+>
+> **Sprint 4½ update:** as of v1.5, `SecondaryDatabase::update_secondary`
+> takes an explicit `Option<&Transaction>`. When you thread the *same*
+> `txn` through both `Database::put` and
+> `SecondaryDatabase::update_secondary`, the primary write and the
+> secondary index update are **atomic** — committing or aborting the
+> txn commits or rolls back both sides together. The earlier
+> partial-atomicity caveat ("`update_secondary` runs auto-committed
+> even when the primary write is under a user transaction") no longer
+> applies to the manual-update pattern.
 
 ## What v1.5 actually does
 
@@ -31,18 +37,20 @@ v1.5 surface is:
 * `secondary.open_cursor(Some(&txn), config)` — secondary reads
   participate in `txn` correctly in v1.5 (Sprint 1C threaded the
   argument through; pre-1.5 release candidates silently ignored it).
-* `secondary.update_secondary(pri_key, old_data, new_data)` —
-  application-driven secondary maintenance. **Does not take a
-  transaction**: it runs auto-committed, even when the surrounding
-  primary write is under an explicit user txn. v1.5 has no
-  `associate()` hook, so the application must call
+* `secondary.update_secondary(Some(&txn), pri_key, old_data, new_data)`
+  — application-driven secondary maintenance. **Takes a transaction**
+  as the leading argument as of Sprint 4½; pass the same `txn` you used
+  for the primary write to make both sides atomic, or pass `None` to
+  run the secondary update auto-committed (the v1.4 / pre-rc shape).
+  v1.5 has no `associate()` hook, so the application must still call
   `update_secondary` after every primary `put` / `delete`.
 
-The atomicity gap is the same shape as the in-memory DPL secondary
-limitation tracked in
+What v1.6 still owes you: an automatic `associate()` hook so
+`Database::put` itself drives every attached secondary inside the
+caller's transaction. The same shape as the in-memory DPL secondary
+gap tracked in
 [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md);
-both close together in v1.6 alongside Decision 1's sorted-dup +
-`associate` work.
+both close together in v1.6 alongside Decision 1's sorted-dup work.
 
 ## Opening a secondary on a transactional environment
 
@@ -90,7 +98,7 @@ fn open_transactional_secondary(
 }
 ```
 
-## Read path: cursors do honour the transaction
+## Read path: cursors honour the transaction
 
 Secondary reads under a user transaction work as expected. Open the
 cursor with `Some(&txn)` and close it before committing or aborting:
@@ -114,11 +122,13 @@ cursor.close()?;       // close before commit/abort
 txn.commit()?;
 ```
 
-## Write path: best-effort atomicity in v1.5
+## Write path: atomic primary + secondary in v1.5 (Sprint 4½)
 
-Because `update_secondary` is auto-committed, the recommended pattern
-is to commit the primary first under your txn, then call
-`update_secondary` from outside the txn:
+The canonical pattern is to thread the *same* transaction through
+both `Database::put` and `SecondaryDatabase::update_secondary`. Both
+operations run inside the same lock set and commit (or abort)
+together — there is no window where the primary record exists
+without its secondary index entry, or vice versa.
 
 ```rust
 use noxu_db::DatabaseEntry;
@@ -126,45 +136,88 @@ use noxu_db::DatabaseEntry;
 let key = DatabaseEntry::from_bytes(b"alice");
 let new_value = DatabaseEntry::from_bytes(b"Engineering|Senior Engineer");
 
-// Read the previous primary record (auto-commit) so we know the old
-// secondary key.
+// Read the previous primary record so we know the old secondary key.
+// (Reads can be auto-commit or under the same txn; either works.)
 let old_value = primary.lock().get(None, &key)?;
 
-// Primary write under txn.
 let txn = env.begin_transaction(None, None)?;
-primary.lock().put(Some(&txn), &key, &new_value)?;
-txn.commit()?;
 
-// Secondary maintenance runs auto-committed. If this step fails the
-// primary is already committed and the secondary will be inconsistent
-// until you retry. Plan for crash-mid-update in your application
-// recovery.
-secondary.update_secondary(&key, old_value.as_ref(), Some(&new_value))?;
+// Primary write under txn.
+primary.lock().put(Some(&txn), &key, &new_value)?;
+
+// Secondary maintenance under the SAME txn. Both ops use `Some(&txn)`,
+// so they participate in the same lock set and commit/abort atomically.
+secondary.update_secondary(
+    Some(&txn),
+    &key,
+    old_value.as_ref(),
+    Some(&new_value),
+)?;
+
+// Commit: the primary record AND the secondary index entry persist
+// together. If you instead call `txn.abort()`, BOTH are rolled back —
+// no dangling secondary entry can survive the abort.
+txn.commit()?;
 ```
+
+Why this is atomic:
+
+* `Database::put(Some(&t), …)` acquires a write lock on the primary
+  record's slot under `t`'s locker.
+* `SecondaryDatabase::update_secondary(Some(&t), …)` opens an inner
+  cursor over the secondary index *with the same `t`*, so its
+  `Put::NoOverwrite` insert (or its `Cursor::delete` for a
+  sec-key change / primary delete) acquires its locks under `t` as
+  well.
+* `t.commit()` flushes both the primary log entry and the secondary
+  log entry as a unit; `t.abort()` rolls both back.
 
 If `update_secondary` returns `NoxuError::Unsupported`, two distinct
 primary records have produced the same secondary key. v1.5 secondaries
 are one-to-one (Decision 1B) and reject the second insert at the
-secondary layer rather than silently overwriting the first; the primary
-is already committed. Your application is responsible for compensating
-(re-keying the new primary, deleting it, or surfacing the conflict).
+secondary layer rather than silently overwriting the first. Because
+both writes are under the same txn, **the conflict surfaces before
+the primary is committed**: handle the error and either re-key, drop
+the new primary, or `txn.abort()` to roll back both sides cleanly.
 Sorted-dup secondaries that accept many-to-one mappings are scheduled
 for v1.6.
 
-If you need stricter atomicity — primary and secondary writes that
-commit or abort together — wait for v1.6 or maintain the secondary
-yourself in a way that tolerates the gap (e.g. periodic full
-re-population from the primary).
+### Auto-commit (v1.4 shape) is still supported
+
+If you do not need cross-database atomicity — e.g. a one-shot
+population script or a single-threaded job that tolerates
+partial-update windows — pass `None` for the txn argument and each
+secondary write is committed individually:
+
+```rust
+secondary.update_secondary(None, &key, old_value.as_ref(), Some(&new_value))?;
+```
+
+This restores the v1.4 / v1.5.0-rc1 / v1.5.0-rc2 behaviour. It is
+intentionally available because not every workload wants to allocate
+a transaction for every write, and a one-shot population path has no
+caller txn to thread through.
+
+### What's still missing (v1.6)
+
+`Database::put` does **not** automatically drive attached
+secondaries. v1.5 has no `associate()` hook, so the application is
+still responsible for calling `update_secondary` after every primary
+`put` / `delete`. Forgetting to call it leaves the index stale; the
+v1.6 automatic-association work removes that hazard by routing every
+primary write through every attached secondary inside the same txn.
 
 ## Concurrency reminder
 
 > **Note:** Secondary indexes change the lock-ordering shape of your
 > workload — a write on the primary takes a lock on the primary, then
-> the auto-committed `update_secondary` takes a lock on the secondary;
-> a secondary cursor takes a lock on the secondary then chases the
-> primary. Concurrent writers can deadlock, and the canonical
+> `update_secondary` takes locks on the secondary under the *same*
+> txn; a secondary cursor takes a lock on the secondary then chases
+> the primary. Concurrent writers can deadlock, and the canonical
 > retry loop from
 > [Aborting a Transaction](basics.md#aborting-a-transaction) is
-> required for the primary write.
+> required for the primary write *and* the secondary update — both
+> ops are now part of the same transactional unit, so a deadlock on
+> either side aborts the whole sequence.
 
 ---

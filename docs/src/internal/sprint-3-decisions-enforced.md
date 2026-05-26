@@ -95,3 +95,60 @@ small set of code paths that the audit confirms are dead today:
 
 The bang is included so consumers of the changelog see the
 behaviour change without having to read the bodies.
+
+## Sprint 4½ addendum — partial-atomicity gap closed
+
+Sprint 3D's table above noted that Decision 1B's `Put::NoOverwrite`
+semantics rejected cross-primary collisions, but it left the v1.4-era
+pattern where `SecondaryDatabase::update_secondary` itself ran
+auto-committed under any caller's transaction. The Sprint 4 mdBook
+reconciliation explicitly called this out as a real partial-atomicity
+gap (audit Theme 2 / finding F5): an aborted primary `put` could
+leave the secondary entry behind on disk, because the secondary
+update had already been auto-committed.
+
+Sprint 4½ (`fix/sprint4-half-secondary-atomic`) closes the gap for
+the **manual-update pattern**:
+
+- `SecondaryDatabase::update_secondary`,
+  `SecondaryDatabase::delete_all_for_primary` (crate-internal),
+  `insert_sec_key`, `delete_sec_key`, and the `make_inner_cursor`
+  helper now take `Option<&Transaction>` as the leading argument and
+  forward it to every inner-database operation (`Database::put`,
+  `Database::delete`, `Database::open_cursor`).
+- When the caller threads the **same** `txn` through
+  `Database::put` / `Database::delete` *and*
+  `SecondaryDatabase::update_secondary`, the primary write and every
+  affected secondary index entry commit or abort together.
+- The Decision-1B idempotent-re-insert behaviour is preserved under
+  transactional cursors: `Put::NoOverwrite` returns `KeyExists`
+  identically on auto-commit and transactional cursors, and the
+  existing probe path distinguishes idempotent vs cross-primary
+  collision before raising `NoxuError::Unsupported`.
+
+New regression tests in
+`crates/noxu-db/tests/secondary_decisions_test.rs`:
+
+- `s4h_abort_rolls_back_primary_and_secondary` — the explicit
+  partial-atomicity pin; pre-fix this test fails because the
+  secondary entry survives the abort.
+- `s4h_commit_persists_primary_and_secondary` — happy-path commit
+  variant.
+- `s4h_same_primary_idempotent_reinsert_under_same_txn` — carries
+  forward `d1b_same_primary_idempotent_reinsert_ok` to the
+  transactional cursor.
+- `s4h_uncommitted_secondary_write_is_not_visible_to_other_readers`
+  — isolation-contract spot-check.
+
+**Out of scope for Sprint 4½:** automatic `associate()`-style
+secondary maintenance — where `Database::put` itself drives every
+attached secondary inside the caller's transaction. That row of the
+capability matrix remains ❌ for v1.5 and is tracked for v1.6
+alongside Decision 1's sorted-dup work.
+
+**Breaking change:** `SecondaryDatabase::update_secondary` gains a
+leading `txn: Option<&Transaction>` parameter. Callers that adopted
+the v1.4 / v1.5.0-rc1 / v1.5.0-rc2 shape must prepend either `None`
+(preserves auto-commit semantics) or `Some(&t)` (atomic with
+`Database::put(Some(&t), …)`). The fix commit is tagged
+`fix(db)!:` accordingly. No version bump (v1.5.0 has not shipped).
