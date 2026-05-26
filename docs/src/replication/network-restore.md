@@ -1,5 +1,14 @@
 # Network Restore
 
+> **v1.5 status — broken on the dispatcher path.** See
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> and [the chapter overview](README.md). The standalone `serve_raw`
+> path used by the unit tests works; the path used by
+> `ReplicatedEnvironment` (via `TcpServiceDispatcher`) misinterprets
+> the 4-byte `NRST` magic as a 1.31 GiB length prefix and never
+> succeeds. New replicas cannot bootstrap through the documented
+> path. (Audit findings 2 and 4.)
+
 If a replica's log has been partially cleaned and it has fallen so far behind
 that it cannot recover from the master's VLSN stream, it needs a **network
 restore** — a full copy of the master's environment.
