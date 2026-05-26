@@ -13,9 +13,11 @@ MD033: false
 # Chapter intro pages don't always start with an H1; mdBook provides the title
 MD041: false
 
-# Allow duplicate heading text in different sections (e.g., multiple "Overview" headings)
+# Allow duplicate heading text across non-sibling sections (e.g.,
+# 'Symptoms', 'Diagnose', 'Mitigate' repeat per runbook; 'What it
+# does', 'Alternatives considered', 'References' repeat per concept).
 MD024:
-  allow_different_nesting: true
+  siblings_only: true
 
 # Ordered lists: allow any starting number (1. 1. 1. style is valid)
 MD029:
