@@ -145,8 +145,7 @@ of any method.
   `TransactionRunner` cannot drive them. Use the runner with the raw
   `Database` / `Cursor` API for now. Threading `Option<&Transaction>`
   is planned for v1.6 alongside the typed-API redesign. See
-  [Collections and Persistence — v1.5 collections — what's in
-  scope](../collections/README.md#v15-collections--whats-in-scope).
+  [Collections and Persistence](../collections/README.md).
 * **Replication is preview / proof-of-concept.** Ten GA blockers are
   tracked in
   [`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md).
