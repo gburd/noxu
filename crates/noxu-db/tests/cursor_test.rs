@@ -7,7 +7,8 @@
 
 use noxu_db::cursor::CursorState;
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, Put,
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
+    Put, TransactionConfig,
 };
 use tempfile::TempDir;
 
@@ -900,3 +901,123 @@ fn cursor_search_gte_oracle_brute_force_small_random() {
         }
     }
 }
+
+// ─── 14. Cursor must participate in the txn passed to open_cursor ─────────────
+//
+// Regression for API audit 2026-05 cursor finding C1 / #1
+// (`docs/src/internal/api-audit-2026-05-cursor.md`):
+// `Database::open_cursor(Some(&txn), None)` previously bound the txn argument
+// as `_txn` and dropped it on the floor.  Cursor writes auto-committed and
+// cursor reads bypassed the txn's lock set, silently breaking ACID isolation
+// for users following the canonical pattern in
+// `docs/src/transactions/cursors.md`.
+
+/// Cursor opened with `Some(&txn)` must participate in that txn: a `put`
+/// followed by `txn.abort()` must leave the database unchanged.
+///
+/// **Pre-fix this test fails** because the cursor was built via
+/// `make_cursor()` instead of `make_cursor_for_txn(t)`, so the put was
+/// auto-committed and survived the abort.
+#[test]
+fn cursor_with_txn_put_is_rolled_back_on_abort() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    // Seed nothing — start with an empty database.
+    let txn = env.begin_transaction(None, None).unwrap();
+    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+
+    let (k, v) = kv(b"rolled-back-key", b"rolled-back-val");
+    let s = cursor.put(&k, &v, Put::Overwrite).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // Cursor must be closed before the txn ends.
+    cursor.close().unwrap();
+    txn.abort().unwrap();
+
+    // Open a fresh, auto-commit cursor and confirm the put did NOT persist.
+    let mut probe = db.open_cursor(None, None).unwrap();
+    let mut out_k = DatabaseEntry::new();
+    let mut out_v = DatabaseEntry::new();
+    let status = probe.get(&mut out_k, &mut out_v, Get::First, None).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "cursor.put under an aborted txn must NOT persist; the txn argument \
+         to Database::open_cursor was being dropped (audit C1)"
+    );
+}
+
+/// A second-line check using `db.get`: even when the auto-commit cursor in
+/// the assertion above is correct, exercising the public `get` path makes
+/// the regression self-evident in a stack trace.
+#[test]
+fn cursor_with_txn_put_invisible_via_get_after_abort() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+
+    let (k, v) = kv(b"k", b"v");
+    cursor.put(&k, &v, Put::Overwrite).unwrap();
+    cursor.close().unwrap();
+    txn.abort().unwrap();
+
+    let mut out = DatabaseEntry::new();
+    let status = db.get(None, &k, &mut out).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "value written through a cursor opened with Some(&txn) must vanish \
+         on txn.abort() (audit C1)"
+    );
+}
+
+/// Cursor reads through a txn must take locks in the txn's lock set.
+/// We verify this indirectly: writer txn A holds an uncommitted write on a
+/// key; reader txn B opens a cursor with `Some(&B)` and a no-wait config and
+/// attempts a `Get::Search` on the same key.  Pre-fix the cursor read does
+/// not engage the lock manager (because the txn argument is dropped) and
+/// the read either spuriously succeeds or returns NotFound without a lock
+/// conflict.  Post-fix the read must conflict with A's write lock and
+/// return an error under no-wait.
+#[test]
+fn cursor_with_txn_get_takes_read_lock_via_locker() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    // Seed a committed value so there is something to lock.
+    let seed = env.begin_transaction(None, None).unwrap();
+    let (k, v0) = kv(b"locked", b"v0");
+    db.put(Some(&seed), &k, &v0).unwrap();
+    seed.commit().unwrap();
+
+    // Writer txn A holds an exclusive lock on `locked` (uncommitted).
+    let txn_a = env.begin_transaction(None, None).unwrap();
+    let v1 = DatabaseEntry::from_bytes(b"v1");
+    db.put(Some(&txn_a), &k, &v1).unwrap();
+
+    // Reader txn B uses a serializable, no-wait config so a lock conflict
+    // surfaces as an error rather than blocking forever.
+    let no_wait = TransactionConfig::new().with_no_wait(true);
+    let txn_b = env.begin_transaction(None, Some(&no_wait)).unwrap();
+    let mut cursor = db.open_cursor(Some(&txn_b), None).unwrap();
+
+    let mut search_k = DatabaseEntry::from_bytes(b"locked");
+    let mut out_v = DatabaseEntry::new();
+    let read_result = cursor.get(&mut search_k, &mut out_v, Get::Search, None);
+
+    assert!(
+        read_result.is_err(),
+        "cursor read under txn B with no-wait must conflict with txn A's \
+         write lock; pre-fix the txn argument was dropped and the cursor \
+         did not consult the lock manager (audit C1). got Ok({:?})",
+        read_result.ok()
+    );
+
+    cursor.close().unwrap();
+    let _ = txn_b.abort();
+    txn_a.abort().unwrap();
+}
+
