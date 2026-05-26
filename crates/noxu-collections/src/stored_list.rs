@@ -4,9 +4,9 @@
 //! sequential-access list interface over a Noxu DB database, using
 //! `usize` indices as keys encoded in big-endian byte order.
 
-use crate::error::Result;
+use crate::error::{CollectionError, Result};
 use crate::stored_map::StoredMap;
-use noxu_db::Database;
+use noxu_db::{Database, DatabaseEntry, Get, OperationStatus};
 
 /// A list-like view of a database.
 ///
@@ -62,6 +62,13 @@ pub struct StoredList<'db> {
 impl<'db> StoredList<'db> {
     /// Creates a new list view of the given database.
     ///
+    /// **Does not recover the next-index counter.**  This constructor
+    /// is the fast path for brand-new (or known-empty) databases:
+    /// `next_index` starts at 0.  When reopening a database that may
+    /// already contain records, use [`StoredList::open`] instead —
+    /// otherwise the next `push` will overwrite existing records at
+    /// index 0, 1, 2, … silently (audit finding #6).
+    ///
     /// # Arguments
     /// * `db` - The database to provide a list view over
     pub fn new(db: &'db Database) -> Self {
@@ -69,6 +76,68 @@ impl<'db> StoredList<'db> {
             map: StoredMap::new(db, false),
             next_index: std::sync::Mutex::new(0),
         }
+    }
+
+    /// Opens a list view over an existing database, recovering the
+    /// next-index counter from the largest existing key.
+    ///
+    /// `open` walks the underlying database with a single
+    /// `Get::Last` cursor read.  If the database is empty,
+    /// `next_index` is initialised to 0 (matching [`StoredList::new`]).
+    /// If the database already contains records, the largest 8-byte
+    /// big-endian key is decoded as a `u64` and `next_index` is set to
+    /// `last + 1`, so the next `push` lands beyond every existing
+    /// record.
+    ///
+    /// This is the v1.5 fix for audit finding #6 (the previous
+    /// `Mutex<usize>` counter resided only in process memory and
+    /// reset to 0 on every reopen, causing pushes after a restart to
+    /// overwrite existing records).
+    ///
+    /// # Errors
+    ///
+    /// * Returns [`CollectionError::DatabaseError`] if the cursor
+    ///   cannot be opened or the read fails.
+    /// * Returns [`CollectionError::IllegalState`] if the largest key
+    ///   is not 8 bytes long (i.e. the database was not produced by
+    ///   `StoredList`).  In that case the caller must use
+    ///   [`StoredList::new`] explicitly to acknowledge the mixed-use
+    ///   layout, or open a different database.
+    ///
+    /// # Concurrency
+    ///
+    /// `open` is not reentrant against concurrent writers.  Callers
+    /// should ensure the underlying database is quiescent during
+    /// recovery.
+    pub fn open(db: &'db Database) -> Result<Self> {
+        let mut cursor = db.open_cursor(None, None)?;
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let next = match cursor.get(&mut key, &mut data, Get::Last, None)? {
+            OperationStatus::Success => {
+                let bytes = key.get_data().unwrap_or(&[]);
+                if bytes.len() != 8 {
+                    let _ = cursor.close();
+                    return Err(CollectionError::IllegalState(format!(
+                        "StoredList::open: largest key is {} bytes; \
+                         expected an 8-byte big-endian index. Database \
+                         was not produced by StoredList; use \
+                         StoredList::new explicitly if this is intentional.",
+                        bytes.len()
+                    )));
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                let last = u64::from_be_bytes(buf);
+                last.saturating_add(1) as usize
+            }
+            _ => 0,
+        };
+        cursor.close()?;
+        Ok(StoredList {
+            map: StoredMap::new(db, false),
+            next_index: std::sync::Mutex::new(next),
+        })
     }
 
     /// Encodes a `usize` index as an 8-byte big-endian key.
