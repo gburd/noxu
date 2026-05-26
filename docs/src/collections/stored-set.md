@@ -1,64 +1,98 @@
 # StoredSet
 
-Noxu DB v1.5 provides two `&[u8]`-keyed set views over a `Database`:
+Noxu DB provides two typed set views over a `Database`:
 
-- **`StoredKeySet`** — set of keys (the database values are unused or
-  treated as opaque payloads).
-- **`StoredValueSet`** — collection of values stored under tracked keys
-  (use this when iteration is by value, not by key).
+- **`StoredKeySet<K, KB>`** — set of typed keys (the database's value
+  payload is empty).
+- **`StoredValueSet<V, VB>`** — typed collection of database values,
+  iterated in cursor walk order.
 
-> **v1.5 surface.**  Earlier drafts of this chapter showed a typed
-> `StoredSet<K>` configured with `TupleBinding<K>` and a
-> `set_sorted_duplicates(true)` database.  That shape is the v1.6
-> target.  In v1.5 the type is byte-slice-keyed, the API takes
-> `&[u8]`, and the underlying database is a normal primary index — no
-> sorted-duplicate machinery is involved.
+Both views are stateless: every `contains` / `len` / `iter` call goes
+to the database.
 
 ## Creating a StoredKeySet
 
 ```rust,ignore
+use noxu_bind::IntBinding;
 use noxu_collections::StoredKeySet;
 use noxu_db::{DatabaseConfig, Environment};
 
 let db_config = DatabaseConfig::new().with_allow_create(true);
 let db  = env.open_database(None, "tags", &db_config)?;
-let set = StoredKeySet::new(&db);
+let set: StoredKeySet<i32, _> = StoredKeySet::new(&db, IntBinding);
 ```
 
 ## Operations
 
 ```rust,ignore
-// Add a key (the value stored under it is empty by default).
-set.add(b"rust")?;
+// Add a key.  Returns true if newly inserted, false if already present.
+let added: bool = set.add(None, &42)?;
 
 // Test membership.
-assert!(set.contains(b"rust")?);
+let present: bool = set.contains(None, &42)?;
 
-// Remove.
-set.remove(b"rust")?;
+// Remove.  Returns whether the key was present.
+let removed: bool = set.remove(None, &42)?;
 
-// Iterate (sorted by key bytes).
-for key in set.iter()? {
-    let key = key?;
-    println!("{:?}", key);
+// Iterate (sorted by the key binding's natural order).
+for key in set.iter(None)? {
+    println!("{}", key?);
 }
+
+// Length / emptiness.
+let n: usize = set.len(None)?;
+let empty: bool = set.is_empty(None)?;
+
+// Clear all.
+set.clear(None)?;
 ```
 
-For pre-existing data, register the keys you care about with
-`register_key` / `register_keys` before iterating.
+## Threading a transaction
 
-## v1.5 limitations
+Every method takes `Option<&Transaction>`:
 
-1. **Auto-commit only.**  Every operation issues the underlying
-   `Database` call with `txn = None`.  Transactional semantics
-   require driving the raw `Database` API directly.  (Audit findings
-   #1, #3, #4.)
+```rust,ignore
+let txn = env.begin_transaction(None, None)?;
+set.add(Some(&txn), &42)?;
+assert!(set.contains(Some(&txn), &42)?);
+txn.abort()?;                // rolled back
+assert!(!set.contains(None, &42)?);
+```
 
-2. **No typed `StoredSet<K>`.**  Use `noxu-bind` to encode typed
-   keys to bytes and pass the bytes to `StoredKeySet::add` /
-   `contains` / `remove`.
+## StoredValueSet
 
-3. **No sorted-duplicate machinery.**  `StoredKeySet` does not open
-   the underlying database with `set_sorted_duplicates(true)`; the
-   inner database is a plain primary index.  Multi-value-per-key
-   storage is part of the v1.6 secondary-index work.
+`StoredValueSet<V, VB>` exposes a typed view focused on the values
+stored in the database.  Iteration walks the cursor and decodes
+each value via the supplied binding:
+
+```rust,ignore
+use noxu_bind::StringBinding;
+use noxu_collections::StoredValueSet;
+
+let vs: StoredValueSet<String, _> = StoredValueSet::new(&db, StringBinding);
+
+for value in vs.iter(None)? {
+    println!("{}", value?);
+}
+
+// Linear-scan membership check (O(N)).
+let has_alpha: bool = vs.contains(None, &"alpha".to_string())?;
+```
+
+## Migrating from v1.5
+
+The v1.5 byte-keyed `StoredKeySet<'db>` / `StoredValueSet<'db>` are
+gone.  Replace:
+
+```rust,ignore
+// v1.5
+let ks = StoredKeySet::new(&db);
+ks.contains(b"key")?;
+ks.register_keys(&[b"a", b"b", b"c"]);   // register_key/known_keys removed
+
+// v1.6
+use noxu_bind::ByteArrayBinding;
+let ks: StoredKeySet<Vec<u8>, _> = StoredKeySet::new(&db, ByteArrayBinding);
+ks.contains(None, &b"key".to_vec())?;
+// No registration step — `iter()` walks the database directly.
+```
