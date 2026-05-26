@@ -14,6 +14,15 @@
 //!
 //! On every primary `put` the secondary is updated via `update_secondary`.
 //! On every primary `delete` the secondary entry is removed.
+//!
+//! # v1.5 limitations
+//!
+//! See [`docs/src/internal/v1.5-decisions-2026-05.md`].
+//!
+//! - **Decision 2C** — foreign-key constraints are not enforced in v1.5.
+//!   [`SecondaryDatabase::open`] rejects any [`SecondaryConfig`] whose
+//!   foreign-key fields are set with [`NoxuError::Unsupported`] (closes
+//!   audit findings C2, F1, F16).  Full FK support is planned for v1.6.
 
 use crate::cursor::Cursor;
 use crate::cursor_config::CursorConfig;
@@ -40,6 +49,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///   secondary index entries).
 /// - `get` returns primary record data, not secondary data.
 /// - `open_cursor` returns a [`SecondaryCursor`].
+///
+/// # v1.5 limitations
+///
+/// - **Foreign-key constraints not enforced** (Decision 2C):
+///   [`SecondaryDatabase::open`] rejects [`SecondaryConfig`]s whose
+///   foreign-key fields are set.  Full FK support is planned for v1.6.
+///
+/// See `docs/src/internal/v1.5-decisions-2026-05.md`.
 ///
 /// # Example
 /// ```ignore
@@ -80,7 +97,14 @@ impl SecondaryDatabase {
     /// * `config` - The secondary configuration (must include a key creator).
     ///
     /// # Errors
-    /// - `NoxuError::IllegalArgument` if the configuration is invalid.
+    /// - [`NoxuError::IllegalArgument`] if the configuration is invalid.
+    /// - [`NoxuError::Unsupported`] if the configuration sets any foreign-key
+    ///   constraint field (`foreign_key_database`,
+    ///   `foreign_key_delete_action != Abort`, `foreign_key_nullifier`, or
+    ///   `foreign_multi_key_nullifier`).  v1.5 does not enforce FK
+    ///   constraints; full FK support is planned for v1.6 — see Decision 2C
+    ///   in `docs/src/internal/v1.5-decisions-2026-05.md` (closes audit
+    ///   findings C2 / F1 / F16).
     pub fn open(
         primary: Arc<Mutex<Database>>,
         secondary_db: Database,
@@ -91,6 +115,22 @@ impl SecondaryDatabase {
         config
             .validate(primary_read_only)
             .map_err(NoxuError::IllegalArgument)?;
+
+        // Decision 2C: reject FK configurations in v1.5.  The fields are
+        // accepted by the builder for forward source compatibility (v1.6
+        // will honour them) but the runtime cannot enforce them today, so
+        // we surface a typed error at open time rather than silently
+        // ignoring user configuration.  Closes audit findings C2 / F1 /
+        // F16.
+        if config.has_foreign_key_config() {
+            return Err(NoxuError::Unsupported(
+                "foreign-key constraints are not supported in v1.5; clear \
+                 SecondaryConfig.foreign_key_database / \
+                 foreign_key_delete_action / foreign_key_nullifier / \
+                 foreign_multi_key_nullifier (planned for v1.6)"
+                    .to_string(),
+            ));
+        }
 
         let sec = SecondaryDatabase {
             inner: secondary_db,

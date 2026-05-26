@@ -306,7 +306,14 @@ impl SecondaryConfig {
     /// The pointer must remain valid for the lifetime of this config and the
     /// secondary database that uses it.
     ///
+    /// # v1.5 status
     ///
+    /// **Decision 2C** in `docs/src/internal/v1.5-decisions-2026-05.md`:
+    /// foreign-key constraints are not enforced in v1.5.  This setter
+    /// stores the value on the config but [`SecondaryDatabase::open`]
+    /// rejects any config that has a non-default foreign-key field set.
+    /// Full FK support is planned for v1.6 alongside Decision 1B's
+    /// sorted-dup secondaries.  See audit findings C2 / F1 / F16.
     pub fn with_foreign_key_database(mut self, db: &Database) -> Self {
         self.foreign_key_database = Some(db as *const Database);
         self
@@ -314,7 +321,12 @@ impl SecondaryConfig {
 
     /// Sets the action to take when a referenced foreign key is deleted.
     ///
+    /// # v1.5 status
     ///
+    /// **Decision 2C**: stored but not enforced; [`SecondaryDatabase::open`]
+    /// rejects configs with a non-`Abort` action set (or any nullifier or
+    /// foreign DB) with [`NoxuError::Unsupported`].  Full FK support is
+    /// planned for v1.6.
     pub fn with_foreign_key_delete_action(
         mut self,
         action: ForeignKeyDeleteAction,
@@ -325,7 +337,11 @@ impl SecondaryConfig {
 
     /// Sets the foreign key nullifier (single-value variant).
     ///
+    /// # v1.5 status
     ///
+    /// **Decision 2C**: stored but not enforced; [`SecondaryDatabase::open`]
+    /// rejects configs with a nullifier set with [`NoxuError::Unsupported`].
+    /// Full FK support is planned for v1.6.
     pub fn with_foreign_key_nullifier(
         mut self,
         nullifier: Box<dyn ForeignKeyNullifier>,
@@ -336,7 +352,11 @@ impl SecondaryConfig {
 
     /// Sets the foreign key nullifier (multi-value variant).
     ///
+    /// # v1.5 status
     ///
+    /// **Decision 2C**: stored but not enforced; [`SecondaryDatabase::open`]
+    /// rejects configs with a nullifier set with [`NoxuError::Unsupported`].
+    /// Full FK support is planned for v1.6.
     pub fn with_foreign_multi_key_nullifier(
         mut self,
         nullifier: Box<dyn ForeignMultiKeyNullifier>,
@@ -409,6 +429,21 @@ impl SecondaryConfig {
     ///
     pub(crate) fn update_may_change_secondary(&self) -> bool {
         !self.immutable_secondary_key && !self.extract_from_primary_key_only
+    }
+
+    /// Returns `true` if any foreign-key constraint field is set to a
+    /// non-default value.
+    ///
+    /// Used by [`SecondaryDatabase::open`] to enforce **Decision 2C**
+    /// (`docs/src/internal/v1.5-decisions-2026-05.md`): foreign-key
+    /// constraints are not enforced in v1.5; full FK support is planned
+    /// for v1.6 alongside Decision 1B's sorted-dup secondaries.  Closes
+    /// audit findings C2 / F1 / F16.
+    pub(crate) fn has_foreign_key_config(&self) -> bool {
+        self.foreign_key_database.is_some()
+            || self.foreign_key_delete_action != ForeignKeyDeleteAction::Abort
+            || self.foreign_key_nullifier.is_some()
+            || self.foreign_multi_key_nullifier.is_some()
     }
 }
 
