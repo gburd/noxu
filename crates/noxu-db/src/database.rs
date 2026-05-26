@@ -25,7 +25,7 @@ use noxu_dbi::{
 };
 use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
-use noxu_txn::LockManager;
+use noxu_txn::{Durability, LockManager, Txn, TxnManager, UndoRecord};
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +86,14 @@ pub struct Database {
     /// Cached cleaner throttle — acquired once at open, None when no cleaner.
     /// Used by put() for write-path backpressure without locking env_impl.
     cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
+    /// Cached transaction manager — acquired once at open.
+    ///
+    /// Used by [`Self::with_auto_txn`] to allocate a synthetic auto-commit
+    /// `Txn` per `txn = None` write so the lock manager sees a typed
+    /// locker id from the explicit-txn id space (`"auto-txn:<id>"` in
+    /// deadlock messages) and the auto-commit op gets full abort-undo
+    /// semantics on any error path.  Closes the F12 residuals.
+    txn_manager: Arc<TxnManager>,
     /// If true, auto-commit writes skip the log flush entirely (: TXN_NO_SYNC).
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
@@ -178,6 +186,143 @@ impl Database {
         }
     }
 
+    /// Allocates a synthetic auto-commit `Txn` and runs `op` under it.
+    ///
+    /// `op` receives an auto-commit-wired [`CursorImpl`] (locker_id = 0
+    /// so the LN is logged with the auto-commit `InsertLN` / `DeleteLN`
+    /// form, txn_ref set so the lock manager sees the synthetic auto-txn
+    /// as the owner).
+    ///
+    /// On `Ok(value)`:
+    ///   * Drops the cursor (closing it).
+    ///   * Calls [`Txn::commit_with_durability`] on the synthetic auto-txn
+    ///     with a [`Durability`] derived from the database's
+    ///     `no_sync` / `write_no_sync` config; this releases all locks
+    ///     and (for `CommitSync`) fsyncs up to the LN's LSN via
+    ///     `LogManager::flush_sync_if_needed` for many-to-one fsync
+    ///     coalescing under concurrent write load.
+    ///   * Records the commit in the txn manager statistics and removes
+    ///     the diagnostic locker label.
+    ///
+    /// On `Err(e)`:
+    ///   * Drops the cursor.
+    ///   * Calls [`Txn::abort_collect_undo`] to harvest before-image undo
+    ///     records WITHOUT releasing the held write locks (so a reader
+    ///     blocked on a write lock cannot observe the in-flight value
+    ///     before we restore the before-image).
+    ///   * Applies the undo records to the in-memory B-tree.
+    ///   * Calls [`Txn::release_all_locks`] to drain the held locks.
+    ///   * Records the abort in the txn manager statistics and removes
+    ///     the diagnostic locker label.
+    ///   * Returns `Err(e)`.
+    ///
+    /// Closes the first F12 residual: an auto-commit op now goes through
+    /// the same lock-tracking and abort-undo machinery as an explicit
+    /// transaction, so two concurrent inserts of the same brand-new key
+    /// serialise through the lock manager and a forced mid-write failure
+    /// rolls back the in-memory tree mutation.
+    fn with_auto_txn<F, T>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&mut CursorImpl) -> Result<T>,
+    {
+        let auto_txn =
+            self.txn_manager.begin_auto_txn(self.log_manager.clone());
+        let synthetic_id = auto_txn.id_as_locker();
+        let auto_txn_arc = Arc::new(std::sync::Mutex::new(auto_txn));
+
+        let mut cursor = self.make_cursor();
+        cursor.attach_txn(Arc::clone(&auto_txn_arc));
+
+        let result = op(&mut cursor);
+        // Drop the cursor handle (un-pins BIN, drops Arc<Mutex<Txn>> ref).
+        drop(cursor);
+
+        // Reclaim sole ownership of the synthetic auto-txn so we can
+        // finalise it.  All cursors and their Arcs were dropped above.
+        let mut auto_txn = match Arc::try_unwrap(auto_txn_arc) {
+            Ok(m) => m.into_inner().unwrap_or_else(|p| p.into_inner()),
+            Err(_arc) => {
+                // A cursor escaped the closure with a clone of the txn
+                // Arc.  This is a caller-side bug — leak the auto-txn
+                // (its Drop calls `close()` which aborts) and surface a
+                // typed error.  No undo applied because we cannot
+                // safely take the Txn out of the shared Arc.
+                return Err(NoxuError::OperationNotAllowed(
+                    "with_auto_txn: synthetic auto-txn outlived cursor scope"
+                        .to_string(),
+                ));
+            }
+        };
+        let txn_manager = Arc::clone(&self.txn_manager);
+
+        match result {
+            Ok(value) => {
+                let durability = if self.no_sync {
+                    Durability::CommitNoSync
+                } else if self.write_no_sync {
+                    Durability::CommitWriteNoSync
+                } else {
+                    Durability::CommitSync
+                };
+                if let Err(e) = auto_txn.commit_with_durability(durability) {
+                    // Commit failed (e.g. log fsync error).  Undo the
+                    // in-memory tree write so we are not left in an
+                    // inconsistent state, then surface the error.
+                    let undo_records =
+                        auto_txn.abort_collect_undo().unwrap_or_default();
+                    self.apply_auto_txn_undo(undo_records);
+                    auto_txn.release_all_locks();
+                    txn_manager.abort_txn(synthetic_id);
+                    return Err(NoxuError::OperationNotAllowed(format!(
+                        "auto-commit fsync failed: {e}"
+                    )));
+                }
+                txn_manager.commit_txn(synthetic_id);
+                Ok(value)
+            }
+            Err(e) => {
+                // Phase 1: collect undo without releasing write locks.
+                let undo_records =
+                    auto_txn.abort_collect_undo().unwrap_or_default();
+                // Phase 2: apply undo while write locks are still held
+                // so any concurrent reader blocked on a write lock
+                // cannot observe the in-flight value.
+                self.apply_auto_txn_undo(undo_records);
+                // Phase 3: drain locks.
+                auto_txn.release_all_locks();
+                txn_manager.abort_txn(synthetic_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Applies undo records collected from a synthetic auto-txn to the
+    /// in-memory B-tree of `self`.  Mirrors the per-`undo_record` block
+    /// in `Transaction::abort()` but specialised for the
+    /// single-database `with_auto_txn` case so we do not need to thread
+    /// the env-impl in.
+    fn apply_auto_txn_undo(&self, undo_records: Vec<UndoRecord>) {
+        let db_id_match = self.id;
+        let db_guard = self.db_impl.read();
+        let Some(tree) = db_guard.get_real_tree() else { return };
+        for undo in undo_records {
+            // The synthetic auto-txn touches only this database, but be
+            // defensive in case future changes broaden the contract.
+            if undo.database_id != db_id_match {
+                continue;
+            }
+            let Some(abort_key) = undo.abort_key else { continue };
+            if undo.abort_known_deleted {
+                if tree.delete(&abort_key) {
+                    db_guard.decrement_entry_count();
+                }
+            } else if let Some(abort_data) = undo.abort_data {
+                let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
+                let _ = tree.insert(abort_key, abort_data, lsn);
+            }
+        }
+    }
+
     /// Auto-commit flush: when `txn` is `None` (auto-commit mode), flush and
     /// fsync the log before returning to the caller.
     ///
@@ -235,12 +380,13 @@ impl Database {
         let throughput = db_impl.read().throughput.clone();
         // Cache the manager Arcs at construction so hot-path operations
         // (get/put/delete) never need to re-acquire env_impl.lock().
-        let (lock_manager, log_manager, cleaner_throttle) = {
+        let (lock_manager, log_manager, cleaner_throttle, txn_manager) = {
             let env = env_impl.lock();
             let lm = Arc::clone(env.get_lock_manager());
             let logm = env.get_log_manager();
             let ct = env.get_cleaner_throttle();
-            (lm, logm, ct)
+            let txnm = Arc::clone(env.get_txn_manager());
+            (lm, logm, ct, txnm)
         };
         Database {
             name,
@@ -253,6 +399,7 @@ impl Database {
             lock_manager,
             log_manager,
             cleaner_throttle,
+            txn_manager,
             no_sync,
             write_no_sync,
         }
@@ -472,14 +619,28 @@ impl Database {
             data.get_data().unwrap_or(&[])
         };
 
-        let mut cursor = match txn {
-            Some(t) => self.make_cursor_for_txn(t),
-            None => self.make_cursor(),
-        };
-        cursor
-            .put(key_bytes, data_bytes, PutMode::Overwrite)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
+        match txn {
+            Some(t) => {
+                let mut cursor = self.make_cursor_for_txn(t);
+                cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
+                    |e| NoxuError::OperationNotAllowed(e.to_string()),
+                )?;
+            }
+            None => {
+                // Wrap the write in a synthetic auto-commit `Txn` so the
+                // lock manager sees a typed locker id ("auto-txn:<id>")
+                // and any error rolls back the in-memory tree write
+                // through `Txn::abort_collect_undo`.
+                self.with_auto_txn(|cursor| {
+                    cursor
+                        .put(key_bytes, data_bytes, PutMode::Overwrite)
+                        .map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
+                    Ok(())
+                })?;
+            }
+        }
 
         // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
         // writes: if the log write rate exceeds the cleaner's capacity, sleep
@@ -493,9 +654,6 @@ impl Database {
         {
             std::thread::sleep(delay);
         }
-
-        // Auto-commit: fsync before returning (skip if already covered).
-        self.auto_commit_sync(txn, write_lsn)?;
 
         self.throughput.n_pri_updates.fetch_add(1, Ordering::Relaxed);
         observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "put");
@@ -569,20 +727,32 @@ impl Database {
         let key_bytes = key.get_data().unwrap_or(&[]);
         let data_bytes = data.get_data().unwrap_or(&[]);
 
-        let mut cursor = match txn {
-            Some(t) => self.make_cursor_for_txn(t),
-            None => self.make_cursor(),
+        let status = match txn {
+            Some(t) => {
+                let mut cursor = self.make_cursor_for_txn(t);
+                match cursor
+                    .put(key_bytes, data_bytes, PutMode::NoOverwrite)
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })? {
+                    noxu_dbi::OperationStatus::KeyExist => {
+                        OperationStatus::KeyExists
+                    }
+                    _ => OperationStatus::Success,
+                }
+            }
+            None => self.with_auto_txn(|cursor| {
+                cursor
+                    .put(key_bytes, data_bytes, PutMode::NoOverwrite)
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
+                    .map(|s| match s {
+                        noxu_dbi::OperationStatus::KeyExist => {
+                            OperationStatus::KeyExists
+                        }
+                        _ => OperationStatus::Success,
+                    })
+            })?,
         };
-        let status = match cursor
-            .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
-        {
-            noxu_dbi::OperationStatus::KeyExist => OperationStatus::KeyExists,
-            _ => OperationStatus::Success,
-        };
-        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
-        // Auto-commit: fsync before returning (skip if already covered).
-        self.auto_commit_sync(txn, write_lsn)?;
         if status == OperationStatus::Success {
             self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -624,37 +794,38 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
-        let mut cursor = match txn {
-            Some(t) => self.make_cursor_for_txn(t),
-            None => self.make_cursor(),
+        // Inner closure shared between the explicit-txn and synthetic
+        // auto-txn paths: scans + deletes every duplicate of `key_bytes`
+        // through the supplied `cursor`.  See comment in pre-Wave-1A
+        // delete for the dup-loop rationale (BDB-JE
+        // `Database.delete(key)` semantics).
+        let run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
+            let mut deleted_any = false;
+            while let noxu_dbi::OperationStatus::Success = cursor
+                .search(key_bytes, None, SearchMode::Set)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            {
+                cursor.delete().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
+                deleted_any = true;
+            }
+            Ok(deleted_any)
         };
-        // For sorted-duplicate databases the BDB-JE contract for
-        // `Database.delete(key)` is to remove EVERY (key, data) pair
-        // sharing the supplied key, not just the first duplicate.  We
-        // implement that by re-positioning the cursor with `Set` after
-        // each successful delete: the search uses the primary-key prefix
-        // so it finds the next surviving dup until the duplicate set is
-        // empty.  For non-dup databases the loop runs at most once (the
-        // second iteration is a single `NotFound` search) so the
-        // single-record fast path is preserved.
-        let mut deleted_any = false;
-        while let noxu_dbi::OperationStatus::Success = cursor
-            .search(key_bytes, None, SearchMode::Set)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
-        {
-            cursor
-                .delete()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-            deleted_any = true;
-        }
+
+        let deleted_any = match txn {
+            Some(t) => {
+                let mut cursor = self.make_cursor_for_txn(t);
+                run_delete(&mut cursor)?
+            }
+            None => self.with_auto_txn(run_delete)?,
+        };
+
         let status = if deleted_any {
             OperationStatus::Success
         } else {
             OperationStatus::NotFound
         };
-        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
-        // Auto-commit: fsync before returning (skip if already covered).
-        self.auto_commit_sync(txn, write_lsn)?;
         if status == OperationStatus::Success {
             self.throughput.n_pri_deletes.fetch_add(1, Ordering::Relaxed);
         } else {

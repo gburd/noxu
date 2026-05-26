@@ -134,6 +134,52 @@ impl Lsn {
     pub fn distance(self, other: Lsn) -> u64 {
         self.0.abs_diff(other.0)
     }
+
+    /// Returns a synthetic, transient `u64` lock id for coordinating
+    /// brand-new (NULL-LSN) inserts of `key` in database `db_id`.
+    ///
+    /// Two concurrent auto-commit inserts of the same brand-new key
+    /// previously had no LSN to lock on and therefore did not coordinate
+    /// through the lock manager (the underlying B+tree latching kept the
+    /// data path safe but the deadlock detector could not reason about
+    /// the conflict).  This helper hashes `(db_id, key)` into a stable
+    /// `u64` lock id reserved for synthetic key-coordination, so the
+    /// auto-commit code can `lock_manager.lock(synthetic_key_lock_id, …)`
+    /// before deciding whether to insert.  Closes the first F12 residual.
+    ///
+    /// # Encoding
+    ///
+    /// The high 32 bits are set to `MAX_FILE_NUM` (`0xFFFF_FFFF`), the
+    /// reserved file number for transient (non-persistent) LSNs.  Real
+    /// WAL LSNs allocate file numbers from 0 upwards and never use the
+    /// reserved value, so a synthetic key lock id can never collide with
+    /// a real LSN-keyed lock.
+    ///
+    /// The low 32 bits are a 32-bit FNV-1a hash of `db_id.to_le_bytes()`
+    /// concatenated with `key`, masked so the low 32 bits never equal
+    /// `u32::MAX` (which would, together with `MAX_FILE_NUM`, equal
+    /// [`NULL_LSN`] and confuse code that special-cases NULL LSNs).
+    pub fn synthetic_key_lock_id(db_id: u64, key: &[u8]) -> u64 {
+        // FNV-1a 32-bit.
+        const FNV_OFFSET: u32 = 0x811c_9dc5;
+        const FNV_PRIME: u32 = 0x0100_0193;
+        let mut h = FNV_OFFSET;
+        for &b in db_id.to_le_bytes().iter() {
+            h ^= b as u32;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        for &b in key.iter() {
+            h ^= b as u32;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // Avoid hashing to u32::MAX, which together with MAX_FILE_NUM
+        // would equal NULL_LSN.  Mapping that single offset to 0 is a
+        // negligible bias for a 2^32 space.
+        if h == u32::MAX {
+            h = 0;
+        }
+        Self::new(MAX_FILE_NUM, h).as_u64()
+    }
 }
 
 impl Ord for Lsn {
