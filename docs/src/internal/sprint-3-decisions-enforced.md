@@ -152,3 +152,92 @@ the v1.4 / v1.5.0-rc1 / v1.5.0-rc2 shape must prepend either `None`
 (preserves auto-commit semantics) or `Some(&t)` (atomic with
 `Database::put(Some(&t), …)`). The fix commit is tagged
 `fix(db)!:` accordingly. No version bump (v1.5.0 has not shipped).
+
+## Wave 1B addendum — SecondaryCursor::delete cascade closes residual F5
+
+Sprint 4½'s deliverable note explicitly flagged one residual
+sub-item: `SecondaryCursor::delete` was already documented to
+cascade-delete the primary record and every matching secondary index
+entry, but the cursor did not store its txn handle.  The cascade
+therefore ran auto-committed even when the user had opened the
+secondary cursor under an explicit transaction — the inner secondary
+cursor participated in the txn (Sprint 1C / F4), but the out-of-band
+`primary.get` / `primary.delete` / `delete_all_for_primary` calls
+fired by `SecondaryCursor::delete` all dropped the txn on the floor.
+An aborted user txn could destroy the primary record (and its
+secondaries) irrespective of the abort, or commit a partial cascade
+in which only some of the secondary cleanups landed.
+
+Wave 1B (`fix/wave1b-secondary-cursor-cascade`) closes the gap:
+
+- `SecondaryCursor` carries an `Option<&'a Transaction>` field; the
+  lifetime `'a` is unified with the lifetime of the
+  `SecondaryDatabase` borrow that produced the cursor, so the type
+  system enforces that the txn outlives the cursor.
+- `SecondaryCursor::new` now takes `txn: Option<&'a Transaction>`
+  (lifetime-tied to the `SecondaryDatabase` borrow) and stores it
+  alongside the inner `Cursor`.
+- Every primary lookup performed by the cursor (`get_with_mode`,
+  `get_search_key`, `get_search_key_range`) and the entire
+  `delete()` cascade (primary `get`, `delete_all_for_primary`,
+  primary `delete`) now run under `self.txn` rather than
+  unconditionally `None`.
+- `SecondaryDatabase::open_cursor` is re-shaped to
+  `pub fn open_cursor<'a>(&'a self, txn: Option<&'a Transaction>,
+  config: Option<&CursorConfig>) -> Result<SecondaryCursor<'a>>` so
+  the caller's `Transaction` borrow is statically known to outlive
+  the returned cursor.
+- `SecondaryDatabase::open_cursor_internal` (crate-private) now
+  takes a `txn: Option<&Transaction>` argument so
+  `SecondaryDatabase::delete` can drive its scan loop under the
+  caller's txn instead of opening an auto-commit cursor.
+
+New regression tests in
+`crates/noxu-db/tests/secondary_decisions_test.rs`:
+
+- `wave1b_cursor_delete_cascade_rolls_back_on_abort` — the explicit
+  pin: open a `SecondaryCursor` under a txn, call `delete()`, abort
+  the txn, and assert **both** the primary record and the secondary
+  index entry are still on disk.  Pre-Wave-1B this test fails
+  because the cascade auto-committed and persisted the deletion
+  irrespective of the abort.
+- `wave1b_cursor_delete_cascade_commits_both_sides` — happy-path
+  commit variant: cascade + commit removes both sides.
+- `wave1b_cursor_delete_uncommitted_cascade_invisible_to_others` —
+  isolation spot-check, modelled on Sprint 4½'s
+  `s4h_uncommitted_secondary_write_is_not_visible_to_other_readers`.
+  Tolerates v1.5's lock-based-without-MVCC contract for in-flight
+  observations and pins the post-abort state across the txn
+  boundary (the real isolation contract Wave 1B closes).
+- `wave1b_cursor_delete_auto_commit_cascade_unchanged` — regression
+  pin for the `open_cursor(None, None)` happy path so a future
+  refactor of the txn plumbing cannot regress the v1.4 auto-commit
+  cascade behaviour.
+
+The existing 14 unit tests in `secondary_cursor.rs` (all using
+`open_cursor(None, None)`) and the 7 Sprint 1C / 4½ integration
+tests pass unchanged: `None` flows through the new field as the
+default, and `Some(&txn)` callers that already exist in
+`tests/cursor_test.rs` (e.g. `sec_open_cursor_threads_txn_and_config`)
+still compile because the new lifetime constraint matches the
+lexical scope they already use.
+
+**Breaking change:** the lifetime parameter on
+`SecondaryDatabase::open_cursor` is now explicit: the returned
+`SecondaryCursor<'a>` borrows both `&'a self` and the supplied
+`Option<&'a Transaction>`.  Callers that previously stored the
+cursor in a different scope from the transaction must move them
+into the same scope.  In practice every existing caller already
+follows this rule (the inner `Database::open_cursor` has the same
+contract) so the breakage is at the type level, not the runtime
+level.  The fix commit is tagged `fix(db)!:` accordingly.
+
+With Wave 1B merged, finding F5 from the API audit
+(`docs/src/internal/api-audit-2026-05-rep.md`, Theme 2: secondary
+atomicity) has no remaining sub-items in v1.5: the manual-update
+pattern (Sprint 4½) and the cursor-driven cascade (Wave 1B)
+both honour any caller-supplied transaction.  Automatic
+`associate()`-style maintenance — where `Database::put` itself
+drives every attached secondary inside the caller's transaction —
+remains the v1.6 work, alongside Decision 1's sorted-dup
+secondaries.
