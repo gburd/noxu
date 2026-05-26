@@ -113,22 +113,32 @@ impl<'db> StoredList<'db> {
         Ok(val)
     }
 
-    /// Removes the value at the given index and re-indexes all higher-indexed
-    /// elements so the list remains contiguous.
+    /// Removes the value at the given index.
     ///
-    /// After removing the element at `index`, every element stored at indices
-    /// `index+1 .. next_index` is read and re-written at the decremented key
-    /// (`old_index - 1`), then the original key is removed.  `next_index` is
-    /// decremented by 1.
+    /// **No compaction.**  This is a single-key delete: the slot at
+    /// `index` becomes a hole, every higher index keeps its slot, and
+    /// `next_index` is unchanged.  This matches the BDB-JE
+    /// `StoredContainer.removeKey()` shape.
     ///
-    /// `StoredList.remove(int index)`: the re-numbers all higher-
-    /// indexed entries so that gaps are never left in the list.
+    /// `next_index` is *not* decremented here; subsequent `push` calls
+    /// continue from the previous high-water mark rather than re-using
+    /// the freed slot.  Use [`StoredList::pop`] if you want to remove
+    /// the highest-index element and reclaim its slot.
     ///
-    /// Returns the removed value, or `None` if no value was at that index.
+    /// # v1.5 limitation
+    ///
+    /// The compaction / re-indexing semantics described in earlier
+    /// release-candidate rustdoc were aspirational and were never
+    /// implemented; the audit (May 2026, finding #5) flagged the
+    /// rustdoc-vs-body mismatch.  Compaction moves to v1.6 alongside
+    /// the broader typed-API work.
+    ///
+    /// # Returns
+    ///
+    /// The removed value, or `None` if no value was stored at `index`.
     pub fn remove(&self, index: usize) -> Result<Option<Vec<u8>>> {
-        // remove deletes the element at the given index
-        // but does NOT compact / re-index remaining elements.  Gaps are left
-        // in the index, consistent with behaviour.
+        // Single-key delete; gaps remain in the index, matching
+        // BDB-JE StoredContainer.removeKey().  See rustdoc above.
         let key = Self::index_to_key(index);
         self.map.remove(&key)
     }
@@ -262,13 +272,40 @@ mod tests {
         let removed = list.remove(1).unwrap();
         assert_eq!(removed, Some(b"beta".to_vec()));
 
-        // StoredList.remove(int) does a simple cursor delete at the key —
-        // no re-indexing / compaction.  Gaps remain at the removed index.
-        // StoredContainer.removeKey() is a cursor delete only.
+        // remove() is a single-key delete — no re-indexing / compaction.
+        // Gaps remain at the removed index and `next_index` is unchanged.
+        // (Audit finding #5 — rustdoc was wrong before sprint 3C.)
         assert_eq!(list.get(0).unwrap(), Some(b"alpha".to_vec()));
         assert_eq!(list.get(1).unwrap(), None); // gap — not compacted
         assert_eq!(list.get(2).unwrap(), Some(b"gamma".to_vec()));
         assert_eq!(list.len().unwrap(), 2);
+        assert_eq!(
+            list.next_index(),
+            3,
+            "remove() must not decrement next_index",
+        );
+    }
+
+    #[test]
+    fn test_remove_does_not_reclaim_slot_on_push() {
+        // Regression for the audit-#5 rustdoc-vs-body mismatch.  The
+        // documented contract is that remove() leaves a hole and the
+        // next push continues at next_index, not at the freed slot.
+        let (_td, _env, db) = setup_env_and_db();
+        let list = StoredList::new(&db);
+
+        list.push(b"a").unwrap(); // 0
+        list.push(b"b").unwrap(); // 1
+        list.push(b"c").unwrap(); // 2
+        list.remove(1).unwrap();
+
+        let idx = list.push(b"d").unwrap();
+        assert_eq!(
+            idx, 3,
+            "push after remove must use next_index, not the freed slot",
+        );
+        assert_eq!(list.get(1).unwrap(), None, "gap must remain");
+        assert_eq!(list.get(3).unwrap(), Some(b"d".to_vec()));
     }
 
     #[test]
