@@ -38,6 +38,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use noxu_db::Transaction;
+
 use crate::entity::{Entity, PrimaryKey};
 use crate::entity_serializer::EntitySerializer;
 use crate::error::Result;
@@ -198,9 +200,9 @@ impl<SK: Ord + Clone, PK: Ord + Clone> SecondaryMap<SK, PK> {
 /// let dept_idx: SecondaryIndex<String, u64, User> =
 ///     primary.open_secondary_index(|u: &User| Some(u.department.clone()));
 ///
-/// primary.put(&UserSerializer, &User { id: 1, name: "Alice".into(), department: "Eng".into() }).unwrap();
+/// primary.put(None, &UserSerializer, &User { id: 1, name: "Alice".into(), department: "Eng".into() }).unwrap();
 ///
-/// let eng = dept_idx.get(&UserSerializer, &primary, &"Eng".to_string()).unwrap();
+/// let eng = dept_idx.get(None, &UserSerializer, &primary, &"Eng".to_string()).unwrap();
 /// assert!(eng.is_some());
 /// ```
 pub struct SecondaryIndex<SK, PK, E>
@@ -242,9 +244,13 @@ where
     /// the entity with the smallest primary key is returned, matching the
     /// `SecondaryDatabase.get` behaviour (returns the first duplicate).
     ///
-    ///
+    /// Pass `Some(&txn)` to perform the primary lookup inside a user
+    /// transaction.  The in-memory secondary map itself is not
+    /// transactional in v1.5 (see
+    /// `PersistError::SecondariesNotTransactional`).
     pub fn get<S: EntitySerializer<E>>(
         &self,
+        txn: Option<&Transaction>,
         serializer: &S,
         primary: &crate::primary_index::PrimaryIndex<'_, PK, E>,
         sk: &SK,
@@ -258,7 +264,7 @@ where
         drop(guard);
         // Return the first matching entity (smallest PK), mirroring the.
         for pk in &pks {
-            if let Some(entity) = primary.get(serializer, pk)? {
+            if let Some(entity) = primary.get(txn, serializer, pk)? {
                 return Ok(Some(entity));
             }
         }
@@ -276,10 +282,13 @@ where
     ///
     /// Returns `true` if at least one entity was deleted.
     ///
-    /// – in this deletes via the
-    /// secondary database which cascades a delete to the primary.
+    /// Pass `Some(&txn)` to perform the underlying primary deletes inside a
+    /// user transaction.  The in-memory secondary map updates that
+    /// follow are not atomic with the transaction (see
+    /// `PersistError::SecondariesNotTransactional`).
     pub fn delete<S: EntitySerializer<E>>(
         &self,
+        txn: Option<&Transaction>,
         serializer: &S,
         primary: &crate::primary_index::PrimaryIndex<'_, PK, E>,
         sk: &SK,
@@ -297,7 +306,7 @@ where
             // (not just this one) are notified of the deletion via their
             // maintainer callbacks.  This mirrors SecondaryDatabase
             // cascade behaviour.
-            if primary.delete_with_entity(serializer, pk)? {
+            if primary.delete_with_entity(txn, serializer, pk)? {
                 deleted = true;
             }
         }
@@ -311,9 +320,11 @@ where
     /// Returns an iterator over all `(secondary_key, entity)` pairs in
     /// secondary key order.
     ///
-    /// / `EntityCursor`.
+    /// Pass `Some(&txn)` to read primaries inside a user transaction;
+    /// `None` for auto-commit.
     pub fn iter<'a, S: EntitySerializer<E>>(
         &'a self,
+        txn: Option<&'a Transaction>,
         serializer: &'a S,
         primary: &'a crate::primary_index::PrimaryIndex<'_, PK, E>,
     ) -> SecondaryIterator<'a, SK, PK, E, S> {
@@ -324,6 +335,7 @@ where
         SecondaryIterator {
             pairs,
             pos: 0,
+            txn,
             serializer,
             primary,
             _phantom: std::marker::PhantomData,
@@ -333,9 +345,11 @@ where
     /// Returns an iterator over `(secondary_key, entity)` pairs where
     /// `secondary_key >= from_sk`, in secondary key order.
     ///
-    /// Range-scan via the entity index.
+    /// Pass `Some(&txn)` to read primaries inside a user transaction;
+    /// `None` for auto-commit.
     pub fn iter_from<'a, S: EntitySerializer<E>>(
         &'a self,
+        txn: Option<&'a Transaction>,
         serializer: &'a S,
         primary: &'a crate::primary_index::PrimaryIndex<'_, PK, E>,
         from_sk: &SK,
@@ -350,6 +364,7 @@ where
         SecondaryIterator {
             pairs,
             pos: 0,
+            txn,
             serializer,
             primary,
             _phantom: std::marker::PhantomData,
@@ -393,6 +408,8 @@ where
 {
     pairs: Vec<(SK, PK)>,
     pos: usize,
+    /// Optional user-managed transaction propagated to primary lookups.
+    txn: Option<&'a Transaction>,
     serializer: &'a S,
     primary: &'a crate::primary_index::PrimaryIndex<'a, PK, E>,
     _phantom: std::marker::PhantomData<(SK, E)>,
@@ -415,7 +432,7 @@ where
             let (sk, pk) = self.pairs[self.pos].clone();
             self.pos += 1;
 
-            match self.primary.get(self.serializer, &pk) {
+            match self.primary.get(self.txn, self.serializer, &pk) {
                 Ok(Some(entity)) => return Some(Ok((sk, entity))),
                 Ok(None) => {
                     // Primary record missing – skip (dangling secondary entry).
@@ -628,10 +645,11 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Engineering")).unwrap();
+        primary.put(None, &ser, &emp(1, "Engineering")).unwrap();
 
-        let found =
-            dept_idx.get(&ser, &primary, &"Engineering".to_string()).unwrap();
+        let found = dept_idx
+            .get(None, &ser, &primary, &"Engineering".to_string())
+            .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, 1);
     }
@@ -645,10 +663,11 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Engineering")).unwrap();
+        primary.put(None, &ser, &emp(1, "Engineering")).unwrap();
 
-        let found =
-            dept_idx.get(&ser, &primary, &"Marketing".to_string()).unwrap();
+        let found = dept_idx
+            .get(None, &ser, &primary, &"Marketing".to_string())
+            .unwrap();
         assert!(found.is_none());
     }
 
@@ -662,7 +681,7 @@ mod tests {
         let ser = EmpSerializer;
 
         assert!(!dept_idx.contains(&"Engineering".to_string()));
-        primary.put(&ser, &emp(1, "Engineering")).unwrap();
+        primary.put(None, &ser, &emp(1, "Engineering")).unwrap();
         assert!(dept_idx.contains(&"Engineering".to_string()));
         assert!(!dept_idx.contains(&"HR".to_string()));
     }
@@ -676,15 +695,15 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Engineering")).unwrap();
+        primary.put(None, &ser, &emp(1, "Engineering")).unwrap();
 
         let deleted = dept_idx
-            .delete(&ser, &primary, &"Engineering".to_string())
+            .delete(None, &ser, &primary, &"Engineering".to_string())
             .unwrap();
         assert!(deleted);
 
         // Primary record should be gone.
-        assert_eq!(primary.get(&ser, &1u64).unwrap(), None);
+        assert_eq!(primary.get(None, &ser, &1u64).unwrap(), None);
         // Secondary map should be clean.
         assert!(!dept_idx.contains(&"Engineering".to_string()));
     }
@@ -699,7 +718,7 @@ mod tests {
         let ser = EmpSerializer;
 
         let deleted = dept_idx
-            .delete(&ser, &primary, &"NonExistent".to_string())
+            .delete(None, &ser, &primary, &"NonExistent".to_string())
             .unwrap();
         assert!(!deleted);
     }
@@ -714,9 +733,9 @@ mod tests {
         let ser = EmpSerializer;
 
         for i in 1u64..=5 {
-            primary.put(&ser, &emp(i, "Engineering")).unwrap();
+            primary.put(None, &ser, &emp(i, "Engineering")).unwrap();
         }
-        primary.put(&ser, &emp(6, "Marketing")).unwrap();
+        primary.put(None, &ser, &emp(6, "Marketing")).unwrap();
 
         // sub_index returns all PKs for "Engineering"
         let eng_pks = dept_idx.sub_index(&"Engineering".to_string());
@@ -735,12 +754,12 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Zebra")).unwrap();
-        primary.put(&ser, &emp(2, "Alpha")).unwrap();
-        primary.put(&ser, &emp(3, "Mango")).unwrap();
+        primary.put(None, &ser, &emp(1, "Zebra")).unwrap();
+        primary.put(None, &ser, &emp(2, "Alpha")).unwrap();
+        primary.put(None, &ser, &emp(3, "Mango")).unwrap();
 
         let pairs: Vec<(String, Employee)> = dept_idx
-            .iter(&ser, &primary)
+            .iter(None, &ser, &primary)
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
 
@@ -760,13 +779,13 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Alpha")).unwrap();
-        primary.put(&ser, &emp(2, "Beta")).unwrap();
-        primary.put(&ser, &emp(3, "Gamma")).unwrap();
-        primary.put(&ser, &emp(4, "Delta")).unwrap();
+        primary.put(None, &ser, &emp(1, "Alpha")).unwrap();
+        primary.put(None, &ser, &emp(2, "Beta")).unwrap();
+        primary.put(None, &ser, &emp(3, "Gamma")).unwrap();
+        primary.put(None, &ser, &emp(4, "Delta")).unwrap();
 
         let pairs: Vec<(String, Employee)> = dept_idx
-            .iter_from(&ser, &primary, &"Beta".to_string())
+            .iter_from(None, &ser, &primary, &"Beta".to_string())
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
 
@@ -785,7 +804,7 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Engineering")).unwrap();
+        primary.put(None, &ser, &emp(1, "Engineering")).unwrap();
         assert!(dept_idx.contains(&"Engineering".to_string()));
 
         // Move employee 1 to Marketing.
@@ -795,7 +814,7 @@ mod tests {
             department: "Marketing".to_string(),
             email: None,
         };
-        primary.put(&ser, &updated).unwrap();
+        primary.put(None, &ser, &updated).unwrap();
 
         // Old secondary key must be gone.
         assert!(!dept_idx.contains(&"Engineering".to_string()));
@@ -812,10 +831,10 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Engineering")).unwrap();
+        primary.put(None, &ser, &emp(1, "Engineering")).unwrap();
         assert!(dept_idx.contains(&"Engineering".to_string()));
 
-        primary.delete_with_entity(&ser, &1u64).unwrap();
+        primary.delete_with_entity(None, &ser, &1u64).unwrap();
         assert!(!dept_idx.contains(&"Engineering".to_string()));
     }
 
@@ -833,8 +852,8 @@ mod tests {
         e1.email = Some("alice@example.com".to_string());
         let e2 = emp(2, "Eng"); // email = None
 
-        primary.put(&ser, &e1).unwrap();
-        primary.put(&ser, &e2).unwrap();
+        primary.put(None, &ser, &e1).unwrap();
+        primary.put(None, &ser, &e2).unwrap();
 
         assert!(email_idx.contains(&"alice@example.com".to_string()));
         // e2 has no email so it must not appear in the index.
@@ -850,9 +869,9 @@ mod tests {
             .open_secondary_index(|e: &Employee| Some(e.department.clone()));
         let ser = EmpSerializer;
 
-        primary.put(&ser, &emp(1, "Eng")).unwrap();
-        primary.put(&ser, &emp(2, "HR")).unwrap();
-        primary.put(&ser, &emp(3, "Eng")).unwrap();
+        primary.put(None, &ser, &emp(1, "Eng")).unwrap();
+        primary.put(None, &ser, &emp(2, "HR")).unwrap();
+        primary.put(None, &ser, &emp(3, "Eng")).unwrap();
 
         let keys = dept_idx.keys_index();
         // 3 entries total (2 Eng + 1 HR)
@@ -876,13 +895,13 @@ mod tests {
 
         let mut e1 = emp(1, "Eng");
         e1.email = Some("a@x.com".to_string());
-        primary.put(&ser, &e1).unwrap();
+        primary.put(None, &ser, &e1).unwrap();
 
         assert!(dept_idx.contains(&"Eng".to_string()));
         assert!(email_idx.contains(&"a@x.com".to_string()));
 
         // Delete via dept secondary – both indexes should be clean.
-        dept_idx.delete(&ser, &primary, &"Eng".to_string()).unwrap();
+        dept_idx.delete(None, &ser, &primary, &"Eng".to_string()).unwrap();
         assert!(!dept_idx.contains(&"Eng".to_string()));
         // email secondary is cleaned by the delete callback.
         assert!(!email_idx.contains(&"a@x.com".to_string()));
@@ -898,7 +917,7 @@ mod tests {
         let ser = EmpSerializer;
 
         let pairs: Vec<_> = dept_idx
-            .iter(&ser, &primary)
+            .iter(None, &ser, &primary)
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert!(pairs.is_empty());
