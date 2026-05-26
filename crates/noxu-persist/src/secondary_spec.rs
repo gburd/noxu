@@ -197,11 +197,9 @@ mod tests {
 
     #[test]
     fn delete_action_all_variants() {
-        for a in [
-            DeleteAction::Abort,
-            DeleteAction::Cascade,
-            DeleteAction::Nullify,
-        ] {
+        for a in
+            [DeleteAction::Abort, DeleteAction::Cascade, DeleteAction::Nullify]
+        {
             let s = SecondarySpec::new("x", Relate::OneToOne)
                 .with_on_related_entity_delete(a);
             match s.on_related_entity_delete {

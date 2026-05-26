@@ -60,9 +60,7 @@ impl EntitySerializer<User> for UserSerializer {
 
     fn deserialize(&self, bytes: &[u8]) -> noxu_persist::Result<User> {
         if bytes.len() < 12 {
-            return Err(PersistError::SerializationError(
-                "short user".into(),
-            ));
+            return Err(PersistError::SerializationError("short user".into()));
         }
         let id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let email_len =
@@ -137,8 +135,7 @@ impl EntitySerializer<Order> for OrderSerializer {
 fn temp_env() -> (TempDir, Environment) {
     let td = TempDir::new().unwrap();
     let env = Environment::open(
-        EnvironmentConfig::new(td.path().to_path_buf())
-            .with_allow_create(true),
+        EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true),
     )
     .unwrap();
     (td, env)
@@ -192,7 +189,7 @@ fn derived_entity_round_trip_via_store() {
     let found = by_email
         .get(None, &ser, &primary, &"alice@example.com".to_string())
         .unwrap();
-    assert_eq!(found, Some(alice.clone()));
+    assert_eq!(found, Some(alice));
 
     // Secondary by dept — ManyToOne with Option<u64>.
     let dept10 = by_dept.sub_index(&10u64);
@@ -245,10 +242,7 @@ fn derived_secondary_index_metadata() {
 
 #[test]
 fn derived_composite_primary_key_round_trip() {
-    let key = CompositeKey {
-        region: "us-east-1".into(),
-        customer_id: 42,
-    };
+    let key = CompositeKey { region: "us-east-1".into(), customer_id: 42 };
     let bytes = key.to_bytes();
     let decoded = CompositeKey::from_bytes(&bytes).unwrap();
     assert_eq!(key, decoded);
@@ -268,10 +262,7 @@ fn derived_newtype_primary_key_round_trip() {
 fn derived_composite_primary_key_short_input_errors() {
     // Truncated bytes — should fail cleanly, not panic.
     let result = CompositeKey::from_bytes(&[0u8, 0, 0, 5, b'h']);
-    assert!(matches!(
-        result,
-        Err(PersistError::SerializationError(_))
-    ));
+    assert!(matches!(result, Err(PersistError::SerializationError(_))));
 }
 
 #[test]
@@ -315,12 +306,8 @@ fn derived_secondary_helper_extractor_handles_option_none() {
     let by_dept = User::open_by_dept_index(&mut primary);
     let ser = UserSerializer;
 
-    let nodept = User {
-        id: 7,
-        email: "x@y.z".into(),
-        dept: None,
-        name: "X".into(),
-    };
+    let nodept =
+        User { id: 7, email: "x@y.z".into(), dept: None, name: "X".into() };
     primary.put(None, &ser, &nodept).unwrap();
 
     // Option<u64> = None → entity excluded from the index.
