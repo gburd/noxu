@@ -1,5 +1,8 @@
 # XA Distributed Transactions
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+
 Noxu DB supports the **X/Open XA** two-phase commit (2PC) protocol for
 coordinating distributed transactions across multiple independent database
 environments. This enables atomic commit/rollback spanning multiple Noxu
