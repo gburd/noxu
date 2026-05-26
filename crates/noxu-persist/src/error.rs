@@ -1,5 +1,24 @@
 //! Error types for the persistence layer.
 //!
+//! # v1.5.1 cleanup (Wave 1C, persist-xa Low audit)
+//!
+//! Four `PersistError` variants used to live here that no production
+//! call site ever returned: `EntityNotFound`, `DuplicateKey`,
+//! `InvalidEntity`, `StoreAlreadyOpen`.  They were removed because
+//! the public surface advertises an error variant the engine cannot
+//! actually emit.  Migration:
+//!
+//! * `EntityNotFound` — `PrimaryIndex::get` returns `Result<Option<E>>`
+//!   already; absence is `Ok(None)`, never an error.
+//! * `DuplicateKey` — `PrimaryIndex::put` is overwrite-by-default; if
+//!   the user wants "insert or fail", they should use the
+//!   `Database::put_no_overwrite` shape and check the
+//!   `OperationStatus::KeyExist` status bit instead.
+//! * `InvalidEntity` — entity validation is the application's
+//!   responsibility; raise an application-level error type or
+//!   `PersistError::SerializationError` instead.
+//! * `StoreAlreadyOpen` — `EntityStore::open` cannot fail with this:
+//!   each call constructs a fresh handle.
 
 use thiserror::Error;
 
@@ -11,14 +30,6 @@ pub enum PersistError {
     #[error("database error: {0}")]
     DatabaseError(#[from] noxu_db::NoxuError),
 
-    /// The requested entity was not found.
-    #[error("entity not found")]
-    EntityNotFound,
-
-    /// A duplicate primary key was detected during insert.
-    #[error("duplicate primary key")]
-    DuplicateKey,
-
     /// An error occurred during serialization or deserialization.
     #[error("serialization error: {0}")]
     SerializationError(String),
@@ -26,14 +37,6 @@ pub enum PersistError {
     /// The entity store is not open.
     #[error("store not open")]
     StoreNotOpen,
-
-    /// The entity store is already open.
-    #[error("store already open")]
-    StoreAlreadyOpen,
-
-    /// An entity failed validation.
-    #[error("invalid entity: {0}")]
-    InvalidEntity(String),
 
     /// The requested index is not available.
     #[error("index not available: {0}")]
@@ -68,18 +71,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_entity_not_found_display() {
-        let err = PersistError::EntityNotFound;
-        assert_eq!(err.to_string(), "entity not found");
-    }
-
-    #[test]
-    fn test_duplicate_key_display() {
-        let err = PersistError::DuplicateKey;
-        assert_eq!(err.to_string(), "duplicate primary key");
-    }
-
-    #[test]
     fn test_serialization_error_display() {
         let err = PersistError::SerializationError("bad format".to_string());
         assert_eq!(err.to_string(), "serialization error: bad format");
@@ -89,18 +80,6 @@ mod tests {
     fn test_store_not_open_display() {
         let err = PersistError::StoreNotOpen;
         assert_eq!(err.to_string(), "store not open");
-    }
-
-    #[test]
-    fn test_store_already_open_display() {
-        let err = PersistError::StoreAlreadyOpen;
-        assert_eq!(err.to_string(), "store already open");
-    }
-
-    #[test]
-    fn test_invalid_entity_display() {
-        let err = PersistError::InvalidEntity("missing key".to_string());
-        assert_eq!(err.to_string(), "invalid entity: missing key");
     }
 
     #[test]

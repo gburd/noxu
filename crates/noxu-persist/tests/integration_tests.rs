@@ -1,22 +1,20 @@
 //! Integration tests for the noxu-persist crate.
 //!
 //! Demonstrates full entity-store workflows using the helper types:
-//! DatabaseNamer, SimpleSerializer, FieldEncoder/FieldDecoder,
-//! KeySelector, Sequence, and the entity store.
+//! DatabaseNamer / KeySelector — removed in v1.5.1 Wave 1C audit cleanup
+//! because they were exported but unwired.  Tests for those modules
+//! were dropped along with the modules.  See `crates/noxu-persist/src/lib.rs`
+//! and the persist-xa Low audit recommendations.
+//!
+//! SimpleSerializer, FieldEncoder/FieldDecoder, Sequence, and the
+//! entity store are still covered here.
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };
-use noxu_persist::database_namer::{
-    CustomDatabaseNamer, DatabaseNamer, DefaultDatabaseNamer,
-};
 use noxu_persist::entity::{Entity, PrimaryKey};
 use noxu_persist::entity_serializer::EntitySerializer;
-use noxu_persist::key_selector::{
-    AllKeysSelector, KeySelector, NotKeySelector, PredicateKeySelector,
-    RangeKeySelector, SetKeySelector,
-};
 use noxu_persist::sequence::{MemorySequence, Sequence};
 use noxu_persist::simple_serializer::{
     FieldDecoder, FieldEncoder, SimpleSerializer, decode_string, decode_u64,
@@ -325,10 +323,9 @@ fn test_multiple_entity_types_same_environment() {
         .with_transactional(false);
     let env = Environment::open(env_config).unwrap();
 
-    let namer = DefaultDatabaseNamer;
-    let user_db_name = namer.primary_db_name("store", User::entity_name());
+    let user_db_name = format!("persist_{}_{}", "store", User::entity_name());
     let product_db_name =
-        namer.primary_db_name("store", Product::entity_name());
+        format!("persist_{}_{}", "store", Product::entity_name());
 
     let db_config = DatabaseConfig::new().with_allow_create(true);
     let user_db = env.open_database(None, &user_db_name, &db_config).unwrap();
@@ -364,44 +361,6 @@ fn test_multiple_entity_types_same_environment() {
     // Verify independent storage
     assert_eq!(user_db.count().unwrap(), 1);
     assert_eq!(product_db.count().unwrap(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Integration tests: DatabaseNamer
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_database_namer_names_are_used_for_real_databases() {
-    let temp_dir = TempDir::new().unwrap();
-    let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-        .with_allow_create(true)
-        .with_transactional(false);
-    let env = Environment::open(env_config).unwrap();
-
-    let namer = DefaultDatabaseNamer;
-    let db_name = namer.primary_db_name("MyStore", "User");
-    assert_eq!(db_name, "persist#MyStore#User");
-
-    let db_config = DatabaseConfig::new().with_allow_create(true);
-    let db = env.open_database(None, &db_name, &db_config).unwrap();
-    assert_eq!(db.get_database_name(), "persist#MyStore#User");
-}
-
-#[test]
-fn test_custom_namer_with_real_databases() {
-    let temp_dir = TempDir::new().unwrap();
-    let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-        .with_allow_create(true)
-        .with_transactional(false);
-    let env = Environment::open(env_config).unwrap();
-
-    let namer = CustomDatabaseNamer::new("app", "/");
-    let db_name = namer.primary_db_name("data", "User");
-    assert_eq!(db_name, "app/data/User");
-
-    let db_config = DatabaseConfig::new().with_allow_create(true);
-    let db = env.open_database(None, &db_name, &db_config).unwrap();
-    assert_eq!(db.get_database_name(), "app/data/User");
 }
 
 // ---------------------------------------------------------------------------
@@ -457,60 +416,6 @@ fn test_memory_sequence_for_testing() {
     assert_eq!(id1, 1000);
     assert_eq!(id2, 1001);
     assert_eq!(id3, 1002);
-}
-
-// ---------------------------------------------------------------------------
-// Integration tests: KeySelector with stored entities
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_key_selector_filters_entities() {
-    let (_td, _env, db) = open_env_db("selector_test");
-    let ser = user_serializer();
-
-    // Store 10 users with IDs 1..=10
-    for i in 1..=10u64 {
-        let user = User {
-            id: i,
-            name: format!("User{}", i),
-            email: format!("user{}@test.com", i),
-            age: 20 + i as u32,
-        };
-        let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
-        let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-        db.put(None, &key, &data).unwrap();
-    }
-
-    // Use range selector to filter IDs 3..=7
-    let selector = RangeKeySelector::closed(3u64, 7);
-    let matching: Vec<u64> =
-        (1..=10u64).filter(|id| selector.select(id)).collect();
-    assert_eq!(matching, vec![3, 4, 5, 6, 7]);
-}
-
-#[test]
-fn test_predicate_selector_even_ids() {
-    let selector = PredicateKeySelector::new(|id: &u64| id.is_multiple_of(2));
-    let matching: Vec<u64> =
-        (1..=10u64).filter(|id| selector.select(id)).collect();
-    assert_eq!(matching, vec![2, 4, 6, 8, 10]);
-}
-
-#[test]
-fn test_set_selector_specific_ids() {
-    let selector = SetKeySelector::new(vec![1u64, 5, 9]);
-    let matching: Vec<u64> =
-        (1..=10u64).filter(|id| selector.select(id)).collect();
-    assert_eq!(matching, vec![1, 5, 9]);
-}
-
-#[test]
-fn test_not_selector_excludes_range() {
-    let inner = RangeKeySelector::closed(4u64, 6);
-    let selector = NotKeySelector::new(inner);
-    let matching: Vec<u64> =
-        (1..=10u64).filter(|id| selector.select(id)).collect();
-    assert_eq!(matching, vec![1, 2, 3, 7, 8, 9, 10]);
 }
 
 // ---------------------------------------------------------------------------
@@ -692,8 +597,7 @@ fn test_entity_store_full_crud() {
         .with_transactional(false);
     let env = Environment::open(env_config).unwrap();
 
-    let namer = DefaultDatabaseNamer;
-    let db_name = namer.primary_db_name("test_store", User::entity_name());
+    let db_name = format!("persist_{}_{}", "test_store", User::entity_name());
     let db_config = DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, &db_name, &db_config).unwrap();
 
@@ -792,36 +696,4 @@ fn test_many_entities() {
         assert_eq!(decoded.id, i);
         assert_eq!(decoded.name, format!("User {}", i));
     }
-}
-
-// ---------------------------------------------------------------------------
-// Integration tests: Combining selectors
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_combined_selector_workflow() {
-    // Simulate filtering query results with a range + predicate
-    let ids: Vec<u64> = (1..=20).collect();
-
-    // Range: 5..=15
-    let range = RangeKeySelector::closed(5u64, 15);
-    // Plus: even only
-    let even = PredicateKeySelector::new(|id: &u64| id.is_multiple_of(2));
-
-    let matching: Vec<u64> = ids
-        .iter()
-        .filter(|id| range.select(id) && even.select(id))
-        .copied()
-        .collect();
-
-    assert_eq!(matching, vec![6, 8, 10, 12, 14]);
-}
-
-#[test]
-fn test_all_keys_selector_with_entities() {
-    let selector = AllKeysSelector;
-    let ids: Vec<u64> = (1..=5).collect();
-    let matching: Vec<u64> =
-        ids.iter().filter(|id| selector.select(*id)).copied().collect();
-    assert_eq!(matching, vec![1, 2, 3, 4, 5]);
 }
