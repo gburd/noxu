@@ -12,11 +12,13 @@
 //! all secondary index entries for that primary record).
 
 use crate::cursor::Cursor;
+use crate::cursor_config::CursorConfig;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
 use crate::get::Get;
 use crate::operation_status::OperationStatus;
 use crate::secondary_database::SecondaryDatabase;
+use crate::transaction::Transaction;
 
 /// A cursor that iterates a secondary index database.
 ///
@@ -50,12 +52,19 @@ pub struct SecondaryCursor<'a> {
 
 impl<'a> SecondaryCursor<'a> {
     /// Creates a new SecondaryCursor.  Called by `SecondaryDatabase::open_cursor`.
-    pub(crate) fn new(secondary_db: &'a SecondaryDatabase) -> Self {
-        let inner = secondary_db
-            .inner_db()
-            .open_cursor(None, None)
-            .expect("Failed to open inner secondary cursor");
-        Self { inner, secondary_db }
+    ///
+    /// `txn` and `config` are forwarded to the inner `Database::open_cursor`
+    /// call so the secondary cursor participates in the caller's transaction
+    /// and honours any cursor-level configuration.  See API audit 2026-05
+    /// secondary-join finding F4: the previous signature dropped both
+    /// arguments on the floor and ran every secondary cursor auto-commit.
+    pub(crate) fn new(
+        secondary_db: &'a SecondaryDatabase,
+        txn: Option<&Transaction>,
+        config: Option<&CursorConfig>,
+    ) -> Result<Self> {
+        let inner = secondary_db.inner_db().open_cursor(txn, config)?;
+        Ok(Self { inner, secondary_db })
     }
 
     // ------------------------------------------------------------------
