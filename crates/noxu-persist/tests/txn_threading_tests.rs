@@ -69,8 +69,8 @@ impl EntitySerializer<Widget> for WidgetSer {
         let p = 12 + nl;
         let cl =
             u32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
-        let color = String::from_utf8(bytes[p + 4..p + 4 + cl].to_vec())
-            .unwrap();
+        let color =
+            String::from_utf8(bytes[p + 4..p + 4 + cl].to_vec()).unwrap();
         Ok(Widget { id, name, color })
     }
 }
@@ -167,8 +167,7 @@ fn delete_with_entity_with_txn_abort_restores_entity() {
     assert!(index.contains(None, &3u64).unwrap());
 
     let txn = env.begin_transaction(None, None).unwrap();
-    let deleted =
-        index.delete_with_entity(Some(&txn), &ser, &3u64).unwrap();
+    let deleted = index.delete_with_entity(Some(&txn), &ser, &3u64).unwrap();
     assert!(deleted);
     // Inside txn: gone.
     assert!(!index.contains(Some(&txn), &3u64).unwrap());
@@ -307,9 +306,7 @@ fn secondary_index_update_is_not_atomic_with_txn_v1_5() {
 
     // Inside an aborted txn: write a Widget with colour "rare".
     let txn = env.begin_transaction(None, None).unwrap();
-    index
-        .put(Some(&txn), &ser, &widget(100, "secret", "rare"))
-        .unwrap();
+    index.put(Some(&txn), &ser, &widget(100, "secret", "rare")).unwrap();
     // Inside the txn the secondary already shows the new entry.
     assert!(by_color.contains(&"rare".to_string()));
     txn.abort().unwrap();
