@@ -17,8 +17,8 @@ use noxu_db::{Database, Get, OperationStatus, Transaction};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::{
-    decode_value, encode_key, encode_value, scan_records, ScanDirection,
-    StartKey,
+    ScanDirection, StartKey, decode_value, encode_key, encode_value,
+    scan_records,
 };
 use crate::stored_iterator::StoredIterator;
 
@@ -126,11 +126,7 @@ where
     /// Retrieves the value associated with the given key.
     ///
     /// Returns `Ok(None)` if the key is not present in the database.
-    pub fn get(
-        &self,
-        txn: Option<&Transaction>,
-        key: &K,
-    ) -> Result<Option<V>> {
+    pub fn get(&self, txn: Option<&Transaction>, key: &K) -> Result<Option<V>> {
         let key_entry = encode_key(&self.key_binding, key)?;
         let mut data_entry = noxu_db::DatabaseEntry::new();
         match self.db.get(txn, &key_entry, &mut data_entry)? {
@@ -261,10 +257,7 @@ where
     }
 
     /// Returns a snapshot iterator over keys.
-    pub fn keys(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<K>> {
+    pub fn keys(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
         let items = scan_records(
             self.db,
             txn,
@@ -354,10 +347,7 @@ mod tests {
         let old = map.put(None, &1, &"alpha".to_string()).unwrap();
         assert!(old.is_none());
 
-        assert_eq!(
-            map.get(None, &1).unwrap(),
-            Some("alpha".to_string()),
-        );
+        assert_eq!(map.get(None, &1).unwrap(), Some("alpha".to_string()),);
         assert!(map.contains_key(None, &1).unwrap());
         assert!(!map.contains_key(None, &99).unwrap());
     }

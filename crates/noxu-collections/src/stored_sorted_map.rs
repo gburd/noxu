@@ -10,8 +10,8 @@ use noxu_db::{Database, Transaction};
 
 use crate::error::Result;
 use crate::internal::{
-    cursor_endpoint, decode_key, encode_key, scan_records, ScanDirection,
-    StartKey,
+    ScanDirection, StartKey, cursor_endpoint, decode_key, encode_key,
+    scan_records,
 };
 use crate::stored_iterator::StoredIterator;
 use crate::stored_map::StoredMap;
@@ -78,11 +78,7 @@ where
     }
 
     /// Retrieves the value associated with the given key.
-    pub fn get(
-        &self,
-        txn: Option<&Transaction>,
-        key: &K,
-    ) -> Result<Option<V>> {
+    pub fn get(&self, txn: Option<&Transaction>, key: &K) -> Result<Option<V>> {
         self.inner.get(txn, key)
     }
 
@@ -128,10 +124,7 @@ where
     }
 
     /// Forward iterator over keys.
-    pub fn keys(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<K>> {
+    pub fn keys(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
         self.inner.keys(txn)
     }
 
@@ -144,18 +137,12 @@ where
     }
 
     /// Returns the smallest key, or `None` if the database is empty.
-    pub fn first_key(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<Option<K>> {
+    pub fn first_key(&self, txn: Option<&Transaction>) -> Result<Option<K>> {
         Ok(self.first_entry(txn)?.map(|(k, _)| k))
     }
 
     /// Returns the largest key, or `None` if the database is empty.
-    pub fn last_key(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<Option<K>> {
+    pub fn last_key(&self, txn: Option<&Transaction>) -> Result<Option<K>> {
         Ok(self.last_entry(txn)?.map(|(k, _)| k))
     }
 
@@ -254,12 +241,8 @@ where
                 result = Some(decode_key(self.inner.key_binding(), &k_buf)?);
                 break;
             }
-            status = cursor.get(
-                &mut k_buf,
-                &mut d_buf,
-                noxu_db::Get::Next,
-                None,
-            )?;
+            status =
+                cursor.get(&mut k_buf, &mut d_buf, noxu_db::Get::Next, None)?;
         }
         cursor.close()?;
         Ok(result)
@@ -291,7 +274,9 @@ mod tests {
         (td, env, db)
     }
 
-    fn populate(map: &StoredSortedMap<'_, i32, String, IntBinding, StringBinding>) {
+    fn populate(
+        map: &StoredSortedMap<'_, i32, String, IntBinding, StringBinding>,
+    ) {
         for (k, v) in
             [(3, "three"), (1, "one"), (2, "two"), (5, "five"), (4, "four")]
         {
@@ -358,11 +343,8 @@ mod tests {
             StoredSortedMap::new(&db, IntBinding, StringBinding);
         populate(&map);
 
-        let items: Vec<_> = map
-            .iter_from(None, &3)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let items: Vec<_> =
+            map.iter_from(None, &3).unwrap().map(Result::unwrap).collect();
         let keys: Vec<i32> = items.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![3, 4, 5]);
     }
@@ -377,11 +359,8 @@ mod tests {
             map.put(None, &k, &format!("{k}")).unwrap();
         }
         // start key 3 → smallest key >= 3 is 4
-        let items: Vec<_> = map
-            .iter_from(None, &3)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let items: Vec<_> =
+            map.iter_from(None, &3).unwrap().map(Result::unwrap).collect();
         let keys: Vec<i32> = items.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![4, 5]);
     }
