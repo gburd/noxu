@@ -90,6 +90,18 @@ pub struct LockManager {
     /// rescanning all N_LOCK_TABLES shards — eliminates the O(64) full scan
     /// that stalls all threads under high contention.
     waiter_graph: Mutex<HashMap<i64, Vec<i64>>>,
+
+    /// Diagnostic label registry: maps locker_id → static label such as
+    /// `"txn"`, `"auto-txn"`, or `"cleaner"`.
+    ///
+    /// Used by [`LockManager::format_locker`] to render a typed identifier
+    /// like `"auto-txn:42"` in deadlock and timeout error messages so a
+    /// deadlock involving a synthetic auto-commit txn and an explicit txn is
+    /// visibly distinguishable from one involving two explicit txns.
+    ///
+    /// Closes the second F12 residual (May 2026 audit follow-up).  Lockers
+    /// without a registered label are reported as `"locker:<id>"`.
+    locker_labels: RwLock<HashMap<i64, &'static str>>,
 }
 
 /// Internal statistics tracking.
@@ -132,7 +144,65 @@ impl LockManager {
             lock_timeout_ms: AtomicU64::new(timeout_ms),
             share_registry: RwLock::new(HashMap::new()),
             waiter_graph: Mutex::new(HashMap::new()),
+            locker_labels: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Registers a diagnostic label for `locker_id`.
+    ///
+    /// Stored in [`Self::locker_labels`] and looked up by
+    /// [`Self::format_locker`] when building deadlock / lock-timeout error
+    /// messages.  Typical labels are `"txn"` (explicit transaction),
+    /// `"auto-txn"` (synthetic auto-commit transaction created by
+    /// `TxnManager::begin_auto_txn`), and `"cleaner"` (cleaner-locker IDs).
+    ///
+    /// Re-registering the same `locker_id` overwrites the previous label.
+    /// Lockers without a registered label are reported as `"locker:<id>"`,
+    /// which preserves backward compatibility with callers that never
+    /// registered.
+    pub fn register_locker_label(&self, locker_id: i64, label: &'static str) {
+        self.locker_labels.write().unwrap().insert(locker_id, label);
+    }
+
+    /// Removes the diagnostic label for `locker_id`.
+    ///
+    /// Called when a transaction (explicit or synthetic auto-commit)
+    /// terminates so the registry does not grow without bound.  Idempotent —
+    /// removing an unknown id is a no-op.
+    pub fn unregister_locker_label(&self, locker_id: i64) {
+        self.locker_labels.write().unwrap().remove(&locker_id);
+    }
+
+    /// Returns a typed identifier string for `locker_id`.
+    ///
+    /// Looks up the label registered via [`Self::register_locker_label`] and
+    /// returns `"<label>:<id>"`; if no label is registered, returns
+    /// `"locker:<id>"`.
+    ///
+    /// Used to format the `requester` and `owner` fields of
+    /// [`TxnError::LockTimeout`] and the message body of
+    /// [`TxnError::Deadlock`] so a mixed auto-commit/explicit-txn deadlock
+    /// reports e.g. `"auto-txn:42"` and `"txn:17"` rather than two opaque
+    /// integers — closing the second F12 residual.
+    pub fn format_locker(&self, locker_id: i64) -> String {
+        match self.locker_labels.read().unwrap().get(&locker_id).copied() {
+            Some(label) => format!("{label}:{locker_id}"),
+            None => format!("locker:{locker_id}"),
+        }
+    }
+
+    /// Returns a comma-separated typed identifier list for `locker_ids`.
+    ///
+    /// Convenience wrapper used in deadlock error messages.
+    pub fn format_lockers(&self, locker_ids: &[i64]) -> String {
+        let mut out = String::new();
+        for (i, id) in locker_ids.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&self.format_locker(*id));
+        }
+        out
     }
 
     /// Updates the default lock timeout.
@@ -335,9 +405,12 @@ impl LockManager {
                     return Err(TxnError::LockTimeout {
                         timeout_ms,
                         lsn,
-                        owner: format!("owners of LSN {}", lsn),
+                        owner: format!(
+                            "[{}] on LSN {lsn}",
+                            self.format_lockers(&owner_ids)
+                        ),
                         requested_type: lock_type,
-                        requester: locker_id.to_string(),
+                        requester: self.format_locker(locker_id),
                     });
                 }
                 timeout_ms - elapsed
@@ -410,9 +483,12 @@ impl LockManager {
                     return Err(TxnError::LockTimeout {
                         timeout_ms,
                         lsn,
-                        owner: format!("owners of LSN {}", lsn),
+                        owner: format!(
+                            "[{}] on LSN {lsn}",
+                            self.format_lockers(&owner_ids)
+                        ),
                         requested_type: lock_type,
-                        requester: locker_id.to_string(),
+                        requester: self.format_locker(locker_id),
                     });
                 }
             }
@@ -804,9 +880,12 @@ impl LockManager {
                     return Err(TxnError::LockTimeout {
                         timeout_ms,
                         lsn,
-                        owner: format!("owners of LSN {}", lsn),
+                        owner: format!(
+                            "[{}] on LSN {lsn}",
+                            self.format_lockers(&owner_ids)
+                        ),
                         requested_type: lock_type,
-                        requester: locker_id.to_string(),
+                        requester: self.format_locker(locker_id),
                     });
                 }
                 timeout_ms - elapsed
@@ -907,10 +986,15 @@ impl LockManager {
         let victim = DeadlockDetector::select_victim(&cycle, &HashMap::new());
 
         if victim == locker_id {
+            // Format the cycle as typed locker IDs (e.g.
+            // `"auto-txn:42 -> txn:17"`) so a mixed auto-commit/explicit-txn
+            // deadlock is visibly distinguishable in the error message.
+            // Closes the second F12 residual.
+            let cycle_fmt = self.format_lockers(&cycle);
+            let victim_fmt = self.format_locker(locker_id);
             Some(TxnError::Deadlock(format!(
-                "deadlock cycle detected; locker {} chosen as victim \
-                 while waiting for LSN {} ({:?})",
-                locker_id, lsn, lock_type
+                "deadlock cycle detected ({cycle_fmt}); {victim_fmt} chosen \
+                 as victim while waiting for LSN {lsn} ({lock_type:?})"
             )))
         } else {
             None
