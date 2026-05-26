@@ -9,14 +9,19 @@ use std::sync::Mutex;
 
 /// A set view of database keys.
 ///
-///
-///
 /// Provides a set interface over the keys of a Noxu DB database.
 /// Keys are returned in sorted byte order.
 ///
 /// Like `StoredMap`, this view maintains an internal key index that
 /// must be populated through `contains()`, `register_key()`, or
 /// `register_keys()` calls for pre-existing data.
+///
+/// # v1.5 limitations
+///
+/// All `StoredKeySet` operations are **auto-commit only** — every
+/// `contains` / `add` / `remove` issues the underlying `Database` call
+/// with `txn = None`.  Threading `Option<&Transaction>` through the
+/// API is tracked for v1.6 (audit findings #1, #3, #4).
 ///
 /// # Example
 /// ```ignore

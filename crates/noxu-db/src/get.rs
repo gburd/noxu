@@ -77,18 +77,33 @@ pub enum Get {
     ///
     /// Positions the cursor at the last record with a key less than or
     /// equal to the search key.
+    ///
+    /// **Not yet implemented.**  `Cursor::get` returns
+    /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
+    /// for a future sprint; see
+    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
     SearchLte,
 
     /// Get the first duplicate of the current key.
     ///
     /// For duplicate databases, positions at the first duplicate of the
     /// current key. Has no effect if not positioned on a key.
+    ///
+    /// **Not yet implemented.**  `Cursor::get` returns
+    /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
+    /// for a future sprint; see
+    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
     FirstDup,
 
     /// Get the last duplicate of the current key.
     ///
     /// For duplicate databases, positions at the last duplicate of the
     /// current key. Has no effect if not positioned on a key.
+    ///
+    /// **Not yet implemented.**  `Cursor::get` returns
+    /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
+    /// for a future sprint; see
+    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
     LastDup,
 
     /// Get the next duplicate of the current key.

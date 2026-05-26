@@ -47,8 +47,11 @@ pub struct Environment {
     config: EnvironmentConfig,
     /// Open databases by name (tracks which names are currently open via this handle)
     databases: Mutex<HashMap<String, Arc<DatabaseHandle>>>,
-    /// Active transactions
-    active_txns: Mutex<HashMap<u64, Arc<TransactionState>>>,
+    /// Active transactions registry, shared with `Transaction` so that
+    /// `Transaction::commit()` / `Transaction::abort()` can prune their
+    /// own entry on completion (F1: `mark_transaction_complete` was dead
+    /// code, so `env.close()` after `txn.commit()` always failed).
+    active_txns: Arc<ActiveTxns>,
     /// Next transaction ID
     next_txn_id: AtomicU64,
     /// Whether the environment is open
@@ -89,6 +92,45 @@ struct TransactionState {
     committed: AtomicBool,
     #[expect(dead_code)]
     aborted: AtomicBool,
+}
+
+/// Shared registry of active transactions, owned by `Environment` and
+/// referenced (via `Arc`) by every `Transaction` so that `commit()` /
+/// `abort()` can prune their own entry without a callback into
+/// `Environment` itself.
+///
+/// Resolves F1 of the May 2026 API audit: `Environment::active_txns` was
+/// previously a private `Mutex<HashMap>` that no `Transaction` could see,
+/// so `mark_transaction_complete` was dead code and `env.close()` after a
+/// commit always returned `OperationNotAllowed`.
+pub(crate) struct ActiveTxns {
+    txns: Mutex<HashMap<u64, Arc<TransactionState>>>,
+}
+
+impl ActiveTxns {
+    fn new() -> Self {
+        Self { txns: Mutex::new(HashMap::new()) }
+    }
+
+    fn insert(&self, id: u64, state: Arc<TransactionState>) {
+        self.txns.lock().insert(id, state);
+    }
+
+    /// Removes the entry for the given transaction id.
+    ///
+    /// Called by `Transaction::commit_with_durability` and `Transaction::abort`
+    /// once the transaction has reached a terminal state.
+    pub(crate) fn mark_complete(&self, id: u64) {
+        self.txns.lock().remove(&id);
+    }
+
+    fn len(&self) -> usize {
+        self.txns.lock().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.txns.lock().is_empty()
+    }
 }
 
 impl Environment {
@@ -309,7 +351,7 @@ impl Environment {
             home,
             config,
             databases: Mutex::new(HashMap::new()),
-            active_txns: Mutex::new(HashMap::new()),
+            active_txns: Arc::new(ActiveTxns::new()),
             next_txn_id: AtomicU64::new(1),
             open: AtomicBool::new(true),
             env_valid: AtomicBool::new(true),
@@ -348,11 +390,10 @@ impl Environment {
         }
 
         // Check for active transactions
-        let active_txns = self.active_txns.lock();
-        if !active_txns.is_empty() {
+        if !self.active_txns.is_empty() {
             return Err(NoxuError::OperationNotAllowed(format!(
                 "Cannot close environment with {} active transactions",
-                active_txns.len()
+                self.active_txns.len()
             )));
         }
 
@@ -584,22 +625,28 @@ impl Environment {
 
     /// Begins a new transaction.
     ///
-    ///
-    ///
     /// # Arguments
-    /// * `parent` - Optional parent transaction (currently ignored)
+    /// * `parent` - Reserved for nested transactions in a future release.  In
+    ///   v1.5 this argument **must** be `None`; passing `Some(_)` returns a
+    ///   typed [`NoxuError::Unsupported`] error (see Decision 3B in
+    ///   `docs/src/internal/v1.5-decisions-2026-05.md`).  The parameter
+    ///   itself is scheduled for removal in v2.0; until then it is kept on
+    ///   the signature so the v1.6 / v2.0 transition does not require a
+    ///   second SemVer break.
     /// * `config` - Optional transaction configuration
     ///
     /// # Returns
-    /// A new transaction handle
+    /// A new transaction handle.
     ///
     /// # Errors
     /// Returns an error if:
     /// - The environment is closed
     /// - The environment is not transactional
+    /// - `parent` is `Some(_)` ([`NoxuError::Unsupported`]) — closes audit
+    ///   finding F11 (`_parent` was previously dropped on the floor).
     pub fn begin_transaction(
         &self,
-        _parent: Option<&Transaction>,
+        parent: Option<&Transaction>,
         config: Option<&TransactionConfig>,
     ) -> Result<Transaction> {
         self.check_open()?;
@@ -611,8 +658,36 @@ impl Environment {
             ));
         }
 
+        // Decision 3B (v1.5-decisions-2026-05.md): nested transactions are
+        // not supported.  Pre-Sprint-3 the parameter was named `_parent` and
+        // silently ignored, which is exactly the F11 audit finding.  We now
+        // reject `Some(_)` with a typed error so users see a loud,
+        // documented failure instead of the BDB-JE-shaped behaviour they
+        // would otherwise expect from the published mdBook.  The parameter
+        // is retained for v1.5 / v1.6 SemVer stability and will be removed
+        // in v2.0.
+        if parent.is_some() {
+            return Err(NoxuError::Unsupported(
+                "nested transactions are not supported in v1.5; pass None \
+                 for parent (planned for v2.0)"
+                    .to_string(),
+            ));
+        }
+
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
-        let txn_config = config.cloned().unwrap_or_default();
+        // F3: when the caller does not supply a TransactionConfig, the
+        // environment-level `Durability` default (`EnvironmentConfig::durability`,
+        // settable via `EnvironmentConfig::with_durability`) must be
+        // honoured.  Pre-fix `unwrap_or_default()` produced a config with
+        // `Durability::COMMIT_SYNC` regardless of the env setting, so a
+        // user opening with `.with_durability(COMMIT_NO_SYNC)` and then
+        // calling `begin_transaction(None, None)` still fsynced on every
+        // commit.
+        let txn_config = match config.cloned() {
+            Some(c) => c,
+            None => TransactionConfig::default()
+                .with_durability(self.config.durability),
+        };
 
         let txn_state = Arc::new(TransactionState {
             id: txn_id,
@@ -621,7 +696,7 @@ impl Environment {
             aborted: AtomicBool::new(false),
         });
 
-        let mut active_txns = self.active_txns.lock();
+        let mut active_txns = self.active_txns.txns.lock();
         active_txns.insert(txn_id, txn_state);
         drop(active_txns);
 
@@ -635,6 +710,13 @@ impl Environment {
                 // inner Txn for lock management and isolation behavior.
                 if txn_config.read_committed {
                     t.set_read_committed_isolation(true);
+                }
+                if txn_config.read_uncommitted {
+                    // F2: previously this branch was missing, so the
+                    // user-set `with_read_uncommitted(true)` flag was
+                    // silently dropped and dirty reads were impossible
+                    // at the txn level.
+                    t.set_read_uncommitted_default(true);
                 }
                 if txn_config.serializable_isolation {
                     t.set_serializable_isolation(true);
@@ -667,6 +749,12 @@ impl Environment {
         // Wire env_impl so Transaction::abort() can apply undo records.
         // Txn environment reference during construction.
         let txn = txn.with_env_impl(Arc::clone(&self.env_impl));
+
+        // Wire the active-txns registry so commit/abort can prune their
+        // own entry (F1).  Without this, every successful txn left an
+        // entry in `active_txns` and `env.close()` returned
+        // `OperationNotAllowed`.
+        let txn = txn.with_active_txns(Arc::clone(&self.active_txns));
 
         Ok(txn)
     }
@@ -922,10 +1010,12 @@ impl Environment {
 
     /// Internal method to mark a transaction as complete.
     ///
-    /// Called by Transaction::commit() or Transaction::abort().
+    /// Historically a no-op call site; now superseded by
+    /// `Transaction::commit` / `Transaction::abort` calling
+    /// `ActiveTxns::mark_complete` directly via the shared `Arc<ActiveTxns>`.
+    /// Kept for backwards compatibility with internal tests.
     pub(crate) fn mark_transaction_complete(&self, txn_id: u64) {
-        let mut active_txns = self.active_txns.lock();
-        active_txns.remove(&txn_id);
+        self.active_txns.mark_complete(txn_id);
     }
 
     fn check_open(&self) -> Result<()> {

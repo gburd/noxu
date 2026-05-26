@@ -1,5 +1,15 @@
 # Entity Persistence (DPL)
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+>
+> **v1.5 limitations** are detailed in the
+> ["v1.5 limitations" section below](#v15-limitations) and in
+> [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md).
+> Headlines: secondary indexes are in-memory only; secondary updates
+> are not atomic with the user txn; primary writes do thread `txn`
+> through correctly (Sprint 3B).
+
 The Direct Persistence Layer (`noxu-persist`) lets you store and retrieve
 Rust structs through a typed primary index instead of writing
 `DatabaseEntry` byte slices by hand. It is a trait-based layer: you opt
@@ -108,26 +118,74 @@ let ser = UserSerializer;
 
 ## Reading and writing entities
 
+Every `PrimaryIndex` operation takes a leading
+`txn: Option<&Transaction>` argument. Pass `Some(&txn)` to participate
+in a user transaction (the underlying database write commits or aborts
+atomically with the txn). Pass `None` to keep the historical
+auto-commit behaviour. This mirrors the
+`noxu_db::Database::{get, put, delete}` shape and matches BDB-JE's
+`PrimaryIndex` surface.
+
 ```rust
-// Insert / update.
-index.put(&ser, &User { id: 1, email: "a@b.com".into(), name: "Alice".into() })?;
+// Auto-commit (no surrounding txn).
+index.put(
+    None,
+    &ser,
+    &User { id: 1, email: "a@b.com".into(), name: "Alice".into() },
+)?;
 
-// Lookup by primary key.
-let user: Option<User> = index.get(&ser, &1u64)?;
+// Lookup by primary key (auto-commit).
+let user: Option<User> = index.get(None, &ser, &1u64)?;
 
-// Delete (no secondary indexes touched — see delete_with_entity below).
-let removed: bool = index.delete(&1u64)?;
+// Delete (auto-commit).  Does not fetch the entity — see
+// `delete_with_entity` below.
+let removed: bool = index.delete(None, &1u64)?;
 
-// Iterate in primary-key order.
-for user in index.entities(&ser)? {
+// Iterate in primary-key order (auto-commit).
+for user in index.entities(None, &ser)? {
     let u: User = user?;
     println!("{u:?}");
 }
 ```
 
+To participate in an explicit transaction:
+
+```rust
+use noxu_db::Environment;
+# fn doc(env: &Environment) -> noxu_persist::Result<()> {
+# use noxu_persist::{EntityStore, PrimaryIndex, StoreConfig, EntitySerializer};
+# let mut store = EntityStore::open(env, StoreConfig::new("s").with_allow_create(true))?;
+# let index: PrimaryIndex<u64, User> = store.get_primary_index()?;
+# struct UserSerializer;
+# impl EntitySerializer<User> for UserSerializer {
+#     fn serialize(&self, _: &User) -> noxu_persist::Result<Vec<u8>> { Ok(vec![]) }
+#     fn deserialize(&self, _: &[u8]) -> noxu_persist::Result<User> { unimplemented!() }
+# }
+# struct User { id: u64, email: String, name: String }
+# impl noxu_persist::Entity for User {
+#     type PrimaryKey = u64;
+#     fn primary_key(&self) -> &u64 { &self.id }
+#     fn entity_name() -> &'static str { "User" }
+# }
+# let ser = UserSerializer;
+let txn = env.begin_transaction(None, None)?;
+index.put(
+    Some(&txn),
+    &ser,
+    &User { id: 2, email: "b@c.com".into(), name: "Bob".into() },
+)?;
+if /* application predicate */ true {
+    txn.commit()?;
+} else {
+    txn.abort()?; // primary write is rolled back
+}
+# Ok(())
+# }
+```
+
 The `index.put` and `index.delete_with_entity` calls automatically
 update every secondary index that has been registered against this
-primary index (see below). The plain `index.delete(&pk)` does not
+primary index (see below). The plain `index.delete(txn, &pk)` does not
 fetch the entity and therefore cannot maintain secondary indexes; use
 `delete_with_entity` whenever secondary maintenance is required.
 
@@ -145,8 +203,10 @@ let by_email: SecondaryIndex<String, u64, User> =
     index.open_secondary_index(|u: &User| Some(u.email.clone()));
 
 // Lookup by secondary key. The lookup goes through the registered
-// PrimaryIndex to materialise the entity, so the call takes both.
-let user: Option<User> = by_email.get(&ser, &index, &"a@b.com".to_string())?;
+// PrimaryIndex to materialise the entity, so the call takes both, plus
+// the optional transaction.
+let user: Option<User> =
+    by_email.get(None, &ser, &index, &"a@b.com".to_string())?;
 ```
 
 The extractor returns `Option<SK>`: `None` means "this entity has no
@@ -188,14 +248,36 @@ in-memory variant for tests.
 
 ## Limitations and roadmap
 
+### v1.5 limitations
+
+- **Secondary indexes are in-memory only.** Entities with secondary
+  keys (registered via `index.open_secondary_index(|e| ...)`) maintain
+  the `secondary_key → primary_key` mapping in a process-local
+  `BTreeMap<SK, BTreeSet<PK>>`. The mapping is **not** written to the
+  underlying log and **does not survive a process restart** — it must
+  be rebuilt by re-registering the index and replaying the primaries
+  through the extractor. v1.6 will back secondaries with a real
+  `Database` so the mapping is durable.
+- **Primary-index writes can participate in transactions; secondary
+  updates currently cannot.** Calling
+  `index.put(Some(&txn), &ser, &entity)` correctly threads the txn
+  through to the primary `Database::put`, but the in-memory secondary
+  map is updated **immediately** — it is not rolled back if the
+  caller later aborts the txn. The first such call against a primary
+  with registered secondaries logs a one-shot
+  `PersistError::SecondariesNotTransactional` warning so the
+  limitation is operator-visible. v1.6 closes this gap together with
+  the durability work above.
+- See [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md)
+  for the full audit context, the rationale for shipping the
+  in-memory secondaries unchanged in v1.5, and the v1.6 plan.
+
+### Other roadmap items
+
 - No `#[derive(Entity)]` macro yet; each type needs explicit `Entity`
   and `EntitySerializer<E>` impls.
 - The serializer is a runtime parameter on every read/write call; it
   is not stored alongside the data. Replacing the serializer for a
   given entity type requires a schema-evolution migration.
-- `delete(&pk)` cannot maintain secondary indexes; prefer
-  `delete_with_entity`.
-- Secondary indexes are in-memory `BTreeMap`s rebuilt by the
-  `PrimaryIndex` registration. They are not persisted independently —
-  see `crates/noxu-persist/src/secondary_index.rs` for the design
-  notes.
+- `delete(txn, &pk)` cannot maintain secondary indexes; prefer
+  `delete_with_entity(txn, &ser, &pk)`.

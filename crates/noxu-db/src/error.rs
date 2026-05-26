@@ -565,6 +565,17 @@ pub enum NoxuError {
     /// An invalid operation was requested.
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
+
+    /// The requested operation is recognised by the API but not yet
+    /// implemented.  The argument names the operation (for example
+    /// `"Get::SearchLte"`).
+    ///
+    /// Returned by API arms that previously fell through to a silent
+    /// `OperationStatus::NotFound`; users now see a loud, typed error
+    /// instead of a misleading miss.  Tracked in
+    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
+    #[error("operation not yet supported: {0}")]
+    Unsupported(String),
 }
 
 impl NoxuError {

@@ -1,5 +1,13 @@
 # Setup and Configuration
 
+> **v1.5 status — preview.** See
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> and [the chapter overview](README.md) for the noxu-rep GA-blocker
+> list. The configuration shape below is the **intended** contract;
+> several `RepConfig` fields are not plumbed into the production path
+> in v1.5 (notably `replica_ack_policy`, `replica_ack_timeout_ms`,
+> `feeder_timeout`, `helper_hosts`).
+
 This page covers how to configure and start a Noxu DB replicated environment.
 
 ## Dependencies
@@ -16,6 +24,7 @@ noxu-rep = { version = "0.1", features = [] }
 ## Group Topology
 
 A replication group consists of:
+
 - **One master** — accepts all writes, feeds log to replicas
 - **Zero or more replicas** — receive the log stream, serve reads
 

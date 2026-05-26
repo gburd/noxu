@@ -16,7 +16,9 @@ assert_eq!(status, OperationStatus::Success);
 
 If a record with the same key already exists, `put` overwrites it by default. The old value is lost.
 
-The first argument to `put` is an optional `Transaction`. Pass `None` for non-transactional writes (the operation is immediately durable) or pass a transaction handle to group multiple writes into a single atomic unit.
+The first argument to `put` is an optional `Transaction`. Pass `None` for non-transactional
+writes (the operation is immediately durable) or pass a transaction handle to group multiple
+writes into a single atomic unit.
 
 ## Reading Records
 
@@ -120,4 +122,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ---
-

@@ -166,9 +166,9 @@ fn test_put_get() {
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
     let e = my_entity(1, Some(10));
-    index.put(&ser, &e).unwrap();
+    index.put(None, &ser, &e).unwrap();
 
-    let found = index.get(&ser, &1).unwrap().unwrap();
+    let found = index.get(None, &ser, &1).unwrap().unwrap();
     assert_eq!(found.pri_key, 1);
     assert_eq!(found.sec_key, Some(10));
     assert_eq!(found.label, "ent1");
@@ -187,14 +187,14 @@ fn test_put_replaces_existing() {
     let ser = MyEntitySerializer;
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
-    index.put(&ser, &my_entity(1, Some(10))).unwrap();
+    index.put(None, &ser, &my_entity(1, Some(10))).unwrap();
 
     // Overwrite with a different sec_key and label.
     let updated =
         MyEntity { pri_key: 1, sec_key: Some(99), label: "updated".into() };
-    index.put(&ser, &updated).unwrap();
+    index.put(None, &ser, &updated).unwrap();
 
-    let found = index.get(&ser, &1).unwrap().unwrap();
+    let found = index.get(None, &ser, &1).unwrap().unwrap();
     assert_eq!(found.sec_key, Some(99));
     assert_eq!(found.label, "updated");
 }
@@ -212,12 +212,12 @@ fn test_delete_then_get_returns_none() {
     let ser = MyEntitySerializer;
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
-    index.put(&ser, &my_entity(1, Some(10))).unwrap();
+    index.put(None, &ser, &my_entity(1, Some(10))).unwrap();
 
-    let deleted = index.delete(&1).unwrap();
+    let deleted = index.delete(None, &1).unwrap();
     assert!(deleted, "delete should return true for existing key");
 
-    assert_eq!(index.get(&ser, &1).unwrap(), None);
+    assert_eq!(index.get(None, &ser, &1).unwrap(), None);
 }
 
 /// Deleting a non-existent key returns `false`.
@@ -231,7 +231,7 @@ fn test_delete_missing_key_returns_false() {
     let mut store = EntityStore::open(&env, cfg).unwrap();
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
-    let deleted = index.delete(&42).unwrap();
+    let deleted = index.delete(None, &42).unwrap();
     assert!(!deleted);
 }
 
@@ -251,16 +251,16 @@ fn test_count_reflects_inserts_and_deletes() {
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
     assert_eq!(index.count().unwrap(), 0);
 
-    index.put(&ser, &my_entity(1, None)).unwrap();
-    index.put(&ser, &my_entity(2, None)).unwrap();
-    index.put(&ser, &my_entity(3, None)).unwrap();
+    index.put(None, &ser, &my_entity(1, None)).unwrap();
+    index.put(None, &ser, &my_entity(2, None)).unwrap();
+    index.put(None, &ser, &my_entity(3, None)).unwrap();
     assert_eq!(index.count().unwrap(), 3);
 
-    index.delete(&2).unwrap();
+    index.delete(None, &2).unwrap();
     assert_eq!(index.count().unwrap(), 2);
 
-    index.delete(&1).unwrap();
-    index.delete(&3).unwrap();
+    index.delete(None, &1).unwrap();
+    index.delete(None, &3).unwrap();
     assert_eq!(index.count().unwrap(), 0);
 }
 
@@ -277,11 +277,13 @@ fn test_put_no_overwrite() {
     let ser = MyEntitySerializer;
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
-    assert!(index.put_no_overwrite(&ser, &my_entity(1, None)).unwrap());
-    assert!(!index.put_no_overwrite(&ser, &my_entity(1, Some(99))).unwrap());
+    assert!(index.put_no_overwrite(None, &ser, &my_entity(1, None)).unwrap());
+    assert!(
+        !index.put_no_overwrite(None, &ser, &my_entity(1, Some(99))).unwrap()
+    );
 
     // Original value must be unchanged.
-    let found = index.get(&ser, &1).unwrap().unwrap();
+    let found = index.get(None, &ser, &1).unwrap().unwrap();
     assert_eq!(found.sec_key, None);
 }
 
@@ -297,11 +299,11 @@ fn test_contains() {
     let ser = MyEntitySerializer;
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
-    assert!(!index.contains(&1).unwrap());
-    index.put(&ser, &my_entity(1, None)).unwrap();
-    assert!(index.contains(&1).unwrap());
-    index.delete(&1).unwrap();
-    assert!(!index.contains(&1).unwrap());
+    assert!(!index.contains(None, &1).unwrap());
+    index.put(None, &ser, &my_entity(1, None)).unwrap();
+    assert!(index.contains(None, &1).unwrap());
+    index.delete(None, &1).unwrap();
+    assert!(!index.contains(None, &1).unwrap());
 }
 
 /// Operations on a closed store return an error.
@@ -373,25 +375,28 @@ fn test_two_entity_types_in_same_store() {
     {
         let idx1: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
-        idx1.put(&ser1, &my_entity(1, Some(10))).unwrap();
+        idx1.put(None, &ser1, &my_entity(1, Some(10))).unwrap();
         assert_eq!(idx1.count().unwrap(), 1);
     }
     {
         let idx2: PrimaryIndex<u64, OtherEntity> =
             store.get_primary_index().unwrap();
-        idx2.put(&ser2, &OtherEntity { key: 100, value: "hello".into() })
+        idx2.put(None, &ser2, &OtherEntity { key: 100, value: "hello".into() })
             .unwrap();
         assert_eq!(idx2.count().unwrap(), 1);
     }
     {
         let idx1: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
-        assert_eq!(idx1.get(&ser1, &1).unwrap().unwrap().pri_key, 1);
+        assert_eq!(idx1.get(None, &ser1, &1).unwrap().unwrap().pri_key, 1);
     }
     {
         let idx2: PrimaryIndex<u64, OtherEntity> =
             store.get_primary_index().unwrap();
-        assert_eq!(idx2.get(&ser2, &100u64).unwrap().unwrap().value, "hello");
+        assert_eq!(
+            idx2.get(None, &ser2, &100u64).unwrap().unwrap().value,
+            "hello"
+        );
     }
 }
 
@@ -417,11 +422,11 @@ fn test_primary_iteration_in_key_order() {
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
     const N: i32 = 5;
     for i in 0..N {
-        index.put(&ser, &my_entity(i, Some(i * 10))).unwrap();
+        index.put(None, &ser, &my_entity(i, Some(i * 10))).unwrap();
     }
 
     let entities: Vec<MyEntity> = index
-        .entities(&ser)
+        .entities(None, &ser)
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
@@ -446,7 +451,7 @@ fn test_primary_iteration_empty() {
 
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
     let entities: Vec<MyEntity> = index
-        .entities(&ser)
+        .entities(None, &ser)
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
@@ -469,15 +474,15 @@ fn test_primary_delete_one_by_one() {
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
     const N: i32 = 5;
     for i in 0..N {
-        index.put(&ser, &my_entity(i, None)).unwrap();
+        index.put(None, &ser, &my_entity(i, None)).unwrap();
     }
 
     // Delete last-first for variety (mirrors IndexTest).
     for i in (0..N).rev() {
-        let deleted = index.delete(&i).unwrap();
+        let deleted = index.delete(None, &i).unwrap();
         assert!(deleted, "should have deleted key {}", i);
         assert_eq!(index.count().unwrap(), i as u64);
-        assert_eq!(index.get(&ser, &i).unwrap(), None);
+        assert_eq!(index.get(None, &ser, &i).unwrap(), None);
     }
 }
 
@@ -497,21 +502,21 @@ fn test_put_operations() {
     let index: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
 
     // put() insert
-    index.put(&ser, &my_entity(1, None)).unwrap();
-    assert_eq!(index.get(&ser, &1).unwrap().unwrap().pri_key, 1);
+    index.put(None, &ser, &my_entity(1, None)).unwrap();
+    assert_eq!(index.get(None, &ser, &1).unwrap().unwrap().pri_key, 1);
 
     // put() update (same key)
     let updated =
         MyEntity { pri_key: 1, sec_key: Some(42), label: "updated".into() };
-    index.put(&ser, &updated).unwrap();
-    assert_eq!(index.get(&ser, &1).unwrap().unwrap().sec_key, Some(42));
+    index.put(None, &ser, &updated).unwrap();
+    assert_eq!(index.get(None, &ser, &1).unwrap().unwrap().sec_key, Some(42));
 
     // put_no_overwrite returns false for existing key
-    assert!(!index.put_no_overwrite(&ser, &my_entity(1, None)).unwrap());
+    assert!(!index.put_no_overwrite(None, &ser, &my_entity(1, None)).unwrap());
 
     // put_no_overwrite returns true for new key
-    assert!(index.put_no_overwrite(&ser, &my_entity(3, None)).unwrap());
-    assert_eq!(index.get(&ser, &3).unwrap().unwrap().pri_key, 3);
+    assert!(index.put_no_overwrite(None, &ser, &my_entity(3, None)).unwrap());
+    assert_eq!(index.get(None, &ser, &3).unwrap().unwrap().pri_key, 3);
 }
 
 /// Secondary index lookup by secondary key.
@@ -533,18 +538,18 @@ fn test_secondary_lookup_by_key() {
 
     // Insert 5 entities with distinct secondary keys.
     for i in 0..5i32 {
-        index.put(&ser, &my_entity(i, Some(-i))).unwrap();
+        index.put(None, &ser, &my_entity(i, Some(-i))).unwrap();
     }
 
     // get() via secondary key.
-    let found = sec.get(&ser, &index, &0).unwrap().unwrap();
+    let found = sec.get(None, &ser, &index, &0).unwrap().unwrap();
     assert_eq!(found.pri_key, 0);
 
-    let found = sec.get(&ser, &index, &-3).unwrap().unwrap();
+    let found = sec.get(None, &ser, &index, &-3).unwrap().unwrap();
     assert_eq!(found.pri_key, 3);
 
     // Non-existent secondary key returns None.
-    assert!(sec.get(&ser, &index, &99).unwrap().is_none());
+    assert!(sec.get(None, &ser, &index, &99).unwrap().is_none());
 }
 
 /// MANY_TO_ONE: multiple entities share the same secondary key; `sub_index`
@@ -568,7 +573,7 @@ fn test_secondary_many_to_one() {
     const N: i32 = 5;
     const THREE_TO_ONE: i32 = 3;
     for i in 0..N {
-        index.put(&ser, &my_entity(i, Some(i % THREE_TO_ONE))).unwrap();
+        index.put(None, &ser, &my_entity(i, Some(i % THREE_TO_ONE))).unwrap();
     }
 
     // Sec key 0 maps to primary keys 0 and 3.
@@ -606,11 +611,11 @@ fn test_secondary_iteration_in_key_order() {
 
     // Insert with reversed secondary keys: entity 0 → sec 4, ..., entity 4 → sec 0.
     for i in 0..5i32 {
-        index.put(&ser, &my_entity(i, Some(4 - i))).unwrap();
+        index.put(None, &ser, &my_entity(i, Some(4 - i))).unwrap();
     }
 
     let pairs: Vec<(i32, MyEntity)> = sec
-        .iter(&ser, &index)
+        .iter(None, &ser, &index)
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
 
@@ -638,12 +643,12 @@ fn test_secondary_iter_from_range() {
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
     for i in 0..5i32 {
-        index.put(&ser, &my_entity(i, Some(i))).unwrap();
+        index.put(None, &ser, &my_entity(i, Some(i))).unwrap();
     }
 
     // iter_from(&2) should yield sec keys 2, 3, 4.
     let pairs: Vec<(i32, MyEntity)> = sec
-        .iter_from(&ser, &index, &2)
+        .iter_from(None, &ser, &index, &2)
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(pairs.len(), 3);
@@ -670,16 +675,16 @@ fn test_secondary_delete_cascades_to_primary() {
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
-    index.put(&ser, &my_entity(1, Some(10))).unwrap();
-    index.put(&ser, &my_entity(2, Some(10))).unwrap(); // same sec key
+    index.put(None, &ser, &my_entity(1, Some(10))).unwrap();
+    index.put(None, &ser, &my_entity(2, Some(10))).unwrap(); // same sec key
 
     // Delete all entities with sec_key == 10.
-    let deleted = sec.delete(&ser, &index, &10).unwrap();
+    let deleted = sec.delete(None, &ser, &index, &10).unwrap();
     assert!(deleted);
 
     // Both primary records gone.
-    assert_eq!(index.get(&ser, &1).unwrap(), None);
-    assert_eq!(index.get(&ser, &2).unwrap(), None);
+    assert_eq!(index.get(None, &ser, &1).unwrap(), None);
+    assert_eq!(index.get(None, &ser, &2).unwrap(), None);
 
     // Secondary map is clean.
     assert!(!sec.contains(&10));
@@ -703,12 +708,12 @@ fn test_secondary_delete_not_found() {
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
-    index.put(&ser, &my_entity(1, Some(10))).unwrap();
+    index.put(None, &ser, &my_entity(1, Some(10))).unwrap();
 
-    let first = sec.delete(&ser, &index, &10).unwrap();
+    let first = sec.delete(None, &ser, &index, &10).unwrap();
     assert!(first);
     // Second delete on same key.
-    let second = sec.delete(&ser, &index, &10).unwrap();
+    let second = sec.delete(None, &ser, &index, &10).unwrap();
     assert!(!second);
 }
 
@@ -730,9 +735,9 @@ fn test_secondary_contains() {
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
     assert!(!sec.contains(&7));
-    index.put(&ser, &my_entity(1, Some(7))).unwrap();
+    index.put(None, &ser, &my_entity(1, Some(7))).unwrap();
     assert!(sec.contains(&7));
-    index.delete_with_entity(&ser, &1).unwrap();
+    index.delete_with_entity(None, &ser, &1).unwrap();
     assert!(!sec.contains(&7));
 }
 
@@ -753,9 +758,9 @@ fn test_secondary_keys_index() {
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
-    index.put(&ser, &my_entity(1, Some(10))).unwrap();
-    index.put(&ser, &my_entity(2, Some(20))).unwrap();
-    index.put(&ser, &my_entity(3, Some(10))).unwrap(); // dup sec key
+    index.put(None, &ser, &my_entity(1, Some(10))).unwrap();
+    index.put(None, &ser, &my_entity(2, Some(20))).unwrap();
+    index.put(None, &ser, &my_entity(3, Some(10))).unwrap(); // dup sec key
 
     let kv = sec.keys_index();
     // 3 total pairs.
@@ -783,13 +788,14 @@ fn test_secondary_updated_on_overwrite() {
     let sec: SecondaryIndex<i32, i32, MyEntity> =
         index.open_secondary_index(|e: &MyEntity| e.sec_key);
 
-    index.put(&ser, &my_entity(1, Some(10))).unwrap();
+    index.put(None, &ser, &my_entity(1, Some(10))).unwrap();
     assert!(sec.contains(&10));
     assert!(!sec.contains(&20));
 
     // Update: change sec_key from 10 to 20.
     index
         .put(
+            None,
             &ser,
             &MyEntity { pri_key: 1, sec_key: Some(20), label: "x".into() },
         )
@@ -848,9 +854,9 @@ fn test_two_secondary_indexes_maintained_independently() {
         primary.open_secondary_index(|e: &EmpB| Some(e.grade));
     let ser = EmpBSer;
 
-    primary.put(&ser, &EmpB { id: 1, dept: 10, grade: 5 }).unwrap();
-    primary.put(&ser, &EmpB { id: 2, dept: 10, grade: 3 }).unwrap();
-    primary.put(&ser, &EmpB { id: 3, dept: 20, grade: 5 }).unwrap();
+    primary.put(None, &ser, &EmpB { id: 1, dept: 10, grade: 5 }).unwrap();
+    primary.put(None, &ser, &EmpB { id: 2, dept: 10, grade: 3 }).unwrap();
+    primary.put(None, &ser, &EmpB { id: 3, dept: 20, grade: 5 }).unwrap();
 
     assert_eq!(dept_idx.sub_index(&10).len(), 2);
     assert_eq!(dept_idx.sub_index(&20).len(), 1);
@@ -858,7 +864,7 @@ fn test_two_secondary_indexes_maintained_independently() {
     assert_eq!(grade_idx.sub_index(&3).len(), 1);
 
     // Delete via primary — both secondaries must be updated.
-    primary.delete_with_entity(&ser, &1).unwrap();
+    primary.delete_with_entity(None, &ser, &1).unwrap();
     assert_eq!(dept_idx.sub_index(&10).len(), 1);
     assert_eq!(grade_idx.sub_index(&5).len(), 1);
 }
@@ -917,7 +923,7 @@ fn test_deleter_mutation_removes_records_and_stats() {
         let idx: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
         for i in 0..3i32 {
-            idx.put(&ser, &my_entity(i, None)).unwrap();
+            idx.put(None, &ser, &my_entity(i, None)).unwrap();
         }
     }
 
@@ -961,7 +967,7 @@ fn test_converter_mutation_transforms_records_and_stats() {
         let idx: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
         for i in 0..N {
-            idx.put(&ser, &my_entity(i, None)).unwrap();
+            idx.put(None, &ser, &my_entity(i, None)).unwrap();
         }
     }
 
@@ -1011,7 +1017,7 @@ fn test_evolve_with_empty_mutations_returns_zero() {
     {
         let idx: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
-        idx.put(&ser, &my_entity(1, None)).unwrap();
+        idx.put(None, &ser, &my_entity(1, None)).unwrap();
     }
 
     let mutations = Mutations::new(); // empty
@@ -1039,7 +1045,7 @@ fn test_evolve_config_class_filter() {
     {
         let idx: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
-        idx.put(&ser, &my_entity(1, None)).unwrap();
+        idx.put(None, &ser, &my_entity(1, None)).unwrap();
     }
 
     let mut mutations = Mutations::new();
@@ -1117,8 +1123,8 @@ fn test_evolve_full_round_trip() {
     {
         let idx: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
-        idx.put(&ser, &my_entity(1, Some(10))).unwrap();
-        idx.put(&ser, &my_entity(2, Some(20))).unwrap();
+        idx.put(None, &ser, &my_entity(1, Some(10))).unwrap();
+        idx.put(None, &ser, &my_entity(2, Some(20))).unwrap();
     }
 
     // Converter: flip the sign of sec_key by rewriting it in-place.
@@ -1152,8 +1158,8 @@ fn test_evolve_full_round_trip() {
 
     // Read back; sec_keys should now be negated.
     let idx: PrimaryIndex<i32, MyEntity> = store.get_primary_index().unwrap();
-    let e1 = idx.get(&ser, &1).unwrap().unwrap();
-    let e2 = idx.get(&ser, &2).unwrap().unwrap();
+    let e1 = idx.get(None, &ser, &1).unwrap().unwrap();
+    let e2 = idx.get(None, &ser, &2).unwrap().unwrap();
     assert_eq!(e1.sec_key, Some(-10));
     assert_eq!(e2.sec_key, Some(-20));
 }

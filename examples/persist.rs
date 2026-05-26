@@ -191,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nStoring {} persons...", people.len());
     for person in &people {
-        index.put(&ser, person)?;
+        index.put(None, &ser, person)?;
         println!(
             "  Stored: id={} {} {}",
             person.person_id, person.first_name, person.last_name
@@ -201,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Retrieve by primary key.
     println!("\nRetrieving by primary key:");
     for id in [1u32, 3, 5] {
-        match index.get(&ser, &id)? {
+        match index.get(None, &ser, &id)? {
             Some(p) => println!(
                 "  id={}: {} {}, age={}",
                 id, p.first_name, p.last_name, p.age
@@ -218,8 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_name: "Johnson".to_string(),
         age: 26,
     };
-    index.put(&ser, &updated_bob)?;
-    let bob = index.get(&ser, &2u32)?.expect("Bob should exist");
+    index.put(None, &ser, &updated_bob)?;
+    let bob = index.get(None, &ser, &2u32)?.expect("Bob should exist");
     println!(
         "  Updated: {} {}, age={}",
         bob.first_name, bob.last_name, bob.age
@@ -230,8 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. Iterate over all entities in key order.
     println!("\nAll persons in key order:");
-    let all: Vec<Person> =
-        index.entities(&ser)?.collect::<noxu_persist::Result<Vec<_>>>()?;
+    let all: Vec<Person> = index
+        .entities(None, &ser)?
+        .collect::<noxu_persist::Result<Vec<_>>>()?;
     for p in &all {
         println!(
             "  id={}: {} {}, age={}",
@@ -241,10 +242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Delete an entity.
     println!("\nDeleting id=4 (Dave Brown)...");
-    let deleted = index.delete(&4u32)?;
+    let deleted = index.delete(None, &4u32)?;
     println!("  Deleted: {}", deleted);
 
-    match index.get(&ser, &4u32)? {
+    match index.get(None, &ser, &4u32)? {
         Some(_) => println!("  ERROR: id=4 still present after delete"),
         None => println!("  Confirmed: id=4 no longer present"),
     }
@@ -253,8 +254,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 10. Verify all remaining entities are accessible.
     println!("\nFinal scan:");
-    let remaining: Vec<Person> =
-        index.entities(&ser)?.collect::<noxu_persist::Result<Vec<_>>>()?;
+    let remaining: Vec<Person> = index
+        .entities(None, &ser)?
+        .collect::<noxu_persist::Result<Vec<_>>>()?;
     for p in &remaining {
         println!(
             "  id={}: {} {}, age={}",

@@ -199,7 +199,28 @@ impl Cursor {
                 self.state = CursorState::Initialized;
                 return Ok(OperationStatus::Success);
             }
-            _ => return Ok(OperationStatus::NotFound),
+            // Audit Finding 3: these three Get variants are recognised by the
+            // public API and have rustdoc claiming working semantics, but no
+            // implementation has been wired up.  Pre-fix they fell through to
+            // a wildcard `_ => Ok(NotFound)` arm, silently misleading users
+            // who could not distinguish "no such record" from "this operator
+            // is not implemented".  Surface a loud, typed error instead.
+            // See `docs/src/internal/api-audit-2026-05-cursor.md`.
+            //
+            // Implementing these properly is tracked for a later sprint.
+            Get::SearchLte => {
+                return Err(NoxuError::Unsupported(
+                    "Get::SearchLte".to_string(),
+                ));
+            }
+            Get::FirstDup => {
+                return Err(NoxuError::Unsupported(
+                    "Get::FirstDup".to_string(),
+                ));
+            }
+            Get::LastDup => {
+                return Err(NoxuError::Unsupported("Get::LastDup".to_string()));
+            }
         };
 
         match status {
@@ -836,7 +857,10 @@ mod tests {
         assert_eq!(status, OperationStatus::NotFound);
     }
 
-    /// Get::_ wildcard arm: unimplemented Get variants return NotFound.
+    /// Get::NextDup on a non-dup DB returns NotFound (audit Finding 5).
+    ///
+    /// Pre-fix this fell through to a wildcard `_ =>` arm; post-fix it is
+    /// handled by an explicit early-return in `CursorImpl::retrieve_next`.
     #[test]
     fn test_get_other_variant_returns_not_found() {
         let mut cursor = make_cursor_with(vec![(b"key1", b"value1")]);
@@ -846,7 +870,7 @@ mod tests {
         // Position cursor first.
         cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
 
-        // Get::NextDup and other variants fall through to the `_ =>` arm.
+        // Get::NextDup on a non-dup DB must always return NotFound.
         let status =
             cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);

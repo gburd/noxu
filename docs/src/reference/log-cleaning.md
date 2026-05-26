@@ -18,6 +18,7 @@ not by re-scanning files.
 ### 2. File Selection
 
 `FileSelector` chooses the file to clean:
+
 1. Compute `adjusted_utilization_pct` (incorporating TTL expiry)
 2. Files below `min_utilization` (default 50%) are candidates
 3. Lowest utilization file is selected first
@@ -25,6 +26,7 @@ not by re-scanning files.
 ### 3. File Processing
 
 `FileProcessor`:
+
 1. Reads live entries from the candidate file
 2. Verifies each against the tree (still current version?)
 3. Migrates confirmed live entries by logging them again (new LSN)
@@ -39,16 +41,19 @@ This invariant ensures recovery never needs a deleted file.
 
 `CleanerThrottle::should_throttle_writer()` returns `Option<Duration>` that
 writers should sleep to let the cleaner catch up. Wired into:
+
 - `Transaction::commit_with_durability()`
 - `Database::put()` auto-commit path
 
 ## Extended-Fork Entry Types
 
 ### DataEraser
+
 Securely erases obsolete record bytes using `pwrite64` zero-overwrite.
 Enable: `EnvironmentConfig::with_data_eraser_enabled(true)`.
 
 ### ExtinctionScanner
+
 Periodically scans the B+tree for TTL-expired and manually extinct records
 and removes them asynchronously.
 Enable: `EnvironmentConfig::with_extinction_scanner_enabled(true)`.

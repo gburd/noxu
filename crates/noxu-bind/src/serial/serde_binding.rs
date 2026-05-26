@@ -1,8 +1,34 @@
 //! Serde-based entry binding for Noxu DB.
 //!
-//! Adapted for Rust's serde
-//! framework. Instead of Java serialization, this uses a compact binary format
-//! implemented in [`super::simple_serial`].
+//! Replaces Java serialization with Rust's serde framework using a
+//! compact binary format implemented in [`super::simple_serial`].
+//!
+//! ## Wire format (v1.5)
+//!
+//! Every payload produced by `SerdeBinding::object_to_entry` begins
+//! with a 2-byte header followed by the [`super::simple_serial`] body:
+//!
+//! ```text
+//! +--------+---------+----------------+
+//! | 0xCB   |   0x01  |  simple_serial |
+//! | magic  | version |    payload     |
+//! +--------+---------+----------------+
+//! ```
+//!
+//! On decode, `entry_to_object` validates both bytes and returns
+//! [`crate::BindError::VersionMismatch`] if either is wrong, rather
+//! than silently producing a wrong-shaped value.  This is **not** full
+//! schema evolution (it cannot tolerate added/removed/reordered struct
+//! fields), but it stops silent corruption and gives an unambiguous,
+//! typed error when on-disk data and the running binary disagree.
+//!
+//! ## Breaking change vs. earlier 1.5 release candidates
+//!
+//! Data written by `SerdeBinding` in pre-3C builds did **not** carry
+//! the 2-byte header.  Records produced by older builds will fail to
+//! decode under v1.5 with `BindError::VersionMismatch { found_magic:
+//! <whatever the first byte happened to be>, ... }`.  See
+//! `docs/src/getting-started/bindings.md` for the migration guidance.
 //!
 //! ## Required dependencies (to be added to Cargo.toml)
 //!
@@ -21,12 +47,23 @@ use crate::Result;
 use crate::entry_binding::EntryBinding;
 use crate::serial::simple_serial;
 
+/// Magic byte identifying a `SerdeBinding`-encoded payload.  Picked to
+/// be stable across releases; bumping it would be a breaking on-disk
+/// change.
+pub const SERDE_BINDING_MAGIC: u8 = 0xCB;
+
+/// Wire-format version emitted by this build.  Bump in lock-step with
+/// any incompatible change to the [`super::simple_serial`] format.
+pub const SERDE_BINDING_VERSION: u8 = 0x01;
+
+/// Length of the version header prefixed to every encoded entry.
+pub const SERDE_BINDING_HEADER_LEN: usize = 2;
+
 /// Binding that uses a compact binary format via serde for serialization.
 ///
 /// Any type implementing `Serialize + DeserializeOwned` can be stored in and
-/// retrieved from database entries using this binding.
-///
-/// Adapted for serde.
+/// retrieved from database entries using this binding.  Each entry is
+/// prefixed with a 2-byte header; see the module docs for the format.
 ///
 /// # Examples
 ///
@@ -85,7 +122,23 @@ impl<T> std::fmt::Debug for SerdeBinding<T> {
 impl<T: Serialize + DeserializeOwned> EntryBinding<T> for SerdeBinding<T> {
     fn entry_to_object(&self, entry: &DatabaseEntry) -> Result<T> {
         let data = entry.data();
-        simple_serial::from_bytes(data)
+        if data.len() < SERDE_BINDING_HEADER_LEN {
+            return Err(crate::BindError::VersionMismatch {
+                expected_magic: SERDE_BINDING_MAGIC,
+                expected_version: SERDE_BINDING_VERSION,
+                found_magic: data.first().copied().unwrap_or(0),
+                found_version: data.get(1).copied().unwrap_or(0),
+            });
+        }
+        if data[0] != SERDE_BINDING_MAGIC || data[1] != SERDE_BINDING_VERSION {
+            return Err(crate::BindError::VersionMismatch {
+                expected_magic: SERDE_BINDING_MAGIC,
+                expected_version: SERDE_BINDING_VERSION,
+                found_magic: data[0],
+                found_version: data[1],
+            });
+        }
+        simple_serial::from_bytes(&data[SERDE_BINDING_HEADER_LEN..])
     }
 
     fn object_to_entry(
@@ -93,7 +146,12 @@ impl<T: Serialize + DeserializeOwned> EntryBinding<T> for SerdeBinding<T> {
         object: &T,
         entry: &mut DatabaseEntry,
     ) -> Result<()> {
-        let bytes = simple_serial::to_bytes(object)?;
+        let body = simple_serial::to_bytes(object)?;
+        let mut bytes =
+            Vec::with_capacity(body.len() + SERDE_BINDING_HEADER_LEN);
+        bytes.push(SERDE_BINDING_MAGIC);
+        bytes.push(SERDE_BINDING_VERSION);
+        bytes.extend_from_slice(&body);
         entry.set_data_vec(bytes);
         Ok(())
     }
@@ -257,5 +315,125 @@ mod tests {
         binding.object_to_entry(&42u32, &mut entry).unwrap();
         assert!(!entry.is_empty());
         assert!(entry.get_data().is_some());
+    }
+
+    // ----- Sprint 3C version-prefix tests (audit finding #19) ----------------
+
+    /// The wire format must begin with the documented 2-byte header.
+    /// If this assertion fails the on-disk format has drifted and the
+    /// version constant must be bumped.
+    #[test]
+    fn test_encoded_payload_starts_with_version_header() {
+        let binding = SerdeBinding::<u32>::new();
+        let mut entry = DatabaseEntry::new();
+        binding.object_to_entry(&42u32, &mut entry).unwrap();
+
+        let bytes = entry.get_data().unwrap();
+        assert!(
+            bytes.len() >= SERDE_BINDING_HEADER_LEN,
+            "encoded entry must include the 2-byte header",
+        );
+        assert_eq!(bytes[0], SERDE_BINDING_MAGIC);
+        assert_eq!(bytes[1], SERDE_BINDING_VERSION);
+        // body is a 4-byte big-endian u32 (= 42).
+        assert_eq!(&bytes[2..], &[0, 0, 0, 42]);
+    }
+
+    /// An entry written by a pre-3C build (no header) must surface as
+    /// `BindError::VersionMismatch` rather than panicking, returning
+    /// `InvalidData`, or producing a wrong-shaped value.
+    #[test]
+    fn test_decode_unprefixed_payload_returns_version_mismatch() {
+        // Pre-3C bytes: a bare big-endian u32 with no header.
+        let entry = DatabaseEntry::from_bytes(&[0, 0, 0, 42]);
+        let binding = SerdeBinding::<u32>::new();
+
+        let err = binding
+            .entry_to_object(&entry)
+            .expect_err("unprefixed payload must fail to decode");
+        match err {
+            crate::BindError::VersionMismatch {
+                expected_magic,
+                expected_version,
+                found_magic,
+                found_version,
+            } => {
+                assert_eq!(expected_magic, SERDE_BINDING_MAGIC);
+                assert_eq!(expected_version, SERDE_BINDING_VERSION);
+                // The pre-3C u32 starts with 0x00 0x00 — neither matches
+                // the magic, so the error reports those bytes verbatim.
+                assert_eq!(found_magic, 0x00);
+                assert_eq!(found_version, 0x00);
+            }
+            other => panic!("expected VersionMismatch, got {:?}", other),
+        }
+    }
+
+    /// A short entry (less than 2 bytes total) must also surface as
+    /// `VersionMismatch` rather than `BufferUnderflow`.
+    #[test]
+    fn test_decode_short_payload_returns_version_mismatch() {
+        let binding = SerdeBinding::<u32>::new();
+
+        for short in &[&[][..], &[SERDE_BINDING_MAGIC][..]] {
+            let entry = DatabaseEntry::from_bytes(short);
+            let err = binding
+                .entry_to_object(&entry)
+                .expect_err("short payload must fail to decode");
+            assert!(
+                matches!(err, crate::BindError::VersionMismatch { .. }),
+                "short payload (len={}) must fail with VersionMismatch, got {:?}",
+                short.len(),
+                err,
+            );
+        }
+    }
+
+    /// A header with the right magic but the wrong version must be
+    /// rejected with `VersionMismatch`, even if the trailing body
+    /// would otherwise round-trip cleanly.
+    #[test]
+    fn test_decode_wrong_version_returns_version_mismatch() {
+        let mut bytes = vec![SERDE_BINDING_MAGIC, 0xFF];
+        bytes.extend_from_slice(&42u32.to_be_bytes());
+        let entry = DatabaseEntry::from_bytes(&bytes);
+        let binding = SerdeBinding::<u32>::new();
+
+        let err = binding
+            .entry_to_object(&entry)
+            .expect_err("wrong-version payload must fail to decode");
+        match err {
+            crate::BindError::VersionMismatch {
+                found_magic,
+                found_version,
+                ..
+            } => {
+                assert_eq!(found_magic, SERDE_BINDING_MAGIC);
+                assert_eq!(found_version, 0xFF);
+            }
+            other => panic!("expected VersionMismatch, got {:?}", other),
+        }
+    }
+
+    /// `VersionMismatch` formats with both expected and found bytes so
+    /// users see exactly what is wrong.
+    #[test]
+    fn test_version_mismatch_display() {
+        let err = crate::BindError::VersionMismatch {
+            expected_magic: 0xCB,
+            expected_version: 0x01,
+            found_magic: 0x00,
+            found_version: 0x00,
+        };
+        let s = err.to_string();
+        assert!(s.contains("0xCB"), "display must include expected magic: {s}");
+        assert!(
+            s.contains("0x01"),
+            "display must include expected version: {s}"
+        );
+        assert!(
+            s.contains("version mismatch"),
+            "display must name the failure: {s}"
+        );
     }
 }

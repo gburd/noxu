@@ -54,4 +54,3 @@ lock-manager contention.  For read-heavy workloads, `TransactionConfig::read_com
 readers scale linearly and are not bounded by the above guideline.
 
 ---
-

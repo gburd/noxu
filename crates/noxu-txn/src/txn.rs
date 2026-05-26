@@ -483,6 +483,24 @@ impl Txn {
         self.read_committed_isolation = v;
     }
 
+    /// Configures the default read-uncommitted isolation level for this
+    /// transaction.
+    ///
+    /// When true, cursors created on this transaction skip read-lock
+    /// acquisition entirely, allowing dirty reads of uncommitted data
+    /// from other transactions.  This is the transaction-level
+    /// counterpart of the per-operation `LockMode::ReadUncommitted`
+    /// flag on `ReadOptions`.
+    ///
+    /// Resolves F2 of the May 2026 API audit: previously the
+    /// `read_uncommitted_default` field was settable only by
+    /// constructing a fresh `Txn` and there was no public setter, so
+    /// `TransactionConfig::with_read_uncommitted(true)` was silently
+    /// dropped by `Environment::begin_transaction`.
+    pub fn set_read_uncommitted_default(&mut self, v: bool) {
+        self.read_uncommitted_default = v;
+    }
+
     /// Sets the per-lock timeout in milliseconds.
     ///
     /// Controls how long a lock request waits before returning a timeout error.

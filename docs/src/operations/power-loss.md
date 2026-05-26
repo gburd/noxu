@@ -63,6 +63,7 @@ moment, no more.
 ### Procedure
 
 1. **Start the test VM with deterministic disk image:**
+
    ```sh
    qemu-system-x86_64 \
        -name noxu-power-loss \
@@ -75,6 +76,7 @@ moment, no more.
    ```
 
 2. **Build and copy `crash_worker` into the VM:**
+
    ```sh
    cargo build -p noxu-db --bin crash_worker --release
    scp -P 2222 \
@@ -83,6 +85,7 @@ moment, no more.
    ```
 
 3. **Inside the VM**, start the worker:
+
    ```sh
    ssh -p 2222 root@127.0.0.1 \
        'NOXU_CRASH_DIR=/var/lib/noxu \
@@ -93,11 +96,13 @@ moment, no more.
 4. **From the host**, after a delay sampled from
    `[0, 250]ms`, send a `quit` to the qemu monitor (kills the
    qemu process, does NOT shut the guest down cleanly):
+
    ```sh
    echo 'quit' | nc -U /tmp/qemu-mon.sock
    ```
 
 5. **Restart the VM** with the same disk image:
+
    ```sh
    # Same qemu command line as step 1
    qemu-system-x86_64 ...

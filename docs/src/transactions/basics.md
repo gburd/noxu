@@ -1,5 +1,25 @@
 # Introduction
 
+> **v1.5 capability matrix:** see
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+>
+> **v1.5 limitations relevant to this chapter:**
+>
+> * **Nested / child transactions are not supported.** Calling
+>   `env.begin_transaction(Some(&parent), …)` returns
+>   `NoxuError::Unsupported`. The `parent` parameter is retained for
+>   forward source compatibility and scheduled for removal in v2.0.
+>   See
+>   [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
+>   Decision 3B and `sprint-3-decisions-enforced.md`.
+> * **Auto-commit “warning” clarification.** Cursors and auto-commit
+>   *do* coexist correctly in v1.5 — auto-commit cursor writes
+>   acquire write locks via the lock manager and block on competing
+>   explicit-txn write/read locks. See
+>   [`sprint-1-followup-f12.md`](../internal/sprint-1-followup-f12.md)
+>   for the verified F12 contract and the two diagnostic gaps that
+>   remain.
+
 This guide provides a thorough introduction to transactions as used with Noxu DB,
 a Rust port of Noxu DB (Noxu DB 7.5.11). It covers the guarantees
 that transactions provide, the application infrastructure required for full
@@ -13,7 +33,7 @@ databases, and performing simple reads and writes — before reading this guide.
 Transactions protect your application's data from failures. Noxu DB transactions
 provide full **ACID** guarantees:
 
-**Atomicity**
+### Atomicity
 
 Multiple database operations are treated as a single unit of work. Once committed,
 all writes performed under the protection of the transaction are saved. If a
@@ -22,22 +42,22 @@ state it was in before the transaction began, regardless of the number or type o
 write operations performed. A single transaction may span multiple database handles
 within the same environment.
 
-**Consistency**
+### Consistency
 
 Your databases will never contain a partially completed transaction. This is true
 even if your application fails while transactions are in progress. If the
 application or OS fails, either all changes appear when the application restarts,
 or none of them do.
 
-**Isolation**
+### Isolation
 
 While a transaction is in progress, the database appears to that transaction as if
 no other operations are occurring outside of it. Operations wrapped inside a
 transaction always have a clean and consistent view and never see updates in
 progress under another transaction. Isolation guarantees can be relaxed for
-performance; see [Isolation Levels](#7-isolation-levels).
+performance; see [Isolation Levels](isolation.md).
 
-**Durability**
+### Durability
 
 Once committed, modifications persist even in the event of an application or OS
 failure. Like isolation, the durability guarantee can be relaxed; see
@@ -76,7 +96,7 @@ application intervention.
 
 Noxu DB also supports archival backup and recovery in the case of catastrophic
 failure such as the loss of a physical disk drive. See
-[Backup and Recovery](#9-backup-and-recovery).
+[Backup and Recovery](backup-recovery.md).
 
 ## Performance Tuning Overview
 
@@ -84,11 +104,11 @@ The use of transactions is not free. Transaction commits usually require disk I/
 that non-transactional applications do not perform. For multi-threaded applications,
 transactions can increase lock contention due to extra locking required by
 transactional isolation guarantees. Performance tuning considerations are discussed
-throughout this guide and are summarized in [Performance Tuning](#10-performance-tuning).
+throughout this guide and are summarized in [Performance Tuning](durability.md).
 
 ---
 
-# 2. Enabling Transactions
+## 2. Enabling Transactions
 
 To use transactions you must:
 
@@ -134,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-# 3. Transaction Basics
+## 3. Transaction Basics
 
 Once you have a transactional environment and database open, you protect operations
 by acquiring a transaction handle and passing it to the database methods you want
@@ -189,14 +209,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Key rules:
-- Obtain a transaction with `env.begin_transaction(parent, config)`. Pass `None`
-  for the parent unless you want a nested (child) transaction.
-- Pass `Some(&txn)` as the first argument to `db.put()`, `db.get()`,
+
+* Obtain a transaction with `env.begin_transaction(parent, config)`. Pass `None`
+  for the parent. Nested (child) transactions are **not supported in v1.5**;
+  passing `Some(&parent)` returns a typed `NoxuError::Unsupported` error.
+  See [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
+  Decision 3B; the `parent` parameter is scheduled for removal in v2.0.
+* Pass `Some(&txn)` as the first argument to `db.put()`, `db.get()`,
   `db.delete()`, and `db.open_cursor()`.
-- Commit with `txn.commit()` or roll back with `txn.abort()`.
-- Once committed or aborted, a transaction handle must not be used again. Any
+* Commit with `txn.commit()` or roll back with `txn.abort()`.
+* Once committed or aborted, a transaction handle must not be used again. Any
   further calls will return an error.
-- All transaction handles must be committed or aborted before closing databases
+* All transaction handles must be committed or aborted before closing databases
   and the environment.
 
 ## Committing a Transaction
@@ -397,13 +421,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-> **Note:** Auto-commit is not available for cursors. You must always open a
-> cursor with an explicit transaction handle if you want its operations to be
-> transaction-protected.
-
-> **Warning:** Never have more than one active transaction in your thread at a
-> time. Mixing an explicit transaction with an auto-commit operation in the same
-> thread can result in undetectable deadlocks.
+> **Note:** Cursors and auto-commit interoperate correctly in v1.5
+> (Sprint 1C / F12). Opening a cursor with `db.open_cursor(None, None)`
+> threads the cursor's writes through the lock manager exactly the
+> same way an explicit-txn cursor does, and auto-commit writes
+> against an unrelated key do not block on an explicit txn's locks.
+> Earlier wording suggested auto-commit was unavailable for cursors;
+> that referred to a v1.4.x bug that has been fixed.
+>
+> **Warning:** Never have more than one active explicit transaction
+> in your thread at a time. Mixing an explicit transaction with an
+> auto-commit operation in the same thread can result in undetectable
+> deadlocks (the auto-commit cursor's locker id and the txn id are
+> tracked in disjoint id spaces, so a deadlock involving both is
+> reported by raw integer id rather than by transaction name — see
+> `docs/src/internal/sprint-1-followup-f12.md`).
 
 ---
-

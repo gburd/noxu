@@ -1,5 +1,12 @@
 # Replication Durability Policies
 
+> **v1.5 status — preview.** See
+> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> and [the chapter overview](README.md). **`ReplicaAckPolicy` is not
+> honoured on commit in v1.5** — the master returns success after the
+> local fsync regardless of how many replicas have acknowledged. This
+> is GA blocker #1 in the noxu-rep audit.
+
 In a replicated environment, durability involves both local disk persistence
 and replica acknowledgments.
 
@@ -41,6 +48,7 @@ write fanout causes multiple concurrent transactions to wait for acks at the
 same time.
 
 On the master, `GroupCommitMaster` buffers commits until either:
+
 - A batch size threshold is reached, or
 - A time deadline expires (default: 1ms)
 

@@ -574,6 +574,21 @@ impl CursorImpl {
                     } else {
                         slot_data
                     };
+                    // Audit Finding 4: BDB-JE's SearchBoth is exact-match on
+                    // (key, data) regardless of duplicate-set membership; on a
+                    // non-dup DB it must still validate that the slot's data
+                    // equals the user-supplied data.  Pre-fix the `data`
+                    // argument was silently dropped and `Success` was
+                    // returned for any matching key, contradicting the
+                    // documented contract on `Get::SearchBoth`.  See
+                    // `docs/src/internal/api-audit-2026-05-cursor.md`.
+                    if matches!(search_mode, SearchMode::Both) {
+                        let user_data = data.unwrap_or(&[]);
+                        let stored = final_data.as_deref().unwrap_or(&[]);
+                        if stored != user_data {
+                            return Ok(OperationStatus::NotFound);
+                        }
+                    }
                     self.current_key = Some(key.to_vec());
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
@@ -770,6 +785,13 @@ impl CursorImpl {
         }
         if let Some(txn) = &self.txn_ref {
             let mut guard = txn.lock().unwrap();
+            // F2: read-uncommitted txns skip read-lock acquisition
+            // entirely.  This mirrors the per-operation
+            // `LockMode::ReadUncommitted` path but applies to every
+            // read on the txn.
+            if guard.is_read_uncommitted_default() {
+                return Ok(false);
+            }
             // Try non-blocking first to detect write contention without waiting.
             let contended = match guard.lock(lsn, LockType::Read, true) {
                 Ok(_) => false, // granted immediately — no concurrent writer
@@ -849,38 +871,134 @@ impl CursorImpl {
     ///
     /// Returns `(key, data, slot_lsn)` so the caller can acquire a read lock.
     ///
-    /// returns the first key in the BIN that
-    /// compares >= the given search key.
+    /// # Algorithm
+    ///
+    /// SearchGte is a two-step probe:
+    ///
+    ///   1. Locate the BIN that *should* contain `key` via
+    ///      `find_bin_for_key` and scan it for the smallest entry whose
+    ///      full key is `>= key`.  The seed `key` is *not* required to
+    ///      share the BIN's learned `key_prefix` — we explicitly handle
+    ///      the three legal seed/`key_prefix` relationships:
+    ///
+    ///      * `key.starts_with(key_prefix)` — cheap suffix comparison;
+    ///        the stored `entries[i].key` are suffixes under that prefix,
+    ///        so we compare against `&key[plen..]`.
+    ///      * `key < key_prefix` lexicographically — every full key in
+    ///        this BIN starts with `key_prefix` and is therefore strictly
+    ///        greater than `key`; the answer is `entries[0]`.  This
+    ///        includes the common case of a short search seed (e.g.
+    ///        `b"K\0"`) on a BIN whose learned prefix has grown longer
+    ///        than the seed (`b"K\0bucket\0…"`).
+    ///      * `key > key_prefix` lexicographically — every full key in
+    ///        this BIN is strictly less than `key`; nothing here matches,
+    ///        fall through to step 2.
+    ///
+    ///   2. If step 1 returned nothing (either no entry in the chosen
+    ///      BIN satisfies `>= key`, or the BIN was empty / the seed sits
+    ///      lex-after the BIN's prefix) call `Tree::get_next_bin(key)`
+    ///      and return its first entry, which by B+tree invariants is
+    ///      strictly greater than `key`.
+    ///
+    /// # Why step 2's first entry is the correct answer
+    ///
+    /// `find_bin_for_key` descends by picking, at each internal level,
+    /// the largest separator `<= key`.  If it lands on BIN `B` reached
+    /// via slot `p` of some ancestor, then `separator(p) <= key` and
+    /// (when slot `p+1` exists) `separator(p+1) > key` strictly —
+    /// otherwise descent would have picked `p+1`.  By the B+tree
+    /// key-range invariant every key in the subtree rooted at `slot(p+1)`
+    /// is `>= separator(p+1) > key`.  `Tree::get_next_bin` returns the
+    /// leftmost BIN of exactly that next-sibling subtree, so its first
+    /// entry is the smallest key in the whole tree that is `> key`.
+    /// One probe, deterministically correct — no looping needed.
+    ///
+    /// # Locking
+    ///
+    /// The step-1 BIN read lock is released before step 2 fires so that
+    /// `get_next_bin`'s own latch-coupled descent is unconstrained and
+    /// other threads (especially writers crossing this BIN) are not
+    /// blocked on a lock we no longer need.
+    ///
+    /// # Empty intermediate BINs
+    ///
+    /// If the chosen BIN is empty *and* `get_next_bin` returns an empty
+    /// BIN (a transient state under delete-heavy workloads, before the
+    /// cleaner has collapsed it), this returns `None` and the caller
+    /// reports `NotFound`.  This matches `Get::Next`'s behaviour today;
+    /// see also the follow-up note in
+    /// `cursor_search_gte_skips_past_empty_bin_is_pre_existing_limit`.
     fn find_range_entry(
         tree: &Tree,
         key: &[u8],
     ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
-        let root = tree.get_root()?;
-        // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-        let bin_arc = Self::find_bin_for_key(root, key)?;
-        let guard = bin_arc.read();
-        match &*guard {
-            TreeNode::Bottom(bin) => {
-                // BIN entries use compressed (suffix) keys; range-compare
-                // against suffix and return the decompressed full key.
-                let suffix = bin.compress_key(key);
-                bin.entries
-                    .iter()
-                    .enumerate()
-                    .find(|(_, e)| e.key.as_slice() >= suffix.as_slice())
-                    .and_then(|(i, e)| {
-                        bin.get_full_key(i).map(|fk| {
-                            (
-                                fk,
-                                e.data.clone().unwrap_or_default(),
-                                e.lsn.as_u64(),
-                            )
-                        })
-                    })
+
+        // Step 1: scan the BIN that should contain `key`.  The read lock
+        // is dropped at the end of this block before step 2 runs.
+        let in_current: Option<(Vec<u8>, Vec<u8>, u64)> = {
+            let root = tree.get_root()?;
+            // Use find_bin_for_key so range searches also work for non-leftmost BINs.
+            let bin_arc = Self::find_bin_for_key(root, key)?;
+            let guard = bin_arc.read();
+            match &*guard {
+                TreeNode::Bottom(bin) => {
+                    let plen = bin.key_prefix.len();
+
+                    if plen != 0 && !key.starts_with(bin.key_prefix.as_slice())
+                    {
+                        // Seed does not share this BIN's learned prefix.
+                        // Decide by lex-comparing seed against key_prefix;
+                        // never call compress_key (which requires `starts_with`).
+                        if key < bin.key_prefix.as_slice() {
+                            // Every key in this BIN is > seed.
+                            bin.entries.first().and_then(|e| {
+                                bin.get_full_key(0).map(|fk| {
+                                    (
+                                        fk,
+                                        e.data.clone().unwrap_or_default(),
+                                        e.lsn.as_u64(),
+                                    )
+                                })
+                            })
+                        } else {
+                            // Every key in this BIN is < seed; let step 2
+                            // handle it.
+                            None
+                        }
+                    } else {
+                        // Cheap path: suffix comparison.
+                        let suffix = &key[plen..];
+                        bin.entries
+                            .iter()
+                            .enumerate()
+                            .find(|(_, e)| e.key.as_slice() >= suffix)
+                            .and_then(|(i, e)| {
+                                bin.get_full_key(i).map(|fk| {
+                                    (
+                                        fk,
+                                        e.data.clone().unwrap_or_default(),
+                                        e.lsn.as_u64(),
+                                    )
+                                })
+                            })
+                    }
+                }
+                _ => None,
             }
-            _ => None,
+            // bin_arc read lock dropped here.
+        };
+
+        if let Some(r) = in_current {
+            return Some(r);
         }
+
+        // Step 2: chosen BIN had nothing >= key.  By B+tree invariants the
+        // first entry of the next BIN is strictly > key, which satisfies
+        // SearchGte.  No iteration: one call, one answer.
+        let next = tree.get_next_bin(key)?;
+        let e = next.into_iter().next()?;
+        Some((e.key, e.data.unwrap_or_default(), e.lsn.as_u64()))
     }
 
     /// Descends from the given node to the leftmost BIN, returning its Arc.
@@ -1186,6 +1304,19 @@ impl CursorImpl {
         }
 
         let is_dup = self.is_sorted_dup();
+
+        // BDB-JE contract: NEXT_DUP / PREV_DUP advance only within the
+        // duplicate-set of the current key.  On a non-sorted-dup database
+        // every key has exactly one record, so there can never be another
+        // duplicate of the current position — the only correct answer is
+        // NotFound.  Without this early-return, the dup-filter below is
+        // gated on `is_dup` and the cursor would silently degenerate into
+        // plain Next / Prev semantics, returning the next *different* key
+        // and violating the documented contract.  See
+        // `docs/src/internal/api-audit-2026-05-cursor.md` Finding 5.
+        if !is_dup && matches!(mode, GetMode::NextDup | GetMode::PrevDup) {
+            return Ok(OperationStatus::NotFound);
+        }
 
         // For NextDup/PrevDup/NextNoDup/PrevNoDup, capture the primary key of
         // the current position before advancing.
@@ -1782,13 +1913,13 @@ impl CursorImpl {
                     Some(b""),
                     self.locker_id,
                 )?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ =
-                            tree.insert(two_part_key.clone(), vec![], new_lsn);
-                    }
-                }
+                // Use apply_tree_insert so the per-database entry counter
+                // is bumped on a new (key, data) pair; otherwise
+                // `Database::count()` (which reads the counter) would stay
+                // at 0 for sorted-dup databases.  BDB-JE
+                // `Database.count()` returns the total number of (key, data)
+                // pairs, including every duplicate.
+                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
@@ -1805,46 +1936,38 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
-                // Delete the old two-part key.
-                self.log_ln_write(&old_key, None, self.locker_id)?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        tree.delete(&old_key);
-                    }
-                }
+                // Delete the old two-part key.  Use apply_tree_delete so
+                // the counter is decremented (it will be re-incremented by
+                // the matching apply_tree_insert below; net change is 0,
+                // matching JE's PutCurrent semantics).
+                let del_lsn =
+                    self.log_ln_write(&old_key, None, self.locker_id)?;
+                self.apply_tree_delete(old_key, del_lsn);
                 // Insert the new two-part key.
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
                 )?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ =
-                            tree.insert(two_part_key.clone(), vec![], new_lsn);
-                    }
-                }
+                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
             }
             PutMode::Overwrite => {
-                // Insert or replace the exact (key, data) pair.
+                // Insert or replace the exact (key, data) pair.  For
+                // sorted-dup databases each unique (key, data) is a
+                // distinct logical record, so a brand-new pair must bump
+                // the per-database entry counter.  apply_tree_insert
+                // checks tree.insert's `is_new` return so an exact-match
+                // re-insert is a no-op for the counter.
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
                 )?;
-                {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        let _ =
-                            tree.insert(two_part_key.clone(), vec![], new_lsn);
-                    }
-                }
+                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
@@ -1900,7 +2023,13 @@ impl CursorImpl {
         entry.write_to_log(&mut buf);
 
         let entry_type = if data.is_some() {
-            LogEntryType::InsertLN
+            if txn_id_opt.is_some() {
+                LogEntryType::InsertLNTxn
+            } else {
+                LogEntryType::InsertLN
+            }
+        } else if txn_id_opt.is_some() {
+            LogEntryType::DeleteLNTxn
         } else {
             LogEntryType::DeleteLN
         };
