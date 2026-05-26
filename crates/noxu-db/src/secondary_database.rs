@@ -227,6 +227,86 @@ impl SecondaryDatabase {
         self.inner.close()
     }
 
+    /// Returns the number of records in the secondary index.
+    ///
+    /// Equivalent to `Database::count` on the underlying inner index
+    /// database; included on `SecondaryDatabase` for symmetry with JE's
+    /// `SecondaryDatabase.count()` method.  See Wave 1C audit cleanup
+    /// (secondary-join “missing count/exists/truncate” Low).
+    ///
+    /// # Errors
+    /// Returns [`NoxuError::DatabaseClosed`] if the secondary handle has
+    /// been closed.
+    pub fn count(&self) -> Result<u64> {
+        self.inner.count()
+    }
+
+    /// Returns `true` if any record with the given secondary key exists.
+    ///
+    /// This avoids the cost of reading the primary record — unlike
+    /// [`Self::get`], which traverses the secondary, then the primary
+    /// database.  Useful for membership probes inside hot paths.
+    ///
+    /// # Errors
+    /// Propagates any error from the underlying secondary lookup.
+    pub fn exists(
+        &self,
+        txn: Option<&Transaction>,
+        key: &DatabaseEntry,
+    ) -> Result<bool> {
+        let mut data = DatabaseEntry::new();
+        let status = self.inner.get(txn, key, &mut data)?;
+        Ok(status == OperationStatus::Success)
+    }
+
+    /// Removes every record from the secondary index, leaving the
+    /// associated primary database untouched.
+    ///
+    /// **Caveat.** Truncating a secondary index without re-running
+    /// `populate_if_empty` (or replaying the primary-side updates)
+    /// leaves the secondary in a state that is not consistent with the
+    /// primary.  Most callers should drop the secondary's primary keys
+    /// via [`Database::truncate_database`] on the inner DB or repopulate
+    /// the index afterwards.  Returned for symmetry with JE's
+    /// `SecondaryDatabase.truncate(...)`.
+    ///
+    /// Returns the number of records that were in the index before the
+    /// truncate.  See Wave 1C audit cleanup (secondary-join “missing
+    /// count/exists/truncate” Low).
+    ///
+    /// # Errors
+    /// Returns [`NoxuError::DatabaseClosed`] if the secondary handle has
+    /// been closed, or any error returned by the underlying delete
+    /// loop.
+    pub fn truncate(&self) -> Result<u64> {
+        let pre = self.count()?;
+        // Walk every (sec_key, pri_key) pair via a primary-table-style
+        // scan and delete each.  The inner index is an ordinary
+        // Database, so this is just a cursor scan + delete.
+        let mut cursor = self.inner.open_cursor(None, None)?;
+        let mut sec_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        // get_first returns NotFound if the index is empty.
+        if cursor.get(&mut sec_key, &mut data, crate::get::Get::First, None)?
+            != OperationStatus::Success
+        {
+            return Ok(0);
+        }
+        loop {
+            cursor.delete()?;
+            match cursor.get(
+                &mut sec_key,
+                &mut data,
+                crate::get::Get::Next,
+                None,
+            )? {
+                OperationStatus::Success => continue,
+                _ => break,
+            }
+        }
+        Ok(pre)
+    }
+
     /// Retrieves a primary record by secondary key.
     ///
     ///
@@ -302,8 +382,10 @@ impl SecondaryDatabase {
     ) -> Result<OperationStatus> {
         self.check_open()?;
 
-        // Use a secondary cursor to iterate all duplicates of the secondary key.
-        let mut sec_cursor = self.open_cursor_internal()?;
+        // Use a secondary cursor (under the caller's txn so the scan
+        // participates in the user's transaction) to iterate all
+        // duplicates of the secondary key.
+        let mut sec_cursor = self.open_cursor_internal(txn)?;
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -350,24 +432,41 @@ impl SecondaryDatabase {
 
     /// Opens a cursor on the secondary database.
     ///
-    /// When `txn` is `Some(_)`, the inner cursor over the secondary index
-    /// participates in the supplied transaction — reads acquire shared
-    /// locks via the txn's locker and any writes (currently only the
-    /// primary delete cascade triggered by `SecondaryCursor::delete`) are
-    /// rolled back when the txn aborts.  When `txn` is `None` the inner
-    /// cursor runs in auto-commit mode.
+    /// When `txn` is `Some(_)`, the inner cursor over the secondary
+    /// index participates in the supplied transaction — reads acquire
+    /// shared locks via the txn's locker and writes acquire exclusive
+    /// locks tracked by the txn.  Wave 1B (audit F5 follow-up) extends
+    /// this to the *primary* lookups and the
+    /// [`SecondaryCursor::delete`] cascade as well: the cursor stores
+    /// the txn handle and forwards it to every primary `get` /
+    /// `delete` and to `delete_all_for_primary`.  Aborting the txn
+    /// rolls back **both** the secondary entry and the primary record
+    /// removed by `SecondaryCursor::delete` (and every secondary
+    /// cleanup it triggers).  When `txn` is `None`, every operation
+    /// runs auto-committed, matching the v1.4 behaviour.
     ///
     /// `config` is forwarded to the inner `Database::open_cursor` call so
     /// `read_uncommitted` and other cursor-level flags propagate correctly.
     ///
+    /// # Lifetime contract (breaking change in Wave 1B)
+    ///
+    /// The returned [`SecondaryCursor`] borrows both the
+    /// `SecondaryDatabase` and — when supplied — the `Transaction`,
+    /// because primary deletes and cleanup writes are deferred until
+    /// `SecondaryCursor::delete` is called.  Callers must therefore
+    /// keep the `Transaction` alive at least as long as the cursor.
+    /// In practice this is the same lifetime rule that already applies
+    /// to [`Database::open_cursor`]; it is now enforced statically by
+    /// the type system.
+    ///
     /// # Returns
     /// A `SecondaryCursor` that iterates secondary index entries and returns
     /// primary data.
-    pub fn open_cursor(
-        &self,
-        txn: Option<&Transaction>,
+    pub fn open_cursor<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
         config: Option<&CursorConfig>,
-    ) -> Result<SecondaryCursor<'_>> {
+    ) -> Result<SecondaryCursor<'a>> {
         self.check_open()?;
         self.check_readable()?;
         SecondaryCursor::new(self, txn, config)
@@ -712,12 +811,16 @@ impl SecondaryDatabase {
 
     /// Builds a `SecondaryCursor` on this secondary database (internal).
     ///
-    /// Called from auto-commit code paths that do not have a transaction
-    /// handle (e.g. `SecondaryDatabase::delete`, which currently runs
-    /// secondary cleanup auto-committed; see audit finding F5 for the
-    /// follow-up work to plumb the txn through these paths).
-    fn open_cursor_internal(&self) -> Result<SecondaryCursor<'_>> {
-        SecondaryCursor::new(self, None, None)
+    /// `txn` is forwarded to [`SecondaryCursor::new`] so all inner-database
+    /// reads and the cascade primary delete participate in the caller's
+    /// transaction (Wave 1B / audit F5).  Used from
+    /// [`SecondaryDatabase::delete`] to drive the secondary scan under
+    /// the caller's txn.
+    fn open_cursor_internal<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<SecondaryCursor<'a>> {
+        SecondaryCursor::new(self, txn, None)
     }
 
     /// Populates the secondary index from the primary if the secondary is empty.
@@ -1118,5 +1221,53 @@ mod tests {
             secondary.get(None, &sec_key_g, &mut pk, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
         assert_eq!(data.get_data().unwrap(), b"Grape");
+    }
+
+    /// Wave 1C audit cleanup (secondary-join "missing count/exists/truncate"
+    /// Low) — the new convenience methods on SecondaryDatabase delegate
+    /// to the inner index DB and surface the JE-shape API for the
+    /// secondary side.
+    #[test]
+    fn test_count_exists_truncate_round_trip() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "pri")));
+        let secondary = open_secondary(Arc::clone(&primary), &env, "sec");
+
+        // Empty index → count == 0, no key exists.
+        assert_eq!(secondary.count().unwrap(), 0);
+        assert!(
+            !secondary.exists(None, &DatabaseEntry::from_bytes(b"A")).unwrap()
+        );
+
+        // Populate three primaries with distinct first-byte secondary keys.
+        for (pk, pv) in &[
+            (&b"pk1"[..], &b"Apple"[..]),
+            (&b"pk2"[..], &b"Banana"[..]),
+            (&b"pk3"[..], &b"Cherry"[..]),
+        ] {
+            let pk_e = DatabaseEntry::from_bytes(pk);
+            let pv_e = DatabaseEntry::from_bytes(pv);
+            primary.lock().put(None, &pk_e, &pv_e).unwrap();
+            secondary.update_secondary(None, &pk_e, None, Some(&pv_e)).unwrap();
+        }
+
+        assert_eq!(secondary.count().unwrap(), 3);
+        assert!(
+            secondary.exists(None, &DatabaseEntry::from_bytes(b"A")).unwrap()
+        );
+        assert!(
+            secondary.exists(None, &DatabaseEntry::from_bytes(b"C")).unwrap()
+        );
+        assert!(
+            !secondary.exists(None, &DatabaseEntry::from_bytes(b"Z")).unwrap()
+        );
+
+        // Truncate clears every record and reports the pre-truncate count.
+        let removed = secondary.truncate().unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(secondary.count().unwrap(), 0);
+        assert!(
+            !secondary.exists(None, &DatabaseEntry::from_bytes(b"A")).unwrap()
+        );
     }
 }

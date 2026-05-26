@@ -43,12 +43,10 @@
 //! ```ignore
 //! use noxu_rep::{ReplicatedEnvironment, RepConfig, NodeType};
 //!
-//! let config = RepConfig::new(
-//!     "my_group".to_string(),
-//!     "node1".to_string(),
-//!     "localhost".to_string(),
-//!     5001,
-//! );
+//! let config = RepConfig::builder("my_group", "node1", "localhost")
+//!     .node_port(14_001)
+//!     .node_type(NodeType::Electable)
+//!     .build();
 //! let rep_env = ReplicatedEnvironment::new(config).unwrap();
 //! ```
 

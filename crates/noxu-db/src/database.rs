@@ -25,7 +25,7 @@ use noxu_dbi::{
 };
 use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
-use noxu_txn::LockManager;
+use noxu_txn::{Durability, LockManager, Txn, TxnManager, UndoRecord};
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +86,14 @@ pub struct Database {
     /// Cached cleaner throttle — acquired once at open, None when no cleaner.
     /// Used by put() for write-path backpressure without locking env_impl.
     cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
+    /// Cached transaction manager — acquired once at open.
+    ///
+    /// Used by [`Self::with_auto_txn`] to allocate a synthetic auto-commit
+    /// `Txn` per `txn = None` write so the lock manager sees a typed
+    /// locker id from the explicit-txn id space (`"auto-txn:<id>"` in
+    /// deadlock messages) and the auto-commit op gets full abort-undo
+    /// semantics on any error path.  Closes the F12 residuals.
+    txn_manager: Arc<TxnManager>,
     /// If true, auto-commit writes skip the log flush entirely (: TXN_NO_SYNC).
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
@@ -178,6 +186,143 @@ impl Database {
         }
     }
 
+    /// Allocates a synthetic auto-commit `Txn` and runs `op` under it.
+    ///
+    /// `op` receives an auto-commit-wired [`CursorImpl`] (locker_id = 0
+    /// so the LN is logged with the auto-commit `InsertLN` / `DeleteLN`
+    /// form, txn_ref set so the lock manager sees the synthetic auto-txn
+    /// as the owner).
+    ///
+    /// On `Ok(value)`:
+    ///   * Drops the cursor (closing it).
+    ///   * Calls [`Txn::commit_with_durability`] on the synthetic auto-txn
+    ///     with a [`Durability`] derived from the database's
+    ///     `no_sync` / `write_no_sync` config; this releases all locks
+    ///     and (for `CommitSync`) fsyncs up to the LN's LSN via
+    ///     `LogManager::flush_sync_if_needed` for many-to-one fsync
+    ///     coalescing under concurrent write load.
+    ///   * Records the commit in the txn manager statistics and removes
+    ///     the diagnostic locker label.
+    ///
+    /// On `Err(e)`:
+    ///   * Drops the cursor.
+    ///   * Calls [`Txn::abort_collect_undo`] to harvest before-image undo
+    ///     records WITHOUT releasing the held write locks (so a reader
+    ///     blocked on a write lock cannot observe the in-flight value
+    ///     before we restore the before-image).
+    ///   * Applies the undo records to the in-memory B-tree.
+    ///   * Calls [`Txn::release_all_locks`] to drain the held locks.
+    ///   * Records the abort in the txn manager statistics and removes
+    ///     the diagnostic locker label.
+    ///   * Returns `Err(e)`.
+    ///
+    /// Closes the first F12 residual: an auto-commit op now goes through
+    /// the same lock-tracking and abort-undo machinery as an explicit
+    /// transaction, so two concurrent inserts of the same brand-new key
+    /// serialise through the lock manager and a forced mid-write failure
+    /// rolls back the in-memory tree mutation.
+    fn with_auto_txn<F, T>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&mut CursorImpl) -> Result<T>,
+    {
+        let auto_txn =
+            self.txn_manager.begin_auto_txn(self.log_manager.clone());
+        let synthetic_id = auto_txn.id_as_locker();
+        let auto_txn_arc = Arc::new(std::sync::Mutex::new(auto_txn));
+
+        let mut cursor = self.make_cursor();
+        cursor.attach_txn(Arc::clone(&auto_txn_arc));
+
+        let result = op(&mut cursor);
+        // Drop the cursor handle (un-pins BIN, drops Arc<Mutex<Txn>> ref).
+        drop(cursor);
+
+        // Reclaim sole ownership of the synthetic auto-txn so we can
+        // finalise it.  All cursors and their Arcs were dropped above.
+        let mut auto_txn = match Arc::try_unwrap(auto_txn_arc) {
+            Ok(m) => m.into_inner().unwrap_or_else(|p| p.into_inner()),
+            Err(_arc) => {
+                // A cursor escaped the closure with a clone of the txn
+                // Arc.  This is a caller-side bug — leak the auto-txn
+                // (its Drop calls `close()` which aborts) and surface a
+                // typed error.  No undo applied because we cannot
+                // safely take the Txn out of the shared Arc.
+                return Err(NoxuError::OperationNotAllowed(
+                    "with_auto_txn: synthetic auto-txn outlived cursor scope"
+                        .to_string(),
+                ));
+            }
+        };
+        let txn_manager = Arc::clone(&self.txn_manager);
+
+        match result {
+            Ok(value) => {
+                let durability = if self.no_sync {
+                    Durability::CommitNoSync
+                } else if self.write_no_sync {
+                    Durability::CommitWriteNoSync
+                } else {
+                    Durability::CommitSync
+                };
+                if let Err(e) = auto_txn.commit_with_durability(durability) {
+                    // Commit failed (e.g. log fsync error).  Undo the
+                    // in-memory tree write so we are not left in an
+                    // inconsistent state, then surface the error.
+                    let undo_records =
+                        auto_txn.abort_collect_undo().unwrap_or_default();
+                    self.apply_auto_txn_undo(undo_records);
+                    auto_txn.release_all_locks();
+                    txn_manager.abort_txn(synthetic_id);
+                    return Err(NoxuError::OperationNotAllowed(format!(
+                        "auto-commit fsync failed: {e}"
+                    )));
+                }
+                txn_manager.commit_txn(synthetic_id);
+                Ok(value)
+            }
+            Err(e) => {
+                // Phase 1: collect undo without releasing write locks.
+                let undo_records =
+                    auto_txn.abort_collect_undo().unwrap_or_default();
+                // Phase 2: apply undo while write locks are still held
+                // so any concurrent reader blocked on a write lock
+                // cannot observe the in-flight value.
+                self.apply_auto_txn_undo(undo_records);
+                // Phase 3: drain locks.
+                auto_txn.release_all_locks();
+                txn_manager.abort_txn(synthetic_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Applies undo records collected from a synthetic auto-txn to the
+    /// in-memory B-tree of `self`.  Mirrors the per-`undo_record` block
+    /// in `Transaction::abort()` but specialised for the
+    /// single-database `with_auto_txn` case so we do not need to thread
+    /// the env-impl in.
+    fn apply_auto_txn_undo(&self, undo_records: Vec<UndoRecord>) {
+        let db_id_match = self.id;
+        let db_guard = self.db_impl.read();
+        let Some(tree) = db_guard.get_real_tree() else { return };
+        for undo in undo_records {
+            // The synthetic auto-txn touches only this database, but be
+            // defensive in case future changes broaden the contract.
+            if undo.database_id != db_id_match {
+                continue;
+            }
+            let Some(abort_key) = undo.abort_key else { continue };
+            if undo.abort_known_deleted {
+                if tree.delete(&abort_key) {
+                    db_guard.decrement_entry_count();
+                }
+            } else if let Some(abort_data) = undo.abort_data {
+                let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
+                let _ = tree.insert(abort_key, abort_data, lsn);
+            }
+        }
+    }
+
     /// Auto-commit flush: when `txn` is `None` (auto-commit mode), flush and
     /// fsync the log before returning to the caller.
     ///
@@ -235,12 +380,13 @@ impl Database {
         let throughput = db_impl.read().throughput.clone();
         // Cache the manager Arcs at construction so hot-path operations
         // (get/put/delete) never need to re-acquire env_impl.lock().
-        let (lock_manager, log_manager, cleaner_throttle) = {
+        let (lock_manager, log_manager, cleaner_throttle, txn_manager) = {
             let env = env_impl.lock();
             let lm = Arc::clone(env.get_lock_manager());
             let logm = env.get_log_manager();
             let ct = env.get_cleaner_throttle();
-            (lm, logm, ct)
+            let txnm = Arc::clone(env.get_txn_manager());
+            (lm, logm, ct, txnm)
         };
         Database {
             name,
@@ -253,6 +399,7 @@ impl Database {
             lock_manager,
             log_manager,
             cleaner_throttle,
+            txn_manager,
             no_sync,
             write_no_sync,
         }
@@ -356,6 +503,20 @@ impl Database {
         opts: &ReadOptions,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        // Wave 1C audit cleanup (database Low "asymmetric observability
+        // between *_with_options paths and the basic ones"): mirror
+        // the span / counter / timer instrumentation that
+        // `Database::get` emits so dashboards do not lose the
+        // per-operation `op = get_with_options` slice when callers
+        // opt for the richer surface.
+        observe_span!(
+            "db_get_with_options",
+            db_name = self.name.as_str(),
+            key_size = key.get_data().map_or(0, |k| k.len()),
+            lock_mode = format!("{:?}", opts.lock_mode),
+        );
+        let _obs_timer = observe_timer_start!();
+        observe_counter!("noxu_db_operations_total", "op" => "get_with_options");
 
         let key_bytes = match key.get_data() {
             Some(k) => k,
@@ -389,12 +550,22 @@ impl Database {
                     data.set_data(&value);
                 }
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
+                observe_timer_record!(
+                    _obs_timer,
+                    "noxu_db_operation_duration_seconds",
+                    "op" => "get_with_options"
+                );
                 Ok(OperationStatus::Success)
             }
             _ => {
                 self.throughput
                     .n_pri_search_fails
                     .fetch_add(1, Ordering::Relaxed);
+                observe_timer_record!(
+                    _obs_timer,
+                    "noxu_db_operation_duration_seconds",
+                    "op" => "get_with_options"
+                );
                 Ok(OperationStatus::NotFound)
             }
         }
@@ -436,11 +607,30 @@ impl Database {
         // Partial put: read-modify-write using the partial offset/length.
         // LN.combinePuts() — existing bytes outside [offset..offset+length]
         // are preserved; only the specified range is replaced with new data.
+        //
+        // Wave 1C audit cleanup (database Low "partial-put length mismatch
+        // silent truncation"): when the user supplies a `data` value
+        // whose byte length does not match the configured partial
+        // length, JE rejects the call; the v1.5.0 implementation here
+        // silently min'd the two lengths and truncated the user's
+        // bytes.  We now return a typed [`NoxuError::IllegalArgument`]
+        // so the mismatch is visible at the call site instead of
+        // corrupting the on-disk record.
         let write_bytes: Vec<u8>;
         let data_bytes: &[u8] = if data.is_partial() {
             let new_bytes = data.get_data().unwrap_or(&[]);
             let off = data.get_partial_offset();
             let len = data.get_partial_length();
+            if new_bytes.len() != len {
+                return Err(NoxuError::IllegalArgument(format!(
+                    "partial put: data length {} does not match \
+                     partial_length {} (partial_offset={}); JE \
+                     requires exact equality",
+                    new_bytes.len(),
+                    len,
+                    off
+                )));
+            }
             // Fetch the existing record to splice into.
             let existing = {
                 let mut tmp_entry = DatabaseEntry::new();
@@ -463,23 +653,35 @@ impl Database {
             let total_len = (off + len).max(existing.len());
             let mut patched = existing;
             patched.resize(total_len, 0);
-            let copy_len = new_bytes.len().min(len);
-            patched[off..off + copy_len]
-                .copy_from_slice(&new_bytes[..copy_len]);
+            patched[off..off + len].copy_from_slice(new_bytes);
             write_bytes = patched;
             &write_bytes
         } else {
             data.get_data().unwrap_or(&[])
         };
 
-        let mut cursor = match txn {
-            Some(t) => self.make_cursor_for_txn(t),
-            None => self.make_cursor(),
-        };
-        cursor
-            .put(key_bytes, data_bytes, PutMode::Overwrite)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
+        match txn {
+            Some(t) => {
+                let mut cursor = self.make_cursor_for_txn(t);
+                cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
+                    |e| NoxuError::OperationNotAllowed(e.to_string()),
+                )?;
+            }
+            None => {
+                // Wrap the write in a synthetic auto-commit `Txn` so the
+                // lock manager sees a typed locker id ("auto-txn:<id>")
+                // and any error rolls back the in-memory tree write
+                // through `Txn::abort_collect_undo`.
+                self.with_auto_txn(|cursor| {
+                    cursor
+                        .put(key_bytes, data_bytes, PutMode::Overwrite)
+                        .map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
+                    Ok(())
+                })?;
+            }
+        }
 
         // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
         // writes: if the log write rate exceeds the cleaner's capacity, sleep
@@ -493,9 +695,6 @@ impl Database {
         {
             std::thread::sleep(delay);
         }
-
-        // Auto-commit: fsync before returning (skip if already covered).
-        self.auto_commit_sync(txn, write_lsn)?;
 
         self.throughput.n_pri_updates.fetch_add(1, Ordering::Relaxed);
         observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "put");
@@ -569,20 +768,32 @@ impl Database {
         let key_bytes = key.get_data().unwrap_or(&[]);
         let data_bytes = data.get_data().unwrap_or(&[]);
 
-        let mut cursor = match txn {
-            Some(t) => self.make_cursor_for_txn(t),
-            None => self.make_cursor(),
+        let status = match txn {
+            Some(t) => {
+                let mut cursor = self.make_cursor_for_txn(t);
+                match cursor
+                    .put(key_bytes, data_bytes, PutMode::NoOverwrite)
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })? {
+                    noxu_dbi::OperationStatus::KeyExist => {
+                        OperationStatus::KeyExists
+                    }
+                    _ => OperationStatus::Success,
+                }
+            }
+            None => self.with_auto_txn(|cursor| {
+                cursor
+                    .put(key_bytes, data_bytes, PutMode::NoOverwrite)
+                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
+                    .map(|s| match s {
+                        noxu_dbi::OperationStatus::KeyExist => {
+                            OperationStatus::KeyExists
+                        }
+                        _ => OperationStatus::Success,
+                    })
+            })?,
         };
-        let status = match cursor
-            .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
-        {
-            noxu_dbi::OperationStatus::KeyExist => OperationStatus::KeyExists,
-            _ => OperationStatus::Success,
-        };
-        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
-        // Auto-commit: fsync before returning (skip if already covered).
-        self.auto_commit_sync(txn, write_lsn)?;
         if status == OperationStatus::Success {
             self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -624,37 +835,38 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
-        let mut cursor = match txn {
-            Some(t) => self.make_cursor_for_txn(t),
-            None => self.make_cursor(),
+        // Inner closure shared between the explicit-txn and synthetic
+        // auto-txn paths: scans + deletes every duplicate of `key_bytes`
+        // through the supplied `cursor`.  See comment in pre-Wave-1A
+        // delete for the dup-loop rationale (BDB-JE
+        // `Database.delete(key)` semantics).
+        let run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
+            let mut deleted_any = false;
+            while let noxu_dbi::OperationStatus::Success = cursor
+                .search(key_bytes, None, SearchMode::Set)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            {
+                cursor.delete().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
+                deleted_any = true;
+            }
+            Ok(deleted_any)
         };
-        // For sorted-duplicate databases the BDB-JE contract for
-        // `Database.delete(key)` is to remove EVERY (key, data) pair
-        // sharing the supplied key, not just the first duplicate.  We
-        // implement that by re-positioning the cursor with `Set` after
-        // each successful delete: the search uses the primary-key prefix
-        // so it finds the next surviving dup until the duplicate set is
-        // empty.  For non-dup databases the loop runs at most once (the
-        // second iteration is a single `NotFound` search) so the
-        // single-record fast path is preserved.
-        let mut deleted_any = false;
-        while let noxu_dbi::OperationStatus::Success = cursor
-            .search(key_bytes, None, SearchMode::Set)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
-        {
-            cursor
-                .delete()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-            deleted_any = true;
-        }
+
+        let deleted_any = match txn {
+            Some(t) => {
+                let mut cursor = self.make_cursor_for_txn(t);
+                run_delete(&mut cursor)?
+            }
+            None => self.with_auto_txn(run_delete)?,
+        };
+
         let status = if deleted_any {
             OperationStatus::Success
         } else {
             OperationStatus::NotFound
         };
-        let write_lsn = Lsn::from_u64(cursor.get_current_lsn());
-        // Auto-commit: fsync before returning (skip if already covered).
-        self.auto_commit_sync(txn, write_lsn)?;
         if status == OperationStatus::Success {
             self.throughput.n_pri_deletes.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -939,8 +1151,8 @@ impl Database {
     /// - Each BIN entry that is not known-deleted has a valid (non-NULL) LSN.
     /// - The BIN's first key is >= the parent routing key (key-range containment).
     ///
-    /// Mirrors `Database.verify(VerifyConfig)` in— calls BtreeVerifier on the
-    /// underlying tree.
+    /// Mirrors `Database.verify(VerifyConfig)` — calls `BtreeVerifier` on
+    /// the underlying tree.
     ///
     /// # Arguments
     /// * `config` - Verification options (which checks to run, max errors, etc.)
@@ -962,7 +1174,7 @@ impl Database {
     /// Creates a join cursor that returns records matching all secondary-key
     /// constraints expressed by the pre-positioned `cursors`.
     ///
-    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)` from .
+    /// Mirrors `Database.join(SecondaryCursor[], JoinConfig)`.
     ///
     /// Each cursor in `cursors` must already be positioned at the desired
     /// secondary key value (e.g. via `SecondaryCursor::get_search_key`).
@@ -973,7 +1185,7 @@ impl Database {
     ///
     /// Unless `config.no_sort` is `true`, the cursor array is re-ordered by
     /// ascending duplicate-count estimate before the join starts, matching
-    /// 's optimisation for minimum candidate-set size.
+    /// JE's optimisation for minimum candidate-set size.
     ///
     /// The returned `JoinCursor` owns the `cursors` for its lifetime.
     ///
@@ -1063,6 +1275,59 @@ mod tests {
 
         let result = db.get(None, &key, &mut data).unwrap();
         assert_eq!(result, OperationStatus::NotFound);
+    }
+
+    /// Wave 1C audit cleanup (database Low "partial-put length
+    /// mismatch silent truncation"): a partial put whose `data` slice
+    /// differs in length from the configured partial-length must be
+    /// rejected with a typed error instead of silently truncating or
+    /// padding the splice.
+    #[test]
+    fn test_partial_put_length_mismatch_rejected() {
+        let (_temp_dir, _env, db) = temp_env_and_db();
+
+        let key = DatabaseEntry::from_bytes(b"k");
+        db.put(None, &key, &DatabaseEntry::from_bytes(b"hello world")).unwrap();
+
+        // Partial offset=6, partial_length=5 ("world"), but only 3 bytes
+        // supplied.  Used to silently truncate; now rejected.
+        let mut patch = DatabaseEntry::from_bytes(b"abc");
+        patch.set_partial(6, 5, true);
+        let err = db.put(None, &key, &patch).unwrap_err();
+        assert!(
+            matches!(err, NoxuError::IllegalArgument(_)),
+            "expected IllegalArgument, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("partial"),
+            "expected partial-related message, got {}",
+            err
+        );
+
+        // The on-disk record is unchanged because the call returned
+        // before any write.
+        let mut buf = DatabaseEntry::new();
+        let status = db.get(None, &key, &mut buf).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+        assert_eq!(buf.get_data().unwrap(), b"hello world");
+    }
+
+    /// Companion: when data.len() == partial_length the partial put
+    /// patches the slice in place and other bytes are preserved.
+    #[test]
+    fn test_partial_put_exact_length_patches_in_place() {
+        let (_temp_dir, _env, db) = temp_env_and_db();
+
+        let key = DatabaseEntry::from_bytes(b"k");
+        db.put(None, &key, &DatabaseEntry::from_bytes(b"hello world")).unwrap();
+
+        let mut patch = DatabaseEntry::from_bytes(b"WORLD");
+        patch.set_partial(6, 5, true);
+        db.put(None, &key, &patch).unwrap();
+
+        let mut buf = DatabaseEntry::new();
+        db.get(None, &key, &mut buf).unwrap();
+        assert_eq!(buf.get_data().unwrap(), b"hello WORLD");
     }
 
     #[test]

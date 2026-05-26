@@ -5,6 +5,7 @@ use hashbrown::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 
+use noxu_log::LogManager;
 use noxu_sync::RwLock;
 use noxu_util::lsn::NULL_LSN;
 
@@ -84,19 +85,65 @@ impl TxnManager {
         self.n_begins.fetch_add(1, Ordering::Relaxed);
         // Register with NULL_LSN initially; updated when first log entry written.
         self.all_txns.write().insert(id, NULL_LSN.as_u64());
+        // Register a typed diagnostic label so deadlock and lock-timeout
+        // error messages render this locker as `"txn:<id>"`.
+        self.lock_manager.register_locker_label(id, "txn");
         Txn::new(id, self.lock_manager.clone())
+    }
+
+    /// Begins a synthetic transient transaction wrapping a single
+    /// auto-commit operation.
+    ///
+    /// Returns a `Txn` whose lifetime is bounded by one auto-commit cursor
+    /// call ([`crate::Txn::new_auto`]).  The auto-txn:
+    ///
+    /// * Allocates its locker id from the SAME counter as explicit
+    ///   transactions (`next_txn_id`), so the lock manager renders typed
+    ///   identifiers like `"auto-txn:42"` and `"txn:17"` in deadlock
+    ///   diagnostics.  This closes the second F12 residual (locker-id
+    ///   collision space).
+    /// * Tracks per-record write locks via `WriteLockInfo` exactly like an
+    ///   explicit `Txn`, so [`crate::Txn::abort`] can release the locks
+    ///   AND collect undo records for the in-memory tree write — closing
+    ///   the first F12 residual (NULL-LSN insert race / abort-undo).
+    /// * Goes through the same WAL fsync coordination as an explicit txn
+    ///   when committed via [`crate::Txn::commit_with_durability`], but
+    ///   does NOT write `TxnCommit` / `TxnAbort` records: the underlying
+    ///   LN was logged as auto-commit (`InsertLN` / `DeleteLN` with
+    ///   `txn_id=0`), so the on-disk WAL format is unchanged and recovery
+    ///   does not need to look up a synthetic commit/abort entry.
+    ///
+    /// `log_manager` is used by `commit_with_durability(CommitSync)` to
+    /// fsync up to the LN's LSN; pass `None` only in unit tests.
+    pub fn begin_auto_txn(&self, log_manager: Option<Arc<LogManager>>) -> Txn {
+        let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        self.last_local_txn_id.store(id, Ordering::Relaxed);
+        self.n_begins.fetch_add(1, Ordering::Relaxed);
+        self.all_txns.write().insert(id, NULL_LSN.as_u64());
+        // Register a typed diagnostic label so deadlock messages involving
+        // this auto-commit op are rendered as `"auto-txn:<id>"` rather than
+        // an opaque integer.
+        self.lock_manager.register_locker_label(id, "auto-txn");
+        match log_manager {
+            Some(lm) => {
+                Txn::with_log_manager_auto(id, self.lock_manager.clone(), lm)
+            }
+            None => Txn::new_auto(id, self.lock_manager.clone()),
+        }
     }
 
     /// Records that a transaction has committed.
     pub fn commit_txn(&self, txn_id: i64) {
         self.all_txns.write().remove(&txn_id);
         self.n_commits.fetch_add(1, Ordering::Relaxed);
+        self.lock_manager.unregister_locker_label(txn_id);
     }
 
     /// Records that a transaction has aborted.
     pub fn abort_txn(&self, txn_id: i64) {
         self.all_txns.write().remove(&txn_id);
         self.n_aborts.fetch_add(1, Ordering::Relaxed);
+        self.lock_manager.unregister_locker_label(txn_id);
     }
 
     /// Updates the first-logged LSN for an active transaction.

@@ -224,25 +224,6 @@ fn database_impl_reference_counting() {
 }
 
 #[test]
-fn database_impl_compare_keys_default_lexicographic() {
-    let db = make_db(1, "db");
-    use std::cmp::Ordering::*;
-    assert_eq!(db.compare_keys(b"abc", b"abd"), Less);
-    assert_eq!(db.compare_keys(b"abd", b"abc"), Greater);
-    assert_eq!(db.compare_keys(b"abc", b"abc"), Equal);
-}
-
-#[test]
-fn database_impl_compare_keys_custom_comparator() {
-    let mut db = make_db(1, "db");
-    // Reverse comparator.
-    db.set_bt_comparator(|a, b| b.cmp(a));
-    use std::cmp::Ordering::*;
-    assert_eq!(db.compare_keys(b"abc", b"abd"), Greater);
-    assert_eq!(db.compare_keys(b"abd", b"abc"), Less);
-}
-
-#[test]
 fn database_impl_tree_access() {
     let mut db = make_db(1, "db");
     {

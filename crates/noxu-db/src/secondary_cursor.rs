@@ -8,8 +8,13 @@
 //! Write operations (put, putCurrent, putNoDupData, putNoOverwrite) are
 //! prohibited on a secondary cursor — use the primary database instead.
 //!
-//! The `delete` operation deletes the *primary* record (which cascades to
-//! all secondary index entries for that primary record).
+//! The `delete` operation deletes the *primary* record and cascades to
+//! every secondary index entry that referred to that primary record
+//! (within this secondary database).  Both deletes participate in the
+//! transaction the cursor was opened under (Wave 1B / audit F5): they
+//! commit together when the txn commits, and roll back together when
+//! the txn aborts.  When the cursor was opened with `txn = None` the
+//! cascade runs auto-committed, matching the v1.4 behaviour.
 
 use crate::cursor::Cursor;
 use crate::cursor_config::CursorConfig;
@@ -48,6 +53,13 @@ pub struct SecondaryCursor<'a> {
     inner: Cursor,
     /// Back-reference to the owning SecondaryDatabase (for primary lookups).
     secondary_db: &'a SecondaryDatabase,
+    /// Transaction handle the cursor was opened under.  Every primary
+    /// lookup, primary delete, and secondary-cleanup call performed by
+    /// the cursor is forwarded under this txn so the whole cursor —
+    /// including the [`SecondaryCursor::delete`] cascade — participates
+    /// in the caller's transaction.  `None` selects auto-commit
+    /// behaviour (Wave 1B / audit F5).
+    txn: Option<&'a Transaction>,
 }
 
 impl<'a> SecondaryCursor<'a> {
@@ -58,13 +70,20 @@ impl<'a> SecondaryCursor<'a> {
     /// and honours any cursor-level configuration.  See API audit 2026-05
     /// secondary-join finding F4: the previous signature dropped both
     /// arguments on the floor and ran every secondary cursor auto-commit.
+    ///
+    /// Wave 1B (audit F5 follow-up): the txn handle is now also stored on
+    /// the `SecondaryCursor` itself so that primary lookups and the
+    /// [`SecondaryCursor::delete`] cascade execute under the same
+    /// transaction as the inner secondary cursor.  Pre-Wave-1B these
+    /// out-of-band primary operations always ran auto-committed, leaking
+    /// secondary-cleanup writes around an aborted user txn.
     pub(crate) fn new(
         secondary_db: &'a SecondaryDatabase,
-        txn: Option<&Transaction>,
+        txn: Option<&'a Transaction>,
         config: Option<&CursorConfig>,
     ) -> Result<Self> {
         let inner = secondary_db.inner_db().open_cursor(txn, config)?;
-        Ok(Self { inner, secondary_db })
+        Ok(Self { inner, secondary_db, txn })
     }
 
     // ------------------------------------------------------------------
@@ -86,14 +105,40 @@ impl<'a> SecondaryCursor<'a> {
     // Delete — deletes the primary record.
     // ------------------------------------------------------------------
 
-    /// Deletes the primary record at the current cursor position.
+    /// Deletes the primary record at the current cursor position and
+    /// every secondary index entry (within this secondary database) that
+    /// referred to it.
     ///
+    /// # Cascade semantics
     ///
+    /// 1. The primary key is read from the current secondary record.
+    /// 2. The primary data is fetched so the key creator can recompute
+    ///    every secondary key it produced for this primary record.
+    /// 3. [`SecondaryDatabase::delete_all_for_primary`] is invoked to
+    ///    remove every matching secondary index entry — **under the
+    ///    cursor's stored txn**.  This is more general than just
+    ///    deleting the entry the cursor is positioned on: a multi-key
+    ///    creator may have produced several secondary keys for the
+    ///    primary, all of which become orphans once the primary is
+    ///    deleted.
+    /// 4. The primary record itself is deleted — also under the
+    ///    cursor's stored txn.
     ///
-    /// Reads the primary key from the current secondary record, then calls
-    /// `Database::delete` on the primary database.  The secondary index
-    /// entries for the deleted primary record are cleaned up by
-    /// `SecondaryDatabase::delete_all_for_primary`.
+    /// # Atomicity (Wave 1B / audit F5)
+    ///
+    /// When the cursor was opened with `Some(&txn)` (see
+    /// [`SecondaryDatabase::open_cursor`]), every step above runs
+    /// inside `txn`.  Aborting the txn rolls back **both** the primary
+    /// delete and every secondary cleanup performed by this method;
+    /// committing the txn persists both.  Pre-Wave-1B this method
+    /// dropped the txn on the floor and ran the cascade
+    /// auto-committed, so an aborted user txn could leave the primary
+    /// behind while still removing the secondary entries (or vice
+    /// versa) — the residual sub-item the Sprint 4½ deliverables
+    /// flagged for follow-up.
+    ///
+    /// When the cursor was opened with `None`, every step runs
+    /// auto-committed, which preserves the v1.4 behaviour.
     pub fn delete(&mut self) -> Result<OperationStatus> {
         // Read the current secondary record to obtain the primary key.
         let mut sec_key = DatabaseEntry::new();
@@ -113,40 +158,35 @@ impl<'a> SecondaryCursor<'a> {
             DatabaseEntry::from_bytes(&bytes)
         };
 
-        // Fetch primary data for secondary cleanup.
+        // Fetch primary data for secondary cleanup.  Reads run under the
+        // cursor's txn so the lookup observes uncommitted writes the
+        // caller's own txn has already made (e.g. an earlier put followed
+        // by a delete in the same txn) and so cross-txn isolation is
+        // honoured.
         let mut pri_data = DatabaseEntry::new();
-        {
+        let pri_get_status = {
             let primary = self.secondary_db.primary_db().lock();
-            let s = primary.get(None, &pri_key, &mut pri_data)?;
-            if s == OperationStatus::Success {
-                // Remove all secondary index entries for this primary key.
-                // Sprint 4½ plumbed `txn` through `delete_all_for_primary`,
-                // but `SecondaryCursor` does not currently store its txn
-                // handle (the inner `Cursor` already participates in it),
-                // so the cascade still runs auto-committed.  Wiring the
-                // txn into `SecondaryCursor::delete` is tracked as audit
-                // finding F5 follow-up work.
-                let old_data = pri_data.clone();
-                drop(primary);
-                self.secondary_db.delete_all_for_primary(
-                    None,
-                    &pri_key,
-                    Some(&old_data),
-                )?;
-            }
+            primary.get(self.txn, &pri_key, &mut pri_data)?
+        };
+
+        if pri_get_status == OperationStatus::Success {
+            // Remove every secondary index entry this primary record
+            // produced — atomic with the primary delete below because
+            // both run under `self.txn` (Wave 1B).
+            let old_data = pri_data.clone();
+            self.secondary_db.delete_all_for_primary(
+                self.txn,
+                &pri_key,
+                Some(&old_data),
+            )?;
         }
 
-        // Delete the primary record.
-        let primary = self.secondary_db.primary_db().lock();
-        let del_status = primary.delete(None, &pri_key)?;
-
-        // Reset the inner cursor state (current position is now deleted).
-        let _ = self.inner.get(
-            &mut DatabaseEntry::new(),
-            &mut DatabaseEntry::new(),
-            Get::Current,
-            None,
-        );
+        // Delete the primary record under the same txn so the cascade
+        // and the primary delete commit / abort together.
+        let del_status = {
+            let primary = self.secondary_db.primary_db().lock();
+            primary.delete(self.txn, &pri_key)?
+        };
 
         Ok(del_status)
     }
@@ -249,10 +289,12 @@ impl<'a> SecondaryCursor<'a> {
         let pri_key_bytes = stored_pk.get_data().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
-        // Fetch primary data.
+        // Fetch primary data under the cursor's txn so the lookup
+        // observes the caller's uncommitted writes and honours cross-txn
+        // isolation (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(None, &pri_key_entry, data)?;
+        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
         if pri_status != OperationStatus::Success {
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
@@ -265,7 +307,14 @@ impl<'a> SecondaryCursor<'a> {
 
     /// Searches for the first secondary key >= `search_key`.
     ///
-    ///
+    /// `search_key` is updated in place with the actual key found (which
+    /// may be strictly greater than the input).  See Wave 1C audit
+    /// cleanup (secondary-join “fragile two-step get_search_key_range”
+    /// Low) — the v1.5.0 implementation issued a redundant `Get::Current`
+    /// probe after the SearchGte to re-read the key, which silently
+    /// discarded errors and re-locked the cursor.  The underlying
+    /// `Cursor::get(Get::SearchGte)` already writes the discovered key
+    /// back into `search_key`, so a single call is sufficient.
     pub fn get_search_key_range(
         &mut self,
         search_key: &mut DatabaseEntry,
@@ -280,17 +329,15 @@ impl<'a> SecondaryCursor<'a> {
             return Ok(OperationStatus::NotFound);
         }
 
-        // Update search_key with the actual key found (GTE may advance it).
-        // The inner cursor is now positioned; read current key via a Current call.
-        let mut dummy_data = DatabaseEntry::new();
-        let _ = self.inner.get(search_key, &mut dummy_data, Get::Current, None);
-
+        // `Cursor::get` for SearchGte already wrote the discovered key
+        // back into `search_key`; copy the primary key out of the inner
+        // cursor's data slot and resolve the primary record.
         let pri_key_bytes = stored_pk.get_data().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(None, &pri_key_entry, data)?;
+        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
         if pri_status != OperationStatus::Success {
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
@@ -454,10 +501,11 @@ impl<'a> SecondaryCursor<'a> {
             pri_key_bytes_entry.get_data().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
-        // Step 3: look up the primary record.
+        // Step 3: look up the primary record under the cursor's txn so
+        // the lookup honours the caller's transaction (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(None, &pri_key_entry, data)?;
+        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
 
         if pri_status != OperationStatus::Success {
             // Secondary refers to a missing primary — integrity issue.

@@ -29,6 +29,17 @@ pub enum DbiError {
     #[error("environment failure: {reason}")]
     EnvironmentFailure { reason: String },
 
+    /// Recovery failed during environment open.
+    ///
+    /// Distinct from the more general `EnvironmentFailure` so callers
+    /// can branch on "recovery couldn't replay the WAL" specifically.
+    /// Wave 1C audit cleanup (transaction-env F22 typed recovery-
+    /// failure variant): previously every recovery failure surfaced
+    /// as `EnvironmentFailure { reason: "recovery failed: ..." }`,
+    /// which forced callers to string-match the prefix.
+    #[error("recovery failed: {reason}")]
+    RecoveryFailure { reason: String },
+
     /// Environment is not open.
     #[error("environment not open")]
     EnvironmentNotOpen,
