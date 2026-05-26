@@ -17,17 +17,20 @@
 //! 5. `xa_prepare` auto-detects writes performed via the inner
 //!    `Transaction` \u2014 a user that forgets to call `mark_write` no longer
 //!    silently slides into the read-only optimisation and aborts their
-//!    work. (Test added in the auto-detect commit.)
+//!    work.
 //! 6. A truly read-only branch still returns `PrepareResult::ReadOnly`
 //!    (the auto-detect must not produce a false positive on read-only
-//!    workloads). (Test added in the auto-detect commit.)
+//!    workloads).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    OperationStatus,
 };
-use noxu_xa::{XaEnvironment, XaError, XaFlags, XaResource, Xid};
+use noxu_xa::{
+    PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid,
+};
 use tempfile::TempDir;
 
 fn make_xa_with_log(dir: &std::path::Path) -> (XaEnvironment, Database) {
@@ -239,3 +242,73 @@ fn xa_forget_after_restart_clears_persistent_log() {
 
 // NOTE: Auto-detect-writes tests are added in the
 // `fix(xa): auto-detect writes in xa_prepare` commit.
+
+// ---------------------------------------------------------------------------
+// 6. xa_prepare auto-detects writes (no explicit mark_write needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn xa_prepare_auto_detects_writes_without_mark_write() {
+    let dir = TempDir::new().unwrap();
+    let (xa, db) = make_xa_no_log(dir.path());
+    let xid = Xid::new(1, b"auto_detect_writes", b"br").unwrap();
+
+    xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+    {
+        let txn = xa.get_transaction(&xid).unwrap();
+        db.put(
+            Some(txn),
+            &DatabaseEntry::from_bytes(b"auto_k"),
+            &DatabaseEntry::from_bytes(b"auto_v"),
+        )
+        .unwrap();
+    }
+    // Deliberately DO NOT call xa.mark_write(&xid).
+    xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+
+    // Auto-detect: the inner Transaction has logged entries, so prepare
+    // must return Ok (NOT ReadOnly), preserving the user's writes for the
+    // second phase.
+    let result = xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
+    assert_eq!(
+        result,
+        PrepareResult::Ok,
+        "xa_prepare must auto-detect writes when mark_write was not called"
+    );
+
+    xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
+
+    // Verify the data really was committed (not silently dropped by the
+    // read-only optimisation).
+    let mut val = DatabaseEntry::new();
+    let status =
+        db.get(None, &DatabaseEntry::from_bytes(b"auto_k"), &mut val).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::Success,
+        "auto-detect must preserve writes through prepare+commit"
+    );
+    assert_eq!(val.get_data(), Some(b"auto_v".as_slice()));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Truly read-only branch still gets the read-only optimisation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn xa_prepare_read_only_branch_still_returns_read_only() {
+    let dir = TempDir::new().unwrap();
+    let (xa, _db) = make_xa_no_log(dir.path());
+    let xid = Xid::new(1, b"true_readonly", b"br").unwrap();
+
+    xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+    // No writes performed at all.
+    xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+
+    let result = xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
+    assert_eq!(
+        result,
+        PrepareResult::ReadOnly,
+        "read-only branches must still take the read-only optimisation"
+    );
+}
