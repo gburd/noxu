@@ -457,6 +457,22 @@ impl Txn {
         self.read_locks.len() + self.write_locks.len()
     }
 
+    /// Returns the number of *read* locks currently held by this
+    /// transaction.  Wave 1C audit cleanup (transaction-env F23): the
+    /// public `noxu_db::Transaction::lock_counts()` accessor needs a
+    /// way to ask the inner `Txn` for read/write lock totals
+    /// separately so it can mirror JE's
+    /// `Transaction.getNumReadLocks()`.
+    pub fn read_lock_count(&self) -> usize {
+        self.read_locks.len()
+    }
+
+    /// Returns the number of *write* locks currently held by this
+    /// transaction.  Mirrors JE's `Transaction.getNumWriteLocks()`.
+    pub fn write_lock_count(&self) -> usize {
+        self.write_locks.len()
+    }
+
     /// Returns true if this transaction is importunate (can steal locks).
     pub fn get_importunate(&self) -> bool {
         self.importunate
