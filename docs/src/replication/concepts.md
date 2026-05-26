@@ -94,7 +94,7 @@ This decoupling is valuable in practice:
 The phi accrual failure detector (`crates/noxu-rep/src/elections/phi_detector.rs`)
 outputs a continuous suspicion level rather than a binary alive/dead decision:
 
-```
+```text
 phi(t) = -log10(P_later(t - T_last))
 ```
 

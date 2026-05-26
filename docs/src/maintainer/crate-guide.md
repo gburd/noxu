@@ -215,7 +215,7 @@ Key files:
 
 State machine per Xid:
 
-```
+```text
 [none] → xa_start → Active → xa_end(SUCCESS) → Idle → xa_prepare → Prepared → xa_commit → [done]
                            → xa_end(SUSPEND) → Suspended → xa_start(RESUME) → Active
                            → xa_end(FAIL) → RollbackOnly → xa_rollback → [done]

@@ -40,7 +40,7 @@ Key characteristics:
 
 A Noxu DB application has three layers:
 
-```
+```text
 Environment
   └── Database (named, multiple per environment)
         └── Records (key/data pairs in a B-tree)

@@ -35,7 +35,7 @@ fidelity, and operational characteristics as Noxu DB — without a JVM.
 
 **Where does the code live?**
 
-```
+```text
 <repo-root>/                 ← this repository (your local clone)
 <repo-root>/_/je/            ← core reference archive (read-only, optional)
 <repo-root>/_/nosql/         ← extended fork reference (read-only, optional)

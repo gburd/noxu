@@ -94,7 +94,7 @@ TRANSPORTS="tcp quic mix" scripts/torture_all.sh
 
 A violation means an invariant failed. The torture test outputs:
 
-```
+```text
 Round 42: violations=1 (split_brain detected at term=5)
 ```
 

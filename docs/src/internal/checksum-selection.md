@@ -83,7 +83,7 @@ To switch: replace `crc32fast::Hasher` with `crc32c::crc32c()` in
 
 ## Feeder Frame Format (with checksum)
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │  magic     : u32  (0x4E584D58 = "NXMX")                 │
 │  version   : u8                                          │

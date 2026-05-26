@@ -5,7 +5,7 @@ with Noxu DB (`.jdb` files).
 
 ## Directory Layout
 
-```
+```text
 /path/to/environment/
     noxu.lck            Environment lock file
     00000000.ndb        Log file 0
@@ -26,7 +26,7 @@ Each `.ndb` file:
 
 ## Entry Header
 
-```
+```text
 Offset  Size  Field
 ------  ----  -----
 0       4     CRC32 checksum (little-endian, covers bytes 4..end)
@@ -41,7 +41,7 @@ Base header: **14 bytes**. With VLSN: **22 bytes**.
 
 ## LSN Encoding
 
-```
+```text
 bits 63..32  →  file_number (u32)
 bits 31..0   →  byte offset within the file (u32)
 NULL_LSN = 0x0000_0000_0000_0000

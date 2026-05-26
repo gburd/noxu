@@ -22,7 +22,7 @@ invariants and control flow are the same.
 
 A write operation flows through the system as follows:
 
-```
+```text
 Application
     |
     v
@@ -57,7 +57,7 @@ in cache, the log is read (`noxu-log`) and the node is loaded into the tree.
 
 The 19 crates form a layered dependency structure:
 
-```
+```text
 Layer 0 (Foundation):
     noxu-util          Core types: LSN, VLSN, packed integers, stats
     noxu-sync          Internal sync primitives (raw locks, condvar, futex)
