@@ -849,82 +849,134 @@ impl CursorImpl {
     ///
     /// Returns `(key, data, slot_lsn)` so the caller can acquire a read lock.
     ///
-    /// Returns the first key in the BIN that compares >= the given search
-    /// key.  The seed `key` is *not* required to share the BIN's learned
-    /// prefix-compression layout — we explicitly handle the three legal
-    /// seed/`key_prefix` relationships:
+    /// # Algorithm
     ///
-    ///   1. `key.starts_with(key_prefix)` — cheap suffix comparison; the
-    ///      stored `entries[i].key` are suffixes under that prefix, so we
-    ///      compare against `&key[plen..]`.
-    ///   2. `key < key_prefix` lexicographically — every full key in this
-    ///      BIN starts with `key_prefix` and is therefore strictly greater
-    ///      than `key`; the answer is `entries[0]`.  This includes the
-    ///      common case of a short search seed (e.g. `b"K\0"`) on a BIN
-    ///      whose learned prefix has grown longer than the seed
-    ///      (`b"K\0bucket\0…"`).
-    ///   3. `key > key_prefix` lexicographically — every full key in this
-    ///      BIN is strictly less than `key`; nothing here matches.  We
-    ///      return `None` and the caller treats it as `NotFound`.
-    ///      (TODO: walk to the next BIN to handle the case where a key
-    ///      `>= seed` lives in a sibling BIN; for now this matches the
-    ///      single-BIN scope of the existing implementation.)
+    /// SearchGte is a two-step probe:
     ///
-    /// Prior to this guard the function unconditionally called
-    /// `bin.compress_key(key)`, which `debug_assert!`s on case 2 and
-    /// panics with a slice out-of-bounds in release on the same shape —
-    /// see the regression test
-    /// `cursor_search_gte_short_seed_under_long_prefix_does_not_panic`.
+    ///   1. Locate the BIN that *should* contain `key` via
+    ///      `find_bin_for_key` and scan it for the smallest entry whose
+    ///      full key is `>= key`.  The seed `key` is *not* required to
+    ///      share the BIN's learned `key_prefix` — we explicitly handle
+    ///      the three legal seed/`key_prefix` relationships:
+    ///
+    ///      * `key.starts_with(key_prefix)` — cheap suffix comparison;
+    ///        the stored `entries[i].key` are suffixes under that prefix,
+    ///        so we compare against `&key[plen..]`.
+    ///      * `key < key_prefix` lexicographically — every full key in
+    ///        this BIN starts with `key_prefix` and is therefore strictly
+    ///        greater than `key`; the answer is `entries[0]`.  This
+    ///        includes the common case of a short search seed (e.g.
+    ///        `b"K\0"`) on a BIN whose learned prefix has grown longer
+    ///        than the seed (`b"K\0bucket\0…"`).
+    ///      * `key > key_prefix` lexicographically — every full key in
+    ///        this BIN is strictly less than `key`; nothing here matches,
+    ///        fall through to step 2.
+    ///
+    ///   2. If step 1 returned nothing (either no entry in the chosen
+    ///      BIN satisfies `>= key`, or the BIN was empty / the seed sits
+    ///      lex-after the BIN's prefix) call `Tree::get_next_bin(key)`
+    ///      and return its first entry, which by B+tree invariants is
+    ///      strictly greater than `key`.
+    ///
+    /// # Why step 2's first entry is the correct answer
+    ///
+    /// `find_bin_for_key` descends by picking, at each internal level,
+    /// the largest separator `<= key`.  If it lands on BIN `B` reached
+    /// via slot `p` of some ancestor, then `separator(p) <= key` and
+    /// (when slot `p+1` exists) `separator(p+1) > key` strictly —
+    /// otherwise descent would have picked `p+1`.  By the B+tree
+    /// key-range invariant every key in the subtree rooted at `slot(p+1)`
+    /// is `>= separator(p+1) > key`.  `Tree::get_next_bin` returns the
+    /// leftmost BIN of exactly that next-sibling subtree, so its first
+    /// entry is the smallest key in the whole tree that is `> key`.
+    /// One probe, deterministically correct — no looping needed.
+    ///
+    /// # Locking
+    ///
+    /// The step-1 BIN read lock is released before step 2 fires so that
+    /// `get_next_bin`'s own latch-coupled descent is unconstrained and
+    /// other threads (especially writers crossing this BIN) are not
+    /// blocked on a lock we no longer need.
+    ///
+    /// # Empty intermediate BINs
+    ///
+    /// If the chosen BIN is empty *and* `get_next_bin` returns an empty
+    /// BIN (a transient state under delete-heavy workloads, before the
+    /// cleaner has collapsed it), this returns `None` and the caller
+    /// reports `NotFound`.  This matches `Get::Next`'s behaviour today;
+    /// see also the follow-up note in
+    /// `cursor_search_gte_skips_past_empty_bin_is_pre_existing_limit`.
     fn find_range_entry(
         tree: &Tree,
         key: &[u8],
     ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
-        let root = tree.get_root()?;
-        // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-        let bin_arc = Self::find_bin_for_key(root, key)?;
-        let guard = bin_arc.read();
-        match &*guard {
-            TreeNode::Bottom(bin) => {
-                let plen = bin.key_prefix.len();
 
-                // Cases 2 and 3: seed does not share the BIN's full prefix.
-                // Decide by lex-comparing seed against key_prefix; do NOT
-                // call compress_key (which requires `starts_with`).
-                if plen != 0 && !key.starts_with(bin.key_prefix.as_slice()) {
-                    return if key < bin.key_prefix.as_slice() {
-                        // Case 2: every key in this BIN is > seed.
-                        let e = bin.entries.first()?;
-                        let fk = bin.get_full_key(0)?;
-                        Some((
-                            fk,
-                            e.data.clone().unwrap_or_default(),
-                            e.lsn.as_u64(),
-                        ))
+        // Step 1: scan the BIN that should contain `key`.  The read lock
+        // is dropped at the end of this block before step 2 runs.
+        let in_current: Option<(Vec<u8>, Vec<u8>, u64)> = {
+            let root = tree.get_root()?;
+            // Use find_bin_for_key so range searches also work for non-leftmost BINs.
+            let bin_arc = Self::find_bin_for_key(root, key)?;
+            let guard = bin_arc.read();
+            match &*guard {
+                TreeNode::Bottom(bin) => {
+                    let plen = bin.key_prefix.len();
+
+                    if plen != 0 && !key.starts_with(bin.key_prefix.as_slice())
+                    {
+                        // Seed does not share this BIN's learned prefix.
+                        // Decide by lex-comparing seed against key_prefix;
+                        // never call compress_key (which requires `starts_with`).
+                        if key < bin.key_prefix.as_slice() {
+                            // Every key in this BIN is > seed.
+                            bin.entries.first().and_then(|e| {
+                                bin.get_full_key(0).map(|fk| {
+                                    (
+                                        fk,
+                                        e.data.clone().unwrap_or_default(),
+                                        e.lsn.as_u64(),
+                                    )
+                                })
+                            })
+                        } else {
+                            // Every key in this BIN is < seed; let step 2
+                            // handle it.
+                            None
+                        }
                     } else {
-                        // Case 3: every key in this BIN is < seed.
-                        None
-                    };
+                        // Cheap path: suffix comparison.
+                        let suffix = &key[plen..];
+                        bin.entries
+                            .iter()
+                            .enumerate()
+                            .find(|(_, e)| e.key.as_slice() >= suffix)
+                            .and_then(|(i, e)| {
+                                bin.get_full_key(i).map(|fk| {
+                                    (
+                                        fk,
+                                        e.data.clone().unwrap_or_default(),
+                                        e.lsn.as_u64(),
+                                    )
+                                })
+                            })
+                    }
                 }
-
-                // Case 1: seed shares the prefix; compare suffixes.
-                let suffix = &key[plen..];
-                bin.entries
-                    .iter()
-                    .enumerate()
-                    .find(|(_, e)| e.key.as_slice() >= suffix)
-                    .and_then(|(i, e)| {
-                        bin.get_full_key(i).map(|fk| {
-                            (
-                                fk,
-                                e.data.clone().unwrap_or_default(),
-                                e.lsn.as_u64(),
-                            )
-                        })
-                    })
+                _ => None,
             }
-            _ => None,
+            // bin_arc read lock dropped here.
+        };
+
+        if let Some(r) = in_current {
+            return Some(r);
         }
+
+        // Step 2: chosen BIN had nothing >= key.  By B+tree invariants the
+        // first entry of the next BIN is strictly > key, which satisfies
+        // SearchGte.  No iteration: one call, one answer.
+        let next = tree.get_next_bin(key)?;
+        let e = next.into_iter().next()?;
+        Some((e.key, e.data.unwrap_or_default(), e.lsn.as_u64()))
     }
 
     /// Descends from the given node to the leftmost BIN, returning its Arc.
