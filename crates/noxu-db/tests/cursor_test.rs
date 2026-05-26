@@ -1057,3 +1057,94 @@ fn cursor_search_both_on_non_dup_db_missing_key_still_not_found() {
     let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
     assert_eq!(s, OperationStatus::NotFound);
 }
+
+#[test]
+fn cursor_search_lte_returns_unsupported_error() {
+    // Audit Finding 3: `Get::SearchLte` is not yet implemented.  Pre-fix
+    // it fell through to the wildcard `_ => Ok(NotFound)` arm in
+    // `Cursor::get`, silently misleading callers.  It must now return a
+    // typed `NoxuError::Unsupported`.
+    use noxu_db::NoxuError;
+
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "search_lte_unsupported");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"a"),
+        &DatabaseEntry::from_bytes(b"1"),
+    )
+    .unwrap();
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::from_bytes(b"a");
+    let mut data = DatabaseEntry::new();
+    let err = cursor
+        .get(&mut key, &mut data, Get::SearchLte, None)
+        .expect_err("Get::SearchLte must return an Unsupported error");
+    match err {
+        NoxuError::Unsupported(op) => {
+            assert!(
+                op.contains("SearchLte"),
+                "Unsupported message must name the operation; got {op:?}"
+            );
+        }
+        other => panic!("expected NoxuError::Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn cursor_first_dup_returns_unsupported_error() {
+    // Audit Finding 3 — companion to the SearchLte case.
+    use noxu_db::NoxuError;
+
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "first_dup_unsupported");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"a"),
+        &DatabaseEntry::from_bytes(b"1"),
+    )
+    .unwrap();
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::from_bytes(b"a");
+    let mut data = DatabaseEntry::new();
+    cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+
+    let err = cursor
+        .get(&mut key, &mut data, Get::FirstDup, None)
+        .expect_err("Get::FirstDup must return an Unsupported error");
+    assert!(
+        matches!(err, NoxuError::Unsupported(ref op) if op.contains("FirstDup"))
+    );
+}
+
+#[test]
+fn cursor_last_dup_returns_unsupported_error() {
+    // Audit Finding 3 — companion to the SearchLte case.
+    use noxu_db::NoxuError;
+
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_and_db_named(&dir, "last_dup_unsupported");
+
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(b"a"),
+        &DatabaseEntry::from_bytes(b"1"),
+    )
+    .unwrap();
+
+    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::from_bytes(b"a");
+    let mut data = DatabaseEntry::new();
+    cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+
+    let err = cursor
+        .get(&mut key, &mut data, Get::LastDup, None)
+        .expect_err("Get::LastDup must return an Unsupported error");
+    assert!(
+        matches!(err, NoxuError::Unsupported(ref op) if op.contains("LastDup"))
+    );
+}
