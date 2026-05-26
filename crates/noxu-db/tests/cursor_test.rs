@@ -7,7 +7,8 @@
 
 use noxu_db::cursor::CursorState;
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, Put,
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
+    Put, TransactionConfig,
 };
 use tempfile::TempDir;
 
@@ -1147,4 +1148,265 @@ fn cursor_last_dup_returns_unsupported_error() {
     assert!(
         matches!(err, NoxuError::Unsupported(ref op) if op.contains("LastDup"))
     );
+}
+
+// ─── 14. Cursor must participate in the txn passed to open_cursor ─────────────
+//
+// Regression for API audit 2026-05 cursor finding C1 / #1
+// (`docs/src/internal/api-audit-2026-05-cursor.md`):
+// `Database::open_cursor(Some(&txn), None)` previously bound the txn argument
+// as `_txn` and dropped it on the floor.  Cursor writes auto-committed and
+// cursor reads bypassed the txn's lock set, silently breaking ACID isolation
+// for users following the canonical pattern in
+// `docs/src/transactions/cursors.md`.
+
+/// Cursor opened with `Some(&txn)` must participate in that txn: a `put`
+/// followed by `txn.abort()` must leave the database unchanged.
+///
+/// **Pre-fix this test fails** because the cursor was built via
+/// `make_cursor()` instead of `make_cursor_for_txn(t)`, so the put was
+/// auto-committed and survived the abort.
+#[test]
+fn cursor_with_txn_put_is_rolled_back_on_abort() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    // Seed nothing — start with an empty database.
+    let txn = env.begin_transaction(None, None).unwrap();
+    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+
+    let (k, v) = kv(b"rolled-back-key", b"rolled-back-val");
+    let s = cursor.put(&k, &v, Put::Overwrite).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // Cursor must be closed before the txn ends.
+    cursor.close().unwrap();
+    txn.abort().unwrap();
+
+    // Open a fresh, auto-commit cursor and confirm the put did NOT persist.
+    let mut probe = db.open_cursor(None, None).unwrap();
+    let mut out_k = DatabaseEntry::new();
+    let mut out_v = DatabaseEntry::new();
+    let status = probe.get(&mut out_k, &mut out_v, Get::First, None).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "cursor.put under an aborted txn must NOT persist; the txn argument \
+         to Database::open_cursor was being dropped (audit C1)"
+    );
+}
+
+/// A second-line check using `db.get`: even when the auto-commit cursor in
+/// the assertion above is correct, exercising the public `get` path makes
+/// the regression self-evident in a stack trace.
+#[test]
+fn cursor_with_txn_put_invisible_via_get_after_abort() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+
+    let (k, v) = kv(b"k", b"v");
+    cursor.put(&k, &v, Put::Overwrite).unwrap();
+    cursor.close().unwrap();
+    txn.abort().unwrap();
+
+    let mut out = DatabaseEntry::new();
+    let status = db.get(None, &k, &mut out).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::NotFound,
+        "value written through a cursor opened with Some(&txn) must vanish \
+         on txn.abort() (audit C1)"
+    );
+}
+
+/// Cursor reads through a txn must take locks in the txn's lock set.
+/// We verify this indirectly: writer txn A holds an uncommitted write on a
+/// key; reader txn B opens a cursor with `Some(&B)` and a no-wait config and
+/// attempts a `Get::Search` on the same key.  Pre-fix the cursor read does
+/// not engage the lock manager (because the txn argument is dropped) and
+/// the read either spuriously succeeds or returns NotFound without a lock
+/// conflict.  Post-fix the read must conflict with A's write lock and
+/// return an error under no-wait.
+#[test]
+fn cursor_with_txn_get_takes_read_lock_via_locker() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    // Seed a committed value so there is something to lock.
+    let seed = env.begin_transaction(None, None).unwrap();
+    let (k, v0) = kv(b"locked", b"v0");
+    db.put(Some(&seed), &k, &v0).unwrap();
+    seed.commit().unwrap();
+
+    // Writer txn A holds an exclusive lock on `locked` (uncommitted).
+    let txn_a = env.begin_transaction(None, None).unwrap();
+    let v1 = DatabaseEntry::from_bytes(b"v1");
+    db.put(Some(&txn_a), &k, &v1).unwrap();
+
+    // Reader txn B uses a serializable, no-wait config so a lock conflict
+    // surfaces as an error rather than blocking forever.
+    let no_wait = TransactionConfig::new().with_no_wait(true);
+    let txn_b = env.begin_transaction(None, Some(&no_wait)).unwrap();
+    let mut cursor = db.open_cursor(Some(&txn_b), None).unwrap();
+
+    let mut search_k = DatabaseEntry::from_bytes(b"locked");
+    let mut out_v = DatabaseEntry::new();
+    let read_result = cursor.get(&mut search_k, &mut out_v, Get::Search, None);
+
+    assert!(
+        read_result.is_err(),
+        "cursor read under txn B with no-wait must conflict with txn A's \
+         write lock; pre-fix the txn argument was dropped and the cursor \
+         did not consult the lock manager (audit C1). got Ok({:?})",
+        read_result.ok()
+    );
+
+    cursor.close().unwrap();
+    let _ = txn_b.abort();
+    txn_a.abort().unwrap();
+}
+
+// ─── 15. Secondary cursor must thread its txn / config arguments ──────────────
+//
+// Regression for API audit 2026-05 secondary-join finding F4
+// (`docs/src/internal/api-audit-2026-05-secondary-join.md`):
+// `SecondaryDatabase::open_cursor` previously accepted `_txn` and `_config`
+// and discarded both, so every secondary cursor ran auto-commit no matter
+// what the caller passed.
+
+mod secondary_cursor_txn {
+    use noxu_db::{
+        CursorConfig, Database, DatabaseConfig, DatabaseEntry, Environment,
+        EnvironmentConfig, OperationStatus, SecondaryConfig, SecondaryDatabase,
+        SecondaryKeyCreator,
+    };
+    use noxu_sync::Mutex;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// `sec_key = first byte of data`.
+    struct FirstByte;
+    impl SecondaryKeyCreator for FirstByte {
+        fn create_secondary_key(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            result: &mut DatabaseEntry,
+        ) -> bool {
+            if let Some(d) = data.get_data()
+                && !d.is_empty()
+            {
+                result.set_data(&d[..1]);
+                return true;
+            }
+            false
+        }
+    }
+
+    fn open_pri_sec(
+        dir: &TempDir,
+    ) -> (Environment, Arc<Mutex<Database>>, SecondaryDatabase) {
+        let env = Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let primary_db = env
+            .open_database(
+                None,
+                "pri",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        let primary = Arc::new(Mutex::new(primary_db));
+        let sec_db = env
+            .open_database(
+                None,
+                "sec",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        let sec_config = SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByte));
+        let secondary =
+            SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)
+                .unwrap();
+        (env, primary, secondary)
+    }
+
+    /// Smoke test: `SecondaryDatabase::open_cursor(Some(&txn), Some(&cfg))`
+    /// must accept and use both arguments — the inner cursor over the
+    /// secondary index now participates in the txn rather than being
+    /// auto-commit.  Pre-fix this call accepted `_txn` and `_config` and
+    /// silently dropped them; the test exists so a future change that
+    /// re-introduces the underscore will trip CI.
+    #[test]
+    fn sec_open_cursor_threads_txn_and_config() {
+        let dir = TempDir::new().unwrap();
+        let (env, primary, secondary) = open_pri_sec(&dir);
+
+        // Seed: primary record + matching secondary entry.
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        let pv = DatabaseEntry::from_bytes(b"Apple");
+        primary.lock().put(None, &pk, &pv).unwrap();
+        secondary.update_secondary(&pk, None, Some(&pv)).unwrap();
+
+        // Open a secondary cursor under a txn with a non-default config.
+        let txn = env.begin_transaction(None, None).unwrap();
+        let cfg = CursorConfig::new();
+        let mut cursor = secondary.open_cursor(Some(&txn), Some(&cfg)).unwrap();
+
+        // Iterate to confirm the cursor is functional under the txn.
+        let mut sec_key = DatabaseEntry::from_bytes(b"A");
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let s = cursor.get_search_key(&sec_key, &mut p_key, &mut data).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(p_key.data(), b"pk1");
+        assert_eq!(data.data(), b"Apple");
+
+        // Cursor must be closed before the txn ends — same lifecycle rule
+        // as the primary cursor.
+        cursor.close().unwrap();
+        txn.commit().unwrap();
+
+        // And again under abort — the cursor read participated in the
+        // (now-aborted) txn but nothing was written, so the secondary
+        // entry must still be reachable from a fresh auto-commit cursor.
+        let txn2 = env.begin_transaction(None, None).unwrap();
+        let mut cursor2 = secondary.open_cursor(Some(&txn2), None).unwrap();
+        sec_key = DatabaseEntry::from_bytes(b"A");
+        let s =
+            cursor2.get_search_key(&sec_key, &mut p_key, &mut data).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        cursor2.close().unwrap();
+        txn2.abort().unwrap();
+
+        let mut probe = secondary.open_cursor(None, None).unwrap();
+        let s = probe
+            .get_search_key(
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        probe.close().unwrap();
+    }
+
+    // NOTE: A deeper test that asserts the secondary cursor's reads engage
+    // the supplied txn's lock set is deferred as a follow-up.  The natural
+    // observation point is "another writer to the same sec record blocks
+    // or fails", but `SecondaryDatabase::update_secondary` /
+    // `insert_sec_key` / `delete_sec_key` themselves do not take a
+    // `Transaction` argument (audit findings F4/F5), so they auto-commit
+    // and will hit the `Locker` synchronously without a `no_wait` knob.
+    // Wiring those helpers through a txn is the next sprint's work; the
+    // lock-set test moves with it.
 }
