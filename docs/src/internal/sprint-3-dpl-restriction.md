@@ -141,7 +141,7 @@ index.delete(None, &id)?;
 ```
 
 To opt into transactions, replace `None` with `Some(&txn)` after
-calling `env.begin_transaction(None, None)?`. See
+calling `env.begin_transaction(None)?`. See
 `docs/src/collections/entity-persistence.md` for a full example.
 
 The single workspace example (`examples/persist.rs`) and all

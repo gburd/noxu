@@ -52,7 +52,7 @@ set.clear(None)?;
 Every method takes `Option<&Transaction>`:
 
 ```rust,ignore
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 set.add(Some(&txn), &42)?;
 assert!(set.contains(Some(&txn), &42)?);
 txn.abort()?;                // rolled back

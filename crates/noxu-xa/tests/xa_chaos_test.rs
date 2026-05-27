@@ -853,7 +853,7 @@ fn test_xa_perf_2pc_vs_single_phase() {
     // Benchmark: plain (non-XA) transaction
     let start = Instant::now();
     for i in 0..n {
-        let txn = cluster.xa.inner().begin_transaction(None, None).unwrap();
+        let txn = cluster.xa.inner().begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_vec(format!("plain_{i:06}").into_bytes());
         let val = DatabaseEntry::from_bytes(&value);
         cluster.db.put(Some(&txn), &key, &val).unwrap();

@@ -531,7 +531,7 @@ mod tests {
             list.push(None, &format!("v{i}")).unwrap();
         }
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         let removed = list.remove(Some(&txn), 1).unwrap();
         assert_eq!(removed, Some("v1".to_string()));
         // Inside the txn the list is compacted.

@@ -11,7 +11,7 @@ let config = TransactionConfig::new()
     .with_read_committed(true)
     .with_lock_timeout_ms(500);
 
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 ```
 
 If you pass `None` for the config, the transaction uses defaults (serializable
@@ -46,7 +46,7 @@ writes. Use this only when approximate results are acceptable.
 ```rust
 // Long-running analytics query that should not block writers
 let config = TransactionConfig::new().with_read_committed(true);
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 // ... scan large ranges without holding locks ...
 txn.commit()?;
 ```
@@ -72,7 +72,7 @@ operations.
 
 ```rust
 let config = TransactionConfig::new().with_lock_timeout_ms(100);
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 
 match db.put(Some(&txn), &key, &val) {
     Ok(_) => txn.commit()?,
@@ -92,7 +92,7 @@ you would rather skip an operation than wait.
 
 ```rust
 let config = TransactionConfig::new().with_no_wait(true);
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 // If any key is already write-locked, this returns LockNotAvailable.
 db.put(Some(&txn), &key, &val)?;
 txn.commit()?;
@@ -108,7 +108,7 @@ repair operations.
 ```rust
 // Administrative cleanup that must not be blocked
 let config = TransactionConfig::new().with_importunate(true);
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 db.delete(Some(&txn), &stale_key)?;
 txn.commit()?;
 ```
@@ -129,7 +129,7 @@ you know a transaction will only read.
 
 ```rust
 let config = TransactionConfig::new().with_read_only(true);
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 db.get(Some(&txn), &key, &mut val)?;
 txn.commit()?;
 ```
@@ -155,7 +155,7 @@ use noxu_db::{Durability, TransactionConfig};
 // Fast commit — data is buffered in the OS page cache but not fsynced.
 let config = TransactionConfig::new()
     .with_durability(Durability::COMMIT_WRITE_NO_SYNC);
-let txn = env.begin_transaction(None, Some(&config))?;
+let txn = env.begin_transaction(Some(&config))?;
 db.put(Some(&txn), &key, &val)?;
 txn.commit()?;
 ```

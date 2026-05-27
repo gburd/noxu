@@ -72,7 +72,7 @@ map.clear(None)?;
 Pass `Some(&txn)` to any method to make it participate in `txn`:
 
 ```rust,ignore
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 
 map.put(Some(&txn), &1, &"alpha".to_string())?;
 map.put(Some(&txn), &2, &"beta".to_string())?;

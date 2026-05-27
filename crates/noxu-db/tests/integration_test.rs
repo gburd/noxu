@@ -2959,7 +2959,7 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
         }
 
         // Uncommitted writes: start a txn, write M records, then abort.
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v = DatabaseEntry::from_vec(b"uncommitted".to_vec());

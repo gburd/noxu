@@ -387,7 +387,7 @@ mod tests {
         let map: StoredSortedMap<'_, i32, String, _, _> =
             StoredSortedMap::new(&db, IntBinding, StringBinding);
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         map.put(Some(&txn), &1, &"one".to_string()).unwrap();
         map.put(Some(&txn), &2, &"two".to_string()).unwrap();
         assert_eq!(map.first_key(Some(&txn)).unwrap(), Some(1));

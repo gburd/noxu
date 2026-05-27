@@ -181,7 +181,7 @@ fn bench_txn_begin_via_env(c: &mut Criterion) {
     // for a benchmark -- we measure the begin_transaction overhead.
     c.bench_function("txn_begin_via_env", |b| {
         b.iter(|| {
-            let txn = env.begin_transaction(None, None).unwrap();
+            let txn = env.begin_transaction(None).unwrap();
             txn.commit().unwrap();
             black_box(txn.get_id());
         })

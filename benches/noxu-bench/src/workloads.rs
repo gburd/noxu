@@ -208,7 +208,7 @@ pub fn w09_txn_multi(
 ) -> usize {
     let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
 
         // 3 gets at key i, i+1, i+2 (wrap around)
         for delta in 0..3usize {
