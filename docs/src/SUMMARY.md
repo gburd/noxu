@@ -126,3 +126,4 @@
   - [JE TCK port (2026-05) — Overview](internal/je-tck-port-2026-05-overview.md)
   - [Wave 4-B — JE TCK port (priority 1)](internal/wave-4-b-je-tck-port-priority1.md)
   - [Wave 5 — Noxu correctness fixes (JE TCK regressions)](internal/wave-5-noxu-correctness-fixes.md)
+  - [Wave 8 — RepTestBase harness + heavy rep TCK port](internal/wave-8-rep-testbase.md)
