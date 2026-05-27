@@ -397,7 +397,8 @@ pub fn open_disk_ordered_cursor_multi<'env>(
             queue_size: config.queue_size,
             lsn_batch_size: config.lsn_batch_size,
             internal_memory_limit: config.internal_memory_limit,
-            keys_only: config.keys_only || config.bins_only
+            keys_only: config.keys_only
+                || config.bins_only
                 || config.count_only,
             dedup_keys: config.dedup_keys,
         },

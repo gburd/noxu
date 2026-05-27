@@ -52,7 +52,9 @@ fn delete(db: &noxu_db::Database, key: &[u8]) {
 }
 
 /// Drain a cursor into a `Vec<(key, data)>` of all returned records.
-fn drain(cursor: &mut noxu_db::DiskOrderedCursor<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn drain(
+    cursor: &mut noxu_db::DiskOrderedCursor<'_>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
@@ -85,9 +87,8 @@ fn walks_all_inserted_records() {
     // but a checkpoint guarantees the log file content is on disk.
     env.checkpoint(None).unwrap();
 
-    let mut cursor = db
-        .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
-        .unwrap();
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
     let got = drain(&mut cursor);
 
     let mut got_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -116,19 +117,16 @@ fn skips_deleted_records() {
     }
     env.checkpoint(None).unwrap();
 
-    let mut cursor = db
-        .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
-        .unwrap();
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
     let got = drain(&mut cursor);
 
     // At minimum, the 25 odd-indexed keys must appear.  The default
     // (no dedup) behaviour means deleted keys MAY also have appeared in
     // their pre-delete form; what we strictly assert is that every key
     // we see is one we previously wrote, and every "live" key is present.
-    let live: HashSet<Vec<u8>> = (1..50)
-        .step_by(2)
-        .map(|i| format!("k{i}").into_bytes())
-        .collect();
+    let live: HashSet<Vec<u8>> =
+        (1..50).step_by(2).map(|i| format!("k{i}").into_bytes()).collect();
     let mut keys_seen: HashSet<Vec<u8>> = HashSet::new();
     for (k, _) in &got {
         keys_seen.insert(k.clone());
@@ -163,7 +161,8 @@ fn skips_deleted_records_with_dedup() {
         .unwrap();
     let got = drain(&mut cursor);
 
-    let keys_seen: HashSet<Vec<u8>> = got.iter().map(|(k, _)| k.clone()).collect();
+    let keys_seen: HashSet<Vec<u8>> =
+        got.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(keys_seen.len(), got.len(), "dedup must yield each key once");
     // All 50 originally-inserted keys should be visible (delete entries
     // don't carry data, so they don't count as a "first appearance").
@@ -317,21 +316,17 @@ fn stale_versions_visible_by_default() {
     put(&db, key, b"v3");
     env.checkpoint(None).unwrap();
 
-    let mut cursor = db
-        .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
-        .unwrap();
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
     let got = drain(&mut cursor);
 
     // Default behaviour: JE returns every LN that survives in the log,
     // including stale (overwritten) versions — so we should see all three.
-    let values_seen: HashSet<Vec<u8>> = got
-        .iter()
-        .filter(|(k, _)| k == key)
-        .map(|(_, v)| v.clone())
-        .collect();
-    assert!(values_seen.contains(&b"v1".to_vec()));
-    assert!(values_seen.contains(&b"v2".to_vec()));
-    assert!(values_seen.contains(&b"v3".to_vec()));
+    let values_seen: HashSet<Vec<u8>> =
+        got.iter().filter(|(k, _)| k == key).map(|(_, v)| v.clone()).collect();
+    assert!(values_seen.contains(b"v1".as_slice()));
+    assert!(values_seen.contains(b"v2".as_slice()));
+    assert!(values_seen.contains(b"v3".as_slice()));
 }
 
 // -----------------------------------------------------------------------------
@@ -374,9 +369,8 @@ fn current_returns_last_record() {
     put(&db, b"b", b"2");
     env.checkpoint(None).unwrap();
 
-    let mut cursor = db
-        .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
-        .unwrap();
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
 
@@ -386,10 +380,7 @@ fn current_returns_last_record() {
         OperationStatus::NotFound
     );
 
-    assert_eq!(
-        cursor.next(&mut k, &mut v).unwrap(),
-        OperationStatus::Success
-    );
+    assert_eq!(cursor.next(&mut k, &mut v).unwrap(), OperationStatus::Success);
     let first_k = k.data().to_vec();
     let first_v = v.data().to_vec();
 
@@ -414,15 +405,11 @@ fn empty_db_yields_no_records() {
     let db = open_db(&env, "doc_empty");
     env.checkpoint(None).unwrap();
 
-    let mut cursor = db
-        .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
-        .unwrap();
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
-    assert_eq!(
-        cursor.next(&mut k, &mut v).unwrap(),
-        OperationStatus::NotFound
-    );
+    assert_eq!(cursor.next(&mut k, &mut v).unwrap(), OperationStatus::NotFound);
 }
 
 // -----------------------------------------------------------------------------
@@ -435,7 +422,11 @@ fn keys_only_returns_empty_data() {
     let env = open_env(&dir);
     let db = open_db(&env, "doc_keys_only");
     for i in 0..20 {
-        put(&db, format!("k{i}").as_bytes(), format!("longish-value-{i}").as_bytes());
+        put(
+            &db,
+            format!("k{i}").as_bytes(),
+            format!("longish-value-{i}").as_bytes(),
+        );
     }
     env.checkpoint(None).unwrap();
 
