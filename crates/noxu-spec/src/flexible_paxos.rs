@@ -8,7 +8,30 @@
 //! Production code under model:
 //!   - `crates/noxu-rep/src/elections/paxos.rs`
 //!   - `crates/noxu-rep/src/elections/proposal.rs`
+//!   - `crates/noxu-rep/src/elections/acceptor_state.rs`
+//!     (audit findings F5/F31: persistent
+//!     `(promised_term, accepted_term, accepted_master)` triple
+//!     written atomically to `acceptor.state`. Without this, a
+//!     restart erases promises and split-brain becomes reachable.)
 //!   - `crates/noxu-rep/src/quorum_policy.rs`
+//!
+//! # Variants
+//!
+//! Following the same convention as
+//! [`crate::btree_latching`], the model is parameterised on a
+//! [`Variant`] so a single spec validates both the fixed and the
+//! pre-fix protocol:
+//!
+//!   - [`Variant::PersistentAcceptor`] — the post-Wave-4-A
+//!     production protocol: `Crash` actions preserve every node's
+//!     `(promised_term, accepted_term, accepted_leader)` triple.
+//!     `assert_properties` succeeds; `ElectionSafety` holds.
+//!   - [`Variant::EphemeralAcceptor`] — the pre-Wave-4-A protocol:
+//!     `Crash` actions zero the triple, modelling a node that
+//!     restarts without `acceptor.state` persisted. `assert_discovery`
+//!     finds a counterexample where two distinct leaders are elected
+//!     at the same term — this is the F5/F31 split-brain that
+//!     [`acceptor_state::PersistentAcceptorState`] closes.
 //!
 //! Properties:
 //!   - `ElectionSafety` — at most one leader per term
@@ -24,6 +47,23 @@ pub const N_NODES: usize = 3;
 pub const MAX_TERM: u64 = 1;
 pub const Q1: usize = 2;
 pub const Q2: usize = 2;
+
+/// Whether the acceptor's promise/accept state is persisted
+/// across crashes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Variant {
+    /// The post-Wave-4-A production protocol: every promise and
+    /// every accept is fsynced to `acceptor.state` (see
+    /// `noxu-rep::elections::acceptor_state`). A `Crash` action
+    /// preserves the triple.
+    PersistentAcceptor,
+    /// The pre-Wave-4-A protocol: the acceptor's state lives only
+    /// in memory. A `Crash` action zeros `(promised_term[n],
+    /// accepted_term[n], accepted_leader[n])`. Used as regression
+    /// bait — a Stateright run on this variant must produce a
+    /// counterexample for `ElectionSafety` (split-brain).
+    EphemeralAcceptor,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct State {
@@ -43,18 +83,59 @@ pub struct State {
     pub phase2_votes: Vec<((u64, usize), Vec<usize>)>,
     /// Successfully elected (term, leader) pairs.
     pub leaders_elected: Vec<(u64, usize)>,
+    /// `crashed[n]` — whether node `n` has experienced a Crash
+    /// action. Each node may crash at most once to keep the state
+    /// space finite (one crash is enough to expose the
+    /// EphemeralAcceptor split-brain).
+    pub crashed: [bool; N_NODES],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Action {
-    StartElection { leader: usize, term: u64 },
-    PromiseVote { acceptor: usize, leader: usize, term: u64 },
-    StartPhase2 { leader: usize, term: u64 },
-    AcceptVote { acceptor: usize, leader: usize, term: u64 },
-    DeclareElected { leader: usize, term: u64 },
+    StartElection {
+        leader: usize,
+        term: u64,
+    },
+    PromiseVote {
+        acceptor: usize,
+        leader: usize,
+        term: u64,
+    },
+    StartPhase2 {
+        leader: usize,
+        term: u64,
+    },
+    AcceptVote {
+        acceptor: usize,
+        leader: usize,
+        term: u64,
+    },
+    DeclareElected {
+        leader: usize,
+        term: u64,
+    },
+    /// Node `n` crashes and is restarted. Under
+    /// `Variant::PersistentAcceptor` this is a no-op on the
+    /// acceptor triple; under `Variant::EphemeralAcceptor` the
+    /// triple is zeroed.
+    Crash {
+        node: usize,
+    },
 }
 
-pub struct FlexiblePaxosModel;
+pub struct FlexiblePaxosModel {
+    pub variant: Variant,
+}
+
+impl FlexiblePaxosModel {
+    pub fn persistent() -> Self {
+        Self { variant: Variant::PersistentAcceptor }
+    }
+
+    pub fn ephemeral() -> Self {
+        Self { variant: Variant::EphemeralAcceptor }
+    }
+}
 
 fn votes_for<'a>(
     list: &'a [((u64, usize), Vec<usize>)],
@@ -83,6 +164,7 @@ impl Model for FlexiblePaxosModel {
             phase1_votes: vec![],
             phase2_votes: vec![],
             leaders_elected: vec![],
+            crashed: [false; N_NODES],
         }]
     }
 
@@ -152,6 +234,16 @@ impl Model for FlexiblePaxosModel {
                 }
             }
         }
+        // Each node may crash at most once. Even under
+        // `PersistentAcceptor` we explore the action so the spec
+        // *exercises* the post-restart code path; the difference is
+        // purely in `next_state`. (Crash with no follow-up action
+        // is harmless under the persistent variant — it is a no-op.)
+        for n in 0..N_NODES {
+            if !s.crashed[n] {
+                out.push(Action::Crash { node: n });
+            }
+        }
     }
 
     fn next_state(
@@ -197,6 +289,28 @@ impl Model for FlexiblePaxosModel {
             }
             Action::DeclareElected { leader, term } => {
                 s.leaders_elected.push((term, leader));
+            }
+            Action::Crash { node } => {
+                if s.crashed[node] {
+                    return None;
+                }
+                s.crashed[node] = true;
+                match self.variant {
+                    Variant::PersistentAcceptor => {
+                        // F5/F31: `acceptor.state` survives the
+                        // crash, so the restart re-loads
+                        // (promised_term, accepted_term,
+                        // accepted_leader) intact.
+                    }
+                    Variant::EphemeralAcceptor => {
+                        // Pre-Wave-4-A: the in-memory acceptor state
+                        // is lost. The node restarts as if it had
+                        // never voted.
+                        s.promised_term[node] = 0;
+                        s.accepted_term[node] = 0;
+                        s.accepted_leader[node] = usize::MAX;
+                    }
+                }
             }
         }
         Some(s)
@@ -246,9 +360,50 @@ mod tests {
     use super::*;
     use stateright::Checker;
 
+    /// Post-Wave-4-A: `acceptor.state` makes the
+    /// (promised_term, accepted_term, accepted_master) triple
+    /// crash-durable. ElectionSafety holds across arbitrary crashes.
     #[test]
     fn paxos_safety_holds() {
-        let checker = FlexiblePaxosModel.checker().spawn_bfs().join();
+        let checker =
+            FlexiblePaxosModel::persistent().checker().spawn_bfs().join();
         checker.assert_properties();
+    }
+
+    /// Pre-Wave-4-A regression bait: with an in-memory-only
+    /// acceptor, a crashed node forgets its promises and a fresh
+    /// proposer can win a second majority at the same term. The
+    /// counterexample below is exactly the split-brain that the
+    /// `acceptor.state` file closes (F5/F31).
+    #[test]
+    fn ephemeral_promises_allow_split_brain() {
+        let checker =
+            FlexiblePaxosModel::ephemeral().checker().spawn_bfs().join();
+        checker.assert_discovery(
+            "ElectionSafety",
+            vec![
+                // Leader 0 wins at term 1 with quorum {0, 1}.
+                Action::StartElection { leader: 0, term: 1 },
+                Action::PromiseVote { acceptor: 0, leader: 0, term: 1 },
+                Action::PromiseVote { acceptor: 1, leader: 0, term: 1 },
+                Action::StartPhase2 { leader: 0, term: 1 },
+                Action::AcceptVote { acceptor: 0, leader: 0, term: 1 },
+                Action::AcceptVote { acceptor: 1, leader: 0, term: 1 },
+                Action::DeclareElected { leader: 0, term: 1 },
+                // Acceptor 1 crashes; its in-memory promise is lost.
+                Action::Crash { node: 1 },
+                // Leader 2 now collects a fresh quorum {1, 2} at the
+                // same term. Without the persisted promise, acceptor
+                // 1 happily votes again — and at Phase 2, accepts
+                // leader 2 at term 1.
+                Action::StartElection { leader: 2, term: 1 },
+                Action::PromiseVote { acceptor: 1, leader: 2, term: 1 },
+                Action::PromiseVote { acceptor: 2, leader: 2, term: 1 },
+                Action::StartPhase2 { leader: 2, term: 1 },
+                Action::AcceptVote { acceptor: 1, leader: 2, term: 1 },
+                Action::AcceptVote { acceptor: 2, leader: 2, term: 1 },
+                Action::DeclareElected { leader: 2, term: 1 },
+            ],
+        );
     }
 }
