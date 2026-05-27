@@ -29,5 +29,6 @@ pub use quic_mux::{
     ReplicationChannel, mux_insecure_client_config, mux_server_config,
 };
 pub use service_dispatcher::{
-    ServiceDispatcher, ServiceHandler, TcpServiceDispatcher, connect_to_service,
+    MAX_SERVICE_NAME_LEN, ServiceDispatcher, ServiceHandler,
+    TcpServiceDispatcher, connect_to_service,
 };
