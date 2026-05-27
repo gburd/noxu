@@ -872,6 +872,17 @@ impl EnvironmentImpl {
             .copied()
             .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
 
+        // Audit database F12 (Wave 2C-4): match `remove_database` /
+        // `rename_database` and reject truncate when any open
+        // `Database` handle still exists.  Pre-fix the tree was
+        // replaced underneath live cursors, leaving them positioned
+        // on a now-unreachable BIN.
+        if let Some(db) = self.db_map.read().get(&db_id)
+            && db.read().reference_count() > 0
+        {
+            return Err(DbiError::DatabaseInUse(name.to_string()));
+        }
+
         let count = {
             let db_map_guard = self.db_map.read();
             let db_arc = db_map_guard
@@ -884,6 +895,11 @@ impl EnvironmentImpl {
             let new_tree =
                 noxu_tree::Tree::new(db_id.as_i64() as u64, max_entries);
             db_guard.set_recovered_tree(new_tree); // resets entry_count to 0
+            // Audit database F13 (Wave 2C-4): re-wire the per-env
+            // memory counter onto the fresh tree so subsequent inserts
+            // continue to update the Arbiter / cleaner budget.
+            // `set_recovered_tree` does not preserve the counter wiring.
+            db_guard.set_memory_counter(Arc::clone(&self.cache_usage));
             old_count
         };
 

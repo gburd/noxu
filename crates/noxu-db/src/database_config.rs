@@ -34,31 +34,61 @@ pub struct DatabaseConfig {
     pub deferred_write: bool,
 
     /// Override the B-tree key comparator.
+    ///
+    /// **Inert as of v1.6.0** (audit database F6 / F7, Wave 2C-4):
+    /// the public API has no setter for an actual comparator function,
+    /// so this flag has nothing to consume.  The flag and the
+    /// `ByteComparator` trait are scheduled for removal in v2.0.
+    /// Setting it to `true` does *not* change the on-disk byte order.
     pub override_btree_comparator: bool,
 
     /// Override the duplicate data comparator.
+    ///
+    /// **Inert as of v1.6.0** — see `override_btree_comparator`.
     pub override_duplicate_comparator: bool,
 
     /// Whether this database is exclusive to a single thread.
+    ///
+    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// `noxu_dbi` engine has no per-database thread-affinity
+    /// enforcement; this flag is recorded but never consulted.
     pub exclusive: bool,
 
     /// Node maximum entries (0 = use default).
     pub node_max_entries: u32,
 
     /// Whether this database participates in replication.
+    ///
+    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// `noxu_dbi::DatabaseConfig` has no `replicated` field; the
+    /// replication scope is set at the env level via `noxu-rep`.
     pub replicated: bool,
 
     /// Enable key prefix compression in BIN nodes.
+    ///
+    /// **Plumbed through to `noxu_dbi::DatabaseConfig` as of v1.6.0**
+    /// (audit database F7, Wave 2C-4).
     pub key_prefixing: bool,
 
     /// Per-database cache eviction hint.
+    ///
+    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// per-DB hint is not yet honoured by the evictor; the env-level
+    /// cache mode is.
     pub cache_mode: CacheMode,
 
     /// Write BIN-deltas to the log instead of full BINs (space optimization).
+    ///
+    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// engine always emits BIN-deltas where applicable.
     pub bin_delta: bool,
 
     /// When true, opening an existing database reuses its stored config
     /// rather than applying this config.
+    ///
+    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// engine does not yet persist per-DB config across runs in a way
+    /// that can be selectively re-applied.
     pub use_existing_config: bool,
 }
 

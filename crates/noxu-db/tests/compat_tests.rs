@@ -147,6 +147,10 @@ fn database_put_no_overwrite_returns_key_exists() {
 
 /// : TruncateTest.testEnvTruncateCommit
 /// truncate_database removes all records; subsequent gets return NotFound.
+///
+/// Audit database F12 (Wave 2C-4): truncate now requires the
+/// `Database` handle to be closed first — matching
+/// `remove_database` / `rename_database` and BDB-JE.
 #[test]
 fn truncate_database_clears_all_records() {
     let dir = TempDir::new().unwrap();
@@ -159,19 +163,26 @@ fn truncate_database_clears_all_records() {
     }
     assert_eq!(db.count().unwrap(), N as u64);
 
+    // F12: close the open handle before truncate.
+    db.close().unwrap();
+
     let count_before = env.truncate_database(None, "test").unwrap();
     assert_eq!(
         count_before, N as u64,
         "truncate must return pre-truncation count"
     );
 
-    // All records must be gone.
-    assert_eq!(db.count().unwrap(), 0);
+    // Re-open to verify all records are gone.
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(false)
+        .with_transactional(true);
+    let db2 = env.open_database(None, "test", &db_cfg).unwrap();
+    assert_eq!(db2.count().unwrap(), 0);
     for i in 0..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
         assert_eq!(
-            db.get(None, &k, &mut out).unwrap(),
+            db2.get(None, &k, &mut out).unwrap(),
             OperationStatus::NotFound,
             "key {i} must be absent after truncate"
         );
@@ -189,10 +200,17 @@ fn truncate_then_add_records_works() {
         let (k, v) = kv(i, i);
         db.put(None, &k, &v).unwrap();
     }
+    // F12: close before truncate.
+    db.close().unwrap();
     env.truncate_database(None, "test").unwrap();
+
+    // Re-open and add new records after truncation.
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(false)
+        .with_transactional(true);
+    let db = env.open_database(None, "test", &db_cfg).unwrap();
     assert_eq!(db.count().unwrap(), 0);
 
-    // Add new records after truncation.
     for i in 100u32..110 {
         let (k, v) = kv(i, i * 3);
         db.put(None, &k, &v).unwrap();
@@ -215,7 +233,9 @@ fn truncate_then_add_records_works() {
 #[test]
 fn truncate_empty_database_returns_zero() {
     let dir = TempDir::new().unwrap();
-    let (env, _db) = open(&dir);
+    let (env, db) = open(&dir);
+    // F12: close the open handle before truncate.
+    db.close().unwrap();
     let count = env.truncate_database(None, "test").unwrap();
     assert_eq!(count, 0);
 }

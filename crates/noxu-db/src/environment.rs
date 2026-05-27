@@ -487,6 +487,9 @@ impl Environment {
         dbi_config.set_temporary(config.temporary);
         dbi_config.set_transactional(config.transactional);
         dbi_config.deferred_write = config.deferred_write;
+        // Audit database F7 (Wave 2C-4): plumb key_prefixing through;
+        // pre-fix the outer flag was silently dropped on the floor.
+        dbi_config.set_key_prefixing(config.key_prefixing);
         if config.node_max_entries > 0 {
             dbi_config.set_node_max_entries(config.node_max_entries as i32);
         }
