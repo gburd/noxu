@@ -341,7 +341,11 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
         for i in 0..n {
             let mut out = DatabaseEntry::new();
             let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(s, OperationStatus::Success, "k={i} missing post-recovery");
+            assert_eq!(
+                s,
+                OperationStatus::Success,
+                "k={i} missing post-recovery"
+            );
         }
         // Aborted-only range (N..2N) must be absent.
         for i in n..(2 * n) {
@@ -356,7 +360,11 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
         for i in (2 * n)..(4 * n) {
             let mut out = DatabaseEntry::new();
             let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(s, OperationStatus::Success, "k={i} missing post-recovery");
+            assert_eq!(
+                s,
+                OperationStatus::Success,
+                "k={i} missing post-recovery"
+            );
         }
 
         db.close().unwrap();
@@ -425,4 +433,3 @@ fn recovery_basic_delete_all_no_resurrect() {
         drop(env);
     }
 }
-

@@ -64,7 +64,8 @@ fn je_atomic_put_overwrite_no_duplicates_concurrent() {
         let next = Arc::clone(&next);
         handles.push(thread::spawn(move || {
             loop {
-                let raw = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let raw =
+                    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if raw >= MAX_KEY {
                     break;
                 }
@@ -172,10 +173,7 @@ fn je_atomic_put_no_overwrite_with_duplicates_concurrent() {
         .get(&mut k, &mut d, noxu_db::Get::First, None)
         .unwrap_or(OperationStatus::NotFound);
     while s == OperationStatus::Success {
-        by_key
-            .entry(k.data().to_vec())
-            .or_default()
-            .push(d.data().to_vec());
+        by_key.entry(k.data().to_vec()).or_default().push(d.data().to_vec());
         s = c
             .get(&mut k, &mut d, noxu_db::Get::Next, None)
             .unwrap_or(OperationStatus::NotFound);

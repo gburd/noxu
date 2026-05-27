@@ -524,13 +524,11 @@ fn je_deadlock_two_lockers_on_one_lock() {
     // (the other completes after the victim aborts).
     let lm1 = Arc::clone(&lm);
     let lm2 = Arc::clone(&lm);
-    let h1 = thread::spawn(move || {
-        lm1.lock(l, t1, LockType::Write, false, false)
-    });
+    let h1 =
+        thread::spawn(move || lm1.lock(l, t1, LockType::Write, false, false));
     thread::sleep(Duration::from_millis(20));
-    let h2 = thread::spawn(move || {
-        lm2.lock(l, t2, LockType::Write, false, false)
-    });
+    let h2 =
+        thread::spawn(move || lm2.lock(l, t2, LockType::Write, false, false));
 
     let r1 = h1.join().unwrap();
     let r2 = h2.join().unwrap();
@@ -593,4 +591,3 @@ fn je_lock_test_conflicts_matrix() {
     );
     let _ = lm.release(l, 1);
 }
-
