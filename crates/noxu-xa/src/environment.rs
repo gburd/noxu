@@ -51,12 +51,36 @@ pub struct XaEnvironment {
     env: Environment,
     branches: Mutex<HashMap<Xid, Branch>>,
     prepared_log: Option<PreparedLog>,
+    /// Recovery-scan cursor state for `xa_recover` (audit
+    /// persist-xa F5, Wave 2C-4).  X/Open requires `STARTRSCAN` to
+    /// rewind the cursor and `ENDRSCAN` to release it; calls
+    /// without `STARTRSCAN` resume from the saved cursor.  Stored
+    /// here so a paginating TM no longer sees duplicates.
+    /// `None` = no scan in progress.
+    recover_cursor: Mutex<Option<RecoverScan>>,
+}
+
+/// Saved state of a paginating `xa_recover` scan.
+#[derive(Debug, Clone)]
+struct RecoverScan {
+    /// Full snapshot of XIDs at scan start; the cursor walks this
+    /// list rather than re-querying the backing maps each call so
+    /// pagination is stable across concurrent prepare / forget
+    /// calls.
+    xids: Vec<Xid>,
+    /// Index of the next XID to return.
+    next: usize,
 }
 
 impl XaEnvironment {
     /// Creates a new XaEnvironment wrapping the given environment.
     pub fn new(env: Environment) -> Self {
-        Self { env, branches: Mutex::new(HashMap::new()), prepared_log: None }
+        Self {
+            env,
+            branches: Mutex::new(HashMap::new()),
+            prepared_log: None,
+            recover_cursor: Mutex::new(None),
+        }
     }
 
     /// Returns a reference to the underlying Environment.
@@ -344,44 +368,86 @@ impl XaResource for XaEnvironment {
         Ok(())
     }
 
-    fn xa_recover(&self, _flags: XaFlags) -> XaResult<Vec<Xid>> {
-        // In-memory prepared branches
-        let branches = self.branches.lock().unwrap();
-        let mut prepared: Vec<Xid> = branches
-            .iter()
-            .filter(|(_, b)| b.state == BranchState::Prepared)
-            .map(|(xid, _)| xid.clone())
-            .collect();
-
-        // Add any from persistent log (crash recovery — not in memory).
+    fn xa_recover(&self, flags: XaFlags) -> XaResult<Vec<Xid>> {
+        // Audit persist-xa F5 (Wave 2C-4): honour the X/Open
+        // STARTRSCAN / ENDRSCAN flags so that paginating TMs no
+        // longer see duplicates.
         //
-        // NOTE (v1.5): XIDs returned here that are NOT also in the in-memory
-        // `branches` map cannot actually be committed or rolled back — the
-        // engine has no `TxnPrepare` WAL record yet, so on a fresh process
-        // the underlying `Transaction` (locks, undo chain) does not exist.
-        // We still report them so the operator can see what is in doubt and
-        // call `xa_forget` to clear the persistent record. Attempting
-        // `xa_commit` / `xa_rollback` on such an XID returns
-        // `XaError::CrashDurabilityNotSupported`. Crash-durable XA is
-        // planned for v2.0.
-        if let Some(ref log) = self.prepared_log {
-            if let Ok(persisted) = log.recover_all() {
+        //   * STARTRSCAN: rewind — build a fresh snapshot of every
+        //     prepared XID and reset the cursor to 0.
+        //   * ENDRSCAN:   release — drop the saved snapshot.
+        //   * Neither flag: resume — return the next page of the
+        //     existing snapshot, or build one on demand if no scan
+        //     is currently in progress (matches "first call rewinds
+        //     implicitly" behaviour expected by simple TMs).
+        //
+        // We continue to return *all* remaining XIDs in a single
+        // call rather than enforcing a TM-supplied page size; XA
+        // does not actually require pagination, only that the same
+        // XID never appears twice across resumed calls.  Re-paging
+        // can be added later by surfacing a `Vec<Xid>` chunk size.
+        let start_rscan = flags.contains(XaFlags::STARTRSCAN);
+        let end_rscan = flags.contains(XaFlags::ENDRSCAN);
+
+        let mut cursor_guard = self.recover_cursor.lock().unwrap();
+
+        if start_rscan || cursor_guard.is_none() {
+            // Build a fresh snapshot.
+            let branches = self.branches.lock().unwrap();
+            let mut prepared: Vec<Xid> = branches
+                .iter()
+                .filter(|(_, b)| b.state == BranchState::Prepared)
+                .map(|(xid, _)| xid.clone())
+                .collect();
+            drop(branches);
+
+            // Add any from persistent log.  Storage-level read errors
+            // are now surfaced (was: silently dropped — audit XA F7).
+            if let Some(ref log) = self.prepared_log {
+                let persisted = log.recover_all().map_err(|e| {
+                    XaError::RmFail(format!(
+                        "xa_recover: prepared-log scan failed: {e}"
+                    ))
+                })?;
                 for xid in persisted {
                     if !prepared.contains(&xid) {
                         prepared.push(xid);
                     }
                 }
             }
+
+            *cursor_guard = Some(RecoverScan { xids: prepared, next: 0 });
         }
-        Ok(prepared)
+
+        let result = if let Some(ref mut scan) = *cursor_guard {
+            // Drain everything from `next..` and advance the cursor.
+            let out: Vec<Xid> = scan.xids[scan.next..].to_vec();
+            scan.next = scan.xids.len();
+            out
+        } else {
+            Vec::new()
+        };
+
+        if end_rscan {
+            *cursor_guard = None;
+        }
+
+        Ok(result)
     }
 
     fn xa_forget(&self, xid: &Xid, _flags: XaFlags) -> XaResult<()> {
         let mut branches = self.branches.lock().unwrap();
         if branches.remove(xid).is_none() {
-            // Check persistent log (may be from crash recovery)
+            // Check persistent log (may be from crash recovery).
+            // Audit XA F7 (Wave 2C-4): surface storage-level read
+            // errors as XAER_RMFAIL instead of pretending the log is
+            // empty.
             if let Some(ref log) = self.prepared_log {
-                let recovered = log.recover_all().unwrap_or_default();
+                let recovered = log.recover_all().map_err(|e| {
+                    XaError::RmFail(format!(
+                        "xa_forget: prepared-log scan failed: {e}"
+                    ))
+                })?;
                 if !recovered.contains(xid) {
                     return Err(XaError::NotFound);
                 }
@@ -579,5 +645,55 @@ mod tests {
 
         // Clean up
         xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
+    }
+
+    /// Audit persist-xa F5 (Wave 2C-4): STARTRSCAN / ENDRSCAN
+    /// pagination. A second `xa_recover` call without STARTRSCAN
+    /// (i.e. resume) returns the empty list because the previous
+    /// call drained the cursor.
+    #[test]
+    fn test_recover_pagination_no_duplicates() {
+        let (xa, _dir) = make_xa_env();
+        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let _db =
+            xa.inner().open_database(None, "test", &db_config).unwrap();
+
+        // Prepare two branches.
+        let mut xids = Vec::new();
+        for i in 0..2u32 {
+            let bqual = format!("bq{i}");
+            let xid = Xid::new(1, b"gtrid", bqual.as_bytes()).unwrap();
+            xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+            xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+            xa.mark_write(&xid).unwrap();
+            xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
+            xids.push(xid);
+        }
+
+        // STARTRSCAN drains everything.
+        let first = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
+        assert_eq!(first.len(), 2);
+
+        // Resume (no flag): no duplicates — empty list.
+        let second = xa.xa_recover(XaFlags::NOFLAGS).unwrap();
+        assert!(
+            second.is_empty(),
+            "second xa_recover (resume) must not duplicate XIDs: {second:?}",
+        );
+
+        // ENDRSCAN releases the cursor; the next implicit-rewind call
+        // sees the snapshot afresh.
+        let _ = xa.xa_recover(XaFlags::ENDRSCAN).unwrap();
+        let again = xa.xa_recover(XaFlags::NOFLAGS).unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "after ENDRSCAN the next call rebuilds and returns all XIDs",
+        );
+
+        // Clean up
+        for xid in &xids {
+            xa.xa_rollback(xid, XaFlags::NOFLAGS).unwrap();
+        }
     }
 }

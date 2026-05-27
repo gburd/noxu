@@ -102,6 +102,16 @@ impl PhiAccrualDetector {
     /// window is left untouched. On every **subsequent** call the
     /// elapsed time since the previous heartbeat is appended to the
     /// sample window (older samples are evicted once the window is full).
+    ///
+    /// # Diagnostic note (audit rep F33, Wave 2C-4)
+    ///
+    /// Until at least two heartbeats have been observed the detector
+    /// reports `phi() == 0.0` (i.e. "available") because there is no
+    /// inter-arrival distribution to compute against.  Operators
+    /// auditing master-failover should expect this *startup window*
+    /// where the detector cannot yet declare a peer suspect; check
+    /// [`Self::sample_count`] to distinguish "warm and confidently up"
+    /// from "too few samples to be sure".
     pub fn record_heartbeat(&self) {
         let now = Instant::now();
         let mut last = self.last_heartbeat.write();
