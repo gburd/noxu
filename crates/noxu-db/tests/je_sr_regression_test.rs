@@ -77,8 +77,7 @@ fn sr9900_put_current_after_delete_fails_no_dups() {
     let new_d = DatabaseEntry::from_bytes(b"aaaa");
     let result = c.put(&k, &new_d, Put::Current);
     assert!(
-        result.is_err()
-            || matches!(result, Ok(OperationStatus::NotFound)),
+        result.is_err() || matches!(result, Ok(OperationStatus::NotFound)),
         "put_current after delete must not succeed: got {:?}",
         result
     );
@@ -120,8 +119,7 @@ fn sr9992_put_current_after_delete_fails_with_dups() {
     let new_d = DatabaseEntry::from_bytes(b"aaaa");
     let result = c.put(&k, &new_d, Put::Current);
     assert!(
-        result.is_err()
-            || matches!(result, Ok(OperationStatus::NotFound)),
+        result.is_err() || matches!(result, Ok(OperationStatus::NotFound)),
         "put_current after delete (dups) must not succeed: got {:?}",
         result
     );

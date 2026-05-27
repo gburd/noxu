@@ -22,7 +22,11 @@ fn open_env(dir: &TempDir) -> noxu_db::Environment {
     noxu_db::Environment::open(cfg).unwrap()
 }
 
-fn open_db(env: &noxu_db::Environment, name: &str, dups: bool) -> noxu_db::Database {
+fn open_db(
+    env: &noxu_db::Environment,
+    name: &str,
+    dups: bool,
+) -> noxu_db::Database {
     let cfg = DatabaseConfig::new()
         .with_allow_create(true)
         .with_transactional(true)
