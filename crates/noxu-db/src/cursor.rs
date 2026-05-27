@@ -106,19 +106,17 @@ impl Cursor {
 
         let status = match get_type {
             Get::Search => {
-                let key_bytes = match key.get_data() {
-                    Some(k) if !k.is_empty() => k,
-                    _ => return Ok(OperationStatus::NotFound),
-                };
+                // Audit cursor F10 (Wave 2C-4): empty keys are accepted as a
+                // first-class input and forwarded to the inner search,
+                // which simply reports `NotFound` because no record can
+                // exist under an empty key on a writable database.
+                let key_bytes = key.get_data().unwrap_or(&[]);
                 self.inner.search(key_bytes, None, SearchMode::Set).map_err(
                     |e| NoxuError::OperationNotAllowed(e.to_string()),
                 )?
             }
             Get::SearchGte | Get::SearchRange => {
-                let key_bytes = match key.get_data() {
-                    Some(k) if !k.is_empty() => k,
-                    _ => return Ok(OperationStatus::NotFound),
-                };
+                let key_bytes = key.get_data().unwrap_or(&[]);
                 self.inner
                     .search(key_bytes, None, SearchMode::SetRange)
                     .map_err(|e| {
@@ -200,6 +198,18 @@ impl Cursor {
                         NoxuError::OperationNotAllowed(e.to_string())
                     })?
             }
+            // Audit cursor F12 (Wave 2C-4): expose `SearchBothRange` to the
+            // public API; the inner `SearchMode::BothRange` was already
+            // implemented in `noxu-dbi` but unreachable from `Cursor::get`.
+            Get::SearchBothRange => {
+                let key_bytes = key.get_data().unwrap_or(&[]);
+                let data_bytes = data.get_data();
+                self.inner
+                    .search(key_bytes, data_bytes, SearchMode::BothRange)
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?
+            }
             Get::Current => {
                 // Already checked initialized above.
                 // : re-check for deletion — Cursor.getCurrentLN() returns
@@ -260,6 +270,8 @@ impl Cursor {
                         | Get::Search
                         | Get::SearchGte
                         | Get::SearchRange
+                        | Get::SearchBoth
+                        | Get::SearchBothRange
                 ) {
                     self.state = CursorState::NotInitialized;
                 }
@@ -388,32 +400,48 @@ impl Cursor {
             return Ok(0);
         }
 
-        self.inner
+        // Audit cursor F16 (Wave 2C-4): drop the previous `.max(1)`
+        // clamp.  The inner `count()` always returns at least 1 when the
+        // cursor is positioned (one record at minimum); a 0 from the
+        // inner is therefore a real bug and must surface, not be silently
+        // promoted to 1.
+        let n = self.inner
             .count()
-            .map(|c| c.max(1) as u64)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        if n < 1 {
+            return Err(NoxuError::OperationNotAllowed(format!(
+                "cursor count() returned {n} while positioned (invariant violated)",
+            )));
+        }
+        Ok(n as u64)
     }
 
     /// Close the cursor.
     ///
-    /// The cursor handle may not be used again after this call — every
-    /// subsequent operation returns [`NoxuError::OperationNotAllowed`].
+    /// The cursor handle may not be used again after this call.  Any
+    /// subsequent navigation / mutation operation returns
+    /// [`NoxuError::OperationNotAllowed`].
+    ///
+    /// `close()` itself is idempotent: calling it more than once is a
+    /// no-op and returns `Ok(())`.  This matches BDB-JE's
+    /// `Cursor.close()` contract (audit cursor F13/F14, Wave 2C-4).
     ///
     /// # Errors
-    /// Returns [`NoxuError::OperationNotAllowed`] if the cursor was
-    /// already closed.  Closing twice is treated as an application
-    /// error rather than a no-op so callers do not lose the signal
-    /// when a closed cursor is reused (Wave 1C audit cleanup,
-    /// cursor F19).
+    /// Returns the inner-cursor close error if the underlying
+    /// `CursorImpl::close` fails — currently the inner close is
+    /// infallible after the first call, so this only surfaces internal
+    /// invariant violations.
     pub fn close(&mut self) -> Result<()> {
         if self.state == CursorState::Closed {
-            return Err(NoxuError::OperationNotAllowed(
-                "Cursor already closed".to_string(),
-            ));
+            return Ok(());
         }
-
         self.state = CursorState::Closed;
-        Ok(())
+        // Audit cursor F14 (Wave 2C-4): propagate close to the inner
+        // CursorImpl so its BIN pin is released immediately rather than
+        // at outer-`Cursor::Drop` time.
+        self.inner
+            .close()
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
     }
 
     /// Check if the cursor is valid (not closed).
@@ -456,8 +484,20 @@ impl Cursor {
 
 impl Drop for Cursor {
     fn drop(&mut self) {
+        // Audit cursor F15 (Wave 2C-4): only warn for genuinely-leaked
+        // cursors that were positioned on a record at drop time.
+        // `NotInitialized` covers freshly-opened cursors and cursors
+        // that just had their record deleted (Finding 7); warning in
+        // those cases is noise that masks real leaks.
+        if self.state == CursorState::Initialized {
+            log::warn!("Cursor dropped without close (still positioned)");
+        }
+        // Best-effort close of the inner CursorImpl — its own Drop will
+        // also release the BIN pin, but this gives us symmetric cleanup
+        // semantics for cursors that were never explicitly closed.
         if self.state != CursorState::Closed {
-            log::warn!("Cursor dropped without close");
+            let _ = self.inner.close();
+            self.state = CursorState::Closed;
         }
     }
 }
@@ -787,11 +827,33 @@ mod tests {
 
     #[test]
     fn test_close_twice() {
+        // Audit cursor F13/F14 (Wave 2C-4): close() is idempotent.
         let mut cursor = make_cursor(false);
 
         cursor.close().unwrap();
-        let result = cursor.close();
-        assert!(result.is_err());
+        // Second close must succeed silently.
+        cursor.close().expect("close() must be idempotent");
+    }
+
+    #[test]
+    fn test_close_propagates_to_inner() {
+        // Audit cursor F14 (Wave 2C-4): outer close() must close the
+        // inner CursorImpl so the BIN pin is released eagerly.
+        let mut cursor = make_cursor_with(vec![(b"key1", b"value1")]);
+
+        let mut key = DatabaseEntry::from_bytes(b"key1");
+        let mut data = DatabaseEntry::new();
+        cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        // Inner state is Initialized at this point.
+        cursor.close().unwrap();
+
+        // Calling any operation on the inner cursor must now report it
+        // as closed.
+        let result = cursor.inner.get_first();
+        assert!(
+            result.is_err(),
+            "inner cursor must be closed after outer close()",
+        );
     }
 
     #[test]
@@ -887,7 +949,11 @@ mod tests {
     // Additional branch-coverage tests
     // ========================================================================
 
-    /// Get::SearchGte with empty key returns NotFound.
+    /// Get::SearchGte with empty key positions at the first record.
+    ///
+    /// Audit cursor F10 (Wave 2C-4): empty keys are valid input under
+    /// the unified contract — SearchGte with the empty key starts the
+    /// range scan at the smallest record, matching BDB-JE.
     #[test]
     fn test_search_gte_empty_key_returns_not_found() {
         let mut cursor = make_cursor_with(vec![(b"key1", b"value1")]);
@@ -896,12 +962,17 @@ mod tests {
 
         let status =
             cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+        // Empty < any non-empty key → SearchGte positions at "key1".
+        assert_eq!(status, OperationStatus::Success);
+        assert_eq!(data.get_data().unwrap(), b"value1");
     }
 
     /// Get::Search with empty key returns NotFound.
     #[test]
     fn test_search_empty_key_returns_not_found() {
+        // Audit cursor F10 (Wave 2C-4): empty keys are valid input;
+        // the search simply yields NotFound because no record uses an
+        // empty key in this fixture.
         let mut cursor = make_cursor_with(vec![(b"key1", b"value1")]);
         let mut key = DatabaseEntry::new(); // no data
         let mut data = DatabaseEntry::new();
@@ -1221,6 +1292,45 @@ mod tests {
         let data = DatabaseEntry::from_bytes(b"v");
         let result = cursor.put(&key, &data, Put::Overwrite);
         assert!(result.is_err());
+    }
+
+    /// Get::SearchBothRange wires through to `SearchMode::BothRange` on
+    /// a sorted-dup database (audit cursor F12, Wave 2C-4).
+    #[test]
+    fn test_search_both_range_on_dup_db() {
+        use noxu_dbi::{DatabaseConfig as DbiCfg, DatabaseId, DatabaseImpl, DbType};
+        use noxu_sync::RwLock;
+        use std::sync::Arc;
+
+        let db_id = DatabaseId::new(7);
+        let mut config = DbiCfg::default();
+        config.sorted_duplicates = true;
+        let db_impl = DatabaseImpl::new(
+            db_id,
+            "dup_test".to_string(),
+            DbType::User,
+            &config,
+        );
+        let db_arc = Arc::new(RwLock::new(db_impl));
+
+        // Insert three duplicates of "k": "a", "b", "d".
+        {
+            let mut tmp = CursorImpl::new(Arc::clone(&db_arc), 0);
+            tmp.put(b"k", b"a", PutMode::Overwrite).unwrap();
+            tmp.put(b"k", b"b", PutMode::Overwrite).unwrap();
+            tmp.put(b"k", b"d", PutMode::Overwrite).unwrap();
+        }
+
+        let inner = CursorImpl::new(db_arc, 0);
+        let mut cursor = Cursor::from_impl(inner, false);
+
+        // SearchBothRange for (key="k", data="c") must position at the
+        // first duplicate >= "c", i.e. "d".
+        let mut k = DatabaseEntry::from_bytes(b"k");
+        let mut d = DatabaseEntry::from_bytes(b"c");
+        let s = cursor.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(d.get_data().unwrap(), b"d");
     }
 
     /// Delete map_err closure: CursorImpl::delete returns an error when inner is closed.
