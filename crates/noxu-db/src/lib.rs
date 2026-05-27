@@ -46,6 +46,7 @@ pub mod database;
 pub mod database_config;
 pub mod database_entry;
 pub mod database_stats;
+pub mod disk_ordered_cursor;
 pub mod durability;
 pub mod environment;
 pub mod environment_config;
@@ -82,6 +83,9 @@ pub use database::Database;
 pub use database_config::DatabaseConfig;
 pub use database_entry::DatabaseEntry;
 pub use database_stats::{BtreeStats, DatabaseStats};
+pub use disk_ordered_cursor::{
+    DiskOrderedCursor, DiskOrderedCursorConfig, open_disk_ordered_cursor_multi,
+};
 pub use durability::{Durability, ReplicaAckPolicy, SyncPolicy};
 pub use environment::Environment;
 pub use environment_config::{EnvironmentConfig, ExceptionListenerHolder};
