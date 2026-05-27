@@ -499,7 +499,7 @@ impl Transaction {
             // crash-recovery undo are observationally identical.  Sorting by
             // `current_lsn` descending is sufficient because LSNs are
             // monotonic per-WAL-write.
-            undo_records.sort_by(|a, b| b.current_lsn.cmp(&a.current_lsn));
+            undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
 
             // Phase 2: apply undo to the B-tree (write locks still held).
             if let Some(env) = &self.env_impl {
@@ -737,7 +737,7 @@ impl Transaction {
             // that delete-then-reinsert sequences in the same txn are
             // unwound in reverse-operation order, matching the recovery
             // path's backward log scan.
-            undo_records.sort_by(|a, b| b.current_lsn.cmp(&a.current_lsn));
+            undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
 
             if let Some(env) = &self.env_impl {
                 let env_guard = env.lock();

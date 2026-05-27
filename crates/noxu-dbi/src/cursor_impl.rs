@@ -511,8 +511,14 @@ impl CursorImpl {
                     Ok(())
                 }
                 Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
-                    lm.lock(synthetic_lsn, self.id, LockType::Read, false, false)
-                        .map_err(DbiError::TxnError)?;
+                    lm.lock(
+                        synthetic_lsn,
+                        self.id,
+                        LockType::Read,
+                        false,
+                        false,
+                    )
+                    .map_err(DbiError::TxnError)?;
                     let _ = lm.release(synthetic_lsn, self.id);
                     Ok(())
                 }
