@@ -1123,3 +1123,236 @@ fn tck_tuple_binding_test_primitive_bindings() {
     slong_b.object_to_entry(&1234i64, &mut e).unwrap();
     assert_eq!(1234i64, slong_b.entry_to_object(&e).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// TupleBindingTest: TupleInputBinding-equivalent round-trip (wave 10-A)
+// ---------------------------------------------------------------------------
+
+/// Port of `TupleBindingTest.testTupleInputBinding`.
+///
+/// JE's `TupleInputBinding` is an `EntryBinding<TupleInput>` that copies
+/// the input's underlying bytes into the entry verbatim, and on the way
+/// back wraps the entry's bytes in a fresh `TupleInput`.
+///
+/// Noxu has no `TupleInputBinding` type, but `TupleInput::new(entry.data())`
+/// is the same operation.  This test asserts the same invariant: writing a
+/// string into a `TupleOutput`, copying its bytes into a `DatabaseEntry`,
+/// and reading them back via `TupleInput` round-trips with no bytes left
+/// over.  In noxu, `"abc"` encodes as 3 payload bytes + 2-byte terminator.
+#[test]
+fn tck_tuple_binding_test_tuple_input_binding() {
+    use noxu_db::DatabaseEntry;
+
+    let mut out = TupleOutput::new();
+    out.write_string("abc");
+    let mut entry = DatabaseEntry::new();
+    entry.set_data_vec(out.into_vec());
+    // JE asserts buffer.getSize() == 4 (3 + 1-byte terminator).
+    // Noxu's terminator is 2 bytes — 3 + 2 = 5.
+    assert_eq!(5, entry.data().len());
+
+    // entryToObject equivalent: TupleInput wrapping the entry's bytes.
+    let mut input = TupleInput::new(entry.data());
+    assert_eq!("abc", input.read_string().unwrap());
+    assert_eq!(0, input.available());
+}
+
+// ---------------------------------------------------------------------------
+// TupleBindingTest: TupleMarshalledBinding-equivalent round-trip (wave 10-A)
+// ---------------------------------------------------------------------------
+
+/// A test analogue of JE's `MarshalledObject`: a value that knows how to
+/// marshal itself into a `TupleOutput` and unmarshal from a `TupleInput`.
+#[derive(Debug, PartialEq, Eq, Default, Clone)]
+struct MarshalledData {
+    data: String,
+    index_key1: String,
+    index_key2: String,
+}
+
+impl MarshalledData {
+    fn marshal_data(&self, out: &mut TupleOutput) {
+        out.write_string(&self.data);
+        out.write_string(&self.index_key1);
+        out.write_string(&self.index_key2);
+    }
+
+    fn unmarshal_data(input: &mut TupleInput) -> Self {
+        let data = input.read_string().unwrap();
+        let index_key1 = input.read_string().unwrap();
+        let index_key2 = input.read_string().unwrap();
+        Self { data, index_key1, index_key2 }
+    }
+
+    /// Expected encoded size: each string contributes len + 2 bytes
+    /// (3 components encoded back-to-back).
+    fn expected_data_length(&self) -> usize {
+        self.data.len() + 2 + self.index_key1.len() + 2 + self.index_key2.len() + 2
+    }
+}
+
+/// Port of `TupleBindingTest.testTupleMarshalledBinding`.
+///
+/// Builds a `TupleBinding<MarshalledData>` whose `object_to_tuple` /
+/// `tuple_to_object` delegate to the marshalled value's own marshal /
+/// unmarshal methods.  Asserts:
+///   1. encoded size matches `expected_data_length`,
+///   2. round-trip preserves the `data` field (and the rest).
+#[test]
+fn tck_tuple_binding_test_tuple_marshalled_binding() {
+    use noxu_bind::{EntryBinding, TupleBinding};
+    use noxu_db::DatabaseEntry;
+
+    struct MarshalledBinding;
+    impl EntryBinding<MarshalledData> for MarshalledBinding {
+        fn entry_to_object(
+            &self,
+            entry: &DatabaseEntry,
+        ) -> noxu_bind::Result<MarshalledData> {
+            let mut input = TupleInput::new(entry.data());
+            self.tuple_to_object(&mut input)
+        }
+        fn object_to_entry(
+            &self,
+            object: &MarshalledData,
+            entry: &mut DatabaseEntry,
+        ) -> noxu_bind::Result<()> {
+            let mut out = TupleOutput::new();
+            self.object_to_tuple(object, &mut out)?;
+            entry.set_data_vec(out.into_vec());
+            Ok(())
+        }
+    }
+    impl TupleBinding<MarshalledData> for MarshalledBinding {
+        fn tuple_to_object(
+            &self,
+            input: &mut TupleInput,
+        ) -> noxu_bind::Result<MarshalledData> {
+            Ok(MarshalledData::unmarshal_data(input))
+        }
+        fn object_to_tuple(
+            &self,
+            object: &MarshalledData,
+            output: &mut TupleOutput,
+        ) -> noxu_bind::Result<()> {
+            object.marshal_data(output);
+            Ok(())
+        }
+    }
+
+    let val = MarshalledData {
+        data: "abc".to_string(),
+        index_key1: String::new(),
+        index_key2: String::new(),
+    };
+    let binding = MarshalledBinding;
+    let mut entry = DatabaseEntry::new();
+    binding.object_to_entry(&val, &mut entry).unwrap();
+    assert_eq!(val.expected_data_length(), entry.data().len());
+
+    let got = binding.entry_to_object(&entry).unwrap();
+    assert_eq!("abc", got.data);
+    assert_eq!(val, got);
+}
+
+// ---------------------------------------------------------------------------
+// TupleBindingTest: TupleTupleMarshalledBinding-equivalent (wave 10-A)
+// ---------------------------------------------------------------------------
+
+/// Marshalled entity with a separate primary key field.  Mirrors JE's
+/// `MarshalledObject` when used through `TupleTupleMarshalledBinding`.
+#[derive(Debug, PartialEq, Eq, Default, Clone)]
+struct MarshalledEntity {
+    data: String,
+    primary_key: String,
+    index_key1: String,
+    index_key2: String,
+}
+
+impl MarshalledEntity {
+    fn expected_data_length(&self) -> usize {
+        self.data.len() + 2 + self.index_key1.len() + 2 + self.index_key2.len() + 2
+    }
+    fn expected_key_length(&self) -> usize {
+        self.primary_key.len() + 2
+    }
+}
+
+/// Port of `TupleBindingTest.testTupleTupleMarshalledBinding`.
+///
+/// Defines an `EntityBinding<MarshalledEntity>` that splits the value across
+/// a `key` entry (primary key) and a `data` entry (data + index keys).
+/// Asserts:
+///   1. encoded data size matches `expected_data_length`,
+///   2. encoded key size matches `expected_key_length`,
+///   3. round-trip preserves all four fields.
+#[test]
+fn tck_tuple_binding_test_tuple_tuple_marshalled_binding() {
+    use noxu_bind::EntityBinding;
+    use noxu_db::DatabaseEntry;
+
+    struct MarshalledEntityBinding;
+    impl EntityBinding<MarshalledEntity> for MarshalledEntityBinding {
+        fn entry_to_object(
+            &self,
+            key: &DatabaseEntry,
+            data: &DatabaseEntry,
+        ) -> noxu_bind::Result<MarshalledEntity> {
+            let mut k = TupleInput::new(key.data());
+            let mut d = TupleInput::new(data.data());
+            let primary_key = k.read_string().unwrap();
+            let dat = d.read_string().unwrap();
+            let i1 = d.read_string().unwrap();
+            let i2 = d.read_string().unwrap();
+            Ok(MarshalledEntity {
+                data: dat,
+                primary_key,
+                index_key1: i1,
+                index_key2: i2,
+            })
+        }
+        fn object_to_key(
+            &self,
+            object: &MarshalledEntity,
+            key: &mut DatabaseEntry,
+        ) -> noxu_bind::Result<()> {
+            let mut out = TupleOutput::new();
+            out.write_string(&object.primary_key);
+            key.set_data_vec(out.into_vec());
+            Ok(())
+        }
+        fn object_to_data(
+            &self,
+            object: &MarshalledEntity,
+            data: &mut DatabaseEntry,
+        ) -> noxu_bind::Result<()> {
+            let mut out = TupleOutput::new();
+            out.write_string(&object.data);
+            out.write_string(&object.index_key1);
+            out.write_string(&object.index_key2);
+            data.set_data_vec(out.into_vec());
+            Ok(())
+        }
+    }
+
+    let val = MarshalledEntity {
+        data: "abc".to_string(),
+        primary_key: "primary".to_string(),
+        index_key1: "index1".to_string(),
+        index_key2: "index2".to_string(),
+    };
+    let binding = MarshalledEntityBinding;
+    let mut key_entry = DatabaseEntry::new();
+    let mut data_entry = DatabaseEntry::new();
+    binding.object_to_data(&val, &mut data_entry).unwrap();
+    assert_eq!(val.expected_data_length(), data_entry.data().len());
+    binding.object_to_key(&val, &mut key_entry).unwrap();
+    assert_eq!(val.expected_key_length(), key_entry.data().len());
+
+    let got = binding.entry_to_object(&key_entry, &data_entry).unwrap();
+    assert_eq!("abc", got.data);
+    assert_eq!("primary", got.primary_key);
+    assert_eq!("index1", got.index_key1);
+    assert_eq!("index2", got.index_key2);
+    assert_eq!(val, got);
+}
