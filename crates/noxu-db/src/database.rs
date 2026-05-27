@@ -698,6 +698,24 @@ impl Database {
             }
         }
 
+        // v1.6 (audit C3 — the associate()-style hook): drive every
+        // registered secondary index under the same caller-supplied
+        // txn so the primary record and its secondary entries commit /
+        // abort together.  Step 4 only handles the insert direction
+        // (`old_data = None`); the put-existing-key update path that
+        // also needs to delete stale secondary entries is wired in
+        // step 6.
+        let secondaries = self.live_secondaries();
+        if !secondaries.is_empty() {
+            // Build a fresh DatabaseEntry around the data we just
+            // wrote so the secondary key creator sees the bytes the
+            // user asked for (and not the partial-put scratch buffer).
+            let new_entry = DatabaseEntry::from_bytes(data_bytes);
+            for hook in secondaries {
+                hook.maintain(txn, key, None, Some(&new_entry))?;
+            }
+        }
+
         // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
         // writes: if the log write rate exceeds the cleaner's capacity, sleep
         // briefly so the cleaner can keep up.  Transactional paths handle this
