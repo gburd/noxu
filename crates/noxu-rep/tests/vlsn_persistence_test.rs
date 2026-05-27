@@ -13,11 +13,10 @@ fn vlsn_index_persists_across_close_and_reopen() {
 
     // First epoch: open as master, register VLSNs, close.
     {
-        let config =
-            RepConfig::builder("test_group", "node1", "127.0.0.1")
-                .node_port(0)
-                .env_home(&env_home)
-                .build();
+        let config = RepConfig::builder("test_group", "node1", "127.0.0.1")
+            .node_port(0)
+            .env_home(&env_home)
+            .build();
         let env = ReplicatedEnvironment::new(config).unwrap();
         env.become_master(1).unwrap();
         for v in 1u64..=20 {
@@ -33,11 +32,10 @@ fn vlsn_index_persists_across_close_and_reopen() {
 
     // Second epoch: reopen, expect the VLSN index to be restored.
     {
-        let config =
-            RepConfig::builder("test_group", "node1", "127.0.0.1")
-                .node_port(0)
-                .env_home(&env_home)
-                .build();
+        let config = RepConfig::builder("test_group", "node1", "127.0.0.1")
+            .node_port(0)
+            .env_home(&env_home)
+            .build();
         let env = ReplicatedEnvironment::new(config).unwrap();
         // Without re-registering anything, the VLSN range should be
         // recovered from disk.

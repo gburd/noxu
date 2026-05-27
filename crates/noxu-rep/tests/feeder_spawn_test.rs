@@ -95,8 +95,8 @@ fn replicate_entry_pushes_into_peer_scanner_so_replicas_see_it() {
     // Set up master and verify that calling `replicate_entry` makes the
     // entry available to a downstream replica via the PEER_FEEDER pull
     // path (using the in-process catch_up_from_peer helper).
-    use noxu_rep::stream::peer_feeder::catch_up_from_peer;
     use noxu_rep::stream::LogWriter;
+    use noxu_rep::stream::peer_feeder::catch_up_from_peer;
     use std::sync::Mutex;
 
     let env = ReplicatedEnvironment::new(master_config("rep_entry")).unwrap();

@@ -66,7 +66,9 @@ pub enum VlsnPersistError {
     BadVersion(u16),
     #[error("truncated vlsn.idx (expected {expected} bytes, got {got})")]
     Truncated { expected: usize, got: usize },
-    #[error("vlsn.idx checksum mismatch: stored {stored:08x}, computed {computed:08x}")]
+    #[error(
+        "vlsn.idx checksum mismatch: stored {stored:08x}, computed {computed:08x}"
+    )]
     BadChecksum { stored: u32, computed: u32 },
 }
 
@@ -265,7 +267,11 @@ mod tests {
         assert_eq!(r.get_first(), 1);
         assert_eq!(r.get_last(), 50);
         for v in 1..=50u64 {
-            assert!(loaded.get_lsn(v).is_some(), "vlsn {} should round-trip", v);
+            assert!(
+                loaded.get_lsn(v).is_some(),
+                "vlsn {} should round-trip",
+                v
+            );
         }
     }
 
@@ -314,10 +320,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let result = load_from_disk(dir.path());
-        assert!(matches!(
-            result,
-            Err(VlsnPersistError::BadChecksum { .. })
-        ));
+        assert!(matches!(result, Err(VlsnPersistError::BadChecksum { .. })));
     }
 
     #[test]

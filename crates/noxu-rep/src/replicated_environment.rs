@@ -335,8 +335,8 @@ impl ReplicatedEnvironment {
         // F5/F31: build the acceptor state with persistence enabled when
         // env_home is configured.  Crash-durable promises are required
         // for the Paxos safety invariant after a process restart.
-        let election_state = Arc::new(
-            if let Some(ref home) = config.env_home {
+        let election_state =
+            Arc::new(if let Some(ref home) = config.env_home {
                 ElectionAcceptorState::with_env_home(
                     config.node_name.clone(),
                     1,
@@ -344,8 +344,7 @@ impl ReplicatedEnvironment {
                 )
             } else {
                 ElectionAcceptorState::new(config.node_name.clone(), 1)
-            },
-        );
+            });
         if let Some(ref dispatcher) = tcp_dispatcher {
             let service = PeerFeederService::new(Arc::clone(&peer_scanner));
             dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(service));
@@ -1055,11 +1054,7 @@ impl ReplicatedEnvironment {
     /// the master's view at the time of the call; subsequent
     /// `add_peer`/`remove_peer` calls may change it.
     pub fn feeder_replica_names(&self) -> Vec<String> {
-        self.feeders
-            .read()
-            .iter()
-            .map(|f| f.get_replica_name())
-            .collect()
+        self.feeders.read().iter().map(|f| f.get_replica_name()).collect()
     }
 
     /// Bootstrap this node's environment by network-restoring all `.ndb`
@@ -1440,10 +1435,7 @@ impl ReplicatedEnvironment {
                 ))
             })?;
 
-        let new_term = self
-            .master_tracker
-            .get_term()
-            .saturating_add(1);
+        let new_term = self.master_tracker.get_term().saturating_add(1);
 
         // 1. Tell the target to become master at the new term.
         let target_ack = crate::group_admin::send_transfer_master(
@@ -1471,9 +1463,7 @@ impl ReplicatedEnvironment {
             {
                 continue;
             }
-            if let Ok(addr) =
-                format!("{}:{}", peer.host, peer.port).parse()
-            {
+            if let Ok(addr) = format!("{}:{}", peer.host, peer.port).parse() {
                 let _ = crate::group_admin::send_transfer_master(
                     addr,
                     &config.target_node,

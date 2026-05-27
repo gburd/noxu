@@ -49,9 +49,13 @@ pub enum AcceptorPersistError {
     BadMagic([u8; 4]),
     #[error("unsupported acceptor.state version {0}")]
     BadVersion(u16),
-    #[error("truncated acceptor.state (expected at least {expected} bytes, got {got})")]
+    #[error(
+        "truncated acceptor.state (expected at least {expected} bytes, got {got})"
+    )]
     Truncated { expected: usize, got: usize },
-    #[error("acceptor.state checksum mismatch: stored {stored:08x}, computed {computed:08x}")]
+    #[error(
+        "acceptor.state checksum mismatch: stored {stored:08x}, computed {computed:08x}"
+    )]
     BadChecksum { stored: u32, computed: u32 },
     #[error("invalid UTF-8 master name in acceptor.state")]
     BadMasterName,
@@ -186,7 +190,11 @@ impl PersistentAcceptorState {
         if let Err(e) = self.flush_locked() {
             // Roll back to avoid lying about persistence.
             self.promised_term.store(cur, Ordering::SeqCst);
-            log::warn!("acceptor.state: failed to persist promise(t={}): {}", t, e);
+            log::warn!(
+                "acceptor.state: failed to persist promise(t={}): {}",
+                t,
+                e
+            );
             return false;
         }
         true
@@ -234,9 +242,9 @@ impl PersistentAcceptorState {
         let accepted = self.accepted_term.load(Ordering::SeqCst);
         let master = self.accepted_master.lock().unwrap().clone();
 
-        let env_home = path
-            .parent()
-            .ok_or_else(|| io::Error::other("acceptor.state path has no parent"))?;
+        let env_home = path.parent().ok_or_else(|| {
+            io::Error::other("acceptor.state path has no parent")
+        })?;
         let tmp = tmp_path(env_home);
 
         let mut buf: Vec<u8> = Vec::with_capacity(MIN_LEN + 64);
@@ -266,9 +274,7 @@ impl PersistentAcceptorState {
     }
 }
 
-fn load_from_disk(
-    path: &Path,
-) -> Result<Option<(u64, u64, Option<String>)>> {
+fn load_from_disk(path: &Path) -> Result<Option<(u64, u64, Option<String>)>> {
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),

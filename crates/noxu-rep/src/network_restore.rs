@@ -378,16 +378,15 @@ impl NetworkRestore {
 
         let addr_str =
             format!("{}:{}", self.config.source_host, self.config.source_port);
-        let addr: std::net::SocketAddr =
-            addr_str.parse().map_err(|e| {
-                RepError::NetworkRestoreError(format!(
-                    "bad source address {}: {}",
-                    addr_str, e
-                ))
-            })?;
+        let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "bad source address {}: {}",
+                addr_str, e
+            ))
+        })?;
 
-        let channel = connect_to_service(addr, RESTORE_SERVICE_NAME)
-            .map_err(|e| {
+        let channel =
+            connect_to_service(addr, RESTORE_SERVICE_NAME).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
                     "connect_to_service(RESTORE) at {}: {}",
                     addr, e
