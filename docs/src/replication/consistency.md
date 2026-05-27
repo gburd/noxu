@@ -1,8 +1,8 @@
 # Consistency Policies
 
-> **v1.5 status — preview.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> and [the chapter overview](README.md).
+> **v2.0 status — GA.** Replica reads can still be stale; the
+> `ConsistencyPolicy` knobs let applications trade read freshness for
+> latency.
 
 Replica reads can be stale if the replica has not yet applied the latest
 entries from the master. Consistency policies let applications trade read

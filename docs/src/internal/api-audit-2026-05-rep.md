@@ -620,6 +620,25 @@ ordered by user-visible impact.
 | 7 / 8 | `transfer_master`, `shutdown_group` no-ops | Two operator-facing APIs that silently do nothing |
 | 22 | Arbiters can win elections | Wedges the cluster |
 
+## Resolution (Wave 3-3 / Wave 4-A)
+
+| # | Status | Wave | Closing commit |
+|---|---|---|---|
+| 1 | **closed** | 3-3 | `feat(rep)!: honour ReplicaAckPolicy on Transaction::commit (F1)` |
+| 2 / 4 | **closed** | **4-A** | `feat(rep): wire NetworkRestore through the dispatcher path (F2/F4)` |
+| 3 | **closed** | 3-3 | `fix(rep)!: bound service-name length on TCP dispatcher (F3)` |
+| 5 / 31 | **closed** | **4-A** | `feat(rep): persist Paxos acceptor promises across restarts (F5/F31)` |
+| 6 | **closed** | 3-3 | `feat(rep): wire election driver into ReplicatedEnvironment::open (F6)` |
+| 7 / 8 | **closed** | **4-A** | `feat(rep)!: implement transfer_master and shutdown_group (F7/F8)` |
+| 9 | **closed** | **4-A** | `feat(rep)!: spawn feeder per known replica on become_master (F9)` |
+| 10 | **closed** | 3-3 | `fix(rep): bound PeerLogScanner memory under sustained apply_entry (F10)` |
+| 11 | **closed** | **4-A** | `feat(rep): persist VLSN index across restarts (F11)` |
+| 22 | **closed** | 3-3 | `fix(rep): arbiters cannot win Paxos elections (F22)` |
+
+All ten v2.0 GA blockers identified by this audit are closed.  See
+[`wave-4-a-rep-ga-finish.md`](wave-4-a-rep-ga-finish.md) for the
+resolution narrative and pointers to the new tests.
+
 The remaining doc-drift, fictional-API, and decorative-stats findings
 are **not** GA blockers — they are marketing/UX issues that should be
 fixed before publication but do not by themselves invalidate
