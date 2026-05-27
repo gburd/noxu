@@ -20,7 +20,7 @@ Sprint 1–3 restriction notes
 |---|---|---|---|
 | Single-process transactional KV          | ✅ | ✅ | ✅ |
 | Sorted-duplicate values (primary DB)     | ✅ | ✅ | ✅ |
-| One-to-one secondary indexes (manual maintenance) | ✅ | ✅ (auto via `associate()`) | ✅ |
+| One-to-one secondary indexes (manual maintenance) | ✅ | ✅ (auto via `associate()` — Wave 2A) | ✅ |
 | `Cursor::get` with `Get::SearchGte` / range scans | ✅ | ✅ | ✅ |
 | `Cursor::get` with `Get::Search` / `SearchBoth` (validated on non-dup) | ✅ | ✅ | ✅ |
 | `Cursor::get` with `Get::SearchLte` / `FirstDup` / `LastDup` | ❌ (`NoxuError::Unsupported`) | ⚠️ planned | ✅ |
@@ -37,10 +37,10 @@ Sprint 1–3 restriction notes
 | `TransactionConfig::read_uncommitted` honoured    | ✅ (Sprint 1) | ✅ | ✅ |
 | In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ |
 | Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ |
-| Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ | ✅ |
-| Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ | ✅ |
-| `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
-| Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ | ✅ |
+| Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ (Wave 2A: sorted-dup inner DB + `SecondaryCursor::get_next_dup_full`) | ✅ |
+| Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ (Wave 2A: end-to-end Abort / Cascade with cycle detection / Nullify single + multi-key) | ✅ |
+| `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ (Wave 2A: every `Database::put` / `Database::delete` fans out to registered secondaries under the caller's txn) | ✅ |
+| Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ (Wave 2A: same atomicity now applies to the auto-maintenance path too) | ✅ |
 | Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter scheduled for removal) |
 | `Stored*` collections under explicit txn          | ✅ (Wave 2B — every Stored* method takes `Option<&Transaction>`) | ✅ | ✅ |
 | Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ✅ (Wave 2B — typed views parameterised by `EntryBinding`) | ✅ | ✅ |

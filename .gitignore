@@ -44,3 +44,4 @@ _
 .jdb
 # TLA+ TLC scratch directories and logs
 tla/states/
+docs/book/
