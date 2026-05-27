@@ -1,0 +1,5 @@
+error: invalid `on_related_entity_delete = Burninate`; allowed values: Abort, Cascade, Nullify (BDB-JE-style ABORT, CASCADE, NULLIFY are also accepted)
+ --> tests/ui/fail_invalid_on_delete.rs:7:5
+  |
+7 |     #[secondary_key(name = "x", relate = OneToOne, on_related_entity_delete = Burninate)]
+  |     ^
