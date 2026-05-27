@@ -132,3 +132,4 @@
   - [Wave 8 — RepTestBase harness + heavy rep TCK port](internal/wave-8-rep-testbase.md)
   - [Wave 9-A — noxu-rep fixes (v2.1.1 / v2.2.0)](internal/wave-9-a-rep-fixes.md)
   - [Wave 9-B — Stateright spec re-validation](internal/wave-9-b-stateright-revalidation.md)
+  - [Wave 9-C — JE TCK port (additional rows)](internal/wave-9-c-je-tck-ports.md)
