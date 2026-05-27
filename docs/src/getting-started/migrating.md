@@ -373,10 +373,11 @@ of any method.
   threading](#wave-2b--collections-typed-api-and-txn-threading-v15--v16)
   above).  `TransactionRunner` is now the recommended way to drive
   multi-statement `Stored*` sequences.
-* **Replication is preview / proof-of-concept.** Ten GA blockers are
-  tracked in
-  [`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md).
-  Do not deploy `noxu-rep` for production data in v1.5.
+* **Replication is GA in v2.0.** All ten GA blockers identified in
+  [`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md)
+  were closed across Waves 3-3 and 4-A.  See the
+  [Wave 4-A report](../internal/wave-4-a-rep-ga-finish.md) for
+  per-finding resolution notes.
 
 ## Quick before/after summary
 

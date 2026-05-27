@@ -644,16 +644,19 @@ are **not** GA blockers — they are marketing/UX issues that should be
 fixed before publication but do not by themselves invalidate
 correctness.
 
-The cumulative picture is that the replication subsystem is at the
-**preview / proof-of-concept** stage: the algorithms have been
-sketched, the wire formats and channels work for unit tests, the
-quorum library and phi detector are excellent contributions, but
-**none of the algorithm modules are wired into the public
-`ReplicatedEnvironment` API in a way that delivers the documented
-behaviour end-to-end**. A v2.0 GA recommendation requires a focused
-remediation phase on findings 1, 2, 3, 4, 5, 6, 9, 10, 11, 22 at
-minimum, followed by a doc rewrite against the real surface and a
-re-validation of the Stateright specs against the (then) production
-code.
+The cumulative picture as of the original audit (May 2026) was that
+the replication subsystem was at the **preview / proof-of-concept**
+stage: the algorithms had been sketched, the wire formats and channels
+worked for unit tests, the quorum library and phi detector were
+excellent contributions, but **none of the algorithm modules were
+wired into the public `ReplicatedEnvironment` API in a way that
+delivered the documented behaviour end-to-end**.
+
+This was remediated across Waves 3-3 and 4-A.  As of v2.0 the
+`ReplicatedEnvironment` public API delivers the documented behaviour
+end-to-end and all ten GA-blocker findings (1, 2, 3, 4, 5, 6, 7, 8, 9,
+10, 11, 22, 31) are closed.  Subsequent waves will revisit the
+Stateright specs against the production binary and address the
+remaining medium/low audit findings.
 
 — end of audit —
