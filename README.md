@@ -1,45 +1,79 @@
 # Noxu DB
 
-[![crates.io](https://img.shields.io/crates/v/noxu-db.svg)](https://crates.io/crates/noxu-db)
-[![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
 [![license](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
+[![rust](https://img.shields.io/badge/rust-stable%201.95+-orange.svg)](rust-toolchain.toml)
+[![docs](https://img.shields.io/badge/docs-codeberg.page-blue.svg)](https://codeberg.page/gregburd/noxu/)
 
-An embedded transactional key-value database engine, written in Rust. Noxu DB provides ACID transactions, a log-structured B+tree, checkpoint-based crash recovery, and optional master-replica replication — all in a single library with no external database process required.
+Noxu DB is an embedded transactional key-value database engine, written in
+Rust.  It provides ACID transactions, a log-structured B+tree, checkpoint-based
+crash recovery, master-replica replication with automatic leader elections,
+and an entity-persistence layer — all in a single library with no external
+database process required.
+
+**Current version**: 2.2.1 (released from `sprint/v2.2.0-base`).  See
+[CHANGELOG.md](CHANGELOG.md) for the full release history.
+
+**Status**: Replication is GA; all ten findings from the May-2026
+`noxu-rep` audit are closed and the corresponding Stateright executable
+specifications have been re-validated.  243 ported tests from the upstream
+JE TCK pass.  At v2.2.0 / v2.2.1 the workspace runs **5,625 tests, 0
+failures** under `cargo test --workspace`, with `cargo fmt`,
+`cargo clippy --workspace --all-targets --all-features -D warnings`, and
+`make docs-check` all clean.
 
 ## Quick Start
 
+Add to your `Cargo.toml` (until the crate is published to crates.io, depend
+on it via the Codeberg git URL):
+
+```toml
+[dependencies]
+noxu-db = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v2.2.1" }
+```
+
+Open an environment, write a record, and read it back:
+
 ```rust
-use noxu_db::{Environment, EnvironmentConfig, DatabaseConfig, DatabaseEntry, OperationStatus};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    OperationStatus,
+};
 use std::path::PathBuf;
 
 fn main() -> noxu_db::Result<()> {
-    // Open an environment
+    // Open (or create) a transactional environment on disk.
     let env_config = EnvironmentConfig::new(PathBuf::from("/tmp/mydb"))
-        .allow_create(true)
-        .transactional(true);
+        .with_allow_create(true)
+        .with_transactional(true);
     let env = Environment::open(env_config)?;
 
-    // Open a database
-    let db_config = DatabaseConfig::new().allow_create(true);
+    // Open a named database within the environment.
+    let db_config = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true);
     let db = env.open_database(None, "mydb", &db_config)?;
 
-    // Insert a record
+    // Auto-commit put.
     let key = DatabaseEntry::from_bytes(b"hello");
     let value = DatabaseEntry::from_bytes(b"world");
     db.put(None, &key, &value)?;
 
-    // Read it back
+    // Auto-commit get.
     let mut result = DatabaseEntry::new();
     let status = db.get(None, &key, &mut result, None)?;
     assert_eq!(status, OperationStatus::Success);
     assert_eq!(result.data(), b"world");
 
-    // Use transactions for ACID guarantees
+    // Explicit transaction.
     let txn = env.begin_transaction(None)?;
-    db.put(Some(&txn), &DatabaseEntry::from_bytes(b"key2"), &DatabaseEntry::from_bytes(b"val2"))?;
+    db.put(
+        Some(&txn),
+        &DatabaseEntry::from_bytes(b"key2"),
+        &DatabaseEntry::from_bytes(b"val2"),
+    )?;
     txn.commit()?;
 
-    // Iterate with a cursor
+    // Cursor scan.
     let mut cursor = db.open_cursor(None, None)?;
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
@@ -48,93 +82,184 @@ fn main() -> noxu_db::Result<()> {
     }
     cursor.close()?;
 
-    // Clean up
     db.close()?;
     env.close()?;
     Ok(())
 }
 ```
 
+For a fuller worked example (vendors + items, secondary indexes, joins),
+see [`examples/getting_started.rs`](examples/getting_started.rs) and the
+[Getting Started guide](https://codeberg.page/gregburd/noxu/getting-started/).
+
 ## Features
 
-- **ACID Transactions** -- Serializable transactions with record-level locking and deadlock detection. Supports configurable durability policies.
-- **B-tree Storage** -- Classic B+tree with Internal Nodes (IN), Bottom Internal Nodes (BIN), and Leaf Nodes (LN). Key prefix encoding and BIN-deltas reduce memory and I/O overhead.
-- **Write-Ahead Log** -- Append-only log with CRC32 checksums, configurable file sizes, and memory-mapped I/O. Log files use `.ndb` extension with hex naming (`00000000.ndb`).
-- **Crash Recovery** -- Three-phase checkpoint-based recovery: find end of log, rebuild the tree, replay/undo operations. Bounded recovery time through periodic checkpointing.
-- **Cache Eviction** -- LRU-based evictor with dual-priority queues and per-operation cache mode control (Default, KeepHot, EvictLn, EvictBin, MakeEvictable). Explicit memory budget tracking.
-- **Log Cleaning** -- Background garbage collection of obsolete log entries with per-file utilization tracking and configurable thresholds.
-- **Replication & HA** -- Master-replica replication with automatic elections, VLSN-based log streaming, network restore, master transfer, and configurable consistency/durability policies. **Security note**: as of v1.3.0 the replication wire protocol has no authentication; deploy only across a trusted network boundary. See [`docs/src/operations/known-limitations.md`](docs/src/operations/known-limitations.md) for the full list of replication-security limitations and the May-2026 security review.
-- **Serialization Bindings** -- Tuple and entry bindings for structured data, plus a trait-based entity persistence layer (Direct Persistence Layer). Users implement `Entity` and an `EntitySerializer` for their types; entries are stored in typed `PrimaryIndex` and `SecondaryIndex` collections.
-- **Collection Views** -- Iterator-based collection abstractions over databases, with sorted map and sorted set semantics.
-- **400+ Configuration Parameters** -- Fine-grained tuning of every subsystem through a validated, typed configuration framework.
+### Storage and transactions
+
+- **ACID transactions** with record-level locking, deadlock detection, and
+  configurable durability (`SyncPolicy::SyncWriteNoSync` /
+  `WriteNoSync` / `NoSync`) and isolation (`Serializable`,
+  `RepeatableRead`, `ReadCommitted`, `ReadUncommitted`).
+- **B+tree storage** with key prefix encoding and BIN-deltas for incremental
+  updates.  Sorted-duplicate values supported on primary databases.
+- **Write-ahead log** in a Rust-native `.ndb` format with CRC32 checksums
+  (15+ GiB/s on CLMUL hardware), configurable file sizes, group commit, and
+  fsync coalescing.
+- **Crash recovery** via three-phase checkpoint-based recovery; bounded by
+  the configured checkpoint interval.
+- **Cache eviction** with LRU/CLOCK/LIRS/ARC/CAR strategies, dual-priority
+  queues, per-operation cache modes, and optional off-heap allocation.
+- **Log cleaning** — background garbage collection of obsolete log entries
+  with per-file utilization tracking.
+
+### Higher-level APIs
+
+- **Cursors**, including `DiskOrderedCursor` for high-throughput unordered
+  scans across one or more databases.
+- **Secondary indexes** with `associate()`-style auto-maintenance, sorted
+  duplicates, and foreign-key constraints (`Abort` / `Cascade` / `Nullify`).
+- **Collections**: typed `StoredMap<K, V>`, `StoredSet<K>`, `StoredList<V>`
+  views with `TransactionRunner`-driven deadlock retry.
+- **Direct Persistence Layer (DPL)**: trait-based entity persistence with
+  `#[derive(Entity)]`, `#[derive(PrimaryKey)]`, `#[derive(SecondaryKey)]`
+  proc-macros, and full schema evolution (`Renamer`, `Deleter`,
+  `Converter`, per-record class-version envelope).
+- **Serialization bindings**: tuple, entry, and serde bindings with
+  version-checking magic headers.
+- **400+ configuration parameters** with typed validation.
+
+### Distribution
+
+- **XA distributed transactions** (X/Open XA two-phase commit), crash-durable
+  across restart via a `TxnPrepare` WAL record.
+- **Master-replica replication / HA**: Flexible Paxos leader election,
+  Phi Accrual Failure Detection, VLSN-based log streaming, network restore,
+  master transfer, dynamic membership, and configurable
+  `ReplicaAckPolicy` / `ReplicaConsistencyPolicy`.  Transport over TCP or
+  QUIC (`rustls`-based).  **Security note**: as of v2.2.1 the replication
+  wire protocol has no authentication; deploy only across a trusted network
+  boundary.  See
+  [`docs/src/operations/known-limitations.md`](docs/src/operations/known-limitations.md)
+  for the full list.
 
 ## Workspace Structure
 
-Noxu DB is organized as a Cargo workspace of 19 crates:
+Noxu DB is a Cargo workspace of **21 crates**:
 
-| Crate | Purpose |
-|-------|---------|
-| `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
-| `noxu-sync` | Internal sync primitives (raw mutex/rwlock, condvar, futex) |
-| `noxu-latch` | Exclusive and shared/exclusive latches (`parking_lot`) |
-| `noxu-config` | 400+ typed configuration parameters with validation |
-| `noxu-log` | Write-ahead log: file manager, log manager, entry I/O |
-| `noxu-tree` | B+tree: IN, BIN, LN, key prefixing, splits |
-| `noxu-txn` | Transactions, record-level locking, deadlock detection |
-| `noxu-evictor` | LRU/CLOCK/LIRS/ARC/CAR cache eviction with memory budget |
-| `noxu-cleaner` | Log file garbage collection, utilization tracking |
-| `noxu-recovery` | Checkpoint-based crash recovery |
-| `noxu-dbi` | Internal implementations: EnvironmentImpl, DatabaseImpl, CursorImpl |
-| `noxu-engine` | Engine orchestration, daemon lifecycle, environment open/close |
-| `noxu-db` | Public API: Environment, Database, Cursor, Transaction |
-| `noxu-bind` | Serialization bindings (tuple, entry, serial) |
-| `noxu-collections` | Iterator-based collection views over databases |
-| `noxu-persist` | Trait-based entity persistence (DPL) |
-| `noxu-xa` | XA distributed transactions (X/Open XA two-phase commit) |
-| `noxu-rep` | Master-replica HA, elections, VLSN tracking |
-| `noxu-observe` | Optional `tracing`/`metrics` observability glue |
+| Layer | Crates |
+|---|---|
+| Foundation | `noxu-util`, `noxu-sync`, `noxu-latch`, `noxu-config` |
+| Storage / log / recovery | `noxu-log`, `noxu-tree`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery` |
+| Transactions / engine | `noxu-txn`, `noxu-dbi`, `noxu-engine`, `noxu-db` |
+| Higher-level APIs | `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-persist-derive`, `noxu-xa` |
+| Replication | `noxu-rep` |
+| Cross-cutting | `noxu-observe` (optional `tracing` / `metrics` / OpenTelemetry), `noxu-spec` (Stateright executable specifications) |
 
-## Building
+See the [crate guide](https://codeberg.page/gregburd/noxu/maintainer/crate-guide.html)
+for a per-crate purpose statement and the
+[v2.2.1 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#v22-current-capability-matrix).
+
+## Building and Testing
 
 ```bash
-# First-time setup: initialize the quoracle submodule (used by noxu-rep).
+# First-time setup — initialize the quoracle submodule used by noxu-rep.
 git submodule update --init --recursive
 
-cargo build          # Build all crates
-cargo test           # Run all tests
-cargo test -p noxu-db    # Test a single crate
-cargo clippy         # Lint
-cargo fmt            # Format
+cargo build                    # Build all crates
+cargo nextest run --workspace  # Run all tests (preferred)
+cargo test --workspace         # Run all tests (fallback)
+cargo test -p noxu-db          # Test a single crate
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all
+cargo doc --workspace --no-deps
+
+make docs-check   # typos + markdownlint + mdbook build
+make docs-serve   # live-reload docs at http://localhost:3000
 ```
 
-Requires Rust 1.85+ (2024 edition); the workspace pins a specific stable
-toolchain in `rust-toolchain.toml`.
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+(currently stable 1.95).
+
+## Documentation
+
+Full documentation is published as an mdBook:
+
+- **Online**: <https://codeberg.page/gregburd/noxu/>
+- **Source**: [`docs/src/`](docs/src/)
+- **Local preview**: `make docs-serve`
+
+Starting points:
+
+- [Introduction & capability matrix](https://codeberg.page/gregburd/noxu/introduction.html)
+- [Getting Started](https://codeberg.page/gregburd/noxu/getting-started/)
+- [Transaction Processing](https://codeberg.page/gregburd/noxu/transactions/)
+- [High Availability](https://codeberg.page/gregburd/noxu/replication/)
+- [Programmer's Reference](https://codeberg.page/gregburd/noxu/reference/)
+- [Operations Guide](https://codeberg.page/gregburd/noxu/operations/)
 
 ## Design Principles
 
-- **Correctness first.** Algorithms and invariants are implemented to match their specifications. Divergence from intended behaviour is a bug.
-- **Idiomatic Rust.** RAII latches, `Result<T, NoxuError>` error handling, enums for closed hierarchies, traits for open extension points.
-- **Minimal core dependencies.** The core engine pulls in only `parking_lot`,
-  `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`,
-  plus `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Replication
-  (`noxu-rep`) and observability (`noxu-observe`) pull in additional
-  dependencies (`tokio`, `quinn`, `rustls`/`native-tls`, `tracing`,
-  `metrics`, `opentelemetry`) only when their features are enabled.
-- **Limited unsafe.** Core data-path crates (`noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`, `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O glue and `parking_lot` raw locking), and a single-line `unsafe` block each in `noxu-latch`, `noxu-db`, and `noxu-xa` documented inline. `noxu-evictor::off_heap` is implemented entirely through safe `memmap2` and `lru` wrappers.
-- **No async.** Core engine uses blocking I/O with explicit threading. Only replication networking may use async.
-- **Own log format.** Noxu DB uses a Rust-native on-disk format — `.ndb` files — not compatible with any other database.
+- **Correctness first.**  Algorithms and invariants are implemented to match
+  their specifications; divergence is treated as a bug.  Critical protocols
+  (B+tree latching, Flexible Paxos, WAL group-commit, recovery, lock
+  manager and deadlock detection, VLSN streaming, master transfer,
+  network restore, XA 2PC, cleaner safety, cache↔cleaner ordering)
+  are modelled in
+  Stateright executable specifications under `crates/noxu-spec`.
+- **Idiomatic Rust.**  RAII latches, `Result<T, NoxuError>` error handling,
+  enums for closed hierarchies, traits for open extension points.
+- **Minimal core dependencies.**  The core engine pulls in only
+  `parking_lot`, `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`,
+  `memmap2`, `fs2`, plus `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`.
+  Replication (`noxu-rep`) and observability (`noxu-observe`) pull in
+  additional dependencies (`tokio`, `quinn`, `rustls` / `native-tls`,
+  `tracing`, `metrics`, `opentelemetry`) only when their features are
+  enabled.
+- **Limited unsafe.**  Core data-path crates target zero `unsafe`.  The
+  exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw
+  locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O glue +
+  `parking_lot` raw locking), and one `unsafe` block each in `noxu-latch`
+  (RAII force-unlock), `noxu-db` (`unsafe impl Send for SecondaryConfig`),
+  and `noxu-xa` (transaction-pointer dereference); each is documented inline.
+- **No async in the core.**  Core engine uses blocking I/O with explicit
+  threading.  Only `noxu-rep` networking uses tokio.
+- **Own log format.**  `.ndb` files are Rust-native and not compatible with
+  any other database.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow,
+[AGENTS.md](AGENTS.md) for the agent / contributor guide, and
+[`docs/src/contributing/`](docs/src/contributing/) for in-depth notes on
+build, testing, PR process, and release.
+
+Issues and patches are welcome at
+<https://codeberg.org/gregburd/noxu>.
 
 ## Acknowledgements
 
-Noxu DB's architecture draws on research and engineering work that spans several decades of embedded database design. The B+tree with write-ahead logging and checkpoint recovery follows the structure established in the embedded database literature. The log-structured approach to record management, BIN-delta write optimisation, and the memory-budget accounting model are derived from published techniques for transactional embedded stores.
+Noxu DB's architecture draws on several decades of embedded database
+design.  The B+tree with write-ahead logging and checkpoint recovery
+follows the structure established in the embedded database literature.
+The log-structured approach, BIN-delta write optimisation, and
+memory-budget accounting model are derived from published techniques for
+transactional embedded stores.
 
-The replication subsystem implements Flexible Paxos for leader election (Howard, Malkhi, and Spiegelman, 2016), the Phi Accrual Failure Detector (Hayashibara et al., 2004), and VLSN-based log streaming. The adaptive replacement cache policy (Megiddo and Modha, 2003) and its CART variant (Bansal and Modha, 2004) are available as optional eviction strategies. The Clock with Adaptive Replacement policy references work by Jiang and Zhang (2005).
+The replication subsystem implements Flexible Paxos for leader election
+(Howard, Malkhi, and Spiegelman, 2016), the Phi Accrual Failure Detector
+(Hayashibara et al., 2004), and VLSN-based log streaming.  The adaptive
+replacement cache policy (Megiddo and Modha, 2003) and its CART variant
+(Bansal and Modha, 2004) are available as optional eviction strategies.
+The Clock with Adaptive Replacement policy references work by Jiang and
+Zhang (2005).
 
 ## License
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
 
 at your option.
