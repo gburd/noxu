@@ -186,29 +186,13 @@ mod tests {
 
     #[test]
     fn new_validates_gtrid_length() {
-        let res = TxnPrepareEntry::new(
-            1,
-            0,
-            0,
-            0,
-            0,
-            vec![0u8; 65],
-            vec![],
-        );
+        let res = TxnPrepareEntry::new(1, 0, 0, 0, 0, vec![0u8; 65], vec![]);
         assert!(matches!(res, Err(TxnPrepareError::GtridTooLong(65))));
     }
 
     #[test]
     fn new_validates_bqual_length() {
-        let res = TxnPrepareEntry::new(
-            1,
-            0,
-            0,
-            0,
-            0,
-            vec![],
-            vec![0u8; 65],
-        );
+        let res = TxnPrepareEntry::new(1, 0, 0, 0, 0, vec![], vec![0u8; 65]);
         assert!(matches!(res, Err(TxnPrepareError::BqualTooLong(65))));
     }
 
@@ -253,9 +237,7 @@ mod tests {
 
     #[test]
     fn read_invalid_gtrid_len_is_error() {
-        let mut buf = Vec::new();
-        // 8 + 8 + 8 + 8 = 32 bytes of zero header
-        buf.resize(32, 0u8);
+        let mut buf = vec![0u8; 32];
         // format_id (i32 BE)
         buf.extend_from_slice(&0i32.to_be_bytes());
         // gtrid_len > MAX_GTRID_LEN

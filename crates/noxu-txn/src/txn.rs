@@ -829,8 +829,7 @@ impl Txn {
         // the LogManager's group-commit batched our entry.  `flush_sync_if_needed`
         // is a no-op when another committer already flushed past this LSN.
         if let Some(ref lm) = self.log_manager {
-            lm.flush_sync_if_needed(prepare_lsn)
-                .map_err(TxnError::LogError)?;
+            lm.flush_sync_if_needed(prepare_lsn).map_err(TxnError::LogError)?;
         }
 
         // Track the prepare LSN as the new last_lsn so that, after a
@@ -848,9 +847,7 @@ impl Txn {
     /// because the prepare already established the commit decision; we
     /// just need to write the durable `TxnCommit` record and release
     /// locks.
-    pub fn resolved_commit_after_prepare(
-        &mut self,
-    ) -> Result<Lsn, TxnError> {
+    pub fn resolved_commit_after_prepare(&mut self) -> Result<Lsn, TxnError> {
         if !self.is_prepared() {
             return Err(TxnError::InvalidTransaction {
                 txn_id: self.id,
@@ -864,9 +861,7 @@ impl Txn {
     }
 
     /// Resolves a prepared transaction with an abort.
-    pub fn resolved_abort_after_prepare(
-        &mut self,
-    ) -> Result<Lsn, TxnError> {
+    pub fn resolved_abort_after_prepare(&mut self) -> Result<Lsn, TxnError> {
         if !self.is_prepared() {
             return Err(TxnError::InvalidTransaction {
                 txn_id: self.id,
@@ -2168,7 +2163,7 @@ mod tests {
     fn test_prepare_blocks_direct_commit() {
         let lock_manager = Arc::new(LockManager::new());
         let (lm, _dir) = make_log_manager_in_tempdir();
-        let mut txn = Txn::with_log_manager(78, lock_manager, lm.clone());
+        let mut txn = Txn::with_log_manager(78, lock_manager, lm);
         txn.note_log_entry(501);
         txn.lock(501, LockType::Write, false).unwrap();
         txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
@@ -2190,7 +2185,7 @@ mod tests {
     fn test_resolved_commit_after_prepare_completes() {
         let lock_manager = Arc::new(LockManager::new());
         let (lm, _dir) = make_log_manager_in_tempdir();
-        let mut txn = Txn::with_log_manager(79, lock_manager, lm.clone());
+        let mut txn = Txn::with_log_manager(79, lock_manager, lm);
         txn.note_log_entry(502);
         txn.lock(502, LockType::Write, false).unwrap();
         txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
@@ -2208,7 +2203,7 @@ mod tests {
     fn test_resolved_abort_after_prepare_completes() {
         let lock_manager = Arc::new(LockManager::new());
         let (lm, _dir) = make_log_manager_in_tempdir();
-        let mut txn = Txn::with_log_manager(80, lock_manager, lm.clone());
+        let mut txn = Txn::with_log_manager(80, lock_manager, lm);
         txn.note_log_entry(503);
         txn.lock(503, LockType::Write, false).unwrap();
         txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
@@ -2223,7 +2218,7 @@ mod tests {
     fn test_prepare_twice_is_protocol_error() {
         let lock_manager = Arc::new(LockManager::new());
         let (lm, _dir) = make_log_manager_in_tempdir();
-        let mut txn = Txn::with_log_manager(81, lock_manager, lm.clone());
+        let mut txn = Txn::with_log_manager(81, lock_manager, lm);
         txn.note_log_entry(504);
         txn.lock(504, LockType::Write, false).unwrap();
         txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
@@ -2235,7 +2230,7 @@ mod tests {
     fn test_prepare_read_only_returns_null_lsn() {
         let lock_manager = Arc::new(LockManager::new());
         let (lm, _dir) = make_log_manager_in_tempdir();
-        let mut txn = Txn::with_log_manager(82, lock_manager, lm.clone());
+        let mut txn = Txn::with_log_manager(82, lock_manager, lm);
         // No note_log_entry: this is a read-only txn.
         let prep = txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
         assert!(prep.is_null());
@@ -2246,7 +2241,7 @@ mod tests {
     fn test_prepare_after_commit_is_protocol_error() {
         let lock_manager = Arc::new(LockManager::new());
         let (lm, _dir) = make_log_manager_in_tempdir();
-        let mut txn = Txn::with_log_manager(83, lock_manager, lm.clone());
+        let mut txn = Txn::with_log_manager(83, lock_manager, lm);
         txn.note_log_entry(505);
         txn.lock(505, LockType::Write, false).unwrap();
         txn.commit().unwrap();

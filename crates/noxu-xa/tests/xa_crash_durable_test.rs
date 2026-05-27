@@ -245,8 +245,7 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
         assert!(recovered.is_empty());
         let mut val = DatabaseEntry::new();
         assert_eq!(
-            db.get(None, &DatabaseEntry::from_bytes(key_c), &mut val)
-                .unwrap(),
+            db.get(None, &DatabaseEntry::from_bytes(key_c), &mut val).unwrap(),
             OperationStatus::Success
         );
         let mut val_r = DatabaseEntry::new();
