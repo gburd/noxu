@@ -3,15 +3,19 @@
 > **v1.5 capability matrix:** see
 > [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
 >
-> **v1.5 limitations relevant to this chapter:**
+> **v1.5 / v2.0 limitations relevant to this chapter:**
 >
-> * **Nested / child transactions are not supported.** Calling
->   `env.begin_transaction(Some(&parent), …)` returns
->   `NoxuError::Unsupported`. The `parent` parameter is retained for
->   forward source compatibility and scheduled for removal in v2.0.
->   See
+> * **Nested / child transactions are not supported.** In v1.5 the
+>   `parent` parameter to `Environment::begin_transaction` was
+>   rejected at runtime with `NoxuError::Unsupported`. **In v2.0
+>   (Wave 3-1) the parameter has been removed entirely** — the type
+>   system now enforces the constraint and the misuse is a compile
+>   error. See
 >   [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
->   Decision 3B and `sprint-3-decisions-enforced.md`.
+>   Decision 3B,
+>   [`sprint-3-decisions-enforced.md`](../internal/sprint-3-decisions-enforced.md),
+>   and
+>   [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md).
 > * **Auto-commit “warning” clarification.** Cursors and auto-commit
 >   *do* coexist correctly in v1.5 — auto-commit cursor writes
 >   acquire write locks via the lock manager and block on competing
@@ -210,11 +214,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Key rules:
 
-* Obtain a transaction with `env.begin_transaction(parent, config)`. Pass `None`
-  for the parent. Nested (child) transactions are **not supported in v1.5**;
-  passing `Some(&parent)` returns a typed `NoxuError::Unsupported` error.
-  See [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
-  Decision 3B; the `parent` parameter is scheduled for removal in v2.0.
+* Obtain a transaction with `env.begin_transaction(config)`. Nested
+  (child) transactions are **not supported**; in v2.0 (Wave 3-1) the
+  `parent` parameter has been removed entirely from the signature — the
+  type system now enforces the constraint. See
+  [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
+  Decision 3B and
+  [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md).
 * Pass `Some(&txn)` as the first argument to `db.put()`, `db.get()`,
   `db.delete()`, and `db.open_cursor()`.
 * Commit with `txn.commit()` or roll back with `txn.abort()`.
