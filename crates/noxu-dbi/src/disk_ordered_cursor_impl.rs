@@ -48,9 +48,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use noxu_log::LogManager;
-use noxu_recovery::{
-    LnOperation, LogEntry, LogScanner, PositionedEntry,
-};
+use noxu_recovery::{LnOperation, LogEntry, LogScanner, PositionedEntry};
 
 use crate::database_id::DatabaseId;
 use crate::error::{DbiError, Result};
@@ -332,10 +330,8 @@ fn produce(
     cancel: Arc<AtomicBool>,
     budget: Arc<MemoryBudget>,
 ) {
-    let target_set: HashSet<u64> = target_db_ids
-        .iter()
-        .map(|d| d.as_i64() as u64)
-        .collect();
+    let target_set: HashSet<u64> =
+        target_db_ids.iter().map(|d| d.as_i64() as u64).collect();
     let fm = Arc::clone(log_manager.file_manager());
     let scanner = FileManagerLogScanner::new(fm);
 
@@ -386,16 +382,13 @@ fn produce(
             let data_bytes: Bytes = ln.data.unwrap_or_default();
 
             let key_vec = key_bytes.to_vec();
-            let data_vec = if opts.keys_only {
-                Vec::new()
-            } else {
-                data_bytes.to_vec()
-            };
+            let data_vec =
+                if opts.keys_only { Vec::new() } else { data_bytes.to_vec() };
 
-            if let Some(set) = dedup.as_mut() {
-                if !set.insert(key_vec.clone()) {
-                    continue;
-                }
+            if let Some(set) = dedup.as_mut()
+                && !set.insert(key_vec.clone())
+            {
+                continue;
             }
 
             // Reserve budget before sending.  If reserve returns false,
