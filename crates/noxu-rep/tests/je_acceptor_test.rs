@@ -54,7 +54,10 @@ fn test_acceptor_je_equivalent() {
     );
 
     // Accept(pn1, V) -> ACCEPTED
-    assert!(acc.try_accept(pn1, "VALUE"), "accept at promised term must succeed");
+    assert!(
+        acc.try_accept(pn1, "VALUE"),
+        "accept at promised term must succeed"
+    );
 
     // Propose(pn0) -> REJECT (still, after accept)
     assert!(
@@ -66,7 +69,10 @@ fn test_acceptor_je_equivalent() {
     assert!(acc.try_promise(pn2), "promise at pn2 (higher) must succeed");
 
     // Accept(pn2, V) -> ACCEPTED
-    assert!(acc.try_accept(pn2, "VALUE"), "accept at pn2 (=promised) must succeed");
+    assert!(
+        acc.try_accept(pn2, "VALUE"),
+        "accept at pn2 (=promised) must succeed"
+    );
 
     // Accept(pn0, V) -> REJECT
     assert!(

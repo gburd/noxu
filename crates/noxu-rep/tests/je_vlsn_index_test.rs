@@ -110,11 +110,7 @@ fn test_non_contiguous_bucket_small_holes() {
         if holes.contains(&v) {
             continue;
         }
-        assert!(
-            index.get_lsn(v).is_some(),
-            "vlsn {} must resolve via LTE",
-            v
-        );
+        assert!(index.get_lsn(v).is_some(), "vlsn {} must resolve via LTE", v);
     }
 
     // Hole vlsns: LTE lookup must return some lower entry without panic.
@@ -160,11 +156,7 @@ fn test_non_contiguous_bucket_large_holes() {
         if holes.contains(&v) {
             continue;
         }
-        assert!(
-            index.get_lsn(v).is_some(),
-            "vlsn {} must resolve via LTE",
-            v
-        );
+        assert!(index.get_lsn(v).is_some(), "vlsn {} must resolve via LTE", v);
     }
 
     for &h in &holes {

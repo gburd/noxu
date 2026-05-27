@@ -78,14 +78,10 @@ fn test_find_entry() {
         next_key_bytes[2] = next_key_bytes[2].wrapping_add(1);
         prev_key_bytes[2] = prev_key_bytes[2].wrapping_sub(1);
 
-        let flags = in_node.insert_entry(key_bytes.clone(), NULL_LSN, 0).unwrap();
+        let flags =
+            in_node.insert_entry(key_bytes.clone(), NULL_LSN, 0).unwrap();
         assert!(flags & INSERT_SUCCESS != 0, "INSERT_SUCCESS flag set");
-        assert_eq!(
-            flags & !INSERT_SUCCESS,
-            i as i32,
-            "inserted at slot {}",
-            i
-        );
+        assert_eq!(flags & !INSERT_SUCCESS, i as i32, "inserted at slot {}", i);
 
         // After insert, the JE asserts (verbatim):
         //   findEntry(zeroBytes, false, false) == 0   // virtual slot 0
@@ -125,8 +121,14 @@ fn test_find_entry() {
             );
             // The "next" key (one byte greater than getKey(j)) and "prev"
             // key locate insertion points i (max real slot) and i-1.
-            assert_eq!(in_node.find_entry(&next_key_bytes, false, false), i as i32);
-            assert_eq!(in_node.find_entry(&prev_key_bytes, false, false), (i as i32) - 1);
+            assert_eq!(
+                in_node.find_entry(&next_key_bytes, false, false),
+                i as i32
+            );
+            assert_eq!(
+                in_node.find_entry(&prev_key_bytes, false, false),
+                (i as i32) - 1
+            );
             assert_eq!(in_node.find_entry(&next_key_bytes, false, true), -1);
             assert_eq!(in_node.find_entry(&prev_key_bytes, false, true), -1);
         }
