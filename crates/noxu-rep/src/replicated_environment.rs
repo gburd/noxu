@@ -1163,6 +1163,18 @@ impl ReplicatedEnvironment {
             ));
         }
 
+        // JE invariant: only `Electable` nodes can become master.  `Secondary`,
+        // `Monitor`, and `Arbiter` are not electable and must be rejected at
+        // the API layer (mirrors JE `ExceptionTest`).  See
+        // `NodeType::can_be_master`.
+        if !self.config.node_type.can_be_master() {
+            return Err(RepError::InvalidStateTransition(format!(
+                "node '{}' has type {} which is not electable as master",
+                self.config.node_name.as_str(),
+                self.config.node_type,
+            )));
+        }
+
         // Ensure we can reach Master state (may need Detached -> Unknown first)
         self.ensure_unknown_state()?;
 
