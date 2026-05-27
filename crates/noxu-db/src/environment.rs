@@ -1102,6 +1102,129 @@ impl Environment {
         self.log_manager.as_ref().map(|lm| lm.fsync_count()).unwrap_or(0)
     }
 
+    // -------------------------------------------------------------------
+    // Wave 3-2: XA crash-durable two-phase commit support
+    // -------------------------------------------------------------------
+
+    /// Returns the list of XA in-doubt prepared transactions surfaced by
+    /// the most recent recovery pass.
+    ///
+    /// The XA layer (`noxu_xa::XaEnvironment::xa_recover`) reads this
+    /// list to populate its return value with XIDs that completed phase
+    /// 1 of two-phase commit but were not committed or aborted before
+    /// the previous shutdown / crash.  An empty `Vec` means there are
+    /// no in-doubt transactions to resolve.
+    ///
+    /// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
+    pub fn recovered_prepared_txns(
+        &self,
+    ) -> Vec<noxu_recovery::PreparedTxnInfo> {
+        let env_impl = self.env_impl.lock();
+        env_impl.recovered_prepared_txns()
+    }
+
+    /// Removes and returns the LN replay list for a recovered prepared
+    /// transaction.
+    ///
+    /// Used by `xa_commit(xid)` after locating the txn id from
+    /// [`Self::recovered_prepared_txns`].  The XA layer iterates the
+    /// returned list and applies each LN to the in-memory tree before
+    /// writing the `TxnCommit` WAL frame.
+    pub fn take_recovered_prepared_lns(
+        &self,
+        txn_id: u64,
+    ) -> Vec<noxu_recovery::PreparedLnReplay> {
+        let env_impl = self.env_impl.lock();
+        env_impl.take_recovered_prepared_lns(txn_id)
+    }
+
+    /// Removes a recovered prepared txn entry after the XA layer has
+    /// successfully resolved it (`xa_commit` or `xa_rollback`).
+    /// Idempotent.
+    pub fn forget_recovered_prepared_txn(&self, txn_id: u64) {
+        let env_impl = self.env_impl.lock();
+        env_impl.forget_recovered_prepared_txn(txn_id);
+    }
+
+    /// Writes a `TxnCommit` WAL frame for `txn_id` and fsyncs.
+    ///
+    /// Used by `xa_commit(xid)` to durably resolve a recovered prepared
+    /// transaction without requiring an in-memory `Txn` (which the
+    /// crash destroyed).  The caller must have already replayed any
+    /// LNs into the in-memory tree via
+    /// [`Self::take_recovered_prepared_lns`] and applied them.
+    ///
+    /// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
+    pub fn write_txn_commit_for_recovered(&self, txn_id: u64) -> Result<()> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(()), // Non-transactional env (shouldn't happen).
+        };
+        write_txn_end_for_recovered(
+            lm, txn_id, true, /* is_commit */
+            true, /* fsync */
+            true, /* flush */
+        )
+    }
+
+    /// Writes a `TxnAbort` WAL frame for `txn_id`.  Used by `xa_rollback(xid)`
+    /// to durably resolve a recovered prepared transaction.
+    pub fn write_txn_abort_for_recovered(&self, txn_id: u64) -> Result<()> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(()),
+        };
+        write_txn_end_for_recovered(
+            lm, txn_id, false, /* is_commit */
+            false, /* fsync */
+            false, /* flush */
+        )
+    }
+
+    /// Replays a recovered prepared transaction’s LNs into the in-memory
+    /// tree at `xa_commit` resolution time.
+    ///
+    /// Iterates the LN list (already removed from the recovered map by
+    /// the caller) and applies each insert/update/delete to the
+    /// matching `DatabaseImpl`'s tree.  This makes the prepared writes
+    /// observable to subsequent reads in the same process — without
+    /// this step, a recovered+committed XA branch's writes would only
+    /// become visible after a second recovery on the next reopen.
+    pub fn apply_recovered_prepared_lns(
+        &self,
+        lns: &[noxu_recovery::PreparedLnReplay],
+    ) -> Result<()> {
+        let env_impl = self.env_impl.lock();
+        for ln in lns {
+            let db_id = noxu_dbi::DatabaseId::new(ln.db_id as i64);
+            let Some(db_arc) = env_impl.get_database_by_id(db_id) else {
+                continue;
+            };
+            let db_guard = db_arc.read();
+            let Some(tree) = db_guard.get_real_tree() else {
+                continue;
+            };
+            match ln.operation {
+                noxu_recovery::PreparedLnOperation::Insert
+                | noxu_recovery::PreparedLnOperation::Update => {
+                    if let Some(data) = &ln.data {
+                        let _ = tree.insert(
+                            ln.key.clone(),
+                            data.clone(),
+                            ln.original_lsn,
+                        );
+                    }
+                }
+                noxu_recovery::PreparedLnOperation::Delete => {
+                    if tree.delete(&ln.key) {
+                        db_guard.decrement_entry_count();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verifies the structural integrity of all databases in this environment.
     ///
     /// Iterates every open `DatabaseImpl` in the environment's db_map and
@@ -1195,6 +1318,60 @@ impl Environment {
         }
         Ok(())
     }
+}
+
+/// Helper used by `Environment::write_txn_commit_for_recovered` and
+/// `write_txn_abort_for_recovered` to write a `TxnCommit` / `TxnAbort` WAL
+/// frame for a transaction id that has no in-memory `Txn` (the original
+/// process crashed before it could commit; recovery surfaced it via
+/// `recovered_prepared_txns`).
+///
+/// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
+fn write_txn_end_for_recovered(
+    lm: &LogManager,
+    txn_id: u64,
+    is_commit: bool,
+    fsync: bool,
+    flush: bool,
+) -> Result<()> {
+    use bytes::BytesMut;
+    use noxu_log::{LogEntryType, Provisional, entry::TxnEndEntry};
+    use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let entry = if is_commit {
+        TxnEndEntry::new_commit(
+            txn_id as i64,
+            NULL_LSN,
+            timestamp,
+            0,
+            NULL_VLSN,
+        )
+    } else {
+        TxnEndEntry::new_abort(txn_id as i64, NULL_LSN, timestamp, 0, NULL_VLSN)
+    };
+
+    let entry_type = if is_commit {
+        LogEntryType::TxnCommit
+    } else {
+        LogEntryType::TxnAbort
+    };
+
+    let mut buf = BytesMut::with_capacity(entry.log_size());
+    entry.write_to_log(&mut buf);
+
+    lm.log(entry_type, &buf, Provisional::No, flush, fsync).map(|_| ()).map_err(
+        |e| {
+            NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::LogWrite,
+                e.to_string(),
+            )
+        },
+    )
 }
 
 impl Drop for Environment {

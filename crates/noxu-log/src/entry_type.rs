@@ -9,9 +9,13 @@ use std::fmt;
 
 /// Current log version for Noxu DB.
 ///
-/// This is a NEW Rust-native log format (NOT binary-compatible with ).
-/// We start at version 1 for the Noxu format.
-pub const LOG_VERSION: u8 = 1;
+/// Version history:
+/// * `1` — initial Noxu format.
+/// * `2` — wave 3-2: added `TxnPrepare` (type 32) frame for crash-durable XA.
+///   On-disk frames written by v1 readers (no TxnPrepare possible) remain
+///   readable by v2 readers; v1 readers reject TxnPrepare frames as
+///   unknown-type errors.
+pub const LOG_VERSION: u8 = 2;
 
 /// First valid log version.
 pub const FIRST_LOG_VERSION: u8 = 1;

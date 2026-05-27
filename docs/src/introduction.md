@@ -36,8 +36,8 @@ Sprint 1–3 restriction notes
 | `Environment::close()` after `txn.commit()`       | ✅ (Sprint 1) | ✅ | ✅ |
 | `EnvironmentConfig::durability` honoured          | ✅ (Sprint 1) | ✅ | ✅ |
 | `TransactionConfig::read_uncommitted` honoured    | ✅ (Sprint 1) | ✅ | ✅ |
-| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ |
-| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ |
+| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ (wave 3-2) |
+| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ (wave 3-2) |
 | Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ (Wave 2A: sorted-dup inner DB + `SecondaryCursor::get_next_dup_full`) | ✅ |
 | Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ (Wave 2A: end-to-end Abort / Cascade with cycle detection / Nullify single + multi-key) | ✅ |
 | `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ (Wave 2A: every `Database::put` / `Database::delete` fans out to registered secondaries under the caller's txn) | ✅ |

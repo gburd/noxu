@@ -171,6 +171,35 @@ pub struct TxnAbortRecord {
     pub txn_id: u64,
 }
 
+/// A transaction-prepare record (XA two-phase commit, wave 3-2).
+///
+/// Recovery must:
+///   * NOT undo a transaction whose tail entry is `TxnPrepare` — the
+///     transaction is in-doubt waiting for `xa_commit` / `xa_rollback`.
+///   * NOT redo its LN entries into the in-memory tree (prepared writes
+///     are invisible until resolution).
+///   * Surface the (xid, txn_id, first_lsn, last_lsn) tuple to the XA
+///     layer via `RecoveryInfo::recovered_prepared_txns()` so
+///     `xa_recover()` can return the in-doubt XID and a subsequent
+///     `xa_commit(xid)` / `xa_rollback(xid)` can resolve it.
+#[derive(Debug, Clone)]
+pub struct TxnPrepareRecord {
+    /// The prepared transaction ID.
+    pub txn_id: u64,
+    /// LSN of the first LN logged by this transaction (NULL_LSN if none).
+    pub first_lsn: Lsn,
+    /// LSN of the last LN logged before this prepare frame.
+    pub last_lsn: Lsn,
+    /// LSN of this `TxnPrepare` entry itself.
+    pub lsn: Lsn,
+    /// XID format identifier (-1 == null).
+    pub xid_format_id: i32,
+    /// XID global transaction id (0..=64 bytes).
+    pub xid_gtrid: Vec<u8>,
+    /// XID branch qualifier (0..=64 bytes).
+    pub xid_bqual: Vec<u8>,
+}
+
 /// A rollback-start record (HA replica syncup).
 #[derive(Debug, Clone)]
 pub struct RollbackStartRecord {
@@ -214,6 +243,8 @@ pub enum LogEntry {
     TxnCommit(TxnCommitRecord),
     /// Transaction abort.
     TxnAbort(TxnAbortRecord),
+    /// Transaction prepare (XA two-phase commit, wave 3-2).
+    TxnPrepare(TxnPrepareRecord),
     /// HA rollback start.
     RollbackStart(RollbackStartRecord),
     /// HA rollback end.

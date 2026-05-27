@@ -17,6 +17,13 @@ use std::time::Instant;
 pub enum TransactionState {
     /// Transaction is open and can be used for operations.
     Open,
+    /// Transaction has been prepared (XA two-phase commit phase 1).
+    ///
+    /// Locks are still held; the only valid transitions are
+    /// [`Transaction::resolved_commit_after_prepare`] and
+    /// [`Transaction::resolved_abort_after_prepare`].  Direct
+    /// `commit()` / `abort()` are protocol errors.
+    Prepared,
     /// Transaction has been committed.
     Committed,
     /// Transaction has been aborted.
@@ -363,6 +370,13 @@ impl Transaction {
                     ));
                 }
                 TransactionState::Open | TransactionState::MustAbort => {}
+                TransactionState::Prepared => {
+                    return Err(NoxuError::OperationNotAllowed(
+                        "Cannot abort a prepared transaction directly; \
+                         use xa_rollback / resolved_abort_after_prepare"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -421,6 +435,273 @@ impl Transaction {
         }
         observe_gauge_dec!("noxu_db_active_transactions");
         Ok(())
+    }
+
+    /// Prepares the transaction for the second phase of XA two-phase
+    /// commit.
+    ///
+    /// Implements the crash-durable contract introduced in wave 3-2:
+    ///
+    /// 1. Writes a `TxnPrepare` WAL frame containing the txn id, the
+    ///    first / last LSN logged by this transaction, and the supplied
+    ///    XID components (format_id, gtrid, bqual).  The frame is
+    ///    fsynced before this method returns, so a crash immediately
+    ///    afterwards still allows recovery to resurrect the prepared
+    ///    state.
+    /// 2. Marks the inner `Txn` as PREPARED — direct `commit()` and
+    ///    `abort()` calls now return `OperationNotAllowed`; only
+    ///    `resolved_commit_after_prepare` and
+    ///    `resolved_abort_after_prepare` may finalise the transaction.
+    /// 3. Locks are RETAINED — prepared transactions hold every lock
+    ///    until xa_commit / xa_rollback so concurrent readers cannot
+    ///    observe in-flight state.
+    /// 4. The persistent prepared-log entry (the `noxu-xa::PreparedLog`
+    ///    XID -> timestamp record) is the responsibility of the XA
+    ///    layer and is written *after* this method returns.  The WAL
+    ///    `TxnPrepare` frame is the source of truth for crash
+    ///    durability; the prepared-log database is a convenience for
+    ///    operators inspecting in-doubt XIDs without scanning the WAL.
+    ///
+    /// Returns `Ok(())` on success.  Read-only transactions (no LN
+    /// frames written) still take a code path here so the inner Txn
+    /// flips to PREPARED, but no `TxnPrepare` frame is emitted — the
+    /// XA layer should take its `PrepareResult::ReadOnly` shortcut
+    /// rather than calling this method on read-only branches.
+    ///
+    /// # Errors
+    /// * `OperationNotAllowed` if the transaction is not Open.
+    /// * `EnvironmentFailure { reason: LogWrite }` if the WAL write or
+    ///   fsync fails.
+    pub fn prepare(
+        &self,
+        xid_format_id: i32,
+        xid_gtrid: &[u8],
+        xid_bqual: &[u8],
+    ) -> Result<()> {
+        self.check_open()?;
+
+        // Capture first / last LSN from the inner Txn so the recovery
+        // code can chain them.  For read-only branches both are
+        // NULL_LSN, in which case we skip writing the frame entirely
+        // (the prepared XID will appear in the persistent prepared-log
+        // database but recovery has nothing to do for it).
+        let (first_lsn, last_lsn) = match &self.inner_txn {
+            Some(inner) => {
+                let g = inner.lock().unwrap();
+                (g.first_lsn(), g.last_lsn())
+            }
+            None => {
+                (noxu_util::NULL_LSN.as_u64(), noxu_util::NULL_LSN.as_u64())
+            }
+        };
+
+        // Write the durable TxnPrepare frame.  Skipped for read-only
+        // txns (no inner Txn or no LN frames) to avoid recording an
+        // empty prepare that recovery would have nothing to do with.
+        if !self.read_only
+            && let Some(lm) = &self.log_manager
+            && first_lsn != noxu_util::NULL_LSN.as_u64()
+        {
+            self.write_txn_prepare(
+                lm,
+                first_lsn,
+                last_lsn,
+                xid_format_id,
+                xid_gtrid,
+                xid_bqual,
+            )?;
+        }
+
+        // Flip the inner Txn into PREPARED state so direct
+        // `inner.commit()` / `inner.abort()` are protocol errors.
+        // The inner Txn has no `log_manager` of its own (the outer
+        // Transaction owns the only LM reference), so its `prepare`
+        // call is a pure flag-flip; it does not write a duplicate
+        // TxnPrepare frame.
+        if let Some(inner) = &self.inner_txn {
+            inner
+                .lock()
+                .unwrap()
+                .prepare(xid_format_id, xid_gtrid.to_vec(), xid_bqual.to_vec())
+                .map_err(NoxuError::from)?;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        *state = TransactionState::Prepared;
+        Ok(())
+    }
+
+    /// Resolves a prepared transaction with a commit.
+    ///
+    /// Used by the XA `xa_commit` path.  Bypasses the
+    /// `TransactionState::Prepared` guard in `commit_with_durability`
+    /// because the prepare already established the commit decision.
+    ///
+    /// Steps:
+    /// 1. Verifies the txn is Prepared.
+    /// 2. Writes a `TxnCommit` WAL frame (mirrors `commit()`).
+    /// 3. Releases the inner Txn's locks via `resolved_commit_after_prepare`.
+    /// 4. Transitions state to Committed and prunes from the active-txns
+    ///    registry.
+    pub fn resolved_commit_after_prepare(&self) -> Result<()> {
+        {
+            let state = self.state.lock().unwrap();
+            if !matches!(*state, TransactionState::Prepared) {
+                return Err(NoxuError::OperationNotAllowed(format!(
+                    "resolved_commit_after_prepare: expected Prepared, got {:?}",
+                    *state
+                )));
+            }
+        }
+
+        // Write the TxnCommit frame.
+        if !self.read_only
+            && let Some(lm) = &self.log_manager
+        {
+            self.write_txn_end(lm, true /* is_commit */, true, true)?;
+        }
+
+        // Inner-side resolution: clear IS_PREPARED and run the standard
+        // commit path (which releases locks and flips inner state).
+        if let Some(inner) = &self.inner_txn {
+            inner
+                .lock()
+                .unwrap()
+                .resolved_commit_after_prepare()
+                .map_err(NoxuError::from)?;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        *state = TransactionState::Committed;
+        if let Some(registry) = &self.active_txns {
+            registry.mark_complete(self.id);
+        }
+        observe_gauge_dec!("noxu_db_active_transactions");
+        Ok(())
+    }
+
+    /// Resolves a prepared transaction with an abort.
+    pub fn resolved_abort_after_prepare(&self) -> Result<()> {
+        {
+            let state = self.state.lock().unwrap();
+            if !matches!(*state, TransactionState::Prepared) {
+                return Err(NoxuError::OperationNotAllowed(format!(
+                    "resolved_abort_after_prepare: expected Prepared, got {:?}",
+                    *state
+                )));
+            }
+        }
+
+        if !self.read_only
+            && let Some(lm) = &self.log_manager
+        {
+            self.write_txn_end(lm, false /* is_commit */, false, false)?;
+        }
+
+        // Apply undo records to the B-tree to restore before-images, then
+        // release write locks.  Same 3-phase ordering as `Transaction::abort()`:
+        // collect undo → apply → release locks.  See the matching comment
+        // in `Transaction::abort` for the rationale (no reader sees the
+        // in-flight value until the before-image is back in the tree).
+        if let Some(inner) = &self.inner_txn {
+            // First, clear the IS_PREPARED flag on the inner Txn so that
+            // `abort_collect_undo()` (which calls into `Txn::abort`) does
+            // not refuse with InvalidTransaction { state: PREPARED }.
+            // We do this via the inner's resolved-abort path, which
+            // performs `txn_flags &= !IS_PREPARED` and then runs `abort()`.
+            // Unfortunately that consumes the locks; we want the
+            // pre-release behaviour instead, so flip the flag manually
+            // and then run abort_collect_undo.
+            let undo_records = {
+                let mut g = inner.lock().unwrap();
+                // Undo the IS_PREPARED flag so abort_collect_undo doesn't
+                // refuse.  Inner state is still Open at this point.
+                g.clear_prepared_flag();
+                g.abort_collect_undo().unwrap_or_default()
+            };
+
+            if let Some(env) = &self.env_impl {
+                let env_guard = env.lock();
+                for undo in undo_records {
+                    let Some(abort_key) = undo.abort_key else { continue };
+                    let db_id =
+                        noxu_dbi::DatabaseId::new(undo.database_id as i64);
+                    let Some(db_arc) = env_guard.get_database_by_id(db_id)
+                    else {
+                        continue;
+                    };
+                    let db_guard = db_arc.read();
+                    if let Some(tree) = db_guard.get_real_tree() {
+                        if undo.abort_known_deleted {
+                            if tree.delete(&abort_key) {
+                                db_guard.decrement_entry_count();
+                            }
+                        } else if let Some(abort_data) = undo.abort_data {
+                            let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
+                            let _ = tree.insert(abort_key, abort_data, lsn);
+                        }
+                    }
+                }
+            }
+
+            inner.lock().unwrap().release_all_locks();
+        }
+
+        let mut state = self.state.lock().unwrap();
+        *state = TransactionState::Aborted;
+        if let Some(registry) = &self.active_txns {
+            registry.mark_complete(self.id);
+        }
+        observe_gauge_dec!("noxu_db_active_transactions");
+        Ok(())
+    }
+
+    /// Serializes a `TxnPrepareEntry` and writes it to the WAL with fsync.
+    fn write_txn_prepare(
+        &self,
+        lm: &LogManager,
+        first_lsn: u64,
+        last_lsn: u64,
+        xid_format_id: i32,
+        xid_gtrid: &[u8],
+        xid_bqual: &[u8],
+    ) -> Result<()> {
+        use noxu_log::{LogEntryType, Provisional, entry::TxnPrepareEntry};
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = TxnPrepareEntry::new(
+            self.id as i64,
+            timestamp_ms,
+            first_lsn,
+            last_lsn,
+            xid_format_id,
+            xid_gtrid.to_vec(),
+            xid_bqual.to_vec(),
+        )
+        .map_err(|e| {
+            NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::LogWrite,
+                format!("prepare entry encode: {e}"),
+            )
+        })?;
+
+        let mut buf = Vec::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        // fsync=true, flush=true: prepare must be durable before
+        // returning so a subsequent crash sees the prepare frame.
+        lm.log(LogEntryType::TxnPrepare, &buf, Provisional::No, true, true)
+            .map(|_| ())
+            .map_err(|e| {
+                NoxuError::environment_with_reason(
+                    crate::error::EnvironmentFailureReason::LogWrite,
+                    e.to_string(),
+                )
+            })
     }
 
     /// Serializes a TxnCommit or TxnAbort entry and writes it to `lm`.
@@ -594,6 +875,10 @@ impl Transaction {
         let state = self.get_state();
         match state {
             TransactionState::Open => Ok(()),
+            TransactionState::Prepared => Err(NoxuError::OperationNotAllowed(
+                "Transaction has been prepared; use xa_commit / xa_rollback"
+                    .to_string(),
+            )),
             TransactionState::Committed => Err(NoxuError::OperationNotAllowed(
                 "Transaction has been committed".to_string(),
             )),
@@ -630,6 +915,17 @@ impl Drop for Transaction {
                     self.id,
                 );
             }
+        } else if matches!(state, TransactionState::Prepared) {
+            // Prepared txns dropped without resolution simulate a crash
+            // — the durable TxnPrepare frame on disk is recovered on the
+            // next environment open, where xa_recover() will surface the
+            // XID for resolution.  This is intentional and supports the
+            // crash-durable XA contract introduced in wave 3-2.
+            log::info!(
+                "Transaction {} dropped while prepared; XID will be \
+                 surfaced via xa_recover() on next open",
+                self.id
+            );
         }
     }
 }
