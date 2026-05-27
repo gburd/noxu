@@ -94,7 +94,7 @@ triggers the publish workflow if one is configured.
 ### 6. Verify Published Docs
 
 After the tag push, verify the GitHub Pages deployment at
-`https://gburd.github.io/lamdb/` reflects the release content.
+`https://codeberg.page/gregburd/noxu/` reflects the release content.
 
 ## Hotfix Process
 

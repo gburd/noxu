@@ -11,6 +11,9 @@ readme = "../../README.md"
 description = "Replication and high availability for Noxu DB"
 
 [features]
+# In-memory `RepTestBase` / `RepEnvInfo` harness for porting JE rep tests.
+# Auto-enabled for `cargo test`; not part of the released API surface.
+test-harness = []
 # Pure-Rust TLS backend (rustls + ring). No C dependencies.
 # Default for any feature that requires TLS.
 tls-rustls = ["dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
@@ -54,6 +57,9 @@ noxu-evictor = { path = "../noxu-evictor" }
 # Used only by F1 end-to-end tests that wire a noxu-db Environment to a
 # noxu-rep ReplicatedEnvironment via the ReplicaAckCoordinator trait.
 noxu-db = { path = "../noxu-db" }
+# Self-dependency to enable the in-memory `RepTestBase` harness for tests
+# in `tests/*.rs` (integration tests link against the published crate).
+noxu-rep = { path = ".", features = ["test-harness"] }
 
 [lints]
 workspace = true

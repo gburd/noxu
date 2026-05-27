@@ -102,4 +102,4 @@ The PR author is responsible for the following before requesting review:
 
 - Delete the branch.
 - If the change affects documented behaviour, verify the deployed docs at
-  `https://gburd.github.io/lamdb/` after the `docs.yml` deploy job completes.
+  `https://codeberg.page/gregburd/noxu/` after the `docs.yml` deploy job completes.
