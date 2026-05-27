@@ -16,12 +16,11 @@
 //!   2. Builds a replica with an empty `env_home` and a wired
 //!      `EnvironmentImpl` so the replica I/O thread will spawn.
 //!   3. Adds master as a peer.
-//!   4. Calls `become_replica`.  The replica I/O thread should:
-//!      a. Open a `PEER_FEEDER` channel to the master.
-//!      b. Receive `NEEDS_RESTORE`.
-//!      c. Upgrade the `Weak<Self>` and call
-//!         `bootstrap_via_dispatcher("master")`.
-//!      d. Copy the master's `.ndb` files into the replica's `env_home`.
+//!   4. Calls `become_replica`.  The replica I/O thread should
+//!      open a `PEER_FEEDER` channel to the master, receive
+//!      `NEEDS_RESTORE`, upgrade the `Weak<Self>`, and call
+//!      `bootstrap_via_dispatcher("master")` which copies the master's
+//!      `.ndb` files into the replica's `env_home`.
 //!   5. Verifies (within a bounded poll loop) that the master's `.ndb`
 //!      files now exist in the replica's `env_home`.
 
@@ -64,7 +63,8 @@ fn replica_auto_bootstraps_on_needs_restore() {
         .node_port(0)
         .env_home(&replica_home)
         .build();
-    let replica_env = Arc::new(ReplicatedEnvironment::new(replica_cfg).unwrap());
+    let replica_env =
+        Arc::new(ReplicatedEnvironment::new(replica_cfg).unwrap());
     // Wave 9-A fix 2: register the self-weak so the I/O thread can
     // auto-bootstrap.  In production this is done by `open()`; for
     // tests that drive transitions manually we wire it explicitly.
@@ -76,8 +76,9 @@ fn replica_auto_bootstraps_on_needs_restore() {
     // the live env so `EnvironmentImpl::new` does not collide with the
     // pre-seeded `.ndb` files we are testing the restore copy of.
     let live_env_dir = TempDir::new().unwrap();
-    let env_impl =
-        Arc::new(EnvironmentImpl::new(live_env_dir.path(), false, false).unwrap());
+    let env_impl = Arc::new(
+        EnvironmentImpl::new(live_env_dir.path(), false, false).unwrap(),
+    );
     replica_env.with_environment(env_impl);
 
     // Register the master as a peer so the replica thread can resolve

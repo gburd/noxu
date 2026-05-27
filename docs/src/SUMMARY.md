@@ -130,3 +130,4 @@
   - [Wave 6 — JE TCK port (priority 3 + 4)](internal/wave-6-je-tck-port-priority-3-4.md)
   - [Wave 7 — v2.0.1 polish](internal/wave-7-polish.md)
   - [Wave 8 — RepTestBase harness + heavy rep TCK port](internal/wave-8-rep-testbase.md)
+  - [Wave 9-A — noxu-rep fixes (v2.1.1 / v2.2.0)](internal/wave-9-a-rep-fixes.md)
