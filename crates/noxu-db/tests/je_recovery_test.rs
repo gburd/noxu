@@ -433,3 +433,119 @@ fn recovery_basic_delete_all_no_resurrect() {
         drop(env);
     }
 }
+
+// ---------------------------------------------------------------------------
+// RecoveryEdgeTest.testNoLogFiles  (wave 10-A)
+//
+// JE invariant: opening an environment in a fresh directory creates the
+// initial log files, and the database list is empty.  After a clean close
+// and reopen, the database list remains empty.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recovery_edge_test_no_log_files() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let env = open_env(&path);
+        let names = env.get_database_names().unwrap();
+        assert!(names.is_empty(), "expected no dbs, got {names:?}");
+        drop(env);
+    }
+
+    // Reopen and re-check.  This is the JE "fake a shutdown/startup" loop.
+    {
+        let env = open_env(&path);
+        let names = env.get_database_names().unwrap();
+        assert!(
+            names.is_empty(),
+            "after reopen expected no dbs, got {names:?}",
+        );
+        drop(env);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecoveryEdgeTest.testNonTxnalDb  (wave 10-A)
+//
+// JE invariant: a non-transactional database in a transactional environment
+// survives a clean close + reopen: the database is still listed, and a
+// transactional db created later is also listed.
+//
+// NOXU BUG: as of v2.2.1, a non-transactional database does NOT survive a
+// clean close + reopen — `Environment::get_database_names()` returns an
+// empty list and `open_database(None, "NotTxnal", &cfg)` (with
+// `allow_create=false`) reports `DatabaseNotFound`.  Only the transactional
+// db registration appears to be flushed to the WAL.  Tracked as a wave-10-A
+// follow-up.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "wave10-a TODO: non-transactional db registration is lost across \
+            clean close+reopen; JE RecoveryEdgeTest.testNonTxnalDb expects it \
+            to survive"]
+fn recovery_edge_test_non_txnal_db() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Phase 1: create a non-transactional db, write into it, clean close.
+    {
+        let env = open_env(&path);
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(false);
+        let db_a = env.open_database(None, "NotTxnal", &db_cfg).unwrap();
+        db_a.put(
+            None,
+            &DatabaseEntry::from_bytes(b"foo"),
+            &DatabaseEntry::from_bytes(b"bar"),
+        )
+        .unwrap();
+        db_a.close().unwrap();
+        drop(env);
+    }
+
+    // Phase 2: reopen, the db is still there.
+    {
+        let env = open_env(&path);
+        // names registry should already include the non-txn db
+        let names = env.get_database_names().unwrap();
+        assert!(
+            names.contains(&"NotTxnal".to_string()),
+            "NotTxnal db should survive clean close+reopen, got {names:?}",
+        );
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(false);
+        let db_a = env.open_database(None, "NotTxnal", &db_cfg).unwrap();
+        db_a.close().unwrap();
+
+        // Add a transactional db on top.
+        let db_cfg_txn = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db_b = env.open_database(None, "Txnal", &db_cfg_txn).unwrap();
+        db_b.put(
+            None,
+            &DatabaseEntry::from_bytes(b"foo"),
+            &DatabaseEntry::from_bytes(b"bar"),
+        )
+        .unwrap();
+        db_b.close().unwrap();
+        drop(env);
+    }
+
+    // Phase 3: reopen again.  Both databases should be visible.
+    {
+        let env = open_env(&path);
+        let mut names = env.get_database_names().unwrap();
+        names.sort();
+        assert_eq!(
+            vec!["NotTxnal".to_string(), "Txnal".to_string()],
+            names,
+            "both databases should survive recovery",
+        );
+        drop(env);
+    }
+}
