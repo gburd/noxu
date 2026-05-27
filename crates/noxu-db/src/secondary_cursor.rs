@@ -114,7 +114,7 @@ impl<'a> SecondaryCursor<'a> {
     /// 1. The primary key is read from the current secondary record.
     /// 2. The primary data is fetched so the key creator can recompute
     ///    every secondary key it produced for this primary record.
-    /// 3. [`SecondaryDatabase::delete_all_for_primary`] is invoked to
+    /// 3. `SecondaryDatabase::delete_all_for_primary` is invoked to
     ///    remove every matching secondary index entry — **under the
     ///    cursor's stored txn**.  This is more general than just
     ///    deleting the entry the cursor is positioned on: a multi-key

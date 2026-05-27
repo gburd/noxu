@@ -348,9 +348,9 @@ impl SecondaryConfig {
     ///
     /// # v1.5 status
     ///
-    /// **Decision 2C**: stored but not enforced; [`SecondaryDatabase::open`]
+    /// **Decision 2C**: stored but not enforced; `SecondaryDatabase::open`
     /// rejects configs with a non-`Abort` action set (or any nullifier or
-    /// foreign DB) with [`NoxuError::Unsupported`].  Full FK support is
+    /// foreign DB) with `NoxuError::Unsupported`.  Full FK support is
     /// planned for v1.6.
     pub fn with_foreign_key_delete_action(
         mut self,
@@ -364,8 +364,8 @@ impl SecondaryConfig {
     ///
     /// # v1.5 status
     ///
-    /// **Decision 2C**: stored but not enforced; [`SecondaryDatabase::open`]
-    /// rejects configs with a nullifier set with [`NoxuError::Unsupported`].
+    /// **Decision 2C**: stored but not enforced; `SecondaryDatabase::open`
+    /// rejects configs with a nullifier set with `NoxuError::Unsupported`.
     /// Full FK support is planned for v1.6.
     pub fn with_foreign_key_nullifier(
         mut self,
@@ -379,8 +379,8 @@ impl SecondaryConfig {
     ///
     /// # v1.5 status
     ///
-    /// **Decision 2C**: stored but not enforced; [`SecondaryDatabase::open`]
-    /// rejects configs with a nullifier set with [`NoxuError::Unsupported`].
+    /// **Decision 2C**: stored but not enforced; `SecondaryDatabase::open`
+    /// rejects configs with a nullifier set with `NoxuError::Unsupported`.
     /// Full FK support is planned for v1.6.
     pub fn with_foreign_multi_key_nullifier(
         mut self,

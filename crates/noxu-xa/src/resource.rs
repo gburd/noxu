@@ -43,7 +43,7 @@ pub trait XaResource: Send + Sync {
     ///
     /// If `xid` exists only in the persistent prepared log (i.e. it was
     /// prepared in a previous process and the in-memory branch was lost on
-    /// restart), this returns [`XaError::CrashDurabilityNotSupported`].
+    /// restart), this returns `XaError::CrashDurabilityNotSupported`.
     /// Crash-durable XA is planned for v2.0.
     fn xa_commit(&self, xid: &Xid, flags: XaFlags) -> XaResult<()>;
 
@@ -53,7 +53,7 @@ pub trait XaResource: Send + Sync {
     ///
     /// As with `xa_commit`, calling `xa_rollback` on a XID that survives
     /// only in the persistent prepared log returns
-    /// [`XaError::CrashDurabilityNotSupported`]. Use
+    /// `XaError::CrashDurabilityNotSupported`. Use
     /// [`XaResource::xa_forget`] to discard the persistent record.
     fn xa_rollback(&self, xid: &Xid, flags: XaFlags) -> XaResult<()>;
 
@@ -69,7 +69,7 @@ pub trait XaResource: Send + Sync {
     /// in-memory `Transaction` on restart. After a fresh process start the
     /// returned list may include XIDs that *cannot* be committed or rolled
     /// back — attempting to do so returns
-    /// [`XaError::CrashDurabilityNotSupported`]. Use `xa_forget` to discard
+    /// `XaError::CrashDurabilityNotSupported`. Use `xa_forget` to discard
     /// such entries from the persistent log. Crash-durable XA is planned
     /// for v2.0.
     fn xa_recover(&self, flags: XaFlags) -> XaResult<Vec<Xid>>;

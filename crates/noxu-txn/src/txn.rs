@@ -205,7 +205,7 @@ impl Txn {
     /// Returned by [`crate::TxnManager::begin_auto_txn`] to wrap a single
     /// auto-commit cursor operation.  The auto-txn:
     ///
-    /// * Carries the [`IS_AUTO_TXN`] flag, so [`Self::is_auto_txn`] returns
+    /// * Carries the `IS_AUTO_TXN` flag, so [`Self::is_auto_txn`] returns
     ///   `true` and [`Self::commit_with_durability`] / [`Self::abort`] skip
     ///   the `TxnCommit` / `TxnAbort` WAL entry (the underlying LN was
     ///   logged as auto-commit by the cursor, so no synthetic commit
@@ -317,7 +317,7 @@ impl Txn {
     /// `LogManager::flush_sync_if_needed` from within
     /// [`Self::commit_with_durability`].  The auto-txn still skips the
     /// `TxnCommit` / `TxnAbort` WAL entries by virtue of the
-    /// [`IS_AUTO_TXN`] flag.
+    /// `IS_AUTO_TXN` flag.
     pub fn with_log_manager_auto(
         id: i64,
         lock_manager: Arc<LockManager>,
