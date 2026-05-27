@@ -3,7 +3,9 @@ name: CI
 # .github/workflows/test.yml uses GitHub-only labels (ubuntu-latest,
 # macos-latest, windows-latest) and is invisible to Codeberg.
 # This file runs the same gates Codeberg can support: fmt, clippy,
-# test, doc, on a single linux runner.
+# test (default features), test (--all-features), doc, on a single
+# linux runner. macOS / Windows coverage lives in the GitHub workflow.
+# See docs/src/internal/wave-10-f-ci-matrix.md for the matrix rationale.
 
 on:
   push:
@@ -60,7 +62,51 @@ jobs:
             --all-features -- -D warnings
 
   test:
-    name: Test (linux)
+    # Default-features test on Codeberg's only-Linux runners. Mirrors the
+    # GitHub `test` job for ubuntu-latest. macOS / Windows coverage lives
+    # in the GitHub workflow only — Forgejo doesn't offer those runners.
+    name: Test default features (linux)
+    runs-on: lxc-bookworm
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build prerequisites
+        run: |
+          apt-get update -q
+          apt-get install -qy curl build-essential pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          # Distinct cache key from `test-all-features` to avoid the two
+          # jobs invalidating each other's `target/` (different feature
+          # graphs).
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-default-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-default-
+
+      - name: Run workspace tests (default features)
+        run: cargo test --workspace --no-fail-fast
+
+  test-all-features:
+    # Mirror of the GitHub `test-all-features` job. Exercises
+    # `tls-native` (system OpenSSL), `tls-rustls`, `quic`,
+    # `observability`, and the rep `test-harness` feature. See
+    # docs/src/internal/wave-10-f-ci-matrix.md for the matrix design.
+    name: Test all features (linux)
     runs-on: lxc-bookworm
     needs: check
     steps:
@@ -86,12 +132,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-allfeat-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-test-allfeat-
 
-      - name: Run workspace tests
-        run: cargo test --workspace --no-fail-fast
+      - name: Run workspace tests (--all-features)
+        run: cargo test --workspace --all-features --no-fail-fast
 
   doc:
     name: Documentation

@@ -16,11 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Install build prerequisites (libssl-dev for tls-native)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -40,7 +47,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
-    name: Test (${{ matrix.os }})
+    # Default-features test on every supported OS.
+    # macOS / Windows do NOT exercise rep TLS, observability, or the
+    # in-memory test harness — those are covered by `test-all-features`
+    # on ubuntu-latest. See docs/src/internal/wave-10-f-ci-matrix.md.
+    name: Test default features (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: check
     strategy:
@@ -49,9 +60,51 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          # Keep cache key distinct from the all-features job so the two
+          # don't fight over `target/` (different feature graphs would
+          # invalidate each other constantly).
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-default-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-default-
+
+      - name: Run tests (default features, no-fail-fast)
+        run: cargo test --workspace --no-fail-fast
+
+  test-all-features:
+    # All-features build *runs* on ubuntu-latest only.
+    # `--all-features` enables `tls-native` (system OpenSSL), `tls-rustls`,
+    # `quic`, `observability`, and the rep `test-harness`. We deliberately
+    # skip macOS / Windows here to keep the toolchain story simple
+    # (no vcpkg / brew openssl gymnastics in CI). See
+    # docs/src/internal/wave-10-f-ci-matrix.md for the rationale.
+    name: Test all features (ubuntu-latest)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build prerequisites (libssl-dev for tls-native)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -60,12 +113,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-allfeat-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-test-allfeat-
 
-      - name: Run tests
-        run: cargo test --workspace
+      - name: Run tests (--all-features, no-fail-fast)
+        run: cargo test --workspace --all-features --no-fail-fast
 
   cross:
     name: Cross-compile (${{ matrix.target }})
@@ -89,6 +142,8 @@ jobs:
             apt: gcc-riscv64-linux-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Rust stable + cross target
         uses: dtolnay/rust-toolchain@stable
@@ -111,6 +166,10 @@ jobs:
           restore-keys: |
             cross-${{ matrix.target }}-
 
+      # `cargo check` only — running tests on foreign architectures would
+      # require qemu-user setup, which is brittle and slow. Cross-compile
+      # validation catches build-time portability bugs, which is the
+      # 90% case for what we want to catch on these targets.
       - name: Cross-compile (check only — no runner for foreign arch)
         run: cargo check --workspace --target ${{ matrix.target }}
         env:
@@ -124,6 +183,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
