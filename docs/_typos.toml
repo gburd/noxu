@@ -20,4 +20,8 @@
 extend-exclude = [
     "book/",
     "*.lock",
+    # JE TCK enumeration TSVs echo JE's own test method names verbatim,
+    # including any typos that exist in those names.  Spell-checking
+    # would diverge from the source.
+    "je-tck-port-*.tsv",
 ]
