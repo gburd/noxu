@@ -609,14 +609,29 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        // Warn if transaction wasn't explicitly committed or aborted
+        // Audit transaction-env F10 (Wave 2C-4): if the txn is still in
+        // a non-terminal state at drop time, perform an actual abort
+        // (release locks, apply undo, prune from active-txn registry,
+        // decrement gauge) instead of just logging a warning.
         let state = *self.state.lock().unwrap();
-        if matches!(state, TransactionState::Open | TransactionState::MustAbort)
-        {
+        if matches!(
+            state,
+            TransactionState::Open | TransactionState::MustAbort
+        ) {
             log::warn!(
-                "Transaction {} dropped without commit or abort, implicitly aborting",
+                "Transaction {} dropped without commit or abort, \
+                 implicitly aborting",
                 self.id
             );
+            // Best-effort abort.  Errors are swallowed because Drop
+            // cannot return Result; any failure (e.g., WAL write error)
+            // is still observable through the abort path's logging.
+            if let Err(e) = self.abort() {
+                log::error!(
+                    "Transaction {} implicit abort on drop failed: {e}",
+                    self.id,
+                );
+            }
         }
     }
 }
