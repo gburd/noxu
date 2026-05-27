@@ -1481,3 +1481,161 @@ fn wave2a_step6_update_same_sec_key_is_idempotent() {
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
     assert_eq!(data.get_data().unwrap(), b"Apricot");
 }
+
+// ─── Wave 2A step 7 — multi-key creator auto-maintenance ───────────
+
+use noxu_db::secondary_config::SecondaryMultiKeyCreator;
+
+/// Multi-key creator that emits one secondary key per byte of the data.
+struct EachByteCreator;
+impl SecondaryMultiKeyCreator for EachByteCreator {
+    fn create_secondary_keys(
+        &self,
+        _db: &Database,
+        _key: &DatabaseEntry,
+        data: &DatabaseEntry,
+        results: &mut Vec<DatabaseEntry>,
+    ) {
+        if let Some(d) = data.get_data() {
+            for b in d {
+                results.push(DatabaseEntry::from_bytes(&[*b]));
+            }
+        }
+    }
+}
+
+/// One primary record produces multiple secondary keys; the auto-maintenance
+/// hook inserts every key inside the user's txn.  Tests the
+/// multi-key-creator path of update_secondary_state under the
+/// associate-style hook.
+#[test]
+fn wave2a_step7_multi_key_creator_auto_maintained() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_multi_key_creator(Box::new(EachByteCreator)),
+    )
+    .unwrap();
+
+    // Insert one record whose data is "AB" — this should produce two
+    // secondary index entries: 'A' -> pk1, 'B' -> pk1.
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"AB");
+    primary.lock().put(None, &pk, &v).unwrap();
+
+    for sec_byte in b"AB" {
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = sec
+            .get(
+                None,
+                &DatabaseEntry::from_bytes(&[*sec_byte]),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(
+            st,
+            OperationStatus::Success,
+            "multi-key creator must index every byte; missing '{}'",
+            *sec_byte as char
+        );
+        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    }
+}
+
+/// Updating a multi-key record so the key set changes from {A, B} to
+/// {A, C}: the old 'B' entry must vanish and a new 'C' entry must
+/// appear; 'A' (unchanged) is preserved.
+#[test]
+fn wave2a_step7_multi_key_update_diffs_correctly() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_multi_key_creator(Box::new(EachByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary.lock().put(None, &pk, &DatabaseEntry::from_bytes(b"AB")).unwrap();
+    primary.lock().put(None, &pk, &DatabaseEntry::from_bytes(b"AC")).unwrap();
+
+    // 'A' still resolves.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::Success
+    );
+
+    // 'C' is new.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"C"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::Success
+    );
+
+    // 'B' is gone.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound,
+        "removed multi-key bytes must be cleaned out of the index"
+    );
+}
+
+/// Deleting a multi-key primary record removes every index entry it
+/// produced.
+#[test]
+fn wave2a_step7_multi_key_delete_removes_all_keys() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_multi_key_creator(Box::new(EachByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary.lock().put(None, &pk, &DatabaseEntry::from_bytes(b"ABC")).unwrap();
+    primary.lock().delete(None, &pk).unwrap();
+
+    for sec_byte in b"ABC" {
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        assert_eq!(
+            sec.get(
+                None,
+                &DatabaseEntry::from_bytes(&[*sec_byte]),
+                &mut p_key,
+                &mut data
+            )
+            .unwrap(),
+            OperationStatus::NotFound,
+            "delete must clean out every multi-key entry; lingering '{}'",
+            *sec_byte as char
+        );
+    }
+}
