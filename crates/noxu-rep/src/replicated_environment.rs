@@ -884,6 +884,25 @@ impl ReplicatedEnvironment {
             node.port,
             self.config.group_name,
         );
+
+        // F9: if we are the current master, immediately register a
+        // `Feeder` tracker for the new peer so AckTracker bookkeeping
+        // and downstream pull-based streaming work without a forced
+        // re-election.
+        if self.is_master()
+            && (node.node_type == crate::node_type::NodeType::Electable
+                || node.node_type == crate::node_type::NodeType::Secondary)
+        {
+            let mut feeders = self.feeders.write();
+            if !feeders.iter().any(|f| f.get_replica_name() == node.name) {
+                feeders.push(Feeder::new(node.name.clone()));
+                log::debug!(
+                    "Node '{}' (master): dispatched Feeder for new peer '{}'",
+                    self.config.node_name,
+                    node.name,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1001,6 +1020,20 @@ impl ReplicatedEnvironment {
         self.vlsn_index.get_latest_vlsn()
     }
 
+    /// Return the list of replica names that currently have a `Feeder`
+    /// tracker on this (master) node.
+    ///
+    /// Used by tests and operator tooling.  The returned list reflects
+    /// the master's view at the time of the call; subsequent
+    /// `add_peer`/`remove_peer` calls may change it.
+    pub fn feeder_replica_names(&self) -> Vec<String> {
+        self.feeders
+            .read()
+            .iter()
+            .map(|f| f.get_replica_name())
+            .collect()
+    }
+
     /// Get replication statistics.
     ///
     ///
@@ -1063,45 +1096,60 @@ impl ReplicatedEnvironment {
         self.node_state.transition_to(NodeState::Master)?;
         self.master_tracker.set_master(self.config.node_name.as_str(), term);
 
-        // --- G19: spawn FeederRunner threads for each known replica --------
+        // --- F9: spawn Feeder trackers for each known replica -------------
         //
-        // → `Feeder.runFeedingLoop()`.
-        // Each active feeder in the feeders list gets a dedicated thread that
-        // runs `FeederRunner::run()` backed by `EnvironmentLogScanner`.
-        if self.env_impl.lock().unwrap().is_some() {
-            let feeders_snap: Vec<String> = self
-                .feeders
-                .read()
-                .iter()
-                .map(|f| f.get_replica_name())
-                .collect();
-
-            for replica_name in feeders_snap {
-                // The PeerFeederService registered on the TCP dispatcher
-                // handles incoming replica connections automatically.
-                // Replicas connect to PEER_FEEDER_SERVICE_NAME and the
-                // dispatcher spawns a per-connection thread running
-                // PeerFeederRunner::run().
-                //
-                // Here we just log the known replicas for observability.
-                log::info!(
-                    "Node '{}' (master): feeder for replica '{}' is served \
-                     by PeerFeederService on the TCP dispatcher",
+        // Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        // The architecture is pull-based: replicas pull from the master's
+        // `PEER_FEEDER` service via `catch_up_from_peer`.  However, the
+        // master must:
+        //   1. Track each replica via a `Feeder` so AckTracker bookkeeping
+        //      can attribute replica acks to the right node.
+        //   2. Push its own writes into `peer_scanner` so replicas pulling
+        //      from `PEER_FEEDER` actually receive entries (`replicate_entry`).
+        //
+        // Here we ensure step 1: every known electable peer in the group
+        // gets a `Feeder` entry.
+        {
+            let mut feeders = self.feeders.write();
+            // Drop any stale feeders left over from a prior role.  A
+            // `Feeder` is just an in-memory tracker; recreating it is
+            // cheap and avoids state inversion bugs across role changes.
+            feeders.clear();
+            for peer in self.group_service.get_all_nodes() {
+                if peer.name == self.config.node_name {
+                    continue;
+                }
+                if peer.node_type != crate::node_type::NodeType::Electable
+                    && peer.node_type != crate::node_type::NodeType::Secondary
+                {
+                    // Arbiters do not receive log entries.
+                    continue;
+                }
+                feeders.push(Feeder::new(peer.name.clone()));
+                log::debug!(
+                    "Node '{}' (master, term={}): registered Feeder for \
+                     replica '{}'",
                     self.config.node_name.as_str(),
-                    replica_name,
+                    term,
+                    peer.name,
                 );
             }
         }
+
+        // For observability, log the count.
+        log::info!(
+            "Node '{}' became master for term {} \
+             (feeder trackers: {} known replicas)",
+            self.config.node_name.as_str(),
+            term,
+            self.feeders.read().len(),
+        );
+
         // -------------------------------------------------------------------
 
         // Notify listeners
         self.notify_listeners(old_state, NodeState::Master);
 
-        log::info!(
-            "Node '{}' became master for term {}",
-            self.config.node_name.as_str(),
-            term
-        );
         Ok(())
     }
 
@@ -1274,6 +1322,42 @@ impl ReplicatedEnvironment {
     /// by the master after it writes a replicated log entry.
     pub fn register_vlsn(&self, vlsn: u64, file_number: u32, file_offset: u32) {
         self.vlsn_index.register(vlsn, file_number, file_offset);
+    }
+
+    /// Replicate a freshly committed log entry from the master.
+    ///
+    /// Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    ///
+    /// Combines `register_vlsn` with a push into the in-memory
+    /// `peer_scanner` so that downstream replicas pulling from this
+    /// node's `PEER_FEEDER` service (via `catch_up_from_peer`) can
+    /// stream the entry without round-tripping through the on-disk
+    /// log.  The local log is still the source of truth; the peer
+    /// scanner is a fast-path cache that bounds itself via
+    /// `PeerLogScanner::with_capacity` so old entries are evicted.
+    ///
+    /// Should be called by the master after the local commit has
+    /// fsynced.  Calling on a non-master is harmless (the peer
+    /// scanner cache is also used by replicas) but is logged at trace
+    /// level for diagnostics.
+    pub fn replicate_entry(
+        &self,
+        vlsn: u64,
+        file_number: u32,
+        file_offset: u32,
+        entry_type: u8,
+        data: Vec<u8>,
+    ) {
+        self.vlsn_index.register(vlsn, file_number, file_offset);
+        self.peer_scanner.push(vlsn, entry_type, data);
+        if !self.is_master() {
+            log::trace!(
+                "replicate_entry called on non-master node '{}': vlsn={}, type={}",
+                self.config.node_name,
+                vlsn,
+                entry_type,
+            );
+        }
     }
 
     /// Apply a replicated entry (as replica).
