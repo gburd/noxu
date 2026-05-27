@@ -25,6 +25,7 @@ the replication test-harness sprint.
 `#[ignore]`'d).
 
 **Symptom (before):**
+
 ```rust
 let store = EntityStore::open(
     &env,
@@ -55,9 +56,11 @@ read-only reopen path. The same pattern was already used by
 DB consistent.
 
 **Tests now passing (no longer `#[ignore]`):**
+
 - `tck_persist_read_only_store_reopens_without_allow_create`
 
 **Tests added for additional coverage:**
+
 - `tck_persist_read_only_reopen_get_succeeds_after_close` — exercises
   `pi.get(...)` after a read-only reopen and asserts the persisted
   values come back, plus confirms `None` for a key that was never
@@ -69,6 +72,7 @@ DB consistent.
   read-only flag).
 
 **Files touched:**
+
 - `crates/noxu-persist/src/entity_store.rs` (15 LoC + extensive doc)
 - `crates/noxu-persist/tests/tck_persist_operations.rs` (removed
   `#[ignore]`, added two coverage tests)
@@ -108,6 +112,7 @@ deliberately omitted — see deferral list.
 ### 3.3 `noxu-bind` polish
 
 Cross-checked `crates/noxu-bind/`:
+
 - 324 unit tests, 9 doc-tests, 12 integration tests, 12 TCK tests, 51
   property tests — all green, zero `#[ignore]`'d entries.
 - No `TODO` / `FIXME` markers in `src/`.
@@ -120,6 +125,7 @@ Cross-checked `crates/noxu-bind/`:
 ### 3.4 `noxu-collections` polish
 
 Cross-checked `crates/noxu-collections/`:
+
 - 4 unit tests, 13 integration tests, 12 TCK tests, plus the wave-2b
   typed-collection suite — all green, zero `#[ignore]`'d entries.
 - No `TODO` / `FIXME` markers in `src/`.
@@ -135,6 +141,7 @@ classes are deliberately omitted (covered by iterators on
 ### 3.5 `noxu-cleaner` polish
 
 Cross-checked `crates/noxu-cleaner/`:
+
 - 312 unit tests, 34 integration tests — all green, zero `#[ignore]`'d
   entries.
 - No `TODO` / `FIXME` markers in `src/`.
