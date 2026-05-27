@@ -103,3 +103,74 @@ fn je_file_manager_list_only_returns_ndb_files() {
     let nums = fm.list_file_numbers().unwrap();
     assert_eq!(2, nums.len(), "expected exactly the two .ndb files: {nums:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FileManagerTest.testFlipFile  (wave 10-A)
+//
+// JE invariant: `FileManager.flipFile()` advances the current file
+// number by exactly one and the new file number is observable via the
+// listing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn je_file_manager_flip_file_creates_next_file() {
+    let dir = TempDir::new().unwrap();
+    let fm = make_fm(&dir);
+
+    // Create initial file 0 (empty header) so flip_file has something to
+    // flip from.
+    fm.create_file(0).unwrap();
+    let initial = fm.get_current_file_num();
+    let next = fm.flip_file().unwrap();
+    assert_eq!(initial + 1, next, "flip_file should advance by 1");
+    assert_eq!(next, fm.get_current_file_num());
+
+    // Both files appear in the listing.
+    let mut nums = fm.list_file_numbers().unwrap();
+    nums.sort_unstable();
+    assert!(nums.contains(&initial));
+    assert!(nums.contains(&next));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FileManagerTest.testTruncatedHeader  (wave 10-A)
+//
+// JE invariant: opening a log file whose header has been truncated
+// short of the FileHeader length must fail rather than silently return
+// a half-initialized handle.  JE throws ChecksumException; noxu surfaces
+// a `LogError` (the exact variant depends on whether the truncation
+// trips the EOF read or the header validation, both of which produce
+// an Err return).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn je_file_manager_get_handle_rejects_truncated_header() {
+
+    let dir = TempDir::new().unwrap();
+    {
+        let fm = make_fm(&dir);
+    let _fh = fm.create_file(0).unwrap();
+        let _ = _fh; // mark used; don't depend on Debug
+        // Drop the FileManager to release the cached handle so we can
+        // truncate the underlying file out from under any open Fd.
+    }
+
+    // Truncate file 0 to half its header length.
+    let path = dir.path().join("00000000.ndb");
+    let truncated_len: u64 = noxu_log::file_manager::first_log_entry_offset() as u64 / 2;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    f.set_len(truncated_len).unwrap();
+    drop(f);
+
+    // Re-open FileManager and try to get the handle.
+    let fm = make_fm(&dir);
+    let result = fm.get_file_handle(0);
+    assert!(
+        result.is_err(),
+        "get_file_handle on truncated header must fail",
+    );
+}
