@@ -377,7 +377,11 @@ fn je_negatives_release_unrelated_lsn_is_noop() {
     // Lock 1 should still be held: a non-blocking write by someone else
     // must fail.
     let r = lm.lock(lsn, 11, LockType::Write, true, false);
-    assert!(r.is_err(), "concurrent write must fail while reader holds: {:?}", r);
+    assert!(
+        r.is_err(),
+        "concurrent write must fail while reader holds: {:?}",
+        r
+    );
 }
 
 // JE: testNegatives — release by non-owner is a no-op
@@ -421,11 +425,7 @@ fn je_upgrade_read_to_write_same_locker() {
     // After upgrade, a concurrent read by another txn must fail (write
     // exclusive).
     let r = lm.lock(lsn, 11, LockType::Read, true, false);
-    assert!(
-        r.is_err(),
-        "after upgrade, concurrent read must fail: {:?}",
-        r
-    );
+    assert!(r.is_err(), "after upgrade, concurrent read must fail: {:?}", r);
 }
 
 // JE: testMultipleReaders — three concurrent readers share a lock

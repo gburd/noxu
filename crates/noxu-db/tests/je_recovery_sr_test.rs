@@ -64,7 +64,10 @@ fn record_count(db: &noxu_db::Database) -> u64 {
 
 const NUM_RECS: u32 = 50;
 
-fn assert_data_matches(db: &noxu_db::Database, expected: &[(Vec<u8>, Vec<u8>)]) {
+fn assert_data_matches(
+    db: &noxu_db::Database,
+    expected: &[(Vec<u8>, Vec<u8>)],
+) {
     let actual = collect_all_kv(db);
     assert_eq!(
         actual.len(),
@@ -230,9 +233,8 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
 
         // Pre-recovery: original value must still be visible.
         let mut out = DatabaseEntry::new();
-        let s = db
-            .get(None, &DatabaseEntry::from_bytes(b"k"), &mut out)
-            .unwrap();
+        let s =
+            db.get(None, &DatabaseEntry::from_bytes(b"k"), &mut out).unwrap();
         assert_eq!(s, OperationStatus::Success);
         assert_eq!(out.get_data().unwrap(), b"committed");
 
@@ -243,9 +245,7 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
     // Recovery: reopen and verify the same.
     let (env2, db2) = open_env_db(&path, "sr9752p1", false);
     let mut out2 = DatabaseEntry::new();
-    let s = db2
-        .get(None, &DatabaseEntry::from_bytes(b"k"), &mut out2)
-        .unwrap();
+    let s = db2.get(None, &DatabaseEntry::from_bytes(b"k"), &mut out2).unwrap();
     assert_eq!(s, OperationStatus::Success);
     assert_eq!(
         out2.get_data().unwrap(),

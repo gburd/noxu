@@ -20,9 +20,8 @@ fn open_env_db(
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(cfg).unwrap();
-    let dbcfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, name, &dbcfg).unwrap();
     (env, db)
 }
@@ -116,13 +115,8 @@ fn dbcursor_delete_records_matching_predicate() {
 fn dbcursor_delete_all_via_walk_empties_db() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir, "del_all");
-    let pairs: &[(&[u8], &[u8])] = &[
-        (b"a", b"1"),
-        (b"b", b"2"),
-        (b"c", b"3"),
-        (b"d", b"4"),
-        (b"e", b"5"),
-    ];
+    let pairs: &[(&[u8], &[u8])] =
+        &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4"), (b"e", b"5")];
     put_simple(&db, pairs);
 
     let keys = collect_keys(&db);
@@ -197,8 +191,7 @@ fn dbcursor_put_current_after_delete_does_not_revive() {
     // putCurrent must NOT revive the deleted slot.
     let r = c.put(&k, &DatabaseEntry::from_bytes(b"new"), Put::Current);
     assert!(
-        r.is_err()
-            || matches!(r, Ok(OperationStatus::NotFound)),
+        r.is_err() || matches!(r, Ok(OperationStatus::NotFound)),
         "put_current after delete must not succeed: got {:?}",
         r
     );

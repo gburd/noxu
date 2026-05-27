@@ -22,7 +22,11 @@ fn open_env(dir: &Path) -> noxu_db::Environment {
     noxu_db::Environment::open(cfg).unwrap()
 }
 
-fn open_db(env: &noxu_db::Environment, name: &str, dups: bool) -> noxu_db::Database {
+fn open_db(
+    env: &noxu_db::Environment,
+    name: &str,
+    dups: bool,
+) -> noxu_db::Database {
     let cfg = DatabaseConfig::new()
         .with_allow_create(true)
         .with_transactional(true)
@@ -109,9 +113,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
 
     for (k, v) in &expected {
         let mut out = DatabaseEntry::new();
-        let s = db
-            .get(None, &DatabaseEntry::from_bytes(k), &mut out)
-            .unwrap();
+        let s = db.get(None, &DatabaseEntry::from_bytes(k), &mut out).unwrap();
         assert_eq!(
             s,
             OperationStatus::Success,
@@ -221,7 +223,7 @@ fn run_sr8984(same_key: bool) {
 
         // Re-insert: same data (Part 1) or fresh data (Part 2).
         let first_data = if same_key {
-            d1.clone()
+            DatabaseEntry::from_bytes(b"d1")
         } else {
             DatabaseEntry::from_bytes(b"d2")
         };
@@ -256,7 +258,7 @@ fn run_sr8984(same_key: bool) {
     assert_eq!(s, OperationStatus::Success);
     let count_via_cursor = c.count().unwrap();
     assert_eq!(
-        count_via_cursor as u64, post_count,
+        count_via_cursor, post_count,
         "cursor.count() on the dup chain must equal db.count()"
     );
     drop(c);

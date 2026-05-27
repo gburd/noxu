@@ -111,9 +111,8 @@ fn database_zero_length_data_round_trip_with_recovery() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "zero_len", &db_cfg).unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
@@ -155,18 +154,10 @@ fn database_delete_non_dup() {
 
         let mut out = DatabaseEntry::new();
         let s = db.get(Some(&txn), &k, &mut out).unwrap();
-        assert_eq!(
-            s,
-            OperationStatus::NotFound,
-            "get after delete on key {i}"
-        );
+        assert_eq!(s, OperationStatus::NotFound, "get after delete on key {i}");
 
         let s = db.delete(Some(&txn), &k).unwrap();
-        assert_eq!(
-            s,
-            OperationStatus::NotFound,
-            "second delete on key {i}"
-        );
+        assert_eq!(s, OperationStatus::NotFound, "second delete on key {i}");
     }
     txn.commit().unwrap();
 }
@@ -297,12 +288,25 @@ fn database_put_no_dup_data_rejects_exact_pair() {
         let k = ikey(i);
         let d = ikey(i);
         let s = c.put(&k, &d, Put::NoDupData).unwrap();
-        assert_eq!(s, OperationStatus::Success, "first NoDupData on (k{i},d{i})");
+        assert_eq!(
+            s,
+            OperationStatus::Success,
+            "first NoDupData on (k{i},d{i})"
+        );
         let s = c.put(&k, &d, Put::NoDupData).unwrap();
-        assert_eq!(s, OperationStatus::KeyExists, "duplicate NoDupData on (k{i},d{i})");
+        assert_eq!(
+            s,
+            OperationStatus::KeyExists,
+            "duplicate NoDupData on (k{i},d{i})"
+        );
         let d2 = ikey(i + 1);
         let s = c.put(&k, &d2, Put::NoDupData).unwrap();
-        assert_eq!(s, OperationStatus::Success, "different-data NoDupData on (k{i},d{}) ", i + 1);
+        assert_eq!(
+            s,
+            OperationStatus::Success,
+            "different-data NoDupData on (k{i},d{}) ",
+            i + 1
+        );
     }
     drop(c);
     txn.commit().unwrap();
