@@ -35,8 +35,8 @@ Sprint 1–3 restriction notes
 | `Environment::close()` after `txn.commit()`       | ✅ (Sprint 1) | ✅ | ✅ |
 | `EnvironmentConfig::durability` honoured          | ✅ (Sprint 1) | ✅ | ✅ |
 | `TransactionConfig::read_uncommitted` honoured    | ✅ (Sprint 1) | ✅ | ✅ |
-| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ |
-| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ |
+| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ (wave 3-2) |
+| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ (wave 3-2) |
 | Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ | ✅ |
 | Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ | ✅ |
 | `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
