@@ -382,27 +382,19 @@ mod tests {
     ///   pk2 → b"AC"  (first byte 'A', last byte 'C')
     ///   pk3 → b"XB"  (first byte 'X', last byte 'B')
     ///
-    /// sec1 (first byte) at 'A' → {pk1, pk2}  (in the one-to-one model: pk1 only)
-    /// sec2 (last byte)  at 'B' → {pk1, pk3}  (in the one-to-one model: pk1 only)
+    /// sec1 (first byte) at 'A' → {pk1, pk2}
+    /// sec2 (last byte)  at 'B' → {pk1, pk3}
     /// Intersection → {pk1}
     ///
-    /// Decision 1B (`docs/src/internal/v1.5-decisions-2026-05.md`):
-    /// v1.5 secondaries are one-to-one, so the second primary that
-    /// resolves to the same secondary key now returns
-    /// `NoxuError::Unsupported` from `update_secondary` rather than
-    /// silently overwriting (audit finding C4).  This test exercises a
-    /// JoinCursor over distinct primaries that share secondary keys —
-    /// the v1.6 sorted-dup feature.  Re-enable when sorted-dup
-    /// secondaries land (audit finding F7).
+    /// v1.6 / wave 2A step 2: sorted-dup secondaries store every
+    /// (sec_key, pri_key) pair so JoinCursor's duplicate-set walk
+    /// finds the true intersection (closes audit finding F7).
     #[test]
-    #[ignore = "requires v1.6 sorted-dup secondaries; see Decision 1B / audit F7"]
     fn test_join_intersection_finds_single_match() {
         let fix = Fixture::new();
-        // In the one-to-one model sec1['A'] stores the last inserted 'A' record.
-        // Insert pk1 last so it is the record held by sec1['A'] and sec2['B'].
+        fix.insert(b"pk1", b"AB");
         fix.insert(b"pk2", b"AC");
         fix.insert(b"pk3", b"XB");
-        fix.insert(b"pk1", b"AB");
 
         let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
         {

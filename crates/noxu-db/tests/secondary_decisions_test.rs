@@ -913,3 +913,141 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
         OperationStatus::NotFound
     );
 }
+
+// ─── Wave 2A step 2 — multi-dup walk via SecondaryCursor ───────────
+
+/// Many-to-one read-back: 5 primaries all share the same secondary
+/// key; iterate them via SecondaryCursor::get_next_dup_record and
+/// verify all five are reachable in sorted-pri-key order.
+#[test]
+fn wave2a_step2_many_to_one_cursor_walk() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    // Insert five primaries that all share the same first byte ('A').
+    let pris: &[(&[u8], &[u8])] = &[
+        (b"pk1", b"Apple"),
+        (b"pk2", b"Apricot"),
+        (b"pk3", b"Avocado"),
+        (b"pk4", b"Almond"),
+        (b"pk5", b"Acorn"),
+    ];
+    for (pk, val) in pris {
+        let pk_e = DatabaseEntry::from_bytes(pk);
+        let v_e = DatabaseEntry::from_bytes(val);
+        primary.lock().put(None, &pk_e, &v_e).unwrap();
+        sec.update_secondary(None, &pk_e, None, Some(&v_e)).unwrap();
+    }
+
+    // Inner index has 5 dups of 'A'.
+    assert_eq!(sec.count().unwrap(), 5);
+
+    // Walk all dups for sec_key 'A'.
+    let mut cur = sec.open_cursor(None, None).unwrap();
+    let mut sec_key = DatabaseEntry::new();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+
+    let st = cur
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    let mut found_pks: Vec<Vec<u8>> = vec![p_key.get_data().unwrap().to_vec()];
+
+    while cur
+        .get_next_dup_record(&mut sec_key, &mut p_key, &mut data)
+        .unwrap()
+        == OperationStatus::Success
+    {
+        found_pks.push(p_key.get_data().unwrap().to_vec());
+    }
+
+    // All five primaries must be present (sorted-dup orders by pri_key).
+    let mut expected: Vec<Vec<u8>> =
+        pris.iter().map(|(pk, _)| pk.to_vec()).collect();
+    expected.sort();
+    found_pks.sort();
+    assert_eq!(found_pks, expected);
+}
+
+/// Deleting one primary leaves the remaining four duplicates of the
+/// same secondary key intact.
+#[test]
+fn wave2a_step2_delete_one_primary_leaves_others() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pris: &[(&[u8], &[u8])] = &[
+        (b"pk1", b"Apple"),
+        (b"pk2", b"Apricot"),
+        (b"pk3", b"Avocado"),
+    ];
+    for (pk, val) in pris {
+        let pk_e = DatabaseEntry::from_bytes(pk);
+        let v_e = DatabaseEntry::from_bytes(val);
+        primary.lock().put(None, &pk_e, &v_e).unwrap();
+        sec.update_secondary(None, &pk_e, None, Some(&v_e)).unwrap();
+    }
+    assert_eq!(sec.count().unwrap(), 3);
+
+    // Delete only pk2's secondary entry.
+    let pk2 = DatabaseEntry::from_bytes(b"pk2");
+    let v2 = DatabaseEntry::from_bytes(b"Apricot");
+    sec.update_secondary(None, &pk2, Some(&v2), None).unwrap();
+    primary.lock().delete(None, &pk2).unwrap();
+
+    // Two duplicates of 'A' remain (pk1, pk3).
+    assert_eq!(sec.count().unwrap(), 2);
+
+    let mut found_pks: Vec<Vec<u8>> = Vec::new();
+    let mut cur = sec.open_cursor(None, None).unwrap();
+    let mut sec_key = DatabaseEntry::new();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = cur
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    found_pks.push(p_key.get_data().unwrap().to_vec());
+    while cur
+        .get_next_dup_record(&mut sec_key, &mut p_key, &mut data)
+        .unwrap()
+        == OperationStatus::Success
+    {
+        found_pks.push(p_key.get_data().unwrap().to_vec());
+    }
+    found_pks.sort();
+    assert_eq!(
+        found_pks,
+        vec![b"pk1".to_vec(), b"pk3".to_vec()],
+        "deleting pk2 must leave pk1 and pk3 reachable under sec_key 'A'"
+    );
+}

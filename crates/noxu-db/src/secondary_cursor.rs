@@ -348,6 +348,40 @@ impl<'a> SecondaryCursor<'a> {
         Ok(OperationStatus::Success)
     }
 
+    /// Advances to the next record that shares the **same** secondary key
+    /// as the current cursor position — the next sorted duplicate
+    /// primary key for `sec_key`.
+    ///
+    /// Mirrors JE's `SecondaryCursor.getNextDup`.  When the cursor is
+    /// positioned on the last duplicate of a sec_key (or on a sec_key
+    /// with only one duplicate) returns `OperationStatus::NotFound`
+    /// without moving the cursor.
+    ///
+    /// On success `key`, `p_key`, `data` are populated with the new
+    /// triple just like [`Self::get_next`].  Reads run under the
+    /// cursor's stored txn (see [`SecondaryDatabase::open_cursor`]).
+    pub fn get_next_dup_record(
+        &mut self,
+        key: &mut DatabaseEntry,
+        p_key: &mut DatabaseEntry,
+        data: &mut DatabaseEntry,
+    ) -> Result<OperationStatus> {
+        self.get_with_mode(key, p_key, data, Get::NextDup)
+    }
+
+    /// Steps to the previous record that shares the **same** secondary
+    /// key as the current cursor position — the previous sorted
+    /// duplicate primary key.  Mirrors JE's
+    /// `SecondaryCursor.getPrevDup`.
+    pub fn get_prev_dup(
+        &mut self,
+        key: &mut DatabaseEntry,
+        p_key: &mut DatabaseEntry,
+        data: &mut DatabaseEntry,
+    ) -> Result<OperationStatus> {
+        self.get_with_mode(key, p_key, data, Get::PrevDup)
+    }
+
     /// Closes the cursor.
     pub fn close(&mut self) -> Result<()> {
         self.inner.close()
@@ -411,9 +445,10 @@ impl<'a> SecondaryCursor<'a> {
     }
 
     /// Returns an estimate of the number of primary keys that share the
-    /// current secondary key.  In the current one-to-one secondary model
-    /// this is always 0 or 1; with duplicate support it will reflect the
-    /// actual duplicate count.
+    /// current secondary key.  With sorted-dup secondaries (v1.6) this
+    /// reflects the actual duplicate count at the cursor's current
+    /// position; the underlying `Cursor::count()` walks the duplicate
+    /// set via PrevDup/NextDup.
     pub(crate) fn count_estimate(&mut self) -> u64 {
         self.inner.count().unwrap_or_default()
     }
@@ -421,31 +456,22 @@ impl<'a> SecondaryCursor<'a> {
     /// Advances to the next record that has the **same** secondary key as
     /// the current position (i.e. the next "duplicate").
     ///
-    /// In the current one-to-one secondary model the cursor stores exactly
-    /// one primary key per secondary key, so this always returns
-    /// `NotFound`.  When full duplicate support is added this will iterate
-    /// the duplicate set.
+    /// With sorted-dup secondaries this iterates the next primary key
+    /// stored under the current secondary key.  `OperationStatus::NotFound`
+    /// when there are no more duplicates.
     pub(crate) fn get_next_dup(&mut self) -> Result<OperationStatus> {
-        let Some(current_sk) = self.get_current_sec_key_bytes()? else {
-            return Ok(OperationStatus::NotFound);
-        };
         let mut sec_key = DatabaseEntry::new();
         let mut pri_key_entry = DatabaseEntry::new();
-        let status = self.inner.get(
+        match self.inner.get(
             &mut sec_key,
             &mut pri_key_entry,
-            Get::Next,
+            Get::NextDup,
             None,
-        )?;
-        if status != OperationStatus::Success {
-            return Ok(OperationStatus::NotFound);
-        }
-        let new_sk = sec_key.get_data().map(|d| d.to_vec()).unwrap_or_default();
-        if new_sk == current_sk {
-            Ok(OperationStatus::Success)
-        } else {
-            // Stepped onto a different secondary key — not a duplicate.
-            Ok(OperationStatus::NotFound)
+        ) {
+            Ok(OperationStatus::Success) => Ok(OperationStatus::Success),
+            Ok(_) => Ok(OperationStatus::NotFound),
+            // Cursor is uninitialised — treat as "no dup".
+            Err(_) => Ok(OperationStatus::NotFound),
         }
     }
 
