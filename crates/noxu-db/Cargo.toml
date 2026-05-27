@@ -21,6 +21,7 @@ noxu-cleaner = { workspace = true }
 noxu-dbi = { workspace = true }
 noxu-engine = { workspace = true }
 noxu-log = { workspace = true }
+noxu-recovery = { workspace = true }
 noxu-txn = { workspace = true }
 noxu-util = { workspace = true }
 noxu-config = { workspace = true }

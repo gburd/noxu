@@ -22,6 +22,68 @@ use crate::log_scanner::InRecord;
 use hashbrown::{HashMap, HashSet};
 use noxu_util::{Lsn, NULL_LSN};
 
+/// A single LN entry queued for replay when a recovered prepared
+/// transaction is committed via `xa_commit(xid)`.
+///
+/// Stored as owned bytes so the recovered prepared-txn list outlives
+/// the file-mmap region that the analysis pass scanned.  This pays a
+/// `Vec` allocation per prepared LN at recovery time, which is
+/// acceptable given that prepared transactions are bounded in size by
+/// the application’s XA workflow.
+///
+/// Wave 3-2 of the v1.5+ remediation plan.
+#[derive(Debug, Clone)]
+pub struct PreparedLnReplay {
+    /// Database id this LN belongs to.
+    pub db_id: u64,
+    /// LSN where this LN was originally logged.
+    pub original_lsn: Lsn,
+    /// LN operation: insert, update, or delete.
+    pub operation: PreparedLnOperation,
+    /// LN key.
+    pub key: Vec<u8>,
+    /// LN value (`None` for deletes).
+    pub data: Option<Vec<u8>>,
+}
+
+/// LN operation type for a prepared-txn replay record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedLnOperation {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Information about a transaction that was found prepared (XA phase 1
+/// completed) but not yet committed or rolled back.
+///
+/// Surfaced to the XA layer via
+/// `RecoveryInfo::recovered_prepared_txns()` so that `xa_recover()` can
+/// return the in-doubt XIDs and a subsequent `xa_commit(xid)` /
+/// `xa_rollback(xid)` can resolve the transaction.
+///
+/// Wave 3-2 of the v1.5+ remediation plan.
+#[derive(Debug, Clone)]
+pub struct PreparedTxnInfo {
+    /// Transaction id of the prepared transaction.
+    pub txn_id: u64,
+    /// LSN of the `TxnPrepare` frame.  `xa_commit` writes a `TxnCommit`
+    /// at a fresh LSN; this LSN is retained for diagnostics.
+    pub prepare_lsn: Lsn,
+    /// LSN of the first LN logged by this transaction (NULL_LSN if none).
+    pub first_lsn: Lsn,
+    /// LSN of the last LN logged before the prepare frame.  Used to bound
+    /// the WAL re-scan that replays the prepared txn’s writes during
+    /// `xa_commit` resolution.
+    pub last_lsn: Lsn,
+    /// XID format identifier (-1 == null).
+    pub xid_format_id: i32,
+    /// XID global transaction id (0..=64 bytes).
+    pub xid_gtrid: Vec<u8>,
+    /// XID branch qualifier (0..=64 bytes).
+    pub xid_bqual: Vec<u8>,
+}
+
 /// Key that uniquely identifies a dirty IN across databases.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirtyInKey {
@@ -69,6 +131,19 @@ pub struct AnalysisResult {
     /// In `RecoveryManager.java`.
     pub aborted_txns: HashSet<u64>,
 
+    /// Prepared transaction IDs (XA phase 1 completed) -> per-txn info.
+    ///
+    /// A txn lands here when the analysis pass sees its `TxnPrepare`
+    /// frame.  It is REMOVED from this map (and added to
+    /// `committed_txns` or `aborted_txns`) if a subsequent `TxnCommit`
+    /// / `TxnAbort` is seen — the prepare is then resolved cleanly and
+    /// no special handling is needed.  Transactions left in this map
+    /// after the analysis pass are in-doubt and must be surfaced to
+    /// the XA layer.
+    ///
+    /// Wave 3-2 of the v1.5+ remediation plan.
+    pub prepared_txns: HashMap<u64, PreparedTxnInfo>,
+
     /// Transaction IDs seen in the recovery interval that have neither
     /// committed nor aborted — i.e., active at crash time, must be undone.
     ///
@@ -112,6 +187,7 @@ impl AnalysisResult {
             dirty_ins: HashMap::new(),
             committed_txns: HashMap::new(),
             aborted_txns: HashSet::new(),
+            prepared_txns: HashMap::new(),
             active_txn_ids: HashSet::new(),
             max_node_id: 0,
             max_db_id: 0,
@@ -155,6 +231,9 @@ impl AnalysisResult {
         }
         self.committed_txns.insert(txn_id, commit_lsn);
         self.active_txn_ids.remove(&txn_id);
+        // A commit AFTER a prepare resolves the in-doubt txn cleanly —
+        // remove from prepared so it does NOT appear in xa_recover.
+        self.prepared_txns.remove(&txn_id);
     }
 
     /// Record an aborted transaction.
@@ -164,6 +243,24 @@ impl AnalysisResult {
         }
         self.aborted_txns.insert(txn_id);
         self.active_txn_ids.remove(&txn_id);
+        self.prepared_txns.remove(&txn_id);
+    }
+
+    /// Record a prepared transaction (`TxnPrepare` frame seen).
+    ///
+    /// The txn is removed from `active_txn_ids` (it is not active any
+    /// more — it is in-doubt), and added to `prepared_txns`.  If a
+    /// later `record_commit` or `record_abort` is called for the same
+    /// id, the entry is removed from `prepared_txns` and the txn is
+    /// considered cleanly resolved.
+    ///
+    /// Wave 3-2 of the v1.5+ remediation plan.
+    pub fn record_prepare(&mut self, info: PreparedTxnInfo) {
+        if info.txn_id > self.max_txn_id {
+            self.max_txn_id = info.txn_id;
+        }
+        self.active_txn_ids.remove(&info.txn_id);
+        self.prepared_txns.insert(info.txn_id, info);
     }
 
     /// Record a transactional LN seen during analysis (txn neither committed
@@ -193,10 +290,19 @@ impl AnalysisResult {
         self.aborted_txns.contains(&txn_id)
     }
 
+    /// Returns `true` if `txn_id` was prepared (XA phase 1 completed)
+    /// and not yet resolved.  These transactions are reported by
+    /// `xa_recover()` and require explicit `xa_commit` / `xa_rollback`.
+    pub fn is_prepared(&self, txn_id: u64) -> bool {
+        self.prepared_txns.contains_key(&txn_id)
+    }
+
     /// Returns `true` if `txn_id` was neither committed nor aborted
     /// (active at crash time, must be undone).
     pub fn is_active(&self, txn_id: u64) -> bool {
-        !self.is_committed(txn_id) && !self.is_aborted(txn_id)
+        !self.is_committed(txn_id)
+            && !self.is_aborted(txn_id)
+            && !self.is_prepared(txn_id)
     }
 
     /// Number of dirty INs tracked.
