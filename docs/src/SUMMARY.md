@@ -145,3 +145,4 @@
   - [Sprint 3 — XA scope restriction](internal/sprint-3-xa-restriction.md)
   - [API audit (2026-05) — noxu-rep](internal/api-audit-2026-05-rep.md)
   - [JE port audit (2026-05) — Overview](internal/je-port-audit-2026-05-overview.md)
+  - [Wave 10-E — crates.io publication prep](internal/wave-10-e-cratesio-prep.md)
