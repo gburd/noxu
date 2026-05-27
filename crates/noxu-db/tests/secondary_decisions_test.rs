@@ -487,6 +487,93 @@ fn c3_primary_delete_preserves_other_dups() {
     assert_eq!(p_key.get_data().unwrap(), b"pk2");
 }
 
+/// v1.6 (audit C3 / step 6): updating an existing primary record so
+/// it produces a different secondary key removes the stale entry and
+/// installs the new one in a single auto-maintained call.
+#[test]
+fn c3_primary_update_swaps_secondary_key() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Mango"))
+        .unwrap();
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Pineapple"))
+        .unwrap();
+
+    // Old sec_key ‘M’ must be gone.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"M"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+
+    // New sec_key ‘P’ must point at pk1.
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"P"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Pineapple");
+
+    // Exactly one row in the index.
+    assert_eq!(sec.count().unwrap(), 1);
+}
+
+/// Updating with the same secondary key (no swap) is idempotent
+/// w.r.t. the index — the count stays at 1 and the same primary still
+/// resolves through the same sec_key.
+#[test]
+fn c3_primary_update_same_sec_key_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Apple"))
+        .unwrap();
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Avocado"))
+        .unwrap();
+    assert_eq!(sec.count().unwrap(), 1);
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Avocado");
+}
+
 // ─── Decision 2C — FK config rejected at open ──────────────────────────
 
 /// Setting `foreign_key_database` on a `SecondaryConfig` causes
