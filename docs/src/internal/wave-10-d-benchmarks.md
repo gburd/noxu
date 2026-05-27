@@ -88,7 +88,7 @@ follow-up work in the Caveats section below rather than rushed in.
 full publishable table.  Numbers below are the JE / Noxu ratios — >1
 means JE wins.)
 
-```
+```text
 Workload                   Noxu ops/s    JE ops/s    JE/Noxu
 w01_seq_write                    1709         628       0.37   ← Noxu 2.7×
 w02_rand_write                   1698        1745       1.03
