@@ -98,6 +98,20 @@ pub struct Database {
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
     write_no_sync: bool,
+    /// Registered secondary indexes that automatically maintain themselves
+    /// when this primary is written.  v1.6 (Decision 1B / audit C3 — the
+    /// associate()-style hook): every [`SecondaryDatabase`] opened against
+    /// this primary downgrades its `Arc<SecondaryHookState>` to a
+    /// `Weak<dyn SecondaryHook>` and pushes it here.  `Database::put` and
+    /// `Database::delete` walk the list under the same caller-supplied
+    /// txn so primary writes and secondary index updates commit / abort
+    /// atomically.
+    ///
+    /// Stored behind an `Arc<RwLock<…>>` (rather than directly on the
+    /// `Database` body) so registrations performed through one of the
+    /// `Arc<Mutex<Database>>` clones the user typically holds become
+    /// visible to every other clone of the same primary.
+    pub(crate) secondaries: Arc<RwLock<Vec<std::sync::Weak<dyn crate::secondary_database::SecondaryHook + Send + Sync>>>>,
 }
 
 /// State of a database handle.
@@ -402,6 +416,7 @@ impl Database {
             txn_manager,
             no_sync,
             write_no_sync,
+            secondaries: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -976,6 +991,47 @@ impl Database {
     ///
     pub fn get_config(&self) -> &DatabaseConfig {
         &self.config
+    }
+
+    /// Registers a secondary index for automatic maintenance.
+    ///
+    /// v1.6 (audit C3 — associate() hook): every [`SecondaryDatabase`]
+    /// downgrades its inner `Arc<SecondaryHookState>` to a `Weak` and
+    /// stores it here.  Subsequent `put` / `delete` calls iterate the
+    /// list and forward the same txn to every live secondary, dropping
+    /// dead `Weak` entries on the fly.
+    pub(crate) fn register_secondary(
+        &self,
+        hook: std::sync::Weak<
+            dyn crate::secondary_database::SecondaryHook + Send + Sync,
+        >,
+    ) {
+        let mut guard = self.secondaries.write();
+        // Compact dead Weak entries lazily on every registration so the
+        // list does not grow unboundedly with churn.
+        guard.retain(|w| w.strong_count() > 0);
+        guard.push(hook);
+    }
+
+    /// Returns a snapshot of every live registered secondary.  Used by
+    /// the automatic-maintenance plumbing in `put` / `delete` to drive
+    /// secondaries without holding the registry lock across the
+    /// secondary call.  Dead `Weak` entries are dropped from the
+    /// returned list (and — because we re-acquire the registry write
+    /// lock at registration time — lazily compacted from the registry
+    /// itself).
+    pub(crate) fn live_secondaries(
+        &self,
+    ) -> Vec<
+        Arc<
+            dyn crate::secondary_database::SecondaryHook + Send + Sync,
+        >,
+    > {
+        self.secondaries
+            .read()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect()
     }
 
     /// Returns an approximate count of records in the database.
