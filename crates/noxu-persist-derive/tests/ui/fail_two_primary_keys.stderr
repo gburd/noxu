@@ -1,0 +1,11 @@
+error: multiple `#[primary_key]` fields are not supported; use `#[derive(PrimaryKey)]` on a composite key struct and reference it from a single primary-key field
+ --> tests/ui/fail_two_primary_keys.rs:7:5
+  |
+7 |     #[primary_key]
+  |     ^
+
+error: first `#[primary_key]` field is here
+ --> tests/ui/fail_two_primary_keys.rs:5:5
+  |
+5 |     #[primary_key]
+  |     ^

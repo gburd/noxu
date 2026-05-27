@@ -26,6 +26,7 @@ members = [
     "crates/noxu-bind",
     "crates/noxu-collections",
     "crates/noxu-persist",
+    "crates/noxu-persist-derive",
     "crates/noxu-rep",
     "crates/noxu-xa",
     "crates/noxu-observe",
@@ -73,6 +74,10 @@ path = "examples/collections.rs"
 [[example]]
 name = "persist"
 path = "examples/persist.rs"
+
+[[example]]
+name = "persist_derive"
+path = "examples/persist_derive.rs"
 
 [[example]]
 name = "secondary"
@@ -128,6 +133,7 @@ noxu-db = { path = "crates/noxu-db" }
 noxu-bind = { path = "crates/noxu-bind" }
 noxu-collections = { path = "crates/noxu-collections" }
 noxu-persist = { path = "crates/noxu-persist" }
+noxu-persist-derive = { path = "crates/noxu-persist-derive" }
 noxu-xa = { path = "crates/noxu-xa" }
 noxu-rep = { path = "crates/noxu-rep" }
 noxu-observe = { path = "crates/noxu-observe" }
