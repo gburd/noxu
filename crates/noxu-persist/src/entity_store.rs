@@ -193,7 +193,33 @@ impl<'env> EntityStore<'env> {
 
         if !self.databases.contains_key(&db_name) {
             let mut db_config = DatabaseConfig::new();
-            db_config.set_allow_create(self.config.allow_create);
+            // Wave 7 polish: align with JE's `EntityStore.open()` semantics
+            // for pure read-only reopens.  JE permits opening an existing
+            // entity store with `setReadOnly(true)` and *no*
+            // `setAllowCreate(true)` — the entity DBs are simply re-opened
+            // from the on-disk image.
+            //
+            // Noxu has no durable name->db_id catalog at recovery time, so
+            // the env's `open_database()` cannot resolve an existing entity
+            // DB by name without `allow_create=true`.  Recovery does
+            // re-materialise the on-disk B-tree (keyed by db_id), and the
+            // get_primary_index call sequence after reopen is deterministic
+            // (catalog -> entity), so the freshly-allocated db_id matches
+            // the recovered tree slot.
+            //
+            // We therefore force `allow_create=true` under the hood when
+            // the store was opened read-only.  The `read_only=true` flag on
+            // the underlying `DatabaseConfig` still rejects every write at
+            // the `Database::put` / `delete` boundary via
+            // `check_writable()` -> `NoxuError::ReadOnly`, so this is
+            // observably equivalent to JE's behaviour for callers.  See
+            // `tck_persist_read_only_store_reopens_without_allow_create`.
+            //
+            // The same pattern is already used by `ClassCatalog::open` for
+            // the catalog DB.
+            let effective_allow_create =
+                self.config.allow_create || self.config.read_only;
+            db_config.set_allow_create(effective_allow_create);
             db_config.set_read_only(self.config.read_only);
             db_config.set_transactional(self.config.transactional);
 
