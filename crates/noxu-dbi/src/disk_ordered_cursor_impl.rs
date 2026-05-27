@@ -1,6 +1,6 @@
 //! Disk-ordered cursor implementation.
 //!
-//! Sits behind the public [`noxu_db::DiskOrderedCursor`] API.  Spawns a
+//! Sits behind the public `noxu_db::DiskOrderedCursor` API.  Spawns a
 //! background producer thread that walks the log files sequentially, decodes
 //! LN entries that belong to the targeted databases, and pushes
 //! `(key, data)` tuples through a bounded channel for the consumer to drain

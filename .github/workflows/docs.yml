@@ -68,10 +68,13 @@ jobs:
           cargo install mdbook --version ${{ env.MDBOOK_VERSION }} --locked
           cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }} --locked
 
-      - name: Build book
+      - name: Build book (no site-url prefix — used for link check only)
         run: mdbook build docs/
         env:
-          MDBOOK_OUTPUT__HTML__SITE_URL: /noxu/
+          # Override book.toml's `site-url = "/noxu/"` so the rendered
+          # `<base href>` is empty.  Otherwise lychee resolves every
+          # local link relative to `/noxu/` and reports false positives.
+          MDBOOK_OUTPUT__HTML__SITE_URL: ''
 
       - name: Check links (lychee)
         uses: lycheeverse/lychee-action@v2
@@ -83,6 +86,11 @@ jobs:
             --exclude 'localhost'
             docs/book/**/*.html
           fail: true
+
+      - name: Re-build book with site-url for artifact upload
+        run: mdbook build docs/
+        env:
+          MDBOOK_OUTPUT__HTML__SITE_URL: /noxu/
 
       - name: Upload book artifact
         uses: actions/upload-artifact@v4

@@ -218,7 +218,7 @@ map.put(None, &b"key".to_vec(), &b"value".to_vec())?;
 
 The same pattern applies to `StoredSortedMap<K, V, KB, VB>`,
 `StoredKeySet<K, KB>`, `StoredValueSet<V, VB>`, and
-`StoredList<V, VB>`.  See [Collections and Persistence](../collections/README.md)
+`StoredList<V, VB>`.  See [Collections and Persistence](../collections/index.html)
 for the full surface.
 
 ## SerdeBinding version prefix (v1.5)

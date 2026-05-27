@@ -46,7 +46,7 @@ use crate::error::{RepError, Result};
 /// small enough that a hostile peer cannot use the field to OOM the master.
 ///
 /// Frames whose length prefix exceeds this bound are rejected before any
-/// allocation occurs (see [`handle_incoming`]).
+/// allocation occurs (see `handle_incoming`).
 pub const MAX_SERVICE_NAME_LEN: usize = 256;
 
 /// Callback for handling incoming connections on a named service.

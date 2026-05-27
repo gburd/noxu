@@ -162,7 +162,7 @@ below:
 ### Verification
 
 New tests in
-[`crates/noxu-db/tests/wave1a_f12_residuals_test.rs`](../../../../crates/noxu-db/tests/wave1a_f12_residuals_test.rs):
+[`crates/noxu-db/tests/wave1a_f12_residuals_test.rs`](https://codeberg.org/gregburd/noxu/src/branch/main/crates/noxu-db/tests/wave1a_f12_residuals_test.rs):
 
 1. `null_lsn_insert_race_two_auto_commit_inserts_serialise_through_lock_manager`
    — 64 rounds of two-thread brand-new-key races assert that exactly

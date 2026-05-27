@@ -150,7 +150,7 @@ impl LockManager {
 
     /// Registers a diagnostic label for `locker_id`.
     ///
-    /// Stored in [`Self::locker_labels`] and looked up by
+    /// Stored in `Self::locker_labels` and looked up by
     /// [`Self::format_locker`] when building deadlock / lock-timeout error
     /// messages.  Typical labels are `"txn"` (explicit transaction),
     /// `"auto-txn"` (synthetic auto-commit transaction created by

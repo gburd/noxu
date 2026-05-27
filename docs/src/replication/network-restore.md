@@ -2,7 +2,7 @@
 
 > **v1.5 status — broken on the dispatcher path.** See
 > [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> and [the chapter overview](README.md). The standalone `serve_raw`
+> and [the chapter overview](index.html). The standalone `serve_raw`
 > path used by the unit tests works; the path used by
 > `ReplicatedEnvironment` (via `TcpServiceDispatcher`) misinterprets
 > the 4-byte `NRST` magic as a 1.31 GiB length prefix and never
