@@ -98,6 +98,19 @@ pub struct Database {
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
     write_no_sync: bool,
+    /// Registry of secondary indexes attached to this primary.
+    ///
+    /// Each entry is a `Weak<SecondaryState>` to a `SecondaryDatabase`
+    /// opened against this primary.  The strong reference is held by
+    /// the user's `SecondaryDatabase` handle; when that handle is
+    /// dropped, the weak entry here dangles and is purged the next
+    /// time the primary iterates the registry.
+    ///
+    /// Wave 2A step 3 (associate-style hook plumbing): registry is
+    /// populated by `SecondaryDatabase::open`.  Steps 4–7 wire it
+    /// into `Database::put` / `Database::delete` so primary writes
+    /// fan out to every registered secondary inside the user's txn.
+    pub(crate) secondaries: Arc<Mutex<Vec<std::sync::Weak<crate::secondary_database::SecondaryState>>>>,
 }
 
 /// State of a database handle.
@@ -402,6 +415,7 @@ impl Database {
             txn_manager,
             no_sync,
             write_no_sync,
+            secondaries: Arc::new(noxu_sync::Mutex::new(Vec::new())),
         }
     }
 
