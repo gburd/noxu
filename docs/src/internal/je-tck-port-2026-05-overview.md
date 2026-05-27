@@ -11,10 +11,10 @@ the row-by-row status, and see the per-wave narrative documents
 | Bucket | Count |
 |---|---:|
 | **Total** JE @Test methods enumerated | 2068 |
-| PORTED-EQUIVALENT | 147 |
+| PORTED-EQUIVALENT | 182 |
 | PORTED-PARTIAL | 62 |
 | OUT-OF-SCOPE | 63 |
-| NOT-PORTED | 1796 |
+| NOT-PORTED | 1761 |
 
 "PORTED-EQUIVALENT" means a Rust test exists that asserts the same
 invariant as the JE original.  "PORTED-PARTIAL" means the Rust test
@@ -29,14 +29,14 @@ topology (e.g. some replication tests).
 
 | package | total | ported | partial | oos | not-ported |
 |---|---:|---:|---:|---:|---:|
-| `bind.serial.test`                            |      7 |      0 |      0 |      0 |      7 |
+| `bind.serial.test`                            |      7 |      7 |      0 |      0 |      0 |
 | `bind.test`                                   |      1 |      0 |      0 |      0 |      1 |
-| `bind.tuple.test`                             |     51 |      0 |      0 |      0 |     51 |
+| `bind.tuple.test`                             |     51 |     21 |      0 |      0 |     30 |
 | `collections.test.serial`                     |      4 |      0 |      0 |      0 |      4 |
-| `collections.test`                            |     23 |      2 |      0 |      0 |     21 |
+| `collections.test`                            |     23 |      4 |      0 |      0 |     19 |
 | `collections`                                 |      3 |      0 |      0 |      0 |      3 |
 | `je.cleaner`                                  |    158 |     10 |     17 |      0 |    131 |
-| `je.config`                                   |      2 |      0 |      0 |      0 |      2 |
+| `je.config`                                   |      2 |      2 |      0 |      0 |      0 |
 | `je.dbi`                                      |    138 |      9 |      0 |      0 |    129 |
 | `je.evictor`                                  |     51 |      2 |      0 |      0 |     49 |
 | `je.incomp`                                   |     29 |      0 |      0 |      0 |     29 |
@@ -73,7 +73,7 @@ topology (e.g. some replication tests).
 | `je.util.dbfilterstats`                       |      6 |      0 |      0 |      0 |      6 |
 | `je.utilint`                                  |     58 |     13 |      0 |      0 |     45 |
 | `je.util`                                     |     81 |      4 |      0 |      0 |     77 |
-| `persist.test`                                |     97 |      3 |      0 |      0 |     94 |
+| `persist.test`                                |     97 |      6 |      0 |      0 |     91 |
 | `utilint`                                     |     10 |      1 |      0 |      0 |      9 |
 | `util.test`                                   |      7 |      0 |      0 |      0 |      7 |
 
