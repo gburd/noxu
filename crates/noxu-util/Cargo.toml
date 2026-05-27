@@ -3,6 +3,11 @@ name = "noxu-util"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Internal utilities for Noxu DB (LSN, VLSN, byte encoding, stats framework)"
 publish = false  # internal implementation detail; consume via noxu-db
 
