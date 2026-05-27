@@ -83,6 +83,7 @@ pub mod ack_tracker;
 pub mod rep_stats;
 
 // Master transfer
+pub mod group_admin;
 pub mod master_transfer;
 
 // Network transport

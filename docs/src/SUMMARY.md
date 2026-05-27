@@ -122,3 +122,4 @@
   - [Wave 2C-3 — DiskOrderedCursor](internal/wave-2c-3-disk-ordered-cursor.md)
   - [Wave 3-1 — nested-transaction parameter removed](internal/wave-3-1-nested-txn-removal.md)
   - [Wave 3-2 — Crash-durable XA](internal/wave-3-2-crash-durable-xa.md)
+  - [Wave 4-A — noxu-rep GA finish](internal/wave-4-a-rep-ga-finish.md)

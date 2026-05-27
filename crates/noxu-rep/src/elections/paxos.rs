@@ -391,6 +391,113 @@ pub fn run_acceptor(
 }
 
 // ---------------------------------------------------------------------------
+// run_acceptor_with_state
+// ---------------------------------------------------------------------------
+
+/// Like `run_acceptor`, but routes the promise/accept decisions through a
+/// crash-durable [`PersistentAcceptorState`].
+///
+/// Closes findings F5 and F31 of `docs/src/internal/api-audit-2026-05-rep.md`.
+///
+/// The Paxos invariant is that an acceptor never accepts a proposal at a
+/// term lower than its highest promise.  The legacy `run_acceptor` keeps
+/// the promise in a local stack variable, which is lost across process
+/// restarts.  This variant calls `state.try_promise(t)` and
+/// `state.try_accept(t, master)` so every state change is fsynced before
+/// the response goes back to the proposer.
+pub fn run_acceptor_with_state(
+    channel: &dyn Channel,
+    node_name: &str,
+    own_vlsn: u64,
+    own_priority: u32,
+    own_term: u64,
+    state: &crate::elections::acceptor_state::PersistentAcceptorState,
+) -> Result<Option<String>> {
+    let timeout = Duration::from_millis(500);
+
+    // Phase 1: receive Propose.
+    let phase1 = match receive_message(channel, timeout)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    let phase1_term = match phase1 {
+        ProtocolMessage::ElectionProposal {
+            node_name: _proposer,
+            vlsn: _vlsn,
+            priority: _priority,
+            term,
+        } => {
+            if state.try_promise(term) {
+                send_message(
+                    channel,
+                    &ProtocolMessage::ElectionProposal {
+                        node_name: node_name.to_string(),
+                        vlsn: own_vlsn,
+                        priority: own_priority,
+                        term: own_term,
+                    },
+                )?;
+                term
+            } else {
+                send_message(
+                    channel,
+                    &ProtocolMessage::ElectionVote {
+                        voter: node_name.to_string(),
+                        granted: false,
+                        term: state.promised_term(),
+                    },
+                )?;
+                return Ok(None);
+            }
+        }
+        _ => {
+            return Err(RepError::ProtocolError(
+                "acceptor: expected ElectionProposal in phase 1".into(),
+            ));
+        }
+    };
+
+    // Phase 2: receive ElectionResult.
+    let phase2 = match receive_message(channel, timeout)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    match phase2 {
+        ProtocolMessage::ElectionResult { master, term } => {
+            // Accept iff the result term is at least our promised term and
+            // matches phase 1's term (proposer must not switch terms
+            // mid-round).
+            if term >= phase1_term && state.try_accept(term, &master) {
+                send_message(
+                    channel,
+                    &ProtocolMessage::ElectionVote {
+                        voter: node_name.to_string(),
+                        granted: true,
+                        term,
+                    },
+                )?;
+                Ok(Some(master))
+            } else {
+                send_message(
+                    channel,
+                    &ProtocolMessage::ElectionVote {
+                        voter: node_name.to_string(),
+                        granted: false,
+                        term,
+                    },
+                )?;
+                Ok(None)
+            }
+        }
+        _ => Err(RepError::ProtocolError(
+            "acceptor: expected ElectionResult in phase 2".into(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

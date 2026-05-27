@@ -13,6 +13,7 @@
 //! - [`MasterTracker`]  -  tracks the current known master and heartbeat
 //!   liveness.
 
+pub mod acceptor_state;
 pub mod election;
 pub mod election_config;
 pub mod election_service;
@@ -21,6 +22,7 @@ pub mod paxos;
 pub mod phi_detector;
 pub mod proposal;
 
+pub use acceptor_state::{AcceptorPersistError, PersistentAcceptorState};
 pub use election::{Election, ElectionOutcome, ElectionState};
 pub use election_config::ElectionConfig;
 pub use election_service::{

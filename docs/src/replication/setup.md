@@ -1,12 +1,9 @@
 # Setup and Configuration
 
-> **v1.5 status — preview.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> and [the chapter overview](README.md) for the noxu-rep GA-blocker
-> list. The configuration shape below is the **intended** contract;
-> several `RepConfig` fields are not plumbed into the production path
-> in v1.5 (notably `replica_ack_policy`, `replica_ack_timeout_ms`,
-> `feeder_timeout`, `helper_hosts`).
+> **v2.0 status — GA.** All ten noxu-rep GA blockers identified in the
+> May 2026 audit are closed in v2.0 (Waves 3-3 and 4-A). See
+> [Wave 4-A report](../internal/wave-4-a-rep-ga-finish.md) for
+> per-finding resolution notes.
 
 This page covers how to configure and start a Noxu DB replicated environment.
 
