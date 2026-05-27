@@ -123,3 +123,5 @@
   - [Wave 3-1 — nested-transaction parameter removed](internal/wave-3-1-nested-txn-removal.md)
   - [Wave 3-2 — Crash-durable XA](internal/wave-3-2-crash-durable-xa.md)
   - [Wave 4-A — noxu-rep GA finish](internal/wave-4-a-rep-ga-finish.md)
+  - [JE TCK port (2026-05) — Overview](internal/je-tck-port-2026-05-overview.md)
+  - [Wave 4-B — JE TCK port (priority 1)](internal/wave-4-b-je-tck-port-priority1.md)
