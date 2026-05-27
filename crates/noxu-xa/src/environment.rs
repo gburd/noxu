@@ -528,9 +528,7 @@ impl XaResource for XaEnvironment {
             // backed by durable WAL `TxnPrepare` frames; xa_commit /
             // xa_rollback resolve them through the recovered_branches
             // map.
-            for xid in
-                self.recovered_branches.lock().unwrap().keys().cloned()
-            {
+            for xid in self.recovered_branches.lock().unwrap().keys().cloned() {
                 if !prepared.contains(&xid) {
                     prepared.push(xid);
                 }

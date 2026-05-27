@@ -309,7 +309,8 @@ impl Transaction {
         // typed `NoxuError::InsufficientReplicas` rather than a state
         // leak.
         let ack_err: Option<NoxuError> = if !self.read_only
-            && durability.replica_ack != crate::durability::ReplicaAckPolicy::None
+            && durability.replica_ack
+                != crate::durability::ReplicaAckPolicy::None
             && let Some(coord) = &self.replica_coordinator
         {
             match coord.await_replica_acks(
@@ -321,8 +322,7 @@ impl Transaction {
                     AckWaitErrorKind::NotMaster => {
                         Some(NoxuError::ReplicaWrite)
                     }
-                    AckWaitErrorKind::Timeout
-                    | AckWaitErrorKind::Shutdown => {
+                    AckWaitErrorKind::Timeout | AckWaitErrorKind::Shutdown => {
                         Some(NoxuError::InsufficientReplicas {
                             required: e.needed,
                             available: e.received,

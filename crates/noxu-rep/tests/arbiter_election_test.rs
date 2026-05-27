@@ -122,10 +122,7 @@ fn f22_arbiter_refuses_to_propose_itself() {
     // Arbiter "arbiter" tries to start an election. No peer channels
     // needed \u2014 the function must short-circuit before sending anything.
     let winner = run_election(3, "arbiter", &group, &[], 999, 1, 1);
-    assert!(
-        winner.is_none(),
-        "Arbiter must not start an election round (F22)"
-    );
+    assert!(winner.is_none(), "Arbiter must not start an election round (F22)");
 }
 
 /// A node not in the group at all should also be refused (closed-world

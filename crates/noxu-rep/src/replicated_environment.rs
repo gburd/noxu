@@ -301,9 +301,8 @@ impl ReplicatedEnvironment {
             );
             // F6: register the ELECTION service so peers can run
             // run_acceptor against this node when proposing.
-            let election_svc = Arc::new(ElectionService::new(
-                Arc::clone(&election_state),
-            ));
+            let election_svc =
+                Arc::new(ElectionService::new(Arc::clone(&election_state)));
             dispatcher.register(ELECTION_SERVICE_NAME, election_svc);
             log::debug!(
                 "Node '{}' ELECTION service registered",
@@ -402,10 +401,7 @@ impl ReplicatedEnvironment {
             })
             .expect("failed to spawn election driver thread");
         self.io_threads.lock().unwrap().push(handle);
-        log::debug!(
-            "Node '{}' election driver started",
-            self.config.node_name,
-        );
+        log::debug!("Node '{}' election driver started", self.config.node_name,);
         // Keep ordering sane on the io_shutdown flag.
         let _ = self.io_shutdown.load(Ordering::SeqCst);
     }
@@ -442,11 +438,11 @@ impl ReplicatedEnvironment {
             // GroupService cache.  In the absence of a heartbeat path
             // we rely on master_tracker (set by become_replica from
             // the receive loop).
-            if let Some(master_name) = self.master_tracker.get_master() {
-                if master_name != self.config.node_name {
-                    let _ = self.become_replica(&master_name);
-                    continue;
-                }
+            if let Some(master_name) = self.master_tracker.get_master()
+                && master_name != self.config.node_name
+            {
+                let _ = self.become_replica(&master_name);
+                continue;
             }
 
             // Snapshot peers to dial for ELECTION.
@@ -477,24 +473,24 @@ impl ReplicatedEnvironment {
             // tolerated: a peer that doesn't answer simply contributes
             // no vote.  The election may still reach quorum in the
             // remaining peers.
-            let mut channels: Vec<
-                Arc<dyn crate::net::channel::Channel>,
-            > = Vec::new();
+            let mut channels: Vec<Arc<dyn crate::net::channel::Channel>> =
+                Vec::new();
             for (peer_name, addr) in &peers {
                 match crate::net::service_dispatcher::connect_to_service(
                     *addr,
                     ELECTION_SERVICE_NAME,
                 ) {
                     Ok(ch) => {
-                        let arc: Arc<
-                            dyn crate::net::channel::Channel,
-                        > = Arc::new(ch);
+                        let arc: Arc<dyn crate::net::channel::Channel> =
+                            Arc::new(ch);
                         channels.push(arc);
                     }
                     Err(e) => {
                         log::trace!(
                             "election driver: peer {} ({}) unreachable: {}",
-                            peer_name, addr, e
+                            peer_name,
+                            addr,
+                            e
                         );
                     }
                 }
@@ -502,9 +498,8 @@ impl ReplicatedEnvironment {
 
             // Resolve our own node_id from the group; if not present
             // we cannot run an election (closed-world guard — see F22).
-            let self_node_id = group
-                .get_node(&self.config.node_name)
-                .map(|n| n.node_id());
+            let self_node_id =
+                group.get_node(&self.config.node_name).map(|n| n.node_id());
             let self_node_id = match self_node_id {
                 Some(id) => id,
                 None => {
@@ -520,7 +515,9 @@ impl ReplicatedEnvironment {
 
             log::debug!(
                 "election driver on '{}': starting term={} with {} peers",
-                self.config.node_name, term, channels.len(),
+                self.config.node_name,
+                term,
+                channels.len(),
             );
             let outcome = crate::elections::paxos::run_election(
                 self_node_id,
@@ -542,7 +539,8 @@ impl ReplicatedEnvironment {
                     } else {
                         log::info!(
                             "election driver: '{}' became master at term {}",
-                            self.config.node_name, term,
+                            self.config.node_name,
+                            term,
                         );
                     }
                 }
@@ -552,9 +550,7 @@ impl ReplicatedEnvironment {
                         .into_iter()
                         .find(|n| n.node_id() == winner_id)
                     {
-                        if let Err(e) =
-                            self.become_replica(&winner_node.name)
-                        {
+                        if let Err(e) = self.become_replica(&winner_node.name) {
                             log::warn!(
                                 "election driver: become_replica failed: {}",
                                 e
@@ -563,7 +559,8 @@ impl ReplicatedEnvironment {
                             log::info!(
                                 "election driver: '{}' became replica of '{}' at term {}",
                                 self.config.node_name,
-                                winner_node.name, term,
+                                winner_node.name,
+                                term,
                             );
                         }
                     }
@@ -571,16 +568,17 @@ impl ReplicatedEnvironment {
                 None => {
                     log::debug!(
                         "election driver on '{}' term={}: no quorum",
-                        self.config.node_name, term,
+                        self.config.node_name,
+                        term,
                     );
                 }
             }
 
             term = term.saturating_add(1);
             // Back off so we don't pin the loop on transient failures.
-            std::thread::sleep(self.config.election_timeout.min(
-                Duration::from_millis(500),
-            ));
+            std::thread::sleep(
+                self.config.election_timeout.min(Duration::from_millis(500)),
+            );
         }
     }
 
@@ -600,8 +598,7 @@ impl ReplicatedEnvironment {
             // Stable self node_id derived from the name hash so
             // re-creations in the same process don't collide.
             use std::hash::{Hash, Hasher};
-            let mut hasher =
-                std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.config.node_name.hash(&mut hasher);
             // Restrict to a u32 range and avoid 0 (reserved for
             // "unknown").
@@ -1412,10 +1409,8 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         // late acks satisfy the policy promptly, and large enough that
         // a single commit waiting on a slow replica does not spin a
         // CPU.
-        let poll_interval = std::cmp::min(
-            timeout / 50,
-            Duration::from_millis(20),
-        );
+        let poll_interval =
+            std::cmp::min(timeout / 50, Duration::from_millis(20));
         let poll_interval = if poll_interval.is_zero() {
             Duration::from_millis(1)
         } else {
@@ -1441,10 +1436,8 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
                 // Tear down the registration so it doesn't accumulate;
                 // record the partial ack count so the caller can report
                 // a useful `InsufficientReplicas { required, available }`.
-                let received = self
-                    .ack_tracker
-                    .received_count(commit_seq)
-                    .unwrap_or(0);
+                let received =
+                    self.ack_tracker.received_count(commit_seq).unwrap_or(0);
                 self.ack_tracker.cleanup_through(commit_seq);
                 return Err(AckWaitError {
                     kind: AckWaitErrorKind::Timeout,
@@ -1452,14 +1445,14 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
                     received,
                 });
             }
-            let sleep_for =
-                std::cmp::min(poll_interval, deadline.saturating_duration_since(now));
+            let sleep_for = std::cmp::min(
+                poll_interval,
+                deadline.saturating_duration_since(now),
+            );
             std::thread::sleep(sleep_for);
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

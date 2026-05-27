@@ -17,8 +17,8 @@
 
 use std::time::{Duration, Instant};
 
-use noxu_rep::{NodeState, NodeType, RepConfig, ReplicatedEnvironment};
 use noxu_rep::rep_node::RepNode;
+use noxu_rep::{NodeState, NodeType, RepConfig, ReplicatedEnvironment};
 
 fn config(node_name: &str) -> RepConfig {
     RepConfig::builder("group_f6", node_name, "127.0.0.1")
@@ -47,10 +47,7 @@ fn f6_single_node_open_becomes_master() {
         "single-node open() must elect self as master (F6)"
     );
     assert!(env.is_master());
-    assert_eq!(
-        env.get_master_name().as_deref(),
-        Some("solo"),
-    );
+    assert_eq!(env.get_master_name().as_deref(), Some("solo"),);
 
     let _ = env.close();
 }
@@ -143,8 +140,7 @@ fn f6_new_does_not_auto_start_driver() {
 #[test]
 fn f6_start_election_driver_idempotent() {
     use std::sync::Arc;
-    let env =
-        Arc::new(ReplicatedEnvironment::new(config("idem")).unwrap());
+    let env = Arc::new(ReplicatedEnvironment::new(config("idem")).unwrap());
     env.start_election_driver();
     env.start_election_driver();
     env.start_election_driver();

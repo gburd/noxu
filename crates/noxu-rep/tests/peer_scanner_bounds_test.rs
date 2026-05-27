@@ -25,18 +25,17 @@ use noxu_rep::{NodeType, RepConfig, ReplicatedEnvironment};
 /// `MAX_BYTES`.
 #[test]
 fn f10_peer_scanner_caps_entry_count() {
-    let scanner = PeerLogScanner::with_capacity(/* entries */ 100, /* bytes */ usize::MAX);
+    let scanner = PeerLogScanner::with_capacity(
+        /* entries */ 100,
+        /* bytes */ usize::MAX,
+    );
 
     // Push 10x the cap.
     for vlsn in 1u64..=1_000 {
         scanner.push(vlsn, 1, vec![0u8; 16]);
     }
 
-    assert_eq!(
-        scanner.len(),
-        100,
-        "queue should be capped at 100 entries"
-    );
+    assert_eq!(scanner.len(), 100, "queue should be capped at 100 entries");
     assert_eq!(
         scanner.evicted_count(),
         900,
@@ -141,9 +140,7 @@ fn f10_apply_entry_stays_bounded_under_sustained_input() {
     // Each entry at 16 bytes payload to keep byte cap low.
     let env_for_burst = &env;
     for vlsn in 257u64..=(257 + 32_000) {
-        env_for_burst
-            .apply_entry(vlsn, 1, vec![0u8; 16])
-            .unwrap();
+        env_for_burst.apply_entry(vlsn, 1, vec![0u8; 16]).unwrap();
     }
 
     // We don't have a direct accessor on ReplicatedEnvironment for the
