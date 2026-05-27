@@ -141,7 +141,7 @@ if self.config.node_type != NodeType::Electable {
 
 Confirmed reproducible by running with `-- --ignored`:
 
-```
+```text
 $ cargo test -p noxu-rep --test je_rep_txn_tck --features test-harness \
     -- --ignored secondary_node_become_master_should_fail
 ... thread 'secondary_node_become_master_should_fail' panicked at:
