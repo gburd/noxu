@@ -111,14 +111,30 @@ pub struct Database {
     /// `Database` body) so registrations performed through one of the
     /// `Arc<Mutex<Database>>` clones the user typically holds become
     /// visible to every other clone of the same primary.
-    pub(crate) secondaries: Arc<RwLock<Vec<std::sync::Weak<dyn crate::secondary_database::SecondaryHook + Send + Sync>>>>,
+    pub(crate) secondaries: Arc<
+        RwLock<
+            Vec<
+                std::sync::Weak<
+                    dyn crate::secondary_database::SecondaryHook + Send + Sync,
+                >,
+            >,
+        >,
+    >,
     /// Foreign-key referrer registry: every child secondary whose
     /// `foreign_key_database` points at *this* primary downgrades its
     /// hook to a `Weak<dyn FkReferrer>` and pushes it here.  When this
     /// primary is deleted, every entry is consulted to apply
     /// `ForeignKeyDeleteAction::Abort` (v1.6 step 8) /
     /// `Cascade` (step 9) / `Nullify` (step 10).
-    pub(crate) fk_referrers: Arc<RwLock<Vec<std::sync::Weak<dyn crate::secondary_database::FkReferrer + Send + Sync>>>>,
+    pub(crate) fk_referrers: Arc<
+        RwLock<
+            Vec<
+                std::sync::Weak<
+                    dyn crate::secondary_database::FkReferrer + Send + Sync,
+                >,
+            >,
+        >,
+    >,
 }
 
 /// State of a database handle.
@@ -751,12 +767,7 @@ impl Database {
                 .as_deref()
                 .map(DatabaseEntry::from_bytes);
             for hook in secondaries {
-                hook.maintain(
-                    txn,
-                    key,
-                    old_entry.as_ref(),
-                    Some(&new_entry),
-                )?;
+                hook.maintain(txn, key, old_entry.as_ref(), Some(&new_entry))?;
             }
         }
 
@@ -1132,16 +1143,9 @@ impl Database {
     /// itself).
     pub(crate) fn live_secondaries(
         &self,
-    ) -> Vec<
-        Arc<
-            dyn crate::secondary_database::SecondaryHook + Send + Sync,
-        >,
-    > {
-        self.secondaries
-            .read()
-            .iter()
-            .filter_map(|w| w.upgrade())
-            .collect()
+    ) -> Vec<Arc<dyn crate::secondary_database::SecondaryHook + Send + Sync>>
+    {
+        self.secondaries.read().iter().filter_map(|w| w.upgrade()).collect()
     }
 
     /// Registers an FK referrer that points at this primary as its
@@ -1160,16 +1164,8 @@ impl Database {
     /// Snapshot of every live FK referrer.
     pub(crate) fn live_fk_referrers(
         &self,
-    ) -> Vec<
-        Arc<
-            dyn crate::secondary_database::FkReferrer + Send + Sync,
-        >,
-    > {
-        self.fk_referrers
-            .read()
-            .iter()
-            .filter_map(|w| w.upgrade())
-            .collect()
+    ) -> Vec<Arc<dyn crate::secondary_database::FkReferrer + Send + Sync>> {
+        self.fk_referrers.read().iter().filter_map(|w| w.upgrade()).collect()
     }
 
     /// Returns an approximate count of records in the database.

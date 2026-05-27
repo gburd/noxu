@@ -267,9 +267,10 @@ impl SecondaryHookState {
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
         let mut cursor = self.make_inner_cursor(txn)?;
-        let status = cursor
-            .put(sec_key, pri_key, crate::put::Put::NoDupData)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        let status =
+            cursor
+                .put(sec_key, pri_key, crate::put::Put::NoDupData)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         match status {
             OperationStatus::Success => Ok(()),
             OperationStatus::KeyExists => Ok(()),
@@ -305,10 +306,7 @@ impl SecondaryHookState {
         Ok(())
     }
 
-    fn make_inner_cursor(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<Cursor> {
+    fn make_inner_cursor(&self, txn: Option<&Transaction>) -> Result<Cursor> {
         self.inner.open_cursor(txn, None)
     }
 }
@@ -334,7 +332,7 @@ impl FkReferrer for SecondaryHookState {
     /// dispatching on the configured [`ForeignKeyDeleteAction`].
     ///
     /// * `Abort`   — if any child secondary entry has `sec_key == fk_value`,
-    ///               return [`NoxuError::ForeignConstraintViolation`].
+    ///   return [`NoxuError::ForeignConstraintViolation`].
     /// * `Cascade` — wired in step 9.
     /// * `Nullify` — wired in step 10.
     fn on_foreign_key_deleted(
@@ -408,12 +406,7 @@ impl FkReferrer for SecondaryHookState {
                     let mut sk = fk_value.clone();
                     let mut pk = DatabaseEntry::new();
                     let mut st = cursor
-                        .get(
-                            &mut sk,
-                            &mut pk,
-                            crate::get::Get::Search,
-                            None,
-                        )
+                        .get(&mut sk, &mut pk, crate::get::Get::Search, None)
                         .map_err(|e| {
                             NoxuError::OperationNotAllowed(e.to_string())
                         })?;
@@ -427,12 +420,7 @@ impl FkReferrer for SecondaryHookState {
                             child_keys.push(DatabaseEntry::from_bytes(b));
                         }
                         st = cursor
-                            .get(
-                                &mut sk,
-                                &mut pk,
-                                crate::get::Get::Next,
-                                None,
-                            )
+                            .get(&mut sk, &mut pk, crate::get::Get::Next, None)
                             .map_err(|e| {
                                 NoxuError::OperationNotAllowed(e.to_string())
                             })?;
@@ -481,8 +469,7 @@ impl FkReferrer for SecondaryHookState {
                 }
 
                 let single = self.config.foreign_key_nullifier.as_deref();
-                let multi =
-                    self.config.foreign_multi_key_nullifier.as_deref();
+                let multi = self.config.foreign_multi_key_nullifier.as_deref();
 
                 // Collect (child_primary_key, child_primary_data) pairs.
                 let child_records: Vec<(DatabaseEntry, DatabaseEntry)> = {
@@ -491,12 +478,7 @@ impl FkReferrer for SecondaryHookState {
                     let mut sk = fk_value.clone();
                     let mut pk = DatabaseEntry::new();
                     let mut st = cursor
-                        .get(
-                            &mut sk,
-                            &mut pk,
-                            crate::get::Get::Search,
-                            None,
-                        )
+                        .get(&mut sk, &mut pk, crate::get::Get::Search, None)
                         .map_err(|e| {
                             NoxuError::OperationNotAllowed(e.to_string())
                         })?;
@@ -508,20 +490,17 @@ impl FkReferrer for SecondaryHookState {
                         }
                         // Fetch the child primary's data so the
                         // nullifier sees it.
-                        let child_pri =
-                            DatabaseEntry::from_bytes(pk.get_data().unwrap_or(&[]));
+                        let child_pri = DatabaseEntry::from_bytes(
+                            pk.get_data().unwrap_or(&[]),
+                        );
                         let mut data = DatabaseEntry::new();
-                        let g = primary.lock().get(txn, &child_pri, &mut data)?;
+                        let g =
+                            primary.lock().get(txn, &child_pri, &mut data)?;
                         if g == OperationStatus::Success {
                             child.push((child_pri, data));
                         }
                         st = cursor
-                            .get(
-                                &mut sk,
-                                &mut pk,
-                                crate::get::Get::Next,
-                                None,
-                            )
+                            .get(&mut sk, &mut pk, crate::get::Get::Next, None)
                             .map_err(|e| {
                                 NoxuError::OperationNotAllowed(e.to_string())
                             })?;
@@ -532,9 +511,10 @@ impl FkReferrer for SecondaryHookState {
                 let nullify_result: Result<()> = (|| {
                     for (child_pri, mut child_data) in child_records {
                         let modified = match (single, multi) {
-                            (Some(n), _) => {
-                                n.nullify_foreign_key(&self.inner, &mut child_data)
-                            }
+                            (Some(n), _) => n.nullify_foreign_key(
+                                &self.inner,
+                                &mut child_data,
+                            ),
                             (None, Some(mn)) => mn.nullify_foreign_key(
                                 &self.inner,
                                 &child_pri,
@@ -1226,7 +1206,9 @@ impl SecondaryDatabase {
                 ) {
                     self.insert_sec_key(None, &sec_key, &pri_key)?;
                 }
-            } else if let Some(multi_creator) = &self.state.config.multi_key_creator {
+            } else if let Some(multi_creator) =
+                &self.state.config.multi_key_creator
+            {
                 let mut sec_keys = Vec::new();
                 multi_creator.create_secondary_keys(
                     &self.state.inner,

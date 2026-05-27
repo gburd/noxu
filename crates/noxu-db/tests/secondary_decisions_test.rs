@@ -132,11 +132,7 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
     let mut data = DatabaseEntry::new();
     let mut seen: Vec<Vec<u8>> = Vec::new();
     let mut st = cursor
-        .get_search_key(
-            &DatabaseEntry::from_bytes(b"A"),
-            &mut p_key,
-            &mut data,
-        )
+        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     while st == OperationStatus::Success {
         seen.push(p_key.get_data().unwrap().to_vec());
@@ -273,11 +269,7 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
 
     // Position on the first ‘A’ dup.
     let st = cursor
-        .get_search_key(
-            &DatabaseEntry::from_bytes(b"A"),
-            &mut p_key,
-            &mut data,
-        )
+        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert_eq!(st, OperationStatus::Success);
     let mut seen: Vec<Vec<u8>> = vec![p_key.get_data().unwrap().to_vec()];
@@ -316,9 +308,8 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
         )
         .unwrap();
     assert_eq!(st2, OperationStatus::Success);
-    let prev_st = cursor
-        .get_prev_dup_full(&mut sec_key, &mut p_key, &mut data)
-        .unwrap();
+    let prev_st =
+        cursor.get_prev_dup_full(&mut sec_key, &mut p_key, &mut data).unwrap();
     assert_eq!(
         prev_st,
         OperationStatus::NotFound,
@@ -401,10 +392,7 @@ fn c3_primary_put_under_txn_rolls_back_secondary_on_abort() {
 
     // After abort: primary and secondary both gone.
     assert_eq!(
-        primary
-            .lock()
-            .get(None, &pk, &mut DatabaseEntry::new())
-            .unwrap(),
+        primary.lock().get(None, &pk, &mut DatabaseEntry::new()).unwrap(),
         OperationStatus::NotFound
     );
     let mut p_key = DatabaseEntry::new();
@@ -616,10 +604,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
 
     // Insert.
     let pk = DatabaseEntry::from_bytes(b"pk1");
-    primary
-        .lock()
-        .put(None, &pk, &DatabaseEntry::from_bytes(b"AB"))
-        .unwrap();
+    primary.lock().put(None, &pk, &DatabaseEntry::from_bytes(b"AB")).unwrap();
     assert_eq!(sec.count().unwrap(), 2);
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -632,10 +617,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
     }
 
     // Update (data set goes A,B → B,C).
-    primary
-        .lock()
-        .put(None, &pk, &DatabaseEntry::from_bytes(b"BC"))
-        .unwrap();
+    primary.lock().put(None, &pk, &DatabaseEntry::from_bytes(b"BC")).unwrap();
     assert_eq!(
         sec.count().unwrap(),
         2,
@@ -710,14 +692,11 @@ fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
         .with_foreign_key_database_handle(Arc::clone(&foreign))
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
 
-    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .unwrap();
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
-    foreign
-        .lock()
-        .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
-        .unwrap();
+    foreign.lock().put(None, &fk, &DatabaseEntry::from_bytes(b"x")).unwrap();
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     primary
         .lock()
@@ -735,17 +714,11 @@ fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
         OperationStatus::Success
     );
     assert_eq!(
-        primary
-            .lock()
-            .get(None, &pk1, &mut DatabaseEntry::new())
-            .unwrap(),
+        primary.lock().get(None, &pk1, &mut DatabaseEntry::new()).unwrap(),
         OperationStatus::NotFound
     );
     assert_eq!(
-        primary
-            .lock()
-            .get(None, &pk2, &mut DatabaseEntry::new())
-            .unwrap(),
+        primary.lock().get(None, &pk2, &mut DatabaseEntry::new()).unwrap(),
         OperationStatus::NotFound
     );
 }
@@ -785,14 +758,11 @@ fn d2c_foreign_key_nullify_runtime_unsupported() {
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
         .with_foreign_key_nullifier(Box::new(UnderscoreNullifier));
 
-    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .unwrap();
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
-    foreign
-        .lock()
-        .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
-        .unwrap();
+    foreign.lock().put(None, &fk, &DatabaseEntry::from_bytes(b"x")).unwrap();
     let pk = DatabaseEntry::from_bytes(b"pk1");
     primary
         .lock()
@@ -823,8 +793,8 @@ fn fk_abort_blocks_delete_of_referenced_foreign_record() {
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
         .with_foreign_key_database_handle(Arc::clone(&foreign));
-    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .unwrap();
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
     foreign
@@ -845,15 +815,10 @@ fn fk_abort_blocks_delete_of_referenced_foreign_record() {
         Err(NoxuError::ForeignConstraintViolation(msg)) => {
             assert!(msg.contains("foreign-key"));
         }
-        other => panic!(
-            "expected ForeignConstraintViolation, got {other:?}"
-        ),
+        other => panic!("expected ForeignConstraintViolation, got {other:?}"),
     }
     assert_eq!(
-        foreign
-            .lock()
-            .get(None, &fk, &mut DatabaseEntry::new())
-            .unwrap(),
+        foreign.lock().get(None, &fk, &mut DatabaseEntry::new()).unwrap(),
         OperationStatus::Success,
         "aborted FK delete must leave the foreign record intact"
     );
@@ -923,20 +888,14 @@ fn fk_nullify_multi_key_nullifier_path() {
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
         .with_foreign_multi_key_nullifier(Box::new(StripByteNullifier));
 
-    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .unwrap();
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk_a = DatabaseEntry::from_bytes(b"A");
-    foreign
-        .lock()
-        .put(None, &fk_a, &DatabaseEntry::from_bytes(b"x"))
-        .unwrap();
+    foreign.lock().put(None, &fk_a, &DatabaseEntry::from_bytes(b"x")).unwrap();
 
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    primary
-        .lock()
-        .put(None, &pk1, &DatabaseEntry::from_bytes(b"ABC"))
-        .unwrap();
+    primary.lock().put(None, &pk1, &DatabaseEntry::from_bytes(b"ABC")).unwrap();
 
     foreign.lock().delete(None, &fk_a).unwrap();
     let mut child = DatabaseEntry::new();
@@ -1004,9 +963,7 @@ fn fk_cascade_transitive_two_levels() {
         .unwrap();
 
     // Cascade root → mid → leaf in one delete.
-    root.lock()
-        .delete(None, &DatabaseEntry::from_bytes(b"A"))
-        .unwrap();
+    root.lock().delete(None, &DatabaseEntry::from_bytes(b"A")).unwrap();
     assert_eq!(
         mid.lock()
             .get(
@@ -1043,14 +1000,11 @@ fn fk_abort_allows_delete_when_no_referrer() {
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
         .with_foreign_key_database_handle(Arc::clone(&foreign));
-    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .unwrap();
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"Z");
-    foreign
-        .lock()
-        .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
-        .unwrap();
+    foreign.lock().put(None, &fk, &DatabaseEntry::from_bytes(b"x")).unwrap();
     assert_eq!(
         foreign.lock().delete(None, &fk).unwrap(),
         OperationStatus::Success
