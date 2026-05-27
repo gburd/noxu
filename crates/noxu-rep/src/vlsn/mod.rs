@@ -7,7 +7,9 @@
 pub mod vlsn_bucket;
 pub mod vlsn_index;
 pub mod vlsn_range;
+pub mod persist;
 
 pub use vlsn_bucket::VlsnBucket;
 pub use vlsn_index::VlsnIndex;
 pub use vlsn_range::VlsnRange;
+pub use persist::{flush_to_disk, index_path, load_from_disk, VlsnPersistError};

@@ -110,7 +110,12 @@ pub struct ReplicatedEnvironment {
     /// Service for managing the replication group membership.
     group_service: GroupService,
     /// Maps VLSNs to log file positions.
-    vlsn_index: VlsnIndex,
+    ///
+    /// Wrapped in `Arc` so that background daemons (election driver,
+    /// VLSN-index persistence flusher) can share access without
+    /// borrowing the env.  Closes finding F11 (
+    /// `docs/src/internal/api-audit-2026-05-rep.md`).
+    vlsn_index: Arc<VlsnIndex>,
     /// Tracks acknowledgments from replicas (used by master).
     ack_tracker: AckTracker,
     /// Replication statistics.
@@ -202,7 +207,48 @@ impl ReplicatedEnvironment {
     pub fn new(config: RepConfig) -> Result<Self> {
         let node_state = NodeStateMachine::new();
         let group_service = GroupService::new(config.group_name.clone());
-        let vlsn_index = VlsnIndex::new(10);
+        let vlsn_index = {
+            // F11: try to load a previously persisted vlsn.idx from
+            // env_home if one exists.  A successfully loaded index lets a
+            // restarted replica resume from where it left off without a
+            // full network restore; a missing or corrupt file falls back
+            // to a fresh in-memory index (caller will need to bootstrap).
+            if let Some(ref home) = config.env_home {
+                match crate::vlsn::persist::load_from_disk(home) {
+                    Ok(Some(idx)) => {
+                        log::info!(
+                            "Node '{}' loaded persisted VLSN index from {} \
+                             ({} entries, latest vlsn={})",
+                            config.node_name,
+                            home.display(),
+                            idx.snapshot_entries().len(),
+                            idx.get_latest_vlsn(),
+                        );
+                        Arc::new(idx)
+                    }
+                    Ok(None) => Arc::new(VlsnIndex::new(10)),
+                    Err(e) => {
+                        log::warn!(
+                            "Node '{}' failed to load persisted VLSN index \
+                             from {}: {} (treating as fresh node — network \
+                             restore required)",
+                            config.node_name,
+                            home.display(),
+                            e
+                        );
+                        // Best-effort: remove the corrupt file so the
+                        // next persist cycle writes a clean one.  A
+                        // missing file is the "fresh node" baseline.
+                        let _ = std::fs::remove_file(
+                            crate::vlsn::persist::index_path(home),
+                        );
+                        Arc::new(VlsnIndex::new(10))
+                    }
+                }
+            } else {
+                Arc::new(VlsnIndex::new(10))
+            }
+        };
         let ack_tracker = AckTracker::new();
         let stats = RepStats::new();
         let feeders = RwLock::new(Vec::new());
@@ -354,7 +400,94 @@ impl ReplicatedEnvironment {
     pub fn open(config: RepConfig) -> Result<Arc<Self>> {
         let env = Arc::new(Self::new(config)?);
         env.start_election_driver();
+        env.start_vlsn_persistence_daemon();
         Ok(env)
+    }
+
+    /// Spawn the VLSN-index persistence daemon (F11).
+    ///
+    /// Periodically (every 2 seconds) snapshots the in-memory
+    /// `VlsnIndex` to `<env_home>/vlsn.idx` so a clean restart can
+    /// resume from where the replica left off without a full network
+    /// restore.  No-op when `config.env_home` is `None`.
+    ///
+    /// Idempotent: only one daemon is ever spawned per env.
+    pub fn start_vlsn_persistence_daemon(self: &Arc<Self>) {
+        let Some(home) = self.config.env_home.clone() else {
+            return;
+        };
+        {
+            let threads = self.io_threads.lock().unwrap();
+            if threads.iter().any(|h| {
+                h.thread()
+                    .name()
+                    .is_some_and(|n| n.starts_with("noxu-vlsn-flush-"))
+            }) {
+                return;
+            }
+        }
+
+        let vlsn_index = Arc::clone(&self.vlsn_index);
+        let name = format!("noxu-vlsn-flush-{}", self.config.node_name);
+        let me = Arc::clone(self);
+        let interval = Duration::from_secs(2);
+
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                let mut last_persisted_vlsn: u64 = 0;
+                while !me.io_shutdown.load(Ordering::SeqCst)
+                    && !me.is_shutdown()
+                {
+                    std::thread::sleep(interval);
+                    if me.io_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let latest = vlsn_index.get_latest_vlsn();
+                    if latest == last_persisted_vlsn {
+                        // Nothing new to flush.
+                        continue;
+                    }
+                    match crate::vlsn::persist::flush_to_disk(
+                        &vlsn_index,
+                        &home,
+                    ) {
+                        Ok(n) => {
+                            log::trace!(
+                                "vlsn-flush: persisted {} entries (latest vlsn={})",
+                                n,
+                                latest,
+                            );
+                            last_persisted_vlsn = latest;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "vlsn-flush: failed to persist VLSN index to {}: {}",
+                                home.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+                // Final flush on shutdown so a clean close is recoverable.
+                if let Err(e) = crate::vlsn::persist::flush_to_disk(
+                    &vlsn_index,
+                    &home,
+                ) {
+                    log::warn!(
+                        "vlsn-flush (final): failed to persist VLSN index: {}",
+                        e
+                    );
+                }
+            })
+            .expect("failed to spawn noxu-vlsn-flush thread");
+
+        self.io_threads.lock().unwrap().push(handle);
+        log::debug!(
+            "Node '{}' VLSN persistence daemon started",
+            self.config.node_name,
+        );
     }
 
     /// Spawn the election driver background thread.
@@ -1257,13 +1390,29 @@ impl ReplicatedEnvironment {
         }
 
         // Signal and join all I/O threads spawned by become_master /
-        // become_replica.
+        // become_replica / start_vlsn_persistence_daemon.  The vlsn-flush
+        // thread does a final flush on its way out so a clean close is
+        // recoverable.  Closes finding F11.
         self.io_shutdown.store(true, Ordering::SeqCst);
         {
             let mut threads = self.io_threads.lock().unwrap();
             for handle in threads.drain(..) {
                 let _ = handle.join();
             }
+        }
+
+        // Belt-and-braces: even when no daemon is running (e.g.
+        // `ReplicatedEnvironment::new` without `open`), persist a final
+        // snapshot if env_home is configured.
+        if let Some(ref home) = self.config.env_home
+            && let Err(e) =
+                crate::vlsn::persist::flush_to_disk(&self.vlsn_index, home)
+        {
+            log::warn!(
+                "close: failed to persist VLSN index to {}: {}",
+                home.display(),
+                e
+            );
         }
 
         // Stop the TCP service dispatcher (the: serviceDispatcher.shutdown()).
