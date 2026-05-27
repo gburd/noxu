@@ -6,15 +6,15 @@ this same directory (`je-tck-port-2026-05-enumeration-<package>.tsv`) for
 the row-by-row status, and see the per-wave narrative documents
 (`wave-4-b-je-tck-port-priority1.md`, …) for what changed in each wave.
 
-## Aggregate status (2026-05-27)
+## Aggregate status (2026-05-27, after wave 6)
 
 | Bucket | Count |
 |---|---:|
 | **Total** JE @Test methods enumerated | 2068 |
-| PORTED-EQUIVALENT | 182 |
-| PORTED-PARTIAL | 62 |
-| OUT-OF-SCOPE | 63 |
-| NOT-PORTED | 1761 |
+| PORTED-EQUIVALENT | 196 |
+| PORTED-PARTIAL | 70 |
+| OUT-OF-SCOPE | 64 |
+| NOT-PORTED | 1738 |
 
 "PORTED-EQUIVALENT" means a Rust test exists that asserts the same
 invariant as the JE original.  "PORTED-PARTIAL" means the Rust test
@@ -37,8 +37,8 @@ topology (e.g. some replication tests).
 | `collections`                                 |      3 |      0 |      0 |      0 |      3 |
 | `je.cleaner`                                  |    158 |     10 |     17 |      0 |    131 |
 | `je.config`                                   |      2 |      2 |      0 |      0 |      0 |
-| `je.dbi`                                      |    138 |      9 |      0 |      0 |    129 |
-| `je.evictor`                                  |     51 |      2 |      0 |      0 |     49 |
+| `je.dbi`                                      |    138 |     10 |      0 |      1 |    127 |
+| `je.evictor`                                  |     51 |      2 |      5 |      0 |     44 |
 | `je.incomp`                                   |     29 |      0 |      0 |      0 |     29 |
 | `je.jmx`                                      |      8 |      0 |      0 |      8 |      0 |
 | `je.latch`                                    |      7 |      0 |      0 |      7 |      0 |
@@ -48,7 +48,7 @@ topology (e.g. some replication tests).
 | `je.rep.arb`                                  |     21 |      0 |      0 |     21 |      0 |
 | `je.rep.dual.trigger`                         |      1 |      0 |      0 |      1 |      0 |
 | `je.rep.dupconvert`                           |      5 |      0 |      0 |      5 |      0 |
-| `je.rep.elections`                            |     32 |      1 |      0 |      0 |     31 |
+| `je.rep.elections`                            |     32 |      7 |      0 |      0 |     25 |
 | `je.rep.impl.networkRestore`                  |     20 |      5 |      0 |      0 |     15 |
 | `je.rep.impl.node`                            |     61 |      4 |      0 |      0 |     57 |
 | `je.rep.impl`                                 |     38 |      1 |      0 |      0 |     37 |
@@ -63,10 +63,10 @@ topology (e.g. some replication tests).
 | `je.rep.utilint`                              |     13 |      3 |      0 |      0 |     10 |
 | `je.rep.util.ldiff`                           |     37 |      2 |      0 |      0 |     35 |
 | `je.rep.util`                                 |     36 |      1 |      0 |      0 |     35 |
-| `je.rep.vlsn`                                 |     38 |      6 |      0 |      0 |     32 |
+| `je.rep.vlsn`                                 |     38 |      8 |      3 |      0 |     27 |
 | `je.serializecompatibility`                   |      2 |      0 |      0 |      2 |      0 |
 | `je.test`                                     |    163 |      7 |      0 |      0 |    156 |
-| `je.tree`                                     |     73 |      8 |      0 |      0 |     65 |
+| `je.tree`                                     |     73 |     13 |      0 |      0 |     60 |
 | `je.trigger`                                  |     22 |      1 |      0 |      0 |     21 |
 | `je`                                          |    199 |     29 |     22 |      1 |    147 |
 | `je.txn`                                      |     74 |      6 |     20 |      0 |     48 |
@@ -79,10 +79,16 @@ topology (e.g. some replication tests).
 
 ## Wave summaries
 
-* `wave-4-b-je-tck-port-priority1.md` — wave 4-B (this wave): added 27
+* `wave-4-b-je-tck-port-priority1.md` — wave 4-B: added 27
   PORTED-EQUIVALENT, 5 PORTED-PARTIAL, 1 OUT-OF-SCOPE rows across `je`,
   `je.dbi`, `je.recovery`, `je.txn`.  Surfaced 3 real Noxu bugs as
   `#[ignore]`-d tests.
+* `wave-6-je-tck-port-priority-3-4.md` — wave 6 (this wave): added 14
+  PORTED-EQUIVALENT, 8 PORTED-PARTIAL, 1 OUT-OF-SCOPE rows across
+  `je.rep.elections`, `je.rep.vlsn`, `je.evictor`, `je.tree`, `je.dbi`.
+  No real Noxu bugs surfaced; one documented semantic difference
+  (Noxu's `VlsnIndex::truncate_after` only removes whole buckets and
+  clamps the range; JE's `VLSNBucket::removeFromTail` partially trims).
 
 ## Methodology
 
