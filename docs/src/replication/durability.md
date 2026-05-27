@@ -1,11 +1,9 @@
 # Replication Durability Policies
 
-> **v1.5 status — preview.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> and [the chapter overview](README.md). **`ReplicaAckPolicy` is not
-> honoured on commit in v1.5** — the master returns success after the
-> local fsync regardless of how many replicas have acknowledged. This
-> is GA blocker #1 in the noxu-rep audit.
+> **v2.0 status — GA.** `ReplicaAckPolicy` is honoured on commit
+> (Wave 3-3, F1).  `Transaction::commit_with_durability` blocks
+> until the configured number of replicas have acknowledged or the
+> commit timeout elapses.
 
 In a replicated environment, durability involves both local disk persistence
 and replica acknowledgments.
