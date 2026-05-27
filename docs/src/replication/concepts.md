@@ -1,10 +1,8 @@
 # Noxu Replication — Design and Implementation
 
-> **v1.5 status — preview.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> and [the chapter overview](README.md). The design below is the
-> intended end-state and is largely correct as a specification; the
-> production binary in v1.5 has 10 GA blockers tracked in the audit.
+> **v2.0 status — GA.** All ten noxu-rep GA blockers identified in
+> the May 2026 audit are closed (Waves 3-3 and 4-A).  The design
+> below now matches the production binary.
 
 ## Overview
 
