@@ -1051,3 +1051,165 @@ fn wave2a_step2_delete_one_primary_leaves_others() {
         "deleting pk2 must leave pk1 and pk3 reachable under sec_key 'A'"
     );
 }
+
+// ─── Wave 2A step 4 — primary `put` auto-maintains secondaries ─────
+
+/// `Database::put` on the primary now automatically updates every
+/// registered secondary index inside the user's transaction.  Pre-step-4
+/// the user had to call `update_secondary` manually after each primary
+/// write (Audit C3).
+#[test]
+fn wave2a_step4_primary_put_auto_maintains_secondary() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let _sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    // Insert via primary only — no manual update_secondary call.
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"Apple");
+    primary.lock().put(None, &pk, &v).unwrap();
+
+    // Lookup by 'A' must succeed; the secondary was maintained
+    // automatically by Database::put.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = _sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(
+        st,
+        OperationStatus::Success,
+        "primary put must fan out to attached secondary (audit C3)"
+    );
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Apple");
+}
+
+/// Auto-maintenance under an explicit transaction commits primary +
+/// secondary together; an abort rolls both back.
+#[test]
+fn wave2a_step4_auto_maintain_atomic_with_user_txn() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    // Abort path: the secondary entry must vanish along with the primary.
+    let txn = env.begin_transaction(None, None).unwrap();
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"Apple");
+    primary.lock().put(Some(&txn), &pk, &v).unwrap();
+    txn.abort().unwrap();
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::NotFound);
+    assert_eq!(sec.count().unwrap(), 0);
+
+    // Commit path: the secondary entry survives.
+    let txn = env.begin_transaction(None, None).unwrap();
+    primary.lock().put(Some(&txn), &pk, &v).unwrap();
+    txn.commit().unwrap();
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+}
+
+/// Multi-secondary case: two secondaries attached to the same primary
+/// are both auto-maintained by a single primary put.
+#[test]
+fn wave2a_step4_two_secondaries_both_auto_maintained() {
+    /// Last-byte secondary key creator.
+    struct LastByteCreator;
+    impl SecondaryKeyCreator for LastByteCreator {
+        fn create_secondary_key(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            result: &mut DatabaseEntry,
+        ) -> bool {
+            if let Some(d) = data.get_data()
+                && !d.is_empty()
+            {
+                result.set_data(&d[d.len() - 1..]);
+                return true;
+            }
+            false
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner1 = open_inner_sec_db(&env, "sec_first");
+    let sec1 = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner1,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+    let inner2 = open_inner_sec_db(&env, "sec_last");
+    let sec2 = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner2,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(LastByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"Apple");
+    primary.lock().put(None, &pk, &v).unwrap();
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec1.get(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data
+        )
+        .unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(
+        sec2.get(
+            None,
+            &DatabaseEntry::from_bytes(b"e"),
+            &mut p_key,
+            &mut data
+        )
+        .unwrap(),
+        OperationStatus::Success
+    );
+}

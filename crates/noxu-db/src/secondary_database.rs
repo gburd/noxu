@@ -69,6 +69,14 @@ use noxu_sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Internal action driven by the associate-style hook on the primary's
+/// `put` / `delete` paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Insert,
+    Delete,
+}
+
 /// A secondary (index) database handle.
 ///
 /// Secondary databases are always associated with a primary database.
@@ -561,8 +569,26 @@ impl SecondaryDatabase {
         old_data: Option<&DatabaseEntry>,
         new_data: Option<&DatabaseEntry>,
     ) -> Result<()> {
-        let key_creator = &self.state.config.key_creator;
-        let multi_key_creator = &self.state.config.multi_key_creator;
+        Self::update_secondary_state(
+            &self.state, txn, pri_key, old_data, new_data,
+        )
+    }
+
+    /// Same as [`Self::update_secondary`] but operates on a borrowed
+    /// `&SecondaryState`.  Used by [`Database::fan_out_to_secondaries`]
+    /// (wave 2A step 4) to drive the associate-style hook from the
+    /// primary's `put` / `delete` paths without requiring the primary
+    /// to hold a strong reference to the user-visible
+    /// [`SecondaryDatabase`] handle.
+    pub(crate) fn update_secondary_state(
+        state: &SecondaryState,
+        txn: Option<&Transaction>,
+        pri_key: &DatabaseEntry,
+        old_data: Option<&DatabaseEntry>,
+        new_data: Option<&DatabaseEntry>,
+    ) -> Result<()> {
+        let key_creator = &state.config.key_creator;
+        let multi_key_creator = &state.config.multi_key_creator;
 
         // Tombstones (both old and new are None) — nothing to do.
         if old_data.is_none() && new_data.is_none() {
@@ -573,10 +599,8 @@ impl SecondaryDatabase {
             // Single-key creator path.
             let old_sec_key = old_data.and_then(|od| {
                 let mut sk = DatabaseEntry::new();
-                // The inner.* borrow requires a temporary Database borrow.
-                // We use &self.state.inner directly, which satisfies the lifetime.
                 if creator.create_secondary_key(
-                    &self.state.inner,
+                    &state.inner,
                     pri_key,
                     od,
                     &mut sk,
@@ -590,7 +614,7 @@ impl SecondaryDatabase {
             let new_sec_key = new_data.and_then(|nd| {
                 let mut sk = DatabaseEntry::new();
                 if creator.create_secondary_key(
-                    &self.state.inner,
+                    &state.inner,
                     pri_key,
                     nd,
                     &mut sk,
@@ -607,17 +631,21 @@ impl SecondaryDatabase {
                 && new_sec_key.as_ref() != old_sec_key.as_ref();
 
             if do_delete {
-                self.delete_sec_key(
+                Self::insert_sec_key_on_state(
+                    state,
                     txn,
                     old_sec_key.as_ref().unwrap(),
                     pri_key,
+                    Action::Delete,
                 )?;
             }
             if do_insert {
-                self.insert_sec_key(
+                Self::insert_sec_key_on_state(
+                    state,
                     txn,
                     new_sec_key.as_ref().unwrap(),
                     pri_key,
+                    Action::Insert,
                 )?;
             }
         } else if let Some(multi_creator) = multi_key_creator {
@@ -627,7 +655,7 @@ impl SecondaryDatabase {
             let old_keys: Vec<DatabaseEntry> = if let Some(od) = old_data {
                 let mut keys = Vec::new();
                 multi_creator.create_secondary_keys(
-                    &self.state.inner,
+                    &state.inner,
                     pri_key,
                     od,
                     &mut keys,
@@ -640,7 +668,7 @@ impl SecondaryDatabase {
             let new_keys: Vec<DatabaseEntry> = if let Some(nd) = new_data {
                 let mut keys = Vec::new();
                 multi_creator.create_secondary_keys(
-                    &self.state.inner,
+                    &state.inner,
                     pri_key,
                     nd,
                     &mut keys,
@@ -653,13 +681,25 @@ impl SecondaryDatabase {
             // Delete keys that are no longer present.
             for old_key in &old_keys {
                 if !new_keys.contains(old_key) {
-                    self.delete_sec_key(txn, old_key, pri_key)?;
+                    Self::insert_sec_key_on_state(
+                        state,
+                        txn,
+                        old_key,
+                        pri_key,
+                        Action::Delete,
+                    )?;
                 }
             }
             // Insert keys that were not present before.
             for new_key in &new_keys {
                 if !old_keys.contains(new_key) {
-                    self.insert_sec_key(txn, new_key, pri_key)?;
+                    Self::insert_sec_key_on_state(
+                        state,
+                        txn,
+                        new_key,
+                        pri_key,
+                        Action::Insert,
+                    )?;
                 }
             }
         }
@@ -720,22 +760,64 @@ impl SecondaryDatabase {
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        let mut cursor = self.make_inner_cursor(txn)?;
-        let status = cursor
-            .put(sec_key, pri_key, crate::put::Put::NoDupData)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        match status {
-            OperationStatus::Success => Ok(()),
-            // Sorted-dup `KeyExist` only triggers when the **exact**
-            // (sec_key, pri_key) pair already exists — i.e. the same
-            // primary is being re-indexed for the same secondary key.
-            // Treat it as an idempotent no-op so existing v1.4 / v1.5
-            // callers that re-run `update_secondary(pk, None, Some(d))`
-            // do not break.
-            OperationStatus::KeyExists => Ok(()),
-            other => Err(NoxuError::OperationNotAllowed(format!(
-                "unexpected put status from secondary index insert: {other:?}"
-            ))),
+        Self::insert_sec_key_on_state(
+            &self.state,
+            txn,
+            sec_key,
+            pri_key,
+            Action::Insert,
+        )
+    }
+
+    /// Inserts or deletes the `(sec_key, pri_key)` dup on the inner
+    /// index, given a borrowed `&SecondaryState`.  The associate-style
+    /// hook on the primary's `put` / `delete` paths uses this entry
+    /// point so it does not need a `SecondaryDatabase` value.
+    pub(crate) fn insert_sec_key_on_state(
+        state: &SecondaryState,
+        txn: Option<&Transaction>,
+        sec_key: &DatabaseEntry,
+        pri_key: &DatabaseEntry,
+        action: Action,
+    ) -> Result<()> {
+        let mut cursor = state.inner.open_cursor(txn, None)?;
+        match action {
+            Action::Insert => {
+                let status = cursor
+                    .put(sec_key, pri_key, crate::put::Put::NoDupData)
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                match status {
+                    OperationStatus::Success | OperationStatus::KeyExists => {
+                        Ok(())
+                    }
+                    other => Err(NoxuError::OperationNotAllowed(format!(
+                        "unexpected put status from secondary index insert: {other:?}"
+                    ))),
+                }
+            }
+            Action::Delete => {
+                let mut sec_key_mut = sec_key.clone();
+                let mut pri_key_mut = pri_key.clone();
+                let status = cursor
+                    .get(
+                        &mut sec_key_mut,
+                        &mut pri_key_mut,
+                        crate::get::Get::SearchBoth,
+                        None,
+                    )
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+
+                if status == OperationStatus::Success {
+                    cursor.delete().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -744,35 +826,19 @@ impl SecondaryDatabase {
     /// On a sorted-dup inner DB this targets the exact duplicate via
     /// [`crate::get::Get::SearchBoth`] so other duplicates of the
     /// same `sec_key` (other primary keys) are not affected.
-    ///
-    /// `txn` is forwarded to the inner cursor so the delete
-    /// participates in the caller's transaction (Sprint 4½).
     fn delete_sec_key(
         &self,
         txn: Option<&Transaction>,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        let mut cursor = self.make_inner_cursor(txn)?;
-        // Position on the exact (sec_key, pri_key) duplicate.
-        let mut sec_key_mut = sec_key.clone();
-        let mut pri_key_mut = pri_key.clone();
-        let status = cursor
-            .get(
-                &mut sec_key_mut,
-                &mut pri_key_mut,
-                crate::get::Get::SearchBoth,
-                None,
-            )
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-
-        if status == OperationStatus::Success {
-            cursor
-                .delete()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        }
-        // If not found, the secondary may already have been cleaned up; ignore.
-        Ok(())
+        Self::insert_sec_key_on_state(
+            &self.state,
+            txn,
+            sec_key,
+            pri_key,
+            Action::Delete,
+        )
     }
 
     /// Builds a writable `Cursor` on the inner secondary index `Database`.

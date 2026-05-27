@@ -236,19 +236,38 @@ impl Database {
     /// rolls back the in-memory tree mutation.
     fn with_auto_txn<F, T>(&self, op: F) -> Result<T>
     where
-        F: FnOnce(&mut CursorImpl) -> Result<T>,
+        F: FnOnce(&mut CursorImpl, &Transaction) -> Result<T>,
     {
         let auto_txn =
             self.txn_manager.begin_auto_txn(self.log_manager.clone());
         let synthetic_id = auto_txn.id_as_locker();
+        let auto_txn_id_u64 = synthetic_id as u64;
         let auto_txn_arc = Arc::new(std::sync::Mutex::new(auto_txn));
 
+        // Auto-commit cursors use locker_id = 0 so the LN log entries
+        // they write are tagged as auto-commit (not part of an explicit
+        // txn).  Recovery's analysis pass treats `txn_id != 0` LNs as
+        // belonging to an explicit txn that requires a matching
+        // TxnCommit / TxnAbort record — a synthetic auto-txn writes
+        // its TxnCommit but pre-existing recovery tooling expects
+        // auto-commit LNs to be tagged with `txn_id = None`.
         let mut cursor = self.make_cursor();
         cursor.attach_txn(Arc::clone(&auto_txn_arc));
 
-        let result = op(&mut cursor);
+        // Build a transient `Transaction` view over the same auto-txn
+        // so the closure can drive secondary-index maintenance under
+        // the same locker (wave 2A step 4: `Database::put` fan-out).
+        let txn_view = Transaction::view_of_auto_txn(
+            auto_txn_id_u64,
+            Arc::clone(&auto_txn_arc),
+        );
+
+        let result = op(&mut cursor, &txn_view);
         // Drop the cursor handle (un-pins BIN, drops Arc<Mutex<Txn>> ref).
         drop(cursor);
+        // Drop the txn view explicitly so the only remaining strong
+        // ref to the auto-txn Arc is `auto_txn_arc` below.
+        drop(txn_view);
 
         // Reclaim sole ownership of the synthetic auto-txn so we can
         // finalise it.  All cursors and their Arcs were dropped above.
@@ -310,21 +329,34 @@ impl Database {
     }
 
     /// Applies undo records collected from a synthetic auto-txn to the
-    /// in-memory B-tree of `self`.  Mirrors the per-`undo_record` block
-    /// in `Transaction::abort()` but specialised for the
-    /// single-database `with_auto_txn` case so we do not need to thread
-    /// the env-impl in.
+    /// in-memory B-tree of every database the synthetic auto-txn
+    /// touched.  Mirrors the per-`undo_record` block in
+    /// `Transaction::abort()` but does not require a `Transaction`
+    /// handle; we reach the env via `self.env_impl` and resolve each
+    /// `database_id` to the live `DatabaseImpl` via
+    /// `EnvironmentImpl::get_database_by_id`.
+    ///
+    /// Pre-Wave-2A this method only undid writes to the primary
+    /// `self.db_impl` because auto-commit fan-out to secondary indexes
+    /// did not yet exist; with the associate-style hook landed in
+    /// step 4, a single auto-commit `put` may touch multiple databases
+    /// (the primary plus every attached secondary), so undo must be
+    /// env-wide to roll the whole atomic group back on a forced
+    /// failure.
     fn apply_auto_txn_undo(&self, undo_records: Vec<UndoRecord>) {
-        let db_id_match = self.id;
-        let db_guard = self.db_impl.read();
-        let Some(tree) = db_guard.get_real_tree() else { return };
+        if undo_records.is_empty() {
+            return;
+        }
+        let env_guard = self.env_impl.lock();
         for undo in undo_records {
-            // The synthetic auto-txn touches only this database, but be
-            // defensive in case future changes broaden the contract.
-            if undo.database_id != db_id_match {
-                continue;
-            }
             let Some(abort_key) = undo.abort_key else { continue };
+            let db_id =
+                noxu_dbi::DatabaseId::new(undo.database_id as i64);
+            let Some(db_arc) = env_guard.get_database_by_id(db_id) else {
+                continue;
+            };
+            let db_guard = db_arc.read();
+            let Some(tree) = db_guard.get_real_tree() else { continue };
             if undo.abort_known_deleted {
                 if tree.delete(&abort_key) {
                     db_guard.decrement_entry_count();
@@ -340,6 +372,44 @@ impl Database {
     /// fsync the log before returning to the caller.
     ///
     /// `write_lsn` is the LSN assigned to the write operation just performed.
+    /// Walks the secondary registry and invokes
+    /// `update_secondary(txn, pri_key, old_data, new_data)` on every
+    /// live secondary attached to this primary.
+    ///
+    /// `txn` is forwarded so the secondary update participates in the
+    /// caller's transaction (or the synthetic auto-commit txn allocated
+    /// by `with_auto_txn`).  Dangling weak refs (secondaries that have
+    /// been dropped) are pruned in place.
+    ///
+    /// Wave 2A step 4 (associate-style hook on `Database::put`):
+    /// called from `Database::put` after the primary write succeeds
+    /// so any cross-primary collision in the secondary index aborts
+    /// the user's txn (sorted-dup `NoDupData` only fails on exact
+    /// `(sec_key, pri_key)` re-insert; that path is treated as a
+    /// no-op by `insert_sec_key`).
+    fn fan_out_to_secondaries(
+        &self,
+        txn: Option<&Transaction>,
+        pri_key: &DatabaseEntry,
+        old_data: Option<&DatabaseEntry>,
+        new_data: Option<&DatabaseEntry>,
+    ) -> Result<()> {
+        // Snapshot the live entries while holding the registry lock
+        // briefly so `update_secondary` (which may take other locks)
+        // does not run with the registry lock held.
+        let live: Vec<Arc<crate::secondary_database::SecondaryState>> = {
+            let mut regs = self.secondaries.lock();
+            regs.retain(|w| w.strong_count() > 0);
+            regs.iter().filter_map(|w| w.upgrade()).collect()
+        };
+        for state in live {
+            crate::secondary_database::SecondaryDatabase::update_secondary_state(
+                &state, txn, pri_key, old_data, new_data,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Port of`LogManager.flushTo(lsn)`: if a concurrent committer already
     /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
     /// natural many:1 fsync coalescing under concurrent write load with no
@@ -680,18 +750,41 @@ impl Database {
                 cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
                     |e| NoxuError::OperationNotAllowed(e.to_string()),
                 )?;
+                // Wave 2A step 4: fan the primary write out to every
+                // attached secondary inside the user's txn so the
+                // primary record and the secondary index entry commit
+                // / abort together.
+                let new_data_entry = DatabaseEntry::from_bytes(data_bytes);
+                let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                self.fan_out_to_secondaries(
+                    Some(t),
+                    &pri_key_entry,
+                    None,
+                    Some(&new_data_entry),
+                )?;
             }
             None => {
                 // Wrap the write in a synthetic auto-commit `Txn` so the
                 // lock manager sees a typed locker id ("auto-txn:<id>")
                 // and any error rolls back the in-memory tree write
-                // through `Txn::abort_collect_undo`.
-                self.with_auto_txn(|cursor| {
+                // through `Txn::abort_collect_undo`.  The same auto-txn
+                // is also used to drive secondary fan-out so primary +
+                // secondary commit/abort together.
+                self.with_auto_txn(|cursor, view| {
                     cursor
                         .put(key_bytes, data_bytes, PutMode::Overwrite)
                         .map_err(|e| {
                             NoxuError::OperationNotAllowed(e.to_string())
                         })?;
+                    let new_data_entry =
+                        DatabaseEntry::from_bytes(data_bytes);
+                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    self.fan_out_to_secondaries(
+                        Some(view),
+                        &pri_key_entry,
+                        None,
+                        Some(&new_data_entry),
+                    )?;
                     Ok(())
                 })?;
             }
@@ -796,7 +889,7 @@ impl Database {
                     _ => OperationStatus::Success,
                 }
             }
-            None => self.with_auto_txn(|cursor| {
+            None => self.with_auto_txn(|cursor, _view| {
                 cursor
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
@@ -873,7 +966,7 @@ impl Database {
                 let mut cursor = self.make_cursor_for_txn(t);
                 run_delete(&mut cursor)?
             }
-            None => self.with_auto_txn(run_delete)?,
+            None => self.with_auto_txn(|cursor, _view| run_delete(cursor))?,
         };
 
         let status = if deleted_any {

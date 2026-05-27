@@ -194,6 +194,38 @@ impl Transaction {
         self.inner_txn.clone()
     }
 
+    /// Builds a transient `Transaction` **view** that wraps an existing
+    /// inner `Txn` (typically the synthetic auto-commit txn allocated
+    /// by [`Database::with_auto_txn`]) so that secondary-index
+    /// maintenance — driven from inside the auto-commit closure — can
+    /// share the same locker as the primary write.
+    ///
+    /// The returned `Transaction` carries `id` and `inner_txn` but is
+    /// **not** registered in the active-txn list and must never have
+    /// `commit()` / `abort()` called on it (the owning `with_auto_txn`
+    /// drives those once the closure returns).  Used internally by
+    /// `Database::put` / `Database::delete` to fan out to attached
+    /// secondary indexes inside the user's or auto-commit txn.
+    pub(crate) fn view_of_auto_txn(
+        id: u64,
+        inner_txn: Arc<Mutex<Txn>>,
+    ) -> Self {
+        Self {
+            id,
+            state: Mutex::new(TransactionState::Open),
+            start_time: Instant::now(),
+            read_only: false,
+            name: Mutex::new(None),
+            durability: None,
+            lock_timeout_ms: Mutex::new(0),
+            txn_timeout_ms: Mutex::new(0),
+            log_manager: None,
+            inner_txn: Some(inner_txn),
+            env_impl: None,
+            active_txns: None,
+        }
+    }
+
     /// Commit the transaction.
     ///
     /// All operations performed under this transaction are made durable
