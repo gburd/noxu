@@ -675,6 +675,29 @@ impl Database {
             data.get_data().unwrap_or(&[])
         };
 
+        // v1.6 (audit C3 / step 6): if any secondaries are registered,
+        // capture the pre-put value of this key (if it exists) BEFORE
+        // the overwrite so we can pass it as `old_data` to the
+        // secondary key creator below.  When the put is a fresh
+        // insert the read returns NotFound and `old_data_for_secondaries`
+        // remains `None`.  For partial puts the pre-put value already
+        // lives in `write_bytes` indirectly; we re-read here to keep
+        // the code paths uniform and to use the caller's txn for the
+        // read so isolation is honoured.
+        let secondaries_pre = self.live_secondaries();
+        let old_data_for_secondaries: Option<Vec<u8>> =
+            if secondaries_pre.is_empty() {
+                None
+            } else {
+                let mut existing = DatabaseEntry::new();
+                match self.get(txn, key, &mut existing)? {
+                    OperationStatus::Success => {
+                        existing.get_data().map(<[u8]>::to_vec)
+                    }
+                    _ => None,
+                }
+            };
+
         match txn {
             Some(t) => {
                 let mut cursor = self.make_cursor_for_txn(t);
@@ -701,18 +724,31 @@ impl Database {
         // v1.6 (audit C3 — the associate()-style hook): drive every
         // registered secondary index under the same caller-supplied
         // txn so the primary record and its secondary entries commit /
-        // abort together.  Step 4 only handles the insert direction
-        // (`old_data = None`); the put-existing-key update path that
-        // also needs to delete stale secondary entries is wired in
-        // step 6.
+        // abort together.
+        //
+        // Step 4 + Step 6 (this path): we capture the pre-put value
+        // before issuing the primary write so the put-existing-key
+        // update path can pass it as `old_data` and the secondary key
+        // creator can compute every stale (sec_key, pri_key) pair to
+        // delete in addition to inserting the new ones.  Pre-Step-6
+        // an update over an existing key leaked the previous
+        // secondary entries (audit C3 sub-case).
         let secondaries = self.live_secondaries();
         if !secondaries.is_empty() {
             // Build a fresh DatabaseEntry around the data we just
             // wrote so the secondary key creator sees the bytes the
             // user asked for (and not the partial-put scratch buffer).
             let new_entry = DatabaseEntry::from_bytes(data_bytes);
+            let old_entry: Option<DatabaseEntry> = old_data_for_secondaries
+                .as_deref()
+                .map(DatabaseEntry::from_bytes);
             for hook in secondaries {
-                hook.maintain(txn, key, None, Some(&new_entry))?;
+                hook.maintain(
+                    txn,
+                    key,
+                    old_entry.as_ref(),
+                    Some(&new_entry),
+                )?;
             }
         }
 
