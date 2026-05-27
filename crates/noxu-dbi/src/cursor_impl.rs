@@ -1981,10 +1981,23 @@ impl CursorImpl {
                 if exists {
                     return Ok(OperationStatus::KeyExist);
                 }
+                // Brand-new dup slot: old_lsn is NULL_LSN, so the txn-undo
+                // record must mark this as `abort_known_deleted` so that
+                // an aborting txn deletes the dup it just inserted.
+                self.lock_write_before_log(
+                    noxu_util::NULL_LSN.as_u64(),
+                    &two_part_key,
+                )?;
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                )?;
+                self.finalize_write_lock(
+                    noxu_util::NULL_LSN.as_u64(),
+                    new_lsn,
+                    Some(two_part_key.clone()),
+                    None,
                 )?;
                 // Use apply_tree_insert so the per-database entry counter
                 // is bumped on a new (key, data) pair; otherwise
@@ -2009,18 +2022,26 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
+                let old_lsn = self.current_lsn;
+                self.lock_write_before_log(old_lsn, &old_key)?;
                 // Delete the old two-part key.  Use apply_tree_delete so
                 // the counter is decremented (it will be re-incremented by
                 // the matching apply_tree_insert below; net change is 0,
                 // matching JE's PutCurrent semantics).
                 let del_lsn =
                     self.log_ln_write(&old_key, None, self.locker_id)?;
-                self.apply_tree_delete(old_key, del_lsn);
+                self.apply_tree_delete(old_key.clone(), del_lsn);
                 // Insert the new two-part key.
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                )?;
+                self.finalize_write_lock(
+                    old_lsn,
+                    new_lsn,
+                    Some(old_key),
+                    Some(vec![]),
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
@@ -2035,10 +2056,38 @@ impl CursorImpl {
                 // the per-database entry counter.  apply_tree_insert
                 // checks tree.insert's `is_new` return so an exact-match
                 // re-insert is a no-op for the counter.
+                let already_exists = {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        tree.search(&two_part_key)
+                            .map(|sr| sr.exact_parent_found)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                let old_lsn = if already_exists {
+                    let db = self.db_impl.read();
+                    db.get_real_tree()
+                        .and_then(|tree| {
+                            Self::get_data_from_tree(tree, &two_part_key)
+                        })
+                        .map(|(_, l)| l)
+                        .unwrap_or(noxu_util::NULL_LSN.as_u64())
+                } else {
+                    noxu_util::NULL_LSN.as_u64()
+                };
+                self.lock_write_before_log(old_lsn, &two_part_key)?;
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                )?;
+                self.finalize_write_lock(
+                    old_lsn,
+                    new_lsn,
+                    Some(two_part_key.clone()),
+                    if already_exists { Some(vec![]) } else { None },
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);

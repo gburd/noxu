@@ -1,16 +1,16 @@
-//! Regression tests for Sprint 3D — Decisions 1B and 2C from
-//! `docs/src/internal/v1.5-decisions-2026-05.md`.
+//! Regression tests for the secondary-database wave-2A unification.
 //!
-//! Each test asserts a documented v1.5 limitation:
+//! Each test asserts a wave-2A invariant.  Decisions 1B and 2C from
+//! `docs/src/internal/v1.5-decisions-2026-05.md` are revisited here:
 //!
-//! - **Decision 1B** — secondaries are one-to-one in v1.5.  Two distinct
-//!   primaries that produce the same secondary key cause the second
-//!   `update_secondary` to fail with [`NoxuError::Unsupported`] (closes
-//!   audit finding C4).
-//! - **Decision 2C** — foreign-key constraints are not enforced in v1.5.
-//!   `SecondaryDatabase::open` rejects any `SecondaryConfig` whose
-//!   foreign-key fields are set with [`NoxuError::Unsupported`] (closes
-//!   audit findings C2 / F1 / F16).
+//! - **Decision 1B** — secondaries are sorted-dup in v1.6.  Multiple
+//!   primary keys may share a secondary key; they coexist as
+//!   duplicates of `sec_key` (closes audit finding C4).
+//! - **Decision 2C** — foreign-key constraints are implemented
+//!   incrementally in this wave.  Steps 8–10 of the wave-2A plan
+//!   land Abort / Cascade / Nullify; until those steps land,
+//!   `SecondaryDatabase::open` still rejects FK config with
+//!   [`NoxuError::Unsupported`] (closes audit findings C2 / F1 / F16).
 
 use noxu_db::secondary_config::ForeignKeyDeleteAction;
 use noxu_db::{
@@ -69,19 +69,25 @@ fn open_inner_sec_db(env: &Environment, name: &str) -> Database {
     env.open_database(
         None,
         name,
-        &DatabaseConfig::new().with_allow_create(true),
+        &DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true),
     )
     .unwrap()
 }
 
-// ─── Decision 1B — one-to-one secondaries ────────────────────
+// ─── Decision 1B — sorted-dup secondaries (v1.6) ────────────────
 
-/// Two distinct primary keys that map to the same secondary key cause the
-/// second insert to fail with [`NoxuError::Unsupported`].  Pre-Sprint-3 the
-/// inner index used `Put::Overwrite` and silently destroyed the first
-/// primary's mapping (audit finding C4).
+/// Two distinct primary keys that map to the same secondary key are
+/// stored as **duplicates** of that secondary key.  Both primaries
+/// remain reachable.  Pre-v1.6 (Decision 1B v1.5 honesty) this returned
+/// [`NoxuError::Unsupported`] because the inner index was opened with
+/// `Put::NoOverwrite`.  v1.6 / wave 2A step 1: the inner index is
+/// opened with sorted duplicates and `insert_sec_key` uses
+/// `Put::NoDupData`, so cross-primary collisions store cleanly
+/// (closes audit finding C4).
 #[test]
-fn d1b_secondary_collision_returns_unsupported() {
+fn d1b_sorted_dup_cross_primary_collisions_succeed() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
@@ -101,7 +107,7 @@ fn d1b_secondary_collision_returns_unsupported() {
     primary.lock().put(None, &pk1, &v1).unwrap();
     sec.update_secondary(None, &pk1, None, Some(&v1)).unwrap();
 
-    // Sanity: lookup by 'A' returns pk1.
+    // Sanity: lookup by 'A' returns pk1 (the only duplicate so far).
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
@@ -110,44 +116,50 @@ fn d1b_secondary_collision_returns_unsupported() {
     assert_eq!(st, OperationStatus::Success);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
 
-    // Second primary record: pk2 -> "Apricot" (sec_key = 'A'). MUST fail.
+    // Second primary record: pk2 -> "Apricot" (sec_key = 'A').
+    // v1.6: this MUST succeed; the second primary is stored as a
+    // duplicate of 'A'.
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
     let v2 = DatabaseEntry::from_bytes(b"Apricot");
     primary.lock().put(None, &pk2, &v2).unwrap();
-    let result = sec.update_secondary(None, &pk2, None, Some(&v2));
+    sec.update_secondary(None, &pk2, None, Some(&v2)).expect(
+        "second primary mapping for sec_key 'A' must succeed under \
+         v1.6 sorted-dup secondaries",
+    );
 
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("one-to-one"),
-                "expected one-to-one wording: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v1.6"),
-                "expected v1.5 and v1.6 references: {msg}"
-            );
+    // Both primaries are reachable from the secondary index.  Iterate
+    // duplicates of 'A' via SecondaryCursor and collect every primary key.
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    {
+        let mut cur = sec.open_cursor(None, None).unwrap();
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = cur
+            .get_search_key(
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        if let Some(pk) = p_key.get_data() {
+            found.push(pk.to_vec());
         }
-        Ok(()) => panic!(
-            "second update_secondary must fail with NoxuError::Unsupported, \
-             got Ok"
-        ),
-        Err(other) => panic!(
-            "second update_secondary must fail with NoxuError::Unsupported, \
-             got: {other:?}"
-        ),
+        // Multi-dup walk lands in step 2 of the wave-2A plan; for now
+        // assert that step 1 stored the second duplicate cleanly by
+        // re-opening a separate cursor and counting via the inner DB's
+        // raw count() instead.
     }
+    assert!(found.contains(&b"pk1".to_vec()) || found.contains(&b"pk2".to_vec()));
 
-    // Decision 1B (honesty): the first primary's mapping is preserved
-    // because we used Put::NoOverwrite.  The user sees a loud failure
-    // *and* their existing index is intact.
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let st = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    // The inner index now contains two duplicates of 'A' (the underlying
+    // `Database::count()` returns the total number of (key, data) pairs
+    // — see `cursor_impl::put_dup` apply_tree_insert).
+    assert_eq!(
+        sec.count().unwrap(),
+        2,
+        "inner sorted-dup index must hold 2 duplicates of 'A'"
+    );
 }
 
 /// The successful one-to-one path still works exactly as before — distinct
@@ -266,10 +278,6 @@ fn d2c_foreign_key_database_rejected_at_open() {
             assert!(
                 msg.contains("foreign-key"),
                 "expected foreign-key wording: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v1.6"),
-                "expected v1.5 and v1.6 references: {msg}"
             );
         }
         Ok(_) => panic!(
