@@ -76,6 +76,7 @@
   - [Operational Runbooks](operations/runbooks.md)
   - [Power-Loss Testing](operations/power-loss.md)
   - [Numerical Baseline](operations/numerical-baseline.md)
+  - [Performance Benchmarks](operations/benchmarks.md)
   - [Known Limitations](operations/known-limitations.md)
 
 ---
@@ -135,6 +136,7 @@
   - [Wave 9-C — JE TCK port (additional rows)](internal/wave-9-c-je-tck-ports.md)
   - [Wave 10-B — `CHANGELOG.md` generation](internal/wave-10-b-changelog.md)
   - [Wave 10-C — README + capability matrix refresh](internal/wave-10-c-readme-matrix.md)
+  - [Wave 10-D — Performance benchmarks vs JE](internal/wave-10-d-benchmarks.md)
   - [v1.5 architectural decisions (2026-05)](internal/v1.5-decisions-2026-05.md)
   - [Sprint 1 follow-up — F12 residuals](internal/sprint-1-followup-f12.md)
   - [Sprint 3 — architectural decisions enforced](internal/sprint-3-decisions-enforced.md)
