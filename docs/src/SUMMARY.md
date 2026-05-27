@@ -133,6 +133,7 @@
   - [Wave 9-A — noxu-rep fixes (v2.1.1 / v2.2.0)](internal/wave-9-a-rep-fixes.md)
   - [Wave 9-B — Stateright spec re-validation](internal/wave-9-b-stateright-revalidation.md)
   - [Wave 9-C — JE TCK port (additional rows)](internal/wave-9-c-je-tck-ports.md)
+  - [Wave 10-C — README + capability matrix refresh](internal/wave-10-c-readme-matrix.md)
   - [v1.5 architectural decisions (2026-05)](internal/v1.5-decisions-2026-05.md)
   - [Sprint 1 follow-up — F12 residuals](internal/sprint-1-followup-f12.md)
   - [Sprint 3 — architectural decisions enforced](internal/sprint-3-decisions-enforced.md)
