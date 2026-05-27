@@ -10,8 +10,6 @@ not end users.
 
 ## Documents
 
-- [Noxu Fidelity Review](je-fidelity-review.md) — code-verified fidelity comparison
-  against Noxu DB 7.5.11 (754 production classes). Last updated: Session 36.
 - [Audit Report](audit-report.md) — historical snapshot of three
   independent audits taken when the workspace had 16 crates and the
   public API was still backed by an in-memory HashMap. Most of its

@@ -39,7 +39,7 @@
 //!
 //! # v1.5 limitations
 //!
-//! See [`docs/src/internal/v1.5-decisions-2026-05.md`].
+//! See `docs/src/internal/v1.5-decisions-2026-05.md`.
 //!
 //! - **Decision 1B** — v1.5 secondaries are honestly **one-to-one**: a given
 //!   secondary key may map to at most one primary key.  Two distinct
@@ -635,7 +635,7 @@ impl SecondaryDatabase {
     /// # Errors
     /// - [`NoxuError::IllegalArgument`] if the configuration is invalid,
     ///   or if the inner `secondary_db` was not opened with
-    ///   [`DatabaseConfig::with_sorted_duplicates(true)`] (v1.6 sorted-dup
+    ///   `DatabaseConfig::with_sorted_duplicates(true)` (v1.6 sorted-dup
     ///   secondaries — closes audit C4).
     /// - [`NoxuError::Unsupported`] if the configuration sets any foreign-key
     ///   constraint field (`foreign_key_database`,
@@ -803,7 +803,7 @@ impl SecondaryDatabase {
     /// `populate_if_empty` (or replaying the primary-side updates)
     /// leaves the secondary in a state that is not consistent with the
     /// primary.  Most callers should drop the secondary's primary keys
-    /// via [`Database::truncate_database`] on the inner DB or repopulate
+    /// via `Database::truncate_database` on the inner DB or repopulate
     /// the index afterwards.  Returned for symmetry with JE's
     /// `SecondaryDatabase.truncate(...)`.
     ///
@@ -1060,7 +1060,7 @@ impl SecondaryDatabase {
     /// invoked twice with the same `(sec_key, pri_key)` pair (whether
     /// auto-commit or under the same `txn`), the second call is a
     /// no-op rather than a [`NoxuError::Unsupported`] collision — see
-    /// [`Self::insert_sec_key`].
+    /// `Self::insert_sec_key`.
     ///
     /// # Arguments
     /// * `txn` - Optional transaction.  Pass the same handle that

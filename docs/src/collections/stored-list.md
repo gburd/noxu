@@ -90,7 +90,7 @@ txn.commit()?;
 ```
 
 A typical pattern is to wrap a sequence of list operations in a
-[`TransactionRunner`](../collections/README.md#v16-collections--whats-in-scope):
+[`TransactionRunner`](../collections/index.html#v16-collections--whats-in-scope):
 
 ```rust,ignore
 use noxu_collections::TransactionRunner;

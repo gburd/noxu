@@ -395,7 +395,7 @@ pub fn run_acceptor(
 // ---------------------------------------------------------------------------
 
 /// Like `run_acceptor`, but routes the promise/accept decisions through a
-/// crash-durable [`PersistentAcceptorState`].
+/// crash-durable `PersistentAcceptorState`.
 ///
 /// Closes findings F5 and F31 of `docs/src/internal/api-audit-2026-05-rep.md`.
 ///

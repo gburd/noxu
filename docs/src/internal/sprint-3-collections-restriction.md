@@ -25,7 +25,7 @@ Sprint 3C is the implementation of that decision.
 | Finding | Subject | Disposition | Where |
 |---|---|---|---|
 | #1 | Stored* ops hard-code `txn=None` | **Documented as v1.5 limitation; threading deferred to v1.6** | crate-level + per-type rustdoc; `docs/src/collections/*.md` |
-| #3 | `TransactionRunner` supplies a `&Transaction` no Stored* method accepts | **Documented as v1.5 limitation; runner restricted to raw `Database` API** | `transaction_runner.rs` rustdoc; `docs/src/collections/README.md` |
+| #3 | `TransactionRunner` supplies a `&Transaction` no Stored* method accepts | **Documented as v1.5 limitation; runner restricted to raw `Database` API** | `transaction_runner.rs` rustdoc; `docs/src/collections/index.html` |
 | #4 | Same as #3 viewed from Stored* side | **Documented; deferred to v1.6** | as above |
 | #5 | `StoredList::remove` rustdoc claimed compaction; body just deletes | **CLOSED** by aligning rustdoc with no-compaction behaviour and adding a regression test | `stored_list.rs` |
 | #6 | `StoredList::next_index` resets to 0 on reopen; pushes overwrite existing records | **CLOSED** by new `StoredList::open(&db) -> Result<Self>` recovery path; `new` retained as fast/empty-DB constructor with a warning rustdoc | `stored_list.rs`; `tests/sprint3c_tests.rs` |
@@ -105,7 +105,7 @@ rewritten:
   actual `&[u8]`-keyed API.
 + Each chapter gained a "v1.5 limitations" section pointing at the
   closed/deferred audit findings.
-+ `docs/src/collections/README.md` got a top-level "v1.5
++ `docs/src/collections/index.html` got a top-level "v1.5
   collections — what's in scope" summary so users see all five
   restrictions in one place.
 + `docs/src/getting-started/bindings.md` got the
@@ -195,7 +195,7 @@ still pass because round-trip exercises the new prefix transparently.
   `BindError::VersionMismatch` variant.
 + `crates/noxu-bind/src/serial/serde_binding.rs` — version-prefix
   encode/decode + tests.
-+ `docs/src/collections/README.md` — top-level v1.5 summary.
++ `docs/src/collections/index.html` — top-level v1.5 summary.
 + `docs/src/collections/stored-map.md` — rewrite to actual API.
 + `docs/src/collections/stored-set.md` — same.
 + `docs/src/collections/stored-list.md` — same + `open` example.
