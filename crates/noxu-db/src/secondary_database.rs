@@ -97,6 +97,32 @@ pub(crate) trait SecondaryHook {
     fn name(&self) -> String;
 }
 
+/// Trait implemented by [`SecondaryHookState`] for the FK referrer
+/// registry (v1.6 audit C2 / Decision 2C).  When a record is deleted
+/// from a foreign-key target primary, the engine iterates every
+/// registered referrer and calls
+/// [`FkReferrer::on_foreign_key_deleted`] under the same caller-supplied
+/// txn.  The implementation runs the configured
+/// [`ForeignKeyDeleteAction`] for every secondary key matching the
+/// deleted foreign key.
+pub(crate) trait FkReferrer {
+    /// Called when a foreign-DB primary record is about to be deleted.
+    /// `fk_value` is the primary key of the foreign DB record (which
+    /// may also be a secondary key in this child index).
+    ///
+    /// Returning `Err(NoxuError::ForeignConstraintViolation(…))` aborts
+    /// the foreign delete (Abort action).  Returning `Ok(())` may have
+    /// already mutated the child primary records (Cascade / Nullify).
+    fn on_foreign_key_deleted(
+        &self,
+        txn: Option<&Transaction>,
+        fk_value: &DatabaseEntry,
+    ) -> Result<()>;
+
+    /// Returns the child secondary's database name (used in error messages).
+    fn name(&self) -> String;
+}
+
 /// Internal state of a [`SecondaryDatabase`].
 ///
 /// Held behind an `Arc` so the primary database can keep a `Weak<_>`
@@ -293,6 +319,81 @@ impl SecondaryHook for SecondaryHookState {
     }
 }
 
+impl FkReferrer for SecondaryHookState {
+    /// v1.6 (audit C2 / Decision 2C): handles a foreign-DB delete by
+    /// dispatching on the configured [`ForeignKeyDeleteAction`].
+    ///
+    /// * `Abort`   — if any child secondary entry has `sec_key == fk_value`,
+    ///               return [`NoxuError::ForeignConstraintViolation`].
+    /// * `Cascade` — wired in step 9.
+    /// * `Nullify` — wired in step 10.
+    fn on_foreign_key_deleted(
+        &self,
+        txn: Option<&Transaction>,
+        fk_value: &DatabaseEntry,
+    ) -> Result<()> {
+        match self.config.foreign_key_delete_action {
+            crate::secondary_config::ForeignKeyDeleteAction::Abort => {
+                // Probe the inner secondary index for any duplicate of
+                // `fk_value`.  If we find at least one, the foreign
+                // delete must abort.
+                let mut probe_key = fk_value.clone();
+                let mut probe_pk = DatabaseEntry::new();
+                let mut cursor = self.inner.open_cursor(txn, None)?;
+                let st = cursor
+                    .get(
+                        &mut probe_key,
+                        &mut probe_pk,
+                        crate::get::Get::Search,
+                        None,
+                    )
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                if st == OperationStatus::Success {
+                    let fk_hex = fk_value
+                        .get_data()
+                        .map(|b| {
+                            b.iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    return Err(NoxuError::ForeignConstraintViolation(
+                        format!(
+                            "foreign-key delete aborted: secondary '{}' \
+                             still references foreign key 0x{fk_hex} \
+                             (ForeignKeyDeleteAction::Abort)",
+                            self.inner.get_database_name()
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            crate::secondary_config::ForeignKeyDeleteAction::Cascade => {
+                // Wired in step 9.
+                Err(NoxuError::Unsupported(
+                    "ForeignKeyDeleteAction::Cascade is not yet implemented \
+                     (planned for v1.6 step 9)"
+                        .to_string(),
+                ))
+            }
+            crate::secondary_config::ForeignKeyDeleteAction::Nullify => {
+                // Wired in step 10.
+                Err(NoxuError::Unsupported(
+                    "ForeignKeyDeleteAction::Nullify is not yet implemented \
+                     (planned for v1.6 step 10)"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    fn name(&self) -> String {
+        self.inner.get_database_name().to_string()
+    }
+}
+
 /// A secondary (index) database handle.
 ///
 ///
@@ -407,18 +508,30 @@ impl SecondaryDatabase {
             ));
         }
 
-        // Decision 2C: reject FK configurations in v1.5.  The fields are
-        // accepted by the builder for forward source compatibility (v1.6
-        // will honour them) but the runtime cannot enforce them today, so
-        // we surface a typed error at open time rather than silently
-        // ignoring user configuration.  Closes audit findings C2 / F1 /
-        // F16.
-        if config.has_foreign_key_config() {
-            return Err(NoxuError::Unsupported(
-                "foreign-key constraints are not supported in v1.5; clear \
-                 SecondaryConfig.foreign_key_database / \
-                 foreign_key_delete_action / foreign_key_nullifier / \
-                 foreign_multi_key_nullifier (planned for v1.6)"
+        // v1.6 (audit C2 / Decision 2C): foreign-key constraints are
+        // now enforced when the user supplies the foreign DB handle
+        // via [`SecondaryConfig::with_foreign_key_database_handle`].
+        // The `name`-only setter remains advisory — a config that
+        // names a foreign DB but never wires the handle is rejected
+        // here so the user is not silently left with an unenforced
+        // constraint.  Cascade / Nullify still require the handle and
+        // the matching nullifier (steps 9 / 10).
+        let fk_handle = config.foreign_key_database.clone();
+        if config.foreign_key_database_name.is_some() && fk_handle.is_none() {
+            return Err(NoxuError::IllegalArgument(
+                "SecondaryConfig.foreign_key_database_name is set without \
+                 a foreign_key_database handle; v1.6 FK enforcement requires \
+                 calling SecondaryConfig::with_foreign_key_database_handle()"
+                    .to_string(),
+            ));
+        }
+        if (config.foreign_key_nullifier.is_some()
+            || config.foreign_multi_key_nullifier.is_some())
+            && fk_handle.is_none()
+        {
+            return Err(NoxuError::IllegalArgument(
+                "foreign-key nullifier is set without a foreign_key_database \
+                 handle (call SecondaryConfig::with_foreign_key_database_handle)"
                     .to_string(),
             ));
         }
@@ -439,6 +552,16 @@ impl SecondaryDatabase {
             let weak: std::sync::Weak<dyn SecondaryHook + Send + Sync> =
                 Arc::downgrade(&state) as _;
             state.primary.lock().register_secondary(weak);
+        }
+
+        // v1.6 (audit C2 / Decision 2C): if the secondary references a
+        // foreign primary DB, register as an FK referrer there so its
+        // `Database::delete` can call back into us with the configured
+        // ForeignKeyDeleteAction.
+        if let Some(fk_handle) = fk_handle {
+            let weak: std::sync::Weak<dyn FkReferrer + Send + Sync> =
+                Arc::downgrade(&state) as _;
+            fk_handle.lock().register_fk_referrer(weak);
         }
 
         let sec = SecondaryDatabase { state };
