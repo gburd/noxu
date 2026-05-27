@@ -91,6 +91,24 @@ pub struct EnvironmentImpl {
     /// `EnvironmentImpl.setupDbEnvironment()` tree population.
     recovered_trees: Mutex<HashMap<u64, noxu_tree::Tree>>,
 
+    /// Wave 3-2: XA in-doubt transactions surfaced by recovery.
+    ///
+    /// `recovered_prepared_txns` is the list of `(xid, txn_id,
+    /// first_lsn, last_lsn)` tuples that completed phase 1 of two-phase
+    /// commit but were not committed or aborted before the crash.  The
+    /// XA layer (`noxu_xa::XaEnvironment`) reads this via
+    /// `recovered_prepared_txns()` to populate `xa_recover()` results
+    /// and to resolve subsequent `xa_commit(xid)` / `xa_rollback(xid)`
+    /// calls.
+    ///
+    /// `recovered_prepared_lns` is keyed by txn_id and holds the LN
+    /// records that belong to each prepared txn.  `xa_commit` replays
+    /// these into the in-memory tree at resolution time; `xa_rollback`
+    /// discards them.
+    recovered_prepared_txns: Mutex<Vec<noxu_recovery::PreparedTxnInfo>>,
+    recovered_prepared_lns:
+        Mutex<HashMap<u64, Vec<noxu_recovery::PreparedLnReplay>>>,
+
     /// The primary (db_id=1) shared tree used for LN migration during
     /// log cleaning.
     ///
@@ -285,6 +303,15 @@ impl EnvironmentImpl {
         // Trees recovered from the log, keyed by database ID.
         // Populated during the recovery pass below (writable envs only).
         let mut recovered: HashMap<u64, noxu_tree::Tree> = HashMap::new();
+        // Wave 3-2: prepared (XA in-doubt) transactions surfaced by
+        // recovery.  Empty for fresh / clean-shutdown environments.
+        let mut recovered_prepared: Vec<
+            noxu_recovery::PreparedTxnInfo,
+        > = Vec::new();
+        let mut recovered_prepared_lns: HashMap<
+            u64,
+            Vec<noxu_recovery::PreparedLnReplay>,
+        > = HashMap::new();
 
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
@@ -334,13 +361,22 @@ impl EnvironmentImpl {
                 HashMap::new();
             recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
 
-            if let Err(e) =
-                rmgr.recover_all(&mut scanner, &mut recovery_trees, true)
+            let recovery_info = match rmgr
+                .recover_all(&mut scanner, &mut recovery_trees, true)
             {
-                return Err(DbiError::RecoveryFailure {
-                    reason: e.to_string(),
-                });
-            }
+                Ok(info) => info,
+                Err(e) => {
+                    return Err(DbiError::RecoveryFailure {
+                        reason: e.to_string(),
+                    });
+                }
+            };
+
+            // Wave 3-2: capture in-doubt prepared (XA) transactions so
+            // the XA layer can surface them via xa_recover() and resolve
+            // them via xa_commit / xa_rollback.
+            recovered_prepared = recovery_info.recovered_prepared_txns.clone();
+            recovered_prepared_lns = recovery_info.prepared_txn_lns.clone();
 
             // Install all recovered trees keyed by db_id so that
             // open_database() can transplant each into the matching DatabaseImpl.
@@ -627,6 +663,8 @@ impl EnvironmentImpl {
             evictor,
             evictor_handle: Mutex::new(Some(evictor_thread)),
             recovered_trees: Mutex::new(recovered),
+            recovered_prepared_txns: Mutex::new(recovered_prepared),
+            recovered_prepared_lns: Mutex::new(recovered_prepared_lns),
             primary_tree,
             cleaner,
             checkpointer,
@@ -932,6 +970,62 @@ impl EnvironmentImpl {
     /// Returns `None` for read-only environments.
     pub fn get_log_manager(&self) -> Option<Arc<LogManager>> {
         self.log_manager.clone()
+    }
+
+    /// Wave 3-2: Returns the list of XA in-doubt prepared transactions
+    /// surfaced by the most recent recovery pass.
+    ///
+    /// Each entry holds the txn id, the first/last LSN logged by the
+    /// transaction, the prepare-frame LSN, and the encoded XID
+    /// components.  The XA layer (`noxu_xa::XaEnvironment::xa_recover`)
+    /// reads this list to populate its return value and to seed the
+    /// recovered-branches map so that `xa_commit(xid)` /
+    /// `xa_rollback(xid)` can resolve the in-doubt transaction.
+    ///
+    /// Calling this method does NOT clear the list — it returns clones
+    /// so multiple `xa_recover()` calls (e.g. across re-scans) all see
+    /// the same set until
+    /// [`Self::take_recovered_prepared_lns`] is called as part of
+    /// resolution.
+    pub fn recovered_prepared_txns(
+        &self,
+    ) -> Vec<noxu_recovery::PreparedTxnInfo> {
+        self.recovered_prepared_txns.lock().unwrap().clone()
+    }
+
+    /// Wave 3-2: Removes and returns the LN replay list for a prepared
+    /// transaction.
+    ///
+    /// Called by `xa_commit(xid)` after locating the txn id from
+    /// [`Self::recovered_prepared_txns`].  The XA layer iterates the
+    /// returned list and applies each LN to the in-memory tree, then
+    /// writes a `TxnCommit` WAL frame.
+    ///
+    /// Returns an empty `Vec` if the txn id is not in the recovered
+    /// set (e.g. it was already resolved in this process, or it was
+    /// never prepared).
+    pub fn take_recovered_prepared_lns(
+        &self,
+        txn_id: u64,
+    ) -> Vec<noxu_recovery::PreparedLnReplay> {
+        self.recovered_prepared_lns
+            .lock()
+            .unwrap()
+            .remove(&txn_id)
+            .unwrap_or_default()
+    }
+
+    /// Wave 3-2: Removes a recovered prepared txn entry from the
+    /// EnvironmentImpl after the XA layer has successfully resolved it.
+    ///
+    /// After this call, [`Self::recovered_prepared_txns`] no longer
+    /// includes this txn id.  Idempotent.
+    pub fn forget_recovered_prepared_txn(&self, txn_id: u64) {
+        self.recovered_prepared_txns
+            .lock()
+            .unwrap()
+            .retain(|info| info.txn_id != txn_id);
+        self.recovered_prepared_lns.lock().unwrap().remove(&txn_id);
     }
 
     /// Returns a clone of the shared Evictor.

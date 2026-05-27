@@ -12,7 +12,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use noxu_log::{
     FileManager,
-    entry::{BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry},
+    entry::{
+        BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry,
+        TxnPrepareEntry,
+    },
     entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     entry_type::LogEntryType,
     file_header::FILE_HEADER_SIZE,
@@ -20,7 +23,7 @@ use noxu_log::{
 use noxu_recovery::{
     CheckpointEnd, CheckpointStart, CkptEndRecord, CkptStartRecord, InRecord,
     LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
-    TxnAbortRecord, TxnCommitRecord,
+    TxnAbortRecord, TxnCommitRecord, TxnPrepareRecord,
 };
 use noxu_util::{Lsn, NULL_LSN};
 
@@ -114,6 +117,21 @@ impl FileManagerLogScanner {
                 let e = TxnEndEntry::read_from_log(&payload).ok()?;
                 Some(LogEntry::TxnAbort(TxnAbortRecord {
                     txn_id: e.txn_id as u64,
+                }))
+            }
+            LogEntryType::TxnPrepare => {
+                // Wave 3-2: parse the XA prepare frame.  `lsn` is filled
+                // in by the caller (parse_entry_from_bytes) since the
+                // entry itself does not carry its own LSN.
+                let e = TxnPrepareEntry::read_from_log(&payload).ok()?;
+                Some(LogEntry::TxnPrepare(TxnPrepareRecord {
+                    txn_id: e.txn_id as u64,
+                    first_lsn: noxu_util::Lsn::from_u64(e.first_lsn),
+                    last_lsn: noxu_util::Lsn::from_u64(e.last_lsn),
+                    lsn: NULL_LSN,
+                    xid_format_id: e.xid_format_id,
+                    xid_gtrid: e.xid_gtrid,
+                    xid_bqual: e.xid_bqual,
                 }))
             }
 
@@ -374,6 +392,9 @@ impl FileManagerLogScanner {
                                     r.lsn = entry_lsn;
                                 }
                                 LogEntry::CkptStart(r) => {
+                                    r.lsn = entry_lsn;
+                                }
+                                LogEntry::TxnPrepare(r) => {
                                     r.lsn = entry_lsn;
                                 }
                                 _ => {}

@@ -149,6 +149,9 @@ pub struct RecoveryStats {
     pub committed_txns: u64,
     /// Number of aborted transactions found.
     pub aborted_txns: u64,
+    /// Number of prepared (XA in-doubt) transactions found in the log.
+    /// Wave 3-2 of the v1.5+ remediation plan.
+    pub prepared_txns: u64,
     /// Number of active (uncommitted) transactions that were undone.
     pub active_txns_undone: u64,
     /// Number of LNs skipped during redo because of out-of-order VLSN
@@ -325,6 +328,13 @@ impl RecoveryManager {
         self.run_undo(scanner, &analysis, tree)?;
 
         // ------------------------------------------------------------------
+        // Wave 3-2: surface prepared (XA in-doubt) txns to the env layer.
+        // ------------------------------------------------------------------
+        self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
+        self.info.recovered_prepared_txns =
+            analysis.prepared_txns.values().cloned().collect();
+
+        // ------------------------------------------------------------------
         // Done
         // ------------------------------------------------------------------
         self.set_progress(RecoveryProgress::Complete);
@@ -440,6 +450,11 @@ impl RecoveryManager {
         self.set_progress(RecoveryProgress::UndoLNs);
         self.run_undo_all(scanner, &analysis, trees)?;
 
+        // Wave 3-2: surface prepared (XA in-doubt) txns to the env layer.
+        self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
+        self.info.recovered_prepared_txns =
+            analysis.prepared_txns.values().cloned().collect();
+
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
     }
@@ -515,6 +530,11 @@ impl RecoveryManager {
                     continue;
                 }
                 if analysis.is_committed(txn_id) {
+                    continue;
+                }
+                // Wave 3-2: skip prepared (XA in-doubt) txns; resolved
+                // through xa_commit / xa_rollback.
+                if analysis.is_prepared(txn_id) {
                     continue;
                 }
                 let action = Self::compute_undo_action(rec);
@@ -801,6 +821,24 @@ impl RecoveryManager {
                     result.record_abort(rec.txn_id);
                     self.stats.aborted_txns += 1;
                 }
+                LogEntry::TxnPrepare(rec) => {
+                    // XA two-phase commit, phase 1 (wave 3-2).
+                    // Move the txn from active→prepared.  If a later
+                    // TxnCommit or TxnAbort is seen, `record_commit` /
+                    // `record_abort` will remove the entry.
+                    result.record_prepare(
+                        crate::analysis_result::PreparedTxnInfo {
+                            txn_id: rec.txn_id,
+                            prepare_lsn: rec.lsn,
+                            first_lsn: rec.first_lsn,
+                            last_lsn: rec.last_lsn,
+                            xid_format_id: rec.xid_format_id,
+                            xid_gtrid: rec.xid_gtrid.clone(),
+                            xid_bqual: rec.xid_bqual.clone(),
+                        },
+                    );
+                    self.stats.prepared_txns += 1;
+                }
 
                 // ----------------------------------------------------------
                 // Checkpoint records: update boundary LSNs
@@ -864,6 +902,50 @@ impl RecoveryManager {
         }
 
         Ok(result)
+    }
+
+    /// Walks `self.redo_entries` and groups every LN whose `txn_id` matches
+    /// one of the in-doubt prepared transactions in `analysis` into a
+    /// `prepared_txn_lns` map keyed by txn_id.
+    ///
+    /// Called from `recover()` / `recover_all()` after the analysis pass
+    /// so that `xa_commit(xid)` can replay the prepared txn’s writes
+    /// into the in-memory tree at resolution time, and so that the
+    /// redo/undo phases can skip prepared LNs without further work.
+    ///
+    /// Wave 3-2 of the v1.5+ remediation plan.
+    fn collect_prepared_txn_lns(
+        &self,
+        analysis: &AnalysisResult,
+    ) -> hashbrown::HashMap<u64, Vec<crate::analysis_result::PreparedLnReplay>>
+    {
+        use crate::analysis_result::{PreparedLnOperation, PreparedLnReplay};
+        let mut by_txn: hashbrown::HashMap<
+            u64,
+            Vec<PreparedLnReplay>,
+        > = hashbrown::HashMap::new();
+        if analysis.prepared_txns.is_empty() {
+            return by_txn;
+        }
+        for (lsn, rec) in &self.redo_entries {
+            let Some(txn_id) = rec.txn_id else { continue };
+            if !analysis.prepared_txns.contains_key(&txn_id) {
+                continue;
+            }
+            let op = match rec.operation {
+                LnOperation::Insert => PreparedLnOperation::Insert,
+                LnOperation::Update => PreparedLnOperation::Update,
+                LnOperation::Delete => PreparedLnOperation::Delete,
+            };
+            by_txn.entry(txn_id).or_default().push(PreparedLnReplay {
+                db_id: rec.db_id,
+                original_lsn: *lsn,
+                operation: op,
+                key: rec.key.to_vec(),
+                data: rec.data.as_ref().map(|b| b.to_vec()),
+            });
+        }
+        by_txn
     }
 
     // ====================================================================
@@ -1209,6 +1291,13 @@ impl RecoveryManager {
                 // Skip committed transactions.
                 // If (committedTxnIds.containsKey(txnId)) continue;
                 if analysis.is_committed(txn_id) {
+                    continue;
+                }
+                // Wave 3-2: skip prepared (XA in-doubt) transactions
+                // — the resolved_commit / resolved_abort path will
+                // either replay them into the tree (xa_commit) or
+                // discard them (xa_rollback).
+                if analysis.is_prepared(txn_id) {
                     continue;
                 }
 
