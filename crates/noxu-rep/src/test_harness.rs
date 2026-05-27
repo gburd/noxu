@@ -49,7 +49,7 @@
 //!
 //! // Spin up a 3-node group, elect node 0 as master, replicate
 //! // 100 entries, and assert all replicas applied them.
-//! let group = RepTestBase::builder("demo_group").group_size(3).build();
+//! let mut group = RepTestBase::builder("demo_group").group_size(3).build();
 //! group.create_group(/* master_term */ 1).unwrap();
 //! group.populate_db(0, 100).unwrap();
 //! group.assert_all_at_vlsn(100);
