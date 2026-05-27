@@ -107,8 +107,7 @@ fn tck_config_unknown_param_rejected() {
 fn tck_config_type_mismatch_rejected() {
     let mut mgr = ConfigManager::new();
     // SHARED_CACHE is bool; pass an Int.
-    let res =
-        mgr.set("noxu.sharedCache", ParamValue::Int(42), false);
+    let res = mgr.set("noxu.sharedCache", ParamValue::Int(42), false);
     assert!(
         matches!(res, Err(ConfigError::TypeMismatch { .. })),
         "expected TypeMismatch, got {res:?}",
@@ -139,19 +138,11 @@ fn tck_config_immutable_param_rejected_after_open() {
     let mut mgr = ConfigManager::new();
 
     // Before open: any value (even an immutable param) is settable.
-    mgr.set(
-        mgr_def.name,
-        ParamValue::Bool(true),
-        /* is_open */ false,
-    )
-    .unwrap();
+    mgr.set(mgr_def.name, ParamValue::Bool(true), /* is_open */ false).unwrap();
 
     // After open: setting an immutable param fails.
-    let res = mgr.set(
-        mgr_def.name,
-        ParamValue::Bool(false),
-        /* is_open */ true,
-    );
+    let res =
+        mgr.set(mgr_def.name, ParamValue::Bool(false), /* is_open */ true);
     assert!(
         matches!(res, Err(ConfigError::NotMutable { .. })),
         "expected NotMutable when setting {} post-open, got {res:?}",
@@ -185,8 +176,7 @@ fn tck_config_defaults_returned_when_not_overridden() {
 #[test]
 fn tck_config_overridden_value_takes_precedence_over_default() {
     let mut mgr = ConfigManager::new();
-    mgr.set("noxu.maxMemoryPercent", ParamValue::Int(75), false)
-        .unwrap();
+    mgr.set("noxu.maxMemoryPercent", ParamValue::Int(75), false).unwrap();
     assert_eq!(75, mgr.get_int(&params::MAX_MEMORY_PERCENT));
     assert!(mgr.is_overridden("noxu.maxMemoryPercent"));
 }

@@ -198,15 +198,8 @@ fn tck_tuple_format_test_packed_int_and_long() {
         assert_eq!(0, input.available());
     }
 
-    let long_data: &[i64] = &[
-        i64::MIN,
-        i32::MIN as i64,
-        -1,
-        0,
-        1,
-        i32::MAX as i64,
-        i64::MAX,
-    ];
+    let long_data: &[i64] =
+        &[i64::MIN, i32::MIN as i64, -1, 0, 1, i32::MAX as i64, i64::MAX];
     for &v in long_data {
         let mut out = TupleOutput::new();
         out.write_packed_long(v);
@@ -230,8 +223,20 @@ fn tck_tuple_format_test_packed_int_and_long() {
 #[test]
 fn tck_tuple_ordering_test_string() {
     let data: &[&str] = &[
-        "", "\u{0001}", "\u{0002}", "A", "a", "ab", "b", "bb", "bba", "c",
-        "c\u{0001}", "d", "\u{007F}", "\u{00FF}",
+        "",
+        "\u{0001}",
+        "\u{0002}",
+        "A",
+        "a",
+        "ab",
+        "b",
+        "bb",
+        "bba",
+        "c",
+        "c\u{0001}",
+        "d",
+        "\u{007F}",
+        "\u{00FF}",
     ];
     check_monotone(data, |out, s| out.write_string(s));
 }

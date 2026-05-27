@@ -24,9 +24,7 @@
 
 use std::path::Path;
 
-use noxu_db::{
-    Database, DatabaseConfig, Environment, EnvironmentConfig,
-};
+use noxu_db::{Database, DatabaseConfig, Environment, EnvironmentConfig};
 use noxu_persist::entity::Entity;
 use noxu_persist::entity_serializer::EntitySerializer;
 use noxu_persist::entity_store::EntityStore;
@@ -79,17 +77,15 @@ impl EntitySerializer<Item> for ItemSer {
                 "Item: name truncated".into(),
             ));
         }
-        let name =
-            String::from_utf8(bytes[12..12 + nlen].to_vec()).map_err(|e| {
-                PersistError::SerializationError(e.to_string())
-            })?;
+        let name = String::from_utf8(bytes[12..12 + nlen].to_vec())
+            .map_err(|e| PersistError::SerializationError(e.to_string()))?;
         Ok(Item { id, name })
     }
 }
 
 fn open_env(path: &Path, allow_create: bool) -> Environment {
-    let mut cfg = EnvironmentConfig::new(path.to_path_buf())
-        .with_transactional(true);
+    let mut cfg =
+        EnvironmentConfig::new(path.to_path_buf()).with_transactional(true);
     if allow_create {
         cfg = cfg.with_allow_create(true);
     }
@@ -138,10 +134,7 @@ fn tck_persist_sequence_monotonic_starts_at_1() {
     let mut prev = 0u64;
     for _ in 0..50 {
         let n = seq.next().unwrap();
-        assert!(
-            n > prev,
-            "sequence not strictly monotone: {n} after {prev}",
-        );
+        assert!(n > prev, "sequence not strictly monotone: {n} after {prev}",);
         prev = n;
     }
     // First call returned a positive value (>= 1).
@@ -225,8 +218,7 @@ fn tck_persist_read_only_store_rejects_writes() {
         .unwrap();
         let pi = store.get_primary_index::<u64, Item>().unwrap();
         let ser = ItemSer;
-        pi.put(None, &ser, &Item { id: 1, name: "alpha".into() })
-            .unwrap();
+        pi.put(None, &ser, &Item { id: 1, name: "alpha".into() }).unwrap();
         store.close().unwrap();
         // Env drops at end of block; explicit `drop(store)` first to
         // release the borrow, then env follows.
@@ -289,8 +281,7 @@ fn tck_persist_read_only_store_reopens_without_allow_create() {
         .unwrap();
         let pi = store.get_primary_index::<u64, Item>().unwrap();
         let ser = ItemSer;
-        pi.put(None, &ser, &Item { id: 1, name: "alpha".into() })
-            .unwrap();
+        pi.put(None, &ser, &Item { id: 1, name: "alpha".into() }).unwrap();
         store.close().unwrap();
         drop(store);
         drop(env);
@@ -360,8 +351,7 @@ fn tck_persist_close_then_reopen_picks_up_data() {
         let pi = store.get_primary_index::<u64, Item>().unwrap();
         let ser = ItemSer;
         for i in 1..=3 {
-            pi.put(None, &ser, &Item { id: i, name: format!("n{i}") })
-                .unwrap();
+            pi.put(None, &ser, &Item { id: i, name: format!("n{i}") }).unwrap();
         }
         store.close().unwrap();
     }
@@ -429,8 +419,7 @@ fn tck_persist_count_after_inserts_and_deletes() {
     assert_eq!(0, pi.count().unwrap());
 
     for i in 1..=10 {
-        pi.put(None, &ser, &Item { id: i, name: format!("i{i}") })
-            .unwrap();
+        pi.put(None, &ser, &Item { id: i, name: format!("i{i}") }).unwrap();
     }
     assert_eq!(10, pi.count().unwrap());
 
