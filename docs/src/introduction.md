@@ -24,6 +24,7 @@ Sprint 1–3 restriction notes
 | `Cursor::get` with `Get::SearchGte` / range scans | ✅ | ✅ | ✅ |
 | `Cursor::get` with `Get::Search` / `SearchBoth` (validated on non-dup) | ✅ | ✅ | ✅ |
 | `Cursor::get` with `Get::SearchLte` / `FirstDup` / `LastDup` | ❌ (`NoxuError::Unsupported`) | ⚠️ planned | ✅ |
+| `DiskOrderedCursor` (high-throughput unordered scan; multi-DB) | ❌ | ✅ (Wave 2C-3) | ✅ |
 | `Cursor::get` with `Get::NextDup` / `PrevDup` on non-dup DB | ❌ (`NotFound`) | ✅ | ✅ |
 | Read-uncommitted isolation (env + per-txn config) | ✅ (honoured) | ✅ | ✅ |
 | Auto-commit + explicit-txn co-existence | ✅ | ✅ | ✅ |
