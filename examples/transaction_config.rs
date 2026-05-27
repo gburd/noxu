@@ -33,7 +33,7 @@ fn main() {
     // ── 1. Default transaction ────────────────────────────────────────────────
     println!("[1] Default transaction (COMMIT_SYNC durability)");
     {
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_default");
         let val = DatabaseEntry::from_bytes(b"value_default");
         db.put(Some(&txn), &key, &val).unwrap();
@@ -45,7 +45,7 @@ fn main() {
     println!("[2] Lock timeout (100ms)");
     {
         let config = TransactionConfig::new().with_lock_timeout_ms(100);
-        let txn = env.begin_transaction(None, Some(&config)).unwrap();
+        let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_timeout");
         let val = DatabaseEntry::from_bytes(b"value_timeout");
         db.put(Some(&txn), &key, &val).unwrap();
@@ -57,7 +57,7 @@ fn main() {
     println!("[3] Serializable isolation");
     {
         let config = TransactionConfig::new().with_serializable_isolation(true);
-        let txn = env.begin_transaction(None, Some(&config)).unwrap();
+        let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_serializable");
         let val = DatabaseEntry::from_bytes(b"value_serializable");
         db.put(Some(&txn), &key, &val).unwrap();
@@ -69,7 +69,7 @@ fn main() {
     println!("[4] No-wait mode (fail immediately on lock conflict)");
     {
         let config = TransactionConfig::new().with_no_wait(true);
-        let txn = env.begin_transaction(None, Some(&config)).unwrap();
+        let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_nowait");
         let val = DatabaseEntry::from_bytes(b"value_nowait");
         db.put(Some(&txn), &key, &val).unwrap();
@@ -81,7 +81,7 @@ fn main() {
     println!("[5] Importunate mode (steal locks)");
     {
         let config = TransactionConfig::new().with_importunate(true);
-        let txn = env.begin_transaction(None, Some(&config)).unwrap();
+        let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_importunate");
         let val = DatabaseEntry::from_bytes(b"value_importunate");
         db.put(Some(&txn), &key, &val).unwrap();
@@ -93,7 +93,7 @@ fn main() {
     println!("[6] Read-committed isolation");
     {
         let config = TransactionConfig::new().with_read_committed(true);
-        let txn = env.begin_transaction(None, Some(&config)).unwrap();
+        let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_default");
         let mut val = DatabaseEntry::new();
         db.get(Some(&txn), &key, &mut val).unwrap();
@@ -109,7 +109,7 @@ fn main() {
     println!("[7] Transaction timeout (5000ms)");
     {
         let config = TransactionConfig::new().with_txn_timeout_ms(5000);
-        let txn = env.begin_transaction(None, Some(&config)).unwrap();
+        let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_txn_timeout");
         let val = DatabaseEntry::from_bytes(b"value_txn_timeout");
         db.put(Some(&txn), &key, &val).unwrap();

@@ -1,0 +1,5 @@
+error: invalid `relate = NotARealVariant`; allowed values: OneToOne, ManyToOne, OneToMany, ManyToMany
+ --> tests/ui/fail_invalid_relate.rs:7:5
+  |
+7 |     #[secondary_key(name = "x", relate = NotARealVariant)]
+  |     ^

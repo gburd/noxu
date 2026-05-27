@@ -12,6 +12,7 @@ mod database_impl;
 mod db_tree;
 mod db_type;
 pub mod dbi_config;
+pub mod disk_ordered_cursor_impl;
 pub mod dup_key_data;
 mod env_failure_reason;
 mod env_state;
@@ -25,6 +26,7 @@ mod node_sequence;
 mod operation;
 mod operation_status;
 mod put_mode;
+pub mod replica_ack;
 mod search_mode;
 pub mod throughput_stats;
 mod truncate_result;
@@ -39,6 +41,9 @@ pub use database_impl::{DatabaseImpl, DatabaseTree};
 pub use db_tree::DbTree;
 pub use db_type::DbType;
 pub use dbi_config::DbiEnvConfig;
+pub use disk_ordered_cursor_impl::{
+    DiskOrderedCursorImpl, DiskOrderedCursorOptions,
+};
 pub use env_failure_reason::EnvironmentFailureReason;
 pub use env_state::EnvState;
 pub use environment_impl::EnvironmentImpl;
@@ -50,6 +55,10 @@ pub use node_sequence::NodeSequence;
 pub use operation::Operation;
 pub use operation_status::OperationStatus;
 pub use put_mode::PutMode;
+pub use replica_ack::{
+    AckWaitError, AckWaitErrorKind, ReplicaAckCoordinator,
+    ReplicaAckPolicyKind, SharedReplicaAckCoordinator,
+};
 pub use search_mode::SearchMode;
 pub use throughput_stats::{ThroughputStats, ThroughputStatsSnapshot};
 pub use truncate_result::TruncateResult;

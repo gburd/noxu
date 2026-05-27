@@ -158,7 +158,7 @@ pub fn run_concurrent_txn(
                             format!("{:010}", key_idx).into_bytes(),
                         );
                         let v = DatabaseEntry::from_bytes(&value);
-                        let txn = env.begin_transaction(None, None).unwrap();
+                        let txn = env.begin_transaction(None).unwrap();
                         let _ = db.put(Some(&txn), &k, &v);
                         let _ = txn.commit();
                         ops += 1;

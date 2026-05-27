@@ -612,10 +612,10 @@ JE exposes ~80 string-keyed parameters with paired setters; Noxu's
 
 | JE annotation/class | Noxu | Status |
 |---|---|---|
-| `@Entity` | `Entity` trait (manual impl) | RENAMED — no proc-macro derive yet |
+| `@Entity` | `Entity` trait + `#[derive(Entity)]` (Wave 2C-1) | RENAMED — derive in `noxu-persist-derive` |
 | `@Persistent` | (none — implicit) | DELIBERATELY-OMITTED |
-| `@PrimaryKey` | `PrimaryKey` trait | RENAMED |
-| `@SecondaryKey` (with `relate`, `relatedEntity`, `onRelatedEntityDelete`) | (manual `KeyCreator` closures) | PARTIAL — declarative form not present |
+| `@PrimaryKey` | `PrimaryKey` trait + `#[primary_key]` field attr / `#[derive(PrimaryKey)]` for composites | RENAMED |
+| `@SecondaryKey` (with `relate`, `relatedEntity`, `onRelatedEntityDelete`) | `#[secondary_key(name = ..., relate = ..., related_entity = ..., on_related_entity_delete = ...)]` field attr + `#[derive(SecondaryKey)]` (Wave 2C-1) | RENAMED — declarative form available, FK actions are metadata only in v1.6 |
 | `@KeyField` | (none) | DELIBERATELY-OMITTED — composite key encoding handled by `serde`+tuple bindings |
 | `@NotPersistent` / `@NotTransient` | (none) | DELIBERATELY-OMITTED |
 | `Relationship.{ONE_TO_ONE, ONE_TO_MANY, MANY_TO_ONE, MANY_TO_MANY}` | (modelled via secondary-index multiplicity in user code) | PARTIAL |

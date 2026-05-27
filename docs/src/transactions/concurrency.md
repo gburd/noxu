@@ -116,10 +116,10 @@ let env = Environment::open(
 // Override the lock timeout for a single transaction.
 let mut txn_config = TransactionConfig::new();
 txn_config.set_no_wait(true); // Fail immediately if lock unavailable.
-let txn = env.begin_transaction(None, Some(&txn_config))?;
+let txn = env.begin_transaction(Some(&txn_config))?;
 
 // Or set a timeout programmatically after the transaction starts.
-let txn2 = env.begin_transaction(None, None)?;
+let txn2 = env.begin_transaction(None)?;
 txn2.set_lock_timeout(1000); // 1 second
 ```
 
@@ -147,7 +147,7 @@ const MAX_RETRIES: u32 = 10;
 let mut retries = 0;
 
 loop {
-    let txn = env.begin_transaction(None, None)?;
+    let txn = env.begin_transaction(None)?;
 
     let result = (|| -> Result<(), NoxuError> {
         let key = DatabaseEntry::from_bytes(b"counter");

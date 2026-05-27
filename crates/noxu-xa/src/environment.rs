@@ -40,6 +40,24 @@ struct Branch {
     has_writes: bool,
 }
 
+/// Branch reconstructed from a recovered (post-crash) prepared
+/// transaction.
+///
+/// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.  Used to
+/// resolve `xa_commit(xid)` / `xa_rollback(xid)` calls for XIDs that
+/// were prepared in a previous process and survived the crash via the
+/// `TxnPrepare` WAL frame.
+///
+/// There is no in-memory `Transaction` for these branches — the original
+/// process crashed before commit / rollback, and the recovery layer
+/// surfaced only the (xid, txn_id, first_lsn, last_lsn) tuple plus the
+/// list of LNs to replay on commit.
+#[derive(Debug, Clone)]
+struct RecoveredBranch {
+    /// Transaction id from the original process.
+    txn_id: u64,
+}
+
 /// XA-enabled wrapper around a Noxu Environment.
 ///
 /// Manages the lifecycle of distributed transaction branches, implementing
@@ -50,13 +68,81 @@ struct Branch {
 pub struct XaEnvironment {
     env: Environment,
     branches: Mutex<HashMap<Xid, Branch>>,
+    /// Wave 3-2: branches restored from the WAL `TxnPrepare` frames
+    /// during the most recent `Environment::open()` recovery pass.
+    /// Resolved via `xa_commit(xid)` / `xa_rollback(xid)`.
+    recovered_branches: Mutex<HashMap<Xid, RecoveredBranch>>,
     prepared_log: Option<PreparedLog>,
+    /// Recovery-scan cursor state for `xa_recover` (audit
+    /// persist-xa F5, Wave 2C-4).  X/Open requires `STARTRSCAN` to
+    /// rewind the cursor and `ENDRSCAN` to release it; calls
+    /// without `STARTRSCAN` resume from the saved cursor.  Stored
+    /// here so a paginating TM no longer sees duplicates.
+    /// `None` = no scan in progress.
+    recover_cursor: Mutex<Option<RecoverScan>>,
+}
+
+/// Saved state of a paginating `xa_recover` scan.
+#[derive(Debug, Clone)]
+struct RecoverScan {
+    /// Full snapshot of XIDs at scan start; the cursor walks this
+    /// list rather than re-querying the backing maps each call so
+    /// pagination is stable across concurrent prepare / forget
+    /// calls.
+    xids: Vec<Xid>,
+    /// Index of the next XID to return.
+    next: usize,
 }
 
 impl XaEnvironment {
     /// Creates a new XaEnvironment wrapping the given environment.
+    ///
+    /// Wave 3-2: also seeds the `recovered_branches` map from the
+    /// engine's recovered prepared-txn list (the durable WAL
+    /// `TxnPrepare` frames are the source of truth for crash
+    /// durability), so `xa_recover()` returns in-doubt XIDs even when
+    /// no `PreparedLog` is configured.
     pub fn new(env: Environment) -> Self {
-        Self { env, branches: Mutex::new(HashMap::new()), prepared_log: None }
+        let recovered = Self::seed_recovered_branches(&env);
+        Self {
+            env,
+            branches: Mutex::new(HashMap::new()),
+            recovered_branches: Mutex::new(recovered),
+            prepared_log: None,
+            recover_cursor: Mutex::new(None),
+        }
+    }
+
+    /// Wave 3-2: pull the recovered prepared-txn list out of the
+    /// engine's `EnvironmentImpl` and rebuild the (Xid →
+    /// RecoveredBranch) map.
+    ///
+    /// Encoding: the XID format_id / gtrid / bqual fields stored in
+    /// the WAL `TxnPrepare` frame are the same components used by
+    /// `noxu_xa::Xid`, so this round-trip is byte-exact.
+    fn seed_recovered_branches(
+        env: &Environment,
+    ) -> HashMap<Xid, RecoveredBranch> {
+        let mut map = HashMap::new();
+        for info in env.recovered_prepared_txns() {
+            let xid = match Xid::new(
+                info.xid_format_id,
+                &info.xid_gtrid,
+                &info.xid_bqual,
+            ) {
+                Ok(xid) => xid,
+                Err(e) => {
+                    log::error!(
+                        "noxu-xa: skipping recovered prepared txn {}: \
+                         malformed XID in WAL: {e}",
+                        info.txn_id
+                    );
+                    continue;
+                }
+            };
+            map.insert(xid, RecoveredBranch { txn_id: info.txn_id });
+        }
+        map
     }
 
     /// Returns a reference to the underlying Environment.
@@ -117,41 +203,21 @@ impl XaEnvironment {
     /// Enable persistent prepared-transaction logging for crash recovery.
     ///
     /// When enabled, `xa_prepare` writes the Xid to a persistent database,
-    /// and `xa_commit`/`xa_rollback`/`xa_forget` remove it. After a crash,
-    /// `xa_recover` returns XIDs from both the in-memory map and the
-    /// persistent log.
+    /// and `xa_commit`/`xa_rollback`/`xa_forget` remove it.
     ///
-    /// # v1.5 limitation
-    ///
-    /// In v1.5, the persistent log records that an XID was prepared but the
-    /// engine does not durably record the underlying `Transaction`'s state
-    /// (write locks, undo chain, dirty pages). On a fresh process, XIDs from
-    /// the persistent log appear in `xa_recover` but cannot be committed or
-    /// rolled back — attempting to do so returns
-    /// [`XaError::CrashDurabilityNotSupported`]. Use `xa_forget` to clear
-    /// the persistent record. Crash-durable XA is planned for v2.0.
+    /// As of wave 3-2, the `PreparedLog` is OPTIONAL: the WAL
+    /// `TxnPrepare` frame written by `Transaction::prepare` is the
+    /// durable source of truth, and `xa_recover()` populates its
+    /// return value from the engine's recovered prepared-txn list
+    /// regardless of whether a `PreparedLog` is configured.  The
+    /// `PreparedLog` is retained as a convenience for operators who
+    /// want to enumerate in-doubt XIDs without scanning the WAL
+    /// (e.g. via a maintenance tool that doesn't open a full
+    /// environment).
     pub fn with_prepared_log(mut self) -> Result<Self, noxu_db::NoxuError> {
         let log = PreparedLog::open(&self.env)?;
         self.prepared_log = Some(log);
         Ok(self)
-    }
-
-    /// Classify the cause of a `branches.get(xid) == None` lookup.
-    ///
-    /// If the XID also appears in the persistent prepared log, the caller is
-    /// trying to operate on a branch that was prepared in a previous process
-    /// and lost on restart; surface the v1.5 limitation as a typed error
-    /// instead of the generic `NotFound`. Otherwise the XID was simply never
-    /// seen — return `NotFound`.
-    fn classify_missing_branch(&self, xid: &Xid) -> XaError {
-        if let Some(ref log) = self.prepared_log {
-            if let Ok(persisted) = log.recover_all() {
-                if persisted.contains(xid) {
-                    return XaError::CrashDurabilityNotSupported;
-                }
-            }
-        }
-        XaError::NotFound
     }
 }
 
@@ -186,12 +252,16 @@ impl XaResource for XaEnvironment {
         if branches.contains_key(xid) {
             return Err(XaError::DuplicateXid);
         }
+        // Wave 3-2: also reject if the XID is already pending
+        // resolution from a previous process — starting fresh work
+        // under it would be ambiguous.
+        if self.recovered_branches.lock().unwrap().contains_key(xid) {
+            return Err(XaError::DuplicateXid);
+        }
 
         let config = TransactionConfig::new();
-        let txn = self
-            .env
-            .begin_transaction(None, Some(&config))
-            .map_err(XaError::Db)?;
+        let txn =
+            self.env.begin_transaction(Some(&config)).map_err(XaError::Db)?;
 
         branches.insert(
             xid.clone(),
@@ -242,14 +312,7 @@ impl XaResource for XaEnvironment {
         }
 
         // Auto-detect writes performed via the inner Transaction. Resolves
-        // the `mark_write` footgun (Sprint 3, audit Finding 3): if the
-        // application performs writes through the inner Transaction but
-        // forgets to call `mark_write`, we must NOT take the read-only
-        // optimisation — doing so silently aborts those writes.
-        //
-        // `Txn::has_logged_entries()` returns true as soon as any LN log
-        // record was emitted under this transaction id, which is exactly
-        // the condition that makes the read-only optimisation unsafe.
+        // the `mark_write` footgun (Sprint 3, audit Finding 3).
         let inner_has_writes = branch
             .txn
             .get_inner_txn()
@@ -266,9 +329,32 @@ impl XaResource for XaEnvironment {
             return Ok(PrepareResult::ReadOnly);
         }
 
-        // Persist prepared record for crash recovery.
+        // Wave 3-2: write the durable TxnPrepare WAL frame.  The
+        // `Transaction::prepare` call serializes (txn_id, first_lsn,
+        // last_lsn, xid_format_id, xid_gtrid, xid_bqual) into the WAL
+        // and fsyncs before returning, so a crash immediately after
+        // this point still yields the XID via xa_recover() on the
+        // next environment open.
+        branch
+            .txn
+            .prepare(
+                xid.format_id,
+                &xid.global_transaction_id,
+                &xid.branch_qualifier,
+            )
+            .map_err(XaError::Db)?;
+
+        // Persist prepared record for operator-facing recovery (the
+        // WAL frame is the durable source of truth; this database is
+        // a convenience).
         if let Some(ref log) = self.prepared_log {
-            log.record_prepare(xid).map_err(XaError::Db)?;
+            if let Err(e) = log.record_prepare(xid) {
+                log::warn!(
+                    "noxu-xa: PreparedLog.record_prepare failed for {xid:?}: \
+                     {e}; WAL TxnPrepare frame is still durable so xa_recover() \
+                     will surface this XID after a crash"
+                );
+            }
         }
         branch.state = BranchState::Prepared;
         log::debug!("xa_prepare: {xid:?} -> Prepared");
@@ -276,121 +362,262 @@ impl XaResource for XaEnvironment {
     }
 
     fn xa_commit(&self, xid: &Xid, flags: XaFlags) -> XaResult<()> {
-        let mut branches = self.branches.lock().unwrap();
-        let branch = match branches.get_mut(xid) {
-            Some(b) => b,
-            None => {
-                // Not in memory — distinguish "never seen this XID" from
-                // "prepared in a previous process and lost on restart".
-                drop(branches);
-                return Err(self.classify_missing_branch(xid));
-            }
-        };
+        // Fast path: in-memory branch (this process prepared the XID).
+        {
+            let mut branches = self.branches.lock().unwrap();
+            if let Some(branch) = branches.get_mut(xid) {
+                if flags.contains(XaFlags::ONEPHASE) {
+                    // One-phase commit: skip prepare.
+                    if branch.state != BranchState::Idle {
+                        return Err(XaError::Protocol(format!(
+                            "xa_commit(ONEPHASE): expected Idle, got {:?}",
+                            branch.state
+                        )));
+                    }
+                } else if branch.state != BranchState::Prepared {
+                    return Err(XaError::Protocol(format!(
+                        "xa_commit: expected Prepared, got {:?}",
+                        branch.state
+                    )));
+                }
 
-        if flags.contains(XaFlags::ONEPHASE) {
-            // One-phase commit: skip prepare.
-            if branch.state != BranchState::Idle {
-                return Err(XaError::Protocol(format!(
-                    "xa_commit(ONEPHASE): expected Idle, got {:?}",
-                    branch.state
-                )));
+                let branch = branches.remove(xid).unwrap();
+                if branch.state == BranchState::Prepared {
+                    branch
+                        .txn
+                        .resolved_commit_after_prepare()
+                        .map_err(XaError::Db)?;
+                } else {
+                    // ONEPHASE: ordinary commit.
+                    branch.txn.commit().map_err(XaError::Db)?;
+                }
+                if let Some(ref log) = self.prepared_log {
+                    let _ = log.remove(xid);
+                }
+                log::debug!("xa_commit: {xid:?}");
+                return Ok(());
             }
-        } else if branch.state != BranchState::Prepared {
-            return Err(XaError::Protocol(format!(
-                "xa_commit: expected Prepared, got {:?}",
-                branch.state
-            )));
         }
 
-        // Remove branch and commit the underlying transaction.
-        let branch = branches.remove(xid).unwrap();
-        branch.txn.commit().map_err(XaError::Db)?;
+        // Wave 3-2: recovered branch path.
+        if flags.contains(XaFlags::ONEPHASE) {
+            return Err(XaError::Protocol(
+                "xa_commit(ONEPHASE): cannot one-phase commit a \
+                 recovered branch"
+                    .into(),
+            ));
+        }
+        let mut recovered = self.recovered_branches.lock().unwrap();
+        let recovered_branch =
+            recovered.remove(xid).ok_or(XaError::NotFound)?;
+        drop(recovered);
+
+        // Replay the prepared txn's LNs into the in-memory tree so
+        // subsequent reads see the committed data without waiting for
+        // the next environment open.
+        let lns = self.env.take_recovered_prepared_lns(recovered_branch.txn_id);
+        self.env.apply_recovered_prepared_lns(&lns).map_err(XaError::Db)?;
+
+        // Write the durable TxnCommit WAL frame.
+        self.env
+            .write_txn_commit_for_recovered(recovered_branch.txn_id)
+            .map_err(XaError::Db)?;
+
+        // Drop from the engine's recovered list and from the
+        // operator-facing PreparedLog.
+        self.env.forget_recovered_prepared_txn(recovered_branch.txn_id);
         if let Some(ref log) = self.prepared_log {
             let _ = log.remove(xid);
         }
-        log::debug!("xa_commit: {xid:?}");
+
+        log::debug!("xa_commit: {xid:?} (recovered)");
         Ok(())
     }
 
     fn xa_rollback(&self, xid: &Xid, flags: XaFlags) -> XaResult<()> {
         let _ = flags;
-        let mut branches = self.branches.lock().unwrap();
-        let branch = match branches.get(xid) {
-            Some(b) => b,
-            None => {
-                drop(branches);
-                return Err(self.classify_missing_branch(xid));
-            }
-        };
-
-        match branch.state {
-            BranchState::Idle
-            | BranchState::Prepared
-            | BranchState::RollbackOnly => {}
-            _ => {
-                return Err(XaError::Protocol(format!(
-                    "xa_rollback: unexpected state {:?}",
-                    branch.state
-                )));
+        // Fast path: in-memory branch.
+        {
+            let mut branches = self.branches.lock().unwrap();
+            if let Some(branch) = branches.get(xid) {
+                match branch.state {
+                    BranchState::Idle
+                    | BranchState::Prepared
+                    | BranchState::RollbackOnly => {}
+                    _ => {
+                        return Err(XaError::Protocol(format!(
+                            "xa_rollback: unexpected state {:?}",
+                            branch.state
+                        )));
+                    }
+                }
+                let branch = branches.remove(xid).unwrap();
+                if branch.state == BranchState::Prepared {
+                    branch
+                        .txn
+                        .resolved_abort_after_prepare()
+                        .map_err(XaError::Db)?;
+                } else {
+                    branch.txn.abort().map_err(XaError::Db)?;
+                }
+                if let Some(ref log) = self.prepared_log {
+                    let _ = log.remove(xid);
+                }
+                log::debug!("xa_rollback: {xid:?}");
+                return Ok(());
             }
         }
 
-        let branch = branches.remove(xid).unwrap();
-        branch.txn.abort().map_err(XaError::Db)?;
+        // Wave 3-2: recovered branch path.
+        let mut recovered = self.recovered_branches.lock().unwrap();
+        let recovered_branch =
+            recovered.remove(xid).ok_or(XaError::NotFound)?;
+        drop(recovered);
+
+        // Discard the prepared LN replay list — nothing to apply.
+        let _ = self.env.take_recovered_prepared_lns(recovered_branch.txn_id);
+
+        // Write the durable TxnAbort WAL frame.
+        self.env
+            .write_txn_abort_for_recovered(recovered_branch.txn_id)
+            .map_err(XaError::Db)?;
+
+        self.env.forget_recovered_prepared_txn(recovered_branch.txn_id);
         if let Some(ref log) = self.prepared_log {
             let _ = log.remove(xid);
         }
-        log::debug!("xa_rollback: {xid:?}");
+
+        log::debug!("xa_rollback: {xid:?} (recovered)");
         Ok(())
     }
 
-    fn xa_recover(&self, _flags: XaFlags) -> XaResult<Vec<Xid>> {
-        // In-memory prepared branches
-        let branches = self.branches.lock().unwrap();
-        let mut prepared: Vec<Xid> = branches
-            .iter()
-            .filter(|(_, b)| b.state == BranchState::Prepared)
-            .map(|(xid, _)| xid.clone())
-            .collect();
-
-        // Add any from persistent log (crash recovery — not in memory).
+    fn xa_recover(&self, flags: XaFlags) -> XaResult<Vec<Xid>> {
+        // Audit persist-xa F5 (Wave 2C-4): honour the X/Open
+        // STARTRSCAN / ENDRSCAN flags so that paginating TMs no
+        // longer see duplicates.
         //
-        // NOTE (v1.5): XIDs returned here that are NOT also in the in-memory
-        // `branches` map cannot actually be committed or rolled back — the
-        // engine has no `TxnPrepare` WAL record yet, so on a fresh process
-        // the underlying `Transaction` (locks, undo chain) does not exist.
-        // We still report them so the operator can see what is in doubt and
-        // call `xa_forget` to clear the persistent record. Attempting
-        // `xa_commit` / `xa_rollback` on such an XID returns
-        // `XaError::CrashDurabilityNotSupported`. Crash-durable XA is
-        // planned for v2.0.
-        if let Some(ref log) = self.prepared_log {
-            if let Ok(persisted) = log.recover_all() {
+        //   * STARTRSCAN: rewind — build a fresh snapshot of every
+        //     prepared XID and reset the cursor to 0.
+        //   * ENDRSCAN:   release — drop the saved snapshot.
+        //   * Neither flag: resume — return the next page of the
+        //     existing snapshot, or build one on demand if no scan
+        //     is currently in progress (matches "first call rewinds
+        //     implicitly" behaviour expected by simple TMs).
+        //
+        // We continue to return *all* remaining XIDs in a single
+        // call rather than enforcing a TM-supplied page size; XA
+        // does not actually require pagination, only that the same
+        // XID never appears twice across resumed calls.  Re-paging
+        // can be added later by surfacing a `Vec<Xid>` chunk size.
+        let start_rscan = flags.contains(XaFlags::STARTRSCAN);
+        let end_rscan = flags.contains(XaFlags::ENDRSCAN);
+
+        let mut cursor_guard = self.recover_cursor.lock().unwrap();
+
+        if start_rscan || cursor_guard.is_none() {
+            // Build a fresh snapshot.
+            let branches = self.branches.lock().unwrap();
+            let mut prepared: Vec<Xid> = branches
+                .iter()
+                .filter(|(_, b)| b.state == BranchState::Prepared)
+                .map(|(xid, _)| xid.clone())
+                .collect();
+            drop(branches);
+
+            // Wave 3-2: in-doubt branches surfaced by recovery.  These are
+            // backed by durable WAL `TxnPrepare` frames; xa_commit /
+            // xa_rollback resolve them through the recovered_branches
+            // map.
+            for xid in self.recovered_branches.lock().unwrap().keys().cloned() {
+                if !prepared.contains(&xid) {
+                    prepared.push(xid);
+                }
+            }
+
+            // Add any from persistent log.  Storage-level read errors
+            // are now surfaced (was: silently dropped — audit XA F7).
+            if let Some(ref log) = self.prepared_log {
+                let persisted = log.recover_all().map_err(|e| {
+                    XaError::RmFail(format!(
+                        "xa_recover: prepared-log scan failed: {e}"
+                    ))
+                })?;
                 for xid in persisted {
                     if !prepared.contains(&xid) {
                         prepared.push(xid);
                     }
                 }
             }
+
+            *cursor_guard = Some(RecoverScan { xids: prepared, next: 0 });
         }
-        Ok(prepared)
+
+        let result = if let Some(ref mut scan) = *cursor_guard {
+            // Drain everything from `next..` and advance the cursor.
+            let out: Vec<Xid> = scan.xids[scan.next..].to_vec();
+            scan.next = scan.xids.len();
+            out
+        } else {
+            Vec::new()
+        };
+
+        if end_rscan {
+            *cursor_guard = None;
+        }
+
+        Ok(result)
     }
 
     fn xa_forget(&self, xid: &Xid, _flags: XaFlags) -> XaResult<()> {
-        let mut branches = self.branches.lock().unwrap();
-        if branches.remove(xid).is_none() {
-            // Check persistent log (may be from crash recovery)
-            if let Some(ref log) = self.prepared_log {
-                let recovered = log.recover_all().unwrap_or_default();
-                if !recovered.contains(xid) {
-                    return Err(XaError::NotFound);
-                }
-            } else {
-                return Err(XaError::NotFound);
+        let mut found = false;
+        // In-memory branch: if it was prepared, write a durable
+        // TxnAbort so the next recovery does NOT surface the XID
+        // again from the still-fsync'd TxnPrepare WAL frame.
+        let in_mem_branch = self.branches.lock().unwrap().remove(xid);
+        if let Some(branch) = in_mem_branch {
+            if branch.state == BranchState::Prepared {
+                // Equivalent to an implicit rollback: discard the
+                // prepared writes (which are still in the in-memory
+                // tree), apply undo, and write a TxnAbort frame.
+                branch
+                    .txn
+                    .resolved_abort_after_prepare()
+                    .map_err(XaError::Db)?;
             }
+            // Other states (Idle, RollbackOnly, Active, Suspended): the
+            // X/Open spec only allows forget on Prepared / heuristically-
+            // completed branches, but we accept the legacy behaviour of
+            // dropping the Branch silently for backwards compatibility
+            // with v1.5.  The Transaction's Drop will best-effort abort
+            // the inner txn.
+            found = true;
+        }
+        if let Some(rec) = self.recovered_branches.lock().unwrap().remove(xid) {
+            // The XA TM has decided to forget this in-doubt branch
+            // without resolving it.  Treat it as an implicit rollback
+            // for durability: write a TxnAbort frame so a subsequent
+            // recovery does not surface the XID again.  The data was
+            // never applied (prepared LNs are not redone), so there is
+            // nothing to undo in the tree.
+            let _ = self.env.take_recovered_prepared_lns(rec.txn_id);
+            self.env
+                .write_txn_abort_for_recovered(rec.txn_id)
+                .map_err(XaError::Db)?;
+            self.env.forget_recovered_prepared_txn(rec.txn_id);
+            found = true;
         }
         if let Some(ref log) = self.prepared_log {
+            // Persistent-log entries always succeed at forget; an
+            // entry without a matching in-memory or recovered branch
+            // is treated as already-cleaned (idempotent).
+            let recovered = log.recover_all().unwrap_or_default();
+            if recovered.contains(xid) {
+                found = true;
+            }
             let _ = log.remove(xid);
+        }
+        if !found {
+            return Err(XaError::NotFound);
         }
         log::debug!("xa_forget: {xid:?}");
         Ok(())
@@ -579,5 +806,54 @@ mod tests {
 
         // Clean up
         xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
+    }
+
+    /// Audit persist-xa F5 (Wave 2C-4): STARTRSCAN / ENDRSCAN
+    /// pagination. A second `xa_recover` call without STARTRSCAN
+    /// (i.e. resume) returns the empty list because the previous
+    /// call drained the cursor.
+    #[test]
+    fn test_recover_pagination_no_duplicates() {
+        let (xa, _dir) = make_xa_env();
+        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let _db = xa.inner().open_database(None, "test", &db_config).unwrap();
+
+        // Prepare two branches.
+        let mut xids = Vec::new();
+        for i in 0..2u32 {
+            let bqual = format!("bq{i}");
+            let xid = Xid::new(1, b"gtrid", bqual.as_bytes()).unwrap();
+            xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+            xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+            xa.mark_write(&xid).unwrap();
+            xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
+            xids.push(xid);
+        }
+
+        // STARTRSCAN drains everything.
+        let first = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
+        assert_eq!(first.len(), 2);
+
+        // Resume (no flag): no duplicates — empty list.
+        let second = xa.xa_recover(XaFlags::NOFLAGS).unwrap();
+        assert!(
+            second.is_empty(),
+            "second xa_recover (resume) must not duplicate XIDs: {second:?}",
+        );
+
+        // ENDRSCAN releases the cursor; the next implicit-rewind call
+        // sees the snapshot afresh.
+        let _ = xa.xa_recover(XaFlags::ENDRSCAN).unwrap();
+        let again = xa.xa_recover(XaFlags::NOFLAGS).unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "after ENDRSCAN the next call rebuilds and returns all XIDs",
+        );
+
+        // Clean up
+        for xid in &xids {
+            xa.xa_rollback(xid, XaFlags::NOFLAGS).unwrap();
+        }
     }
 }

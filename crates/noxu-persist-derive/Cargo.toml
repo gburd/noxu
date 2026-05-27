@@ -1,0 +1,29 @@
+[package]
+name = "noxu-persist-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Derive macros for the Noxu DB Direct Persistence Layer (Entity, PrimaryKey, SecondaryKey)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+trybuild = "1"
+# noxu-persist is the runtime side of the macro; tests invoke it.
+noxu-persist = { workspace = true }
+noxu-db = { workspace = true }
+tempfile = "3"

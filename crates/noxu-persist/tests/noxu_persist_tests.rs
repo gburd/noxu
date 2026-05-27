@@ -1024,7 +1024,10 @@ fn test_evolve_with_empty_mutations_returns_zero() {
     let evolve_cfg = EvolveConfig::new();
     let stats = store.evolve(&mutations, &evolve_cfg).unwrap();
 
-    assert_eq!(stats.n_read(), 0);
+    // Wave 2C-2 streamed evolve reads every record (n_read counts the
+    // cursor scan) but never rewrites when nothing matches and the
+    // on-disk envelope already matches the catalog target.
+    assert_eq!(stats.n_read(), 1);
     assert_eq!(stats.n_converted(), 0);
 }
 

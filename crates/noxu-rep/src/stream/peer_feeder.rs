@@ -47,12 +47,55 @@ pub const PEER_FEEDER_SERVICE_NAME: &str = "PEER_FEEDER";
 // PeerLogScanner
 // ---------------------------------------------------------------------------
 
+/// Default maximum number of entries retained in a `PeerLogScanner`
+/// in-memory queue.
+///
+/// Without a bound, every replicated entry stays in RAM until it is
+/// consumed by a downstream peer. A long-running replica with no
+/// downstream consumers therefore accumulates one VecDeque entry per
+/// replicated record forever (audit finding F10).
+///
+/// 16 384 entries is enough headroom for the slowest expected
+/// downstream peer to drain while keeping resident memory bounded
+/// (assuming sub-MiB entries, this caps the queue at ~16 GiB worst
+/// case; the byte-size cap is the harder bound).
+pub const DEFAULT_PEER_SCANNER_MAX_ENTRIES: usize = 16_384;
+
+/// Default maximum total payload size, in bytes, retained in a
+/// `PeerLogScanner` queue.  Once the cumulative payload bytes exceed
+/// this threshold, the oldest entries are evicted on each `push`.
+///
+/// 64 MiB matches the channel's `MAX_FRAME_PAYLOAD` and is large
+/// enough to absorb a large in-flight transaction without being
+/// large enough to OOM a small replica box.
+pub const DEFAULT_PEER_SCANNER_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// A [`LogScanner`] backed by an in-memory queue of `(vlsn, type, payload)`
 /// entries.
 ///
 /// Entries are pushed by the `ReplicaReceiver` as they arrive from the
 /// master (or from another peer).  The `PeerFeederRunner` consumes entries
 /// from this queue and streams them to a downstream replica.
+///
+/// ## Bounded memory (F10)
+///
+/// The queue has two configurable bounds:
+///
+/// - `max_entries`: maximum entry count (default
+///   [`DEFAULT_PEER_SCANNER_MAX_ENTRIES`]).
+/// - `max_bytes`: maximum cumulative payload size in bytes
+///   (default [`DEFAULT_PEER_SCANNER_MAX_BYTES`]).
+///
+/// On `push`, if either bound is exceeded the oldest entries are
+/// evicted from the front of the queue until both bounds are
+/// satisfied.  The evicted entries are no longer available for peer
+/// streaming through this scanner; downstream peers that fall behind
+/// the eviction window must catch up via the on-disk
+/// `EnvironmentLogScanner` or via network restore.  This matches
+/// HA semantics where peer-to-peer log distribution is
+/// best-effort and the on-disk log is the durable source.
+///
+/// Closes finding F10 of `docs/src/internal/api-audit-2026-05-rep.md`.
 ///
 /// Thread safety: the queue is protected by a `Mutex` so that the receiver
 /// thread (writer) and the feeder thread (reader) can operate concurrently.
@@ -63,15 +106,41 @@ pub struct PeerLogScanner {
     /// whether this scanner can serve a given VLSN.
     first_vlsn: Mutex<u64>,
     last_vlsn: Mutex<u64>,
+    /// Maximum entry count before oldest-evicting begins.
+    max_entries: usize,
+    /// Maximum cumulative payload bytes before oldest-evicting begins.
+    max_bytes: usize,
+    /// Current cumulative payload bytes (updated on every push/evict).
+    current_bytes: Mutex<usize>,
+    /// Cumulative count of entries evicted by the F10 bound (for
+    /// observability and tests).
+    evicted_count: std::sync::atomic::AtomicU64,
 }
 
 impl PeerLogScanner {
-    /// Create an empty scanner.
+    /// Create an empty scanner with the default F10 bounds.
     pub fn new() -> Self {
+        Self::with_capacity(
+            DEFAULT_PEER_SCANNER_MAX_ENTRIES,
+            DEFAULT_PEER_SCANNER_MAX_BYTES,
+        )
+    }
+
+    /// Create an empty scanner with explicit bounds.
+    ///
+    /// `max_entries` and `max_bytes` are both honoured; whichever is
+    /// breached first triggers oldest-evicting on subsequent `push`
+    /// calls.  Passing `usize::MAX` disables the corresponding bound
+    /// (not recommended in production).
+    pub fn with_capacity(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             first_vlsn: Mutex::new(0),
             last_vlsn: Mutex::new(0),
+            max_entries: max_entries.max(1),
+            max_bytes: max_bytes.max(1),
+            current_bytes: Mutex::new(0),
+            evicted_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -84,16 +153,60 @@ impl PeerLogScanner {
     /// the new VLSN. Out-of-order or duplicate entries are filtered later
     /// by [`LogScanner::next_entry`](crate::stream::feeder::LogScanner),
     /// which skips entries with `vlsn < from_vlsn`.
+    ///
+    /// **F10 bound**: after the new entry is appended, if the queue
+    /// exceeds either `max_entries` or `max_bytes`, the oldest entries
+    /// are evicted from the front until both bounds are satisfied. The
+    /// retained `first_vlsn` is updated to the new front-of-queue VLSN
+    /// so downstream peers that ask for an evicted VLSN range observe
+    /// `log_range().first > from_vlsn` and know they must catch up via
+    /// the durable log.
     pub fn push(&self, vlsn: u64, entry_type: u8, payload: Vec<u8>) {
-        let mut first = self.first_vlsn.lock();
-        let mut last = self.last_vlsn.lock();
-        if *first == 0 || vlsn < *first {
-            *first = vlsn;
+        let payload_len = payload.len();
+        {
+            let mut last = self.last_vlsn.lock();
+            if vlsn > *last {
+                *last = vlsn;
+            }
         }
-        if vlsn > *last {
-            *last = vlsn;
+        let mut q = self.queue.lock();
+        let mut current_bytes = self.current_bytes.lock();
+        // Append unconditionally.
+        q.push_back((vlsn, entry_type, payload));
+        *current_bytes += payload_len;
+
+        // F10 eviction: drop oldest until both bounds are honoured.
+        let mut evicted = 0u64;
+        while q.len() > self.max_entries || *current_bytes > self.max_bytes {
+            if let Some((_evicted_vlsn, _ty, evicted_payload)) = q.pop_front() {
+                *current_bytes =
+                    current_bytes.saturating_sub(evicted_payload.len());
+                evicted += 1;
+            } else {
+                break;
+            }
         }
-        self.queue.lock().push_back((vlsn, entry_type, payload));
+        if evicted > 0 {
+            self.evicted_count
+                .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Refresh first_vlsn from the (possibly mutated) queue front.
+        let new_first = q.front().map(|(v, _, _)| *v).unwrap_or(0);
+        drop(current_bytes);
+        drop(q);
+        *self.first_vlsn.lock() = new_first;
+    }
+
+    /// Cumulative number of entries dropped by the F10 bound since
+    /// scanner construction.  Useful for monitoring whether downstream
+    /// peers are keeping up.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current cumulative payload size in bytes (live snapshot).
+    pub fn current_bytes(&self) -> usize {
+        *self.current_bytes.lock()
     }
 
     /// Return the VLSN range currently held in this scanner.
@@ -126,13 +239,31 @@ impl LogScanner for PeerLogScanner {
     fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
         let mut q = self.queue.lock();
         // Skip entries with VLSN < from_vlsn (they were already seen by the
-        // downstream replica).
+        // downstream replica). Track byte-budget reduction so the F10
+        // bound stays accurate.
+        let mut current_bytes = self.current_bytes.lock();
         while let Some(&(vlsn, _, _)) = q.front() {
             if vlsn >= from_vlsn {
-                return q.pop_front();
+                let entry = q.pop_front();
+                if let Some((_, _, ref payload)) = entry {
+                    *current_bytes =
+                        current_bytes.saturating_sub(payload.len());
+                }
+                let new_first = q.front().map(|(v, _, _)| *v).unwrap_or(0);
+                drop(current_bytes);
+                drop(q);
+                *self.first_vlsn.lock() = new_first;
+                return entry;
             }
-            q.pop_front();
+            if let Some((_, _, evicted_payload)) = q.pop_front() {
+                *current_bytes =
+                    current_bytes.saturating_sub(evicted_payload.len());
+            }
         }
+        let new_first = q.front().map(|(v, _, _)| *v).unwrap_or(0);
+        drop(current_bytes);
+        drop(q);
+        *self.first_vlsn.lock() = new_first;
         None
     }
 }

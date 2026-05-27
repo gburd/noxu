@@ -26,6 +26,7 @@ members = [
     "crates/noxu-bind",
     "crates/noxu-collections",
     "crates/noxu-persist",
+    "crates/noxu-persist-derive",
     "crates/noxu-rep",
     "crates/noxu-xa",
     "crates/noxu-observe",
@@ -75,6 +76,10 @@ name = "persist"
 path = "examples/persist.rs"
 
 [[example]]
+name = "persist_derive"
+path = "examples/persist_derive.rs"
+
+[[example]]
 name = "secondary"
 path = "examples/secondary.rs"
 
@@ -99,7 +104,7 @@ name = "transaction_config"
 path = "examples/transaction_config.rs"
 
 [workspace.package]
-version = "1.5.1"
+version = "1.6.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 repository = "https://codeberg.org/gregburd/noxu"
@@ -128,6 +133,7 @@ noxu-db = { path = "crates/noxu-db" }
 noxu-bind = { path = "crates/noxu-bind" }
 noxu-collections = { path = "crates/noxu-collections" }
 noxu-persist = { path = "crates/noxu-persist" }
+noxu-persist-derive = { path = "crates/noxu-persist-derive" }
 noxu-xa = { path = "crates/noxu-xa" }
 noxu-rep = { path = "crates/noxu-rep" }
 noxu-observe = { path = "crates/noxu-observe" }

@@ -1,0 +1,5 @@
+error: missing `#[primary_key]` field — exactly one field must be annotated `#[primary_key]` on a `#[derive(Entity)]` struct
+ --> tests/ui/fail_missing_primary_key.rs:5:5
+  |
+5 |     id: u64,
+  |     ^^

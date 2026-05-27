@@ -209,7 +209,7 @@ impl CaskStore {
 
     /// Begin a new transaction for MULTI/EXEC support.
     pub fn begin_transaction(&self) -> Result<Transaction, StoreError> {
-        Ok(self.env.begin_transaction(None, None)?)
+        Ok(self.env.begin_transaction(None)?)
     }
 
     /// Put within a transaction.

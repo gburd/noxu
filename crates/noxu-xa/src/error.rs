@@ -37,32 +37,26 @@ pub enum XaError {
     #[error("XA_HEURRB: heuristic rollback")]
     HeuristicRollback,
 
-    /// The operation requires crash-durable XA recovery, which is not
-    /// implemented in v1.5.
+    /// **Wave 3-2 / v2.0**: this variant is retained for SemVer
+    /// compatibility but is no longer returned by the engine.  Crash-
+    /// durable XA is now supported — a `TxnPrepare` WAL frame is
+    /// written by `xa_prepare`, recovery surfaces in-doubt XIDs via
+    /// `xa_recover()`, and `xa_commit` / `xa_rollback` resolve them
+    /// against the recovered prepared list maintained on the
+    /// `EnvironmentImpl`.
     ///
-    /// In v1.5, [`XaResource::xa_prepare`](crate::XaResource::xa_prepare)
-    /// records prepared XIDs in a fsync'd `PreparedLog`, but the engine does
-    /// not write a `TxnPrepare` WAL record and `noxu-recovery` does not
-    /// reconstruct the prepared in-memory `Transaction` on a fresh process.
-    /// As a result:
+    /// New code should not match on this variant.  It will be removed
+    /// in v3.0.
     ///
-    /// * `xa_recover` *does* return such XIDs (so operators can see what is
-    ///   in doubt), but
-    /// * `xa_commit` and `xa_rollback` of those XIDs return this error
-    ///   because the underlying transaction state — write locks, undo
-    ///   chain, dirty in-memory tree pages — does not exist anymore.
-    ///
-    /// To clear an in-doubt entry from the persistent prepared log without
-    /// resolving its data, use [`XaResource::xa_forget`].
-    ///
-    /// Crash-durable XA — adding a `TxnPrepare` log record and integrating
-    /// it with `noxu-recovery` — is planned for v2.0. See
-    /// `docs/src/internal/sprint-3-xa-restriction.md` for the rationale.
+    /// Use [`XaError::NotFound`] for genuinely unknown XIDs and
+    /// [`XaError::Protocol`] for state-machine violations.
+    #[deprecated(
+        since = "2.0.0",
+        note = "crash-durable XA is now supported (wave 3-2); this variant is no longer returned"
+    )]
     #[error(
-        "XA crash durability is not supported in v1.5: this XID exists only \
-         in the persistent prepared log; the in-memory branch was lost on \
-         process restart. Use xa_forget to discard the persistent record. \
-         Crash-durable XA is planned for v2.0."
+        "XA crash durability is not supported: this variant is retained \
+         for SemVer compatibility and will be removed in v3.0."
     )]
     CrashDurabilityNotSupported,
 

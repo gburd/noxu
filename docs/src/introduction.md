@@ -20,10 +20,11 @@ Sprint 1–3 restriction notes
 |---|---|---|---|
 | Single-process transactional KV          | ✅ | ✅ | ✅ |
 | Sorted-duplicate values (primary DB)     | ✅ | ✅ | ✅ |
-| One-to-one secondary indexes (manual maintenance) | ✅ | ✅ (auto via `associate()`) | ✅ |
+| One-to-one secondary indexes (manual maintenance) | ✅ | ✅ (auto via `associate()` — Wave 2A) | ✅ |
 | `Cursor::get` with `Get::SearchGte` / range scans | ✅ | ✅ | ✅ |
 | `Cursor::get` with `Get::Search` / `SearchBoth` (validated on non-dup) | ✅ | ✅ | ✅ |
 | `Cursor::get` with `Get::SearchLte` / `FirstDup` / `LastDup` | ❌ (`NoxuError::Unsupported`) | ⚠️ planned | ✅ |
+| `DiskOrderedCursor` (high-throughput unordered scan; multi-DB) | ❌ | ✅ (Wave 2C-3) | ✅ |
 | `Cursor::get` with `Get::NextDup` / `PrevDup` on non-dup DB | ❌ (`NotFound`) | ✅ | ✅ |
 | Read-uncommitted isolation (env + per-txn config) | ✅ (honoured) | ✅ | ✅ |
 | Auto-commit + explicit-txn co-existence | ✅ | ✅ | ✅ |
@@ -35,20 +36,23 @@ Sprint 1–3 restriction notes
 | `Environment::close()` after `txn.commit()`       | ✅ (Sprint 1) | ✅ | ✅ |
 | `EnvironmentConfig::durability` honoured          | ✅ (Sprint 1) | ✅ | ✅ |
 | `TransactionConfig::read_uncommitted` honoured    | ✅ (Sprint 1) | ✅ | ✅ |
-| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ |
-| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ |
-| Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ | ✅ |
-| Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ | ✅ |
-| `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
-| Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ | ✅ |
-| Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter scheduled for removal) |
-| `Stored*` collections under explicit txn          | ❌ (auto-commit only; `TransactionRunner` does not drive `Stored*`) | ✅ | ✅ |
-| Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ❌ (the documented surface; never implemented — use `&[u8]`-keyed surface) | ✅ | ✅ |
+| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ⚠️ in-process only | ✅ (wave 3-2) |
+| Crash-durable XA (`TxnPrepare` WAL + recovery)    | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ❌ | ✅ (wave 3-2) |
+| Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`NoxuError::Unsupported` on collision) | ✅ (Wave 2A: sorted-dup inner DB + `SecondaryCursor::get_next_dup_full`) | ✅ |
+| Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ (Wave 2A: end-to-end Abort / Cascade with cycle detection / Nullify single + multi-key) | ✅ |
+| `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ (Wave 2A: every `Database::put` / `Database::delete` fans out to registered secondaries under the caller's txn) | ✅ |
+| Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ (Wave 2A: same atomicity now applies to the auto-maintenance path too) | ✅ |
+| Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter removed in Wave 3-1 — compile error, not runtime error) |
+| `Stored*` collections under explicit txn          | ✅ (Wave 2B — every Stored* method takes `Option<&Transaction>`) | ✅ | ✅ |
+| Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ✅ (Wave 2B — typed views parameterised by `EntryBinding`) | ✅ | ✅ |
 | `StoredList::next_index` persistent across reopen | ✅ (via `StoredList::open`; `StoredList::new` resets) | ✅ | ✅ |
-| `StoredList::remove` compacts the freed slot      | ❌ (single-key delete; documented hole) | ✅ | ✅ |
+| `StoredList::remove` compacts the freed slot      | ✅ (Wave 2B — shift-down compaction; atomic under user txn) | ✅ | ✅ |
+| `TransactionRunner` drives Stored* methods (deadlock retry + jittered backoff) | ✅ (Wave 2B) | ✅ | ✅ |
 | `SerdeBinding` version-checking (2-byte magic + version header) | ✅ (breaking on-disk vs pre-Sprint-3 builds) | ✅ | ✅ |
 | Schema evolution for `SerdeBinding` (read older struct shapes) | ❌ (header catches inter-format drift only) | ✅ | ✅ |
 | DPL primary-index reads/writes participate in user txn (`PrimaryIndex::{put,get,delete,…}(txn, …)`) | ✅ (Sprint 3B — BREAKING source-level signature change) | ✅ | ✅ |
+| DPL `#[derive(Entity)]` / `#[derive(PrimaryKey)]` / `#[derive(SecondaryKey)]` proc-macros | ❌ (manual `impl` only) | ✅ (Wave 2C-1) | ✅ |
+| DPL schema evolution (Mutations wired into open path; Renamer / Deleter / Converter; per-record class-version envelope) | ✅ (Wave 2C-2 — BREAKING on-disk shape vs. pre-v1.6) | ✅ | ✅ |
 | DPL secondary indexes are durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ | ✅ |
 | DPL secondary updates atomic with user txn        | ❌ (`PersistError::SecondariesNotTransactional` warning) | ✅ | ✅ |
 | Replication — single-process election test, 2-node sync, FPaxos shape | preview | refined | GA |

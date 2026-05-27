@@ -256,6 +256,37 @@ impl<'a> SecondaryCursor<'a> {
         self.get_with_mode(key, p_key, data, Get::Prev)
     }
 
+    /// Moves to the next duplicate of the current secondary key, returning
+    /// the (sec_key, p_key, data) triple of that duplicate.
+    ///
+    /// v1.6 sorted-dup secondaries (Decision 1B / audit C4): when a single
+    /// secondary key is shared by multiple primaries, this enumerates them
+    /// in cursor order.  Returns [`OperationStatus::NotFound`] when the
+    /// cursor steps onto a different secondary key, which is the standard
+    /// signal for “end of duplicate run”.
+    pub fn get_next_dup_full(
+        &mut self,
+        key: &mut DatabaseEntry,
+        p_key: &mut DatabaseEntry,
+        data: &mut DatabaseEntry,
+    ) -> Result<OperationStatus> {
+        self.step_dup_full(key, p_key, data, /* forward = */ true)
+    }
+
+    /// Moves to the previous duplicate of the current secondary key,
+    /// returning the (sec_key, p_key, data) triple of that duplicate.
+    ///
+    /// Returns [`OperationStatus::NotFound`] when the cursor steps onto a
+    /// different secondary key, marking the start of the duplicate run.
+    pub fn get_prev_dup_full(
+        &mut self,
+        key: &mut DatabaseEntry,
+        p_key: &mut DatabaseEntry,
+        data: &mut DatabaseEntry,
+    ) -> Result<OperationStatus> {
+        self.step_dup_full(key, p_key, data, /* forward = */ false)
+    }
+
     /// Searches for the given secondary key (exact match).
     ///
     ///
@@ -522,6 +553,43 @@ impl<'a> SecondaryCursor<'a> {
     }
 }
 
+impl<'a> SecondaryCursor<'a> {
+    /// Stepwise helper for `get_next_dup_full` / `get_prev_dup_full`.
+    ///
+    /// Reads the current secondary key, steps the inner cursor in the
+    /// requested direction, then verifies the new secondary key still
+    /// matches.  If it does, fetches the primary data; otherwise reports
+    /// `NotFound` (run end).
+    fn step_dup_full(
+        &mut self,
+        key: &mut DatabaseEntry,
+        p_key: &mut DatabaseEntry,
+        data: &mut DatabaseEntry,
+        forward: bool,
+    ) -> Result<OperationStatus> {
+        let Some(current_sk) = self.get_current_sec_key_bytes()? else {
+            return Ok(OperationStatus::NotFound);
+        };
+
+        let mode = if forward { Get::Next } else { Get::Prev };
+        let status = self.get_with_mode(key, p_key, data, mode)?;
+        if status != OperationStatus::Success {
+            return Ok(OperationStatus::NotFound);
+        }
+
+        let new_sk = key.get_data().map(|d| d.to_vec()).unwrap_or_default();
+        if new_sk == current_sk {
+            Ok(OperationStatus::Success)
+        } else {
+            // Stepped onto a different secondary key — end of the
+            // duplicate run.  We deliberately do not back the inner
+            // cursor up; callers that want to keep iterating should
+            // switch to plain Next/Prev.
+            Ok(OperationStatus::NotFound)
+        }
+    }
+}
+
 impl Drop for SecondaryCursor<'_> {
     fn drop(&mut self) {
         if self.inner.is_valid() {
@@ -575,7 +643,9 @@ mod tests {
             env.open_database(None, "primary", &db_config).unwrap();
         let primary = Arc::new(Mutex::new(primary_db));
 
-        let sec_db_config = DatabaseConfig::new().with_allow_create(true);
+        let sec_db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true);
         let sec_db =
             env.open_database(None, "secondary", &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()

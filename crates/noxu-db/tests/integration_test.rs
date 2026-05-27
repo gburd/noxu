@@ -1771,7 +1771,9 @@ fn open_pri_sec(
         .open_database(
             None,
             "secondary",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true),
         )
         .unwrap();
     let sec_config = SecondaryConfig::new()
@@ -2151,7 +2153,9 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
         .open_database(
             None,
             "sec_mk",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true),
         )
         .unwrap();
     let sec_config = SecondaryConfig::new()
@@ -2235,7 +2239,9 @@ fn sec_auto_populate_on_open() {
         .open_database(
             None,
             "sec_pop",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true),
         )
         .unwrap();
     let sec_config = SecondaryConfig::new()
@@ -2312,7 +2318,9 @@ fn sec_num_recs_put_get_round_trip() {
         .open_database(
             None,
             "sec_nr",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true),
         )
         .unwrap();
     let sec_config = SecondaryConfig::new()
@@ -2959,7 +2967,7 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
         }
 
         // Uncommitted writes: start a txn, write M records, then abort.
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v = DatabaseEntry::from_vec(b"uncommitted".to_vec());

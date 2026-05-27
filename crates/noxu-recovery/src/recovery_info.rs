@@ -1,6 +1,7 @@
 //! Recovery processing information.
 //!
 
+use crate::analysis_result::{PreparedLnReplay, PreparedTxnInfo};
 use crate::checkpoint_end::CheckpointEnd;
 use noxu_util::{Lsn, NULL_LSN};
 use std::fmt;
@@ -46,6 +47,27 @@ pub struct RecoveryInfo {
     pub use_min_replicated_db_id: i64,
     pub use_max_txn_id: u64,
     pub use_min_replicated_txn_id: i64,
+
+    /// Transactions that completed XA phase 1 (`TxnPrepare` written) but
+    /// were not committed or rolled back before the crash.  Surfaced to
+    /// the XA layer for `xa_recover()` so the transaction manager can
+    /// resolve them.  Empty when the WAL contained no in-doubt prepares.
+    ///
+    /// Wave 3-2 of the v1.5+ remediation plan.
+    pub recovered_prepared_txns: Vec<PreparedTxnInfo>,
+
+    /// LN entries (in WAL order) belonging to each prepared transaction
+    /// that has not yet been resolved.  Keyed by txn_id.
+    ///
+    /// `xa_commit(xid)` looks up the entry, replays each LN into the
+    /// in-memory tree, and writes a `TxnCommit` frame.
+    /// `xa_rollback(xid)` writes a `TxnAbort` frame; nothing has to be
+    /// undone in the tree because the prepared writes were never
+    /// applied during the redo phase.
+    ///
+    /// Stored as raw byte vectors instead of `LnRecord` so this struct
+    /// stays self-contained (`LnRecord` borrows lifetime-bound `Bytes`).
+    pub prepared_txn_lns: hashbrown::HashMap<u64, Vec<PreparedLnReplay>>,
 }
 
 impl RecoveryInfo {
@@ -66,6 +88,8 @@ impl RecoveryInfo {
             use_min_replicated_db_id: 0,
             use_max_txn_id: 0,
             use_min_replicated_txn_id: 0,
+            recovered_prepared_txns: Vec::new(),
+            prepared_txn_lns: hashbrown::HashMap::new(),
         }
     }
 }
