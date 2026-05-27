@@ -24,14 +24,11 @@ use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 const SIMPLE_KEYS: &[&str] = &[
-    "foo", "bar", "baz", "aaa", "fubar",
-    "foobar", "quux", "mumble", "froboy",
+    "foo", "bar", "baz", "aaa", "fubar", "foobar", "quux", "mumble", "froboy",
 ];
 
-const SIMPLE_DATA: &[&str] = &[
-    "one", "two", "three", "four", "five",
-    "six", "seven", "eight", "nine",
-];
+const SIMPLE_DATA: &[&str] =
+    &["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
 
 fn open_env_db() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
     let dir = TempDir::new().unwrap();
@@ -39,9 +36,8 @@ fn open_env_db() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "DbCursorTest", &db_cfg).unwrap();
     (dir, env, db)
 }
@@ -146,7 +142,7 @@ fn db_cursor_test_cursor_advance() {
     let first_key = k.get_data().unwrap_or(&[]).to_vec();
 
     // Walk the rest forward.
-    let mut prev = first_key.clone();
+    let mut prev = first_key;
     let mut n = 1usize;
     let mut s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
     while s == OperationStatus::Success {
@@ -215,7 +211,11 @@ fn db_cursor_search_test_simple_delete_and_search_key() {
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         if *k == target {
-            assert_eq!(OperationStatus::NotFound, s, "deleted {k} should be gone");
+            assert_eq!(
+                OperationStatus::NotFound,
+                s,
+                "deleted {k} should be gone"
+            );
         } else {
             assert_eq!(OperationStatus::Success, s, "k={k}");
         }
@@ -263,7 +263,9 @@ fn db_cursor_delete_test_simple_delete_insert() {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        seen.insert(String::from_utf8(k.get_data().unwrap_or(&[]).to_vec()).unwrap());
+        seen.insert(
+            String::from_utf8(k.get_data().unwrap_or(&[]).to_vec()).unwrap(),
+        );
         s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
     let expected: BTreeSet<String> =
