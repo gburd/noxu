@@ -193,23 +193,17 @@ impl RepEnvInfo {
 
     /// Returns `true` iff the node is currently in [`NodeState::Master`].
     pub fn is_master(&self) -> bool {
-        self.env
-            .as_ref()
-            .is_some_and(|e| e.get_state() == NodeState::Master)
+        self.env.as_ref().is_some_and(|e| e.get_state() == NodeState::Master)
     }
 
     /// Returns `true` iff the node is currently in [`NodeState::Replica`].
     pub fn is_replica(&self) -> bool {
-        self.env
-            .as_ref()
-            .is_some_and(|e| e.get_state() == NodeState::Replica)
+        self.env.as_ref().is_some_and(|e| e.get_state() == NodeState::Replica)
     }
 
     /// Returns `true` iff the node is currently in [`NodeState::Unknown`].
     pub fn is_unknown(&self) -> bool {
-        self.env
-            .as_ref()
-            .is_some_and(|e| e.get_state() == NodeState::Unknown)
+        self.env.as_ref().is_some_and(|e| e.get_state() == NodeState::Unknown)
     }
 
     /// Returns the current node state, or `None` if the env is not open.
@@ -711,7 +705,8 @@ impl RepTestBaseBuilder {
     /// Construct the [`RepTestBase`].  Does NOT open any envs — call
     /// [`RepTestBase::create_group`] to drive the lifecycle.
     pub fn build(self) -> RepTestBase {
-        let base_port = self.base_port.unwrap_or_else(|| alloc_base_port(self.group_size));
+        let base_port =
+            self.base_port.unwrap_or_else(|| alloc_base_port(self.group_size));
         let prefix = self
             .name_prefix
             .unwrap_or_else(|| format!("{}_n", self.group_name));
@@ -727,13 +722,10 @@ impl RepTestBaseBuilder {
             let node_type = *overrides.get(&i).unwrap_or(&self.node_type);
             let port = base_port + i as u16;
 
-            let mut b = RepConfig::builder(
-                &self.group_name,
-                &node_name,
-                "127.0.0.1",
-            )
-            .node_port(port)
-            .node_type(node_type);
+            let mut b =
+                RepConfig::builder(&self.group_name, &node_name, "127.0.0.1")
+                    .node_port(port)
+                    .node_type(node_type);
             if let Some(t) = self.election_timeout {
                 b = b.election_timeout(t);
             }
@@ -820,11 +812,8 @@ mod tests {
             group.nodes().iter().map(|n| n.node_name()).collect();
         assert_eq!(names, vec!["hs1_n1", "hs1_n2", "hs1_n3", "hs1_n4"]);
         // Ports are monotonically increasing.
-        let ports: Vec<u16> = group
-            .nodes()
-            .iter()
-            .map(|n| n.rep_config().node_port)
-            .collect();
+        let ports: Vec<u16> =
+            group.nodes().iter().map(|n| n.rep_config().node_port).collect();
         for w in ports.windows(2) {
             assert!(w[1] == w[0] + 1, "ports must be consecutive: {:?}", ports);
         }
@@ -897,9 +886,11 @@ mod tests {
         group.create_group(1).unwrap();
 
         let listener = CountingListener::new();
-        group.nodes()[0].get_env().set_state_change_listener(
-            Arc::clone(&listener) as Arc<dyn StateChangeListener>,
-        );
+        group.nodes()[0]
+            .get_env()
+            .set_state_change_listener(
+                Arc::clone(&listener) as Arc<dyn StateChangeListener>
+            );
         // Setting a listener fires once with the current state (Master).
         assert_eq!(listener.master_count(), 1);
     }
