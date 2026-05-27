@@ -149,7 +149,10 @@ impl SecondaryDatabase {
     /// * `config` - The secondary configuration (must include a key creator).
     ///
     /// # Errors
-    /// - [`NoxuError::IllegalArgument`] if the configuration is invalid.
+    /// - [`NoxuError::IllegalArgument`] if the configuration is invalid,
+    ///   or if the inner `secondary_db` was not opened with
+    ///   [`DatabaseConfig::with_sorted_duplicates(true)`] (v1.6 sorted-dup
+    ///   secondaries — closes audit C4).
     /// - [`NoxuError::Unsupported`] if the configuration sets any foreign-key
     ///   constraint field (`foreign_key_database`,
     ///   `foreign_key_delete_action != Abort`, `foreign_key_nullifier`, or
@@ -167,6 +170,21 @@ impl SecondaryDatabase {
         config
             .validate(primary_read_only)
             .map_err(NoxuError::IllegalArgument)?;
+
+        // v1.6 (Decision 1B / audit C4): the inner secondary index DB
+        // must be opened with sorted_duplicates so multiple primary
+        // records can share the same secondary key as duplicates of
+        // the (sec_key) entry.  Reject otherwise — in v1.5 we used
+        // Put::NoOverwrite and surfaced cross-primary collisions as
+        // NoxuError::Unsupported; v1.6 stores them as duplicates.
+        if !secondary_db.get_config().sorted_duplicates {
+            return Err(NoxuError::IllegalArgument(
+                "v1.6 secondary databases require the inner index DB to \
+                 be opened with DatabaseConfig::with_sorted_duplicates(true) \
+                 — see docs/src/internal/v1.5-decisions-2026-05.md Decision 1B"
+                    .to_string(),
+            ));
+        }
 
         // Decision 2C: reject FK configurations in v1.5.  The fields are
         // accepted by the builder for forward source compatibility (v1.6
@@ -674,18 +692,14 @@ impl SecondaryDatabase {
 
     /// Inserts a secondary index entry: (sec_key -> pri_key).
     ///
-    /// Decision 1B (`docs/src/internal/v1.5-decisions-2026-05.md`):
-    /// v1.5 secondaries are one-to-one.  We use
-    /// [`crate::put::Put::NoOverwrite`] so a collision — two distinct
-    /// primary keys mapping to the same secondary key — returns
-    /// [`OperationStatus::KeyExists`] from the cursor, which we surface
-    /// as a typed [`NoxuError::Unsupported`] explaining that sorted-dup
-    /// secondaries are planned for v1.6.
-    ///
-    /// Pre-Sprint-3 this used `Put::Overwrite`, which let the second
-    /// primary silently destroy the first primary's mapping (audit
-    /// finding C4).  The new behaviour is honest about what v1.5
-    /// supports.
+    /// v1.6 (Decision 1B / audit C4): the inner index DB is sorted-dup,
+    /// so multiple primary records that produce the same `sec_key` are
+    /// stored as duplicates of `sec_key`.  We use
+    /// [`crate::put::Put::NoDupData`] which inserts the (sec_key, pri_key)
+    /// pair if it is new and returns `OperationStatus::KeyExists` if the
+    /// exact pair is already present — that is the idempotent re-insert
+    /// case (Decision 1B same-primary re-insert) and we treat it as a
+    /// no-op.
     fn insert_sec_key(
         &self,
         txn: Option<&Transaction>,
@@ -694,66 +708,15 @@ impl SecondaryDatabase {
     ) -> Result<()> {
         let mut cursor = self.make_inner_cursor(txn)?;
         let status = cursor
-            .put(sec_key, pri_key, crate::put::Put::NoOverwrite)
+            .put(sec_key, pri_key, crate::put::Put::NoDupData)
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         match status {
+            // New (sec_key, pri_key) pair inserted as a fresh duplicate.
             OperationStatus::Success => Ok(()),
-            OperationStatus::KeyExists => {
-                // Decision 1B: distinguish idempotent re-insert of the
-                // *same* (sec_key, pri_key) pair from a true cross-primary
-                // collision.  An idempotent re-insert is a misuse the
-                // documented manual-`update_secondary` pattern can produce
-                // (calling `update_secondary(pk, None, Some(data))` twice
-                // for the same primary instead of
-                // `update_secondary(pk, Some(old), Some(new))`); we treat
-                // it as a no-op so existing v1.4 callers do not break.
-                // A *cross-primary* collision is the v1.6-feature
-                // (sorted-dup secondaries) gap and is reported as
-                // [`NoxuError::Unsupported`].
-                let mut probe_key = sec_key.clone();
-                let mut existing_pk = DatabaseEntry::new();
-                let mut probe_cursor = self.make_inner_cursor(txn)?;
-                let probe_status = probe_cursor
-                    .get(
-                        &mut probe_key,
-                        &mut existing_pk,
-                        crate::get::Get::Search,
-                        None,
-                    )
-                    .map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?;
-                if probe_status == OperationStatus::Success
-                    && existing_pk.get_data() == pri_key.get_data()
-                {
-                    // Same primary key already mapped here — idempotent.
-                    return Ok(());
-                }
-                let sec_hex = sec_key
-                    .get_data()
-                    .map(|b| {
-                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    })
-                    .unwrap_or_default();
-                let existing_hex = existing_pk
-                    .get_data()
-                    .map(|b| {
-                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    })
-                    .unwrap_or_default();
-                let pri_hex = pri_key
-                    .get_data()
-                    .map(|b| {
-                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    })
-                    .unwrap_or_default();
-                Err(NoxuError::Unsupported(format!(
-                    "v1.5 secondaries are one-to-one; primary key 0x{existing_hex} \
-                     already maps to secondary key 0x{sec_hex} (cannot also \
-                     map primary key 0x{pri_hex}; sorted-dup secondaries are \
-                     planned for v1.6)"
-                )))
-            }
+            // Same (sec_key, pri_key) pair already present — idempotent
+            // re-insert is a documented no-op (see
+            // `d1b_same_primary_idempotent_reinsert_ok` regression).
+            OperationStatus::KeyExists => Ok(()),
             other => Err(NoxuError::OperationNotAllowed(format!(
                 "unexpected put status from secondary index insert: {other:?}"
             ))),
@@ -761,6 +724,12 @@ impl SecondaryDatabase {
     }
 
     /// Deletes a secondary index entry: (sec_key -> pri_key).
+    ///
+    /// v1.6: the inner index is sorted-dup, so we use
+    /// [`crate::get::Get::SearchBoth`] to position the cursor on the
+    /// exact `(sec_key, pri_key)` duplicate before deleting.  This
+    /// leaves any other primaries that share the same `sec_key`
+    /// untouched (Decision 1B).
     ///
     /// `txn` is forwarded to the inner cursor so the delete participates
     /// in the caller's transaction (Sprint 4½).
@@ -770,32 +739,25 @@ impl SecondaryDatabase {
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        // Find the exact (sec_key, pri_key) pair and delete it.
-        // For non-dup databases a simple key search suffices.
-        // For dup databases we need a SEARCH_BOTH, but since the inner
-        // database is always configured as a simple key->value store in our
-        // implementation (sec_key->pri_key, no dup support at the b-tree level),
-        // a key search is correct.
         let mut cursor = self.make_inner_cursor(txn)?;
-        let mut stored_pk = DatabaseEntry::new();
-        // Clone sec_key because Cursor::get requires &mut but key is input-only for Search.
+        // SearchBoth requires `&mut` on key+data even though both are
+        // inputs; clone so the caller-supplied entries are not
+        // disturbed.
         let mut sec_key_mut = sec_key.clone();
+        let mut pri_key_mut = pri_key.clone();
         let status = cursor
             .get(
                 &mut sec_key_mut,
-                &mut stored_pk,
-                crate::get::Get::Search,
+                &mut pri_key_mut,
+                crate::get::Get::SearchBoth,
                 None,
             )
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
 
         if status == OperationStatus::Success {
-            // Verify the stored primary key matches before deleting.
-            if stored_pk.get_data() == pri_key.get_data() {
-                cursor.delete().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-            }
+            cursor
+                .delete()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         }
         // If not found, the secondary may already have been cleaned up; ignore.
         Ok(())
@@ -968,7 +930,10 @@ mod tests {
         env: &Environment,
         name: &str,
     ) -> SecondaryDatabase {
-        let sec_db_config = DatabaseConfig::new().with_allow_create(true);
+        // v1.6 sorted-dup secondaries: inner index DB must allow dups.
+        let sec_db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true);
         let sec_db = env.open_database(None, name, &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()
             .with_allow_create(true)
@@ -1202,7 +1167,9 @@ mod tests {
         }
 
         // Open secondary with allow_populate=true.
-        let sec_db_config = DatabaseConfig::new().with_allow_create(true);
+        let sec_db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true);
         let sec_db =
             env.open_database(None, "secondary_pop", &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()

@@ -334,7 +334,12 @@ mod tests {
             let pri_db = env.open_database(None, "primary", &db_cfg).unwrap();
             let primary = Arc::new(Mutex::new(pri_db));
 
-            let sec1_store = env.open_database(None, "sec1", &db_cfg).unwrap();
+            // v1.6 sorted-dup secondaries: inner index DB needs dups.
+            let sec_db_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true);
+            let sec1_store =
+                env.open_database(None, "sec1", &sec_db_cfg).unwrap();
             let sec1 = SecondaryDatabase::open(
                 Arc::clone(&primary),
                 sec1_store,
@@ -344,7 +349,8 @@ mod tests {
             )
             .unwrap();
 
-            let sec2_store = env.open_database(None, "sec2", &db_cfg).unwrap();
+            let sec2_store =
+                env.open_database(None, "sec2", &sec_db_cfg).unwrap();
             let sec2 = SecondaryDatabase::open(
                 Arc::clone(&primary),
                 sec2_store,

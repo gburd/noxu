@@ -66,22 +66,31 @@ fn open_pri(env: &Environment, name: &str) -> Arc<Mutex<Database>> {
 }
 
 fn open_inner_sec_db(env: &Environment, name: &str) -> Database {
+    // v1.6 sorted-dup secondaries: the inner index DB must allow
+    // duplicates so multiple primaries with the same secondary key
+    // coexist as duplicates of the (sec_key) entry.
     env.open_database(
         None,
         name,
-        &DatabaseConfig::new().with_allow_create(true),
+        &DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true),
     )
     .unwrap()
 }
 
-// ─── Decision 1B — one-to-one secondaries ────────────────────
+// ─── Decision 1B — sorted-dup secondaries (v1.6) ─────────────────
 
-/// Two distinct primary keys that map to the same secondary key cause the
-/// second insert to fail with [`NoxuError::Unsupported`].  Pre-Sprint-3 the
-/// inner index used `Put::Overwrite` and silently destroyed the first
-/// primary's mapping (audit finding C4).
+/// Two distinct primary keys that produce the same secondary key now
+/// **both** appear in the secondary as duplicates of that key (v1.6 /
+/// audit C4).  Pre-v1.5 the inner index used `Put::Overwrite` and
+/// silently destroyed the first primary's mapping; v1.5 used
+/// `Put::NoOverwrite` and surfaced the second insert as
+/// `NoxuError::Unsupported`.  v1.6 stores them as sorted duplicates
+/// of the same secondary key and lets cursor iteration enumerate the
+/// fan-out.
 #[test]
-fn d1b_secondary_collision_returns_unsupported() {
+fn d1b_secondary_dup_admits_multiple_primaries() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
@@ -101,53 +110,48 @@ fn d1b_secondary_collision_returns_unsupported() {
     primary.lock().put(None, &pk1, &v1).unwrap();
     sec.update_secondary(None, &pk1, None, Some(&v1)).unwrap();
 
-    // Sanity: lookup by 'A' returns pk1.
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let st = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-
-    // Second primary record: pk2 -> "Apricot" (sec_key = 'A'). MUST fail.
+    // Second primary record sharing the same secondary key (‘A’).
+    // v1.6: this MUST succeed and store a second duplicate of ‘A’.
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
     let v2 = DatabaseEntry::from_bytes(b"Apricot");
     primary.lock().put(None, &pk2, &v2).unwrap();
-    let result = sec.update_secondary(None, &pk2, None, Some(&v2));
+    sec.update_secondary(None, &pk2, None, Some(&v2))
+        .expect("v1.6 sorted-dup secondaries must admit a second primary");
 
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("one-to-one"),
-                "expected one-to-one wording: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v1.6"),
-                "expected v1.5 and v1.6 references: {msg}"
-            );
-        }
-        Ok(()) => panic!(
-            "second update_secondary must fail with NoxuError::Unsupported, \
-             got Ok"
-        ),
-        Err(other) => panic!(
-            "second update_secondary must fail with NoxuError::Unsupported, \
-             got: {other:?}"
-        ),
-    }
+    // The inner index now holds two duplicates of ‘A’.
+    assert_eq!(
+        sec.count().unwrap(),
+        2,
+        "both primaries must be indexed under ‘A’"
+    );
 
-    // Decision 1B (honesty): the first primary's mapping is preserved
-    // because we used Put::NoOverwrite.  The user sees a loud failure
-    // *and* their existing index is intact.
+    // Iterate the cursor and confirm both primaries surface.
+    let mut cursor = sec.open_cursor(None, None).unwrap();
+    let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let st = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut st = cursor
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
         .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    while st == OperationStatus::Success {
+        seen.push(p_key.get_data().unwrap().to_vec());
+        // Step to the next dup of the same sec_key, if any.
+        st = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
+        if st == OperationStatus::Success {
+            // Stepping with `Get::Next` advances across keys too — stop
+            // when we leave ‘A’.
+            if sec_key.get_data() != Some(b"A".as_ref()) {
+                break;
+            }
+        }
+    }
+    seen.sort();
+    assert_eq!(seen, vec![b"pk1".to_vec(), b"pk2".to_vec()]);
 }
 
 /// The successful one-to-one path still works exactly as before — distinct
