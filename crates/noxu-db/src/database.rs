@@ -1142,7 +1142,7 @@ impl Database {
         // `elapsed_ms` to their config) but does not yet stop the
         // walk early.  Tracked for v2.0 alongside true LN warming.
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        if max_millis > 0 && elapsed_ms > max_millis as u64 {
+        if max_millis > 0 && elapsed_ms > max_millis {
             log::warn!(
                 "Database::preload: walk took {elapsed_ms} ms, exceeding \
                  max_millis budget of {max_millis} ms (advisory until \

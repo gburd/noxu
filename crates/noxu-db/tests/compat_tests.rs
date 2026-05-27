@@ -173,9 +173,8 @@ fn truncate_database_clears_all_records() {
     );
 
     // Re-open to verify all records are gone.
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(false)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(false).with_transactional(true);
     let db2 = env.open_database(None, "test", &db_cfg).unwrap();
     assert_eq!(db2.count().unwrap(), 0);
     for i in 0..N {
@@ -205,9 +204,8 @@ fn truncate_then_add_records_works() {
     env.truncate_database(None, "test").unwrap();
 
     // Re-open and add new records after truncation.
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(false)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(false).with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
     assert_eq!(db.count().unwrap(), 0);
 

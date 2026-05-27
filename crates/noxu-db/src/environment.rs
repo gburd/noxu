@@ -750,7 +750,9 @@ impl Environment {
                 self.config.txn_no_sync,
                 self.config.txn_write_no_sync,
             ) {
-                (true, _) => Some(crate::durability::Durability::COMMIT_NO_SYNC),
+                (true, _) => {
+                    Some(crate::durability::Durability::COMMIT_NO_SYNC)
+                }
                 (_, true) => {
                     Some(crate::durability::Durability::COMMIT_WRITE_NO_SYNC)
                 }
@@ -969,9 +971,8 @@ impl Environment {
                     .map(|lm| lm.get_end_of_log())
                     .unwrap_or(noxu_util::NULL_LSN);
                 let last = *self.last_checkpoint_end_lsn.lock();
-                let bytes_written = cur_lsn
-                    .as_u64()
-                    .saturating_sub(last.as_u64());
+                let bytes_written =
+                    cur_lsn.as_u64().saturating_sub(last.as_u64());
                 let threshold = (cfg.k_bytes as u64) * 1024;
                 if bytes_written < threshold {
                     log::debug!(
@@ -1908,9 +1909,7 @@ mod tests {
         // succeed and not error.
 
         // Third call with force=true must run regardless.
-        let cfg = CheckpointConfig::default()
-            .with_force(true)
-            .with_minutes(60);
+        let cfg = CheckpointConfig::default().with_force(true).with_minutes(60);
         env.checkpoint(Some(&cfg)).unwrap();
         env.close().unwrap();
     }
