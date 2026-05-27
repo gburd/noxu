@@ -1096,6 +1096,13 @@ impl Database {
         &self.config
     }
 
+    /// Returns the underlying database ID.  Used by FK cascade guards
+    /// to disambiguate `(db, key)` frames when several databases
+    /// participate in a cycle.
+    pub(crate) fn db_id_for_fk_guard(&self) -> u64 {
+        self.id
+    }
+
     /// Registers a secondary index for automatic maintenance.
     ///
     /// v1.6 (audit C3 — associate() hook): every [`SecondaryDatabase`]

@@ -693,9 +693,9 @@ fn d2c_foreign_key_database_name_without_handle_rejected() {
     );
 }
 
-/// `ForeignKeyDeleteAction::Cascade` is wired in step 9.  Until then
-/// step 8 accepts the open and surfaces the typed Unsupported only
-/// when the foreign delete actually fires.
+/// `ForeignKeyDeleteAction::Cascade`: deleting a foreign primary
+/// record cascades the delete to every child primary record whose
+/// secondary key equals the foreign key.  v1.6 step 9.
 #[test]
 fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
     let dir = TempDir::new().unwrap();
@@ -711,26 +711,42 @@ fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
 
     let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .expect("FK config with handle and Cascade must open in v1.6 step 8");
+        .unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
     foreign
         .lock()
         .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
         .unwrap();
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
     primary
         .lock()
-        .put(
-            None,
-            &DatabaseEntry::from_bytes(b"pk1"),
-            &DatabaseEntry::from_bytes(b"Apple"),
-        )
+        .put(None, &pk1, &DatabaseEntry::from_bytes(b"Apple"))
         .unwrap();
-    let result = foreign.lock().delete(None, &fk);
-    assert!(
-        matches!(result, Err(NoxuError::Unsupported(_))),
-        "Cascade is wired in step 9; until then runtime must surface \
-         NoxuError::Unsupported, got {result:?}"
+    let pk2 = DatabaseEntry::from_bytes(b"pk2");
+    primary
+        .lock()
+        .put(None, &pk2, &DatabaseEntry::from_bytes(b"Apricot"))
+        .unwrap();
+
+    // Foreign delete cascades to both child primaries.
+    assert_eq!(
+        foreign.lock().delete(None, &fk).unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(
+        primary
+            .lock()
+            .get(None, &pk1, &mut DatabaseEntry::new())
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    assert_eq!(
+        primary
+            .lock()
+            .get(None, &pk2, &mut DatabaseEntry::new())
+            .unwrap(),
+        OperationStatus::NotFound
     );
 }
 
@@ -835,6 +851,91 @@ fn fk_abort_blocks_delete_of_referenced_foreign_record() {
             .unwrap(),
         OperationStatus::Success,
         "aborted FK delete must leave the foreign record intact"
+    );
+}
+
+/// FK Cascade transitive: deleting a record in the root foreign
+/// causes the cascade to walk through both levels.  v1.6 step 9.
+#[test]
+fn fk_cascade_transitive_two_levels() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let root = open_pri(&env, "root");
+    let mid = open_pri(&env, "mid");
+    let leaf = open_pri(&env, "leaf");
+    let mid_sec_inner = open_inner_sec_db(&env, "mid_sec");
+    let leaf_sec_inner = open_inner_sec_db(&env, "leaf_sec");
+
+    let _mid_sec = SecondaryDatabase::open(
+        Arc::clone(&mid),
+        mid_sec_inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database_handle(Arc::clone(&root))
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade),
+    )
+    .unwrap();
+    let _leaf_sec = SecondaryDatabase::open(
+        Arc::clone(&leaf),
+        leaf_sec_inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database_handle(Arc::clone(&mid))
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade),
+    )
+    .unwrap();
+
+    root.lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"root"),
+        )
+        .unwrap();
+    // mid record: key="M", data="Apple" — first byte ‘A’ indexes the
+    // root foreign-key value.
+    mid.lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"M"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+    // leaf record: key="L", data="Mango" — first byte ‘M’ matches
+    // mid’s primary key, indexing the mid foreign-key value.
+    leaf.lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"L"),
+            &DatabaseEntry::from_bytes(b"Mango"),
+        )
+        .unwrap();
+
+    // Cascade root → mid → leaf in one delete.
+    root.lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"A"))
+        .unwrap();
+    assert_eq!(
+        mid.lock()
+            .get(
+                None,
+                &DatabaseEntry::from_bytes(b"M"),
+                &mut DatabaseEntry::new()
+            )
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    assert_eq!(
+        leaf.lock()
+            .get(
+                None,
+                &DatabaseEntry::from_bytes(b"L"),
+                &mut DatabaseEntry::new()
+            )
+            .unwrap(),
+        OperationStatus::NotFound
     );
 }
 
