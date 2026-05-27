@@ -27,6 +27,7 @@ pub mod restore_required;
 pub mod rollback_end_entry;
 pub mod rollback_start_entry;
 pub mod trace_log_entry;
+pub mod txn_prepare_entry;
 
 pub use bin_delta_log_entry::BinDeltaLogEntry;
 pub use commit_abort_entry::TxnEndEntry;
@@ -50,3 +51,4 @@ pub use restore_required::RestoreRequired;
 pub use rollback_end_entry::RollbackEndEntry;
 pub use rollback_start_entry::RollbackStartEntry;
 pub use trace_log_entry::TraceLogEntry;
+pub use txn_prepare_entry::{TxnPrepareEntry, TxnPrepareError};
