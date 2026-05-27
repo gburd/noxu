@@ -416,6 +416,77 @@ fn c3_primary_put_under_txn_rolls_back_secondary_on_abort() {
     );
 }
 
+/// v1.6 (audit C3): primary `delete` automatically removes the
+/// matching secondary entries through the registered SecondaryHook;
+/// callers no longer have to call `update_secondary(…, None)`.
+#[test]
+fn c3_primary_delete_drives_registered_secondary() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"Apple");
+    primary.lock().put(None, &pk, &v).unwrap();
+    assert_eq!(sec.count().unwrap(), 1);
+
+    let st = primary.lock().delete(None, &pk).unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(sec.count().unwrap(), 0);
+}
+
+/// Two primaries share sec_key ‘A’.  Deleting one must leave the
+/// other primary's secondary entry intact (sorted-dup SearchBoth
+/// preserves the non-target dup).
+#[test]
+fn c3_primary_delete_preserves_other_dups() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    let pk2 = DatabaseEntry::from_bytes(b"pk2");
+    primary
+        .lock()
+        .put(None, &pk1, &DatabaseEntry::from_bytes(b"Apple"))
+        .unwrap();
+    primary
+        .lock()
+        .put(None, &pk2, &DatabaseEntry::from_bytes(b"Apricot"))
+        .unwrap();
+    assert_eq!(sec.count().unwrap(), 2);
+
+    primary.lock().delete(None, &pk1).unwrap();
+    assert_eq!(sec.count().unwrap(), 1);
+
+    // pk2 still indexed under ‘A’.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk2");
+}
+
 // ─── Decision 2C — FK config rejected at open ──────────────────────────
 
 /// Setting `foreign_key_database` on a `SecondaryConfig` causes
