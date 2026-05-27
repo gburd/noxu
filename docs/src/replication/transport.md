@@ -1,12 +1,9 @@
 # Transport Layer
 
-> **v1.5 status — preview.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> and [the chapter overview](README.md). The TCP service dispatcher's
-> 4-byte service-name length field is currently unbounded and treats
-> the network-restore `NRST` magic as a 1.31 GiB allocation request
-> (audit findings 2 / 3 / 4); cap and dispatcher fix is required for
-> GA.
+> **v2.0 status — GA.** The TCP service-name handshake is bounded
+> at 256 bytes (Wave 3-3, F3).  Network restore via the dispatcher's
+> `RESTORE` service is wired end-to-end via
+> `ReplicatedEnvironment::bootstrap_via_dispatcher` (Wave 4-A, F2/F4).
 
 Noxu DB supports two network transports for replication: **TCP** and **QUIC**.
 Both implement the `ReplicationChannel` trait and are interchangeable at

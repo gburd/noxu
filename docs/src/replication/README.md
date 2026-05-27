@@ -1,34 +1,18 @@
 # High Availability
 
-> **v1.5 status — PREVIEW / proof-of-concept.** The replication
-> subsystem (`noxu-rep`) is **not** recommended for production in
-> v1.5. The May 2026 noxu-rep API audit
+> **v2.0 status — GA.** All ten noxu-rep GA blockers identified in
+> the May 2026 API audit
 > ([`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md))
-> identified **10 GA blockers**, none of which were addressed in
-> Sprints 1–3. Headlines:
->
-> * `ReplicaAckPolicy` is not honoured on commit — the master
->   returns success after local fsync regardless of how many replicas
->   have acknowledged. The single most-marketed durability promise
->   of the subsystem is silently a no-op.
-> * The election driver is not wired into
->   `ReplicatedEnvironment::new`; a freshly-constructed node sits in
->   `Detached` until `become_master()` is called manually.
-> * The dispatcher path of `NetworkRestore::execute()` is broken on
->   arrival (4-byte magic is misinterpreted as a length prefix); new
->   replicas cannot bootstrap through the documented path.
-> * The acceptor's promise state is not persisted across restart, so
->   the Stateright safety proof does not apply to the production
->   binary; two masters per term can be elected.
-> * `transfer_master` and `shutdown_group` are silent no-ops.
->
-> The full list and remediation plan are in the audit's
-> [§7 — cross-reference: GA blockers for v1.x / v2.0](../internal/api-audit-2026-05-rep.md#7-cross-reference-blockers-for-v1x--v20).
-> The chapters below describe the **intended** contract of the
-> replication subsystem and remain useful for design review and for
-> driving the v1.x → v2.0 GA work, but the documented behaviour does
-> not match the production binary in v1.5. Treat each example as a
-> design sketch until the GA-blocker list is closed.
+> are closed in v2.0.  Wave 3-3 closed F1 (`ReplicaAckPolicy`
+> honoured on commit), F3 (dispatcher service-name length bound), F6
+> (election driver wired in `open()`), F10 (peer scanner bounded),
+> and F22 (Arbiters cannot win Paxos elections).  Wave 4-A closed
+> F2/F4 (NetworkRestore via dispatcher), F5/F31 (acceptor promises
+> persisted across restart), F7/F8 (`transfer_master` and
+> `shutdown_group`), F9 (Feeder per replica on `become_master`), and
+> F11 (VLSN index persisted across restart).  See the
+> [Wave 4-A report](../internal/wave-4-a-rep-ga-finish.md) for
+> per-finding resolution notes.
 
 This chapter describes Noxu DB's replication subsystem (`noxu-rep`), which
 provides active/passive multi-node high availability using the **Flexible

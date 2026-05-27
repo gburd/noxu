@@ -479,8 +479,27 @@ impl Transaction {
         // already see the restored before-image.
         if let Some(inner) = &self.inner_txn {
             // Phase 1: collect undo records without releasing write locks.
-            let undo_records =
+            let mut undo_records =
                 inner.lock().unwrap().abort_collect_undo().unwrap_or_default();
+
+            // Apply undo in reverse-operation order (newest LSN first).
+            //
+            // The in-memory write-lock map is a HashMap (no order), so the
+            // raw `undo_records` order is non-deterministic.  When the same
+            // key is touched multiple times in one txn (e.g. delete →
+            // re-insert in SR9465), the undo records carry conflicting
+            // intents:
+            //   - DELETE undo  (abort_data=orig)        : restore the slot
+            //   - INSERT undo  (abort_known_deleted=t)  : remove the slot
+            // Applying these in arbitrary order can leave the tree in either
+            // "correct" or "slot deleted" depending on iteration luck.
+            //
+            // The recovery path's backward log scan already applies undo
+            // newest-first; we mirror that here so the in-memory abort and
+            // crash-recovery undo are observationally identical.  Sorting by
+            // `current_lsn` descending is sufficient because LSNs are
+            // monotonic per-WAL-write.
+            undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
 
             // Phase 2: apply undo to the B-tree (write locks still held).
             if let Some(env) = &self.env_impl {
@@ -500,7 +519,16 @@ impl Transaction {
                             }
                         } else if let Some(abort_data) = undo.abort_data {
                             let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
-                            let _ = tree.insert(abort_key, abort_data, lsn);
+                            if let Ok(is_new) =
+                                tree.insert(abort_key, abort_data, lsn)
+                                && is_new
+                            {
+                                // Restoring a slot that the aborted txn had
+                                // deleted: the in-memory delete already
+                                // decremented the counter, so the restore
+                                // must re-bump it.
+                                db_guard.increment_entry_count();
+                            }
                         }
                     }
                 }
@@ -697,13 +725,19 @@ impl Transaction {
             // Unfortunately that consumes the locks; we want the
             // pre-release behaviour instead, so flip the flag manually
             // and then run abort_collect_undo.
-            let undo_records = {
+            let mut undo_records = {
                 let mut g = inner.lock().unwrap();
                 // Undo the IS_PREPARED flag so abort_collect_undo doesn't
                 // refuse.  Inner state is still Open at this point.
                 g.clear_prepared_flag();
                 g.abort_collect_undo().unwrap_or_default()
             };
+
+            // See `abort()` above: undo must be applied newest-LSN first so
+            // that delete-then-reinsert sequences in the same txn are
+            // unwound in reverse-operation order, matching the recovery
+            // path's backward log scan.
+            undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
 
             if let Some(env) = &self.env_impl {
                 let env_guard = env.lock();
@@ -723,7 +757,12 @@ impl Transaction {
                             }
                         } else if let Some(abort_data) = undo.abort_data {
                             let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
-                            let _ = tree.insert(abort_key, abort_data, lsn);
+                            if let Ok(is_new) =
+                                tree.insert(abort_key, abort_data, lsn)
+                                && is_new
+                            {
+                                db_guard.increment_entry_count();
+                            }
                         }
                     }
                 }

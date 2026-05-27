@@ -320,3 +320,126 @@ fn writer_blocked_then_released() {
         "writer should have been granted after reader released"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE LockManagerTest ports
+// ──────────────────────────────────────────────────────────────────────────────
+
+// JE: testSR15926LargeNodeIds
+//
+// Locks a record at a very large LSN (top bit set in the 32-bit half) and
+// verifies it succeeds.  The original JE bug was that `lock(0x80000000L, ...)`
+// went through a path that mishandled the sign bit of an int conversion.
+// Noxu uses `u64` for LSNs so the sign-bit hazard does not strictly apply,
+// but the test still exercises that the LockManager handles "high" LSNs
+// near the 32-bit boundary correctly.
+#[test]
+fn je_sr15926_large_node_ids_can_be_locked() {
+    let lm = lm();
+    let lsn: u64 = 0x80000000u64;
+    let r = lm.lock(lsn, 1, LockType::Write, false, false);
+    assert!(r.is_ok(), "lock at LSN 0x80000000 must succeed: {:?}", r);
+
+    // Also exercise an even larger LSN.
+    let lsn2: u64 = 0xFFFF_FFFFu64;
+    let r = lm.lock(lsn2, 1, LockType::Write, false, false);
+    assert!(r.is_ok(), "lock at LSN 0xFFFFFFFF must succeed: {:?}", r);
+
+    let lsn3: u64 = 0x1_0000_0000u64;
+    let r = lm.lock(lsn3, 1, LockType::Write, false, false);
+    assert!(r.is_ok(), "lock at LSN 0x1_0000_0000 must succeed: {:?}", r);
+}
+
+// JE: testNegatives — repeated lock by same locker is "Existing"
+#[test]
+fn je_negatives_repeat_read_returns_existing() {
+    let lm = lm();
+    let lsn: u64 = 1;
+    let g = lm.lock(lsn, 10, LockType::Read, false, false).unwrap();
+    assert!(matches!(g, LockGrantType::New));
+    let g = lm.lock(lsn, 10, LockType::Read, false, false).unwrap();
+    assert_eq!(
+        g,
+        LockGrantType::Existing,
+        "repeated read lock by the same locker must return Existing"
+    );
+}
+
+// JE: testNegatives — release on unrelated LSN is a no-op
+#[test]
+fn je_negatives_release_unrelated_lsn_is_noop() {
+    let lm = lm();
+    let lsn: u64 = 1;
+    let other: u64 = 2;
+    lm.lock(lsn, 10, LockType::Read, false, false).unwrap();
+    // Release a LSN we don't hold — must not affect the held lock.
+    let _ = lm.release(other, 10);
+    // Lock 1 should still be held: a non-blocking write by someone else
+    // must fail.
+    let r = lm.lock(lsn, 11, LockType::Write, true, false);
+    assert!(
+        r.is_err(),
+        "concurrent write must fail while reader holds: {:?}",
+        r
+    );
+}
+
+// JE: testNegatives — release by non-owner is a no-op
+#[test]
+fn je_negatives_release_by_non_owner_is_noop() {
+    let lm = lm();
+    let lsn: u64 = 1;
+    lm.lock(lsn, 10, LockType::Read, false, false).unwrap();
+    // txn 11 doesn't own the lock — releasing it must not affect ownership.
+    let _ = lm.release(lsn, 11);
+    // Owner (10) still holds it: a non-blocking write by 11 still fails.
+    let r = lm.lock(lsn, 11, LockType::Write, true, false);
+    assert!(
+        r.is_err(),
+        "concurrent write must still fail after non-owner release: {:?}",
+        r
+    );
+}
+
+// JE: testUpgradeLock — same locker holding read can upgrade to write
+#[test]
+fn je_upgrade_read_to_write_same_locker() {
+    let lm = lm();
+    let lsn: u64 = 42;
+    lm.lock(lsn, 10, LockType::Read, false, false).unwrap();
+    let g = lm.lock(lsn, 10, LockType::Write, false, false).unwrap();
+    // Both Promoted and Existing are acceptable depending on internal
+    // representation; the invariant is that the lock is now write-held.
+    assert!(
+        matches!(
+            g,
+            LockGrantType::Promotion
+                | LockGrantType::WaitPromotion
+                | LockGrantType::Existing
+                | LockGrantType::New
+        ),
+        "read→write upgrade must succeed for same locker: got {:?}",
+        g
+    );
+
+    // After upgrade, a concurrent read by another txn must fail (write
+    // exclusive).
+    let r = lm.lock(lsn, 11, LockType::Read, true, false);
+    assert!(r.is_err(), "after upgrade, concurrent read must fail: {:?}", r);
+}
+
+// JE: testMultipleReaders — three concurrent readers share a lock
+#[test]
+fn je_multiple_readers_share() {
+    let lm = lm();
+    let lsn: u64 = 7;
+    for locker in [10i64, 11, 12] {
+        let g = lm.lock(lsn, locker, LockType::Read, false, false).unwrap();
+        assert!(
+            matches!(g, LockGrantType::New | LockGrantType::Existing),
+            "reader {} must share, got {:?}",
+            locker,
+            g
+        );
+    }
+}

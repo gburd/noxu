@@ -56,21 +56,27 @@ Sprint 1–3 restriction notes
 | DPL secondary indexes are durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ | ✅ |
 | DPL secondary updates atomic with user txn        | ❌ (`PersistError::SecondariesNotTransactional` warning) | ✅ | ✅ |
 | Replication — single-process election test, 2-node sync, FPaxos shape | preview | refined | GA |
-| `ReplicaAckPolicy` honoured on commit             | ❌ (config not plumbed; commits return after local fsync) | ⚠️ planned | ✅ |
-| Election driver wired into `ReplicatedEnvironment` | ❌ (constructor sits in `Detached` until `become_master`) | ⚠️ | ✅ |
-| Network restore via dispatcher (`ReplicatedEnvironment` bootstrap) | ❌ (broken framing; standalone path works) | ⚠️ | ✅ |
-| Acceptor promise persistent across restart        | ❌ (Stateright spec doesn’t match impl) | ⚠️ | ✅ |
-| `transfer_master` / `shutdown_group` operator APIs | ❌ (silently no-op) | ⚠️ | ✅ |
+| `ReplicaAckPolicy` honoured on commit             | ❌ (config not plumbed; commits return after local fsync) | ✅ (Wave 3-3, F1) | ✅ |
+| Election driver wired into `ReplicatedEnvironment` | ❌ (constructor sits in `Detached` until `become_master`) | ✅ (Wave 3-3, F6) | ✅ |
+| Dispatcher service-name length bound (DoS hardening) | ❌ (4-byte unbounded length prefix) | ✅ (Wave 3-3, F3) | ✅ |
+| `apply_entry` peer-scanner bounded under sustained load | ❌ (unbounded growth) | ✅ (Wave 3-3, F10) | ✅ |
+| Arbiters cannot win Paxos elections                | ❌ (could be elected master, wedging the cluster) | ✅ (Wave 3-3, F22) | ✅ |
+| Network restore via dispatcher (`ReplicatedEnvironment` bootstrap) | ❌ (broken framing; standalone path works) | ⚠️ | ✅ (Wave 4-A, F2/F4) |
+| Acceptor promise persistent across restart        | ❌ (Stateright spec doesn’t match impl) | ⚠️ | ✅ (Wave 4-A, F5/F31) |
+| `transfer_master` / `shutdown_group` operator APIs | ❌ (silently no-op) | ⚠️ | ✅ (Wave 4-A, F7/F8) |
+| Master spawns Feeder per known replica on `become_master` | ❌ (no feeders dispatched) | ⚠️ | ✅ (Wave 4-A, F9) |
+| VLSN index persistent across restart              | ❌ (in-memory only; restart → forced full restore) | ⚠️ | ✅ (Wave 4-A, F11) |
 
 Legend: ✅ supported, ❌ not supported in that release,
 ⚠️ partial / preview — see the cited audit or sprint note for
 the exact scope.
 
 The replication rows reflect the May 2026 noxu-rep audit's
-[GA-blocker list (10 items)](internal/api-audit-2026-05-rep.md)
-and are unchanged by Sprints 1–3, which did not touch noxu-rep.
-Replication is **preview / proof-of-concept** in v1.5 and is not
-recommended for production.
+[GA-blocker list (10 items)](internal/api-audit-2026-05-rep.md).
+Waves 3-3 and 4-A close all ten blockers; v2.0 is the first release
+where the replication subsystem honours its documented contract
+end-to-end.  See [Wave 4-A report](internal/wave-4-a-rep-ga-finish.md)
+for per-finding resolution notes.
 
 ## Quick Start
 
