@@ -2053,10 +2053,45 @@ impl CursorImpl {
                 // the per-database entry counter.  apply_tree_insert
                 // checks tree.insert's `is_new` return so an exact-match
                 // re-insert is a no-op for the counter.
+                //
+                // SR9752 Part 2 (Wave 5): we MUST also register the
+                // brand-new sorted-dup insert with the cursor's
+                // txn / lock manager so abort-undo can roll the dup
+                // back.  Pre-fix the path skipped
+                // lock_write_before_log / finalize_write_lock entirely,
+                // so an aborted txn left dups visible past the
+                // rollback (the same regression that surfaced for
+                // NoOverwrite / NoDupData and was patched in v1.6 —
+                // Overwrite was missed because the existing tests did
+                // not exercise it on a sorted-dup database).
+                //
+                // Distinguish update vs. insert: if the (key, data)
+                // pair already exists, this is a no-op for the
+                // counter and the slot LSN moves; we still record the
+                // before-image (slot LSN → new LSN) so abort restores
+                // the prior LSN.  If the pair is new, the abort-undo
+                // is `delete the slot` (abort_known_deleted=true,
+                // matching apply_tree_insert's is_new branch).
+                let exists_old_lsn: u64 = {
+                    let db = self.db_impl.read();
+                    db.get_real_tree()
+                        .and_then(|tree| {
+                            Self::get_data_from_tree(tree, &two_part_key)
+                        })
+                        .map(|(_, lsn)| lsn)
+                        .unwrap_or(noxu_util::NULL_LSN.as_u64())
+                };
+                self.lock_write_before_log(exists_old_lsn, &two_part_key)?;
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                )?;
+                self.finalize_write_lock(
+                    exists_old_lsn,
+                    new_lsn,
+                    Some(two_part_key.clone()),
+                    None,
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);

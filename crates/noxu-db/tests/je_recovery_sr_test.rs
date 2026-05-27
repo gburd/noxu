@@ -263,10 +263,6 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "NOXU-BUG: aborted dup inserts persist on a sorted-duplicates \
-    database.  After Transaction::abort, the dup values inserted by the \
-    aborted txn are still visible (count=6 instead of 3).  Aborted dup \
-    rollback does not undo dup-insertion — see JE SR #9752 Part 2."]
 fn sr9752_part2_abort_after_committed_dups_reverts_with_dups() {
     let dir = TempDir::new().unwrap();
     let path: PathBuf = dir.path().to_path_buf();
