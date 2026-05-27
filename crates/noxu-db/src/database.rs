@@ -1398,6 +1398,27 @@ impl Database {
         Ok(())
     }
 
+    /// Public-ish accessor for the cached log manager, used by
+    /// [`crate::disk_ordered_cursor::open_disk_ordered_cursor_multi`].
+    /// Returns `None` for non-WAL environments.
+    pub(crate) fn cached_log_manager(
+        &self,
+    ) -> Option<&std::sync::Arc<noxu_log::LogManager>> {
+        self.log_manager.as_ref()
+    }
+
+    /// Public-ish accessor used by the disk-ordered-cursor helper to
+    /// validate that the database is still open before scanning.
+    pub(crate) fn check_open_for_doc(&self) -> Result<()> {
+        self.check_open()
+    }
+
+    /// Returns this database's `DatabaseId` for use by the disk-ordered
+    /// cursor producer.
+    pub(crate) fn database_id_for_doc(&self) -> noxu_dbi::DatabaseId {
+        noxu_dbi::DatabaseId::new(self.id as i64)
+    }
+
     /// Checks if the database is writable, returns an error if not.
     fn check_writable(&self) -> Result<()> {
         if self.config.read_only {
