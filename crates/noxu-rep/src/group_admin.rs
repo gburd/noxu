@@ -66,11 +66,10 @@ impl ServiceHandler for AdminService {
     }
 
     fn handle(&self, channel: Box<dyn Channel>) -> Result<()> {
-        let msg = channel.receive(Duration::from_secs(10))?.ok_or_else(|| {
-            RepError::ProtocolError(
-                "ADMIN: empty command frame".into(),
-            )
-        })?;
+        let msg =
+            channel.receive(Duration::from_secs(10))?.ok_or_else(|| {
+                RepError::ProtocolError("ADMIN: empty command frame".into())
+            })?;
         if msg.is_empty() {
             let _ = channel.send(&[ACK_REJECTED]);
             return Ok(());
@@ -154,9 +153,7 @@ pub fn send_transfer_master(
 }
 
 /// Send a `SHUTDOWN_GROUP` command to `peer_addr`.
-pub fn send_shutdown_group(
-    peer_addr: std::net::SocketAddr,
-) -> Result<bool> {
+pub fn send_shutdown_group(peer_addr: std::net::SocketAddr) -> Result<bool> {
     let channel = connect_to_service(peer_addr, ADMIN_SERVICE_NAME)?;
     channel.send(&[CMD_SHUTDOWN_GROUP])?;
     let reply = channel.receive(Duration::from_secs(10))?.unwrap_or_default();

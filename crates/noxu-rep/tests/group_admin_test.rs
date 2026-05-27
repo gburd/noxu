@@ -3,8 +3,8 @@
 //! Closes findings F7 and F8 of `docs/src/internal/api-audit-2026-05-rep.md`.
 
 use noxu_rep::{
-    master_transfer::MasterTransferConfig, NodeType, RepConfig, RepNode,
-    ReplicatedEnvironment,
+    NodeType, RepConfig, RepNode, ReplicatedEnvironment,
+    master_transfer::MasterTransferConfig,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,10 +20,12 @@ fn config(name: &str, env_home: &std::path::Path) -> RepConfig {
 /// Build a `ReplicatedEnvironment` with the ADMIN service registered
 /// but WITHOUT the election driver (which would otherwise spontaneously
 /// elect a 1-node group when run via `open`).
-fn admin_env(name: &str, env_home: &std::path::Path) -> Arc<ReplicatedEnvironment> {
-    let env = Arc::new(
-        ReplicatedEnvironment::new(config(name, env_home)).unwrap(),
-    );
+fn admin_env(
+    name: &str,
+    env_home: &std::path::Path,
+) -> Arc<ReplicatedEnvironment> {
+    let env =
+        Arc::new(ReplicatedEnvironment::new(config(name, env_home)).unwrap());
     env.register_admin_service();
     env
 }
@@ -34,12 +36,10 @@ fn transfer_master_demotes_old_and_promotes_new() {
     let dir2 = TempDir::new().unwrap();
 
     let master_env = admin_env("master", dir1.path());
-    let master_addr =
-        master_env.bound_addr().expect("master must bind");
+    let master_addr = master_env.bound_addr().expect("master must bind");
 
     let target_env = admin_env("target", dir2.path());
-    let target_addr =
-        target_env.bound_addr().expect("target must bind");
+    let target_addr = target_env.bound_addr().expect("target must bind");
 
     // Have master become master and register the target as a peer.
     master_env.become_master(1).unwrap();
@@ -69,11 +69,11 @@ fn transfer_master_demotes_old_and_promotes_new() {
     assert!(!target_env.is_master());
 
     // Initiate transfer.
-    let cfg = MasterTransferConfig::new(
-        "target".to_string(),
-        Duration::from_secs(5),
-    );
-    Arc::clone(&master_env).transfer_master(cfg).expect("transfer must succeed");
+    let cfg =
+        MasterTransferConfig::new("target".to_string(), Duration::from_secs(5));
+    Arc::clone(&master_env)
+        .transfer_master(cfg)
+        .expect("transfer must succeed");
 
     // Old master is now a replica of target.
     assert!(
@@ -110,10 +110,8 @@ fn transfer_master_rejects_unknown_target() {
     let env = admin_env("master", dir.path());
     env.become_master(1).unwrap();
 
-    let cfg = MasterTransferConfig::new(
-        "ghost".to_string(),
-        Duration::from_secs(1),
-    );
+    let cfg =
+        MasterTransferConfig::new("ghost".to_string(), Duration::from_secs(1));
     let res = Arc::clone(&env).transfer_master(cfg);
     assert!(res.is_err(), "transfer to unknown peer must fail");
     Arc::clone(&env).close().unwrap();
@@ -126,8 +124,7 @@ fn shutdown_group_closes_master_and_signals_replicas() {
 
     let master_env = admin_env("master", dir1.path());
     let replica_env = admin_env("replica", dir2.path());
-    let replica_addr =
-        replica_env.bound_addr().expect("replica must bind");
+    let replica_addr = replica_env.bound_addr().expect("replica must bind");
 
     master_env.become_master(1).unwrap();
     master_env
@@ -141,9 +138,9 @@ fn shutdown_group_closes_master_and_signals_replicas() {
         .unwrap();
 
     // Master initiates shutdown_group with a 5 s replica timeout.
-    Arc::clone(&master_env).shutdown_group(5_000).expect(
-        "shutdown_group must succeed",
-    );
+    Arc::clone(&master_env)
+        .shutdown_group(5_000)
+        .expect("shutdown_group must succeed");
 
     // Master is closed.
     assert!(master_env.is_shutdown());

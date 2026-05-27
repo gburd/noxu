@@ -17,8 +17,8 @@
 //!    rejected.
 
 use noxu_rep::{
-    elections::{ELECTION_SERVICE_NAME, PersistentAcceptorState},
     RepConfig, ReplicatedEnvironment,
+    elections::{ELECTION_SERVICE_NAME, PersistentAcceptorState},
 };
 use std::sync::Arc;
 use tempfile::TempDir;
