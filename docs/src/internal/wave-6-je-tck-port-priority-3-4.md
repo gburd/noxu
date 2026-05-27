@@ -154,10 +154,10 @@ crates; no production-code changes were made in this wave.
 
 ## Gate status
 
-* `cargo fmt --all -- --check`         — pass
-* `cargo clippy --workspace --all-targets -- -D warnings` — pending re-check (final gate run is below in the wave-6 commit log)
-* per-crate test runs                  — all 39 new tests pass
-* `make docs-check`                    — pending re-check (final gate run is below)
+* `cargo fmt --all -- --check` — pass
+* `cargo clippy --workspace --all-targets -- -D warnings` — pass
+* per-crate test runs — all 39 new tests pass
+* `make docs-check` — pass
 
 ## Methodology
 
