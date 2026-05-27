@@ -614,10 +614,8 @@ impl Drop for Transaction {
         // (release locks, apply undo, prune from active-txn registry,
         // decrement gauge) instead of just logging a warning.
         let state = *self.state.lock().unwrap();
-        if matches!(
-            state,
-            TransactionState::Open | TransactionState::MustAbort
-        ) {
+        if matches!(state, TransactionState::Open | TransactionState::MustAbort)
+        {
             log::warn!(
                 "Transaction {} dropped without commit or abort, \
                  implicitly aborting",

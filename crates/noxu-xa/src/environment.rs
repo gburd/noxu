@@ -655,8 +655,7 @@ mod tests {
     fn test_recover_pagination_no_duplicates() {
         let (xa, _dir) = make_xa_env();
         let db_config = DatabaseConfig::new().with_allow_create(true);
-        let _db =
-            xa.inner().open_database(None, "test", &db_config).unwrap();
+        let _db = xa.inner().open_database(None, "test", &db_config).unwrap();
 
         // Prepare two branches.
         let mut xids = Vec::new();

@@ -405,7 +405,8 @@ impl Cursor {
         // cursor is positioned (one record at minimum); a 0 from the
         // inner is therefore a real bug and must surface, not be silently
         // promoted to 1.
-        let n = self.inner
+        let n = self
+            .inner
             .count()
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         if n < 1 {
@@ -1298,13 +1299,14 @@ mod tests {
     /// a sorted-dup database (audit cursor F12, Wave 2C-4).
     #[test]
     fn test_search_both_range_on_dup_db() {
-        use noxu_dbi::{DatabaseConfig as DbiCfg, DatabaseId, DatabaseImpl, DbType};
+        use noxu_dbi::{
+            DatabaseConfig as DbiCfg, DatabaseId, DatabaseImpl, DbType,
+        };
         use noxu_sync::RwLock;
         use std::sync::Arc;
 
         let db_id = DatabaseId::new(7);
-        let mut config = DbiCfg::default();
-        config.sorted_duplicates = true;
+        let config = DbiCfg { sorted_duplicates: true, ..DbiCfg::default() };
         let db_impl = DatabaseImpl::new(
             db_id,
             "dup_test".to_string(),
