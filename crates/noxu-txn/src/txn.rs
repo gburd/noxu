@@ -349,6 +349,17 @@ impl Txn {
         &mut self,
         durability: Durability,
     ) -> Result<Lsn, TxnError> {
+        // Prepared txns must be resolved through
+        // `resolved_commit_after_prepare` so the XA layer is the only path
+        // that can finalise them.  A direct `commit()` on a prepared txn
+        // would skip the prepare→commit ordering invariant and is a
+        // protocol error.
+        if self.is_prepared() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "PREPARED".into(),
+            });
+        }
         // Drain locks on every error return path so that an early
         // return (state-check failure, open cursors, log fsync error)
         // never leaves entries in `lock_manager` until environment
@@ -708,6 +719,154 @@ impl Txn {
         self.cursor_count.load(Ordering::Relaxed) > 0
     }
 
+    /// Returns `true` if this transaction has been prepared
+    /// ([`Self::prepare`]).
+    ///
+    /// Prepared transactions retain their write locks and cannot be
+    /// committed or aborted via [`Self::commit`] / [`Self::abort`] — the
+    /// XA layer must call them through the resolved code paths.
+    pub fn is_prepared(&self) -> bool {
+        self.txn_flags & IS_PREPARED != 0
+    }
+
+    /// Prepares the transaction for the second phase of XA two-phase commit.
+    ///
+    /// 1. Checks state (must be `Open`, no open cursors).
+    /// 2. Serialises a `TxnPrepareEntry` carrying (txn_id, first_lsn,
+    ///    last_lsn, xid_format_id, xid_gtrid, xid_bqual) and writes it to
+    ///    the WAL via the configured `LogManager`.  The frame is **fsynced**
+    ///    before this method returns so a crash immediately afterwards still
+    ///    allows recovery to resurrect the prepared state.
+    /// 3. Marks the transaction as prepared (`IS_PREPARED` flag), which
+    ///    blocks subsequent direct `commit()` / `abort()` calls.  After
+    ///    this point only the XA layer's resolved paths
+    ///    (`Txn::resolved_commit_after_prepare` /
+    ///    `Txn::resolved_abort_after_prepare`) may finalise the txn.
+    /// 4. Read locks are NOT released here — prepared txns hold every
+    ///    lock until resolution so that no other txn can observe the
+    ///    in-flight state.
+    ///
+    /// Returns the LSN of the `TxnPrepare` record, or `NULL_LSN` if the
+    /// txn has no logged entries (read-only txn — the XA layer should take
+    /// the `PrepareResult::ReadOnly` optimisation rather than calling
+    /// this method).
+    ///
+    /// # Arguments
+    /// * `xid_format_id`, `xid_gtrid`, `xid_bqual` — the components of the
+    ///   `noxu_xa::Xid` being prepared.  Encoded the same way the XA
+    ///   `PreparedLog` encodes them so recovery can round-trip the XID.
+    ///
+    /// # Errors
+    /// * `InvalidTransaction` if the txn is not `Open` (already committed,
+    ///   aborted, prepared, or flipped to MUST_ABORT).
+    /// * `InvalidTransaction` if cursors remain open on this txn.
+    /// * `LogError` if writing the `TxnPrepare` frame fails.
+    pub fn prepare(
+        &mut self,
+        xid_format_id: i32,
+        xid_gtrid: Vec<u8>,
+        xid_bqual: Vec<u8>,
+    ) -> Result<Lsn, TxnError> {
+        // State machine: prepare requires Open.  IS_PREPARED transitions
+        // are NOT idempotent — a second prepare() returns InvalidTransaction
+        // so the XA layer cannot accidentally write two TxnPrepare frames
+        // for the same txn.
+        if self.is_prepared() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "PREPARED".into(),
+            });
+        }
+        self.check_state()?;
+        if self.has_open_cursors() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "has open cursors".into(),
+            });
+        }
+
+        // No logged entries — caller should have taken the read-only
+        // optimisation.  We still mark prepared (defensive), but do not
+        // emit a TxnPrepare frame: there is nothing to resolve.
+        if !self.has_logged_entries() {
+            self.txn_flags |= IS_PREPARED;
+            return Ok(NULL_LSN);
+        }
+
+        // Serialise and write the TxnPrepare frame, with fsync.
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let entry = noxu_log::entry::TxnPrepareEntry::new(
+            self.id,
+            timestamp_ms,
+            self.first_lsn,
+            self.last_lsn,
+            xid_format_id,
+            xid_gtrid,
+            xid_bqual,
+        )
+        .map_err(|e| TxnError::StateError(format!("prepare: {e}")))?;
+        let mut payload = Vec::with_capacity(entry.log_size());
+        entry.write_to_log(&mut payload);
+
+        // fsync=true: the prepare contract is durable-by-the-time-we-return.
+        let prepare_lsn =
+            self.log_entry(LogEntryType::TxnPrepare, &payload, true)?;
+
+        // Belt-and-braces: ensure the write reached the platter even if
+        // the LogManager's group-commit batched our entry.  `flush_sync_if_needed`
+        // is a no-op when another committer already flushed past this LSN.
+        if let Some(ref lm) = self.log_manager {
+            lm.flush_sync_if_needed(prepare_lsn)
+                .map_err(TxnError::LogError)?;
+        }
+
+        // Track the prepare LSN as the new last_lsn so that, after a
+        // crash, recovery can chain undo / redo correctly off it.
+        self.note_log_entry(prepare_lsn.as_u64());
+        self.txn_flags |= IS_PREPARED;
+
+        Ok(prepare_lsn)
+    }
+
+    /// Resolves a prepared transaction with a commit.
+    ///
+    /// Used by the XA `xa_commit` path after `prepare()` has succeeded.
+    /// Bypasses the IS_PREPARED guard in [`Self::commit_with_durability`]
+    /// because the prepare already established the commit decision; we
+    /// just need to write the durable `TxnCommit` record and release
+    /// locks.
+    pub fn resolved_commit_after_prepare(
+        &mut self,
+    ) -> Result<Lsn, TxnError> {
+        if !self.is_prepared() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "not prepared".into(),
+            });
+        }
+        // Clear the prepared flag so commit_with_durability's check_state
+        // path takes the normal Open route.
+        self.txn_flags &= !IS_PREPARED;
+        self.commit_with_durability(Durability::CommitSync)
+    }
+
+    /// Resolves a prepared transaction with an abort.
+    pub fn resolved_abort_after_prepare(
+        &mut self,
+    ) -> Result<Lsn, TxnError> {
+        if !self.is_prepared() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "not prepared".into(),
+            });
+        }
+        self.txn_flags &= !IS_PREPARED;
+        self.abort()
+    }
+
     /// Commits the transaction.
     ///
     ///
@@ -757,6 +916,15 @@ impl Txn {
         // Idempotent for already-terminated transactions.
         if self.state == TxnState::Aborted {
             return Ok(NULL_LSN);
+        }
+        // Prepared txns must be resolved through
+        // `resolved_abort_after_prepare`; see the matching guard in
+        // `commit_with_durability` for the rationale.
+        if self.is_prepared() {
+            return Err(TxnError::InvalidTransaction {
+                txn_id: self.id,
+                state: "PREPARED".into(),
+            });
         }
         if self.state == TxnState::Committed {
             return Err(TxnError::InvalidTransaction {
@@ -1960,5 +2128,119 @@ mod tests {
 
         txn.abort().unwrap();
         assert_eq!(txn.n_locks(), 0);
+    }
+
+    // ============================================================
+    // Prepare path (XA crash-durable two-phase commit, wave 3-2)
+    // ============================================================
+
+    #[test]
+    fn test_prepare_writes_txn_prepare_frame() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(77, lock_manager, lm.clone());
+        txn.note_log_entry(500);
+        txn.lock(500, LockType::Write, false).unwrap();
+
+        let eol_before = lm.get_end_of_log();
+        let prep_lsn =
+            txn.prepare(1, b"gtrid".to_vec(), b"bqual".to_vec()).unwrap();
+        let eol_after = lm.get_end_of_log();
+
+        assert!(!prep_lsn.is_null());
+        assert!(eol_after.as_u64() > eol_before.as_u64());
+        assert!(txn.is_prepared());
+        // Locks are retained across prepare.
+        assert_eq!(txn.n_locks(), 1);
+    }
+
+    #[test]
+    fn test_prepare_blocks_direct_commit() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(78, lock_manager, lm.clone());
+        txn.note_log_entry(501);
+        txn.lock(501, LockType::Write, false).unwrap();
+        txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
+
+        let res = txn.commit();
+        assert!(matches!(
+            res,
+            Err(TxnError::InvalidTransaction { state, .. }) if state == "PREPARED"
+        ));
+        // Same for direct abort.
+        let res = txn.abort();
+        assert!(matches!(
+            res,
+            Err(TxnError::InvalidTransaction { state, .. }) if state == "PREPARED"
+        ));
+    }
+
+    #[test]
+    fn test_resolved_commit_after_prepare_completes() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(79, lock_manager, lm.clone());
+        txn.note_log_entry(502);
+        txn.lock(502, LockType::Write, false).unwrap();
+        txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
+
+        let commit_lsn = txn.resolved_commit_after_prepare().unwrap();
+        assert!(!commit_lsn.is_null());
+        assert_eq!(txn.get_state(), TxnState::Committed);
+        // Locks released.
+        assert_eq!(txn.n_locks(), 0);
+        // Prepared flag cleared.
+        assert!(!txn.is_prepared());
+    }
+
+    #[test]
+    fn test_resolved_abort_after_prepare_completes() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(80, lock_manager, lm.clone());
+        txn.note_log_entry(503);
+        txn.lock(503, LockType::Write, false).unwrap();
+        txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
+
+        let abort_lsn = txn.resolved_abort_after_prepare().unwrap();
+        assert!(!abort_lsn.is_null());
+        assert_eq!(txn.get_state(), TxnState::Aborted);
+        assert_eq!(txn.n_locks(), 0);
+    }
+
+    #[test]
+    fn test_prepare_twice_is_protocol_error() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(81, lock_manager, lm.clone());
+        txn.note_log_entry(504);
+        txn.lock(504, LockType::Write, false).unwrap();
+        txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
+        let res = txn.prepare(1, b"g".to_vec(), b"b".to_vec());
+        assert!(matches!(res, Err(TxnError::InvalidTransaction { .. })));
+    }
+
+    #[test]
+    fn test_prepare_read_only_returns_null_lsn() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(82, lock_manager, lm.clone());
+        // No note_log_entry: this is a read-only txn.
+        let prep = txn.prepare(1, b"g".to_vec(), b"b".to_vec()).unwrap();
+        assert!(prep.is_null());
+        assert!(txn.is_prepared());
+    }
+
+    #[test]
+    fn test_prepare_after_commit_is_protocol_error() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(83, lock_manager, lm.clone());
+        txn.note_log_entry(505);
+        txn.lock(505, LockType::Write, false).unwrap();
+        txn.commit().unwrap();
+        let res = txn.prepare(1, b"g".to_vec(), b"b".to_vec());
+        assert!(matches!(res, Err(TxnError::InvalidTransaction { .. })));
     }
 }
