@@ -1,26 +1,26 @@
-//! Sprint 3 regression tests \u2014 v1.5 XA is in-process only.
+//! Sprint 3 / Wave 3-2 tests — XA crash-durable two-phase commit.
 //!
-//! See `docs/src/internal/sprint-3-xa-restriction.md` for the rationale.
+//! See `docs/src/internal/sprint-3-xa-restriction.md` and
+//! `docs/src/internal/wave-3-2-crash-durable-xa.md` for the full
+//! design.
 //!
-//! These tests pin down the v1.5 contract that:
+//! Wave 3-2 implemented crash-durable XA, removing the v1.5 in-process-
+//! only restriction.  These tests now pin down the v2.0 contract:
 //!
-//! 1. `xa_recover` on a fresh `XaEnvironment` (no prior `xa_prepare`) returns
-//!    an empty list \u2014 i.e. no spurious entries.
-//! 2. `xa_commit` of an XID that survives only in the persistent prepared
-//!    log returns the new typed error
-//!    [`XaError::CrashDurabilityNotSupported`], not `NotFound` and not a
-//!    spurious success.
-//! 3. `xa_rollback` of such an XID likewise returns
-//!    `CrashDurabilityNotSupported`.
-//! 4. `xa_forget` of such an XID still succeeds \u2014 operators must be able
-//!    to clear the persistent record without an in-memory branch.
+//! 1. `xa_recover` on a fresh `XaEnvironment` (no prior `xa_prepare`)
+//!    returns an empty list — no spurious entries.
+//! 2. `xa_commit` of an XID that was prepared in a previous process
+//!    (and survived the crash via the WAL `TxnPrepare` frame) **succeeds**
+//!    and the prepared writes become visible.
+//! 3. `xa_rollback` of such an XID **succeeds** and the prepared writes
+//!    are discarded.
+//! 4. `xa_forget` of such an XID still succeeds — operators can clear
+//!    in-doubt entries without resolving their data.
 //! 5. `xa_prepare` auto-detects writes performed via the inner
-//!    `Transaction` \u2014 a user that forgets to call `mark_write` no longer
+//!    `Transaction` — a user that forgets to call `mark_write` no longer
 //!    silently slides into the read-only optimisation and aborts their
 //!    work.
-//! 6. A truly read-only branch still returns `PrepareResult::ReadOnly`
-//!    (the auto-detect must not produce a false positive on read-only
-//!    workloads).
+//! 6. A truly read-only branch still returns `PrepareResult::ReadOnly`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -89,13 +89,16 @@ fn fresh_env_xa_recover_returns_empty_without_log() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. xa_commit after restart returns CrashDurabilityNotSupported
+// 2. xa_commit after restart succeeds and prepared writes become visible.
+//    Wave 3-2: crash-durable XA replaces the v1.5
+//    `CrashDurabilityNotSupported` regression.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn xa_commit_after_restart_returns_crash_durability_not_supported() {
+fn xa_commit_after_restart_succeeds() {
     let dir = TempDir::new().unwrap();
-    let xid = Xid::new(1, b"sprint3_commit_after_restart", b"br").unwrap();
+    let xid = Xid::new(1, b"v2_commit_after_restart", b"br").unwrap();
+    let key = b"k_after_restart_commit";
 
     // Phase 1: prepare and "crash" (drop without committing).
     {
@@ -105,52 +108,57 @@ fn xa_commit_after_restart_returns_crash_durability_not_supported() {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
                 Some(txn),
-                &DatabaseEntry::from_bytes(b"k_after_restart_commit"),
+                &DatabaseEntry::from_bytes(key),
                 &DatabaseEntry::from_bytes(b"v"),
             )
             .unwrap();
         }
-        xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
-        // Drop xa + db + env without committing \u2014 simulates a crash.
+        // Drop xa + db + env without committing — simulates a crash.
     }
 
-    // Phase 2: reopen. The XID is in the persistent log but the in-memory
-    // branch is gone; xa_commit must fail with CrashDurabilityNotSupported.
+    // Phase 2: reopen.  The XID is in the WAL; xa_recover must surface it,
+    // xa_commit must succeed, and the prepared write must become visible.
     {
-        let (xa, _db) = make_xa_with_log(dir.path());
+        let (xa, db) = make_xa_with_log(dir.path());
         let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
         assert!(
             recovered.contains(&xid),
             "recovered XIDs should include the prepared one: {recovered:?}"
         );
 
-        let result = xa.xa_commit(&xid, XaFlags::NOFLAGS);
-        assert!(
-            matches!(result, Err(XaError::CrashDurabilityNotSupported)),
-            "expected CrashDurabilityNotSupported, got {result:?}"
-        );
+        xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
 
-        // The error message must mention v1.5 and xa_forget so the
-        // operator knows what to do.
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("v1.5"), "error must mention v1.5: {msg}");
+        // After commit, the prepared write is visible.
+        let mut val = DatabaseEntry::new();
+        let status =
+            db.get(None, &DatabaseEntry::from_bytes(key), &mut val).unwrap();
+        assert_eq!(status, OperationStatus::Success);
+        assert_eq!(val.get_data(), Some(b"v".as_slice()));
+    }
+
+    // Phase 3: reopen one more time.  The XID must NOT reappear (it was
+    // resolved by the TxnCommit frame written in phase 2).
+    {
+        let (xa, _db) = make_xa_with_log(dir.path());
+        let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
         assert!(
-            msg.contains("xa_forget"),
-            "error must mention xa_forget: {msg}"
+            !recovered.contains(&xid),
+            "resolved XID should NOT reappear: {recovered:?}"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// 3. xa_rollback after restart returns CrashDurabilityNotSupported
+// 3. xa_rollback after restart succeeds and prepared writes are discarded.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn xa_rollback_after_restart_returns_crash_durability_not_supported() {
+fn xa_rollback_after_restart_succeeds() {
     let dir = TempDir::new().unwrap();
-    let xid = Xid::new(1, b"sprint3_rb_after_restart", b"br").unwrap();
+    let xid = Xid::new(1, b"v2_rb_after_restart", b"br").unwrap();
+    let key = b"k_after_restart_rb";
 
     {
         let (xa, db) = make_xa_with_log(dir.path());
@@ -159,28 +167,32 @@ fn xa_rollback_after_restart_returns_crash_durability_not_supported() {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
                 Some(txn),
-                &DatabaseEntry::from_bytes(b"k_after_restart_rb"),
+                &DatabaseEntry::from_bytes(key),
                 &DatabaseEntry::from_bytes(b"v"),
             )
             .unwrap();
         }
-        xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
     }
 
     {
-        let (xa, _db) = make_xa_with_log(dir.path());
-        let result = xa.xa_rollback(&xid, XaFlags::NOFLAGS);
-        assert!(
-            matches!(result, Err(XaError::CrashDurabilityNotSupported)),
-            "expected CrashDurabilityNotSupported, got {result:?}"
-        );
+        let (xa, db) = make_xa_with_log(dir.path());
+        let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
+        assert!(recovered.contains(&xid));
+
+        xa.xa_rollback(&xid, XaFlags::NOFLAGS).unwrap();
+
+        // Prepared write must NOT be visible.
+        let mut val = DatabaseEntry::new();
+        let status =
+            db.get(None, &DatabaseEntry::from_bytes(key), &mut val).unwrap();
+        assert_eq!(status, OperationStatus::NotFound);
     }
 }
 
 // ---------------------------------------------------------------------------
-// 4. xa_commit / xa_rollback of a *truly unknown* XID still returns NotFound
+// 4. xa_commit / xa_rollback of a *truly unknown* XID still returns NotFound.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -197,13 +209,13 @@ fn xa_commit_unknown_xid_returns_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. xa_forget on a recovered persistent-only XID still succeeds
+// 5. xa_forget on a recovered persistent-only XID still succeeds.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn xa_forget_after_restart_clears_persistent_log() {
     let dir = TempDir::new().unwrap();
-    let xid = Xid::new(1, b"sprint3_forget_after_restart", b"br").unwrap();
+    let xid = Xid::new(1, b"v2_forget_after_restart", b"br").unwrap();
 
     {
         let (xa, db) = make_xa_with_log(dir.path());
@@ -217,7 +229,6 @@ fn xa_forget_after_restart_clears_persistent_log() {
             )
             .unwrap();
         }
-        xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
     }
@@ -228,23 +239,19 @@ fn xa_forget_after_restart_clears_persistent_log() {
         let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
         assert!(recovered.contains(&xid));
 
-        // Forget should succeed and remove it from the persistent log.
+        // Forget should succeed and remove it from the in-doubt list.
         xa.xa_forget(&xid, XaFlags::NOFLAGS).unwrap();
         let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
         assert!(!recovered.contains(&xid));
 
-        // Now it really is unknown \u2014 commit returns NotFound, not
-        // CrashDurabilityNotSupported.
+        // Now it really is unknown — commit returns NotFound.
         let result = xa.xa_commit(&xid, XaFlags::NOFLAGS);
         assert!(matches!(result, Err(XaError::NotFound)));
     }
 }
 
-// NOTE: Auto-detect-writes tests are added in the
-// `fix(xa): auto-detect writes in xa_prepare` commit.
-
 // ---------------------------------------------------------------------------
-// 6. xa_prepare auto-detects writes (no explicit mark_write needed)
+// 6. xa_prepare auto-detects writes (no explicit mark_write needed).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -292,7 +299,7 @@ fn xa_prepare_auto_detects_writes_without_mark_write() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Truly read-only branch still gets the read-only optimisation
+// 7. Truly read-only branch still gets the read-only optimisation.
 // ---------------------------------------------------------------------------
 
 #[test]
