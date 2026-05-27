@@ -942,6 +942,24 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
+        // Snapshot the primary record before deleting so we can fan a
+        // matching secondary cleanup out to attached indexes (wave 2A
+        // step 5).  We read under the supplied txn so the snapshot
+        // is consistent with the about-to-delete write set.  Fast
+        // exit when there are no secondaries: the snapshot read is
+        // skipped.
+        let has_secondaries = !self.secondaries.lock().is_empty();
+        let old_data: Option<DatabaseEntry> = if has_secondaries {
+            let mut tmp = DatabaseEntry::new();
+            let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+            match self.get(txn, &pri_key_entry, &mut tmp)? {
+                OperationStatus::Success => Some(tmp),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Inner closure shared between the explicit-txn and synthetic
         // auto-txn paths: scans + deletes every duplicate of `key_bytes`
         // through the supplied `cursor`.  See comment in pre-Wave-1A
@@ -964,9 +982,31 @@ impl Database {
         let deleted_any = match txn {
             Some(t) => {
                 let mut cursor = self.make_cursor_for_txn(t);
-                run_delete(&mut cursor)?
+                let any = run_delete(&mut cursor)?;
+                if any && let Some(od) = old_data.as_ref() {
+                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    self.fan_out_to_secondaries(
+                        Some(t),
+                        &pri_key_entry,
+                        Some(od),
+                        None,
+                    )?;
+                }
+                any
             }
-            None => self.with_auto_txn(|cursor, _view| run_delete(cursor))?,
+            None => self.with_auto_txn(|cursor, view| {
+                let any = run_delete(cursor)?;
+                if any && let Some(od) = old_data.as_ref() {
+                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    self.fan_out_to_secondaries(
+                        Some(view),
+                        &pri_key_entry,
+                        Some(od),
+                        None,
+                    )?;
+                }
+                Ok(any)
+            })?,
         };
 
         let status = if deleted_any {
