@@ -91,11 +91,21 @@ order:
 
 ## Scope of this audit
 
+> The reference archives lived in the auditor's local filesystem at
+> `$JE_HOME` (Berkeley DB Java Edition) and `$NOSQL_HOME` (the Oracle
+> NoSQL DB extended fork) when this audit was performed.  These
+> archives are **not** part of the Noxu repository — the project
+> builds and tests cleanly without them.  External readers do not
+> need to fetch them to read this report; the references below
+> point into the archives only as the source-of-truth for the JE
+> shape we ported from.  See `AGENTS.md` §“Reference Archives” for
+> how to obtain them if you want to follow the deep links.
+
 | Item | Scope |
 |---|---|
-| **JE source archive** | `/home/gburd/ws/je/src/` (990 .java files) |
-| **JE test archive** | `/home/gburd/ws/je/test/com/sleepycat/` (570 .java files, 2,069 `@Test` methods) |
-| **NoSQL extended fork** | `/home/gburd/ws/nosql/kvmain/src/` (3,051 .java files) — **not deeply read** for this audit; only used as a tie-breaker reference for ambiguous JE behaviour |
+| **JE source archive** | `$JE_HOME/src/` (990 .java files) |
+| **JE test archive** | `$JE_HOME/test/com/sleepycat/` (570 .java files, 2,069 `@Test` methods) |
+| **NoSQL extended fork** | `$NOSQL_HOME/kvmain/src/` (3,051 .java files) — **not deeply read** for this audit; only used as a tie-breaker reference for ambiguous JE behaviour |
 | **Noxu source** | `crates/*/src/**/*.rs` (357 files with `#[test]` or `#[cfg(test)]`) |
 | **Noxu integration tests** | `crates/*/tests/*.rs` (48 files) |
 | **Public packages enumerated** | `com.sleepycat.je`, `com.sleepycat.je.rep`, `com.sleepycat.bind*`, `com.sleepycat.collections`, `com.sleepycat.persist*` |
@@ -378,7 +388,7 @@ the 4–8h budget. Specifically:
   enumerated and mapped to a Noxu type (or marked MISSING /
   DELIBERATELY-OMITTED) in `je-port-audit-2026-05-api-map.md`.
 - **Covered comprehensively**: every JE test directory under
-  `/home/gburd/ws/je/test/com/sleepycat/` is enumerated and mapped
+  `$JE_HOME/test/com/sleepycat/` is enumerated and mapped
   to a Noxu test file (or marked MISSING / SKIPPED) in
   `je-port-audit-2026-05-test-map.md`.
 - **Sampled at ~30 %**: the deeper read of paired tests (six pairs
@@ -391,7 +401,7 @@ the 4–8h budget. Specifically:
   `je.utilint` / `je.statcap` / `je.evictor` internal package detail
   — only class names and the count-of-tests are recorded.
 - **NOT covered**: the NoSQL extended fork at
-  `/home/gburd/ws/nosql/kvmain/`. We confirmed it exists (3,051
+  `$NOSQL_HOME/kvmain/`. We confirmed it exists (3,051
   `.java` files) but did not perform any per-class enumeration.
 
 ## Recommended follow-up sprint scope
