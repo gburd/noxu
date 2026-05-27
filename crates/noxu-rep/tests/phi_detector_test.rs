@@ -129,8 +129,12 @@ fn test_master_tracker_phi_mode() {
 
     tracker.set_master("node1", 1);
 
-    // Send heartbeats to populate the phi detector's window.
-    for _ in 0..20 {
+    // Send heartbeats to populate the phi detector's window.  Use 30 samples
+    // (instead of 20) so a single GC-pause-style outlier cannot dominate the
+    // computed stddev and push the survival probability above 0.1 (which
+    // would keep phi below the 1.0 threshold).  Wave 9-A fix 3 — the
+    // previous test was flaky under workspace test load (~20% miss rate).
+    for _ in 0..30 {
         tracker.record_heartbeat();
         thread::sleep(Duration::from_millis(10));
     }
@@ -141,11 +145,27 @@ fn test_master_tracker_phi_mode() {
         "master must be alive right after heartbeats"
     );
 
-    // Silence for 200 ms → phi rises above 1.0 → suspected.
-    thread::sleep(Duration::from_millis(200));
+    // Silence: phi rises monotonically as `elapsed = last.elapsed()` grows.
+    // Even if the inter-arrival window has high variance from a CI outlier,
+    // waiting long enough drives `z = (elapsed - mean) / stddev` arbitrarily
+    // high.  Poll `is_master_alive()` over an extended window (was: single
+    // 200 ms check) so the assertion succeeds as soon as phi has grown past
+    // the threshold, and only fails if it never does.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut suspected = false;
+    let mut last_phi = 0.0_f64;
+    while std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        last_phi = tracker.phi().unwrap_or(0.0);
+        if !tracker.is_master_alive() {
+            suspected = true;
+            break;
+        }
+    }
     assert!(
-        !tracker.is_master_alive(),
-        "master must be suspected after extended silence with phi detector"
+        suspected,
+        "master must be suspected after extended silence; \
+         last observed phi={last_phi:.4} (threshold=1.0)",
     );
 
     // phi() accessor returns Some(phi_value) in phi mode.
@@ -156,7 +176,8 @@ fn test_master_tracker_phi_mode() {
     );
     assert!(
         phi_val.unwrap() >= 1.0,
-        "phi value must exceed threshold after silence"
+        "phi value must exceed threshold after silence (got {:.4})",
+        phi_val.unwrap(),
     );
 }
 
