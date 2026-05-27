@@ -61,7 +61,7 @@ use crate::database::Database;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
 use crate::operation_status::OperationStatus;
-use crate::secondary_config::SecondaryConfig;
+use crate::secondary_config::{ForeignKeyDeleteAction, SecondaryConfig};
 use crate::secondary_cursor::SecondaryCursor;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, GetMode};
@@ -135,6 +135,10 @@ pub(crate) struct SecondaryState {
     pub(crate) config: SecondaryConfig,
     /// Whether this secondary is fully populated (not in incremental mode).
     pub(crate) is_fully_populated: AtomicBool,
+    /// Optional FK target — the parent (foreign-key) database whose
+    /// primary keys this secondary's secondary-keys reference.
+    /// Resolved from `config.foreign_key_database` at open time.
+    pub(crate) fk_target: Option<Arc<Mutex<Database>>>,
 }
 
 pub struct SecondaryDatabase {
@@ -187,24 +191,52 @@ impl SecondaryDatabase {
             )));
         }
 
-        // FK rejection is still in force here; it will be lifted in
-        // step 8 of the wave-2A plan (Audit C2 / Decision 2C).
-        if config.has_foreign_key_config() {
-            return Err(NoxuError::Unsupported(
-                "foreign-key constraints are not yet enabled in this build; \
-                 clear SecondaryConfig.foreign_key_database / \
-                 foreign_key_delete_action / foreign_key_nullifier / \
-                 foreign_multi_key_nullifier (FK enforcement lands in v1.6 \
-                 step 8–10 of wave 2A)"
-                    .to_string(),
-            ));
-        }
+        // FK config handling (wave 2A step 8): Abort action is
+        // implemented; Cascade and Nullify land in steps 9 and 10
+        // respectively.
+        let fk_target = if config.foreign_key_database_name.is_some()
+            || config.foreign_key_database.is_some()
+        {
+            // Cascade and Nullify still rejected at open until
+            // their dedicated steps land.
+            match config.foreign_key_delete_action {
+                ForeignKeyDeleteAction::Abort => {}
+                ForeignKeyDeleteAction::Cascade => {
+                    return Err(NoxuError::Unsupported(
+                        "ForeignKeyDeleteAction::Cascade is not yet \
+                         enabled in this build (wave 2A step 9)"
+                            .to_string(),
+                    ));
+                }
+                ForeignKeyDeleteAction::Nullify => {
+                    return Err(NoxuError::Unsupported(
+                        "ForeignKeyDeleteAction::Nullify is not yet \
+                         enabled in this build (wave 2A step 10)"
+                            .to_string(),
+                    ));
+                }
+            }
+            // Require the actual handle, not just the name; the engine
+            // must be able to resolve the parent at open time.
+            let handle = config.foreign_key_database.clone().ok_or_else(|| {
+                NoxuError::IllegalArgument(
+                    "SecondaryConfig.foreign_key_database (handle) must be set \
+                     via with_foreign_key_database_handle when foreign_key_database_name \
+                     is set; the name alone is no longer sufficient"
+                        .to_string(),
+                )
+            })?;
+            Some(handle)
+        } else {
+            None
+        };
 
         let state = Arc::new(SecondaryState {
             inner: secondary_db,
             primary,
             config,
             is_fully_populated: AtomicBool::new(true),
+            fk_target: fk_target.clone(),
         });
         let sec = SecondaryDatabase { state };
 
@@ -217,9 +249,16 @@ impl SecondaryDatabase {
         {
             let pri_guard = sec.state.primary.lock();
             let mut regs = pri_guard.secondaries.lock();
-            // Purge dangling weaks while we're here.
             regs.retain(|w| w.strong_count() > 0);
             regs.push(Arc::downgrade(&sec.state));
+        }
+
+        // Step 8: register on the FK target's referrer list.
+        if let Some(parent) = fk_target.as_ref() {
+            let parent_guard = parent.lock();
+            let mut refs = parent_guard.fk_referrers.lock();
+            refs.retain(|w| w.strong_count() > 0);
+            refs.push(Arc::downgrade(&sec.state));
         }
 
         // If allow_populate and the secondary is empty, populate from primary.

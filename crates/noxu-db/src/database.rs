@@ -111,6 +111,20 @@ pub struct Database {
     /// into `Database::put` / `Database::delete` so primary writes
     /// fan out to every registered secondary inside the user's txn.
     pub(crate) secondaries: Arc<Mutex<Vec<std::sync::Weak<crate::secondary_database::SecondaryState>>>>,
+    /// Foreign-key referrer registry.
+    ///
+    /// When a secondary index opens with a `foreign_key_database`
+    /// pointing at THIS database, it pushes a `Weak<SecondaryState>`
+    /// onto this list.  `Database::delete` walks the list before
+    /// performing the primary delete and applies each child's
+    /// [`crate::secondary_config::ForeignKeyDeleteAction`] (Abort,
+    /// Cascade, Nullify).
+    ///
+    /// Wave 2A step 8 introduces this registry.  Strong references
+    /// are held by the user's `SecondaryDatabase` handles; dropping
+    /// a child secondary purges its weak entry the next time the
+    /// list is iterated.
+    pub(crate) fk_referrers: Arc<Mutex<Vec<std::sync::Weak<crate::secondary_database::SecondaryState>>>>,
 }
 
 /// State of a database handle.
@@ -410,6 +424,70 @@ impl Database {
         Ok(())
     }
 
+    /// Walks the FK referrer list and applies each child secondary's
+    /// [`crate::secondary_config::ForeignKeyDeleteAction`].  Called
+    /// from `Database::delete` BEFORE the actual delete so an Abort
+    /// action can short-circuit the whole operation.
+    ///
+    /// Wave 2A step 8: only the `Abort` action is wired.  Returns
+    /// `Err(NoxuError::ForeignConstraintViolation)` if any child
+    /// secondary has a duplicate of `pri_key` as a secondary key.
+    fn check_fk_referrers_on_delete(
+        &self,
+        txn: Option<&Transaction>,
+        pri_key: &DatabaseEntry,
+    ) -> Result<()> {
+        use crate::secondary_config::ForeignKeyDeleteAction;
+
+        let referrers: Vec<Arc<crate::secondary_database::SecondaryState>> = {
+            let mut refs = self.fk_referrers.lock();
+            refs.retain(|w| w.strong_count() > 0);
+            refs.iter().filter_map(|w| w.upgrade()).collect()
+        };
+        if referrers.is_empty() {
+            return Ok(());
+        }
+
+        for child in referrers {
+            // The child's secondary index keys ARE foreign-key
+            // references to this database's primary keys.  Look up
+            // `pri_key` as a sec_key in the child's inner index; if
+            // any dup exists, the FK is violated.
+            let mut probe_data = DatabaseEntry::new();
+            let status = child.inner.get(txn, pri_key, &mut probe_data)?;
+            if status != OperationStatus::Success {
+                continue;
+            }
+            // At least one child references this parent record.
+            match child.config.foreign_key_delete_action {
+                ForeignKeyDeleteAction::Abort => {
+                    return Err(NoxuError::ForeignConstraintViolation(
+                        format!(
+                            "primary key in '{}' is referenced by \
+                             foreign-key secondary '{}' (action=Abort); \
+                             delete one or more referencing primaries first",
+                            self.name,
+                            child.inner.get_database_name()
+                        ),
+                    ));
+                }
+                ForeignKeyDeleteAction::Cascade
+                | ForeignKeyDeleteAction::Nullify => {
+                    // Steps 9 and 10 handle these; SecondaryDatabase::open
+                    // currently rejects non-Abort actions so this arm is
+                    // unreachable in step 8.  Keep it explicit so step 9
+                    // / 10 only need to extend this match.
+                    return Err(NoxuError::Unsupported(format!(
+                        "foreign-key delete action {:?} is not yet wired \
+                         in this build (wave 2A step 9 / 10)",
+                        child.config.foreign_key_delete_action
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Port of`LogManager.flushTo(lsn)`: if a concurrent committer already
     /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
     /// natural many:1 fsync coalescing under concurrent write load with no
@@ -486,6 +564,7 @@ impl Database {
             no_sync,
             write_no_sync,
             secondaries: Arc::new(noxu_sync::Mutex::new(Vec::new())),
+            fk_referrers: Arc::new(noxu_sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -971,6 +1050,14 @@ impl Database {
             Some(k) => k,
             None => return Ok(OperationStatus::NotFound),
         };
+
+        // Wave 2A step 8: enforce foreign-key constraints BEFORE the
+        // delete.  An Abort action returns ForeignConstraintViolation
+        // here so neither the primary delete nor any secondary fan-out
+        // happens — the user's txn is left intact for an explicit
+        // commit/abort.
+        let pri_key_for_fk = DatabaseEntry::from_bytes(key_bytes);
+        self.check_fk_referrers_on_delete(txn, &pri_key_for_fk)?;
 
         // Snapshot the primary record before deleting so we can fan a
         // matching secondary cleanup out to attached indexes (wave 2A

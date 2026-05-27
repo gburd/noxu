@@ -4,6 +4,7 @@
 use crate::database::Database;
 use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
+use std::sync::Arc;
 
 /// Callback trait for creating a single secondary key from a primary record.
 ///
@@ -184,6 +185,21 @@ pub struct SecondaryConfig {
     /// corresponding `Database` handle at open time.
     pub foreign_key_database_name: Option<String>,
 
+    /// Resolved handle to the foreign-key database.
+    ///
+    /// When set, the secondary registers itself as a foreign-key
+    /// referrer on this database at open time so deletes on the FK
+    /// target can apply [`ForeignKeyDeleteAction`] (Abort / Cascade /
+    /// Nullify).  The handle is `Arc<Mutex<Database>>` so the FK
+    /// registry on the parent's `Database` can hold a `Weak<...>` to
+    /// the *child* secondary while keeping the parent alive through
+    /// the strong Arc.
+    ///
+    /// Wave 2A step 8 introduces this field; pre-step-8 the
+    /// foreign-key configuration was rejected at
+    /// `SecondaryDatabase::open`.
+    pub foreign_key_database: Option<Arc<noxu_sync::Mutex<crate::database::Database>>>,
+
     /// Action to take when a referenced foreign key record is deleted.
     pub foreign_key_delete_action: ForeignKeyDeleteAction,
 
@@ -221,6 +237,7 @@ impl SecondaryConfig {
             multi_key_creator: None,
             allow_populate: false,
             foreign_key_database_name: None,
+            foreign_key_database: None,
             foreign_key_delete_action: ForeignKeyDeleteAction::Abort,
             foreign_key_nullifier: None,
             foreign_multi_key_nullifier: None,
@@ -324,6 +341,23 @@ impl SecondaryConfig {
         name: S,
     ) -> Self {
         self.foreign_key_database_name = Some(name.into());
+        self
+    }
+
+    /// Sets the foreign-key database **handle** in addition to the
+    /// name.  Required for FK enforcement in v1.6 (wave-2A step 8+):
+    /// the engine registers this secondary on the named database's
+    /// foreign-key referrer registry so deletes on the FK target can
+    /// apply [`ForeignKeyDeleteAction`].
+    ///
+    /// The handle is `Arc<Mutex<Database>>` (the same shape used for
+    /// the primary database parameter to
+    /// [`crate::secondary_database::SecondaryDatabase::open`]).
+    pub fn with_foreign_key_database_handle(
+        mut self,
+        handle: Arc<noxu_sync::Mutex<Database>>,
+    ) -> Self {
+        self.foreign_key_database = Some(handle);
         self
     }
 

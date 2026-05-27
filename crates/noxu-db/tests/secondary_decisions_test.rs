@@ -243,12 +243,13 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
 }
 
-// ─── Decision 2C — FK config rejected at open ──────────────────────────
+// ─── Decision 2C — FK Abort lands; Cascade/Nullify still rejected ────
 
-/// Setting `foreign_key_database` on a `SecondaryConfig` causes
-/// `SecondaryDatabase::open` to return `NoxuError::Unsupported`.
+/// Setting `foreign_key_database` (name only, without the resolved
+/// handle) returns [`NoxuError::IllegalArgument`] — the engine needs
+/// the actual handle to register on the FK target's referrer list.
 #[test]
-fn d2c_foreign_key_database_rejected_at_open() {
+fn d2c_foreign_key_database_name_only_rejected() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
@@ -273,42 +274,35 @@ fn d2c_foreign_key_database_rejected_at_open() {
         .with_foreign_key_database("foreign");
 
     let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("foreign-key"),
-                "expected foreign-key wording: {msg}"
-            );
-        }
-        Ok(_) => panic!(
-            "SecondaryDatabase::open with foreign_key_database must fail \
-             with NoxuError::Unsupported"
-        ),
-        Err(other) => panic!(
-            "SecondaryDatabase::open with foreign_key_database must fail \
-             with NoxuError::Unsupported, got: {other:?}"
-        ),
-    }
+    assert!(
+        matches!(result.as_ref().err(), Some(NoxuError::IllegalArgument(_))),
+        "FK config with name only (no resolved handle) must be rejected, \
+         got Ok? {}",
+        result.is_ok()
+    );
 }
 
-/// Setting `foreign_key_delete_action = Cascade` (any non-`Abort` value) is
-/// also rejected at open.
+/// Setting `foreign_key_delete_action = Cascade` is rejected at open
+/// until step 9 of wave 2A wires the action.
 #[test]
 fn d2c_foreign_key_delete_action_cascade_rejected_at_open() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
 
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("foreign")
+        .with_foreign_key_database_handle(Arc::clone(&foreign))
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
 
     let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
     assert!(
         matches!(result, Err(NoxuError::Unsupported(_))),
-        "non-Abort delete action must be rejected with Unsupported"
+        "Cascade delete action must be rejected at open until step 9 lands"
     );
 }
 
@@ -332,10 +326,13 @@ fn d2c_foreign_key_nullifier_rejected_at_open() {
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
 
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("foreign")
+        .with_foreign_key_database_handle(Arc::clone(&foreign))
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
         .with_foreign_key_nullifier(Box::new(NullNullifier));
 
@@ -1638,4 +1635,143 @@ fn wave2a_step7_multi_key_delete_removes_all_keys() {
             *sec_byte as char
         );
     }
+}
+
+// ─── Wave 2A step 8 — FK Abort end-to-end ──────────────────────────
+
+/// FK Abort: when a parent record is referenced by a child secondary's
+/// foreign key, deleting the parent returns
+/// [`NoxuError::ForeignConstraintViolation`].  The parent record stays
+/// intact and so do the child references.
+#[test]
+fn wave2a_step8_fk_abort_blocks_parent_delete() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    // Parent ("foreign") and child ("primary") DBs.
+    let parent = open_pri(&env, "parent");
+    let child_pri = open_pri(&env, "child");
+    let inner = open_inner_sec_db(&env, "child_fk_idx");
+
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("parent")
+        .with_foreign_key_database_handle(Arc::clone(&parent))
+        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Abort);
+
+    let _sec = SecondaryDatabase::open(Arc::clone(&child_pri), inner, cfg)
+        .expect("FK Abort config must open under wave 2A step 8");
+
+    // Seed: parent has a record under key 'A'.  Child has a record
+    // whose first byte == 'A' (so the secondary key references parent).
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"the_A_entity"),
+        )
+        .unwrap();
+    child_pri
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"c1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+
+    // Deleting parent's 'A' must fail with ForeignConstraintViolation.
+    let result = parent.lock().delete(None, &DatabaseEntry::from_bytes(b"A"));
+    match result {
+        Err(NoxuError::ForeignConstraintViolation(msg)) => {
+            assert!(
+                msg.contains("foreign-key") || msg.contains("Abort"),
+                "expected FK / Abort wording: {msg}"
+            );
+        }
+        Ok(s) => panic!(
+            "delete of FK-referenced parent must return \
+             ForeignConstraintViolation; got Ok({s:?})"
+        ),
+        Err(other) => panic!(
+            "delete of FK-referenced parent must return \
+             ForeignConstraintViolation; got: {other:?}"
+        ),
+    }
+
+    // The parent record is intact (the FK check ran before the delete).
+    let mut data = DatabaseEntry::new();
+    let st = parent
+        .lock()
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(data.get_data().unwrap(), b"the_A_entity");
+
+    // The child record is intact too.
+    let mut data = DatabaseEntry::new();
+    let st = child_pri
+        .lock()
+        .get(None, &DatabaseEntry::from_bytes(b"c1"), &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+}
+
+/// FK Abort: deleting a parent record that has NO referrers succeeds
+/// normally.
+#[test]
+fn wave2a_step8_fk_abort_unreferenced_parent_delete_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let parent = open_pri(&env, "parent");
+    let child_pri = open_pri(&env, "child");
+    let inner = open_inner_sec_db(&env, "child_fk_idx");
+
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("parent")
+        .with_foreign_key_database_handle(Arc::clone(&parent))
+        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Abort);
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&child_pri), inner, cfg).unwrap();
+
+    // Parent has 'A' and 'B'; child only references 'A'.
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"a_entity"),
+        )
+        .unwrap();
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"B"),
+            &DatabaseEntry::from_bytes(b"b_entity"),
+        )
+        .unwrap();
+    child_pri
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"c1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+
+    // Deleting unreferenced 'B' succeeds.
+    let st = parent.lock().delete(None, &DatabaseEntry::from_bytes(b"B")).unwrap();
+    assert_eq!(st, OperationStatus::Success);
+
+    // Deleting referenced 'A' still fails.
+    assert!(
+        parent
+            .lock()
+            .delete(None, &DatabaseEntry::from_bytes(b"A"))
+            .is_err()
+    );
 }
