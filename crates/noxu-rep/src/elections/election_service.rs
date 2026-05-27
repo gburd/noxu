@@ -10,7 +10,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::elections::paxos::run_acceptor;
+use crate::elections::acceptor_state::PersistentAcceptorState;
+use crate::elections::paxos::run_acceptor_with_state;
 use crate::error::Result;
 use crate::net::channel::Channel;
 use crate::net::service_dispatcher::ServiceHandler;
@@ -35,17 +36,43 @@ pub struct ElectionAcceptorState {
     pub own_priority: u32,
     /// Current election term as observed by the local driver.
     pub own_term: AtomicU64,
+    /// Crash-durable acceptor state (promised_term, accepted_term,
+    /// accepted_master).  Closes findings F5/F31 of the May 2026
+    /// noxu-rep audit.  When `env_home` is `None` (test harness, in-memory
+    /// configurations), this falls back to in-memory-only mode.
+    pub persistent: Arc<PersistentAcceptorState>,
 }
 
 impl ElectionAcceptorState {
     /// Create a new acceptor state for `node_name` with the given
-    /// fixed priority.
+    /// fixed priority.  Persistence is disabled (in-memory only);
+    /// callers that need crash-durable promises should use
+    /// `with_env_home`.
     pub fn new(node_name: String, own_priority: u32) -> Self {
         Self {
             node_name,
             own_vlsn: AtomicU64::new(0),
             own_priority,
             own_term: AtomicU64::new(0),
+            persistent: Arc::new(PersistentAcceptorState::in_memory()),
+        }
+    }
+
+    /// Create a new acceptor state whose Paxos promises are persisted
+    /// to `<env_home>/acceptor.state`.  Closes findings F5/F31.
+    pub fn with_env_home(
+        node_name: String,
+        own_priority: u32,
+        env_home: &std::path::Path,
+    ) -> Self {
+        Self {
+            node_name,
+            own_vlsn: AtomicU64::new(0),
+            own_priority,
+            own_term: AtomicU64::new(0),
+            persistent: Arc::new(PersistentAcceptorState::load_or_default(
+                env_home,
+            )),
         }
     }
 
@@ -84,17 +111,15 @@ impl ElectionService {
 impl ServiceHandler for ElectionService {
     fn handle(&self, channel: Box<dyn Channel>) -> Result<()> {
         let (vlsn, priority, term) = self.state.snapshot();
-        // Errors from `run_acceptor` are typically protocol errors
-        // (peer disconnected mid-handshake / sent garbage). Log and
-        // swallow rather than propagate, so the dispatcher's per-
-        // connection thread cleanly exits without affecting the
-        // accept loop.
-        match run_acceptor(
+        // F5/F31: route the acceptor through the persistent state so
+        // promises and accepts survive process restarts.
+        match run_acceptor_with_state(
             &*channel,
             &self.state.node_name,
             vlsn,
             priority,
             term,
+            &self.state.persistent,
         ) {
             Ok(_) => Ok(()),
             Err(e) => {

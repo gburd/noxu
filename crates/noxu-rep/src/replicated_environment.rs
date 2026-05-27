@@ -331,13 +331,20 @@ impl ReplicatedEnvironment {
         // Build the in-memory peer log scanner; register the peer feeder
         // service on the dispatcher so downstream replicas can connect.
         let peer_scanner = Arc::new(PeerLogScanner::new());
-        let election_state = Arc::new(ElectionAcceptorState::new(
-            config.node_name.clone(),
-            // RepConfig has no priority field today; default to 1.  When
-            // RepConfig grows a priority knob (planned for v2.x) this
-            // wiring updates accordingly.
-            1,
-        ));
+        // F5/F31: build the acceptor state with persistence enabled when
+        // env_home is configured.  Crash-durable promises are required
+        // for the Paxos safety invariant after a process restart.
+        let election_state = Arc::new(
+            if let Some(ref home) = config.env_home {
+                ElectionAcceptorState::with_env_home(
+                    config.node_name.clone(),
+                    1,
+                    home,
+                )
+            } else {
+                ElectionAcceptorState::new(config.node_name.clone(), 1)
+            },
+        );
         if let Some(ref dispatcher) = tcp_dispatcher {
             let service = PeerFeederService::new(Arc::clone(&peer_scanner));
             dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(service));
