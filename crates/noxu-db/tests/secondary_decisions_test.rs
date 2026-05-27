@@ -661,20 +661,18 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
 
 // ─── Decision 2C — FK config rejected at open ──────────────────────────
 
-/// Setting `foreign_key_database` on a `SecondaryConfig` causes
-/// `SecondaryDatabase::open` to return `NoxuError::Unsupported`.
+/// Setting `foreign_key_database_name` *without* the matching
+/// `foreign_key_database_handle` is rejected at open with
+/// IllegalArgument so callers do not silently end up with an
+/// unenforced constraint.  Pre-v1.6 step-8 the open would reject
+/// the *name* setter outright; v1.6 accepts the name as advisory but
+/// requires the handle for enforcement.
 #[test]
-fn d2c_foreign_key_database_rejected_at_open() {
+fn d2c_foreign_key_database_name_without_handle_rejected() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
-    // The foreign DB no longer needs to exist as a real handle: the
-    // FK setter takes a name string in v1.5.1 (Wave 1C) and
-    // SecondaryDatabase::open rejects FK config at open time per
-    // Decision 2C.  We still create the DB to keep the test honest
-    // about the v1.6 wiring — once FK is implemented the engine will
-    // resolve the name to this handle.
     let _foreign = env
         .open_database(
             None,
@@ -689,52 +687,56 @@ fn d2c_foreign_key_database_rejected_at_open() {
         .with_foreign_key_database("foreign");
 
     let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("foreign-key"),
-                "expected foreign-key wording: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v1.6"),
-                "expected v1.5 and v1.6 references: {msg}"
-            );
-        }
-        Ok(_) => panic!(
-            "SecondaryDatabase::open with foreign_key_database must fail \
-             with NoxuError::Unsupported"
-        ),
-        Err(other) => panic!(
-            "SecondaryDatabase::open with foreign_key_database must fail \
-             with NoxuError::Unsupported, got: {other:?}"
-        ),
-    }
+    assert!(
+        matches!(result.as_ref(), Err(NoxuError::IllegalArgument(_))),
+        "FK name without handle must be rejected"
+    );
 }
 
-/// Setting `foreign_key_delete_action = Cascade` (any non-`Abort` value) is
-/// also rejected at open.
+/// `ForeignKeyDeleteAction::Cascade` is wired in step 9.  Until then
+/// step 8 accepts the open and surfaces the typed Unsupported only
+/// when the foreign delete actually fires.
 #[test]
-fn d2c_foreign_key_delete_action_cascade_rejected_at_open() {
+fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
 
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database_handle(Arc::clone(&foreign))
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
 
-    let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
+    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
+        .expect("FK config with handle and Cascade must open in v1.6 step 8");
+
+    let fk = DatabaseEntry::from_bytes(b"A");
+    foreign
+        .lock()
+        .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
+        .unwrap();
+    primary
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+    let result = foreign.lock().delete(None, &fk);
     assert!(
         matches!(result, Err(NoxuError::Unsupported(_))),
-        "non-Abort delete action must be rejected with Unsupported"
+        "Cascade is wired in step 9; until then runtime must surface \
+         NoxuError::Unsupported, got {result:?}"
     );
 }
 
-/// A `ForeignKeyNullifier` set on the config is also rejected at open.
+/// `Nullify` action surfaces Unsupported at runtime until step 10.
 #[test]
-fn d2c_foreign_key_nullifier_rejected_at_open() {
+fn d2c_foreign_key_nullify_runtime_unsupported() {
     use noxu_db::secondary_config::ForeignKeyNullifier;
 
     struct NullNullifier;
@@ -752,17 +754,115 @@ fn d2c_foreign_key_nullifier_rejected_at_open() {
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
 
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database_handle(Arc::clone(&foreign))
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
         .with_foreign_key_nullifier(Box::new(NullNullifier));
 
-    let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
+    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
+        .expect("FK config with handle and Nullify must open in v1.6 step 8");
+
+    let fk = DatabaseEntry::from_bytes(b"A");
+    foreign
+        .lock()
+        .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
+        .unwrap();
+    primary
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+    let result = foreign.lock().delete(None, &fk);
     assert!(
         matches!(result, Err(NoxuError::Unsupported(_))),
-        "foreign_key_nullifier must be rejected with Unsupported"
+        "Nullify is wired in step 10; until then runtime surfaces \
+         NoxuError::Unsupported, got {result:?}"
+    );
+}
+
+/// FK Abort happy path: deleting a foreign primary record that is
+/// still referenced by a child secondary entry returns
+/// `ForeignConstraintViolation`; the foreign record is NOT deleted.
+#[test]
+fn fk_abort_blocks_delete_of_referenced_foreign_record() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
+
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database_handle(Arc::clone(&foreign));
+    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
+        .unwrap();
+
+    let fk = DatabaseEntry::from_bytes(b"A");
+    foreign
+        .lock()
+        .put(None, &fk, &DatabaseEntry::from_bytes(b"foreign_payload"))
+        .unwrap();
+    primary
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+
+    let result = foreign.lock().delete(None, &fk);
+    match result {
+        Err(NoxuError::ForeignConstraintViolation(msg)) => {
+            assert!(msg.contains("foreign-key"));
+        }
+        other => panic!(
+            "expected ForeignConstraintViolation, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        foreign
+            .lock()
+            .get(None, &fk, &mut DatabaseEntry::new())
+            .unwrap(),
+        OperationStatus::Success,
+        "aborted FK delete must leave the foreign record intact"
+    );
+}
+
+/// FK Abort allows the delete when no child record references the
+/// foreign key.
+#[test]
+fn fk_abort_allows_delete_when_no_referrer() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
+
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database_handle(Arc::clone(&foreign));
+    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
+        .unwrap();
+
+    let fk = DatabaseEntry::from_bytes(b"Z");
+    foreign
+        .lock()
+        .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
+        .unwrap();
+    assert_eq!(
+        foreign.lock().delete(None, &fk).unwrap(),
+        OperationStatus::Success
     );
 }
 

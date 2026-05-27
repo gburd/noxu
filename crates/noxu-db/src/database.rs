@@ -112,6 +112,13 @@ pub struct Database {
     /// `Arc<Mutex<Database>>` clones the user typically holds become
     /// visible to every other clone of the same primary.
     pub(crate) secondaries: Arc<RwLock<Vec<std::sync::Weak<dyn crate::secondary_database::SecondaryHook + Send + Sync>>>>,
+    /// Foreign-key referrer registry: every child secondary whose
+    /// `foreign_key_database` points at *this* primary downgrades its
+    /// hook to a `Weak<dyn FkReferrer>` and pushes it here.  When this
+    /// primary is deleted, every entry is consulted to apply
+    /// `ForeignKeyDeleteAction::Abort` (v1.6 step 8) /
+    /// `Cascade` (step 9) / `Nullify` (step 10).
+    pub(crate) fk_referrers: Arc<RwLock<Vec<std::sync::Weak<dyn crate::secondary_database::FkReferrer + Send + Sync>>>>,
 }
 
 /// State of a database handle.
@@ -417,6 +424,7 @@ impl Database {
             no_sync,
             write_no_sync,
             secondaries: Arc::new(RwLock::new(Vec::new())),
+            fk_referrers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -913,6 +921,20 @@ impl Database {
         let track_old_data = !secondaries.is_empty();
         let mut deleted_old_values: Vec<Vec<u8>> = Vec::new();
 
+        // v1.6 (audit C2 / Decision 2C — step 8): consult any FK
+        // referrers BEFORE the delete is applied.  An Abort action
+        // raises a typed error and prevents the foreign delete from
+        // happening at all (matching JE's `ForeignConstraintException`
+        // semantics).  Cascade / Nullify (steps 9 / 10) mutate child
+        // records under the same caller-supplied txn so the foreign
+        // delete and its consequences commit / abort together.
+        let fk_referrers = self.live_fk_referrers();
+        if !fk_referrers.is_empty() {
+            for referrer in &fk_referrers {
+                referrer.on_foreign_key_deleted(txn, key)?;
+            }
+        }
+
         // Inner closure shared between the explicit-txn and synthetic
         // auto-txn paths: scans + deletes every duplicate of `key_bytes`
         // through the supplied `cursor`.  See comment in pre-Wave-1A
@@ -1109,6 +1131,34 @@ impl Database {
         >,
     > {
         self.secondaries
+            .read()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect()
+    }
+
+    /// Registers an FK referrer that points at this primary as its
+    /// foreign-key target (v1.6 audit C2 / Decision 2C — Abort hook).
+    pub(crate) fn register_fk_referrer(
+        &self,
+        referrer: std::sync::Weak<
+            dyn crate::secondary_database::FkReferrer + Send + Sync,
+        >,
+    ) {
+        let mut guard = self.fk_referrers.write();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.push(referrer);
+    }
+
+    /// Snapshot of every live FK referrer.
+    pub(crate) fn live_fk_referrers(
+        &self,
+    ) -> Vec<
+        Arc<
+            dyn crate::secondary_database::FkReferrer + Send + Sync,
+        >,
+    > {
+        self.fk_referrers
             .read()
             .iter()
             .filter_map(|w| w.upgrade())
