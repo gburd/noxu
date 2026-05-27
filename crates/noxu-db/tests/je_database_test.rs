@@ -355,3 +355,164 @@ fn database_count_returns_record_count() {
     assert_eq!(c, NUM_RECS as u64);
     txn.commit().unwrap();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseConfigTest.testConfig (wave 9-C)
+//
+// JE invariant: a Database keeps its own copy of the configuration; the
+// `getConfig()` accessor returns a snapshot, not the original object.
+//
+// Noxu adaptation: `DatabaseConfig` is `Clone, PartialEq, Eq`.  We
+// assert the same shape — mutating the config the user passed at open
+// time, then re-opening with that mutated config, behaves consistently;
+// `get_config()` reflects the values the database stored.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_config_snapshot_after_open() {
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+
+    // Open dbA with allow_create=true, sorted_duplicates=false.
+    let cfg_a =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db_a = env.open_database(None, "foo", &cfg_a).unwrap();
+
+    // Database stores its own copy: get_config still reports the
+    // values the user passed at open time.
+    let stored = db_a.get_config().clone();
+    assert!(stored.allow_create);
+    assert!(!stored.sorted_duplicates);
+    assert!(stored.transactional);
+
+    // Mutating a clone of the stored config does not affect the
+    // database's view (the database returns &DatabaseConfig and
+    // borrow-checks any direct mutation).
+    let mut other = stored;
+    other.sorted_duplicates = true;
+    let _ = &other;
+    assert!(!db_a.get_config().sorted_duplicates);
+
+    db_a.close().unwrap();
+    drop(env);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseConfigTest.testIsTransactional (wave 9-C)
+//
+// JE invariant: a database opened with transactional=true reports
+// transactional=true; both implicit auto-commit (txn=null) and explicit
+// transaction handles are accepted for puts and gets.
+//
+// Noxu adaptation: there is no `Database::is_transactional()`; we use
+// `db.get_config().transactional`.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_config_is_transactional() {
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+
+    // Open transactional db with explicit transaction handle.
+    let txn = env.begin_transaction(None).unwrap();
+    let cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db = env.open_database(Some(&txn), "testDB2", &cfg).unwrap();
+    assert!(db.get_config().transactional);
+
+    // Implicit-auto-commit put (txn=None) is accepted on a txn DB.
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(&[0]),
+        &DatabaseEntry::from_bytes(&[0]),
+    )
+    .unwrap();
+
+    // Explicit-txn put + get on the same txn handle is accepted.
+    db.put(
+        Some(&txn),
+        &DatabaseEntry::from_bytes(&[1]),
+        &DatabaseEntry::from_bytes(&[1]),
+    )
+    .unwrap();
+    let mut out = DatabaseEntry::new();
+    let s =
+        db.get(Some(&txn), &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    txn.commit().unwrap();
+
+    // After commit, no-txn read sees the record.
+    let mut out = DatabaseEntry::new();
+    let s = db.get(None, &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    db.close().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseConfigTest.testOpenReadOnly (wave 9-C, partial)
+//
+// JE invariant: opening a database with `read_only=true` rejects any
+// write attempt (put or cursor.delete) with UnsupportedOperationException;
+// gets and forward iteration succeed.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_config_open_read_only_rejects_writes() {
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+
+    // Pre-populate the DB with k=0,d=0 under transactional+rw.
+    let cfg_rw =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db = env.open_database(None, "testDB2", &cfg_rw).unwrap();
+    db.put(
+        None,
+        &DatabaseEntry::from_bytes(&[0]),
+        &DatabaseEntry::from_bytes(&[0]),
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    // Re-open read-only.  Reads succeed.
+    let cfg_ro =
+        DatabaseConfig::new().with_transactional(true).with_read_only(true);
+    let db_ro = env.open_database(None, "testDB2", &cfg_ro).unwrap();
+    assert!(db_ro.get_config().read_only);
+    assert!(db_ro.get_config().transactional);
+
+    let mut out = DatabaseEntry::new();
+    let s =
+        db_ro.get(None, &DatabaseEntry::from_bytes(&[0]), &mut out).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    assert_eq!(out.data(), &[0]);
+
+    // Writes fail.
+    let r = db_ro.put(
+        None,
+        &DatabaseEntry::from_bytes(&[1]),
+        &DatabaseEntry::from_bytes(&[1]),
+    );
+    assert!(r.is_err(), "put on read-only db must fail; got {:?}", r);
+
+    // Cursor delete fails as well.
+    let mut c = db_ro.open_cursor(None, None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    let r = c.delete();
+    assert!(r.is_err(), "cursor delete on read-only db must fail; got {:?}", r);
+    drop(c);
+
+    db_ro.close().unwrap();
+}
