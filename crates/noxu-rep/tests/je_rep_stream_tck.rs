@@ -48,7 +48,8 @@ fn forward_scan_replicas_see_every_entry() {
 /// after replication has both first and last set correctly.
 #[test]
 fn vlsn_range_first_and_last_are_consistent() {
-    let mut group = RepTestBase::builder("vlsn_first_last").group_size(2).build();
+    let mut group =
+        RepTestBase::builder("vlsn_first_last").group_size(2).build();
     group.create_group(1).unwrap();
 
     group.populate_db(1, 50).unwrap();
@@ -96,8 +97,7 @@ fn replica_catch_up_starts_at_correct_vlsn() {
 /// order, and the replica's apply order matches.
 #[test]
 fn write_queue_preserves_vlsn_order() {
-    let mut group =
-        RepTestBase::builder("write_queue").group_size(2).build();
+    let mut group = RepTestBase::builder("write_queue").group_size(2).build();
     group.create_group(1).unwrap();
 
     // Replicate in strict VLSN order.
@@ -167,8 +167,7 @@ fn syncup_distinguishes_replicated_vs_master_only() {
 /// final VLSN.
 #[test]
 fn multiple_checkpoint_chunks_replicate_cleanly() {
-    let mut group =
-        RepTestBase::builder("multi_ckpt").group_size(3).build();
+    let mut group = RepTestBase::builder("multi_ckpt").group_size(3).build();
     group.create_group(1).unwrap();
 
     // Three checkpoint-style chunks.

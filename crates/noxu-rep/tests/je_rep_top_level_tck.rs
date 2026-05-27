@@ -71,7 +71,7 @@ fn state_change_listener_replacement() {
 
     let listener1 = CountingListener::new();
     env.set_state_change_listener(
-        Arc::clone(&listener1) as Arc<dyn StateChangeListener>,
+        Arc::clone(&listener1) as Arc<dyn StateChangeListener>
     );
     // Initial state on a freshly-opened env is Detached → exactly one
     // event delivered.
@@ -90,7 +90,7 @@ fn state_change_listener_replacement() {
     // Add a second listener; it must immediately observe the current state.
     let listener2 = CountingListener::new();
     env.set_state_change_listener(
-        Arc::clone(&listener2) as Arc<dyn StateChangeListener>,
+        Arc::clone(&listener2) as Arc<dyn StateChangeListener>
     );
     assert_eq!(
         listener2.master.load(Ordering::SeqCst),
@@ -117,16 +117,19 @@ fn state_change_listener_basic() {
     group.create_group(1).unwrap();
 
     let listener_master = RecordingListener::new();
-    group.node(0).get_env().set_state_change_listener(
-        Arc::clone(&listener_master) as Arc<dyn StateChangeListener>,
-    );
+    group
+        .node(0)
+        .get_env()
+        .set_state_change_listener(
+            Arc::clone(&listener_master) as Arc<dyn StateChangeListener>
+        );
 
     // Initial event: current state (Master).
     assert_eq!(listener_master.snapshot(), vec![NodeState::Master]);
 
     let listener_r1 = RecordingListener::new();
     group.node(1).get_env().set_state_change_listener(
-        Arc::clone(&listener_r1) as Arc<dyn StateChangeListener>,
+        Arc::clone(&listener_r1) as Arc<dyn StateChangeListener>
     );
     assert_eq!(listener_r1.snapshot(), vec![NodeState::Replica]);
 
@@ -159,7 +162,7 @@ fn state_change_listener_secondary() {
 
     let listener = RecordingListener::new();
     group.node(1).get_env().set_state_change_listener(
-        Arc::clone(&listener) as Arc<dyn StateChangeListener>,
+        Arc::clone(&listener) as Arc<dyn StateChangeListener>
     );
 
     // Close master, then secondary.
@@ -225,8 +228,7 @@ fn rep_env_config_round_trips() {
 /// returns a fresh handle that starts in [`NodeState::Detached`].
 #[test]
 fn rep_env_close_reopen_returns_fresh_handle() {
-    let mut group =
-        RepTestBase::builder("env_reopen").group_size(1).build();
+    let mut group = RepTestBase::builder("env_reopen").group_size(1).build();
     let info = group.node_mut(0);
     info.open_env().unwrap();
     info.close_env().unwrap();
@@ -247,8 +249,7 @@ fn rep_env_close_reopen_returns_fresh_handle() {
 /// elect (deterministic).
 #[test]
 fn join_group_join_leave_join() {
-    let mut group =
-        RepTestBase::builder("join_leave").group_size(3).build();
+    let mut group = RepTestBase::builder("join_leave").group_size(3).build();
     group.create_group(1).unwrap();
     assert_eq!(group.find_master_idx(), Some(0));
 
@@ -268,8 +269,7 @@ fn join_group_join_leave_join() {
 /// "Opening the same `RepEnvInfo` twice without closing fails."
 #[test]
 fn join_group_repeated_open_fails() {
-    let mut group =
-        RepTestBase::builder("join_dup").group_size(1).build();
+    let mut group = RepTestBase::builder("join_dup").group_size(1).build();
     group.node_mut(0).open_env().unwrap();
     let r = group.node_mut(0).open_env();
     assert!(r.is_err(), "second open without close must fail");
@@ -286,8 +286,7 @@ fn join_group_repeated_open_fails() {
 /// the master reports itself as master."
 #[test]
 fn replication_group_basic_membership_visible() {
-    let mut group =
-        RepTestBase::builder("rep_grp_basic").group_size(3).build();
+    let mut group = RepTestBase::builder("rep_grp_basic").group_size(3).build();
     group.create_group(1).unwrap();
 
     let group_name = group.group_name().to_string();
@@ -332,7 +331,10 @@ fn secondary_node_join_leave_join() {
     // Secondary leaves.
     group.nodes_mut()[2].close_env().unwrap();
     assert!(group.node(0).is_master(), "master unaffected by secondary leave");
-    assert!(group.node(1).is_replica(), "replica unaffected by secondary leave");
+    assert!(
+        group.node(1).is_replica(),
+        "replica unaffected by secondary leave"
+    );
 
     // Secondary re-joins.
     group.nodes_mut()[2].open_env().unwrap();
@@ -355,10 +357,7 @@ fn secondary_node_follows_new_master() {
         .build();
     group.create_group(1).unwrap();
     let initial_master = group.node(0).node_name().to_string();
-    assert_eq!(
-        group.node(2).get_env().get_master_name(),
-        Some(initial_master.clone()),
-    );
+    assert_eq!(group.node(2).get_env().get_master_name(), Some(initial_master),);
 
     // Original master leaves.
     group.close_master().unwrap();
@@ -367,10 +366,7 @@ fn secondary_node_follows_new_master() {
     group.failover_to(1).unwrap();
     let new_master = group.node(1).node_name().to_string();
     assert!(group.node(2).is_replica());
-    assert_eq!(
-        group.node(2).get_env().get_master_name(),
-        Some(new_master),
-    );
+    assert_eq!(group.node(2).get_env().get_master_name(), Some(new_master),);
 }
 
 // =====================================================================

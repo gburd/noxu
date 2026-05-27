@@ -119,8 +119,7 @@ fn detached_node_cannot_skip_unknown_to_master() {
 /// catch-up half: replicate to master only, then catch up the replica.
 #[test]
 fn post_log_commit_replica_catches_up() {
-    let mut group =
-        RepTestBase::builder("post_commit").group_size(2).build();
+    let mut group = RepTestBase::builder("post_commit").group_size(2).build();
     group.create_group(1).unwrap();
 
     // Master commits VLSNs 1–10 alone (replica unreachable).
@@ -210,8 +209,7 @@ fn rollback_discards_post_matchpoint_master_only_writes() {
 /// invisible after recovery.
 #[test]
 fn rollback_straddling_txn_is_fully_discarded() {
-    let mut group =
-        RepTestBase::builder("rb_straddle").group_size(2).build();
+    let mut group = RepTestBase::builder("rb_straddle").group_size(2).build();
     group.create_group(1).unwrap();
 
     group.populate_db(1, 3).unwrap();
@@ -246,11 +244,7 @@ fn rollback_old_master_rejoins_as_replica() {
     // Old master rejoins as replica of the new master.
     group.nodes_mut()[0].open_env().unwrap();
     let new_master_name = group.node(1).node_name().to_string();
-    group
-        .node(0)
-        .get_env()
-        .become_replica(&new_master_name)
-        .unwrap();
+    group.node(0).get_env().become_replica(&new_master_name).unwrap();
     assert!(group.node(0).is_replica());
     assert_eq!(
         group.node(0).get_env().get_master_name(),
@@ -282,11 +276,7 @@ fn apply_entry_on_shutdown_env_fails() {
     group.nodes_mut()[1].open_env().unwrap();
     group.node(1).get_env().close().unwrap();
     let r = group.node(1).get_env().apply_entry(1, 0, vec![0; 4]);
-    assert!(
-        r.is_err(),
-        "apply_entry on shutdown env must fail; got {:?}",
-        r,
-    );
+    assert!(r.is_err(), "apply_entry on shutdown env must fail; got {:?}", r,);
 }
 
 // =====================================================================
@@ -301,18 +291,13 @@ fn apply_entry_on_shutdown_env_fails() {
 /// shut-down env fails cleanly.
 #[test]
 fn become_master_on_shutdown_env_fails() {
-    let mut group =
-        RepTestBase::builder("ex_shutdown").group_size(1).build();
+    let mut group = RepTestBase::builder("ex_shutdown").group_size(1).build();
     group.node_mut(0).open_env().unwrap();
     let env = group.node(0).get_env();
     env.close().unwrap();
 
     let r = env.become_master(2);
-    assert!(
-        r.is_err(),
-        "become_master on shutdown env must fail; got {:?}",
-        r,
-    );
+    assert!(r.is_err(), "become_master on shutdown env must fail; got {:?}", r,);
 }
 
 /// JE: `ExceptionTest.test` (subset, secondary tries to become master).
@@ -357,11 +342,7 @@ fn replay_recovery_resumes_after_reopen() {
     // Replica is shut down then reopens (simulating crash recovery).
     group.nodes_mut()[1].close_env().unwrap();
     group.nodes_mut()[1].open_env().unwrap();
-    group
-        .node(1)
-        .get_env()
-        .become_replica(group.node(0).node_name())
-        .unwrap();
+    group.node(1).get_env().become_replica(group.node(0).node_name()).unwrap();
     // Fresh handle starts at VLSN 0; apply 6..=10 to bring it forward.
     group.catch_up_replica(1, 6, 5).unwrap();
     // Catch-up advances at the replica's local VLSN index, which began at 0.
@@ -375,8 +356,7 @@ fn replay_recovery_resumes_after_reopen() {
 /// The replica's VLSN must never regress when no rollback occurs.
 #[test]
 fn replica_vlsn_is_monotonic_under_replication() {
-    let mut group =
-        RepTestBase::builder("mono").group_size(2).build();
+    let mut group = RepTestBase::builder("mono").group_size(2).build();
     group.create_group(1).unwrap();
 
     let mut prev = 0u64;
@@ -400,9 +380,7 @@ fn replica_vlsn_is_monotonic_under_replication() {
 fn await_state_returns_immediately_when_matched() {
     let mut group = RepTestBase::builder("await_now").group_size(2).build();
     group.create_group(1).unwrap();
-    group
-        .await_state(0, NodeState::Master, Duration::from_millis(50))
-        .unwrap();
+    group.await_state(0, NodeState::Master, Duration::from_millis(50)).unwrap();
     group
         .await_state(1, NodeState::Replica, Duration::from_millis(50))
         .unwrap();
