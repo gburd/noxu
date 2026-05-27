@@ -182,7 +182,7 @@ fn test_insert_duplicate_returns_existing_slot_no_success_flag() {
     assert!(first & INSERT_SUCCESS != 0, "first insert sets INSERT_SUCCESS");
     let first_slot = first & !INSERT_SUCCESS;
 
-    let second = in_node.insert_entry(k.clone(), NULL_LSN, 0).unwrap();
+    let second = in_node.insert_entry(k, NULL_LSN, 0).unwrap();
     assert_eq!(
         second & INSERT_SUCCESS,
         0,
@@ -203,9 +203,9 @@ fn test_find_entry_uses_unsigned_byte_comparison() {
     in_node.insert_entry(vec![0xFF, 0xFF, 0xFF], NULL_LSN, 0).unwrap();
 
     // Both real entries must be findable; 0xFF must locate slot > 0x7F.
-    let high = in_node.find_entry(&vec![0xFF, 0xFF, 0xFF], true, true);
+    let high = in_node.find_entry(&[0xFF, 0xFF, 0xFF], true, true);
     assert!(high & EXACT_MATCH != 0, "0xFF entry must be findable exactly");
-    let mid = in_node.find_entry(&vec![0x7F, 0x7F, 0x7F], true, true);
+    let mid = in_node.find_entry(&[0x7F, 0x7F, 0x7F], true, true);
     assert!(mid & EXACT_MATCH != 0);
     assert!(
         (high & 0xffff) > (mid & 0xffff),

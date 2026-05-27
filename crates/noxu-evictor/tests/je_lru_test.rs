@@ -10,15 +10,13 @@
 //! those semantics directly against `LruList`:
 //!
 //! * `testBaseline`               -> insertion order is preserved, the
-//!                                   LRU end is the one popped first.
+//!   LRU end is the one popped first.
 //! * `testCacheMode_KEEP_HOT`     -> `touch()` moves a node to the MRU
-//!                                   end; subsequent pops return the
-//!                                   un-touched (cold) nodes.
+//!   end; subsequent pops return the un-touched (cold) nodes.
 //! * `testCacheMode_UNCHANGED`    -> a node not touched stays where it
-//!                                   was inserted; LRU pops are stable.
+//!   was inserted; LRU pops are stable.
 //! * `testCacheMode_EVICT_LN`     -> `remove(node)` immediately removes
-//!                                   a node (regardless of position),
-//!                                   reducing the list size.
+//!   a node (regardless of position), reducing the list size.
 
 use noxu_evictor::LruList;
 
