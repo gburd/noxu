@@ -729,6 +729,16 @@ impl Txn {
         self.txn_flags & IS_PREPARED != 0
     }
 
+    /// Clears the IS_PREPARED flag without writing any log entry.
+    ///
+    /// Used by the higher-level `noxu_db::Transaction::resolved_*_after_prepare`
+    /// methods so they can invoke `abort_collect_undo()` (which has
+    /// its own `is_prepared` guard) without first writing a duplicate
+    /// log frame.  This is a no-op if the txn was not prepared.
+    pub fn clear_prepared_flag(&mut self) {
+        self.txn_flags &= !IS_PREPARED;
+    }
+
     /// Prepares the transaction for the second phase of XA two-phase commit.
     ///
     /// 1. Checks state (must be `Open`, no open cursors).

@@ -603,12 +603,54 @@ impl Transaction {
             self.write_txn_end(lm, false /* is_commit */, false, false)?;
         }
 
+        // Apply undo records to the B-tree to restore before-images, then
+        // release write locks.  Same 3-phase ordering as `Transaction::abort()`:
+        // collect undo → apply → release locks.  See the matching comment
+        // in `Transaction::abort` for the rationale (no reader sees the
+        // in-flight value until the before-image is back in the tree).
         if let Some(inner) = &self.inner_txn {
-            inner
-                .lock()
-                .unwrap()
-                .resolved_abort_after_prepare()
-                .map_err(NoxuError::from)?;
+            // First, clear the IS_PREPARED flag on the inner Txn so that
+            // `abort_collect_undo()` (which calls into `Txn::abort`) does
+            // not refuse with InvalidTransaction { state: PREPARED }.
+            // We do this via the inner's resolved-abort path, which
+            // performs `txn_flags &= !IS_PREPARED` and then runs `abort()`.
+            // Unfortunately that consumes the locks; we want the
+            // pre-release behaviour instead, so flip the flag manually
+            // and then run abort_collect_undo.
+            let undo_records = {
+                let mut g = inner.lock().unwrap();
+                // Undo the IS_PREPARED flag so abort_collect_undo doesn't
+                // refuse.  Inner state is still Open at this point.
+                g.clear_prepared_flag();
+                g.abort_collect_undo().unwrap_or_default()
+            };
+
+            if let Some(env) = &self.env_impl {
+                let env_guard = env.lock();
+                for undo in undo_records {
+                    let Some(abort_key) = undo.abort_key else { continue };
+                    let db_id = noxu_dbi::DatabaseId::new(
+                        undo.database_id as i64,
+                    );
+                    let Some(db_arc) = env_guard.get_database_by_id(db_id)
+                    else {
+                        continue;
+                    };
+                    let db_guard = db_arc.read();
+                    if let Some(tree) = db_guard.get_real_tree() {
+                        if undo.abort_known_deleted {
+                            if tree.delete(&abort_key) {
+                                db_guard.decrement_entry_count();
+                            }
+                        } else if let Some(abort_data) = undo.abort_data {
+                            let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
+                            let _ = tree.insert(abort_key, abort_data, lsn);
+                        }
+                    }
+                }
+            }
+
+            inner.lock().unwrap().release_all_locks();
         }
 
         let mut state = self.state.lock().unwrap();
