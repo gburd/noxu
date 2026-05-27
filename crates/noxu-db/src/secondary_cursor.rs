@@ -572,8 +572,7 @@ impl<'a> SecondaryCursor<'a> {
         };
 
         let mode = if forward { Get::Next } else { Get::Prev };
-        let status =
-            self.get_with_mode(key, p_key, data, mode)?;
+        let status = self.get_with_mode(key, p_key, data, mode)?;
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
         }
