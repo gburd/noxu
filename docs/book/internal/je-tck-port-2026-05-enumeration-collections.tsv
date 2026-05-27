@@ -1,4 +1,0 @@
-je_package	je_class	je_test_method	je_test_path	je_test_doc	noxu_status	noxu_test_path	noxu_test_method	effort_estimate	priority	notes
-com/sleepycat/collections	KeyRangeTest	testScan	test/com/sleepycat/collections/KeyRangeTest.java		NOT-PORTED			medium	high	no matching test by name (snake=scan); behaviour-level check needed
-com/sleepycat/collections	KeyRangeTest	testScanComparator	test/com/sleepycat/collections/KeyRangeTest.java		NOT-PORTED			medium	high	no matching test by name (snake=scan_comparator); behaviour-level check needed
-com/sleepycat/collections	KeyRangeTest	testSubRanges	test/com/sleepycat/collections/KeyRangeTest.java		NOT-PORTED			medium	high	no matching test by name (snake=sub_ranges); behaviour-level check needed
