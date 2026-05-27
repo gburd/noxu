@@ -275,3 +275,154 @@ fn recovery_sr8984_part1_same_key_dups_no_resurrect() {
 fn recovery_sr8984_part2_different_key_dups_no_resurrect() {
     run_sr8984(false);
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryAbortTest.testInserts (wave 9-C)
+//
+// JE invariant: alternating commit / abort / commit insert phases
+// followed by a clean close+recover yield the union of the committed
+// inserts — aborted inserts must NOT resurrect after recovery.
+// JE additionally drains the IN-compressor queue to force the recovery
+// to replay IN-deletes; Noxu has no equivalent public probe, so this
+// port relies on the recovery pipeline doing the equivalent work.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_abort_test_inserts_three_phase_no_dups() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let n: u32 = NUM_RECS;
+
+    // Phase 1: insert 0..N, commit.
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "abort_inserts", false);
+        let t = env.begin_transaction(None).unwrap();
+        for i in 0..n {
+            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+        }
+        t.commit().unwrap();
+
+        // Phase 2: insert N..3N, abort.
+        let t = env.begin_transaction(None).unwrap();
+        for i in n..(3 * n) {
+            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+        }
+        t.abort().unwrap();
+
+        // Verify aborted inserts are gone.
+        for i in n..(3 * n) {
+            let mut out = DatabaseEntry::new();
+            let s = db.get(None, &ikey(i), &mut out).unwrap();
+            assert_eq!(
+                s,
+                OperationStatus::NotFound,
+                "aborted insert k={i} resurrected before recovery"
+            );
+        }
+
+        // Phase 3: insert 2N..4N, commit (overlapping range with the
+        // aborted phase to exercise slot reuse).
+        let t = env.begin_transaction(None).unwrap();
+        for i in (2 * n)..(4 * n) {
+            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+        }
+        t.commit().unwrap();
+
+        db.close().unwrap();
+        drop(env);
+    }
+
+    // Recovery: re-open, verify that committed = (0..N) U (2N..4N).
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "abort_inserts", false);
+
+        for i in 0..n {
+            let mut out = DatabaseEntry::new();
+            let s = db.get(None, &ikey(i), &mut out).unwrap();
+            assert_eq!(s, OperationStatus::Success, "k={i} missing post-recovery");
+        }
+        // Aborted-only range (N..2N) must be absent.
+        for i in n..(2 * n) {
+            let mut out = DatabaseEntry::new();
+            let s = db.get(None, &ikey(i), &mut out).unwrap();
+            assert_eq!(
+                s,
+                OperationStatus::NotFound,
+                "aborted-only k={i} resurrected after recovery"
+            );
+        }
+        for i in (2 * n)..(4 * n) {
+            let mut out = DatabaseEntry::new();
+            let s = db.get(None, &ikey(i), &mut out).unwrap();
+            assert_eq!(s, OperationStatus::Success, "k={i} missing post-recovery");
+        }
+
+        db.close().unwrap();
+        drop(env);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryTest.testBasicDeleteAll (wave 9-C)
+//
+// JE invariant: insert N records, modify half, delete all, close,
+// recover — post-recovery the database has zero records.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_basic_delete_all_no_resurrect() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let n: u32 = NUM_RECS;
+
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "delete_all", false);
+
+        // Insert all the data, commit.
+        let t = env.begin_transaction(None).unwrap();
+        for i in 0..n {
+            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+        }
+        t.commit().unwrap();
+
+        // Modify half the records (overwrite), commit.
+        let t = env.begin_transaction(None).unwrap();
+        for i in 0..(n / 2) {
+            db.put(Some(&t), &ikey(i), &ikey(i + 1000)).unwrap();
+        }
+        t.commit().unwrap();
+
+        // Delete all the records, commit.
+        let t = env.begin_transaction(None).unwrap();
+        for i in 0..n {
+            let s = db.delete(Some(&t), &ikey(i)).unwrap();
+            assert_eq!(s, OperationStatus::Success);
+        }
+        t.commit().unwrap();
+
+        db.close().unwrap();
+        drop(env);
+    }
+
+    // Recovery: db has 0 records.
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "delete_all", false);
+        assert_eq!(0, db.count().unwrap());
+        for i in 0..n {
+            let mut out = DatabaseEntry::new();
+            let s = db.get(None, &ikey(i), &mut out).unwrap();
+            assert_eq!(
+                s,
+                OperationStatus::NotFound,
+                "deleted k={i} resurrected after recovery"
+            );
+        }
+        db.close().unwrap();
+        drop(env);
+    }
+}
+
