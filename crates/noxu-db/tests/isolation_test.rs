@@ -155,8 +155,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
 
     // Concurrent writer with no_wait tries to write "k" — must conflict.
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let writer_txn =
-        env.begin_transaction(Some(&no_wait_config)).unwrap();
+    let writer_txn = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     let write_result = db.put(Some(&writer_txn), &k, &v2);
@@ -170,8 +169,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     // Once the serializable reader commits, a new writer can succeed.
     ser_txn.commit().unwrap();
 
-    let writer_txn2 =
-        env.begin_transaction(Some(&no_wait_config)).unwrap();
+    let writer_txn2 = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert_eq!(
@@ -207,8 +205,7 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
     // After the read operation the lock is released, so a no_wait writer
     // must succeed (no lock conflict).
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let writer_txn =
-        env.begin_transaction(Some(&no_wait_config)).unwrap();
+    let writer_txn = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert_eq!(

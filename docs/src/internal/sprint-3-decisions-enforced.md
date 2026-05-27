@@ -241,3 +241,27 @@ both honour any caller-supplied transaction.  Automatic
 drives every attached secondary inside the caller's transaction —
 remains the v1.6 work, alongside Decision 1's sorted-dup
 secondaries.
+
+## Wave 3-1 postscript — Decision 3B v2.0 path landed
+
+Decision 3B was deliberately staged in two phases: v1.5 rejected
+`Some(parent)` at runtime with `NoxuError::Unsupported`, and v2.0
+removes the `parent` parameter entirely.  Wave 3-1
+(`fix/wave3-1-nested-txn-removal`) lands the v2.0 path:
+
+* `Environment::begin_transaction` now takes only
+  `config: Option<&TransactionConfig>`; the `parent` argument is gone.
+* The Sprint 3D `parent.is_some()` rejection block in
+  `crates/noxu-db/src/environment.rs` is removed (it would be
+  unreachable).
+* `f11_nested_transaction_returns_unsupported` is deleted because the
+  misuse it guarded is no longer representable in the type system —
+  what was a runtime error is now a compile error.
+* `f11_nested_transaction_none_still_works` is retained as a smoke
+  test that the new signature is correct.
+* `NoxuError::Unsupported` itself stays; it is shared with the cursor
+  `Get::*Dup` arms (audit F3) and the secondary-config / DPL paths.
+
+Audit finding F11 is now closed on both the v1.5 and v2.0 paths.  See
+[`wave-3-1-nested-txn-removal.md`](wave-3-1-nested-txn-removal.md) for
+the migration note.

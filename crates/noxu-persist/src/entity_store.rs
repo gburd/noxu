@@ -574,11 +574,8 @@ fn stream_evolve_class(
     let mut stats = EvolveStats::new();
 
     // Open a write transaction unless the env or store is non-transactional.
-    let txn: Option<Transaction> = if transactional {
-        Some(env.begin_transaction(None)?)
-    } else {
-        None
-    };
+    let txn: Option<Transaction> =
+        if transactional { Some(env.begin_transaction(None)?) } else { None };
     let txn_ref = txn.as_ref();
 
     let mut cursor = db.open_cursor(txn_ref, None)?;

@@ -41,7 +41,7 @@ Sprint 1–3 restriction notes
 | Foreign-key constraints (Abort / Cascade / Nullify) | ❌ (rejected at `SecondaryDatabase::open` with `NoxuError::Unsupported`) | ✅ | ✅ |
 | `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ | ✅ |
 | Atomic primary + secondary writes under one txn (manual-update pattern) | ✅ (Sprint 4½ — thread same `txn` through `Database::put` and `SecondaryDatabase::update_secondary`) | ✅ | ✅ |
-| Nested / child transactions (`begin_transaction(Some(parent), …)`) | ❌ (`NoxuError::Unsupported`) | ❌ | ❌ (`parent` parameter scheduled for removal) |
+| Nested / child transactions | ❌ (`NoxuError::Unsupported` if `parent.is_some()`) | ❌ | ❌ (`parent` parameter removed in Wave 3-1 — compile error, not runtime error) |
 | `Stored*` collections under explicit txn          | ✅ (Wave 2B — every Stored* method takes `Option<&Transaction>`) | ✅ | ✅ |
 | Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` API | ✅ (Wave 2B — typed views parameterised by `EntryBinding`) | ✅ | ✅ |
 | `StoredList::next_index` persistent across reopen | ✅ (via `StoredList::open`; `StoredList::new` resets) | ✅ | ✅ |
