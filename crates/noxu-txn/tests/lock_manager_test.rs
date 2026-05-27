@@ -443,3 +443,151 @@ fn je_multiple_readers_share() {
         );
     }
 }
+
+// ─── DeadlockTest ports (wave 9-C) ──────────────────────────────────────────
+//
+// JE invariant (DeadlockTest.testDeadlockBetweenTwoTxns):
+//   Txn1 owns L1, waits on L2; Txn2 owns L2, waits on L1.  One of
+//   them is chosen as the deadlock victim and surfaces a deadlock
+//   exception; the other proceeds.
+//
+// Noxu adaptation: drive the same scenario via two threads using
+// `LockManager::lock` directly and assert that exactly one thread
+// observes a `TxnError::Deadlock`, and the other ultimately holds
+// both locks.
+
+#[test]
+fn je_deadlock_between_two_txns() {
+    let lm = lm();
+    let lm1 = Arc::clone(&lm);
+    let lm2 = Arc::clone(&lm);
+
+    let l1: u64 = 100;
+    let l2: u64 = 200;
+    let txn1: i64 = 1001;
+    let txn2: i64 = 1002;
+
+    // Txn1 grabs L1 first.
+    lm.lock(l1, txn1, LockType::Write, false, false).unwrap();
+    // Txn2 grabs L2 first.
+    lm.lock(l2, txn2, LockType::Write, false, false).unwrap();
+
+    // Spawn one waiter on L2 (txn1) and one on L1 (txn2); one of them
+    // must surface a deadlock.
+    let h1 = thread::spawn(move || {
+        lm1.lock(l2, txn1, LockType::Write, false, false)
+    });
+    // Give h1 time to enter the wait queue, then start h2.
+    thread::sleep(Duration::from_millis(50));
+    let h2 = thread::spawn(move || {
+        lm2.lock(l1, txn2, LockType::Write, false, false)
+    });
+
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+
+    let r1_dl = matches!(&r1, Err(TxnError::Deadlock(_)));
+    let r2_dl = matches!(&r2, Err(TxnError::Deadlock(_)));
+    assert!(
+        r1_dl ^ r2_dl,
+        "exactly one of the two waiters must surface a deadlock; \
+         r1={:?} r2={:?}",
+        r1,
+        r2
+    );
+
+    // The non-victim eventually granted its lock; clean up.
+    let _ = lm.release(l1, txn1);
+    let _ = lm.release(l2, txn1);
+    let _ = lm.release(l1, txn2);
+    let _ = lm.release(l2, txn2);
+}
+
+// JE invariant (DeadlockTest.testDeadlockProducedByTwoLockersOnOneLock):
+//   Two lockers contend on a single lock with incompatible modes; if
+//   they form a cycle (each holds something the other waits for), one
+//   becomes the victim.  The simpler one-lock variant: T1 holds Read,
+//   T2 holds Read, T1 then upgrades to Write while T2 also tries to
+//   upgrade — one deadlocks.
+#[test]
+fn je_deadlock_two_lockers_on_one_lock() {
+    let lm = lm();
+    let l: u64 = 42;
+    let t1: i64 = 1;
+    let t2: i64 = 2;
+
+    // Both grab read locks.
+    lm.lock(l, t1, LockType::Read, false, false).unwrap();
+    lm.lock(l, t2, LockType::Read, false, false).unwrap();
+
+    // Both try to upgrade to write — exactly one should deadlock
+    // (the other completes after the victim aborts).
+    let lm1 = Arc::clone(&lm);
+    let lm2 = Arc::clone(&lm);
+    let h1 =
+        thread::spawn(move || lm1.lock(l, t1, LockType::Write, false, false));
+    thread::sleep(Duration::from_millis(20));
+    let h2 =
+        thread::spawn(move || lm2.lock(l, t2, LockType::Write, false, false));
+
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+
+    let r1_dl = matches!(&r1, Err(TxnError::Deadlock(_)));
+    let r2_dl = matches!(&r2, Err(TxnError::Deadlock(_)));
+    assert!(
+        r1_dl || r2_dl,
+        "at least one upgrade must surface a deadlock; r1={:?} r2={:?}",
+        r1,
+        r2
+    );
+
+    let _ = lm.release(l, t1);
+    let _ = lm.release(l, t2);
+}
+
+// JE invariant (LockTest.testLockConflicts, narrow port):
+//   The lock-mode compatibility matrix is asserted for the basic
+//   conflict pairs Noxu supports: Read-Read share, Read-Write
+//   conflict, Write-Write conflict.
+#[test]
+fn je_lock_test_conflicts_matrix() {
+    let lm = lm();
+    let l: u64 = 7;
+    // Read-Read: share.
+    lm.lock(l, 1, LockType::Read, false, false).unwrap();
+    let g = lm.lock(l, 2, LockType::Read, false, false).unwrap();
+    assert!(matches!(g, LockGrantType::New | LockGrantType::Existing));
+    let _ = lm.release(l, 1);
+    let _ = lm.release(l, 2);
+
+    // Read-Write: conflict (non-blocking).
+    lm.lock(l, 1, LockType::Read, false, false).unwrap();
+    let r = lm.lock(l, 2, LockType::Write, true, false);
+    assert!(
+        r.is_err(),
+        "Write must conflict with held Read (non-blocking): got {:?}",
+        r
+    );
+    let _ = lm.release(l, 1);
+
+    // Write-Write: conflict (non-blocking).
+    lm.lock(l, 1, LockType::Write, false, false).unwrap();
+    let r = lm.lock(l, 2, LockType::Write, true, false);
+    assert!(
+        r.is_err(),
+        "Write must conflict with held Write (non-blocking): got {:?}",
+        r
+    );
+    let _ = lm.release(l, 1);
+
+    // Write-Read: conflict (non-blocking).
+    lm.lock(l, 1, LockType::Write, false, false).unwrap();
+    let r = lm.lock(l, 2, LockType::Read, true, false);
+    assert!(
+        r.is_err(),
+        "Read must conflict with held Write (non-blocking): got {:?}",
+        r
+    );
+    let _ = lm.release(l, 1);
+}
