@@ -135,6 +135,41 @@ fn decode_point(entry: &DatabaseEntry) -> Point {
 
 This technique (XOR with `MIN` before big-endian encoding) is the same approach used internally by `IntBinding` and `LongBinding`.
 
+## Using bindings with Stored* collection views (v1.6)
+
+The `noxu-collections` typed Stored* views consume `EntryBinding`
+implementations directly:
+
+```rust,ignore
+use noxu_bind::{IntBinding, StringBinding};
+use noxu_collections::StoredMap;
+
+// `StoredMap<K, V, KB, VB>` — the binding values are passed by value
+// at construction time, then used internally for every operation.
+let map: StoredMap<i32, String, _, _> =
+    StoredMap::new(&db, IntBinding, StringBinding);
+
+map.put(None, &42, &"the answer".to_string())?;
+let value: Option<String> = map.get(None, &42)?;
+```
+
+For raw byte slices (the v1.5 default), use `ByteArrayBinding`:
+
+```rust,ignore
+use noxu_bind::ByteArrayBinding;
+use noxu_collections::StoredMap;
+
+let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
+    StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
+
+map.put(None, &b"key".to_vec(), &b"value".to_vec())?;
+```
+
+The same pattern applies to `StoredSortedMap<K, V, KB, VB>`,
+`StoredKeySet<K, KB>`, `StoredValueSet<V, VB>`, and
+`StoredList<V, VB>`.  See [Collections and Persistence](../collections/README.md)
+for the full surface.
+
 ## SerdeBinding version prefix (v1.5)
 
 `SerdeBinding<T>` (and the `TupleSerdeBinding<K, V>` data side that

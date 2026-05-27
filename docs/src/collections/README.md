@@ -1,63 +1,72 @@
 # Collections and Persistence
 
-> **v1.5 capability matrix:** see
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+> **v1.6 capability matrix:** see
+> [Introduction → v1.6 capability matrix](../introduction.md#v16-capability-matrix).
 
-This chapter covers the higher-level APIs built on top of the core Noxu DB
-key-value store:
+This chapter covers the higher-level APIs built on top of the core
+Noxu DB key-value store:
 
-- **`noxu-collections`** — iterator-based `StoredMap`, `StoredSet`, and
-  `StoredList` views that wrap databases with idiomatic Rust collection
-  semantics. Corresponds to `noxu_collections` in Noxu DB.
+- **`noxu-collections`** — typed `StoredMap<K, V>`, `StoredSortedMap<K, V>`,
+  `StoredKeySet<K>`, `StoredValueSet<V>`, and `StoredList<V>` views
+  parameterised by `noxu_bind::EntryBinding` implementations.  Every
+  method takes `txn: Option<&Transaction>` so the views compose with
+  user-driven transactions.  Corresponds to BDB-JE's
+  `com.sleepycat.collections`.
 
 - **`noxu-persist`** — the Direct Persistence Layer (DPL), which lets
   you store Rust structs in Noxu databases through a typed
   `PrimaryIndex<K, E>` instead of hand-written `DatabaseEntry` byte
-  slices. The wiring is explicit (you implement `Entity` and an
+  slices.  The wiring is explicit (you implement `Entity` and an
   `EntitySerializer` for your type) — there are no derive macros today.
 
-## v1.5 collections — what's in scope
+## v1.6 collections — what's in scope
 
-The v1.5 collections surface is intentionally narrower than the
-BDB-JE `com.sleepycat.collections` contract.  These constraints are
-tracked by the May 2026 collections/bind API audit and are scheduled
-for revisit in v1.6.
+Wave 2B (v1.6) closes the v1.5 collections audit by:
 
-1. **`Stored*` operations are auto-commit only.**  Every `get` /
-   `put` / `remove` / `iter` call on `StoredMap`, `StoredSortedMap`,
-   `StoredList`, `StoredKeySet`, and `StoredValueSet` issues the
-   underlying `Database` call with `txn = None`.  There is no way
-   to thread an externally-begun `noxu_db::Transaction` into a
-   collection method in v1.5.  (Audit findings #1, #3, #4.)
+1. **Typed `Stored*` surface.**  `StoredMap<K, V, KB, VB>` is now
+   parameterised by `EntryBinding`s for keys and values.  Same for
+   `StoredSortedMap`, `StoredKeySet`, `StoredValueSet`, and
+   `StoredList`.  Construct as:
 
-2. **`TransactionRunner` does not drive `Stored*` calls.**  The
-   `&Transaction` it supplies cannot be passed into any `Stored*`
-   method in v1.5.  Use the runner with the raw `Database` /
-   `Cursor` API (passing `Some(&txn)` to `db.put` / `db.delete` /
-   `db.open_cursor`), or use auto-commit `Stored*` ops without a
-   runner.  See the per-chapter notes below.
+   ```rust,ignore
+   let map: StoredMap<i32, String, _, _> =
+       StoredMap::new(&db, IntBinding, StringBinding);
+   ```
 
-3. **`StoredList::new` does not recover the next-index counter.**
-   Use [`StoredList::open`](stored-list.md#creating-a-storedlist)
-   when reopening a database that already contains entries.
-   (Audit finding #6.)
+2. **`Option<&Transaction>` threaded through every method.**  Pass
+   `None` for auto-commit semantics, `Some(&t)` to participate in a
+   user transaction:
 
-4. **`StoredList::remove` does not compact.**  It is a single-key
-   delete; it leaves a hole at the removed index and does not
-   re-number higher indices.  (Audit finding #5.)
+   ```rust,ignore
+   map.put(None, &1, &"alpha".to_string())?;            // auto-commit
+   map.put(Some(&txn), &2, &"beta".to_string())?;       // user txn
+   ```
 
-5. **`SerdeBinding` is now version-prefixed.**  Every payload
-   begins with two bytes (`0xCB` magic + `0x01` version).
-   This is a breaking change: data written by earlier 1.5 release
-   candidates is not readable without migration.  See
-   [the bindings chapter](../getting-started/bindings.md#serdebinding-version-prefix-v15).
-   (Audit finding #19.)
+3. **`TransactionRunner` drives `Stored*` methods.**  The
+   `&Transaction` the runner supplies can now be threaded straight
+   into any `Stored*` method.  The runner retries on every
+   `is_retryable()` error (deadlock, lock conflict, lock timeout,
+   transaction timeout, lock preempted) with jittered exponential
+   backoff (default: 10 retries, 10 ms base, 1 s ceiling, ±25%
+   jitter; all configurable).
+
+4. **`StoredList::remove` compacts.**  Removing index `i` shifts every
+   record at index `j > i` down by one slot and decrements
+   `next_index`.  Run under the supplied txn, so passing a
+   `Some(&txn)` makes the compaction crash-atomic.
+
+5. **`StoredList::open` recovers `next_index` across reopen.**  Use
+   `StoredList::open(&db, value_binding)` when reopening a database
+   with existing entries.  `StoredList::new(&db, value_binding)` is
+   preserved for empty / fresh databases (it does not scan).
 
 ## In this chapter
 
-1. [StoredMap](stored-map.md) — `BTreeMap`-like view backed by a primary database
-2. [StoredSet](stored-set.md) — `&[u8]`-keyed `StoredKeySet` / `StoredValueSet`
-3. [StoredList](stored-list.md) — sequence-indexed list (with reopen support)
+1. [StoredMap](stored-map.md) — typed map view with sorted-map navigation
+2. [StoredSet](stored-set.md) — typed `StoredKeySet<K>` /
+   `StoredValueSet<V>`
+3. [StoredList](stored-list.md) — typed indexed list with shift-down
+   compaction
 4. [Entity Persistence (DPL)](entity-persistence.md) — `Entity` /
    `EntitySerializer` traits, `EntityStore`, primary and secondary
    indexes

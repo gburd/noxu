@@ -1,8 +1,10 @@
-//! Collections example for Noxu DB.
+//! Collections example for Noxu DB (Wave 2B / v1.6 typed API).
 //!
-//! Demonstrates using noxu-collections StoredMap to provide a familiar
-//! map-like interface over a Noxu DB database.
+//! Demonstrates using noxu-collections `StoredMap<K, V, KB, VB>` to
+//! provide a familiar map-like interface over a Noxu DB database
+//! with typed keys and values.
 
+use noxu_bind::StringBinding;
 use noxu_collections::StoredMap;
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 
@@ -17,8 +19,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_config = DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, "mapDb", &db_config)?;
 
-    // --- Create a StoredMap view ---
-    let map = StoredMap::new(&db, false);
+    // --- Create a typed StoredMap<String, String> view ---
+    // String keys, String values, encoded via the StringBinding tuple
+    // binding (length-prefixed UTF-8).
+    let map: StoredMap<'_, String, String, _, _> =
+        StoredMap::new(&db, StringBinding, StringBinding);
 
     // --- Put key-value pairs ---
     println!("=== Inserting records via StoredMap ===");
@@ -31,106 +36,94 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (name, role) in &items {
-        let old = map.put(name.as_bytes(), role.as_bytes())?;
-        println!(
-            "  put({}, {}) -> previous: {:?}",
-            name,
-            role,
-            old.map(|v| String::from_utf8_lossy(&v).into_owned())
-        );
+        let old = map.put(None, &name.to_string(), &role.to_string())?;
+        println!("  put({}, {}) -> previous: {:?}", name, role, old);
     }
 
     // --- Get individual values ---
     println!("\n=== Looking up records ===");
     for name in ["alice", "charlie", "frank"] {
-        let result = map.get(name.as_bytes())?;
+        let result = map.get(None, &name.to_string())?;
         match result {
-            Some(v) => {
-                let role = String::from_utf8_lossy(&v);
-                println!("  {} -> {}", name, role);
-            }
-            None => {
-                println!("  {} -> NOT FOUND", name);
-            }
+            Some(role) => println!("  {} -> {}", name, role),
+            None => println!("  {} -> NOT FOUND", name),
         }
     }
 
     // --- Check containment ---
     println!("\n=== Contains key checks ===");
-    println!("  contains 'bob': {}", map.contains_key(b"bob")?);
-    println!("  contains 'frank': {}", map.contains_key(b"frank")?);
+    println!(
+        "  contains 'bob': {}",
+        map.contains_key(None, &"bob".to_string())?,
+    );
+    println!(
+        "  contains 'frank': {}",
+        map.contains_key(None, &"frank".to_string())?,
+    );
 
     // --- Size ---
     println!("\n=== Map size ===");
-    println!("  len: {}", map.len()?);
-    println!("  is_empty: {}", map.is_empty()?);
+    println!("  len: {}", map.len(None)?);
+    println!("  is_empty: {}", map.is_empty(None)?);
 
     // --- Iterate over all entries ---
     println!("\n=== Iterating all entries (sorted by key) ===");
-    for entry in map.iter()? {
+    for entry in map.iter(None)? {
         let (key, value) = entry?;
-        let k = String::from_utf8_lossy(&key);
-        let v = String::from_utf8_lossy(&value);
-        println!("  {} -> {}", k, v);
+        println!("  {} -> {}", key, value);
     }
 
     // --- Iterate over keys only ---
     println!("\n=== Keys only ===");
-    for key in map.keys()? {
-        let key_bytes = key?;
-        let k = String::from_utf8_lossy(&key_bytes);
-        println!("  {}", k);
+    for key in map.keys(None)? {
+        println!("  {}", key?);
     }
 
     // --- Iterate over values only ---
     println!("\n=== Values only ===");
-    for value in map.values()? {
-        let value_bytes = value?;
-        let v = String::from_utf8_lossy(&value_bytes);
-        println!("  {}", v);
+    for value in map.values(None)? {
+        println!("  {}", value?);
     }
 
     // --- Update a value ---
     println!("\n=== Updating 'bob' from designer to architect ===");
-    let old = map.put(b"bob", b"architect")?;
-    println!(
-        "  Previous value: {:?}",
-        old.map(|v| String::from_utf8_lossy(&v).into_owned())
-    );
-    let new_val = map.get(b"bob")?;
-    println!(
-        "  New value: {:?}",
-        new_val.map(|v| String::from_utf8_lossy(&v).into_owned())
-    );
+    let old = map.put(None, &"bob".to_string(), &"architect".to_string())?;
+    println!("  Previous value: {:?}", old);
+    let new_val = map.get(None, &"bob".to_string())?;
+    println!("  New value: {:?}", new_val);
 
     // --- Remove a record ---
     println!("\n=== Removing 'dave' ===");
-    let removed = map.remove(b"dave")?;
+    let removed = map.remove(None, &"dave".to_string())?;
+    println!("  Removed value: {:?}", removed);
+    println!("  len after remove: {}", map.len(None)?);
+
+    // --- Use a transaction across several writes ---
+    println!("\n=== Transactional batch update ===");
+    let txn = env.begin_transaction(None, None)?;
+    map.put(Some(&txn), &"frank".to_string(), &"intern".to_string())?;
+    map.put(Some(&txn), &"grace".to_string(), &"director".to_string())?;
+    txn.commit()?;
     println!(
-        "  Removed value: {:?}",
-        removed.map(|v| String::from_utf8_lossy(&v).into_owned())
+        "  After txn commit: frank={:?}, grace={:?}",
+        map.get(None, &"frank".to_string())?,
+        map.get(None, &"grace".to_string())?,
     );
-    println!("  len after remove: {}", map.len()?);
 
     // --- Final iteration ---
     println!("\n=== Final state ===");
-    for entry in map.iter()? {
+    for entry in map.iter(None)? {
         let (key, value) = entry?;
-        let k = String::from_utf8_lossy(&key);
-        let v = String::from_utf8_lossy(&value);
-        println!("  {} -> {}", k, v);
+        println!("  {} -> {}", key, value);
     }
 
     // --- Clear all ---
     println!("\n=== Clearing all records ===");
-    map.clear()?;
-    println!("  len after clear: {}", map.len()?);
-    println!("  is_empty: {}", map.is_empty()?);
+    map.clear(None)?;
+    println!("  len after clear: {}", map.len(None)?);
+    println!("  is_empty: {}", map.is_empty(None)?);
 
     // --- Cleanup ---
-    drop(map);
-    drop(db);
-    drop(env);
     let _ = std::fs::remove_dir_all(&env_dir);
 
     println!("\nDone!");
