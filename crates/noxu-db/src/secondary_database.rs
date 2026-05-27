@@ -66,8 +66,18 @@ use crate::secondary_cursor::SecondaryCursor;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, GetMode};
 use noxu_sync::Mutex;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+thread_local! {
+    /// Cycle-detection frame for FK cascades and nullifications.
+    /// Contains every `(db_id, fk_value)` pair the current thread is
+    /// in the middle of cascading.  See [`FkReferrer`].
+    static FK_CASCADE_GUARD: RefCell<HashSet<(u64, Vec<u8>)>> =
+        RefCell::new(HashSet::new());
+}
 
 /// Trait implemented by [`SecondaryHookState`] so a primary
 /// [`Database`] can keep the secondary registry as
@@ -371,12 +381,83 @@ impl FkReferrer for SecondaryHookState {
                 Ok(())
             }
             crate::secondary_config::ForeignKeyDeleteAction::Cascade => {
-                // Wired in step 9.
-                Err(NoxuError::Unsupported(
-                    "ForeignKeyDeleteAction::Cascade is not yet implemented \
-                     (planned for v1.6 step 9)"
-                        .to_string(),
-                ))
+                // v1.6 step 9 — transitive cascade with cycle detection.
+                //
+                // For every primary record indexed under `fk_value` in
+                // *this* secondary, delete the primary.  The primary's
+                // own [`Database::delete`] fan-out re-enters this hook
+                // for any deeper cascades; the thread-local guard keeps
+                // a cycle from spinning forever.
+                let primary = Arc::clone(&self.primary);
+                let db_id = primary.lock().db_id_for_fk_guard();
+                let fk_bytes = fk_value.get_data().unwrap_or(&[]).to_vec();
+
+                if !FK_CASCADE_GUARD
+                    .with(|c| c.borrow_mut().insert((db_id, fk_bytes.clone())))
+                {
+                    // Already cascading on this (db, key) frame — skip
+                    // to break the cycle.  This matches JE's
+                    // `cascadeDeletePrimaries` cycle-skip logic.
+                    return Ok(());
+                }
+
+                // Collect every child primary key indexed under fk_value.
+                let child_pris: Vec<DatabaseEntry> = {
+                    let mut child_keys = Vec::new();
+                    let mut cursor = self.inner.open_cursor(txn, None)?;
+                    let mut sk = fk_value.clone();
+                    let mut pk = DatabaseEntry::new();
+                    let mut st = cursor
+                        .get(
+                            &mut sk,
+                            &mut pk,
+                            crate::get::Get::Search,
+                            None,
+                        )
+                        .map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
+                    while st == OperationStatus::Success {
+                        if sk.get_data().unwrap_or(&[])
+                            != fk_value.get_data().unwrap_or(&[])
+                        {
+                            break;
+                        }
+                        if let Some(b) = pk.get_data() {
+                            child_keys.push(DatabaseEntry::from_bytes(b));
+                        }
+                        st = cursor
+                            .get(
+                                &mut sk,
+                                &mut pk,
+                                crate::get::Get::Next,
+                                None,
+                            )
+                            .map_err(|e| {
+                                NoxuError::OperationNotAllowed(e.to_string())
+                            })?;
+                    }
+                    child_keys
+                };
+
+                // Apply the cascade.  Each `primary.delete` re-enters
+                // the maintenance plumbing on the child primary so its
+                // secondaries and any deeper FK relationships are
+                // honoured.  Errors propagate so the caller's txn rolls
+                // the cascade back together with the originating delete.
+                let cascade_result: Result<()> = (|| {
+                    let primary_guard = primary.lock();
+                    for child_pri in child_pris {
+                        primary_guard.delete(txn, &child_pri)?;
+                    }
+                    Ok(())
+                })();
+
+                FK_CASCADE_GUARD.with(|c| {
+                    c.borrow_mut().remove(&(db_id, fk_bytes));
+                });
+
+                cascade_result
             }
             crate::secondary_config::ForeignKeyDeleteAction::Nullify => {
                 // Wired in step 10.
