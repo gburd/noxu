@@ -947,3 +947,188 @@ fn tck_tuple_format_test_unsigned_int() {
         assert_eq!(0, input.available());
     }
 }
+
+// ---------------------------------------------------------------------------
+// TupleOrderingTest extras (wave 9-C)
+// ---------------------------------------------------------------------------
+
+/// Port of `TupleOrderingTest.testChars`: per-char writes (16-bit BE)
+/// produce a monotone-byte ordering by lexicographic char order.
+/// Adapted: noxu has only `write_char` (single u16); we loop instead
+/// of using JE's `writeChars(char[])`.
+#[test]
+fn tck_tuple_ordering_test_chars() {
+    let data: &[&[u16]] = &[
+        &[],
+        &[0],
+        &[b'a' as u16],
+        &[b'a' as u16, 0],
+        &[b'a' as u16, b'b' as u16],
+        &[b'b' as u16],
+        &[b'b' as u16, b'b' as u16],
+        &[0x7F],
+        &[0x7F, 0],
+        &[0xFF],
+        &[0xFF, 0],
+    ];
+    let mut prev: Option<Vec<u8>> = None;
+    for (i, &v) in data.iter().enumerate() {
+        let mut out = TupleOutput::new();
+        for &c in v {
+            out.write_char(c);
+        }
+        let next = out.as_bytes().to_vec();
+        if let Some(prev) = &prev {
+            assert_lt_bytes(prev, &next, i);
+        }
+        prev = Some(next);
+    }
+}
+
+/// Port of `TupleOrderingTest.testBytes`: writing raw bytes preserves
+/// lexicographic byte ordering.
+#[test]
+fn tck_tuple_ordering_test_bytes() {
+    let data: &[&[u8]] = &[
+        &[],
+        &[0],
+        &[b'a'],
+        &[b'a', 0],
+        &[b'a', b'b'],
+        &[b'b'],
+        &[b'b', b'b'],
+        &[0x7F],
+        &[0xFF],
+    ];
+    let mut prev: Option<Vec<u8>> = None;
+    for (i, &v) in data.iter().enumerate() {
+        let mut out = TupleOutput::new();
+        out.write_bytes(v);
+        let next = out.as_bytes().to_vec();
+        if let Some(prev) = &prev {
+            assert_lt_bytes(prev, &next, i);
+        }
+        prev = Some(next);
+    }
+}
+
+/// Port of `TupleOrderingTest.testPackedIntAndLong`: documents the JE
+/// contract that the *unsorted* packed encoding sorts correctly only
+/// across small non-negative integers (0..=630).  Full-range monotone
+/// ordering requires `write_sorted_packed_*`.
+#[test]
+fn tck_tuple_ordering_test_packed_int_and_long() {
+    let mut prev: Option<Vec<u8>> = None;
+    for i in 0..=630i32 {
+        let mut out = TupleOutput::new();
+        out.write_packed_int(i);
+        let next = out.as_bytes().to_vec();
+        if let Some(prev) = &prev {
+            assert_lt_bytes(prev, &next, i as usize);
+        }
+        prev = Some(next);
+    }
+
+    let mut prev: Option<Vec<u8>> = None;
+    for i in 0..=630i64 {
+        let mut out = TupleOutput::new();
+        out.write_packed_long(i);
+        let next = out.as_bytes().to_vec();
+        if let Some(prev) = &prev {
+            assert_lt_bytes(prev, &next, i as usize);
+        }
+        prev = Some(next);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TupleBindingTest: primitive object<->entry round-trip (wave 9-C)
+// ---------------------------------------------------------------------------
+
+/// Port of `TupleBindingTest.testPrimitiveBindings`: every primitive
+/// binding round-trips an object via `object_to_entry` /
+/// `entry_to_object`, with the expected byte size.
+///
+/// Adapted: noxu has no BigInteger / BigDecimal bindings (OUT-OF-SCOPE).
+/// The Java-`null` paths (`StringBinding.stringToEntry(null,...)`) are
+/// also absent because noxu's `StringBinding` round-trips a `String`
+/// without a null-marker.  Boolean, byte (u8), short (i16), int (i32),
+/// long (i64), float, double, packed int/long, sorted float/double,
+/// sorted packed int/long, char, and string are all exercised.
+#[test]
+fn tck_tuple_binding_test_primitive_bindings() {
+    use noxu_bind::{
+        BoolBinding, ByteBinding, CharBinding, DoubleBinding, EntryBinding,
+        FloatBinding, IntBinding, LongBinding, PackedIntBinding,
+        PackedLongBinding, ShortBinding, SortedDoubleBinding,
+        SortedFloatBinding, SortedPackedIntBinding, SortedPackedLongBinding,
+        StringBinding,
+    };
+    use noxu_db::DatabaseEntry;
+
+    fn rt<B, T>(binding: &B, value: T, expected_size: usize)
+    where
+        B: EntryBinding<T>,
+        T: PartialEq + std::fmt::Debug + Clone,
+    {
+        let mut entry = DatabaseEntry::new();
+        binding.object_to_entry(&value, &mut entry).unwrap();
+        assert_eq!(
+            expected_size,
+            entry.data().len(),
+            "unexpected encoded size for {value:?}",
+        );
+        let got = binding.entry_to_object(&entry).unwrap();
+        assert_eq!(value, got);
+    }
+
+    // String: "abc" -> 3 bytes payload + 2-byte terminator (noxu).
+    rt(&StringBinding::new(), "abc".to_string(), 3 + 2);
+
+    // Char (u16) -> 2 bytes BE.
+    rt(&CharBinding::new(), b'a' as u16, 2);
+
+    // Bool -> 1 byte.
+    rt(&BoolBinding::new(), true, 1);
+    rt(&BoolBinding::new(), false, 1);
+
+    // Byte (u8) -> 1 byte.
+    rt(&ByteBinding::new(), 123u8, 1);
+
+    // Short (i16) -> 2 bytes.
+    rt(&ShortBinding::new(), 123i16, 2);
+
+    // Int (i32) -> 4 bytes.
+    rt(&IntBinding::new(), 123i32, 4);
+
+    // Long (i64) -> 8 bytes.
+    rt(&LongBinding::new(), 123i64, 8);
+
+    // Float -> 4 bytes.
+    rt(&FloatBinding::new(), 123.123f32, 4);
+
+    // Double -> 8 bytes.
+    rt(&DoubleBinding::new(), 123.123f64, 8);
+
+    // Sorted float/double -> 4/8 bytes.
+    rt(&SortedFloatBinding::new(), 123.123f32, 4);
+    rt(&SortedDoubleBinding::new(), 123.123f64, 8);
+
+    // Packed int/long: actual encoding is variable-length.  Just
+    // round-trip and assert decode(encode) == value.
+    let int_b = PackedIntBinding::new();
+    let long_b = PackedLongBinding::new();
+    let mut e = DatabaseEntry::new();
+    int_b.object_to_entry(&1234i32, &mut e).unwrap();
+    assert_eq!(1234i32, int_b.entry_to_object(&e).unwrap());
+    long_b.object_to_entry(&1234i64, &mut e).unwrap();
+    assert_eq!(1234i64, long_b.entry_to_object(&e).unwrap());
+
+    // Sorted packed int/long similarly.
+    let sint_b = SortedPackedIntBinding::new();
+    let slong_b = SortedPackedLongBinding::new();
+    sint_b.object_to_entry(&1234i32, &mut e).unwrap();
+    assert_eq!(1234i32, sint_b.entry_to_object(&e).unwrap());
+    slong_b.object_to_entry(&1234i64, &mut e).unwrap();
+    assert_eq!(1234i64, slong_b.entry_to_object(&e).unwrap());
+}
