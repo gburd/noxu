@@ -181,7 +181,7 @@ impl<'env> TransactionRunner<'env> {
     {
         let mut attempt: u32 = 0;
         loop {
-            let txn = self.env.begin_transaction(None, None)?;
+            let txn = self.env.begin_transaction(None)?;
             match f(&txn) {
                 Ok(value) => {
                     txn.commit().map_err(CollectionError::DatabaseError)?;

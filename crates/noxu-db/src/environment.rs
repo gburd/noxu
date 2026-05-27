@@ -660,13 +660,6 @@ impl Environment {
     /// Begins a new transaction.
     ///
     /// # Arguments
-    /// * `parent` - Reserved for nested transactions in a future release.  In
-    ///   v1.5 this argument **must** be `None`; passing `Some(_)` returns a
-    ///   typed [`NoxuError::Unsupported`] error (see Decision 3B in
-    ///   `docs/src/internal/v1.5-decisions-2026-05.md`).  The parameter
-    ///   itself is scheduled for removal in v2.0; until then it is kept on
-    ///   the signature so the v1.6 / v2.0 transition does not require a
-    ///   second SemVer break.
     /// * `config` - Optional transaction configuration
     ///
     /// # Returns
@@ -676,11 +669,17 @@ impl Environment {
     /// Returns an error if:
     /// - The environment is closed
     /// - The environment is not transactional
-    /// - `parent` is `Some(_)` ([`NoxuError::Unsupported`]) — closes audit
-    ///   finding F11 (`_parent` was previously dropped on the floor).
+    ///
+    /// # Nested transactions
+    /// Nested (child) transactions are not supported.  In v1.5 this method
+    /// took an `Option<&Transaction>` `parent` argument that was rejected
+    /// at runtime with [`NoxuError::Unsupported`] (Decision 3B in
+    /// `docs/src/internal/v1.5-decisions-2026-05.md`, audit finding F11).
+    /// In v2.0 the parameter has been removed entirely (Wave 3-1) — the
+    /// type system now enforces the constraint, so what was a runtime
+    /// error is now a compile error.
     pub fn begin_transaction(
         &self,
-        parent: Option<&Transaction>,
         config: Option<&TransactionConfig>,
     ) -> Result<Transaction> {
         self.check_open()?;
@@ -707,22 +706,6 @@ impl Environment {
             ));
         }
 
-        // Decision 3B (v1.5-decisions-2026-05.md): nested transactions are
-        // not supported.  Pre-Sprint-3 the parameter was named `_parent` and
-        // silently ignored, which is exactly the F11 audit finding.  We now
-        // reject `Some(_)` with a typed error so users see a loud,
-        // documented failure instead of the BDB-JE-shaped behaviour they
-        // would otherwise expect from the published mdBook.  The parameter
-        // is retained for v1.5 / v1.6 SemVer stability and will be removed
-        // in v2.0.
-        if parent.is_some() {
-            return Err(NoxuError::Unsupported(
-                "nested transactions are not supported in v1.5; pass None \
-                 for parent (planned for v2.0)"
-                    .to_string(),
-            ));
-        }
-
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
         // F3: when the caller does not supply a TransactionConfig, the
         // environment-level `Durability` default (`EnvironmentConfig::durability`,
@@ -730,7 +713,7 @@ impl Environment {
         // honoured.  Pre-fix `unwrap_or_default()` produced a config with
         // `Durability::COMMIT_SYNC` regardless of the env setting, so a
         // user opening with `.with_durability(COMMIT_NO_SYNC)` and then
-        // calling `begin_transaction(None, None)` still fsynced on every
+        // calling `begin_transaction(None)` still fsynced on every
         // commit.
         // Audit transaction-env F4 (Wave 2C-4): the env-level
         // `txn_no_sync` / `txn_write_no_sync` flags now apply to explicit
@@ -1457,7 +1440,7 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         assert!(txn.is_valid());
     }
 
@@ -1469,7 +1452,7 @@ mod tests {
             .with_transactional(false);
         let env = Environment::open(config).unwrap();
 
-        let result = env.begin_transaction(None, None);
+        let result = env.begin_transaction(None);
         assert!(result.is_err());
     }
 
@@ -1510,7 +1493,7 @@ mod tests {
         assert!(env.open_database(None, "test", &db_config).is_err());
         assert!(env.remove_database(None, "test").is_err());
         assert!(env.rename_database(None, "a", "b").is_err());
-        assert!(env.begin_transaction(None, None).is_err());
+        assert!(env.begin_transaction(None).is_err());
         assert!(env.get_database_names().is_err());
     }
 
@@ -1554,7 +1537,7 @@ mod tests {
         let env = Environment::open(config).unwrap();
 
         let txn_config = TransactionConfig::new();
-        let txn = env.begin_transaction(None, Some(&txn_config)).unwrap();
+        let txn = env.begin_transaction(Some(&txn_config)).unwrap();
         assert!(txn.is_valid());
     }
 
@@ -1593,7 +1576,7 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let _txn = env.begin_transaction(None, None).unwrap();
+        let _txn = env.begin_transaction(None).unwrap();
 
         let result = env.close();
         assert!(result.is_err());
@@ -1641,7 +1624,7 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         let txn_id = txn.get_id();
 
         // Without removing the txn, close would fail.

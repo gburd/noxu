@@ -111,7 +111,7 @@ fn test_sustained_8r8w_60s() {
                 barrier.wait();
                 let mut seq: u64 = 0;
                 while !done.load(Ordering::Relaxed) {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     for i in 0..KEYS_PER_WRITER {
                         let key = format!("w{tid:02}-k{i:02}");
                         let val = format!("seq{seq:010}");
@@ -139,7 +139,7 @@ fn test_sustained_8r8w_60s() {
                 barrier.wait();
                 let rc = TransactionConfig::read_committed();
                 while !done.load(Ordering::Relaxed) {
-                    let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                    let txn = env.begin_transaction(Some(&rc)).unwrap();
                     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
                     let mut k = DatabaseEntry::new();
                     let mut v = DatabaseEntry::new();

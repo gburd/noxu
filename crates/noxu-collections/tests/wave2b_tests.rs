@@ -73,14 +73,14 @@ fn stored_map_methods_take_optional_txn() {
     assert!(!map.is_empty(None).unwrap());
 
     // Explicit-txn form (txn = Some(&t)).
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     map.put(Some(&txn), &2, &"beta".to_string()).unwrap();
     assert_eq!(map.get(Some(&txn), &2).unwrap(), Some("beta".to_string()),);
     assert!(map.contains_key(Some(&txn), &2).unwrap());
     txn.commit().unwrap();
 
     // Iteration variants take txn too.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let _items = map.iter(Some(&txn)).unwrap();
     let _keys = map.keys(Some(&txn)).unwrap();
     let _values = map.values(Some(&txn)).unwrap();
@@ -99,7 +99,7 @@ fn stored_map_writes_abort_with_user_txn() {
     // Pre-populate.
     map.put(None, &1, &"original".to_string()).unwrap();
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     map.put(Some(&txn), &1, &"modified".to_string()).unwrap();
     map.put(Some(&txn), &2, &"new".to_string()).unwrap();
     txn.abort().unwrap();

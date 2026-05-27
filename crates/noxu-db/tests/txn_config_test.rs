@@ -31,7 +31,7 @@ fn test_lock_timeout_propagated_from_config() {
     let (env, _db) = open_env_and_db(&dir);
 
     let config = TransactionConfig::new().with_lock_timeout_ms(2500);
-    let txn = env.begin_transaction(None, Some(&config)).unwrap();
+    let txn = env.begin_transaction(Some(&config)).unwrap();
     assert_eq!(txn.get_lock_timeout(), 2500);
     txn.abort().unwrap();
 }
@@ -44,7 +44,7 @@ fn test_txn_timeout_propagated_from_config() {
     let (env, _db) = open_env_and_db(&dir);
 
     let config = TransactionConfig::new().with_txn_timeout_ms(8000);
-    let txn = env.begin_transaction(None, Some(&config)).unwrap();
+    let txn = env.begin_transaction(Some(&config)).unwrap();
     assert_eq!(txn.get_txn_timeout(), 8000);
     txn.abort().unwrap();
 }
@@ -62,12 +62,12 @@ fn test_no_wait_causes_immediate_lock_failure() {
     let val = DatabaseEntry::from_bytes(b"value1");
 
     // Writer 1: hold a write lock
-    let txn1 = env.begin_transaction(None, None).unwrap();
+    let txn1 = env.begin_transaction(None).unwrap();
     db.put(Some(&txn1), &key, &val).unwrap();
 
     // Writer 2: try to write same key with no_wait — should fail immediately
     let config = TransactionConfig::new().with_no_wait(true);
-    let txn2 = env.begin_transaction(None, Some(&config)).unwrap();
+    let txn2 = env.begin_transaction(Some(&config)).unwrap();
 
     let start = Instant::now();
     let result =
@@ -98,12 +98,12 @@ fn test_lock_timeout_bounds_wait_time() {
     let val = DatabaseEntry::from_bytes(b"v");
 
     // Writer 1 holds the lock
-    let txn1 = env.begin_transaction(None, None).unwrap();
+    let txn1 = env.begin_transaction(None).unwrap();
     db.put(Some(&txn1), &key, &val).unwrap();
 
     // Writer 2 with 50ms lock timeout
     let config = TransactionConfig::new().with_lock_timeout_ms(50);
-    let txn2 = env.begin_transaction(None, Some(&config)).unwrap();
+    let txn2 = env.begin_transaction(Some(&config)).unwrap();
 
     let start = Instant::now();
     let result = db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"v2"));

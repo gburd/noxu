@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Use a transaction across several writes ---
     println!("\n=== Transactional batch update ===");
-    let txn = env.begin_transaction(None, None)?;
+    let txn = env.begin_transaction(None)?;
     map.put(Some(&txn), &"frank".to_string(), &"intern".to_string())?;
     map.put(Some(&txn), &"grace".to_string(), &"director".to_string())?;
     txn.commit()?;

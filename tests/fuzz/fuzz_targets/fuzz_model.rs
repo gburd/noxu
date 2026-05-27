@@ -208,14 +208,14 @@ fuzz_target!(|ops: Vec<Op>| {
 
             Op::TxnCommit => {
                 if env.is_transactional() {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     txn.commit().unwrap();
                 }
             }
 
             Op::TxnAbort => {
                 if env.is_transactional() {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     txn.abort().unwrap();
                 }
             }

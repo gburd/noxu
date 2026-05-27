@@ -46,7 +46,7 @@ pub enum TransactionState {
 ///     .allow_create(true)
 ///     .transactional(true);
 /// let env = Environment::open(config).unwrap();
-/// let txn = env.begin_transaction(None, None).unwrap();
+/// let txn = env.begin_transaction(None).unwrap();
 /// // ... do operations ...
 /// txn.commit().unwrap();
 /// ```

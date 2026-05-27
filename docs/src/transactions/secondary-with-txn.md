@@ -37,7 +37,7 @@ cursor with `Some(&txn)` and close it before committing or aborting:
 ```rust
 use noxu_db::{Get, OperationStatus};
 
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 let mut cursor = secondary.open_cursor(Some(&txn), None)?;
 
 let mut sec_key = DatabaseEntry::from_bytes(b"Engineering");
@@ -65,7 +65,11 @@ use noxu_db::DatabaseEntry;
 let key = DatabaseEntry::from_bytes(b"alice");
 let new_value = DatabaseEntry::from_bytes(b"Engineering|Senior Engineer");
 
-let txn = env.begin_transaction(None, None)?;
+// Read the previous primary record so we know the old secondary key.
+// (Reads can be auto-commit or under the same txn; either works.)
+let old_value = primary.lock().get(None, &key)?;
+
+let txn = env.begin_transaction(None)?;
 
 // Primary put under txn — auto-maintenance walks every registered
 // secondary under the same `txn`.

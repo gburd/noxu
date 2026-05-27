@@ -71,7 +71,7 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
         std::thread::spawn(move || {
             barrier.wait();
             for i in 0..N_KEYS {
-                let txn = env.begin_transaction(None, None).unwrap();
+                let txn = env.begin_transaction(None).unwrap();
                 let key =
                     DatabaseEntry::from_vec(format!("k{i:06}").into_bytes());
                 let val =

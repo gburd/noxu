@@ -185,7 +185,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                 let k = make_key(*key);
 
                 if env.is_transactional() {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     let key_entry = DatabaseEntry::from_bytes(&k);
                     let val_entry = DatabaseEntry::from_bytes(value);
                     // Write under the transaction.
@@ -229,7 +229,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                     // Remember pre-abort state so we can verify no change.
                     let pre_abort_value = oracle.get(&k).cloned();
 
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     let key_entry = DatabaseEntry::from_bytes(&k);
                     let val_entry = DatabaseEntry::from_bytes(value);
                     db.put(Some(&txn), &key_entry, &val_entry).unwrap();
@@ -276,7 +276,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                 let k = make_key(*key);
 
                 if env.is_transactional() {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     let key_entry = DatabaseEntry::from_bytes(&k);
                     let status = db.delete(Some(&txn), &key_entry).unwrap();
 
@@ -318,7 +318,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                 if env.is_transactional() {
                     let pre_abort_value = oracle.get(&k).cloned();
 
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     let key_entry = DatabaseEntry::from_bytes(&k);
                     db.delete(Some(&txn), &key_entry).unwrap();
                     txn.abort().unwrap();
@@ -359,14 +359,14 @@ fuzz_target!(|ops: Vec<TxnOp>| {
             // ----------------------------------------------------------------
             TxnOp::EmptyCommit => {
                 if env.is_transactional() {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     txn.commit().unwrap();
                 }
             }
 
             TxnOp::EmptyAbort => {
                 if env.is_transactional() {
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     txn.abort().unwrap();
                 }
             }

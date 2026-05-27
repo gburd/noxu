@@ -1086,7 +1086,7 @@ fn s4h_abort_rolls_back_primary_and_secondary() {
 
     // Begin an explicit txn and write to both primary and secondary
     // under it.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     put_under_txn(&primary, &sec, &txn, b"pk1", b"Apple");
 
     // The same txn can read its own write through the secondary.
@@ -1146,7 +1146,7 @@ fn s4h_commit_persists_primary_and_secondary() {
     let (env, primary, sec) =
         open_pri_sec_for_txn(&dir, "primary", "secondary");
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     put_under_txn(&primary, &sec, &txn, b"pk1", b"Apple");
     txn.commit().unwrap();
 
@@ -1180,7 +1180,7 @@ fn s4h_same_primary_idempotent_reinsert_under_same_txn() {
     let (env, primary, sec) =
         open_pri_sec_for_txn(&dir, "primary", "secondary");
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
     primary.lock().put(Some(&txn), &pk, &v).unwrap();
@@ -1223,7 +1223,7 @@ fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
         open_pri_sec_for_txn(&dir, "primary", "secondary");
 
     // Writer txn: stage a primary + secondary write but DO NOT commit.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     put_under_txn(&primary, &sec, &txn, b"pk1", b"Apple");
 
     // Independent reader (auto-commit, default isolation) on the
@@ -1291,7 +1291,7 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
 
     // Seed: commit a primary + secondary record.
     {
-        let seed = env.begin_transaction(None, None).unwrap();
+        let seed = env.begin_transaction(None).unwrap();
         put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
         seed.commit().unwrap();
     }
@@ -1310,7 +1310,7 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
     // Open a cursor under a txn, position on the secondary entry,
     // call delete (cascades to primary + secondary cleanup), then
     // abort.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     {
         let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
         let mut p_key = DatabaseEntry::new();
@@ -1394,14 +1394,14 @@ fn wave1b_cursor_delete_cascade_commits_both_sides() {
 
     // Seed.
     {
-        let seed = env.begin_transaction(None, None).unwrap();
+        let seed = env.begin_transaction(None).unwrap();
         put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
         put_under_txn(&primary, &sec, &seed, b"pk2", b"Banana");
         seed.commit().unwrap();
     }
 
     // Cursor under a txn: delete the 'A' entry, commit.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     {
         let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
         let mut p_key = DatabaseEntry::new();
@@ -1469,13 +1469,13 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
 
     // Seed.
     {
-        let seed = env.begin_transaction(None, None).unwrap();
+        let seed = env.begin_transaction(None).unwrap();
         put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
         seed.commit().unwrap();
     }
 
     // Stage the cascade under a txn but DO NOT commit.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();

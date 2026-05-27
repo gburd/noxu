@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Use uncommitted reads for this transaction.
     let txn_config = TransactionConfig::new().with_read_uncommitted(true);
-    let txn = env.begin_transaction(None, Some(&txn_config))?;
+    let txn = env.begin_transaction(Some(&txn_config))?;
 
     let key = DatabaseEntry::from_bytes(b"thekey");
     let mut data = DatabaseEntry::new();
@@ -90,7 +90,7 @@ use noxu_db::TransactionConfig;
 
 // Use read committed isolation for this transaction.
 let txn_config = TransactionConfig::new().with_read_committed(true);
-let txn = env.begin_transaction(None, Some(&txn_config))?;
+let txn = env.begin_transaction(Some(&txn_config))?;
 ```
 
 Or per-operation:
@@ -142,7 +142,7 @@ use noxu_db::TransactionConfig;
 // with the transaction config.
 let txn_config = TransactionConfig::new()
     .with_serializable_isolation(true);
-let txn = env.begin_transaction(None, Some(&txn_config))?;
+let txn = env.begin_transaction(Some(&txn_config))?;
 ```
 
 ---
