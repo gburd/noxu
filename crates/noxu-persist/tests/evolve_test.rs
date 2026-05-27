@@ -613,7 +613,7 @@ fn evolve_class_rename() {
             .with_allow_create(true)
             .with_transactional(true);
         let db = env.open_database(None, "s_Person", &dbcfg).unwrap();
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         let key = noxu_db::DatabaseEntry::from_vec(1u64.to_be_bytes().to_vec());
         let val = noxu_db::DatabaseEntry::from_vec(envelope);
         db.put(Some(&txn), &key, &val).unwrap();

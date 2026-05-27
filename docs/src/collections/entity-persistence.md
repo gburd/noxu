@@ -210,7 +210,7 @@ for user in index.entities(None, &ser)? {
 To participate in an explicit transaction, pass `Some(&txn)`:
 
 ```rust
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 index.put(
     Some(&txn),
     &ser,

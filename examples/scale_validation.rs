@@ -204,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while key_idx < end_key {
                 let batch_end = (key_idx + batch_size).min(end_key);
                 let batch_count = batch_end - key_idx;
-                let txn = env.begin_transaction(None, None).unwrap();
+                let txn = env.begin_transaction(None).unwrap();
                 while key_idx < batch_end {
                     let key = format!("key:{key_idx:012}");
                     let val = format!("val:{tid:04}:{key_idx:012}");

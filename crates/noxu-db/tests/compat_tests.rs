@@ -64,7 +64,7 @@ fn database_txn_put_get_delete() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let (k, v) = kv(1, 100);
     assert_eq!(db.put(Some(&txn), &k, &v).unwrap(), OperationStatus::Success);
     let mut out = DatabaseEntry::new();
@@ -253,7 +253,7 @@ fn read_uncommitted_sees_dirty_write() {
 
     // Insert a committed baseline value.
     {
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         db.put(
             Some(&txn),
             &DatabaseEntry::from_bytes(b"key"),
@@ -272,7 +272,7 @@ fn read_uncommitted_sees_dirty_write() {
 
     // Writer: put dirty value, then hold the transaction open.
     let writer = thread::spawn(move || {
-        let txn = env_w.begin_transaction(None, None).unwrap();
+        let txn = env_w.begin_transaction(None).unwrap();
         db_w.put(
             Some(&txn),
             &DatabaseEntry::from_bytes(b"key"),
@@ -569,7 +569,7 @@ fn txn_abort_insert_not_visible() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open(&dir);
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let (k, v) = kv(42, 999);
     db.put(Some(&txn), &k, &v).unwrap();
     txn.abort().unwrap();
@@ -594,7 +594,7 @@ fn txn_abort_update_restores_original_value() {
     db.put(None, &k, &v_orig).unwrap();
 
     // Update within a transaction, then abort.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&200u32.to_be_bytes()))
         .unwrap();
     txn.abort().unwrap();
@@ -619,7 +619,7 @@ fn txn_abort_delete_restores_record() {
     let (k, v) = kv(7, 777);
     db.put(None, &k, &v).unwrap();
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     db.delete(Some(&txn), &k).unwrap();
     txn.abort().unwrap();
 
@@ -646,7 +646,7 @@ fn txn_abort_multiple_ops_restores_prior_state() {
         db.put(None, &k, &v).unwrap();
     }
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     // Insert new key 10.
     db.put(
         Some(&txn),
@@ -895,7 +895,7 @@ fn read_committed_allows_non_repeatable_read() {
 
     // Establish initial value.
     {
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         db.put(
             Some(&txn),
             &DatabaseEntry::from_bytes(b"key"),
@@ -914,7 +914,7 @@ fn read_committed_allows_non_repeatable_read() {
 
     let writer = thread::spawn(move || {
         b1.wait(); // wait until T1 has done its first read
-        let txn = env2.begin_transaction(None, None).unwrap();
+        let txn = env2.begin_transaction(None).unwrap();
         db2.put(
             Some(&txn),
             &DatabaseEntry::from_bytes(b"key"),
@@ -927,7 +927,7 @@ fn read_committed_allows_non_repeatable_read() {
 
     // T1: read-committed transaction.
     let rc_cfg = TransactionConfig::read_committed();
-    let txn1 = env.begin_transaction(None, Some(&rc_cfg)).unwrap();
+    let txn1 = env.begin_transaction(Some(&rc_cfg)).unwrap();
 
     let mut out = DatabaseEntry::new();
     // First read: must see v1.
@@ -974,7 +974,7 @@ fn serializable_isolation_repeatable_read() {
     let db = Arc::new(env.open_database(None, "test", &db_cfg).unwrap());
 
     {
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         db.put(
             Some(&txn),
             &DatabaseEntry::from_bytes(b"key"),
@@ -985,7 +985,7 @@ fn serializable_isolation_repeatable_read() {
     }
 
     // T1 reads key under serializable (holds read lock).
-    let txn1 = env.begin_transaction(None, None).unwrap();
+    let txn1 = env.begin_transaction(None).unwrap();
     let mut out = DatabaseEntry::new();
     db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out).unwrap();
     let first_read = out.data().to_vec();
@@ -1000,7 +1000,7 @@ fn serializable_isolation_repeatable_read() {
     let writer = thread::spawn(move || {
         // Use no_wait to avoid indefinite blocking in test.
         let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
-        let txn2 = env2.begin_transaction(None, Some(&no_wait_cfg)).unwrap();
+        let txn2 = env2.begin_transaction(Some(&no_wait_cfg)).unwrap();
         bs.wait();
         // This should fail because T1 holds a read lock.
         let result = db2.put(

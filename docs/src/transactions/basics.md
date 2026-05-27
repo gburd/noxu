@@ -188,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = DatabaseEntry::from_bytes(b"thedata");
 
     // Begin a transaction.
-    let txn = env.begin_transaction(None, None)?;
+    let txn = env.begin_transaction(None)?;
 
     // Perform the write under the transaction.
     match db.put(Some(&txn), &key, &data) {
@@ -251,7 +251,7 @@ Aborting a transaction discards all database writes made under its protection. T
 database is left in the state it was in before the transaction began.
 
 ```rust
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 
 // ... perform some operations ...
 
@@ -269,7 +269,7 @@ const MAX_RETRIES: u32 = 10;
 let mut retries = 0;
 
 loop {
-    let txn = env.begin_transaction(None, None)?;
+    let txn = env.begin_transaction(None)?;
 
     let result = (|| -> Result<(), NoxuError> {
         let key = DatabaseEntry::from_bytes(b"mykey");
@@ -347,7 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Override durability for a specific transaction using NO_SYNC.
     let txn_config = TransactionConfig::new()
         .with_durability(Durability::COMMIT_NO_SYNC);
-    let txn = env.begin_transaction(None, Some(&txn_config))?;
+    let txn = env.begin_transaction(Some(&txn_config))?;
 
     let key = DatabaseEntry::from_bytes(b"thekey");
     let data = DatabaseEntry::from_bytes(b"thedata");

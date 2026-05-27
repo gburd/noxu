@@ -70,7 +70,7 @@ fn test_concurrent_reads_do_not_block() {
             barrier_clone.wait(); // all start together
 
             // Every reader opens its own transaction so the locking is real.
-            let txn = env_clone.begin_transaction(None, None).unwrap();
+            let txn = env_clone.begin_transaction(None).unwrap();
             for i in 0u8..20 {
                 let k = DatabaseEntry::from_bytes(&[i]);
                 let mut out = DatabaseEntry::new();
@@ -128,7 +128,7 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
     let b_w = Arc::clone(&barrier);
 
     let writer_handle = thread::spawn(move || {
-        let txn = env_w.begin_transaction(None, None).unwrap();
+        let txn = env_w.begin_transaction(None).unwrap();
         db_w.put(
             Some(&txn),
             &DatabaseEntry::from_bytes(key_bytes),
@@ -179,7 +179,7 @@ fn test_aborted_transaction_writes_not_visible() {
     let key = DatabaseEntry::from_bytes(b"abort_key");
     let val = DatabaseEntry::from_bytes(b"abort_val");
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     db.put(Some(&txn), &key, &val).unwrap();
     txn.abort().unwrap();
 
@@ -201,7 +201,7 @@ fn test_atomic_commit_all_keys_visible() {
     let (env, db) = open_env_and_db(&dir);
 
     const N: usize = 50;
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     for i in 0..N {
         let k = format!("batch_key_{:03}", i).into_bytes();
         let v = format!("batch_val_{:03}", i).into_bytes();
@@ -258,7 +258,7 @@ fn test_concurrent_writes_disjoint_keys() {
         handles.push(thread::spawn(move || {
             b_clone.wait();
 
-            let txn = env_clone.begin_transaction(None, None).unwrap();
+            let txn = env_clone.begin_transaction(None).unwrap();
             for k in 0..KEYS_PER_THREAD {
                 // Each thread writes to a non-overlapping key space.
                 let key_num = t * KEYS_PER_THREAD + k;
@@ -356,7 +356,7 @@ fn test_concurrent_inserts_then_full_scan() {
         let b_clone = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             b_clone.wait();
-            let txn = env_clone.begin_transaction(None, None).unwrap();
+            let txn = env_clone.begin_transaction(None).unwrap();
             for k in 0..KEYS_PER_THREAD {
                 let key_num = t * KEYS_PER_THREAD + k;
                 let key = format!("scan_{:06}", key_num).into_bytes();
@@ -466,7 +466,7 @@ fn test_concurrent_overlapping_writes_abort_does_not_clobber_commit() {
 
     let t2 = thread::spawn(move || {
         // T2: begin, write, signal T1, commit.
-        let txn2 = env2.begin_transaction(None, None).unwrap();
+        let txn2 = env2.begin_transaction(None).unwrap();
         let k2 = DatabaseEntry::from_bytes(b"contended_key");
         let v2 = DatabaseEntry::from_bytes(b"t2_value");
         db2.put(Some(&txn2), &k2, &v2).unwrap();
@@ -480,7 +480,7 @@ fn test_concurrent_overlapping_writes_abort_does_not_clobber_commit() {
     // write lock), then abort once T2 commits and releases the lock.
     barrier.wait();
     // T2 holds the write lock; T1's put will block until T2 commits.
-    let txn1 = env.begin_transaction(None, None).unwrap();
+    let txn1 = env.begin_transaction(None).unwrap();
     let k1 = DatabaseEntry::from_bytes(b"contended_key");
     let v1 = DatabaseEntry::from_bytes(b"t1_aborted_value");
     db.put(Some(&txn1), &k1, &v1).unwrap();
@@ -527,7 +527,7 @@ fn test_reader_sees_before_image_after_concurrent_writer_aborts() {
     let db_w = Arc::clone(&db);
 
     let writer = thread::spawn(move || {
-        let txn = env_w.begin_transaction(None, None).unwrap();
+        let txn = env_w.begin_transaction(None).unwrap();
         let k = DatabaseEntry::from_bytes(b"abort_race_key");
         let v = DatabaseEntry::from_bytes(b"in_flight");
         db_w.put(Some(&txn), &k, &v).unwrap();

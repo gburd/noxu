@@ -296,7 +296,7 @@ fn test_dup_cursor_txn_isolation() {
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
     // Write under a transaction and commit.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"iso_key");
     db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(b"v1")).unwrap();
     txn.commit().unwrap();

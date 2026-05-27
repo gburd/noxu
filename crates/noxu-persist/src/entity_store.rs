@@ -575,7 +575,7 @@ fn stream_evolve_class(
 
     // Open a write transaction unless the env or store is non-transactional.
     let txn: Option<Transaction> = if transactional {
-        Some(env.begin_transaction(None, None)?)
+        Some(env.begin_transaction(None)?)
     } else {
         None
     };

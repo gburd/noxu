@@ -82,7 +82,7 @@ the BDB-JE `StoredList.remove(int index)` contract and
 Every method takes `Option<&Transaction>`:
 
 ```rust,ignore
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 list.push(Some(&txn), &"first".to_string())?;
 list.push(Some(&txn), &"second".to_string())?;
 let len = list.len(Some(&txn))?;
