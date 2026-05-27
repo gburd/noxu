@@ -338,7 +338,11 @@ impl Database {
     /// in `Transaction::abort()` but specialised for the
     /// single-database `with_auto_txn` case so we do not need to thread
     /// the env-impl in.
-    fn apply_auto_txn_undo(&self, undo_records: Vec<UndoRecord>) {
+    fn apply_auto_txn_undo(&self, mut undo_records: Vec<UndoRecord>) {
+        // Apply newest-LSN first so multi-step writes (delete + reinsert)
+        // unwind in reverse-operation order.  See the matching sort in
+        // `Transaction::abort()`.
+        undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
         let db_id_match = self.id;
         let db_guard = self.db_impl.read();
         let Some(tree) = db_guard.get_real_tree() else { return };
@@ -355,7 +359,14 @@ impl Database {
                 }
             } else if let Some(abort_data) = undo.abort_data {
                 let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
-                let _ = tree.insert(abort_key, abort_data, lsn);
+                if let Ok(is_new) = tree.insert(abort_key, abort_data, lsn)
+                    && is_new
+                {
+                    // Restoring a slot that the aborted txn had deleted:
+                    // re-bump the counter that the in-memory delete
+                    // already decremented.
+                    db_guard.increment_entry_count();
+                }
             }
         }
     }
