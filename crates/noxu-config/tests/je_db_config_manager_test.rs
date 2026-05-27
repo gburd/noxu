@@ -33,8 +33,12 @@ fn test_basic_params() {
     let mut mgr = ConfigManager::new();
 
     // EnvironmentConfig.setCacheSize(2000) maps to MAX_MEMORY = 2000.
-    mgr.set(params::MAX_MEMORY.name, ParamValue::Long(2000), /* is_open = */ false)
-        .expect("setting MAX_MEMORY=2000 must succeed");
+    mgr.set(
+        params::MAX_MEMORY.name,
+        ParamValue::Long(2000),
+        /* is_open = */ false,
+    )
+    .expect("setting MAX_MEMORY=2000 must succeed");
 
     // Long override is returned.
     assert_eq!(
@@ -91,8 +95,7 @@ fn test_is_overridden_state_machine() {
         !mgr.is_overridden(params::SHARED_CACHE.name),
         "fresh manager: SHARED_CACHE must not be overridden"
     );
-    mgr.set(params::SHARED_CACHE.name, ParamValue::Bool(true), false)
-        .unwrap();
+    mgr.set(params::SHARED_CACHE.name, ParamValue::Bool(true), false).unwrap();
     assert!(mgr.is_overridden(params::SHARED_CACHE.name));
     assert!(mgr.get_bool(&params::SHARED_CACHE));
 }

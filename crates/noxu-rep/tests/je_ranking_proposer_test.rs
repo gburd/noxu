@@ -50,18 +50,24 @@ fn choose_phase2_value(promises: &[Proposal]) -> Option<Proposal> {
 #[test]
 fn test_phase2_two_nodes() {
     // (NODE,100) + (NODE,100) -> NODE
-    let r =
-        choose_phase2_value(&[promise(NODE_NAME, 100, 1), promise(NODE_NAME, 100, 1)]);
+    let r = choose_phase2_value(&[
+        promise(NODE_NAME, 100, 1),
+        promise(NODE_NAME, 100, 1),
+    ]);
     assert_eq!(r.unwrap().node_name, NODE_NAME);
 
     // (NODE,100) + (NODE,200) -> NODE
-    let r =
-        choose_phase2_value(&[promise(NODE_NAME, 100, 1), promise(NODE_NAME, 200, 1)]);
+    let r = choose_phase2_value(&[
+        promise(NODE_NAME, 100, 1),
+        promise(NODE_NAME, 200, 1),
+    ]);
     assert_eq!(r.unwrap().node_name, NODE_NAME);
 
     // (NODE,200) + (NODE,100) -> NODE
-    let r =
-        choose_phase2_value(&[promise(NODE_NAME, 200, 1), promise(NODE_NAME, 100, 1)]);
+    let r = choose_phase2_value(&[
+        promise(NODE_NAME, 200, 1),
+        promise(NODE_NAME, 100, 1),
+    ]);
     assert_eq!(r.unwrap().node_name, NODE_NAME);
 }
 

@@ -126,10 +126,7 @@ fn test_key_prefix_invariants() {
     // (1) Disjoint first byte: None.
     assert_eq!(create_key_prefix(b"x", b"y"), None);
     // (2) k1 itself is a prefix of k2: prefix is k1.
-    assert_eq!(
-        create_key_prefix(b"abc", b"abcdef"),
-        Some(b"abc".to_vec())
-    );
+    assert_eq!(create_key_prefix(b"abc", b"abcdef"), Some(b"abc".to_vec()));
     // (3) k1 == k2: prefix is k1.
     assert_eq!(create_key_prefix(b"abc", b"abc"), Some(b"abc".to_vec()));
     // (4) Empty inputs: no prefix.
