@@ -2,6 +2,7 @@
 //!
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use noxu_db::{Database, DatabaseEntry, OperationStatus, Transaction};
@@ -9,6 +10,8 @@ use noxu_db::{Database, DatabaseEntry, OperationStatus, Transaction};
 use crate::entity::{Entity, PrimaryKey};
 use crate::entity_serializer::EntitySerializer;
 use crate::error::{PersistError, Result};
+use crate::evolve::envelope;
+use crate::evolve::mutations::Mutations;
 use crate::secondary_index::{
     SecondaryIndex, SecondaryIndexMaintainer, SecondaryRegistration,
     make_secondary_index,
@@ -29,6 +32,17 @@ use crate::secondary_index::{
 /// * `E` - The entity type (must implement `Entity` with `PrimaryKey = K`)
 pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     db: &'db Database,
+    /// Schema-evolution mutations (Wave 2C-2).
+    ///
+    /// Plumbed in from `EntityStore` via [`PrimaryIndex::with_mutations`].
+    /// On every `get` / iteration, the per-record class version peeled
+    /// from the on-disk envelope and `mutations` are passed to
+    /// [`EntitySerializer::deserialize_versioned`] so user serializers
+    /// can do field-level evolution on read.  Defaults to a shared
+    /// empty `Mutations`, which makes
+    /// `deserialize_versioned`'s default impl behave identically to
+    /// `deserialize`.
+    mutations: Arc<Mutations>,
     /// Secondary index maintainers registered via `open_secondary_index`.
     ///
     /// Each secondary index deposits a `SecondaryRegistration` here. On every
@@ -51,13 +65,32 @@ where
     E: Entity<PrimaryKey = K> + Clone + Send + Sync + 'static,
 {
     /// Creates a new `PrimaryIndex` wrapping the given database.
+    ///
+    /// The new index has no [`Mutations`] registered; field-level
+    /// schema evolution will not be available on read.  Use
+    /// [`Self::with_mutations`] to attach a mutations set.
     pub fn new(db: &'db Database) -> Self {
+        Self::with_mutations(db, Arc::new(Mutations::new()))
+    }
+
+    /// Creates a new `PrimaryIndex` wrapping the given database and
+    /// remembering the mutations set for read-side evolution.
+    pub fn with_mutations(
+        db: &'db Database,
+        mutations: Arc<Mutations>,
+    ) -> Self {
         Self {
             db,
+            mutations,
             secondaries: Vec::new(),
             warned_secondaries_non_txn: AtomicBool::new(false),
             _phantom: PhantomData,
         }
+    }
+
+    /// Returns a clone of the registered mutations Arc.
+    pub fn mutations(&self) -> &Arc<Mutations> {
+        &self.mutations
     }
 
     /// Emit a one-shot operator warning when a primary write occurs inside
@@ -194,12 +227,53 @@ where
                         "empty data from database".to_string(),
                     )
                 })?;
-                let entity = serializer.deserialize(bytes)?;
+                let entity = self.decode_record(bytes, serializer)?;
                 Ok(Some(entity))
             }
             OperationStatus::NotFound => Ok(None),
             OperationStatus::KeyExists => Ok(None),
         }
+    }
+
+    /// Decodes a raw on-disk record into an entity, peeling the
+    /// per-record class-version envelope and dispatching to
+    /// [`EntitySerializer::deserialize_versioned`].
+    ///
+    /// Pre-Wave-2C-2 records had no envelope; the migration guide
+    /// describes the dump-and-reload procedure.  We fail loudly
+    /// (rather than silently misinterpreting old bytes) when the
+    /// embedded class tag does not match `E::entity_name()`,
+    /// **unless** a [`crate::evolve::Renamer::for_class`] mutation
+    /// remaps the on-disk tag to `E::entity_name()`.
+    fn decode_record<S: EntitySerializer<E>>(
+        &self,
+        bytes: &[u8],
+        serializer: &S,
+    ) -> Result<E> {
+        let dec = envelope::decode(bytes)?;
+        let expected_tag = E::entity_name();
+        if dec.class_tag != expected_tag {
+            // Look for a class-level renamer that maps the on-disk tag to
+            // the current entity name.  Any version is accepted (we walk
+            // the registered renamers).
+            let renamed = self.mutations.renamers().any(|r| {
+                r.field_name().is_none()
+                    && r.class_name() == dec.class_tag
+                    && r.new_name() == expected_tag
+            });
+            if !renamed {
+                return Err(PersistError::SerializationError(format!(
+                    "entity class tag mismatch: on-disk '{}' != \
+                     expected '{}' (no Renamer registered)",
+                    dec.class_tag, expected_tag,
+                )));
+            }
+        }
+        serializer.deserialize_versioned(
+            dec.payload,
+            dec.class_version,
+            self.mutations.as_ref(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -241,8 +315,10 @@ where
 
         let key_bytes = entity.primary_key().to_bytes();
         let key_entry = DatabaseEntry::from_vec(key_bytes);
-        let data_bytes = serializer.serialize(entity)?;
-        let data_entry = DatabaseEntry::from_vec(data_bytes);
+        let payload = serializer.serialize(entity)?;
+        let envelope_bytes =
+            envelope::encode(E::class_version(), E::entity_name(), &payload)?;
+        let data_entry = DatabaseEntry::from_vec(envelope_bytes);
 
         self.db.put(txn, &key_entry, &data_entry)?;
 
@@ -276,8 +352,10 @@ where
 
         let key_bytes = entity.primary_key().to_bytes();
         let key_entry = DatabaseEntry::from_vec(key_bytes);
-        let data_bytes = serializer.serialize(entity)?;
-        let data_entry = DatabaseEntry::from_vec(data_bytes);
+        let payload = serializer.serialize(entity)?;
+        let envelope_bytes =
+            envelope::encode(E::class_version(), E::entity_name(), &payload)?;
+        let data_entry = DatabaseEntry::from_vec(envelope_bytes);
 
         let status = self.db.put_no_overwrite(txn, &key_entry, &data_entry)?;
         let inserted = status == OperationStatus::Success;
@@ -394,6 +472,7 @@ where
         Ok(EntityIterator {
             cursor,
             serializer,
+            mutations: Arc::clone(&self.mutations),
             started: false,
             done: false,
             _phantom: PhantomData,
@@ -436,6 +515,11 @@ where
 pub struct EntityIterator<'a, K, E, S> {
     cursor: noxu_db::Cursor,
     serializer: &'a S,
+    /// Schema-evolution mutations cloned from the parent
+    /// [`PrimaryIndex`].  Passed to
+    /// [`EntitySerializer::deserialize_versioned`] for each record so
+    /// users can do field-level evolution while iterating.
+    mutations: Arc<Mutations>,
     started: bool,
     done: bool,
     _phantom: PhantomData<(K, E)>,
@@ -472,7 +556,11 @@ impl<'a, K: PrimaryKey, E: Entity<PrimaryKey = K>, S: EntitySerializer<E>>
                         )));
                     }
                 };
-                Some(self.serializer.deserialize(bytes))
+                Some(decode_iter_record::<E, S>(
+                    bytes,
+                    self.serializer,
+                    self.mutations.as_ref(),
+                ))
             }
             Ok(_) => {
                 self.done = true;
@@ -484,6 +572,37 @@ impl<'a, K: PrimaryKey, E: Entity<PrimaryKey = K>, S: EntitySerializer<E>>
             }
         }
     }
+}
+
+/// Free function variant of `PrimaryIndex::decode_record` used by
+/// `EntityIterator`, which cannot easily borrow the `PrimaryIndex` due
+/// to lifetime constraints on the iterator itself.
+fn decode_iter_record<E, S>(
+    bytes: &[u8],
+    serializer: &S,
+    mutations: &Mutations,
+) -> Result<E>
+where
+    E: Entity,
+    S: EntitySerializer<E>,
+{
+    let dec = envelope::decode(bytes)?;
+    let expected_tag = E::entity_name();
+    if dec.class_tag != expected_tag {
+        let renamed = mutations.renamers().any(|r| {
+            r.field_name().is_none()
+                && r.class_name() == dec.class_tag
+                && r.new_name() == expected_tag
+        });
+        if !renamed {
+            return Err(PersistError::SerializationError(format!(
+                "entity class tag mismatch: on-disk '{}' != expected '{}' \
+                 (no Renamer registered)",
+                dec.class_tag, expected_tag,
+            )));
+        }
+    }
+    serializer.deserialize_versioned(dec.payload, dec.class_version, mutations)
 }
 
 impl<K, E, S> Drop for EntityIterator<'_, K, E, S> {

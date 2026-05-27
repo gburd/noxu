@@ -116,3 +116,4 @@
   - [Wave 1C — audit Low/Info cleanup](internal/wave1c-audit-low-info-cleanup-2026-05.md)
   - [Wave 2B — Collections typed API and txn threading](internal/wave-2b-collections-typed.md)
   - [Wave 2C-1 — DPL derive macros](internal/wave-2c-1-derive-macro.md)
+  - [Wave 2C-2 — DPL schema evolution](internal/wave-2c-2-dpl-evolution.md)

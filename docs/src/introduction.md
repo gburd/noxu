@@ -51,6 +51,7 @@ Sprint 1–3 restriction notes
 | Schema evolution for `SerdeBinding` (read older struct shapes) | ❌ (header catches inter-format drift only) | ✅ | ✅ |
 | DPL primary-index reads/writes participate in user txn (`PrimaryIndex::{put,get,delete,…}(txn, …)`) | ✅ (Sprint 3B — BREAKING source-level signature change) | ✅ | ✅ |
 | DPL `#[derive(Entity)]` / `#[derive(PrimaryKey)]` / `#[derive(SecondaryKey)]` proc-macros | ❌ (manual `impl` only) | ✅ (Wave 2C-1) | ✅ |
+| DPL schema evolution (Mutations wired into open path; Renamer / Deleter / Converter; per-record class-version envelope) | ✅ (Wave 2C-2 — BREAKING on-disk shape vs. pre-v1.6) | ✅ | ✅ |
 | DPL secondary indexes are durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ | ✅ |
 | DPL secondary updates atomic with user txn        | ❌ (`PersistError::SecondariesNotTransactional` warning) | ✅ | ✅ |
 | Replication — single-process election test, 2-node sync, FPaxos shape | preview | refined | GA |

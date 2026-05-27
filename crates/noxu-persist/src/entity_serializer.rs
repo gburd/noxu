@@ -7,6 +7,7 @@
 
 use crate::entity::Entity;
 use crate::error::Result;
+use crate::evolve::mutations::Mutations;
 
 /// Trait for serializing and deserializing entities to and from bytes.
 ///
@@ -61,6 +62,38 @@ pub trait EntitySerializer<E: Entity> {
     /// # Errors
     /// Returns `PersistError::SerializationError` if the bytes cannot be deserialized.
     fn deserialize(&self, bytes: &[u8]) -> Result<E>;
+
+    /// Deserializes an entity given the class version the bytes were
+    /// written under, plus a reference to the registered
+    /// [`Mutations`] (Wave 2C-2).
+    ///
+    /// The default implementation ignores the version and the
+    /// mutations and delegates to [`Self::deserialize`].  Override
+    /// this method when you need field-level schema evolution
+    /// (renamer / deleter / converter for individual fields) — switch
+    /// on `class_version` to call the right decoding logic for
+    /// records written by that version, optionally consulting
+    /// `mutations` for field-level transforms.
+    ///
+    /// At the persistence layer, [`crate::primary_index::PrimaryIndex`]
+    /// always strips the on-disk envelope (which carries
+    /// `class_version`) before invoking this method, so the `bytes`
+    /// passed here are the raw payload your `serialize` method
+    /// emitted.
+    ///
+    /// # Errors
+    /// Returns `PersistError::SerializationError` if the bytes cannot be
+    /// deserialized for the given version.
+    fn deserialize_versioned(
+        &self,
+        bytes: &[u8],
+        class_version: u16,
+        mutations: &Mutations,
+    ) -> Result<E> {
+        let _ = class_version;
+        let _ = mutations;
+        self.deserialize(bytes)
+    }
 }
 
 #[cfg(test)]
