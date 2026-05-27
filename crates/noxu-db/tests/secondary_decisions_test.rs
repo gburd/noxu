@@ -1380,3 +1380,104 @@ fn wave2a_step5_delete_one_dup_leaves_others() {
     found_pks.sort();
     assert_eq!(found_pks, vec![b"pk1".to_vec(), b"pk3".to_vec()]);
 }
+
+// ─── Wave 2A step 6 — primary update path (delete-old + insert-new) ─
+
+/// Updating an existing primary record's data so that the secondary
+/// key changes: the OLD secondary entry must be removed and the NEW
+/// secondary entry inserted, all inside the same txn.
+#[test]
+fn wave2a_step6_primary_update_swaps_old_and_new_sec_keys() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Apple"))
+        .unwrap();
+
+    // Sanity: 'A' maps to pk1.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::Success
+    );
+
+    // Update: change the primary value so the sec_key flips to 'B'.
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Banana"))
+        .unwrap();
+
+    // Old key 'A' must be gone.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound,
+        "update must remove the old secondary key 'A'"
+    );
+
+    // New key 'B' must be present and resolve to pk1 / Banana.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Banana");
+}
+
+/// Update where the secondary key does NOT change (same first byte) —
+/// the dup is preserved, no spurious delete-and-reinsert.
+#[test]
+fn wave2a_step6_update_same_sec_key_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Apple"))
+        .unwrap();
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Apricot"))
+        .unwrap();
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Apricot");
+}

@@ -746,24 +746,51 @@ impl Database {
 
         match txn {
             Some(t) => {
+                // Wave 2A step 6: snapshot the existing primary record
+                // so an update fans `(old_sec_key, pk)` deletion AND
+                // `(new_sec_key, pk)` insertion out to attached
+                // secondaries.  Skip the read entirely when there are
+                // no secondaries to keep the no-secondary hot path free
+                // of an extra get().
+                let has_secondaries = !self.secondaries.lock().is_empty();
+                let old_data: Option<DatabaseEntry> = if has_secondaries {
+                    let mut tmp = DatabaseEntry::new();
+                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    match self.get(Some(t), &pri_key_entry, &mut tmp)? {
+                        OperationStatus::Success => Some(tmp),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let mut cursor = self.make_cursor_for_txn(t);
                 cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
                     |e| NoxuError::OperationNotAllowed(e.to_string()),
                 )?;
-                // Wave 2A step 4: fan the primary write out to every
-                // attached secondary inside the user's txn so the
-                // primary record and the secondary index entry commit
-                // / abort together.
-                let new_data_entry = DatabaseEntry::from_bytes(data_bytes);
-                let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
-                self.fan_out_to_secondaries(
-                    Some(t),
-                    &pri_key_entry,
-                    None,
-                    Some(&new_data_entry),
-                )?;
+                if has_secondaries {
+                    let new_data_entry =
+                        DatabaseEntry::from_bytes(data_bytes);
+                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    self.fan_out_to_secondaries(
+                        Some(t),
+                        &pri_key_entry,
+                        old_data.as_ref(),
+                        Some(&new_data_entry),
+                    )?;
+                }
             }
             None => {
+                let has_secondaries = !self.secondaries.lock().is_empty();
+                let old_data: Option<DatabaseEntry> = if has_secondaries {
+                    let mut tmp = DatabaseEntry::new();
+                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    match self.get(None, &pri_key_entry, &mut tmp)? {
+                        OperationStatus::Success => Some(tmp),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 // Wrap the write in a synthetic auto-commit `Txn` so the
                 // lock manager sees a typed locker id ("auto-txn:<id>")
                 // and any error rolls back the in-memory tree write
@@ -776,15 +803,18 @@ impl Database {
                         .map_err(|e| {
                             NoxuError::OperationNotAllowed(e.to_string())
                         })?;
-                    let new_data_entry =
-                        DatabaseEntry::from_bytes(data_bytes);
-                    let pri_key_entry = DatabaseEntry::from_bytes(key_bytes);
-                    self.fan_out_to_secondaries(
-                        Some(view),
-                        &pri_key_entry,
-                        None,
-                        Some(&new_data_entry),
-                    )?;
+                    if has_secondaries {
+                        let new_data_entry =
+                            DatabaseEntry::from_bytes(data_bytes);
+                        let pri_key_entry =
+                            DatabaseEntry::from_bytes(key_bytes);
+                        self.fan_out_to_secondaries(
+                            Some(view),
+                            &pri_key_entry,
+                            old_data.as_ref(),
+                            Some(&new_data_entry),
+                        )?;
+                    }
                     Ok(())
                 })?;
             }
