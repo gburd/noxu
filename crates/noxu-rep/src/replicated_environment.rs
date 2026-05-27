@@ -409,7 +409,27 @@ impl ReplicatedEnvironment {
         let env = Arc::new(Self::new(config)?);
         env.start_election_driver();
         env.start_vlsn_persistence_daemon();
+        env.register_admin_service();
         Ok(env)
+    }
+
+    /// Register the `ADMIN` service handler on the TCP dispatcher.
+    ///
+    /// Closes findings F7 / F8.  Holds a `Weak<Self>` so the handler
+    /// does not extend the env's lifetime.  Idempotent: re-registering
+    /// is harmless because `TcpServiceDispatcher::register` overwrites
+    /// the existing handler.
+    pub fn register_admin_service(self: &Arc<Self>) {
+        if let Some(ref dispatcher) = self.tcp_dispatcher {
+            crate::group_admin::register_admin_service(
+                dispatcher,
+                Arc::downgrade(self),
+            );
+            log::debug!(
+                "Node '{}' ADMIN service registered",
+                self.config.node_name,
+            );
+        }
     }
 
     /// Spawn the VLSN-index persistence daemon (F11).
@@ -1389,8 +1409,88 @@ impl ReplicatedEnvironment {
             config.target_node,
         );
 
-        // In a full implementation, this would coordinate with the target
-        // replica to complete the transfer. For now, we record the intent.
+        // Closes finding F7 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        //
+        // Steps:
+        //   1. Locate the target's address.
+        //   2. Compute the new term (current observed term + 1).
+        //   3. Send TRANSFER_MASTER to the target — it will become master.
+        //   4. Send TRANSFER_MASTER (with the same term + new master name) to
+        //      every other peer so they re-target.
+        //   5. Demote self to Replica of the target.
+        //
+        // The transfer is best-effort: a peer that doesn't ack is logged
+        // and skipped.  The election driver will reconcile any divergence
+        // on the next election round.
+
+        let target_addr = self
+            .group_service
+            .get_all_nodes()
+            .into_iter()
+            .find(|n| n.name == config.target_node)
+            .and_then(|n| {
+                format!("{}:{}", n.host, n.port)
+                    .parse::<std::net::SocketAddr>()
+                    .ok()
+            })
+            .ok_or_else(|| {
+                RepError::ConfigError(format!(
+                    "transfer_master: target '{}' not registered or has bad address",
+                    config.target_node
+                ))
+            })?;
+
+        let new_term = self
+            .master_tracker
+            .get_term()
+            .saturating_add(1);
+
+        // 1. Tell the target to become master at the new term.
+        let target_ack = crate::group_admin::send_transfer_master(
+            target_addr,
+            &config.target_node,
+            new_term,
+        )
+        .map_err(|e| {
+            RepError::NetworkError(format!(
+                "transfer_master: failed to signal target '{}': {}",
+                config.target_node, e
+            ))
+        })?;
+        if !target_ack {
+            return Err(RepError::StateError(format!(
+                "transfer_master: target '{}' rejected the transfer",
+                config.target_node
+            )));
+        }
+
+        // 2. Inform all other peers (best-effort).
+        for peer in self.group_service.get_all_nodes() {
+            if peer.name == self.config.node_name
+                || peer.name == config.target_node
+            {
+                continue;
+            }
+            if let Ok(addr) =
+                format!("{}:{}", peer.host, peer.port).parse()
+            {
+                let _ = crate::group_admin::send_transfer_master(
+                    addr,
+                    &config.target_node,
+                    new_term,
+                );
+            }
+        }
+
+        // 3. Demote self to Replica of the new master.
+        self.become_replica(&config.target_node)?;
+
+        log::info!(
+            "Node '{}' transferred master to '{}' at term {}",
+            self.config.node_name.as_str(),
+            config.target_node,
+            new_term,
+        );
         Ok(())
     }
 
@@ -1606,7 +1706,7 @@ impl ReplicatedEnvironment {
     /// logs, and then shuts them down.
     pub fn shutdown_group(
         &self,
-        _replica_shutdown_timeout_ms: u64,
+        replica_shutdown_timeout_ms: u64,
     ) -> Result<()> {
         if !self.is_master() {
             return Err(RepError::InvalidState(
@@ -1615,11 +1715,65 @@ impl ReplicatedEnvironment {
         }
 
         log::info!(
-            "Node '{}' shutting down replication group '{}'",
+            "Node '{}' shutting down replication group '{}' (replica_timeout={}ms)",
             self.config.node_name.as_str(),
-            self.config.group_name.as_str()
+            self.config.group_name.as_str(),
+            replica_shutdown_timeout_ms,
         );
 
+        // Closes finding F8 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        //
+        // Send SHUTDOWN_GROUP to every known peer.  The recipient calls
+        // its own `close()` and the per-connection ADMIN handler
+        // returns ACK_OK.  Any peer that doesn't ack within the
+        // timeout is logged and the master proceeds.  After signalling
+        // every peer, the master closes its own env.
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(replica_shutdown_timeout_ms);
+
+        for peer in self.group_service.get_all_nodes() {
+            if peer.name == self.config.node_name {
+                continue;
+            }
+            // Don't exceed the deadline waiting for any single peer.
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                log::warn!(
+                    "shutdown_group: deadline reached; skipping remaining peers"
+                );
+                break;
+            }
+            let addr_str = format!("{}:{}", peer.host, peer.port);
+            let addr = match addr_str.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!(
+                        "shutdown_group: peer '{}' has bad address {}: {}",
+                        peer.name,
+                        addr_str,
+                        e
+                    );
+                    continue;
+                }
+            };
+            match crate::group_admin::send_shutdown_group(addr) {
+                Ok(true) => log::info!(
+                    "shutdown_group: peer '{}' acknowledged",
+                    peer.name
+                ),
+                Ok(false) => log::warn!(
+                    "shutdown_group: peer '{}' rejected the request",
+                    peer.name
+                ),
+                Err(e) => log::warn!(
+                    "shutdown_group: peer '{}' unreachable: {}",
+                    peer.name,
+                    e
+                ),
+            }
+        }
+
+        // Master closes itself last.
         self.close()
     }
 
@@ -1914,16 +2068,22 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_master_as_master() {
+    fn test_transfer_master_requires_registered_target() {
+        // F7: transfer_master is no longer a no-op; it sends an ADMIN
+        // TRANSFER_MASTER signal to the target via TCP.  An unregistered
+        // target is rejected at the address-resolution step.
         let env = ReplicatedEnvironment::new(test_config("node1")).unwrap();
         env.become_master(1).unwrap();
 
         let config = MasterTransferConfig::new(
-            "replica1".to_string(),
+            "unknown_target".to_string(),
             Duration::from_secs(30),
         );
         let result = env.transfer_master(config);
-        assert!(result.is_ok());
+        assert!(
+            result.is_err(),
+            "transfer_master to unregistered target must error"
+        );
     }
 
     #[test]
