@@ -65,6 +65,30 @@ pub const SERDE_BINDING_HEADER_LEN: usize = 2;
 /// retrieved from database entries using this binding.  Each entry is
 /// prefixed with a 2-byte header; see the module docs for the format.
 ///
+/// # Schema management caveat (audit collections-bind F19, Wave 2C-4)
+///
+/// `SerdeBinding` does **not** carry a per-record schema descriptor.
+/// The 2-byte header guards against decoding records produced by an
+/// incompatible *wire format* (`BindError::VersionMismatch`), but it
+/// cannot detect changes in the *Rust struct* being serialised:
+///
+/// * Adding a struct field, removing a struct field, or reordering
+///   fields **silently corrupts** records written by an earlier
+///   build of the same binary — the deserializer walks the same
+///   field list, in the same order, with no field tags to anchor it.
+///
+/// JE's `SerialBinding` solved the same problem with a
+/// `StoredClassCatalog` keyed off a per-record class id; this crate
+/// has no equivalent today.  Two concrete mitigations:
+///
+/// 1. Keep the on-disk struct stable and add fields only via
+///    `Option<T>`-typed wrappers under a new top-level enum variant
+///    that you can match on at the application layer.
+/// 2. For schemas that need to evolve, use the DPL
+///    (`noxu-persist`) which has explicit `@KeyField` /
+///    `@SecondaryKey` annotation-driven evolution; see
+///    `docs/src/collections/entity-persistence.md`.
+///
 /// # Examples
 ///
 /// ```ignore
