@@ -142,6 +142,28 @@ impl VlsnIndex {
     pub fn bucket_count(&self) -> usize {
         self.buckets.read().len()
     }
+
+    /// Return the bucket stride this index was constructed with.
+    pub fn bucket_stride(&self) -> u32 {
+        self.bucket_stride
+    }
+
+    /// Snapshot every (vlsn, file_number, file_offset) tuple stored in the
+    /// index, in vlsn-ascending order.
+    ///
+    /// Used by the persistence layer (`vlsn::persist`) to flush the index
+    /// to disk.  Entries on stride boundaries are emitted exactly once;
+    /// the last vlsn in each bucket is also emitted (it is always stored).
+    pub fn snapshot_entries(&self) -> Vec<(u64, u32, u32)> {
+        let buckets = self.buckets.read();
+        let mut out: Vec<(u64, u32, u32)> = Vec::new();
+        for bucket in buckets.iter() {
+            bucket.append_entries(&mut out);
+        }
+        out.sort_unstable_by_key(|t| t.0);
+        out.dedup_by_key(|t| t.0);
+        out
+    }
 }
 
 impl std::fmt::Debug for VlsnIndex {
