@@ -265,12 +265,6 @@ fn cursor_edge_prev_no_dup_with_empty_tree() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "NOXU-BUG: an uncommitted delete in T1 is visible to other \
-    transactions as NotFound (no lock conflict).  An uncommitted *overwrite* \
-    correctly blocks a no-wait reader with a lock error, but an uncommitted \
-    *delete* does not — the deleted record's write-lock is not contested on \
-    read.  This is a dirty-read of a delete; JE's contract (LockNotAvailable) \
-    is violated.  See JE CursorEdgeTest.testReadDeletedUncommitted."]
 fn cursor_edge_read_deleted_uncommitted() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
