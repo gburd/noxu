@@ -6,15 +6,15 @@ this same directory (`je-tck-port-2026-05-enumeration-<package>.tsv`) for
 the row-by-row status, and see the per-wave narrative documents
 (`wave-4-b-je-tck-port-priority1.md`, …) for what changed in each wave.
 
-## Aggregate status (2026-05-27, after wave 8)
+## Aggregate status (2026-05-27, after wave 9-C)
 
 | Bucket | Count |
 |---|---:|
 | **Total** JE @Test methods enumerated | 2068 |
-| PORTED-EQUIVALENT | 205 |
-| PORTED-PARTIAL | 89 |
-| OUT-OF-SCOPE | 64 |
-| NOT-PORTED | 1710 |
+| PORTED-EQUIVALENT | 243 |
+| PORTED-PARTIAL | 96 |
+| OUT-OF-SCOPE | 77 |
+| NOT-PORTED | 1653 |
 
 "PORTED-EQUIVALENT" means a Rust test exists that asserts the same
 invariant as the JE original.  "PORTED-PARTIAL" means the Rust test
@@ -22,7 +22,8 @@ captures only a subset of the invariant (typically because Noxu's API
 surface is narrower) or is committed `#[ignore]`d to document a Noxu bug.
 "OUT-OF-SCOPE" rows are tests that depend on JE-internal classes Noxu
 does not expose, on features Noxu has dropped (custom byte comparators,
-JMX, JE-specific log versions), or on the JE-specific deployment
+JMX, JE-specific log versions, Java BigInteger/BigDecimal bindings,
+WeakHashMap GC semantics), or on the JE-specific deployment
 topology (e.g. some replication tests).
 
 ## Per-package counts
@@ -31,9 +32,9 @@ topology (e.g. some replication tests).
 |---|---:|---:|---:|---:|---:|
 | `bind.serial.test`                            |      7 |      7 |      0 |      0 |      0 |
 | `bind.test`                                   |      1 |      0 |      0 |      0 |      1 |
-| `bind.tuple.test`                             |     51 |     21 |      0 |      0 |     30 |
+| `bind.tuple.test`                             |     51 |     38 |      0 |      9 |      5 |
 | `collections.test.serial`                     |      4 |      0 |      0 |      0 |      4 |
-| `collections.test`                            |     23 |      4 |      0 |      0 |     19 |
+| `collections.test`                            |     23 |     12 |      0 |      3 |      8 |
 | `collections`                                 |      3 |      0 |      0 |      0 |      3 |
 | `je.cleaner`                                  |    158 |     10 |     17 |      0 |    131 |
 | `je.config`                                   |      2 |      2 |      0 |      0 |      0 |
@@ -42,9 +43,9 @@ topology (e.g. some replication tests).
 | `je.incomp`                                   |     29 |      0 |      0 |      0 |     29 |
 | `je.jmx`                                      |      8 |      0 |      0 |      8 |      0 |
 | `je.latch`                                    |      7 |      0 |      0 |      7 |      0 |
-| `je.log`                                      |     94 |      9 |      0 |      0 |     85 |
+| `je.log`                                      |     94 |     12 |      0 |      1 |     81 |
 | `je.logversion`                               |     15 |      0 |      0 |     15 |      0 |
-| `je.recovery`                                 |     66 |      9 |      3 |      0 |     54 |
+| `je.recovery`                                 |     66 |     11 |      3 |      0 |     52 |
 | `je.rep.arb`                                  |     21 |      0 |      0 |     21 |      0 |
 | `je.rep.dual.trigger`                         |      1 |      0 |      0 |      1 |      0 |
 | `je.rep.dupconvert`                           |      5 |      0 |      0 |      5 |      0 |
@@ -65,15 +66,15 @@ topology (e.g. some replication tests).
 | `je.rep.util`                                 |     36 |      1 |      0 |      0 |     35 |
 | `je.rep.vlsn`                                 |     38 |      8 |      3 |      0 |     27 |
 | `je.serializecompatibility`                   |      2 |      0 |      0 |      2 |      0 |
-| `je.test`                                     |    163 |      7 |      0 |      0 |    156 |
+| `je.test`                                     |    163 |      9 |      0 |      0 |    154 |
 | `je.tree`                                     |     73 |     13 |      0 |      0 |     60 |
 | `je.trigger`                                  |     22 |      1 |      0 |      0 |     21 |
-| `je`                                          |    199 |     29 |     22 |      1 |    147 |
-| `je.txn`                                      |     74 |      6 |     20 |      0 |     48 |
+| `je`                                          |    199 |     31 |     24 |      1 |    143 |
+| `je.txn`                                      |     74 |      8 |     21 |      0 |     45 |
 | `je.util.dbfilterstats`                       |      6 |      0 |      0 |      0 |      6 |
 | `je.utilint`                                  |     58 |     13 |      0 |      0 |     45 |
 | `je.util`                                     |     81 |      4 |      0 |      0 |     77 |
-| `persist.test`                                |     97 |      6 |      0 |      0 |     91 |
+| `persist.test`                                |     97 |      8 |      4 |      0 |     85 |
 | `utilint`                                     |     10 |      1 |      0 |      0 |      9 |
 | `util.test`                                   |      7 |      0 |      0 |      0 |      7 |
 
@@ -89,7 +90,7 @@ topology (e.g. some replication tests).
   No real Noxu bugs surfaced; one documented semantic difference
   (Noxu's `VlsnIndex::truncate_after` only removes whole buckets and
   clamps the range; JE's `VLSNBucket::removeFromTail` partially trims).
-* `wave-8-rep-testbase.md` — wave 8 (this wave): added the
+* `wave-8-rep-testbase.md` — wave 8: added the
   `RepTestBase` / `RepEnvInfo` in-memory test harness
   (`crates/noxu-rep/src/test_harness.rs`) and ported 36 heavy tests
   on top of it across `je.rep` (13), `je.rep.txn` (14 + 1 #[ignore]),
@@ -102,6 +103,16 @@ topology (e.g. some replication tests).
   were re-tagged PORTED-PARTIAL because Wave 8's harness-level analog
   is a subset of the JE original; this is honest accounting, not a
   regression.
+* `wave-9-c-je-tck-ports.md` — wave 9-C (this wave): added 34
+  substantive new ports across 6 test files plus 11 docs-only
+  re-tags of pre-existing analogues that the wave-1D name-match
+  heuristic had missed.  Coverage: 18 tuple binding/format/ordering
+  ports in `noxu-bind`, 7 cursor-edge / database-config / atomic-put
+  ports in `noxu-db`, 2 recovery ports, 3 deadlock / lock-conflict
+  ports in `noxu-txn`, 4 file-manager ports in `noxu-log`.  No real
+  Noxu bugs surfaced.  Net counts: PORTED-EQUIVALENT 205 → 243
+  (+38), PORTED-PARTIAL 89 → 96 (+7), OUT-OF-SCOPE 64 → 77 (+13),
+  NOT-PORTED 1710 → 1653 (-57).
 
 ## Methodology
 

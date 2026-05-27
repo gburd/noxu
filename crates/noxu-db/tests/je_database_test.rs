@@ -377,9 +377,8 @@ fn database_config_snapshot_after_open() {
     let env = noxu_db::Environment::open(env_cfg).unwrap();
 
     // Open dbA with allow_create=true, sorted_duplicates=false.
-    let cfg_a = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let cfg_a =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db_a = env.open_database(None, "foo", &cfg_a).unwrap();
 
     // Database stores its own copy: get_config still reports the
@@ -392,7 +391,7 @@ fn database_config_snapshot_after_open() {
     // Mutating a clone of the stored config does not affect the
     // database's view (the database returns &DatabaseConfig and
     // borrow-checks any direct mutation).
-    let mut other = stored.clone();
+    let mut other = stored;
     other.sorted_duplicates = true;
     let _ = &other;
     assert!(!db_a.get_config().sorted_duplicates);
@@ -422,9 +421,8 @@ fn database_config_is_transactional() {
 
     // Open transactional db with explicit transaction handle.
     let txn = env.begin_transaction(None).unwrap();
-    let cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(Some(&txn), "testDB2", &cfg).unwrap();
     assert!(db.get_config().transactional);
 
@@ -444,9 +442,8 @@ fn database_config_is_transactional() {
     )
     .unwrap();
     let mut out = DatabaseEntry::new();
-    let s = db
-        .get(Some(&txn), &DatabaseEntry::from_bytes(&[1]), &mut out)
-        .unwrap();
+    let s =
+        db.get(Some(&txn), &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
     assert_eq!(s, OperationStatus::Success);
     txn.commit().unwrap();
 
@@ -475,9 +472,8 @@ fn database_config_open_read_only_rejects_writes() {
     let env = noxu_db::Environment::open(env_cfg).unwrap();
 
     // Pre-populate the DB with k=0,d=0 under transactional+rw.
-    let cfg_rw = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let cfg_rw =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "testDB2", &cfg_rw).unwrap();
     db.put(
         None,
@@ -488,15 +484,15 @@ fn database_config_open_read_only_rejects_writes() {
     db.close().unwrap();
 
     // Re-open read-only.  Reads succeed.
-    let cfg_ro = DatabaseConfig::new()
-        .with_transactional(true)
-        .with_read_only(true);
+    let cfg_ro =
+        DatabaseConfig::new().with_transactional(true).with_read_only(true);
     let db_ro = env.open_database(None, "testDB2", &cfg_ro).unwrap();
     assert!(db_ro.get_config().read_only);
     assert!(db_ro.get_config().transactional);
 
     let mut out = DatabaseEntry::new();
-    let s = db_ro.get(None, &DatabaseEntry::from_bytes(&[0]), &mut out).unwrap();
+    let s =
+        db_ro.get(None, &DatabaseEntry::from_bytes(&[0]), &mut out).unwrap();
     assert_eq!(s, OperationStatus::Success);
     assert_eq!(out.data(), &[0]);
 

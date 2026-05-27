@@ -989,17 +989,8 @@ fn tck_tuple_ordering_test_chars() {
 /// lexicographic byte ordering.
 #[test]
 fn tck_tuple_ordering_test_bytes() {
-    let data: &[&[u8]] = &[
-        &[],
-        &[0],
-        &[b'a'],
-        &[b'a', 0],
-        &[b'a', b'b'],
-        &[b'b'],
-        &[b'b', b'b'],
-        &[0x7F],
-        &[0xFF],
-    ];
+    let data: &[&[u8]] =
+        &[&[], &[0], b"a", &[b'a', 0], b"ab", b"b", b"bb", &[0x7F], &[0xFF]];
     let mut prev: Option<Vec<u8>> = None;
     for (i, &v) in data.iter().enumerate() {
         let mut out = TupleOutput::new();
