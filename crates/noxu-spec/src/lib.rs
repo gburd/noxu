@@ -1,3 +1,8 @@
+// Copyright (C) 2024-2025 Greg Burd.  Licensed under either of the
+// Apache License, Version 2.0 or the MIT license, at your option.
+// See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
 //! Executable specifications for the noxu protocols.
 //!
 //! Each module in this crate is a [Stateright][1] model of a

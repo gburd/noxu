@@ -133,10 +133,20 @@ Jobs:
 
 | Job | What it checks |
 |-----|----------------|
-| `check` | `cargo fmt` + `cargo clippy` |
-| `test` | `cargo test` on Linux, macOS, Windows |
-| `cross` | `cargo check` on AArch64, ARMv7, RISC-V |
+| `check` | `cargo fmt` + `cargo clippy --all-features` |
+| `test` | `cargo test --no-fail-fast` (default features) on Linux, macOS, Windows |
+| `test-all-features` | `cargo test --all-features --no-fail-fast` on Linux |
+| `cross` | `cargo check` on AArch64, ARMv7, RISC-V (default features) |
 | `doc` | `cargo doc` + `mdbook build docs/` |
 | `spell` (docs.yml) | `typos docs/src/` |
 | `prose` (docs.yml) | `markdownlint-cli2` |
 | `build` (docs.yml) | `mdbook build` + lychee link check |
+
+The Forgejo (Codeberg) mirror at `.forgejo/workflows/test.yml` runs
+`check`, `test`, `test-all-features`, and `doc` on a single Linux
+runner; macOS and Windows coverage live only on the GitHub side.
+
+See [Wave 10-F — CI matrix expansion](../internal/wave-10-f-ci-matrix.md)
+for the design rationale (why `--all-features` runs on Linux only,
+why `cross` is `cargo check` only, and how the cache keys are
+partitioned across jobs).
