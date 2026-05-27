@@ -574,6 +574,91 @@ fn c3_primary_update_same_sec_key_is_idempotent() {
     assert_eq!(data.get_data().unwrap(), b"Avocado");
 }
 
+/// Multi-key creator with auto-maintenance: a primary record whose
+/// data byte set is `{A, B}` registers two secondary entries, both
+/// pointing at the primary, without any manual update_secondary call.
+/// Updating the primary to data `{B, C}` leaves the ‘A’ entry stale
+/// and removed, the ‘B’ entry intact (idempotent), and the ‘C’ entry
+/// freshly inserted.  Audit C3 × multi-key creators — step 7.
+#[test]
+fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
+    use noxu_db::secondary_config::SecondaryMultiKeyCreator;
+
+    struct EachByteCreator;
+    impl SecondaryMultiKeyCreator for EachByteCreator {
+        fn create_secondary_keys(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            results: &mut Vec<DatabaseEntry>,
+        ) {
+            if let Some(d) = data.get_data() {
+                for b in d {
+                    results.push(DatabaseEntry::from_bytes(&[*b]));
+                }
+            }
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "sec_mk");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_multi_key_creator(Box::new(EachByteCreator)),
+    )
+    .unwrap();
+
+    // Insert.
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"AB"))
+        .unwrap();
+    assert_eq!(sec.count().unwrap(), 2);
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    for byte in [b"A", b"B"] {
+        let st = sec
+            .get(None, &DatabaseEntry::from_bytes(byte), &mut p_key, &mut data)
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    }
+
+    // Update (data set goes A,B → B,C).
+    primary
+        .lock()
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"BC"))
+        .unwrap();
+    assert_eq!(
+        sec.count().unwrap(),
+        2,
+        "old ‘A’ entry must drop and ‘C’ must be added; ‘B’ stays"
+    );
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    for byte in [b"B", b"C"] {
+        let st = sec
+            .get(None, &DatabaseEntry::from_bytes(byte), &mut p_key, &mut data)
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    }
+
+    // Delete fans out to all three sec keys produced by the current data.
+    primary.lock().delete(None, &pk).unwrap();
+    assert_eq!(sec.count().unwrap(), 0);
+}
+
 // ─── Decision 2C — FK config rejected at open ──────────────────────────
 
 /// Setting `foreign_key_database` on a `SecondaryConfig` causes
