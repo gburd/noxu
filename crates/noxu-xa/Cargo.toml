@@ -1,15 +1,27 @@
 [package]
 name = "noxu-xa"
-version = "0.1.0"
+version.workspace = true
+# Pinned to edition 2021 (workspace is 2024) until a follow-up wave can
+# address the edition-2024 clippy lints (`collapsible_if` for `if let` chains)
+# that fire under the new edition. Tracked in
+# docs/src/internal/wave-10-e-cratesio-prep.md.
 edition = "2021"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "XA distributed transaction support for Noxu DB"
-license = "MIT OR Apache-2.0"
+# v2.3.0: every crate is `publish = false` while the workspace dependency graph
+# still uses `path = "..."` deps. See docs/src/internal/wave-10-e-cratesio-prep.md.
+publish = false
 
 [dependencies]
-noxu-db = { path = "../noxu-db" }
-noxu-txn = { path = "../noxu-txn" }
-thiserror = "2"
-log = "0.4"
+noxu-db = { workspace = true }
+noxu-txn = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
 hashbrown = { workspace = true }
 
 [dev-dependencies]
