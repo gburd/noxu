@@ -103,6 +103,13 @@ pub mod network_restore_server;
 pub mod replicated_environment;
 pub mod state_change_listener;
 
+// Test harness (in-memory `RepTestBase` / `RepEnvInfo` for porting JE
+// rep TCK tests).  Gated on the `test-harness` feature so it is not part
+// of the released API surface; auto-enabled for `cargo test` via the
+// dev-dependency self-feature trick in `Cargo.toml`.
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test_harness;
+
 // Re-export primary types
 pub use commit_durability::{CommitDurability, ReplicaAckPolicy};
 pub use consistency::ConsistencyPolicy;
