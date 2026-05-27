@@ -338,6 +338,185 @@ impl NetworkRestore {
         Ok(())
     }
 
+    /// Execute a network restore against a peer's `RESTORE` service
+    /// running on the `TcpServiceDispatcher`.
+    ///
+    /// Closes findings F2 / F4 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    ///
+    /// `execute()` (above) connects raw TCP and writes `RESTORE_MAGIC`,
+    /// which works only against the standalone `NetworkRestoreServer::start`
+    /// path.  Production replicated environments register the
+    /// `NetworkRestoreServer` as a `ServiceHandler` on the dispatcher;
+    /// the dispatcher first reads a length-prefixed service-name
+    /// handshake, then delegates to the handler.  The handler reads
+    /// `RESTORE_MAGIC` over the channel framing (not raw stream bytes)
+    /// and replies with a single framed payload.
+    ///
+    /// This method speaks that protocol: it goes through
+    /// `connect_to_service(RESTORE)`, sends the magic over the channel,
+    /// then receives one framed payload containing the entire
+    /// `[count][file_records...]` structure and decodes it into local
+    /// files.
+    pub fn execute_via_dispatcher(&self) -> Result<()> {
+        use crate::net::Channel;
+        use crate::net::service_dispatcher::connect_to_service;
+        use crate::network_restore_server::RESTORE_SERVICE_NAME;
+
+        // Validate state.
+        {
+            let state = self.state.lock();
+            if *state != RestoreState::NotStarted {
+                return Err(RepError::NetworkRestoreError(format!(
+                    "execute_via_dispatcher called in wrong state: {:?}",
+                    *state
+                )));
+            }
+        }
+
+        self.start()?;
+        let started_at = Instant::now();
+
+        let addr_str =
+            format!("{}:{}", self.config.source_host, self.config.source_port);
+        let addr: std::net::SocketAddr =
+            addr_str.parse().map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "bad source address {}: {}",
+                    addr_str, e
+                ))
+            })?;
+
+        let channel = connect_to_service(addr, RESTORE_SERVICE_NAME)
+            .map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "connect_to_service(RESTORE) at {}: {}",
+                    addr, e
+                ))
+            })?;
+
+        // Send the RESTORE magic over the channel framing.
+        channel.send(&RESTORE_MAGIC.to_le_bytes()).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "sending restore magic via dispatcher: {}",
+                e
+            ))
+        })?;
+
+        // Receive one framed payload containing the entire restore body.
+        let payload = channel
+            .receive(Duration::from_secs(120))
+            .map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "receiving restore payload: {}",
+                    e
+                ))
+            })?
+            .ok_or_else(|| {
+                RepError::NetworkRestoreError(
+                    "empty restore payload from dispatcher".to_string(),
+                )
+            })?;
+
+        // Decode the payload.
+        if payload.len() < 4 {
+            return Err(RepError::NetworkRestoreError(format!(
+                "truncated restore payload: {} bytes",
+                payload.len()
+            )));
+        }
+        let mut off = 0usize;
+        let mut buf4 = [0u8; 4];
+        buf4.copy_from_slice(&payload[off..off + 4]);
+        off += 4;
+        let file_count = u32::from_le_bytes(buf4);
+
+        let log_dir = self.local_log_dir.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+        std::fs::create_dir_all(&log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "creating log dir {}: {}",
+                log_dir.display(),
+                e
+            ))
+        })?;
+
+        let mut total_bytes: u64 = 0;
+        let mut files_done: u32 = 0;
+        let mut buf2 = [0u8; 2];
+        let mut buf8 = [0u8; 8];
+
+        for _ in 0..file_count {
+            if off + 2 > payload.len() {
+                return Err(RepError::NetworkRestoreError(
+                    "truncated restore payload at name_len".to_string(),
+                ));
+            }
+            buf2.copy_from_slice(&payload[off..off + 2]);
+            off += 2;
+            let name_len = u16::from_le_bytes(buf2) as usize;
+            if off + name_len + 8 > payload.len() {
+                return Err(RepError::NetworkRestoreError(
+                    "truncated restore payload at name+size".to_string(),
+                ));
+            }
+            let name_bytes = payload[off..off + name_len].to_vec();
+            off += name_len;
+            let filename = String::from_utf8(name_bytes).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "non-UTF8 filename: {}",
+                    e
+                ))
+            })?;
+            validate_restore_filename(&filename)?;
+
+            buf8.copy_from_slice(&payload[off..off + 8]);
+            off += 8;
+            let file_size = u64::from_le_bytes(buf8) as usize;
+            if off + file_size > payload.len() {
+                return Err(RepError::NetworkRestoreError(format!(
+                    "truncated restore payload at file body for {:?} \
+                     (need {} bytes, have {})",
+                    filename,
+                    file_size,
+                    payload.len() - off,
+                )));
+            }
+
+            let dest_path = log_dir.join(&filename);
+            if self.config.retain_log_files && dest_path.exists() {
+                let backup = log_dir.join(format!("{}.bak", filename));
+                let _ = std::fs::rename(&dest_path, &backup);
+            }
+
+            std::fs::write(&dest_path, &payload[off..off + file_size])
+                .map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "writing '{}': {}",
+                        dest_path.display(),
+                        e
+                    ))
+                })?;
+            off += file_size;
+            total_bytes += file_size as u64;
+            files_done += 1;
+            self.update_progress(total_bytes, files_done);
+            self.update_elapsed(started_at.elapsed());
+        }
+
+        self.update_elapsed(started_at.elapsed());
+        self.complete()?;
+
+        log::info!(
+            "NetworkRestore via dispatcher from {}: {} file(s), {} bytes in {:?}",
+            addr,
+            files_done,
+            total_bytes,
+            started_at.elapsed(),
+        );
+        Ok(())
+    }
+
     /// Mark the restore as in-progress.
     ///
     /// State-transition helper that moves the restore from

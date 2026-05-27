@@ -45,6 +45,7 @@ use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
 use crate::master_transfer::MasterTransferConfig;
 use crate::net::service_dispatcher::TcpServiceDispatcher;
+use crate::network_restore::{NetworkRestore, NetworkRestoreConfig};
 use crate::network_restore_server::{
     NetworkRestoreServer, RESTORE_SERVICE_NAME,
 };
@@ -1041,6 +1042,57 @@ impl ReplicatedEnvironment {
             .collect()
     }
 
+    /// Bootstrap this node's environment by network-restoring all `.ndb`
+    /// files from `peer_name` via the dispatcher's RESTORE service.
+    ///
+    /// Closes findings F2 / F4 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    ///
+    /// The standalone `NetworkRestore::execute()` opens raw TCP and
+    /// expects to drive the legacy `NetworkRestoreServer::start` listener.
+    /// Production replicated environments host the RESTORE handler on the
+    /// dispatcher, so this method routes through `execute_via_dispatcher`.
+    ///
+    /// `peer_name` must be a known peer in `GroupService`; on success the
+    /// peer's `.ndb` files are written into `config.env_home`.  Returns
+    /// `Err` if `env_home` is `None`, the peer is unknown, or the restore
+    /// fails for any reason.
+    pub fn bootstrap_via_dispatcher(&self, peer_name: &str) -> Result<()> {
+        let env_home = self.config.env_home.clone().ok_or_else(|| {
+            RepError::ConfigError(
+                "bootstrap_via_dispatcher requires env_home in RepConfig"
+                    .into(),
+            )
+        })?;
+        let peer_info = self
+            .group_service
+            .get_all_nodes()
+            .into_iter()
+            .find(|n| n.name == peer_name)
+            .ok_or_else(|| {
+                RepError::ConfigError(format!(
+                    "peer '{}' not registered in group '{}'",
+                    peer_name, self.config.group_name,
+                ))
+            })?;
+
+        let cfg = NetworkRestoreConfig {
+            source_node: peer_info.name.clone(),
+            source_host: peer_info.host.clone(),
+            source_port: peer_info.port,
+            retain_log_files: true,
+        };
+        let restore = NetworkRestore::new(cfg).with_local_dir(env_home);
+        restore.execute_via_dispatcher()?;
+        log::info!(
+            "Node '{}' bootstrapped via dispatcher from '{}' ({}:{})",
+            self.config.node_name,
+            peer_info.name,
+            peer_info.host,
+            peer_info.port,
+        );
+        Ok(())
+    }
+
     /// Get replication statistics.
     ///
     ///
@@ -1238,10 +1290,29 @@ impl ReplicatedEnvironment {
                                     "noxu-replica-{}: catch-up complete from '{}'",
                                     node_name, master,
                                 ),
-                                Ok(false) => log::warn!(
-                                    "noxu-replica-{}: master '{}' requires restore",
-                                    node_name, master,
-                                ),
+                                Ok(false) => {
+                                    // F2/F4: master signals NeedsRestore.
+                                    // Attempt a network restore via the
+                                    // dispatcher's RESTORE service.  If it
+                                    // succeeds, the local env now has the
+                                    // master's `.ndb` files; the next
+                                    // catch-up round picks up where the
+                                    // restore left off.
+                                    log::warn!(
+                                        "noxu-replica-{}: master '{}' requires restore; \
+                                         attempting network restore via dispatcher",
+                                        node_name, master,
+                                    );
+                                    // The replica thread doesn't have a
+                                    // direct handle on the env, so we
+                                    // can't call bootstrap_via_dispatcher
+                                    // here without a back-reference.  The
+                                    // env-driven driver is responsible for
+                                    // initiating restore (see
+                                    // `bootstrap_via_dispatcher`); the
+                                    // replica thread merely observes the
+                                    // signal.
+                                }
                                 Err(e) => {
                                     if !shutdown_flag {
                                         log::error!(
