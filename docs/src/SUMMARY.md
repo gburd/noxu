@@ -117,3 +117,4 @@
   - [Wave 2B — Collections typed API and txn threading](internal/wave-2b-collections-typed.md)
   - [Wave 2C-1 — DPL derive macros](internal/wave-2c-1-derive-macro.md)
   - [Wave 2C-2 — DPL schema evolution](internal/wave-2c-2-dpl-evolution.md)
+  - [Wave 3-2 — Crash-durable XA](internal/wave-3-2-crash-durable-xa.md)

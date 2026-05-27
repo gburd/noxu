@@ -159,3 +159,39 @@ public API surface (other than the new error variant) are unchanged.
   `crates/noxu-xa/src/resource.rs`.
 * Regression tests: `crates/noxu-xa/tests/xa_v15_in_process_only_test.rs`.
 * User-facing docs: `docs/src/transactions/xa-distributed.md`.
+
+## Postscript — wave 3-2 lifted the restriction
+
+Wave 3-2 of the v1.5+ remediation plan implemented crash-durable XA
+and removed the in-process-only restriction.  As of v2.0:
+
+* `xa_prepare` writes a durable `TxnPrepare` WAL frame containing
+  `(txn_id, first_lsn, last_lsn, xid_format_id, xid_gtrid, xid_bqual)`
+  and fsyncs it before returning.
+* `noxu-recovery` understands `TxnPrepare`: prepared transactions are
+  NOT undone (they are in-doubt awaiting resolution) and their LNs
+  are NOT redone (visibility is gated on `xa_commit`).  After
+  recovery, `RecoveryInfo::recovered_prepared_txns` lists every
+  in-doubt XID with its txn id and LSN range.
+* `EnvironmentImpl` exposes the recovered prepared list via
+  `recovered_prepared_txns()` / `take_recovered_prepared_lns(id)` /
+  `forget_recovered_prepared_txn(id)`.  `noxu-db::Environment` wraps
+  these for `noxu-xa`.
+* `XaEnvironment::new(env)` now seeds an internal
+  `recovered_branches` map from the engine's recovered list, so
+  `xa_recover()` returns durable in-doubt XIDs even when no optional
+  `PreparedLog` is configured.
+* `xa_commit(xid)` and `xa_rollback(xid)` have a recovered-branch
+  fast-path: they replay (or discard) the prepared LNs into the
+  in-memory tree and write a durable `TxnCommit` / `TxnAbort` frame.
+* `XaError::CrashDurabilityNotSupported` is `#[deprecated]` and no
+  longer returned by the engine.
+
+The regression file `xa_v15_in_process_only_test.rs` has been
+rewritten to assert the v2.0 contract (`xa_commit_after_restart`
+*succeeds*, etc.) and is supplemented by
+`xa_crash_durable_test.rs` which covers two-XID recovery,
+back-to-back crashes before resolution, and visibility durability.
+
+See `docs/src/internal/wave-3-2-crash-durable-xa.md` for the design
+record.
