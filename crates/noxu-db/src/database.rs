@@ -98,6 +98,43 @@ pub struct Database {
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
     write_no_sync: bool,
+    /// Registered secondary indexes that automatically maintain themselves
+    /// when this primary is written.  v1.6 (Decision 1B / audit C3 — the
+    /// associate()-style hook): every [`SecondaryDatabase`] opened against
+    /// this primary downgrades its `Arc<SecondaryHookState>` to a
+    /// `Weak<dyn SecondaryHook>` and pushes it here.  `Database::put` and
+    /// `Database::delete` walk the list under the same caller-supplied
+    /// txn so primary writes and secondary index updates commit / abort
+    /// atomically.
+    ///
+    /// Stored behind an `Arc<RwLock<…>>` (rather than directly on the
+    /// `Database` body) so registrations performed through one of the
+    /// `Arc<Mutex<Database>>` clones the user typically holds become
+    /// visible to every other clone of the same primary.
+    pub(crate) secondaries: Arc<
+        RwLock<
+            Vec<
+                std::sync::Weak<
+                    dyn crate::secondary_database::SecondaryHook + Send + Sync,
+                >,
+            >,
+        >,
+    >,
+    /// Foreign-key referrer registry: every child secondary whose
+    /// `foreign_key_database` points at *this* primary downgrades its
+    /// hook to a `Weak<dyn FkReferrer>` and pushes it here.  When this
+    /// primary is deleted, every entry is consulted to apply
+    /// `ForeignKeyDeleteAction::Abort` (v1.6 step 8) /
+    /// `Cascade` (step 9) / `Nullify` (step 10).
+    pub(crate) fk_referrers: Arc<
+        RwLock<
+            Vec<
+                std::sync::Weak<
+                    dyn crate::secondary_database::FkReferrer + Send + Sync,
+                >,
+            >,
+        >,
+    >,
 }
 
 /// State of a database handle.
@@ -402,6 +439,8 @@ impl Database {
             txn_manager,
             no_sync,
             write_no_sync,
+            secondaries: Arc::new(RwLock::new(Vec::new())),
+            fk_referrers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -660,6 +699,29 @@ impl Database {
             data.get_data().unwrap_or(&[])
         };
 
+        // v1.6 (audit C3 / step 6): if any secondaries are registered,
+        // capture the pre-put value of this key (if it exists) BEFORE
+        // the overwrite so we can pass it as `old_data` to the
+        // secondary key creator below.  When the put is a fresh
+        // insert the read returns NotFound and `old_data_for_secondaries`
+        // remains `None`.  For partial puts the pre-put value already
+        // lives in `write_bytes` indirectly; we re-read here to keep
+        // the code paths uniform and to use the caller's txn for the
+        // read so isolation is honoured.
+        let secondaries_pre = self.live_secondaries();
+        let old_data_for_secondaries: Option<Vec<u8>> =
+            if secondaries_pre.is_empty() {
+                None
+            } else {
+                let mut existing = DatabaseEntry::new();
+                match self.get(txn, key, &mut existing)? {
+                    OperationStatus::Success => {
+                        existing.get_data().map(<[u8]>::to_vec)
+                    }
+                    _ => None,
+                }
+            };
+
         match txn {
             Some(t) => {
                 let mut cursor = self.make_cursor_for_txn(t);
@@ -680,6 +742,32 @@ impl Database {
                         })?;
                     Ok(())
                 })?;
+            }
+        }
+
+        // v1.6 (audit C3 — the associate()-style hook): drive every
+        // registered secondary index under the same caller-supplied
+        // txn so the primary record and its secondary entries commit /
+        // abort together.
+        //
+        // Step 4 + Step 6 (this path): we capture the pre-put value
+        // before issuing the primary write so the put-existing-key
+        // update path can pass it as `old_data` and the secondary key
+        // creator can compute every stale (sec_key, pri_key) pair to
+        // delete in addition to inserting the new ones.  Pre-Step-6
+        // an update over an existing key leaked the previous
+        // secondary entries (audit C3 sub-case).
+        let secondaries = self.live_secondaries();
+        if !secondaries.is_empty() {
+            // Build a fresh DatabaseEntry around the data we just
+            // wrote so the secondary key creator sees the bytes the
+            // user asked for (and not the partial-put scratch buffer).
+            let new_entry = DatabaseEntry::from_bytes(data_bytes);
+            let old_entry: Option<DatabaseEntry> = old_data_for_secondaries
+                .as_deref()
+                .map(DatabaseEntry::from_bytes);
+            for hook in secondaries {
+                hook.maintain(txn, key, old_entry.as_ref(), Some(&new_entry))?;
             }
         }
 
@@ -835,17 +923,46 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
+        // v1.6 (audit C3): if any secondaries are registered we must
+        // capture the pre-delete primary data on each iteration so the
+        // secondary key creator can recompute every (sec_key, pri_key)
+        // pair to remove.  Collected outside the cursor closure so
+        // the auto-commit and explicit-txn paths share one buffer.
+        let secondaries = self.live_secondaries();
+        let track_old_data = !secondaries.is_empty();
+        let mut deleted_old_values: Vec<Vec<u8>> = Vec::new();
+
+        // v1.6 (audit C2 / Decision 2C — step 8): consult any FK
+        // referrers BEFORE the delete is applied.  An Abort action
+        // raises a typed error and prevents the foreign delete from
+        // happening at all (matching JE's `ForeignConstraintException`
+        // semantics).  Cascade / Nullify (steps 9 / 10) mutate child
+        // records under the same caller-supplied txn so the foreign
+        // delete and its consequences commit / abort together.
+        let fk_referrers = self.live_fk_referrers();
+        if !fk_referrers.is_empty() {
+            for referrer in &fk_referrers {
+                referrer.on_foreign_key_deleted(txn, key)?;
+            }
+        }
+
         // Inner closure shared between the explicit-txn and synthetic
         // auto-txn paths: scans + deletes every duplicate of `key_bytes`
         // through the supplied `cursor`.  See comment in pre-Wave-1A
         // delete for the dup-loop rationale (BDB-JE
         // `Database.delete(key)` semantics).
-        let run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
+        let mut run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
             let mut deleted_any = false;
             while let noxu_dbi::OperationStatus::Success = cursor
                 .search(key_bytes, None, SearchMode::Set)
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
             {
+                if track_old_data {
+                    let (_, v) = cursor.get_current().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                    deleted_old_values.push(v);
+                }
                 cursor.delete().map_err(|e| {
                     NoxuError::OperationNotAllowed(e.to_string())
                 })?;
@@ -859,8 +976,20 @@ impl Database {
                 let mut cursor = self.make_cursor_for_txn(t);
                 run_delete(&mut cursor)?
             }
-            None => self.with_auto_txn(run_delete)?,
+            None => self.with_auto_txn(&mut run_delete)?,
         };
+
+        // v1.6 (audit C3): fan out the secondary cleanup under the
+        // caller's txn so the primary delete and every secondary
+        // tombstone commit / abort together.
+        if deleted_any && !secondaries.is_empty() {
+            for old_bytes in &deleted_old_values {
+                let old_entry = DatabaseEntry::from_bytes(old_bytes);
+                for hook in &secondaries {
+                    hook.maintain(txn, key, Some(&old_entry), None)?;
+                }
+            }
+        }
 
         let status = if deleted_any {
             OperationStatus::Success
@@ -976,6 +1105,67 @@ impl Database {
     ///
     pub fn get_config(&self) -> &DatabaseConfig {
         &self.config
+    }
+
+    /// Returns the underlying database ID.  Used by FK cascade guards
+    /// to disambiguate `(db, key)` frames when several databases
+    /// participate in a cycle.
+    pub(crate) fn db_id_for_fk_guard(&self) -> u64 {
+        self.id
+    }
+
+    /// Registers a secondary index for automatic maintenance.
+    ///
+    /// v1.6 (audit C3 — associate() hook): every [`SecondaryDatabase`]
+    /// downgrades its inner `Arc<SecondaryHookState>` to a `Weak` and
+    /// stores it here.  Subsequent `put` / `delete` calls iterate the
+    /// list and forward the same txn to every live secondary, dropping
+    /// dead `Weak` entries on the fly.
+    pub(crate) fn register_secondary(
+        &self,
+        hook: std::sync::Weak<
+            dyn crate::secondary_database::SecondaryHook + Send + Sync,
+        >,
+    ) {
+        let mut guard = self.secondaries.write();
+        // Compact dead Weak entries lazily on every registration so the
+        // list does not grow unboundedly with churn.
+        guard.retain(|w| w.strong_count() > 0);
+        guard.push(hook);
+    }
+
+    /// Returns a snapshot of every live registered secondary.  Used by
+    /// the automatic-maintenance plumbing in `put` / `delete` to drive
+    /// secondaries without holding the registry lock across the
+    /// secondary call.  Dead `Weak` entries are dropped from the
+    /// returned list (and — because we re-acquire the registry write
+    /// lock at registration time — lazily compacted from the registry
+    /// itself).
+    pub(crate) fn live_secondaries(
+        &self,
+    ) -> Vec<Arc<dyn crate::secondary_database::SecondaryHook + Send + Sync>>
+    {
+        self.secondaries.read().iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    /// Registers an FK referrer that points at this primary as its
+    /// foreign-key target (v1.6 audit C2 / Decision 2C — Abort hook).
+    pub(crate) fn register_fk_referrer(
+        &self,
+        referrer: std::sync::Weak<
+            dyn crate::secondary_database::FkReferrer + Send + Sync,
+        >,
+    ) {
+        let mut guard = self.fk_referrers.write();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.push(referrer);
+    }
+
+    /// Snapshot of every live FK referrer.
+    pub(crate) fn live_fk_referrers(
+        &self,
+    ) -> Vec<Arc<dyn crate::secondary_database::FkReferrer + Send + Sync>> {
+        self.fk_referrers.read().iter().filter_map(|w| w.upgrade()).collect()
     }
 
     /// Returns an approximate count of records in the database.
