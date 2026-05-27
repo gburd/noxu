@@ -7,7 +7,7 @@ unsafe are in external dependencies (`parking_lot`, `memmap2`) and
 potentially in a future off-heap cache implementation.
 
 Please report security vulnerabilities through
-[GitHub Security Advisories](https://github.com/gburd/lamdb/security/advisories/new)
+[GitHub Security Advisories](https://codeberg.org/gregburd/noxu/security/advisories/new)
 or by contacting [Greg Burd](https://github.com/gburd) directly.
 
 All reports will be investigated promptly. We will coordinate disclosure
