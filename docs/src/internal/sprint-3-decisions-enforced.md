@@ -249,17 +249,17 @@ Decision 3B was deliberately staged in two phases: v1.5 rejected
 removes the `parent` parameter entirely.  Wave 3-1
 (`fix/wave3-1-nested-txn-removal`) lands the v2.0 path:
 
-* `Environment::begin_transaction` now takes only
+- `Environment::begin_transaction` now takes only
   `config: Option<&TransactionConfig>`; the `parent` argument is gone.
-* The Sprint 3D `parent.is_some()` rejection block in
+- The Sprint 3D `parent.is_some()` rejection block in
   `crates/noxu-db/src/environment.rs` is removed (it would be
   unreachable).
-* `f11_nested_transaction_returns_unsupported` is deleted because the
+- `f11_nested_transaction_returns_unsupported` is deleted because the
   misuse it guarded is no longer representable in the type system —
   what was a runtime error is now a compile error.
-* `f11_nested_transaction_none_still_works` is retained as a smoke
+- `f11_nested_transaction_none_still_works` is retained as a smoke
   test that the new signature is correct.
-* `NoxuError::Unsupported` itself stays; it is shared with the cursor
+- `NoxuError::Unsupported` itself stays; it is shared with the cursor
   `Get::*Dup` arms (audit F3) and the secondary-config / DPL paths.
 
 Audit finding F11 is now closed on both the v1.5 and v2.0 paths.  See
