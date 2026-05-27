@@ -326,6 +326,96 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
     );
 }
 
+// ─── Decision 2C — FK config rejected at open ────────────────────
+
+/// v1.6 (audit C3 — the associate()-style hook): a registered
+/// secondary now sees primary writes automatically; callers no
+/// longer have to manually invoke `update_secondary` after every
+/// `Database::put`.
+#[test]
+fn c3_primary_put_drives_registered_secondary() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    // Plain `db.put` — no manual update_secondary call.
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"Apple");
+    primary.lock().put(None, &pk, &v).unwrap();
+
+    // The secondary must already be visible.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(data.get_data().unwrap(), b"Apple");
+}
+
+/// Auto-maintenance participates in the caller's transaction:
+/// aborting a primary `put` rolls back the secondary entry too.
+#[test]
+fn c3_primary_put_under_txn_rolls_back_secondary_on_abort() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    let pk = DatabaseEntry::from_bytes(b"pk1");
+    let v = DatabaseEntry::from_bytes(b"Apple");
+    primary.lock().put(Some(&txn), &pk, &v).unwrap();
+    // Same txn sees its own auto-maintained secondary write.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data
+        )
+        .unwrap(),
+        OperationStatus::Success
+    );
+    txn.abort().unwrap();
+
+    // After abort: primary and secondary both gone.
+    assert_eq!(
+        primary
+            .lock()
+            .get(None, &pk, &mut DatabaseEntry::new())
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+}
+
 // ─── Decision 2C — FK config rejected at open ──────────────────────────
 
 /// Setting `foreign_key_database` on a `SecondaryConfig` causes
