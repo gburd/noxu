@@ -1,6 +1,11 @@
 //! Entity store configuration.
 //!
 
+use std::sync::Arc;
+
+use crate::evolve::evolve_config::EvolveConfig;
+use crate::evolve::mutations::Mutations;
+
 /// Configuration for an `EntityStore`.
 ///
 /// Controls how the entity store is opened, including whether to allow
@@ -31,18 +36,40 @@ pub struct StoreConfig {
 
     /// Whether the store operates in transactional mode.
     pub transactional: bool,
+
+    /// Schema-evolution mutations applied on the open path (Wave 2C-2).
+    ///
+    /// When `EntityStore::get_primary_index<E>` is called, the persisted
+    /// catalog version is compared against `E::class_version()`.  If they
+    /// differ and `mutations` is `Some`, the records of the entity class
+    /// are streamed through the catalog evolution under a single
+    /// transaction; class-level [`crate::evolve::Renamer`] /
+    /// [`crate::evolve::Deleter`] / [`crate::evolve::Converter`] are
+    /// applied; per-record envelopes are rewritten with the current
+    /// version.
+    ///
+    /// Wrapped in `Arc` so the same set of mutations can be shared with
+    /// `PrimaryIndex` for read-side, version-aware deserialisation
+    /// without cloning.
+    pub mutations: Option<Arc<Mutations>>,
+
+    /// Filter / progress listener for the open-path eager evolution.
+    pub evolve_config: Option<Arc<EvolveConfig>>,
 }
 
 impl StoreConfig {
     /// Creates a new `StoreConfig` with the given store name.
     ///
-    /// Defaults: `allow_create = false`, `read_only = false`, `transactional = false`.
+    /// Defaults: `allow_create = false`, `read_only = false`,
+    /// `transactional = false`, no mutations registered.
     pub fn new(store_name: impl Into<String>) -> Self {
         Self {
             store_name: store_name.into(),
             allow_create: false,
             read_only: false,
             transactional: false,
+            mutations: None,
+            evolve_config: None,
         }
     }
 
@@ -61,6 +88,31 @@ impl StoreConfig {
     /// Builder-style method to set `transactional`.
     pub fn with_transactional(mut self, txn: bool) -> Self {
         self.transactional = txn;
+        self
+    }
+
+    /// Registers a [`Mutations`] config to drive open-path schema evolution
+    /// (Wave 2C-2).
+    ///
+    /// The mutations are also exposed to [`EntitySerializer::deserialize_versioned`]
+    /// so user serializers can do field-level evolution on read.
+    ///
+    /// [`EntitySerializer::deserialize_versioned`]: crate::entity_serializer::EntitySerializer::deserialize_versioned
+    pub fn with_mutations(mut self, mutations: Mutations) -> Self {
+        self.mutations = Some(Arc::new(mutations));
+        self
+    }
+
+    /// Like [`Self::with_mutations`] but accepts an already-shared `Arc`.
+    pub fn with_mutations_arc(mut self, mutations: Arc<Mutations>) -> Self {
+        self.mutations = Some(mutations);
+        self
+    }
+
+    /// Registers an [`EvolveConfig`] used to filter or report progress on
+    /// the open-path evolution.
+    pub fn with_evolve_config(mut self, cfg: EvolveConfig) -> Self {
+        self.evolve_config = Some(Arc::new(cfg));
         self
     }
 
@@ -85,6 +137,16 @@ impl StoreConfig {
     /// Returns the store name.
     pub fn get_store_name(&self) -> &str {
         &self.store_name
+    }
+
+    /// Returns the registered mutations, if any.
+    pub fn mutations(&self) -> Option<&Arc<Mutations>> {
+        self.mutations.as_ref()
+    }
+
+    /// Returns the registered evolve config, if any.
+    pub fn evolve_config(&self) -> Option<&Arc<EvolveConfig>> {
+        self.evolve_config.as_ref()
     }
 }
 
@@ -171,5 +233,32 @@ mod tests {
         let config2 = config1.clone();
         assert_eq!(config1.store_name, config2.store_name);
         assert_eq!(config1.allow_create, config2.allow_create);
+    }
+
+    #[test]
+    fn test_with_mutations_round_trip() {
+        use crate::evolve::{Mutations, Renamer};
+        let mut m = Mutations::new();
+        m.add_renamer(Renamer::for_class("A", 0, "B"));
+        let cfg = StoreConfig::new("s").with_mutations(m);
+        assert!(cfg.mutations().is_some());
+        assert!(cfg.mutations().unwrap().get_renamer("A", 0, None).is_some());
+    }
+
+    #[test]
+    fn test_with_evolve_config() {
+        use crate::evolve::EvolveConfig;
+        let cfg = StoreConfig::new("s")
+            .with_evolve_config(EvolveConfig::new().with_class_to_evolve("X"));
+        assert!(cfg.evolve_config().is_some());
+        assert!(cfg.evolve_config().unwrap().should_evolve("X"));
+        assert!(!cfg.evolve_config().unwrap().should_evolve("Y"));
+    }
+
+    #[test]
+    fn test_default_no_mutations_or_evolve_config() {
+        let cfg = StoreConfig::new("s");
+        assert!(cfg.mutations().is_none());
+        assert!(cfg.evolve_config().is_none());
     }
 }

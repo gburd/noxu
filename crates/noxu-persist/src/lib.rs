@@ -92,6 +92,7 @@ pub use store_config::StoreConfig;
 
 // Schema evolution re-exports
 pub use evolve::{
-    ClassMutations, ConversionFn, Converter, Deleter, EvolveConfig,
-    EvolveListener, EvolveStats, MutationKey, Mutations, Renamer,
+    CatalogEntry, ClassCatalog, ClassMutations, ConversionFn, Converter,
+    DecodedRecord, Deleter, EvolveConfig, EvolveListener, EvolveStats,
+    MAX_CLASS_TAG_LEN, MutationKey, Mutations, Renamer, catalog_db_name,
 };
