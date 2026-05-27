@@ -6,7 +6,20 @@
 //!
 //! Production code under model:
 //!   - `crates/noxu-rep/src/network_restore.rs`
-//!   - `crates/noxu-rep/src/restore_state.rs`
+//!   - `crates/noxu-rep/src/network_restore_server.rs`
+//!     (audit findings F2/F4: the restore is now dispatcher-
+//!     mediated; `execute_via_dispatcher` connects via
+//!     `connect_to_service(RESTORE)` and exchanges framed payloads,
+//!     while the legacy `execute` raw-TCP path remains for
+//!     standalone testing. From the abstract-protocol point of
+//!     view the dispatcher is a transport detail — the donor still
+//!     sends `[count][file_records...]` exactly once and the
+//!     recipient still applies entries in vlsn order. The model
+//!     therefore continues to use a single `StartRestore` /
+//!     `ApplyEntry` sequence; the `EnableStreamFeeder` transition
+//!     added in Wave 9-B captures the post-restore resumption that
+//!     was previously left implicit.)
+//!   - `crates/noxu-rep/src/replicated_environment.rs::bootstrap_via_dispatcher`
 //!
 //! Properties:
 //!   - `PrefixOfDonor` — at every reachable state, the recipient's
@@ -17,7 +30,6 @@
 //!   - `NoConcurrentCorruption` — while restore is in progress, the
 //!     recipient does not accept VLSN-stream entries from any other
 //!     source.
-
 use stateright::{Model, Property};
 
 pub const DONOR_WAL_LEN: u64 = 5;
@@ -44,10 +56,16 @@ pub struct State {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Action {
     StartRestore,
-    ApplyEntry { vlsn: u64 },
+    ApplyEntry {
+        vlsn: u64,
+    },
     Fail,
     Resume,
     CompleteRestore,
+    /// Post-restore: the dispatcher hands control back to the
+    /// stream feeder and the replica re-enables the streaming path.
+    /// Only valid after `CompleteRestore`.
+    EnableStreamFeeder,
 }
 
 pub struct NetworkRestoreModel;
@@ -82,7 +100,11 @@ impl Model for NetworkRestoreModel {
                 }
             }
             RestoreState::Failed => out.push(Action::Resume),
-            RestoreState::Complete => {}
+            RestoreState::Complete => {
+                if !s.stream_feeder_active {
+                    out.push(Action::EnableStreamFeeder);
+                }
+            }
         }
     }
 
@@ -118,6 +140,12 @@ impl Model for NetworkRestoreModel {
                     return None;
                 }
                 s.state = RestoreState::Complete;
+            }
+            Action::EnableStreamFeeder => {
+                if !matches!(s.state, RestoreState::Complete) {
+                    return None;
+                }
+                s.stream_feeder_active = true;
             }
         }
         Some(s)
