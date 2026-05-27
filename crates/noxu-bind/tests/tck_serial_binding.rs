@@ -228,7 +228,10 @@ fn tck_serde_version_header_rejects_wrong_magic() {
     let binding = SerdeBinding::<u32>::new();
     let err = binding.entry_to_object(&entry).unwrap_err();
     assert!(
-        matches!(err, noxu_bind::BindError::VersionMismatch { found_magic: 0x00, .. }),
+        matches!(
+            err,
+            noxu_bind::BindError::VersionMismatch { found_magic: 0x00, .. }
+        ),
         "expected VersionMismatch with found_magic=0x00, got {err:?}",
     );
 }
@@ -241,7 +244,14 @@ fn tck_serde_version_header_rejects_wrong_version() {
     let binding = SerdeBinding::<u32>::new();
     let err = binding.entry_to_object(&entry).unwrap_err();
     assert!(
-        matches!(err, noxu_bind::BindError::VersionMismatch { found_magic: 0xCB, found_version: 0xFF, .. }),
+        matches!(
+            err,
+            noxu_bind::BindError::VersionMismatch {
+                found_magic: 0xCB,
+                found_version: 0xFF,
+                ..
+            }
+        ),
         "expected VersionMismatch with found_magic=0xCB found_version=0xFF, got {err:?}",
     );
 }

@@ -25,12 +25,8 @@
 //!   `TransactionTest`.
 
 use noxu_bind::{IntBinding, SerdeBinding};
-use noxu_collections::{
-    StoredMap, StoredSortedMap, TransactionRunner,
-};
-use noxu_db::{
-    Database, DatabaseConfig, Environment, EnvironmentConfig,
-};
+use noxu_collections::{StoredMap, StoredSortedMap, TransactionRunner};
+use noxu_db::{Database, DatabaseConfig, Environment, EnvironmentConfig};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -39,8 +35,8 @@ use tempfile::TempDir;
 
 fn open_env(transactional: bool) -> (TempDir, Environment, Database) {
     let td = TempDir::new().unwrap();
-    let mut cfg = EnvironmentConfig::new(td.path().to_path_buf())
-        .with_allow_create(true);
+    let mut cfg =
+        EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true);
     if transactional {
         cfg = cfg.with_transactional(true);
     }
@@ -107,13 +103,9 @@ fn tck_collection_iteration_yields_keys_in_sorted_order() {
         map.put(None, &k, &(k * 10)).unwrap();
     }
 
-    let pairs: Vec<(i32, i32)> = map
-        .iter(None)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    let expected: Vec<(i32, i32)> =
-        (1..=9).map(|k| (k, k * 10)).collect();
+    let pairs: Vec<(i32, i32)> =
+        map.iter(None).unwrap().map(Result::unwrap).collect();
+    let expected: Vec<(i32, i32)> = (1..=9).map(|k| (k, k * 10)).collect();
     assert_eq!(expected, pairs);
 }
 
@@ -143,10 +135,7 @@ fn tck_collection_iterator_is_a_snapshot_of_construction_time() {
 
     // The snapshot reflects the pre-mutation state.
     let pairs: Vec<(i32, i32)> = snapshot.map(Result::unwrap).collect();
-    assert_eq!(
-        vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
-        pairs,
-    );
+    assert_eq!(vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)], pairs,);
 }
 
 // ---------------------------------------------------------------------------
@@ -165,11 +154,8 @@ fn tck_collection_iter_from_starts_at_or_after_key() {
     }
 
     // iter_from(4) should start at the first key >= 4, i.e. 5.
-    let from_4: Vec<(i32, i32)> = map
-        .iter_from(None, &4)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let from_4: Vec<(i32, i32)> =
+        map.iter_from(None, &4).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         vec![(5, 500), (7, 700), (9, 900)],
         from_4,
@@ -177,19 +163,13 @@ fn tck_collection_iter_from_starts_at_or_after_key() {
     );
 
     // iter_from(5) starts exactly at 5 (inclusive).
-    let from_5: Vec<(i32, i32)> = map
-        .iter_from(None, &5)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let from_5: Vec<(i32, i32)> =
+        map.iter_from(None, &5).unwrap().map(Result::unwrap).collect();
     assert_eq!(vec![(5, 500), (7, 700), (9, 900)], from_5);
 
     // iter_from(beyond all) is empty.
-    let from_99: Vec<(i32, i32)> = map
-        .iter_from(None, &99)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let from_99: Vec<(i32, i32)> =
+        map.iter_from(None, &99).unwrap().map(Result::unwrap).collect();
     assert!(from_99.is_empty());
 }
 
@@ -203,11 +183,8 @@ fn tck_collection_iter_reverse_yields_descending_order() {
         map.put(None, &k, &(k * 10)).unwrap();
     }
 
-    let rev: Vec<(i32, i32)> = map
-        .iter_reverse(None)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let rev: Vec<(i32, i32)> =
+        map.iter_reverse(None).unwrap().map(Result::unwrap).collect();
     assert_eq!(vec![(5, 50), (4, 40), (3, 30), (2, 20), (1, 10)], rev);
 }
 
@@ -234,17 +211,11 @@ fn tck_collection_null_values_round_trip_via_option() {
     assert_eq!(Some(None), map.get(None, &1).unwrap());
 
     map.put(None, &2, &Some("hello".to_string())).unwrap();
-    assert_eq!(
-        Some(Some("hello".to_string())),
-        map.get(None, &2).unwrap(),
-    );
+    assert_eq!(Some(Some("hello".to_string())), map.get(None, &2).unwrap(),);
 
     // values() iterator yields None for the null entry.
-    let vals: Vec<Option<String>> = map
-        .values(None)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let vals: Vec<Option<String>> =
+        map.values(None).unwrap().map(Result::unwrap).collect();
     assert_eq!(vec![None, Some("hello".to_string())], vals);
 }
 
@@ -322,10 +293,11 @@ fn tck_collection_transaction_runner_rolls_back_on_err() {
         StoredMap::new(&db, IntBinding::new(), IntBinding::new());
 
     let runner = TransactionRunner::new(&env);
-    let result: Result<(), noxu_collections::CollectionError> = runner.run(|txn| {
-        map.put(Some(txn), &1, &11)?;
-        Err(noxu_collections::CollectionError::ReadOnly) // arbitrary error
-    });
+    let result: Result<(), noxu_collections::CollectionError> =
+        runner.run(|txn| {
+            map.put(Some(txn), &1, &11)?;
+            Err(noxu_collections::CollectionError::ReadOnly) // arbitrary error
+        });
     assert!(result.is_err());
 
     // Closure error => txn rolled back => map is empty.
