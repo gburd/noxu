@@ -20,6 +20,11 @@
 //! After sending the service name the client owns the connection and may
 //! begin the actual service protocol. This `ServiceDispatcher`
 //! which reads a service name from each new socket before routing.
+//!
+//! The `name_len` field is bounded by [`MAX_SERVICE_NAME_LEN`] to prevent
+//! a malicious or accidental peer from triggering an unbounded allocation
+//! by sending an arbitrary 4-byte length prefix. The dispatcher rejects
+//! frames whose length exceeds the bound before any allocation occurs.
 
 use hashbrown::HashMap;
 use std::io::{Read as IoRead, Write as IoWrite};
@@ -32,6 +37,17 @@ use noxu_sync::Mutex;
 
 use super::channel::{Channel, TcpChannel};
 use crate::error::{RepError, Result};
+
+/// Maximum permitted length, in bytes, of the service-name field on the
+/// dispatcher wire protocol.
+///
+/// The longest defined service name today is `"PEER_FEEDER"` (11 bytes);
+/// 256 bytes is comfortable headroom for future names while still being
+/// small enough that a hostile peer cannot use the field to OOM the master.
+///
+/// Frames whose length prefix exceeds this bound are rejected before any
+/// allocation occurs (see [`handle_incoming`]).
+pub const MAX_SERVICE_NAME_LEN: usize = 256;
 
 /// Callback for handling incoming connections on a named service.
 ///
@@ -267,6 +283,18 @@ fn handle_incoming(
         return;
     }
     let name_len = u32::from_le_bytes(len_buf) as usize;
+    // Bound check BEFORE allocation. A hostile or buggy peer that sends a
+    // 4-byte length of e.g. 0xFFFF_FFFF would otherwise trigger a 4 GiB
+    // allocation here. See `MAX_SERVICE_NAME_LEN` and finding F3 in the
+    // 2026-05 noxu-rep API audit.
+    if name_len == 0 || name_len > MAX_SERVICE_NAME_LEN {
+        log::warn!(
+            "TcpServiceDispatcher: rejected service-name length {} (max {})",
+            name_len,
+            MAX_SERVICE_NAME_LEN
+        );
+        return;
+    }
     let mut name_buf = vec![0u8; name_len];
     if read_stream.read_exact(&mut name_buf).is_err() {
         return;
@@ -293,16 +321,27 @@ fn handle_incoming(
 /// This is a convenience function for client code. It connects, sends the
 /// service name using the dispatcher's wire protocol, and returns the
 /// connected `TcpChannel` ready for the service protocol.
+///
+/// Returns [`RepError::ConfigError`] if `service_name` is empty or longer
+/// than [`MAX_SERVICE_NAME_LEN`].
 pub fn connect_to_service(
     addr: SocketAddr,
     service_name: &str,
 ) -> Result<TcpChannel> {
     use std::net::TcpStream;
 
+    let name_bytes = service_name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.len() > MAX_SERVICE_NAME_LEN {
+        return Err(RepError::ConfigError(format!(
+            "service name length {} out of range [1, {}]",
+            name_bytes.len(),
+            MAX_SERVICE_NAME_LEN,
+        )));
+    }
+
     let mut stream = TcpStream::connect(addr)
         .map_err(|e| RepError::NetworkError(e.to_string()))?;
 
-    let name_bytes = service_name.as_bytes();
     let len = name_bytes.len() as u32;
     stream
         .write_all(&len.to_le_bytes())

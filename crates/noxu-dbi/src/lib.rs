@@ -6,6 +6,7 @@
 
 pub mod backup_manager;
 pub mod cursor_impl;
+pub mod replica_ack;
 mod database_config;
 mod database_id;
 mod database_impl;
@@ -54,6 +55,10 @@ pub use node_sequence::NodeSequence;
 pub use operation::Operation;
 pub use operation_status::OperationStatus;
 pub use put_mode::PutMode;
+pub use replica_ack::{
+    AckWaitError, AckWaitErrorKind, ReplicaAckCoordinator,
+    ReplicaAckPolicyKind, SharedReplicaAckCoordinator,
+};
 pub use search_mode::SearchMode;
 pub use throughput_stats::{ThroughputStats, ThroughputStatsSnapshot};
 pub use truncate_result::TruncateResult;
