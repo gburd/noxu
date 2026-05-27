@@ -250,26 +250,14 @@ fn tck_persist_read_only_store_rejects_writes() {
     );
 }
 
-/// Captures a real Noxu deviation surfaced by the wave 4-C JE TCK port.
-///
-/// In JE, opening a `StoreConfig` with `setReadOnly(true)` and *no*
-/// `setAllowCreate(true)` against a path where the entity DBs already
-/// exist on disk is the canonical "open an existing store read-only"
-/// recipe — it must succeed without auto-creating anything.
-///
-/// Noxu currently rejects this with
-/// `DatabaseNotFound("Database 'X' does not exist and allow_create is false")`
-/// on `get_primary_index`, because the on-disk DB is not surfaced into
-/// the env's open-database set unless the open path also has
-/// `allow_create=true`.  The working test above papers over the
-/// divergence by passing both flags.
-///
-/// TODO(noxu-persist): align with JE semantics so a pure read-only
-/// reopen succeeds against an existing on-disk store.  Until then this
-/// test stays `#[ignore]` and documents the JE-expected behaviour.
+/// Captures the JE-equivalent "reopen an existing entity store read-only"
+/// recipe: `setReadOnly(true)` with *no* `setAllowCreate(true)` against a
+/// path where the entity DBs already exist on disk.  Wave 7 polish
+/// (v2.0.1-equivalent) closed the JE deviation surfaced by wave 4-C: the
+/// entity DB is now transparently re-opened off the recovered tree, and
+/// the underlying `DatabaseConfig.read_only=true` continues to enforce
+/// write-rejection at the `Database::put` boundary.
 #[test]
-#[ignore = "Noxu deviates from JE: read_only without allow_create cannot \
-             reopen an existing entity DB; see comment for tracking notes."]
 fn tck_persist_read_only_store_reopens_without_allow_create() {
     let td = TempDir::new().unwrap();
     {
@@ -299,6 +287,91 @@ fn tck_persist_read_only_store_reopens_without_allow_create() {
     assert_eq!(
         Some(Item { id: 1, name: "alpha".into() }),
         pi.get(None, &ser, &1).unwrap(),
+    );
+}
+
+/// Wave 7 polish coverage: read-only reopen, then a `get` should succeed
+/// without ever passing `allow_create=true`.  This is the smoke-test
+/// counterpart to `tck_persist_read_only_store_reopens_without_allow_create`
+/// and exercises the same path under explicit close-then-reopen.
+#[test]
+fn tck_persist_read_only_reopen_get_succeeds_after_close() {
+    let td = TempDir::new().unwrap();
+
+    {
+        let env = open_env(td.path(), true);
+        let mut store = EntityStore::open(
+            &env,
+            StoreConfig::new("ro_get").with_allow_create(true),
+        )
+        .unwrap();
+        let pi = store.get_primary_index::<u64, Item>().unwrap();
+        let ser = ItemSer;
+        pi.put(None, &ser, &Item { id: 7, name: "seven".into() }).unwrap();
+        pi.put(None, &ser, &Item { id: 8, name: "eight".into() }).unwrap();
+        store.close().unwrap();
+    }
+
+    let env = open_env(td.path(), true);
+    let mut store = EntityStore::open(
+        &env,
+        StoreConfig::new("ro_get").with_read_only(true),
+    )
+    .unwrap();
+    let pi = store.get_primary_index::<u64, Item>().unwrap();
+    let ser = ItemSer;
+
+    assert_eq!(
+        Some(Item { id: 7, name: "seven".into() }),
+        pi.get(None, &ser, &7).unwrap(),
+    );
+    assert_eq!(
+        Some(Item { id: 8, name: "eight".into() }),
+        pi.get(None, &ser, &8).unwrap(),
+    );
+    assert_eq!(None, pi.get(None, &ser, &99).unwrap());
+}
+
+/// Wave 7 polish coverage: a `put` against a read-only-reopened store must
+/// surface a typed error (`NoxuError::ReadOnly`), not silently succeed and
+/// not panic.  Confirms that the `allow_create=true` we now pass under the
+/// hood does NOT bypass the per-DB read-only flag.
+#[test]
+fn tck_persist_read_only_reopen_rejects_put() {
+    let td = TempDir::new().unwrap();
+
+    {
+        let env = open_env(td.path(), true);
+        let mut store = EntityStore::open(
+            &env,
+            StoreConfig::new("ro_put").with_allow_create(true),
+        )
+        .unwrap();
+        let pi = store.get_primary_index::<u64, Item>().unwrap();
+        let ser = ItemSer;
+        pi.put(None, &ser, &Item { id: 1, name: "alpha".into() }).unwrap();
+        store.close().unwrap();
+    }
+
+    let env = open_env(td.path(), true);
+    let mut store = EntityStore::open(
+        &env,
+        StoreConfig::new("ro_put").with_read_only(true),
+    )
+    .unwrap();
+    let pi = store.get_primary_index::<u64, Item>().unwrap();
+    let ser = ItemSer;
+
+    let res = pi.put(None, &ser, &Item { id: 2, name: "beta".into() });
+    assert!(
+        res.is_err(),
+        "read-only reopened store accepted a write; result = {res:?}",
+    );
+    let err = res.unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ReadOnly") || msg.contains("read-only"),
+        "expected a read-only typed error, got: {msg}",
     );
 }
 
