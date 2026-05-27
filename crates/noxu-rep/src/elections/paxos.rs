@@ -105,6 +105,31 @@ pub fn run_election_with_phi(
     phi_detector: Option<&PhiAccrualDetector>,
     fallback_timeout: Duration,
 ) -> Option<NodeId> {
+    // ---------------------------------------------------------------
+    // F22 guard: a node that cannot be master (Arbiter, Monitor,
+    // Secondary) must NOT propose itself as master, nor count a
+    // counter-proposal from such a node as a candidate value in
+    // Phase 2. Otherwise an Arbiter at the highest VLSN can win the
+    // election and wedge the cluster, since it cannot serve reads or
+    // generate VLSNs (`is_data_node() == false`).
+    //
+    // See docs/src/internal/api-audit-2026-05-rep.md finding F22.
+    // ---------------------------------------------------------------
+    let our_node_can_be_master = group
+        .get_node(node_name)
+        .map(|n| n.can_be_master())
+        // If the proposer is not yet a known group member, fall back
+        // to refusing election — only Electable members start rounds.
+        .unwrap_or(false);
+    if !our_node_can_be_master {
+        log::warn!(
+            "election: node {} (non-electable-as-master) refusing to \
+             propose; arbiter / monitor / secondary cannot be master",
+            node_name
+        );
+        return None;
+    }
+
     // Flexible Paxos: Phase 1 and Phase 2 may use different quorum sizes.
     // For SimpleMajority both equal (n/2)+1; for Flexible they differ.
     let phase1_quorum = group.phase1_quorum();
@@ -157,17 +182,30 @@ pub fn run_election_with_phi(
                     priority: peer_priority,
                     term: peer_term,
                 })) => {
-                    // Acceptor returned a counter-proposal (its own state).
-                    let peer_p = Proposal::new(
-                        peer_name,
-                        peer_vlsn,
-                        peer_priority,
-                        peer_term,
-                    );
-                    if peer_p.is_better_than(&best_proposal) {
-                        best_proposal = peer_p;
+                    // F22: a counter-proposal from a peer that cannot be
+                    // master (Arbiter / Monitor / Secondary) is treated
+                    // only as a Promise — never as a candidate value.
+                    // Otherwise an Arbiter with the highest VLSN would
+                    // win Phase 2 and wedge the cluster.
+                    let peer_can_be_master = group
+                        .get_node(&peer_name)
+                        .map(|n| n.can_be_master())
+                        // Unknown peer name — be conservative and do
+                        // NOT promote it.
+                        .unwrap_or(false);
+                    if peer_can_be_master {
+                        let peer_p = Proposal::new(
+                            peer_name,
+                            peer_vlsn,
+                            peer_priority,
+                            peer_term,
+                        );
+                        if peer_p.is_better_than(&best_proposal) {
+                            best_proposal = peer_p;
+                        }
                     }
-                    // Still counts as a promise.
+                    // Counts as a Promise either way (Arbiters DO
+                    // participate in elections — they just cannot win).
                     promises.push(Arc::clone(ch));
                 }
                 _ => {

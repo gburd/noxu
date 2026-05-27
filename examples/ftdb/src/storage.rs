@@ -37,7 +37,7 @@ impl Storage {
 
     /// Begins a new transaction.
     pub fn begin_transaction(&self) -> Result<Transaction, FtdbError> {
-        Ok(self.env.begin_transaction(None, None)?)
+        Ok(self.env.begin_transaction(None)?)
     }
 
     // ── Account operations ──────────────────────────────────────────────────

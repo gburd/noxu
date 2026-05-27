@@ -1,0 +1,5 @@
+error: `#[derive(SecondaryKey)]` requires at least one field with `#[secondary_key(name = "...", relate = ...)]`
+ --> tests/ui/fail_secondary_no_fields.rs:4:1
+  |
+4 | struct NoSecondary {
+  | ^^^^^^

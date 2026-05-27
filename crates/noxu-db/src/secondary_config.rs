@@ -4,6 +4,8 @@
 use crate::database::Database;
 use crate::database_config::DatabaseConfig;
 use crate::database_entry::DatabaseEntry;
+use noxu_sync::Mutex;
+use std::sync::Arc;
 
 /// Callback trait for creating a single secondary key from a primary record.
 ///
@@ -172,17 +174,20 @@ pub struct SecondaryConfig {
 
     /// Foreign key database name for referential integrity constraint.
     ///
-    /// When `Some(name)`, every inserted secondary key must exist as a
-    /// key in the database with this name.  In v1.5 this field is
-    /// **stored but not enforced** — see Decision 2C and the
-    /// rejection in [`crate::secondary_database::SecondaryDatabase::open`].
-    /// The previous `Option<*const Database>` representation has been
-    /// replaced by an owned database name (Wave 1C audit cleanup,
-    /// secondary-join F16) so that the configuration carries no raw
-    /// pointer and no `unsafe impl Send`.  When v1.6 implements FK
-    /// enforcement the engine will resolve this name to the
-    /// corresponding `Database` handle at open time.
+    /// Stored separately from the [`Self::foreign_key_database`] handle
+    /// so configuration objects without a live `Arc` reference (e.g.
+    /// for diagnostic logging or programmatic inspection of
+    /// `SecondaryConfig`) still carry the relationship name.
     pub foreign_key_database_name: Option<String>,
+
+    /// Foreign key database **handle** for referential integrity
+    /// constraint enforcement.  v1.6 (audit C2 / Decision 2C):
+    /// when set, the engine ensures every secondary key produced by
+    /// this index also exists as a primary key in the supplied
+    /// foreign database, and triggers the configured
+    /// [`Self::foreign_key_delete_action`] when a foreign-DB record
+    /// is deleted.
+    pub foreign_key_database: Option<Arc<Mutex<Database>>>,
 
     /// Action to take when a referenced foreign key record is deleted.
     pub foreign_key_delete_action: ForeignKeyDeleteAction,
@@ -221,6 +226,7 @@ impl SecondaryConfig {
             multi_key_creator: None,
             allow_populate: false,
             foreign_key_database_name: None,
+            foreign_key_database: None,
             foreign_key_delete_action: ForeignKeyDeleteAction::Abort,
             foreign_key_nullifier: None,
             foreign_multi_key_nullifier: None,
@@ -300,30 +306,41 @@ impl SecondaryConfig {
         self
     }
 
-    /// Sets the foreign key database (by name).
+    /// Sets the foreign key database (by name only — advisory).
     ///
-    /// # v1.5 status
-    ///
-    /// **Decision 2C** in `docs/src/internal/v1.5-decisions-2026-05.md`:
-    /// foreign-key constraints are not enforced in v1.5.  This setter
-    /// stores the value on the config but [`crate::secondary_database::SecondaryDatabase::open`]
-    /// rejects any config that has a non-default foreign-key field set.
-    /// Full FK support is planned for v1.6 alongside Decision 1B's
-    /// sorted-dup secondaries.  See audit findings C2 / F1 / F16.
-    ///
-    /// # Wave 1C breaking change
-    ///
-    /// The previous signature was `with_foreign_key_database(&Database)`
-    /// which stored a raw `*const Database` pointer and required an
-    /// unsafe `impl Send for SecondaryConfig`.  Since FK is rejected at
-    /// open in v1.5 the pointer was unused and unsafe; the setter now
-    /// takes the foreign DB's name and stores an owned `String`.  v1.6
-    /// will resolve the name to a real handle when FK lands.
+    /// v1.6: this records the relationship name for diagnostics but
+    /// **does not by itself activate FK enforcement**.  To enforce the
+    /// constraint, additionally call
+    /// [`Self::with_foreign_key_database_handle`] with the foreign
+    /// primary's `Arc<Mutex<Database>>` so the engine has a live
+    /// reference for cascade / abort / nullify fan-out.
     pub fn with_foreign_key_database<S: Into<String>>(
         mut self,
         name: S,
     ) -> Self {
         self.foreign_key_database_name = Some(name.into());
+        self
+    }
+
+    /// Sets the foreign key database handle for runtime FK enforcement.
+    ///
+    /// v1.6 (audit C2 / Decision 2C): the secondary index registers
+    /// itself as an FK referrer on the supplied foreign primary so
+    /// `Database::delete` on the foreign primary triggers the
+    /// configured [`ForeignKeyDeleteAction`] for every child record
+    /// whose secondary key equals the deleted foreign key.
+    pub fn with_foreign_key_database_handle(
+        mut self,
+        handle: Arc<Mutex<Database>>,
+    ) -> Self {
+        // Pull the database name out for diagnostics if the user did
+        // not also call [`Self::with_foreign_key_database`].  Locks
+        // briefly; this is a one-time setup call.
+        if self.foreign_key_database_name.is_none() {
+            let n = handle.lock().get_database_name().to_string();
+            self.foreign_key_database_name = Some(n);
+        }
+        self.foreign_key_database = Some(handle);
         self
     }
 
@@ -442,13 +459,12 @@ impl SecondaryConfig {
     /// Returns `true` if any foreign-key constraint field is set to a
     /// non-default value.
     ///
-    /// Used by [`SecondaryDatabase::open`] to enforce **Decision 2C**
-    /// (`docs/src/internal/v1.5-decisions-2026-05.md`): foreign-key
-    /// constraints are not enforced in v1.5; full FK support is planned
-    /// for v1.6 alongside Decision 1B's sorted-dup secondaries.  Closes
-    /// audit findings C2 / F1 / F16.
+    /// v1.6 still uses this helper to gate the open-time rejection of
+    /// half-configured FK setups (e.g. a nullifier without
+    /// `foreign_key_database_handle` set).
     pub(crate) fn has_foreign_key_config(&self) -> bool {
         self.foreign_key_database_name.is_some()
+            || self.foreign_key_database.is_some()
             || self.foreign_key_delete_action != ForeignKeyDeleteAction::Abort
             || self.foreign_key_nullifier.is_some()
             || self.foreign_multi_key_nullifier.is_some()

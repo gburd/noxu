@@ -1,57 +1,74 @@
 # Secondary Databases
 
-> **v1.5 capability matrix:** see
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+> **v1.6 capability matrix:** see
+> [Introduction → v1.6 capability matrix](../introduction.md#v15-capability-matrix).
 
 ## What is a Secondary Database?
 
-A secondary database is an index over a primary database. While the primary database stores your
-canonical records keyed by a primary key (e.g., employee ID), a secondary database stores an
-additional mapping from some derived key (e.g., department name) to the primary key.
+A secondary database is an index over a primary database. While the primary
+database stores your canonical records keyed by a primary key (e.g.
+employee ID), a secondary database stores an additional mapping from some
+derived key (e.g. department name) to the primary key.
 
-Secondary databases are read-only from your application's perspective — you do not insert into
-them directly. Instead, whenever you update the primary database, you update the secondary index
-to reflect the change.
+Secondary databases are read-only from your application's perspective —
+you do not insert into them directly. **As of v1.6 the primary database
+maintains every registered secondary index automatically**: when you
+`primary.put(...)` or `primary.delete(...)`, every `SecondaryDatabase`
+opened against that primary is updated under the same caller-supplied
+transaction, so the primary record and its index entries commit or abort
+atomically. Manual `update_secondary` calls are still available as an
+escape hatch for population from external feeds, but ordinary application
+code no longer needs them.
 
-## v1.5 limitations
+## v1.6 contract
 
-Noxu DB v1.5 ships **honest one-to-one secondary databases** with the
-following two limitations carried over from
-[`docs/src/internal/v1.5-decisions-2026-05.md`][decisions]:
+Three v1.5 limitations are closed in v1.6:
 
-1. **One-to-one only** (Decision 1B). A given secondary key may map to at
-   most one primary record. Two distinct primary records that produce the
-   same secondary key cause the second `update_secondary` to fail with a
-   typed `NoxuError::Unsupported`. The first primary's mapping is left
-   intact, so the failure is loud and the index does not silently
-   corrupt. Sorted-dup secondaries (many primaries per secondary key, with
-   `JoinCursor` over true duplicate intersections) are planned for v1.6.
-2. **Foreign-key constraints are not enforced** (Decision 2C). Setting
-   any of `SecondaryConfig.foreign_key_database`,
-   `foreign_key_delete_action != Abort`, `foreign_key_nullifier`, or
-   `foreign_multi_key_nullifier` causes `SecondaryDatabase::open` to
-   return `NoxuError::Unsupported`. The fields are accepted by the
-   builder for forward source compatibility (v1.6 will honour them), but
-   the runtime cannot enforce them today, so we surface a typed error at
-   open time rather than silently ignoring user configuration. Full FK
-   support (Abort, Cascade, Nullify) is planned for v1.6 alongside the
-   sorted-dup work, because Cascade and Nullify both depend on the
-   associate-hook that sorted-dup secondaries introduce.
+1. **Sorted-dup secondaries** (Decision 1B / audit C4). Multiple
+   primary records may produce the same secondary key. The inner
+   index storage stores them as duplicates of the secondary key; cursor
+   walks via `SecondaryCursor::get_next_dup_full` /
+   `get_prev_dup_full` enumerate every primary that shares the
+   secondary key.
 
-The SecondaryConfig builder methods
-(`with_foreign_key_database`, `with_foreign_key_delete_action`,
-`with_foreign_key_nullifier`, `with_foreign_multi_key_nullifier`) remain
-chainable so user code can be written against the v1.6 surface and
-rejected loudly at open under v1.5 — not silently broken.
+   The inner index database **must** be opened with
+   `DatabaseConfig::with_sorted_duplicates(true)`. A non-sorted-dup
+   inner DB causes `SecondaryDatabase::open` to return
+   `NoxuError::IllegalArgument`.
 
-See `crates/noxu-db/tests/secondary_decisions_test.rs` for the
-regression tests that demonstrate each rejection.
+2. **Automatic associate()-style maintenance** (audit C3). Every
+   `SecondaryDatabase` registers itself on the primary at open time;
+   `Database::put` and `Database::delete` walk the registry under the
+   caller's txn so primary writes and secondary index updates commit
+   or abort together. Update-existing-key semantics (delete-old +
+   insert-new) and multi-key creators are honoured.
 
-[decisions]: ../internal/v1.5-decisions-2026-05.md
+3. **Foreign-key constraints** (Decision 2C / audit C2). When the
+   secondary's `SecondaryConfig::with_foreign_key_database_handle(...)`
+   names a foreign primary, that foreign DB's `delete` triggers the
+   configured `ForeignKeyDeleteAction`:
+
+   * `Abort` — return `NoxuError::ForeignConstraintViolation` and
+     leave the foreign record in place.
+   * `Cascade` — delete every child primary record indexed under the
+     foreign key, transitively, with cycle detection.
+   * `Nullify` — call the user's `ForeignKeyNullifier` (single-key)
+     or `ForeignMultiKeyNullifier` (multi-key) to mutate the child
+     primary's data; auto-maintenance removes the now-stale secondary
+     entry.
+
+   Setting `foreign_key_database_name` (the legacy advisory setter)
+   without the matching handle is rejected with
+   `NoxuError::IllegalArgument` so callers do not silently end up with
+   an unenforced constraint.
+
+See `crates/noxu-db/tests/secondary_decisions_test.rs` for the regression
+tests that exercise each behaviour.
 
 ## Implementing a Key Creator
 
-A key creator extracts the secondary key from a primary record. Implement the `SecondaryKeyCreator` trait:
+A key creator extracts the secondary key from a primary record. Implement
+the `SecondaryKeyCreator` trait:
 
 ```rust
 use noxu_db::{Database, DatabaseEntry, SecondaryKeyCreator};
@@ -80,8 +97,11 @@ impl SecondaryKeyCreator for DepartmentKeyCreator {
 }
 ```
 
-The method returns `true` if a secondary key was produced, or `false` if this primary record
-should have no entry in the secondary database.
+The method returns `true` if a secondary key was produced, or `false` if
+this primary record should have no entry in the secondary database.
+
+For records that produce more than one secondary key (e.g. tags), use the
+`SecondaryMultiKeyCreator` trait instead.
 
 ## Opening a Secondary Database
 
@@ -90,22 +110,31 @@ use noxu_db::{SecondaryConfig, SecondaryDatabase};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-// Open primary database
-let primary_db = env.open_database(None, "employees",
-    &DatabaseConfig::new().with_allow_create(true))?;
+// Open the primary database.
+let primary_db = env.open_database(
+    None, "employees",
+    &DatabaseConfig::new().with_allow_create(true),
+)?;
 let primary = Arc::new(Mutex::new(primary_db));
 
-// Open the underlying storage database for the secondary index
-let sec_db = env.open_database(None, "by_department",
-    &DatabaseConfig::new().with_allow_create(true))?;
+// Open the underlying storage for the secondary index.  v1.6 sorted-dup
+// secondaries require the inner DB to allow duplicates.
+let sec_db = env.open_database(
+    None, "by_department",
+    &DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true),
+)?;
 
-// Create and open the secondary database
+// Create and open the secondary database.
 let sec_config = SecondaryConfig::new()
     .with_allow_create(true)
     .with_allow_populate(true)
     .with_key_creator(Box::new(DepartmentKeyCreator));
 
-let secondary = SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_config)?;
+let secondary = SecondaryDatabase::open(
+    Arc::clone(&primary), sec_db, sec_config,
+)?;
 ```
 
 ## Reading from a Secondary Database
@@ -117,62 +146,78 @@ let mut data = DatabaseEntry::new();
 
 let status = secondary.get(None, &dept_key, &mut primary_key, &mut data)?;
 if status == OperationStatus::Success {
-    let emp_name = std::str::from_utf8(primary_key.data())?;
-    let record   = std::str::from_utf8(data.data())?;
+    let emp_name = std::str::from_utf8(primary_key.get_data().unwrap())?;
+    let record = std::str::from_utf8(data.get_data().unwrap())?;
     println!("{}: {}", emp_name, record);
 }
 ```
 
-A secondary `get` returns three values: the secondary key, the primary key, and the primary data.
+`SecondaryDatabase::get` returns the **first** primary indexed under the
+secondary key (the smallest primary key in cursor order). To enumerate
+every primary indexed under the same secondary key, use the cursor.
 
-## Iterating a Secondary Database
+## Walking duplicates of a secondary key
 
 ```rust
 let mut cursor = secondary.open_cursor(None, None)?;
 let mut sec_key = DatabaseEntry::new();
-let mut pk      = DatabaseEntry::new();
-let mut data    = DatabaseEntry::new();
+let mut pk = DatabaseEntry::new();
+let mut data = DatabaseEntry::new();
 
-let mut status = cursor.get_first(&mut sec_key, &mut pk, &mut data)?;
+// Position on the first record under "Engineering".
+let mut status = cursor.get_search_key(
+    &DatabaseEntry::from_bytes(b"Engineering"),
+    &mut pk,
+    &mut data,
+)?;
 while status == OperationStatus::Success {
-    let dept = std::str::from_utf8(sec_key.data())?;
-    let name = std::str::from_utf8(pk.data())?;
-    println!("{}: {}", dept, name);
-    status = cursor.get_next(&mut sec_key, &mut pk, &mut data)?;
+    println!("emp = {:?}", pk.get_data());
+    // Step to the next primary indexed under the SAME secondary key,
+    // or NotFound when the run ends.
+    status = cursor.get_next_dup_full(
+        &mut sec_key,
+        &mut pk,
+        &mut data,
+    )?;
 }
 cursor.close()?;
 ```
 
-## Keeping the Secondary Index in Sync
+`get_next_dup_full` and the symmetric `get_prev_dup_full` walk every
+duplicate of the cursor's current secondary key and return
+`OperationStatus::NotFound` as soon as the cursor leaves the run.
 
-When you insert or update a primary record, call `secondary.update_secondary` to keep the index consistent:
-
-```rust
-// Insert into primary
-let key   = DatabaseEntry::from_bytes(b"Alice");
-let value = DatabaseEntry::from_bytes(b"Engineering|Senior Engineer");
-primary.lock().put(None, &key, &value)?;
-
-// Update secondary index
-secondary.update_secondary(&key, None, Some(&value))?;
-// Arguments: primary_key, old_data (None for insert), new_data (None for delete)
-```
-
-For updates, provide both old and new data:
+## Foreign-key constraints
 
 ```rust
-let old_value = DatabaseEntry::from_bytes(b"Engineering|Senior Engineer");
-let new_value = DatabaseEntry::from_bytes(b"Engineering|Staff Engineer");
-primary.lock().put(None, &key, &new_value)?;
-secondary.update_secondary(&key, Some(&old_value), Some(&new_value))?;
+use noxu_db::secondary_config::ForeignKeyDeleteAction;
+
+// Open the foreign primary (e.g. a "departments" lookup table).
+let depts = Arc::new(Mutex::new(env.open_database(
+    None, "departments",
+    &DatabaseConfig::new().with_allow_create(true),
+)?));
+
+// Open an "employees-by-department" index that references it.
+let sec_db = env.open_database(
+    None, "emp_by_dept",
+    &DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true),
+)?;
+let cfg = SecondaryConfig::new()
+    .with_allow_create(true)
+    .with_key_creator(Box::new(DepartmentKeyCreator))
+    .with_foreign_key_database_handle(Arc::clone(&depts))
+    .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
+
+let _emp_idx = SecondaryDatabase::open(
+    Arc::clone(&primary), sec_db, cfg,
+)?;
 ```
 
-For deletes, provide only the old data:
-
-```rust
-secondary.update_secondary(&key, Some(&old_value), None)?;
-primary.lock().delete(None, &key)?;
-```
+Now `depts.lock().delete(...)` cascades into every employee whose
+department matches, all under the caller's txn.
 
 ## Closing a Secondary Database
 
@@ -180,6 +225,7 @@ primary.lock().delete(None, &key)?;
 secondary.close()?;
 ```
 
-The secondary must be closed before the primary database and before the environment.
+The secondary must be closed before the primary database and before the
+environment.
 
 ---

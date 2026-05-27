@@ -1,169 +1,85 @@
-//! Database iterators for collection views.
+//! Typed iterators for `noxu-collections` Stored* views.
 //!
+//! Wave 2B redesign (v1.6).  The pre-1.6 iterator was a snapshot-of-keys
+//! type that lazily fetched values, parameterised over `&[u8]` keys.
+//! In v1.6 the Stored* surface is fully typed (parameterised by
+//! `EntryBinding<K>` / `EntryBinding<V>`), so the iterator is now
+//! generic over the item type `T` it yields.
 //!
-//! Provides iterators over database records. Unlike the StoredIterator
-//! which wraps a live cursor, these iterators work from a snapshot of
-//! sorted keys and fetch values on demand from the database.
+//! Implementation strategy: at iter() construction time the calling
+//! Stored* view opens a cursor under the supplied `Option<&Transaction>`,
+//! walks every record (or every record from a starting key), decodes
+//! each via the bindings, and pushes the decoded items into a `Vec<T>`.
+//! The iterator then yields from the `Vec`.  This matches BDB-JE's
+//! "snapshot at iter() time" contract and avoids holding a live cursor
+//! across the iteration's lifetime — the latter would force every
+//! call site to thread three or four extra lifetime parameters.
 
-use crate::error::{CollectionError, Result};
-use noxu_db::{Database, DatabaseEntry, OperationStatus};
+use crate::error::Result;
 
-/// Iterator over database records yielding (key, value) pairs.
+/// Generic snapshot-based iterator over Stored* views.
 ///
+/// `T` is the item type, which is `(K, V)` for `iter()`, `K` for
+/// `keys()`, and `V` for `values()`.
 ///
+/// # Snapshot semantics
 ///
-/// This iterator yields key-value pairs as `(Vec<u8>, Vec<u8>)`. Records
-/// are returned in sorted key order. The iterator takes a snapshot of keys
-/// at creation time and fetches values from the database on each call to
-/// `next()`.
-///
-/// # Note
-///
-/// Because this iterator snapshots keys at creation time, concurrent
-/// modifications to the database may cause some entries to be missing
-/// (if deleted after snapshot) or stale.
-pub struct StoredIterator<'db> {
-    /// Reference to the database for fetching values.
-    db: &'db Database,
-    /// Sorted snapshot of keys to iterate over.
-    keys: Vec<Vec<u8>>,
-    /// Current position in the keys vector.
-    position: usize,
-    /// Whether to iterate in reverse order.
-    reverse: bool,
+/// The iterator is materialised eagerly at the call to `iter()` /
+/// `keys()` / `values()`.  Concurrent modifications made *after* the
+/// iterator has been constructed are not reflected in the iteration.
+/// If you need transactional semantics, pass `Some(&txn)` to the
+/// `iter()` call so the snapshot scan participates in your txn and
+/// holds the appropriate locks.
+pub struct StoredIterator<T> {
+    /// Items materialised at iter() construction time.
+    items: std::vec::IntoIter<T>,
+    /// Total number of items at construction (for `len()` / size_hint).
+    total: usize,
+    /// Number consumed so far.
+    consumed: usize,
 }
 
-impl<'db> StoredIterator<'db> {
-    /// Creates a new iterator over all records in the database.
+impl<T> StoredIterator<T> {
+    /// Constructs a new iterator from a pre-materialised vector of items.
     ///
-    /// Keys are snapshotted at creation time and sorted in ascending order.
-    pub fn new(db: &'db Database, keys: Vec<Vec<u8>>) -> Self {
-        let mut sorted_keys = keys;
-        sorted_keys.sort();
-        StoredIterator { db, keys: sorted_keys, position: 0, reverse: false }
+    /// Called by Stored* views after they have completed the cursor scan.
+    pub(crate) fn from_vec(items: Vec<T>) -> Self {
+        let total = items.len();
+        StoredIterator { items: items.into_iter(), total, consumed: 0 }
     }
 
-    /// Creates a new reverse iterator over all records in the database.
-    ///
-    /// Keys are snapshotted at creation time and iterated in descending order.
-    pub fn new_reverse(db: &'db Database, keys: Vec<Vec<u8>>) -> Self {
-        let mut sorted_keys = keys;
-        sorted_keys.sort();
-        sorted_keys.reverse();
-        StoredIterator { db, keys: sorted_keys, position: 0, reverse: true }
+    /// Returns the total number of items the iterator was constructed with.
+    pub fn total(&self) -> usize {
+        self.total
     }
 
-    /// Creates a new iterator starting from the given key (inclusive).
-    ///
-    /// Only keys greater than or equal to `start_key` are included.
-    /// Keys are iterated in ascending order.
-    pub fn new_from(
-        db: &'db Database,
-        keys: Vec<Vec<u8>>,
-        start_key: &[u8],
-    ) -> Self {
-        let mut sorted_keys = keys;
-        sorted_keys.sort();
-        sorted_keys.retain(|k| k.as_slice() >= start_key);
-        StoredIterator { db, keys: sorted_keys, position: 0, reverse: false }
+    /// Returns the number of items already produced.
+    pub fn consumed(&self) -> usize {
+        self.consumed
     }
 
-    /// Returns the number of remaining entries.
+    /// Returns the number of items remaining.
     pub fn remaining(&self) -> usize {
-        if self.position >= self.keys.len() {
-            0
-        } else {
-            self.keys.len() - self.position
-        }
+        self.total.saturating_sub(self.consumed)
     }
 
-    /// Returns whether the iterator is in reverse mode.
-    pub fn is_reverse(&self) -> bool {
-        self.reverse
+    /// Returns whether the iterator has been exhausted.
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining() == 0
     }
 }
 
-impl<'db> Iterator for StoredIterator<'db> {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+impl<T> Iterator for StoredIterator<T> {
+    type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.keys.len() {
-            return None;
-        }
-
-        let key_bytes = self.keys[self.position].clone();
-        self.position += 1;
-
-        let key_entry = DatabaseEntry::from_vec(key_bytes.clone());
-        let mut data_entry = DatabaseEntry::new();
-
-        match self.db.get(None, &key_entry, &mut data_entry) {
-            Ok(OperationStatus::Success) => {
-                let value = data_entry
-                    .get_data()
-                    .map(|d| d.to_vec())
-                    .unwrap_or_default();
-                Some(Ok((key_bytes, value)))
+        match self.items.next() {
+            Some(item) => {
+                self.consumed += 1;
+                Some(Ok(item))
             }
-            Ok(OperationStatus::NotFound) => {
-                // Key was deleted between snapshot and fetch; skip to next
-                self.next()
-            }
-            Ok(_) => {
-                // Unexpected status
-                self.next()
-            }
-            Err(e) => Some(Err(CollectionError::DatabaseError(e))),
+            None => None,
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.remaining();
-        (0, Some(remaining))
-    }
-}
-
-/// Iterator over database keys only.
-///
-/// Yields keys as `Vec<u8>` in sorted order. This iterator does not
-/// fetch values from the database, making it more efficient when only
-/// keys are needed.
-pub struct StoredKeyIterator {
-    /// Sorted snapshot of keys to iterate over.
-    keys: Vec<Vec<u8>>,
-    /// Current position in the keys vector.
-    position: usize,
-}
-
-impl StoredKeyIterator {
-    /// Creates a new key iterator from a sorted key snapshot.
-    pub fn new(keys: Vec<Vec<u8>>) -> Self {
-        let mut sorted_keys = keys;
-        sorted_keys.sort();
-        StoredKeyIterator { keys: sorted_keys, position: 0 }
-    }
-
-    /// Returns the number of remaining keys.
-    pub fn remaining(&self) -> usize {
-        if self.position >= self.keys.len() {
-            0
-        } else {
-            self.keys.len() - self.position
-        }
-    }
-}
-
-impl Iterator for StoredKeyIterator {
-    type Item = Result<Vec<u8>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.keys.len() {
-            return None;
-        }
-
-        let key = self.keys[self.position].clone();
-        self.position += 1;
-        Some(Ok(key))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -172,270 +88,55 @@ impl Iterator for StoredKeyIterator {
     }
 }
 
-/// Iterator over database values only.
-///
-/// Yields values as `Vec<u8>` in key-sorted order. Values are fetched
-/// from the database on each call to `next()`.
-pub struct StoredValueIterator<'db> {
-    /// The underlying key-value iterator.
-    inner: StoredIterator<'db>,
-}
-
-impl<'db> StoredValueIterator<'db> {
-    /// Creates a new value iterator from a database and key snapshot.
-    pub fn new(db: &'db Database, keys: Vec<Vec<u8>>) -> Self {
-        StoredValueIterator { inner: StoredIterator::new(db, keys) }
-    }
-
-    /// Returns the number of remaining values.
-    pub fn remaining(&self) -> usize {
-        self.inner.remaining()
+impl<T> ExactSizeIterator for StoredIterator<T> {
+    fn len(&self) -> usize {
+        self.remaining()
     }
 }
 
-impl<'db> Iterator for StoredValueIterator<'db> {
-    type Item = Result<Vec<u8>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|result| result.map(|(_, v)| v))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
+impl<T> std::iter::FusedIterator for StoredIterator<T> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
-    use tempfile::TempDir;
-
-    fn setup_db_with_data() -> (TempDir, Environment, Database, Vec<Vec<u8>>) {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-
-        let keys: Vec<Vec<u8>> =
-            vec![b"cherry".to_vec(), b"apple".to_vec(), b"banana".to_vec()];
-
-        for key in &keys {
-            let k = DatabaseEntry::from_vec(key.clone());
-            let v = DatabaseEntry::from_vec(
-                format!("val_{}", String::from_utf8_lossy(key)).into_bytes(),
-            );
-            db.put(None, &k, &v).unwrap();
-        }
-
-        (temp_dir, env, db, keys)
-    }
 
     #[test]
-    fn test_stored_iterator_sorted_order() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredIterator::new(&db, keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].0, b"apple");
-        assert_eq!(items[1].0, b"banana");
-        assert_eq!(items[2].0, b"cherry");
-    }
-
-    #[test]
-    fn test_stored_iterator_values() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredIterator::new(&db, keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        assert_eq!(items[0].1, b"val_apple");
-        assert_eq!(items[1].1, b"val_banana");
-        assert_eq!(items[2].1, b"val_cherry");
-    }
-
-    #[test]
-    fn test_stored_iterator_reverse() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredIterator::new_reverse(&db, keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].0, b"cherry");
-        assert_eq!(items[1].0, b"banana");
-        assert_eq!(items[2].0, b"apple");
-    }
-
-    #[test]
-    fn test_stored_iterator_from() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredIterator::new_from(&db, keys, b"banana");
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].0, b"banana");
-        assert_eq!(items[1].0, b"cherry");
-    }
-
-    #[test]
-    fn test_stored_iterator_empty() {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-
-        let iter = StoredIterator::new(&db, vec![]);
-        let items: Vec<_> = iter.collect::<Vec<_>>();
-        assert!(items.is_empty());
-    }
-
-    #[test]
-    fn test_stored_iterator_remaining() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let mut iter = StoredIterator::new(&db, keys);
-
-        assert_eq!(iter.remaining(), 3);
-        iter.next();
-        assert_eq!(iter.remaining(), 2);
-        iter.next();
-        assert_eq!(iter.remaining(), 1);
-        iter.next();
+    fn empty_iterator_is_exhausted() {
+        let mut iter: StoredIterator<i32> = StoredIterator::from_vec(vec![]);
+        assert_eq!(iter.total(), 0);
         assert_eq!(iter.remaining(), 0);
+        assert!(iter.is_exhausted());
+        assert!(iter.next().is_none());
     }
 
     #[test]
-    fn test_stored_iterator_skips_deleted() {
-        let (_td, _env, db, keys) = setup_db_with_data();
+    fn iterator_yields_in_order_and_tracks_progress() {
+        let mut iter = StoredIterator::from_vec(vec![1, 2, 3]);
+        assert_eq!(iter.total(), 3);
+        assert_eq!(iter.size_hint(), (3, Some(3)));
 
-        // Delete "banana" from the database
-        let banana_key = DatabaseEntry::from_bytes(b"banana");
-        db.delete(None, &banana_key).unwrap();
-
-        let iter = StoredIterator::new(&db, keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        // Should skip the deleted key
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].0, b"apple");
-        assert_eq!(items[1].0, b"cherry");
-    }
-
-    #[test]
-    fn test_stored_key_iterator() {
-        let keys =
-            vec![b"cherry".to_vec(), b"apple".to_vec(), b"banana".to_vec()];
-        let iter = StoredKeyIterator::new(keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0], b"apple");
-        assert_eq!(items[1], b"banana");
-        assert_eq!(items[2], b"cherry");
-    }
-
-    #[test]
-    fn test_stored_key_iterator_empty() {
-        let iter = StoredKeyIterator::new(vec![]);
-        let items: Vec<_> = iter.collect::<Vec<_>>();
-        assert!(items.is_empty());
-    }
-
-    #[test]
-    fn test_stored_key_iterator_remaining() {
-        let keys = vec![b"a".to_vec(), b"b".to_vec()];
-        let mut iter = StoredKeyIterator::new(keys);
+        assert_eq!(iter.next().unwrap().unwrap(), 1);
+        assert_eq!(iter.consumed(), 1);
         assert_eq!(iter.remaining(), 2);
-        iter.next();
-        assert_eq!(iter.remaining(), 1);
-        iter.next();
-        assert_eq!(iter.remaining(), 0);
+
+        assert_eq!(iter.next().unwrap().unwrap(), 2);
+        assert_eq!(iter.next().unwrap().unwrap(), 3);
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
     }
 
     #[test]
-    fn test_stored_value_iterator() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredValueIterator::new(&db, keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0], b"val_apple");
-        assert_eq!(items[1], b"val_banana");
-        assert_eq!(items[2], b"val_cherry");
+    fn iterator_is_fused() {
+        let mut iter = StoredIterator::from_vec(vec![10]);
+        assert_eq!(iter.next().unwrap().unwrap(), 10);
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
     }
 
     #[test]
-    fn test_stored_value_iterator_empty() {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-
-        let iter = StoredValueIterator::new(&db, vec![]);
-        let items: Vec<_> = iter.collect::<Vec<_>>();
-        assert!(items.is_empty());
-    }
-
-    #[test]
-    fn test_stored_iterator_size_hint() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredIterator::new(&db, keys);
-        let (lower, upper) = iter.size_hint();
-        assert_eq!(lower, 0);
-        assert_eq!(upper, Some(3));
-    }
-
-    #[test]
-    fn test_stored_key_iterator_size_hint() {
-        let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
-        let iter = StoredKeyIterator::new(keys);
-        let (lower, upper) = iter.size_hint();
-        assert_eq!(lower, 3);
-        assert_eq!(upper, Some(3));
-    }
-
-    #[test]
-    fn test_stored_iterator_is_reverse() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-
-        let iter = StoredIterator::new(&db, keys.clone());
-        assert!(!iter.is_reverse());
-
-        let iter = StoredIterator::new_reverse(&db, keys);
-        assert!(iter.is_reverse());
-    }
-
-    #[test]
-    fn test_stored_iterator_from_beyond_all_keys() {
-        let (_td, _env, db, keys) = setup_db_with_data();
-        let iter = StoredIterator::new_from(&db, keys, b"zzz");
-        let items: Vec<_> = iter.collect::<Vec<_>>();
-        assert!(items.is_empty());
-    }
-
-    #[test]
-    fn test_stored_iterator_single_record() {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-
-        let k = DatabaseEntry::from_bytes(b"only");
-        let v = DatabaseEntry::from_bytes(b"one");
-        db.put(None, &k, &v).unwrap();
-
-        let keys = vec![b"only".to_vec()];
-        let iter = StoredIterator::new(&db, keys);
-        let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].0, b"only");
-        assert_eq!(items[0].1, b"one");
+    fn exact_size_iterator() {
+        let iter = StoredIterator::from_vec(vec!["a", "b", "c"]);
+        assert_eq!(iter.len(), 3);
     }
 }

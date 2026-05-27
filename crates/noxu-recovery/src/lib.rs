@@ -16,7 +16,10 @@ pub mod recovery_info;
 pub mod recovery_manager;
 pub mod rollback_tracker;
 
-pub use analysis_result::{AnalysisResult, DirtyInEntry, DirtyInKey};
+pub use analysis_result::{
+    AnalysisResult, DirtyInEntry, DirtyInKey, PreparedLnOperation,
+    PreparedLnReplay, PreparedTxnInfo,
+};
 pub use checkpoint_end::CheckpointEnd;
 pub use checkpoint_start::CheckpointStart;
 pub use checkpoint_stat::{CheckpointStats, CheckpointStatsSnapshot};
@@ -27,6 +30,7 @@ pub use log_scanner::{
     CkptEndRecord, CkptStartRecord, DbTreeRecord, InMemoryLogScanner, InRecord,
     LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
     RollbackEndRecord, RollbackStartRecord, TxnAbortRecord, TxnCommitRecord,
+    TxnPrepareRecord,
 };
 pub use recovery_info::RecoveryInfo;
 pub use recovery_manager::{

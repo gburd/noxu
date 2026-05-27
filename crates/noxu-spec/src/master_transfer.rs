@@ -7,7 +7,10 @@
 //!
 //! Production code under model:
 //!   - `crates/noxu-rep/src/master_transfer.rs`
-//!   - `crates/noxu-rep/src/elections/master_term.rs`
+//!   - `crates/noxu-rep/src/elections/master_tracker.rs`
+//!     (audit rep F32 (Wave 2C-4): the spec previously pointed at
+//!     `master_term.rs`, which has never existed; the term state
+//!     lives in `master_tracker.rs::MasterTracker::master_term`).
 //!
 //! Properties:
 //!   - `AtMostOneMaster` — across all reachable states, at most one

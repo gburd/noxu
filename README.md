@@ -35,7 +35,7 @@ fn main() -> noxu_db::Result<()> {
     assert_eq!(result.data(), b"world");
 
     // Use transactions for ACID guarantees
-    let txn = env.begin_transaction(None, None)?;
+    let txn = env.begin_transaction(None)?;
     db.put(Some(&txn), &DatabaseEntry::from_bytes(b"key2"), &DatabaseEntry::from_bytes(b"val2"))?;
     txn.commit()?;
 

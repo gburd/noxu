@@ -116,6 +116,17 @@ impl AckTracker {
         }
     }
 
+    /// Number of distinct replica acks recorded for `vlsn`, or `None`
+    /// if no registration exists for that VLSN.
+    ///
+    /// Used by the F1 commit-coordinator path to report the partial
+    /// ack count when a commit times out without satisfying the
+    /// configured `ReplicaAckPolicy`.
+    pub fn received_count(&self, vlsn: u64) -> Option<u32> {
+        let pending = self.pending_acks.lock();
+        pending.get(&vlsn).map(|ack| ack.received.len() as u32)
+    }
+
     /// Remove all pending acks for VLSNs <= the given value.
     ///
     /// This is used to clean up acks for transactions that have been

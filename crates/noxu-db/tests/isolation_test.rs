@@ -44,7 +44,7 @@ fn put_committed(
     key: &[u8],
     val: &[u8],
 ) {
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(key);
     let v = DatabaseEntry::from_bytes(val);
     db.put(Some(&txn), &k, &v).unwrap();
@@ -87,7 +87,7 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     let brd = Arc::clone(&barrier_reader_done);
 
     let writer = thread::spawn(move || {
-        let txn = env_w.begin_transaction(None, None).unwrap();
+        let txn = env_w.begin_transaction(None).unwrap();
         let k = DatabaseEntry::from_bytes(b"key");
         let v = DatabaseEntry::from_bytes(b"v2");
         db_w.put(Some(&txn), &k, &v).unwrap();
@@ -102,7 +102,7 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     // Reader (no_wait) must NOT see the dirty b"v2".
     barrier_write_done.wait();
     let rc_config = TransactionConfig::read_committed();
-    let reader_txn = env.begin_transaction(None, Some(&rc_config)).unwrap();
+    let reader_txn = env.begin_transaction(Some(&rc_config)).unwrap();
     let key = DatabaseEntry::from_bytes(b"key");
     let mut out = DatabaseEntry::new();
     let status = db.get(Some(&reader_txn), &key, &mut out);
@@ -115,7 +115,7 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     writer.join().unwrap();
     // After writer commits, we drop and re-read to verify the commit is visible.
     drop(reader_txn);
-    let txn2 = env.begin_transaction(None, Some(&rc_config)).unwrap();
+    let txn2 = env.begin_transaction(Some(&rc_config)).unwrap();
     let mut out2 = DatabaseEntry::new();
     assert_eq!(
         get_val(&db, Some(&txn2), b"key", &mut out2),
@@ -145,7 +145,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     put_committed(&env, &db, b"k", b"v1");
 
     // Serializable reader acquires and holds a read lock on "k".
-    let ser_txn = env.begin_transaction(None, None).unwrap(); // serializable by default
+    let ser_txn = env.begin_transaction(None).unwrap(); // serializable by default
     let mut out = DatabaseEntry::new();
     assert_eq!(
         get_val(&db, Some(&ser_txn), b"k", &mut out),
@@ -155,8 +155,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
 
     // Concurrent writer with no_wait tries to write "k" — must conflict.
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let writer_txn =
-        env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let writer_txn = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     let write_result = db.put(Some(&writer_txn), &k, &v2);
@@ -170,8 +169,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     // Once the serializable reader commits, a new writer can succeed.
     ser_txn.commit().unwrap();
 
-    let writer_txn2 =
-        env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let writer_txn2 = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert_eq!(
@@ -196,7 +194,7 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
 
     // Read-committed reader acquires and immediately releases the read lock.
     let rc_config = TransactionConfig::read_committed();
-    let reader_txn = env.begin_transaction(None, Some(&rc_config)).unwrap();
+    let reader_txn = env.begin_transaction(Some(&rc_config)).unwrap();
     let mut out = DatabaseEntry::new();
     assert_eq!(
         get_val(&db, Some(&reader_txn), b"k", &mut out),
@@ -207,8 +205,7 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
     // After the read operation the lock is released, so a no_wait writer
     // must succeed (no lock conflict).
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let writer_txn =
-        env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let writer_txn = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert_eq!(
@@ -240,14 +237,14 @@ fn test_write_write_conflict_no_wait() {
     put_committed(&env, &db, b"ww", b"initial");
 
     // First writer acquires WRITE lock.
-    let txn_a = env.begin_transaction(None, None).unwrap();
+    let txn_a = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(b"ww");
     let va = DatabaseEntry::from_bytes(b"from_a");
     db.put(Some(&txn_a), &k, &va).unwrap();
 
     // Second writer (no_wait) must conflict.
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
-    let txn_b = env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let txn_b = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k2 = DatabaseEntry::from_bytes(b"ww");
     let vb = DatabaseEntry::from_bytes(b"from_b");
     let result_b = db.put(Some(&txn_b), &k2, &vb);
@@ -261,7 +258,7 @@ fn test_write_write_conflict_no_wait() {
     txn_a.commit().unwrap();
 
     // Third writer (no_wait) now succeeds.
-    let txn_c = env.begin_transaction(None, Some(&no_wait_config)).unwrap();
+    let txn_c = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k3 = DatabaseEntry::from_bytes(b"ww");
     let vc = DatabaseEntry::from_bytes(b"from_c");
     assert_eq!(
@@ -288,7 +285,7 @@ fn test_read_committed_allows_non_repeatable_read() {
     put_committed(&env, &db, b"nr", b"v1");
 
     let rc_config = TransactionConfig::read_committed();
-    let reader = env.begin_transaction(None, Some(&rc_config)).unwrap();
+    let reader = env.begin_transaction(Some(&rc_config)).unwrap();
 
     // First read: sees v1.
     let mut out = DatabaseEntry::new();
@@ -330,7 +327,7 @@ fn test_serializable_prevents_non_repeatable_read() {
     put_committed(&env, &db, b"rr", b"v1");
 
     // Serializable reader (default).
-    let ser_txn = env.begin_transaction(None, None).unwrap();
+    let ser_txn = env.begin_transaction(None).unwrap();
 
     // First read: sees v1, acquires read lock.
     let mut out = DatabaseEntry::new();
@@ -342,7 +339,7 @@ fn test_serializable_prevents_non_repeatable_read() {
 
     // Another writer tries to commit v2 with no_wait — must fail (read lock held).
     let no_wait = TransactionConfig::new().with_no_wait(true);
-    let w = env.begin_transaction(None, Some(&no_wait)).unwrap();
+    let w = env.begin_transaction(Some(&no_wait)).unwrap();
     let k = DatabaseEntry::from_bytes(b"rr");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert!(
@@ -378,7 +375,7 @@ fn test_atomic_commit_all_or_nothing_visibility() {
     let (_dir, env, db) = setup();
 
     // Write N keys in a single transaction.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let v = DatabaseEntry::from_bytes(b"batch");
@@ -387,7 +384,7 @@ fn test_atomic_commit_all_or_nothing_visibility() {
     txn.commit().unwrap();
 
     // All N keys must be readable.
-    let read_txn = env.begin_transaction(None, None).unwrap();
+    let read_txn = env.begin_transaction(None).unwrap();
     let mut missing = 0u32;
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
@@ -415,7 +412,7 @@ fn test_aborted_transaction_full_rollback() {
     // Pre-existing key with known value.
     put_committed(&env, &db, b"existing", b"original");
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     // Modify existing key.
     let k1 = DatabaseEntry::from_bytes(b"existing");
     let v1 = DatabaseEntry::from_bytes(b"modified");
@@ -495,7 +492,7 @@ fn test_32_thread_concurrent_readers() {
             thread::spawn(move || {
                 barrier.wait(); // all threads start simultaneously
                 let rc = TransactionConfig::read_committed();
-                let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                let txn = env.begin_transaction(Some(&rc)).unwrap();
                 let mut missing = 0u32;
                 for i in 0u32..KEYS {
                     let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
@@ -559,7 +556,7 @@ fn test_8r8w_all_committed_data_visible() {
                     let key_idx = w * KEYS_PER_WRITER + j;
                     let k = DatabaseEntry::from_bytes(&key_idx.to_be_bytes());
                     let v = DatabaseEntry::from_bytes(b"written");
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     db.put(Some(&txn), &k, &v).unwrap();
                     txn.commit().unwrap();
                 }
@@ -579,7 +576,7 @@ fn test_8r8w_all_committed_data_visible() {
                 b.wait();
                 let rc = TransactionConfig::read_committed();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                    let txn = env.begin_transaction(Some(&rc)).unwrap();
                     // Scan a few keys; accept NotFound (writer may not have committed yet).
                     for i in 0u32..WRITERS * KEYS_PER_WRITER {
                         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
@@ -656,7 +653,7 @@ fn test_64_thread_concurrent_readers() {
     for i in 0u32..KEYS {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let v = DatabaseEntry::from_bytes(b"rval");
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         db.put(Some(&txn), &k, &v).unwrap();
         txn.commit().unwrap();
     }
@@ -677,7 +674,7 @@ fn test_64_thread_concurrent_readers() {
                 let rc = TransactionConfig::read_committed();
                 let mut errors = 0u32;
                 for _ in 0..TXNS_PER_THREAD {
-                    let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                    let txn = env.begin_transaction(Some(&rc)).unwrap();
                     for j in 0u32..LOOKUPS_PER_TXN {
                         // Spread lookups across the key space.
                         let idx = (tid as u32 * LOOKUPS_PER_TXN + j) % KEYS;
@@ -759,7 +756,7 @@ fn test_32r32w_concurrent() {
                     let key = format!("w{wid:03}:{j:04}");
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(b"wval");
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     db.put(Some(&txn), &k, &v).unwrap();
                     txn.commit().unwrap();
                 }
@@ -777,7 +774,7 @@ fn test_32r32w_concurrent() {
                 barrier.wait();
                 let rc = TransactionConfig::read_committed();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    let txn = env.begin_transaction(None, Some(&rc)).unwrap();
+                    let txn = env.begin_transaction(Some(&rc)).unwrap();
                     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
                     let mut k = DatabaseEntry::new();
                     let mut v = DatabaseEntry::new();
@@ -872,7 +869,7 @@ fn test_200_thread_disjoint_writers() {
                     let key = format!("range{tid:03}:{i:04}");
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(b"dval");
-                    let txn = env.begin_transaction(None, None).unwrap();
+                    let txn = env.begin_transaction(None).unwrap();
                     db.put(Some(&txn), &k, &v).unwrap();
                     txn.commit().unwrap();
                 }

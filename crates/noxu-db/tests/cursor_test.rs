@@ -1268,7 +1268,7 @@ fn cursor_with_txn_put_is_rolled_back_on_abort() {
     let (env, db) = open_env_and_db(&dir);
 
     // Seed nothing — start with an empty database.
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
 
     let (k, v) = kv(b"rolled-back-key", b"rolled-back-val");
@@ -1300,7 +1300,7 @@ fn cursor_with_txn_put_invisible_via_get_after_abort() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_env_and_db(&dir);
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
 
     let (k, v) = kv(b"k", b"v");
@@ -1332,20 +1332,20 @@ fn cursor_with_txn_get_takes_read_lock_via_locker() {
     let (env, db) = open_env_and_db(&dir);
 
     // Seed a committed value so there is something to lock.
-    let seed = env.begin_transaction(None, None).unwrap();
+    let seed = env.begin_transaction(None).unwrap();
     let (k, v0) = kv(b"locked", b"v0");
     db.put(Some(&seed), &k, &v0).unwrap();
     seed.commit().unwrap();
 
     // Writer txn A holds an exclusive lock on `locked` (uncommitted).
-    let txn_a = env.begin_transaction(None, None).unwrap();
+    let txn_a = env.begin_transaction(None).unwrap();
     let v1 = DatabaseEntry::from_bytes(b"v1");
     db.put(Some(&txn_a), &k, &v1).unwrap();
 
     // Reader txn B uses a serializable, no-wait config so a lock conflict
     // surfaces as an error rather than blocking forever.
     let no_wait = TransactionConfig::new().with_no_wait(true);
-    let txn_b = env.begin_transaction(None, Some(&no_wait)).unwrap();
+    let txn_b = env.begin_transaction(Some(&no_wait)).unwrap();
     let mut cursor = db.open_cursor(Some(&txn_b), None).unwrap();
 
     let mut search_k = DatabaseEntry::from_bytes(b"locked");
@@ -1424,7 +1424,9 @@ mod secondary_cursor_txn {
             .open_database(
                 None,
                 "sec",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_sorted_duplicates(true),
             )
             .unwrap();
         let sec_config = SecondaryConfig::new()
@@ -1454,7 +1456,7 @@ mod secondary_cursor_txn {
         secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
 
         // Open a secondary cursor under a txn with a non-default config.
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         let cfg = CursorConfig::new();
         let mut cursor = secondary.open_cursor(Some(&txn), Some(&cfg)).unwrap();
 
@@ -1475,7 +1477,7 @@ mod secondary_cursor_txn {
         // And again under abort — the cursor read participated in the
         // (now-aborted) txn but nothing was written, so the secondary
         // entry must still be reachable from a fresh auto-commit cursor.
-        let txn2 = env.begin_transaction(None, None).unwrap();
+        let txn2 = env.begin_transaction(None).unwrap();
         let mut cursor2 = secondary.open_cursor(Some(&txn2), None).unwrap();
         sec_key = DatabaseEntry::from_bytes(b"A");
         let s =

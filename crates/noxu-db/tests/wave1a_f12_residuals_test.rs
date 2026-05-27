@@ -372,7 +372,7 @@ fn lock_timeout_message_uses_typed_locker_ids() {
 
     // Tight lock timeout so the auto-commit thread fails quickly.
     let cfg = TransactionConfig::new().with_lock_timeout_ms(100);
-    let txn = env.begin_transaction(None, Some(&cfg)).unwrap();
+    let txn = env.begin_transaction(Some(&cfg)).unwrap();
 
     // Explicit txn writes K1 → holds write lock on K1's LSN.
     db.put(

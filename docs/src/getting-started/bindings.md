@@ -21,12 +21,63 @@ noxu-bind = { path = "crates/noxu-bind" }
 
 Available bindings in `noxu_bind`:
 
+### Primitive numeric bindings (sort-preserving)
+
 | Type | Binding | Notes |
 |---|---|---|
+| `bool` | `BoolBinding` | Single byte, `0x00` / `0x01` |
+| `i8` | `ByteBinding` | Sort-preserving signed 8-bit |
+| `char` | `CharBinding` | Unicode scalar value as u32 |
+| `i16` | `ShortBinding` | Sort-preserving signed 16-bit |
 | `i32` | `IntBinding` | Sort-preserving signed 32-bit integer |
 | `i64` | `LongBinding` | Sort-preserving signed 64-bit integer |
+| `f32` | `FloatBinding` | **Not** sort-preserving — see warning below |
+| `f64` | `DoubleBinding` | **Not** sort-preserving — see warning below |
+| `f32` | `SortedFloatBinding` | Sort-preserving IEEE 754 single |
 | `f64` | `SortedDoubleBinding` | Sort-preserving IEEE 754 double |
-| `String` | `StringBinding` | UTF-8 string, null-byte safe |
+
+### Variable-length numeric bindings (compact)
+
+| Type | Binding | Notes |
+|---|---|---|
+| `i32` | `PackedIntBinding` | 1–5 byte variable-length — **not** sort-preserving |
+| `i64` | `PackedLongBinding` | 1–10 byte variable-length — **not** sort-preserving |
+| `i32` | `SortedPackedIntBinding` | Variable-length, sort-preserving |
+| `i64` | `SortedPackedLongBinding` | Variable-length, sort-preserving |
+
+### String / byte bindings
+
+| Type | Binding | Notes |
+|---|---|---|
+| `String` | `StringBinding` | UTF-8 string, null-byte safe, sort-preserving |
+| `Vec<u8>` | `ByteArrayBinding` | Raw bytes — the universal escape hatch for Stored* views |
+
+### Specialised bindings
+
+| Type | Binding | Notes |
+|---|---|---|
+| `i64` | `RecordNumberBinding` | Big-endian 8-byte; for record-number databases (sequence keys) |
+| `T: Serialize + DeserializeOwned` | `SerdeBinding<T>` | Compact binary; see [SerdeBinding version prefix](#serdebinding-version-prefix-v15) |
+| `(K, V)` | `TupleSerdeBinding<K, V>` | Sort-preserving tuple key + serde-encoded data |
+| `(K, V)` | `TupleSerdeKeyDataBinding<K, V>` | Two halves of a `TupleBinding` glued together |
+| user-defined | `TupleBinding` (trait) | Implement to plug your own multi-field key codec |
+
+### Sortable vs. non-sortable encodings
+
+The most common foot-gun is using a *non-sort-preserving* binding
+as a key.  `FloatBinding` / `DoubleBinding` / `PackedIntBinding` /
+`PackedLongBinding` write the raw bit pattern and are great for
+*data* slots; **as keys** they will produce iterations that do not
+follow numeric order (negative floats sort *after* positive ones,
+and variable-length encodings interleave by leading byte).  Use
+the `Sorted*` variant of each binding when you want
+`get_search_key_range` / cursor scans to follow numeric order.
+
+The in-memory benchmark and `noxu-examples` directories use the
+sort-preserving variants throughout; cross-check there if you are
+unsure which to pick.
+
+## The `EntryBinding<T>` trait
 
 All bindings implement the `EntryBinding<T>` trait with two methods:
 
@@ -134,6 +185,41 @@ fn decode_point(entry: &DatabaseEntry) -> Point {
 ```
 
 This technique (XOR with `MIN` before big-endian encoding) is the same approach used internally by `IntBinding` and `LongBinding`.
+
+## Using bindings with Stored* collection views (v1.6)
+
+The `noxu-collections` typed Stored* views consume `EntryBinding`
+implementations directly:
+
+```rust,ignore
+use noxu_bind::{IntBinding, StringBinding};
+use noxu_collections::StoredMap;
+
+// `StoredMap<K, V, KB, VB>` — the binding values are passed by value
+// at construction time, then used internally for every operation.
+let map: StoredMap<i32, String, _, _> =
+    StoredMap::new(&db, IntBinding, StringBinding);
+
+map.put(None, &42, &"the answer".to_string())?;
+let value: Option<String> = map.get(None, &42)?;
+```
+
+For raw byte slices (the v1.5 default), use `ByteArrayBinding`:
+
+```rust,ignore
+use noxu_bind::ByteArrayBinding;
+use noxu_collections::StoredMap;
+
+let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
+    StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
+
+map.put(None, &b"key".to_vec(), &b"value".to_vec())?;
+```
+
+The same pattern applies to `StoredSortedMap<K, V, KB, VB>`,
+`StoredKeySet<K, KB>`, `StoredValueSet<V, VB>`, and
+`StoredList<V, VB>`.  See [Collections and Persistence](../collections/README.md)
+for the full surface.
 
 ## SerdeBinding version prefix (v1.5)
 

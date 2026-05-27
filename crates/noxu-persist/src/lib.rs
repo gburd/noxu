@@ -1,10 +1,24 @@
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Derive-macro-based entity persistence for Noxu DB.
 //!
-//! Direct Persistence Layer — provides
-//! trait-based entity-to-database mapping. Users implement `Entity`,
-//! `PrimaryKey`, and `EntitySerializer` traits for their types. Derive
-//! macros can be added later in a separate proc-macro crate.
+//! Direct Persistence Layer — provides trait-based entity-to-database
+//! mapping with a proc-macro derive shortcut.  As of v1.6 (Wave 2C-1) users
+//! can opt in to a derive-driven shape:
+//!
+//! ```ignore
+//! use noxu_persist::{Entity, SecondaryKey};
+//!
+//! #[derive(Clone, Debug, Entity, SecondaryKey)]
+//! struct User {
+//!     #[primary_key]
+//!     id: u64,
+//!     #[secondary_key(name = "by_email", relate = OneToOne)]
+//!     email: String,
+//! }
+//! ```
+//!
+//! The manual `impl Entity for User { … }` path is still supported and is
+//! described in the legacy section of `docs/src/collections/entity-persistence.md`.
 //!
 //! # Overview
 //!
@@ -53,6 +67,7 @@ pub mod error;
 pub mod evolve;
 pub mod primary_index;
 pub mod secondary_index;
+pub mod secondary_spec;
 pub mod sequence;
 pub mod simple_serializer;
 pub mod store_config;
@@ -64,12 +79,20 @@ pub use entity_store::EntityStore;
 pub use error::{PersistError, Result};
 pub use primary_index::{EntityIterator, KeyIterator, PrimaryIndex};
 pub use secondary_index::SecondaryIndex;
+pub use secondary_spec::{DeleteAction, Relate, SecondarySpec};
+
+// Derive-macro re-exports — see `noxu-persist-derive`.
+// The user only needs `noxu_persist` in their `Cargo.toml`; the derive
+// crate is pulled in transitively.  This mirrors the `serde` /
+// `serde_derive` re-export pattern.
+pub use noxu_persist_derive::{Entity, PrimaryKey, SecondaryKey};
 pub use sequence::{MemorySequence, Sequence};
 pub use simple_serializer::{FieldDecoder, FieldEncoder, SimpleSerializer};
 pub use store_config::StoreConfig;
 
 // Schema evolution re-exports
 pub use evolve::{
-    ClassMutations, ConversionFn, Converter, Deleter, EvolveConfig,
-    EvolveListener, EvolveStats, MutationKey, Mutations, Renamer,
+    CatalogEntry, ClassCatalog, ClassMutations, ConversionFn, Converter,
+    DecodedRecord, Deleter, EvolveConfig, EvolveListener, EvolveStats,
+    MAX_CLASS_TAG_LEN, MutationKey, Mutations, Renamer, catalog_db_name,
 };

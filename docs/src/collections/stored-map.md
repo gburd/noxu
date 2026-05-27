@@ -1,19 +1,19 @@
 # StoredMap
 
-`StoredMap` provides a `BTreeMap`-like view over a Noxu primary database
-where keys and values are raw byte slices (`&[u8]`). Use it when you want
-familiar collection ergonomics without writing the cursor / `DatabaseEntry`
-boilerplate by hand.
+`StoredMap<K, V, KB, VB>` provides a `BTreeMap`-like view over a Noxu
+primary database, parameterised by [`noxu_bind::EntryBinding`]
+implementations for keys and values.  Use it when you want familiar
+collection ergonomics with typed Rust keys and values, without writing
+the cursor / `DatabaseEntry` boilerplate by hand.
 
-> **v1.5 surface.**  The actual `StoredMap` is _not_ generic over typed
-> `K` / `V` parameters yet.  Earlier drafts of this chapter showed
-> `StoredMap<K, V>` with `TupleBinding<K>` / `EntryBinding<V>` arguments;
-> that is the v1.6 target shape.  In v1.5 the type is `StoredMap<'db>`
-> and the operations take and return `&[u8]` / `Vec<u8>`.
+The `StoredMap` is *stateless* — it holds a reference to the database
+and the bindings, but no in-process record of "what's in the map".
+Every `len()`, `iter()`, `contains_key()` call goes to the database.
 
 ## Creating a StoredMap
 
 ```rust,ignore
+use noxu_bind::{IntBinding, StringBinding};
 use noxu_collections::StoredMap;
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 
@@ -21,61 +21,111 @@ let env = Environment::open(env_config)?;
 let db_config = DatabaseConfig::new().with_allow_create(true);
 let db  = env.open_database(None, "users", &db_config)?;
 
-// Second argument is the read-only flag.
-let map = StoredMap::new(&db, /* read_only = */ false);
+let map: StoredMap<i32, String, _, _> =
+    StoredMap::new(&db, IntBinding, StringBinding);
+
+// Or read-only:
+let ro: StoredMap<i32, String, _, _> =
+    StoredMap::new_read_only(&db, IntBinding, StringBinding);
 ```
+
+The `_` placeholders ask Rust to infer the binding types from the
+`IntBinding` / `StringBinding` arguments.
 
 ## Operations
 
 ```rust,ignore
 // Insert (returns the previous value, if any).
-map.put(b"alice", b"alice@example.com")?;
+let old: Option<String> = map.put(None, &1, &"alice".to_string())?;
 
-// Get (returns Option<Vec<u8>>).
-let value = map.get(b"alice")?;
-assert_eq!(value, Some(b"alice@example.com".to_vec()));
+// Get (returns Option<V>).
+let value: Option<String> = map.get(None, &1)?;
+assert_eq!(value, Some("alice".to_string()));
 
 // Remove (returns the previous value, if any).
-map.remove(b"alice")?;
+let removed: Option<String> = map.remove(None, &1)?;
 
 // Contains.
-assert!(!map.contains_key(b"alice")?);
+let present: bool = map.contains_key(None, &1)?;
 
-// Size / emptiness.
-let n = map.len()?;            // u64
-let empty = map.is_empty()?;   // bool
+// Size.
+let n: usize = map.len(None)?;
+let empty: bool = map.is_empty(None)?;
 
-// Iterate (sorted by key bytes).
-for entry in map.iter()? {
+// Iterate.  Returns `StoredIterator<(K, V)>` materialised eagerly
+// at the call to `iter()`.
+for entry in map.iter(None)? {
     let (k, v) = entry?;
-    println!("{:?} -> {:?}", k, v);
+    println!("{} -> {}", k, v);
 }
+
+// Keys / values only.
+for key in map.keys(None)? { /* ... */ }
+for value in map.values(None)? { /* ... */ }
+
+// Clear all records.
+map.clear(None)?;
 ```
 
-For pre-existing data, populate the internal key index before
-iterating (see the `register_key` / `register_keys` methods on
-`StoredMap`).
+## Threading a transaction
+
+Pass `Some(&txn)` to any method to make it participate in `txn`:
+
+```rust,ignore
+let txn = env.begin_transaction(None)?;
+
+map.put(Some(&txn), &1, &"alpha".to_string())?;
+map.put(Some(&txn), &2, &"beta".to_string())?;
+let alpha = map.get(Some(&txn), &1)?;
+// ... visible to other reads under txn, invisible to other txns ...
+
+txn.commit()?;
+```
+
+Every method accepts `Option<&Transaction>`, including the iterator
+constructors (`iter` / `keys` / `values` / `iter_from`).  The
+iterator is materialised at call time under `txn`, so concurrent
+modifications after the iterator is constructed are *not* reflected.
 
 ## Sorted semantics
 
-Keys sort by raw byte order.  If you need numeric / signed-integer
-sort order, encode keys with `noxu-bind` (`IntBinding`,
-`LongBinding`, `SortedDoubleBinding`, …) and pass the resulting
-bytes to `put` / `get`.  See [the bindings chapter](../getting-started/bindings.md)
-for the exact encodings.
+Iteration order is the natural order of the on-disk byte
+representation, which depends on the binding.  Bindings in
+`noxu-bind`:
 
-## v1.5 limitations
+| Binding | Sorts in… |
+|---|---|
+| `IntBinding`, `LongBinding`, `ShortBinding`, `ByteBinding` | numeric order (signed two's-complement; sign bit flipped on disk) |
+| `BoolBinding` | `false < true` |
+| `StringBinding` | UTF-8 lexicographic |
+| `SortedFloatBinding`, `SortedDoubleBinding` | numeric order |
+| `FloatBinding`, `DoubleBinding` | raw IEEE 754 — **not** numeric |
+| `ByteArrayBinding` | byte-lex (raw `Vec<u8>`) |
+| `RecordNumberBinding` | numeric (big-endian `u64`) |
+| `SortedPackedIntBinding`, `SortedPackedLongBinding` | numeric |
 
-These constraints are tracked by the May 2026 collections/bind API
-audit.  All of them are scheduled for revisit in v1.6.
+If you need a numeric-sort `f64` key, use `SortedDoubleBinding`, not
+`DoubleBinding`.  The plain `*Binding` types are length-efficient but
+do not sort numerically.
 
-1. **Auto-commit only.**  Every `StoredMap` operation issues the
-   underlying `Database` call with `txn = None`.  There is no way to
-   thread an externally-begun `noxu_db::Transaction` into a
-   `StoredMap` method.  If you need transactional semantics across
-   several writes, drive the raw `Database::put` / `Database::delete`
-   API directly with `Some(&txn)`.  (Audit findings #1, #3, #4.)
+## Migrating from v1.5
 
-2. **`StoredMap<K, V>` typed shape is not implemented yet.**  The
-   v1.5 type is byte-slice-keyed; the typed shape moves with the
-   v1.6 work that also fixes (1).
+The v1.5 `StoredMap<'db>` byte-keyed type is gone.  Replace:
+
+```rust,ignore
+// v1.5
+let map = StoredMap::new(&db, false);
+map.put(b"key", b"value")?;
+let v: Option<Vec<u8>> = map.get(b"key")?;
+
+// v1.6
+use noxu_bind::ByteArrayBinding;
+let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
+    StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
+map.put(None, &b"key".to_vec(), &b"value".to_vec())?;
+let v: Option<Vec<u8>> = map.get(None, &b"key".to_vec())?;
+```
+
+`ByteArrayBinding` reproduces the v1.5 byte-slice semantics
+verbatim.  See [the migration chapter](../getting-started/migrating.md#wave-2b--collections-typed-api-and-txn-threading)
+for the full before/after.

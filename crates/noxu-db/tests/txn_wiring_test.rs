@@ -37,7 +37,7 @@ fn f1_env_close_after_commit_succeeds() {
     let tmp = TempDir::new().unwrap();
     let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     txn.commit().expect("commit must succeed");
 
     // Pre-fix: this returns OperationNotAllowed("Cannot close
@@ -50,7 +50,7 @@ fn f1_env_close_after_abort_succeeds() {
     let tmp = TempDir::new().unwrap();
     let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     txn.abort().expect("abort must succeed");
 
     env.close().expect("env.close() must succeed after abort");
@@ -63,7 +63,7 @@ fn f1_env_close_after_many_commits_succeeds() {
     let db = open_db(&env, "f1");
 
     for i in 0..16 {
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_data(format!("k{}", i).as_bytes());
         let val = DatabaseEntry::from_data(b"v");
         db.put(Some(&txn), &key, &val).unwrap();
@@ -80,7 +80,7 @@ fn f1_env_close_with_one_active_txn_still_fails() {
     // transaction must still block close().
     let tmp = TempDir::new().unwrap();
     let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
-    let _txn = env.begin_transaction(None, None).unwrap();
+    let _txn = env.begin_transaction(None).unwrap();
 
     let result = env.close();
     assert!(result.is_err(), "close() must fail with active txn");
@@ -105,13 +105,13 @@ fn f2_read_uncommitted_sees_uncommitted_writes() {
     db.put(None, &key, &val_before).unwrap();
 
     // Writer txn: writes a new value but does NOT commit yet.
-    let writer_txn = env.begin_transaction(None, None).unwrap();
+    let writer_txn = env.begin_transaction(None).unwrap();
     let val_after = DatabaseEntry::from_data(b"after");
     db.put(Some(&writer_txn), &key, &val_after).unwrap();
 
     // Reader txn: read-uncommitted, should see the dirty write.
     let read_cfg = TransactionConfig::new().with_read_uncommitted(true);
-    let reader_txn = env.begin_transaction(None, Some(&read_cfg)).unwrap();
+    let reader_txn = env.begin_transaction(Some(&read_cfg)).unwrap();
 
     let mut data = DatabaseEntry::new();
     let key_lookup = DatabaseEntry::from_data(b"k");
@@ -135,7 +135,7 @@ fn f2_read_uncommitted_sees_uncommitted_writes() {
 
 #[test]
 fn f3_env_default_durability_no_sync_skips_fsync() {
-    // Open with COMMIT_NO_SYNC; commit a txn with `begin_transaction(None, None)`;
+    // Open with COMMIT_NO_SYNC; commit a txn with `begin_transaction(None)`;
     // assert the WAL fsync count did not increase.  Pre-fix, every commit
     // fsynced because TransactionConfig::default().durability ==
     // COMMIT_SYNC and the env-level durability was never consulted.
@@ -154,7 +154,7 @@ fn f3_env_default_durability_no_sync_skips_fsync() {
 
     let fsyncs_before = env.stat_fsync_count();
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_data(b"k");
     let val = DatabaseEntry::from_data(b"v");
     db.put(Some(&txn), &key, &val).unwrap();
@@ -186,7 +186,7 @@ fn f3_env_default_durability_sync_does_fsync() {
 
     let fsyncs_before = env.stat_fsync_count();
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_data(b"k");
     let val = DatabaseEntry::from_data(b"v");
     db.put(Some(&txn), &key, &val).unwrap();
@@ -220,7 +220,7 @@ fn f3_explicit_txn_durability_overrides_env_default() {
     let fsyncs_before = env.stat_fsync_count();
 
     let cfg = TransactionConfig::new().with_durability(Durability::COMMIT_SYNC);
-    let txn = env.begin_transaction(None, Some(&cfg)).unwrap();
+    let txn = env.begin_transaction(Some(&cfg)).unwrap();
     let key = DatabaseEntry::from_data(b"k");
     let val = DatabaseEntry::from_data(b"v");
     db.put(Some(&txn), &key, &val).unwrap();
@@ -262,7 +262,7 @@ fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
     db.put(None, &key, &val0).unwrap();
 
     // Writer txn: take the write lock by issuing a put.
-    let writer_txn = env.begin_transaction(None, None).unwrap();
+    let writer_txn = env.begin_transaction(None).unwrap();
     let val1 = DatabaseEntry::from_data(b"v1");
     db.put(Some(&writer_txn), &key, &val1).unwrap();
 
@@ -323,7 +323,7 @@ fn f12_auto_commit_does_not_block_on_unrelated_key() {
     let v0 = DatabaseEntry::from_data(b"v0");
     db.put(None, &k1, &v0).unwrap();
 
-    let writer_txn = env.begin_transaction(None, None).unwrap();
+    let writer_txn = env.begin_transaction(None).unwrap();
     let v1 = DatabaseEntry::from_data(b"v1");
     db.put(Some(&writer_txn), &k1, &v1).unwrap();
 
@@ -356,7 +356,7 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
     // Explicit txn under serializable isolation: read locks are held
     // until commit/abort.
     let cfg = TransactionConfig::new().with_serializable_isolation(true);
-    let reader_txn = env.begin_transaction(None, Some(&cfg)).unwrap();
+    let reader_txn = env.begin_transaction(Some(&cfg)).unwrap();
     let mut data = DatabaseEntry::new();
     let key_lookup = DatabaseEntry::from_data(b"k");
     let status = db.get(Some(&reader_txn), &key_lookup, &mut data).unwrap();
@@ -500,7 +500,7 @@ mod prop_txn_visibility {
                 match step {
                     TxnStep::Begin => {
                         if active.is_none() {
-                            let txn = env.begin_transaction(None, None).unwrap();
+                            let txn = env.begin_transaction(None).unwrap();
                             // Snapshot the committed state; mutations
                             // accumulate here until commit/abort.
                             let snap = committed.clone();
@@ -563,66 +563,30 @@ mod prop_txn_visibility {
     }
 }
 
-// ─── F11 / Decision 3B: nested txn rejected with typed Unsupported ────
+// ─── F11 / Decision 3B: nested-txn parameter removed in v2.0 (Wave 3-1) ─
+//
+// In v1.5 `Environment::begin_transaction` took an `Option<&Transaction>`
+// `parent` argument that was rejected at runtime with
+// `NoxuError::Unsupported`.  Wave 3-1 (v2.0) removed the parameter from
+// the signature entirely — what was a runtime error is now a compile
+// error.  The former `f11_nested_transaction_returns_unsupported` test
+// has been deleted because the misuse it guarded is no longer
+// representable in the type system; the documented happy-path test
+// remains below as a smoke test that the new signature is correct.
 
-/// `Environment::begin_transaction(Some(parent), …)` previously dropped the
-/// parent on the floor (the parameter was `_parent`).  Decision 3B in
-/// `docs/src/internal/v1.5-decisions-2026-05.md` makes that case a typed
-/// error so users see a loud, documented failure instead of the silent
-/// BDB-JE-shaped behaviour the published mdBook implied.
-///
-/// The parameter is retained for v1.5 / v1.6 SemVer stability and is
-/// scheduled for removal in v2.0.
-#[test]
-fn f11_nested_transaction_returns_unsupported() {
-    use noxu_db::NoxuError;
-
-    let tmp = TempDir::new().unwrap();
-    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
-
-    let parent = env.begin_transaction(None, None).unwrap();
-
-    let result = env.begin_transaction(Some(&parent), None);
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("nested transactions"),
-                "error message should mention nested transactions: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v2.0"),
-                "error message should reference v1.5 and v2.0: {msg}"
-            );
-            assert!(
-                msg.contains("None"),
-                "error message should tell the caller to pass None: {msg}"
-            );
-        }
-        Ok(_) => {
-            panic!("expected NoxuError::Unsupported for nested txn, got Ok")
-        }
-        Err(other) => panic!(
-            "expected NoxuError::Unsupported for nested txn, got: {other:?}"
-        ),
-    }
-
-    // Parent must still be valid (rejection must not leak any state).
-    parent.commit().expect("parent commit must succeed");
-    env.close().expect("env.close() must succeed");
-}
-
-/// `parent = None` continues to work exactly as before — the rejection is
-/// surgical and does not regress the documented happy path.
+/// `begin_transaction(None)` and `begin_transaction(Some(&cfg))` continue
+/// to work exactly as before — the v2.0 signature change is surgical and
+/// does not regress the documented happy path.
 #[test]
 fn f11_nested_transaction_none_still_works() {
     let tmp = TempDir::new().unwrap();
     let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     txn.commit().unwrap();
 
     let cfg = TransactionConfig::new();
-    let txn2 = env.begin_transaction(None, Some(&cfg)).unwrap();
+    let txn2 = env.begin_transaction(Some(&cfg)).unwrap();
     txn2.commit().unwrap();
 
     env.close().expect("env.close() must succeed");
