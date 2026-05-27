@@ -1,229 +1,185 @@
-//! Value set view of a database.
+//! Typed value-collection view of a database.
 //!
+//! Wave 2B redesign (v1.6).  `StoredValueSet<V, VB>` is a collection
+//! view focused on the *values* of a Noxu database.  It mirrors
+//! BDB-JE's `StoredValueSet` and is most useful in conjunction with a
+//! sorted-duplicate database (one logical key, many values), although
+//! the v1.6 surface works on any database — iteration order is the
+//! natural cursor walk order.
+//!
+//! Note: in v1.6 sorted-duplicate semantics for the underlying
+//! database are still v1.6-future work; this view treats every
+//! record's value as an element of the multiset and ignores the key.
+
+use std::marker::PhantomData;
+
+use noxu_bind::EntryBinding;
+use noxu_db::{Database, OperationStatus, Transaction};
 
 use crate::error::Result;
-use crate::stored_iterator::StoredValueIterator;
-use noxu_db::Database;
-use std::collections::BTreeSet;
-use std::sync::Mutex;
+use crate::stored_iterator::StoredIterator;
 
-/// A collection view of database values.
-///
-/// Provides a collection interface over the values stored in a Noxu DB
-/// database. Values are yielded in key-sorted order during iteration.
-///
-/// Like `StoredMap`, this view maintains an internal key index that
-/// must be populated for iteration support. Use `register_key()` or
-/// `register_keys()` to populate the index.
-///
-/// # v1.5 limitations
-///
-/// All `StoredValueSet` operations are **auto-commit only** — every
-/// fetch issues the underlying `Database` call with `txn = None`.
-/// Threading `Option<&Transaction>` through the API is tracked for
-/// v1.6 (audit findings #1, #3, #4).
-///
-/// # Example
-/// ```ignore
-/// use noxu_collections::StoredValueSet;
-///
-/// let values = StoredValueSet::new(&db);
-/// values.register_keys(&[b"key1", b"key2"]);
-/// for val in values.iter().unwrap() {
-///     println!("{:?}", val.unwrap());
-/// }
-/// ```
-pub struct StoredValueSet<'db> {
-    /// Reference to the underlying database.
+/// A typed collection view of database values.
+pub struct StoredValueSet<'db, V, VB>
+where
+    VB: EntryBinding<V>,
+{
     db: &'db Database,
-    /// Internal sorted key index for iteration.
-    key_index: Mutex<BTreeSet<Vec<u8>>>,
+    value_binding: VB,
+    _marker: PhantomData<fn() -> V>,
 }
 
-impl<'db> StoredValueSet<'db> {
-    /// Creates a new value set view of the given database.
-    ///
-    /// # Arguments
-    /// * `db` - The database whose values to view
-    pub fn new(db: &'db Database) -> Self {
-        StoredValueSet { db, key_index: Mutex::new(BTreeSet::new()) }
-    }
-
-    /// Returns the number of records in the database.
-    pub fn len(&self) -> Result<u64> {
-        Ok(self.db.count()?)
-    }
-
-    /// Returns whether the database is empty.
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
-    }
-
-    /// Returns an iterator over all known values in key-sorted order.
-    ///
-    /// The iterator works from a snapshot of the key index taken
-    /// at the time of this call. Values are fetched from the database
-    /// on demand.
-    pub fn iter(&self) -> Result<StoredValueIterator<'db>> {
-        let keys = self.known_keys();
-        Ok(StoredValueIterator::new(self.db, keys))
-    }
-
-    /// Registers a key in the internal key index.
-    ///
-    /// # Arguments
-    /// * `key` - The key to register (the value associated with this key
-    ///   will be included in iteration)
-    pub fn register_key(&self, key: &[u8]) {
-        self.key_index.lock().unwrap().insert(key.to_vec());
-    }
-
-    /// Registers multiple keys in the internal key index.
-    ///
-    /// # Arguments
-    /// * `keys` - The keys to register
-    pub fn register_keys(&self, keys: &[&[u8]]) {
-        let mut index = self.key_index.lock().unwrap();
-        for key in keys {
-            index.insert(key.to_vec());
-        }
-    }
-
-    /// Returns a snapshot of known keys in sorted order.
-    pub fn known_keys(&self) -> Vec<Vec<u8>> {
-        self.key_index.lock().unwrap().iter().cloned().collect()
+impl<'db, V, VB> StoredValueSet<'db, V, VB>
+where
+    VB: EntryBinding<V>,
+{
+    /// Creates a new typed value-collection view.
+    pub fn new(db: &'db Database, value_binding: VB) -> Self {
+        StoredValueSet { db, value_binding, _marker: PhantomData }
     }
 
     /// Returns a reference to the underlying database.
     pub fn database(&self) -> &'db Database {
         self.db
     }
+
+    /// Returns a reference to the value binding.
+    pub fn value_binding(&self) -> &VB {
+        &self.value_binding
+    }
+
+    /// Returns the number of records in the database.
+    pub fn len(&self, _txn: Option<&Transaction>) -> Result<usize> {
+        let n = self.db.count()?;
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    /// Returns whether the database is empty.
+    pub fn is_empty(&self, txn: Option<&Transaction>) -> Result<bool> {
+        Ok(self.len(txn)? == 0)
+    }
+
+    /// Returns whether `value` is present anywhere in the database.
+    ///
+    /// This is `O(N)`: it walks every record under `txn`, decoding
+    /// values until it finds a match (or exhausts the database).
+    pub fn contains(&self, txn: Option<&Transaction>, value: &V) -> Result<bool>
+    where
+        V: PartialEq,
+    {
+        let mut cursor = self.db.open_cursor(txn, None)?;
+        let mut key = noxu_db::DatabaseEntry::new();
+        let mut data = noxu_db::DatabaseEntry::new();
+        let mut status =
+            cursor.get(&mut key, &mut data, noxu_db::Get::First, None)?;
+        let mut found = false;
+        while matches!(status, OperationStatus::Success) {
+            let v = self.value_binding.entry_to_object(&data).map_err(|e| {
+                crate::error::CollectionError::BindingError(e.to_string())
+            })?;
+            if &v == value {
+                found = true;
+                break;
+            }
+            status =
+                cursor.get(&mut key, &mut data, noxu_db::Get::Next, None)?;
+        }
+        cursor.close()?;
+        Ok(found)
+    }
+
+    /// Returns a snapshot iterator over every value.
+    pub fn iter(&self, txn: Option<&Transaction>) -> Result<StoredIterator<V>> {
+        use crate::internal::{ScanDirection, StartKey, scan_records};
+        use noxu_bind::ByteArrayBinding;
+
+        let key_binding = ByteArrayBinding;
+        let items = scan_records::<Vec<u8>, V, ByteArrayBinding, VB, V, _>(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &key_binding,
+            &self.value_binding,
+            |_k, v| v,
+        )?;
+        Ok(StoredIterator::from_vec(items))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noxu_db::{
-        DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    };
+    use noxu_bind::{IntBinding, StringBinding};
+    use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
     use tempfile::TempDir;
 
-    fn setup_env_and_db() -> (TempDir, Environment, Database) {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
-        let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-        (temp_dir, env, db)
+    use crate::stored_map::StoredMap;
+
+    fn setup() -> (TempDir, Environment, noxu_db::Database) {
+        let td = TempDir::new().unwrap();
+        let env = Environment::open(
+            EnvironmentConfig::new(td.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let db = env
+            .open_database(
+                None,
+                "vset",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        (td, env, db)
     }
 
-    fn populate_db(db: &Database) {
-        let pairs = vec![
-            (b"cherry".as_slice(), b"c".as_slice()),
-            (b"apple", b"a"),
-            (b"banana", b"b"),
-        ];
-        for (k, v) in pairs {
-            let key = DatabaseEntry::from_bytes(k);
-            let val = DatabaseEntry::from_bytes(v);
-            db.put(None, &key, &val).unwrap();
+    #[test]
+    fn iter_yields_values_in_key_order() {
+        let (_td, _env, db) = setup();
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
+        for (k, v) in [(3, "three"), (1, "one"), (2, "two")] {
+            map.put(None, &k, &v.to_string()).unwrap();
         }
+
+        let set: StoredValueSet<'_, String, _> =
+            StoredValueSet::new(&db, StringBinding);
+        let values: Vec<String> =
+            set.iter(None).unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            values,
+            vec!["one".to_string(), "two".to_string(), "three".to_string()],
+        );
     }
 
     #[test]
-    fn test_new_value_set() {
-        let (_td, _env, db) = setup_env_and_db();
-        let set = StoredValueSet::new(&db);
-        assert!(set.is_empty().unwrap());
+    fn contains_walks_values() {
+        let (_td, _env, db) = setup();
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
+        map.put(None, &1, &"alpha".to_string()).unwrap();
+        map.put(None, &2, &"beta".to_string()).unwrap();
+
+        let set: StoredValueSet<'_, String, _> =
+            StoredValueSet::new(&db, StringBinding);
+        assert!(set.contains(None, &"alpha".to_string()).unwrap());
+        assert!(set.contains(None, &"beta".to_string()).unwrap());
+        assert!(!set.contains(None, &"missing".to_string()).unwrap());
     }
 
     #[test]
-    fn test_len() {
-        let (_td, _env, db) = setup_env_and_db();
-        populate_db(&db);
+    fn len_and_is_empty() {
+        let (_td, _env, db) = setup();
+        let set: StoredValueSet<'_, String, _> =
+            StoredValueSet::new(&db, StringBinding);
+        assert!(set.is_empty(None).unwrap());
 
-        let set = StoredValueSet::new(&db);
-        assert_eq!(set.len().unwrap(), 3);
-    }
-
-    #[test]
-    fn test_is_empty() {
-        let (_td, _env, db) = setup_env_and_db();
-        let set = StoredValueSet::new(&db);
-        assert!(set.is_empty().unwrap());
-
-        populate_db(&db);
-        assert!(!set.is_empty().unwrap());
-    }
-
-    #[test]
-    fn test_iter_with_registered_keys() {
-        let (_td, _env, db) = setup_env_and_db();
-        populate_db(&db);
-
-        let set = StoredValueSet::new(&db);
-        set.register_keys(&[b"apple", b"banana", b"cherry"]);
-
-        let vals: Vec<_> = set.iter().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(vals.len(), 3);
-        // Values in key-sorted order
-        assert_eq!(vals[0], b"a");
-        assert_eq!(vals[1], b"b");
-        assert_eq!(vals[2], b"c");
-    }
-
-    #[test]
-    fn test_iter_empty() {
-        let (_td, _env, db) = setup_env_and_db();
-        let set = StoredValueSet::new(&db);
-
-        let vals: Vec<_> = set.iter().unwrap().collect::<Vec<_>>();
-        assert!(vals.is_empty());
-    }
-
-    #[test]
-    fn test_register_key() {
-        let (_td, _env, db) = setup_env_and_db();
-        let set = StoredValueSet::new(&db);
-
-        set.register_key(b"key1");
-        let keys = set.known_keys();
-        assert_eq!(keys.len(), 1);
-    }
-
-    #[test]
-    fn test_register_keys() {
-        let (_td, _env, db) = setup_env_and_db();
-        let set = StoredValueSet::new(&db);
-
-        set.register_keys(&[b"a", b"b", b"c"]);
-        let keys = set.known_keys();
-        assert_eq!(keys.len(), 3);
-    }
-
-    #[test]
-    fn test_database_accessor() {
-        let (_td, _env, db) = setup_env_and_db();
-        let set = StoredValueSet::new(&db);
-        assert_eq!(set.database().get_database_name(), "testdb");
-    }
-
-    #[test]
-    fn test_iter_skips_deleted_keys() {
-        let (_td, _env, db) = setup_env_and_db();
-        populate_db(&db);
-
-        let set = StoredValueSet::new(&db);
-        set.register_keys(&[b"apple", b"banana", b"cherry"]);
-
-        // Delete banana
-        let banana_key = DatabaseEntry::from_bytes(b"banana");
-        db.delete(None, &banana_key).unwrap();
-
-        let vals: Vec<_> = set.iter().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(vals.len(), 2);
-        assert_eq!(vals[0], b"a");
-        assert_eq!(vals[1], b"c");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
+        for i in 0..3 {
+            map.put(None, &i, &format!("v{i}")).unwrap();
+        }
+        assert_eq!(set.len(None).unwrap(), 3);
     }
 }

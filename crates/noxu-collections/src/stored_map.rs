@@ -1,183 +1,106 @@
-//! Map view of a database.
+//! Typed map view of a database.
 //!
+//! Wave 2B redesign (v1.6).  `StoredMap<K, V, KB, VB>` is the typed
+//! map surface: keys and values are arbitrary Rust types, with
+//! [`EntryBinding`] implementations doing the byte ↔ typed conversion.
+//!
+//! Every operation accepts `txn: Option<&Transaction>`.  `None` is
+//! auto-commit; `Some(&t)` participates in the caller's transaction.
+//! This is the BDB-JE shape, and it matches `noxu_db::Database` and
+//! `noxu_db::SecondaryDatabase` so a typed `StoredMap` composes
+//! cleanly with the rest of the engine.
+
+use std::marker::PhantomData;
+
+use noxu_bind::EntryBinding;
+use noxu_db::{Database, Get, OperationStatus, Transaction};
 
 use crate::error::{CollectionError, Result};
-use crate::stored_iterator::{
-    StoredIterator, StoredKeyIterator, StoredValueIterator,
+use crate::internal::{
+    ScanDirection, StartKey, decode_value, encode_key, encode_value,
+    scan_records,
 };
-use noxu_db::{Database, DatabaseEntry, OperationStatus};
-use std::collections::BTreeSet;
-use std::sync::Mutex;
+use crate::stored_iterator::StoredIterator;
 
-/// A map-like view of a database.
+/// A typed map-like view of a database.
 ///
-/// Provides a familiar map interface over a Noxu DB database. Keys and
-/// values are raw byte vectors (`Vec<u8>`). Records can be inserted,
-/// retrieved, removed, and iterated.
+/// `K` is the key type and `V` is the value type.  `KB` and `VB` are
+/// the [`EntryBinding`]s that convert between the typed values and
+/// the on-disk byte representation.
 ///
-/// The `StoredMap` maintains an internal key index (a `BTreeSet`) that
-/// tracks all keys known to this view. This index is populated when
-/// records are inserted via `put()` and updated on `remove()`. For
-/// databases that already contain data, call `register_key()` or use
-/// `contains_key()` to populate the index.
+/// # Transaction threading
 ///
-/// # v1.5 limitations
-///
-/// All `StoredMap` operations are **auto-commit only**.  Every `get`,
-/// `put`, `remove`, `contains_key`, `len`, `clear`, and iterator
-/// fetch issues the underlying `Database` call with `txn = None`.
-/// There is no way to thread an externally-begun
-/// [`noxu_db::Transaction`] into a `StoredMap` method in v1.5.  If you
-/// need transactional semantics across several `StoredMap` writes, use
-/// the raw `Database::put` / `Database::delete` API with an explicit
-/// txn instead.
-///
-/// Threading `Option<&Transaction>` through every method is tracked
-/// for v1.6 (audit findings #1, #3, #4 — see
-/// `docs/src/internal/sprint-3-collections-restriction.md`).
+/// Every method accepts `txn: Option<&Transaction>`.  Pass `None` to
+/// run as auto-commit (the engine allocates a synthetic auto-txn for
+/// each call) or `Some(&t)` to participate in `t`.  This is the v1.6
+/// API shape — it matches BDB-JE's `StoredMap` and the
+/// `noxu_db::Database` / `SecondaryDatabase` signature.
 ///
 /// # Example
+///
 /// ```ignore
+/// use noxu_bind::{IntBinding, StringBinding};
 /// use noxu_collections::StoredMap;
 ///
-/// let map = StoredMap::new(&db, false);
-/// map.put(b"key1", b"value1").unwrap();
-/// let value = map.get(b"key1").unwrap();
-/// assert_eq!(value, Some(b"value1".to_vec()));
+/// let map: StoredMap<i32, String, _, _> =
+///     StoredMap::new(&db, IntBinding, StringBinding);
+///
+/// // Auto-commit:
+/// map.put(None, &1, &"alpha".to_string())?;
+///
+/// // Participate in a user txn:
+/// let txn = env.begin_transaction(None, None)?;
+/// map.put(Some(&txn), &2, &"beta".to_string())?;
+/// txn.commit()?;
 /// ```
-pub struct StoredMap<'db> {
-    /// Reference to the underlying database.
-    db: &'db Database,
-    /// Whether this map view is read-only.
-    read_only: bool,
-    /// Internal sorted key index for iteration support.
-    /// Since the cursor API does not expose keys, we maintain our own
-    /// sorted key set to support iteration.
-    key_index: Mutex<BTreeSet<Vec<u8>>>,
+pub struct StoredMap<'db, K, V, KB, VB>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+{
+    pub(crate) db: &'db Database,
+    pub(crate) key_binding: KB,
+    pub(crate) value_binding: VB,
+    pub(crate) read_only: bool,
+    pub(crate) _marker: PhantomData<fn() -> (K, V)>,
 }
 
-impl<'db> StoredMap<'db> {
-    /// Creates a new map view of the given database.
+impl<'db, K, V, KB, VB> StoredMap<'db, K, V, KB, VB>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+{
+    /// Creates a new typed map view of the given database.
     ///
-    /// # Arguments
-    /// * `db` - The database to provide a map view over
-    /// * `read_only` - If true, write operations will return `CollectionError::ReadOnly`
-    pub fn new(db: &'db Database, read_only: bool) -> Self {
-        StoredMap { db, read_only, key_index: Mutex::new(BTreeSet::new()) }
-    }
-
-    /// Retrieves the value associated with the given key.
-    ///
-    /// Returns `None` if the key is not found in the database.
-    /// On success, the key is registered in the internal key index.
-    ///
-    /// # Arguments
-    /// * `key` - The key to look up
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let key_entry = DatabaseEntry::from_bytes(key);
-        let mut data_entry = DatabaseEntry::new();
-
-        match self.db.get(None, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => {
-                // Register key in our index since it exists
-                self.key_index.lock().unwrap().insert(key.to_vec());
-                Ok(Some(
-                    data_entry
-                        .get_data()
-                        .map(|d| d.to_vec())
-                        .unwrap_or_default(),
-                ))
-            }
-            _ => Ok(None),
+    /// The map is read-write by default.  Use [`Self::new_read_only`]
+    /// for a view that rejects mutating operations with
+    /// [`CollectionError::ReadOnly`].
+    pub fn new(db: &'db Database, key_binding: KB, value_binding: VB) -> Self {
+        StoredMap {
+            db,
+            key_binding,
+            value_binding,
+            read_only: false,
+            _marker: PhantomData,
         }
     }
 
-    /// Inserts or updates a key-value pair.
+    /// Creates a new read-only typed map view of the given database.
     ///
-    /// Returns the previous value if the key was already present,
-    /// or `None` if this is a new key.
-    ///
-    /// # Arguments
-    /// * `key` - The key to insert/update
-    /// * `value` - The value to store
-    ///
-    /// # Errors
-    /// Returns `CollectionError::ReadOnly` if this map is read-only.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.read_only {
-            return Err(CollectionError::ReadOnly);
+    /// Mutating operations (`put`, `remove`, `clear`) return
+    /// [`CollectionError::ReadOnly`].
+    pub fn new_read_only(
+        db: &'db Database,
+        key_binding: KB,
+        value_binding: VB,
+    ) -> Self {
+        StoredMap {
+            db,
+            key_binding,
+            value_binding,
+            read_only: true,
+            _marker: PhantomData,
         }
-
-        // Try to get the old value first
-        let old_value = self.get(key)?;
-
-        let key_entry = DatabaseEntry::from_bytes(key);
-        let data_entry = DatabaseEntry::from_bytes(value);
-
-        self.db.put(None, &key_entry, &data_entry)?;
-
-        // Register key in our index
-        self.key_index.lock().unwrap().insert(key.to_vec());
-
-        Ok(old_value)
-    }
-
-    /// Removes a key-value pair from the database.
-    ///
-    /// Returns the previous value if the key was present,
-    /// or `None` if the key was not found.
-    ///
-    /// # Arguments
-    /// * `key` - The key to remove
-    ///
-    /// # Errors
-    /// Returns `CollectionError::ReadOnly` if this map is read-only.
-    pub fn remove(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.read_only {
-            return Err(CollectionError::ReadOnly);
-        }
-
-        // Get the old value first
-        let old_value = self.get(key)?;
-
-        let key_entry = DatabaseEntry::from_bytes(key);
-        self.db.delete(None, &key_entry)?;
-
-        // Remove from our key index
-        self.key_index.lock().unwrap().remove(key);
-
-        Ok(old_value)
-    }
-
-    /// Tests whether the given key exists in the database.
-    ///
-    /// If the key exists, it is registered in the internal key index.
-    ///
-    /// # Arguments
-    /// * `key` - The key to check
-    pub fn contains_key(&self, key: &[u8]) -> Result<bool> {
-        let key_entry = DatabaseEntry::from_bytes(key);
-        let mut data_entry = DatabaseEntry::new();
-
-        match self.db.get(None, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => {
-                self.key_index.lock().unwrap().insert(key.to_vec());
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    /// Returns the number of records in the database.
-    ///
-    /// Uses the database's `count()` method for an accurate count.
-    pub fn len(&self) -> Result<u64> {
-        Ok(self.db.count()?)
-    }
-
-    /// Returns whether the database is empty.
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
     }
 
     /// Returns whether this map view is read-only.
@@ -185,90 +108,208 @@ impl<'db> StoredMap<'db> {
         self.read_only
     }
 
-    /// Registers a key in the internal key index.
-    ///
-    /// This is useful for populating the index with keys that are
-    /// already in the database but were not inserted through this
-    /// `StoredMap` instance.
-    ///
-    /// # Arguments
-    /// * `key` - The key to register
-    pub fn register_key(&self, key: &[u8]) {
-        self.key_index.lock().unwrap().insert(key.to_vec());
-    }
-
-    /// Registers multiple keys in the internal key index.
-    ///
-    /// Convenience method for bulk registration.
-    ///
-    /// # Arguments
-    /// * `keys` - The keys to register
-    pub fn register_keys(&self, keys: &[&[u8]]) {
-        let mut index = self.key_index.lock().unwrap();
-        for key in keys {
-            index.insert(key.to_vec());
-        }
-    }
-
-    /// Returns a snapshot of the current key index.
-    ///
-    /// The returned vector contains all keys known to this map view,
-    /// sorted in ascending order.
-    pub fn known_keys(&self) -> Vec<Vec<u8>> {
-        self.key_index.lock().unwrap().iter().cloned().collect()
-    }
-
-    /// Returns an iterator over all key-value pairs.
-    ///
-    /// Entries are yielded in sorted key order. The iterator works from
-    /// a snapshot of the key index taken at the time of this call.
-    pub fn iter(&self) -> Result<StoredIterator<'db>> {
-        let keys = self.known_keys();
-        Ok(StoredIterator::new(self.db, keys))
-    }
-
-    /// Returns an iterator over all keys.
-    ///
-    /// Keys are yielded in sorted order. The iterator works from a
-    /// snapshot of the key index taken at the time of this call.
-    pub fn keys(&self) -> Result<StoredKeyIterator> {
-        let keys = self.known_keys();
-        Ok(StoredKeyIterator::new(keys))
-    }
-
-    /// Returns an iterator over all values.
-    ///
-    /// Values are yielded in key-sorted order. The iterator works from
-    /// a snapshot of the key index taken at the time of this call.
-    pub fn values(&self) -> Result<StoredValueIterator<'db>> {
-        let keys = self.known_keys();
-        Ok(StoredValueIterator::new(self.db, keys))
-    }
-
     /// Returns a reference to the underlying database.
     pub fn database(&self) -> &'db Database {
         self.db
     }
 
-    /// Clears all records from the database.
+    /// Returns a reference to the key binding.
+    pub fn key_binding(&self) -> &KB {
+        &self.key_binding
+    }
+
+    /// Returns a reference to the value binding.
+    pub fn value_binding(&self) -> &VB {
+        &self.value_binding
+    }
+
+    /// Retrieves the value associated with the given key.
     ///
-    /// Removes all entries that are tracked in the key index.
+    /// Returns `Ok(None)` if the key is not present in the database.
+    pub fn get(&self, txn: Option<&Transaction>, key: &K) -> Result<Option<V>> {
+        let key_entry = encode_key(&self.key_binding, key)?;
+        let mut data_entry = noxu_db::DatabaseEntry::new();
+        match self.db.get(txn, &key_entry, &mut data_entry)? {
+            OperationStatus::Success => {
+                Ok(Some(decode_value(&self.value_binding, &data_entry)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Inserts or updates a key-value pair.
     ///
-    /// # Errors
-    /// Returns `CollectionError::ReadOnly` if this map is read-only.
-    pub fn clear(&self) -> Result<()> {
+    /// Returns the previous value associated with `key`, or `None`
+    /// if the key was not present.  This is the `Map.put(...)`
+    /// semantic from `java.util.Map`, matching BDB-JE.
+    pub fn put(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+        value: &V,
+    ) -> Result<Option<V>> {
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
 
-        let keys: Vec<Vec<u8>> =
-            self.key_index.lock().unwrap().iter().cloned().collect();
-        for key in &keys {
-            let key_entry = DatabaseEntry::from_vec(key.clone());
-            let _ = self.db.delete(None, &key_entry);
+        // Read-then-write under the user's txn so the read+write are
+        // serialisable as a single unit; if `txn` is `None` each call
+        // is its own auto-txn and the pair is observably non-atomic
+        // (acceptable v1.6 documented caveat — the same trade-off
+        // applies to BDB-JE's auto-commit `StoredMap.put`).
+        let key_entry = encode_key(&self.key_binding, key)?;
+        let value_entry = encode_value(&self.value_binding, value)?;
+
+        let old_value = {
+            let mut data_entry = noxu_db::DatabaseEntry::new();
+            match self.db.get(txn, &key_entry, &mut data_entry)? {
+                OperationStatus::Success => {
+                    Some(decode_value(&self.value_binding, &data_entry)?)
+                }
+                _ => None,
+            }
+        };
+
+        self.db.put(txn, &key_entry, &value_entry)?;
+        Ok(old_value)
+    }
+
+    /// Removes the entry for `key` and returns the previous value, or
+    /// `None` if no entry was present.
+    pub fn remove(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+    ) -> Result<Option<V>> {
+        if self.read_only {
+            return Err(CollectionError::ReadOnly);
         }
 
-        self.key_index.lock().unwrap().clear();
+        let key_entry = encode_key(&self.key_binding, key)?;
+
+        let old_value = {
+            let mut data_entry = noxu_db::DatabaseEntry::new();
+            match self.db.get(txn, &key_entry, &mut data_entry)? {
+                OperationStatus::Success => {
+                    Some(decode_value(&self.value_binding, &data_entry)?)
+                }
+                _ => None,
+            }
+        };
+
+        if old_value.is_some() {
+            self.db.delete(txn, &key_entry)?;
+        }
+        Ok(old_value)
+    }
+
+    /// Returns whether `key` is present in the database.
+    pub fn contains_key(
+        &self,
+        txn: Option<&Transaction>,
+        key: &K,
+    ) -> Result<bool> {
+        let key_entry = encode_key(&self.key_binding, key)?;
+        let mut data_entry = noxu_db::DatabaseEntry::new();
+        match self.db.get(txn, &key_entry, &mut data_entry)? {
+            OperationStatus::Success => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    /// Returns the number of records.
+    ///
+    /// Goes to [`Database::count`] which Sprint 1A fixed for
+    /// sorted-duplicate databases.
+    pub fn len(&self, _txn: Option<&Transaction>) -> Result<usize> {
+        // `Database::count` does not currently take a txn; the count
+        // is a B-tree property.  The `_txn` parameter is preserved on
+        // the API for future per-txn snapshotting and matches the
+        // BDB-JE / noxu_db `count(txn)` signature.
+        let n = self.db.count()?;
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    /// Returns whether the database is empty.
+    pub fn is_empty(&self, txn: Option<&Transaction>) -> Result<bool> {
+        Ok(self.len(txn)? == 0)
+    }
+
+    /// Returns a snapshot iterator over every (key, value) pair.
+    ///
+    /// The iterator is materialised eagerly: at the call to `iter()`
+    /// the cursor walks every record under `txn` and decodes every
+    /// pair into the returned `Vec`-backed iterator.
+    pub fn iter(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<(K, V)>> {
+        let items = scan_records(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &self.key_binding,
+            &self.value_binding,
+            |k, v| (k, v),
+        )?;
+        Ok(StoredIterator::from_vec(items))
+    }
+
+    /// Returns a snapshot iterator over keys.
+    pub fn keys(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
+        let items = scan_records(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &self.key_binding,
+            &self.value_binding,
+            |k, _v| k,
+        )?;
+        Ok(StoredIterator::from_vec(items))
+    }
+
+    /// Returns a snapshot iterator over values.
+    pub fn values(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<V>> {
+        let items = scan_records(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &self.key_binding,
+            &self.value_binding,
+            |_k, v| v,
+        )?;
+        Ok(StoredIterator::from_vec(items))
+    }
+
+    /// Removes every record from the database.
+    ///
+    /// Walks a cursor under `txn` and calls `delete` for each record
+    /// it encounters.  When `txn` is `Some(&t)` every delete is part
+    /// of the user txn and `clear` is atomic on commit/abort.  When
+    /// `txn` is `None` each delete is its own auto-txn — concurrent
+    /// readers may observe a partially-cleared database.
+    pub fn clear(&self, txn: Option<&Transaction>) -> Result<()> {
+        if self.read_only {
+            return Err(CollectionError::ReadOnly);
+        }
+
+        let mut cursor = self.db.open_cursor(txn, None)?;
+        let mut key = noxu_db::DatabaseEntry::new();
+        let mut data = noxu_db::DatabaseEntry::new();
+
+        while let OperationStatus::Success =
+            cursor.get(&mut key, &mut data, Get::First, None)?
+        {
+            cursor.delete()?;
+        }
+
+        cursor.close()?;
         Ok(())
     }
 }
@@ -276,308 +317,240 @@ impl<'db> StoredMap<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
+    use noxu_bind::{ByteArrayBinding, IntBinding, StringBinding};
+    use noxu_db::{
+        DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    };
     use tempfile::TempDir;
 
-    fn setup_env_and_db() -> (TempDir, Environment, Database) {
-        let temp_dir = TempDir::new().unwrap();
-        let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
-            .with_allow_create(true);
+    fn setup_env() -> (TempDir, Environment) {
+        let td = TempDir::new().unwrap();
+        let env_config = EnvironmentConfig::new(td.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
         let env = Environment::open(env_config).unwrap();
+        (td, env)
+    }
+
+    fn open_db(env: &Environment, name: &str) -> noxu_db::Database {
         let db_config = DatabaseConfig::new().with_allow_create(true);
-        let db = env.open_database(None, "testdb", &db_config).unwrap();
-        (temp_dir, env, db)
+        env.open_database(None, name, &db_config).unwrap()
     }
 
     #[test]
-    fn test_new_map() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-        assert!(!map.is_read_only());
-    }
+    fn typed_put_get_round_trip() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_put_get");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-    #[test]
-    fn test_new_read_only_map() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, true);
-        assert!(map.is_read_only());
-    }
-
-    #[test]
-    fn test_put_and_get() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-
-        let old = map.put(b"key1", b"value1").unwrap();
+        let old = map.put(None, &1, &"alpha".to_string()).unwrap();
         assert!(old.is_none());
 
-        let val = map.get(b"key1").unwrap();
-        assert_eq!(val, Some(b"value1".to_vec()));
+        assert_eq!(map.get(None, &1).unwrap(), Some("alpha".to_string()),);
+        assert!(map.contains_key(None, &1).unwrap());
+        assert!(!map.contains_key(None, &99).unwrap());
     }
 
     #[test]
-    fn test_put_overwrite() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_put_returns_old_value() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_put_old");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        map.put(b"key1", b"value1").unwrap();
-        let old = map.put(b"key1", b"value2").unwrap();
-        assert_eq!(old, Some(b"value1".to_vec()));
-
-        let val = map.get(b"key1").unwrap();
-        assert_eq!(val, Some(b"value2".to_vec()));
+        map.put(None, &1, &"alpha".to_string()).unwrap();
+        let old = map.put(None, &1, &"beta".to_string()).unwrap();
+        assert_eq!(old, Some("alpha".to_string()));
+        assert_eq!(map.get(None, &1).unwrap(), Some("beta".to_string()));
     }
 
     #[test]
-    fn test_get_nonexistent() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_remove_returns_old_value() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_remove");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        let val = map.get(b"nonexistent").unwrap();
-        assert!(val.is_none());
+        map.put(None, &7, &"hello".to_string()).unwrap();
+        let removed = map.remove(None, &7).unwrap();
+        assert_eq!(removed, Some("hello".to_string()));
+        assert_eq!(map.get(None, &7).unwrap(), None);
+
+        // Removing a missing key returns None.
+        assert_eq!(map.remove(None, &999).unwrap(), None);
     }
 
     #[test]
-    fn test_remove() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_len_and_is_empty() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_len");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        map.put(b"key1", b"value1").unwrap();
-        let old = map.remove(b"key1").unwrap();
-        assert_eq!(old, Some(b"value1".to_vec()));
+        assert!(map.is_empty(None).unwrap());
+        assert_eq!(map.len(None).unwrap(), 0);
 
-        let val = map.get(b"key1").unwrap();
-        assert!(val.is_none());
+        for i in 0..5 {
+            map.put(None, &i, &format!("v{i}")).unwrap();
+        }
+        assert!(!map.is_empty(None).unwrap());
+        assert_eq!(map.len(None).unwrap(), 5);
     }
 
     #[test]
-    fn test_remove_nonexistent() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_iter_yields_decoded_pairs() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_iter");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        let old = map.remove(b"nonexistent").unwrap();
-        assert!(old.is_none());
-    }
+        map.put(None, &3, &"three".to_string()).unwrap();
+        map.put(None, &1, &"one".to_string()).unwrap();
+        map.put(None, &2, &"two".to_string()).unwrap();
 
-    #[test]
-    fn test_contains_key() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+        let items: Vec<(i32, String)> =
+            map.iter(None).unwrap().map(Result::unwrap).collect();
 
-        assert!(!map.contains_key(b"key1").unwrap());
-        map.put(b"key1", b"value1").unwrap();
-        assert!(map.contains_key(b"key1").unwrap());
-    }
-
-    #[test]
-    fn test_len_and_is_empty() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-
-        assert!(map.is_empty().unwrap());
-        assert_eq!(map.len().unwrap(), 0);
-
-        map.put(b"key1", b"value1").unwrap();
-        assert!(!map.is_empty().unwrap());
-        assert_eq!(map.len().unwrap(), 1);
-
-        map.put(b"key2", b"value2").unwrap();
-        assert_eq!(map.len().unwrap(), 2);
-    }
-
-    #[test]
-    fn test_read_only_put() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, true);
-
-        let result = map.put(b"key1", b"value1");
-        assert!(matches!(result, Err(CollectionError::ReadOnly)));
-    }
-
-    #[test]
-    fn test_read_only_remove() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, true);
-
-        let result = map.remove(b"key1");
-        assert!(matches!(result, Err(CollectionError::ReadOnly)));
-    }
-
-    #[test]
-    fn test_read_only_get() {
-        let (_td, _env, db) = setup_env_and_db();
-
-        // Put data using another map view
-        let writer = StoredMap::new(&db, false);
-        writer.put(b"key1", b"value1").unwrap();
-
-        // Read via read-only map
-        let reader = StoredMap::new(&db, true);
-        let val = reader.get(b"key1").unwrap();
-        assert_eq!(val, Some(b"value1".to_vec()));
-    }
-
-    #[test]
-    fn test_iter() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-
-        map.put(b"cherry", b"c").unwrap();
-        map.put(b"apple", b"a").unwrap();
-        map.put(b"banana", b"b").unwrap();
-
-        let items: Vec<_> = map.iter().unwrap().map(|r| r.unwrap()).collect();
+        // IntBinding sorts numerically, so the natural cursor order is
+        // 1, 2, 3.
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].0, b"apple");
-        assert_eq!(items[1].0, b"banana");
-        assert_eq!(items[2].0, b"cherry");
+        assert_eq!(items[0], (1, "one".to_string()));
+        assert_eq!(items[1], (2, "two".to_string()));
+        assert_eq!(items[2], (3, "three".to_string()));
     }
 
     #[test]
-    fn test_keys() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_keys_and_values() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_kv");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        map.put(b"cherry", b"c").unwrap();
-        map.put(b"apple", b"a").unwrap();
-        map.put(b"banana", b"b").unwrap();
+        map.put(None, &1, &"one".to_string()).unwrap();
+        map.put(None, &2, &"two".to_string()).unwrap();
 
-        let keys: Vec<_> = map.keys().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(keys.len(), 3);
-        assert_eq!(keys[0], b"apple");
-        assert_eq!(keys[1], b"banana");
-        assert_eq!(keys[2], b"cherry");
+        let keys: Vec<i32> =
+            map.keys(None).unwrap().map(Result::unwrap).collect();
+        assert_eq!(keys, vec![1, 2]);
+
+        let values: Vec<String> =
+            map.values(None).unwrap().map(Result::unwrap).collect();
+        assert_eq!(values, vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]
-    fn test_values() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_clear_empties_database() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_clear");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        map.put(b"cherry", b"c").unwrap();
-        map.put(b"apple", b"a").unwrap();
-        map.put(b"banana", b"b").unwrap();
+        for i in 0..10 {
+            map.put(None, &i, &format!("v{i}")).unwrap();
+        }
+        assert_eq!(map.len(None).unwrap(), 10);
 
-        let vals: Vec<_> = map.values().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(vals.len(), 3);
-        assert_eq!(vals[0], b"a");
-        assert_eq!(vals[1], b"b");
-        assert_eq!(vals[2], b"c");
+        map.clear(None).unwrap();
+        assert_eq!(map.len(None).unwrap(), 0);
+        assert!(map.iter(None).unwrap().next().is_none());
     }
 
     #[test]
-    fn test_register_key() {
-        let (_td, _env, db) = setup_env_and_db();
+    fn typed_read_only_rejects_writes() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_ro");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new_read_only(&db, IntBinding, StringBinding);
+        assert!(map.is_read_only());
 
-        // Put data directly via database
-        let k = DatabaseEntry::from_bytes(b"existing");
-        let v = DatabaseEntry::from_bytes(b"data");
-        db.put(None, &k, &v).unwrap();
+        let r = map.put(None, &1, &"x".to_string());
+        assert!(matches!(r, Err(CollectionError::ReadOnly)));
 
-        // Create map and register the existing key
-        let map = StoredMap::new(&db, true);
-        map.register_key(b"existing");
+        let r = map.remove(None, &1);
+        assert!(matches!(r, Err(CollectionError::ReadOnly)));
 
-        let keys = map.known_keys();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], b"existing");
-
-        // Iteration should now include this key
-        let items: Vec<_> = map.iter().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].1, b"data");
+        let r = map.clear(None);
+        assert!(matches!(r, Err(CollectionError::ReadOnly)));
     }
 
     #[test]
-    fn test_register_keys() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_participates_in_user_txn_commit() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_txn_commit");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        map.register_keys(&[b"a", b"b", b"c"]);
-        let keys = map.known_keys();
-        assert_eq!(keys.len(), 3);
+        let txn = env.begin_transaction(None, None).unwrap();
+        map.put(Some(&txn), &1, &"a".to_string()).unwrap();
+        map.put(Some(&txn), &2, &"b".to_string()).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(map.get(None, &1).unwrap(), Some("a".to_string()));
+        assert_eq!(map.get(None, &2).unwrap(), Some("b".to_string()));
     }
 
     #[test]
-    fn test_clear() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn typed_participates_in_user_txn_abort() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "typed_txn_abort");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
 
-        map.put(b"key1", b"value1").unwrap();
-        map.put(b"key2", b"value2").unwrap();
-        assert_eq!(map.len().unwrap(), 2);
+        // Pre-populate.
+        map.put(None, &1, &"original".to_string()).unwrap();
 
-        map.clear().unwrap();
-        assert_eq!(map.len().unwrap(), 0);
-        assert!(map.known_keys().is_empty());
+        let txn = env.begin_transaction(None, None).unwrap();
+        map.put(Some(&txn), &1, &"modified".to_string()).unwrap();
+        map.put(Some(&txn), &2, &"new".to_string()).unwrap();
+        txn.abort().unwrap();
+
+        assert_eq!(map.get(None, &1).unwrap(), Some("original".to_string()));
+        assert_eq!(map.get(None, &2).unwrap(), None);
     }
 
     #[test]
-    fn test_clear_read_only() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, true);
+    fn byte_array_binding_round_trip() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "byte_map");
+        let map: StoredMap<'_, Vec<u8>, Vec<u8>, _, _> =
+            StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
 
-        let result = map.clear();
-        assert!(matches!(result, Err(CollectionError::ReadOnly)));
+        map.put(None, &b"hello".to_vec(), &b"world".to_vec()).unwrap();
+        assert_eq!(
+            map.get(None, &b"hello".to_vec()).unwrap(),
+            Some(b"world".to_vec()),
+        );
     }
 
     #[test]
-    fn test_database_accessor() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-        assert_eq!(map.database().get_database_name(), "testdb");
+    fn database_accessor() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "accessor");
+        let map: StoredMap<'_, i32, String, _, _> =
+            StoredMap::new(&db, IntBinding, StringBinding);
+        assert_eq!(map.database().get_database_name(), "accessor");
     }
 
     #[test]
-    fn test_known_keys_sorted() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
+    fn iter_visits_pre_existing_records_no_index_required() {
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "preexisting");
 
-        map.put(b"zebra", b"z").unwrap();
-        map.put(b"apple", b"a").unwrap();
-        map.put(b"mango", b"m").unwrap();
+        // Write directly through Database (no Stored* tracking).
+        for i in 1u64..=5 {
+            let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
+            let v = DatabaseEntry::from_vec(format!("v{i}").into_bytes());
+            db.put(None, &k, &v).unwrap();
+        }
 
-        let keys = map.known_keys();
-        assert_eq!(keys[0], b"apple");
-        assert_eq!(keys[1], b"mango");
-        assert_eq!(keys[2], b"zebra");
-    }
-
-    #[test]
-    fn test_empty_key_and_value() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-
-        map.put(b"", b"").unwrap();
-        let val = map.get(b"").unwrap();
-        assert_eq!(val, Some(b"".to_vec()));
-    }
-
-    #[test]
-    fn test_binary_data() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-
-        let key = &[0u8, 255, 128, 64];
-        let value = &[255u8, 0, 1, 254];
-
-        map.put(key, value).unwrap();
-        let val = map.get(key).unwrap();
-        assert_eq!(val, Some(value.to_vec()));
-    }
-
-    #[test]
-    fn test_multiple_puts_same_key() {
-        let (_td, _env, db) = setup_env_and_db();
-        let map = StoredMap::new(&db, false);
-
-        map.put(b"key", b"v1").unwrap();
-        map.put(b"key", b"v2").unwrap();
-        map.put(b"key", b"v3").unwrap();
-
-        let val = map.get(b"key").unwrap();
-        assert_eq!(val, Some(b"v3".to_vec()));
-        // Key index should have only one entry for this key
-        assert_eq!(map.known_keys().len(), 1);
+        // Open a typed map over the same database; iter() must see
+        // every record without any "register_key" call.  This is the
+        // central point of the Wave 2B redesign.
+        let map: StoredMap<'_, Vec<u8>, Vec<u8>, _, _> =
+            StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
+        let items: Vec<_> =
+            map.iter(None).unwrap().map(Result::unwrap).collect();
+        assert_eq!(items.len(), 5);
     }
 }
