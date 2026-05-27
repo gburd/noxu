@@ -82,8 +82,7 @@ pub struct Environment {
     /// elapses, in which case `NoxuError::InsufficientReplicas` is
     /// returned).  Closes finding F1 of
     /// `docs/src/internal/api-audit-2026-05-rep.md`.
-    replica_coordinator:
-        Mutex<Option<noxu_dbi::SharedReplicaAckCoordinator>>,
+    replica_coordinator: Mutex<Option<noxu_dbi::SharedReplicaAckCoordinator>>,
     /// Per-commit timeout for replica acknowledgments.  Mirrors
     /// `noxu_rep::RepConfig::replica_ack_timeout`; defaults to 5s.
     replica_ack_timeout: Mutex<std::time::Duration>,
@@ -833,9 +832,7 @@ impl Environment {
         // `set_replica_coordinator`), wire it into the transaction so
         // that `commit_with_durability` blocks until the configured
         // `ReplicaAckPolicy` is satisfied.
-        let txn = if let Some(coord) =
-            self.replica_coordinator.lock().clone()
-        {
+        let txn = if let Some(coord) = self.replica_coordinator.lock().clone() {
             let timeout = *self.replica_ack_timeout.lock();
             txn.with_replica_coordinator(coord, timeout)
         } else {
@@ -2118,13 +2115,13 @@ mod tests {
         let env = Environment::open(ro_config).unwrap();
 
         // Default txn config is writable — must be rejected.
-        let result = env.begin_transaction(None, None);
+        let result = env.begin_transaction(None);
         assert!(result.is_err(), "writable txn on read-only env must fail");
 
         // Read-only txn must be allowed.
         let ro_txn_cfg = TransactionConfig::default().with_read_only(true);
         let _txn = env
-            .begin_transaction(None, Some(&ro_txn_cfg))
+            .begin_transaction(Some(&ro_txn_cfg))
             .expect("read-only txn on read-only env must succeed");
     }
 
@@ -2184,7 +2181,7 @@ mod tests {
             .with_txn_no_sync(true);
         let env = Environment::open(config).unwrap();
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         // The transaction must have inherited COMMIT_NO_SYNC.
         let dur = txn.get_durability().expect("durability must be set");
         assert_eq!(
@@ -2205,7 +2202,7 @@ mod tests {
 
         let initial_active = env.active_txns.len();
         {
-            let _txn = env.begin_transaction(None, None).unwrap();
+            let _txn = env.begin_transaction(None).unwrap();
             assert_eq!(env.active_txns.len(), initial_active + 1);
             // Drop _txn at scope exit without commit/abort.
         }

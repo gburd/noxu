@@ -38,14 +38,10 @@ impl ServiceHandler for PingHandler {
 fn start_dispatcher()
 -> (TcpServiceDispatcher, std::net::SocketAddr, Arc<AtomicBool>) {
     let invoked = Arc::new(AtomicBool::new(false));
-    let sd =
-        TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
+    let sd = TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
     sd.register(
         "PING",
-        Arc::new(PingHandler {
-            name: "PING".into(),
-            invoked: invoked.clone(),
-        }),
+        Arc::new(PingHandler { name: "PING".into(), invoked: invoked.clone() }),
     );
     let addr = sd.start().unwrap();
     std::thread::sleep(Duration::from_millis(20));

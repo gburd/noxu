@@ -23,9 +23,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use noxu_dbi::{
-    AckWaitErrorKind, ReplicaAckCoordinator, ReplicaAckPolicyKind,
-};
+use noxu_dbi::{AckWaitErrorKind, ReplicaAckCoordinator, ReplicaAckPolicyKind};
 use noxu_rep::{NodeType, RepConfig, ReplicatedEnvironment, rep_node::RepNode};
 
 fn build_master_env(node_name: &str) -> Arc<ReplicatedEnvironment> {
@@ -87,8 +85,8 @@ fn f1_simple_majority_with_no_acks_times_out() {
     add_peers(&env, 1);
 
     let timeout = Duration::from_millis(150);
-    let res = env
-        .await_replica_acks(ReplicaAckPolicyKind::SimpleMajority, timeout);
+    let res =
+        env.await_replica_acks(ReplicaAckPolicyKind::SimpleMajority, timeout);
 
     let err = res.expect_err("commit must time out");
     assert_eq!(err.kind, AckWaitErrorKind::Timeout);
@@ -207,7 +205,7 @@ fn f1_commit_blocks_on_replica_acks() {
     env.set_replica_coordinator(rep_env.clone());
     env.set_replica_ack_timeout(Duration::from_millis(200));
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let durability = Durability::new(
         SyncPolicy::Sync,
         SyncPolicy::Sync,

@@ -98,10 +98,7 @@ impl ServiceHandler for ElectionService {
         ) {
             Ok(_) => Ok(()),
             Err(e) => {
-                log::debug!(
-                    "ELECTION service: acceptor returned error: {}",
-                    e
-                );
+                log::debug!("ELECTION service: acceptor returned error: {}", e);
                 Ok(())
             }
         }
@@ -150,10 +147,8 @@ mod tests {
         // Spin up an ELECTION service and a peer that runs run_election
         // against it.  Quorum = 2 in a 2-node group; proposer self-vote
         // + 1 peer promise = 2.
-        let acceptor_state = Arc::new(ElectionAcceptorState::new(
-            "peer".into(),
-            1,
-        ));
+        let acceptor_state =
+            Arc::new(ElectionAcceptorState::new("peer".into(), 1));
         acceptor_state.set_vlsn(50);
         acceptor_state.set_term(1);
         let svc = Arc::new(ElectionService::new(acceptor_state));

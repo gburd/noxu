@@ -6,7 +6,6 @@
 
 pub mod backup_manager;
 pub mod cursor_impl;
-pub mod replica_ack;
 mod database_config;
 mod database_id;
 mod database_impl;
@@ -27,6 +26,7 @@ mod node_sequence;
 mod operation;
 mod operation_status;
 mod put_mode;
+pub mod replica_ack;
 mod search_mode;
 pub mod throughput_stats;
 mod truncate_result;

@@ -371,7 +371,7 @@ fn c3_primary_put_under_txn_rolls_back_secondary_on_abort() {
     )
     .unwrap();
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
     primary.lock().put(Some(&txn), &pk, &v).unwrap();

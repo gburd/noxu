@@ -177,12 +177,8 @@ impl PeerLogScanner {
 
         // F10 eviction: drop oldest until both bounds are honoured.
         let mut evicted = 0u64;
-        while q.len() > self.max_entries
-            || *current_bytes > self.max_bytes
-        {
-            if let Some((_evicted_vlsn, _ty, evicted_payload)) =
-                q.pop_front()
-            {
+        while q.len() > self.max_entries || *current_bytes > self.max_bytes {
+            if let Some((_evicted_vlsn, _ty, evicted_payload)) = q.pop_front() {
                 *current_bytes =
                     current_bytes.saturating_sub(evicted_payload.len());
                 evicted += 1;
@@ -205,8 +201,7 @@ impl PeerLogScanner {
     /// scanner construction.  Useful for monitoring whether downstream
     /// peers are keeping up.
     pub fn evicted_count(&self) -> u64 {
-        self.evicted_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.evicted_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Current cumulative payload size in bytes (live snapshot).
