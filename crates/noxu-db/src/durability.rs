@@ -1,6 +1,8 @@
 //! Durability and sync policies for transactions.
 //!
 
+use noxu_dbi::ReplicaAckPolicyKind;
+
 /// Sync policy for local commit synchronization.
 ///
 /// Determines how transaction commits are synchronized to stable storage.
@@ -63,6 +65,20 @@ pub struct Durability {
 
     /// Acknowledgment policy for replicas.
     pub replica_ack: ReplicaAckPolicy,
+}
+
+impl ReplicaAckPolicy {
+    /// Convert this policy to the dependency-free `ReplicaAckPolicyKind`
+    /// used by the `ReplicaAckCoordinator` trait in `noxu-dbi`.
+    pub fn as_kind(self) -> ReplicaAckPolicyKind {
+        match self {
+            ReplicaAckPolicy::All => ReplicaAckPolicyKind::All,
+            ReplicaAckPolicy::SimpleMajority => {
+                ReplicaAckPolicyKind::SimpleMajority
+            }
+            ReplicaAckPolicy::None => ReplicaAckPolicyKind::None,
+        }
+    }
 }
 
 impl Durability {

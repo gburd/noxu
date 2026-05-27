@@ -67,6 +67,20 @@ pub struct Environment {
     /// Cached log manager — acquired once at open; None for non-transactional envs.
     /// Used by stat_fsync_count() to avoid env_impl.lock() on the stats hot path.
     log_manager: Option<Arc<LogManager>>,
+    /// Optional replica-ack coordinator (typically a
+    /// `noxu_rep::ReplicatedEnvironment`).  When set via
+    /// [`Environment::set_replica_coordinator`], every new
+    /// `Transaction` is wired to the coordinator and its
+    /// `commit_with_durability` blocks until the configured
+    /// `ReplicaAckPolicy` is satisfied (or the configured timeout
+    /// elapses, in which case `NoxuError::InsufficientReplicas` is
+    /// returned).  Closes finding F1 of
+    /// `docs/src/internal/api-audit-2026-05-rep.md`.
+    replica_coordinator:
+        Mutex<Option<noxu_dbi::SharedReplicaAckCoordinator>>,
+    /// Per-commit timeout for replica acknowledgments.  Mirrors
+    /// `noxu_rep::RepConfig::replica_ack_timeout`; defaults to 5s.
+    replica_ack_timeout: Mutex<std::time::Duration>,
 }
 
 /// Internal database handle state.
@@ -357,6 +371,8 @@ impl Environment {
             env_valid: AtomicBool::new(true),
             env_impl: env_impl_arc,
             log_manager,
+            replica_coordinator: Mutex::new(None),
+            replica_ack_timeout: Mutex::new(std::time::Duration::from_secs(5)),
         })
     }
 
@@ -756,6 +772,19 @@ impl Environment {
         // `OperationNotAllowed`.
         let txn = txn.with_active_txns(Arc::clone(&self.active_txns));
 
+        // F1: if a replica-ack coordinator has been installed (via
+        // `set_replica_coordinator`), wire it into the transaction so
+        // that `commit_with_durability` blocks until the configured
+        // `ReplicaAckPolicy` is satisfied.
+        let txn = if let Some(coord) =
+            self.replica_coordinator.lock().clone()
+        {
+            let timeout = *self.replica_ack_timeout.lock();
+            txn.with_replica_coordinator(coord, timeout)
+        } else {
+            txn
+        };
+
         Ok(txn)
     }
 
@@ -772,6 +801,53 @@ impl Environment {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         Ok(env_impl.get_database_names())
+    }
+
+    /// Install a replica-ack coordinator on this environment.
+    ///
+    /// After this call, every transaction begun on this environment
+    /// will consult the coordinator on `commit_with_durability` and
+    /// block until the configured `ReplicaAckPolicy` is satisfied (or
+    /// until `replica_ack_timeout` elapses, in which case
+    /// `NoxuError::InsufficientReplicas` is returned).
+    ///
+    /// `noxu_rep::ReplicatedEnvironment` implements
+    /// `noxu_dbi::ReplicaAckCoordinator`; users typically wire it as:
+    ///
+    /// ```ignore
+    /// let rep_env = Arc::new(ReplicatedEnvironment::new(rep_config)?);
+    /// env.set_replica_coordinator(rep_env.clone());
+    /// rep_env.with_environment(env_impl);
+    /// ```
+    ///
+    /// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    pub fn set_replica_coordinator(
+        &self,
+        coord: noxu_dbi::SharedReplicaAckCoordinator,
+    ) {
+        *self.replica_coordinator.lock() = Some(coord);
+    }
+
+    /// Clear any installed replica-ack coordinator.
+    ///
+    /// Subsequent `commit_with_durability` calls revert to local-only
+    /// durability semantics.
+    pub fn clear_replica_coordinator(&self) {
+        *self.replica_coordinator.lock() = None;
+    }
+
+    /// Set the per-commit timeout used when waiting for replica
+    /// acknowledgments.
+    ///
+    /// Default is 5 seconds.  Mirrors
+    /// `noxu_rep::RepConfig::replica_ack_timeout`.
+    pub fn set_replica_ack_timeout(&self, timeout: std::time::Duration) {
+        *self.replica_ack_timeout.lock() = timeout;
+    }
+
+    /// Returns the per-commit replica-ack timeout.
+    pub fn get_replica_ack_timeout(&self) -> std::time::Duration {
+        *self.replica_ack_timeout.lock()
     }
 
     /// Returns the home directory path.
