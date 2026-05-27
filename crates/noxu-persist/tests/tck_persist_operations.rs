@@ -397,7 +397,7 @@ fn tck_persist_put_is_idempotent_for_identical_value() {
 
     // Count is 1 (single key) regardless of number of puts.
     assert_eq!(1, pi.count().unwrap());
-    assert_eq!(Some(v.clone()), pi.get(None, &ser, &100).unwrap());
+    assert_eq!(Some(v), pi.get(None, &ser, &100).unwrap());
 }
 
 // ---------------------------------------------------------------------------
