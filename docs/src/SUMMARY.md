@@ -120,3 +120,4 @@
   - [Wave 2C-1 — DPL derive macros](internal/wave-2c-1-derive-macro.md)
   - [Wave 2C-2 — DPL schema evolution](internal/wave-2c-2-dpl-evolution.md)
   - [Wave 2C-3 — DiskOrderedCursor](internal/wave-2c-3-disk-ordered-cursor.md)
+  - [Wave 3-1 — nested-transaction parameter removed](internal/wave-3-1-nested-txn-removal.md)

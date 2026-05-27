@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let replacement = b"new data";
 
-    let txn = env.begin_transaction(None, None)?;
+    let txn = env.begin_transaction(None)?;
 
     // Open the cursor with the transaction handle.
     let mut cursor = db.open_cursor(Some(&txn), None)?;

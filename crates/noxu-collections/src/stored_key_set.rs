@@ -232,7 +232,7 @@ mod tests {
     fn participates_in_user_txn() {
         let (_td, env, db) = setup();
         let set: StoredKeySet<'_, i32, _> = StoredKeySet::new(&db, IntBinding);
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         set.add(Some(&txn), &7).unwrap();
         assert!(set.contains(Some(&txn), &7).unwrap());
         txn.abort().unwrap();

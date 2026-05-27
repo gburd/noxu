@@ -198,9 +198,9 @@ The breakage radius for each is described in
 none of them have non-test callers in the repository.
 
 * **`Environment::begin_transaction(Some(&parent), …)` returns
-  `NoxuError::Unsupported`.** Decision 3B. The `parent` parameter is
-  retained for forward source compatibility and scheduled for removal
-  in v2.0.
+  `NoxuError::Unsupported` (v1.5) — and the `parent` parameter has been
+  removed entirely in v2.0 (Wave 3-1).** Decision 3B. See the v1.5 →
+  v2.0 section below for the source-compatibility break.
 * **`SecondaryConfig::with_foreign_key_database` /
   `with_foreign_key_delete_action` /
   `with_foreign_key_nullifier` /
@@ -387,7 +387,7 @@ secondary.update_secondary(&pk, None, Some(&v))?; // silently overwrote
                                                   // existing secondary
                                                   // for cross-primary
                                                   // key collisions
-let txn2 = env.begin_transaction(Some(&txn), None)?; // accepted, no-op
+let txn2 = env.begin_transaction(Some(&txn), None)?; // accepted, no-op (v1.4.x)
 
 // v1.5 (correct)
 let cursor = db.open_cursor(Some(&txn), None)?;  // honours txn
@@ -397,6 +397,10 @@ secondary.update_secondary(&pk, None, Some(&v))?; // returns
                                                   // collision
 let txn2 = env.begin_transaction(Some(&txn), None)?; // returns
                                                      // NoxuError::Unsupported
+                                                     // (v1.5; in v2.0 this
+                                                     //  is a compile error
+                                                     //  — see the v1.5 →
+                                                     //  v2.0 section below)
 
 // DPL (breaking source-level signature change)
 // v1.4.x:
@@ -408,5 +412,54 @@ let u = index.get(None, &ser, &id)?;
 // or, to participate in a user txn:
 index.put(Some(&txn), &ser, &user)?;
 ```
+
+---
+
+## v1.5 → v2.0 — nested-transaction parameter removed (Wave 3-1)
+
+Decision 3B in
+[`v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
+staged the deprecation of the nested-transaction `parent` argument in
+two phases: v1.5 rejected `Some(_)` at runtime, and v2.0 removes the
+parameter from the signature entirely.  Wave 3-1 lands the v2.0 path.
+
+### Breaking signature change
+
+```rust
+// v1.4.x and v1.5 / v1.6
+fn begin_transaction(
+    &self,
+    parent: Option<&Transaction>,
+    config: Option<&TransactionConfig>,
+) -> Result<Transaction>;
+
+// v2.0 (Wave 3-1)
+fn begin_transaction(
+    &self,
+    config: Option<&TransactionConfig>,
+) -> Result<Transaction>;
+```
+
+### Mechanical migration
+
+```rust
+// before
+let txn  = env.begin_transaction(None, None)?;
+let txn2 = env.begin_transaction(None, Some(&cfg))?;
+// (and the v1.5-rejected misuse, which now will not compile)
+let bad  = env.begin_transaction(Some(&parent), None)?;
+
+// after
+let txn  = env.begin_transaction(None)?;
+let txn2 = env.begin_transaction(Some(&cfg))?;
+// no v2.0 equivalent for nested txns — they remain unsupported, and the
+// type system now enforces it.
+```
+
+The blast radius for this change is small in practice because Decision
+3B's v1.5 path already rejected the `Some(parent)` form at runtime; in
+v2.0 the same misuse is caught at compile time instead.  See
+[`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md)
+for details.
 
 ---

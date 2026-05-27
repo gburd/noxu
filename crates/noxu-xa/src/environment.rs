@@ -212,10 +212,8 @@ impl XaResource for XaEnvironment {
         }
 
         let config = TransactionConfig::new();
-        let txn = self
-            .env
-            .begin_transaction(None, Some(&config))
-            .map_err(XaError::Db)?;
+        let txn =
+            self.env.begin_transaction(Some(&config)).map_err(XaError::Db)?;
 
         branches.insert(
             xid.clone(),

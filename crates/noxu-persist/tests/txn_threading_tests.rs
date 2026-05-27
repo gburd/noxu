@@ -116,7 +116,7 @@ fn put_with_txn_commit_makes_entity_visible() {
     let index: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSer;
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     index.put(Some(&txn), &ser, &widget(1, "alpha", "red")).unwrap();
 
     // Inside the txn: visible.
@@ -140,7 +140,7 @@ fn put_with_txn_abort_rolls_back_entity() {
     let index: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSer;
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     index.put(Some(&txn), &ser, &widget(2, "beta", "blue")).unwrap();
     txn.abort().unwrap();
 
@@ -166,7 +166,7 @@ fn delete_with_entity_with_txn_abort_restores_entity() {
     index.put(None, &ser, &widget(3, "gamma", "green")).unwrap();
     assert!(index.contains(None, &3u64).unwrap());
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let deleted = index.delete_with_entity(Some(&txn), &ser, &3u64).unwrap();
     assert!(deleted);
     // Inside txn: gone.
@@ -188,7 +188,7 @@ fn put_no_overwrite_with_txn_abort_rolls_back() {
     let index: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSer;
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     let inserted = index
         .put_no_overwrite(Some(&txn), &ser, &widget(4, "delta", "yellow"))
         .unwrap();
@@ -305,7 +305,7 @@ fn secondary_index_update_is_not_atomic_with_txn_v1_5() {
         index.open_secondary_index(|w: &Widget| Some(w.color.clone()));
 
     // Inside an aborted txn: write a Widget with colour "rare".
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     index.put(Some(&txn), &ser, &widget(100, "secret", "rare")).unwrap();
     // Inside the txn the secondary already shows the new entry.
     assert!(by_color.contains(&"rare".to_string()));
@@ -355,7 +355,7 @@ fn put_with_txn_without_secondaries_does_not_warn() {
     let index: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSer;
 
-    let txn = env.begin_transaction(None, None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
     // No secondaries registered, so the warning + debug_assert path is
     // bypassed. This must succeed even without the env-var opt-in.
     index.put(Some(&txn), &ser, &widget(50, "phi", "magenta")).unwrap();

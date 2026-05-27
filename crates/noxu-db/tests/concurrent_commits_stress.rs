@@ -81,7 +81,7 @@ fn concurrent_commits_no_lost_writes() {
                 std::thread::spawn(move || {
                     barrier.wait();
                     for k in 0..KEYS_PER_THREAD {
-                        let txn = env.begin_transaction(None, None).unwrap();
+                        let txn = env.begin_transaction(None).unwrap();
                         let key = DatabaseEntry::from_vec(
                             format!("t{tid:02}_k{k:04}").into_bytes(),
                         );
@@ -145,7 +145,7 @@ fn concurrent_commits_no_lost_writes_smoke() {
                 std::thread::spawn(move || {
                     barrier.wait();
                     for k in 0..SMOKE_KEYS_PER_THREAD {
-                        let txn = env.begin_transaction(None, None).unwrap();
+                        let txn = env.begin_transaction(None).unwrap();
                         let key = DatabaseEntry::from_vec(
                             format!("t{tid:02}_k{k:04}").into_bytes(),
                         );

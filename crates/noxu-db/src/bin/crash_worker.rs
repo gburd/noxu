@@ -42,7 +42,7 @@ fn main() {
         "committed_then_uncommitted" => {
             // Phase 1: one committed transaction per key.
             for i in 0u32..50 {
-                let txn = env.begin_transaction(None, None).expect("begin txn");
+                let txn = env.begin_transaction(None).expect("begin txn");
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"committed");
                 db.put(Some(&txn), &key, &val).expect("put");
@@ -51,7 +51,7 @@ fn main() {
             flag(&dir, "phase1_done");
 
             // Phase 2: one uncommitted transaction — parent kills us here.
-            let txn = env.begin_transaction(None, None).expect("begin txn");
+            let txn = env.begin_transaction(None).expect("begin txn");
             for i in 1000u32..1050 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"uncommitted");
@@ -65,7 +65,7 @@ fn main() {
 
         "uncommitted_only" => {
             // Committed sentinel so the parent can confirm the db was open.
-            let txn = env.begin_transaction(None, None).expect("begin txn");
+            let txn = env.begin_transaction(None).expect("begin txn");
             let sentinel_key = DatabaseEntry::from_bytes(b"sentinel");
             let sentinel_val = DatabaseEntry::from_bytes(b"ok");
             db.put(Some(&txn), &sentinel_key, &sentinel_val)
@@ -74,7 +74,7 @@ fn main() {
             flag(&dir, "sentinel_committed");
 
             // Uncommitted batch — parent kills us here.
-            let txn = env.begin_transaction(None, None).expect("begin txn");
+            let txn = env.begin_transaction(None).expect("begin txn");
             for i in 0u32..50 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"uncommitted");
@@ -98,7 +98,7 @@ fn main() {
         // an uncommitted T2 was in-flight at crash time.
         "ordered_commits" => {
             // T1: committed.
-            let txn = env.begin_transaction(None, None).expect("begin T1");
+            let txn = env.begin_transaction(None).expect("begin T1");
             for i in 0u32..25 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"t1");
@@ -108,7 +108,7 @@ fn main() {
             flag(&dir, "t1_done");
 
             // T2: uncommitted — parent kills us here.
-            let txn = env.begin_transaction(None, None).expect("begin T2");
+            let txn = env.begin_transaction(None).expect("begin T2");
             for i in 100u32..125 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"t2");
@@ -127,7 +127,7 @@ fn main() {
         // The parent can either let this exit cleanly (graceful) or SIGKILL it.
         "clean_then_dirty" => {
             for i in 0u32..25 {
-                let txn = env.begin_transaction(None, None).expect("begin txn");
+                let txn = env.begin_transaction(None).expect("begin txn");
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"parity");
                 db.put(Some(&txn), &key, &val).expect("put");

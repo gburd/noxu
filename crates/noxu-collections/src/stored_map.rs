@@ -49,7 +49,7 @@ use crate::stored_iterator::StoredIterator;
 /// map.put(None, &1, &"alpha".to_string())?;
 ///
 /// // Participate in a user txn:
-/// let txn = env.begin_transaction(None, None)?;
+/// let txn = env.begin_transaction(None)?;
 /// map.put(Some(&txn), &2, &"beta".to_string())?;
 /// txn.commit()?;
 /// ```
@@ -481,7 +481,7 @@ mod tests {
         let map: StoredMap<'_, i32, String, _, _> =
             StoredMap::new(&db, IntBinding, StringBinding);
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         map.put(Some(&txn), &1, &"a".to_string()).unwrap();
         map.put(Some(&txn), &2, &"b".to_string()).unwrap();
         txn.commit().unwrap();
@@ -500,7 +500,7 @@ mod tests {
         // Pre-populate.
         map.put(None, &1, &"original".to_string()).unwrap();
 
-        let txn = env.begin_transaction(None, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
         map.put(Some(&txn), &1, &"modified".to_string()).unwrap();
         map.put(Some(&txn), &2, &"new".to_string()).unwrap();
         txn.abort().unwrap();

@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Transaction 1: Insert records and COMMIT ---
     println!("\nTransaction 1: inserting committed records...");
-    let txn1 = env.begin_transaction(None, None)?;
+    let txn1 = env.begin_transaction(None)?;
     println!("  Started transaction {}", txn1.get_id());
 
     // Note: The current simplified implementation does not actually
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Transaction 2: Insert records and ABORT ---
     println!("\nTransaction 2: inserting records that will be aborted...");
-    let txn2 = env.begin_transaction(None, None)?;
+    let txn2 = env.begin_transaction(None)?;
     println!("  Started transaction {}", txn2.get_id());
 
     for i in 0..3 {
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Demonstrate transaction state ---
     println!("\nDemonstrating transaction state:");
-    let txn3 = env.begin_transaction(None, None)?;
+    let txn3 = env.begin_transaction(None)?;
     println!("  txn3 is_valid: {}", txn3.is_valid());
     println!("  txn3 state: {:?}", txn3.get_state());
 
