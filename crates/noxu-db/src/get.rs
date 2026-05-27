@@ -20,6 +20,13 @@ pub enum Get {
     /// and the data. Returns an error if not found.
     SearchBoth,
 
+    /// Get the record matching the key with data >= the specified data.
+    ///
+    /// For duplicate databases, positions the cursor at the first duplicate
+    /// of the specified key whose data is >= the supplied data slice.
+    /// Equivalent to BDB-JE's `Cursor.getSearchBothRange`.
+    SearchBothRange,
+
     /// Get the record with the smallest key.
     ///
     /// Positions the cursor at the first record in the database.
@@ -126,6 +133,7 @@ impl Get {
             self,
             Get::Search
                 | Get::SearchBoth
+                | Get::SearchBothRange
                 | Get::SearchGte
                 | Get::SearchLte
                 | Get::SearchRange
@@ -134,7 +142,7 @@ impl Get {
 
     /// Returns whether this operation requires a data parameter.
     pub fn requires_data(&self) -> bool {
-        matches!(self, Get::SearchBoth)
+        matches!(self, Get::SearchBoth | Get::SearchBothRange)
     }
 
     /// Returns whether this operation is valid only for duplicate databases.
@@ -142,6 +150,7 @@ impl Get {
         matches!(
             self,
             Get::SearchBoth
+                | Get::SearchBothRange
                 | Get::FirstDup
                 | Get::LastDup
                 | Get::NextDup
@@ -173,6 +182,7 @@ mod tests {
     fn test_requires_key() {
         assert!(Get::Search.requires_key());
         assert!(Get::SearchBoth.requires_key());
+        assert!(Get::SearchBothRange.requires_key());
         assert!(Get::SearchGte.requires_key());
         assert!(Get::SearchLte.requires_key());
         assert!(!Get::First.requires_key());
@@ -182,6 +192,7 @@ mod tests {
     #[test]
     fn test_requires_data() {
         assert!(Get::SearchBoth.requires_data());
+        assert!(Get::SearchBothRange.requires_data());
         assert!(!Get::Search.requires_data());
         assert!(!Get::First.requires_data());
     }
@@ -189,6 +200,7 @@ mod tests {
     #[test]
     fn test_requires_duplicates() {
         assert!(Get::SearchBoth.requires_duplicates());
+        assert!(Get::SearchBothRange.requires_duplicates());
         assert!(Get::FirstDup.requires_duplicates());
         assert!(Get::LastDup.requires_duplicates());
         assert!(Get::NextDup.requires_duplicates());
