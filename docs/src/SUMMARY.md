@@ -129,3 +129,4 @@
   - [Wave 4-C — JE TCK port (priority 2)](internal/wave-4-c-je-tck-port-priority2.md)
   - [Wave 6 — JE TCK port (priority 3 + 4)](internal/wave-6-je-tck-port-priority-3-4.md)
   - [Wave 7 — v2.0.1 polish](internal/wave-7-polish.md)
+  - [Wave 8 — RepTestBase harness + heavy rep TCK port](internal/wave-8-rep-testbase.md)
