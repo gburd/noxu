@@ -25,7 +25,10 @@
 //!
 //! When the environment is closed, the node transitions to the Detached state.
 
-use noxu_dbi::EnvironmentImpl;
+use noxu_dbi::{
+    AckWaitError, AckWaitErrorKind, EnvironmentImpl, ReplicaAckCoordinator,
+    ReplicaAckPolicyKind,
+};
 use noxu_sync::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -162,6 +165,14 @@ pub struct ReplicatedEnvironment {
     /// reads from this queue to stream entries to downstream replicas that
     /// are behind this node (peer-to-peer log distribution, HA style).
     peer_scanner: Arc<PeerLogScanner>,
+
+    /// Monotonic sequence used by `await_replica_acks` to assign unique
+    /// keys to in-flight commits awaiting replica acknowledgment.  In
+    /// production this should track the real master VLSN; until F11
+    /// closes the VLSN<->commit linkage, the coordinator uses a
+    /// synthetic sequence so that ack tracking is unique per commit.
+    /// See finding F1 in `docs/src/internal/api-audit-2026-05-rep.md`.
+    commit_ack_seq: std::sync::atomic::AtomicU64,
 }
 
 impl ReplicatedEnvironment {
@@ -292,6 +303,7 @@ impl ReplicatedEnvironment {
             io_shutdown: AtomicBool::new(false),
             restore_registered: AtomicBool::new(restore_registered_init),
             peer_scanner,
+            commit_ack_seq: std::sync::atomic::AtomicU64::new(1),
         };
 
         Ok(env)
@@ -1007,6 +1019,131 @@ impl ReplicatedEnvironment {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// F1: ReplicaAckCoordinator impl wires master commits into the AckTracker.
+// ---------------------------------------------------------------------------
+//
+// `noxu_db::Transaction::commit_with_durability` calls
+// `await_replica_acks` after the local WAL fsync.  This impl:
+//
+//   1. Rejects calls on a non-master node with `NotMaster`.
+//   2. Rejects calls during shutdown with `Shutdown`.
+//   3. Computes the required ack count from `electable_count` and the
+//      requested policy.
+//   4. Allocates a unique commit sequence number, registers the ack
+//      requirement on the `AckTracker`, and polls `is_satisfied` with
+//      a small sleep until either the timeout elapses or the policy
+//      is satisfied.
+//   5. Cleans up the tracker entry on every exit path.
+//
+// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+impl ReplicaAckCoordinator for ReplicatedEnvironment {
+    fn await_replica_acks(
+        &self,
+        policy: ReplicaAckPolicyKind,
+        timeout: Duration,
+    ) -> std::result::Result<u32, AckWaitError> {
+        // Fast-path: ReplicaAckPolicy::None never blocks. The trait spec
+        // says callers may already short-circuit, but be defensive.
+        if matches!(policy, ReplicaAckPolicyKind::None) {
+            return Ok(0);
+        }
+
+        if self.is_shutdown() {
+            return Err(AckWaitError {
+                kind: AckWaitErrorKind::Shutdown,
+                needed: 0,
+                received: 0,
+            });
+        }
+
+        if !self.is_master() {
+            return Err(AckWaitError {
+                kind: AckWaitErrorKind::NotMaster,
+                needed: 0,
+                received: 0,
+            });
+        }
+
+        // Count electable peers (excluding the master) using the
+        // RepGroup view, which counts Arbiters and Electables
+        // identically. Only Electable nodes are counted as data
+        // replicas able to ack a commit.  The master itself is
+        // *implicit*: it is not registered in `group_service` (only
+        // peers are), so we add 1 to obtain the total electable
+        // count expected by `ReplicaAckPolicyKind::required_acks`.
+        let group = self.get_rep_group();
+        let electable_peers: u32 = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
+            .count() as u32;
+        let electable_count: u32 = electable_peers + 1; // +1 for self/master
+
+        let needed = policy.required_acks(electable_count);
+        if needed == 0 {
+            // Single-node group, or All with only the master itself.
+            return Ok(0);
+        }
+
+        let commit_seq = self
+            .commit_ack_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.ack_tracker.register(commit_seq, needed);
+
+        // Poll-with-sleep loop. The poll interval is small enough that
+        // late acks satisfy the policy promptly, and large enough that
+        // a single commit waiting on a slow replica does not spin a
+        // CPU.
+        let poll_interval = std::cmp::min(
+            timeout / 50,
+            Duration::from_millis(20),
+        );
+        let poll_interval = if poll_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            poll_interval
+        };
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            if self.ack_tracker.is_satisfied(commit_seq) {
+                self.ack_tracker.cleanup_through(commit_seq);
+                return Ok(needed);
+            }
+            if self.is_shutdown() {
+                self.ack_tracker.cleanup_through(commit_seq);
+                return Err(AckWaitError {
+                    kind: AckWaitErrorKind::Shutdown,
+                    needed,
+                    received: 0,
+                });
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                // Tear down the registration so it doesn't accumulate;
+                // record the partial ack count so the caller can report
+                // a useful `InsufficientReplicas { required, available }`.
+                let received = self
+                    .ack_tracker
+                    .received_count(commit_seq)
+                    .unwrap_or(0);
+                self.ack_tracker.cleanup_through(commit_seq);
+                return Err(AckWaitError {
+                    kind: AckWaitErrorKind::Timeout,
+                    needed,
+                    received,
+                });
+            }
+            let sleep_for =
+                std::cmp::min(poll_interval, deadline.saturating_duration_since(now));
+            std::thread::sleep(sleep_for);
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {

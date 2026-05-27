@@ -5,7 +5,10 @@ use crate::durability::{Durability, SyncPolicy};
 use crate::environment::ActiveTxns;
 use crate::error::{NoxuError, Result};
 use crate::transaction_config::TransactionConfig;
-use noxu_dbi::{DatabaseId, EnvironmentImpl};
+use noxu_dbi::{
+    AckWaitErrorKind, DatabaseId, EnvironmentImpl, ReplicaAckPolicyKind,
+    SharedReplicaAckCoordinator,
+};
 use noxu_log::LogManager;
 use noxu_sync::Mutex as SyncMutex;
 use noxu_txn::Txn;
@@ -99,6 +102,19 @@ pub struct Transaction {
     ///
     /// Resolves F1 of the May 2026 API audit.
     active_txns: Option<Arc<ActiveTxns>>,
+    /// Optional replica-ack coordinator (typically a
+    /// `noxu_rep::ReplicatedEnvironment`).  When `Some`, a successful
+    /// `commit_with_durability` blocks until the configured
+    /// `ReplicaAckPolicy` is satisfied or the durability ack-timeout
+    /// elapses, in which case `NoxuError::InsufficientReplicas` is
+    /// returned.  Closes finding F1 of
+    /// `docs/src/internal/api-audit-2026-05-rep.md`.
+    replica_coordinator: Option<SharedReplicaAckCoordinator>,
+    /// Per-commit timeout for replica acknowledgments.  Default 5s; set
+    /// from the environment's `replica_ack_timeout_ms` (see
+    /// `EnvironmentConfig::replica_ack_timeout_ms`) when the
+    /// coordinator is installed.
+    replica_ack_timeout: std::time::Duration,
 }
 
 impl Transaction {
@@ -122,6 +138,8 @@ impl Transaction {
             inner_txn: None,
             env_impl: None,
             active_txns: None,
+            replica_coordinator: None,
+            replica_ack_timeout: std::time::Duration::from_secs(5),
         }
     }
 
@@ -148,6 +166,8 @@ impl Transaction {
             inner_txn: None,
             env_impl: None,
             active_txns: None,
+            replica_coordinator: None,
+            replica_ack_timeout: std::time::Duration::from_secs(5),
         }
     }
 
@@ -183,6 +203,24 @@ impl Transaction {
         registry: Arc<ActiveTxns>,
     ) -> Self {
         self.active_txns = Some(registry);
+        self
+    }
+
+    /// Wires the replica-ack coordinator from the owning `Environment`.
+    ///
+    /// When set, a successful `commit_with_durability` blocks until the
+    /// configured `ReplicaAckPolicy` is satisfied or `replica_ack_timeout`
+    /// elapses, in which case `NoxuError::InsufficientReplicas` is
+    /// returned.
+    ///
+    /// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    pub(crate) fn with_replica_coordinator(
+        mut self,
+        coord: SharedReplicaAckCoordinator,
+        ack_timeout: std::time::Duration,
+    ) -> Self {
+        self.replica_coordinator = Some(coord);
+        self.replica_ack_timeout = ack_timeout;
         self
     }
 
@@ -249,6 +287,45 @@ impl Transaction {
             };
             self.write_txn_end(lm, true, fsync, flush)?;
         }
+
+        // F1 (rep audit): wait for replica acknowledgments before returning
+        // success.  This wait happens AFTER the local WAL is durable but
+        // BEFORE the inner txn releases its locks, mirroring BDB-JE
+        // `Txn.preLogCommitHook` / `commit(Durability)` ordering: the
+        // master is durable locally and replicas are notified, but the
+        // commit only "returns" once `replica_ack` is satisfied.
+        //
+        // If no coordinator is wired (non-replicated env) or the policy
+        // is `None`, the wait is skipped.  Read-only commits never need
+        // replica acks.  Captured failure is propagated at the end of
+        // the function after lock release so the caller observes a
+        // typed `NoxuError::InsufficientReplicas` rather than a state
+        // leak.
+        let ack_err: Option<NoxuError> = if !self.read_only
+            && durability.replica_ack != crate::durability::ReplicaAckPolicy::None
+            && let Some(coord) = &self.replica_coordinator
+        {
+            match coord.await_replica_acks(
+                durability.replica_ack.as_kind(),
+                self.replica_ack_timeout,
+            ) {
+                Ok(_received) => None,
+                Err(e) => match e.kind {
+                    AckWaitErrorKind::NotMaster => {
+                        Some(NoxuError::ReplicaWrite)
+                    }
+                    AckWaitErrorKind::Timeout
+                    | AckWaitErrorKind::Shutdown => {
+                        Some(NoxuError::InsufficientReplicas {
+                            required: e.needed,
+                            available: e.received,
+                        })
+                    }
+                },
+            }
+        } else {
+            None
+        };
 
         // Apply cleaner write-path backpressure: if the log write rate exceeds
         // the cleaner's capacity, sleep briefly to let cleaning catch up.
@@ -331,6 +408,14 @@ impl Transaction {
 
         if let Some(e) = inner_err {
             return Err(NoxuError::from(e));
+        }
+        // F1: surface any replica-ack failure last, after the local
+        // commit has fully released locks.  The local commit is durable;
+        // returning this error tells the caller the durability policy
+        // was not satisfied so they can retry or rollback at the
+        // application layer.
+        if let Some(e) = ack_err {
+            return Err(e);
         }
         Ok(())
     }
