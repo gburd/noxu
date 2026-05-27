@@ -84,51 +84,50 @@ fn assert_data_matches(
 }
 
 #[test]
-#[ignore = "NOXU-BUG: aborting a delete-then-reinsert sequence corrupts the BIN — \
-    after abort, db.count() returns 0 and a non-deterministic subset of the \
-    originally-committed records is missing.  See JE SR #9465 for the \
-    historical analogue.  TODO: file follow-up issue and remove #[ignore]."]
 fn sr9465_part1_delete_reinsert_abort_restores_no_dups() {
     let dir = TempDir::new().unwrap();
     let path: PathBuf = dir.path().to_path_buf();
 
-    // Phase 1: create env, insert N records, commit.
-    let (env, db) = open_env_db(&path, "sr9465p1", false);
-    let txn1 = env.begin_transaction(None).unwrap();
-    let mut expected = Vec::with_capacity(NUM_RECS as usize);
-    for i in 0..NUM_RECS {
-        let k = i.to_be_bytes().to_vec();
-        let v = format!("orig-{i}").into_bytes();
-        let key = DatabaseEntry::from_bytes(&k);
-        let val = DatabaseEntry::from_bytes(&v);
-        db.put(Some(&txn1), &key, &val).unwrap();
-        expected.push((k, v));
-    }
-    txn1.commit().unwrap();
+    let expected = {
+        // Phase 1: create env, insert N records, commit.
+        let (env, db) = open_env_db(&path, "sr9465p1", false);
+        let txn1 = env.begin_transaction(None).unwrap();
+        let mut expected = Vec::with_capacity(NUM_RECS as usize);
+        for i in 0..NUM_RECS {
+            let k = i.to_be_bytes().to_vec();
+            let v = format!("orig-{i}").into_bytes();
+            let key = DatabaseEntry::from_bytes(&k);
+            let val = DatabaseEntry::from_bytes(&v);
+            db.put(Some(&txn1), &key, &val).unwrap();
+            expected.push((k, v));
+        }
+        txn1.commit().unwrap();
 
-    // Phase 2: delete all + re-insert with different values, then abort.
-    let txn2 = env.begin_transaction(None).unwrap();
-    for (k, _) in &expected {
-        let key = DatabaseEntry::from_bytes(k);
-        let s = db.delete(Some(&txn2), &key).unwrap();
-        assert_eq!(s, OperationStatus::Success);
-    }
-    for (k, _) in &expected {
-        let key = DatabaseEntry::from_bytes(k);
-        let v2 = format!("aborted-{}", k.len()).into_bytes();
-        let val = DatabaseEntry::from_bytes(&v2);
-        db.put(Some(&txn2), &key, &val).unwrap();
-    }
-    txn2.abort().unwrap();
+        // Phase 2: delete all + re-insert with different values, then abort.
+        let txn2 = env.begin_transaction(None).unwrap();
+        for (k, _) in &expected {
+            let key = DatabaseEntry::from_bytes(k);
+            let s = db.delete(Some(&txn2), &key).unwrap();
+            assert_eq!(s, OperationStatus::Success);
+        }
+        for (k, _) in &expected {
+            let key = DatabaseEntry::from_bytes(k);
+            let v2 = format!("aborted-{}", k.len()).into_bytes();
+            let val = DatabaseEntry::from_bytes(&v2);
+            db.put(Some(&txn2), &key, &val).unwrap();
+        }
+        txn2.abort().unwrap();
 
-    // Verify: the database must still contain the originally-committed data.
-    assert_data_matches(&db, &expected);
-    assert_eq!(record_count(&db), NUM_RECS as u64);
+        // Verify: the database must still contain the originally-committed data.
+        assert_data_matches(&db, &expected);
+        assert_eq!(record_count(&db), NUM_RECS as u64);
+        // Phase 1+2 handles drop here so the FileManager lock is released
+        // before the recovery reopen below.  See `sr9752_part1` for the
+        // matching pattern.
+        expected
+    };
 
-    // Close, reopen (forces recovery), verify again.
-    drop(db);
-    drop(env);
-
+    // Reopen (forces recovery), verify again.
     let (env2, db2) = open_env_db(&path, "sr9465p1", false);
     assert_data_matches(&db2, &expected);
     assert_eq!(record_count(&db2), NUM_RECS as u64);
@@ -144,51 +143,51 @@ fn sr9465_part1_delete_reinsert_abort_restores_no_dups() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "NOXU-BUG: same as sr9465_part1 — aborted delete+insert+delete \
-    sequence loses originally-committed records (see JE SR #9465)."]
 fn sr9465_part2_delete_reinsert_redelete_abort_restores_no_dups() {
     let dir = TempDir::new().unwrap();
     let path: PathBuf = dir.path().to_path_buf();
 
-    let (env, db) = open_env_db(&path, "sr9465p2", false);
-    let txn1 = env.begin_transaction(None).unwrap();
     let expected = {
-        let mut v = Vec::with_capacity(NUM_RECS as usize);
-        for i in 0..NUM_RECS {
-            let k = i.to_be_bytes().to_vec();
-            let val_bytes = format!("orig-{i}").into_bytes();
+        let (env, db) = open_env_db(&path, "sr9465p2", false);
+        let txn1 = env.begin_transaction(None).unwrap();
+        let expected = {
+            let mut v = Vec::with_capacity(NUM_RECS as usize);
+            for i in 0..NUM_RECS {
+                let k = i.to_be_bytes().to_vec();
+                let val_bytes = format!("orig-{i}").into_bytes();
+                db.put(
+                    Some(&txn1),
+                    &DatabaseEntry::from_bytes(&k),
+                    &DatabaseEntry::from_bytes(&val_bytes),
+                )
+                .unwrap();
+                v.push((k, val_bytes));
+            }
+            v
+        };
+        txn1.commit().unwrap();
+
+        let txn2 = env.begin_transaction(None).unwrap();
+        for (k, _) in &expected {
+            db.delete(Some(&txn2), &DatabaseEntry::from_bytes(k)).unwrap();
+        }
+        for (k, _) in &expected {
             db.put(
-                Some(&txn1),
-                &DatabaseEntry::from_bytes(&k),
-                &DatabaseEntry::from_bytes(&val_bytes),
+                Some(&txn2),
+                &DatabaseEntry::from_bytes(k),
+                &DatabaseEntry::from_bytes(b"new"),
             )
             .unwrap();
-            v.push((k, val_bytes));
         }
-        v
+        for (k, _) in &expected {
+            db.delete(Some(&txn2), &DatabaseEntry::from_bytes(k)).unwrap();
+        }
+        txn2.abort().unwrap();
+
+        assert_data_matches(&db, &expected);
+        // Phase 1+2 handles drop here; see `sr9465_part1` for rationale.
+        expected
     };
-    txn1.commit().unwrap();
-
-    let txn2 = env.begin_transaction(None).unwrap();
-    for (k, _) in &expected {
-        db.delete(Some(&txn2), &DatabaseEntry::from_bytes(k)).unwrap();
-    }
-    for (k, _) in &expected {
-        db.put(
-            Some(&txn2),
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(b"new"),
-        )
-        .unwrap();
-    }
-    for (k, _) in &expected {
-        db.delete(Some(&txn2), &DatabaseEntry::from_bytes(k)).unwrap();
-    }
-    txn2.abort().unwrap();
-
-    assert_data_matches(&db, &expected);
-    drop(db);
-    drop(env);
 
     let (env2, db2) = open_env_db(&path, "sr9465p2", false);
     assert_data_matches(&db2, &expected);
@@ -264,42 +263,38 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "NOXU-BUG: aborted dup inserts persist on a sorted-duplicates \
-    database.  After Transaction::abort, the dup values inserted by the \
-    aborted txn are still visible (count=6 instead of 3).  Aborted dup \
-    rollback does not undo dup-insertion — see JE SR #9752 Part 2."]
 fn sr9752_part2_abort_after_committed_dups_reverts_with_dups() {
     let dir = TempDir::new().unwrap();
     let path: PathBuf = dir.path().to_path_buf();
 
-    let (env, db) = open_env_db(&path, "sr9752p2", true);
-    // Commit some dups under one key.
-    let txn1 = env.begin_transaction(None).unwrap();
-    let key = DatabaseEntry::from_bytes(b"k");
-    for d in [b"a".as_slice(), b"b", b"c"] {
-        db.put(Some(&txn1), &key, &DatabaseEntry::from_bytes(d)).unwrap();
+    {
+        let (env, db) = open_env_db(&path, "sr9752p2", true);
+        // Commit some dups under one key.
+        let txn1 = env.begin_transaction(None).unwrap();
+        let key = DatabaseEntry::from_bytes(b"k");
+        for d in [b"a".as_slice(), b"b", b"c"] {
+            db.put(Some(&txn1), &key, &DatabaseEntry::from_bytes(d)).unwrap();
+        }
+        txn1.commit().unwrap();
+
+        // Abort additional dups.
+        let txn2 = env.begin_transaction(None).unwrap();
+        for d in [b"x".as_slice(), b"y", b"z"] {
+            db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(d)).unwrap();
+        }
+        txn2.abort().unwrap();
+
+        // Pre-recovery: only original 3 dups visible.
+        let actual = collect_all_kv(&db);
+        let actual_data: Vec<&[u8]> =
+            actual.iter().map(|(_, d)| d.as_slice()).collect();
+        assert_eq!(
+            actual_data,
+            vec![b"a".as_slice(), b"b", b"c"],
+            "after abort, only originally-committed dups must be visible"
+        );
+        // Inner block drop releases env / db / txn handles before recovery.
     }
-    txn1.commit().unwrap();
-
-    // Abort additional dups.
-    let txn2 = env.begin_transaction(None).unwrap();
-    for d in [b"x".as_slice(), b"y", b"z"] {
-        db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(d)).unwrap();
-    }
-    txn2.abort().unwrap();
-
-    // Pre-recovery: only original 3 dups visible.
-    let actual = collect_all_kv(&db);
-    let actual_data: Vec<&[u8]> =
-        actual.iter().map(|(_, d)| d.as_slice()).collect();
-    assert_eq!(
-        actual_data,
-        vec![b"a".as_slice(), b"b", b"c"],
-        "after abort, only originally-committed dups must be visible"
-    );
-
-    drop(db);
-    drop(env);
 
     let (env2, db2) = open_env_db(&path, "sr9752p2", true);
     let actual = collect_all_kv(&db2);
