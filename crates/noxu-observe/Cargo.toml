@@ -9,6 +9,9 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 description = "Optional observability integration for Noxu DB (metrics, tracing, OpenTelemetry)"
+# v2.3.0: every crate is `publish = false` while the workspace dependency graph
+# still uses `path = "..."` deps. See docs/src/internal/wave-10-e-cratesio-prep.md.
+publish = false
 
 [dependencies]
 tracing = "0.1"

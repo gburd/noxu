@@ -3,6 +3,11 @@ name = "noxu-recovery"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Checkpoint-based crash recovery for Noxu DB"
 publish = false  # internal implementation detail; consume via noxu-db
 
