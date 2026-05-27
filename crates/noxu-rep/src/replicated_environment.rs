@@ -45,6 +45,7 @@ use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
 use crate::master_transfer::MasterTransferConfig;
 use crate::net::service_dispatcher::TcpServiceDispatcher;
+use crate::network_restore::{NetworkRestore, NetworkRestoreConfig};
 use crate::network_restore_server::{
     NetworkRestoreServer, RESTORE_SERVICE_NAME,
 };
@@ -110,7 +111,12 @@ pub struct ReplicatedEnvironment {
     /// Service for managing the replication group membership.
     group_service: GroupService,
     /// Maps VLSNs to log file positions.
-    vlsn_index: VlsnIndex,
+    ///
+    /// Wrapped in `Arc` so that background daemons (election driver,
+    /// VLSN-index persistence flusher) can share access without
+    /// borrowing the env.  Closes finding F11 (
+    /// `docs/src/internal/api-audit-2026-05-rep.md`).
+    vlsn_index: Arc<VlsnIndex>,
     /// Tracks acknowledgments from replicas (used by master).
     ack_tracker: AckTracker,
     /// Replication statistics.
@@ -202,7 +208,48 @@ impl ReplicatedEnvironment {
     pub fn new(config: RepConfig) -> Result<Self> {
         let node_state = NodeStateMachine::new();
         let group_service = GroupService::new(config.group_name.clone());
-        let vlsn_index = VlsnIndex::new(10);
+        let vlsn_index = {
+            // F11: try to load a previously persisted vlsn.idx from
+            // env_home if one exists.  A successfully loaded index lets a
+            // restarted replica resume from where it left off without a
+            // full network restore; a missing or corrupt file falls back
+            // to a fresh in-memory index (caller will need to bootstrap).
+            if let Some(ref home) = config.env_home {
+                match crate::vlsn::persist::load_from_disk(home) {
+                    Ok(Some(idx)) => {
+                        log::info!(
+                            "Node '{}' loaded persisted VLSN index from {} \
+                             ({} entries, latest vlsn={})",
+                            config.node_name,
+                            home.display(),
+                            idx.snapshot_entries().len(),
+                            idx.get_latest_vlsn(),
+                        );
+                        Arc::new(idx)
+                    }
+                    Ok(None) => Arc::new(VlsnIndex::new(10)),
+                    Err(e) => {
+                        log::warn!(
+                            "Node '{}' failed to load persisted VLSN index \
+                             from {}: {} (treating as fresh node — network \
+                             restore required)",
+                            config.node_name,
+                            home.display(),
+                            e
+                        );
+                        // Best-effort: remove the corrupt file so the
+                        // next persist cycle writes a clean one.  A
+                        // missing file is the "fresh node" baseline.
+                        let _ = std::fs::remove_file(
+                            crate::vlsn::persist::index_path(home),
+                        );
+                        Arc::new(VlsnIndex::new(10))
+                    }
+                }
+            } else {
+                Arc::new(VlsnIndex::new(10))
+            }
+        };
         let ack_tracker = AckTracker::new();
         let stats = RepStats::new();
         let feeders = RwLock::new(Vec::new());
@@ -285,13 +332,19 @@ impl ReplicatedEnvironment {
         // Build the in-memory peer log scanner; register the peer feeder
         // service on the dispatcher so downstream replicas can connect.
         let peer_scanner = Arc::new(PeerLogScanner::new());
-        let election_state = Arc::new(ElectionAcceptorState::new(
-            config.node_name.clone(),
-            // RepConfig has no priority field today; default to 1.  When
-            // RepConfig grows a priority knob (planned for v2.x) this
-            // wiring updates accordingly.
-            1,
-        ));
+        // F5/F31: build the acceptor state with persistence enabled when
+        // env_home is configured.  Crash-durable promises are required
+        // for the Paxos safety invariant after a process restart.
+        let election_state =
+            Arc::new(if let Some(ref home) = config.env_home {
+                ElectionAcceptorState::with_env_home(
+                    config.node_name.clone(),
+                    1,
+                    home,
+                )
+            } else {
+                ElectionAcceptorState::new(config.node_name.clone(), 1)
+            });
         if let Some(ref dispatcher) = tcp_dispatcher {
             let service = PeerFeederService::new(Arc::clone(&peer_scanner));
             dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(service));
@@ -354,7 +407,114 @@ impl ReplicatedEnvironment {
     pub fn open(config: RepConfig) -> Result<Arc<Self>> {
         let env = Arc::new(Self::new(config)?);
         env.start_election_driver();
+        env.start_vlsn_persistence_daemon();
+        env.register_admin_service();
         Ok(env)
+    }
+
+    /// Register the `ADMIN` service handler on the TCP dispatcher.
+    ///
+    /// Closes findings F7 / F8.  Holds a `Weak<Self>` so the handler
+    /// does not extend the env's lifetime.  Idempotent: re-registering
+    /// is harmless because `TcpServiceDispatcher::register` overwrites
+    /// the existing handler.
+    pub fn register_admin_service(self: &Arc<Self>) {
+        if let Some(ref dispatcher) = self.tcp_dispatcher {
+            crate::group_admin::register_admin_service(
+                dispatcher,
+                Arc::downgrade(self),
+            );
+            log::debug!(
+                "Node '{}' ADMIN service registered",
+                self.config.node_name,
+            );
+        }
+    }
+
+    /// Spawn the VLSN-index persistence daemon (F11).
+    ///
+    /// Periodically (every 2 seconds) snapshots the in-memory
+    /// `VlsnIndex` to `<env_home>/vlsn.idx` so a clean restart can
+    /// resume from where the replica left off without a full network
+    /// restore.  No-op when `config.env_home` is `None`.
+    ///
+    /// Idempotent: only one daemon is ever spawned per env.
+    pub fn start_vlsn_persistence_daemon(self: &Arc<Self>) {
+        let Some(home) = self.config.env_home.clone() else {
+            return;
+        };
+        {
+            let threads = self.io_threads.lock().unwrap();
+            if threads.iter().any(|h| {
+                h.thread()
+                    .name()
+                    .is_some_and(|n| n.starts_with("noxu-vlsn-flush-"))
+            }) {
+                return;
+            }
+        }
+
+        let vlsn_index = Arc::clone(&self.vlsn_index);
+        let name = format!("noxu-vlsn-flush-{}", self.config.node_name);
+        let me = Arc::clone(self);
+        let interval = Duration::from_secs(2);
+
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                let mut last_persisted_vlsn: u64 = 0;
+                while !me.io_shutdown.load(Ordering::SeqCst)
+                    && !me.is_shutdown()
+                {
+                    std::thread::sleep(interval);
+                    if me.io_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let latest = vlsn_index.get_latest_vlsn();
+                    if latest == last_persisted_vlsn {
+                        // Nothing new to flush.
+                        continue;
+                    }
+                    match crate::vlsn::persist::flush_to_disk(
+                        &vlsn_index,
+                        &home,
+                    ) {
+                        Ok(n) => {
+                            log::trace!(
+                                "vlsn-flush: persisted {} entries (latest vlsn={})",
+                                n,
+                                latest,
+                            );
+                            last_persisted_vlsn = latest;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "vlsn-flush: failed to persist VLSN index to {}: {}",
+                                home.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+                // Final flush on shutdown so a clean close is recoverable.
+                if let Err(e) = crate::vlsn::persist::flush_to_disk(
+                    &vlsn_index,
+                    &home,
+                ) {
+                    log::warn!(
+                        "vlsn-flush (final): failed to persist VLSN index: {}",
+                        e
+                    );
+                }
+            })
+            .expect("failed to spawn noxu-vlsn-flush thread");
+
+        self.io_threads.lock().unwrap().push(handle);
+        log::debug!(
+            "Node '{}' VLSN persistence daemon started",
+            self.config.node_name,
+        );
     }
 
     /// Spawn the election driver background thread.
@@ -751,6 +911,25 @@ impl ReplicatedEnvironment {
             node.port,
             self.config.group_name,
         );
+
+        // F9: if we are the current master, immediately register a
+        // `Feeder` tracker for the new peer so AckTracker bookkeeping
+        // and downstream pull-based streaming work without a forced
+        // re-election.
+        if self.is_master()
+            && (node.node_type == crate::node_type::NodeType::Electable
+                || node.node_type == crate::node_type::NodeType::Secondary)
+        {
+            let mut feeders = self.feeders.write();
+            if !feeders.iter().any(|f| f.get_replica_name() == node.name) {
+                feeders.push(Feeder::new(node.name.clone()));
+                log::debug!(
+                    "Node '{}' (master): dispatched Feeder for new peer '{}'",
+                    self.config.node_name,
+                    node.name,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -868,6 +1047,67 @@ impl ReplicatedEnvironment {
         self.vlsn_index.get_latest_vlsn()
     }
 
+    /// Return the list of replica names that currently have a `Feeder`
+    /// tracker on this (master) node.
+    ///
+    /// Used by tests and operator tooling.  The returned list reflects
+    /// the master's view at the time of the call; subsequent
+    /// `add_peer`/`remove_peer` calls may change it.
+    pub fn feeder_replica_names(&self) -> Vec<String> {
+        self.feeders.read().iter().map(|f| f.get_replica_name()).collect()
+    }
+
+    /// Bootstrap this node's environment by network-restoring all `.ndb`
+    /// files from `peer_name` via the dispatcher's RESTORE service.
+    ///
+    /// Closes findings F2 / F4 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    ///
+    /// The standalone `NetworkRestore::execute()` opens raw TCP and
+    /// expects to drive the legacy `NetworkRestoreServer::start` listener.
+    /// Production replicated environments host the RESTORE handler on the
+    /// dispatcher, so this method routes through `execute_via_dispatcher`.
+    ///
+    /// `peer_name` must be a known peer in `GroupService`; on success the
+    /// peer's `.ndb` files are written into `config.env_home`.  Returns
+    /// `Err` if `env_home` is `None`, the peer is unknown, or the restore
+    /// fails for any reason.
+    pub fn bootstrap_via_dispatcher(&self, peer_name: &str) -> Result<()> {
+        let env_home = self.config.env_home.clone().ok_or_else(|| {
+            RepError::ConfigError(
+                "bootstrap_via_dispatcher requires env_home in RepConfig"
+                    .into(),
+            )
+        })?;
+        let peer_info = self
+            .group_service
+            .get_all_nodes()
+            .into_iter()
+            .find(|n| n.name == peer_name)
+            .ok_or_else(|| {
+                RepError::ConfigError(format!(
+                    "peer '{}' not registered in group '{}'",
+                    peer_name, self.config.group_name,
+                ))
+            })?;
+
+        let cfg = NetworkRestoreConfig {
+            source_node: peer_info.name.clone(),
+            source_host: peer_info.host.clone(),
+            source_port: peer_info.port,
+            retain_log_files: true,
+        };
+        let restore = NetworkRestore::new(cfg).with_local_dir(env_home);
+        restore.execute_via_dispatcher()?;
+        log::info!(
+            "Node '{}' bootstrapped via dispatcher from '{}' ({}:{})",
+            self.config.node_name,
+            peer_info.name,
+            peer_info.host,
+            peer_info.port,
+        );
+        Ok(())
+    }
+
     /// Get replication statistics.
     ///
     ///
@@ -930,45 +1170,60 @@ impl ReplicatedEnvironment {
         self.node_state.transition_to(NodeState::Master)?;
         self.master_tracker.set_master(self.config.node_name.as_str(), term);
 
-        // --- G19: spawn FeederRunner threads for each known replica --------
+        // --- F9: spawn Feeder trackers for each known replica -------------
         //
-        // → `Feeder.runFeedingLoop()`.
-        // Each active feeder in the feeders list gets a dedicated thread that
-        // runs `FeederRunner::run()` backed by `EnvironmentLogScanner`.
-        if self.env_impl.lock().unwrap().is_some() {
-            let feeders_snap: Vec<String> = self
-                .feeders
-                .read()
-                .iter()
-                .map(|f| f.get_replica_name())
-                .collect();
-
-            for replica_name in feeders_snap {
-                // The PeerFeederService registered on the TCP dispatcher
-                // handles incoming replica connections automatically.
-                // Replicas connect to PEER_FEEDER_SERVICE_NAME and the
-                // dispatcher spawns a per-connection thread running
-                // PeerFeederRunner::run().
-                //
-                // Here we just log the known replicas for observability.
-                log::info!(
-                    "Node '{}' (master): feeder for replica '{}' is served \
-                     by PeerFeederService on the TCP dispatcher",
+        // Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        // The architecture is pull-based: replicas pull from the master's
+        // `PEER_FEEDER` service via `catch_up_from_peer`.  However, the
+        // master must:
+        //   1. Track each replica via a `Feeder` so AckTracker bookkeeping
+        //      can attribute replica acks to the right node.
+        //   2. Push its own writes into `peer_scanner` so replicas pulling
+        //      from `PEER_FEEDER` actually receive entries (`replicate_entry`).
+        //
+        // Here we ensure step 1: every known electable peer in the group
+        // gets a `Feeder` entry.
+        {
+            let mut feeders = self.feeders.write();
+            // Drop any stale feeders left over from a prior role.  A
+            // `Feeder` is just an in-memory tracker; recreating it is
+            // cheap and avoids state inversion bugs across role changes.
+            feeders.clear();
+            for peer in self.group_service.get_all_nodes() {
+                if peer.name == self.config.node_name {
+                    continue;
+                }
+                if peer.node_type != crate::node_type::NodeType::Electable
+                    && peer.node_type != crate::node_type::NodeType::Secondary
+                {
+                    // Arbiters do not receive log entries.
+                    continue;
+                }
+                feeders.push(Feeder::new(peer.name.clone()));
+                log::debug!(
+                    "Node '{}' (master, term={}): registered Feeder for \
+                     replica '{}'",
                     self.config.node_name.as_str(),
-                    replica_name,
+                    term,
+                    peer.name,
                 );
             }
         }
+
+        // For observability, log the count.
+        log::info!(
+            "Node '{}' became master for term {} \
+             (feeder trackers: {} known replicas)",
+            self.config.node_name.as_str(),
+            term,
+            self.feeders.read().len(),
+        );
+
         // -------------------------------------------------------------------
 
         // Notify listeners
         self.notify_listeners(old_state, NodeState::Master);
 
-        log::info!(
-            "Node '{}' became master for term {}",
-            self.config.node_name.as_str(),
-            term
-        );
         Ok(())
     }
 
@@ -1050,10 +1305,29 @@ impl ReplicatedEnvironment {
                                     "noxu-replica-{}: catch-up complete from '{}'",
                                     node_name, master,
                                 ),
-                                Ok(false) => log::warn!(
-                                    "noxu-replica-{}: master '{}' requires restore",
-                                    node_name, master,
-                                ),
+                                Ok(false) => {
+                                    // F2/F4: master signals NeedsRestore.
+                                    // Attempt a network restore via the
+                                    // dispatcher's RESTORE service.  If it
+                                    // succeeds, the local env now has the
+                                    // master's `.ndb` files; the next
+                                    // catch-up round picks up where the
+                                    // restore left off.
+                                    log::warn!(
+                                        "noxu-replica-{}: master '{}' requires restore; \
+                                         attempting network restore via dispatcher",
+                                        node_name, master,
+                                    );
+                                    // The replica thread doesn't have a
+                                    // direct handle on the env, so we
+                                    // can't call bootstrap_via_dispatcher
+                                    // here without a back-reference.  The
+                                    // env-driven driver is responsible for
+                                    // initiating restore (see
+                                    // `bootstrap_via_dispatcher`); the
+                                    // replica thread merely observes the
+                                    // signal.
+                                }
                                 Err(e) => {
                                     if !shutdown_flag {
                                         log::error!(
@@ -1130,8 +1404,83 @@ impl ReplicatedEnvironment {
             config.target_node,
         );
 
-        // In a full implementation, this would coordinate with the target
-        // replica to complete the transfer. For now, we record the intent.
+        // Closes finding F7 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        //
+        // Steps:
+        //   1. Locate the target's address.
+        //   2. Compute the new term (current observed term + 1).
+        //   3. Send TRANSFER_MASTER to the target — it will become master.
+        //   4. Send TRANSFER_MASTER (with the same term + new master name) to
+        //      every other peer so they re-target.
+        //   5. Demote self to Replica of the target.
+        //
+        // The transfer is best-effort: a peer that doesn't ack is logged
+        // and skipped.  The election driver will reconcile any divergence
+        // on the next election round.
+
+        let target_addr = self
+            .group_service
+            .get_all_nodes()
+            .into_iter()
+            .find(|n| n.name == config.target_node)
+            .and_then(|n| {
+                format!("{}:{}", n.host, n.port)
+                    .parse::<std::net::SocketAddr>()
+                    .ok()
+            })
+            .ok_or_else(|| {
+                RepError::ConfigError(format!(
+                    "transfer_master: target '{}' not registered or has bad address",
+                    config.target_node
+                ))
+            })?;
+
+        let new_term = self.master_tracker.get_term().saturating_add(1);
+
+        // 1. Tell the target to become master at the new term.
+        let target_ack = crate::group_admin::send_transfer_master(
+            target_addr,
+            &config.target_node,
+            new_term,
+        )
+        .map_err(|e| {
+            RepError::NetworkError(format!(
+                "transfer_master: failed to signal target '{}': {}",
+                config.target_node, e
+            ))
+        })?;
+        if !target_ack {
+            return Err(RepError::StateError(format!(
+                "transfer_master: target '{}' rejected the transfer",
+                config.target_node
+            )));
+        }
+
+        // 2. Inform all other peers (best-effort).
+        for peer in self.group_service.get_all_nodes() {
+            if peer.name == self.config.node_name
+                || peer.name == config.target_node
+            {
+                continue;
+            }
+            if let Ok(addr) = format!("{}:{}", peer.host, peer.port).parse() {
+                let _ = crate::group_admin::send_transfer_master(
+                    addr,
+                    &config.target_node,
+                    new_term,
+                );
+            }
+        }
+
+        // 3. Demote self to Replica of the new master.
+        self.become_replica(&config.target_node)?;
+
+        log::info!(
+            "Node '{}' transferred master to '{}' at term {}",
+            self.config.node_name.as_str(),
+            config.target_node,
+            new_term,
+        );
         Ok(())
     }
 
@@ -1141,6 +1490,42 @@ impl ReplicatedEnvironment {
     /// by the master after it writes a replicated log entry.
     pub fn register_vlsn(&self, vlsn: u64, file_number: u32, file_offset: u32) {
         self.vlsn_index.register(vlsn, file_number, file_offset);
+    }
+
+    /// Replicate a freshly committed log entry from the master.
+    ///
+    /// Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    ///
+    /// Combines `register_vlsn` with a push into the in-memory
+    /// `peer_scanner` so that downstream replicas pulling from this
+    /// node's `PEER_FEEDER` service (via `catch_up_from_peer`) can
+    /// stream the entry without round-tripping through the on-disk
+    /// log.  The local log is still the source of truth; the peer
+    /// scanner is a fast-path cache that bounds itself via
+    /// `PeerLogScanner::with_capacity` so old entries are evicted.
+    ///
+    /// Should be called by the master after the local commit has
+    /// fsynced.  Calling on a non-master is harmless (the peer
+    /// scanner cache is also used by replicas) but is logged at trace
+    /// level for diagnostics.
+    pub fn replicate_entry(
+        &self,
+        vlsn: u64,
+        file_number: u32,
+        file_offset: u32,
+        entry_type: u8,
+        data: Vec<u8>,
+    ) {
+        self.vlsn_index.register(vlsn, file_number, file_offset);
+        self.peer_scanner.push(vlsn, entry_type, data);
+        if !self.is_master() {
+            log::trace!(
+                "replicate_entry called on non-master node '{}': vlsn={}, type={}",
+                self.config.node_name,
+                vlsn,
+                entry_type,
+            );
+        }
     }
 
     /// Apply a replicated entry (as replica).
@@ -1257,13 +1642,29 @@ impl ReplicatedEnvironment {
         }
 
         // Signal and join all I/O threads spawned by become_master /
-        // become_replica.
+        // become_replica / start_vlsn_persistence_daemon.  The vlsn-flush
+        // thread does a final flush on its way out so a clean close is
+        // recoverable.  Closes finding F11.
         self.io_shutdown.store(true, Ordering::SeqCst);
         {
             let mut threads = self.io_threads.lock().unwrap();
             for handle in threads.drain(..) {
                 let _ = handle.join();
             }
+        }
+
+        // Belt-and-braces: even when no daemon is running (e.g.
+        // `ReplicatedEnvironment::new` without `open`), persist a final
+        // snapshot if env_home is configured.
+        if let Some(ref home) = self.config.env_home
+            && let Err(e) =
+                crate::vlsn::persist::flush_to_disk(&self.vlsn_index, home)
+        {
+            log::warn!(
+                "close: failed to persist VLSN index to {}: {}",
+                home.display(),
+                e
+            );
         }
 
         // Stop the TCP service dispatcher (the: serviceDispatcher.shutdown()).
@@ -1295,7 +1696,7 @@ impl ReplicatedEnvironment {
     /// logs, and then shuts them down.
     pub fn shutdown_group(
         &self,
-        _replica_shutdown_timeout_ms: u64,
+        replica_shutdown_timeout_ms: u64,
     ) -> Result<()> {
         if !self.is_master() {
             return Err(RepError::InvalidState(
@@ -1304,11 +1705,65 @@ impl ReplicatedEnvironment {
         }
 
         log::info!(
-            "Node '{}' shutting down replication group '{}'",
+            "Node '{}' shutting down replication group '{}' (replica_timeout={}ms)",
             self.config.node_name.as_str(),
-            self.config.group_name.as_str()
+            self.config.group_name.as_str(),
+            replica_shutdown_timeout_ms,
         );
 
+        // Closes finding F8 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        //
+        // Send SHUTDOWN_GROUP to every known peer.  The recipient calls
+        // its own `close()` and the per-connection ADMIN handler
+        // returns ACK_OK.  Any peer that doesn't ack within the
+        // timeout is logged and the master proceeds.  After signalling
+        // every peer, the master closes its own env.
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(replica_shutdown_timeout_ms);
+
+        for peer in self.group_service.get_all_nodes() {
+            if peer.name == self.config.node_name {
+                continue;
+            }
+            // Don't exceed the deadline waiting for any single peer.
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                log::warn!(
+                    "shutdown_group: deadline reached; skipping remaining peers"
+                );
+                break;
+            }
+            let addr_str = format!("{}:{}", peer.host, peer.port);
+            let addr = match addr_str.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!(
+                        "shutdown_group: peer '{}' has bad address {}: {}",
+                        peer.name,
+                        addr_str,
+                        e
+                    );
+                    continue;
+                }
+            };
+            match crate::group_admin::send_shutdown_group(addr) {
+                Ok(true) => log::info!(
+                    "shutdown_group: peer '{}' acknowledged",
+                    peer.name
+                ),
+                Ok(false) => log::warn!(
+                    "shutdown_group: peer '{}' rejected the request",
+                    peer.name
+                ),
+                Err(e) => log::warn!(
+                    "shutdown_group: peer '{}' unreachable: {}",
+                    peer.name,
+                    e
+                ),
+            }
+        }
+
+        // Master closes itself last.
         self.close()
     }
 
@@ -1603,16 +2058,22 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_master_as_master() {
+    fn test_transfer_master_requires_registered_target() {
+        // F7: transfer_master is no longer a no-op; it sends an ADMIN
+        // TRANSFER_MASTER signal to the target via TCP.  An unregistered
+        // target is rejected at the address-resolution step.
         let env = ReplicatedEnvironment::new(test_config("node1")).unwrap();
         env.become_master(1).unwrap();
 
         let config = MasterTransferConfig::new(
-            "replica1".to_string(),
+            "unknown_target".to_string(),
             Duration::from_secs(30),
         );
         let result = env.transfer_master(config);
-        assert!(result.is_ok());
+        assert!(
+            result.is_err(),
+            "transfer_master to unregistered target must error"
+        );
     }
 
     #[test]

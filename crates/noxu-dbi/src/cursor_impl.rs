@@ -403,6 +403,132 @@ impl CursorImpl {
         Ok(())
     }
 
+    /// Acquires a synthetic-key write lock for the given key.
+    ///
+    /// Wave 5 / SR9752 / CursorEdgeTest.testReadDeletedUncommitted:
+    /// in-flight deletes physically remove the BIN slot via
+    /// `tree.delete()`, so a concurrent reader looking up the same
+    /// key sees `NotFound` without ever consulting the lock manager
+    /// for the slot's pre-delete LSN.  This violates JE's contract:
+    /// uncommitted deletes are dirty data and a no-wait reader must
+    /// see `LockNotAvailable`, blocking readers must wait until the
+    /// deleter commits.
+    ///
+    /// To restore that invariant without rewriting the BIN's
+    /// physical-removal model, the deleter ALSO holds a synthetic-key
+    /// write lock for the duration of the txn.  Readers that probe
+    /// the BIN and find no matching key call
+    /// [`Self::contest_synthetic_key_for_missing_read`] which
+    /// attempts a read-lock on the same synthetic-key id; the
+    /// uncontested case is one extra lock-manager round-trip and
+    /// the contested case surfaces the lock conflict to the caller.
+    fn lock_synthetic_key_for_delete(
+        &self,
+        key: &[u8],
+    ) -> Result<(), DbiError> {
+        let db_id = self.db_impl.read().get_id().id() as u64;
+        let synthetic_lsn = Lsn::synthetic_key_lock_id(db_id, key);
+        if let Some(txn) = &self.txn_ref {
+            // Held until commit/abort — readers contending on the
+            // synthetic-key block / fail until the deleter finalises.
+            txn.lock()
+                .unwrap()
+                .lock(synthetic_lsn, LockType::Write, false)
+                .map_err(DbiError::TxnError)?;
+        } else if let Some(lm) = &self.lock_manager {
+            // Legacy auto-commit (no synthetic auto-txn): acquire and
+            // immediately release.  The Database::delete path always
+            // wraps in a synthetic auto-txn so the lock is actually
+            // held across the per-record delete; this branch is only
+            // for direct-CursorImpl callers.
+            lm.lock(synthetic_lsn, self.id, LockType::Write, false, false)
+                .map_err(DbiError::TxnError)?;
+            let _ = lm.release(synthetic_lsn, self.id);
+        }
+        Ok(())
+    }
+
+    /// Probes the synthetic-key lock for `key` to detect uncommitted
+    /// deletes after a `NotFound` BIN lookup.
+    ///
+    /// Returns `Ok(())` if the key is genuinely absent (no concurrent
+    /// writer holds the synthetic-key lock); returns the lock-manager
+    /// error otherwise so the caller can surface it to the user.
+    ///
+    /// See [`Self::lock_synthetic_key_for_delete`] for the wider
+    /// rationale.  Read-uncommitted txns skip the probe entirely
+    /// (matching the LSN-keyed `lock_ln` early-return).
+    fn contest_synthetic_key_for_missing_read(
+        &self,
+        key: &[u8],
+    ) -> Result<(), DbiError> {
+        let db_id = self.db_impl.read().get_id().id() as u64;
+        let synthetic_lsn = Lsn::synthetic_key_lock_id(db_id, key);
+        if let Some(txn) = &self.txn_ref {
+            let mut guard = txn.lock().unwrap();
+            if guard.is_read_uncommitted_default() {
+                return Ok(());
+            }
+            // CRITICAL: if this txn already owns a Write lock on the
+            // synthetic key (because it is the deleter), short-circuit
+            // — we must NEVER call `release_lock` on a Read acquisition
+            // that aliased an existing Write lock, because the inner
+            // `Txn::lock` unconditionally inserts the lsn into
+            // `read_locks`, and a subsequent `release_lock` would
+            // remove the txn from the lock manager's owner set,
+            // erroneously freeing the Write lock for other lockers.
+            if guard.owns_write_lock(synthetic_lsn) {
+                return Ok(());
+            }
+            // Try non-blocking first to detect contention without
+            // waiting; on contention, switch to blocking (no-wait
+            // txns surface the LockNotAvailable error here).
+            match guard.lock(synthetic_lsn, LockType::Read, true) {
+                Ok(_) => {
+                    // Granted immediately — no contender; release
+                    // immediately so we don't hold a lock on a
+                    // not-found probe.  Read-committed and
+                    // serializable both treat this as a one-shot
+                    // probe (the data does not exist; there is
+                    // nothing to keep stable).
+                    let _ = guard.release_lock(synthetic_lsn);
+                    Ok(())
+                }
+                Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
+                    // No-wait txn: surface the typed lock error.
+                    guard
+                        .lock(synthetic_lsn, LockType::Read, false)
+                        .map_err(DbiError::TxnError)?;
+                    let _ = guard.release_lock(synthetic_lsn);
+                    Ok(())
+                }
+                Err(e) => Err(DbiError::TxnError(e)),
+            }
+        } else if let Some(lm) = &self.lock_manager {
+            match lm.lock(synthetic_lsn, self.id, LockType::Read, true, false) {
+                Ok(_) => {
+                    let _ = lm.release(synthetic_lsn, self.id);
+                    Ok(())
+                }
+                Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
+                    lm.lock(
+                        synthetic_lsn,
+                        self.id,
+                        LockType::Read,
+                        false,
+                        false,
+                    )
+                    .map_err(DbiError::TxnError)?;
+                    let _ = lm.release(synthetic_lsn, self.id);
+                    Ok(())
+                }
+                Err(e) => Err(DbiError::TxnError(e)),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     /// Moves the write lock to `new_lsn` and records abort before-image info.
     ///
     /// For txn-backed cursors:
@@ -656,6 +782,10 @@ impl CursorImpl {
                     self.update_bin_pin(bin_arc);
                     Ok(OperationStatus::Success)
                 } else {
+                    // Wave 5: contest a synthetic-key read lock on the
+                    // missing slot to detect uncommitted deletes.  See
+                    // `lock_synthetic_key_for_delete`.
+                    self.contest_synthetic_key_for_missing_read(key)?;
                     Ok(OperationStatus::NotFound)
                 }
             }
@@ -2053,10 +2183,45 @@ impl CursorImpl {
                 // the per-database entry counter.  apply_tree_insert
                 // checks tree.insert's `is_new` return so an exact-match
                 // re-insert is a no-op for the counter.
+                //
+                // SR9752 Part 2 (Wave 5): we MUST also register the
+                // brand-new sorted-dup insert with the cursor's
+                // txn / lock manager so abort-undo can roll the dup
+                // back.  Pre-fix the path skipped
+                // lock_write_before_log / finalize_write_lock entirely,
+                // so an aborted txn left dups visible past the
+                // rollback (the same regression that surfaced for
+                // NoOverwrite / NoDupData and was patched in v1.6 —
+                // Overwrite was missed because the existing tests did
+                // not exercise it on a sorted-dup database).
+                //
+                // Distinguish update vs. insert: if the (key, data)
+                // pair already exists, this is a no-op for the
+                // counter and the slot LSN moves; we still record the
+                // before-image (slot LSN → new LSN) so abort restores
+                // the prior LSN.  If the pair is new, the abort-undo
+                // is `delete the slot` (abort_known_deleted=true,
+                // matching apply_tree_insert's is_new branch).
+                let exists_old_lsn: u64 = {
+                    let db = self.db_impl.read();
+                    db.get_real_tree()
+                        .and_then(|tree| {
+                            Self::get_data_from_tree(tree, &two_part_key)
+                        })
+                        .map(|(_, lsn)| lsn)
+                        .unwrap_or(noxu_util::NULL_LSN.as_u64())
+                };
+                self.lock_write_before_log(exists_old_lsn, &two_part_key)?;
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                )?;
+                self.finalize_write_lock(
+                    exists_old_lsn,
+                    new_lsn,
+                    Some(two_part_key.clone()),
+                    None,
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
@@ -2170,6 +2335,11 @@ impl CursorImpl {
         if let Some(tree_key) = self.current_key.clone() {
             let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
             self.lock_write_before_log(old_lsn, &tree_key)?;
+            // Wave 5: also hold a synthetic-key write lock for the
+            // duration of the txn so concurrent readers that probe the
+            // BIN post-physical-removal can detect contention via
+            // `contest_synthetic_key_for_missing_read`.
+            self.lock_synthetic_key_for_delete(&tree_key)?;
             let del_lsn = self.log_ln_write(&tree_key, None, self.locker_id)?;
             self.finalize_write_lock(
                 old_lsn,

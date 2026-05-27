@@ -197,6 +197,33 @@ impl VlsnBucket {
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
+
+    /// Append every populated (vlsn, file_number, file_offset) entry in this
+    /// bucket to `out`, in vlsn-ascending order.
+    ///
+    /// Used by the VLSN-index persistence layer to snapshot bucket
+    /// contents.  Stride-boundary entries are emitted in array order;
+    /// the last vlsn (which may not be on a stride boundary) is
+    /// emitted last when it differs from the highest stored stride entry.
+    pub fn append_entries(&self, out: &mut Vec<(u64, u32, u32)>) {
+        for (i, slot) in self.offsets.iter().enumerate() {
+            if *slot != NO_OFFSET {
+                let vlsn = self.first_vlsn + (i as u64) * (self.stride as u64);
+                if vlsn <= self.last_vlsn {
+                    out.push((vlsn, slot.0, slot.1));
+                }
+            }
+        }
+        if let Some(last) = self.last_lsn {
+            // The last vlsn always has a recorded LSN; emit it if it isn't
+            // already covered by a stride entry above.
+            let already_emitted = (self.last_vlsn - self.first_vlsn)
+                .is_multiple_of(self.stride as u64);
+            if !already_emitted {
+                out.push((self.last_vlsn, last.0, last.1));
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for VlsnBucket {
