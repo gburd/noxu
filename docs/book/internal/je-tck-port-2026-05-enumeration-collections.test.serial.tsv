@@ -1,5 +1,0 @@
-je_package	je_class	je_test_method	je_test_path	je_test_doc	noxu_status	noxu_test_path	noxu_test_method	effort_estimate	priority	notes
-com/sleepycat/collections/test/serial	CatalogCornerCaseTest	testReadOnlyEmptyCatalog	test/com/sleepycat/collections/test/serial/CatalogCornerCaseTest.java		NOT-PORTED			medium	high	no matching test by name (snake=read_only_empty_catalog); behaviour-level check needed
-com/sleepycat/collections/test/serial	StoredClassCatalogTest	runTest	test/com/sleepycat/collections/test/serial/StoredClassCatalogTest.java		NOT-PORTED			medium	high	no matching test by name (snake=run_test); behaviour-level check needed
-com/sleepycat/collections/test/serial	StoredClassCatalogTestInit	runTest	test/com/sleepycat/collections/test/serial/StoredClassCatalogTestInit.java		NOT-PORTED			medium	high	no matching test by name (snake=run_test); behaviour-level check needed
-com/sleepycat/collections/test/serial	TupleSerialFactoryTest	runTest	test/com/sleepycat/collections/test/serial/TupleSerialFactoryTest.java		NOT-PORTED			medium	high	no matching test by name (snake=run_test); behaviour-level check needed
