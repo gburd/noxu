@@ -25,7 +25,10 @@
 //!
 //! When the environment is closed, the node transitions to the Detached state.
 
-use noxu_dbi::EnvironmentImpl;
+use noxu_dbi::{
+    AckWaitError, AckWaitErrorKind, EnvironmentImpl, ReplicaAckCoordinator,
+    ReplicaAckPolicyKind,
+};
 use noxu_sync::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,6 +37,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::ack_tracker::AckTracker;
+use crate::elections::election_service::{
+    ELECTION_SERVICE_NAME, ElectionAcceptorState, ElectionService,
+};
 use crate::elections::master_tracker::MasterTracker;
 use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
@@ -162,6 +168,21 @@ pub struct ReplicatedEnvironment {
     /// reads from this queue to stream entries to downstream replicas that
     /// are behind this node (peer-to-peer log distribution, HA style).
     peer_scanner: Arc<PeerLogScanner>,
+
+    /// Monotonic sequence used by `await_replica_acks` to assign unique
+    /// keys to in-flight commits awaiting replica acknowledgment.  In
+    /// production this should track the real master VLSN; until F11
+    /// closes the VLSN<->commit linkage, the coordinator uses a
+    /// synthetic sequence so that ack tracking is unique per commit.
+    /// See finding F1 in `docs/src/internal/api-audit-2026-05-rep.md`.
+    commit_ack_seq: std::sync::atomic::AtomicU64,
+
+    /// Shared acceptor state used by the ELECTION service handler.
+    /// The election driver updates `own_vlsn` / `own_term` here as the
+    /// node progresses; incoming acceptor sessions read it on every
+    /// connection so their replies always reflect the local node's
+    /// most recent state.  Closes finding F6.
+    election_state: Arc<ElectionAcceptorState>,
 }
 
 impl ReplicatedEnvironment {
@@ -264,11 +285,28 @@ impl ReplicatedEnvironment {
         // Build the in-memory peer log scanner; register the peer feeder
         // service on the dispatcher so downstream replicas can connect.
         let peer_scanner = Arc::new(PeerLogScanner::new());
+        let election_state = Arc::new(ElectionAcceptorState::new(
+            config.node_name.clone(),
+            // RepConfig has no priority field today; default to 1.  When
+            // RepConfig grows a priority knob (planned for v2.x) this
+            // wiring updates accordingly.
+            1,
+        ));
         if let Some(ref dispatcher) = tcp_dispatcher {
             let service = PeerFeederService::new(Arc::clone(&peer_scanner));
             dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(service));
             log::debug!(
                 "Node '{}' PEER_FEEDER service registered",
+                config.node_name,
+            );
+            // F6: register the ELECTION service so peers can run
+            // run_acceptor against this node when proposing.
+            let election_svc = Arc::new(ElectionService::new(
+                Arc::clone(&election_state),
+            ));
+            dispatcher.register(ELECTION_SERVICE_NAME, election_svc);
+            log::debug!(
+                "Node '{}' ELECTION service registered",
                 config.node_name,
             );
         }
@@ -292,9 +330,286 @@ impl ReplicatedEnvironment {
             io_shutdown: AtomicBool::new(false),
             restore_registered: AtomicBool::new(restore_registered_init),
             peer_scanner,
+            commit_ack_seq: std::sync::atomic::AtomicU64::new(1),
+            election_state,
         };
 
         Ok(env)
+    }
+
+    /// Open a replicated environment with the standard production
+    /// lifecycle.
+    ///
+    /// This is the entry point recommended by the mdBook chapters:
+    /// it allocates the `ReplicatedEnvironment`, registers all
+    /// services on the TCP dispatcher, and spawns the **election
+    /// driver** background thread that runs Paxos rounds against
+    /// known peers until the node has resolved into either Master or
+    /// Replica state.
+    ///
+    /// Closes finding F6 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    ///
+    /// Use [`ReplicatedEnvironment::new`] directly only when the
+    /// caller plans to drive state transitions explicitly (test
+    /// harnesses, scripted bootstrap, recovery tooling).
+    pub fn open(config: RepConfig) -> Result<Arc<Self>> {
+        let env = Arc::new(Self::new(config)?);
+        env.start_election_driver();
+        Ok(env)
+    }
+
+    /// Spawn the election driver background thread.
+    ///
+    /// While the env is in `Detached` or `Unknown` state and no master
+    /// is known, the driver periodically attempts a Paxos election
+    /// against peers in `GroupService` (whose ELECTION services were
+    /// registered at `open()` time).  On success the driver calls
+    /// `become_master` (if this node is the winner) or `become_replica`
+    /// (otherwise).  On failure (no quorum), the driver waits
+    /// `config.election_timeout` and tries again.
+    ///
+    /// The driver respects `io_shutdown`; on env close the loop exits
+    /// promptly.
+    ///
+    /// Idempotent: a second call is a no-op (only one driver thread is
+    /// ever spawned per env).
+    pub fn start_election_driver(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        // Reuse io_shutdown for cancellation; a successful spawn is
+        // recorded by appending to io_threads, so a duplicate call
+        // would re-add a thread — we use a one-shot `AtomicBool`
+        // sentinel placed in the io_shutdown's slot via a new field.
+        // Cheaper: a static name check on io_threads is impossible;
+        // instead, gate spawning on whether any io_thread already
+        // carries the driver name.
+        {
+            let threads = self.io_threads.lock().unwrap();
+            if threads.iter().any(|h| {
+                h.thread()
+                    .name()
+                    .is_some_and(|n| n.starts_with("noxu-election-"))
+            }) {
+                return;
+            }
+        }
+
+        let me = Arc::clone(self);
+        let name = format!("noxu-election-{}", self.config.node_name);
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                me.run_election_loop();
+            })
+            .expect("failed to spawn election driver thread");
+        self.io_threads.lock().unwrap().push(handle);
+        log::debug!(
+            "Node '{}' election driver started",
+            self.config.node_name,
+        );
+        // Keep ordering sane on the io_shutdown flag.
+        let _ = self.io_shutdown.load(Ordering::SeqCst);
+    }
+
+    /// Body of the election driver loop.  Public only for tests; called
+    /// by [`Self::start_election_driver`].
+    fn run_election_loop(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        // Maintain an internal monotonically increasing election term.
+        // Each successful or failed round bumps the term so retries do
+        // not collide with stale acceptor promises.
+        let mut term: u64 = 1;
+
+        loop {
+            if self.io_shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.is_shutdown() {
+                return;
+            }
+
+            let state = self.node_state.get_state();
+            // Stop driving once we've resolved into Master/Replica;
+            // re-arm only if the node returns to Unknown.
+            if matches!(state, NodeState::Master | NodeState::Replica) {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            if matches!(state, NodeState::Shutdown) {
+                return;
+            }
+
+            // Probe peers for an active master via the existing
+            // GroupService cache.  In the absence of a heartbeat path
+            // we rely on master_tracker (set by become_replica from
+            // the receive loop).
+            if let Some(master_name) = self.master_tracker.get_master() {
+                if master_name != self.config.node_name {
+                    let _ = self.become_replica(&master_name);
+                    continue;
+                }
+            }
+
+            // Snapshot peers to dial for ELECTION.
+            let peers: Vec<(String, SocketAddr)> = self
+                .group_service
+                .get_all_nodes()
+                .into_iter()
+                .filter(|n| n.name != self.config.node_name)
+                .filter_map(|n| {
+                    format!("{}:{}", n.host, n.port)
+                        .parse::<SocketAddr>()
+                        .ok()
+                        .map(|a| (n.name, a))
+                })
+                .collect();
+
+            // Build the local rep group view used by run_election to
+            // compute quorum and resolve the winner name.  Include
+            // self.
+            let group = self.local_rep_group_with_self();
+
+            // Update election state for any concurrent acceptor calls.
+            let our_vlsn = self.vlsn_index.get_latest_vlsn();
+            self.election_state.set_vlsn(our_vlsn);
+            self.election_state.set_term(term);
+
+            // Connect to each peer's ELECTION service.  Failures are
+            // tolerated: a peer that doesn't answer simply contributes
+            // no vote.  The election may still reach quorum in the
+            // remaining peers.
+            let mut channels: Vec<
+                Arc<dyn crate::net::channel::Channel>,
+            > = Vec::new();
+            for (peer_name, addr) in &peers {
+                match crate::net::service_dispatcher::connect_to_service(
+                    *addr,
+                    ELECTION_SERVICE_NAME,
+                ) {
+                    Ok(ch) => {
+                        let arc: Arc<
+                            dyn crate::net::channel::Channel,
+                        > = Arc::new(ch);
+                        channels.push(arc);
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "election driver: peer {} ({}) unreachable: {}",
+                            peer_name, addr, e
+                        );
+                    }
+                }
+            }
+
+            // Resolve our own node_id from the group; if not present
+            // we cannot run an election (closed-world guard — see F22).
+            let self_node_id = group
+                .get_node(&self.config.node_name)
+                .map(|n| n.node_id());
+            let self_node_id = match self_node_id {
+                Some(id) => id,
+                None => {
+                    log::warn!(
+                        "election driver: node '{}' not registered in \
+                         own group view; sleeping",
+                        self.config.node_name
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            };
+
+            log::debug!(
+                "election driver on '{}': starting term={} with {} peers",
+                self.config.node_name, term, channels.len(),
+            );
+            let outcome = crate::elections::paxos::run_election(
+                self_node_id,
+                &self.config.node_name,
+                &group,
+                &channels,
+                our_vlsn,
+                /* priority */ 1,
+                term,
+            );
+
+            match outcome {
+                Some(winner_id) if winner_id == self_node_id => {
+                    if let Err(e) = self.become_master(term) {
+                        log::warn!(
+                            "election driver: become_master failed: {}",
+                            e
+                        );
+                    } else {
+                        log::info!(
+                            "election driver: '{}' became master at term {}",
+                            self.config.node_name, term,
+                        );
+                    }
+                }
+                Some(winner_id) => {
+                    if let Some(winner_node) = group
+                        .get_nodes()
+                        .into_iter()
+                        .find(|n| n.node_id() == winner_id)
+                    {
+                        if let Err(e) =
+                            self.become_replica(&winner_node.name)
+                        {
+                            log::warn!(
+                                "election driver: become_replica failed: {}",
+                                e
+                            );
+                        } else {
+                            log::info!(
+                                "election driver: '{}' became replica of '{}' at term {}",
+                                self.config.node_name,
+                                winner_node.name, term,
+                            );
+                        }
+                    }
+                }
+                None => {
+                    log::debug!(
+                        "election driver on '{}' term={}: no quorum",
+                        self.config.node_name, term,
+                    );
+                }
+            }
+
+            term = term.saturating_add(1);
+            // Back off so we don't pin the loop on transient failures.
+            std::thread::sleep(self.config.election_timeout.min(
+                Duration::from_millis(500),
+            ));
+        }
+    }
+
+    /// Internal: a `RepGroup` snapshot that includes self.
+    fn local_rep_group_with_self(&self) -> crate::rep_group::RepGroup {
+        let mut group = self.get_rep_group();
+        // Ensure self is present in the group view; the
+        // group_service does not auto-register the local node.
+        if group.get_node(&self.config.node_name).is_none() {
+            let mut self_node = crate::rep_node::RepNode::new(
+                self.config.node_name.clone(),
+                self.config.node_type,
+                self.config.node_host.clone(),
+                self.config.node_port,
+                /* node_id */ 0,
+            );
+            // Stable self node_id derived from the name hash so
+            // re-creations in the same process don't collide.
+            use std::hash::{Hash, Hasher};
+            let mut hasher =
+                std::collections::hash_map::DefaultHasher::new();
+            self.config.node_name.hash(&mut hasher);
+            // Restrict to a u32 range and avoid 0 (reserved for
+            // "unknown").
+            let id = ((hasher.finish() as u32) | 1).max(1);
+            self_node.node_id = id;
+            group.add_node(self_node);
+        }
+        group
     }
 
     /// Return the socket address the TCP service dispatcher is bound to.
@@ -1020,6 +1335,131 @@ impl ReplicatedEnvironment {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// F1: ReplicaAckCoordinator impl wires master commits into the AckTracker.
+// ---------------------------------------------------------------------------
+//
+// `noxu_db::Transaction::commit_with_durability` calls
+// `await_replica_acks` after the local WAL fsync.  This impl:
+//
+//   1. Rejects calls on a non-master node with `NotMaster`.
+//   2. Rejects calls during shutdown with `Shutdown`.
+//   3. Computes the required ack count from `electable_count` and the
+//      requested policy.
+//   4. Allocates a unique commit sequence number, registers the ack
+//      requirement on the `AckTracker`, and polls `is_satisfied` with
+//      a small sleep until either the timeout elapses or the policy
+//      is satisfied.
+//   5. Cleans up the tracker entry on every exit path.
+//
+// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+impl ReplicaAckCoordinator for ReplicatedEnvironment {
+    fn await_replica_acks(
+        &self,
+        policy: ReplicaAckPolicyKind,
+        timeout: Duration,
+    ) -> std::result::Result<u32, AckWaitError> {
+        // Fast-path: ReplicaAckPolicy::None never blocks. The trait spec
+        // says callers may already short-circuit, but be defensive.
+        if matches!(policy, ReplicaAckPolicyKind::None) {
+            return Ok(0);
+        }
+
+        if self.is_shutdown() {
+            return Err(AckWaitError {
+                kind: AckWaitErrorKind::Shutdown,
+                needed: 0,
+                received: 0,
+            });
+        }
+
+        if !self.is_master() {
+            return Err(AckWaitError {
+                kind: AckWaitErrorKind::NotMaster,
+                needed: 0,
+                received: 0,
+            });
+        }
+
+        // Count electable peers (excluding the master) using the
+        // RepGroup view, which counts Arbiters and Electables
+        // identically. Only Electable nodes are counted as data
+        // replicas able to ack a commit.  The master itself is
+        // *implicit*: it is not registered in `group_service` (only
+        // peers are), so we add 1 to obtain the total electable
+        // count expected by `ReplicaAckPolicyKind::required_acks`.
+        let group = self.get_rep_group();
+        let electable_peers: u32 = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
+            .count() as u32;
+        let electable_count: u32 = electable_peers + 1; // +1 for self/master
+
+        let needed = policy.required_acks(electable_count);
+        if needed == 0 {
+            // Single-node group, or All with only the master itself.
+            return Ok(0);
+        }
+
+        let commit_seq = self
+            .commit_ack_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.ack_tracker.register(commit_seq, needed);
+
+        // Poll-with-sleep loop. The poll interval is small enough that
+        // late acks satisfy the policy promptly, and large enough that
+        // a single commit waiting on a slow replica does not spin a
+        // CPU.
+        let poll_interval = std::cmp::min(
+            timeout / 50,
+            Duration::from_millis(20),
+        );
+        let poll_interval = if poll_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            poll_interval
+        };
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            if self.ack_tracker.is_satisfied(commit_seq) {
+                self.ack_tracker.cleanup_through(commit_seq);
+                return Ok(needed);
+            }
+            if self.is_shutdown() {
+                self.ack_tracker.cleanup_through(commit_seq);
+                return Err(AckWaitError {
+                    kind: AckWaitErrorKind::Shutdown,
+                    needed,
+                    received: 0,
+                });
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                // Tear down the registration so it doesn't accumulate;
+                // record the partial ack count so the caller can report
+                // a useful `InsufficientReplicas { required, available }`.
+                let received = self
+                    .ack_tracker
+                    .received_count(commit_seq)
+                    .unwrap_or(0);
+                self.ack_tracker.cleanup_through(commit_seq);
+                return Err(AckWaitError {
+                    kind: AckWaitErrorKind::Timeout,
+                    needed,
+                    received,
+                });
+            }
+            let sleep_for =
+                std::cmp::min(poll_interval, deadline.saturating_duration_since(now));
+            std::thread::sleep(sleep_for);
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
