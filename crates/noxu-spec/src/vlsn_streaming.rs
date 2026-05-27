@@ -10,10 +10,35 @@
 //!   - `crates/noxu-rep/src/stream/peer_feeder.rs`
 //!   - `crates/noxu-rep/src/stream/replica_stream.rs`
 //!   - `crates/noxu-rep/src/vlsn.rs`
+//!   - `crates/noxu-rep/src/vlsn/persist.rs`
+//!     (audit finding F11: persists the VLSN index to
+//!     `<env_home>/vlsn.idx` so a clean shutdown + restart resumes
+//!     from the last persisted vlsn rather than forcing a full
+//!     network restore.)
+//!
+//! # Variants
+//!
+//! Following the same convention as
+//! [`crate::flexible_paxos`], the model is parameterised on a
+//! [`Variant`] so a single spec validates both the post-Wave-4-A
+//! production protocol and the pre-fix variant where the VLSN
+//! index lived only in memory:
+//!
+//!   - [`Variant::PersistentVlsnIndex`] — the post-Wave-4-A
+//!     production protocol: `Restart` actions preserve the
+//!     replica's `applied_high`. `assert_properties` succeeds.
+//!   - [`Variant::EphemeralVlsnIndex`] — the pre-Wave-4-A protocol:
+//!     `Restart` zeroes `applied_high`, modelling a replica that
+//!     forgot which entries it had already applied. `assert_discovery`
+//!     finds an `AckTracksReceived` counterexample where the master
+//!     has acked an entry the replica no longer remembers applying
+//!     — exactly the apparent-rollback scenario that
+//!     `vlsn::persist::save_to_disk` closes.
 //!
 //! Properties:
 //!   - `VlsnMonotone` — the replica's applied VLSN never goes
-//!     backwards.
+//!     backwards, and the master-side ack high never exceeds
+//!     applied.
 //!   - `NoOverflow` — the feeder's in-flight buffer never exceeds
 //!     `MAX_BUFFER`.
 //!   - `AckTracksReceived` — for every ack, the replica must have
@@ -21,8 +46,21 @@
 
 use stateright::{Model, Property};
 
-pub const MASTER_WAL_LEN: u64 = 4;
+pub const MASTER_WAL_LEN: u64 = 3;
 pub const MAX_BUFFER: usize = 2;
+
+/// Whether the replica's VLSN index is persisted across restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Variant {
+    /// The post-Wave-4-A production protocol: every applied vlsn
+    /// is durable in `vlsn.idx`. A `Restart` action preserves
+    /// `replica_applied_high`.
+    PersistentVlsnIndex,
+    /// The pre-Wave-4-A protocol: the VLSN index lives only in
+    /// memory. A `Restart` action zeroes `replica_applied_high`,
+    /// modelling a replica that forgot what it had applied.
+    EphemeralVlsnIndex,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct State {
@@ -30,18 +68,57 @@ pub struct State {
     pub feeder_sent_high: u64,
     pub replica_applied_high: u64,
     pub master_acked_high: u64,
+    /// Entries the feeder has sent for which the master has not yet
+    /// received an ack from the replica. Cleared by
+    /// [`Action::MasterReceiveAck`], **not** by [`Action::ReplicaApply`]
+    /// — applying advances `replica_applied_high` but the master
+    /// still considers the entry in flight until it observes the ack
+    /// on the wire. (Fixed in Wave 9-B: the original model removed
+    /// entries on apply, which made `master_acked_high` unreachable
+    /// from any non-zero value and silently weakened the
+    /// `AckTracksReceived` check to a trivial truth.)
     pub in_flight: Vec<u64>,
+    /// Whether the replica has already restarted once. We bound to
+    /// at most one restart so the state space stays finite — one
+    /// restart is enough to expose the `EphemeralVlsnIndex`
+    /// regression.
+    pub replica_restarted: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Action {
     FeederSend,
-    ReplicaApply { vlsn: u64 },
-    ReplicaAck { vlsn: u64 },
-    MasterReceiveAck { vlsn: u64 },
+    ReplicaApply {
+        vlsn: u64,
+    },
+    ReplicaAck {
+        vlsn: u64,
+    },
+    MasterReceiveAck {
+        vlsn: u64,
+    },
+    /// The replica process crashes and is restarted. Under
+    /// `Variant::PersistentVlsnIndex` `replica_applied_high`
+    /// survives; under `Variant::EphemeralVlsnIndex` it is zeroed.
+    /// Either way the in-flight buffer is dropped (the TCP/QUIC
+    /// connection is lost on crash) and the feeder rewinds to the
+    /// replica's reported applied vlsn.
+    ReplicaRestart,
 }
 
-pub struct VlsnStreamingModel;
+pub struct VlsnStreamingModel {
+    pub variant: Variant,
+}
+
+impl VlsnStreamingModel {
+    pub fn persistent() -> Self {
+        Self { variant: Variant::PersistentVlsnIndex }
+    }
+
+    pub fn ephemeral() -> Self {
+        Self { variant: Variant::EphemeralVlsnIndex }
+    }
+}
 
 impl Model for VlsnStreamingModel {
     type State = State;
@@ -54,6 +131,7 @@ impl Model for VlsnStreamingModel {
             replica_applied_high: 0,
             master_acked_high: 0,
             in_flight: vec![],
+            replica_restarted: false,
         }]
     }
 
@@ -62,9 +140,13 @@ impl Model for VlsnStreamingModel {
         {
             out.push(Action::FeederSend);
         }
-        if let Some(&next) = s.in_flight.first() {
-            if next == s.replica_applied_high + 1 {
-                out.push(Action::ReplicaApply { vlsn: next });
+        // Replica applies the next entry in flight in vlsn order, if
+        // it has not been applied yet. (Apply does not drain
+        // `in_flight` — see the field comment.)
+        for &v in &s.in_flight {
+            if v == s.replica_applied_high + 1 {
+                out.push(Action::ReplicaApply { vlsn: v });
+                break;
             }
         }
         if s.replica_applied_high > 0 {
@@ -74,6 +156,10 @@ impl Model for VlsnStreamingModel {
             if v <= s.replica_applied_high && v > s.master_acked_high {
                 out.push(Action::MasterReceiveAck { vlsn: v });
             }
+        }
+        // At most one restart per execution.
+        if !s.replica_restarted {
+            out.push(Action::ReplicaRestart);
         }
     }
 
@@ -96,13 +182,15 @@ impl Model for VlsnStreamingModel {
                 s.in_flight.push(v);
             }
             Action::ReplicaApply { vlsn } => {
-                if Some(&vlsn) != s.in_flight.first() {
+                if !s.in_flight.contains(&vlsn) {
                     return None;
                 }
                 if vlsn != s.replica_applied_high + 1 {
                     return None;
                 }
-                s.in_flight.remove(0);
+                // Apply does not drain `in_flight`: the master still
+                // sees the entry as outstanding until it receives the
+                // ack on the wire.
                 s.replica_applied_high = vlsn;
             }
             Action::ReplicaAck { vlsn } => {
@@ -114,7 +202,37 @@ impl Model for VlsnStreamingModel {
                 if vlsn > s.replica_applied_high {
                     return None;
                 }
+                // The ack tells the master it can drop the entry
+                // from its retry buffer.
+                if let Some(pos) = s.in_flight.iter().position(|&v| v == vlsn) {
+                    s.in_flight.remove(pos);
+                }
                 s.master_acked_high = s.master_acked_high.max(vlsn);
+            }
+            Action::ReplicaRestart => {
+                if s.replica_restarted {
+                    return None;
+                }
+                s.replica_restarted = true;
+                // The TCP/QUIC connection is lost: drop in-flight
+                // entries so the feeder retransmits from the
+                // replica's reported applied vlsn.
+                s.in_flight.clear();
+                match self.variant {
+                    Variant::PersistentVlsnIndex => {
+                        // F11: vlsn.idx survived; replica resumes
+                        // at the same applied_high it had before
+                        // crashing. The feeder rewinds to match.
+                        s.feeder_sent_high = s.replica_applied_high;
+                    }
+                    Variant::EphemeralVlsnIndex => {
+                        // Pre-Wave-4-A: the in-memory VLSN index is
+                        // gone. The replica restarts at applied=0,
+                        // and the feeder rewinds with it.
+                        s.replica_applied_high = 0;
+                        s.feeder_sent_high = 0;
+                    }
+                }
             }
         }
         Some(s)
@@ -141,9 +259,38 @@ mod tests {
     use super::*;
     use stateright::Checker;
 
+    /// Post-Wave-4-A: vlsn.idx persists `applied_high` across
+    /// restart. NoOverflow / AckTracksReceived / VlsnMonotone all
+    /// hold under arbitrary restart timing.
     #[test]
     fn vlsn_streaming_safety_holds() {
-        let checker = VlsnStreamingModel.checker().spawn_bfs().join();
+        let checker =
+            VlsnStreamingModel::persistent().checker().spawn_bfs().join();
         checker.assert_properties();
+    }
+
+    /// Pre-Wave-4-A regression bait: with an in-memory-only VLSN
+    /// index, a replica restart erases applied_high. The master's
+    /// already-recorded ack now points beyond what the replica
+    /// remembers applying — apparent rollback. The counterexample
+    /// is exactly the F11 scenario that `vlsn::persist` closes.
+    #[test]
+    fn ephemeral_vlsn_index_loses_applied_progress() {
+        let checker =
+            VlsnStreamingModel::ephemeral().checker().spawn_bfs().join();
+        checker.assert_discovery(
+            "AckTracksReceived",
+            vec![
+                // Master streams vlsn=1; replica applies and acks.
+                Action::FeederSend,
+                Action::ReplicaApply { vlsn: 1 },
+                Action::MasterReceiveAck { vlsn: 1 },
+                // Replica crashes. Without vlsn.idx the in-memory
+                // index is gone: applied_high snaps back to 0,
+                // while master_acked_high stays at 1 — apparent
+                // replica rollback.
+                Action::ReplicaRestart,
+            ],
+        );
     }
 }

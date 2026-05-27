@@ -140,6 +140,7 @@ impl RepEnvInfo {
             ));
         }
         let env = Arc::new(ReplicatedEnvironment::new(self.config.clone())?);
+        env.init_self_weak();
         self.env = Some(Arc::clone(&env));
         Ok(env)
     }

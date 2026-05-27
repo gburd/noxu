@@ -11,6 +11,11 @@
 //!     (audit rep F32 (Wave 2C-4): the spec previously pointed at
 //!     `master_term.rs`, which has never existed; the term state
 //!     lives in `master_tracker.rs::MasterTracker::master_term`).
+//!   - `crates/noxu-rep/src/replicated_environment.rs::become_master`
+//!     (audit finding F9: spawning a `Feeder` tracker per electable
+//!     replica when this node enters `MasterActive`. Modelled by
+//!     `current_master_feeders` and the `MasterHasFeeders`
+//!     invariant.)
 //!
 //! Properties:
 //!   - `AtMostOneMaster` — across all reachable states, at most one
@@ -20,6 +25,12 @@
 //!   - `MasterTermsMonotone` — `current_master_term` is at least
 //!     the highest per-node `master_term` ever recorded, so terms
 //!     never re-use earlier values.
+//!   - `MasterHasFeeders` — whenever a node is in `MasterActive`,
+//!     `current_master_feeders` is exactly the set of other
+//!     electable peers. Closes audit finding F9: a master without
+//!     feeders cannot push entries to the replicas pulling from
+//!     `PEER_FEEDER`, even though the role state alone (which the
+//!     pre-Wave-4-A spec validated) looked correct.
 
 use stateright::{Model, Property};
 
@@ -38,6 +49,11 @@ pub struct State {
     pub master_term: [u64; N_NODES],
     pub commit_point: u64,
     pub current_master_term: u64,
+    /// Set of peer node indices the *current* master has spawned a
+    /// `Feeder` tracker for. Empty when no node is `MasterActive`.
+    /// Encoded as a fixed-length bitfield indexed by node id so the
+    /// state remains `Hash + Eq`.
+    pub current_master_feeders: [bool; N_NODES],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -66,11 +82,18 @@ impl Model for MasterTransferModel {
         roles[0] = NodeRole::MasterActive;
         let mut master_term = [0; N_NODES];
         master_term[0] = 1;
+        // F9: node 0 is the initial master, so it has feeders
+        // spawned for every other (electable) peer.
+        let mut feeders = [false; N_NODES];
+        for (i, slot) in feeders.iter_mut().enumerate() {
+            *slot = i != 0;
+        }
         vec![State {
             roles,
             master_term,
             commit_point: 0,
             current_master_term: 1,
+            current_master_feeders: feeders,
         }]
     }
 
@@ -120,6 +143,13 @@ impl Model for MasterTransferModel {
                 s.roles[node] = NodeRole::MasterActive;
                 s.current_master_term += 1;
                 s.master_term[node] = s.current_master_term;
+                // F9: become_master spawns a Feeder per electable
+                // peer; clears any feeders left over from a prior
+                // role.
+                for (i, slot) in s.current_master_feeders.iter_mut().enumerate()
+                {
+                    *slot = i != node;
+                }
             }
             Action::StartDrain { node } => {
                 if !matches!(s.roles[node], NodeRole::MasterActive) {
@@ -138,6 +168,14 @@ impl Model for MasterTransferModel {
                 s.roles[to] = NodeRole::MasterActive;
                 s.current_master_term += 1;
                 s.master_term[to] = s.current_master_term;
+                // F9: the successor's `become_master` re-creates the
+                // feeder map. The drain path on `from` has already
+                // dropped its feeders (modelled here by recomputing
+                // from `to`'s perspective).
+                for (i, slot) in s.current_master_feeders.iter_mut().enumerate()
+                {
+                    *slot = i != to;
+                }
             }
             Action::AdvanceCommitPoint { delta } => {
                 s.commit_point += delta;
@@ -165,6 +203,35 @@ impl Model for MasterTransferModel {
             Property::<Self>::always("MasterTermsMonotone", |_, s: &State| {
                 let max_term = *s.master_term.iter().max().unwrap_or(&0);
                 s.current_master_term >= max_term
+            }),
+            Property::<Self>::always("MasterHasFeeders", |_, s: &State| {
+                // F9: whenever some node is `MasterActive` or
+                // `MasterDraining`, it has a feeder tracker for
+                // every other peer. (`StartDrain` does not tear
+                // down the feeders — they keep pushing entries
+                // until `HandoffComplete` hands the role to the
+                // successor.) When no node holds the role, no
+                // feeders are expected.
+                let in_charge = s.roles.iter().position(|r| {
+                    matches!(
+                        r,
+                        NodeRole::MasterActive | NodeRole::MasterDraining
+                    )
+                });
+                match in_charge {
+                    Some(m) => {
+                        for (i, &spawned) in
+                            s.current_master_feeders.iter().enumerate()
+                        {
+                            let expected = i != m;
+                            if spawned != expected {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    None => s.current_master_feeders.iter().all(|f| !*f),
+                }
             }),
         ]
     }
