@@ -750,19 +750,25 @@ fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
     );
 }
 
-/// `Nullify` action surfaces Unsupported at runtime until step 10.
+/// `Nullify` action: when a foreign primary record is deleted, every
+/// child primary record indexed under it has its FK field nullified
+/// via the user-supplied [`ForeignKeyNullifier`].  v1.6 step 10.
 #[test]
 fn d2c_foreign_key_nullify_runtime_unsupported() {
     use noxu_db::secondary_config::ForeignKeyNullifier;
 
-    struct NullNullifier;
-    impl ForeignKeyNullifier for NullNullifier {
+    /// Replaces the data with `b"_"` so the secondary key creator
+    /// (FirstByteCreator) produces a sec_key of `b"_"` instead of
+    /// the original first byte.
+    struct UnderscoreNullifier;
+    impl ForeignKeyNullifier for UnderscoreNullifier {
         fn nullify_foreign_key(
             &self,
             _db: &Database,
-            _data: &mut DatabaseEntry,
+            data: &mut DatabaseEntry,
         ) -> bool {
-            false
+            data.set_data(b"_");
+            true
         }
     }
 
@@ -777,30 +783,29 @@ fn d2c_foreign_key_nullify_runtime_unsupported() {
         .with_key_creator(Box::new(FirstByteCreator))
         .with_foreign_key_database_handle(Arc::clone(&foreign))
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
-        .with_foreign_key_nullifier(Box::new(NullNullifier));
+        .with_foreign_key_nullifier(Box::new(UnderscoreNullifier));
 
     let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .expect("FK config with handle and Nullify must open in v1.6 step 8");
+        .unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
     foreign
         .lock()
         .put(None, &fk, &DatabaseEntry::from_bytes(b"x"))
         .unwrap();
+    let pk = DatabaseEntry::from_bytes(b"pk1");
     primary
         .lock()
-        .put(
-            None,
-            &DatabaseEntry::from_bytes(b"pk1"),
-            &DatabaseEntry::from_bytes(b"Apple"),
-        )
+        .put(None, &pk, &DatabaseEntry::from_bytes(b"Apple"))
         .unwrap();
-    let result = foreign.lock().delete(None, &fk);
-    assert!(
-        matches!(result, Err(NoxuError::Unsupported(_))),
-        "Nullify is wired in step 10; until then runtime surfaces \
-         NoxuError::Unsupported, got {result:?}"
-    );
+
+    foreign.lock().delete(None, &fk).unwrap();
+
+    // Child primary still exists, but its data has been nullified.
+    let mut child_data = DatabaseEntry::new();
+    let st = primary.lock().get(None, &pk, &mut child_data).unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(child_data.get_data().unwrap(), b"_");
 }
 
 /// FK Abort happy path: deleting a foreign primary record that is
@@ -852,6 +857,91 @@ fn fk_abort_blocks_delete_of_referenced_foreign_record() {
         OperationStatus::Success,
         "aborted FK delete must leave the foreign record intact"
     );
+}
+
+/// FK Nullify with the multi-key variant: every secondary key in a
+/// multi-key index is nullified individually via
+/// [`ForeignMultiKeyNullifier`].  v1.6 step 10.
+#[test]
+fn fk_nullify_multi_key_nullifier_path() {
+    use noxu_db::secondary_config::{
+        ForeignMultiKeyNullifier, SecondaryMultiKeyCreator,
+    };
+
+    struct EachByteCreator;
+    impl SecondaryMultiKeyCreator for EachByteCreator {
+        fn create_secondary_keys(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            results: &mut Vec<DatabaseEntry>,
+        ) {
+            if let Some(d) = data.get_data() {
+                for b in d {
+                    results.push(DatabaseEntry::from_bytes(&[*b]));
+                }
+            }
+        }
+    }
+
+    struct StripByteNullifier;
+    impl ForeignMultiKeyNullifier for StripByteNullifier {
+        fn nullify_foreign_key(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &mut DatabaseEntry,
+            secondary_key: &DatabaseEntry,
+        ) -> bool {
+            let target = secondary_key.get_data().unwrap_or(&[]);
+            if target.is_empty() {
+                return false;
+            }
+            let stripped: Vec<u8> = data
+                .get_data()
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|b| *b != target[0])
+                .collect();
+            data.set_data(&stripped);
+            true
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "sec_mk");
+    let foreign = open_pri(&env, "foreign");
+
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_multi_key_creator(Box::new(EachByteCreator))
+        .with_foreign_key_database_handle(Arc::clone(&foreign))
+        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
+        .with_foreign_multi_key_nullifier(Box::new(StripByteNullifier));
+
+    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
+        .unwrap();
+
+    let fk_a = DatabaseEntry::from_bytes(b"A");
+    foreign
+        .lock()
+        .put(None, &fk_a, &DatabaseEntry::from_bytes(b"x"))
+        .unwrap();
+
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    primary
+        .lock()
+        .put(None, &pk1, &DatabaseEntry::from_bytes(b"ABC"))
+        .unwrap();
+
+    foreign.lock().delete(None, &fk_a).unwrap();
+    let mut child = DatabaseEntry::new();
+    primary.lock().get(None, &pk1, &mut child).unwrap();
+    assert_eq!(child.get_data().unwrap(), b"BC");
 }
 
 /// FK Cascade transitive: deleting a record in the root foreign
