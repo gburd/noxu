@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Noxu DB. This chapter documents
 the development workflow, porting guidelines, testing approach, PR process, and
 release procedures.
 
-For the community code of conduct see [`code-of-conduct.md`](https://github.com/gburd/lamdb/blob/main/code-of-conduct.md)
+For the community code of conduct see [`code-of-conduct.md`](https://codeberg.org/gregburd/noxu/blob/main/code-of-conduct.md)
 at the project root.
 
 ## In This Chapter

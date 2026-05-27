@@ -71,7 +71,7 @@ jobs:
       - name: Build book
         run: mdbook build docs/
         env:
-          MDBOOK_OUTPUT__HTML__SITE_URL: /lamdb/
+          MDBOOK_OUTPUT__HTML__SITE_URL: /noxu/
 
       - name: Check links (lychee)
         uses: lycheeverse/lychee-action@v2
@@ -121,7 +121,7 @@ jobs:
       - name: Build book for GitHub Pages
         run: mdbook build docs/
         env:
-          MDBOOK_OUTPUT__HTML__SITE_URL: /lamdb/
+          MDBOOK_OUTPUT__HTML__SITE_URL: /noxu/
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
