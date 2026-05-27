@@ -1981,10 +1981,28 @@ impl CursorImpl {
                 if exists {
                     return Ok(OperationStatus::KeyExist);
                 }
+                // v1.6 (Wave 2A): register the brand-new sorted-dup
+                // insert with the cursor's txn (or auto-commit lock
+                // manager) so abort-undo can reach it.  The non-dup
+                // path uses the same lock_write_before_log /
+                // finalize_write_lock pair (see PutMode::NoDupData
+                // above); without it, an aborted txn could leak a
+                // sorted-dup insert past the rollback (the regression
+                // that surfaced when secondaries flipped to
+                // sorted-dup).  old_lsn is NULL_LSN because we just
+                // verified !exists.
+                let old_lsn = noxu_util::NULL_LSN.as_u64();
+                self.lock_write_before_log(old_lsn, &two_part_key)?;
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                )?;
+                self.finalize_write_lock(
+                    old_lsn,
+                    new_lsn,
+                    Some(two_part_key.clone()),
+                    None,
                 )?;
                 // Use apply_tree_insert so the per-database entry counter
                 // is bumped on a new (key, data) pair; otherwise

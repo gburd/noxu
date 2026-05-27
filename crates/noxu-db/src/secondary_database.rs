@@ -66,8 +66,495 @@ use crate::secondary_cursor::SecondaryCursor;
 use crate::transaction::Transaction;
 use noxu_dbi::{CursorImpl, GetMode};
 use noxu_sync::Mutex;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+thread_local! {
+    /// Cycle-detection frame for FK cascades and nullifications.
+    /// Contains every `(db_id, fk_value)` pair the current thread is
+    /// in the middle of cascading.  See [`FkReferrer`].
+    static FK_CASCADE_GUARD: RefCell<HashSet<(u64, Vec<u8>)>> =
+        RefCell::new(HashSet::new());
+}
+
+/// Trait implemented by [`SecondaryHookState`] so a primary
+/// [`Database`] can keep the secondary registry as
+/// `Vec<Weak<dyn SecondaryHook + Send + Sync>>` without naming the
+/// concrete state struct (the struct holds a non-`Send` config field
+/// for some user-supplied callbacks; the trait only exposes the
+/// txn-driven update entry point and the secondary's name for
+/// diagnostics).
+///
+/// v1.6 (audit C3 — the `associate()`-style hook).
+pub(crate) trait SecondaryHook {
+    /// Updates this secondary index after a primary write.  Called by
+    /// `Database::put` (`old_data` = `None`, `new_data = Some(…)`),
+    /// `Database::delete` (`old_data = Some(…)`, `new_data = None`),
+    /// or a primary update path (both `Some`).  `txn` is the same
+    /// transaction that drove the primary write so the secondary update
+    /// participates atomically.
+    fn maintain(
+        &self,
+        txn: Option<&Transaction>,
+        pri_key: &DatabaseEntry,
+        old_data: Option<&DatabaseEntry>,
+        new_data: Option<&DatabaseEntry>,
+    ) -> Result<()>;
+
+    /// Returns the secondary's database name (used in diagnostics).
+    fn name(&self) -> String;
+}
+
+/// Trait implemented by [`SecondaryHookState`] for the FK referrer
+/// registry (v1.6 audit C2 / Decision 2C).  When a record is deleted
+/// from a foreign-key target primary, the engine iterates every
+/// registered referrer and calls
+/// [`FkReferrer::on_foreign_key_deleted`] under the same caller-supplied
+/// txn.  The implementation runs the configured
+/// [`ForeignKeyDeleteAction`] for every secondary key matching the
+/// deleted foreign key.
+pub(crate) trait FkReferrer {
+    /// Called when a foreign-DB primary record is about to be deleted.
+    /// `fk_value` is the primary key of the foreign DB record (which
+    /// may also be a secondary key in this child index).
+    ///
+    /// Returning `Err(NoxuError::ForeignConstraintViolation(…))` aborts
+    /// the foreign delete (Abort action).  Returning `Ok(())` may have
+    /// already mutated the child primary records (Cascade / Nullify).
+    fn on_foreign_key_deleted(
+        &self,
+        txn: Option<&Transaction>,
+        fk_value: &DatabaseEntry,
+    ) -> Result<()>;
+
+    /// Returns the child secondary's database name (used in error messages).
+    fn name(&self) -> String;
+}
+
+/// Internal state of a [`SecondaryDatabase`].
+///
+/// Held behind an `Arc` so the primary database can keep a `Weak<_>`
+/// reference for automatic-maintenance fan-out without creating a
+/// cycle.  Dropping the [`SecondaryDatabase`] handle drops the strong
+/// `Arc`; the next primary registration will purge the now-dangling
+/// `Weak`.
+pub(crate) struct SecondaryHookState {
+    /// The underlying secondary index storage (sec_key -> [pri_key…]).
+    pub(crate) inner: Database,
+    /// The primary database this index is associated with.
+    pub(crate) primary: Arc<Mutex<Database>>,
+    /// The secondary configuration (holds key creator callback, etc.).
+    pub(crate) config: SecondaryConfig,
+    /// Whether this secondary is fully populated (not in incremental mode).
+    pub(crate) is_fully_populated: AtomicBool,
+}
+
+impl SecondaryHookState {
+    /// Updates this secondary index after a primary insert / update /
+    /// delete.  Mirrors the v1.5 [`SecondaryDatabase::update_secondary`]
+    /// behaviour but lives on the state so it can be invoked from the
+    /// [`SecondaryHook`] trait impl as well as the public
+    /// [`SecondaryDatabase`] facade.
+    pub(crate) fn update_secondary(
+        &self,
+        txn: Option<&Transaction>,
+        pri_key: &DatabaseEntry,
+        old_data: Option<&DatabaseEntry>,
+        new_data: Option<&DatabaseEntry>,
+    ) -> Result<()> {
+        let key_creator = &self.config.key_creator;
+        let multi_key_creator = &self.config.multi_key_creator;
+
+        if old_data.is_none() && new_data.is_none() {
+            return Ok(());
+        }
+
+        if let Some(creator) = key_creator {
+            let old_sec_key = old_data.and_then(|od| {
+                let mut sk = DatabaseEntry::new();
+                if creator.create_secondary_key(
+                    &self.inner,
+                    pri_key,
+                    od,
+                    &mut sk,
+                ) {
+                    Some(sk)
+                } else {
+                    None
+                }
+            });
+            let new_sec_key = new_data.and_then(|nd| {
+                let mut sk = DatabaseEntry::new();
+                if creator.create_secondary_key(
+                    &self.inner,
+                    pri_key,
+                    nd,
+                    &mut sk,
+                ) {
+                    Some(sk)
+                } else {
+                    None
+                }
+            });
+            let do_delete = old_sec_key.is_some()
+                && old_sec_key.as_ref() != new_sec_key.as_ref();
+            let do_insert = new_sec_key.is_some()
+                && new_sec_key.as_ref() != old_sec_key.as_ref();
+            if do_delete {
+                self.delete_sec_key(
+                    txn,
+                    old_sec_key.as_ref().unwrap(),
+                    pri_key,
+                )?;
+            }
+            if do_insert {
+                self.insert_sec_key(
+                    txn,
+                    new_sec_key.as_ref().unwrap(),
+                    pri_key,
+                )?;
+            }
+        } else if let Some(multi_creator) = multi_key_creator {
+            let empty = Vec::<DatabaseEntry>::new();
+            let old_keys: Vec<DatabaseEntry> = if let Some(od) = old_data {
+                let mut keys = Vec::new();
+                multi_creator.create_secondary_keys(
+                    &self.inner,
+                    pri_key,
+                    od,
+                    &mut keys,
+                );
+                keys
+            } else {
+                empty.clone()
+            };
+            let new_keys: Vec<DatabaseEntry> = if let Some(nd) = new_data {
+                let mut keys = Vec::new();
+                multi_creator.create_secondary_keys(
+                    &self.inner,
+                    pri_key,
+                    nd,
+                    &mut keys,
+                );
+                keys
+            } else {
+                empty
+            };
+            for old_key in &old_keys {
+                if !new_keys.contains(old_key) {
+                    self.delete_sec_key(txn, old_key, pri_key)?;
+                }
+            }
+            for new_key in &new_keys {
+                if !old_keys.contains(new_key) {
+                    self.insert_sec_key(txn, new_key, pri_key)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Inserts a (sec_key, pri_key) duplicate.  See the
+    /// [`SecondaryDatabase`] impl for the full doc-comment; this is the
+    /// state-side implementation that the public method delegates to.
+    fn insert_sec_key(
+        &self,
+        txn: Option<&Transaction>,
+        sec_key: &DatabaseEntry,
+        pri_key: &DatabaseEntry,
+    ) -> Result<()> {
+        let mut cursor = self.make_inner_cursor(txn)?;
+        let status =
+            cursor
+                .put(sec_key, pri_key, crate::put::Put::NoDupData)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        match status {
+            OperationStatus::Success => Ok(()),
+            OperationStatus::KeyExists => Ok(()),
+            other => Err(NoxuError::OperationNotAllowed(format!(
+                "unexpected put status from secondary index insert: {other:?}"
+            ))),
+        }
+    }
+
+    /// Deletes the exact (sec_key, pri_key) duplicate.
+    fn delete_sec_key(
+        &self,
+        txn: Option<&Transaction>,
+        sec_key: &DatabaseEntry,
+        pri_key: &DatabaseEntry,
+    ) -> Result<()> {
+        let mut cursor = self.make_inner_cursor(txn)?;
+        let mut sec_key_mut = sec_key.clone();
+        let mut pri_key_mut = pri_key.clone();
+        let status = cursor
+            .get(
+                &mut sec_key_mut,
+                &mut pri_key_mut,
+                crate::get::Get::SearchBoth,
+                None,
+            )
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        if status == OperationStatus::Success {
+            cursor
+                .delete()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn make_inner_cursor(&self, txn: Option<&Transaction>) -> Result<Cursor> {
+        self.inner.open_cursor(txn, None)
+    }
+}
+
+impl SecondaryHook for SecondaryHookState {
+    fn maintain(
+        &self,
+        txn: Option<&Transaction>,
+        pri_key: &DatabaseEntry,
+        old_data: Option<&DatabaseEntry>,
+        new_data: Option<&DatabaseEntry>,
+    ) -> Result<()> {
+        self.update_secondary(txn, pri_key, old_data, new_data)
+    }
+
+    fn name(&self) -> String {
+        self.inner.get_database_name().to_string()
+    }
+}
+
+impl FkReferrer for SecondaryHookState {
+    /// v1.6 (audit C2 / Decision 2C): handles a foreign-DB delete by
+    /// dispatching on the configured [`ForeignKeyDeleteAction`].
+    ///
+    /// * `Abort`   — if any child secondary entry has `sec_key == fk_value`,
+    ///   return [`NoxuError::ForeignConstraintViolation`].
+    /// * `Cascade` — wired in step 9.
+    /// * `Nullify` — wired in step 10.
+    fn on_foreign_key_deleted(
+        &self,
+        txn: Option<&Transaction>,
+        fk_value: &DatabaseEntry,
+    ) -> Result<()> {
+        match self.config.foreign_key_delete_action {
+            crate::secondary_config::ForeignKeyDeleteAction::Abort => {
+                // Probe the inner secondary index for any duplicate of
+                // `fk_value`.  If we find at least one, the foreign
+                // delete must abort.
+                let mut probe_key = fk_value.clone();
+                let mut probe_pk = DatabaseEntry::new();
+                let mut cursor = self.inner.open_cursor(txn, None)?;
+                let st = cursor
+                    .get(
+                        &mut probe_key,
+                        &mut probe_pk,
+                        crate::get::Get::Search,
+                        None,
+                    )
+                    .map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                if st == OperationStatus::Success {
+                    let fk_hex = fk_value
+                        .get_data()
+                        .map(|b| {
+                            b.iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    return Err(NoxuError::ForeignConstraintViolation(
+                        format!(
+                            "foreign-key delete aborted: secondary '{}' \
+                             still references foreign key 0x{fk_hex} \
+                             (ForeignKeyDeleteAction::Abort)",
+                            self.inner.get_database_name()
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            crate::secondary_config::ForeignKeyDeleteAction::Cascade => {
+                // v1.6 step 9 — transitive cascade with cycle detection.
+                //
+                // For every primary record indexed under `fk_value` in
+                // *this* secondary, delete the primary.  The primary's
+                // own [`Database::delete`] fan-out re-enters this hook
+                // for any deeper cascades; the thread-local guard keeps
+                // a cycle from spinning forever.
+                let primary = Arc::clone(&self.primary);
+                let db_id = primary.lock().db_id_for_fk_guard();
+                let fk_bytes = fk_value.get_data().unwrap_or(&[]).to_vec();
+
+                if !FK_CASCADE_GUARD
+                    .with(|c| c.borrow_mut().insert((db_id, fk_bytes.clone())))
+                {
+                    // Already cascading on this (db, key) frame — skip
+                    // to break the cycle.  This matches JE's
+                    // `cascadeDeletePrimaries` cycle-skip logic.
+                    return Ok(());
+                }
+
+                // Collect every child primary key indexed under fk_value.
+                let child_pris: Vec<DatabaseEntry> = {
+                    let mut child_keys = Vec::new();
+                    let mut cursor = self.inner.open_cursor(txn, None)?;
+                    let mut sk = fk_value.clone();
+                    let mut pk = DatabaseEntry::new();
+                    let mut st = cursor
+                        .get(&mut sk, &mut pk, crate::get::Get::Search, None)
+                        .map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
+                    while st == OperationStatus::Success {
+                        if sk.get_data().unwrap_or(&[])
+                            != fk_value.get_data().unwrap_or(&[])
+                        {
+                            break;
+                        }
+                        if let Some(b) = pk.get_data() {
+                            child_keys.push(DatabaseEntry::from_bytes(b));
+                        }
+                        st = cursor
+                            .get(&mut sk, &mut pk, crate::get::Get::Next, None)
+                            .map_err(|e| {
+                                NoxuError::OperationNotAllowed(e.to_string())
+                            })?;
+                    }
+                    child_keys
+                };
+
+                // Apply the cascade.  Each `primary.delete` re-enters
+                // the maintenance plumbing on the child primary so its
+                // secondaries and any deeper FK relationships are
+                // honoured.  Errors propagate so the caller's txn rolls
+                // the cascade back together with the originating delete.
+                let cascade_result: Result<()> = (|| {
+                    let primary_guard = primary.lock();
+                    for child_pri in child_pris {
+                        primary_guard.delete(txn, &child_pri)?;
+                    }
+                    Ok(())
+                })();
+
+                FK_CASCADE_GUARD.with(|c| {
+                    c.borrow_mut().remove(&(db_id, fk_bytes));
+                });
+
+                cascade_result
+            }
+            crate::secondary_config::ForeignKeyDeleteAction::Nullify => {
+                // v1.6 step 10 — nullify the FK field on every child
+                // primary record indexed under fk_value, then re-put
+                // the modified record so auto-maintenance cleans up
+                // the now-stale secondary entry.
+                //
+                // Cycle detection mirrors the Cascade arm: even though
+                // a Nullify cannot directly cascade through more FK
+                // edges, a child primary update may itself be a
+                // foreign-key-delete from another perspective via the
+                // auto-maintenance fan-out, so we still guard the
+                // (db, key) frame.
+                let primary = Arc::clone(&self.primary);
+                let db_id = primary.lock().db_id_for_fk_guard();
+                let fk_bytes = fk_value.get_data().unwrap_or(&[]).to_vec();
+                if !FK_CASCADE_GUARD
+                    .with(|c| c.borrow_mut().insert((db_id, fk_bytes.clone())))
+                {
+                    return Ok(());
+                }
+
+                let single = self.config.foreign_key_nullifier.as_deref();
+                let multi = self.config.foreign_multi_key_nullifier.as_deref();
+
+                // Collect (child_primary_key, child_primary_data) pairs.
+                let child_records: Vec<(DatabaseEntry, DatabaseEntry)> = {
+                    let mut child = Vec::new();
+                    let mut cursor = self.inner.open_cursor(txn, None)?;
+                    let mut sk = fk_value.clone();
+                    let mut pk = DatabaseEntry::new();
+                    let mut st = cursor
+                        .get(&mut sk, &mut pk, crate::get::Get::Search, None)
+                        .map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
+                    while st == OperationStatus::Success {
+                        if sk.get_data().unwrap_or(&[])
+                            != fk_value.get_data().unwrap_or(&[])
+                        {
+                            break;
+                        }
+                        // Fetch the child primary's data so the
+                        // nullifier sees it.
+                        let child_pri = DatabaseEntry::from_bytes(
+                            pk.get_data().unwrap_or(&[]),
+                        );
+                        let mut data = DatabaseEntry::new();
+                        let g =
+                            primary.lock().get(txn, &child_pri, &mut data)?;
+                        if g == OperationStatus::Success {
+                            child.push((child_pri, data));
+                        }
+                        st = cursor
+                            .get(&mut sk, &mut pk, crate::get::Get::Next, None)
+                            .map_err(|e| {
+                                NoxuError::OperationNotAllowed(e.to_string())
+                            })?;
+                    }
+                    child
+                };
+
+                let nullify_result: Result<()> = (|| {
+                    for (child_pri, mut child_data) in child_records {
+                        let modified = match (single, multi) {
+                            (Some(n), _) => n.nullify_foreign_key(
+                                &self.inner,
+                                &mut child_data,
+                            ),
+                            (None, Some(mn)) => mn.nullify_foreign_key(
+                                &self.inner,
+                                &child_pri,
+                                &mut child_data,
+                                fk_value,
+                            ),
+                            (None, None) => {
+                                return Err(NoxuError::IllegalArgument(
+                                    "ForeignKeyDeleteAction::Nullify requires a \
+                                     ForeignKeyNullifier or \
+                                     ForeignMultiKeyNullifier on the \
+                                     SecondaryConfig"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        if modified {
+                            // Re-put the modified record under the
+                            // caller's txn.  Auto-maintenance on the
+                            // child primary handles clearing the stale
+                            // secondary entries.
+                            primary.lock().put(txn, &child_pri, &child_data)?;
+                        }
+                    }
+                    Ok(())
+                })();
+
+                FK_CASCADE_GUARD.with(|c| {
+                    c.borrow_mut().remove(&(db_id, fk_bytes));
+                });
+
+                nullify_result
+            }
+        }
+    }
+
+    fn name(&self) -> String {
+        self.inner.get_database_name().to_string()
+    }
+}
 
 /// A secondary (index) database handle.
 ///
@@ -127,14 +614,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// let secondary = SecondaryDatabase::open(primary_db, "my_index", sec_config)?;
 /// ```
 pub struct SecondaryDatabase {
-    /// The underlying secondary index storage (sec_key -> pri_key).
-    inner: Database,
-    /// The primary database this index is associated with.
-    primary: Arc<Mutex<Database>>,
-    /// The secondary configuration (holds key creator callback, etc.).
-    config: SecondaryConfig,
-    /// Whether this secondary is fully populated (not in incremental mode).
-    is_fully_populated: AtomicBool,
+    /// All shared state behind an `Arc` so the primary registry can
+    /// keep `Weak<dyn SecondaryHook + Send + Sync>` references
+    /// (Decision 1B / audit C3).  Every public method on
+    /// `SecondaryDatabase` accesses the fields through `state.field`.
+    state: Arc<SecondaryHookState>,
 }
 
 impl SecondaryDatabase {
@@ -149,7 +633,10 @@ impl SecondaryDatabase {
     /// * `config` - The secondary configuration (must include a key creator).
     ///
     /// # Errors
-    /// - [`NoxuError::IllegalArgument`] if the configuration is invalid.
+    /// - [`NoxuError::IllegalArgument`] if the configuration is invalid,
+    ///   or if the inner `secondary_db` was not opened with
+    ///   [`DatabaseConfig::with_sorted_duplicates(true)`] (v1.6 sorted-dup
+    ///   secondaries — closes audit C4).
     /// - [`NoxuError::Unsupported`] if the configuration sets any foreign-key
     ///   constraint field (`foreign_key_database`,
     ///   `foreign_key_delete_action != Abort`, `foreign_key_nullifier`, or
@@ -168,31 +655,81 @@ impl SecondaryDatabase {
             .validate(primary_read_only)
             .map_err(NoxuError::IllegalArgument)?;
 
-        // Decision 2C: reject FK configurations in v1.5.  The fields are
-        // accepted by the builder for forward source compatibility (v1.6
-        // will honour them) but the runtime cannot enforce them today, so
-        // we surface a typed error at open time rather than silently
-        // ignoring user configuration.  Closes audit findings C2 / F1 /
-        // F16.
-        if config.has_foreign_key_config() {
-            return Err(NoxuError::Unsupported(
-                "foreign-key constraints are not supported in v1.5; clear \
-                 SecondaryConfig.foreign_key_database / \
-                 foreign_key_delete_action / foreign_key_nullifier / \
-                 foreign_multi_key_nullifier (planned for v1.6)"
+        // v1.6 (Decision 1B / audit C4): the inner secondary index DB
+        // must be opened with sorted_duplicates so multiple primary
+        // records can share the same secondary key as duplicates of
+        // the (sec_key) entry.  Reject otherwise — in v1.5 we used
+        // Put::NoOverwrite and surfaced cross-primary collisions as
+        // NoxuError::Unsupported; v1.6 stores them as duplicates.
+        if !secondary_db.get_config().sorted_duplicates {
+            return Err(NoxuError::IllegalArgument(
+                "v1.6 secondary databases require the inner index DB to \
+                 be opened with DatabaseConfig::with_sorted_duplicates(true) \
+                 — see docs/src/internal/v1.5-decisions-2026-05.md Decision 1B"
                     .to_string(),
             ));
         }
 
-        let sec = SecondaryDatabase {
+        // v1.6 (audit C2 / Decision 2C): foreign-key constraints are
+        // now enforced when the user supplies the foreign DB handle
+        // via [`SecondaryConfig::with_foreign_key_database_handle`].
+        // The `name`-only setter remains advisory — a config that
+        // names a foreign DB but never wires the handle is rejected
+        // here so the user is not silently left with an unenforced
+        // constraint.  Cascade / Nullify still require the handle and
+        // the matching nullifier (steps 9 / 10).
+        let fk_handle = config.foreign_key_database.clone();
+        if config.foreign_key_database_name.is_some() && fk_handle.is_none() {
+            return Err(NoxuError::IllegalArgument(
+                "SecondaryConfig.foreign_key_database_name is set without \
+                 a foreign_key_database handle; v1.6 FK enforcement requires \
+                 calling SecondaryConfig::with_foreign_key_database_handle()"
+                    .to_string(),
+            ));
+        }
+        if (config.foreign_key_nullifier.is_some()
+            || config.foreign_multi_key_nullifier.is_some())
+            && fk_handle.is_none()
+        {
+            return Err(NoxuError::IllegalArgument(
+                "foreign-key nullifier is set without a foreign_key_database \
+                 handle (call SecondaryConfig::with_foreign_key_database_handle)"
+                    .to_string(),
+            ));
+        }
+
+        let state = Arc::new(SecondaryHookState {
             inner: secondary_db,
             primary,
             config,
             is_fully_populated: AtomicBool::new(true),
-        };
+        });
+
+        // v1.6 (audit C3): register the secondary on the primary so
+        // future `Database::put` / `Database::delete` calls fan out to
+        // it automatically.  We downgrade to `Weak` so dropping the
+        // `SecondaryDatabase` handle removes it from the registry on
+        // the next iteration.
+        {
+            let weak: std::sync::Weak<dyn SecondaryHook + Send + Sync> =
+                Arc::downgrade(&state) as _;
+            state.primary.lock().register_secondary(weak);
+        }
+
+        // v1.6 (audit C2 / Decision 2C): if the secondary references a
+        // foreign primary DB, register as an FK referrer there so its
+        // `Database::delete` can call back into us with the configured
+        // ForeignKeyDeleteAction.
+        if let Some(fk_handle) = fk_handle {
+            let weak: std::sync::Weak<dyn FkReferrer + Send + Sync> =
+                Arc::downgrade(&state) as _;
+            fk_handle.lock().register_fk_referrer(weak);
+        }
+
+        let sec = SecondaryDatabase { state };
 
         // If allow_populate and the secondary is empty, populate from primary.
-        if sec.config.allow_populate {
+        if sec.state.config.allow_populate {
             sec.populate_if_empty()?;
         }
 
@@ -205,26 +742,26 @@ impl SecondaryDatabase {
 
     /// Returns the database name of the secondary index.
     pub fn get_database_name(&self) -> &str {
-        self.inner.get_database_name()
+        self.state.inner.get_database_name()
     }
 
     /// Returns the secondary configuration.
     ///
     ///
     pub fn get_config(&self) -> &SecondaryConfig {
-        &self.config
+        &self.state.config
     }
 
     /// Returns whether this handle is open.
     pub fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        self.state.inner.is_valid()
     }
 
     /// Closes the secondary database handle.
     ///
     ///
     pub fn close(&self) -> Result<()> {
-        self.inner.close()
+        self.state.inner.close()
     }
 
     /// Returns the number of records in the secondary index.
@@ -238,7 +775,7 @@ impl SecondaryDatabase {
     /// Returns [`NoxuError::DatabaseClosed`] if the secondary handle has
     /// been closed.
     pub fn count(&self) -> Result<u64> {
-        self.inner.count()
+        self.state.inner.count()
     }
 
     /// Returns `true` if any record with the given secondary key exists.
@@ -255,7 +792,7 @@ impl SecondaryDatabase {
         key: &DatabaseEntry,
     ) -> Result<bool> {
         let mut data = DatabaseEntry::new();
-        let status = self.inner.get(txn, key, &mut data)?;
+        let status = self.state.inner.get(txn, key, &mut data)?;
         Ok(status == OperationStatus::Success)
     }
 
@@ -283,7 +820,7 @@ impl SecondaryDatabase {
         // Walk every (sec_key, pri_key) pair via a primary-table-style
         // scan and delete each.  The inner index is an ordinary
         // Database, so this is just a cursor scan + delete.
-        let mut cursor = self.inner.open_cursor(None, None)?;
+        let mut cursor = self.state.inner.open_cursor(None, None)?;
         let mut sec_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         // get_first returns NotFound if the index is empty.
@@ -334,7 +871,7 @@ impl SecondaryDatabase {
 
         // Look up the secondary key in the index to get the primary key.
         let mut pri_key_entry = DatabaseEntry::new();
-        let status = self.inner.get(txn, key, &mut pri_key_entry)?;
+        let status = self.state.inner.get(txn, key, &mut pri_key_entry)?;
 
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
@@ -346,7 +883,7 @@ impl SecondaryDatabase {
         }
 
         // Now fetch the primary record.
-        let primary = self.primary.lock();
+        let primary = self.state.primary.lock();
         let pri_status = primary.get(txn, &pri_key_entry, data)?;
         if pri_status != OperationStatus::Success {
             // Secondary refers to a missing primary — integrity issue.
@@ -411,7 +948,7 @@ impl SecondaryDatabase {
 
             // 2. Delete the primary record.
             {
-                let primary = self.primary.lock();
+                let primary = self.state.primary.lock();
                 let _ = primary.delete(txn, &pri_key_entry)?;
             }
 
@@ -476,21 +1013,21 @@ impl SecondaryDatabase {
     ///
     ///
     pub fn start_incremental_population(&self) {
-        self.is_fully_populated.store(false, Ordering::Release);
+        self.state.is_fully_populated.store(false, Ordering::Release);
     }
 
     /// Ends incremental population mode.
     ///
     ///
     pub fn end_incremental_population(&self) {
-        self.is_fully_populated.store(true, Ordering::Release);
+        self.state.is_fully_populated.store(true, Ordering::Release);
     }
 
     /// Returns whether incremental population is currently enabled.
     ///
     ///
     pub fn is_incremental_population_enabled(&self) -> bool {
-        !self.is_fully_populated.load(Ordering::Acquire)
+        !self.state.is_fully_populated.load(Ordering::Acquire)
     }
 
     // ------------------------------------------------------------------
@@ -538,110 +1075,10 @@ impl SecondaryDatabase {
         old_data: Option<&DatabaseEntry>,
         new_data: Option<&DatabaseEntry>,
     ) -> Result<()> {
-        let key_creator = &self.config.key_creator;
-        let multi_key_creator = &self.config.multi_key_creator;
-
-        // Tombstones (both old and new are None) — nothing to do.
-        if old_data.is_none() && new_data.is_none() {
-            return Ok(());
-        }
-
-        if let Some(creator) = key_creator {
-            // Single-key creator path.
-            let old_sec_key = old_data.and_then(|od| {
-                let mut sk = DatabaseEntry::new();
-                // The inner.* borrow requires a temporary Database borrow.
-                // We use &self.inner directly, which satisfies the lifetime.
-                if creator.create_secondary_key(
-                    &self.inner,
-                    pri_key,
-                    od,
-                    &mut sk,
-                ) {
-                    Some(sk)
-                } else {
-                    None
-                }
-            });
-
-            let new_sec_key = new_data.and_then(|nd| {
-                let mut sk = DatabaseEntry::new();
-                if creator.create_secondary_key(
-                    &self.inner,
-                    pri_key,
-                    nd,
-                    &mut sk,
-                ) {
-                    Some(sk)
-                } else {
-                    None
-                }
-            });
-
-            let do_delete = old_sec_key.is_some()
-                && old_sec_key.as_ref() != new_sec_key.as_ref();
-            let do_insert = new_sec_key.is_some()
-                && new_sec_key.as_ref() != old_sec_key.as_ref();
-
-            if do_delete {
-                self.delete_sec_key(
-                    txn,
-                    old_sec_key.as_ref().unwrap(),
-                    pri_key,
-                )?;
-            }
-            if do_insert {
-                self.insert_sec_key(
-                    txn,
-                    new_sec_key.as_ref().unwrap(),
-                    pri_key,
-                )?;
-            }
-        } else if let Some(multi_creator) = multi_key_creator {
-            // Multi-key creator path.
-            let empty = Vec::<DatabaseEntry>::new();
-
-            let old_keys: Vec<DatabaseEntry> = if let Some(od) = old_data {
-                let mut keys = Vec::new();
-                multi_creator.create_secondary_keys(
-                    &self.inner,
-                    pri_key,
-                    od,
-                    &mut keys,
-                );
-                keys
-            } else {
-                empty.clone()
-            };
-
-            let new_keys: Vec<DatabaseEntry> = if let Some(nd) = new_data {
-                let mut keys = Vec::new();
-                multi_creator.create_secondary_keys(
-                    &self.inner,
-                    pri_key,
-                    nd,
-                    &mut keys,
-                );
-                keys
-            } else {
-                empty
-            };
-
-            // Delete keys that are no longer present.
-            for old_key in &old_keys {
-                if !new_keys.contains(old_key) {
-                    self.delete_sec_key(txn, old_key, pri_key)?;
-                }
-            }
-            // Insert keys that were not present before.
-            for new_key in &new_keys {
-                if !old_keys.contains(new_key) {
-                    self.insert_sec_key(txn, new_key, pri_key)?;
-                }
-            }
-        }
-
-        Ok(())
+        // Delegated to the state so the [`SecondaryHook`] trait impl can
+        // share the same body when `Database::put` / `Database::delete`
+        // drives automatic maintenance (audit C3).
+        self.state.update_secondary(txn, pri_key, old_data, new_data)
     }
 
     /// Removes all secondary index entries for the given primary key.
@@ -655,17 +1092,17 @@ impl SecondaryDatabase {
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
     ) -> Result<()> {
-        self.update_secondary(txn, pri_key, old_data, None)
+        self.state.update_secondary(txn, pri_key, old_data, None)
     }
 
     /// Returns a reference to the inner index `Database`.
     pub(crate) fn inner_db(&self) -> &Database {
-        &self.inner
+        &self.state.inner
     }
 
     /// Returns a reference to the primary `Database` (via the mutex).
     pub(crate) fn primary_db(&self) -> &Arc<Mutex<Database>> {
-        &self.primary
+        &self.state.primary
     }
 
     // ------------------------------------------------------------------
@@ -674,139 +1111,36 @@ impl SecondaryDatabase {
 
     /// Inserts a secondary index entry: (sec_key -> pri_key).
     ///
-    /// Decision 1B (`docs/src/internal/v1.5-decisions-2026-05.md`):
-    /// v1.5 secondaries are one-to-one.  We use
-    /// [`crate::put::Put::NoOverwrite`] so a collision — two distinct
-    /// primary keys mapping to the same secondary key — returns
-    /// [`OperationStatus::KeyExists`] from the cursor, which we surface
-    /// as a typed [`NoxuError::Unsupported`] explaining that sorted-dup
-    /// secondaries are planned for v1.6.
-    ///
-    /// Pre-Sprint-3 this used `Put::Overwrite`, which let the second
-    /// primary silently destroy the first primary's mapping (audit
-    /// finding C4).  The new behaviour is honest about what v1.5
-    /// supports.
+    /// v1.6 (Decision 1B / audit C4): the inner index DB is sorted-dup,
+    /// so multiple primary records that produce the same `sec_key` are
+    /// stored as duplicates of `sec_key`.  Delegates to the state-side
+    /// implementation so the [`SecondaryHook`] trait shares it.
     fn insert_sec_key(
         &self,
         txn: Option<&Transaction>,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        let mut cursor = self.make_inner_cursor(txn)?;
-        let status = cursor
-            .put(sec_key, pri_key, crate::put::Put::NoOverwrite)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        match status {
-            OperationStatus::Success => Ok(()),
-            OperationStatus::KeyExists => {
-                // Decision 1B: distinguish idempotent re-insert of the
-                // *same* (sec_key, pri_key) pair from a true cross-primary
-                // collision.  An idempotent re-insert is a misuse the
-                // documented manual-`update_secondary` pattern can produce
-                // (calling `update_secondary(pk, None, Some(data))` twice
-                // for the same primary instead of
-                // `update_secondary(pk, Some(old), Some(new))`); we treat
-                // it as a no-op so existing v1.4 callers do not break.
-                // A *cross-primary* collision is the v1.6-feature
-                // (sorted-dup secondaries) gap and is reported as
-                // [`NoxuError::Unsupported`].
-                let mut probe_key = sec_key.clone();
-                let mut existing_pk = DatabaseEntry::new();
-                let mut probe_cursor = self.make_inner_cursor(txn)?;
-                let probe_status = probe_cursor
-                    .get(
-                        &mut probe_key,
-                        &mut existing_pk,
-                        crate::get::Get::Search,
-                        None,
-                    )
-                    .map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?;
-                if probe_status == OperationStatus::Success
-                    && existing_pk.get_data() == pri_key.get_data()
-                {
-                    // Same primary key already mapped here — idempotent.
-                    return Ok(());
-                }
-                let sec_hex = sec_key
-                    .get_data()
-                    .map(|b| {
-                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    })
-                    .unwrap_or_default();
-                let existing_hex = existing_pk
-                    .get_data()
-                    .map(|b| {
-                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    })
-                    .unwrap_or_default();
-                let pri_hex = pri_key
-                    .get_data()
-                    .map(|b| {
-                        b.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    })
-                    .unwrap_or_default();
-                Err(NoxuError::Unsupported(format!(
-                    "v1.5 secondaries are one-to-one; primary key 0x{existing_hex} \
-                     already maps to secondary key 0x{sec_hex} (cannot also \
-                     map primary key 0x{pri_hex}; sorted-dup secondaries are \
-                     planned for v1.6)"
-                )))
-            }
-            other => Err(NoxuError::OperationNotAllowed(format!(
-                "unexpected put status from secondary index insert: {other:?}"
-            ))),
-        }
+        self.state.insert_sec_key(txn, sec_key, pri_key)
     }
 
-    /// Deletes a secondary index entry: (sec_key -> pri_key).
-    ///
-    /// `txn` is forwarded to the inner cursor so the delete participates
-    /// in the caller's transaction (Sprint 4½).
+    /// Deletes a secondary index entry: (sec_key -> pri_key).  Delegates
+    /// to the state-side implementation.
+    #[allow(dead_code)]
     fn delete_sec_key(
         &self,
         txn: Option<&Transaction>,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
-        // Find the exact (sec_key, pri_key) pair and delete it.
-        // For non-dup databases a simple key search suffices.
-        // For dup databases we need a SEARCH_BOTH, but since the inner
-        // database is always configured as a simple key->value store in our
-        // implementation (sec_key->pri_key, no dup support at the b-tree level),
-        // a key search is correct.
-        let mut cursor = self.make_inner_cursor(txn)?;
-        let mut stored_pk = DatabaseEntry::new();
-        // Clone sec_key because Cursor::get requires &mut but key is input-only for Search.
-        let mut sec_key_mut = sec_key.clone();
-        let status = cursor
-            .get(
-                &mut sec_key_mut,
-                &mut stored_pk,
-                crate::get::Get::Search,
-                None,
-            )
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-
-        if status == OperationStatus::Success {
-            // Verify the stored primary key matches before deleting.
-            if stored_pk.get_data() == pri_key.get_data() {
-                cursor.delete().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-            }
-        }
-        // If not found, the secondary may already have been cleaned up; ignore.
-        Ok(())
+        self.state.delete_sec_key(txn, sec_key, pri_key)
     }
 
     /// Builds a writable `Cursor` on the inner secondary index `Database`.
-    ///
-    /// `txn` is forwarded to [`Database::open_cursor`] so writes through
-    /// the cursor participate in the caller's transaction (Sprint 4½).
+    /// Delegates to the state-side implementation.
+    #[allow(dead_code)]
     fn make_inner_cursor(&self, txn: Option<&Transaction>) -> Result<Cursor> {
-        self.inner.open_cursor(txn, None)
+        self.state.inner.open_cursor(txn, None)
     }
 
     /// Builds a `SecondaryCursor` on this secondary database (internal).
@@ -828,13 +1162,13 @@ impl SecondaryDatabase {
     /// Population logic in `SecondaryDatabase.init`.
     fn populate_if_empty(&self) -> Result<()> {
         // Check if the secondary is empty.
-        let sec_count = self.inner.count()?;
+        let sec_count = self.state.inner.count()?;
         if sec_count > 0 {
             return Ok(());
         }
 
         // Use direct CursorImpl scan to access both key and value.
-        let primary = self.primary.lock();
+        let primary = self.state.primary.lock();
         self.populate_from_primary_scan(&primary)?;
 
         Ok(())
@@ -862,20 +1196,22 @@ impl SecondaryDatabase {
             // Create secondary key(s) and insert them.  Population runs
             // at `SecondaryDatabase::open` time, before any user txn
             // exists, so we auto-commit each insert (`txn = None`).
-            if let Some(creator) = &self.config.key_creator {
+            if let Some(creator) = &self.state.config.key_creator {
                 let mut sec_key = DatabaseEntry::new();
                 if creator.create_secondary_key(
-                    &self.inner,
+                    &self.state.inner,
                     &pri_key,
                     &pri_data,
                     &mut sec_key,
                 ) {
                     self.insert_sec_key(None, &sec_key, &pri_key)?;
                 }
-            } else if let Some(multi_creator) = &self.config.multi_key_creator {
+            } else if let Some(multi_creator) =
+                &self.state.config.multi_key_creator
+            {
                 let mut sec_keys = Vec::new();
                 multi_creator.create_secondary_keys(
-                    &self.inner,
+                    &self.state.inner,
                     &pri_key,
                     &pri_data,
                     &mut sec_keys,
@@ -895,7 +1231,7 @@ impl SecondaryDatabase {
 
     /// Checks that this database is open.
     fn check_open(&self) -> Result<()> {
-        if !self.inner.is_valid() {
+        if !self.state.inner.is_valid() {
             return Err(NoxuError::DatabaseClosed);
         }
         Ok(())
@@ -903,7 +1239,7 @@ impl SecondaryDatabase {
 
     /// Checks that this database is readable (not in incremental population mode).
     fn check_readable(&self) -> Result<()> {
-        if !self.is_fully_populated.load(Ordering::Acquire) {
+        if !self.state.is_fully_populated.load(Ordering::Acquire) {
             return Err(NoxuError::OperationNotAllowed(
                 "Incremental population is currently enabled".to_string(),
             ));
@@ -968,7 +1304,10 @@ mod tests {
         env: &Environment,
         name: &str,
     ) -> SecondaryDatabase {
-        let sec_db_config = DatabaseConfig::new().with_allow_create(true);
+        // v1.6 sorted-dup secondaries: inner index DB must allow dups.
+        let sec_db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true);
         let sec_db = env.open_database(None, name, &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()
             .with_allow_create(true)
@@ -1202,7 +1541,9 @@ mod tests {
         }
 
         // Open secondary with allow_populate=true.
-        let sec_db_config = DatabaseConfig::new().with_allow_create(true);
+        let sec_db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true);
         let sec_db =
             env.open_database(None, "secondary_pop", &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()

@@ -210,6 +210,18 @@ none of them have non-test callers in the repository.
   `SecondaryConfig` so source written against v1.6 keeps compiling
   on v1.5; the rejection fires only when an FK-configured config
   reaches `open`.
+
+  > **v1.6 (Wave 2A) update.** Foreign-key constraints are now
+  > enforced.  Use the new
+  > `SecondaryConfig::with_foreign_key_database_handle(Arc<Mutex<Database>>)`
+  > setter to register the foreign primary's runtime handle; the
+  > legacy `with_foreign_key_database(name)` setter is retained as
+  > advisory but combining `name` *without* `handle` is rejected with
+  > `NoxuError::IllegalArgument`.  All three actions — Abort,
+  > Cascade (transitive, with cycle detection), Nullify (single-key
+  > and multi-key) — work end-to-end under the caller's txn.  See
+  > [Wave 2A — Secondary database unification](../internal/wave-2a-secondary-unification.md).
+
 * **`SecondaryDatabase` cross-primary collisions return
   `NoxuError::Unsupported`.** Decision 1B. v1.4.x silently overwrote
   the first primary's secondary entry when a second primary produced
@@ -218,6 +230,18 @@ none of them have non-test callers in the repository.
   re-inserts of the same `(sec_key, pri_key)` pair remain a no-op so
   v1.4 callers that relied on `update_secondary(pk, None, Some(d))`
   twice for the same primary keep working.
+
+  > **v1.6 (Wave 2A) update.** v1.6 secondaries are sorted-dup, so
+  > many primaries may share a secondary key.  The inner secondary
+  > database **must** be opened with
+  > `DatabaseConfig::with_sorted_duplicates(true)`; without it,
+  > `SecondaryDatabase::open` returns `NoxuError::IllegalArgument`.
+  > Cross-primary inserts succeed and the cursor's new
+  > `get_next_dup_full` / `get_prev_dup_full` walk the duplicate run.
+  > Additionally, `Database::put` / `Database::delete` now drive
+  > every registered secondary automatically under the caller's
+  > txn — manual `update_secondary` calls are no longer required
+  > (but still supported for population paths).
 
 ## Behaviour changes (Sprint 3A — XA in-process only)
 

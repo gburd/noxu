@@ -1424,7 +1424,9 @@ mod secondary_cursor_txn {
             .open_database(
                 None,
                 "sec",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_sorted_duplicates(true),
             )
             .unwrap();
         let sec_config = SecondaryConfig::new()
