@@ -84,6 +84,7 @@ pub mod rep_stats;
 
 // Master transfer
 pub mod master_transfer;
+pub mod group_admin;
 
 // Network transport
 pub mod net;
