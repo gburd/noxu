@@ -20,6 +20,7 @@ use noxu_sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// A database environment.
 ///
@@ -67,6 +68,11 @@ pub struct Environment {
     /// Cached log manager — acquired once at open; None for non-transactional envs.
     /// Used by stat_fsync_count() to avoid env_impl.lock() on the stats hot path.
     log_manager: Option<Arc<LogManager>>,
+    /// Bookkeeping for `Environment::checkpoint(CheckpointConfig)` so that
+    /// `force` / `k_bytes` / `minutes` can gate whether the call actually
+    /// runs a checkpoint.  Audit transaction-env F6 (Wave 2C-4).
+    last_checkpoint_time: Mutex<Option<Instant>>,
+    last_checkpoint_end_lsn: Mutex<noxu_util::Lsn>,
 }
 
 /// Internal database handle state.
@@ -357,6 +363,8 @@ impl Environment {
             env_valid: AtomicBool::new(true),
             env_impl: env_impl_arc,
             log_manager,
+            last_checkpoint_time: Mutex::new(None),
+            last_checkpoint_end_lsn: Mutex::new(noxu_util::NULL_LSN),
         })
     }
 
@@ -429,6 +437,29 @@ impl Environment {
         config: &DatabaseConfig,
     ) -> Result<Database> {
         self.check_open()?;
+
+        // Audit transaction-env F5 (Wave 2C-4): on a read-only env,
+        // open_database must not create new databases nor open existing
+        // ones in writable mode.  Pre-fix the request silently created an
+        // in-memory-only database (no WAL backing) which violated the
+        // "no write operations" guarantee in the user-facing docs.
+        if self.config.read_only {
+            if config.allow_create {
+                return Err(NoxuError::OperationNotAllowed(
+                    "open_database: cannot create a database on a read-only \
+                     environment (DatabaseConfig::with_allow_create(true))"
+                        .to_string(),
+                ));
+            }
+            if !config.read_only {
+                return Err(NoxuError::OperationNotAllowed(
+                    "open_database: read-only environment requires the \
+                     database to be opened read-only \
+                     (DatabaseConfig::with_read_only(true))"
+                        .to_string(),
+                ));
+            }
+        }
 
         if name.is_empty() {
             return Err(NoxuError::IllegalArgument(
@@ -523,7 +554,7 @@ impl Environment {
         _txn: Option<&Transaction>,
         name: &str,
     ) -> Result<()> {
-        self.check_open()?;
+        self.check_writable("remove_database")?;
 
         let mut databases = self.databases.lock();
         {
@@ -554,7 +585,7 @@ impl Environment {
         _txn: Option<&Transaction>,
         name: &str,
     ) -> Result<u64> {
-        self.check_open()?;
+        self.check_writable("truncate_database")?;
         let env_impl = self.env_impl.lock();
         env_impl.truncate_database(name).map_err(|e| match &e {
             noxu_dbi::DbiError::DatabaseNotFound(_) => {
@@ -588,7 +619,7 @@ impl Environment {
         old_name: &str,
         new_name: &str,
     ) -> Result<()> {
-        self.check_open()?;
+        self.check_writable("rename_database")?;
 
         if old_name == new_name {
             return Ok(());
@@ -658,6 +689,21 @@ impl Environment {
             ));
         }
 
+        // Audit transaction-env F5 (Wave 2C-4): on a read-only env, only
+        // explicitly read-only transactions are allowed.  A writable txn
+        // on a read-only env was previously accepted but every commit
+        // silently no-op'd because `log_manager` was None.
+        if self.config.read_only
+            && !config.map(|c| c.read_only).unwrap_or(false)
+        {
+            return Err(NoxuError::OperationNotAllowed(
+                "begin_transaction: read-only environment requires the \
+                 transaction to be read-only \
+                 (TransactionConfig::with_read_only(true))"
+                    .to_string(),
+            ));
+        }
+
         // Decision 3B (v1.5-decisions-2026-05.md): nested transactions are
         // not supported.  Pre-Sprint-3 the parameter was named `_parent` and
         // silently ignored, which is exactly the F11 audit finding.  We now
@@ -683,11 +729,34 @@ impl Environment {
         // user opening with `.with_durability(COMMIT_NO_SYNC)` and then
         // calling `begin_transaction(None, None)` still fsynced on every
         // commit.
-        let txn_config = match config.cloned() {
+        // Audit transaction-env F4 (Wave 2C-4): the env-level
+        // `txn_no_sync` / `txn_write_no_sync` flags now apply to explicit
+        // commits as well as auto-commit.  When neither config nor
+        // env-default sets a durability override, derive one from the
+        // boolean flags.  An explicit `with_durability(...)` on the
+        // TransactionConfig still wins.
+        let mut txn_config = match config.cloned() {
             Some(c) => c,
             None => TransactionConfig::default()
                 .with_durability(self.config.durability),
         };
+        if config.is_none() {
+            // No caller config: env flags can override the inherited
+            // durability if they request a less-strict sync policy.
+            let derived = match (
+                self.config.txn_no_sync,
+                self.config.txn_write_no_sync,
+            ) {
+                (true, _) => Some(crate::durability::Durability::COMMIT_NO_SYNC),
+                (_, true) => {
+                    Some(crate::durability::Durability::COMMIT_WRITE_NO_SYNC)
+                }
+                _ => None,
+            };
+            if let Some(d) = derived {
+                txn_config = txn_config.with_durability(d);
+            }
+        }
 
         let txn_state = Arc::new(TransactionState {
             id: txn_id,
@@ -824,12 +893,30 @@ impl Environment {
         self.check_open()?;
         if let Some(sz) = cfg.cache_size {
             self.config.cache_size = sz as u64;
+            // Audit transaction-env F7 (Wave 2C-4): push the cache-size
+            // change to the evictor's Arbiter so it actually takes
+            // effect at runtime; pre-fix the value was only recorded in
+            // `self.config`.
+            let env_impl = self.env_impl.lock();
+            let evictor = env_impl.get_evictor();
+            evictor.get_arbiter().set_max_memory(sz as i64);
         }
         if let Some(ms) = cfg.lock_timeout_ms {
             self.config.lock_timeout_ms = ms;
+            // Push the new default to the live LockManager.
+            let env_impl = self.env_impl.lock();
+            env_impl.get_lock_manager().set_lock_timeout(ms);
         }
         if let Some(ms) = cfg.txn_timeout_ms {
             self.config.txn_timeout_ms = ms;
+            // The TxnManager does not currently track a default txn
+            // timeout (each Txn snapshots the value at `begin_txn` from
+            // its own TransactionConfig).  We record the new env-level
+            // default here so that future `begin_transaction` calls that
+            // rely on the env default pick it up; live txns keep their
+            // original timeout.  Tracked under transaction-env F7
+            // residual; pushing into running txns requires a TxnManager
+            // API change beyond Wave 2C-4.
         }
         self.config.txn_no_sync = cfg.txn_no_sync;
         self.config.txn_write_no_sync = cfg.txn_write_no_sync;
@@ -859,12 +946,87 @@ impl Environment {
     /// # Errors
     /// Returns an error if the environment is closed, invalidated, or if the
     /// checkpoint itself fails (e.g. disk write error).
-    pub fn checkpoint(&self, _config: Option<&CheckpointConfig>) -> Result<()> {
+    pub fn checkpoint(&self, config: Option<&CheckpointConfig>) -> Result<()> {
         self.check_open()?;
+
+        // Audit transaction-env F6 (Wave 2C-4): honour `force` /
+        // `k_bytes` / `minutes` / `minimize_recovery_time` in
+        // `CheckpointConfig`.  Pre-fix the entire config was a no-op.
+        // Threshold gating happens in the wrapper layer; the underlying
+        // `noxu_recovery::Checkpointer::do_checkpoint` is invoker-only.
+        let cfg = config.cloned().unwrap_or_default();
+
+        if !cfg.force {
+            // k_bytes: skip the checkpoint if not enough log bytes have
+            // been written since the last successful checkpoint.
+            if cfg.k_bytes > 0 {
+                let cur_lsn = self
+                    .log_manager
+                    .as_ref()
+                    .map(|lm| lm.get_end_of_log())
+                    .unwrap_or(noxu_util::NULL_LSN);
+                let last = *self.last_checkpoint_end_lsn.lock();
+                let bytes_written = cur_lsn
+                    .as_u64()
+                    .saturating_sub(last.as_u64());
+                let threshold = (cfg.k_bytes as u64) * 1024;
+                if bytes_written < threshold {
+                    log::debug!(
+                        "checkpoint: skipping (k_bytes threshold {} not \
+                         met, only {} bytes since last checkpoint)",
+                        threshold,
+                        bytes_written,
+                    );
+                    return Ok(());
+                }
+            }
+
+            // minutes: skip the checkpoint if not enough wall-clock time
+            // has elapsed since the last successful checkpoint.
+            if cfg.minutes > 0 {
+                let last_at = *self.last_checkpoint_time.lock();
+                if let Some(at) = last_at {
+                    let elapsed = at.elapsed();
+                    let threshold =
+                        std::time::Duration::from_secs(cfg.minutes as u64 * 60);
+                    if elapsed < threshold {
+                        log::debug!(
+                            "checkpoint: skipping (minutes threshold {:?} \
+                             not met, only {:?} since last checkpoint)",
+                            threshold,
+                            elapsed,
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // `minimize_recovery_time` is currently advisory — the recovery
+        // checkpointer always writes the full set of dirty BINs; the
+        // "minimal" path requires a pluggable BIN-flush filter that is
+        // outside the scope of Wave 2C-4.  We surface the request in the
+        // invoker label so it shows up in structured logs.
+        let invoker = match (cfg.force, cfg.minimize_recovery_time) {
+            (true, true) => "manual_force_full",
+            (true, false) => "manual_force",
+            (false, true) => "manual_full",
+            (false, false) => "manual",
+        };
+
         let env_impl = self.env_impl.lock();
         env_impl
-            .run_checkpoint()
-            .map_err(|e| NoxuError::environment(e.to_string()))
+            .run_checkpoint_with_invoker(invoker)
+            .map_err(|e| NoxuError::environment(e.to_string()))?;
+        drop(env_impl);
+
+        // Update bookkeeping so subsequent threshold-gated calls can
+        // honour `k_bytes` / `minutes`.
+        *self.last_checkpoint_time.lock() = Some(Instant::now());
+        if let Some(lm) = &self.log_manager {
+            *self.last_checkpoint_end_lsn.lock() = lm.get_end_of_log();
+        }
+        Ok(())
     }
 
     /// Returns `true` if the environment is open and has not been invalidated by a fatal error.
@@ -1029,6 +1191,20 @@ impl Environment {
                 "environment has been invalidated due to a prior fatal error"
                     .to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Audit transaction-env F5 (Wave 2C-4): every mutating env-layer
+    /// operation funnels through this helper so a `read_only=true`
+    /// environment cannot create / remove / rename / truncate databases
+    /// nor begin a (writable) transaction.
+    fn check_writable(&self, what: &str) -> Result<()> {
+        self.check_open()?;
+        if self.config.read_only {
+            return Err(NoxuError::OperationNotAllowed(format!(
+                "{what}: environment is read-only",
+            )));
         }
         Ok(())
     }
@@ -1635,5 +1811,173 @@ mod tests {
         env.close().unwrap();
         let mc = EnvironmentMutableConfig::new();
         assert!(env.set_mutable_config(mc).is_err());
+    }
+
+    // ========================================================================
+    // Audit transaction-env F4 / F5 / F6 / F7 / F10 — Wave 2C-4
+    // ========================================================================
+
+    /// F5 — read-only env rejects database creation.
+    #[test]
+    fn test_read_only_env_rejects_create_database() {
+        // First create the env writably so the directory exists.
+        let temp_dir = TempDir::new().unwrap();
+        {
+            let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true);
+            let _env = Environment::open(config).unwrap();
+        }
+        // Re-open read-only.
+        let ro_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+            .with_read_only(true)
+            .with_transactional(true);
+        let env = Environment::open(ro_config).unwrap();
+
+        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        let result = env.open_database(None, "new", &db_cfg);
+        assert!(
+            result.is_err(),
+            "open_database with allow_create on read-only env must fail",
+        );
+    }
+
+    /// F5 — read-only env rejects remove_database.
+    #[test]
+    fn test_read_only_env_rejects_remove_database() {
+        let temp_dir = TempDir::new().unwrap();
+        {
+            let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true);
+            let _env = Environment::open(config).unwrap();
+        }
+        let ro_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+            .with_read_only(true)
+            .with_transactional(true);
+        let env = Environment::open(ro_config).unwrap();
+
+        assert!(env.remove_database(None, "test").is_err());
+        assert!(env.truncate_database(None, "test").is_err());
+        assert!(env.rename_database(None, "a", "b").is_err());
+    }
+
+    /// F5 — read-only env rejects writable transactions.
+    #[test]
+    fn test_read_only_env_rejects_writable_txn() {
+        let temp_dir = TempDir::new().unwrap();
+        {
+            let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true);
+            let _env = Environment::open(config).unwrap();
+        }
+        let ro_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+            .with_read_only(true)
+            .with_transactional(true);
+        let env = Environment::open(ro_config).unwrap();
+
+        // Default txn config is writable — must be rejected.
+        let result = env.begin_transaction(None, None);
+        assert!(result.is_err(), "writable txn on read-only env must fail");
+
+        // Read-only txn must be allowed.
+        let ro_txn_cfg = TransactionConfig::default().with_read_only(true);
+        let _txn = env
+            .begin_transaction(None, Some(&ro_txn_cfg))
+            .expect("read-only txn on read-only env must succeed");
+    }
+
+    /// F6 — checkpoint() with `force=false` and a fresh `minutes`
+    /// threshold skips the checkpoint when it has just run.
+    #[test]
+    fn test_checkpoint_minutes_threshold_skips() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+
+        // First call: runs (no prior checkpoint).
+        env.checkpoint(None).unwrap();
+
+        // Second call with minutes=60 and force=false: should skip.
+        let cfg = CheckpointConfig::default().with_minutes(60);
+        env.checkpoint(Some(&cfg)).unwrap();
+        // No assertion-able effect we can read here, but the call must
+        // succeed and not error.
+
+        // Third call with force=true must run regardless.
+        let cfg = CheckpointConfig::default()
+            .with_force(true)
+            .with_minutes(60);
+        env.checkpoint(Some(&cfg)).unwrap();
+        env.close().unwrap();
+    }
+
+    /// F7 — set_mutable_config(cache_size) pushes through to the
+    /// evictor's Arbiter.
+    #[test]
+    fn test_set_mutable_config_pushes_cache_size_to_evictor() {
+        let (_tmp, config) = temp_env_config();
+        let mut env = Environment::open(config).unwrap();
+
+        let mc = EnvironmentMutableConfig {
+            cache_size: Some(64 * 1024 * 1024),
+            ..EnvironmentMutableConfig::default()
+        };
+        env.set_mutable_config(mc).unwrap();
+
+        let env_impl = env.env_impl.lock();
+        let evictor = env_impl.get_evictor();
+        assert_eq!(
+            evictor.get_arbiter().get_max_memory(),
+            64 * 1024 * 1024,
+            "set_mutable_config(cache_size) must push to Arbiter",
+        );
+    }
+
+    /// F4 — env-level `txn_no_sync = true` makes explicit-txn commits
+    /// inherit COMMIT_NO_SYNC when the caller does not specify a
+    /// TransactionConfig.
+    #[test]
+    fn test_env_txn_no_sync_applies_to_explicit_txn() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_txn_no_sync(true);
+        let env = Environment::open(config).unwrap();
+
+        let txn = env.begin_transaction(None, None).unwrap();
+        // The transaction must have inherited COMMIT_NO_SYNC.
+        let dur = txn.get_durability().expect("durability must be set");
+        assert_eq!(
+            dur,
+            crate::durability::Durability::COMMIT_NO_SYNC,
+            "env txn_no_sync=true must propagate to explicit-txn durability",
+        );
+        txn.commit().unwrap();
+        env.close().unwrap();
+    }
+
+    /// F10 — dropping an open transaction performs an actual abort,
+    /// releasing locks instead of leaking them.
+    #[test]
+    fn test_drop_aborts_open_transaction() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+
+        let initial_active = env.active_txns.len();
+        {
+            let _txn = env.begin_transaction(None, None).unwrap();
+            assert_eq!(env.active_txns.len(), initial_active + 1);
+            // Drop _txn at scope exit without commit/abort.
+        }
+        // After drop, the active-txns registry must have pruned the entry.
+        assert_eq!(
+            env.active_txns.len(),
+            initial_active,
+            "Transaction::Drop must abort and prune from active_txns",
+        );
+        // close() must succeed because no txns remain registered.
+        env.close().unwrap();
     }
 }

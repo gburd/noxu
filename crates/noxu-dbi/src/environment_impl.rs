@@ -971,10 +971,22 @@ impl EnvironmentImpl {
     /// `noxu_recovery` as a direct dependency of that crate.
     /// Returns `Ok(())` if there is no checkpointer (read-only / non-txn env).
     pub fn run_checkpoint(&self) -> Result<(), DbiError> {
+        self.run_checkpoint_with_invoker("manual")
+    }
+
+    /// Variant of [`run_checkpoint`] that lets the caller supply a
+    /// non-default invoker label for structured logs / observability.
+    /// Used by `noxu-db::Environment::checkpoint` to thread the
+    /// `CheckpointConfig` semantics through to the recovery layer
+    /// (audit transaction-env F6, Wave 2C-4).
+    pub fn run_checkpoint_with_invoker(
+        &self,
+        invoker: &str,
+    ) -> Result<(), DbiError> {
         match &self.checkpointer {
             None => Ok(()),
             Some(ckpt) => {
-                ckpt.do_checkpoint("manual").map(|_| ()).map_err(|e| {
+                ckpt.do_checkpoint(invoker).map(|_| ()).map_err(|e| {
                     DbiError::EnvironmentFailure { reason: e.to_string() }
                 })
             }
