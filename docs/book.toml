@@ -28,7 +28,7 @@ git-repository-icon = "fa-github"
 edit-url-template = "https://codeberg.org/gregburd/noxu/src/branch/main/docs/src/{path}"
 # site-url is overridden per-deploy via MDBOOK_OUTPUT__HTML__SITE_URL env var:
 #   Codeberg Pages: /noxu/   (Woodpecker CI)
-#   GitHub Pages:  /lamdb/  (GitHub Actions mirror)
+#   GitHub Pages:  /noxu/  (GitHub Actions mirror)
 site-url = "/noxu/"
 fold.enable = true
 fold.level = 1
