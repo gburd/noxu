@@ -920,10 +920,8 @@ impl RecoveryManager {
     ) -> hashbrown::HashMap<u64, Vec<crate::analysis_result::PreparedLnReplay>>
     {
         use crate::analysis_result::{PreparedLnOperation, PreparedLnReplay};
-        let mut by_txn: hashbrown::HashMap<
-            u64,
-            Vec<PreparedLnReplay>,
-        > = hashbrown::HashMap::new();
+        let mut by_txn: hashbrown::HashMap<u64, Vec<PreparedLnReplay>> =
+            hashbrown::HashMap::new();
         if analysis.prepared_txns.is_empty() {
             return by_txn;
         }

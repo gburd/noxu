@@ -1006,10 +1006,7 @@ impl Environment {
     /// [`Self::take_recovered_prepared_lns`] and applied them.
     ///
     /// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
-    pub fn write_txn_commit_for_recovered(
-        &self,
-        txn_id: u64,
-    ) -> Result<()> {
+    pub fn write_txn_commit_for_recovered(&self, txn_id: u64) -> Result<()> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
             None => return Ok(()), // Non-transactional env (shouldn't happen).
@@ -1023,10 +1020,7 @@ impl Environment {
 
     /// Writes a `TxnAbort` WAL frame for `txn_id`.  Used by `xa_rollback(xid)`
     /// to durably resolve a recovered prepared transaction.
-    pub fn write_txn_abort_for_recovered(
-        &self,
-        txn_id: u64,
-    ) -> Result<()> {
+    pub fn write_txn_abort_for_recovered(&self, txn_id: u64) -> Result<()> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
             None => return Ok(()),
@@ -1195,13 +1189,7 @@ fn write_txn_end_for_recovered(
             NULL_VLSN,
         )
     } else {
-        TxnEndEntry::new_abort(
-            txn_id as i64,
-            NULL_LSN,
-            timestamp,
-            0,
-            NULL_VLSN,
-        )
+        TxnEndEntry::new_abort(txn_id as i64, NULL_LSN, timestamp, 0, NULL_VLSN)
     };
 
     let entry_type = if is_commit {
@@ -1213,14 +1201,14 @@ fn write_txn_end_for_recovered(
     let mut buf = BytesMut::with_capacity(entry.log_size());
     entry.write_to_log(&mut buf);
 
-    lm.log(entry_type, &buf, Provisional::No, flush, fsync)
-        .map(|_| ())
-        .map_err(|e| {
+    lm.log(entry_type, &buf, Provisional::No, flush, fsync).map(|_| ()).map_err(
+        |e| {
             NoxuError::environment_with_reason(
                 crate::error::EnvironmentFailureReason::LogWrite,
                 e.to_string(),
             )
-        })
+        },
+    )
 }
 
 impl Drop for Environment {

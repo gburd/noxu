@@ -13,8 +13,7 @@ use bytes::Bytes;
 use noxu_log::{
     FileManager,
     entry::{
-        BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry,
-        TxnPrepareEntry,
+        BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry, TxnPrepareEntry,
     },
     entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     entry_type::LogEntryType,

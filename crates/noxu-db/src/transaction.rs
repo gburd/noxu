@@ -490,10 +490,9 @@ impl Transaction {
                 let g = inner.lock().unwrap();
                 (g.first_lsn(), g.last_lsn())
             }
-            None => (
-                noxu_util::NULL_LSN.as_u64(),
-                noxu_util::NULL_LSN.as_u64(),
-            ),
+            None => {
+                (noxu_util::NULL_LSN.as_u64(), noxu_util::NULL_LSN.as_u64())
+            }
         };
 
         // Write the durable TxnPrepare frame.  Skipped for read-only
@@ -523,11 +522,7 @@ impl Transaction {
             inner
                 .lock()
                 .unwrap()
-                .prepare(
-                    xid_format_id,
-                    xid_gtrid.to_vec(),
-                    xid_bqual.to_vec(),
-                )
+                .prepare(xid_format_id, xid_gtrid.to_vec(), xid_bqual.to_vec())
                 .map_err(NoxuError::from)?;
         }
 
@@ -629,9 +624,8 @@ impl Transaction {
                 let env_guard = env.lock();
                 for undo in undo_records {
                     let Some(abort_key) = undo.abort_key else { continue };
-                    let db_id = noxu_dbi::DatabaseId::new(
-                        undo.database_id as i64,
-                    );
+                    let db_id =
+                        noxu_dbi::DatabaseId::new(undo.database_id as i64);
                     let Some(db_arc) = env_guard.get_database_by_id(db_id)
                     else {
                         continue;
@@ -672,9 +666,7 @@ impl Transaction {
         xid_gtrid: &[u8],
         xid_bqual: &[u8],
     ) -> Result<()> {
-        use noxu_log::{
-            LogEntryType, Provisional, entry::TxnPrepareEntry,
-        };
+        use noxu_log::{LogEntryType, Provisional, entry::TxnPrepareEntry};
 
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

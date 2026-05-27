@@ -532,17 +532,14 @@ impl XaResource for XaEnvironment {
             // the inner txn.
             found = true;
         }
-        if let Some(rec) =
-            self.recovered_branches.lock().unwrap().remove(xid)
-        {
+        if let Some(rec) = self.recovered_branches.lock().unwrap().remove(xid) {
             // The XA TM has decided to forget this in-doubt branch
             // without resolving it.  Treat it as an implicit rollback
             // for durability: write a TxnAbort frame so a subsequent
             // recovery does not surface the XID again.  The data was
             // never applied (prepared LNs are not redone), so there is
             // nothing to undo in the tree.
-            let _ =
-                self.env.take_recovered_prepared_lns(rec.txn_id);
+            let _ = self.env.take_recovered_prepared_lns(rec.txn_id);
             self.env
                 .write_txn_abort_for_recovered(rec.txn_id)
                 .map_err(XaError::Db)?;

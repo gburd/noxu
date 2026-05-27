@@ -305,9 +305,8 @@ impl EnvironmentImpl {
         let mut recovered: HashMap<u64, noxu_tree::Tree> = HashMap::new();
         // Wave 3-2: prepared (XA in-doubt) transactions surfaced by
         // recovery.  Empty for fresh / clean-shutdown environments.
-        let mut recovered_prepared: Vec<
-            noxu_recovery::PreparedTxnInfo,
-        > = Vec::new();
+        let mut recovered_prepared: Vec<noxu_recovery::PreparedTxnInfo> =
+            Vec::new();
         let mut recovered_prepared_lns: HashMap<
             u64,
             Vec<noxu_recovery::PreparedLnReplay>,
@@ -361,22 +360,22 @@ impl EnvironmentImpl {
                 HashMap::new();
             recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
 
-            let recovery_info = match rmgr
-                .recover_all(&mut scanner, &mut recovery_trees, true)
-            {
-                Ok(info) => info,
-                Err(e) => {
-                    return Err(DbiError::RecoveryFailure {
-                        reason: e.to_string(),
-                    });
-                }
-            };
+            let recovery_info =
+                match rmgr.recover_all(&mut scanner, &mut recovery_trees, true)
+                {
+                    Ok(info) => info,
+                    Err(e) => {
+                        return Err(DbiError::RecoveryFailure {
+                            reason: e.to_string(),
+                        });
+                    }
+                };
 
             // Wave 3-2: capture in-doubt prepared (XA) transactions so
             // the XA layer can surface them via xa_recover() and resolve
             // them via xa_commit / xa_rollback.
             recovered_prepared = recovery_info.recovered_prepared_txns.clone();
-            recovered_prepared_lns = recovery_info.prepared_txn_lns.clone();
+            recovered_prepared_lns = recovery_info.prepared_txn_lns;
 
             // Install all recovered trees keyed by db_id so that
             // open_database() can transplant each into the matching DatabaseImpl.
