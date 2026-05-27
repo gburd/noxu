@@ -3,8 +3,18 @@
 
 Usage: wave1d_enumerate.py <je_package_subpath> <output_tsv>
 
-Where <je_package_subpath> is relative to /home/gburd/ws/je/test/, e.g.
+Where <je_package_subpath> is relative to $JE_HOME/test/, e.g.
   com/sleepycat/je/cleaner
+
+Environment:
+  JE_HOME             Path to the BDB-JE checkout (required).  The
+                      script reads $JE_HOME/test/<package>/*.java and
+                      derives test paths relative to $JE_HOME.
+  NOXU_INDEX_PATH     Path to the Noxu test index TSV (default:
+                      /tmp/noxu_test_index.tsv).  Build it once with
+                      `find crates -name '*.rs' | xargs grep -l '#\[test\]'
+                      | ...` (see the wave 1D narrative for the exact
+                      command).
 
 Strategy:
 - find *.java files in that directory (maxdepth 1)
@@ -14,8 +24,16 @@ Strategy:
 """
 import os, re, sys, json
 
-JE_TEST_ROOT = "/home/gburd/ws/je/test"
-NOXU_INDEX_PATH = "/tmp/noxu_test_index.tsv"
+JE_HOME = os.environ.get("JE_HOME")
+if not JE_HOME:
+    sys.exit(
+        "error: $JE_HOME is not set.  Point it at your local BDB-JE\n"
+        "checkout (e.g. export JE_HOME=$HOME/ws/je) and re-run."
+    )
+JE_TEST_ROOT = os.path.join(JE_HOME, "test")
+NOXU_INDEX_PATH = os.environ.get(
+    "NOXU_INDEX_PATH", "/tmp/noxu_test_index.tsv"
+)
 
 
 def load_noxu_index():
@@ -184,7 +202,7 @@ def main():
     header = "je_package\tje_class\tje_test_method\tje_test_path\tje_test_doc\tnoxu_status\tnoxu_test_path\tnoxu_test_method\teffort_estimate\tpriority\tnotes\n"
     counts = {'PORTED-EQUIVALENT':0,'PORTED-PARTIAL':0,'PORTED-MISSING':0,'NOT-PORTED':0,'OUT-OF-SCOPE':0}
     for fpath in files:
-        rel_path = os.path.relpath(fpath, "/home/gburd/ws/je")
+        rel_path = os.path.relpath(fpath, JE_HOME)
         for entry in (parse_java_file(fpath) or []):
             method = entry['method']
             doc = entry['doc'].replace('\t',' ').replace('\n',' ')

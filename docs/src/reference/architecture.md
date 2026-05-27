@@ -5,7 +5,7 @@ transactional key-value database. This chapter documents the system
 architecture, data flow, crate structure, and subsystem interactions.
 
 The canonical prose version of this document is also maintained at
-[`ARCHITECTURE.md`](https://github.com/gburd/lamdb/blob/main/ARCHITECTURE.md)
+[`ARCHITECTURE.md`](https://codeberg.org/gregburd/noxu/blob/main/ARCHITECTURE.md)
 in the repository root.
 
 ## Heritage

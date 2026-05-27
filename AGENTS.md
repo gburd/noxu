@@ -131,14 +131,18 @@ When auditing or extending subsystems, compare against the archived reference
 source if you have a local checkout (read-only — do not modify, and do not
 commit them; the `_/` path is gitignored):
 
-- **Core archive**: `_/je/src/`
-- **Extended-fork archive**: `_/nosql/kvmain/src/main/java/`
+- **Core archive (BDB-JE)**: place at `_/je/` (so the source tree lives at
+  `_/je/src/com/sleepycat/je/...`).  Some audit reports also reference
+  this as `$JE_HOME` — they're equivalent; pick whichever convention
+  suits your shell setup.
+- **Extended-fork archive (Oracle NoSQL DB)**: place at `_/nosql/` (so the
+  source tree lives at `_/nosql/kvmain/src/main/java/...`).  Some audit
+  reports also reference this as `$NOSQL_HOME`.
 
 These archives are not part of the repository. Contributors who do not have
 them can still build, test, and run Noxu DB; references to them in this
 document and in `docs/src/contributing/porting-guidelines.md` are guidance
 for porting work, not a build prerequisite.
-
 ## Development Guidelines
 
 When implementing or modifying subsystem code:
@@ -207,8 +211,8 @@ Agent skill files are in `.agent/skills/`:
 **Tool**: mdBook 0.4.40. **Source**: `docs/src/`. **Output**: `docs/book/`.
 
 Published at:
-- GitHub Pages: `https://gburd.github.io/lamdb/`
-- Codeberg Pages: `https://codeberg.page/gburd/lamdb`
+- GitHub Pages: `https://codeberg.page/gregburd/noxu/`
+- Codeberg Pages: `https://codeberg.page/gregburd/noxu`
 
 ### What belongs where
 
