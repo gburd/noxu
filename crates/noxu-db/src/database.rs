@@ -342,7 +342,7 @@ impl Database {
         // Apply newest-LSN first so multi-step writes (delete + reinsert)
         // unwind in reverse-operation order.  See the matching sort in
         // `Transaction::abort()`.
-        undo_records.sort_by(|a, b| b.current_lsn.cmp(&a.current_lsn));
+        undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
         let db_id_match = self.id;
         let db_guard = self.db_impl.read();
         let Some(tree) = db_guard.get_real_tree() else { return };
