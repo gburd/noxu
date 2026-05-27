@@ -469,6 +469,19 @@ impl ReplicatedEnvironment {
     ///
     /// If the quorum policy is `Flexible` or `Expression`, the quorum system
     /// is rebuilt to reflect the new capacity/latency weights.
+    ///
+    /// # Audit residual (rep F34, Wave 2C-4)
+    ///
+    /// `update_peer_metadata` does not currently re-run
+    /// `QuorumPolicy::validate(electable_count)` after the metadata
+    /// change.  An LP-optimal `Expression` quorum that was safe before
+    /// the update may no longer satisfy the intersection property
+    /// afterwards.  Until automatic revalidation lands, deployments
+    /// using `QuorumPolicy::Expression` should call
+    /// `quorum_policy().validate(get_rep_group().electable_count())`
+    /// on the returned `RepGroup` after every metadata change and
+    /// fail the operator-facing operation if validation reports
+    /// unsafety.
     pub fn update_peer_metadata(
         &self,
         name: &str,

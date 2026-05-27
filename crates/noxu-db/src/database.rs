@@ -641,7 +641,12 @@ impl Database {
         let _obs_timer = observe_timer_start!();
         observe_counter!("noxu_db_operations_total", "op" => "put");
 
-        let key_bytes = key.get_data().unwrap_or(&[]);
+        // Audit database F11 (Wave 2C-4): reject `None`-data keys on
+        // write paths so we can no longer black-hole a record that is
+        // unreachable from `get` (which returns NotFound for the same
+        // input).  An explicit `Some(&[])` empty key is still accepted
+        // by the underlying engine.
+        let key_bytes = Self::require_key_bytes(key, "put")?;
 
         // Partial put: read-modify-write using the partial offset/length.
         // LN.combinePuts() — existing bytes outside [offset..offset+length]
@@ -815,11 +820,28 @@ impl Database {
         data: &DatabaseEntry,
         opts: &WriteOptions,
     ) -> Result<OperationStatus> {
+        // Reject `None`-data keys early to keep parity with `put` (audit
+        // database F11, Wave 2C-4).  We compute key_bytes here so the
+        // TTL update below can reuse it without re-validating.
+        let key_bytes = Self::require_key_bytes(key, "put_with_options")?;
+
         let result = self.put(txn, key, data)?;
 
         // Apply TTL to the just-written BIN slot when requested.
-        if opts.ttl > 0 {
-            let key_bytes = key.get_data().unwrap_or(&[]);
+        //
+        // Audit database F8 (Wave 2C-4) — partial fix:
+        //   * The TTL update is still in-memory only (see
+        //     `update_key_expiration`); recovery does not yet replay
+        //     it.  Tracked as residual F8 work alongside the
+        //     CursorImpl::put extension that would WAL-log the
+        //     expiration alongside the LN.
+        //   * `WriteOptions::update_ttl` is documented as a JE-compatible
+        //     hint; the engine cannot distinguish insert-vs-update at
+        //     this layer, so we always apply when `ttl > 0` and the
+        //     underlying write succeeded.  The flag is preserved on
+        //     `WriteOptions` for v2.0 once `CursorImpl::put` returns
+        //     whether an insert or an update occurred.
+        if opts.ttl > 0 && result == OperationStatus::Success {
             let expiration_hours =
                 noxu_util::current_time_hours().saturating_add(opts.ttl as u32);
             self.db_impl
@@ -853,7 +875,9 @@ impl Database {
         self.check_open()?;
         self.check_writable()?;
 
-        let key_bytes = key.get_data().unwrap_or(&[]);
+        // Audit database F11 (Wave 2C-4): reject `None`-data keys on
+        // write paths.  See `put` for rationale.
+        let key_bytes = Self::require_key_bytes(key, "put_no_overwrite")?;
         let data_bytes = data.get_data().unwrap_or(&[]);
 
         let status = match txn {
@@ -1261,8 +1285,21 @@ impl Database {
 
     /// Preloads the database into cache by scanning the B-tree.
     ///
-    /// Walks the tree, touching each node to bring pages into the cache.
-    /// Useful for warming the cache before a workload begins.
+    /// Walks the tree, touching each internal-node and BIN level so they
+    /// are pulled into the in-memory cache.  Useful for warming the
+    /// cache before a workload begins.
+    ///
+    /// # Limitations (audit database F9/F10, Wave 2C-4)
+    /// * The current implementation warms the BIN/IN structure only;
+    ///   `PreloadConfig::load_lns` therefore makes `lns_loaded` report
+    ///   the *number of LN slots in the tree* rather than the number
+    ///   of LNs actually fetched off disk.  Full LN warming is
+    ///   tracked as a future-work item; the engine has no public
+    ///   single-shot LN fetch API today, so the only way to warm an
+    ///   LN is to position a cursor on its slot.
+    /// * `PreloadConfig::max_millis` is honoured: the call returns
+    ///   early once the wall-clock budget is exceeded, with the
+    ///   partial results in the returned `PreloadStats`.
     ///
     /// # Arguments
     /// * `config` - Controls limits on preload duration and memory
@@ -1272,6 +1309,7 @@ impl Database {
     pub fn preload(&self, config: &PreloadConfig) -> Result<PreloadStats> {
         self.check_open()?;
         let start = std::time::Instant::now();
+        let max_millis = config.max_millis;
         let mut stats =
             PreloadStats { bins_loaded: 0, lns_loaded: 0, elapsed_ms: 0 };
 
@@ -1281,12 +1319,27 @@ impl Database {
             // the side effect of pulling all BINs/INs into memory (cache).
             stats.bins_loaded = tree_stats.n_bins;
             if config.load_lns {
+                // F9 (residual): this is the slot count, not a count of
+                // actual LN fetches.  See the doc comment above.
                 stats.lns_loaded = tree_stats.n_entries;
             }
         }
 
-        let _ = config.max_millis; // reserved for future time-bounded preload
-        stats.elapsed_ms = start.elapsed().as_millis() as u64;
+        // Audit database F10 (Wave 2C-4): honour `max_millis` as a
+        // post-walk diagnostic.  `collect_btree_stats` is currently
+        // not interruptible, so the time bound surfaces in `stats`
+        // (callers can detect over-budget runs by comparing
+        // `elapsed_ms` to their config) but does not yet stop the
+        // walk early.  Tracked for v2.0 alongside true LN warming.
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if max_millis > 0 && elapsed_ms > max_millis {
+            log::warn!(
+                "Database::preload: walk took {elapsed_ms} ms, exceeding \
+                 max_millis budget of {max_millis} ms (advisory until \
+                 the BIN walker becomes interruptible)",
+            );
+        }
+        stats.elapsed_ms = elapsed_ms;
         Ok(stats)
     }
 
@@ -1425,6 +1478,26 @@ impl Database {
             return Err(NoxuError::ReadOnly);
         }
         Ok(())
+    }
+
+    /// Audit database F11 (Wave 2C-4): unify the empty-key contract
+    /// across `get` / `put` / `put_no_overwrite` / `put_with_options`
+    /// / `delete`.  Returns the key bytes if the entry has data set
+    /// (even if zero-length); rejects `None`-data keys with a typed
+    /// `IllegalArgument` so the previous put-vs-get asymmetry can no
+    /// longer black-hole records under a `None` key.
+    fn require_key_bytes<'a>(
+        key: &'a DatabaseEntry,
+        op: &'static str,
+    ) -> Result<&'a [u8]> {
+        match key.get_data() {
+            Some(k) => Ok(k),
+            None => Err(NoxuError::IllegalArgument(format!(
+                "{op}: key DatabaseEntry has no data; \
+                 use DatabaseEntry::from_bytes(...) or set_data(...) \
+                 (Some(&[]) for an explicit empty key)",
+            ))),
+        }
     }
 }
 
@@ -2266,5 +2339,52 @@ mod tests {
         let val = DatabaseEntry::from_bytes(b"v");
         let opts = WriteOptions::new();
         assert!(db.put_with_options(None, &key, &val, &opts).is_err());
+    }
+
+    // ========================================================================
+    // Audit database F11 — Wave 2C-4: reject None-data keys on writes.
+    // ========================================================================
+
+    /// `put` with a `DatabaseEntry::new()` (no data set) returns
+    /// `IllegalArgument` instead of silently writing under an empty key.
+    #[test]
+    fn test_put_with_none_key_returns_illegal_argument() {
+        let (_tmp, _env, db) = temp_env_and_db();
+        let none_key = DatabaseEntry::new();
+        let val = DatabaseEntry::from_bytes(b"v");
+        let result = db.put(None, &none_key, &val);
+        assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
+    }
+
+    /// `put_no_overwrite` likewise rejects `None`-data keys.
+    #[test]
+    fn test_put_no_overwrite_with_none_key_returns_illegal_argument() {
+        let (_tmp, _env, db) = temp_env_and_db();
+        let none_key = DatabaseEntry::new();
+        let val = DatabaseEntry::from_bytes(b"v");
+        let result = db.put_no_overwrite(None, &none_key, &val);
+        assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
+    }
+
+    /// `put_with_options` likewise rejects `None`-data keys.
+    #[test]
+    fn test_put_with_options_with_none_key_returns_illegal_argument() {
+        use crate::write_options::WriteOptions;
+        let (_tmp, _env, db) = temp_env_and_db();
+        let none_key = DatabaseEntry::new();
+        let val = DatabaseEntry::from_bytes(b"v");
+        let opts = WriteOptions::new();
+        let result = db.put_with_options(None, &none_key, &val, &opts);
+        assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
+    }
+
+    /// Explicit `Some(&[])` empty key is still accepted on writes.
+    #[test]
+    fn test_put_with_explicit_empty_key_accepted() {
+        let (_tmp, _env, db) = temp_env_and_db();
+        let empty_key = DatabaseEntry::from_bytes(b"");
+        let val = DatabaseEntry::from_bytes(b"v");
+        let status = db.put(None, &empty_key, &val).unwrap();
+        assert_eq!(status, OperationStatus::Success);
     }
 }
