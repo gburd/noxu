@@ -8,12 +8,10 @@
 //! Mapping table (JE -> Noxu):
 //! * `Key.createKeyPrefix(k1, k2)`        -> `key::create_key_prefix(k1, k2)`
 //! * `Key.compareKeys(k1, k2, null)`      -> `key::compare_keys(k1, k2, None)`
-//! * `IN.setKeyPrefix / getKeyPrefix`     -> tested at the IN level (covered
-//!                                           by other tree tests).  The
-//!                                           `keyPrefixSubsetTest` invariant
-//!                                           (a key's prefix must be a prefix
-//!                                           of another key) is captured by
-//!                                           the helper `is_prefix_of` here.
+//! * `IN.setKeyPrefix / getKeyPrefix`     -> tested at the IN level
+//!   (covered by other tree tests).  The `keyPrefixSubsetTest`
+//!   invariant (a key's prefix must be a prefix of another key) is
+//!   captured by the helper `is_prefix_of` here.
 
 use std::cmp::Ordering;
 
@@ -45,7 +43,7 @@ fn test_key_prefixer() {
 fn key_prefix_is_prefix_of(key_prefix: Option<&[u8]>, new_key: &[u8]) -> bool {
     match key_prefix {
         None => false,
-        Some(p) if p.is_empty() => false,
+        Some([]) => false,
         Some(p) => p.len() <= new_key.len() && new_key.starts_with(p),
     }
 }
