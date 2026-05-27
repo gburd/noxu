@@ -235,6 +235,97 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
 }
 
+/// v1.6 sorted-dup secondaries (Decision 1B / audit C4): cursor
+/// `get_next_dup_full` enumerates every primary that shares a
+/// secondary key, in cursor order.
+#[test]
+fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let sec = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(FirstByteCreator)),
+    )
+    .unwrap();
+
+    // Three primaries share sec_key ‘A’ and one primary owns sec_key ‘B’.
+    for &(pk, val) in &[
+        (&b"pk1"[..], &b"Apple"[..]),
+        (&b"pk2"[..], &b"Apricot"[..]),
+        (&b"pk3"[..], &b"Avocado"[..]),
+        (&b"pk4"[..], &b"Banana"[..]),
+    ] {
+        let pk_e = DatabaseEntry::from_bytes(pk);
+        let v_e = DatabaseEntry::from_bytes(val);
+        primary.lock().put(None, &pk_e, &v_e).unwrap();
+        sec.update_secondary(None, &pk_e, None, Some(&v_e)).unwrap();
+    }
+
+    let mut cursor = sec.open_cursor(None, None).unwrap();
+    let mut sec_key = DatabaseEntry::new();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+
+    // Position on the first ‘A’ dup.
+    let st = cursor
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    let mut seen: Vec<Vec<u8>> = vec![p_key.get_data().unwrap().to_vec()];
+
+    loop {
+        let s = cursor
+            .get_next_dup_full(&mut sec_key, &mut p_key, &mut data)
+            .unwrap();
+        if s != OperationStatus::Success {
+            break;
+        }
+        assert_eq!(
+            sec_key.get_data().unwrap(),
+            b"A",
+            "get_next_dup_full must stay on the original sec_key"
+        );
+        seen.push(p_key.get_data().unwrap().to_vec());
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![b"pk1".to_vec(), b"pk2".to_vec(), b"pk3".to_vec()],
+        "all three primaries sharing sec_key ‘A’ must surface"
+    );
+
+    // get_prev_dup_full at the start of the run yields NotFound — we
+    // re-seek to the first ‘A’ dup explicitly because the previous loop
+    // exited after stepping past the run’s end.
+    let mut p_key2 = DatabaseEntry::new();
+    let mut data2 = DatabaseEntry::new();
+    let st2 = cursor
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key2,
+            &mut data2,
+        )
+        .unwrap();
+    assert_eq!(st2, OperationStatus::Success);
+    let prev_st = cursor
+        .get_prev_dup_full(&mut sec_key, &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(
+        prev_st,
+        OperationStatus::NotFound,
+        "get_prev_dup_full at the run start must report NotFound"
+    );
+}
+
 // ─── Decision 2C — FK config rejected at open ──────────────────────────
 
 /// Setting `foreign_key_database` on a `SecondaryConfig` causes
