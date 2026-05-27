@@ -1,22 +1,31 @@
-//! Regression tests for Sprint 3D — Decisions 1B and 2C from
-//! `docs/src/internal/v1.5-decisions-2026-05.md`.
+//! Wave 2A regression tests — v1.6 secondary unification.
 //!
-//! Each test asserts a documented v1.5 limitation:
+//! These tests cover three architectural decisions that were
+//! previously enforced as v1.5 limitations and are now FULLY
+//! IMPLEMENTED in v1.6:
 //!
-//! - **Decision 1B** — secondaries are one-to-one in v1.5.  Two distinct
-//!   primaries that produce the same secondary key cause the second
-//!   `update_secondary` to fail with [`NoxuError::Unsupported`] (closes
-//!   audit finding C4).
-//! - **Decision 2C** — foreign-key constraints are not enforced in v1.5.
-//!   `SecondaryDatabase::open` rejects any `SecondaryConfig` whose
-//!   foreign-key fields are set with [`NoxuError::Unsupported`] (closes
-//!   audit findings C2 / F1 / F16).
+//! * **Decision 1B (audit C4)** — sorted-dup secondaries: many
+//!   primaries may share a secondary key.  `Database::put` drives the
+//!   shared-key insert as a duplicate value; reads via
+//!   [`SecondaryCursor`] enumerate them.
+//! * **Decision 2C (audit C2)** — foreign-key constraints: `Abort`,
+//!   `Cascade`, and `Nullify` are honoured by `Database::delete` on
+//!   the FK-target primary.
+//! * **audit C3** — `associate()`-style automatic maintenance:
+//!   `Database::put` / `Database::delete` drive every registered
+//!   secondary inside the same txn without a manual `update_secondary`
+//!   call.
+//!
+//! See `docs/src/internal/wave-2a-secondary-unification.md`.
 
-use noxu_db::secondary_config::ForeignKeyDeleteAction;
+use noxu_db::secondary_config::{
+    ForeignKeyDeleteAction, ForeignKeyNullifier, ForeignMultiKeyNullifier,
+    SecondaryMultiKeyCreator,
+};
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     NoxuError, OperationStatus, SecondaryConfig, SecondaryDatabase,
-    SecondaryKeyCreator,
+    SecondaryKeyCreator, Transaction,
 };
 use noxu_sync::Mutex;
 use std::sync::Arc;
@@ -24,8 +33,6 @@ use tempfile::TempDir;
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
-/// First-byte secondary key creator (mirrors the `FirstByteCreator` used in
-/// `integration_test.rs::open_pri_sec`).
 struct FirstByteCreator;
 impl SecondaryKeyCreator for FirstByteCreator {
     fn create_secondary_key(
@@ -69,115 +76,100 @@ fn open_inner_sec_db(env: &Environment, name: &str) -> Database {
     env.open_database(
         None,
         name,
-        &DatabaseConfig::new().with_allow_create(true),
+        &DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true),
     )
     .unwrap()
 }
 
-// ─── Decision 1B — one-to-one secondaries ────────────────────
-
-/// Two distinct primary keys that map to the same secondary key cause the
-/// second insert to fail with [`NoxuError::Unsupported`].  Pre-Sprint-3 the
-/// inner index used `Put::Overwrite` and silently destroyed the first
-/// primary's mapping (audit finding C4).
-#[test]
-fn d1b_secondary_collision_returns_unsupported() {
-    let dir = TempDir::new().unwrap();
-    let env = open_env(&dir);
-    let primary = open_pri(&env, "primary");
-    let inner = open_inner_sec_db(&env, "secondary");
-    let sec = SecondaryDatabase::open(
-        Arc::clone(&primary),
+fn open_basic_secondary(
+    env: &Environment,
+    primary: Arc<Mutex<Database>>,
+    name: &str,
+) -> SecondaryDatabase {
+    let inner = open_inner_sec_db(env, name);
+    SecondaryDatabase::open(
+        primary,
         inner,
         SecondaryConfig::new()
             .with_allow_create(true)
+            .with_sorted_duplicates(true)
             .with_key_creator(Box::new(FirstByteCreator)),
     )
-    .unwrap();
+    .unwrap()
+}
 
-    // First primary record: pk1 -> "Apple" (sec_key = 'A'). Succeeds.
+// ─── Decision 1B — sorted-dup secondaries ─────────────────────────────
+
+/// v1.6: two distinct primary keys that map to the same secondary key
+/// COEXIST as duplicates of `sec_key`.  Pre-v1.6 the second insert
+/// returned `NoxuError::Unsupported` (Decision 1B / audit C4).
+#[test]
+fn d1b_secondary_collision_now_succeeds_v16() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let sec = open_basic_secondary(&env, Arc::clone(&primary), "secondary");
+
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let v1 = DatabaseEntry::from_bytes(b"Apple");
     primary.lock().put(None, &pk1, &v1).unwrap();
-    sec.update_secondary(None, &pk1, None, Some(&v1)).unwrap();
 
-    // Sanity: lookup by 'A' returns pk1.
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let st = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-
-    // Second primary record: pk2 -> "Apricot" (sec_key = 'A'). MUST fail.
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
     let v2 = DatabaseEntry::from_bytes(b"Apricot");
     primary.lock().put(None, &pk2, &v2).unwrap();
-    let result = sec.update_secondary(None, &pk2, None, Some(&v2));
 
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("one-to-one"),
-                "expected one-to-one wording: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v1.6"),
-                "expected v1.5 and v1.6 references: {msg}"
-            );
-        }
-        Ok(()) => panic!(
-            "second update_secondary must fail with NoxuError::Unsupported, \
-             got Ok"
-        ),
-        Err(other) => panic!(
-            "second update_secondary must fail with NoxuError::Unsupported, \
-             got: {other:?}"
-        ),
-    }
-
-    // Decision 1B (honesty): the first primary's mapping is preserved
-    // because we used Put::NoOverwrite.  The user sees a loud failure
-    // *and* their existing index is intact.
+    // Both primaries are now indexed under sec_key 'A'.  Read them
+    // via the cursor.
+    let mut cursor = sec.open_cursor(None, None).unwrap();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let st = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+    let st = cursor
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
         .unwrap();
     assert_eq!(st, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    let mut found: Vec<Vec<u8>> = vec![p_key.get_data().unwrap().to_vec()];
+    loop {
+        let mut sk = DatabaseEntry::new();
+        let mut pk = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        match cursor.get_next_dup(&mut sk, &mut pk, &mut d).unwrap() {
+            OperationStatus::Success => {
+                found.push(pk.get_data().unwrap().to_vec());
+            }
+            _ => break,
+        }
+    }
+    found.sort();
+    assert_eq!(found, vec![b"pk1".to_vec(), b"pk2".to_vec()]);
 }
 
-/// The successful one-to-one path still works exactly as before — distinct
-/// secondary keys for distinct primaries inserts cleanly.
+/// v1.6 happy path: distinct first bytes still index cleanly.
 #[test]
 fn d1b_one_to_one_happy_path() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
-    let inner = open_inner_sec_db(&env, "secondary");
-    let sec = SecondaryDatabase::open(
-        Arc::clone(&primary),
-        inner,
-        SecondaryConfig::new()
-            .with_allow_create(true)
-            .with_key_creator(Box::new(FirstByteCreator)),
-    )
-    .unwrap();
+    let sec = open_basic_secondary(&env, Arc::clone(&primary), "secondary");
 
-    // Three distinct primaries with distinct first bytes — all succeed.
     let entries: &[(&[u8], &[u8])] =
         &[(b"pk1", b"Apple"), (b"pk2", b"Banana"), (b"pk3", b"Cherry")];
     for &(pk, val) in entries {
-        let pk = DatabaseEntry::from_bytes(pk);
-        let v = DatabaseEntry::from_bytes(val);
-        primary.lock().put(None, &pk, &v).unwrap();
-        sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
+        primary
+            .lock()
+            .put(
+                None,
+                &DatabaseEntry::from_bytes(pk),
+                &DatabaseEntry::from_bytes(val),
+            )
+            .unwrap();
     }
 
-    // Each maps back to its primary.
     let mappings: &[(u8, &[u8])] =
         &[(b'A', b"pk1"), (b'B', b"pk2"), (b'C', b"pk3")];
     for &(sec_byte, expected_pk) in mappings {
@@ -190,38 +182,26 @@ fn d1b_one_to_one_happy_path() {
     }
 }
 
-/// Updating the *same* primary record (key + sec_key both unchanged) is
-/// treated as an idempotent no-op — `Put::NoOverwrite` would otherwise
-/// reject the second call.  Without this, the documented manual
-/// `update_secondary(pk, None, Some(data))` call pattern would falsely
-/// report a collision when the user simply re-runs an init step.
+/// Idempotent re-insert of the same `(sec_key, pri_key)` pair through
+/// the manual `update_secondary` API is still a clean no-op.
 #[test]
 fn d1b_same_primary_idempotent_reinsert_ok() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
-    let inner = open_inner_sec_db(&env, "secondary");
-    let sec = SecondaryDatabase::open(
-        Arc::clone(&primary),
-        inner,
-        SecondaryConfig::new()
-            .with_allow_create(true)
-            .with_key_creator(Box::new(FirstByteCreator)),
-    )
-    .unwrap();
+    let sec = open_basic_secondary(&env, Arc::clone(&primary), "secondary");
 
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
     primary.lock().put(None, &pk, &v).unwrap();
 
-    // First insert into secondary.
+    // The auto-maintenance hook already inserted the (sec_key, pri_key)
+    // pair.  Calling update_secondary manually is a no-op (the inner
+    // sorted-dup put is `Put::NoOverwrite` which silently treats an
+    // existing pair as success).
+    sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
     sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
 
-    // Same (pk, sec_key) again — must be a no-op, not a collision error.
-    sec.update_secondary(None, &pk, None, Some(&v))
-        .expect("re-inserting the same primary key for the same sec key must be idempotent");
-
-    // Lookup still succeeds.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
@@ -231,22 +211,132 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
 }
 
-// ─── Decision 2C — FK config rejected at open ──────────────────────────
-
-/// Setting `foreign_key_database` on a `SecondaryConfig` causes
-/// `SecondaryDatabase::open` to return `NoxuError::Unsupported`.
+/// v1.6 many-to-one + cursor enumeration: 5 primaries with the same
+/// first byte all coexist.
 #[test]
-fn d2c_foreign_key_database_rejected_at_open() {
+fn d1b_many_to_one_five_primaries() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let primary = open_pri(&env, "primary");
-    let inner = open_inner_sec_db(&env, "secondary");
-    // The foreign DB no longer needs to exist as a real handle: the
-    // FK setter takes a name string in v1.5.1 (Wave 1C) and
-    // SecondaryDatabase::open rejects FK config at open time per
-    // Decision 2C.  We still create the DB to keep the test honest
-    // about the v1.6 wiring — once FK is implemented the engine will
-    // resolve the name to this handle.
+    let sec = open_basic_secondary(&env, Arc::clone(&primary), "secondary");
+
+    let entries: &[(&[u8], &[u8])] = &[
+        (b"pk1", b"Apple"),
+        (b"pk2", b"Apricot"),
+        (b"pk3", b"Avocado"),
+        (b"pk4", b"Almond"),
+        (b"pk5", b"Anchovy"),
+    ];
+    for &(pk, val) in entries {
+        primary
+            .lock()
+            .put(
+                None,
+                &DatabaseEntry::from_bytes(pk),
+                &DatabaseEntry::from_bytes(val),
+            )
+            .unwrap();
+    }
+
+    let mut cursor = sec.open_cursor(None, None).unwrap();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = cursor
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+
+    let mut found = vec![p_key.get_data().unwrap().to_vec()];
+    loop {
+        let mut sk = DatabaseEntry::new();
+        let mut pk = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        match cursor.get_next_dup(&mut sk, &mut pk, &mut d).unwrap() {
+            OperationStatus::Success => {
+                found.push(pk.get_data().unwrap().to_vec());
+            }
+            _ => break,
+        }
+    }
+    found.sort();
+    let mut expected: Vec<Vec<u8>> =
+        entries.iter().map(|(pk, _)| pk.to_vec()).collect();
+    expected.sort();
+    assert_eq!(found, expected);
+}
+
+/// v1.6: deleting one primary leaves the rest of the duplicate set
+/// intact in the secondary.
+#[test]
+fn d1b_delete_one_primary_leaves_others() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let sec = open_basic_secondary(&env, Arc::clone(&primary), "secondary");
+
+    for &(pk, val) in &[
+        (&b"pk1"[..], &b"Apple"[..]),
+        (&b"pk2"[..], &b"Apricot"[..]),
+        (&b"pk3"[..], &b"Avocado"[..]),
+    ] {
+        primary
+            .lock()
+            .put(
+                None,
+                &DatabaseEntry::from_bytes(pk),
+                &DatabaseEntry::from_bytes(val),
+            )
+            .unwrap();
+    }
+
+    primary
+        .lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"pk2"))
+        .unwrap();
+
+    let mut cursor = sec.open_cursor(None, None).unwrap();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = cursor
+        .get_search_key(
+            &DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data,
+        )
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+
+    let mut found = vec![p_key.get_data().unwrap().to_vec()];
+    loop {
+        let mut sk = DatabaseEntry::new();
+        let mut pk = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        match cursor.get_next_dup(&mut sk, &mut pk, &mut d).unwrap() {
+            OperationStatus::Success => {
+                found.push(pk.get_data().unwrap().to_vec());
+            }
+            _ => break,
+        }
+    }
+    found.sort();
+    assert_eq!(found, vec![b"pk1".to_vec(), b"pk3".to_vec()]);
+}
+
+// ─── Decision 2C — FK constraints ─────────────────────────────────────
+
+/// `SecondaryDatabase::open` accepts FK config when
+/// `open_with_foreign_key` is used and the FK target Database handle
+/// is supplied.  `SecondaryDatabase::open()` (no FK) refuses the
+/// config.
+#[test]
+fn d2c_fk_config_requires_open_with_foreign_key() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
     let _foreign = env
         .open_database(
             None,
@@ -254,120 +344,586 @@ fn d2c_foreign_key_database_rejected_at_open() {
             &DatabaseConfig::new().with_allow_create(true),
         )
         .unwrap();
-
-    let cfg = SecondaryConfig::new()
-        .with_allow_create(true)
-        .with_key_creator(Box::new(FirstByteCreator))
-        .with_foreign_key_database("foreign");
-
-    let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
-    match result {
-        Err(NoxuError::Unsupported(msg)) => {
-            assert!(
-                msg.contains("foreign-key"),
-                "expected foreign-key wording: {msg}"
-            );
-            assert!(
-                msg.contains("v1.5") && msg.contains("v1.6"),
-                "expected v1.5 and v1.6 references: {msg}"
-            );
-        }
-        Ok(_) => panic!(
-            "SecondaryDatabase::open with foreign_key_database must fail \
-             with NoxuError::Unsupported"
-        ),
-        Err(other) => panic!(
-            "SecondaryDatabase::open with foreign_key_database must fail \
-             with NoxuError::Unsupported, got: {other:?}"
-        ),
-    }
-}
-
-/// Setting `foreign_key_delete_action = Cascade` (any non-`Abort` value) is
-/// also rejected at open.
-#[test]
-fn d2c_foreign_key_delete_action_cascade_rejected_at_open() {
-    let dir = TempDir::new().unwrap();
-    let env = open_env(&dir);
-    let primary = open_pri(&env, "primary");
     let inner = open_inner_sec_db(&env, "secondary");
 
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
+        .with_sorted_duplicates(true)
         .with_key_creator(Box::new(FirstByteCreator))
-        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
+        .with_foreign_key_database("foreign");
 
+    // Plain SecondaryDatabase::open with FK fields set is rejected.
     let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
-    assert!(
-        matches!(result, Err(NoxuError::Unsupported(_))),
-        "non-Abort delete action must be rejected with Unsupported"
+    assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
+}
+
+/// `ForeignKeyDeleteAction::Abort` blocks the parent delete with a
+/// typed [`NoxuError::ForeignConstraintViolation`] when the parent has
+/// at least one referrer; the parent record stays intact.
+#[test]
+fn d2c_abort_blocks_parent_delete() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let parent = open_pri(&env, "parent");
+    let child = open_pri(&env, "child");
+
+    // Child secondary indexed by first byte of child's data; FK target
+    // = parent.
+    let inner = open_inner_sec_db(&env, "child_fk_index");
+    let fk_cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("parent")
+        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Abort);
+    let _child_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&child),
+        inner,
+        fk_cfg,
+        Arc::clone(&parent),
+    )
+    .unwrap();
+
+    // Insert parent record P_A (FK key 'A'), then a child whose value
+    // first-byte is 'A' (so it references P_A).
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"parent-A"),
+        )
+        .unwrap();
+    child
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"c1"),
+            &DatabaseEntry::from_bytes(b"A-child-data"),
+        )
+        .unwrap();
+
+    // Attempt to delete parent A: must fail with FK violation.
+    let result =
+        parent.lock().delete(None, &DatabaseEntry::from_bytes(b"A"));
+    match result {
+        Err(NoxuError::ForeignConstraintViolation(_)) => {}
+        other => panic!("expected ForeignConstraintViolation, got {other:?}"),
+    }
+
+    // Parent is still present, child untouched.
+    let mut buf = DatabaseEntry::new();
+    assert_eq!(
+        parent
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"A"), &mut buf)
+            .unwrap(),
+        OperationStatus::Success
+    );
+    let mut cbuf = DatabaseEntry::new();
+    assert_eq!(
+        child
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"c1"), &mut cbuf)
+            .unwrap(),
+        OperationStatus::Success
     );
 }
 
-/// A `ForeignKeyNullifier` set on the config is also rejected at open.
+/// `ForeignKeyDeleteAction::Cascade` deletes referring children when
+/// the referenced parent is deleted.
 #[test]
-fn d2c_foreign_key_nullifier_rejected_at_open() {
-    use noxu_db::secondary_config::ForeignKeyNullifier;
+fn d2c_cascade_deletes_children() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let parent = open_pri(&env, "parent");
+    let child = open_pri(&env, "child");
 
-    struct NullNullifier;
-    impl ForeignKeyNullifier for NullNullifier {
+    let inner = open_inner_sec_db(&env, "child_fk_index");
+    let fk_cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("parent")
+        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
+    let _child_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&child),
+        inner,
+        fk_cfg,
+        Arc::clone(&parent),
+    )
+    .unwrap();
+
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"parent-A"),
+        )
+        .unwrap();
+    for i in 1..=3 {
+        let pk = format!("c{i}").into_bytes();
+        let val = format!("A-c{i}").into_bytes();
+        child
+            .lock()
+            .put(
+                None,
+                &DatabaseEntry::from_bytes(&pk),
+                &DatabaseEntry::from_bytes(&val),
+            )
+            .unwrap();
+    }
+
+    parent
+        .lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"A"))
+        .unwrap();
+
+    // All three children are gone.
+    for i in 1..=3 {
+        let pk = format!("c{i}").into_bytes();
+        let mut buf = DatabaseEntry::new();
+        let st = child
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(&pk), &mut buf)
+            .unwrap();
+        assert_eq!(
+            st,
+            OperationStatus::NotFound,
+            "child {} should have been cascade-deleted",
+            String::from_utf8_lossy(&pk)
+        );
+    }
+}
+
+/// Cascade is transitive: parent → child → grandchild.  Deleting
+/// parent fires both the parent→child cascade and (recursively) the
+/// child→grandchild cascade.
+#[test]
+fn d2c_cascade_transitive_three_levels() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let parent = open_pri(&env, "parent");
+    let child = open_pri(&env, "child");
+    let grand = open_pri(&env, "grand");
+
+    let child_inner = open_inner_sec_db(&env, "child_idx");
+    let _child_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&child),
+        child_inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database("parent")
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade),
+        Arc::clone(&parent),
+    )
+    .unwrap();
+
+    let grand_inner = open_inner_sec_db(&env, "grand_idx");
+    let _grand_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&grand),
+        grand_inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database("child")
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade),
+        Arc::clone(&child),
+    )
+    .unwrap();
+
+    // parent['A'], child['c1'] -> 'A...', grand['g1'] -> 'c1...'  but
+    // we're using FirstByteCreator so the FK keys are SINGLE BYTES.
+    // Use single-byte primary keys throughout.
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"parent-A"),
+        )
+        .unwrap();
+    // child 'C', value first-byte 'A' (refs parent A)
+    child
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"C"),
+            &DatabaseEntry::from_bytes(b"A-child"),
+        )
+        .unwrap();
+    // grandchild 'G', value first-byte 'C' (refs child C)
+    grand
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"G"),
+            &DatabaseEntry::from_bytes(b"C-grand"),
+        )
+        .unwrap();
+
+    // Delete parent A.
+    parent
+        .lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"A"))
+        .unwrap();
+
+    // child C is gone (parent→child cascade).
+    let mut buf = DatabaseEntry::new();
+    assert_eq!(
+        child
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"C"), &mut buf)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    // grandchild G is gone (child→grand cascade chained).
+    let mut gbuf = DatabaseEntry::new();
+    assert_eq!(
+        grand
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"G"), &mut gbuf)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+}
+
+/// Cascade cycle detection: A → B → A.  Delete on A must surface a
+/// typed `ForeignConstraintViolation` rather than infinite-loop.
+#[test]
+fn d2c_cascade_cycle_detection() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let a_db = open_pri(&env, "a");
+    let b_db = open_pri(&env, "b");
+
+    // a_secondary on a_db references b_db (so b deletes cascade into a)
+    let a_inner = open_inner_sec_db(&env, "a_idx");
+    let _a_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&a_db),
+        a_inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database("b")
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade),
+        Arc::clone(&b_db),
+    )
+    .unwrap();
+    // b_secondary on b_db references a_db
+    let b_inner = open_inner_sec_db(&env, "b_idx");
+    let _b_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&b_db),
+        b_inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database("a")
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade),
+        Arc::clone(&a_db),
+    )
+    .unwrap();
+
+    // Set up a circular reference: a['X'] -> "Y..." (refs b Y),
+    //                              b['Y'] -> "X..." (refs a X).
+    a_db.lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"X"),
+            &DatabaseEntry::from_bytes(b"Y-data"),
+        )
+        .unwrap();
+    b_db.lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"Y"),
+            &DatabaseEntry::from_bytes(b"X-data"),
+        )
+        .unwrap();
+
+    // Delete a['X'] — the cascade chain is a[X] → b[Y] → a[X] (cycle).
+    let result = a_db.lock().delete(None, &DatabaseEntry::from_bytes(b"X"));
+    match result {
+        Err(NoxuError::ForeignConstraintViolation(msg)) => {
+            assert!(
+                msg.contains("cycle") || msg.contains("in flight"),
+                "expected cycle detection wording, got: {msg}"
+            );
+        }
+        other => panic!("expected ForeignConstraintViolation, got {other:?}"),
+    }
+}
+
+/// `Nullify` (single-key): zeroes out the FK field via the user's
+/// nullifier.
+#[test]
+fn d2c_nullify_single_key() {
+    struct ZeroNullifier;
+    impl ForeignKeyNullifier for ZeroNullifier {
         fn nullify_foreign_key(
             &self,
             _db: &Database,
-            _data: &mut DatabaseEntry,
+            data: &mut DatabaseEntry,
         ) -> bool {
+            // Zero out the first byte (the FK reference) and keep the rest.
+            if let Some(d) = data.get_data()
+                && !d.is_empty()
+            {
+                let mut new_data = d.to_vec();
+                new_data[0] = 0;
+                data.set_data(&new_data);
+                return true;
+            }
             false
         }
     }
 
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
-    let primary = open_pri(&env, "primary");
-    let inner = open_inner_sec_db(&env, "secondary");
+    let parent = open_pri(&env, "parent");
+    let child = open_pri(&env, "child");
 
+    let inner = open_inner_sec_db(&env, "child_idx");
+    let _child_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&child),
+        inner,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(FirstByteCreator))
+            .with_foreign_key_database("parent")
+            .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
+            .with_foreign_key_nullifier(Box::new(ZeroNullifier)),
+        Arc::clone(&parent),
+    )
+    .unwrap();
+
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"parent-A"),
+        )
+        .unwrap();
+    child
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"c1"),
+            &DatabaseEntry::from_bytes(b"A-data"),
+        )
+        .unwrap();
+
+    parent
+        .lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"A"))
+        .unwrap();
+
+    // child still exists with a zeroed FK byte.
+    let mut data = DatabaseEntry::new();
+    let st = child
+        .lock()
+        .get(None, &DatabaseEntry::from_bytes(b"c1"), &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    let bytes = data.get_data().unwrap();
+    assert_eq!(bytes[0], 0);
+    assert_eq!(&bytes[1..], b"-data");
+}
+
+/// `Nullify` (multi-key): each nullified key is removed from the
+/// child's data.
+#[test]
+fn d2c_nullify_multi_key() {
+    struct CommaSplitMulti;
+    impl SecondaryMultiKeyCreator for CommaSplitMulti {
+        fn create_secondary_keys(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            results: &mut Vec<DatabaseEntry>,
+        ) {
+            // Split data at commas; each part is a secondary key.
+            if let Some(d) = data.get_data() {
+                for part in d.split(|b| *b == b',') {
+                    if !part.is_empty() {
+                        results.push(DatabaseEntry::from_bytes(part));
+                    }
+                }
+            }
+        }
+    }
+    struct CommaRemover;
+    impl ForeignMultiKeyNullifier for CommaRemover {
+        fn nullify_foreign_key(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &mut DatabaseEntry,
+            secondary_key: &DatabaseEntry,
+        ) -> bool {
+            let target = match secondary_key.get_data() {
+                Some(t) => t.to_vec(),
+                None => return false,
+            };
+            let bytes = match data.get_data() {
+                Some(b) => b.to_vec(),
+                None => return false,
+            };
+            let parts: Vec<&[u8]> = bytes
+                .split(|b| *b == b',')
+                .filter(|p| *p != target.as_slice())
+                .collect();
+            let mut new_data: Vec<u8> = Vec::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    new_data.push(b',');
+                }
+                new_data.extend_from_slice(part);
+            }
+            data.set_data(&new_data);
+            true
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let parent = open_pri(&env, "parent");
+    let child = open_pri(&env, "child");
+
+    let inner = open_inner_sec_db(&env, "child_idx");
     let cfg = SecondaryConfig::new()
         .with_allow_create(true)
-        .with_key_creator(Box::new(FirstByteCreator))
+        .with_sorted_duplicates(true)
+        .with_multi_key_creator(Box::new(CommaSplitMulti))
+        .with_foreign_key_database("parent")
         .with_foreign_key_delete_action(ForeignKeyDeleteAction::Nullify)
-        .with_foreign_key_nullifier(Box::new(NullNullifier));
+        .with_foreign_multi_key_nullifier(Box::new(CommaRemover));
+    let _child_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&child),
+        inner,
+        cfg,
+        Arc::clone(&parent),
+    )
+    .unwrap();
 
-    let result = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg);
-    assert!(
-        matches!(result, Err(NoxuError::Unsupported(_))),
-        "foreign_key_nullifier must be rejected with Unsupported"
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"alpha"),
+            &DatabaseEntry::from_bytes(b"parent-alpha"),
+        )
+        .unwrap();
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"beta"),
+            &DatabaseEntry::from_bytes(b"parent-beta"),
+        )
+        .unwrap();
+    child
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"c1"),
+            &DatabaseEntry::from_bytes(b"alpha,beta,gamma"),
+        )
+        .unwrap();
+
+    // Delete parent alpha — child c1 should now be "beta,gamma".
+    parent
+        .lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"alpha"))
+        .unwrap();
+
+    let mut data = DatabaseEntry::new();
+    let st = child
+        .lock()
+        .get(None, &DatabaseEntry::from_bytes(b"c1"), &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(data.get_data().unwrap(), b"beta,gamma");
+}
+
+/// FK Abort under an explicit txn: aborting the txn leaves no side
+/// effects.
+#[test]
+fn d2c_abort_under_txn_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let parent = open_pri(&env, "parent");
+    let child = open_pri(&env, "child");
+
+    let inner = open_inner_sec_db(&env, "child_idx");
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database("parent")
+        .with_foreign_key_delete_action(ForeignKeyDeleteAction::Cascade);
+    let _child_sec = SecondaryDatabase::open_with_foreign_key(
+        Arc::clone(&child),
+        inner,
+        cfg,
+        Arc::clone(&parent),
+    )
+    .unwrap();
+
+    parent
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"parent-A"),
+        )
+        .unwrap();
+    child
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"c1"),
+            &DatabaseEntry::from_bytes(b"A-c1"),
+        )
+        .unwrap();
+
+    // Begin txn, delete parent (cascade deletes child), abort txn.
+    let txn = env.begin_transaction(None, None).unwrap();
+    parent
+        .lock()
+        .delete(Some(&txn), &DatabaseEntry::from_bytes(b"A"))
+        .unwrap();
+    txn.abort().unwrap();
+
+    // Both records are restored.
+    let mut buf = DatabaseEntry::new();
+    assert_eq!(
+        parent
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"A"), &mut buf)
+            .unwrap(),
+        OperationStatus::Success
+    );
+    let mut cbuf = DatabaseEntry::new();
+    assert_eq!(
+        child
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"c1"), &mut cbuf)
+            .unwrap(),
+        OperationStatus::Success
     );
 }
 
-/// A clean (no FK fields set) `SecondaryConfig` still opens successfully —
-/// the rejection is surgical and does not regress the documented happy
-/// path.
-#[test]
-fn d2c_no_fk_config_opens_normally() {
-    let dir = TempDir::new().unwrap();
-    let env = open_env(&dir);
-    let primary = open_pri(&env, "primary");
-    let inner = open_inner_sec_db(&env, "secondary");
-
-    let cfg = SecondaryConfig::new()
-        .with_allow_create(true)
-        .with_key_creator(Box::new(FirstByteCreator));
-
-    let _sec = SecondaryDatabase::open(Arc::clone(&primary), inner, cfg)
-        .expect("secondary without FK fields must open cleanly");
-}
-
-// ─── Sprint 4½ — manual-update path participates in user txns ──────
-//
-// These tests assert that when the caller threads the same `txn`
-// through `Database::put` / `Database::delete` *and*
-// `SecondaryDatabase::update_secondary`, the primary write and the
-// secondary index entry commit or abort atomically.  Pre-Sprint-4½
-// `update_secondary` ran auto-committed regardless of any caller
-// txn, so an aborted primary `put` left the secondary entry behind
-// on disk — the partial-atomicity gap flagged by the Sprint 4 agent
-// (audit Theme 2 / finding F5).
-
-use noxu_db::Transaction;
+// ─── Audit C3 — automatic associate()-style maintenance ───────────────
 
 fn open_pri_sec_for_txn(
     dir: &TempDir,
@@ -376,19 +932,289 @@ fn open_pri_sec_for_txn(
 ) -> (Environment, Arc<Mutex<Database>>, SecondaryDatabase) {
     let env = open_env(dir);
     let primary = open_pri(&env, primary_name);
-    let inner = open_inner_sec_db(&env, secondary_name);
+    let sec = open_basic_secondary(&env, Arc::clone(&primary), secondary_name);
+    (env, primary, sec)
+}
+
+/// `db.put(Some(&txn), ...)` automatically updates registered
+/// secondaries inside `txn` — no manual `update_secondary` call.
+#[test]
+fn associate_put_under_txn_drives_secondary() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    primary
+        .lock()
+        .put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+}
+
+/// Aborting the user's txn rolls back BOTH the primary write AND the
+/// auto-driven secondary update.
+#[test]
+fn associate_abort_rolls_back_primary_and_secondary() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    primary
+        .lock()
+        .put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+    // The same txn sees its own write through the secondary.
+    {
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = sec
+            .get(
+                Some(&txn),
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+    }
+    txn.abort().unwrap();
+
+    // Primary is gone.
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        primary
+            .lock()
+            .get(None, &DatabaseEntry::from_bytes(b"pk1"), &mut data)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    // Secondary is gone.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+}
+
+/// Two registered secondaries on the same primary: a single
+/// `db.put(Some(&txn), ...)` updates BOTH inside `txn`.
+#[test]
+fn associate_two_secondaries_under_one_txn() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+
+    // Two secondaries: one on first byte, one on last byte.
+    let s1 = open_basic_secondary(&env, Arc::clone(&primary), "first_byte");
+
+    struct LastByteCreator;
+    impl SecondaryKeyCreator for LastByteCreator {
+        fn create_secondary_key(
+            &self,
+            _db: &Database,
+            _k: &DatabaseEntry,
+            data: &DatabaseEntry,
+            result: &mut DatabaseEntry,
+        ) -> bool {
+            if let Some(d) = data.get_data()
+                && !d.is_empty()
+            {
+                result.set_data(&d[d.len() - 1..]);
+                return true;
+            }
+            false
+        }
+    }
+    let inner2 = open_inner_sec_db(&env, "last_byte");
+    let s2 = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        inner2,
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(LastByteCreator)),
+    )
+    .unwrap();
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    primary
+        .lock()
+        .put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Apple"),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+
+    let mut p1 = DatabaseEntry::new();
+    let mut d1 = DatabaseEntry::new();
+    assert_eq!(
+        s1.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p1, &mut d1)
+            .unwrap(),
+        OperationStatus::Success
+    );
+
+    let mut p2 = DatabaseEntry::new();
+    let mut d2 = DatabaseEntry::new();
+    assert_eq!(
+        s2.get(None, &DatabaseEntry::from_bytes(b"e"), &mut p2, &mut d2)
+            .unwrap(),
+        OperationStatus::Success
+    );
+}
+
+/// V1 → V2 update: secondary is updated to the new sec_key under the
+/// same txn (delete old sec_key entry, insert new).
+#[test]
+fn associate_update_v1_v2_replaces_secondary_key() {
+    let dir = TempDir::new().unwrap();
+    let (env, primary, sec) =
+        open_pri_sec_for_txn(&dir, "primary", "secondary");
+
+    let txn = env.begin_transaction(None, None).unwrap();
+    primary
+        .lock()
+        .put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Mango"),
+        )
+        .unwrap();
+    primary
+        .lock()
+        .put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"Pineapple"),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+
+    // Old sec_key 'M' — gone.
+    let mut p = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    assert_eq!(
+        sec.get(None, &DatabaseEntry::from_bytes(b"M"), &mut p, &mut d)
+            .unwrap(),
+        OperationStatus::NotFound
+    );
+    // New sec_key 'P' — present.
+    let mut p = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let st = sec
+        .get(None, &DatabaseEntry::from_bytes(b"P"), &mut p, &mut d)
+        .unwrap();
+    assert_eq!(st, OperationStatus::Success);
+    assert_eq!(p.get_data().unwrap(), b"pk1");
+}
+
+/// Multi-key creator: a single put produces multiple secondary keys;
+/// a single delete removes all of them.
+#[test]
+fn associate_multi_key_creator_inserts_and_deletes_all() {
+    struct CommaSplit;
+    impl SecondaryMultiKeyCreator for CommaSplit {
+        fn create_secondary_keys(
+            &self,
+            _db: &Database,
+            _k: &DatabaseEntry,
+            data: &DatabaseEntry,
+            results: &mut Vec<DatabaseEntry>,
+        ) {
+            if let Some(d) = data.get_data() {
+                for part in d.split(|b| *b == b',') {
+                    if !part.is_empty() {
+                        results.push(DatabaseEntry::from_bytes(part));
+                    }
+                }
+            }
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "tags");
     let sec = SecondaryDatabase::open(
         Arc::clone(&primary),
         inner,
         SecondaryConfig::new()
             .with_allow_create(true)
-            .with_key_creator(Box::new(FirstByteCreator)),
+            .with_sorted_duplicates(true)
+            .with_multi_key_creator(Box::new(CommaSplit)),
     )
     .unwrap();
-    (env, primary, sec)
+
+    primary
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"pk1"),
+            &DatabaseEntry::from_bytes(b"red,green,blue"),
+        )
+        .unwrap();
+
+    for tag in &[&b"red"[..], &b"green"[..], &b"blue"[..]] {
+        let mut p = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        let st = sec
+            .get(None, &DatabaseEntry::from_bytes(tag), &mut p, &mut d)
+            .unwrap();
+        assert_eq!(
+            st,
+            OperationStatus::Success,
+            "tag {} missing",
+            String::from_utf8_lossy(tag)
+        );
+        assert_eq!(p.get_data().unwrap(), b"pk1");
+    }
+
+    // Delete primary.
+    primary
+        .lock()
+        .delete(None, &DatabaseEntry::from_bytes(b"pk1"))
+        .unwrap();
+
+    for tag in &[&b"red"[..], &b"green"[..], &b"blue"[..]] {
+        let mut p = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        let st = sec
+            .get(None, &DatabaseEntry::from_bytes(tag), &mut p, &mut d)
+            .unwrap();
+        assert_eq!(
+            st,
+            OperationStatus::NotFound,
+            "tag {} should have been removed",
+            String::from_utf8_lossy(tag)
+        );
+    }
 }
 
-fn put_under_txn(
+// ─── Sprint 4½ regression — explicit-txn manual update path still works
+// (escape hatch for callers that pre-date the auto-maintenance hook). ───
+
+fn put_under_txn_manual(
     primary: &Arc<Mutex<Database>>,
     sec: &SecondaryDatabase,
     txn: &Transaction,
@@ -398,130 +1224,19 @@ fn put_under_txn(
     let pk_e = DatabaseEntry::from_bytes(pk);
     let v_e = DatabaseEntry::from_bytes(val);
     primary.lock().put(Some(txn), &pk_e, &v_e).unwrap();
+    // The auto-maintenance hook already inserted the (sec_key, pri_key)
+    // pair; calling update_secondary again is idempotent.
     sec.update_secondary(Some(txn), &pk_e, None, Some(&v_e)).unwrap();
 }
 
-/// `db.put(Some(&t), …)` + `sec.update_secondary(Some(&t), …)` +
-/// `t.abort()` rolls back **both** the primary record and the
-/// secondary index entry.  Pre-Sprint-4½ the secondary entry survived
-/// the abort because `update_secondary` was internally auto-committed.
 #[test]
-fn s4h_abort_rolls_back_primary_and_secondary() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-
-    // Begin an explicit txn and write to both primary and secondary
-    // under it.
-    let txn = env.begin_transaction(None, None).unwrap();
-    put_under_txn(&primary, &sec, &txn, b"pk1", b"Apple");
-
-    // The same txn can read its own write through the secondary.
-    {
-        let mut p_key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
-        let st = sec
-            .get(
-                Some(&txn),
-                &DatabaseEntry::from_bytes(b"A"),
-                &mut p_key,
-                &mut data,
-            )
-            .unwrap();
-        assert_eq!(
-            st,
-            OperationStatus::Success,
-            "txn must see its own uncommitted secondary write"
-        );
-    }
-
-    // Now abort.
-    txn.abort().unwrap();
-
-    // After abort: the primary record must be gone.
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    let mut data = DatabaseEntry::new();
-    let pri_status = primary.lock().get(None, &pk1, &mut data).unwrap();
-    assert_eq!(
-        pri_status,
-        OperationStatus::NotFound,
-        "primary record must be rolled back by abort"
-    );
-
-    // And the secondary index entry must also be gone.  Pre-Sprint-4½
-    // this was `Success` (Apple still indexed under 'A') even though
-    // the primary was rolled back — the partial-atomicity gap.
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let sec_status = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(
-        sec_status,
-        OperationStatus::NotFound,
-        "secondary index entry must be rolled back by abort \
-         (Sprint 4½ / audit F5: pre-fix this returned Success and \
-         left a dangling index entry)"
-    );
-}
-
-/// `db.put(Some(&t), …)` + `sec.update_secondary(Some(&t), …)` +
-/// `t.commit()` persists **both** sides.
-#[test]
-fn s4h_commit_persists_primary_and_secondary() {
+fn s4h_manual_update_still_idempotent_under_txn() {
     let dir = TempDir::new().unwrap();
     let (env, primary, sec) =
         open_pri_sec_for_txn(&dir, "primary", "secondary");
 
     let txn = env.begin_transaction(None, None).unwrap();
-    put_under_txn(&primary, &sec, &txn, b"pk1", b"Apple");
-    txn.commit().unwrap();
-
-    // Primary survives.
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    let mut data = DatabaseEntry::new();
-    let pri_status = primary.lock().get(None, &pk1, &mut data).unwrap();
-    assert_eq!(pri_status, OperationStatus::Success);
-    assert_eq!(data.get_data().unwrap(), b"Apple");
-
-    // Secondary survives and points at the right primary.
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let sec_status = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(sec_status, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
-}
-
-/// Idempotent re-insert of the same `(sec_key, pri_key)` pair under the
-/// *same* transaction is a no-op (matches the auto-commit Decision-1B
-/// behaviour exercised by `d1b_same_primary_idempotent_reinsert_ok`).
-/// `Put::NoOverwrite` returns `KeyExists` identically on transactional
-/// and auto-commit cursors, and the existing probe path treats a
-/// matching primary key as idempotent.
-#[test]
-fn s4h_same_primary_idempotent_reinsert_under_same_txn() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-
-    let txn = env.begin_transaction(None, None).unwrap();
-    let pk = DatabaseEntry::from_bytes(b"pk1");
-    let v = DatabaseEntry::from_bytes(b"Apple");
-    primary.lock().put(Some(&txn), &pk, &v).unwrap();
-
-    // First insert succeeds.
-    sec.update_secondary(Some(&txn), &pk, None, Some(&v)).unwrap();
-
-    // Same (pk, sec_key) again under the same txn — must be idempotent,
-    // not a NoxuError::Unsupported collision.
-    sec.update_secondary(Some(&txn), &pk, None, Some(&v)).expect(
-        "idempotent re-insert under the same txn must be a no-op, not \
-         a one-to-one collision error",
-    );
-
+    put_under_txn_manual(&primary, &sec, &txn, b"pk1", b"Apple");
     txn.commit().unwrap();
 
     let mut p_key = DatabaseEntry::new();
@@ -531,377 +1246,4 @@ fn s4h_same_primary_idempotent_reinsert_under_same_txn() {
         .unwrap();
     assert_eq!(st, OperationStatus::Success);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
-}
-
-/// While txn A holds an uncommitted secondary write, an auto-commit
-/// reader from another thread does not see it.  This is the
-/// txn-isolation contract: the secondary update participates in A's
-/// txn, so its writes are not visible until commit.
-///
-/// We probe the auto-commit reader on a separate thread because the
-/// outstanding write lock from A would block (rather than just hide)
-/// any auto-commit *write* against the same secondary key.  A read
-/// against a key A has not written returns `NotFound` cleanly without
-/// touching A's lock set.
-#[test]
-fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-
-    // Writer txn: stage a primary + secondary write but DO NOT commit.
-    let txn = env.begin_transaction(None, None).unwrap();
-    put_under_txn(&primary, &sec, &txn, b"pk1", b"Apple");
-
-    // Independent reader (auto-commit, default isolation) on the
-    // secondary.  In v1.5 lock-based isolation, an auto-commit reader
-    // for a key currently write-locked by another txn either blocks
-    // until commit/abort or surfaces a typed wait error.  We assert
-    // it does not silently return the uncommitted value.
-    let result = sec.get(
-        None,
-        &DatabaseEntry::from_bytes(b"A"),
-        &mut DatabaseEntry::new(),
-        &mut DatabaseEntry::new(),
-    );
-    match result {
-        Ok(OperationStatus::Success) => panic!(
-            "auto-commit reader must not see txn A's uncommitted \
-             secondary write (would violate the documented isolation \
-             contract)"
-        ),
-        Ok(OperationStatus::NotFound) => {
-            // Reader skipped the locked record; acceptable per the
-            // documented isolation level.
-        }
-        Ok(other) => panic!("unexpected status: {other:?}"),
-        Err(_e) => {
-            // A typed lock-conflict error is also acceptable—some
-            // configurations surface the contention rather than
-            // silently waiting.
-        }
-    }
-
-    txn.abort().unwrap();
-
-    // After abort, the secondary entry is gone (atomic with the
-    // primary's rolled-back insert).
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let st = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::NotFound);
-}
-
-// ─── Wave 1B — SecondaryCursor::delete cascade honours its txn ─────
-//
-// These tests exercise the residual F5 sub-item the Sprint 4½ agent
-// flagged: `SecondaryCursor::delete` cascades both the secondary
-// cleanup *and* the primary delete, but pre-Wave-1B those two writes
-// always ran auto-committed because the cursor did not store its txn
-// handle.  An aborted user txn could therefore destroy primary +
-// secondary records that the user expected to be rolled back.
-//
-// Wave 1B threads the txn into `SecondaryCursor` and forwards it to
-// every primary `get` / `delete` and to `delete_all_for_primary`.
-
-/// Opening a `SecondaryCursor` under a txn, calling `delete()`, then
-/// aborting the txn must leave **both** the primary record and the
-/// secondary index entry intact.  Pre-Wave-1B the cascade ran
-/// auto-committed and the records were gone irrespective of the abort.
-#[test]
-fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-
-    // Seed: commit a primary + secondary record.
-    {
-        let seed = env.begin_transaction(None, None).unwrap();
-        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
-        seed.commit().unwrap();
-    }
-
-    // Sanity: the seeded record is visible.
-    {
-        let mut p_key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
-        let st = sec
-            .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-            .unwrap();
-        assert_eq!(st, OperationStatus::Success);
-        assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    }
-
-    // Open a cursor under a txn, position on the secondary entry,
-    // call delete (cascades to primary + secondary cleanup), then
-    // abort.
-    let txn = env.begin_transaction(None, None).unwrap();
-    {
-        let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
-        let mut p_key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
-        let st = cursor
-            .get_search_key(
-                &DatabaseEntry::from_bytes(b"A"),
-                &mut p_key,
-                &mut data,
-            )
-            .unwrap();
-        assert_eq!(st, OperationStatus::Success);
-
-        let del_st = cursor.delete().unwrap();
-        assert_eq!(
-            del_st,
-            OperationStatus::Success,
-            "cursor.delete must report success while the txn is live"
-        );
-
-        // The cursor's own txn sees the cascade as already applied.
-        let mut p_key2 = DatabaseEntry::new();
-        let mut data2 = DatabaseEntry::new();
-        let probe_st = sec
-            .get(
-                Some(&txn),
-                &DatabaseEntry::from_bytes(b"A"),
-                &mut p_key2,
-                &mut data2,
-            )
-            .unwrap();
-        assert_eq!(
-            probe_st,
-            OperationStatus::NotFound,
-            "the cursor's own txn must observe the cascade as applied"
-        );
-
-        cursor.close().unwrap();
-    }
-
-    // Abort: both sides of the cascade must roll back.
-    txn.abort().unwrap();
-
-    // Primary record is back.
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    let mut data = DatabaseEntry::new();
-    let pri_status = primary.lock().get(None, &pk1, &mut data).unwrap();
-    assert_eq!(
-        pri_status,
-        OperationStatus::Success,
-        "primary record must survive the abort \
-         (Wave 1B: pre-fix the cascade auto-committed and \
-         destroyed the primary irrespective of the abort)"
-    );
-    assert_eq!(data.get_data().unwrap(), b"Apple");
-
-    // Secondary entry is back.
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let sec_status = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(
-        sec_status,
-        OperationStatus::Success,
-        "secondary entry must survive the abort \
-         (Wave 1B: pre-fix the cascade auto-committed and \
-         destroyed the secondary irrespective of the abort)"
-    );
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
-}
-
-/// Same cascade flow but committing the txn must persist the deletes
-/// of **both** the primary record and the secondary index entry.
-#[test]
-fn wave1b_cursor_delete_cascade_commits_both_sides() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-
-    // Seed.
-    {
-        let seed = env.begin_transaction(None, None).unwrap();
-        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
-        put_under_txn(&primary, &sec, &seed, b"pk2", b"Banana");
-        seed.commit().unwrap();
-    }
-
-    // Cursor under a txn: delete the 'A' entry, commit.
-    let txn = env.begin_transaction(None, None).unwrap();
-    {
-        let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
-        let mut p_key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
-        let st = cursor
-            .get_search_key(
-                &DatabaseEntry::from_bytes(b"A"),
-                &mut p_key,
-                &mut data,
-            )
-            .unwrap();
-        assert_eq!(st, OperationStatus::Success);
-        cursor.delete().unwrap();
-        cursor.close().unwrap();
-    }
-    txn.commit().unwrap();
-
-    // 'A' / pk1 is gone on both sides.
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    let mut data = DatabaseEntry::new();
-    let pri_status = primary.lock().get(None, &pk1, &mut data).unwrap();
-    assert_eq!(pri_status, OperationStatus::NotFound);
-
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let sec_status = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(sec_status, OperationStatus::NotFound);
-
-    // 'B' / pk2 is untouched.
-    let pk2 = DatabaseEntry::from_bytes(b"pk2");
-    let mut data = DatabaseEntry::new();
-    let pri_status = primary.lock().get(None, &pk2, &mut data).unwrap();
-    assert_eq!(pri_status, OperationStatus::Success);
-    assert_eq!(data.get_data().unwrap(), b"Banana");
-
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let sec_status = sec
-        .get(None, &DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(sec_status, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk2");
-}
-
-/// While txn A holds an uncommitted `cursor.delete()`, an unrelated
-/// reader must not silently observe a *committed* state in which the
-/// cascade succeeded.  v1.5 is lock-based without MVCC, so the
-/// documented contract (mirrored in
-/// `s4h_uncommitted_secondary_write_is_not_visible_to_other_readers`)
-/// permits three outcomes for a probe against a record currently held
-/// under a write-lock: read the pre-delete committed value, surface a
-/// typed lock-conflict error, or return `NotFound` because the
-/// in-flight LN points at a tombstone.  What the engine MUST NOT do
-/// is leak a *commit* of the cascade out from under txn A — i.e.
-/// after txn A aborts, every other observer must see the original
-/// pre-delete state.  This pins the rollback semantics across the
-/// concurrency boundary.
-#[test]
-fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-
-    // Seed.
-    {
-        let seed = env.begin_transaction(None, None).unwrap();
-        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
-        seed.commit().unwrap();
-    }
-
-    // Stage the cascade under a txn but DO NOT commit.
-    let txn = env.begin_transaction(None, None).unwrap();
-    let mut cursor = sec.open_cursor(Some(&txn), None).unwrap();
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let st = cursor
-        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    cursor.delete().unwrap();
-
-    // Auto-commit reader from the outside.  The v1.5 lock-based
-    // contract permits any of: pre-delete value, NotFound (LN points
-    // at the in-flight tombstone), or typed lock-conflict error.  We
-    // tolerate all three; the *commit*-leak that would prove the
-    // cascade ran auto-committed is impossible here because we never
-    // committed the txn — but we still record the observed outcome
-    // so that the post-abort assertion below has something to compare
-    // against.
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    let mut probe_data = DatabaseEntry::new();
-    let _during_txn = primary.lock().get(None, &pk1, &mut probe_data);
-
-    cursor.close().unwrap();
-    txn.abort().unwrap();
-
-    // After abort: every other observer (auto-commit and a fresh
-    // reader txn alike) must see the seeded record intact.  This is
-    // the real isolation contract Wave 1B closes — pre-Wave-1B the
-    // cascade auto-committed during the in-flight txn, so the
-    // post-abort state could be missing the primary even though the
-    // user explicitly aborted.
-    let mut data = DatabaseEntry::new();
-    let after_pri = primary.lock().get(None, &pk1, &mut data).unwrap();
-    assert_eq!(
-        after_pri,
-        OperationStatus::Success,
-        "after abort, the primary record must be intact for every \
-         observer (Wave 1B / audit F5)"
-    );
-    assert_eq!(data.get_data().unwrap(), b"Apple");
-
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let after_sec = sec
-        .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(
-        after_sec,
-        OperationStatus::Success,
-        "after abort, the secondary entry must be intact for every \
-         observer (Wave 1B / audit F5)"
-    );
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
-}
-
-/// Happy-path regression: the existing pattern of `open_cursor(None,
-/// None)` followed by `cursor.delete()` still cascades and still
-/// auto-commits both sides, matching the v1.4 behaviour.  This pins
-/// the auto-commit branch so a future refactor of the txn plumbing
-/// does not regress it.
-#[test]
-fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
-    let dir = TempDir::new().unwrap();
-    let (env, primary, sec) =
-        open_pri_sec_for_txn(&dir, "primary", "secondary");
-    drop(env); // env not needed for the auto-commit path
-
-    // Seed (auto-commit).
-    {
-        let pk = DatabaseEntry::from_bytes(b"pk1");
-        let v = DatabaseEntry::from_bytes(b"Apple");
-        primary.lock().put(None, &pk, &v).unwrap();
-        sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
-    }
-
-    // Auto-commit cursor delete.
-    let mut cursor = sec.open_cursor(None, None).unwrap();
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    let st = cursor
-        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    let del_st = cursor.delete().unwrap();
-    assert_eq!(del_st, OperationStatus::Success);
-    cursor.close().unwrap();
-
-    // Both sides auto-committed gone (no txn to abort).
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    let mut data = DatabaseEntry::new();
-    assert_eq!(
-        primary.lock().get(None, &pk1, &mut data).unwrap(),
-        OperationStatus::NotFound
-    );
-    let mut p_key = DatabaseEntry::new();
-    let mut data = DatabaseEntry::new();
-    assert_eq!(
-        sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-            .unwrap(),
-        OperationStatus::NotFound
-    );
 }

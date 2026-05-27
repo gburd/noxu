@@ -99,6 +99,14 @@ pub struct Transaction {
     ///
     /// Resolves F1 of the May 2026 API audit.
     active_txns: Option<Arc<ActiveTxns>>,
+    /// Internal flag: `true` for synthetic auto-txn wrappers that the
+    /// engine builds inside `Database::with_auto_txn` so secondary /
+    /// FK maintenance can run through the normal `txn = Some(_)`
+    /// code paths.  Synthetic wrappers do not increment / decrement
+    /// the active-transactions gauge, do not emit a drop-warning, and
+    /// must not be `commit()`ed or `abort()`ed by callers —
+    /// `with_auto_txn` drives the inner `Txn` lifecycle directly.
+    pub(crate) synthetic: bool,
 }
 
 impl Transaction {
@@ -122,6 +130,32 @@ impl Transaction {
             inner_txn: None,
             env_impl: None,
             active_txns: None,
+            synthetic: false,
+        }
+    }
+
+    /// Internal constructor for the synthetic auto-txn wrapper used
+    /// by [`crate::database::Database`] inside `with_auto_txn` to drive
+    /// secondary / FK maintenance through the normal `txn = Some(_)`
+    /// code paths.  Skips gauge instrumentation and drop-warnings.
+    pub(crate) fn new_synthetic_wrapper(
+        id: u64,
+        inner_txn: Arc<Mutex<noxu_txn::Txn>>,
+    ) -> Self {
+        Self {
+            id,
+            state: Mutex::new(TransactionState::Open),
+            start_time: Instant::now(),
+            read_only: false,
+            name: Mutex::new(Some("<synthetic-auto-txn>".to_string())),
+            durability: None,
+            lock_timeout_ms: Mutex::new(0),
+            txn_timeout_ms: Mutex::new(0),
+            log_manager: None,
+            inner_txn: Some(inner_txn),
+            env_impl: None,
+            active_txns: None,
+            synthetic: true,
         }
     }
 
@@ -148,6 +182,7 @@ impl Transaction {
             inner_txn: None,
             env_impl: None,
             active_txns: None,
+            synthetic: false,
         }
     }
 
@@ -609,6 +644,11 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
+        // Synthetic auto-txn wrappers are managed by Database::with_auto_txn
+        // — do not warn or emit gauge events for them.
+        if self.synthetic {
+            return;
+        }
         // Warn if transaction wasn't explicitly committed or aborted
         let state = *self.state.lock().unwrap();
         if matches!(state, TransactionState::Open | TransactionState::MustAbort)

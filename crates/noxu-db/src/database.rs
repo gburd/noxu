@@ -13,12 +13,18 @@ use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
 use crate::preload::{PreloadConfig, PreloadStats};
 use crate::read_options::ReadOptions;
+use crate::secondary_config::ForeignKeyDeleteAction;
 use crate::secondary_cursor::SecondaryCursor;
+use crate::secondary_database::{
+    FkDeleteAction, FkDeletePlan, SecondaryState, update_secondary_impl,
+};
 use crate::sequence::Sequence;
 use crate::sequence_config::SequenceConfig;
 use crate::stats_config::StatsConfig;
 use crate::transaction::Transaction;
+use crate::transaction_config::TransactionConfig;
 use crate::write_options::WriteOptions;
+use std::sync::Weak;
 use noxu_dbi::{
     CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode,
     ThroughputStats,
@@ -98,6 +104,36 @@ pub struct Database {
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
     write_no_sync: bool,
+    /// Secondaries that maintain themselves on this database's writes.
+    ///
+    /// Populated by `SecondaryDatabase::open` via
+    /// [`Database::__register_secondary`].  Each entry is a `Weak`
+    /// reference; entries whose secondary has been dropped are pruned
+    /// lazily on the next iteration.  See `wave-2a-secondary-unification.md`.
+    pub(crate) secondaries: noxu_sync::Mutex<Vec<RegisteredSecondary>>,
+    /// Secondaries (potentially attached to other primaries) that
+    /// reference THIS database's primary keys via foreign-key
+    /// constraints.  When THIS database deletes a record, every entry
+    /// here is invoked with the delete-action plan (Abort / Cascade /
+    /// Nullify).
+    pub(crate) fk_referrers: noxu_sync::Mutex<Vec<RegisteredFkReferrer>>,
+}
+
+/// Bookkeeping entry: a `Weak` reference to a secondary's state.
+///
+/// `Database` stores these in [`Database.secondaries`] and consults
+/// the list on every primary write to drive automatic maintenance.
+pub(crate) struct RegisteredSecondary {
+    pub(crate) state: Weak<SecondaryState>,
+}
+
+/// Bookkeeping entry: a `Weak` reference to a secondary that points
+/// at this database via a foreign-key constraint.
+///
+/// `Database` stores these in [`Database.fk_referrers`] and consults
+/// the list on every primary delete.
+pub(crate) struct RegisteredFkReferrer {
+    pub(crate) state: Weak<SecondaryState>,
 }
 
 /// State of a database handle.
@@ -171,14 +207,22 @@ impl Database {
     /// In which passes the
     /// transaction's `Locker` to the new `CursorImpl`.
     fn make_cursor_for_txn(&self, txn: &Transaction) -> CursorImpl {
-        // Use the transaction id as the cursor's locker_id so that LN
-        // log entries written under this cursor carry the txn id
-        // (recovery's analysis pass uses LN.txn_id together with
-        // TxnCommit / TxnAbort records to decide whether to redo or
-        // undo the LN). Pre-fix this was hardcoded to 0, which made
-        // every txn-LN look like an auto-commit LN and caused
-        // recovery to redo aborted writes.
-        let cursor = self.make_cursor_with_locker(txn.get_id() as i64);
+        // For an explicit transaction, use the txn id as the cursor's
+        // locker_id so that LN log entries written under this cursor
+        // carry the txn id (recovery's analysis pass uses LN.txn_id
+        // together with TxnCommit / TxnAbort records to decide whether
+        // to redo or undo the LN).
+        //
+        // For the synthetic auto-txn wrapper that `with_auto_txn`
+        // builds (Wave 2A), use locker_id = 0 instead so LN log entries
+        // are written in the auto-commit form (no txn id) — matching
+        // what the original cursor-only `with_auto_txn` did.  The
+        // synthetic auto-txn does not write a TxnCommit / TxnAbort
+        // record, so giving the LN a non-zero txn_id would make
+        // recovery treat it as in-progress and undo it.
+        let locker_id =
+            if txn.synthetic { 0 } else { txn.get_id() as i64 };
+        let cursor = self.make_cursor_with_locker(locker_id);
         if let Some(inner) = txn.get_inner_txn() {
             cursor.with_txn(inner)
         } else {
@@ -223,19 +267,29 @@ impl Database {
     /// rolls back the in-memory tree mutation.
     fn with_auto_txn<F, T>(&self, op: F) -> Result<T>
     where
-        F: FnOnce(&mut CursorImpl) -> Result<T>,
+        F: FnOnce(&Transaction) -> Result<T>,
     {
         let auto_txn =
             self.txn_manager.begin_auto_txn(self.log_manager.clone());
         let synthetic_id = auto_txn.id_as_locker();
         let auto_txn_arc = Arc::new(std::sync::Mutex::new(auto_txn));
 
-        let mut cursor = self.make_cursor();
-        cursor.attach_txn(Arc::clone(&auto_txn_arc));
+        // Build a synthetic public Transaction wrapper around the
+        // auto-txn so the closure can use the regular `txn = Some(_)`
+        // code paths (open_cursor, secondary maintenance, FK cascade)
+        // and have every cursor lock / WAL entry attach to the same
+        // locker.
+        let synthetic_txn = Transaction::new_synthetic_wrapper(
+            synthetic_id as u64,
+            Arc::clone(&auto_txn_arc),
+        );
 
-        let result = op(&mut cursor);
-        // Drop the cursor handle (un-pins BIN, drops Arc<Mutex<Txn>> ref).
-        drop(cursor);
+        let result = op(&synthetic_txn);
+
+        // Drop the public wrapper before reclaiming the inner Txn.
+        // The wrapper holds an Arc<Mutex<Txn>> that we need exclusive
+        // ownership of in `Arc::try_unwrap` below.
+        drop(synthetic_txn);
 
         // Reclaim sole ownership of the synthetic auto-txn so we can
         // finalise it.  All cursors and their Arcs were dropped above.
@@ -265,9 +319,6 @@ impl Database {
                     Durability::CommitSync
                 };
                 if let Err(e) = auto_txn.commit_with_durability(durability) {
-                    // Commit failed (e.g. log fsync error).  Undo the
-                    // in-memory tree write so we are not left in an
-                    // inconsistent state, then surface the error.
                     let undo_records =
                         auto_txn.abort_collect_undo().unwrap_or_default();
                     self.apply_auto_txn_undo(undo_records);
@@ -281,14 +332,9 @@ impl Database {
                 Ok(value)
             }
             Err(e) => {
-                // Phase 1: collect undo without releasing write locks.
                 let undo_records =
                     auto_txn.abort_collect_undo().unwrap_or_default();
-                // Phase 2: apply undo while write locks are still held
-                // so any concurrent reader blocked on a write lock
-                // cannot observe the in-flight value.
                 self.apply_auto_txn_undo(undo_records);
-                // Phase 3: drain locks.
                 auto_txn.release_all_locks();
                 txn_manager.abort_txn(synthetic_id);
                 Err(e)
@@ -402,8 +448,250 @@ impl Database {
             txn_manager,
             no_sync,
             write_no_sync,
+            secondaries: noxu_sync::Mutex::new(Vec::new()),
+            fk_referrers: noxu_sync::Mutex::new(Vec::new()),
         }
     }
+
+    /// Internal: registers a secondary on this database's auto-maintenance
+    /// list.  Called by [`crate::secondary_database::SecondaryDatabase::open`].
+    #[doc(hidden)]
+    pub(crate) fn __register_secondary(&self, reg: RegisteredSecondary) {
+        let mut guard = self.secondaries.lock();
+        guard.retain(|r| r.state.strong_count() > 0);
+        guard.push(reg);
+    }
+
+    /// Internal: registers a foreign-key referrer on this database.
+    /// Called by [`crate::secondary_database::SecondaryDatabase::open_with_foreign_key`].
+    #[doc(hidden)]
+    pub(crate) fn __register_fk_referrer(&self, reg: RegisteredFkReferrer) {
+        let mut guard = self.fk_referrers.lock();
+        guard.retain(|r| r.state.strong_count() > 0);
+        guard.push(reg);
+    }
+
+    /// Snapshot of currently-live secondaries.  Caller-owned `Arc`s
+    /// keep each secondary alive for the duration of the snapshot.
+    fn live_secondaries(&self) -> Vec<Arc<SecondaryState>> {
+        let guard = self.secondaries.lock();
+        guard.iter().filter_map(|r| r.state.upgrade()).collect()
+    }
+
+    /// Snapshot of currently-live FK referrers.
+    fn live_fk_referrers(&self) -> Vec<Arc<SecondaryState>> {
+        let guard = self.fk_referrers.lock();
+        guard.iter().filter_map(|r| r.state.upgrade()).collect()
+    }
+
+    /// Reads the current value of `key_bytes` under `txn` (or
+    /// auto-commit when `txn` is `None`).  Returns `Some(bytes)` if
+    /// the record exists, `None` otherwise.  Used by the put / delete
+    /// paths to compute the `old_data` fed to secondary maintenance
+    /// and FK plans.
+    fn read_existing_under(
+        &self,
+        txn: Option<&Transaction>,
+        key_bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let mut cursor = match txn {
+            Some(t) => self.make_cursor_for_txn(t),
+            None => self.make_cursor(),
+        };
+        match cursor
+            .search(key_bytes, None, SearchMode::Set)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+        {
+            noxu_dbi::OperationStatus::Success => {
+                let (_, value) = cursor.get_current().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
+                Ok(Some(value))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Auto-maintenance core for [`Self::put`].
+    ///
+    /// Reads the existing value (if any) under `txn`, performs the
+    /// put, and then drives every registered secondary's update logic
+    /// under the same `txn`.  Used by both the explicit-txn path and
+    /// the synthetic auto-txn wrapper produced by
+    /// [`Self::with_auto_txn`].
+    fn put_with_secondaries(
+        &self,
+        txn: &Transaction,
+        key_bytes: &[u8],
+        data_bytes: &[u8],
+    ) -> Result<()> {
+        let live_secs = self.live_secondaries();
+
+        // Read the previous value (if any) so we can hand the secondary
+        // hooks both old and new data.  We avoid this read entirely
+        // when there are no live secondaries to keep the hot path
+        // tight.
+        let old_data: Option<Vec<u8>> = if live_secs.is_empty() {
+            None
+        } else {
+            self.read_existing_under(Some(txn), key_bytes)?
+        };
+
+        // Primary put.
+        {
+            let mut cursor = self.make_cursor_for_txn(txn);
+            cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
+                |e| NoxuError::OperationNotAllowed(e.to_string()),
+            )?;
+        }
+
+        // Drive every registered secondary under the same txn.
+        if !live_secs.is_empty() {
+            let key_e = DatabaseEntry::from_bytes(key_bytes);
+            let new_e = DatabaseEntry::from_bytes(data_bytes);
+            let old_e = old_data.as_ref().map(|d| DatabaseEntry::from_bytes(d));
+            for s in &live_secs {
+                update_secondary_impl(
+                    s,
+                    Some(txn),
+                    &key_e,
+                    old_e.as_ref(),
+                    Some(&new_e),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Auto-maintenance core for [`Self::delete`].
+    ///
+    /// Steps under `txn`:
+    /// 1. Build the foreign-key delete plan for every registered
+    ///    referrer.  If any plan is `Abort`, return immediately with a
+    ///    typed [`NoxuError::ForeignConstraintViolation`] — no side
+    ///    effects survive (the user's txn is consistent and may be
+    ///    aborted or continued).
+    /// 2. Execute every cascade-delete plan recursively under the same
+    ///    `txn` (which may trigger further FK actions, including
+    ///    cycle-detection bail-outs).
+    /// 3. Execute every nullify plan: re-put the affected child record
+    ///    with the user-supplied nullified value.
+    /// 4. Read this primary's existing value, then delete it (every
+    ///    duplicate, mirroring `Database.delete(key)` semantics).
+    /// 5. Drive secondary cleanup for the deleted record so each
+    ///    registered secondary removes its corresponding entries.
+    fn delete_with_fk_and_secondaries(
+        &self,
+        txn: &Transaction,
+        key_bytes: &[u8],
+    ) -> Result<bool> {
+        let key_e = DatabaseEntry::from_bytes(key_bytes);
+
+        // ---- Cycle detection ----
+        let cycle_key = (self.id, key_bytes.to_vec());
+        if !cascade_stack_push(&cycle_key) {
+            return Err(NoxuError::ForeignConstraintViolation(format!(
+                "foreign-key cascade cycle detected on database '{}' \
+                 (key already in flight)",
+                self.name
+            )));
+        }
+        // RAII guard so any early return pops the stack.
+        struct CascadePopGuard(Option<(u64, Vec<u8>)>);
+        impl Drop for CascadePopGuard {
+            fn drop(&mut self) {
+                if let Some(k) = self.0.take() {
+                    cascade_stack_pop(&k);
+                }
+            }
+        }
+        let _pop_guard = CascadePopGuard(Some(cycle_key));
+
+        // ---- FK plan stage ----
+        let referrers = self.live_fk_referrers();
+        let mut cascade_jobs: Vec<(Arc<noxu_sync::Mutex<Database>>, Vec<u8>)> =
+            Vec::new();
+        let mut nullify_jobs: Vec<(
+            Arc<noxu_sync::Mutex<Database>>,
+            Vec<u8>,
+            Vec<u8>,
+        )> = Vec::new();
+        for state in &referrers {
+            let action = FkDeleteAction {
+                state,
+                deleted_key: &key_e,
+                txn: Some(txn),
+            };
+            match action.plan()? {
+                FkDeletePlan::Abort(msg) => {
+                    return Err(NoxuError::ForeignConstraintViolation(msg));
+                }
+                FkDeletePlan::Cascade(jobs) => cascade_jobs.extend(jobs),
+                FkDeletePlan::Nullify(jobs) => nullify_jobs.extend(jobs),
+            }
+        }
+
+        // ---- Execute cascade deletes ----
+        for (child_db, child_pk) in cascade_jobs {
+            let guard = child_db.lock();
+            // Recursive delete under the same txn.
+            let _ = guard.delete(
+                Some(txn),
+                &DatabaseEntry::from_bytes(&child_pk),
+            )?;
+        }
+
+        // ---- Execute nullify re-puts ----
+        for (child_db, child_pk, new_data) in nullify_jobs {
+            let guard = child_db.lock();
+            guard.put(
+                Some(txn),
+                &DatabaseEntry::from_bytes(&child_pk),
+                &DatabaseEntry::from_bytes(&new_data),
+            )?;
+        }
+
+        // ---- Now delete the primary record itself ----
+        let live_secs = self.live_secondaries();
+        let old_data: Option<Vec<u8>> = if live_secs.is_empty() {
+            None
+        } else {
+            self.read_existing_under(Some(txn), key_bytes)?
+        };
+
+        let deleted_any = {
+            let mut cursor = self.make_cursor_for_txn(txn);
+            let mut any = false;
+            while let noxu_dbi::OperationStatus::Success = cursor
+                .search(key_bytes, None, SearchMode::Set)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            {
+                cursor.delete().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
+                any = true;
+            }
+            any
+        };
+
+        // ---- Drive registered secondaries ----
+        if deleted_any && !live_secs.is_empty() {
+            let old_e = old_data.as_ref().map(|d| DatabaseEntry::from_bytes(d));
+            for s in &live_secs {
+                update_secondary_impl(
+                    s,
+                    Some(txn),
+                    &key_e,
+                    old_e.as_ref(),
+                    None,
+                )?;
+            }
+        }
+
+        Ok(deleted_any)
+    }
+
 
     /// Retrieves a record by key.
     ///
@@ -662,23 +950,11 @@ impl Database {
 
         match txn {
             Some(t) => {
-                let mut cursor = self.make_cursor_for_txn(t);
-                cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
-                    |e| NoxuError::OperationNotAllowed(e.to_string()),
-                )?;
+                self.put_with_secondaries(t, key_bytes, data_bytes)?;
             }
             None => {
-                // Wrap the write in a synthetic auto-commit `Txn` so the
-                // lock manager sees a typed locker id ("auto-txn:<id>")
-                // and any error rolls back the in-memory tree write
-                // through `Txn::abort_collect_undo`.
-                self.with_auto_txn(|cursor| {
-                    cursor
-                        .put(key_bytes, data_bytes, PutMode::Overwrite)
-                        .map_err(|e| {
-                            NoxuError::OperationNotAllowed(e.to_string())
-                        })?;
-                    Ok(())
+                self.with_auto_txn(|t| {
+                    self.put_with_secondaries(t, key_bytes, data_bytes)
                 })?;
             }
         }
@@ -782,7 +1058,8 @@ impl Database {
                     _ => OperationStatus::Success,
                 }
             }
-            None => self.with_auto_txn(|cursor| {
+            None => self.with_auto_txn(|t| {
+                let mut cursor = self.make_cursor_for_txn(t);
                 cursor
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
                     .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
@@ -837,9 +1114,7 @@ impl Database {
 
         // Inner closure shared between the explicit-txn and synthetic
         // auto-txn paths: scans + deletes every duplicate of `key_bytes`
-        // through the supplied `cursor`.  See comment in pre-Wave-1A
-        // delete for the dup-loop rationale (BDB-JE
-        // `Database.delete(key)` semantics).
+        // through the supplied `cursor`.
         let run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
             let mut deleted_any = false;
             while let noxu_dbi::OperationStatus::Success = cursor
@@ -855,12 +1130,13 @@ impl Database {
         };
 
         let deleted_any = match txn {
-            Some(t) => {
-                let mut cursor = self.make_cursor_for_txn(t);
-                run_delete(&mut cursor)?
-            }
-            None => self.with_auto_txn(run_delete)?,
+            Some(t) => self.delete_with_fk_and_secondaries(t, key_bytes)?,
+            None => self.with_auto_txn(|t| {
+                self.delete_with_fk_and_secondaries(t, key_bytes)
+            })?,
         };
+        // Suppress unused-warning for the helper used in legacy flows.
+        let _ = run_delete;
 
         let status = if deleted_any {
             OperationStatus::Success
@@ -1222,6 +1498,46 @@ impl Drop for Database {
         // Best effort close on drop
         let _ = self.close();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// FK cascade cycle detection
+//
+// `delete_with_fk_and_secondaries` may recursively call itself via FK
+// cascades.  We push `(database_id, key)` onto a thread-local stack
+// whenever a cascade enters a new database/key pair; if we see the
+// same pair already in flight we surface a typed
+// `ForeignConstraintViolation` instead of looping forever.
+// ─────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static CASCADE_STACK: std::cell::RefCell<Vec<(u64, Vec<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pushes `(db_id, key)` onto the cascade stack.  Returns `false` if
+/// the same pair is already on the stack (cycle detected).
+fn cascade_stack_push(item: &(u64, Vec<u8>)) -> bool {
+    CASCADE_STACK.with(|s| {
+        let mut g = s.borrow_mut();
+        if g.iter().any(|(db, k)| *db == item.0 && k == &item.1) {
+            false
+        } else {
+            g.push(item.clone());
+            true
+        }
+    })
+}
+
+fn cascade_stack_pop(item: &(u64, Vec<u8>)) {
+    CASCADE_STACK.with(|s| {
+        let mut g = s.borrow_mut();
+        if let Some(idx) =
+            g.iter().rposition(|(db, k)| *db == item.0 && k == &item.1)
+        {
+            g.remove(idx);
+        }
+    });
 }
 
 #[cfg(test)]

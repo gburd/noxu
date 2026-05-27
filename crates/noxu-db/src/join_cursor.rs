@@ -114,7 +114,7 @@ impl<'a> JoinCursor<'a> {
             // For non-dup secondaries this loop runs at most once; for
             // sorted-dup secondaries it drains all entries sharing the
             // same secondary key value ( JoinCursor.getNext() pattern).
-            while first.get_next_dup()? == OperationStatus::Success {
+            while first.next_dup_only()? == OperationStatus::Success {
                 if let Some(pk_extra) = first.get_current_primary_key_only()? {
                     candidates.push_back(pk_extra);
                 }
@@ -205,7 +205,7 @@ impl<'a> JoinCursor<'a> {
         loop {
             // --- Refill candidates from cursor[0]'s next duplicate ---
             if self.candidates.is_empty() {
-                match self.cursors[0].get_next_dup()? {
+                match self.cursors[0].next_dup_only()? {
                     OperationStatus::Success => {
                         if let Some(pk) =
                             self.cursors[0].get_current_primary_key_only()?
@@ -330,26 +330,31 @@ mod tests {
                 .with_transactional(true);
             let env = Environment::open(env_cfg).unwrap();
 
-            let db_cfg = DatabaseConfig::new().with_allow_create(true);
-            let pri_db = env.open_database(None, "primary", &db_cfg).unwrap();
+            let pri_cfg = DatabaseConfig::new().with_allow_create(true);
+            let pri_db = env.open_database(None, "primary", &pri_cfg).unwrap();
             let primary = Arc::new(Mutex::new(pri_db));
 
-            let sec1_store = env.open_database(None, "sec1", &db_cfg).unwrap();
+            let sec_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true);
+            let sec1_store = env.open_database(None, "sec1", &sec_cfg).unwrap();
             let sec1 = SecondaryDatabase::open(
                 Arc::clone(&primary),
                 sec1_store,
                 SecondaryConfig::new()
                     .with_allow_create(true)
+                    .with_sorted_duplicates(true)
                     .with_key_creator(Box::new(FirstByteCreator)),
             )
             .unwrap();
 
-            let sec2_store = env.open_database(None, "sec2", &db_cfg).unwrap();
+            let sec2_store = env.open_database(None, "sec2", &sec_cfg).unwrap();
             let sec2 = SecondaryDatabase::open(
                 Arc::clone(&primary),
                 sec2_store,
                 SecondaryConfig::new()
                     .with_allow_create(true)
+                    .with_sorted_duplicates(true)
                     .with_key_creator(Box::new(LastByteCreator)),
             )
             .unwrap();
@@ -358,11 +363,12 @@ mod tests {
         }
 
         fn insert(&self, pk: &[u8], val: &[u8]) {
+            // v1.6: Database::put drives registered secondaries
+            // automatically; manual update_secondary calls are no
+            // longer required.
             let k = DatabaseEntry::from_bytes(pk);
             let v = DatabaseEntry::from_bytes(val);
             self.primary.lock().put(None, &k, &v).unwrap();
-            self.sec1.update_secondary(None, &k, None, Some(&v)).unwrap();
-            self.sec2.update_secondary(None, &k, None, Some(&v)).unwrap();
         }
     }
 
@@ -377,24 +383,17 @@ mod tests {
     ///   pk2 → b"AC"  (first byte 'A', last byte 'C')
     ///   pk3 → b"XB"  (first byte 'X', last byte 'B')
     ///
-    /// sec1 (first byte) at 'A' → {pk1, pk2}  (in the one-to-one model: pk1 only)
-    /// sec2 (last byte)  at 'B' → {pk1, pk3}  (in the one-to-one model: pk1 only)
+    /// sec1 (first byte) at 'A' → {pk1, pk2}
+    /// sec2 (last byte)  at 'B' → {pk1, pk3}
     /// Intersection → {pk1}
     ///
-    /// Decision 1B (`docs/src/internal/v1.5-decisions-2026-05.md`):
-    /// v1.5 secondaries are one-to-one, so the second primary that
-    /// resolves to the same secondary key now returns
-    /// `NoxuError::Unsupported` from `update_secondary` rather than
-    /// silently overwriting (audit finding C4).  This test exercises a
-    /// JoinCursor over distinct primaries that share secondary keys —
-    /// the v1.6 sorted-dup feature.  Re-enable when sorted-dup
-    /// secondaries land (audit finding F7).
+    /// Wave 2A (v1.6) closes audit F7: sorted-dup secondaries make
+    /// many primaries coexist under a shared secondary key, and the
+    /// `JoinCursor` algorithm walks the duplicate set on each cursor
+    /// to compute the intersection correctly.
     #[test]
-    #[ignore = "requires v1.6 sorted-dup secondaries; see Decision 1B / audit F7"]
     fn test_join_intersection_finds_single_match() {
         let fix = Fixture::new();
-        // In the one-to-one model sec1['A'] stores the last inserted 'A' record.
-        // Insert pk1 last so it is the record held by sec1['A'] and sec2['B'].
         fix.insert(b"pk2", b"AC");
         fix.insert(b"pk3", b"XB");
         fix.insert(b"pk1", b"AB");
