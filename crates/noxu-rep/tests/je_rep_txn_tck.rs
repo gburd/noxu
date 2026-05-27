@@ -302,12 +302,11 @@ fn become_master_on_shutdown_env_fails() {
 
 /// JE: `ExceptionTest.test` (subset, secondary tries to become master).
 ///
-/// "Secondary nodes are not eligible to become master."  Noxu does not
-/// yet enforce this at the API level — `become_master` succeeds on a
-/// Secondary node — so this test is `#[ignore]`d with a TODO marking
-/// the latent bug for follow-up.
+/// "Secondary nodes are not eligible to become master."  Wave 9-A added a
+/// guard at the top of `become_master` that rejects non-electable node
+/// types (`Secondary`, `Monitor`, `Arbiter`) with
+/// `RepError::InvalidStateTransition`.
 #[test]
-#[ignore = "Noxu bug: become_master should reject Secondary nodes; tracked as wave-8 follow-up"]
 fn secondary_node_become_master_should_fail() {
     let mut group = RepTestBase::builder("sec_no_master")
         .group_size(2)
