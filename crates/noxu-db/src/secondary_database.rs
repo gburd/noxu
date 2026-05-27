@@ -460,12 +460,113 @@ impl FkReferrer for SecondaryHookState {
                 cascade_result
             }
             crate::secondary_config::ForeignKeyDeleteAction::Nullify => {
-                // Wired in step 10.
-                Err(NoxuError::Unsupported(
-                    "ForeignKeyDeleteAction::Nullify is not yet implemented \
-                     (planned for v1.6 step 10)"
-                        .to_string(),
-                ))
+                // v1.6 step 10 — nullify the FK field on every child
+                // primary record indexed under fk_value, then re-put
+                // the modified record so auto-maintenance cleans up
+                // the now-stale secondary entry.
+                //
+                // Cycle detection mirrors the Cascade arm: even though
+                // a Nullify cannot directly cascade through more FK
+                // edges, a child primary update may itself be a
+                // foreign-key-delete from another perspective via the
+                // auto-maintenance fan-out, so we still guard the
+                // (db, key) frame.
+                let primary = Arc::clone(&self.primary);
+                let db_id = primary.lock().db_id_for_fk_guard();
+                let fk_bytes = fk_value.get_data().unwrap_or(&[]).to_vec();
+                if !FK_CASCADE_GUARD
+                    .with(|c| c.borrow_mut().insert((db_id, fk_bytes.clone())))
+                {
+                    return Ok(());
+                }
+
+                let single = self.config.foreign_key_nullifier.as_deref();
+                let multi =
+                    self.config.foreign_multi_key_nullifier.as_deref();
+
+                // Collect (child_primary_key, child_primary_data) pairs.
+                let child_records: Vec<(DatabaseEntry, DatabaseEntry)> = {
+                    let mut child = Vec::new();
+                    let mut cursor = self.inner.open_cursor(txn, None)?;
+                    let mut sk = fk_value.clone();
+                    let mut pk = DatabaseEntry::new();
+                    let mut st = cursor
+                        .get(
+                            &mut sk,
+                            &mut pk,
+                            crate::get::Get::Search,
+                            None,
+                        )
+                        .map_err(|e| {
+                            NoxuError::OperationNotAllowed(e.to_string())
+                        })?;
+                    while st == OperationStatus::Success {
+                        if sk.get_data().unwrap_or(&[])
+                            != fk_value.get_data().unwrap_or(&[])
+                        {
+                            break;
+                        }
+                        // Fetch the child primary's data so the
+                        // nullifier sees it.
+                        let child_pri =
+                            DatabaseEntry::from_bytes(pk.get_data().unwrap_or(&[]));
+                        let mut data = DatabaseEntry::new();
+                        let g = primary.lock().get(txn, &child_pri, &mut data)?;
+                        if g == OperationStatus::Success {
+                            child.push((child_pri, data));
+                        }
+                        st = cursor
+                            .get(
+                                &mut sk,
+                                &mut pk,
+                                crate::get::Get::Next,
+                                None,
+                            )
+                            .map_err(|e| {
+                                NoxuError::OperationNotAllowed(e.to_string())
+                            })?;
+                    }
+                    child
+                };
+
+                let nullify_result: Result<()> = (|| {
+                    for (child_pri, mut child_data) in child_records {
+                        let modified = match (single, multi) {
+                            (Some(n), _) => {
+                                n.nullify_foreign_key(&self.inner, &mut child_data)
+                            }
+                            (None, Some(mn)) => mn.nullify_foreign_key(
+                                &self.inner,
+                                &child_pri,
+                                &mut child_data,
+                                fk_value,
+                            ),
+                            (None, None) => {
+                                return Err(NoxuError::IllegalArgument(
+                                    "ForeignKeyDeleteAction::Nullify requires a \
+                                     ForeignKeyNullifier or \
+                                     ForeignMultiKeyNullifier on the \
+                                     SecondaryConfig"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        if modified {
+                            // Re-put the modified record under the
+                            // caller's txn.  Auto-maintenance on the
+                            // child primary handles clearing the stale
+                            // secondary entries.
+                            primary.lock().put(txn, &child_pri, &child_data)?;
+                        }
+                    }
+                    Ok(())
+                })();
+
+                FK_CASCADE_GUARD.with(|c| {
+                    c.borrow_mut().remove(&(db_id, fk_bytes));
+                });
+
+                nullify_result
             }
         }
     }
