@@ -33,6 +33,8 @@ use noxu_sync::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -189,6 +191,17 @@ pub struct ReplicatedEnvironment {
     /// connection so their replies always reflect the local node's
     /// most recent state.  Closes finding F6.
     election_state: Arc<ElectionAcceptorState>,
+
+    /// Self-referential `Weak` populated once the env has been wrapped
+    /// in an `Arc`.  Used by the replica I/O thread spawned in
+    /// `become_replica` so it can call `bootstrap_via_dispatcher` when
+    /// the master signals `NeedsRestore` (Wave 9-A fix 2).
+    ///
+    /// Populated lazily via [`Self::init_self_weak`] from `open()` and
+    /// the test harness.  When unset (callers that build the env via
+    /// raw `Arc::new(Self::new(...))` and never call `init_self_weak`)
+    /// the I/O thread falls back to operator-driven bootstrap.
+    self_weak: OnceLock<Weak<Self>>,
 }
 
 impl ReplicatedEnvironment {
@@ -384,6 +397,7 @@ impl ReplicatedEnvironment {
             peer_scanner,
             commit_ack_seq: std::sync::atomic::AtomicU64::new(1),
             election_state,
+            self_weak: OnceLock::new(),
         };
 
         Ok(env)
@@ -406,10 +420,26 @@ impl ReplicatedEnvironment {
     /// harnesses, scripted bootstrap, recovery tooling).
     pub fn open(config: RepConfig) -> Result<Arc<Self>> {
         let env = Arc::new(Self::new(config)?);
+        env.init_self_weak();
         env.start_election_driver();
         env.start_vlsn_persistence_daemon();
         env.register_admin_service();
         Ok(env)
+    }
+
+    /// Populate the env's self-referential `Weak` so background
+    /// threads can obtain a back-reference for auto-orchestrated
+    /// follow-up actions (e.g. replica auto-bootstrap on
+    /// `NeedsRestore`).  Idempotent: subsequent calls are silent
+    /// no-ops because the inner [`OnceLock`] only accepts one set.
+    ///
+    /// Callers that wrap the env in `Arc` and want auto-bootstrap
+    /// behaviour should call this immediately after construction.
+    /// `Self::open` already does so.  Test harnesses that drive
+    /// transitions manually (`RepTestBase`) also call this so the
+    /// auto-bootstrap path is exercised in tests.
+    pub fn init_self_weak(self: &Arc<Self>) {
+        let _ = self.self_weak.set(Arc::downgrade(self));
     }
 
     /// Register the `ADMIN` service handler on the TCP dispatcher.
@@ -1294,6 +1324,15 @@ impl ReplicatedEnvironment {
                 let master = master_name.to_string();
                 let vlsn_index_clone = Arc::clone(&vlsn_index);
                 let shutdown_flag = self.io_shutdown.load(Ordering::SeqCst);
+                // Wave 9-A fix 2: capture a Weak<Self> so the I/O thread
+                // can call `bootstrap_via_dispatcher` automatically when
+                // the master signals `NeedsRestore`.  When the env was
+                // never registered with `init_self_weak` (raw
+                // `Arc::new(Self::new(...))` without going through
+                // `open()` or the test harness), the weak ref is `None`
+                // and we fall back to operator-driven bootstrap.
+                let self_weak: Option<Weak<Self>> =
+                    self.self_weak.get().cloned();
 
                 let handle = std::thread::Builder::new()
                     .name(format!("noxu-replica-{}", node_name))
@@ -1303,42 +1342,110 @@ impl ReplicatedEnvironment {
                             vlsn_index_clone,
                         );
 
-                        if let Some(addr) = master_addr_opt {
+                        let Some(addr) = master_addr_opt else {
+                            log::warn!(
+                                "noxu-replica-{}: master '{}' address not in RepGroup; \
+                                 waiting for TCP dispatcher connection",
+                                node_name, master,
+                            );
+                            return;
+                        };
+
+                        // Catch-up loop: catch up, observe NeedsRestore,
+                        // optionally auto-bootstrap, retry once.  We cap
+                        // the retry count at MAX_AUTO_BOOTSTRAP_ATTEMPTS
+                        // (small) so a misbehaving master does not loop
+                        // forever consuming network bandwidth.
+                        const MAX_AUTO_BOOTSTRAP_ATTEMPTS: u32 = 2;
+                        let mut attempts: u32 = 0;
+                        loop {
                             log::info!(
                                 "noxu-replica-{}: connecting to master '{}' at {}",
                                 node_name, master, addr,
                             );
-                            // Run catch-up loop (blocks until channel closes
-                            // or the master disconnects).
                             match crate::stream::peer_feeder::catch_up_from_peer(
                                 addr, 0, &mut writer,
                             ) {
-                                Ok(true) => log::info!(
-                                    "noxu-replica-{}: catch-up complete from '{}'",
-                                    node_name, master,
-                                ),
-                                Ok(false) => {
-                                    // F2/F4: master signals NeedsRestore.
-                                    // Attempt a network restore via the
-                                    // dispatcher's RESTORE service.  If it
-                                    // succeeds, the local env now has the
-                                    // master's `.ndb` files; the next
-                                    // catch-up round picks up where the
-                                    // restore left off.
-                                    log::warn!(
-                                        "noxu-replica-{}: master '{}' requires restore; \
-                                         attempting network restore via dispatcher",
+                                Ok(true) => {
+                                    log::info!(
+                                        "noxu-replica-{}: catch-up complete from '{}'",
                                         node_name, master,
                                     );
-                                    // The replica thread doesn't have a
-                                    // direct handle on the env, so we
-                                    // can't call bootstrap_via_dispatcher
-                                    // here without a back-reference.  The
-                                    // env-driven driver is responsible for
-                                    // initiating restore (see
-                                    // `bootstrap_via_dispatcher`); the
-                                    // replica thread merely observes the
-                                    // signal.
+                                    return;
+                                }
+                                Ok(false) => {
+                                    // F2/F4: master signals NeedsRestore.
+                                    // Wave 9-A fix 2: if a Weak<Self> was
+                                    // plumbed in, upgrade it and call
+                                    // `bootstrap_via_dispatcher` ourselves
+                                    // so the replica auto-bootstraps and
+                                    // resumes catch-up without operator
+                                    // intervention.
+                                    log::warn!(
+                                        "noxu-replica-{}: master '{}' requires restore",
+                                        node_name, master,
+                                    );
+                                    attempts += 1;
+                                    if attempts > MAX_AUTO_BOOTSTRAP_ATTEMPTS {
+                                        log::error!(
+                                            "noxu-replica-{}: exceeded \
+                                             auto-bootstrap attempts ({}); giving up",
+                                            node_name,
+                                            MAX_AUTO_BOOTSTRAP_ATTEMPTS,
+                                        );
+                                        return;
+                                    }
+                                    let env_arc = match self_weak
+                                        .as_ref()
+                                        .and_then(Weak::upgrade)
+                                    {
+                                        Some(e) => e,
+                                        None => {
+                                            // No back-ref or env dropped:
+                                            // fall back to operator-driven
+                                            // bootstrap and exit cleanly.
+                                            log::warn!(
+                                                "noxu-replica-{}: no back-reference \
+                                                 available; operator must call \
+                                                 bootstrap_via_dispatcher manually",
+                                                node_name,
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    if env_arc.is_shutdown() {
+                                        return;
+                                    }
+                                    log::info!(
+                                        "noxu-replica-{}: auto-bootstrapping via \
+                                         dispatcher from '{}' (attempt {})",
+                                        node_name, master, attempts,
+                                    );
+                                    match env_arc
+                                        .bootstrap_via_dispatcher(&master)
+                                    {
+                                        Ok(()) => {
+                                            log::info!(
+                                                "noxu-replica-{}: auto-bootstrap \
+                                                 succeeded; resuming catch-up",
+                                                node_name,
+                                            );
+                                            // Drop the strong ref before
+                                            // re-entering catch-up so we
+                                            // do not keep the env alive
+                                            // longer than necessary.
+                                            drop(env_arc);
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "noxu-replica-{}: auto-bootstrap \
+                                                 failed: {}",
+                                                node_name, e,
+                                            );
+                                            return;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     if !shutdown_flag {
@@ -1347,14 +1454,9 @@ impl ReplicatedEnvironment {
                                             node_name, master,
                                         );
                                     }
+                                    return;
                                 }
                             }
-                        } else {
-                            log::warn!(
-                                "noxu-replica-{}: master '{}' address not in RepGroup; \
-                                 waiting for TCP dispatcher connection",
-                                node_name, master,
-                            );
                         }
                     })
                     .expect("failed to spawn noxu-replica thread");
