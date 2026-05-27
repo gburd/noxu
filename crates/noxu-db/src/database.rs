@@ -868,17 +868,32 @@ impl Database {
             None => return Ok(OperationStatus::NotFound),
         };
 
+        // v1.6 (audit C3): if any secondaries are registered we must
+        // capture the pre-delete primary data on each iteration so the
+        // secondary key creator can recompute every (sec_key, pri_key)
+        // pair to remove.  Collected outside the cursor closure so
+        // the auto-commit and explicit-txn paths share one buffer.
+        let secondaries = self.live_secondaries();
+        let track_old_data = !secondaries.is_empty();
+        let mut deleted_old_values: Vec<Vec<u8>> = Vec::new();
+
         // Inner closure shared between the explicit-txn and synthetic
         // auto-txn paths: scans + deletes every duplicate of `key_bytes`
         // through the supplied `cursor`.  See comment in pre-Wave-1A
         // delete for the dup-loop rationale (BDB-JE
         // `Database.delete(key)` semantics).
-        let run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
+        let mut run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
             let mut deleted_any = false;
             while let noxu_dbi::OperationStatus::Success = cursor
                 .search(key_bytes, None, SearchMode::Set)
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
             {
+                if track_old_data {
+                    let (_, v) = cursor.get_current().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                    deleted_old_values.push(v);
+                }
                 cursor.delete().map_err(|e| {
                     NoxuError::OperationNotAllowed(e.to_string())
                 })?;
@@ -892,8 +907,20 @@ impl Database {
                 let mut cursor = self.make_cursor_for_txn(t);
                 run_delete(&mut cursor)?
             }
-            None => self.with_auto_txn(run_delete)?,
+            None => self.with_auto_txn(&mut run_delete)?,
         };
+
+        // v1.6 (audit C3): fan out the secondary cleanup under the
+        // caller's txn so the primary delete and every secondary
+        // tombstone commit / abort together.
+        if deleted_any && !secondaries.is_empty() {
+            for old_bytes in &deleted_old_values {
+                let old_entry = DatabaseEntry::from_bytes(old_bytes);
+                for hook in &secondaries {
+                    hook.maintain(txn, key, Some(&old_entry), None)?;
+                }
+            }
+        }
 
         let status = if deleted_any {
             OperationStatus::Success
