@@ -8,7 +8,7 @@
 **Date:** 2026-05-01
 **Scope:** All crates under `crates/` (workspace covers 19 crates today;
 this review was originally written when the workspace had 16 crates and
-the findings reflect that snapshot — see `docs/src/internal/README.md`
+the findings reflect that snapshot — see `docs/src/internal/index.html`
 for caveats about historical internal documents).
 
 ## Executive Summary

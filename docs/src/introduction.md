@@ -150,11 +150,11 @@ _/nosql/    extended fork with 10 additional capabilities — Java, read-only
 
 | If you want to… | Go to… |
 |---|---|
-| Write your first Noxu program | [Getting Started](getting-started/README.md) |
-| Understand transactions and isolation | [Transaction Processing](transactions/README.md) |
-| Set up multi-node replication | [High Availability](replication/README.md) |
-| Use the collections or DPL API | [Collections and Persistence](collections/README.md) |
-| Tune performance or operate in production | [Operations Guide](operations/README.md) |
-| Understand the internals | [Programmer's Reference](reference/README.md) |
-| Contribute or port new Noxu features | [Contributing](contributing/README.md) |
-| Take over maintenance of the project | [Maintainer's Guide](maintainer/README.md) |
+| Write your first Noxu program | [Getting Started](getting-started/index.html) |
+| Understand transactions and isolation | [Transaction Processing](transactions/index.html) |
+| Set up multi-node replication | [High Availability](replication/index.html) |
+| Use the collections or DPL API | [Collections and Persistence](collections/index.html) |
+| Tune performance or operate in production | [Operations Guide](operations/index.html) |
+| Understand the internals | [Programmer's Reference](reference/index.html) |
+| Contribute or port new Noxu features | [Contributing](contributing/index.html) |
+| Take over maintenance of the project | [Maintainer's Guide](maintainer/index.html) |

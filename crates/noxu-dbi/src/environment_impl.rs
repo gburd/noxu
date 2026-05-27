@@ -1083,7 +1083,7 @@ impl EnvironmentImpl {
         self.run_checkpoint_with_invoker("manual")
     }
 
-    /// Variant of [`run_checkpoint`] that lets the caller supply a
+    /// Variant of `run_checkpoint` that lets the caller supply a
     /// non-default invoker label for structured logs / observability.
     /// Used by `noxu-db::Environment::checkpoint` to thread the
     /// `CheckpointConfig` semantics through to the recovery layer
