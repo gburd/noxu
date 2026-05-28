@@ -25,9 +25,7 @@ use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };
-use noxu_xa::{
-    PrepareResult, XaEnvironment, XaFlags, XaResource, Xid,
-};
+use noxu_xa::{PrepareResult, XaEnvironment, XaFlags, XaResource, Xid};
 use tempfile::TempDir;
 
 struct Harness {

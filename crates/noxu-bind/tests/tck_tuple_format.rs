@@ -1187,7 +1187,12 @@ impl MarshalledData {
     /// Expected encoded size: each string contributes len + 2 bytes
     /// (3 components encoded back-to-back).
     fn expected_data_length(&self) -> usize {
-        self.data.len() + 2 + self.index_key1.len() + 2 + self.index_key2.len() + 2
+        self.data.len()
+            + 2
+            + self.index_key1.len()
+            + 2
+            + self.index_key2.len()
+            + 2
     }
 }
 
@@ -1271,7 +1276,12 @@ struct MarshalledEntity {
 
 impl MarshalledEntity {
     fn expected_data_length(&self) -> usize {
-        self.data.len() + 2 + self.index_key1.len() + 2 + self.index_key2.len() + 2
+        self.data.len()
+            + 2
+            + self.index_key1.len()
+            + 2
+            + self.index_key2.len()
+            + 2
     }
     fn expected_key_length(&self) -> usize {
         self.primary_key.len() + 2
