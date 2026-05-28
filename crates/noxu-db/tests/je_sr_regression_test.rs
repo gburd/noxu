@@ -33,6 +33,7 @@ fn open_env_and_db(
     let env = noxu_db::Environment::open(env_config).unwrap();
     let db_config = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(sorted_dups);
     let db = env.open_database(None, name, &db_config).unwrap();
     (env, db)

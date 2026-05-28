@@ -59,7 +59,7 @@ fn open_pri(env: &Environment, name: &str) -> Arc<Mutex<Database>> {
         .open_database(
             None,
             name,
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
         )
         .unwrap();
     Arc::new(Mutex::new(db))
@@ -74,6 +74,7 @@ fn open_inner_sec_db(env: &Environment, name: &str) -> Database {
         name,
         &DatabaseConfig::new()
             .with_allow_create(true)
+            .with_transactional(true)
             .with_sorted_duplicates(true),
     )
     .unwrap()
@@ -659,7 +660,7 @@ fn d2c_foreign_key_database_name_without_handle_rejected() {
         .open_database(
             None,
             "foreign",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
         )
         .unwrap();
 
