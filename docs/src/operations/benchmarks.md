@@ -267,12 +267,12 @@ sorted-dup walk cost.
 Wave 10-D ran on tmpfs, where `fdatasync` is instant and the
 FsyncManager's coalescing window is invisible.  Wave 11-C re-runs the
 W10 (concurrent) and W11 (recovery) workloads with the database rooted
-on real NVMe to surface the coalescing behaviour.  Numbers were
+on real NVMe to surface the coalescing behaviour.  Numbers below were
 collected with:
 
 ```bash
 NOXU_BENCH_DIR=/scratch/noxu_bench NOXU_BENCH_CLEANUP=1 \
-NOXU_BENCH_SCALES=1000,10000 \
+NOXU_BENCH_SCALES=10000 \
     ./target/release/noxu-workload-bench
 ```
 
@@ -280,8 +280,58 @@ The harness auto-detects `/scratch` and uses it without an explicit
 `NOXU_BENCH_DIR` when the path exists, which is what happened on the
 machine these numbers are from (note the
 "`Storage:    /scratch/noxu_bench (NVMe auto-detected)`" line in the
-harness output).  See `benches/results/noxu_results.csv` for the
-per-workload row data; the corresponding JE NVMe run is gated on
-`bash benches/setup.sh` running successfully, which it did not in this
-environment, so the side-by-side comparison report is left to a
-future wave.
+harness output).
+
+### Noxu DB on NVMe at N=10 000
+
+| Workload                | Threads | Time (ms) | ops/s | Fsyncs |
+|-------------------------|--------:|----------:|------:|-------:|
+| `w10_conc_1r0w`         |       1 |      15.4 | 651 445 |     0 |
+| `w10_conc_0r1w`         |       1 |    6 284.7 |   1 591 | 10 000 |
+| `w10_conc_4r0w`         |       4 |       6.3 | 1 587 195 |     0 |
+| `w10_conc_0r4w`         |       4 |    3 897.8 |   2 566 |  6 219 |
+| `w10_conc_4r4w`         |       8 |    1 956.7 |   5 111 |  3 174 |
+| `w10_conc_8r8w`         |      16 |    1 658.7 |   6 029 |  2 631 |
+| `w10_txn_no_gc`         |       8 |    4 716.9 |   2 120 |  7 445 |
+| `w10_txn_group_commit`  |       8 |    4 580.9 |   2 183 |  7 227 |
+| `w11_recovery`          |       1 |      218.4 |       5 |     0 |
+
+### What changed vs the tmpfs run
+
+* **Single-writer (`w10_conc_0r1w`).**  10 000 fsyncs, one per write.
+  No coalescing is possible — there is exactly one writer.  This is
+  the worst-case fsync-bound regime.
+* **Four writers (`w10_conc_0r4w`).**  6 219 fsyncs for 40 000
+  writes — the FsyncManager coalesces ~6.4 writes per fsync on
+  average.  Coalescing was invisible on tmpfs because every fsync
+  returned in O(µs); on NVMe each fsync takes ~600µs, leaving a
+  meaningful window for other writers to queue and ride the next
+  group fsync.
+* **Mixed (`w10_conc_4r4w`, `w10_conc_8r8w`).**  Coalescing factor
+  rises to 12.6× (40 000 / 3 174) and 30.4× (80 000 / 2 631) — more
+  threads, longer queue, more aggressive coalescing.
+* **Group commit (`w10_txn_group_commit` vs `w10_txn_no_gc`).**
+  Group commit shaves ~3 % off the elapsed time at this scale on
+  NVMe (4 581 ms vs 4 717 ms) and reduces fsync count by 218 (7 227
+  vs 7 445).  The benefit is real but small at 8 writers because
+  the auto-coalescing already gets most of the available wins; the
+  group-commit configured threshold of 4 with a 5 ms interval gives
+  the leader more time to accumulate more committers per fsync, but
+  most of the wallclock at this scale is dominated by the actual
+  fsync round-trip latency, not the queueing.
+* **Recovery (`w11_recovery`).**  218 ms to replay a 10 000-record
+  log on NVMe.  This is the I/O-bound regime; tmpfs ran the same
+  workload in ~5 ms because there was no actual disk I/O to do.
+
+The matching JE NVMe run is gated on `bash benches/setup.sh` running
+successfully (it requires Maven plus internet access to download the
+JE jar dependency tree), which it did not in this environment, so a
+side-by-side comparison report is left to a future wave.  The
+reproducer command is:
+
+```bash
+bash benches/setup.sh
+bash benches/run_comparison.sh \
+    --bench-dir /scratch/noxu_bench \
+    --max-scale 10000
+```
