@@ -544,9 +544,8 @@ fn multi_env_open_close_test_multi_open_close() {
         let db_cfg = DatabaseConfig::new()
             .with_allow_create(true)
             .with_transactional(true);
-        let db = env
-            .open_database(None, "MultiEnvOpenCloseTest", &db_cfg)
-            .unwrap();
+        let db =
+            env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         let value = vec![0u8; DATA_SIZE];
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..N_RECORDS {
@@ -576,13 +575,16 @@ fn multi_env_open_close_test_multi_open_close() {
         let db_cfg = DatabaseConfig::new()
             .with_transactional(true)
             .with_allow_create(true);
-        let db = env
-            .open_database(None, "MultiEnvOpenCloseTest", &db_cfg)
-            .unwrap();
+        let db =
+            env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         for i in 0..N_RECORDS {
             let mut out = DatabaseEntry::new();
             let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(OperationStatus::Success, s, "k={i} should survive reopen");
+            assert_eq!(
+                OperationStatus::Success,
+                s,
+                "k={i} should survive reopen"
+            );
         }
         db.close().unwrap();
         drop(env);
@@ -710,10 +712,7 @@ fn database_put_no_overwrite_in_dup_db_no_txn() {
             OperationStatus::KeyExists
         );
         let d2 = ikey(i << 1);
-        assert_eq!(
-            db.put(None, &k, &d2).unwrap(),
-            OperationStatus::Success
-        );
+        assert_eq!(db.put(None, &k, &d2).unwrap(), OperationStatus::Success);
         let d3 = ikey(i << 2);
         assert_eq!(
             db.put_no_overwrite(None, &k, &d3).unwrap(),
@@ -851,9 +850,8 @@ fn environment_read_only_rejects_db_name_ops() {
     assert!(env.remove_database(None, "db1").is_err());
     assert!(env.rename_database(None, "db1", "db2").is_err());
 
-    let dbcfg = DatabaseConfig::new()
-        .with_read_only(true)
-        .with_transactional(true);
+    let dbcfg =
+        DatabaseConfig::new().with_read_only(true).with_transactional(true);
     let db = env.open_database(None, "db1", &dbcfg).unwrap();
     assert_eq!(db.count().unwrap(), 1);
 }
@@ -901,9 +899,8 @@ fn environment_checkpoint_forces_durability() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(cfg).unwrap();
-    let dbcfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "flush", &dbcfg).unwrap();
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..NUM_RECS {
@@ -960,9 +957,8 @@ fn environment_checkpoint_after_commit_loses_data() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(cfg).unwrap();
-    let dbcfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "ckp_loss", &dbcfg).unwrap();
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..NUM_RECS {
@@ -993,9 +989,8 @@ fn environment_open_reserved_name_db_rejected() {
         .with_transactional(true);
     let env = noxu_db::Environment::open(cfg).unwrap();
 
-    let dbcfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let result = env.open_database(None, "", &dbcfg);
     assert!(
         result.is_err(),

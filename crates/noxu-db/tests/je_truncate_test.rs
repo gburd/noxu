@@ -24,9 +24,8 @@ fn open_env(dir: &Path) -> noxu_db::Environment {
 }
 
 fn open_db(env: &noxu_db::Environment, name: &str) -> noxu_db::Database {
-    let cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     env.open_database(None, name, &cfg).unwrap()
 }
 
