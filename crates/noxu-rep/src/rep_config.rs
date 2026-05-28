@@ -48,10 +48,10 @@ const DEFAULT_PHI_WINDOW_SIZE: usize = 200;
 pub enum RepTransportKind {
     /// Plaintext TCP via [`crate::net::TcpChannel`].
     Tcp,
-    /// TLS-encrypted TCP via [`crate::net::TlsTcpChannel`]
+    /// TLS-encrypted TCP via `crate::net::TlsTcpChannel`
     /// (requires `tls-rustls` or `tls-native`).
     Tls,
-    /// QUIC over UDP via [`crate::net::QuicChannel`]
+    /// QUIC over UDP via `crate::net::QuicChannel`
     /// (requires the `quic` feature).
     Quic,
     /// In-process [`crate::net::InMemoryTransport`].  Useful for

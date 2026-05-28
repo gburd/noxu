@@ -40,9 +40,8 @@ use noxu_rep::{NodeState, RepTransportKind};
 /// both replicas.
 #[test]
 fn three_node_group_elects_master_and_replicates() {
-    let mut group = RepTestBase::builder("inmem_3node_replicate")
-        .group_size(3)
-        .build();
+    let mut group =
+        RepTestBase::builder("inmem_3node_replicate").group_size(3).build();
     group.create_group(/* term */ 1).unwrap();
 
     // Sanity: exactly one master, two replicas.
@@ -122,8 +121,7 @@ fn failover_after_master_crash_promotes_replica() {
 /// the replica catches up to the master's VLSN.
 #[test]
 fn network_restore_catches_up_lagging_replica() {
-    let mut group =
-        RepTestBase::builder("inmem_restore").group_size(2).build();
+    let mut group = RepTestBase::builder("inmem_restore").group_size(2).build();
     group.create_group(/* term */ 1).unwrap();
 
     // Phase 1: 10 entries, both nodes in sync.
@@ -211,19 +209,13 @@ fn inmem_simulate_crash_then_reconnect_cycles_correctly() {
 
     // Surviving (1, 2) link is unaffected.
     mesh.channel(1, 2).send(b"alive").unwrap();
-    let got = mesh
-        .channel(2, 1)
-        .receive(Duration::from_millis(50))
-        .unwrap();
+    let got = mesh.channel(2, 1).receive(Duration::from_millis(50)).unwrap();
     assert_eq!(got, Some(b"alive".to_vec()));
 
     // Reconnect node 0 and verify a fresh handle works end-to-end.
     mesh.reconnect(0);
     mesh.channel(0, 1).send(b"reborn").unwrap();
-    let got = mesh
-        .channel(1, 0)
-        .receive(Duration::from_millis(50))
-        .unwrap();
+    let got = mesh.channel(1, 0).receive(Duration::from_millis(50)).unwrap();
     assert_eq!(got, Some(b"reborn".to_vec()));
 }
 
@@ -284,9 +276,6 @@ fn three_node_inmem_full_smoke_with_clean_shutdown() {
 
     // Wire mesh remains independently usable.
     mesh.channel(0, 1).send(b"post-shutdown").unwrap();
-    let got = mesh
-        .channel(1, 0)
-        .receive(Duration::from_millis(50))
-        .unwrap();
+    let got = mesh.channel(1, 0).receive(Duration::from_millis(50)).unwrap();
     assert_eq!(got, Some(b"post-shutdown".to_vec()));
 }
