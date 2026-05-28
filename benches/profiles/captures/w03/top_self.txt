@@ -1,0 +1,50 @@
+    15.09%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+               |          
+                --0.56%--equal_same_length<u8, u8> (inlined)
+                          eq<u8, u8> (inlined)
+                          eq<[u8], [u8]> (inlined)
+                          {closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     5.18%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::find_bin_for_key
+     3.21%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::search
+     3.19%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
+                --2.55%--malloc
+
+     2.97%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::lock_with_timeout
+     2.60%  noxu-perf-profi  noxu-perf-profiler    [.] crc32fast::baseline::update_fast_16
+     2.43%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree
+     2.43%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::release
+     2.41%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --2.30%--cfree@GLIBC_2.2.5
+
+     2.30%  noxu-perf-profi  noxu-perf-profiler    [.] std::thread::current::current
+     1.95%  noxu-perf-profi  noxu-perf-profiler    [.] core::ptr::drop_in_place<noxu_dbi::cursor_impl::CursorImpl>
+     1.81%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_sync::raw_mutex::thread_id
+     1.66%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+     1.65%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::search
+     1.63%  noxu-perf-profi  libc.so.6             [.] cfree@GLIBC_2.2.5
+            |
+            ---cfree@GLIBC_2.2.5
+
+     1.63%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+
+     1.38%  noxu-perf-profi  noxu-perf-profiler    [.] alloc::fmt::format::format_inner
+     1.28%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::log_manager::LogManager::log_internal
+     1.13%  noxu-perf-profi  noxu-perf-profiler    [.] <core::fmt::Formatter>::pad_integral

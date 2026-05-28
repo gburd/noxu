@@ -1,0 +1,50 @@
+     9.70%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+
+     9.20%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+     7.96%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --7.92%--cfree@GLIBC_2.2.5
+
+     7.34%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::insert_recursive
+     5.27%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |          
+            |--4.40%--__memmove_avx_unaligned_erms
+            |          |          
+            |           --1.00%--_int_realloc
+            |                     realloc
+            |          
+             --0.87%--0xffffffff83801280
+
+     4.85%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
+               |--4.11%--malloc
+               |          
+                --0.65%--_int_realloc
+                          realloc
+
+     3.55%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::file_manager_scanner::FileManagerLogScanner::parse_entry_from_bytes
+     3.48%  noxu-perf-profi  libc.so.6             [.] malloc_consolidate
+            |
+            ---malloc_consolidate
+               |          
+                --3.00%--_int_malloc
+                          |          
+                          |--1.62%--_int_realloc
+                          |          realloc
+                          |          
+                           --1.39%--malloc
+
+     3.17%  noxu-perf-profi  noxu-perf-profiler    [.] bytes::bytes::owned_clone
+     2.93%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::insert_with_prefix
+     2.40%  noxu-perf-profi  noxu-perf-profiler    [.] bytes::bytes::owned_drop
+     2.27%  noxu-perf-profi  libc.so.6             [.] unlink_chunk.isra.0
+            |
