@@ -31,13 +31,17 @@ enum LnEvent {
 fn ln_event_strategy() -> impl Strategy<Value = LnEvent> {
     prop_oneof![
         // Writes: small file space (4 files), modest sizes, modest offsets.
-        (0u32..4, 0u32..1024, 1u32..512)
-            .prop_map(|(f, o, s)| LnEvent::Write { file_number: f, offset: o, size: s }),
+        (0u32..4, 0u32..1024, 1u32..512).prop_map(|(f, o, s)| LnEvent::Write {
+            file_number: f,
+            offset: o,
+            size: s
+        }),
         // Deletes target the same space.  If they reference an LN that
         // was never written, the tracker still records the obsolete event;
         // the oracle handles missing LNs the same way.
-        (0u32..4, 0u32..1024, 1u32..512)
-            .prop_map(|(f, o, s)| LnEvent::Delete { file_number: f, offset: o, size: s }),
+        (0u32..4, 0u32..1024, 1u32..512).prop_map(|(f, o, s)| {
+            LnEvent::Delete { file_number: f, offset: o, size: s }
+        }),
     ]
 }
 
@@ -167,38 +171,51 @@ proptest! {
 /// sequences must satisfy it.
 fn consistent_summary_strategy() -> impl Strategy<Value = FileSummary> {
     (
-        1i32..1_000_000,    // total_size
-        1i32..10_000,       // total_count
-        0i32..10_000,       // total_ln_count
-        0i32..10_000,       // total_in_count
-        0u32..1000,         // ln_share (per-mille of total_size for LN)
-        0u32..1000,         // in_share (per-mille of total_size for IN)
-        0i32..10_000,       // obsolete_ln_count_raw
-        0i32..10_000,       // obsolete_in_count_raw
-        0u32..1000,         // obs_ln_share (per-mille of ln_size)
+        1i32..1_000_000, // total_size
+        1i32..10_000,    // total_count
+        0i32..10_000,    // total_ln_count
+        0i32..10_000,    // total_in_count
+        0u32..1000,      // ln_share (per-mille of total_size for LN)
+        0u32..1000,      // in_share (per-mille of total_size for IN)
+        0i32..10_000,    // obsolete_ln_count_raw
+        0i32..10_000,    // obsolete_in_count_raw
+        0u32..1000,      // obs_ln_share (per-mille of ln_size)
     )
-        .prop_map(|(ts, tc, tlc, tic, ln_share, in_share_raw, olc_raw, oic_raw, obs_ln_share)| {
-            // Partition total_size into IN, LN, and leftover so that
-            //   total_in_size + total_ln_size <= total_size.
-            let ln_size = (ts as i64 * ln_share as i64 / 1000) as i32;
-            let max_in_share = 1000u32.saturating_sub(ln_share);
-            let in_share = in_share_raw.min(max_in_share);
-            let in_size = (ts as i64 * in_share as i64 / 1000) as i32;
+        .prop_map(
+            |(
+                ts,
+                tc,
+                tlc,
+                tic,
+                ln_share,
+                in_share_raw,
+                olc_raw,
+                oic_raw,
+                obs_ln_share,
+            )| {
+                // Partition total_size into IN, LN, and leftover so that
+                //   total_in_size + total_ln_size <= total_size.
+                let ln_size = (ts as i64 * ln_share as i64 / 1000) as i32;
+                let max_in_share = 1000u32.saturating_sub(ln_share);
+                let in_share = in_share_raw.min(max_in_share);
+                let in_size = (ts as i64 * in_share as i64 / 1000) as i32;
 
-            let mut s = FileSummary::new();
-            s.total_size = ts;
-            s.total_count = tc;
-            s.total_ln_count = tlc;
-            s.total_ln_size = ln_size;
-            s.obsolete_ln_count = olc_raw.min(tlc);
-            let obs_ln_size = (ln_size as i64 * obs_ln_share as i64 / 1000) as i32;
-            s.obsolete_ln_size = obs_ln_size.min(ln_size);
-            s.obsolete_ln_size_counted = s.obsolete_ln_count;
-            s.total_in_count = tic;
-            s.total_in_size = in_size;
-            s.obsolete_in_count = oic_raw.min(tic);
-            s
-        })
+                let mut s = FileSummary::new();
+                s.total_size = ts;
+                s.total_count = tc;
+                s.total_ln_count = tlc;
+                s.total_ln_size = ln_size;
+                s.obsolete_ln_count = olc_raw.min(tlc);
+                let obs_ln_size =
+                    (ln_size as i64 * obs_ln_share as i64 / 1000) as i32;
+                s.obsolete_ln_size = obs_ln_size.min(ln_size);
+                s.obsolete_ln_size_counted = s.obsolete_ln_count;
+                s.total_in_count = tic;
+                s.total_in_size = in_size;
+                s.obsolete_in_count = oic_raw.min(tic);
+                s
+            },
+        )
 }
 
 proptest! {
