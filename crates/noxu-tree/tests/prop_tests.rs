@@ -318,9 +318,7 @@ proptest! {
 // ============================================================================
 
 /// Generate a small set of distinct keys for BIN-delta tests.
-fn bin_keys_strategy(
-    max: usize,
-) -> impl Strategy<Value = Vec<Vec<u8>>> {
+fn bin_keys_strategy(max: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
     prop::collection::hash_set(
         prop::collection::vec(any::<u8>(), 1..16),
         1..=max,

@@ -388,6 +388,8 @@ fn prop_active_txn_after_terminal_resurrects_phantom_active() {
     assert!(!a.is_active(1));
     // The next assertion is what surfaces the gap: oracle says
     // has_active_txns should be false, but the impl returns true.
-    assert!(!a.has_active_txns(),
-        "phantom active txn after Commit then record_active_txn");
+    assert!(
+        !a.has_active_txns(),
+        "phantom active txn after Commit then record_active_txn"
+    );
 }
