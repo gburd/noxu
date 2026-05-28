@@ -48,7 +48,7 @@ Every wave ships:
 | 11-E | v2.4.0 | Property test expansion (target: +20 properties) | queued |
 | 11-F | v2.4.0 | Stateright coverage of remaining 6 protocols | dispatched |
 | 11-G | v2.4.0 | Continue JE TCK long-tail port (~30-50 more tests) | queued |
-| 11-H | v2.4.0 | Performance investigation on JE-wins workloads (W03/W04/W10/W11) | queued |
+| 11-H | v2.4.0 | Performance investigation on JE-wins workloads (W03/W04/W10/W11) | merged: per-workload analysis + ROI plan in [wave-11-h-perf-investigation.md](wave-11-h-perf-investigation.md) |
 | 11-I | v2.5.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | gated on 11-H findings |
 | 11-J | v2.5.0 | Optimize fsync coalescing (closes W10 gap) | gated on 11-H findings |
 | 11-K | v2.5.0 | Optimize log scanner (closes W11 gap) | gated on 11-H findings |
