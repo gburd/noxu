@@ -33,7 +33,7 @@ pub use dirty_in_map::{CheckpointReference, CkptState, DirtyINMap};
 pub use error::{RecoveryError, Result};
 pub use log_scanner::{
     CkptEndRecord, CkptStartRecord, DbTreeRecord, InMemoryLogScanner, InRecord,
-    LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
+    LnOperation, LnRecord, LogEntry, LogScanner, NameLnRecord, PositionedEntry,
     RollbackEndRecord, RollbackStartRecord, TxnAbortRecord, TxnCommitRecord,
     TxnPrepareRecord,
 };

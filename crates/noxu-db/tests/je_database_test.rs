@@ -811,7 +811,6 @@ fn database_close_idempotent() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn environment_read_only_rejects_db_name_ops() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

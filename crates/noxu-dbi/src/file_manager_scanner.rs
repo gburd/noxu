@@ -242,7 +242,45 @@ impl FileManagerLogScanner {
                 }))
             }
 
-            // Everything else (FileHeader, Trace, MapLN, NameLN, etc.) ─
+            // NameLN / NameLNTxn: database name registration entries.
+            // Parse using the LnLogEntry format: key = db_name bytes,
+            // data = 8-byte little-endian db_id (or None for deletion).
+            // db_id in the entry header is ignored (we use the data field).
+            LogEntryType::NameLN | LogEntryType::NameLNTxn => {
+                let is_txn = entry_type == LogEntryType::NameLNTxn;
+                let raw: &[u8] = &payload;
+                let r = LnLogEntry::parse_from_slice(raw, is_txn).ok()?;
+                let name =
+                    String::from_utf8(r.key.to_vec()).ok()?;
+                if let Some(data_bytes) = r.data {
+                    if data_bytes.len() >= 8 {
+                        let db_id = u64::from_le_bytes(
+                            data_bytes[..8].try_into().ok()?,
+                        );
+                        Some(LogEntry::NameLn(
+                            noxu_recovery::NameLnRecord {
+                                name,
+                                db_id,
+                                is_deleted: false,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    // Deletion: data is None.
+                    // db_id 0 is a sentinel (unused for deletions).
+                    Some(LogEntry::NameLn(
+                        noxu_recovery::NameLnRecord {
+                            name,
+                            db_id: 0,
+                            is_deleted: true,
+                        },
+                    ))
+                }
+            }
+
+            // Everything else (FileHeader, Trace, MapLN, etc.) ─
             _ => None,
         }
     }

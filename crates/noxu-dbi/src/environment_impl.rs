@@ -20,7 +20,8 @@ use crate::{
 use noxu_cleaner::{Cleaner, UtilizationTracker, UtilizationTrackerObserver};
 use noxu_evictor::{Arbiter, EvictionSource, Evictor};
 use noxu_log::{
-    FileManager, LogEntryType, LogManager, Provisional, entry::TxnEndEntry,
+    FileManager, LogEntryType, LogManager, Provisional,
+    entry::{LnLogEntry, TxnEndEntry},
 };
 use noxu_recovery::RecoveryManager;
 use noxu_sync::Mutex as NoxuMutex;
@@ -303,6 +304,8 @@ impl EnvironmentImpl {
         // Trees recovered from the log, keyed by database ID.
         // Populated during the recovery pass below (writable envs only).
         let mut recovered: HashMap<u64, noxu_tree::Tree> = HashMap::new();
+        // Database name → id mappings recovered from NameLN entries.
+        let mut recovered_names: HashMap<String, DatabaseId> = HashMap::new();
         // Wave 3-2: prepared (XA in-doubt) transactions surfaced by
         // recovery.  Empty for fresh / clean-shutdown environments.
         let mut recovered_prepared: Vec<noxu_recovery::PreparedTxnInfo> =
@@ -385,6 +388,14 @@ impl EnvironmentImpl {
                 recovered.insert(db_id, tree);
             }
 
+            // Restore the database name → id map from NameLN entries in the
+            // WAL so that subsequent open_database() calls (including
+            // read-only reopens with allow_create=false) can find registered
+            // databases without needing to recreate them.
+            for (name, db_id) in recovery_info.recovered_db_names {
+                recovered_names.insert(name, DatabaseId::new(db_id as i64));
+            }
+
             let mut lm = LogManager::new(
                 fm,
                 cfg.log_num_buffers,
@@ -411,6 +422,31 @@ impl EnvironmentImpl {
 
             Some((Arc::new(lm), util_tracker))
         } else {
+            // Read-only environment: run a read-only scan to recover both
+            // the name map and the trees so that open_database() can find
+            // registered databases and their committed data.
+            if let Ok(fm) = FileManager::new(
+                &env_home,
+                true, // read_only
+                0,    // default log file size
+                0,    // default cache size
+            ) {
+                let fm_arc = Arc::new(fm);
+                let mut scanner =
+                    FileManagerLogScanner::new(Arc::clone(&fm_arc));
+                let mut rmgr = noxu_recovery::RecoveryManager::new();
+                let mut recovery_trees: HashMap<u64, noxu_tree::Tree> =
+                    HashMap::new();
+                recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+                if let Ok(info) = rmgr.recover_all(&mut scanner, &mut recovery_trees, true) {
+                    for (name, db_id) in info.recovered_db_names {
+                        recovered_names.insert(name, DatabaseId::new(db_id as i64));
+                    }
+                }
+                for (db_id, tree) in recovery_trees {
+                    recovered.insert(db_id, tree);
+                }
+            }
             None
         };
         let (log_manager, utilization_tracker): (
@@ -651,7 +687,7 @@ impl EnvironmentImpl {
             lock_manager,
             txn_manager,
             db_map,
-            name_map: RwLock::new(HashMap::new()),
+            name_map: RwLock::new(recovered_names),
             is_invalid: AtomicBool::new(false),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
@@ -749,7 +785,7 @@ impl EnvironmentImpl {
     ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
         self.check_open()?;
 
-        // Check if database already exists
+        // Check if database already exists in the open db_map.
         if let Some(db_id) = self.name_map.read().get(name)
             && let Some(db) = self.db_map.read().get(db_id)
         {
@@ -757,13 +793,35 @@ impl EnvironmentImpl {
             return Ok(db.clone());
         }
 
-        // Create new database
-        if !config.allow_create {
+        // Check if the name was recovered from the WAL (name in name_map but
+        // no live db_map entry yet).  Use the recovered db_id so that the
+        // correct recovered tree is transplanted below.
+        let recovered_db_id: Option<i64> = self
+            .name_map
+            .read()
+            .get(name)
+            .copied()
+            .map(|id| id.id());
+
+        if recovered_db_id.is_none() && !config.allow_create {
             return Err(DbiError::DatabaseNotFound(name.to_string()));
         }
 
-        let db_id =
-            DatabaseId::new(self.next_db_id.fetch_add(1, Ordering::Relaxed));
+        let db_id = if let Some(rid) = recovered_db_id {
+            // Reopen: use the recovered db_id and ensure the counter is
+            // at least rid + 1 so fresh creations don't reuse it.
+            let next = self.next_db_id.load(Ordering::Relaxed);
+            if next <= rid {
+                self.next_db_id
+                    .store(rid + 1, Ordering::Relaxed);
+            }
+            DatabaseId::new(rid)
+        } else {
+            // New creation: allocate a fresh ID.
+            DatabaseId::new(
+                self.next_db_id.fetch_add(1, Ordering::Relaxed),
+            )
+        };
 
         let mut db_impl =
             DatabaseImpl::new(db_id, name.to_string(), DbType::User, config);
@@ -792,7 +850,55 @@ impl EnvironmentImpl {
         self.db_map.write().insert(db_id, db.clone());
         self.name_map.write().insert(name.to_string(), db_id);
 
+        // Persist the name → id mapping to the WAL (only for new creations
+        // and writable environments) so that subsequent reopens — including
+        // read-only ones with allow_create=false — can reconstruct name_map.
+        if recovered_db_id.is_none() {
+            if let Some(lm) = &self.log_manager {
+                let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
+            }
+        }
+
         Ok(db)
+    }
+
+    /// Write a NameLN entry to the WAL mapping `name` → `db_id`.
+    ///
+    /// Format: `LnLogEntry` with key=name bytes, data=8-byte LE db_id.
+    /// Uses `LogEntryType::NameLN` (non-transactional).
+    fn log_name_ln(
+        lm: &Arc<LogManager>,
+        name: &str,
+        db_id: u64,
+    ) -> Result<(), DbiError> {
+        let key = name.as_bytes().to_vec();
+        let data = db_id.to_le_bytes().to_vec();
+        let entry = LnLogEntry::new(
+            0,     // db_id header field (unused for NameLN, use 0)
+            None,  // txn_id: non-transactional
+            NULL_LSN,
+            false,
+            None,
+            None,
+            noxu_util::vlsn::NULL_VLSN,
+            0,
+            false,
+            key,
+            Some(data),
+            0,
+            noxu_util::vlsn::NULL_VLSN,
+        );
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        lm.log(
+            LogEntryType::NameLN,
+            &buf,
+            Provisional::No,
+            false, // flush: lazy
+            false, // fsync: lazy
+        )
+        .map(|_| ())
+        .map_err(DbiError::from)
     }
 
     /// Returns the `Arc<RwLock<DatabaseImpl>>` for `db_id`, or `None` if not found.

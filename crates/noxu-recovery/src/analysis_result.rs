@@ -178,6 +178,10 @@ pub struct AnalysisResult {
 
     /// LSN of the mapping-tree root.
     pub use_root_lsn: Lsn,
+
+    /// Database name → ID mappings accumulated from NameLN entries.
+    /// Populated by `record_name_ln`; consumed by `RecoveryManager`.
+    pub recovered_db_names: hashbrown::HashMap<String, u64>,
 }
 
 impl AnalysisResult {
@@ -196,6 +200,7 @@ impl AnalysisResult {
             checkpoint_end_lsn: NULL_LSN,
             first_active_lsn: NULL_LSN,
             use_root_lsn: NULL_LSN,
+            recovered_db_names: hashbrown::HashMap::new(),
         }
     }
 

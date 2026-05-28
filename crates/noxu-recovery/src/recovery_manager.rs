@@ -454,6 +454,8 @@ impl RecoveryManager {
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
+        // Propagate recovered database name→id mappings.
+        self.info.recovered_db_names = analysis.recovered_db_names.clone();
 
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
@@ -885,6 +887,18 @@ impl RecoveryManager {
                     // RollbackTracker.register(RollbackEnd, lsn)
                     self.rollback_tracker
                         .register_rollback_end(rec.matchpoint_lsn, rec.lsn);
+                }
+
+                // ----------------------------------------------------------
+                // NameLN: database name registration
+                // ----------------------------------------------------------
+                LogEntry::NameLn(rec) => {
+                    if rec.is_deleted {
+                        result.recovered_db_names.remove(&rec.name);
+                    } else {
+                        result.recovered_db_names
+                            .insert(rec.name.clone(), rec.db_id);
+                    }
                 }
 
                 // ----------------------------------------------------------
