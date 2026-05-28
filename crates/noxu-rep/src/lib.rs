@@ -126,6 +126,7 @@ pub use error::{RepError, Result};
 pub use master_transfer::{
     MasterTransfer, MasterTransferConfig, TransferState,
 };
+pub use net::{InMemoryEndpoint, InMemoryGroup, InMemoryTransport};
 #[cfg(feature = "quic")]
 pub use net::{
     QuicChannel, QuicChannelListener, default_server_config,
@@ -138,7 +139,6 @@ pub use net::{
 };
 pub use network_restore::{NetworkRestore, NetworkRestoreConfig, RestoreState};
 pub use network_restore_server::{NetworkRestoreServer, RESTORE_SERVICE_NAME};
-pub use net::{InMemoryEndpoint, InMemoryGroup, InMemoryTransport};
 pub use node_state::{NodeState, NodeStateMachine};
 pub use node_type::NodeType;
 pub use quorum_policy::QuorumPolicy;

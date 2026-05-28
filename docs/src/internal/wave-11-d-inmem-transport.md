@@ -115,8 +115,8 @@ behaviour; existing callers see no observable change.
   round-trip across every ordered pair.
 * `inmem_simulate_crash_then_reconnect_cycles_correctly` — wire-level
   crash + reconnect cycle.
-* `rep_config_transport_kind_round_trips` — builder field round-trip
-  + `ReplicatedEnvironment::new` accepts an `InMemory` config.
+* `rep_config_transport_kind_round_trips` — builder field round-trip;
+  `ReplicatedEnvironment::new` accepts an `InMemory` config.
 * `three_node_inmem_full_smoke_with_clean_shutdown` — end-to-end
   smoke covering mesh + harness + clean shutdown.
 

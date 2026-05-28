@@ -5,8 +5,8 @@
 //! | Transport | Module | Use case |
 //! |-----------|--------|----------|
 //! | TCP       | [`crate::net::TcpChannel`]      | Plain replication LAN/WAN |
-//! | TLS       | [`crate::net::TlsTcpChannel`]   | Encrypted WAN (rustls / native-tls) |
-//! | QUIC      | [`crate::net::QuicChannel`]     | Multiplexed UDP (feature `quic`) |
+//! | TLS       | `crate::net::TlsTcpChannel`     | Encrypted WAN (rustls / native-tls) |
+//! | QUIC      | `crate::net::QuicChannel`       | Multiplexed UDP (feature `quic`) |
 //! | **In-memory** | [`InMemoryTransport`] (this module) | In-process clusters, embedded use cases, tests |
 //!
 //! The in-memory transport originated as a wire-level fixture for
@@ -88,7 +88,7 @@ use crate::net::channel::{Channel, LocalChannel, LocalChannelPair};
 /// One end of an in-memory replication channel.
 ///
 /// Implements [`Channel`] identically to [`crate::net::TcpChannel`] and
-/// [`crate::net::TlsTcpChannel`].  Internally backed by
+/// `crate::net::TlsTcpChannel`.  Internally backed by
 /// [`LocalChannel`] queues and a `noxu_sync::Mutex`.
 ///
 /// Endpoints are constructed via [`InMemoryTransport::new_pair`] or
@@ -155,7 +155,10 @@ impl InMemoryTransport {
     /// production-named [`InMemoryEndpoint`] handles.
     pub fn new_pair() -> (InMemoryEndpoint, InMemoryEndpoint) {
         let pair = LocalChannelPair::new();
-        (InMemoryEndpoint::new(pair.channel_a), InMemoryEndpoint::new(pair.channel_b))
+        (
+            InMemoryEndpoint::new(pair.channel_a),
+            InMemoryEndpoint::new(pair.channel_b),
+        )
     }
 
     /// Create an `n`-node fully-connected in-memory group.
@@ -213,11 +216,13 @@ impl InMemoryGroup {
         assert!(n > 0, "InMemoryGroup requires at least one node");
 
         // Build n×n matrix; diagonal stays None.
-        let endpoints: Vec<Vec<Mutex<Option<InMemoryEndpoint>>>> =
-            (0..n).map(|_| (0..n).map(|_| Mutex::new(None)).collect()).collect();
+        let endpoints: Vec<Vec<Mutex<Option<InMemoryEndpoint>>>> = (0..n)
+            .map(|_| (0..n).map(|_| Mutex::new(None)).collect())
+            .collect();
 
         // Cross-connect every (i, j) with i < j: one LocalChannelPair
         // gives us both `i → j` (channel_a) and `j → i` (channel_b).
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             for j in (i + 1)..n {
                 let pair = LocalChannelPair::new();
@@ -331,7 +336,8 @@ impl InMemoryGroup {
             }
             // Lock both ordered pairs, smallest index first to keep a
             // global lock order (deadlock-free).
-            let (lo, hi) = if node < peer { (node, peer) } else { (peer, node) };
+            let (lo, hi) =
+                if node < peer { (node, peer) } else { (peer, node) };
             let mut a = self.endpoints[lo][hi].lock();
             let mut b = self.endpoints[hi][lo].lock();
 
@@ -405,10 +411,8 @@ mod tests {
         // Sends on (i → j) are received on the (j → i) endpoint
         // (same underlying queue pair, opposite end).
         group.channel(0, 1).send(b"01").unwrap();
-        let got = group
-            .channel(1, 0)
-            .receive(Duration::from_millis(50))
-            .unwrap();
+        let got =
+            group.channel(1, 0).receive(Duration::from_millis(50)).unwrap();
         assert_eq!(got, Some(b"01".to_vec()));
     }
 
@@ -418,18 +422,12 @@ mod tests {
         group.channel(0, 1).send(b"to-1").unwrap();
         group.channel(0, 2).send(b"to-2").unwrap();
 
-        let g10 = group
-            .channel(1, 0)
-            .receive(Duration::from_millis(50))
-            .unwrap();
-        let g20 = group
-            .channel(2, 0)
-            .receive(Duration::from_millis(50))
-            .unwrap();
-        let g30 = group
-            .channel(3, 0)
-            .receive(Duration::from_millis(50))
-            .unwrap();
+        let g10 =
+            group.channel(1, 0).receive(Duration::from_millis(50)).unwrap();
+        let g20 =
+            group.channel(2, 0).receive(Duration::from_millis(50)).unwrap();
+        let g30 =
+            group.channel(3, 0).receive(Duration::from_millis(50)).unwrap();
         assert_eq!(g10, Some(b"to-1".to_vec()));
         assert_eq!(g20, Some(b"to-2".to_vec()));
         assert_eq!(g30, None, "node 3 must not see node 1's traffic");
@@ -455,10 +453,8 @@ mod tests {
         // Non-crashed pair still works.
         assert!(group.try_channel(1, 2).is_some());
         group.channel(1, 2).send(b"alive").unwrap();
-        let got = group
-            .channel(2, 1)
-            .receive(Duration::from_millis(50))
-            .unwrap();
+        let got =
+            group.channel(2, 1).receive(Duration::from_millis(50)).unwrap();
         assert_eq!(got, Some(b"alive".to_vec()));
     }
 
@@ -474,10 +470,8 @@ mod tests {
         assert!(group.try_channel(1, 0).is_some());
         // Sanity: nodes 0 and 1 each still have an open neighbor.
         group.channel(0, 1).send(b"alive").unwrap();
-        let got = group
-            .channel(1, 0)
-            .receive(Duration::from_millis(50))
-            .unwrap();
+        let got =
+            group.channel(1, 0).receive(Duration::from_millis(50)).unwrap();
         assert_eq!(got, Some(b"alive".to_vec()));
     }
 
@@ -492,10 +486,8 @@ mod tests {
 
         // New handles work end-to-end.
         group.channel(0, 1).send(b"reborn").unwrap();
-        let got = group
-            .channel(1, 0)
-            .receive(Duration::from_millis(50))
-            .unwrap();
+        let got =
+            group.channel(1, 0).receive(Duration::from_millis(50)).unwrap();
         assert_eq!(got, Some(b"reborn".to_vec()));
     }
 
