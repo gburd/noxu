@@ -13,6 +13,13 @@
 //! to a small file `<env_home>/acceptor.state` and reloads it on
 //! startup.  Every state change is atomic (write+rename) and CRC32-protected.
 //!
+//! ## Property tests
+//!
+//! Paxos safety properties (promise/accept contracts, monotonicity,
+//! restart-preserves-promise) live in `crates/noxu-rep/tests/prop_tests.rs`
+//! (Wave 11-E).  These complement the Stateright spec by exercising the
+//! production code path end-to-end.
+//!
 //! # On-disk format
 //!
 //! ```text

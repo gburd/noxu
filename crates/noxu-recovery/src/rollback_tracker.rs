@@ -6,6 +6,12 @@
 //! differ from aborts in that a rollback returns a LN to its previous version,
 //! whether intra or inter-txnal, while an abort always returns an LN to its
 //! pre-txn version.
+//!
+//! ## Property tests
+//!
+//! Half-open-interval and oracle-comparison properties for `RollbackPeriod`,
+//! `RollbackTracker`, and `RollbackScanner` live in
+//! `crates/noxu-recovery/tests/prop_tests.rs` (Wave 11-E).
 
 use hashbrown::HashMap;
 use noxu_util::{Lsn, NULL_LSN};

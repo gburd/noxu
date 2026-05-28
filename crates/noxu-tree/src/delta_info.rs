@@ -4,6 +4,13 @@
 //! Holds the delta information for one BIN entry in a partial BIN log entry.
 //! BIN deltas are logged instead of full BINs when only a few slots have changed,
 //! reducing the amount of data written to the log.
+//!
+//! ## Property tests
+//!
+//! Round-trip and reverse-direction encode/decode properties live in
+//! `crates/noxu-tree/tests/prop_tests.rs` (see Wave 11-E):
+//! `delta_info_roundtrip`, `delta_info_encode_deterministic`,
+//! `delta_info_read_then_write_idempotent`.
 
 use crate::entry_states::SlotState;
 use noxu_util::Lsn;

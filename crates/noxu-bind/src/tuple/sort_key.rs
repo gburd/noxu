@@ -33,6 +33,12 @@
 //! composite keys containing multiple variable-length fields remain sortable
 //! and self-delimiting: each embedded `0x00` byte is written as `[0x00, 0x01]`
 //! and the field is terminated with `[0x00, 0x00]`.
+//!
+//! ## Property tests
+//!
+//! Reverse round-trip (decode-then-re-encode is byte-identical) and order-
+//! preservation properties for each `SortKey` impl live in
+//! `crates/noxu-bind/tests/prop_tests.rs` (Wave 11-E).
 
 use crate::error::{BindError, Result};
 use crate::tuple::tuple_input::TupleInput;

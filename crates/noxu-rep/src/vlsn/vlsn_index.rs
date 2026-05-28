@@ -6,6 +6,12 @@
 //!
 //! The index automatically creates new buckets as VLSNs are registered.
 //! Thread-safe access is provided via `noxu_sync::RwLock`.
+//!
+//! ## Property tests
+//!
+//! VLSN streaming invariants (latest-is-max, exact-lookup at stride=1,
+//! replica-never-exceeds-master) live in `crates/noxu-rep/tests/prop_tests.rs`
+//! (Wave 11-E).
 
 use noxu_sync::RwLock;
 
