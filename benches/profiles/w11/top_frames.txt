@@ -1,0 +1,40 @@
+    11.85%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+     8.94%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+
+     7.36%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --7.21%--cfree@GLIBC_2.2.5
+
+     6.54%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::insert_recursive
+     5.12%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
+               |--4.02%--malloc
+               |          
+                --0.95%--_int_realloc
+                          realloc
+
+     4.27%  noxu-perf-profi  libc.so.6             [.] malloc_consolidate
+            |
+            ---malloc_consolidate
+               |          
+                --4.01%--_int_malloc
+                          |          
+                          |--2.03%--_int_realloc
+                          |          realloc
+                          |          
+                           --1.98%--malloc
+
+     3.80%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::insert_with_prefix
+     3.64%  noxu-perf-profi  noxu-perf-profiler    [.] bytes::bytes::owned_drop
+     3.61%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |          
+            |--2.86%--__memmove_avx_unaligned_erms
