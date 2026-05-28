@@ -296,3 +296,187 @@ pub fn w12_xa_1pc(
     }
     n
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// W13 – Sorted-dup secondary index walk (Wave 11-B)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Wave 10-D flagged that no benchmark exercises the sorted-dup secondary
+// index path that landed in Wave 2A.  W13 closes that gap.
+//
+// Scenario: populate a primary DB with N records.  A secondary key
+// creator buckets primaries to share secondary keys
+// (`bucket = primary_key as u32 % BUCKETS`), so each secondary key
+// owns ~N/BUCKETS primaries — exactly the many-primaries-to-one-
+// secondary-key shape that sorted-dup secondaries are built for.
+//
+// Read phase: walk the secondary cursor with `get_first` then repeated
+// `get_next` for up to `2 * n` steps.  Operations counted = number of
+// (sec_key, primary_key, data) triples actually observed.
+//
+// Bugs surfaced during Wave 11-B authoring (DO NOT FIX HERE — routed to
+// a follow-up bug-fix wave per Wave 11-B / Wave 11-A discipline):
+//
+//   1. `SecondaryCursor::get_search_key` followed by `get_next_dup_full`
+//      triggers the same multi-primary boundary-check bug as
+//      `db_cursor_duplicate_test_get_next_dup` in the noxu-db TCK suite,
+//      surfaced here as `SecondaryIntegrityException`.
+//   2. Once the dup chain under one secondary key spans more than a
+//      handful of records, plain `get_first` + repeated `get_next`
+//      walks revisit primaries and either yield wrong primary keys
+//      (triggering `SecondaryIntegrityException`) or fail to terminate.
+//
+// Both are real noxu sorted-dup cursor bugs.  W13 therefore caps the
+// walk at `2 * n` and treats both natural termination and cap-hit as
+// valid completions; the harness reports the actual yield count, which
+// tells us whether the walk got farther on noxu or on JE.  As the bugs
+// are fixed in subsequent waves, the assertion in the smoke test (and
+// the docs/src/operations/benchmarks.md interpretation) will tighten.
+//
+// JE counterpart: `benches/je-bench/.../w13SecondaryDupWalk` opens a
+// SecondaryDatabase with a SecondaryKeyCreator that buckets the primary
+// key the same way and walks via `Cursor.getFirst` + `Cursor.getNext`.
+
+use noxu_db::{
+    DatabaseConfig, EnvironmentConfig, SecondaryConfig, SecondaryDatabase,
+    SecondaryKeyCreator,
+};
+use noxu_sync::Mutex;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Number of secondary-key buckets.  100 buckets × 1K..10K primaries
+/// gives 10..100 dups per secondary key — the multi-primary regime
+/// sorted-dup secondaries are designed for, and the regime that
+/// surfaces the noxu cursor bugs documented above.
+const W13_BUCKETS: u32 = 100;
+
+/// Buckets primary keys by `key_as_u32 % W13_BUCKETS`.  The primary key
+/// is the 10-digit zero-padded decimal produced by `make_key(i)`; we
+/// parse it back as a `u32` to derive the bucket id, then encode the
+/// bucket id as a 4-byte big-endian secondary key.  Big-endian keeps
+/// secondary-key sort order matching numeric order.
+struct W13BucketKeyCreator;
+
+impl SecondaryKeyCreator for W13BucketKeyCreator {
+    fn create_secondary_key(
+        &self,
+        _secondary_db: &Database,
+        key: &DatabaseEntry,
+        _data: &DatabaseEntry,
+        result: &mut DatabaseEntry,
+    ) -> bool {
+        let bytes = key.get_data().unwrap_or(&[]);
+        let s = std::str::from_utf8(bytes).unwrap_or("0");
+        let n: u32 = s.parse::<u64>().unwrap_or(0) as u32;
+        let bucket = n % W13_BUCKETS;
+        result.set_data(&bucket.to_be_bytes());
+        true
+    }
+}
+
+/// Open a fresh primary + sorted-dup secondary on the given directory,
+/// populate `n` primary records, then open the secondary with
+/// `allow_populate=true` so the index is built in one pass.
+pub fn w13_setup(
+    dir: &Path,
+    n: usize,
+    value: &[u8],
+) -> (Environment, Arc<Mutex<Database>>, SecondaryDatabase) {
+    let env_cfg = EnvironmentConfig::new(dir.to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = Environment::open(env_cfg).unwrap();
+
+    let pri_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true);
+    let primary = Arc::new(Mutex::new(
+        env.open_database(None, "w13_primary", &pri_cfg).unwrap(),
+    ));
+
+    {
+        let v = DatabaseEntry::from_bytes(value);
+        let pri = primary.lock();
+        for i in 0..n {
+            let k = DatabaseEntry::from_vec(make_key(i));
+            pri.put(None, &k, &v).unwrap();
+        }
+    }
+
+    let sec_db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
+    let sec_db =
+        env.open_database(None, "w13_secondary", &sec_db_cfg).unwrap();
+    let sec_cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_allow_populate(true)
+        .with_key_creator(Box::new(W13BucketKeyCreator));
+    let secondary =
+        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_cfg)
+            .unwrap();
+
+    (env, primary, secondary)
+}
+
+/// W13 read phase: walk the sorted-dup secondary from `get_first` via
+/// `get_next`, capped at `2 * n` steps.  The cap defends against the
+/// unbounded-loop bug surfaced during Wave 11-B authoring (see module
+/// comment above).  Both natural termination and `Err`-from-engine are
+/// treated as valid completions; the harness reports the actual yield
+/// count.
+pub fn w13_secondary_dup_walk(
+    secondary: &SecondaryDatabase,
+    n: usize,
+) -> usize {
+    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut sec_key = DatabaseEntry::new();
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+
+    let cap = n.saturating_mul(2).max(1);
+    let mut total = 0usize;
+    let mut s = match cursor.get_first(&mut sec_key, &mut p_key, &mut data) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    while s == OperationStatus::Success && total < cap {
+        total += 1;
+        s = match cursor.get_next(&mut sec_key, &mut p_key, &mut data) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+    }
+    total
+}
+
+/// Single-shot workload entry-point: setup + bounded read walk.
+/// Returns the number of (sec_key, primary_key, data) triples observed.
+pub fn w13_secondary_dup(env_dir: &Path, n: usize, value: &[u8]) -> usize {
+    let (_env, _primary, secondary) = w13_setup(env_dir, n, value);
+    w13_secondary_dup_walk(&secondary, n)
+}
+
+#[cfg(test)]
+mod w13_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Smoke test: walk completes within the safety cap and yields
+    /// at least one record.  Tightening to `walked == n` is gated on
+    /// fixing the noxu sorted-dup cursor bugs documented in the W13
+    /// module comment.
+    #[test]
+    fn w13_smoke_1000() {
+        let dir = TempDir::new().unwrap();
+        let value = vec![0x58u8; 64];
+        let n = 1_000;
+        let walked = w13_secondary_dup(dir.path(), n, &value);
+        assert!(walked > 0, "W13: walk yielded zero records");
+        assert!(
+            walked <= 2 * n,
+            "W13: walk exceeded the safety cap (got {})",
+            walked
+        );
+    }
+}

@@ -185,3 +185,103 @@ Outputs (all under `benches/results/`, gitignored):
   with `tmpfs` for the database directory.  `numerical-baseline.md`
   documents the engine-internal baselines that should hold across
   hardware.
+
+## W13 — Sorted-dup secondary index walk (Wave 11-B)
+
+Wave 10-D flagged that no benchmark exercised the sorted-dup secondary
+index path that landed in Wave 2A.  W13 closes that gap.
+
+### Workload shape
+
+* Primary DB populated with `N` records (10-digit zero-padded
+  decimal keys, 64-byte value).
+* Secondary DB opened with `with_sorted_duplicates(true)` and a
+  `SecondaryKeyCreator` that buckets primaries by
+  `bucket = primary_key as u32 % 100`, so each secondary key owns
+  ~`N/100` primaries — the many-primaries-per-secondary-key shape
+  sorted-dup secondaries are designed for.
+* Read phase: `secondary.open_cursor(...).get_first(...)` then
+  `get_next(...)` until exhaustion or until a safety cap of `2 * N`
+  steps fires.
+
+The setup (primary populate + secondary `allow_populate=true` build)
+runs *outside* the timer, so reported `ns/op` reflects the cursor walk
+only.  The harness reports the *actual* yield count, which the
+side-by-side report uses to compare noxu and JE walk progress.
+
+### Bugs surfaced (routed to follow-up bug-fix waves)
+
+While authoring W13 the following sorted-dup cursor bugs surfaced.
+They are **not** fixed in Wave 11-B per the wave's "do-not-fix-in-port-
+or-bench-wave" discipline; they are tracked separately and will be
+addressed in a dedicated bug-fix wave.
+
+1. `SecondaryCursor::get_search_key` followed by `get_next_dup_full`
+   returns `SecondaryIntegrityException` for every primary except the
+   lexicographically smallest.
+2. Plain `get_first` + repeated `get_next` walks revisit primaries and
+   either yield wrong primary keys (triggering
+   `SecondaryIntegrityException`) or fail to terminate once the dup
+   chain spans more than a handful of records.
+
+W13's safety cap means the workload still terminates, but on noxu the
+walk currently yields only the first 1–2 records before the engine
+returns an error.  Once the bugs are fixed, W13 will yield exactly
+`N` records and the `ns/op` denominator will become meaningful for
+A/B-with-JE comparison.
+
+### Reproducer
+
+```bash
+# Noxu side:
+cargo build --release --package noxu-workload-bench
+NOXU_BENCH_SCALES=1000,10000 NOXU_BENCH_CLEANUP=1 \
+    ./target/release/noxu-workload-bench
+
+# JE side (after `bash benches/setup.sh`):
+bash benches/run_comparison.sh --max-scale 10000
+```
+
+W13 only runs at scales ≤ 10K to keep the safety cap from dominating
+runtime in the buggy regime.
+
+### Real-storage results (Wave 11-C)
+
+These numbers are from a single-socket x86-64 host with the database
+directory rooted on a real NVMe SSD (`/scratch/noxu_bench` —
+auto-detected by the harness, see `benches/noxu-bench/src/main.rs`):
+
+| Scale | Workload         | Time (ms) | ns/op | ops/s | Yields |
+|-------|------------------|----------:|------:|------:|-------:|
+| 1 000 | w13_sec_dup_walk |       0.0 | 8 518 | 117 392 |     2  |
+| 10 000| w13_sec_dup_walk |       0.0 | 8 303 | 120 438 |     2  |
+
+The "Yields" column is the *actual* number of cursor steps the walk
+returned before terminating (either naturally or because the
+safety-cap-pre-bug condition fired).  As the bugs above are fixed,
+Yields will rise to `N` and `ns/op` will reflect the steady-state
+sorted-dup walk cost.
+
+## Real-storage W10 / W11 re-run (Wave 11-C)
+
+Wave 10-D ran on tmpfs, where `fdatasync` is instant and the
+FsyncManager's coalescing window is invisible.  Wave 11-C re-runs the
+W10 (concurrent) and W11 (recovery) workloads with the database rooted
+on real NVMe to surface the coalescing behaviour.  Numbers were
+collected with:
+
+```bash
+NOXU_BENCH_DIR=/scratch/noxu_bench NOXU_BENCH_CLEANUP=1 \
+NOXU_BENCH_SCALES=1000,10000 \
+    ./target/release/noxu-workload-bench
+```
+
+The harness auto-detects `/scratch` and uses it without an explicit
+`NOXU_BENCH_DIR` when the path exists, which is what happened on the
+machine these numbers are from (note the
+"`Storage:    /scratch/noxu_bench (NVMe auto-detected)`" line in the
+harness output).  See `benches/results/noxu_results.csv` for the
+per-workload row data; the corresponding JE NVMe run is gated on
+`bash benches/setup.sh` running successfully, which it did not in this
+environment, so the side-by-side comparison report is left to a
+future wave.
