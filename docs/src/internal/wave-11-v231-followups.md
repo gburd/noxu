@@ -84,19 +84,20 @@ cursor walk only.
 ### More noxu bugs surfaced
 
 Authoring W13 surfaced two more sorted-dup cursor bugs in addition
-to the two from 11-A.  Both are documented in detail at the top of
+to the two from 11-A (numbered #3 and #4 in the bug catalog at the
+bottom of this note).  Both are documented in detail at the top of
 the W13 module in `benches/noxu-bench/src/workloads.rs` and again
 in the W13 section of `docs/src/operations/benchmarks.md`.
 
-3. **`SecondaryCursor::get_search_key` + `get_next_dup_full`** on a
-   multi-bucket secondary triggers
-   `SecondaryIntegrityException` after the first yield — the same
-   class as bug #2 from 11-A, surfaced through the secondary
-   layer.
+* Bug #3 — **`SecondaryCursor::get_search_key` + `get_next_dup_full`**
+  on a multi-bucket secondary triggers
+  `SecondaryIntegrityException` after the first yield — the same
+  class as bug #2 from 11-A, surfaced through the secondary
+  layer.
 
-4. **`SecondaryCursor::get_first` + repeated `get_next`** revisits
-   primaries instead of advancing past the dup chain, eventually
-   either yielding a stale primary key (causing
+* Bug #4 — **`SecondaryCursor::get_first` + repeated `get_next`**
+  revisits primaries instead of advancing past the dup chain,
+  eventually either yielding a stale primary key (causing
    `SecondaryIntegrityException`) or failing to terminate
    altogether.  The W13 walk caps the step count at `2 * N` to
    ensure the workload always terminates.
