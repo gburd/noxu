@@ -52,6 +52,7 @@ Every wave ships:
 | 11-I | v2.5.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | gated on 11-H findings |
 | 11-J | v2.5.0 | Optimize fsync coalescing (closes W10 gap) | gated on 11-H findings |
 | 11-K | v2.5.0 | Optimize log scanner (closes W11 gap) | gated on 11-H findings |
+| 11-N | v2.3.1 | Sorted-dup cursor bug fixes (4 bugs Wave 11-A/B surfaced) | merged — see `wave-11-n-sorted-dup-cursor-bugs.md`; the 4 #[ignore]'d / safety-cap regression tests are now passing live tests |
 | 11-L | v3.0.0 | API stability commitment + SemVer policy + deprecation cycle | queued |
 | 11-M | v3.0.0 | Path-dep restructuring + actual crates.io publish | queued |
 
@@ -191,6 +192,29 @@ Acceptance:
 
 * W11 closes to within 1.5× of JE.
 * Recovery correctness tests still pass.
+
+### 11-N — Sorted-dup cursor bug fixes
+
+Merged on `fix/wave11-n-sorted-dup-cursor-bugs` (off
+`fix/wave11-v231-followups`).  Closes the four sorted-dup cursor bugs
+that Wave 11-A and Wave 11-B surfaced and routed to a follow-up
+bug-fix wave.
+
+Acceptance (all met):
+
+* Bug 1 — `Cursor::count()` correct on multi-primary sorted-dup DBs.
+* Bug 2 — `Get::Search` + `Get::NextDup` correct on every primary
+  (not just the lexicographically smallest).
+* Bug 3 — `SecondaryCursor::get_search_key` + `get_next_dup_full`
+  no longer raises `SecondaryIntegrityException` past the first
+  yield.
+* Bug 4 — `SecondaryCursor::get_first` + repeated `get_next` walks
+  every (sec_key, primary_key) pair exactly once and terminates.
+* Two `#[ignore]`'d Wave 11-A regression tests promoted to live
+  tests; two new regression tests added under
+  `crates/noxu-db/tests/wave11n_secondary_dup_test.rs`.
+* Per-bug analysis in
+  `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.
 
 ### 11-L — API stability commitment
 

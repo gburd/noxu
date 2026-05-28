@@ -16,6 +16,53 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed
+
+Four noxu sorted-dup cursor bugs surfaced during Wave 11 and routed to
+this follow-up wave (Wave 11-N) are now closed.  All four shared a
+common root-cause area: incomplete multi-primary / cross-BIN handling
+in `noxu-dbi::CursorImpl`'s sorted-dup logic.  None affected
+single-primary sorted-dup use, which has been covered by
+`crates/noxu-db/tests/sorted_dup_test.rs` throughout.
+
+1. **`Cursor::count()` over-counted past the first dup of a primary**
+   on multi-primary sorted-dup DBs.  The previous formula
+   `backward + 1 + forward` double-counted because the backward walk
+   already repositioned scratch on the first dup, and the forward
+   walk then re-traversed every dup including the original
+   position.  Fix in `noxu-dbi::CursorImpl::count`: drop the
+   `backward` term, return `forward + 1`.  Regression test
+   `db_cursor_duplicate_test_duplicate_count` (no longer `#[ignore]`).
+2. **`Get::Search` + `Get::NextDup` returned NotFound on every primary
+   except the lexicographically smallest**, on multi-primary
+   sorted-dup DBs.  Root cause: `search_dup` hard-coded
+   `current_index = 0` after locating the entry, so the subsequent
+   `retrieve_next` computed `next_index = 1` in the BIN's slot
+   space.  Fix: new `Tree::first_entry_at_or_after_with_index`
+   returns the BIN node and the slot index; `search_dup` now stores
+   the real index and pins the BIN, mirroring the invariant
+   `get_first` / `get_last` already maintain.  Regression test
+   `db_cursor_duplicate_test_get_next_dup` (no longer `#[ignore]`).
+3. **`SecondaryCursor::get_search_key` + `get_next_dup_full`**
+   triggered `SecondaryIntegrityException` past the first yield.
+   This is the same `Search`-then-step boundary defect as #2 reaching
+   through the secondary layer; closed by the same `search_dup` fix.
+   Regression test `wave11n_bug3_get_search_key_then_next_dup_full_yields_all`
+   in `crates/noxu-db/tests/wave11n_secondary_dup_test.rs`.
+4. **`SecondaryCursor::get_first` + repeated `get_next` revisited
+   primaries or failed to terminate** once the secondary tree spanned
+   more than one BIN.  Root cause: `apply_dup_filter`'s cross-BIN
+   acceptance paths updated `current_key` / `current_index` but left
+   `current_bin_arc` pointing at the prior BIN, so the next
+   `retrieve_next` fast-path read `next_index = current_index + 1`
+   from the stale BIN — effectively re-emitting old entries.  Fix:
+   new `CursorImpl::find_bin_arc_for_key` helper plus an
+   `update_bin_pin` call at every accept site in `apply_dup_filter`.
+   Regression test `wave11n_bug4_get_first_get_next_full_walk_terminates`.
+
+See `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md` for the
+full per-bug analysis.
+
 ### Tests
 
 * **TCK ports (Wave 11-A).**  6 dup-cursor methods from JE's
@@ -41,34 +88,11 @@ listed in [References](#references).
 
 * `docs/src/internal/wave-11-v231-followups.md`: narrative summary
   of Waves 11-A / 11-B / 11-C, including the four sorted-dup cursor
-  bugs surfaced (all routed to a follow-up bug-fix wave).
+  bugs surfaced (all closed in Wave 11-N — see `### Fixed` above).
+* `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`: per-bug
+  analysis for the four sorted-dup cursor bugs closed in Wave 11-N.
 * `docs/src/operations/benchmarks.md`: new W13 and "Real-storage
 W10 / W11 re-run" sections.
-
-### Known issues (NOT fixed in this release)
-
-Four noxu sorted-dup cursor bugs were surfaced and documented during
-Wave 11.  All are tracked as `#[ignore]`'d tests in
-`crates/noxu-db/tests/je_db_cursor_test.rs` (for #1 and #2) or
-bounded benchmark code in `benches/noxu-bench/src/workloads.rs` (for
-#3 and #4):
-
-1. `Cursor::count()` over-counts when positioned past the first dup
-   of the current primary on multi-primary sorted-dup DBs.
-2. `Get::Search` followed by `Get::NextDup` returns NotFound
-   immediately on every primary except the lexicographically
-   smallest, on multi-primary sorted-dup DBs.
-3. `SecondaryCursor::get_search_key` + `get_next_dup_full` triggers
-   `SecondaryIntegrityException` past the first yield.
-4. `SecondaryCursor::get_first` + repeated `get_next` walks revisit
-   primaries and either yield stale primary keys or fail to
-   terminate.
-
-All four are symptoms of incomplete multi-primary handling in
-`noxu-dbi`'s sorted-dup cursor logic and should be fixed together in
-a dedicated bug-fix wave.  None affects single-primary sorted-dup
-use, which remains correct (covered by the existing
-`crates/noxu-db/tests/sorted_dup_test.rs`).
 
 ## [2.2.1] - 2026-05-27
 
