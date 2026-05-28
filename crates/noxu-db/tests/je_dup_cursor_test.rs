@@ -278,12 +278,25 @@ fn dup_cursor_put_no_dup_data_inserts_unique_pairs() {
 
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"oneKey");
-    for d in [b"one".as_slice(), b"two", b"three", b"four", b"five",
-              b"six", b"seven", b"eight", b"nine"] {
+    for d in [
+        b"one".as_slice(),
+        b"two",
+        b"three",
+        b"four",
+        b"five",
+        b"six",
+        b"seven",
+        b"eight",
+        b"nine",
+    ] {
         let s = db
             .put_no_overwrite(Some(&txn), &key, &DatabaseEntry::from_bytes(d))
             .unwrap();
-        assert_eq!(s, OperationStatus::Success, "data {d:?} must insert as new dup");
+        assert_eq!(
+            s,
+            OperationStatus::Success,
+            "data {d:?} must insert as new dup"
+        );
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 9);
@@ -342,9 +355,8 @@ fn cursor_delete_first_via_walk_keeps_rest() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "del_first", &db_cfg).unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
@@ -398,9 +410,8 @@ fn cursor_delete_last_via_walk_keeps_rest() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "del_last", &db_cfg).unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
