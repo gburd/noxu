@@ -549,3 +549,252 @@ fn recovery_edge_test_non_txnal_db() {
         drop(env);
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryDuplicatesTest.testDuplicates
+//
+// JE invariant: insert N records × M dups across multiple databases in a
+// single committed txn, close, recover, verify all (key, dup) pairs are
+// readable in dup order.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_duplicates_round_trip_across_clean_close() {
+    const N_RECS: u32 = 10;
+    const N_DUPS: u32 = 4;
+    const N_DBS: usize = 3;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut expected: BTreeMap<(usize, Vec<u8>), Vec<Vec<u8>>> =
+        BTreeMap::new();
+
+    {
+        let env = open_env(&path);
+        let mut dbs: Vec<noxu_db::Database> = Vec::new();
+        for d in 0..N_DBS {
+            dbs.push(open_db(&env, &format!("dups_db{d}"), true));
+        }
+
+        let txn = env.begin_transaction(None).unwrap();
+        for d in 0..N_DBS {
+            for i in 0..N_RECS {
+                let k = ikey(i);
+                let kbytes = k.get_data().unwrap().to_vec();
+                for j in 0..N_DUPS {
+                    let dv = (i * 1000 + j).to_be_bytes().to_vec();
+                    dbs[d].put(
+                        Some(&txn),
+                        &k,
+                        &DatabaseEntry::from_bytes(&dv),
+                    )
+                    .unwrap();
+                    expected
+                        .entry((d, kbytes.clone()))
+                        .or_default()
+                        .push(dv);
+                }
+            }
+        }
+        txn.commit().unwrap();
+        for db in dbs.drain(..) {
+            drop(db);
+        }
+        drop(env);
+    }
+
+    // Recover.
+    let env = open_env(&path);
+    for d in 0..N_DBS {
+        let db = open_db(&env, &format!("dups_db{d}"), true);
+        let actual = collect_all(&db);
+        for ((dd, k), expected_dups) in &expected {
+            if *dd != d {
+                continue;
+            }
+            let mut got = actual.get(k).cloned().unwrap_or_default();
+            got.sort();
+            let mut exp = expected_dups.clone();
+            exp.sort();
+            assert_eq!(got, exp, "db={d} key={k:?}");
+        }
+        drop(db);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryDuplicatesTest.testDuplicatesWithDeletion
+//
+// JE invariant: same as above, but delete every other record before
+// committing.  Only the surviving (key, dup) pairs must be readable
+// post-recovery.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_duplicates_with_deletion_survives_recovery() {
+    const N_RECS: u32 = 10;
+    const N_DUPS: u32 = 3;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut expected: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "dup_del", true);
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..N_RECS {
+            let k = ikey(i);
+            for j in 0..N_DUPS {
+                let dv = (i * 1000 + j).to_be_bytes().to_vec();
+                db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&dv))
+                    .unwrap();
+                if i % 2 != 0 {
+                    expected
+                        .entry(k.get_data().unwrap().to_vec())
+                        .or_default()
+                        .push(dv);
+                }
+            }
+        }
+        // Delete all even-numbered keys.
+        for i in (0..N_RECS).step_by(2) {
+            db.delete(Some(&txn), &ikey(i)).unwrap();
+        }
+        txn.commit().unwrap();
+        drop(db);
+        drop(env);
+    }
+
+    let env = open_env(&path);
+    let db = open_db(&env, "dup_del", true);
+    let actual = collect_all(&db);
+    assert_eq!(actual.len(), expected.len());
+    for (k, mut dups) in expected {
+        let mut got = actual.get(&k).cloned().unwrap_or_default();
+        got.sort();
+        dups.sort();
+        assert_eq!(got, dups, "key={k:?}");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryCheckpointTest.testEmptyCheckpoint (spirit port)
+//
+// JE invariant: a forced checkpoint on an empty (no records) environment
+// runs cleanly; subsequent recovery yields the same empty state.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_empty_checkpoint_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let env = open_env(&path);
+        let _db = open_db(&env, "empty_ckpt", false);
+        // Immediately close without inserting anything.  drop runs the
+        // implicit shutdown checkpoint.
+        drop(_db);
+        drop(env);
+    }
+
+    // Recover and confirm the db is still empty.
+    let env = open_env(&path);
+    let db = open_db(&env, "empty_ckpt", false);
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+    drop(c);
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryDeleteTest.testDeleteAllAndCompress (spirit port)
+//
+// JE invariant: insert all + commit + checkpoint + delete all + commit +
+// recovery → db is empty.  Compression in JE removes empty BINs; Noxu's
+// compressor runs as a daemon, but the user-facing invariant
+// (`db.count() == 0` after recovery) must hold either way.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_delete_all_then_recovery_empties_db() {
+    const N: u32 = 50;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "del_all", false);
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..N {
+            db.put(Some(&txn), &ikey(i), &DatabaseEntry::from_bytes(b"v"))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..N {
+            db.delete(Some(&txn), &ikey(i)).unwrap();
+        }
+        txn.commit().unwrap();
+        drop(db);
+        drop(env);
+    }
+
+    let env = open_env(&path);
+    let db = open_db(&env, "del_all", false);
+    assert_eq!(db.count().unwrap(), 0);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RecoveryEdgeTest.testTxnId (spirit port)
+//
+// JE invariant: txn IDs assigned post-recovery must be ≥ the highest
+// pre-recovery txn ID, so a recovered system can't accidentally reuse a
+// txn ID.  We can't observe txn IDs through Noxu's public API directly,
+// but we can observe the consequence: post-recovery, a fresh write does
+// not collide with a pre-recovery committed write.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn recovery_edge_txn_id_continues_post_recovery() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let env = open_env(&path);
+        let db = open_db(&env, "txn_id", false);
+        for i in 0..50u32 {
+            let txn = env.begin_transaction(None).unwrap();
+            db.put(Some(&txn), &ikey(i), &DatabaseEntry::from_bytes(b"pre"))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(db);
+        drop(env);
+    }
+
+    let env = open_env(&path);
+    let db = open_db(&env, "txn_id", false);
+    for i in 50..100u32 {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(Some(&txn), &ikey(i), &DatabaseEntry::from_bytes(b"post"))
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    assert_eq!(db.count().unwrap(), 100);
+    // Verify the pre-recovery records are still readable.
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..50u32 {
+        let mut out = DatabaseEntry::new();
+        let s = db.get(Some(&txn), &ikey(i), &mut out).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(out.get_data().unwrap(), b"pre");
+    }
+    txn.commit().unwrap();
+}
