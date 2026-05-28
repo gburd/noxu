@@ -16,6 +16,44 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (v2.3.2)
+
+- **`AnalysisResult::record_active_txn` precondition gap** (`noxu-recovery`).
+  Calling `record_active_txn` after `record_commit` / `record_abort` for the
+  same txn id re-inserted the txn into `active_txn_ids`, causing
+  `has_active_txns()` to return a phantom `true`.  Added an early-return guard.
+  ([Wave 11-E regression](docs/src/internal/wave-11-e-property-tests.md))
+
+- **Transactional cursor on non-transactional database now rejected**
+  (`noxu-db`).  `Database::open_cursor(Some(&txn), None)` now returns
+  `IllegalArgument` when the database is non-transactional, matching JE.
+  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+
+- **`put_no_overwrite` on sorted-dup DB now checks key only** (`noxu-dbi`).
+  `CursorImpl::put_dup` was checking the `(key, data)` pair for both
+  `NoDupData` and `NoOverwrite`; per JE semantics `NoOverwrite` must check
+  the key only.
+  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+
+- **Database name registry now persisted across clean close+reopen**
+  (`noxu-dbi`, `noxu-recovery`).  Writes a `NameLN` WAL entry on database
+  creation; recovery re-populates `name_map` from these entries.  Read-only
+  reopens and non-transactional databases both survive the cycle.
+  ([Wave 11-G and Wave 10-A regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+
+- **Explicit checkpoint no longer loses committed data** (`noxu-recovery`).
+  `Checkpointer::do_checkpoint()` was writing `NULL_LSN` as `first_active_lsn`
+  in `CkptEnd`, causing recovery to skip committed LN entries before the
+  checkpoint start.  Fixed by writing `Lsn::new(0, 0)` and always replaying
+  committed LNs in `eligible_for_redo`.
+  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+
+- **`truncate_database` is now durable across clean close+reopen**
+  (`noxu-dbi`).  Before replacing the in-memory tree, write non-transactional
+  `DeleteLN` entries for every key; recovery replays them after the original
+  inserts, leaving an empty tree.
+  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+
 ### Added (v2.4.0 — Wave 11-D)
 
 - **First-class in-memory replication transport.** Wave 11-D promotes
