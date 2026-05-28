@@ -10,6 +10,17 @@
 //!   - `crates/noxu-txn/src/deadlock_detector.rs`
 //!   - `crates/noxu-txn/src/lock_type.rs` (compatibility matrix)
 //!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! production lock manager / deadlock detector still expose the
+//! same `LockType` alphabet (`Read`, `Write`, `RangeRead`,
+//! `RangeWrite`, `RangeInsert`, `Restart`, `None`) and follow the
+//! same wait-for / abort-victim discipline. The compile-time anchor
+//! `spec_lock_kind` enforces an exhaustive match over `LockType`,
+//! so a future variant addition forces a spec-level decision before
+//! the build succeeds. The model + the `lock_manager_drives_production`
+//! integration tests in `tests/lock_manager_drives_production.rs`
+//! together pin the spec to production behaviour.
+//!
 //! Properties:
 //!   - `WriteLocksExclusive` — at most one writer per LSN, and
 //!     never both a writer and a reader on the same LSN.

@@ -29,6 +29,45 @@ const DEFAULT_ELECTION_PHASE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Default phi accrual sample window size.
 const DEFAULT_PHI_WINDOW_SIZE: usize = 200;
 
+/// Wire-level transport selected for replication traffic.
+///
+/// Wave 11-D promoted the in-memory transport into a first-class
+/// production option alongside TCP / TLS / QUIC.  This enum lets a
+/// caller declare the transport choice in [`RepConfig`] so higher-level
+/// orchestration code (e.g., the test harness, the `RepTestBase`
+/// integration tests, embedded deployments) can route channel
+/// construction through the right factory.
+///
+/// Note: noxu-rep's [`crate::net`] channel types are constructed
+/// directly by the user code that drives the cluster (a `TcpListener`
+/// on a port, a [`crate::net::InMemoryTransport::new_group`] mesh,
+/// etc.).  This field is therefore advisory — it documents intent and
+/// lets observability / chaos / harness layers introspect the
+/// transport without inspecting individual channel types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RepTransportKind {
+    /// Plaintext TCP via [`crate::net::TcpChannel`].
+    Tcp,
+    /// TLS-encrypted TCP via `crate::net::TlsTcpChannel`
+    /// (requires `tls-rustls` or `tls-native`).
+    Tls,
+    /// QUIC over UDP via `crate::net::QuicChannel`
+    /// (requires the `quic` feature).
+    Quic,
+    /// In-process [`crate::net::InMemoryTransport`].  Useful for
+    /// embedded deployments and integration tests that want real
+    /// `ReplicatedEnvironment` behaviour without opening sockets.
+    InMemory,
+}
+
+impl Default for RepTransportKind {
+    /// Defaults to [`RepTransportKind::Tcp`] to preserve
+    /// pre-Wave-11-D behaviour.
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
 /// Configuration for a replication node.
 ///
 /// Use the builder
@@ -84,6 +123,14 @@ pub struct RepConfig {
     pub election_phase_timeout: Duration,
     /// Reconnection backoff configuration for replica partition recovery.
     pub reconnect_config: ReconnectConfig,
+    /// Wire-level transport this node will use.
+    ///
+    /// Wave 11-D added this field so callers can declare whether they
+    /// intend to drive replication over TCP, TLS, QUIC, or the
+    /// in-process [`crate::net::InMemoryTransport`].  See
+    /// [`RepTransportKind`] for the variants.  Defaults to
+    /// [`RepTransportKind::Tcp`] to preserve pre-Wave-11-D behaviour.
+    pub transport_kind: RepTransportKind,
 }
 
 impl RepConfig {
@@ -110,6 +157,7 @@ impl RepConfig {
             initial_peers: Vec::new(),
             election_phase_timeout: DEFAULT_ELECTION_PHASE_TIMEOUT,
             reconnect_config: ReconnectConfig::default(),
+            transport_kind: RepTransportKind::default(),
         }
     }
 
@@ -156,6 +204,7 @@ pub struct RepConfigBuilder {
     initial_peers: Vec<RepNode>,
     election_phase_timeout: Duration,
     reconnect_config: ReconnectConfig,
+    transport_kind: RepTransportKind,
 }
 
 impl RepConfigBuilder {
@@ -241,6 +290,15 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Sets the wire-level transport this node will use.
+    ///
+    /// Defaults to [`RepTransportKind::Tcp`].  Wave 11-D added
+    /// [`RepTransportKind::InMemory`] for in-process clusters.
+    pub fn transport_kind(mut self, kind: RepTransportKind) -> Self {
+        self.transport_kind = kind;
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -260,6 +318,7 @@ impl RepConfigBuilder {
             initial_peers: self.initial_peers,
             election_phase_timeout: self.election_phase_timeout,
             reconnect_config: self.reconnect_config,
+            transport_kind: self.transport_kind,
         }
     }
 }

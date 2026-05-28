@@ -34,6 +34,15 @@
 //!   - `crates/noxu-tree/src/tree.rs::insert_recursive`
 //!   - `crates/noxu-tree/src/tree.rs::split_child`
 //!   - `crates/noxu-tree/src/tree.rs::split_root_if_needed`
+//!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! production entry points (`Tree::insert`, `insert_recursive`,
+//! `split_child`, `split_root_if_needed`) still follow
+//! hand-over-hand latch coupling: the BIN write is taken before
+//! the parent read is dropped, and `split_child` holds
+//! `parent.write()` through snapshot/install/sibling-publish.
+//! Variant::HandOverHand and Variant::DropParentEarly therefore
+//! remain accurate models for the fixed and pre-fix protocols.
 
 use stateright::{Model, Property};
 

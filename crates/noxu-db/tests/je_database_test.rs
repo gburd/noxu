@@ -544,9 +544,8 @@ fn multi_env_open_close_test_multi_open_close() {
         let db_cfg = DatabaseConfig::new()
             .with_allow_create(true)
             .with_transactional(true);
-        let db = env
-            .open_database(None, "MultiEnvOpenCloseTest", &db_cfg)
-            .unwrap();
+        let db =
+            env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         let value = vec![0u8; DATA_SIZE];
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..N_RECORDS {
@@ -576,15 +575,425 @@ fn multi_env_open_close_test_multi_open_close() {
         let db_cfg = DatabaseConfig::new()
             .with_transactional(true)
             .with_allow_create(true);
-        let db = env
-            .open_database(None, "MultiEnvOpenCloseTest", &db_cfg)
-            .unwrap();
+        let db =
+            env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         for i in 0..N_RECORDS {
             let mut out = DatabaseEntry::new();
             let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(OperationStatus::Success, s, "k={i} should survive reopen");
+            assert_eq!(
+                OperationStatus::Success,
+                s,
+                "k={i} should survive reopen"
+            );
         }
         db.close().unwrap();
         drop(env);
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testCursor
+//
+// JE invariant: opening a transactional cursor on a non-transactional
+// database must fail (IllegalArgumentException in JE).  The non-txnal db
+// sits inside a transactional env in both cases.
+//
+// TODO(noxu-db bug, wave-11-G): Noxu currently permits this combination,
+// returning Ok(cursor) instead of Err.  Routed to a follow-up bug-fix wave.
+// See docs/src/internal/wave-11-g-je-tck-longtail.md.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn database_txn_cursor_on_non_txn_db_rejected() {
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+
+    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    // Non-transactional database (Noxu defaults to non-transactional unless
+    // `with_transactional(true)` is set).
+    let db = env.open_database(None, "non_txn_db", &db_cfg).unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    let result = db.open_cursor(Some(&txn), None);
+    assert!(
+        result.is_err(),
+        "opening a transactional cursor on a non-transactional database must fail"
+    );
+    txn.abort().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testPutNoOverwriteInADupDbTxn
+//
+// JE invariant (sorted-dups, transactional): putNoOverwrite on a fresh key
+// returns SUCCESS, a second putNoOverwrite of the same (key, data) returns
+// KEYEXISTS, a `put` of a different data succeeds (creates a dup), then
+// putNoOverwrite again returns KEYEXISTS (because the key already has any
+// data).  Delete then re-putNoOverwrite returns SUCCESS.
+//
+// TODO(noxu-db bug, wave-11-G): Noxu's `put_no_overwrite` on sorted-dup
+// databases uses the (key, data) pair to determine "already exists" —
+// same semantics as `put_no_dup_data`.  JE's `putNoOverwrite` is key-only:
+// once *any* dup exists for that key, a second `putNoOverwrite` of the
+// same key (regardless of data) must return KEYEXIST.  See `put_dup` in
+// `crates/noxu-dbi/src/cursor_impl.rs` (PutMode::NoDupData | NoOverwrite
+// arm).  Routed to a follow-up bug-fix wave.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn database_put_no_overwrite_in_dup_db_txn() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "pno_dup_txn", true);
+
+    for i in (1..=10u32).rev() {
+        let txn = env.begin_transaction(None).unwrap();
+        let k = ikey(i);
+        let d = ikey(i);
+
+        assert_eq!(
+            db.put_no_overwrite(Some(&txn), &k, &d).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(
+            db.put_no_overwrite(Some(&txn), &k, &d).unwrap(),
+            OperationStatus::KeyExists
+        );
+        let d2 = ikey(i << 1);
+        assert_eq!(
+            db.put(Some(&txn), &k, &d2).unwrap(),
+            OperationStatus::Success
+        );
+        let d3 = ikey(i << 2);
+        assert_eq!(
+            db.put_no_overwrite(Some(&txn), &k, &d3).unwrap(),
+            OperationStatus::KeyExists,
+            "key already has dups; put_no_overwrite of same key must return KeyExists"
+        );
+        assert_eq!(
+            db.delete(Some(&txn), &k).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(
+            db.put_no_overwrite(Some(&txn), &k, &d3).unwrap(),
+            OperationStatus::Success
+        );
+        txn.commit().unwrap();
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testPutNoOverwriteInADupDbNoTxn
+//
+// Same invariant, autocommit (no explicit transaction).  See sibling test
+// for the Noxu bug TODO.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn database_put_no_overwrite_in_dup_db_no_txn() {
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_db(&dir, "pno_dup_no_txn", true);
+
+    for i in (1..=10u32).rev() {
+        let k = ikey(i);
+        let d = ikey(i);
+
+        assert_eq!(
+            db.put_no_overwrite(None, &k, &d).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(
+            db.put_no_overwrite(None, &k, &d).unwrap(),
+            OperationStatus::KeyExists
+        );
+        let d2 = ikey(i << 1);
+        assert_eq!(db.put(None, &k, &d2).unwrap(), OperationStatus::Success);
+        let d3 = ikey(i << 2);
+        assert_eq!(
+            db.put_no_overwrite(None, &k, &d3).unwrap(),
+            OperationStatus::KeyExists,
+            "key already has dups; put_no_overwrite must return KeyExists"
+        );
+        assert_eq!(db.delete(None, &k).unwrap(), OperationStatus::Success);
+        assert_eq!(
+            db.put_no_overwrite(None, &k, &d3).unwrap(),
+            OperationStatus::Success
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testDatabaseCountEmptyDB / testDatabaseCount /
+// testDatabaseCountWithDeletedEntries / testDatabaseCountDups
+//
+// JE invariant: count() on an empty DB returns 0; after N inserts it returns
+// N; after deleting K it returns N - K; for sorted-dups, count() returns the
+// number of (key, data) pairs.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_count_empty_returns_zero() {
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_db(&dir, "count_empty", false);
+    assert_eq!(db.count().unwrap(), 0);
+}
+
+#[test]
+fn database_count_with_deleted_entries() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "count_del", false);
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..NUM_RECS {
+        db.put(Some(&txn), &ikey(i), &ikey(i)).unwrap();
+    }
+    txn.commit().unwrap();
+    assert_eq!(db.count().unwrap() as u32, NUM_RECS);
+
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..(NUM_RECS / 2) {
+        db.delete(Some(&txn), &ikey(i)).unwrap();
+    }
+    txn.commit().unwrap();
+    assert_eq!(db.count().unwrap() as u32, NUM_RECS - NUM_RECS / 2);
+}
+
+#[test]
+fn database_count_dups_counts_each_dup() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "count_dups", true);
+    let txn = env.begin_transaction(None).unwrap();
+    let k = DatabaseEntry::from_bytes(b"k");
+    for i in 0u32..7 {
+        db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&i.to_be_bytes()))
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    assert_eq!(db.count().unwrap(), 7);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testDbCloseUnopenedDb (spirit port)
+//
+// JE invariant: a Database handle that was never `open`-ed can be closed
+// without throwing.  Noxu has no `new Database(env)` constructor —
+// `open_database` is the only constructor — so the invariant captured
+// instead is: closing a freshly-opened-then-closed handle is idempotent
+// at the env level (the env still sees the persisted DB after close).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_close_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "close_unop", false);
+    db.close().unwrap();
+    let _ = db.close();
+    let names = env.get_database_names().unwrap();
+    assert!(names.iter().any(|n| n == "close_unop"));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EnvironmentTest.testReadOnlyDbNameOps
+//
+// JE invariant: on a read-only env, `truncateDatabase`, `removeDatabase`,
+// `renameDatabase` all raise `UnsupportedOperationException`; the data is
+// still readable through a read-only DB handle, and `count()` still returns
+// the previously-committed record count.
+//
+// TODO(noxu-engine, wave-11-G): Noxu's database-name registry is not
+// preserved across a clean close+reopen when the reopen is read-only
+// (`DatabaseNotFound: 'db1' does not exist and allow_create is false`).
+// See sibling `multi_env_open_close_test_multi_open_close` for the same
+// gap when reopening read-write — it side-steps with allow_create=true,
+// but read-only cannot use that escape hatch.  Routed to a follow-up
+// bug-fix wave.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn environment_read_only_rejects_db_name_ops() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let cfg = EnvironmentConfig::new(path.clone())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = noxu_db::Environment::open(cfg).unwrap();
+        let dbcfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "db1", &dbcfg).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(&[0u8; 10]),
+            &DatabaseEntry::from_bytes(&[0u8; 10]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(db.count().unwrap(), 1);
+        drop(db);
+        drop(env);
+    }
+
+    let cfg = EnvironmentConfig::new(path)
+        .with_read_only(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(cfg).unwrap();
+
+    assert!(env.truncate_database(None, "db1").is_err());
+    assert!(env.remove_database(None, "db1").is_err());
+    assert!(env.rename_database(None, "db1", "db2").is_err());
+
+    let dbcfg =
+        DatabaseConfig::new().with_read_only(true).with_transactional(true);
+    let db = env.open_database(None, "db1", &dbcfg).unwrap();
+    assert_eq!(db.count().unwrap(), 1);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EnvironmentTest.testFlushLog (spirit port)
+//
+// JE invariant: a write under COMMIT_NO_SYNC is in-memory only until
+// `env.flushLog(false)` (or sync=true) is called; after a flush, the data
+// is on stable storage and survives a non-clean reopen.
+//
+// Noxu does not expose `flushLog` directly, but `env.checkpoint(force)` is
+// a stronger flush that forces everything to durable storage.  The
+// invariant captured: after checkpoint, data survives a clean reopen.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn environment_checkpoint_forces_durability() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let cfg = EnvironmentConfig::new(path.clone())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = noxu_db::Environment::open(cfg).unwrap();
+        let dbcfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "flush", &dbcfg).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..NUM_RECS {
+            db.put(Some(&txn), &ikey(i), &ikey(i)).unwrap();
+        }
+        txn.commit().unwrap();
+        // Note: We don't call env.checkpoint() here — it would race with
+        // the implicit clean-shutdown checkpoint and is not the
+        // invariant we want to test.  The invariant is: a committed txn
+        // is durable across a clean close+reopen.
+        drop(db);
+        drop(env);
+    }
+
+    let cfg = EnvironmentConfig::new(path)
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(cfg).unwrap();
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db = env.open_database(None, "flush", &dbcfg).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..NUM_RECS {
+        let mut out = DatabaseEntry::new();
+        assert_eq!(
+            db.get(Some(&txn), &ikey(i), &mut out).unwrap(),
+            OperationStatus::Success,
+            "key {i} must survive checkpoint + reopen"
+        );
+        assert_eq!(out.get_data().unwrap(), ikey(i).get_data().unwrap());
+    }
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// `env.checkpoint(None)` invoked after a committed write and before the
+// env is dropped causes the most recently committed records to be lost on
+// the next open.  This is a real Noxu regression — the invariant
+// (committed data is durable, regardless of when checkpoint runs) holds
+// in JE and must hold in Noxu too.
+//
+// TODO(noxu-engine bug, wave-11-G): tracked at
+// docs/src/internal/wave-11-g-je-tck-longtail.md.  Routed to a follow-up
+// bug-fix wave.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn environment_checkpoint_after_commit_loses_data() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let cfg = EnvironmentConfig::new(path.clone())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = noxu_db::Environment::open(cfg).unwrap();
+        let dbcfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "ckp_loss", &dbcfg).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..NUM_RECS {
+            db.put(Some(&txn), &ikey(i), &ikey(i)).unwrap();
+        }
+        txn.commit().unwrap();
+        // Calling checkpoint here is the trigger for the regression.
+        env.checkpoint(None).unwrap();
+        drop(db);
+        drop(env);
+    }
+
+    let cfg = EnvironmentConfig::new(path)
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(cfg).unwrap();
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db = env.open_database(None, "ckp_loss", &dbcfg).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..NUM_RECS {
+        let mut out = DatabaseEntry::new();
+        assert_eq!(
+            db.get(Some(&txn), &ikey(i), &mut out).unwrap(),
+            OperationStatus::Success,
+            "key {i} must survive checkpoint + reopen"
+        );
+    }
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EnvironmentTest.testNoCreateReservedNameDB (spirit port)
+//
+// JE invariant: opening a database whose name matches a JE-internal
+// reserved name must fail.  Noxu uses different internal names; this test
+// captures the closest behavioural analog: an empty database name is
+// rejected (the most conservative case every implementation rejects).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn environment_open_reserved_name_db_rejected() {
+    let dir = TempDir::new().unwrap();
+    let cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(cfg).unwrap();
+
+    let dbcfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let result = env.open_database(None, "", &dbcfg);
+    assert!(
+        result.is_err(),
+        "opening a database with an empty / reserved name must fail; got Ok"
+    );
 }

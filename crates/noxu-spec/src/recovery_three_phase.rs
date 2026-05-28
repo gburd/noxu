@@ -10,12 +10,21 @@
 //!   - `crates/noxu-recovery/src/transaction_table.rs`
 //!   - `crates/noxu-recovery/src/dirty_page_table.rs`
 //!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! production phases (analysis, redo, undo) are unchanged. The
+//! Wave 11-F update strengthens `IdempotentReplay`: the model now
+//! snapshots `materialised` after the first redo into
+//! `materialised_after_first_redo` and asserts the snapshot equals
+//! the post-RedoAgain materialisation, so the property is a true
+//! invariant under repeated redo runs (production rewinds the WAL
+//! head if recovery is interrupted; idempotent replay must hold).
+//!
 //! Properties:
 //!   - `AllAndOnlyCommitted` — after recovery, the live tree
 //!     contains entries for every committed txn and no entries for
 //!     any aborted txn.
-//!   - `IdempotentReplay` — running redo twice produces the same
-//!     state as running it once.
+//!   - `IdempotentReplay` — the materialisation produced by redo
+//!     equals the materialisation produced by redo run twice.
 
 use stateright::{Model, Property};
 
@@ -42,6 +51,11 @@ pub struct State {
     pub phase: Phase,
     /// Whether each txn's data is materialised in the recovered tree.
     pub materialised: [bool; N_TXNS],
+    /// Snapshot of `materialised` immediately after the first
+    /// `Action::Redo`. None until the first redo runs. Used by the
+    /// `IdempotentReplay` invariant: after `Action::RedoAgain` the
+    /// post-state must equal this snapshot.
+    pub materialised_after_first_redo: Option<[bool; N_TXNS]>,
     pub redo_run_count: usize,
 }
 
@@ -77,6 +91,7 @@ impl Model for RecoveryThreePhaseModel {
                         outcomes: [c0, c1, c2],
                         phase: Phase::PreAnalysis,
                         materialised: [false; N_TXNS],
+                        materialised_after_first_redo: None,
                         redo_run_count: 0,
                     });
                 }
@@ -122,6 +137,9 @@ impl Model for RecoveryThreePhaseModel {
                 }
                 s.phase = Phase::AfterRedo;
                 s.redo_run_count += 1;
+                if s.materialised_after_first_redo.is_none() {
+                    s.materialised_after_first_redo = Some(s.materialised);
+                }
             }
             Action::Undo => {
                 for tid in 0..N_TXNS {
@@ -158,6 +176,17 @@ impl Model for RecoveryThreePhaseModel {
                         if matches!(s.outcomes[tid], TxnOutcome::Committed)
                             && !s.materialised[tid]
                         {
+                            return false;
+                        }
+                    }
+                }
+                // 2-state idempotency: after Action::RedoAgain (i.e.
+                // when redo_run_count > 1 and we are AfterRedo), the
+                // current materialisation must equal the snapshot
+                // taken after the first redo.
+                if matches!(s.phase, Phase::AfterRedo) && s.redo_run_count > 1 {
+                    if let Some(snap) = s.materialised_after_first_redo {
+                        if snap != s.materialised {
                             return false;
                         }
                     }

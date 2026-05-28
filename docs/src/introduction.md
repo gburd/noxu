@@ -85,6 +85,7 @@ and the Sprint 1–3 restriction notes.
 | `become_master` rejects non-`Electable` node types | ❌ (silently transitioned `Secondary` → `Master`) | ❌ | ❌ (regression surfaced by Wave 8 RepTestBase) | ✅ (Wave 9-A) |
 | Replica I/O thread auto-bootstraps on `NeedsRestore` | ❌ (manual `bootstrap_via_dispatcher` required) | ❌ | ❌ | ✅ (Wave 9-A) |
 | Stateright executable specs match implementation (persistent acceptor, persistent VLSN, F9 feeder spawn, F2/F4 dispatcher restore) | n/a | n/a | ⚠️ deferred at v2.0 | ✅ (Wave 9-B re-validation; all 5 updated specs pass) |
+| In-memory transport for production use (`InMemoryTransport`, `RepTransportKind::InMemory`) | ❌ | ❌ | ⚠️ cfg(test) / `test-harness` only | ⚠️ cfg(test) / `test-harness` only — promoted to first-class in v2.4 (Wave 11-D) |
 | **Test coverage** | | | | |
 | Workspace test gate (`cargo test --workspace`) | ~3,800 passed | 5,384 passed | 5,540 passed | 5,625 passed |
 | JE TCK ported tests (`PORTED-EQUIVALENT`) | n/a | partial | 205 | 243 (Wave 9-C) |

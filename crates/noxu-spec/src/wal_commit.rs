@@ -10,15 +10,24 @@
 //!   - `crates/noxu-txn/src/group_commit.rs`
 //!   - `crates/noxu-txn/src/txn.rs::commit_with_durability`
 //!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! production entry points (`LogManager::log`, `LogBuffer::flush`,
+//! `Txn::commit_with_durability`, `GroupCommitState`) still follow
+//! the same write-LSN → fsync-or-coalesce → mark-committed
+//! pipeline. Wave 11-F also strengthened `FsyncedNeverDecreases`
+//! from a coarse termination check (`fsynced_lsn < next_lsn`) to a
+//! true 2-state monotonicity invariant by tracking
+//! `previous_fsynced_lsn` in state.
+//!
 //! Properties:
 //!   - `DurableImpliesLogged` — every transaction reported as
 //!     committed by its caller has its TxnCommit record at an LSN
 //!     ≤ the most recently fsynced LSN.
 //!   - `LsnMonotone` — assigned LSNs strictly increase across
 //!     commits.
-//!   - `FsyncedNeverDecreases` — the fsynced high-water mark stays
-//!     within `[0, next_lsn)` (a coarse termination check; a
-//!     dedicated 2-state monotonicity check is left as future work).
+//!   - `FsyncedNeverDecreases` — the fsynced high-water mark is
+//!     monotonically non-decreasing across every transition (true
+//!     2-state invariant) and stays within `[0, next_lsn)`.
 
 use stateright::{Model, Property};
 
@@ -39,6 +48,11 @@ pub struct State {
     pub next_lsn: u64,
     /// Highest LSN that has been fsynced to disk.
     pub fsynced_lsn: u64,
+    /// Snapshot of `fsynced_lsn` immediately before the most recent
+    /// transition. Used by the `FsyncedNeverDecreases` 2-state
+    /// invariant: `fsynced_lsn >= previous_fsynced_lsn` must hold
+    /// in every reachable state.
+    pub previous_fsynced_lsn: u64,
     /// LSNs currently buffered in the group-commit handler.
     pub group_buffer: Vec<u64>,
 }
@@ -77,6 +91,7 @@ impl Model for WalCommitModel {
             txns: [TxnState::Pending; N_TXNS],
             next_lsn: 1,
             fsynced_lsn: 0,
+            previous_fsynced_lsn: 0,
             group_buffer: vec![],
         }]
     }
@@ -108,6 +123,9 @@ impl Model for WalCommitModel {
         a: Self::Action,
     ) -> Option<Self::State> {
         let mut s = s.clone();
+        // Snapshot the previous fsynced LSN so the
+        // `FsyncedNeverDecreases` 2-state invariant can compare.
+        s.previous_fsynced_lsn = s.fsynced_lsn;
         match a {
             Action::WriteTxnCommit { tid } => {
                 let lsn = s.next_lsn;
@@ -166,7 +184,13 @@ impl Model for WalCommitModel {
             }),
             Property::<Self>::always(
                 "FsyncedNeverDecreases",
-                |_, s: &State| s.fsynced_lsn < s.next_lsn,
+                |_, s: &State| {
+                    // 2-state monotonicity: every transition must
+                    // leave `fsynced_lsn` >= its prior value, AND
+                    // `fsynced_lsn` must remain in [0, next_lsn).
+                    s.fsynced_lsn >= s.previous_fsynced_lsn
+                        && s.fsynced_lsn < s.next_lsn
+                },
             ),
         ]
     }

@@ -752,6 +752,30 @@ fn main() {
                 drop(env);
             }
         }
+
+        // W13: sorted-dup secondary index walk (Wave 11-B).  Skipped at
+        // scales > 10K because the documented sorted-dup cursor bugs
+        // (see workloads.rs W13 module comment) make the run
+        // untrustworthy at high dup counts and the safety cap dominates.
+        // The setup (primary populate + secondary populate) runs *outside*
+        // the timer so ns/op reflects the cursor walk only.
+        if n <= 10_000 {
+            let dir = new_bench_dir(&bench_base, "bench_w13", n, cleanup);
+            let (env_w13, _primary_w13, secondary_w13) =
+                workloads::w13_setup(dir.path(), n, &value_bytes);
+            let r = run_timed(
+                "w13_sec_dup_walk",
+                n,
+                1,
+                dir.path(),
+                Some(&env_w13),
+                || workloads::w13_secondary_dup_walk(&secondary_w13, n),
+            );
+            print_progress(&r);
+            results.push(r);
+            drop(secondary_w13);
+            drop(env_w13);
+        }
     }
 
     // ── Print table ───────────────────────────────────────────────────────────
