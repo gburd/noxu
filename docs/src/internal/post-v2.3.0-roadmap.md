@@ -44,7 +44,7 @@ Every wave ships:
 | 11-A | v2.3.1 | Wave 10-A continuation (more dup-cursor JE TCK ports) | merged — 6 PORTED + 2 #[ignore] on real noxu bugs (see `wave-11-v231-followups.md`) |
 | 11-B | v2.3.1 | Sorted-dup secondary index benchmark workload | merged — W13 in noxu-bench + je-bench, 2 more sorted-dup cursor bugs surfaced |
 | 11-C | v2.3.1 | Real-storage (NVMe) benchmark re-run | merged — W10/W11 re-run on /scratch NVMe; FsyncManager coalescing now visible (~6–30×) |
-| 11-D | v2.4.0 | In-memory-only transport for noxu-rep | dispatched |
+| 11-D | v2.4.0 | In-memory-only transport for noxu-rep | merged — `InMemoryTransport` + `RepTransportKind::InMemory` (`docs/src/internal/wave-11-d-inmem-transport.md`) |
 | 11-E | v2.4.0 | Property test expansion (target: +20 properties) | queued |
 | 11-F | v2.4.0 | Stateright coverage of remaining 6 protocols | dispatched |
 | 11-G | v2.4.0 | Continue JE TCK long-tail port (~30-50 more tests) | queued |

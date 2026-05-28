@@ -16,7 +16,37 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-### Fixed
+### Added (v2.4.0 — Wave 11-D)
+
+- **First-class in-memory replication transport.** Wave 11-D promotes
+  the in-memory transport from a `cfg(test)` / `feature = "test-harness"`
+  test fixture into a production transport alongside TCP, TLS, and QUIC.
+  See [`docs/src/replication/in-memory-transport.md`](docs/src/replication/in-memory-transport.md)
+  and the wave note at
+  [`docs/src/internal/wave-11-d-inmem-transport.md`](docs/src/internal/wave-11-d-inmem-transport.md).
+  - New: `noxu_rep::net::InMemoryTransport` (factory) with
+    `new_pair()` and `new_group(n)`.
+  - New: `noxu_rep::net::InMemoryEndpoint` (implements the same
+    `Channel` trait as `TcpChannel` / `TlsTcpChannel` /
+    `QuicMultiplexedChannel`).
+  - New: `noxu_rep::net::InMemoryGroup` (n-node fully-connected mesh)
+    with `simulate_crash(node)`, `reconnect(node)`,
+    `is_node_live(node)`, and `try_channel(from, to)` for crash
+    recovery, partition, and asymmetric-link tests.
+  - New: `noxu_rep::RepTransportKind` enum (`Tcp`, `Tls`, `Quic`,
+    `InMemory`; default `Tcp`) and `RepConfig::transport_kind` /
+    `RepConfigBuilder::transport_kind` so callers declare their
+    transport choice declaratively.
+  - The pre-existing `noxu_rep::test_harness::RepTestBase` /
+    `RepEnvInfo` / `CountingListener` types are lifted out of the
+    `cfg(test)` / `feature = "test-harness"` gate and are now
+    always part of the public API surface; the `test-harness`
+    feature flag is retained as a no-op for backward compatibility.
+  - 11 new unit tests in `crates/noxu-rep/src/net/inmem.rs`; 7 new
+    integration tests in
+    `crates/noxu-rep/tests/inmem_transport_test.rs`.
+
+### Fixed (v2.3.1 — Wave 11-N)
 
 Four noxu sorted-dup cursor bugs surfaced during Wave 11 and routed to
 this follow-up wave (Wave 11-N) are now closed.  All four shared a
