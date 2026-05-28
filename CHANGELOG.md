@@ -16,7 +16,59 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-(nothing yet — v2.3.x development is happening on `sprint/v2.3.0-base`.)
+### Tests
+
+* **TCK ports (Wave 11-A).**  6 dup-cursor methods from JE's
+  `com.sleepycat.je.dbi.DbCursorDuplicateTest` ported to
+  `crates/noxu-db/tests/je_db_cursor_test.rs`
+  (`testDuplicateCreationForward` / `Backwards`, `testGetNextNoDup`,
+  `testPutNoDupData2`, `testDuplicateReplacement`,
+  `testDuplicateDuplicates`).  Master TSV bumped from NOT-PORTED to
+  PORTED-EQUIVALENT.
+
+### Benchmarks
+
+* **W13 sorted-dup secondary index walk (Wave 11-B).**  New workload
+  in `benches/noxu-bench/` plus a matching JE counterpart in
+  `benches/je-bench/`.  Closes Wave 10-D gap #1.
+* **Real-storage W10 / W11 re-run (Wave 11-C).**  W10 (concurrent)
+  and W11 (recovery) re-run on real NVMe at N=10 000;
+  FsyncManager group-commit coalescing now visible (~6–30×
+  coalescing factor depending on writer count).  Numbers tabled in
+  `docs/src/operations/benchmarks.md`.
+
+### Documentation
+
+* `docs/src/internal/wave-11-v231-followups.md`: narrative summary
+  of Waves 11-A / 11-B / 11-C, including the four sorted-dup cursor
+  bugs surfaced (all routed to a follow-up bug-fix wave).
+* `docs/src/operations/benchmarks.md`: new W13 and "Real-storage
+W10 / W11 re-run" sections.
+
+### Known issues (NOT fixed in this release)
+
+Four noxu sorted-dup cursor bugs were surfaced and documented during
+Wave 11.  All are tracked as `#[ignore]`'d tests in
+`crates/noxu-db/tests/je_db_cursor_test.rs` (for #1 and #2) or
+bounded benchmark code in `benches/noxu-bench/src/workloads.rs` (for
+#3 and #4):
+
+1. `Cursor::count()` over-counts when positioned past the first dup
+   of the current primary on multi-primary sorted-dup DBs.
+2. `Get::Search` followed by `Get::NextDup` returns NotFound
+   immediately on every primary except the lexicographically
+   smallest, on multi-primary sorted-dup DBs.
+3. `SecondaryCursor::get_search_key` + `get_next_dup_full` triggers
+   `SecondaryIntegrityException` past the first yield.
+4. `SecondaryCursor::get_first` + repeated `get_next` walks revisit
+   primaries and either yield stale primary keys or fail to
+   terminate.
+
+All four are symptoms of incomplete multi-primary handling in
+`noxu-dbi`'s sorted-dup cursor logic and should be fixed together in
+a dedicated bug-fix wave.  None affects single-primary sorted-dup
+use, which remains correct (covered by the existing
+`crates/noxu-db/tests/sorted_dup_test.rs`).
 
 ## [2.2.1] - 2026-05-27
 
