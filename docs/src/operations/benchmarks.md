@@ -185,3 +185,153 @@ Outputs (all under `benches/results/`, gitignored):
   with `tmpfs` for the database directory.  `numerical-baseline.md`
   documents the engine-internal baselines that should hold across
   hardware.
+
+## W13 — Sorted-dup secondary index walk (Wave 11-B)
+
+Wave 10-D flagged that no benchmark exercised the sorted-dup secondary
+index path that landed in Wave 2A.  W13 closes that gap.
+
+### Workload shape
+
+* Primary DB populated with `N` records (10-digit zero-padded
+  decimal keys, 64-byte value).
+* Secondary DB opened with `with_sorted_duplicates(true)` and a
+  `SecondaryKeyCreator` that buckets primaries by
+  `bucket = primary_key as u32 % 100`, so each secondary key owns
+  ~`N/100` primaries — the many-primaries-per-secondary-key shape
+  sorted-dup secondaries are designed for.
+* Read phase: `secondary.open_cursor(...).get_first(...)` then
+  `get_next(...)` until exhaustion or until a safety cap of `2 * N`
+  steps fires.
+
+The setup (primary populate + secondary `allow_populate=true` build)
+runs *outside* the timer, so reported `ns/op` reflects the cursor walk
+only.  The harness reports the *actual* yield count, which the
+side-by-side report uses to compare noxu and JE walk progress.
+
+### Bugs surfaced (routed to follow-up bug-fix waves)
+
+While authoring W13 the following sorted-dup cursor bugs surfaced.
+They are **not** fixed in Wave 11-B per the wave's "do-not-fix-in-port-
+or-bench-wave" discipline; they are tracked separately and will be
+addressed in a dedicated bug-fix wave.
+
+1. `SecondaryCursor::get_search_key` followed by `get_next_dup_full`
+   returns `SecondaryIntegrityException` for every primary except the
+   lexicographically smallest.
+2. Plain `get_first` + repeated `get_next` walks revisit primaries and
+   either yield wrong primary keys (triggering
+   `SecondaryIntegrityException`) or fail to terminate once the dup
+   chain spans more than a handful of records.
+
+W13's safety cap means the workload still terminates, but on noxu the
+walk currently yields only the first 1–2 records before the engine
+returns an error.  Once the bugs are fixed, W13 will yield exactly
+`N` records and the `ns/op` denominator will become meaningful for
+A/B-with-JE comparison.
+
+### Reproducer
+
+```bash
+# Noxu side:
+cargo build --release --package noxu-workload-bench
+NOXU_BENCH_SCALES=1000,10000 NOXU_BENCH_CLEANUP=1 \
+    ./target/release/noxu-workload-bench
+
+# JE side (after `bash benches/setup.sh`):
+bash benches/run_comparison.sh --max-scale 10000
+```
+
+W13 only runs at scales ≤ 10K to keep the safety cap from dominating
+runtime in the buggy regime.
+
+### Real-storage results (Wave 11-C)
+
+These numbers are from a single-socket x86-64 host with the database
+directory rooted on a real NVMe SSD (`/scratch/noxu_bench` —
+auto-detected by the harness, see `benches/noxu-bench/src/main.rs`):
+
+| Scale | Workload         | Time (ms) | ns/op | ops/s | Yields |
+|-------|------------------|----------:|------:|------:|-------:|
+| 1 000 | w13_sec_dup_walk |       0.0 | 8 518 | 117 392 |     2  |
+| 10 000| w13_sec_dup_walk |       0.0 | 8 303 | 120 438 |     2  |
+
+The "Yields" column is the *actual* number of cursor steps the walk
+returned before terminating (either naturally or because the
+safety-cap-pre-bug condition fired).  As the bugs above are fixed,
+Yields will rise to `N` and `ns/op` will reflect the steady-state
+sorted-dup walk cost.
+
+## Real-storage W10 / W11 re-run (Wave 11-C)
+
+Wave 10-D ran on tmpfs, where `fdatasync` is instant and the
+FsyncManager's coalescing window is invisible.  Wave 11-C re-runs the
+W10 (concurrent) and W11 (recovery) workloads with the database rooted
+on real NVMe to surface the coalescing behaviour.  Numbers below were
+collected with:
+
+```bash
+NOXU_BENCH_DIR=/scratch/noxu_bench NOXU_BENCH_CLEANUP=1 \
+NOXU_BENCH_SCALES=10000 \
+    ./target/release/noxu-workload-bench
+```
+
+The harness auto-detects `/scratch` and uses it without an explicit
+`NOXU_BENCH_DIR` when the path exists, which is what happened on the
+machine these numbers are from (note the
+"`Storage:    /scratch/noxu_bench (NVMe auto-detected)`" line in the
+harness output).
+
+### Noxu DB on NVMe at N=10 000
+
+| Workload                | Threads | Time (ms) | ops/s | Fsyncs |
+|-------------------------|--------:|----------:|------:|-------:|
+| `w10_conc_1r0w`         |       1 |      15.4 | 651 445 |     0 |
+| `w10_conc_0r1w`         |       1 |    6 284.7 |   1 591 | 10 000 |
+| `w10_conc_4r0w`         |       4 |       6.3 | 1 587 195 |     0 |
+| `w10_conc_0r4w`         |       4 |    3 897.8 |   2 566 |  6 219 |
+| `w10_conc_4r4w`         |       8 |    1 956.7 |   5 111 |  3 174 |
+| `w10_conc_8r8w`         |      16 |    1 658.7 |   6 029 |  2 631 |
+| `w10_txn_no_gc`         |       8 |    4 716.9 |   2 120 |  7 445 |
+| `w10_txn_group_commit`  |       8 |    4 580.9 |   2 183 |  7 227 |
+| `w11_recovery`          |       1 |      218.4 |       5 |     0 |
+
+### What changed vs the tmpfs run
+
+* **Single-writer (`w10_conc_0r1w`).**  10 000 fsyncs, one per write.
+  No coalescing is possible — there is exactly one writer.  This is
+  the worst-case fsync-bound regime.
+* **Four writers (`w10_conc_0r4w`).**  6 219 fsyncs for 40 000
+  writes — the FsyncManager coalesces ~6.4 writes per fsync on
+  average.  Coalescing was invisible on tmpfs because every fsync
+  returned in O(µs); on NVMe each fsync takes ~600µs, leaving a
+  meaningful window for other writers to queue and ride the next
+  group fsync.
+* **Mixed (`w10_conc_4r4w`, `w10_conc_8r8w`).**  Coalescing factor
+  rises to 12.6× (40 000 / 3 174) and 30.4× (80 000 / 2 631) — more
+  threads, longer queue, more aggressive coalescing.
+* **Group commit (`w10_txn_group_commit` vs `w10_txn_no_gc`).**
+  Group commit shaves ~3 % off the elapsed time at this scale on
+  NVMe (4 581 ms vs 4 717 ms) and reduces fsync count by 218 (7 227
+  vs 7 445).  The benefit is real but small at 8 writers because
+  the auto-coalescing already gets most of the available wins; the
+  group-commit configured threshold of 4 with a 5 ms interval gives
+  the leader more time to accumulate more committers per fsync, but
+  most of the wallclock at this scale is dominated by the actual
+  fsync round-trip latency, not the queueing.
+* **Recovery (`w11_recovery`).**  218 ms to replay a 10 000-record
+  log on NVMe.  This is the I/O-bound regime; tmpfs ran the same
+  workload in ~5 ms because there was no actual disk I/O to do.
+
+The matching JE NVMe run is gated on `bash benches/setup.sh` running
+successfully (it requires Maven plus internet access to download the
+JE jar dependency tree), which it did not in this environment, so a
+side-by-side comparison report is left to a future wave.  The
+reproducer command is:
+
+```bash
+bash benches/setup.sh
+bash benches/run_comparison.sh \
+    --bench-dir /scratch/noxu_bench \
+    --max-scale 10000
+```

@@ -13,7 +13,7 @@
 //! in-process: `become_master`, `become_replica`, `register_vlsn`,
 //! and `apply_entry` operate on the local node's state machine
 //! without requiring any TCP wiring (the TCP receive loop in
-//! `become_replica` is only spawned when an [`EnvironmentImpl`] has
+//! `become_replica` is only spawned when an `EnvironmentImpl` has
 //! been attached via `with_environment`).  This harness builds on
 //! that property to provide a JE-style group abstraction that:
 //!

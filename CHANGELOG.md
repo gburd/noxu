@@ -16,7 +16,196 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-(nothing yet — v2.3.x development is happening on `sprint/v2.3.0-base`.)
+### Added (v2.4.0 — Wave 11-D)
+
+- **First-class in-memory replication transport.** Wave 11-D promotes
+  the in-memory transport from a `cfg(test)` / `feature = "test-harness"`
+  test fixture into a production transport alongside TCP, TLS, and QUIC.
+  See [`docs/src/replication/in-memory-transport.md`](docs/src/replication/in-memory-transport.md)
+  and the wave note at
+  [`docs/src/internal/wave-11-d-inmem-transport.md`](docs/src/internal/wave-11-d-inmem-transport.md).
+  - New: `noxu_rep::net::InMemoryTransport` (factory) with
+    `new_pair()` and `new_group(n)`.
+  - New: `noxu_rep::net::InMemoryEndpoint` (implements the same
+    `Channel` trait as `TcpChannel` / `TlsTcpChannel` /
+    `QuicMultiplexedChannel`).
+  - New: `noxu_rep::net::InMemoryGroup` (n-node fully-connected mesh)
+    with `simulate_crash(node)`, `reconnect(node)`,
+    `is_node_live(node)`, and `try_channel(from, to)` for crash
+    recovery, partition, and asymmetric-link tests.
+  - New: `noxu_rep::RepTransportKind` enum (`Tcp`, `Tls`, `Quic`,
+    `InMemory`; default `Tcp`) and `RepConfig::transport_kind` /
+    `RepConfigBuilder::transport_kind` so callers declare their
+    transport choice declaratively.
+  - The pre-existing `noxu_rep::test_harness::RepTestBase` /
+    `RepEnvInfo` / `CountingListener` types are lifted out of the
+    `cfg(test)` / `feature = "test-harness"` gate and are now
+    always part of the public API surface; the `test-harness`
+    feature flag is retained as a no-op for backward compatibility.
+  - 11 new unit tests in `crates/noxu-rep/src/net/inmem.rs`; 7 new
+    integration tests in
+    `crates/noxu-rep/tests/inmem_transport_test.rs`.
+
+### Fixed (v2.3.1 — Wave 11-N)
+
+Four noxu sorted-dup cursor bugs surfaced during Wave 11 and routed to
+this follow-up wave (Wave 11-N) are now closed.  All four shared a
+common root-cause area: incomplete multi-primary / cross-BIN handling
+in `noxu-dbi::CursorImpl`'s sorted-dup logic.  None affected
+single-primary sorted-dup use, which has been covered by
+`crates/noxu-db/tests/sorted_dup_test.rs` throughout.
+
+1. **`Cursor::count()` over-counted past the first dup of a primary**
+   on multi-primary sorted-dup DBs.  The previous formula
+   `backward + 1 + forward` double-counted because the backward walk
+   already repositioned scratch on the first dup, and the forward
+   walk then re-traversed every dup including the original
+   position.  Fix in `noxu-dbi::CursorImpl::count`: drop the
+   `backward` term, return `forward + 1`.  Regression test
+   `db_cursor_duplicate_test_duplicate_count` (no longer `#[ignore]`).
+2. **`Get::Search` + `Get::NextDup` returned NotFound on every primary
+   except the lexicographically smallest**, on multi-primary
+   sorted-dup DBs.  Root cause: `search_dup` hard-coded
+   `current_index = 0` after locating the entry, so the subsequent
+   `retrieve_next` computed `next_index = 1` in the BIN's slot
+   space.  Fix: new `Tree::first_entry_at_or_after_with_index`
+   returns the BIN node and the slot index; `search_dup` now stores
+   the real index and pins the BIN, mirroring the invariant
+   `get_first` / `get_last` already maintain.  Regression test
+   `db_cursor_duplicate_test_get_next_dup` (no longer `#[ignore]`).
+3. **`SecondaryCursor::get_search_key` + `get_next_dup_full`**
+   triggered `SecondaryIntegrityException` past the first yield.
+   This is the same `Search`-then-step boundary defect as #2 reaching
+   through the secondary layer; closed by the same `search_dup` fix.
+   Regression test `wave11n_bug3_get_search_key_then_next_dup_full_yields_all`
+   in `crates/noxu-db/tests/wave11n_secondary_dup_test.rs`.
+4. **`SecondaryCursor::get_first` + repeated `get_next` revisited
+   primaries or failed to terminate** once the secondary tree spanned
+   more than one BIN.  Root cause: `apply_dup_filter`'s cross-BIN
+   acceptance paths updated `current_key` / `current_index` but left
+   `current_bin_arc` pointing at the prior BIN, so the next
+   `retrieve_next` fast-path read `next_index = current_index + 1`
+   from the stale BIN — effectively re-emitting old entries.  Fix:
+   new `CursorImpl::find_bin_arc_for_key` helper plus an
+   `update_bin_pin` call at every accept site in `apply_dup_filter`.
+   Regression test `wave11n_bug4_get_first_get_next_full_walk_terminates`.
+
+See `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md` for the
+full per-bug analysis.
+
+### Tests
+
+* **TCK ports (Wave 11-A).**  6 dup-cursor methods from JE's
+  `com.sleepycat.je.dbi.DbCursorDuplicateTest` ported to
+  `crates/noxu-db/tests/je_db_cursor_test.rs`
+  (`testDuplicateCreationForward` / `Backwards`, `testGetNextNoDup`,
+  `testPutNoDupData2`, `testDuplicateReplacement`,
+  `testDuplicateDuplicates`).  Master TSV bumped from NOT-PORTED to
+  PORTED-EQUIVALENT.
+
+### Benchmarks
+
+* **W13 sorted-dup secondary index walk (Wave 11-B).**  New workload
+  in `benches/noxu-bench/` plus a matching JE counterpart in
+  `benches/je-bench/`.  Closes Wave 10-D gap #1.
+* **Real-storage W10 / W11 re-run (Wave 11-C).**  W10 (concurrent)
+  and W11 (recovery) re-run on real NVMe at N=10 000;
+  FsyncManager group-commit coalescing now visible (~6–30×
+  coalescing factor depending on writer count).  Numbers tabled in
+  `docs/src/operations/benchmarks.md`.
+
+### Documentation
+
+* `docs/src/internal/wave-11-v231-followups.md`: narrative summary
+  of Waves 11-A / 11-B / 11-C, including the four sorted-dup cursor
+  bugs surfaced (all closed in Wave 11-N — see `### Fixed` above).
+* `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`: per-bug
+  analysis for the four sorted-dup cursor bugs closed in Wave 11-N.
+* `docs/src/operations/benchmarks.md`: new W13 and "Real-storage
+W10 / W11 re-run" sections.
+
+### Changed
+
+- **Stateright spec coverage (Wave 11-F)** — every protocol modelled
+  in `noxu-spec` is now stamped with an explicit `VALIDATED-AS-OF`
+  version in its module preamble.  Five models were also
+  strengthened with new or upgraded invariants:
+  * `wal_commit::FsyncedNeverDecreases` is now a true 2-state
+    monotonicity invariant (was a coarse termination check).
+  * `recovery_three_phase::IdempotentReplay` is now a true 2-state
+    idempotency invariant (snapshot the materialisation after the
+    first redo; assert subsequent redos yield the same vector).
+  * `cleaner_safety::LiveCheckHonoured` (new) — every deleted file
+    must have its `cleared_for_delete` bit cleared at the moment
+    of deletion.
+  * `cache_vs_cleaner::MigratedReflectsDisk` (new) — every committed
+    migration must equal the cleaner's pre-migration snapshot.
+  * `xa_two_phase_commit::RecoveryConsistent` (new) — closes the
+    original module-preamble TODO with a 2-state pre-crash /
+    post-recovery decision-consistency predicate.
+
+  All 11 specs continue to pass under `make spec` in ~31 seconds.
+
+### Added (v2.4.0 — Wave 11-E)
+
+- **Wave 11-E — Property test expansion**: +39 new `proptest` blocks
+  across `noxu-tree` (BIN-delta and DeltaInfo round-trips, 7), `noxu-bind`
+  (`SortKey` reverse and ordering properties, 6), `noxu-cleaner`
+  (utilization tracker oracle and `FileSummary` arithmetic, 10),
+  `noxu-recovery` (rollback periods and `AnalysisResult` txn state
+  machine, 9), and `noxu-rep` (Paxos acceptor and VLSN streaming, 7).
+  See [`docs/src/internal/wave-11-e-property-tests.md`](docs/src/internal/wave-11-e-property-tests.md).
+  Adds `proptest` as a dev-dependency for `noxu-cleaner` and
+  `noxu-recovery`.  No production-code changes.
+
+### Notes (Wave 11-E)
+
+- Wave 11-E surfaced one behaviour gap in `noxu-recovery::AnalysisResult`
+  (`record_active_txn` does not defensively check the committed/aborted
+  sets), committed as an `#[ignore]`'d test
+  `prop_active_txn_after_terminal_resurrects_phantom_active`.  Bug fix
+  routed to a post-v2.4.0 wave per the property-test discipline.
+
+### Added (v2.4.0 — Wave 11-G)
+
+- **Wave 11-G — JE TCK long-tail port (49 new tests).**  Across
+  `crates/noxu-db/tests/`: 9 DatabaseTest/EnvironmentTest invariants,
+  7 SR-numbered + DupSlotReuse regression tests, 5 TruncateTest
+  invariants, 6 GetSearchBothRangeTest range-query corner cases, 5
+  recovery invariants (RecoveryDuplicates / Checkpoint / Delete /
+  EdgeTxnId), 7 tree-level invariants (Split / TreeBalance /
+  KeyPrefix), and 9 dup cursor invariants
+  (DbCursorDuplicate{,Delete}Test).  TSV row totals went from PE 263 /
+  PP 99 / NOT 1580 to PE 306 / PP 105 / NOT 1531 (+43 PE, +6 PP, −49
+  NOT).  See
+  [`docs/src/internal/wave-11-g-je-tck-longtail.md`](docs/src/internal/wave-11-g-je-tck-longtail.md).
+
+### Tracked Noxu bugs surfaced (Wave 11-G; 5 total)
+
+Each of these is a `#[ignore]`'d test in this wave's commits that
+documents a real Noxu regression vs JE's invariant.  All routed to a
+follow-up bug-fix wave (no production code changed in Wave 11-G).
+
+- `database_txn_cursor_on_non_txn_db_rejected` — Noxu permits opening
+  a transactional cursor on a non-transactional database; JE rejects.
+- `database_put_no_overwrite_in_dup_db_{txn,no_txn}` — Noxu's
+  `put_no_overwrite` on sorted-dup databases checks the *(key, data)*
+  pair instead of the key alone.
+- `environment_read_only_rejects_db_name_ops` — Noxu's database-name
+  registry is not preserved across a clean close+read-only reopen.
+- `environment_checkpoint_after_commit_loses_data` — Calling
+  `env.checkpoint(None)` between `txn.commit()` and `drop(env)` causes
+  the most recently committed records to be lost on the next env open.
+- `truncate_survives_clean_close_reopen` — Noxu's `truncate_database`
+  is not durable across a clean close+reopen.
+
+### Added (v2.4.0 — Wave 11-H)
+
+- Wave 11-H: per-workload `perf` profile captures (W03/W04/W10/W11)
+  and a single-workload profiler harness under `benches/profiles/`.
+  See `docs/src/internal/wave-11-h-perf-investigation.md` for the
+  per-workload root-cause analysis and the ROI ordering of waves
+  11-I (cursor/BIN), 11-K (recovery), and 11-J (fsync).
 
 ## [2.2.1] - 2026-05-27
 

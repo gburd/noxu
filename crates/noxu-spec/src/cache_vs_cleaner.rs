@@ -10,12 +10,25 @@
 //!   - `crates/noxu-evictor/src/evictor.rs`
 //!   - `crates/noxu-cleaner/src/file_processor.rs::migrate_ln_slot`
 //!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! evictor still flushes a BIN before clearing its dirty bit, and
+//! the cleaner still snapshots the disk version before migrating.
+//! The Wave 11-F update adds a third invariant `MigratedReflectsDisk`
+//! that exercises the full snapshot → migrate handshake: when the
+//! cleaner has migrated a slot, the migrated version must equal
+//! the disk version observed at snapshot time, and that version
+//! must equal disk_version when migration completes (no
+//! intervening dirty/evict cycle without a re-snapshot).
+//!
 //! Properties:
 //!   - `DirtyBitPreserved` — the cleaner never observes a clean BIN
 //!     before the evictor has fsynced its dirty contents.
 //!   - `NoStaleMigration` — when the cleaner migrates a slot, the LN
 //!     it copies is at least as fresh as the LN visible to readers
 //!     at that moment.
+//!   - `MigratedReflectsDisk` — once `migrated_version` is `Some(v)`,
+//!     `v == cleaner_seen_version` (the cleaner only commits a
+//!     migration that matches what it snapshotted).
 
 use stateright::{Model, Property};
 
@@ -137,6 +150,25 @@ impl Model for CacheVsCleanerModel {
                 // migration time, and disk_version is monotonic.
                 if let Some(v) = s.migrated_version {
                     return v <= s.disk_version;
+                }
+                true
+            }),
+            Property::<Self>::always("MigratedReflectsDisk", |_, s: &State| {
+                // Whenever a migration has been committed, it
+                // must equal the cleaner's snapshot AND that
+                // snapshot must have been disk_version at the
+                // time of CleanerMigrate. The model encodes the
+                // second clause by clearing
+                // cleaner_seen_version when DirtyTheBin
+                // invalidates pre-migration snapshots; here we
+                // check the first clause as a 1-state predicate.
+                if let Some(v) = s.migrated_version {
+                    if let Some(seen) = s.cleaner_seen_version {
+                        return v == seen;
+                    } else {
+                        // migrated without a live snapshot: bug.
+                        return false;
+                    }
                 }
                 true
             }),

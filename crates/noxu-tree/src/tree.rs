@@ -1664,6 +1664,83 @@ impl Tree {
         }
     }
 
+    /// Like [`Tree::first_entry_at_or_after`] but also returns the BIN node
+    /// (so callers may pin it) and the entry's slot index inside that
+    /// BIN.
+    ///
+    /// Wave 11-N (Bug 2): `CursorImpl::search_dup` previously stored
+    /// `current_index = 0` after a sorted-dup `Search`, which broke the
+    /// fast-path of `retrieve_next` (and the slow path's
+    /// `next_index = current_index + 1` arithmetic) for any primary
+    /// that was not the first slot of its BIN.  This helper hands back
+    /// the real index so the cursor can be positioned correctly.
+    pub fn first_entry_at_or_after_with_index(
+        &self,
+        key: &[u8],
+    ) -> Option<(
+        Vec<u8>,
+        Vec<u8>,
+        usize,
+        u64,
+        std::sync::Arc<crate::NodeRwLock<TreeNode>>,
+    )> {
+        // Hand-over-hand latch coupling — same descent strategy as
+        // first_entry_at_or_after; we additionally retain the BIN's Arc
+        // so the caller can pin it.
+        let mut arc = self.get_root()?;
+        loop {
+            let is_bin = arc.read().is_bin();
+            if is_bin {
+                let g = arc.read();
+                if let TreeNode::Bottom(bin) = &*g {
+                    let (idx, _exact) = match &self.key_comparator {
+                        Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+                        None => bin.find_entry_compressed(key),
+                    };
+                    if idx < bin.entries.len() {
+                        let full_key =
+                            bin.get_full_key(idx).unwrap_or_default();
+                        let data =
+                            bin.entries[idx].data.clone().unwrap_or_default();
+                        let lsn = bin.entries[idx].lsn.as_u64();
+                        let bin_arc = arc.clone();
+                        return Some((full_key, data, idx, lsn, bin_arc));
+                    } else {
+                        return None;
+                    }
+                }
+                return None;
+            }
+            // Upper IN: same descent as `first_entry_at_or_after` /
+            // `search`.
+            let next_arc = {
+                let g = arc.read();
+                match &*g {
+                    TreeNode::Internal(n) => {
+                        if n.entries.is_empty() {
+                            return None;
+                        }
+                        let mut idx = 0usize;
+                        for (i, entry) in n.entries.iter().enumerate() {
+                            if i == 0 {
+                                idx = 0;
+                            } else if self.key_cmp(entry.key.as_slice(), key)
+                                != std::cmp::Ordering::Greater
+                            {
+                                idx = i;
+                            } else {
+                                break;
+                            }
+                        }
+                        n.entries.get(idx)?.child.clone()?
+                    }
+                    TreeNode::Bottom(_) => unreachable!(),
+                }
+            };
+            arc = next_arc;
+        }
+    }
+
     /// Insert a key/data pair into the tree.
     ///
     /// . Handles the root-is-null case by

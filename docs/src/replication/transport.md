@@ -4,10 +4,25 @@
 > at 256 bytes (Wave 3-3, F3).  Network restore via the dispatcher's
 > `RESTORE` service is wired end-to-end via
 > `ReplicatedEnvironment::bootstrap_via_dispatcher` (Wave 4-A, F2/F4).
+>
+> **v2.4 update — Wave 11-D.** The in-memory transport, originally
+> a `cfg(test)` test fixture, is now a first-class production
+> transport.  See [In-Memory Transport](in-memory-transport.md).
 
-Noxu DB supports two network transports for replication: **TCP** and **QUIC**.
-Both implement the `ReplicationChannel` trait and are interchangeable at
-configuration time.
+Noxu DB supports four network transports for replication:
+
+| Transport | Channel type | Use case |
+|-----------|--------------|----------|
+| **TCP**       | `TcpChannel`        | Plain LAN/WAN replication (default) |
+| **TLS**       | `TlsTcpChannel`     | Encrypted WAN (`tls-rustls` or `tls-native`) |
+| **QUIC**      | `QuicMultiplexedChannel` | Multiplexed UDP (`quic` feature) |
+| **In-memory** | `InMemoryEndpoint`  | In-process clusters & tests (Wave 11-D) |
+
+All four implement the same `Channel` trait and are interchangeable
+at the protocol layer; higher-level code (feeder, replica stream,
+elections) consumes `dyn Channel` and works identically over any
+transport.  See `RepTransportKind` on `RepConfig` for the
+declarative selector.
 
 ## TCP Transport
 
@@ -88,3 +103,11 @@ pub trait ReplicationChannel: Send + Sync {
 `connect_host` resolves hostnames via `(host, port).to_socket_addrs()` and
 applies **Happy Eyeballs** ordering: IPv6 candidates are sorted before IPv4.
 Connection attempts use a 30s timeout each.
+
+## In-Memory Transport
+
+`InMemoryTransport` (Wave 11-D) provides an in-process channel mesh
+with the same `Channel` trait as TCP / TLS / QUIC.  Use it for
+embedded multi-node deployments, integration tests, and Stateright
+property-test driver harnesses.  Full chapter:
+[In-Memory Transport](in-memory-transport.md).
