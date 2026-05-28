@@ -455,10 +455,11 @@ fn db_cursor_duplicate_test_duplicate_creation_backwards() {
 /// because, after the PrevDup walk repositions scratch on the first
 /// dup, the subsequent NextDup walk re-traverses every dup including
 /// the original.  JE returns `N_DUPLICATE_PER_KEY` at every position.
-/// Routed to a follow-up bug-fix wave per Wave 11-A discipline (do not
-/// fix in TCK port wave).
+///
+/// Fixed in Wave 11-N (Bug 1): the count formula is now `forward + 1`
+/// after the backward walk repositions scratch on the first dup; see
+/// `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.
 #[test]
-#[ignore = "noxu-bug: cursor.count() over-counts past first dup of primary; see TODO above"]
 fn db_cursor_duplicate_test_duplicate_count() {
     let (_dir, env, db) = open_dup_env_db();
     put_dup_fixture(&env, &db);
@@ -496,9 +497,13 @@ fn db_cursor_duplicate_test_duplicate_count() {
 /// `sorted_dup_test::test_dup_sorted_order` (which passes), confirming
 /// the bug is multi-primary specific.  JE returns the next dup until
 /// the dup-set is exhausted regardless of which primary was searched.
-/// Routed to a follow-up bug-fix wave per Wave 11-A discipline.
+///
+/// Fixed in Wave 11-N (Bug 2): `CursorImpl::search_dup` now stores the
+/// real BIN slot index of the located dup (and pins the BIN) instead
+/// of the previous hard-coded `current_index = 0`, so the subsequent
+/// `retrieve_next` increments the right slot.  See
+/// `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.
 #[test]
-#[ignore = "noxu-bug: Search+NextDup boundary check fires on non-first primaries; see TODO above"]
 fn db_cursor_duplicate_test_get_next_dup() {
     let (_dir, env, db) = open_dup_env_db();
     put_dup_fixture(&env, &db);

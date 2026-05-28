@@ -27,12 +27,12 @@ Implementation in `crates/noxu-db/tests/je_db_cursor_test.rs`:
 | `testDuplicateCount`               | `db_cursor_duplicate_test_duplicate_count`             | IGNORED |
 | `testGetNextDup`                   | `db_cursor_duplicate_test_get_next_dup`                | IGNORED |
 
-### Real noxu bugs surfaced (routed to follow-up bug-fix wave)
+### Real noxu bugs surfaced (now fixed in Wave 11-N)
 
-Two real noxu bugs surfaced while authoring the ports and are
-captured as `#[ignore = "noxu-bug: ..."]` in
-`je_db_cursor_test.rs` with full TODOs.  Per Wave 11-A discipline
-they are NOT fixed here.
+Two real noxu bugs surfaced while authoring the ports and were
+captured as `#[ignore = "noxu-bug: ..."]` in `je_db_cursor_test.rs`
+with full TODOs.  Per Wave 11-A discipline they were NOT fixed in
+that wave.
 
 1. **`Cursor::count()` over-counts past first dup of primary on
    multi-primary sorted-dup DBs.**  Empirically `count()` returns
@@ -51,6 +51,10 @@ they are NOT fixed here.
    that decides "we've stepped onto a different primary" fires
    incorrectly when the cursor is positioned via `Get::Search` on a
    non-first primary.
+
+Both were fixed in Wave 11-N — see
+`docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.  The two
+`#[ignore]`'d tests are no longer ignored and pass.
 
 ## 11-B — Sorted-dup secondary index benchmark workload (W13)
 
@@ -81,7 +85,7 @@ unreliable.  Real-storage numbers are tabled in
 The setup runs *outside* the timer; reported `ns/op` reflects the
 cursor walk only.
 
-### More noxu bugs surfaced
+### More noxu bugs surfaced (now fixed in Wave 11-N)
 
 Authoring W13 surfaced two more sorted-dup cursor bugs in addition
 to the two from 11-A (numbered #3 and #4 in the bug catalog at the
@@ -90,21 +94,26 @@ the W13 module in `benches/noxu-bench/src/workloads.rs` and again
 in the W13 section of `docs/src/operations/benchmarks.md`.
 
 * Bug #3 — **`SecondaryCursor::get_search_key` + `get_next_dup_full`**
-  on a multi-bucket secondary triggers
+  on a multi-bucket secondary triggered
   `SecondaryIntegrityException` after the first yield — the same
   class as bug #2 from 11-A, surfaced through the secondary
-  layer.
+  layer.  Closed transitively by the Bug 2 fix in Wave 11-N.
 
 * Bug #4 — **`SecondaryCursor::get_first` + repeated `get_next`**
-  revisits primaries instead of advancing past the dup chain,
+  revisited primaries instead of advancing past the dup chain,
   eventually either yielding a stale primary key (causing
    `SecondaryIntegrityException`) or failing to terminate
    altogether.  The W13 walk caps the step count at `2 * N` to
-   ensure the workload always terminates.
+   ensure the workload always terminates.  Root cause: the
+   sorted-dup cross-BIN path in `apply_dup_filter` did not re-pin
+   `current_bin_arc`, so the next fast-path step read from the
+   stale BIN.  Fixed in Wave 11-N.
 
-Per Wave 11-B discipline, these bugs are NOT fixed here.  W13's
-safety cap means the workload still produces a number, and as the
-bugs are fixed, the W13 row in the benchmark table will tighten.
+Both fixes are described in
+`docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.  The W13
+safety cap remains in place — the workload still produces a number
+and the Wave 11-N regression tests live in
+`crates/noxu-db/tests/wave11n_secondary_dup_test.rs`.
 
 ## 11-C — Real-storage benchmark re-run
 
@@ -137,12 +146,12 @@ command is documented inline.
 
 The four noxu sorted-dup cursor bugs surfaced across 11-A and 11-B
 are all symptoms of incomplete multi-primary handling in
-`noxu-dbi`'s sorted-dup cursor logic.  None of them are fixed in
-this wave.  They share a common root-cause area (BIN-boundary /
-dup-chain traversal in `noxu_dbi::CursorImpl`), and a dedicated
-bug-fix wave should address them together rather than piecemeal.
-The four `#[ignore]`'d / `Result`-tolerant tests are the regression
-gate for that fix wave.
+`noxu-dbi`'s sorted-dup cursor logic.  All four were closed in Wave
+11-N (`fix/wave11-n-sorted-dup-cursor-bugs`); the four
+`#[ignore]`'d / `Result`-tolerant tests have been promoted to live
+regression tests.  See
+`docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md` for the
+per-bug analysis.
 
 ## Roadmap status
 
