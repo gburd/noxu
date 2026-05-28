@@ -1664,7 +1664,7 @@ impl Tree {
         }
     }
 
-    /// Like [`first_entry_at_or_after`] but also returns the BIN node
+    /// Like [`Tree::first_entry_at_or_after`] but also returns the BIN node
     /// (so callers may pin it) and the entry's slot index inside that
     /// BIN.
     ///
