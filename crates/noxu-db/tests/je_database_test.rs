@@ -924,7 +924,6 @@ fn environment_checkpoint_forces_durability() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn environment_checkpoint_after_commit_loses_data() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
