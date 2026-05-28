@@ -59,7 +59,7 @@ fn populate(db: &Database, n: usize, value: &[u8]) {
 fn run_w03(scale: usize, repeats: usize) {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_db(dir.path());
-    populate(&db, scale, &vec![0x58u8; 64]);
+    populate(&db, scale, &[0x58u8; 64]);
 
     eprintln!("[w03] populate done; entering timed read loop");
     let t0 = Instant::now();
@@ -88,7 +88,7 @@ fn run_w03(scale: usize, repeats: usize) {
 fn run_w04(scale: usize, repeats: usize) {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_db(dir.path());
-    populate(&db, scale, &vec![0x58u8; 64]);
+    populate(&db, scale, &[0x58u8; 64]);
 
     eprintln!("[w04] populate done; entering timed read loop");
     let t0 = Instant::now();
@@ -122,7 +122,7 @@ fn run_w10(scale: usize, threads: usize, repeats: usize) {
 
     let dir = TempDir::new().unwrap();
     let (env, db) = open_db(dir.path());
-    populate(&db, scale, &vec![0x58u8; 64]);
+    populate(&db, scale, &[0x58u8; 64]);
 
     let db = Arc::new(db);
     eprintln!(
@@ -140,7 +140,7 @@ fn run_w10(scale: usize, threads: usize, repeats: usize) {
             let db_t = Arc::clone(&db);
             s.spawn(move || {
                 let mut rng = SmallRng::seed_from_u64(0xc0ffee + tid as u64);
-                let v = DatabaseEntry::from_bytes(&vec![0x58u8; 64]);
+                let v = DatabaseEntry::from_bytes(&[0x58u8; 64]);
                 let n_per = (scale / threads) * repeats;
                 for _ in 0..n_per {
                     let idx = rng.gen_range(0..scale);
@@ -171,7 +171,7 @@ fn run_w11(scale: usize, repeats: usize) {
     let dir = TempDir::new().unwrap();
     {
         let (env, db) = open_db(dir.path());
-        populate(&db, scale, &vec![0x58u8; 64]);
+        populate(&db, scale, &[0x58u8; 64]);
         drop(db);
         drop(env);
     }
