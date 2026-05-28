@@ -613,6 +613,81 @@ public class JeBenchmark {
                 results.add(r);
                 printProgress("w11_recovery", n, 1, r);
             }
+
+            // W13: sorted-dup secondary index walk (Wave 11-B counterpart
+            // to noxu-bench `w13_secondary_dup`).  Skipped at scales > 10K
+            // to keep runtime bounded and to mirror the noxu side, which
+            // documents two sorted-dup cursor bugs that make high-dup
+            // walks unreliable on noxu.  JE walks the full secondary
+            // here so the JE numbers are an upper bound; comparison is
+            // honest only at scales ≤ 10K.
+            if (n <= 10_000) {
+                File dir = makeTempDir("w13");
+                // Pre-populate (not timed): primary populate + secondary
+                // index build.  100 buckets keyed by `key as int % 100`
+                // matches the noxu-side `W13BucketKeyCreator`.
+                Environment env = EnvHelper.openEnv(dir);
+                DatabaseConfig priCfg = new DatabaseConfig();
+                priCfg.setAllowCreate(true);
+                priCfg.setTransactional(true);
+                Database primary =
+                        env.openDatabase(null, "w13_primary", priCfg);
+                for (int i = 0; i < n; i++) {
+                    DatabaseEntry k = new DatabaseEntry(EnvHelper.makeKey(i));
+                    DatabaseEntry v = new DatabaseEntry(EnvHelper.VALUE);
+                    primary.put(null, k, v);
+                }
+                SecondaryConfig secCfg = new SecondaryConfig();
+                secCfg.setAllowCreate(true);
+                secCfg.setTransactional(true);
+                secCfg.setSortedDuplicates(true);
+                secCfg.setAllowPopulate(true);
+                secCfg.setKeyCreator(new SecondaryKeyCreator() {
+                    @Override
+                    public boolean createSecondaryKey(
+                            SecondaryDatabase db, DatabaseEntry key,
+                            DatabaseEntry data, DatabaseEntry result) {
+                        String s = new String(key.getData(),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        int bucket = (Integer.parseInt(s) % 100) & 0xFF_FF_FF_FF;
+                        result.setData(new byte[] {
+                                (byte) (bucket >>> 24),
+                                (byte) (bucket >>> 16),
+                                (byte) (bucket >>> 8),
+                                (byte) bucket,
+                        });
+                        return true;
+                    }
+                });
+                SecondaryDatabase secondary =
+                        env.openSecondaryDatabase(null, "w13_secondary",
+                                primary, secCfg);
+                final SecondaryDatabase finalSec = secondary;
+                final int finalN = n;
+                WorkloadResult r = measure("w13_sec_dup_walk", n, 1, dir, env,
+                        () -> {
+                            int cap = Math.max(1, finalN * 2);
+                            int total = 0;
+                            try (SecondaryCursor c = finalSec.openCursor(null, null)) {
+                                DatabaseEntry sk = new DatabaseEntry();
+                                DatabaseEntry pk = new DatabaseEntry();
+                                DatabaseEntry data = new DatabaseEntry();
+                                OperationStatus s =
+                                        c.getFirst(sk, pk, data, LockMode.DEFAULT);
+                                while (s == OperationStatus.SUCCESS && total < cap) {
+                                    total++;
+                                    s = c.getNext(sk, pk, data, LockMode.DEFAULT);
+                                }
+                            }
+                            return (long) total;
+                        });
+                secondary.close();
+                primary.close();
+                env.close();
+                deleteDir(dir);
+                results.add(r);
+                printProgress("w13_sec_dup_walk", n, 1, r);
+            }
         }
 
         printTable(results);
