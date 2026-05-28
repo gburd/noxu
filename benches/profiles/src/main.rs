@@ -176,7 +176,10 @@ fn run_w11(scale: usize, repeats: usize) {
         drop(env);
     }
 
-    eprintln!("[w11] populate done; timing {} re-opens (recovery path)", repeats);
+    eprintln!(
+        "[w11] populate done; timing {} re-opens (recovery path)",
+        repeats
+    );
     let t0 = Instant::now();
     for _ in 0..repeats {
         let (env, db) = open_db(dir.path());
