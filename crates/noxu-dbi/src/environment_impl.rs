@@ -1033,6 +1033,36 @@ impl EnvironmentImpl {
                 .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
             let mut db_guard = db_arc.write();
             let old_count = db_guard.entry_count();
+
+            // Write DeleteLN entries to the WAL for every key in the
+            // database before clearing the tree.  On recovery, these
+            // non-transactional deletes are replayed after the original
+            // committed inserts, resulting in an empty tree.  Without
+            // this WAL fence the truncation is invisible after reopen.
+            if let Some(lm) = &self.log_manager {
+                if let Some(tree) = db_guard.get_real_tree() {
+                    let all_nodes = tree.rebuild_in_list();
+                    for node_arc in all_nodes {
+                        let node_guard = node_arc.read();
+                        if let noxu_tree::tree::TreeNode::Bottom(bin) =
+                            &*node_guard
+                        {
+                            for idx in 0..bin.entries.len() {
+                                if let Some(full_key) = bin.get_full_key(idx) {
+                                    if !full_key.is_empty() {
+                                        let _ = Self::log_delete_ln(
+                                            lm,
+                                            db_id.id() as u64,
+                                            &full_key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Replace the real tree with a fresh empty tree, preserving config.
             let max_entries = db_guard.max_tree_entries_per_node() as usize;
             let new_tree =
@@ -1047,6 +1077,41 @@ impl EnvironmentImpl {
         };
 
         Ok(count)
+    }
+
+    /// Write a non-transactional `DeleteLN` entry to the WAL.
+    fn log_delete_ln(
+        lm: &Arc<LogManager>,
+        db_id: u64,
+        key: &[u8],
+    ) -> Result<(), DbiError> {
+        use noxu_util::vlsn::NULL_VLSN;
+        let entry = LnLogEntry::new(
+            db_id,
+            None,     // txn_id: non-transactional
+            NULL_LSN, // abort_lsn
+            false,
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            false,
+            key.to_vec(),
+            None, // data = None → DeleteLN
+            0,
+            NULL_VLSN,
+        );
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        lm.log(
+            LogEntryType::DeleteLN,
+            &buf,
+            Provisional::No,
+            false,
+            false,
+        )
+        .map(|_| ())
+        .map_err(DbiError::from)
     }
 
     /// Returns the list of database names.
