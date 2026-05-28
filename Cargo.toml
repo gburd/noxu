@@ -105,7 +105,7 @@ name = "transaction_config"
 path = "examples/transaction_config.rs"
 
 [workspace.package]
-version = "2.3.0"
+version = "2.3.1"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 repository = "https://codeberg.org/gregburd/noxu"
