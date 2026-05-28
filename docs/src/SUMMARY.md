@@ -152,3 +152,4 @@
   - [Wave 11 — v2.3.1 follow-ups](internal/wave-11-v231-followups.md)
   - [Wave 11-N — sorted-dup cursor bug fixes](internal/wave-11-n-sorted-dup-cursor-bugs.md)
   - [Wave 11-F — Stateright spec coverage expansion](internal/wave-11-f-stateright-coverage.md)
+  - [Wave 11-E — Property test expansion](internal/wave-11-e-property-tests.md)

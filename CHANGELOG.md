@@ -146,6 +146,26 @@ W10 / W11 re-run" sections.
 
   All 11 specs continue to pass under `make spec` in ~31 seconds.
 
+### Added (v2.4.0 — Wave 11-E)
+
+- **Wave 11-E — Property test expansion**: +39 new `proptest` blocks
+  across `noxu-tree` (BIN-delta and DeltaInfo round-trips, 7), `noxu-bind`
+  (`SortKey` reverse and ordering properties, 6), `noxu-cleaner`
+  (utilization tracker oracle and `FileSummary` arithmetic, 10),
+  `noxu-recovery` (rollback periods and `AnalysisResult` txn state
+  machine, 9), and `noxu-rep` (Paxos acceptor and VLSN streaming, 7).
+  See [`docs/src/internal/wave-11-e-property-tests.md`](docs/src/internal/wave-11-e-property-tests.md).
+  Adds `proptest` as a dev-dependency for `noxu-cleaner` and
+  `noxu-recovery`.  No production-code changes.
+
+### Notes (Wave 11-E)
+
+- Wave 11-E surfaced one behaviour gap in `noxu-recovery::AnalysisResult`
+  (`record_active_txn` does not defensively check the committed/aborted
+  sets), committed as an `#[ignore]`'d test
+  `prop_active_txn_after_terminal_resurrects_phantom_active`.  Bug fix
+  routed to a post-v2.4.0 wave per the property-test discipline.
+
 ## [2.2.1] - 2026-05-27
 
 CI-green release.  Unblocks GitHub Pages and Codeberg Pages publishing.
