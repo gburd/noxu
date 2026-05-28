@@ -268,7 +268,7 @@ mod tests {
             .open_database(
                 None,
                 "ssm",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
             )
             .unwrap();
         (td, env, db)
