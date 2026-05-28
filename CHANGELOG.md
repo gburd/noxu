@@ -16,7 +16,6 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added (v2.4.0 — Wave 11-D)
 
 - **First-class in-memory replication transport.** Wave 11-D promotes
@@ -166,8 +165,8 @@ W10 / W11 re-run" sections.
   sets), committed as an `#[ignore]`'d test
   `prop_active_txn_after_terminal_resurrects_phantom_active`.  Bug fix
   routed to a post-v2.4.0 wave per the property-test discipline.
-=======
-### Added
+
+### Added (v2.4.0 — Wave 11-G)
 
 - **Wave 11-G — JE TCK long-tail port (49 new tests).**  Across
   `crates/noxu-db/tests/`: 9 DatabaseTest/EnvironmentTest invariants,
@@ -181,7 +180,7 @@ W10 / W11 re-run" sections.
   NOT).  See
   [`docs/src/internal/wave-11-g-je-tck-longtail.md`](docs/src/internal/wave-11-g-je-tck-longtail.md).
 
-### Tracked Noxu bugs surfaced (5)
+### Tracked Noxu bugs surfaced (Wave 11-G; 5 total)
 
 Each of these is a `#[ignore]`'d test in this wave's commits that
 documents a real Noxu regression vs JE's invariant.  All routed to a
@@ -199,7 +198,6 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   the most recently committed records to be lost on the next env open.
 - `truncate_survives_clean_close_reopen` — Noxu's `truncate_database`
   is not durable across a clean close+reopen.
->>>>>>> fix/wave11-g-je-tck-longtail
 
 ## [2.2.1] - 2026-05-27
 
