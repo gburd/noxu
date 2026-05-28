@@ -16,7 +16,13 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-(nothing yet — v2.3.x development is happening on `sprint/v2.3.0-base`.)
+### Added
+
+- Wave 11-H: per-workload `perf` profile captures (W03/W04/W10/W11)
+  and a single-workload profiler harness under `benches/profiles/`.
+  See `docs/src/internal/wave-11-h-perf-investigation.md` for the
+  per-workload root-cause analysis and the ROI ordering of waves
+  11-I (cursor/BIN), 11-K (recovery), and 11-J (fsync).
 
 ## [2.2.1] - 2026-05-27
 
