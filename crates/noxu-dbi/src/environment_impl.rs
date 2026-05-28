@@ -848,10 +848,10 @@ impl EnvironmentImpl {
         // Persist the name → id mapping to the WAL (only for new creations
         // and writable environments) so that subsequent reopens — including
         // read-only ones with allow_create=false — can reconstruct name_map.
-        if recovered_db_id.is_none() {
-            if let Some(lm) = &self.log_manager {
-                let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
-            }
+        if recovered_db_id.is_none()
+            && let Some(lm) = &self.log_manager
+        {
+            let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
         }
 
         Ok(db)
@@ -1034,24 +1034,23 @@ impl EnvironmentImpl {
             // non-transactional deletes are replayed after the original
             // committed inserts, resulting in an empty tree.  Without
             // this WAL fence the truncation is invisible after reopen.
-            if let Some(lm) = &self.log_manager {
-                if let Some(tree) = db_guard.get_real_tree() {
-                    let all_nodes = tree.rebuild_in_list();
-                    for node_arc in all_nodes {
-                        let node_guard = node_arc.read();
-                        if let noxu_tree::tree::TreeNode::Bottom(bin) =
-                            &*node_guard
-                        {
-                            for idx in 0..bin.entries.len() {
-                                if let Some(full_key) = bin.get_full_key(idx) {
-                                    if !full_key.is_empty() {
-                                        let _ = Self::log_delete_ln(
-                                            lm,
-                                            db_id.id() as u64,
-                                            &full_key,
-                                        );
-                                    }
-                                }
+            if let Some(lm) = &self.log_manager
+                && let Some(tree) = db_guard.get_real_tree()
+            {
+                let all_nodes = tree.rebuild_in_list();
+                for node_arc in all_nodes {
+                    let node_guard = node_arc.read();
+                    if let noxu_tree::tree::TreeNode::Bottom(bin) = &*node_guard
+                    {
+                        for idx in 0..bin.entries.len() {
+                            if let Some(full_key) = bin.get_full_key(idx)
+                                && !full_key.is_empty()
+                            {
+                                let _ = Self::log_delete_ln(
+                                    lm,
+                                    db_id.id() as u64,
+                                    &full_key,
+                                );
                             }
                         }
                     }

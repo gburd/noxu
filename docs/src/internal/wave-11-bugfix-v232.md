@@ -144,7 +144,7 @@ Two compounding issues:
 **Issue A**: `Checkpointer::do_checkpoint()` wrote `NULL_LSN` as
 `first_active_lsn` in `CkptEnd`.  Recovery's scan-start selection:
 
-```
+```text
 if first_active_lsn != NULL_LSN  →  scan from first_active_lsn
 else if checkpoint_start_lsn != NULL_LSN  →  scan from checkpoint_start_lsn
 ```
@@ -198,7 +198,7 @@ Added `EnvironmentImpl::log_delete_ln()` as a private helper.
 
 ## Gate results
 
-```
+```text
 cargo fmt --all -- --check              ✓  zero violations
 cargo clippy --workspace … -D warnings ✓  zero warnings
 RUSTDOCFLAGS=-D warnings cargo doc …   ✓  zero warnings
