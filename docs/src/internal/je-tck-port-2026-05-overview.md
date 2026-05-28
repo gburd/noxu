@@ -6,15 +6,15 @@ this same directory (`je-tck-port-2026-05-enumeration-<package>.tsv`) for
 the row-by-row status, and see the per-wave narrative documents
 (`wave-4-b-je-tck-port-priority1.md`, …) for what changed in each wave.
 
-## Aggregate status (2026-05-27, after wave 9-C)
+## Aggregate status (2026-05-28, after wave 11-G)
 
 | Bucket | Count |
 |---|---:|
-| **Total** JE @Test methods enumerated | 2068 |
-| PORTED-EQUIVALENT | 243 |
-| PORTED-PARTIAL | 96 |
-| OUT-OF-SCOPE | 77 |
-| NOT-PORTED | 1653 |
+| **Total** JE @Test methods enumerated | 2114 |
+| PORTED-EQUIVALENT | 306 |
+| PORTED-PARTIAL | 105 |
+| OUT-OF-SCOPE | 127 |
+| NOT-PORTED | 1531 |
 
 "PORTED-EQUIVALENT" means a Rust test exists that asserts the same
 invariant as the JE original.  "PORTED-PARTIAL" means the Rust test
@@ -30,53 +30,53 @@ topology (e.g. some replication tests).
 
 | package | total | ported | partial | oos | not-ported |
 |---|---:|---:|---:|---:|---:|
-| `bind.serial.test`                            |      7 |      7 |      0 |      0 |      0 |
-| `bind.test`                                   |      1 |      0 |      0 |      0 |      1 |
-| `bind.tuple.test`                             |     51 |     38 |      0 |      9 |      5 |
-| `collections.test.serial`                     |      4 |      0 |      0 |      0 |      4 |
-| `collections.test`                            |     23 |     12 |      0 |      3 |      8 |
-| `collections`                                 |      3 |      0 |      0 |      0 |      3 |
-| `je.cleaner`                                  |    158 |     10 |     17 |      0 |    131 |
-| `je.config`                                   |      2 |      2 |      0 |      0 |      0 |
-| `je.dbi`                                      |    138 |     10 |      0 |      1 |    127 |
-| `je.evictor`                                  |     51 |      2 |      5 |      0 |     44 |
-| `je.incomp`                                   |     29 |      0 |      0 |      0 |     29 |
-| `je.jmx`                                      |      8 |      0 |      0 |      8 |      0 |
-| `je.latch`                                    |      7 |      0 |      0 |      7 |      0 |
-| `je.log`                                      |     94 |     12 |      0 |      1 |     81 |
-| `je.logversion`                               |     15 |      0 |      0 |     15 |      0 |
-| `je.recovery`                                 |     66 |     11 |      3 |      0 |     52 |
-| `je.rep.arb`                                  |     21 |      0 |      0 |     21 |      0 |
-| `je.rep.dual.trigger`                         |      1 |      0 |      0 |      1 |      0 |
-| `je.rep.dupconvert`                           |      5 |      0 |      0 |      5 |      0 |
-| `je.rep.elections`                            |     32 |      7 |      0 |      0 |     25 |
-| `je.rep.impl.networkRestore`                  |     20 |      5 |      0 |      0 |     15 |
-| `je.rep.impl.node`                            |     61 |      4 |      0 |      0 |     57 |
-| `je.rep.impl`                                 |     38 |      1 |      0 |      0 |     37 |
-| `je.rep.monitor`                              |     17 |      0 |      0 |      0 |     17 |
-| `je.rep.node.replica`                         |      3 |      0 |      0 |      3 |      0 |
-| `je.rep.persist.test`                         |      9 |      0 |      0 |      0 |      9 |
-| `je.rep.stream`                               |     18 |      2 |      8 |      0 |      8 |
-| `je.rep.subscription`                         |     18 |      0 |      0 |      0 |     18 |
-| `je.rep`                                      |    197 |     17 |      4 |      0 |    176 |
-| `je.rep.txn`                                  |     41 |      5 |      7 |      0 |     29 |
-| `je.rep.utilint.net`                          |     14 |      0 |      0 |      0 |     14 |
-| `je.rep.utilint`                              |     13 |      3 |      0 |      0 |     10 |
-| `je.rep.util.ldiff`                           |     37 |      2 |      0 |      0 |     35 |
-| `je.rep.util`                                 |     36 |      1 |      0 |      0 |     35 |
-| `je.rep.vlsn`                                 |     38 |      8 |      3 |      0 |     27 |
-| `je.serializecompatibility`                   |      2 |      0 |      0 |      2 |      0 |
-| `je.test`                                     |    163 |      9 |      0 |      0 |    154 |
-| `je.tree`                                     |     73 |     13 |      0 |      0 |     60 |
-| `je.trigger`                                  |     22 |      1 |      0 |      0 |     21 |
-| `je`                                          |    199 |     31 |     24 |      1 |    143 |
-| `je.txn`                                      |     74 |      8 |     21 |      0 |     45 |
-| `je.util.dbfilterstats`                       |      6 |      0 |      0 |      0 |      6 |
-| `je.utilint`                                  |     58 |     13 |      0 |      0 |     45 |
-| `je.util`                                     |     81 |      4 |      0 |      0 |     77 |
-| `persist.test`                                |     97 |      8 |      4 |      0 |     85 |
-| `utilint`                                     |     10 |      1 |      0 |      0 |      9 |
-| `util.test`                                   |      7 |      0 |      0 |      0 |      7 |
+| `bind.serial.test`                             |      7 |      7 |      0 |      0 |          0 |
+| `bind.test`                                    |      1 |      0 |      0 |      0 |          1 |
+| `bind.tuple.test`                              |     51 |     41 |      0 |     10 |          0 |
+| `collections`                                  |      3 |      0 |      0 |      0 |          3 |
+| `collections.test`                             |     23 |     12 |      0 |      3 |          8 |
+| `collections.test.serial`                      |      4 |      0 |      0 |      0 |          4 |
+| `je`                                           |    199 |     51 |     29 |      1 |        118 |
+| `je.cleaner`                                   |    158 |     10 |     17 |      0 |        131 |
+| `je.config`                                    |      2 |      2 |      0 |      0 |          0 |
+| `je.dbi`                                       |    138 |     27 |      2 |      1 |        108 |
+| `je.evictor`                                   |     51 |      2 |      5 |      0 |         44 |
+| `je.incomp`                                    |     29 |      0 |      0 |      0 |         29 |
+| `je.jmx`                                       |      8 |      0 |      0 |      8 |          0 |
+| `je.latch`                                     |      7 |      0 |      0 |      7 |          0 |
+| `je.log`                                       |     94 |     14 |      0 |      1 |         79 |
+| `je.logversion`                                |     15 |      0 |      0 |     15 |          0 |
+| `je.recovery`                                  |     66 |     17 |      4 |      0 |         45 |
+| `je.rep`                                       |    197 |     15 |      4 |      0 |        178 |
+| `je.rep.arb`                                   |     21 |      0 |      0 |     21 |          0 |
+| `je.rep.dual.trigger`                          |      1 |      0 |      0 |      1 |          0 |
+| `je.rep.dupconvert`                            |      5 |      0 |      0 |      5 |          0 |
+| `je.rep.elections`                             |     32 |      7 |      0 |      0 |         25 |
+| `je.rep.impl`                                  |     38 |      1 |      0 |      0 |         37 |
+| `je.rep.impl.networkRestore`                   |     20 |      5 |      0 |      0 |         15 |
+| `je.rep.impl.node`                             |     61 |      4 |      0 |      0 |         57 |
+| `je.rep.monitor`                               |     17 |      0 |      0 |      0 |         17 |
+| `je.rep.node.replica`                          |      3 |      0 |      0 |      3 |          0 |
+| `je.rep.persist.test`                          |      9 |      0 |      0 |      0 |          9 |
+| `je.rep.stream`                                |     18 |      1 |      8 |      0 |          9 |
+| `je.rep.subscription`                          |     18 |      0 |      0 |      0 |         18 |
+| `je.rep.txn`                                   |     41 |      4 |      7 |      0 |         30 |
+| `je.rep.util`                                  |     36 |      1 |      0 |      0 |         35 |
+| `je.rep.util.ldiff`                            |     37 |      2 |      0 |      0 |         35 |
+| `je.rep.utilint`                               |     13 |      3 |      0 |      0 |         10 |
+| `je.rep.utilint.net`                           |     14 |      0 |      0 |      0 |         14 |
+| `je.rep.vlsn`                                  |     38 |      8 |      3 |      0 |         27 |
+| `je.serializecompatibility`                    |      2 |      0 |      0 |      2 |          0 |
+| `je.test`                                      |    163 |     10 |      1 |      0 |        152 |
+| `je.tree`                                      |     73 |     20 |      0 |      0 |         53 |
+| `je.trigger`                                   |     22 |      1 |      0 |      0 |         21 |
+| `je.txn`                                       |     74 |     13 |     21 |      0 |         40 |
+| `je.util`                                      |     81 |      6 |      0 |      3 |         72 |
+| `je.util.dbfilterstats`                        |      6 |      0 |      0 |      0 |          6 |
+| `je.utilint`                                   |     58 |     13 |      0 |     45 |          0 |
+| `persist.test`                                 |     97 |      8 |      4 |      0 |         85 |
+| `util.test`                                    |      7 |      0 |      0 |      0 |          7 |
+| `utilint`                                      |     10 |      1 |      0 |      0 |          9 |
 
 ## Wave summaries
 
@@ -103,7 +103,7 @@ topology (e.g. some replication tests).
   were re-tagged PORTED-PARTIAL because Wave 8's harness-level analog
   is a subset of the JE original; this is honest accounting, not a
   regression.
-* `wave-9-c-je-tck-ports.md` — wave 9-C (this wave): added 34
+* `wave-9-c-je-tck-ports.md` — wave 9-C: added 34
   substantive new ports across 6 test files plus 11 docs-only
   re-tags of pre-existing analogues that the wave-1D name-match
   heuristic had missed.  Coverage: 18 tuple binding/format/ordering
@@ -113,6 +113,21 @@ topology (e.g. some replication tests).
   Noxu bugs surfaced.  Net counts: PORTED-EQUIVALENT 205 → 243
   (+38), PORTED-PARTIAL 89 → 96 (+7), OUT-OF-SCOPE 64 → 77 (+13),
   NOT-PORTED 1710 → 1653 (-57).
+* `wave-11-g-je-tck-longtail.md` — wave 11-G (this wave): added 49
+  substantive new ports across 7 new/extended test files.  Coverage:
+  9 DatabaseTest/EnvironmentTest invariants (incl. 4 #[ignore]'d real
+  Noxu bugs); 7 SR-numbered + DupSlotReuse regression tests; 5
+  TruncateTest invariants (1 #[ignore]'d real bug); 6
+  GetSearchBothRangeTest range-query corner cases; 5 recovery
+  invariants (RecoveryDuplicates / Checkpoint / Delete / EdgeTxnId);
+  7 tree-level invariants (Split / TreeBalance / KeyPrefix); 9 dup
+  cursor invariants (DbCursorDuplicate{,Delete}Test).  Surfaced 5
+  real Noxu bugs (committed as #[ignore]'d tests; routed to a
+  follow-up bug-fix wave): txn cursor on non-txn db, put_no_overwrite
+  semantics on sorted-dups, db-name registry across read-only reopen,
+  checkpoint-after-commit loses data, truncate not durable across
+  reopen.  Net counts: PORTED-EQUIVALENT 263 → 306 (+43),
+  PORTED-PARTIAL 99 → 105 (+6), NOT-PORTED 1580 → 1531 (-49).
 
 ## Methodology
 

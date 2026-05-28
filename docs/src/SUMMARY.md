@@ -149,7 +149,11 @@
   - [Wave 10-E — crates.io publication prep](internal/wave-10-e-cratesio-prep.md)
   - [Wave 10-F — CI matrix expansion](internal/wave-10-f-ci-matrix.md)
   - [Post-v2.3.0 Roadmap (Wave 11 onward)](internal/post-v2.3.0-roadmap.md)
+<<<<<<< HEAD
   - [Wave 11 — v2.3.1 follow-ups](internal/wave-11-v231-followups.md)
   - [Wave 11-N — sorted-dup cursor bug fixes](internal/wave-11-n-sorted-dup-cursor-bugs.md)
   - [Wave 11-F — Stateright spec coverage expansion](internal/wave-11-f-stateright-coverage.md)
   - [Wave 11-E — Property test expansion](internal/wave-11-e-property-tests.md)
+=======
+  - [Wave 11-G — JE TCK long-tail port](internal/wave-11-g-je-tck-longtail.md)
+>>>>>>> fix/wave11-g-je-tck-longtail

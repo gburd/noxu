@@ -47,7 +47,7 @@ Every wave ships:
 | 11-D | v2.4.0 | In-memory-only transport for noxu-rep | merged — `InMemoryTransport` + `RepTransportKind::InMemory` (`docs/src/internal/wave-11-d-inmem-transport.md`) |
 | 11-E | v2.4.0 | Property test expansion (target: +20 properties) | merged: +39 proptest blocks across noxu-tree/bind/cleaner/recovery/rep (+1 #[ignore]'d behavior); see [wave-11-e-property-tests.md](./wave-11-e-property-tests.md) |
 | 11-F | v2.4.0 | Stateright coverage of remaining 6 protocols | merged — [all 11 specs stamped VALIDATED-AS-OF v2.0.0/v2.4.0; 5 strengthened](wave-11-f-stateright-coverage.md) |
-| 11-G | v2.4.0 | Continue JE TCK long-tail port (~30-50 more tests) | queued |
+| 11-G | v2.4.0 | Continue JE TCK long-tail port (~30-50 more tests) | merged: +49 PORTED-EQUIVALENT/PARTIAL ([wave-11-g-je-tck-longtail.md](wave-11-g-je-tck-longtail.md)) |
 | 11-H | v2.4.0 | Performance investigation on JE-wins workloads (W03/W04/W10/W11) | queued |
 | 11-I | v2.5.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | gated on 11-H findings |
 | 11-J | v2.5.0 | Optimize fsync coalescing (closes W10 gap) | gated on 11-H findings |
