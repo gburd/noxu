@@ -16,7 +16,38 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-(nothing yet — v2.3.x development is happening on `sprint/v2.3.0-base`.)
+### Added
+
+- **Wave 11-G — JE TCK long-tail port (49 new tests).**  Across
+  `crates/noxu-db/tests/`: 9 DatabaseTest/EnvironmentTest invariants,
+  7 SR-numbered + DupSlotReuse regression tests, 5 TruncateTest
+  invariants, 6 GetSearchBothRangeTest range-query corner cases, 5
+  recovery invariants (RecoveryDuplicates / Checkpoint / Delete /
+  EdgeTxnId), 7 tree-level invariants (Split / TreeBalance /
+  KeyPrefix), and 9 dup cursor invariants
+  (DbCursorDuplicate{,Delete}Test).  TSV row totals went from PE 263 /
+  PP 99 / NOT 1580 to PE 306 / PP 105 / NOT 1531 (+43 PE, +6 PP, −49
+  NOT).  See
+  [`docs/src/internal/wave-11-g-je-tck-longtail.md`](docs/src/internal/wave-11-g-je-tck-longtail.md).
+
+### Tracked Noxu bugs surfaced (5)
+
+Each of these is a `#[ignore]`'d test in this wave's commits that
+documents a real Noxu regression vs JE's invariant.  All routed to a
+follow-up bug-fix wave (no production code changed in Wave 11-G).
+
+- `database_txn_cursor_on_non_txn_db_rejected` — Noxu permits opening
+  a transactional cursor on a non-transactional database; JE rejects.
+- `database_put_no_overwrite_in_dup_db_{txn,no_txn}` — Noxu's
+  `put_no_overwrite` on sorted-dup databases checks the *(key, data)*
+  pair instead of the key alone.
+- `environment_read_only_rejects_db_name_ops` — Noxu's database-name
+  registry is not preserved across a clean close+read-only reopen.
+- `environment_checkpoint_after_commit_loses_data` — Calling
+  `env.checkpoint(None)` between `txn.commit()` and `drop(env)` causes
+  the most recently committed records to be lost on the next env open.
+- `truncate_survives_clean_close_reopen` — Noxu's `truncate_database`
+  is not durable across a clean close+reopen.
 
 ## [2.2.1] - 2026-05-27
 
