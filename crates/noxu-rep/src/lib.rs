@@ -108,11 +108,14 @@ pub mod network_restore_server;
 pub mod replicated_environment;
 pub mod state_change_listener;
 
-// Test harness (in-memory `RepTestBase` / `RepEnvInfo` for porting JE
-// rep TCK tests).  Gated on the `test-harness` feature so it is not part
-// of the released API surface; auto-enabled for `cargo test` via the
-// dev-dependency self-feature trick in `Cargo.toml`.
-#[cfg(any(test, feature = "test-harness"))]
+// In-memory `RepTestBase` / `RepEnvInfo` harness for porting JE rep
+// tests and for production in-process clusters.  Originally gated
+// behind `cfg(any(test, feature = "test-harness"))`; Wave 11-D
+// promoted it to first-class production status alongside the new
+// [`net::InMemoryTransport`] (see
+// `docs/src/internal/wave-11-d-inmem-transport.md`).  The
+// `test-harness` feature flag is retained as a no-op for backward
+// compatibility with downstream Cargo.toml entries.
 pub mod test_harness;
 
 // Re-export primary types
@@ -135,10 +138,12 @@ pub use net::{
 };
 pub use network_restore::{NetworkRestore, NetworkRestoreConfig, RestoreState};
 pub use network_restore_server::{NetworkRestoreServer, RESTORE_SERVICE_NAME};
+pub use net::{InMemoryEndpoint, InMemoryGroup, InMemoryTransport};
 pub use node_state::{NodeState, NodeStateMachine};
 pub use node_type::NodeType;
 pub use quorum_policy::QuorumPolicy;
 pub use rep_config::RepConfig;
+pub use rep_config::RepTransportKind;
 pub use rep_group::RepGroup;
 pub use rep_node::RepNode;
 pub use rep_stats::RepStats;
