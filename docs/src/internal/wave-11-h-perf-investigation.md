@@ -105,7 +105,7 @@ bin.entries
 This is the call site that the call graph attaches to the 15.09 %
 `__memcmp_avx2_movbe` self-time:
 
-```
+```text
   --0.56%-- equal_same_length<u8,u8>  (inlined)
             …
             find<…cursor_impl::{impl#0}::get_data_from_tree…>
