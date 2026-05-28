@@ -9,6 +9,20 @@
 //!   - `crates/noxu-xa/src/internal.rs`
 //!   - `crates/noxu-xa/src/types.rs`
 //!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! production state machine (Idle → Preparing → CommitDecided/
+//! AbortDecided) and the recovery rule (presumed-abort if no RM is
+//! Committed at recovery time) are unchanged. The compile-time
+//! `_FLAG_ANCHOR` already pins the public `XaFlags` constants.
+//!
+//! Wave 11-F closes the original RecoveryConsistent TODO: the
+//! model now snapshots the TM's pre-crash decision into
+//! `tm_decision_before_crash` and asserts that the post-recovery
+//! decision equals the pre-crash decision (when a decision had
+//! been made before the crash). This is the 2-state recovery-
+//! consistency property the original preamble flagged as future
+//! work.
+//!
 //! Properties:
 //!   - `PreparedImpliesDecided` — an RM in the `Committed` state
 //!     can only exist when the TM is in `CommitDecided`.
@@ -17,12 +31,11 @@
 //!     `CommitDecided`.
 //!   - `NoUnilateralCommit` — an RM never reaches `Committed`
 //!     while the TM is in any state other than `CommitDecided`.
-//!
-//! TODO: a `RecoveryConsistent` property — that after a TM crash,
-//! recovery yields the same global decision for every RM — would
-//! benefit from a 2-state predicate (compare pre-crash and
-//! post-recovery decision); currently the model handles recovery
-//! but only the per-state safety invariants above are checked.
+//!   - `RecoveryConsistent` — if the TM had reached
+//!     `CommitDecided` or `AbortDecided` before crashing, the
+//!     post-recovery decision matches the pre-crash decision; if
+//!     the TM crashed mid-`Preparing`, recovery may freely choose
+//!     abort (presumed-abort) but never commit.
 
 use stateright::{Model, Property};
 
@@ -78,6 +91,10 @@ pub struct State {
     /// until recovery).
     pub tm_crashed: bool,
     pub recovered: bool,
+    /// Snapshot of `tm` immediately before the most recent
+    /// `Action::TmCrash`. `None` if no crash has happened yet.
+    /// Used by the `RecoveryConsistent` 2-state invariant.
+    pub tm_decision_before_crash: Option<TmState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -105,6 +122,7 @@ impl Model for XaTwoPhaseCommitModel {
             rms: [RmState::Active; N_RMS],
             tm_crashed: false,
             recovered: false,
+            tm_decision_before_crash: None,
         }]
     }
 
@@ -175,7 +193,10 @@ impl Model for XaTwoPhaseCommitModel {
                 }
                 s.rms[rm] = RmState::Aborted;
             }
-            Action::TmCrash => s.tm_crashed = true,
+            Action::TmCrash => {
+                s.tm_decision_before_crash = Some(s.tm);
+                s.tm_crashed = true;
+            }
             Action::Recover => {
                 s.tm_crashed = false;
                 s.recovered = true;
@@ -232,6 +253,47 @@ impl Model for XaTwoPhaseCommitModel {
                 }
                 true
             }),
+            Property::<Self>::always(
+                "RecoveryConsistent",
+                |_, s: &State| {
+                    // 2-state predicate: if recovery has run, the
+                    // post-recovery TM decision must be consistent
+                    // with the pre-crash decision.
+                    //   - If TM had reached CommitDecided pre-crash,
+                    //     post-recovery must also be CommitDecided
+                    //     (durable commit must survive crash).
+                    //   - If TM had reached AbortDecided pre-crash,
+                    //     post-recovery must also be AbortDecided.
+                    //   - If TM crashed mid-Preparing or in Idle,
+                    //     recovery may choose abort (presumed-abort)
+                    //     but never commit, unless an RM had already
+                    //     committed (the recovery rule reads
+                    //     committed RM state to force-commit).
+                    if !s.recovered {
+                        return true;
+                    }
+                    match s.tm_decision_before_crash {
+                        Some(TmState::CommitDecided) => {
+                            matches!(s.tm, TmState::CommitDecided)
+                        }
+                        Some(TmState::AbortDecided) => {
+                            matches!(s.tm, TmState::AbortDecided)
+                        }
+                        Some(TmState::Idle) | Some(TmState::Preparing) => {
+                            // No durable decision was made before
+                            // crash; presumed-abort is safe unless
+                            // an RM had already committed (which
+                            // can't happen pre-decision under
+                            // PreparedImpliesDecided).
+                            !matches!(s.tm, TmState::CommitDecided)
+                                || s.rms.iter().any(|r| {
+                                    matches!(r, RmState::Committed)
+                                })
+                        }
+                        None => true, // no crash recorded
+                    }
+                },
+            ),
         ]
     }
 }
