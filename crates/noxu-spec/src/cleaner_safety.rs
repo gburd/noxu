@@ -140,28 +140,25 @@ impl Model for CleanerSafetyModel {
                 }
                 true
             }),
-            Property::<Self>::always(
-                "LiveCheckHonoured",
-                |_, s: &State| {
-                    // Every deleted file must have had its
-                    // cleared_for_delete bit cleared by the Delete
-                    // step itself (post-condition: false), and the
-                    // bit could only have been true at the moment of
-                    // Delete because it had been set by a prior
-                    // LiveCheck that observed no live readers, and
-                    // not invalidated by an intervening AcquireRef.
-                    // This invariant is automatically preserved by
-                    // the next_state encoding; explicitly checking
-                    // it here protects against future model edits
-                    // that might bypass the live-check.
-                    for f in 0..N_FILES {
-                        if s.file_deleted[f] && s.cleared_for_delete[f] {
-                            return false;
-                        }
+            Property::<Self>::always("LiveCheckHonoured", |_, s: &State| {
+                // Every deleted file must have had its
+                // cleared_for_delete bit cleared by the Delete
+                // step itself (post-condition: false), and the
+                // bit could only have been true at the moment of
+                // Delete because it had been set by a prior
+                // LiveCheck that observed no live readers, and
+                // not invalidated by an intervening AcquireRef.
+                // This invariant is automatically preserved by
+                // the next_state encoding; explicitly checking
+                // it here protects against future model edits
+                // that might bypass the live-check.
+                for f in 0..N_FILES {
+                    if s.file_deleted[f] && s.cleared_for_delete[f] {
+                        return false;
                     }
-                    true
-                },
-            ),
+                }
+                true
+            }),
         ]
     }
 }
