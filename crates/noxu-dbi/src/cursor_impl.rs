@@ -1725,6 +1725,14 @@ impl CursorImpl {
     ///   same primary key as the saved position, returning the first entry with
     ///   a DIFFERENT primary key.
     /// * `Next` / `Prev` — accept any entry.
+    ///
+    /// Wave 11-N (Bug 4): every accept site re-finds and pins the BIN that
+    /// contains `raw_key`.  Pre-fix the cross-BIN paths in this function
+    /// updated `current_key` / `current_index` but left `current_bin_arc`
+    /// pointing at the prior BIN, so the next `retrieve_next` fast-path
+    /// would read `next_index = current_index + 1` from the old BIN —
+    /// effectively re-emitting old entries and (for large secondary
+    /// indexes) preventing the walk from terminating.
     fn apply_dup_filter(
         &mut self,
         mut raw_key: Vec<u8>,
@@ -1746,10 +1754,12 @@ impl CursorImpl {
                     };
                     if same {
                         self.lock_ln(lsn)?;
+                        let bin_arc = self.find_bin_arc_for_key(&raw_key);
                         self.current_key = Some(raw_key);
                         self.current_data = Some(raw_data);
                         self.current_lsn = lsn;
                         self.current_index = idx;
+                        self.update_bin_pin(bin_arc);
                         return Ok(OperationStatus::Success);
                     } else {
                         return Ok(OperationStatus::NotFound);
@@ -1763,10 +1773,12 @@ impl CursorImpl {
                     };
                     if !same {
                         self.lock_ln(lsn)?;
+                        let bin_arc = self.find_bin_arc_for_key(&raw_key);
                         self.current_key = Some(raw_key);
                         self.current_data = Some(raw_data);
                         self.current_lsn = lsn;
                         self.current_index = idx;
+                        self.update_bin_pin(bin_arc);
                         return Ok(OperationStatus::Success);
                     }
                     // Need to advance further.
@@ -1876,10 +1888,12 @@ impl CursorImpl {
                 // Next / Prev: accept any entry.
                 GetMode::Next | GetMode::Prev => {
                     self.lock_ln(lsn)?;
+                    let bin_arc = self.find_bin_arc_for_key(&raw_key);
                     self.current_key = Some(raw_key);
                     self.current_data = Some(raw_data);
                     self.current_lsn = lsn;
                     self.current_index = idx;
+                    self.update_bin_pin(bin_arc);
                     return Ok(OperationStatus::Success);
                 }
             }
@@ -2483,6 +2497,21 @@ impl CursorImpl {
     /// Decrements  on the old BIN (if any) and increments it
     /// on  (if ).  No-op when the cursor stays on the same BIN
     /// (pointer equality checked via ).
+    /// Re-descends the tree to find the BIN that contains `key`.  Used
+    /// by the sorted-dup cross-BIN paths in `apply_dup_filter` to
+    /// re-pin `current_bin_arc` after a BIN boundary is crossed.
+    fn find_bin_arc_for_key(
+        &self,
+        key: &[u8],
+    ) -> Option<
+        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    > {
+        let db = self.db_impl.read();
+        let tree = db.get_real_tree()?;
+        let root = tree.get_root()?;
+        Self::find_bin_for_key(root, key)
+    }
+
     ///
     /// Matching  /
     ///  calls in cursor positioning.
