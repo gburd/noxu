@@ -72,8 +72,9 @@ fn open_pri_sec(
         }
     }
 
-    let sec_cfg =
-        DatabaseConfig::new().with_allow_create(true).with_sorted_duplicates(true);
+    let sec_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_sorted_duplicates(true);
     let sec_db =
         env.open_database(None, "wave11n_secondary", &sec_cfg).unwrap();
     let sec_config = SecondaryConfig::new()
@@ -109,25 +110,24 @@ fn wave11n_bug3_get_search_key_then_next_dup_full_yields_all() {
         let search = DatabaseEntry::from_bytes(&[bucket]);
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let s = cursor
-            .get_search_key(&search, &mut p_key, &mut data)
-            .expect("get_search_key must not raise SecondaryIntegrityException");
+        let s = cursor.get_search_key(&search, &mut p_key, &mut data).expect(
+            "get_search_key must not raise SecondaryIntegrityException",
+        );
         assert_eq!(s, OperationStatus::Success, "bucket={bucket}");
 
         let mut seen: Vec<u32> = Vec::new();
         let pk_bytes = p_key.get_data().unwrap();
         seen.push(u32::from_be_bytes([
-            pk_bytes[0], pk_bytes[1], pk_bytes[2], pk_bytes[3],
+            pk_bytes[0],
+            pk_bytes[1],
+            pk_bytes[2],
+            pk_bytes[3],
         ]));
 
         let mut sec_key_out = DatabaseEntry::new();
         loop {
             let s = cursor
-                .get_next_dup_full(
-                    &mut sec_key_out,
-                    &mut p_key,
-                    &mut data,
-                )
+                .get_next_dup_full(&mut sec_key_out, &mut p_key, &mut data)
                 .expect("get_next_dup_full must not raise");
             if s == OperationStatus::NotFound {
                 break;
@@ -141,7 +141,10 @@ fn wave11n_bug3_get_search_key_then_next_dup_full_yields_all() {
             );
             let pk_bytes = p_key.get_data().unwrap();
             seen.push(u32::from_be_bytes([
-                pk_bytes[0], pk_bytes[1], pk_bytes[2], pk_bytes[3],
+                pk_bytes[0],
+                pk_bytes[1],
+                pk_bytes[2],
+                pk_bytes[3],
             ]));
         }
         cursor.close().unwrap();
@@ -186,10 +189,7 @@ fn wave11n_bug4_get_first_get_next_full_walk_terminates() {
         assert_eq!(sk.len(), 1, "secondary keys are 1-byte bucket ids");
         let pk = p_key.get_data().unwrap();
         assert_eq!(pk.len(), 4, "primary keys are 4-byte u32");
-        let entry = (
-            sk[0],
-            u32::from_be_bytes([pk[0], pk[1], pk[2], pk[3]]),
-        );
+        let entry = (sk[0], u32::from_be_bytes([pk[0], pk[1], pk[2], pk[3]]));
         seen.push(entry);
         assert!(
             seen.len() <= cap,
@@ -203,7 +203,12 @@ fn wave11n_bug4_get_first_get_next_full_walk_terminates() {
     cursor.close().unwrap();
 
     // Exactly N triples, no duplicates.
-    assert_eq!(seen.len(), N, "expected exactly {N} triples, got {}", seen.len());
+    assert_eq!(
+        seen.len(),
+        N,
+        "expected exactly {N} triples, got {}",
+        seen.len()
+    );
     let mut sorted = seen.clone();
     sorted.sort();
     let before_dedup = sorted.len();
