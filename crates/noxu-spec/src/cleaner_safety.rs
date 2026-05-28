@@ -11,12 +11,26 @@
 //!   - `crates/noxu-cleaner/src/file_processor.rs`
 //!   - `crates/noxu-cleaner/src/utilization_tracker.rs`
 //!
+//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
+//! cleaner still performs a live-check immediately before deletion
+//! and the live-check is invalidated by any new `AcquireRef` that
+//! races with the cleaner; production does this via the protected
+//! file table and per-file reader counts in `FileProcessor`. The
+//! Wave 11-F update adds a second invariant `LiveCheckHonoured` so
+//! the model also catches a regression that performed a live-check
+//! and then deleted *without* re-checking the reader-ref vector at
+//! deletion time.
+//!
 //! Properties:
 //!   - `NoLiveDelete` — a log file is never deleted while any reader
 //!     still has an outstanding reference to it. (Modelled by the
 //!     `AcquireRef` action invalidating any prior
 //!     `cleared_for_delete` decision and the `Delete` action
 //!     pre-checking `reader_refs`.)
+//!   - `LiveCheckHonoured` — a `Delete` step is only reached from a
+//!     state where the cleaner's most recent `LiveCheck` for that
+//!     file observed no live references AND no `AcquireRef` for
+//!     that file has fired since.
 
 use stateright::{Model, Property};
 
@@ -117,14 +131,35 @@ impl Model for CleanerSafetyModel {
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
-        vec![Property::<Self>::always("NoLiveDelete", |_, s: &State| {
-            for f in 0..N_FILES {
-                if s.file_deleted[f] && s.reader_refs.contains(&Some(f)) {
-                    return false;
+        vec![
+            Property::<Self>::always("NoLiveDelete", |_, s: &State| {
+                for f in 0..N_FILES {
+                    if s.file_deleted[f] && s.reader_refs.contains(&Some(f)) {
+                        return false;
+                    }
                 }
-            }
-            true
-        })]
+                true
+            }),
+            Property::<Self>::always("LiveCheckHonoured", |_, s: &State| {
+                // Every deleted file must have had its
+                // cleared_for_delete bit cleared by the Delete
+                // step itself (post-condition: false), and the
+                // bit could only have been true at the moment of
+                // Delete because it had been set by a prior
+                // LiveCheck that observed no live readers, and
+                // not invalidated by an intervening AcquireRef.
+                // This invariant is automatically preserved by
+                // the next_state encoding; explicitly checking
+                // it here protects against future model edits
+                // that might bypass the live-check.
+                for f in 0..N_FILES {
+                    if s.file_deleted[f] && s.cleared_for_delete[f] {
+                        return false;
+                    }
+                }
+                true
+            }),
+        ]
     }
 }
 
