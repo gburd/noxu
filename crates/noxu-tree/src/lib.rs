@@ -81,7 +81,7 @@ pub use versioned_ln::make_versioned_ln;
 
 // Tree types
 pub use tree::{
-    BinEntry, BinStub, InNodeStub, KeyComparatorFn, Tree, TreeNode, TreeStats,
+    BinEntry, BinStub, InNodeStub, KeyComparatorFn, SlotFetch, Tree, TreeNode, TreeStats,
     generate_node_id,
 };
 

@@ -1,0 +1,40 @@
+    13.65%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+     5.40%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::find_bin_for_key
+     2.85%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::lock_with_timeout
+     2.70%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree
+     2.69%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+     2.46%  noxu-perf-profi  libc.so.6             [.] malloc
+     2.22%  noxu-perf-profi  noxu-perf-profiler    [.] crc32fast::baseline::update_fast_16
+            |          
+             --0.54%--update_fast_16 (inlined)
+
+     2.06%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_db::database::Database::put
+     1.89%  noxu-perf-profi  libc.so.6             [.] _int_free
+     1.69%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::search
+     1.60%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::insert_recursive
+     1.48%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::release
+     1.44%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+     1.38%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::txn::Txn::commit_with_durability
+     1.31%  noxu-perf-profi  libc.so.6             [.] cfree@GLIBC_2.2.5
+     1.29%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::file_manager::FileManager::get_file_handle
+     1.28%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::find_entry_compressed
+     1.22%  noxu-perf-profi  noxu-perf-profiler    [.] <core::fmt::Formatter>::pad_integral
+     1.22%  noxu-perf-profi  libc.so.6             [.] malloc_consolidate
+     1.22%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_sync::raw_mutex::thread_id
+     1.18%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::search
+     1.05%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::with_log_manager
+     0.98%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::put
+     0.97%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::log_manager::LogManager::log_internal
+     0.96%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::get_resident_root_in
+     0.94%  noxu-perf-profi  noxu-perf-profiler    [.] <usize as core::fmt::Display>::fmt
+     0.93%  noxu-perf-profi  noxu-perf-profiler    [.] alloc::fmt::format::format_inner
+     0.91%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::fsync_manager::FsyncManager::fsync
+     0.91%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::file_manager::FileManager::sync_log_end
+     0.90%  noxu-perf-profi  noxu-perf-profiler    [.] <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>
+     0.84%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::unpin_bin
+     0.78%  noxu-perf-profi  libc.so.6             [.] unlink_chunk.isra.0
+     0.76%  noxu-perf-profi  noxu-perf-profiler    [.] std::thread::current::current
+     0.76%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_cleaner::throttle::CleanerThrottle::should_throttle_writer
+     0.71%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_db::database::Database::live_secondaries
+     0.70%  noxu-perf-profi  noxu-perf-profiler    [.] <noxu_cleaner::utilization_tracker_observer::UtilizationTrackerObserver as noxu_log::write_observer::LogWriteObserver>::count_new_entry
+     0.70%  noxu-perf-profi  noxu-perf-profiler    [.] core::ptr::drop_in_place<noxu_dbi::cursor_impl::CursorImpl>
