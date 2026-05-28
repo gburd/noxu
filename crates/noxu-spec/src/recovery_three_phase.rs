@@ -184,8 +184,7 @@ impl Model for RecoveryThreePhaseModel {
                 // when redo_run_count > 1 and we are AfterRedo), the
                 // current materialisation must equal the snapshot
                 // taken after the first redo.
-                if matches!(s.phase, Phase::AfterRedo) && s.redo_run_count > 1
-                {
+                if matches!(s.phase, Phase::AfterRedo) && s.redo_run_count > 1 {
                     if let Some(snap) = s.materialised_after_first_redo {
                         if snap != s.materialised {
                             return false;

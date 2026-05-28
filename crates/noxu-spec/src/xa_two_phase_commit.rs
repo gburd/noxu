@@ -253,47 +253,44 @@ impl Model for XaTwoPhaseCommitModel {
                 }
                 true
             }),
-            Property::<Self>::always(
-                "RecoveryConsistent",
-                |_, s: &State| {
-                    // 2-state predicate: if recovery has run, the
-                    // post-recovery TM decision must be consistent
-                    // with the pre-crash decision.
-                    //   - If TM had reached CommitDecided pre-crash,
-                    //     post-recovery must also be CommitDecided
-                    //     (durable commit must survive crash).
-                    //   - If TM had reached AbortDecided pre-crash,
-                    //     post-recovery must also be AbortDecided.
-                    //   - If TM crashed mid-Preparing or in Idle,
-                    //     recovery may choose abort (presumed-abort)
-                    //     but never commit, unless an RM had already
-                    //     committed (the recovery rule reads
-                    //     committed RM state to force-commit).
-                    if !s.recovered {
-                        return true;
+            Property::<Self>::always("RecoveryConsistent", |_, s: &State| {
+                // 2-state predicate: if recovery has run, the
+                // post-recovery TM decision must be consistent
+                // with the pre-crash decision.
+                //   - If TM had reached CommitDecided pre-crash,
+                //     post-recovery must also be CommitDecided
+                //     (durable commit must survive crash).
+                //   - If TM had reached AbortDecided pre-crash,
+                //     post-recovery must also be AbortDecided.
+                //   - If TM crashed mid-Preparing or in Idle,
+                //     recovery may choose abort (presumed-abort)
+                //     but never commit, unless an RM had already
+                //     committed (the recovery rule reads
+                //     committed RM state to force-commit).
+                if !s.recovered {
+                    return true;
+                }
+                match s.tm_decision_before_crash {
+                    Some(TmState::CommitDecided) => {
+                        matches!(s.tm, TmState::CommitDecided)
                     }
-                    match s.tm_decision_before_crash {
-                        Some(TmState::CommitDecided) => {
-                            matches!(s.tm, TmState::CommitDecided)
-                        }
-                        Some(TmState::AbortDecided) => {
-                            matches!(s.tm, TmState::AbortDecided)
-                        }
-                        Some(TmState::Idle) | Some(TmState::Preparing) => {
-                            // No durable decision was made before
-                            // crash; presumed-abort is safe unless
-                            // an RM had already committed (which
-                            // can't happen pre-decision under
-                            // PreparedImpliesDecided).
-                            !matches!(s.tm, TmState::CommitDecided)
-                                || s.rms.iter().any(|r| {
-                                    matches!(r, RmState::Committed)
-                                })
-                        }
-                        None => true, // no crash recorded
+                    Some(TmState::AbortDecided) => {
+                        matches!(s.tm, TmState::AbortDecided)
                     }
-                },
-            ),
+                    Some(TmState::Idle) | Some(TmState::Preparing) => {
+                        // No durable decision was made before
+                        // crash; presumed-abort is safe unless
+                        // an RM had already committed (which
+                        // can't happen pre-decision under
+                        // PreparedImpliesDecided).
+                        !matches!(s.tm, TmState::CommitDecided)
+                            || s.rms
+                                .iter()
+                                .any(|r| matches!(r, RmState::Committed))
+                    }
+                    None => true, // no crash recorded
+                }
+            }),
         ]
     }
 }

@@ -153,28 +153,25 @@ impl Model for CacheVsCleanerModel {
                 }
                 true
             }),
-            Property::<Self>::always(
-                "MigratedReflectsDisk",
-                |_, s: &State| {
-                    // Whenever a migration has been committed, it
-                    // must equal the cleaner's snapshot AND that
-                    // snapshot must have been disk_version at the
-                    // time of CleanerMigrate. The model encodes the
-                    // second clause by clearing
-                    // cleaner_seen_version when DirtyTheBin
-                    // invalidates pre-migration snapshots; here we
-                    // check the first clause as a 1-state predicate.
-                    if let Some(v) = s.migrated_version {
-                        if let Some(seen) = s.cleaner_seen_version {
-                            return v == seen;
-                        } else {
-                            // migrated without a live snapshot: bug.
-                            return false;
-                        }
+            Property::<Self>::always("MigratedReflectsDisk", |_, s: &State| {
+                // Whenever a migration has been committed, it
+                // must equal the cleaner's snapshot AND that
+                // snapshot must have been disk_version at the
+                // time of CleanerMigrate. The model encodes the
+                // second clause by clearing
+                // cleaner_seen_version when DirtyTheBin
+                // invalidates pre-migration snapshots; here we
+                // check the first clause as a 1-state predicate.
+                if let Some(v) = s.migrated_version {
+                    if let Some(seen) = s.cleaner_seen_version {
+                        return v == seen;
+                    } else {
+                        // migrated without a live snapshot: bug.
+                        return false;
                     }
-                    true
-                },
-            ),
+                }
+                true
+            }),
         ]
     }
 }
