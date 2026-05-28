@@ -604,7 +604,6 @@ fn multi_env_open_close_test_multi_open_close() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn database_txn_cursor_on_non_txn_db_rejected() {
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())

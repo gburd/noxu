@@ -1069,6 +1069,17 @@ impl Database {
     ) -> Result<Cursor> {
         self.check_open()?;
 
+        // JE invariant: a transactional cursor cannot be opened on a
+        // non-transactional database.  JE throws IllegalArgumentException
+        // in DatabaseTest.testCursor when a Transaction is supplied to
+        // a non-txnal DB (wave-11-G, database_txn_cursor_on_non_txn_db_rejected).
+        if txn.is_some() && !self.config.transactional {
+            return Err(NoxuError::IllegalArgument(
+                "cannot open a transactional cursor on a \
+                 non-transactional database"
+                    .to_string(),
+            ));
+        }
         let read_only = config.map(|c| c.read_uncommitted).unwrap_or(false)
             || self.config.read_only;
 
