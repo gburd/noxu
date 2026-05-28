@@ -348,8 +348,7 @@ fn open_dup_env_db() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true)
         .with_sorted_duplicates(true);
-    let db =
-        env.open_database(None, "DbCursorDuplicateTest", &db_cfg).unwrap();
+    let db = env.open_database(None, "DbCursorDuplicateTest", &db_cfg).unwrap();
     (dir, env, db)
 }
 
@@ -515,7 +514,8 @@ fn db_cursor_duplicate_test_get_next_dup() {
         let mut prev = data.get_data().unwrap_or(&[]).to_vec();
         let mut seen = 1usize;
         loop {
-            let s = cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
+            let s =
+                cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
             if s == OperationStatus::NotFound {
                 break;
             }

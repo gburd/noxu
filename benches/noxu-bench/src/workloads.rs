@@ -387,9 +387,8 @@ pub fn w13_setup(
         .with_transactional(true);
     let env = Environment::open(env_cfg).unwrap();
 
-    let pri_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let pri_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let primary = Arc::new(Mutex::new(
         env.open_database(None, "w13_primary", &pri_cfg).unwrap(),
     ));
@@ -406,15 +405,13 @@ pub fn w13_setup(
     let sec_db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
         .with_sorted_duplicates(true);
-    let sec_db =
-        env.open_database(None, "w13_secondary", &sec_db_cfg).unwrap();
+    let sec_db = env.open_database(None, "w13_secondary", &sec_db_cfg).unwrap();
     let sec_cfg = SecondaryConfig::new()
         .with_allow_create(true)
         .with_allow_populate(true)
         .with_key_creator(Box::new(W13BucketKeyCreator));
     let secondary =
-        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_cfg)
-            .unwrap();
+        SecondaryDatabase::open(Arc::clone(&primary), sec_db, sec_cfg).unwrap();
 
     (env, primary, secondary)
 }
