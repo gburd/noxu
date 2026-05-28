@@ -41,6 +41,7 @@
   - [Master Transfer](replication/master-transfer.md)
   - [Dynamic Membership](replication/dynamic-membership.md)
   - [Transport Layer](replication/transport.md)
+  - [In-Memory Transport](replication/in-memory-transport.md)
 
 - [Collections and Persistence](collections/README.md)
   - [StoredMap](collections/stored-map.md)
