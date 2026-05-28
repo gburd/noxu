@@ -26,9 +26,8 @@ fn open_env_db() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "DatabaseEntryTest", &db_cfg).unwrap();
     (dir, env, db)
 }
@@ -98,9 +97,8 @@ fn database_entry_test_offset() {
     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
     let mut found_key = DatabaseEntry::new();
     let mut found_data = DatabaseEntry::new();
-    let s = cursor
-        .get(&mut found_key, &mut found_data, Get::First, None)
-        .unwrap();
+    let s =
+        cursor.get(&mut found_key, &mut found_data, Get::First, None).unwrap();
     assert_eq!(OperationStatus::Success, s);
 
     // Returned entries always start at offset 0 with size = stored payload.
