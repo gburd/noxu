@@ -333,7 +333,9 @@ mod tests {
     }
 
     fn open_db(env: &Environment, name: &str) -> noxu_db::Database {
-        let db_config = DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         env.open_database(None, name, &db_config).unwrap()
     }
 

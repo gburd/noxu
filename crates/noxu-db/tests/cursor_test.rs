@@ -27,12 +27,15 @@ fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
 /// Like `open_env_and_db` but creates a transactional database, required
 /// for cursors that are opened with an explicit `Transaction` argument
 /// (JE invariant: txn cursors on non-txn DBs are rejected).
-fn open_env_and_txn_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
+fn open_env_and_txn_db(
+    dir: &TempDir,
+) -> (noxu_db::Environment, noxu_db::Database) {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "cursor_txn_test_db", &db_config).unwrap();
     (env, db)
 }
@@ -1429,7 +1432,9 @@ mod secondary_cursor_txn {
             .open_database(
                 None,
                 "pri",
-                &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
         let primary = Arc::new(Mutex::new(primary_db));

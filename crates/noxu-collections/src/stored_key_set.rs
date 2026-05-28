@@ -176,7 +176,9 @@ mod tests {
             .open_database(
                 None,
                 "kset",
-                &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
         (td, env, db)

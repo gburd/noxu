@@ -434,7 +434,7 @@ impl Checkpointer {
                 checkpoint_id,
                 invoker,
                 start_lsn,
-                None,              // root_lsn  (P1/P2 will fill this)
+                None, // root_lsn  (P1/P2 will fill this)
                 // Set first_active_lsn to Lsn::new(0, 0) (beginning of log)
                 // rather than NULL_LSN.  This tells recovery to scan from
                 // the start of the log, ensuring that committed LN entries

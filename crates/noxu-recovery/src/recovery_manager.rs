@@ -896,7 +896,8 @@ impl RecoveryManager {
                     if rec.is_deleted {
                         result.recovered_db_names.remove(&rec.name);
                     } else {
-                        result.recovered_db_names
+                        result
+                            .recovered_db_names
                             .insert(rec.name.clone(), rec.db_id);
                     }
                 }

@@ -426,8 +426,7 @@ impl EnvironmentImpl {
             // the name map and the trees so that open_database() can find
             // registered databases and their committed data.
             if let Ok(fm) = FileManager::new(
-                &env_home,
-                true, // read_only
+                &env_home, true, // read_only
                 0,    // default log file size
                 0,    // default cache size
             ) {
@@ -438,9 +437,12 @@ impl EnvironmentImpl {
                 let mut recovery_trees: HashMap<u64, noxu_tree::Tree> =
                     HashMap::new();
                 recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
-                if let Ok(info) = rmgr.recover_all(&mut scanner, &mut recovery_trees, true) {
+                if let Ok(info) =
+                    rmgr.recover_all(&mut scanner, &mut recovery_trees, true)
+                {
                     for (name, db_id) in info.recovered_db_names {
-                        recovered_names.insert(name, DatabaseId::new(db_id as i64));
+                        recovered_names
+                            .insert(name, DatabaseId::new(db_id as i64));
                     }
                 }
                 for (db_id, tree) in recovery_trees {
@@ -796,12 +798,8 @@ impl EnvironmentImpl {
         // Check if the name was recovered from the WAL (name in name_map but
         // no live db_map entry yet).  Use the recovered db_id so that the
         // correct recovered tree is transplanted below.
-        let recovered_db_id: Option<i64> = self
-            .name_map
-            .read()
-            .get(name)
-            .copied()
-            .map(|id| id.id());
+        let recovered_db_id: Option<i64> =
+            self.name_map.read().get(name).copied().map(|id| id.id());
 
         if recovered_db_id.is_none() && !config.allow_create {
             return Err(DbiError::DatabaseNotFound(name.to_string()));
@@ -812,15 +810,12 @@ impl EnvironmentImpl {
             // at least rid + 1 so fresh creations don't reuse it.
             let next = self.next_db_id.load(Ordering::Relaxed);
             if next <= rid {
-                self.next_db_id
-                    .store(rid + 1, Ordering::Relaxed);
+                self.next_db_id.store(rid + 1, Ordering::Relaxed);
             }
             DatabaseId::new(rid)
         } else {
             // New creation: allocate a fresh ID.
-            DatabaseId::new(
-                self.next_db_id.fetch_add(1, Ordering::Relaxed),
-            )
+            DatabaseId::new(self.next_db_id.fetch_add(1, Ordering::Relaxed))
         };
 
         let mut db_impl =
@@ -874,8 +869,8 @@ impl EnvironmentImpl {
         let key = name.as_bytes().to_vec();
         let data = db_id.to_le_bytes().to_vec();
         let entry = LnLogEntry::new(
-            0,     // db_id header field (unused for NameLN, use 0)
-            None,  // txn_id: non-transactional
+            0,    // db_id header field (unused for NameLN, use 0)
+            None, // txn_id: non-transactional
             NULL_LSN,
             false,
             None,
@@ -1103,15 +1098,9 @@ impl EnvironmentImpl {
         );
         let mut buf = BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
-        lm.log(
-            LogEntryType::DeleteLN,
-            &buf,
-            Provisional::No,
-            false,
-            false,
-        )
-        .map(|_| ())
-        .map_err(DbiError::from)
+        lm.log(LogEntryType::DeleteLN, &buf, Provisional::No, false, false)
+            .map(|_| ())
+            .map_err(DbiError::from)
     }
 
     /// Returns the list of database names.
