@@ -644,7 +644,6 @@ fn database_txn_cursor_on_non_txn_db_rejected() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn database_put_no_overwrite_in_dup_db_txn() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_env_db(&dir, "pno_dup_txn", true);
@@ -693,7 +692,6 @@ fn database_put_no_overwrite_in_dup_db_txn() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn database_put_no_overwrite_in_dup_db_no_txn() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir, "pno_dup_no_txn", true);
