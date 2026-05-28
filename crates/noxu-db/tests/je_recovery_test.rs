@@ -578,14 +578,13 @@ fn recovery_duplicates_round_trip_across_clean_close() {
         }
 
         let txn = env.begin_transaction(None).unwrap();
-        for d in 0..N_DBS {
+        for (d, db) in dbs.iter().enumerate() {
             for i in 0..N_RECS {
                 let k = ikey(i);
                 let kbytes = k.get_data().unwrap().to_vec();
                 for j in 0..N_DUPS {
                     let dv = (i * 1000 + j).to_be_bytes().to_vec();
-                    dbs[d]
-                        .put(Some(&txn), &k, &DatabaseEntry::from_bytes(&dv))
+                    db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&dv))
                         .unwrap();
                     expected.entry((d, kbytes.clone())).or_default().push(dv);
                 }
