@@ -266,6 +266,21 @@ impl AnalysisResult {
     /// Record a transactional LN seen during analysis (txn neither committed
     /// nor aborted yet).
     pub fn record_active_txn(&mut self, txn_id: u64) {
+        // Defensive precondition: if this txn has already been recorded as
+        // committed or aborted, do not re-add it to `active_txn_ids`.  An
+        // out-of-order caller could otherwise create a phantom active txn
+        // that causes `has_active_txns()` to return true after a clean
+        // shutdown, triggering a spurious undo pass.
+        //
+        // In production the analysis pass sees log entries chronologically
+        // so `record_commit` / `record_abort` always precede any later
+        // re-encounter of the same txn id.  This guard makes the method
+        // safe even if the caller violates that ordering assumption.
+        if self.committed_txns.contains_key(&txn_id)
+            || self.aborted_txns.contains(&txn_id)
+        {
+            return;
+        }
         if txn_id > self.max_txn_id {
             self.max_txn_id = txn_id;
         }

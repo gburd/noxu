@@ -378,7 +378,6 @@ fn _force_use_imports() {
 /// or whether the precondition should be promoted to a `debug_assert!` and
 /// callers audited.  Tracked under the post-v2.3.0 roadmap.
 #[test]
-#[ignore = "surfaces a precondition-violation behavior; see TODO above"]
 fn prop_active_txn_after_terminal_resurrects_phantom_active() {
     let mut a = AnalysisResult::new();
     a.record_commit(1, Lsn::from_u64(0));
