@@ -148,3 +148,4 @@
   - [Wave 10-E — crates.io publication prep](internal/wave-10-e-cratesio-prep.md)
   - [Wave 10-F — CI matrix expansion](internal/wave-10-f-ci-matrix.md)
   - [Post-v2.3.0 Roadmap (Wave 11 onward)](internal/post-v2.3.0-roadmap.md)
+  - [Wave 11-F — Stateright spec coverage expansion](internal/wave-11-f-stateright-coverage.md)
