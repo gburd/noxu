@@ -454,6 +454,8 @@ impl RecoveryManager {
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
+        // Propagate recovered database name→id mappings.
+        self.info.recovered_db_names = analysis.recovered_db_names.clone();
 
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
@@ -888,6 +890,19 @@ impl RecoveryManager {
                 }
 
                 // ----------------------------------------------------------
+                // NameLN: database name registration
+                // ----------------------------------------------------------
+                LogEntry::NameLn(rec) => {
+                    if rec.is_deleted {
+                        result.recovered_db_names.remove(&rec.name);
+                    } else {
+                        result
+                            .recovered_db_names
+                            .insert(rec.name.clone(), rec.db_id);
+                    }
+                }
+
+                // ----------------------------------------------------------
                 // DbTree (mapping-tree root)
                 // ----------------------------------------------------------
                 LogEntry::DbTree(rec) => {
@@ -1207,8 +1222,17 @@ impl RecoveryManager {
                 }
             }
             Some(txn_id) => {
-                if after_ckpt_start && analysis.is_committed(txn_id) {
-                    // Committed LN after checkpoint start → redo.
+                if analysis.is_committed(txn_id) {
+                    // Committed LN: always redo, regardless of whether it
+                    // precedes the checkpoint start.  Noxu's checkpointer
+                    // flushes an in-memory primary_tree that may not yet
+                    // contain all committed data from all open databases, so
+                    // the BIN entries in the checkpoint cannot be trusted as
+                    // a complete snapshot of pre-checkpoint state.  We must
+                    // replay all committed LNs from the full scan range.
+                    // `redo_ln` is idempotent (it skips if the tree already
+                    // holds a newer LSN for the key), so replaying redundantly
+                    // is always correct.
                     RedoAction::Apply
                 } else {
                     // Active or aborted txn → skip (undo handles active ones).

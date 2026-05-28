@@ -482,9 +482,6 @@ fn recovery_edge_test_no_log_files() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "wave10-a TODO: non-transactional db registration is lost across \
-            clean close+reopen; JE RecoveryEdgeTest.testNonTxnalDb expects it \
-            to survive"]
 fn recovery_edge_test_non_txnal_db() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

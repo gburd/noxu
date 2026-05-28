@@ -434,8 +434,19 @@ impl Checkpointer {
                 checkpoint_id,
                 invoker,
                 start_lsn,
-                None,                // root_lsn  (P1/P2 will fill this)
-                noxu_util::NULL_LSN, // first_active_lsn
+                None, // root_lsn  (P1/P2 will fill this)
+                // Set first_active_lsn to Lsn::new(0, 0) (beginning of log)
+                // rather than NULL_LSN.  This tells recovery to scan from
+                // the start of the log, ensuring that committed LN entries
+                // written before the checkpoint start are still replayed.
+                // Noxu's checkpointer flushes an in-memory primary_tree that
+                // may not contain all committed data, so we cannot rely on
+                // BIN entries to capture pre-checkpoint state and must scan
+                // from the beginning.  (JE would set this to the LSN of the
+                // earliest active txn at checkpoint time; Noxu conservatively
+                // uses Lsn::new(0,0) until the checkpoint wires the full
+                // db_map.)
+                noxu_util::Lsn::new(0, 0), // first_active_lsn
                 0,
                 0,
                 0,

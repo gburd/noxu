@@ -289,9 +289,8 @@ fn dup_cursor_put_no_dup_data_inserts_unique_pairs() {
         b"eight",
         b"nine",
     ] {
-        let s = db
-            .put_no_overwrite(Some(&txn), &key, &DatabaseEntry::from_bytes(d))
-            .unwrap();
+        let s =
+            db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(d)).unwrap();
         assert_eq!(
             s,
             OperationStatus::Success,

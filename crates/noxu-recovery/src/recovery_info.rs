@@ -68,6 +68,15 @@ pub struct RecoveryInfo {
     /// Stored as raw byte vectors instead of `LnRecord` so this struct
     /// stays self-contained (`LnRecord` borrows lifetime-bound `Bytes`).
     pub prepared_txn_lns: hashbrown::HashMap<u64, Vec<PreparedLnReplay>>,
+
+    /// Database name → database ID mappings recovered from `NameLN` / `NameLNTxn`
+    /// WAL entries.  Populated by the analysis pass and consumed by
+    /// `EnvironmentImpl::new_with_config_inner` to rebuild `name_map` before
+    /// any `open_database` call, enabling read-only reopens with
+    /// `allow_create = false` to succeed.
+    ///
+    /// A `None` value means the name was removed (NameLN with is_deleted=true).
+    pub recovered_db_names: hashbrown::HashMap<String, u64>,
 }
 
 impl RecoveryInfo {
@@ -90,6 +99,7 @@ impl RecoveryInfo {
             use_min_replicated_txn_id: 0,
             recovered_prepared_txns: Vec::new(),
             prepared_txn_lns: hashbrown::HashMap::new(),
+            recovered_db_names: hashbrown::HashMap::new(),
         }
     }
 }

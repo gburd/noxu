@@ -604,7 +604,6 @@ fn multi_env_open_close_test_multi_open_close() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn database_txn_cursor_on_non_txn_db_rejected() {
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
@@ -645,7 +644,6 @@ fn database_txn_cursor_on_non_txn_db_rejected() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn database_put_no_overwrite_in_dup_db_txn() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_env_db(&dir, "pno_dup_txn", true);
@@ -694,7 +692,6 @@ fn database_put_no_overwrite_in_dup_db_txn() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn database_put_no_overwrite_in_dup_db_no_txn() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir, "pno_dup_no_txn", true);
@@ -814,7 +811,6 @@ fn database_close_idempotent() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn environment_read_only_rejects_db_name_ops() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -928,7 +924,6 @@ fn environment_checkpoint_forces_durability() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn environment_checkpoint_after_commit_loses_data() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

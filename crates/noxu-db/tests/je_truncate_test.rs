@@ -127,7 +127,6 @@ fn truncate_then_write_succeeds_no_deadlock() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn truncate_survives_clean_close_reopen() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

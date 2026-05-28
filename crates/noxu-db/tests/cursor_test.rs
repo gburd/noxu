@@ -24,6 +24,22 @@ fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
     (env, db)
 }
 
+/// Like `open_env_and_db` but creates a transactional database, required
+/// for cursors that are opened with an explicit `Transaction` argument
+/// (JE invariant: txn cursors on non-txn DBs are rejected).
+fn open_env_and_txn_db(
+    dir: &TempDir,
+) -> (noxu_db::Environment, noxu_db::Database) {
+    let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_config).unwrap();
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db = env.open_database(None, "cursor_txn_test_db", &db_config).unwrap();
+    (env, db)
+}
+
 fn kv(k: &[u8], v: &[u8]) -> (DatabaseEntry, DatabaseEntry) {
     (DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(v))
 }
@@ -1265,7 +1281,7 @@ fn cursor_last_dup_returns_unsupported_error() {
 #[test]
 fn cursor_with_txn_put_is_rolled_back_on_abort() {
     let dir = TempDir::new().unwrap();
-    let (env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_txn_db(&dir);
 
     // Seed nothing — start with an empty database.
     let txn = env.begin_transaction(None).unwrap();
@@ -1298,7 +1314,7 @@ fn cursor_with_txn_put_is_rolled_back_on_abort() {
 #[test]
 fn cursor_with_txn_put_invisible_via_get_after_abort() {
     let dir = TempDir::new().unwrap();
-    let (env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_txn_db(&dir);
 
     let txn = env.begin_transaction(None).unwrap();
     let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
@@ -1329,7 +1345,7 @@ fn cursor_with_txn_put_invisible_via_get_after_abort() {
 #[test]
 fn cursor_with_txn_get_takes_read_lock_via_locker() {
     let dir = TempDir::new().unwrap();
-    let (env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_txn_db(&dir);
 
     // Seed a committed value so there is something to lock.
     let seed = env.begin_transaction(None).unwrap();
@@ -1416,7 +1432,9 @@ mod secondary_cursor_txn {
             .open_database(
                 None,
                 "pri",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
         let primary = Arc::new(Mutex::new(primary_db));
@@ -1426,6 +1444,7 @@ mod secondary_cursor_txn {
                 "sec",
                 &DatabaseConfig::new()
                     .with_allow_create(true)
+                    .with_transactional(true)
                     .with_sorted_duplicates(true),
             )
             .unwrap();

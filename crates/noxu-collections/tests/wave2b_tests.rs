@@ -46,7 +46,8 @@ fn open_env(path: &Path, transactional: bool) -> Environment {
 }
 
 fn open_db(env: &Environment, name: &str) -> Database {
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     env.open_database(None, name, &db_config).unwrap()
 }
 

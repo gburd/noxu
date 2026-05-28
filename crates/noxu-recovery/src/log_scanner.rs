@@ -251,9 +251,28 @@ pub enum LogEntry {
     RollbackEnd(RollbackEndRecord),
     /// Mapping-tree root.
     DbTree(DbTreeRecord),
+    /// Database name registration (NameLN / NameLNTxn).
+    NameLn(NameLnRecord),
 }
 
-/// A log entry together with its position in the log.
+/// Database name registration record (NameLN).
+///
+/// Carries the mapping between a database name and its integer ID as
+/// written to the WAL by `EnvironmentImpl::open_database` whenever a new
+/// database is created.  During the analysis pass, these records are
+/// collected into `RecoveryInfo::recovered_db_names` so that the name_map
+/// can be restored on a subsequent open — including read-only reopens where
+/// `allow_create=false` would otherwise fail with `DatabaseNotFound`.
+///
+/// `is_deleted = true` marks a Remove (or Truncate) operation that should
+/// remove the name from the registry.
+#[derive(Debug, Clone)]
+pub struct NameLnRecord {
+    pub name: String,
+    pub db_id: u64,
+    pub is_deleted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PositionedEntry {
     /// LSN of this entry.

@@ -2119,6 +2119,7 @@ impl CursorImpl {
     /// correct ordering.
     ///
     /// Dup path from 7.5.
+    /// Dup path from 7.5.
     fn put_dup(
         &mut self,
         key: &[u8],
@@ -2128,75 +2129,19 @@ impl CursorImpl {
         let two_part_key = dup_key_data::combine(key, data);
 
         match put_mode {
-            PutMode::NoDupData | PutMode::NoOverwrite => {
-                // Return KeyExist if the exact (key, data) pair already exists.
-                let exists = {
-                    let db = self.db_impl.read();
-                    if let Some(tree) = db.get_real_tree() {
-                        tree.search(&two_part_key)
-                            .map(|sr| sr.exact_parent_found)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                };
-                if exists {
-                    return Ok(OperationStatus::KeyExist);
-                }
-                // v1.6 (Wave 2A): register the brand-new sorted-dup
-                // insert with the cursor's txn (or auto-commit lock
-                // manager) so abort-undo can reach it.  The non-dup
-                // path uses the same lock_write_before_log /
-                // finalize_write_lock pair (see PutMode::NoDupData
-                // above); without it, an aborted txn could leak a
-                // sorted-dup insert past the rollback (the regression
-                // that surfaced when secondaries flipped to
-                // sorted-dup).  old_lsn is NULL_LSN because we just
-                // verified !exists.
-                let old_lsn = noxu_util::NULL_LSN.as_u64();
-                self.lock_write_before_log(old_lsn, &two_part_key)?;
-                let new_lsn = self.log_ln_write(
-                    &two_part_key,
-                    Some(b""),
-                    self.locker_id,
-                )?;
-                self.finalize_write_lock(
-                    old_lsn,
-                    new_lsn,
-                    Some(two_part_key.clone()),
-                    None,
-                )?;
-                // Use apply_tree_insert so the per-database entry counter
-                // is bumped on a new (key, data) pair; otherwise
-                // `Database::count()` (which reads the counter) would stay
-                // at 0 for sorted-dup databases.  BDB-JE
-                // `Database.count()` returns the total number of (key, data)
-                // pairs, including every duplicate.
-                self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
-                self.current_key = Some(two_part_key);
-                self.current_data = None;
-                self.current_lsn = new_lsn.as_u64();
-                self.current_index = 0;
-                self.state = CursorState::Initialized;
-                Ok(OperationStatus::Success)
-            }
+            // --- Current: replace the data of the currently-positioned record ---
             PutMode::Current => {
-                // Replace the data of the currently positioned record.
-                // In dup mode this means replacing the current two-part key
-                // with a new one (delete old, insert new).
+                // In dup mode, "current" is the two-part key at the cursor
+                // position; replacing it means deleting the old two-part key
+                // and inserting a new one (delete old, insert new).
                 self.check_initialized()?;
                 let old_key = self
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
-                // Delete the old two-part key.  Use apply_tree_delete so
-                // the counter is decremented (it will be re-incremented by
-                // the matching apply_tree_insert below; net change is 0,
-                // matching JE's PutCurrent semantics).
                 let del_lsn =
                     self.log_ln_write(&old_key, None, self.locker_id)?;
                 self.apply_tree_delete(old_key, del_lsn);
-                // Insert the new two-part key.
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
@@ -2206,34 +2151,16 @@ impl CursorImpl {
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
-                Ok(OperationStatus::Success)
+                return Ok(OperationStatus::Success);
             }
+            // --- Overwrite: insert or replace the exact (key, data) pair ---
             PutMode::Overwrite => {
-                // Insert or replace the exact (key, data) pair.  For
-                // sorted-dup databases each unique (key, data) is a
-                // distinct logical record, so a brand-new pair must bump
-                // the per-database entry counter.  apply_tree_insert
-                // checks tree.insert's `is_new` return so an exact-match
-                // re-insert is a no-op for the counter.
-                //
-                // SR9752 Part 2 (Wave 5): we MUST also register the
-                // brand-new sorted-dup insert with the cursor's
-                // txn / lock manager so abort-undo can roll the dup
-                // back.  Pre-fix the path skipped
-                // lock_write_before_log / finalize_write_lock entirely,
-                // so an aborted txn left dups visible past the
-                // rollback (the same regression that surfaced for
-                // NoOverwrite / NoDupData and was patched in v1.6 —
-                // Overwrite was missed because the existing tests did
-                // not exercise it on a sorted-dup database).
-                //
-                // Distinguish update vs. insert: if the (key, data)
-                // pair already exists, this is a no-op for the
-                // counter and the slot LSN moves; we still record the
-                // before-image (slot LSN → new LSN) so abort restores
-                // the prior LSN.  If the pair is new, the abort-undo
-                // is `delete the slot` (abort_known_deleted=true,
-                // matching apply_tree_insert's is_new branch).
+                // SR9752 Part 2 (Wave 5): register the brand-new sorted-dup
+                // insert with the cursor's txn / lock manager so abort-undo
+                // can roll the dup back.  Distinguish update vs. insert: if
+                // the (key, data) pair already exists, this is a no-op for
+                // the counter and the slot LSN moves; if the pair is new,
+                // the abort-undo deletes the slot.
                 let exists_old_lsn: u64 = {
                     let db = self.db_impl.read();
                     db.get_real_tree()
@@ -2261,9 +2188,75 @@ impl CursorImpl {
                 self.current_lsn = new_lsn.as_u64();
                 self.current_index = 0;
                 self.state = CursorState::Initialized;
-                Ok(OperationStatus::Success)
+                return Ok(OperationStatus::Success);
+            }
+            // --- NoDupData: (key, data) pair uniqueness check ---
+            PutMode::NoDupData => {
+                // Return KeyExist if the exact (key, data) pair already exists.
+                // Mirrors JE's Cursor.putNoDupData() semantics.
+                let exists = {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        tree.search(&two_part_key)
+                            .map(|sr| sr.exact_parent_found)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if exists {
+                    return Ok(OperationStatus::KeyExist);
+                }
+            }
+            // --- NoOverwrite: key-only uniqueness check (JE semantics) ---
+            PutMode::NoOverwrite => {
+                // JE invariant (DatabaseTest.testPutNoOverwriteInADupDb*):
+                // once ANY (key, *) pair exists for this key, a putNoOverwrite
+                // of the same key with ANY data value must return KEYEXIST.
+                // This is different from NoDupData which checks (key,data).
+                let key_exists = {
+                    let db = self.db_impl.read();
+                    if let Some(tree) = db.get_real_tree() {
+                        let lb = dup_key_data::lower_bound(key);
+                        tree.first_entry_at_or_after_with_index(&lb)
+                            .map(|(found_key, _, _, _, _)| {
+                                dup_key_data::matches_key(&found_key, key)
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if key_exists {
+                    return Ok(OperationStatus::KeyExist);
+                }
             }
         }
+
+        // --- Common insert path for NoDupData / NoOverwrite ---
+        // Reached only when the existence check above passed (no early return).
+        // v1.6 (Wave 2A): register the insert with the cursor's txn /
+        // lock manager so abort-undo can roll back the new dup.
+        // old_lsn is NULL_LSN: the existence check confirmed the pair is absent.
+        let old_lsn = noxu_util::NULL_LSN.as_u64();
+        self.lock_write_before_log(old_lsn, &two_part_key)?;
+        let new_lsn =
+            self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
+        self.finalize_write_lock(
+            old_lsn,
+            new_lsn,
+            Some(two_part_key.clone()),
+            None,
+        )?;
+        // Use apply_tree_insert so the per-database entry counter is bumped
+        // on a new (key, data) pair — `Database::count()` reads this counter.
+        self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
+        self.current_key = Some(two_part_key);
+        self.current_data = None;
+        self.current_lsn = new_lsn.as_u64();
+        self.current_index = 0;
+        self.state = CursorState::Initialized;
+        Ok(OperationStatus::Success)
     }
 
     /// Writes an LN (Leaf Node) log entry for a put or delete operation.
