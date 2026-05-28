@@ -6,6 +6,7 @@
 
 pub mod channel;
 pub mod data_channel;
+pub mod inmem;
 #[cfg(feature = "quic")]
 pub mod quic_channel;
 #[cfg(feature = "quic")]
@@ -15,6 +16,7 @@ pub mod service_dispatcher;
 pub use channel::{
     Channel, LocalChannel, LocalChannelPair, TcpChannel, TcpChannelListener,
 };
+pub use inmem::{InMemoryEndpoint, InMemoryGroup, InMemoryTransport};
 #[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
 pub use channel::{TlsTcpChannel, TlsTcpChannelListener};
 pub use data_channel::DataChannel;
