@@ -50,6 +50,24 @@ pub const INSERT_SUCCESS: i32 = 1 << 17;
 pub type KeyComparatorFn =
     Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
 
+/// Combined search result carrying slot data and the BIN arc, returned by
+/// [`Tree::search_with_data`].
+///
+/// Avoids the double-descent pattern where `Tree::search` checked key
+/// existence and a second call re-descended to fetch the actual slot bytes.
+/// One descent now serves both purposes (Wave-11-I optimisation).
+pub struct SlotFetch {
+    /// `true` if an exact key match was found and is not expired.
+    pub found: bool,
+    /// Data bytes for the slot (`None` when `found` is `false`).
+    pub data: Option<Vec<u8>>,
+    /// Raw slot LSN as `u64`; zero when `found` is `false`.
+    pub lsn: u64,
+    /// Arc to the BIN that the descent reached.  Always `Some` when the
+    /// tree has at least one node, regardless of whether `found` is `true`.
+    pub bin_arc: Arc<RwLock<TreeNode>>,
+}
+
 /// The B+tree.
 ///
 ///
@@ -1477,6 +1495,110 @@ impl Tree {
             // Take the child read lock BEFORE releasing the parent's read
             // lock — this is the actual hand-over-hand step that closes
             // the descender-vs-splitter race for the read path.
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
+        }
+    }
+
+    /// Combined search-and-fetch: descend once to the BIN and return the
+    /// slot's data together with a reference to the BIN arc.
+    ///
+    /// Replaces the previous three-descent sequence on the `Database::get`
+    /// hot path:
+    ///   1. `Tree::search` — existence check only.
+    ///   2. `CursorImpl::get_data_from_tree` — re-descended to fetch data.
+    ///   3. `CursorImpl::find_bin_for_key` — re-descended for BIN pinning.
+    ///
+    /// One descent now does all three jobs.  At the BIN level it uses the
+    /// existing binary-search helper `find_entry_compressed` instead of the
+    /// O(n) `iter().find()` used by `get_data_from_tree`.
+    ///
+    /// Returns `None` only when the tree is empty.  Otherwise returns
+    /// `Some(SlotFetch)` — callers must inspect `SlotFetch::found` to
+    /// determine whether the key was present.  The BIN read-guard is released
+    /// before this method returns so callers may safely call `lock_ln`
+    /// (which may block) without holding any tree latch.
+    ///
+    /// Wave-11-I — see `docs/src/internal/wave-11-i-cursor-double-descent.md`.
+    pub fn search_with_data(&self, key: &[u8]) -> Option<SlotFetch> {
+        let root = self.get_root()?;
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = root.read_arc();
+
+        loop {
+            if guard.is_bin() {
+                // Capture the BIN Arc before inspecting entries.
+                let bin_arc =
+                    parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+
+                let (found, data, lsn) = match &*guard {
+                    TreeNode::Bottom(bin) => {
+                        let (idx, exact) = match &self.key_comparator {
+                            Some(cmp) => {
+                                bin.find_entry_cmp(key, cmp.as_ref())
+                            }
+                            None => bin.find_entry_compressed(key),
+                        };
+                        if exact {
+                            // Honour TTL: expired entries are treated as absent.
+                            let live = bin
+                                .entries
+                                .get(idx)
+                                .map(|e| {
+                                    !(e.expiration_time != 0
+                                        && noxu_util::ttl::is_expired(
+                                            e.expiration_time,
+                                            bin.expiration_in_hours,
+                                        ))
+                                })
+                                .unwrap_or(false);
+                            if live {
+                                let e = &bin.entries[idx];
+                                (true, e.data.clone(), e.lsn.as_u64())
+                            } else {
+                                (false, None, 0u64)
+                            }
+                        } else {
+                            (false, None, 0u64)
+                        }
+                    }
+                    _ => (false, None, 0u64),
+                };
+                // Release the BIN read guard before returning so the caller
+                // can call lock_ln (which may block) without holding a latch.
+                drop(guard);
+                return Some(SlotFetch { found, data, lsn, bin_arc });
+            }
+
+            // Upper IN: same hand-over-hand descent as `Tree::search`.
+            let next_arc = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
+                    }
+                    // Slot 0 = virtual −∞; walk forward while entry.key ≤ key.
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else if self
+                            .key_cmp(entry.key.as_slice(), key)
+                            != std::cmp::Ordering::Greater
+                        {
+                            idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    n.entries.get(idx)?.child.clone()?
+                }
+                TreeNode::Bottom(_) => {
+                    unreachable!("is_bin() returned false above")
+                }
+            };
             let next_guard = next_arc.read_arc();
             drop(guard);
             guard = next_guard;
