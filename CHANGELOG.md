@@ -16,7 +16,6 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added (v2.4.0 — Wave 11-D)
 
 - **First-class in-memory replication transport.** Wave 11-D promotes
