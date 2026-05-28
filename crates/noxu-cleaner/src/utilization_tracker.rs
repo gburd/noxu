@@ -2,6 +2,15 @@
 //!
 //! Base and per-file utilization tracking for log space accounting.
 //! tracks per-file utilization changes in memory between checkpoints.
+//!
+//! ## Property tests
+//!
+//! Oracle properties comparing the tracker against a brute-force scan over
+//! the LN write/delete event log live in
+//! `crates/noxu-cleaner/tests/prop_tests.rs` (Wave 11-E):
+//! `prop_tracker_total_size_matches_writes`,
+//! `prop_tracker_obsolete_count_matches_oracle`,
+//! `prop_tracker_file_set_is_union`, `prop_tracker_clear_resets`.
 
 use crate::tracked_file_summary::TrackedFileSummary;
 use hashbrown::HashMap;
