@@ -262,3 +262,178 @@ fn dup_cursor_delete_first_dup_via_positioned_cursor() {
     drop(c);
     txn.commit().unwrap();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DbCursorDuplicateTest.testPutNoDupData2
+//
+// JE invariant: Cursor::put with NoDupData under one key inserts each of N
+// distinct dup-data values successfully (no collision since each (k, d) is
+// unique).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn dup_cursor_put_no_dup_data_inserts_unique_pairs() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "no_dup2");
+
+    let txn = env.begin_transaction(None).unwrap();
+    let key = DatabaseEntry::from_bytes(b"oneKey");
+    for d in [b"one".as_slice(), b"two", b"three", b"four", b"five",
+              b"six", b"seven", b"eight", b"nine"] {
+        let s = db
+            .put_no_overwrite(Some(&txn), &key, &DatabaseEntry::from_bytes(d))
+            .unwrap();
+        assert_eq!(s, OperationStatus::Success, "data {d:?} must insert as new dup");
+    }
+    txn.commit().unwrap();
+    assert_eq!(db.count().unwrap(), 9);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DbCursorDuplicateTest.testAbortDuplicateTreeCreation
+//
+// JE invariant: txn1 puts (k, d1) and commits; txn2 puts (k, d2) and aborts.
+// Post-abort, only (k, d1) is visible; cursor.count() == 1; getNext after
+// the first record returns NotFound.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn dup_cursor_abort_after_dup_creation_keeps_committed_only() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "abort_dup");
+
+    let txn1 = env.begin_transaction(None).unwrap();
+    let key = DatabaseEntry::from_bytes(b"oneKey");
+    db.put(Some(&txn1), &key, &DatabaseEntry::from_bytes(b"firstData"))
+        .unwrap();
+    txn1.commit().unwrap();
+
+    let txn2 = env.begin_transaction(None).unwrap();
+    db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"secondData"))
+        .unwrap();
+    txn2.abort().unwrap();
+
+    let txn3 = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor(Some(&txn3), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    assert_eq!(d.get_data().unwrap(), b"firstData");
+    assert_eq!(c.count().unwrap(), 1, "only one dup must remain after abort");
+    let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+    assert_eq!(s, OperationStatus::NotFound);
+    drop(c);
+    txn3.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DbCursorDeleteTest.testLargeDeleteFirst
+//
+// JE invariant: insert N keys (no dups), walk forward, delete the first one
+// via cursor.delete; the remaining N-1 keys are still walkable in order.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cursor_delete_first_via_walk_keeps_rest() {
+    const N: u32 = 100;
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true);
+    let db = env.open_database(None, "del_first", &db_cfg).unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..N {
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    c.delete().unwrap();
+    drop(c);
+    txn.commit().unwrap();
+
+    assert_eq!(db.count().unwrap() as u32, N - 1);
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    for i in 1..N {
+        let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        let mut a = [0u8; 4];
+        a.copy_from_slice(k.get_data().unwrap());
+        assert_eq!(u32::from_be_bytes(a), i);
+    }
+    drop(c);
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DbCursorDeleteTest.testLargeDeleteLast
+//
+// Same as above but delete the last one via Get::Last.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cursor_delete_last_via_walk_keeps_rest() {
+    const N: u32 = 100;
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true);
+    let db = env.open_database(None, "del_last", &db_cfg).unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0..N {
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let s = c.get(&mut k, &mut d, Get::Last, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    c.delete().unwrap();
+    drop(c);
+    txn.commit().unwrap();
+
+    assert_eq!(db.count().unwrap() as u32, N - 1);
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let s = c.get(&mut k, &mut d, Get::Last, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    let mut a = [0u8; 4];
+    a.copy_from_slice(k.get_data().unwrap());
+    assert_eq!(u32::from_be_bytes(a), N - 2);
+    drop(c);
+    txn.commit().unwrap();
+}
