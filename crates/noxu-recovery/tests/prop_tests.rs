@@ -118,7 +118,7 @@ proptest! {
         bases in prop::collection::vec(0u64..1_000_000_u64, 0..16),
     ) {
         // Deduplicate base LSNs to ensure distinct matchpoints.
-        let mut uniq: Vec<u64> = bases.clone();
+        let mut uniq: Vec<u64> = bases;
         uniq.sort();
         uniq.dedup();
 
@@ -141,7 +141,7 @@ proptest! {
     fn prop_rollback_tracker_periods_sorted(
         bases in prop::collection::vec(0u64..1_000_000_u64, 0..12),
     ) {
-        let mut uniq: Vec<u64> = bases.clone();
+        let mut uniq: Vec<u64> = bases;
         uniq.sort();
         uniq.dedup();
         prop_assume!(uniq.len() >= 2);
