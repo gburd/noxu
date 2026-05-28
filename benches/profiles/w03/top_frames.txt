@@ -1,0 +1,40 @@
+    15.92%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+               |          
+                --0.53%--equal_same_length<u8, u8> (inlined)
+                          eq<u8, u8> (inlined)
+                          eq<[u8], [u8]> (inlined)
+                          {closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     7.39%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::find_bin_for_key
+     2.86%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree
+     2.80%  noxu-perf-profi  noxu-perf-profiler    [.] crc32fast::baseline::update_fast_16
+     2.79%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --2.63%--cfree@GLIBC_2.2.5
+
+     2.73%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+     2.62%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::lock_with_timeout
+     2.19%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::release
+     2.01%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_db::database::Database::put
+     1.90%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::search
+     1.74%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::get_resident_root_in
+     1.68%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+
+     1.67%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::txn::Txn::commit_with_durability
+     1.55%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |          
+             --1.49%--_int_malloc
+                       |          

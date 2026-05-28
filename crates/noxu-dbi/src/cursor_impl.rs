@@ -704,36 +704,32 @@ impl CursorImpl {
             return self.search_dup(key, data, search_mode);
         }
 
-        // Non-dup path (original logic).
-        let found = {
+        // Non-dup path — single descent via `search_with_data` (Wave-11-I).
+        //
+        // Previously this path made three separate tree descents per `get()`:
+        //   1. `tree.search(key)` — existence check only.
+        //   2. `get_data_from_tree(tree, key)` — re-descended to fetch data.
+        //   3. `find_bin_for_key(root, key)` — re-descended for BIN pinning.
+        // `search_with_data` folds all three into one descent and uses binary
+        // search (`find_entry_compressed`) at the BIN level.
+        let slot = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
-                tree.search(key)
-                    .map(|sr| sr.exact_parent_found)
-                    .unwrap_or(false)
+                tree.search_with_data(key)
             } else {
-                false
+                None
             }
         };
+        let found = slot.as_ref().is_some_and(|s| s.found);
 
         match search_mode {
             SearchMode::Set | SearchMode::Both => {
                 if found {
-                    let result: Option<(Vec<u8>, u64)> = {
-                        let db = self.db_impl.read();
-                        if let Some(tree) = db.get_real_tree() {
-                            Self::get_data_from_tree(tree, key)
-                        } else {
-                            None
-                        }
-                    };
-                    let (slot_data, slot_lsn) = match result {
-                        Some((d, l)) => (Some(d), l),
-                        None => (
-                            data.map(|d| d.to_vec()),
-                            noxu_util::NULL_LSN.as_u64(),
-                        ),
-                    };
+                    // SAFETY: found => slot.is_some() && slot.found
+                    let slot = slot.unwrap();
+                    let slot_data = slot.data;
+                    let slot_lsn = slot.lsn;
+                    let bin_arc = slot.bin_arc;
                     // If a writer held the write lock when we called lock_ln,
                     // our pre-fetched slot_data is stale — re-read from the BIN
                     // after the writer commits/aborts.  If lock_ln returned
@@ -771,15 +767,8 @@ impl CursorImpl {
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
-                    // Pin the BIN the cursor is now positioned on.
-                    let bin_arc = {
-                        let db = self.db_impl.read();
-                        db.get_real_tree().and_then(|tree| {
-                            tree.get_root()
-                                .and_then(|r| Self::find_bin_for_key(r, key))
-                        })
-                    };
-                    self.update_bin_pin(bin_arc);
+                    // BIN arc already obtained from the single descent.
+                    self.update_bin_pin(Some(bin_arc));
                     Ok(OperationStatus::Success)
                 } else {
                     // Wave 5: contest a synthetic-key read lock on the
@@ -791,21 +780,10 @@ impl CursorImpl {
             }
             SearchMode::SetRange | SearchMode::BothRange => {
                 if found {
-                    let result: Option<(Vec<u8>, u64)> = {
-                        let db = self.db_impl.read();
-                        if let Some(tree) = db.get_real_tree() {
-                            Self::get_data_from_tree(tree, key)
-                        } else {
-                            None
-                        }
-                    };
-                    let (slot_data, slot_lsn) = match result {
-                        Some((d, l)) => (Some(d), l),
-                        None => (
-                            data.map(|d| d.to_vec()),
-                            noxu_util::NULL_LSN.as_u64(),
-                        ),
-                    };
+                    let slot = slot.unwrap();
+                    let slot_data = slot.data;
+                    let slot_lsn = slot.lsn;
+                    let bin_arc = slot.bin_arc;
                     let contended = self.lock_ln(slot_lsn)?;
                     let final_data = if contended {
                         let db = self.db_impl.read();
@@ -824,15 +802,8 @@ impl CursorImpl {
                     self.current_lsn = slot_lsn;
                     self.current_index = 0;
                     self.state = CursorState::Initialized;
-                    // Pin the BIN the cursor is now positioned on.
-                    let bin_arc = {
-                        let db = self.db_impl.read();
-                        db.get_real_tree().and_then(|tree| {
-                            tree.get_root()
-                                .and_then(|r| Self::find_bin_for_key(r, key))
-                        })
-                    };
-                    self.update_bin_pin(bin_arc);
+                    // BIN arc already obtained from the single descent.
+                    self.update_bin_pin(Some(bin_arc));
                     Ok(OperationStatus::Success)
                 } else {
                     let next_entry: Option<(Vec<u8>, Vec<u8>, u64)> = {

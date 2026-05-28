@@ -156,3 +156,4 @@
   - [Wave 11-G — JE TCK long-tail port](internal/wave-11-g-je-tck-longtail.md)
   - [Wave 11-H — Performance investigation on JE-wins workloads](internal/wave-11-h-perf-investigation.md)
   - [Wave 11 Bug-Fix Wave — v2.3.2](internal/wave-11-bugfix-v232.md)
+  - [Wave 11-I — Cursor / BIN scan optimization](internal/wave-11-i-cursor-double-descent.md)

@@ -1,0 +1,25 @@
+    15.92%  [.] __memcmp_avx2_movbe                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      -      -            
+            |
+            ---__memcmp_avx2_movbe
+               |          
+                --0.53%--equal_same_length<u8, u8> (inlined)
+                          eq<u8, u8> (inlined)
+                          eq<[u8], [u8]> (inlined)
+                          {closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     7.39%  [.] noxu_dbi::cursor_impl::CursorImpl::find_bin_for_key                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      -      -            
+     2.86%  [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    -      -            
+     2.80%  [.] crc32fast::baseline::update_fast_16                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      -      -            
+     2.79%  [.] _int_free                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                -      -            
+            |
+            ---_int_free
+               |          
+                --2.68%--cfree@GLIBC_2.2.5
+
+     2.73%  [.] malloc                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   -      -            
+            |
+            ---malloc
