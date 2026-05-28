@@ -897,17 +897,17 @@ impl CursorImpl {
             }
         };
 
-        let entry: Option<(Vec<u8>, Vec<u8>, u64)> = {
+        let entry: Option<(Vec<u8>, Vec<u8>, usize, u64, std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>)> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
-                tree.first_entry_at_or_after(&search_two_part_key)
+                tree.first_entry_at_or_after_with_index(&search_two_part_key)
             } else {
                 None
             }
         };
 
         match entry {
-            Some((raw_key, _, slot_lsn)) => {
+            Some((raw_key, _, idx, slot_lsn, bin_arc)) => {
                 // raw_key is the two-part key found; check that the primary
                 // key part matches what was requested (for Set and Both).
                 let matches = match search_mode {
@@ -929,8 +929,20 @@ impl CursorImpl {
                     self.current_key = Some(raw_key);
                     self.current_data = None; // decoded lazily in get_current()
                     self.current_lsn = slot_lsn;
-                    self.current_index = 0;
+                    // Wave 11-N Bug 2 fix: store the actual BIN index, not
+                    // a hard-coded 0.  Pre-fix the cursor reported
+                    // current_index = 0 after every dup search, which made
+                    // the subsequent NextDup compute next_index = 1 in the
+                    // BIN's slot space.  For any primary not occupying
+                    // BIN slot 0 the read either landed on a different
+                    // primary's dup (apply_dup_filter rejected it as
+                    // NotFound) or returned an unrelated entry entirely.
+                    // Storing the real slot index plus pinning the BIN
+                    // closes the bug and matches the invariant maintained
+                    // by `get_first` / `get_last`.
+                    self.current_index = idx as i32;
                     self.state = CursorState::Initialized;
+                    self.update_bin_pin(Some(bin_arc));
                     Ok(OperationStatus::Success)
                 } else {
                     Ok(OperationStatus::NotFound)
@@ -2380,32 +2392,34 @@ impl CursorImpl {
         // For sorted-dup databases, count all entries sharing the same primary
         // key as the current position.
         //
-        // Strategy: clone the cursor at the current position (already on some
-        // dup for the primary key), then:
-        //   1. Walk backward with PrevDup until NotFound — each success is one
-        //      dup before the original position.
-        //   2. Walk forward with NextDup until NotFound — each success is one
-        //      dup after.
-        //   3. Total = backward + 1 + forward.
+        // Strategy (Wave 11-N Bug 1 fix): clone the cursor at the current
+        // position, walk backward with PrevDup until NotFound (which leaves
+        // scratch on the FIRST dup of the primary), then walk forward with
+        // NextDup counting successful steps.  The total count is
+        // `forward + 1` because the forward walk visits every dup *after*
+        // the first, plus the one scratch is parked on at the start of the
+        // forward walk.
         //
-        // This reuses the existing retrieve_next(PrevDup/NextDup) logic which
-        // correctly handles BIN boundaries and the two-part key filter.
+        // Pre-fix the formula was `backward + 1 + forward`, which double
+        // counted: the backward walk left scratch on the first dup
+        // already, so the forward walk re-traverses every dup including
+        // the original position.  The result for an N-dup primary observed
+        // at offset `i` was `i + N` instead of `N`.
         if self.is_sorted_dup() {
             let mut scratch = self.dup(true)?;
-            let mut backward: i64 = 0;
+            // Walk backward to the first dup of this primary.  We do not
+            // count these steps — they are pure repositioning.
             while let Ok(OperationStatus::Success) =
                 scratch.retrieve_next(GetMode::PrevDup)
-            {
-                backward += 1;
-            }
-            // scratch is now at the first dup for this primary key.
+            {}
+            // scratch is now parked on the first dup of this primary.
             let mut forward: i64 = 0;
             while let Ok(OperationStatus::Success) =
                 scratch.retrieve_next(GetMode::NextDup)
             {
                 forward += 1;
             }
-            return Ok(backward + 1 + forward);
+            return Ok(forward + 1);
         }
 
         Ok(1)
