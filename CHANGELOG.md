@@ -207,6 +207,19 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   per-workload root-cause analysis and the ROI ordering of waves
   11-I (cursor/BIN), 11-K (recovery), and 11-J (fsync).
 
+### Performance (v2.4.0 — Wave 11-I)
+
+- `Database::get` hot path: eliminated triple tree descent (Wave-11-I).
+  `Tree::search_with_data` folds the previous three separate descents
+  (existence check, data fetch, BIN pinning) into one, and replaces the
+  O(n) `iter().find()` BIN slot lookup with the existing binary-search
+  helper `find_entry_compressed`.
+  - W03 sequential read (100 K): 657 K → 1 413 K ops/s (+115%)
+  - W04 random read (100 K):     438 K → 1 030 K ops/s (+135%)
+  - Both workloads now exceed JE on the same hardware.
+  - Secondary-index / sorted-dup path unchanged.
+  - See `docs/src/internal/wave-11-i-cursor-double-descent.md`.
+
 ## [2.2.1] - 2026-05-27
 
 CI-green release.  Unblocks GitHub Pages and Codeberg Pages publishing.

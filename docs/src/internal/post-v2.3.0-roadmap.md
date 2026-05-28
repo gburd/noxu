@@ -49,7 +49,7 @@ Every wave ships:
 | 11-F | v2.4.0 | Stateright coverage of remaining 6 protocols | merged — [all 11 specs stamped VALIDATED-AS-OF v2.0.0/v2.4.0; 5 strengthened](wave-11-f-stateright-coverage.md) |
 | 11-G | v2.4.0 | Continue JE TCK long-tail port (~30-50 more tests) | merged: +49 PORTED-EQUIVALENT/PARTIAL ([wave-11-g-je-tck-longtail.md](wave-11-g-je-tck-longtail.md)) |
 | 11-H | v2.4.0 | Performance investigation on JE-wins workloads (W03/W04/W10/W11) | merged: per-workload analysis + ROI plan in [wave-11-h-perf-investigation.md](wave-11-h-perf-investigation.md) |
-| 11-I | v2.5.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | gated on 11-H findings |
+| 11-I | v2.4.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | **merged**: W03 +115%, W04 +135%; both now beat JE ([wave-11-i-cursor-double-descent.md](wave-11-i-cursor-double-descent.md)) |
 | 11-J | v2.5.0 | Optimize fsync coalescing (closes W10 gap) | gated on 11-H findings |
 | 11-K | v2.5.0 | Optimize log scanner (closes W11 gap) | gated on 11-H findings |
 | 11-N | v2.3.1 | Sorted-dup cursor bug fixes (4 bugs Wave 11-A/B surfaced) | merged — see `wave-11-n-sorted-dup-cursor-bugs.md`; the 4 #[ignore]'d / safety-cap regression tests are now passing live tests |
