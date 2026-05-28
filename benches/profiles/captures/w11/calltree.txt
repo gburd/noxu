@@ -1,0 +1,120 @@
+    15.67%     9.20%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+    10.93%     2.01%  noxu-perf-profi  libc.so.6             [.] cfree@GLIBC_2.2.5
+            |
+            ---cfree@GLIBC_2.2.5
+
+     9.78%     4.85%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
+               |--6.47%--malloc
+               |          
+                --3.22%--_int_realloc
+                          realloc
+
+     9.70%     9.70%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+
+     8.97%     7.96%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --8.92%--cfree@GLIBC_2.2.5
+
+     7.34%     7.34%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::insert_recursive
+     5.35%     5.27%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |          
+            |--4.49%--__memmove_avx_unaligned_erms
+            |          |          
+            |           --1.00%--_int_realloc
+            |                     realloc
+            |          
+             --0.87%--0xffffffff83801280
+
+     5.35%     3.48%  noxu-perf-profi  libc.so.6             [.] malloc_consolidate
+            |
+            ---malloc_consolidate
+               |          
+               |--4.55%--_int_malloc
+               |          |          
+               |          |--2.57%--_int_realloc
+               |          |          realloc
+               |          |          
+               |           --1.98%--malloc
+               |          
+                --0.80%--_int_free_maybe_consolidate.part.0
+                          _int_free
+                          cfree@GLIBC_2.2.5
+
+     4.94%     0.27%  noxu-perf-profi  libc.so.6             [.] realloc
+            |
+            ---realloc
+
+     4.67%     0.14%  noxu-perf-profi  libc.so.6             [.] _int_realloc
+            |
+            ---_int_realloc
+               realloc
+
+     3.55%     3.55%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::file_manager_scanner::FileManagerLogScanner::parse_entry_from_bytes
+     3.17%     3.17%  noxu-perf-profi  noxu-perf-profiler    [.] bytes::bytes::owned_clone
+     2.93%     2.93%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::insert_with_prefix
+     2.40%     2.40%  noxu-perf-profi  noxu-perf-profiler    [.] bytes::bytes::owned_drop
+     2.27%     2.27%  noxu-perf-profi  libc.so.6             [.] unlink_chunk.isra.0
+            |
+            ---unlink_chunk.isra.0
+               |          
+                --1.86%--malloc_consolidate
+                          |          
+                           --1.54%--_int_malloc
+                                     |          
+                                     |--0.95%--_int_realloc
+                                     |          realloc
+                                     |          
+                                      --0.59%--malloc
+
+     2.10%     2.10%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::insert
+     1.72%     1.72%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::get_full_key
+     1.22%     1.22%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::lock_with_timeout
+     1.02%     1.02%  noxu-perf-profi  noxu-perf-profiler    [.] crc32fast::baseline::update_fast_16
+     0.93%     0.00%  noxu-perf-profi  [unknown]             [.] 0xffffffff83801280
+            |
+            ---0xffffffff83801280
+
+     0.84%     0.84%  noxu-perf-profi  noxu-perf-profiler    [.] __rustc::__rdl_alloc
+     0.80%     0.00%  noxu-perf-profi  libc.so.6             [.] _int_free_maybe_consolidate.part.0
+            |
+            ---_int_free_maybe_consolidate.part.0
+               _int_free
+               cfree@GLIBC_2.2.5
+
+     0.77%     0.77%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree
+     0.73%     0.73%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_recovery::recovery_manager::RecoveryManager::redo_ln
+     0.68%     0.68%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::log_manager::LogManager::collect_dirty_buffers
+     0.67%     0.67%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::compute_key_prefix
+     0.63%     0.63%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::compress_key
+     0.62%     0.62%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_db::database::Database::put
+     0.60%     0.60%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::put
+     0.60%     0.60%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_sync::raw_mutex::thread_id
+     0.57%     0.57%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::log_ln_write
+     0.56%     0.56%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::SplitEntries::slice
+     0.54%     0.54%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::log_manager::LogManager::log_internal
+     0.51%     0.25%  noxu-perf-profi  libc.so.6             [.] fdatasync
+            |
+            ---fdatasync
+
+     0.50%     0.50%  noxu-perf-profi  noxu-perf-profiler    [.] std::thread::current::current
+     0.50%     0.50%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_recovery::recovery_manager::RecoveryManager::find_last_checkpoint
+
+
+    22.89%    11.15%  noxu-perf-profi  libc.so.6           [.] malloc
+            |
+            ---malloc
+
+    12.73%    10.11%  noxu-perf-profi  libc.so.6           [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
