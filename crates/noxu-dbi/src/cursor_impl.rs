@@ -897,7 +897,13 @@ impl CursorImpl {
             }
         };
 
-        let entry: Option<(Vec<u8>, Vec<u8>, usize, u64, std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>)> = {
+        let entry: Option<(
+            Vec<u8>,
+            Vec<u8>,
+            usize,
+            u64,
+            std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+        )> = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 tree.first_entry_at_or_after_with_index(&search_two_part_key)
@@ -2503,9 +2509,8 @@ impl CursorImpl {
     fn find_bin_arc_for_key(
         &self,
         key: &[u8],
-    ) -> Option<
-        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
-    > {
+    ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
+    {
         let db = self.db_impl.read();
         let tree = db.get_real_tree()?;
         let root = tree.get_root()?;
