@@ -5,9 +5,11 @@
 //! record`/`perf report`/`flamegraph`/`samply`.
 //!
 //! Usage:
-//!   noxu-perf-profiler --workload <w03|w04|w10|w11> --scale <N>
-//!     [--threads <T>]              (W10 only, default 8)
-//!     [--repeats <R>]              (default 1)
+//!   `noxu-perf-profiler --workload <WORKLOAD> --scale <N>`
+//!     `[--threads <T>]`              (W10 only, default 8)
+//!     `[--repeats <R>]`              (default 1)
+//!
+//! Where `<WORKLOAD>` is one of `w03`, `w04`, `w10`, `w11`.
 //!
 //! W03/W04 pre-populate then loop reads (the profiler hot path is the
 //! read loop only).
