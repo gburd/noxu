@@ -124,6 +124,28 @@ full per-bug analysis.
 * `docs/src/operations/benchmarks.md`: new W13 and "Real-storage
 W10 / W11 re-run" sections.
 
+### Changed
+
+- **Stateright spec coverage (Wave 11-F)** — every protocol modelled
+  in `noxu-spec` is now stamped with an explicit `VALIDATED-AS-OF`
+  version in its module preamble.  Five models were also
+  strengthened with new or upgraded invariants:
+  * `wal_commit::FsyncedNeverDecreases` is now a true 2-state
+    monotonicity invariant (was a coarse termination check).
+  * `recovery_three_phase::IdempotentReplay` is now a true 2-state
+    idempotency invariant (snapshot the materialisation after the
+    first redo; assert subsequent redos yield the same vector).
+  * `cleaner_safety::LiveCheckHonoured` (new) — every deleted file
+    must have its `cleared_for_delete` bit cleared at the moment
+    of deletion.
+  * `cache_vs_cleaner::MigratedReflectsDisk` (new) — every committed
+    migration must equal the cleaner's pre-migration snapshot.
+  * `xa_two_phase_commit::RecoveryConsistent` (new) — closes the
+    original module-preamble TODO with a 2-state pre-crash /
+    post-recovery decision-consistency predicate.
+
+  All 11 specs continue to pass under `make spec` in ~31 seconds.
+
 ## [2.2.1] - 2026-05-27
 
 CI-green release.  Unblocks GitHub Pages and Codeberg Pages publishing.
