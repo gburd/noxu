@@ -154,3 +154,4 @@
   - [Wave 11-F — Stateright spec coverage expansion](internal/wave-11-f-stateright-coverage.md)
   - [Wave 11-E — Property test expansion](internal/wave-11-e-property-tests.md)
   - [Wave 11-G — JE TCK long-tail port](internal/wave-11-g-je-tck-longtail.md)
+  - [Wave 11-H — Performance investigation on JE-wins workloads](internal/wave-11-h-perf-investigation.md)

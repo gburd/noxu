@@ -1,0 +1,15 @@
+[package]
+name = "noxu-perf-profiler"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Per-workload single-shot profiler for wave 11-H investigation"
+
+[[bin]]
+name = "noxu-perf-profiler"
+path = "src/main.rs"
+
+[dependencies]
+noxu-db = { workspace = true }
+tempfile = "3"
+rand = { version = "0.8", features = ["small_rng"] }

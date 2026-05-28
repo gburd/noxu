@@ -1,0 +1,50 @@
+    14.56%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+               |          
+                --0.73%--equal_same_length<u8, u8> (inlined)
+                          eq<u8, u8> (inlined)
+                          eq<[u8], [u8]> (inlined)
+                          {closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     6.79%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::find_bin_for_key
+     4.05%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::lock_with_timeout
+     3.51%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree
+     3.46%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::find_entry_compressed
+     3.15%  noxu-perf-profi  noxu-perf-profiler    [.] crc32fast::baseline::update_fast_16
+     2.89%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --2.72%--cfree@GLIBC_2.2.5
+
+     2.66%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+
+     2.32%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::search
+     1.91%  noxu-perf-profi  noxu-perf-profiler    [.] std::thread::current::current
+     1.89%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+     1.81%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
+                --1.63%--malloc
+
+     1.69%  noxu-perf-profi  libc.so.6             [.] cfree@GLIBC_2.2.5
+            |
+            ---cfree@GLIBC_2.2.5
+
+     1.57%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::txn::Txn::commit_with_durability
+     1.31%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_sync::raw_mutex::thread_id
+     1.24%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::file_manager::FileManager::get_file_handle
+     1.24%  noxu-perf-profi  libc.so.6             [.] unlink_chunk.isra.0
+            |
+            ---unlink_chunk.isra.0

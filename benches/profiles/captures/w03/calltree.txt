@@ -1,0 +1,120 @@
+    15.09%    15.09%  noxu-perf-profi  libc.so.6             [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+               |          
+                --0.56%--equal_same_length<u8, u8> (inlined)
+                          eq<u8, u8> (inlined)
+                          eq<[u8], [u8]> (inlined)
+                          {closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     5.65%     1.66%  noxu-perf-profi  libc.so.6             [.] malloc
+            |
+            ---malloc
+
+     5.18%     5.18%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::find_bin_for_key
+     4.78%     3.19%  noxu-perf-profi  libc.so.6             [.] _int_malloc
+            |
+            ---_int_malloc
+               |          
+                --3.99%--malloc
+
+     3.93%     1.63%  noxu-perf-profi  libc.so.6             [.] cfree@GLIBC_2.2.5
+            |
+            ---cfree@GLIBC_2.2.5
+
+     3.21%     3.21%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::search
+     2.97%     2.97%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::lock_with_timeout
+     2.60%     2.60%  noxu-perf-profi  noxu-perf-profiler    [.] crc32fast::baseline::update_fast_16
+     2.43%     2.43%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::get_data_from_tree
+     2.43%     2.43%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::lock_manager::LockManager::release
+     2.41%     2.41%  noxu-perf-profi  libc.so.6             [.] _int_free
+            |
+            ---_int_free
+               |          
+                --2.30%--cfree@GLIBC_2.2.5
+
+     2.30%     2.30%  noxu-perf-profi  noxu-perf-profiler    [.] std::thread::current::current
+     1.95%     1.95%  noxu-perf-profi  noxu-perf-profiler    [.] core::ptr::drop_in_place<noxu_dbi::cursor_impl::CursorImpl>
+     1.81%     1.81%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_sync::raw_mutex::thread_id
+     1.65%     1.65%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::search
+     1.63%     1.63%  noxu-perf-profi  libc.so.6             [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+
+     1.38%     1.38%  noxu-perf-profi  noxu-perf-profiler    [.] alloc::fmt::format::format_inner
+     1.29%     1.05%  noxu-perf-profi  libc.so.6             [.] malloc_consolidate
+            |
+            ---malloc_consolidate
+               |          
+                --1.21%--_int_malloc
+                          |          
+                           --1.05%--malloc
+
+     1.28%     1.28%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::log_manager::LogManager::log_internal
+     1.18%     0.44%  noxu-perf-profi  libc.so.6             [.] realloc
+            |
+            ---realloc
+
+     1.13%     1.13%  noxu-perf-profi  noxu-perf-profiler    [.] <core::fmt::Formatter>::pad_integral
+     1.10%     1.10%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::unpin_bin
+     1.08%     0.66%  noxu-perf-profi  libc.so.6             [.] fdatasync
+            |          
+             --1.02%--fdatasync
+
+     1.05%     1.05%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_db::database::Database::put
+     0.99%     0.99%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_dbi::cursor_impl::CursorImpl::put
+     0.94%     0.94%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::BinStub::find_entry_compressed
+     0.86%     0.86%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::insert
+     0.85%     0.22%  noxu-perf-profi  libc.so.6             [.] _int_realloc
+            |
+            ---_int_realloc
+               |          
+                --0.74%--realloc
+
+     0.84%     0.52%  noxu-perf-profi  libc.so.6             [.] __libc_calloc
+            |
+            ---__libc_calloc
+
+     0.80%     0.80%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_txn::txn::Txn::commit_with_durability
+     0.78%     0.00%  noxu-perf-profi  [unknown]             [.] 0x0000000000000002
+            |
+            ---0x2
+               |          
+                --0.69%--0x1f3
+
+     0.77%     0.00%  noxu-perf-profi  noxu-perf-profiler    [.] get_data_from_tree (inlined)
+            |
+            ---get_data_from_tree (inlined)
+               |          
+                --0.69%--0x2
+                          0x1f3
+
+     0.77%     0.00%  noxu-perf-profi  noxu-perf-profiler    [.] eq<[u8], [u8]> (inlined)
+            |
+            ---eq<[u8], [u8]> (inlined)
+               |          
+                --0.69%--{closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     0.77%     0.00%  noxu-perf-profi  noxu-perf-profiler    [.] eq<u8, u8> (inlined)
+            |
+            ---eq<u8, u8> (inlined)
+               eq<[u8], [u8]> (inlined)
+               |          
+                --0.69%--{closure#0} (inlined)
+                          find<noxu_tree::tree::BinEntry, noxu_dbi::cursor_impl::{impl#0}::get_data_from_tree::{closure_env#0}> (inlined)
+                          get_data_from_tree (inlined)
+                          0x2
+                          0x1f3
+
+     0.77%     0.77%  noxu-perf-profi  noxu-perf-profiler    [.] <alloc::string::String as core::fmt::Write>::write_char
+     0.76%     0.76%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_log::file_manager::FileManager::file_path
+     0.75%     0.75%  noxu-perf-profi  noxu-perf-profiler    [.] noxu_tree::tree::Tree::get_resident_root_in
+     0.74%     0.00%  noxu-perf-profi  noxu-perf-profiler    [.] log_internal (inlined)
