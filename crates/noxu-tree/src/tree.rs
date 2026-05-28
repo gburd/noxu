@@ -1537,9 +1537,7 @@ impl Tree {
                 let (found, data, lsn) = match &*guard {
                     TreeNode::Bottom(bin) => {
                         let (idx, exact) = match &self.key_comparator {
-                            Some(cmp) => {
-                                bin.find_entry_cmp(key, cmp.as_ref())
-                            }
+                            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                             None => bin.find_entry_compressed(key),
                         };
                         if exact {
@@ -1584,8 +1582,7 @@ impl Tree {
                     for (i, entry) in n.entries.iter().enumerate() {
                         if i == 0 {
                             idx = 0;
-                        } else if self
-                            .key_cmp(entry.key.as_slice(), key)
+                        } else if self.key_cmp(entry.key.as_slice(), key)
                             != std::cmp::Ordering::Greater
                         {
                             idx = i;
