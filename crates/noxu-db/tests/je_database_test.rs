@@ -544,9 +544,8 @@ fn multi_env_open_close_test_multi_open_close() {
         let db_cfg = DatabaseConfig::new()
             .with_allow_create(true)
             .with_transactional(true);
-        let db = env
-            .open_database(None, "MultiEnvOpenCloseTest", &db_cfg)
-            .unwrap();
+        let db =
+            env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         let value = vec![0u8; DATA_SIZE];
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..N_RECORDS {
@@ -576,13 +575,16 @@ fn multi_env_open_close_test_multi_open_close() {
         let db_cfg = DatabaseConfig::new()
             .with_transactional(true)
             .with_allow_create(true);
-        let db = env
-            .open_database(None, "MultiEnvOpenCloseTest", &db_cfg)
-            .unwrap();
+        let db =
+            env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         for i in 0..N_RECORDS {
             let mut out = DatabaseEntry::new();
             let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(OperationStatus::Success, s, "k={i} should survive reopen");
+            assert_eq!(
+                OperationStatus::Success,
+                s,
+                "k={i} should survive reopen"
+            );
         }
         db.close().unwrap();
         drop(env);
