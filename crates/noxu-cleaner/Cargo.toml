@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
+proptest = { workspace = true }
 tempfile = "3"
 
 [lints]
