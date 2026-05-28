@@ -250,7 +250,7 @@ proptest! {
 
         let mut inp = TupleInput::new(&bytes);
         let decoded = <Vec<u8>>::decode_sort_key(&mut inp).unwrap();
-        prop_assert_eq!(decoded.clone(), v);
+        prop_assert_eq!(&decoded, &v);
 
         // Reverse direction: re-encode decoded value yields same bytes.
         let mut out2 = TupleOutput::new();
