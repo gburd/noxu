@@ -33,6 +33,7 @@ members = [
     "crates/noxu-spec",
     "benches/comparison",
     "benches/noxu-bench",
+    "benches/profiles",
     "examples/cash",
     "examples/cask",
     "examples/ftdb",
