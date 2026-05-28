@@ -1,0 +1,7 @@
+# Wave 11-H per-workload profiler captures
+#
+# perf.data files are large (50-150 MB each) and machine-specific —
+# only the text summaries (top_self.txt, calltree.txt) are committed.
+*.perf.data
+flamegraph.svg
+*.folded

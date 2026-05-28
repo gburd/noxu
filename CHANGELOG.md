@@ -16,6 +16,7 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Added (v2.4.0 — Wave 11-D)
 
 - **First-class in-memory replication transport.** Wave 11-D promotes
@@ -198,6 +199,14 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   the most recently committed records to be lost on the next env open.
 - `truncate_survives_clean_close_reopen` — Noxu's `truncate_database`
   is not durable across a clean close+reopen.
+
+### Added (v2.4.0 — Wave 11-H)
+
+- Wave 11-H: per-workload `perf` profile captures (W03/W04/W10/W11)
+  and a single-workload profiler harness under `benches/profiles/`.
+  See `docs/src/internal/wave-11-h-perf-investigation.md` for the
+  per-workload root-cause analysis and the ROI ordering of waves
+  11-I (cursor/BIN), 11-K (recovery), and 11-J (fsync).
 
 ## [2.2.1] - 2026-05-27
 
