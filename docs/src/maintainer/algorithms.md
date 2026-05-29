@@ -62,7 +62,7 @@ Merge-Tree (LSM-Tree)", *Acta Informatica* 1996.
 
 **Source**: `crates/noxu-txn/src/lock_manager.rs`
 
-`waiter_graph: Mutex<HashMap<i64, Vec<i64>>>` maps blocker→[waiters].
+`waiter_graph: Mutex<HashMap<i64, Vec<i64>>>` maps waiter→[owner_ids it is blocked by].
 Maintained incrementally (O(1) per lock acquisition/release).
 
 Cycle detection: DFS from each node. Youngest transaction (by txn_id) in the
