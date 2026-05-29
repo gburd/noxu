@@ -521,7 +521,7 @@ pub fn verify_database_impl(
 ) -> VerifyResult {
     let db_name = db_impl.get_name();
     match db_impl.get_real_tree() {
-        Some(tree) => verify_tree(tree, db_name, config),
+        Some(tree) => verify_tree(&*tree, db_name, config),
         None => {
             // No real B-tree attached (e.g., stub / metadata DB) — treat as empty.
             VerifyResult {
