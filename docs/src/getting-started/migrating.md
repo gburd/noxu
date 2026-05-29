@@ -512,3 +512,38 @@ let bytes_freed: usize = env.evict_memory()?;
 ```
 
 These are additive (non-breaking) additions to the public API.
+
+---
+
+## v3.0.0 — Wave 11-T Cross-Feature Correctness Fixes
+
+### X-5: `CleanResult::files_deleted` semantics changed
+
+Previously `Cleaner::do_clean()` deleted files immediately in the same pass,
+so `CleanResult::files_deleted` was always equal to `files_cleaned` (minus
+protected files).
+
+After the X-5 checkpoint-barrier fix, files are only deleted **after two
+successive checkpoints** have captured the migration.  During the cleaning pass
+itself, `files_deleted` will be **0** (or a small non-zero value if files from
+a prior cleaning cycle have now passed the barrier).
+
+**Migration**: if your code asserts `result.files_deleted > 0` immediately after
+`do_clean()`, update it to call `cleaner.delete_safe_files()` explicitly after
+triggering two checkpoints, or rely on the background checkpointer to advance
+the barrier automatically.
+
+### X-13: `EnvironmentImpl::is_invalid` type changed to `Arc<AtomicBool>`
+
+Internal API only (`noxu-dbi`).  If you directly access
+`EnvironmentImpl::is_invalid` (e.g. in integration-test mocks), change the
+field access to use the new `is_invalid_flag()` method which returns an
+`Arc<AtomicBool>`.
+
+### X-3: `ReplicaAckCoordinator` trait: new default method
+
+The `ReplicaAckCoordinator` trait gained
+`alloc_vlsn_for_recovered_commit(&self, lsn: Lsn) -> u64` with a default
+implementation that returns 0 (NULL_VLSN — correct for non-replicated envs).
+No action is required unless you have a custom `ReplicaAckCoordinator` impl
+that should assign VLSNs to recovered XA commits.

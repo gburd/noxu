@@ -416,7 +416,8 @@ impl EnvironmentImpl {
             recovered_prepared_lns = recovery_info.prepared_txn_lns;
             // X-14 / X-1: stash VLSN rebuild data.
             recovery_vlsns = recovery_info.recovered_vlsns;
-            recovery_rollback_matchpoint = recovery_info.rollback_matchpoint_lsn;
+            recovery_rollback_matchpoint =
+                recovery_info.rollback_matchpoint_lsn;
 
             // Install all recovered trees keyed by db_id so that
             // open_database() can transplant each into the matching DatabaseImpl.

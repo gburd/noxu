@@ -1277,7 +1277,9 @@ impl Environment {
                 log::debug!(
                     "write_txn_commit_for_recovered: txn_id={} commit_lsn={:?} \
                      assigned vlsn={}",
-                    txn_id, commit_lsn, vlsn
+                    txn_id,
+                    commit_lsn,
+                    vlsn
                 );
             }
         }
@@ -1514,14 +1516,12 @@ fn write_txn_end_for_recovered(
     let mut buf = BytesMut::with_capacity(entry.log_size());
     entry.write_to_log(&mut buf);
 
-    lm.log(entry_type, &buf, Provisional::No, flush, fsync).map_err(
-        |e| {
-            NoxuError::environment_with_reason(
-                crate::error::EnvironmentFailureReason::LogWrite,
-                e.to_string(),
-            )
-        },
-    )
+    lm.log(entry_type, &buf, Provisional::No, flush, fsync).map_err(|e| {
+        NoxuError::environment_with_reason(
+            crate::error::EnvironmentFailureReason::LogWrite,
+            e.to_string(),
+        )
+    })
 }
 
 impl Drop for Environment {
@@ -2365,11 +2365,13 @@ mod tests {
     /// `alloc_vlsn_for_recovered_commit` must be called with a non-NULL LSN.
     #[test]
     fn test_x3_recovered_commit_calls_alloc_vlsn() {
-        use std::sync::atomic::{AtomicU64, Ordering as AO};
-        use std::sync::Arc;
-        use std::time::Duration;
-        use noxu_dbi::{AckWaitError, ReplicaAckCoordinator, ReplicaAckPolicyKind};
+        use noxu_dbi::{
+            AckWaitError, ReplicaAckCoordinator, ReplicaAckPolicyKind,
+        };
         use noxu_util::Lsn;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering as AO};
+        use std::time::Duration;
 
         // Mock coordinator that records the LSN passed to alloc_vlsn_for_recovered_commit.
         struct MockCoord {

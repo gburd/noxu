@@ -61,7 +61,7 @@ Every wave ships:
 | 11-S | v2.5.0 | UX + docs + cleanup from 2026-05 audit (H-1, H-3, H-5–H-8, Q-1, Q-2, Q-6, Q-7) | **merged** — 5792 tests passing; Database::iter/range, abort lock-hold fix, log-alloc reduction, on-disk-format corrected, CursorImpl::search index bug fixed; see [wave-11-s-ux-cleanup.md](wave-11-s-ux-cleanup.md) |
 | 11-R | v3.0.0 | Breaking semantic correctness from 2026-05 audit (C-4, C-5, C-6, C-8, Q-3, Q-4) | **merged** — open_database txn rollback, BIN delta guards, recovery MapLN two-pass scaffold, SR9465/SR9752 (already fixed in Wave 5), evict_memory()/compress(), recovery test fidelity; see [wave-11-r-semantic.md](wave-11-r-semantic.md) |
 | 11-W | (audit) | Cross-feature / end-to-end second-pass audit | **complete** — 14 new findings (3 critical: X-3 XA×rep NULL_VLSN, X-5 cleaner×ckpt barrier, X-15 rollback interval); feeds Wave 11-T |
-| 11-T | v2.5.x / v3.0.0 | Cross-feature critical fixes from 11-W (X-3, X-5, X-15 + high-sev X-1/4/6/10/11/12/13/14) | **queued** |
+| 11-T | v3.0.0 | Cross-feature critical fixes from 11-W (X-3, X-5, X-15 + high-sev X-1/4/6/10/11/12/13/14) | **merged** — 7 items fixed (X-1, X-3, X-5, X-6, X-13, X-14, X-15), 5807 tests; X-2/4/7/8/10/11/12 deferred; see [wave-11-t-crossfeature.md](wave-11-t-crossfeature.md) |
 
 ## Acceptance gates per wave
 

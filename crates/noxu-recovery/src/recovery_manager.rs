@@ -551,10 +551,8 @@ impl RecoveryManager {
 
         // X-1: record the minimum rollback matchpoint so ReplicatedEnvironment
         // can truncate the VLSN index to match the recovered B-tree state.
-        self.info.rollback_matchpoint_lsn = self
-            .rollback_tracker
-            .safe_matchpoint_lsn()
-            .map(|lsn| lsn.as_u64());
+        self.info.rollback_matchpoint_lsn =
+            self.rollback_tracker.safe_matchpoint_lsn().map(|lsn| lsn.as_u64());
 
         // Wave 3-2: surface prepared (XA in-doubt) txns to the env layer.
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
@@ -2883,14 +2881,15 @@ mod tests {
     /// (vlsn, lsn) pairs from every LN in the redo pass that carries a VLSN.
     #[test]
     fn test_x14_recovered_vlsns_populated() {
-        use crate::log_scanner::LnOperation;
-
         let mut scanner = InMemoryLogScanner::new();
 
         // Committed txn 1 with a VLSN on the LN.
         scanner.push(
             lsn(1, 100),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(1, 100) }),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 1,
+                lsn: lsn(1, 100),
+            }),
         );
         // LN with vlsn=5.
         let mut ln_with_vlsn = make_insert(1, Some(1), b"vkey", NULL_LSN);
@@ -2900,7 +2899,10 @@ mod tests {
         // Committed txn 2 with a different VLSN.
         scanner.push(
             lsn(1, 300),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 2, lsn: lsn(1, 300) }),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 2,
+                lsn: lsn(1, 300),
+            }),
         );
         let mut ln_with_vlsn2 = make_insert(1, Some(2), b"vkey2", NULL_LSN);
         ln_with_vlsn2.vlsn = Some(7);
@@ -2912,7 +2914,8 @@ mod tests {
         let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
 
         // Both VLSN entries must be in recovered_vlsns.
-        let vlsns: Vec<u64> = info.recovered_vlsns.iter().map(|&(v, _)| v).collect();
+        let vlsns: Vec<u64> =
+            info.recovered_vlsns.iter().map(|&(v, _)| v).collect();
         assert!(
             vlsns.contains(&5),
             "X-14: vlsn=5 must be in recovered_vlsns, got: {vlsns:?}"
@@ -2933,7 +2936,10 @@ mod tests {
         // end at lsn(1,400).
         scanner.push(
             lsn(1, 50),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 99, lsn: lsn(1, 50) }),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 99,
+                lsn: lsn(1, 50),
+            }),
         );
         scanner.push(
             lsn(1, 300),

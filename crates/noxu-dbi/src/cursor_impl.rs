@@ -673,10 +673,7 @@ impl CursorImpl {
         // Both the explicit invalidation flag and the I/O-failure flag
         // (io_invalid) are tested so that reads on a failed environment
         // return EnvironmentFailure rather than stale BIN data.
-        if self
-            .env_invalid
-            .as_ref()
-            .map_or(false, |f| f.load(Ordering::Acquire))
+        if self.env_invalid.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
         {
             return Err(DbiError::EnvironmentFailure {
                 reason: "environment has been invalidated".into(),
@@ -685,7 +682,7 @@ impl CursorImpl {
         if self
             .log_manager
             .as_ref()
-            .map_or(false, |lm| lm.io_invalid.load(Ordering::Acquire))
+            .is_some_and(|lm| lm.io_invalid.load(Ordering::Acquire))
         {
             return Err(DbiError::EnvironmentFailure {
                 reason: "I/O failure: environment invalidated by fsync error"

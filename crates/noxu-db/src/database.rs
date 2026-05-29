@@ -439,7 +439,13 @@ impl Database {
         let throughput = db_impl.read().throughput.clone();
         // Cache the manager Arcs at construction so hot-path operations
         // (get/put/delete) never need to re-acquire env_impl.lock().
-        let (lock_manager, log_manager, cleaner_throttle, txn_manager, env_invalid) = {
+        let (
+            lock_manager,
+            log_manager,
+            cleaner_throttle,
+            txn_manager,
+            env_invalid,
+        ) = {
             let env = env_impl.lock();
             let lm = Arc::clone(env.get_lock_manager());
             let logm = env.get_log_manager();
@@ -1580,11 +1586,12 @@ impl Database {
         if self
             .log_manager
             .as_ref()
-            .map_or(false, |lm| lm.io_invalid.load(Ordering::Acquire))
+            .is_some_and(|lm| lm.io_invalid.load(Ordering::Acquire))
         {
             return Err(NoxuError::environment_with_reason(
                 crate::error::EnvironmentFailureReason::LogWrite,
-                "I/O failure: environment invalidated by fsync error".to_string(),
+                "I/O failure: environment invalidated by fsync error"
+                    .to_string(),
             ));
         }
         if !self.open.load(Ordering::Acquire) {
@@ -2589,7 +2596,8 @@ mod tests {
         // The cursor's check_state should detect the flag.
         let mut key = DatabaseEntry::new();
         let mut out = DatabaseEntry::new();
-        let result = cursor.get(&mut key, &mut out, crate::get::Get::First, None);
+        let result =
+            cursor.get(&mut key, &mut out, crate::get::Get::First, None);
         assert!(
             matches!(result, Err(NoxuError::EnvironmentFailure { .. })),
             "expected EnvironmentFailure from cursor, got {result:?}"

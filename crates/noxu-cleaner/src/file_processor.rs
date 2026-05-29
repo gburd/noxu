@@ -67,17 +67,17 @@ fn write_migration_ln(
 
     let entry = LnLogEntry::new(
         db_id,
-        None,    // txn_id: non-transactional migration
-        old_lsn, // abort_lsn: the pre-migration slot LSN (before-image)
-        false,   // abort_known_deleted
-        None,    // abort_key
-        None,    // abort_data
+        None,      // txn_id: non-transactional migration
+        old_lsn,   // abort_lsn: the pre-migration slot LSN (before-image)
+        false,     // abort_known_deleted
+        None,      // abort_key
+        None,      // abort_data
         NULL_VLSN, // abort_vlsn
-        0,       // abort_expiration
-        true,    // embedded_ln (data inline in BIN)
+        0,         // abort_expiration
+        true,      // embedded_ln (data inline in BIN)
         key.to_vec(),
         Some(data.to_vec()),
-        0,       // expiration
+        0,         // expiration
         NULL_VLSN, // vlsn
     );
 
@@ -783,9 +783,14 @@ impl TreeLookup for SharedTreeLookup {
         };
 
         let db_id_u64 = _db_id.unsigned_abs();
-        let new_lsn =
-            write_migration_ln(&self.log_manager, db_id_u64, key, &data, log_lsn)
-                .unwrap_or_else(|| self.log_manager.get_end_of_log());
+        let new_lsn = write_migration_ln(
+            &self.log_manager,
+            db_id_u64,
+            key,
+            &data,
+            log_lsn,
+        )
+        .unwrap_or_else(|| self.log_manager.get_end_of_log());
 
         let result =
             self.tree.read().map(|t| t.insert(key.to_vec(), data, new_lsn));

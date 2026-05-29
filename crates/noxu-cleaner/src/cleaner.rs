@@ -827,8 +827,7 @@ impl Cleaner {
                 // File is still protected — re-queue for later deletion.
                 self.pending_deletions.lock().push(file_number);
                 // Also restore in the selector so the barrier is not lost.
-                self.file_selector.lock()
-                    .add_safe_to_delete_back(file_number);
+                self.file_selector.lock().add_safe_to_delete_back(file_number);
             }
         }
         deleted
@@ -1430,15 +1429,20 @@ mod tests {
 
         // Simulate two checkpoints to advance the barrier.
         {
-            let state1 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            let state1 =
+                cleaner.get_file_selector().lock().get_checkpoint_state();
             cleaner.after_checkpoint(&state1);
-            let state2 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            let state2 =
+                cleaner.get_file_selector().lock().get_checkpoint_state();
             cleaner.after_checkpoint(&state2);
         }
 
         // Now delete_safe_files should remove the file.
         let deleted = cleaner.delete_safe_files();
-        assert_eq!(deleted, 1, "one file must be deleted after two checkpoints");
+        assert_eq!(
+            deleted, 1,
+            "one file must be deleted after two checkpoints"
+        );
         assert!(
             !file_path.exists(),
             "log file must be gone from disk after checkpoint barrier fires"
@@ -1686,14 +1690,19 @@ mod tests {
 
         // Advance through the two-checkpoint barrier.
         {
-            let state1 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            let state1 =
+                cleaner.get_file_selector().lock().get_checkpoint_state();
             cleaner.after_checkpoint(&state1);
-            let state2 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            let state2 =
+                cleaner.get_file_selector().lock().get_checkpoint_state();
             cleaner.after_checkpoint(&state2);
         }
         let deleted = cleaner.delete_safe_files();
         assert_eq!(deleted, 1);
-        assert!(!file_path.exists(), "cleaned file must be removed from disk after barrier");
+        assert!(
+            !file_path.exists(),
+            "cleaned file must be removed from disk after barrier"
+        );
 
         // TxnCommit entries are classified as Other → not migrated.
         let stats = cleaner.get_stats().snapshot();
@@ -1721,22 +1730,39 @@ mod tests {
 
         {
             use bytes::BytesMut;
-            use noxu_log::{LogEntryType, Provisional};
             use noxu_log::entry::LnLogEntry;
+            use noxu_log::{LogEntryType, Provisional};
             use noxu_util::vlsn::NULL_VLSN;
 
             let entry = LnLogEntry::new(
-                db_id, None, old_lsn, false, None, None,
-                NULL_VLSN, 0, true,
-                key.to_vec(), Some(data.to_vec()), 0, NULL_VLSN,
+                db_id,
+                None,
+                old_lsn,
+                false,
+                None,
+                None,
+                NULL_VLSN,
+                0,
+                true,
+                key.to_vec(),
+                Some(data.to_vec()),
+                0,
+                NULL_VLSN,
             );
             let mut buf = BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);
-            let new_lsn = lm.log(
-                LogEntryType::UpdateLN, &buf, Provisional::No, false, false,
-            ).expect("X-6: migration log write must succeed");
+            let new_lsn = lm
+                .log(
+                    LogEntryType::UpdateLN,
+                    &buf,
+                    Provisional::No,
+                    false,
+                    false,
+                )
+                .expect("X-6: migration log write must succeed");
             assert_ne!(
-                new_lsn.as_u64(), 0,
+                new_lsn.as_u64(),
+                0,
                 "X-6: migration must return a real non-NULL LSN"
             );
         }
