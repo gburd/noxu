@@ -688,4 +688,108 @@ mod tests {
         let m3 = FsyncManager::new(2, 100);
         assert!(m3.grp_wait_on);
     }
+
+    // ── Wave 11-J: fsync-before-commit invariant ───────────────────────────
+    //
+    // Property test: every committed transaction's LSN is fdatasync'd before
+    // `txn.commit()` returns.
+    //
+    // Simulation: N concurrent committers each record a monotonically
+    // increasing "commit LSN".  The `do_fsync` closure advances `flushed_lsn`
+    // to cover all LSNs seen so far.  After `FsyncManager::fsync()` returns
+    // for committer T at LSN L, we assert `flushed_lsn >= L`.
+    //
+    // This test was added in Wave 11-J as the crash-safety coverage required
+    // by `docs/src/internal/wave-11-h-perf-investigation.md` (W10 section).
+
+    /// Fsync-before-commit invariant: `flushed_lsn >= commit_lsn` after
+    /// `FsyncManager::fsync()` returns for every concurrent committer.
+    #[test]
+    fn test_fsync_before_commit_invariant() {
+        use std::sync::atomic::AtomicU64;
+
+        const N_THREADS: usize = 8;
+        const OPS_PER_THREAD: usize = 200;
+
+        // Shared monotonic LSN counter: each committer gets a unique LSN.
+        let next_lsn = Arc::new(AtomicU64::new(1));
+        // Maximum LSN covered by a completed fdatasync.
+        let flushed_lsn = Arc::new(AtomicU64::new(0));
+        // Running maximum of all registered commit LSNs (used by do_fsync to
+        // know what range it must durably cover).
+        let snap_lsn = Arc::new(AtomicU64::new(0));
+
+        let mgr = Arc::new(FsyncManager::new(2, 5));
+        let barrier = Arc::new(std::sync::Barrier::new(N_THREADS));
+        let mut handles = vec![];
+
+        for _ in 0..N_THREADS {
+            let mgr2 = Arc::clone(&mgr);
+            let b = Arc::clone(&barrier);
+            let nl = Arc::clone(&next_lsn);
+            let fl = Arc::clone(&flushed_lsn);
+            let sl = Arc::clone(&snap_lsn);
+
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+
+                for _ in 0..OPS_PER_THREAD {
+                    // "Write commit record" — assign a unique LSN.
+                    let my_lsn =
+                        nl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                    // Advance snap_lsn to at least my_lsn so do_fsync knows
+                    // it must cover my_lsn when it executes.
+                    let mut cur = sl.load(std::sync::atomic::Ordering::Relaxed);
+                    while cur < my_lsn {
+                        match sl.compare_exchange(
+                            cur,
+                            my_lsn,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(a) => cur = a,
+                        }
+                    }
+
+                    // Request fsync.  The closure "syncs" by advancing
+                    // flushed_lsn to the current snap_lsn.
+                    let fl2 = Arc::clone(&fl);
+                    let sl2 = Arc::clone(&sl);
+                    mgr2.fsync(move || {
+                        let covered =
+                            sl2.load(std::sync::atomic::Ordering::SeqCst);
+                        let mut f =
+                            fl2.load(std::sync::atomic::Ordering::Relaxed);
+                        while f < covered {
+                            match fl2.compare_exchange(
+                                f,
+                                covered,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(a) => f = a,
+                            }
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+
+                    // Post-condition: flushed_lsn must be ≥ my_lsn.
+                    let fl_now = fl.load(std::sync::atomic::Ordering::SeqCst);
+                    assert!(
+                        fl_now >= my_lsn,
+                        "fsync-before-commit violated: \
+                         flushed_lsn={fl_now} < commit_lsn={my_lsn}"
+                    );
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }
