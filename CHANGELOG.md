@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [v2.4.1] — 2026-05-29
+
+### Fixed
+
+- `noxu-rep::phi_detector_test::test_master_tracker_phi_mode` is no longer
+  `#[ignore]`'d.  Wave 9-A's de-flake reduced but did not eliminate a
+  ~20 % miss rate on dev machines under workspace test load.  The miss
+  was traced to the test's first assertion ("master must be alive right
+  after heartbeats"), which is fundamentally racy: phi is computed from
+  `last_heartbeat.elapsed()`, so any scheduler delay between the final
+  `record_heartbeat()` and the `is_master_alive()` check briefly inflates
+  phi above the 1.0 threshold even when no master failure occurred.  The
+  fix removes that racy assertion (the deterministic alive-after-heartbeats
+  invariant is already covered by unit tests in `master_tracker.rs` and
+  `phi_accrual.rs` with controlled clocks) and keeps only the
+  monotonic, timing-robust failure-detection assertions.  Verified with
+  8 consecutive successful runs.
+
 ## [v2.4.0] — 2026-05-28
 
 ### Known issues
@@ -27,7 +45,7 @@ listed in [References](#references).
   scheduler delay between the last `record_heartbeat()` and the
   `is_master_alive()` call pushes phi briefly above the 1.0 threshold). The
   proper fix is deterministic phi-clock injection or restructuring the
-  test; tracked for a follow-up wave.
+  test; tracked for a follow-up wave.  *(Closed in v2.4.1.)*
 
 ## [v2.3.2] — 2026-05-28
 

@@ -123,13 +123,6 @@ fn test_suspected_above_threshold() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "timing-sensitive: Wave 9-A fix #3 reduced the miss rate but ~20% \
-           failures still occur on dev machines under workspace test load \
-           (the first assertion 'master must be alive right after heartbeats' \
-           trips when scheduler delay between the last record_heartbeat() and \
-           is_master_alive() pushes phi briefly above 1.0). Real fix is to \
-           change the test to use a deterministic phi-clock injection or to \
-           drop the immediate-alive assertion. Tracked in TODO/follow-up."]
 fn test_master_tracker_phi_mode() {
     let det = PhiAccrualDetector::new(1.0, 50);
     let tracker = MasterTracker::new(Duration::from_secs(10)).with_phi(det);
@@ -138,26 +131,32 @@ fn test_master_tracker_phi_mode() {
 
     // Send heartbeats to populate the phi detector's window.  Use 30 samples
     // (instead of 20) so a single GC-pause-style outlier cannot dominate the
-    // computed stddev and push the survival probability above 0.1 (which
-    // would keep phi below the 1.0 threshold).  Wave 9-A fix 3 — the
-    // previous test was flaky under workspace test load (~20% miss rate).
+    // computed stddev.  Wave 9-A fix 3 reduced flake; the v2.4.1 fix below
+    // removes the remaining ~20% miss source by dropping the racy
+    // "immediately-alive" assertion entirely.
     for _ in 0..30 {
         tracker.record_heartbeat();
         thread::sleep(Duration::from_millis(10));
     }
 
-    // Immediately after heartbeats: should be alive.
-    assert!(
-        tracker.is_master_alive(),
-        "master must be alive right after heartbeats"
-    );
+    // NOTE: the previous version of this test asserted
+    // `tracker.is_master_alive()` here, immediately after the heartbeat loop.
+    // That assertion is fundamentally racy: phi is computed from
+    // `last_heartbeat.elapsed()`, so any scheduler delay between the final
+    // `record_heartbeat()` call and the `is_master_alive()` check (which on
+    // dev machines under workspace test load can hit ~5–20 ms) inflates the
+    // observed elapsed time vs. the ~10 ms training mean and pushes phi
+    // briefly above the 1.0 threshold — a transient, expected condition
+    // that does not indicate an actual master failure.  The deterministic
+    // alive-after-heartbeats invariant is exercised by the unit tests in
+    // `master_tracker.rs` and `phi_accrual.rs` with controlled clocks.
+    // Here we only test the failure-detection path (the second half), which
+    // is monotonic and timing-robust.
 
     // Silence: phi rises monotonically as `elapsed = last.elapsed()` grows.
-    // Even if the inter-arrival window has high variance from a CI outlier,
-    // waiting long enough drives `z = (elapsed - mean) / stddev` arbitrarily
-    // high.  Poll `is_master_alive()` over an extended window (was: single
-    // 200 ms check) so the assertion succeeds as soon as phi has grown past
-    // the threshold, and only fails if it never does.
+    // Poll `is_master_alive()` over an extended window so the assertion
+    // succeeds as soon as phi has grown past the threshold, and only fails
+    // if it never does.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut suspected = false;
     let mut last_phi = 0.0_f64;
