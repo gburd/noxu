@@ -516,12 +516,17 @@ impl Environment {
         let is_transactional_create = txn.is_some() && config.allow_create;
         let db_impl_arc = {
             let env_impl = self.env_impl.lock();
-            let open_fn = if is_transactional_create {
-                noxu_dbi::EnvironmentImpl::open_database_transactional
+            if is_transactional_create {
+                // SAFETY: is_transactional_create implies txn.is_some().
+                let txn_id = txn
+                    .expect("invariant: txn is Some when is_transactional_create")
+                    .get_id();
+                env_impl
+                    .open_database_transactional(name, &dbi_config, txn_id)
             } else {
-                noxu_dbi::EnvironmentImpl::open_database
-            };
-            open_fn(&env_impl, name, &dbi_config).map_err(|e| {
+                env_impl.open_database(name, &dbi_config)
+            }
+            .map_err(|e| {
                 match &e {
                     noxu_dbi::DbiError::DatabaseNotFound(_) => {
                         NoxuError::DatabaseNotFound(format!(

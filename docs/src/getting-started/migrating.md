@@ -600,3 +600,27 @@ setting a non-zero value starts the `noxu-log-flusher` background daemon.
 This is a **behaviour change** (not a source-level breaking change): code
 that previously set this parameter expecting it to be ignored will now see
 background flushes.  Default is 0 (disabled, same as before).
+
+### C-6: Transactional database creation WAL behavior changed (Wave 11-Y)
+
+**Previously**: `open_database_transactional` deferred the `NameLN` WAL write
+to commit time (`commit_pending_database` called `log_name_ln`).  The WAL
+entry had `txn_id = None` and was written as a plain `NameLN` after the
+`TxnCommit` record.
+
+**Now**: The `NameLNTxn` WAL entry is written **inside** the creating
+transaction (`Provisional::Yes`, `LogEntryType::NameLNTxn`) with the live
+`txn_id`.  `commit_pending_database` no longer writes a WAL entry; the
+`TxnCommit` record makes the provisional entry durable.  An aborted or
+crashed transaction leaves no committed `NameLNTxn` in the log, and recovery
+removes it.
+
+**Source-level impact**: `EnvironmentImpl::open_database_transactional` now
+requires a `txn_id: u64` parameter (internal API, `noxu-dbi` crate).
+External callers use `Environment::open_database(txn, name, config)` which
+is unchanged.
+
+**On-disk compatibility**: Existing WAL files with `NameLN` entries
+(txn_id=None, written at commit time) recover correctly — the undo predicate
+treats `txn_id=None` as committed.  No migration or log version bump is
+required for files created by earlier versions.
