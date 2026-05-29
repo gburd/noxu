@@ -1678,8 +1678,8 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
             let sec_key_a = noxu_db::DatabaseEntry::from_bytes(b"A");
             let mut pk_entry = noxu_db::DatabaseEntry::new();
             let mut data_entry = noxu_db::DatabaseEntry::new();
-            if let Ok(noxu_db::OperationStatus::Success) =
-                cursor.get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
+            if let Ok(noxu_db::OperationStatus::Success) = cursor
+                .get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
             {
                 let mut pri_data = noxu_db::DatabaseEntry::new();
                 let found = pri_clone
