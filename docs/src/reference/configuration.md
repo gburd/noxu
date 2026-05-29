@@ -7,8 +7,53 @@ Noxu DB has 400+ configuration parameters organized by subsystem, all set on
 
 | Parameter | Default | Description |
 |---|---|---|
-| `cache_size` | 60% RAM | On-heap B+tree node cache |
-| `max_off_heap_memory` | 0 | Off-heap evicted-BIN storage |
+| `cache_size` | 60% RAM | **Total** memory budget (BIN tree + log buffers + off-heap) |
+| `max_off_heap_memory` | 0 | Off-heap evicted-BIN storage (subtracted from `cache_size`) |
+| `log_file_max_bytes` | 10 MiB | Trigger log file rotation |
+| `lock_timeout_ms` | 500 | Per-lock acquisition timeout |
+| `txn_timeout_ms` | 0 (off) | Transaction age limit |
+| `checkpoint_bytes` | 20 MiB | Log bytes between checkpoints |
+| `checkpoint_interval_ms` | 20 000 | Time between checkpoints |
+| `cleaner_min_utilization` | 50 | % below which files are cleaned |
+| `cleaner_threads` | 1 | Concurrent cleaner threads |
+| `evictor_threads` | 1 | Background evictor threads |
+
+## Memory Budget Model (v3.0.0)
+
+As of v3.0.0, `cache_size` is the **total** memory ceiling, matching JE
+semantics.  The three internal memory pools are:
+
+| Pool | Size |
+|---|---|
+| BIN tree (Arbiter) | `cache_size − log_buffers − off_heap_reserved` |
+| Log write buffers | `log_num_buffers × log_buffer_size` (default 3 MiB) |
+| Off-heap BIN store | `max_off_heap_memory` (default 0) |
+
+**Example**: `cache_size = 256 MiB`, `log_buffer_size = 1 MiB`,
+`log_num_buffers = 3`, `max_off_heap_memory = 0` →
+Arbiter budget = 256 − 3 = 253 MiB.
+
+> **v3.0.0 migration**: If you were relying on the pre-v3.0.0 behaviour
+> where `cache_size` bounded only the BIN tree pool, increase `cache_size`
+> by `log_num_buffers × log_buffer_size + max_off_heap_memory` to maintain
+> the same BIN tree allocation.  See
+> [`migrating.md`](../getting-started/migrating.md).
+
+## `CommitNoSync` background flush
+
+When using `Durability::CommitNoSync` (no flush on commit), the
+`log_flush_no_sync_interval_ms` parameter controls how often the
+background `LogFlushTask` daemon drains write buffers to the OS page
+cache.  Default: 0 (disabled — data stays in write buffers until the
+next synchronous commit or explicit `env.sync()`).  Setting a non-zero
+value (e.g. 100 ms) ensures `CommitNoSync` data is visible to other
+processes within the interval.
+
+```rust
+EnvironmentConfig::new(path)
+    .with_log_flush_no_sync_interval_ms(100) // flush to OS every 100 ms
+```
+
 | `log_file_max_bytes` | 10 MiB | Trigger log file rotation |
 | `lock_timeout_ms` | 500 | Per-lock acquisition timeout |
 | `txn_timeout_ms` | 0 (off) | Transaction age limit |

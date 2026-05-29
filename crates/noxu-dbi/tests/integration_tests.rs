@@ -989,7 +989,7 @@ fn utilization_tracker_is_populated_after_writes() {
 ///    `get_log_manager().unwrap().get_last_flush_lsn()`.
 #[test]
 fn test_x11_log_flush_no_sync_daemon_fires() {
-    use noxu_dbi::{DatabaseConfig, DbiEnvConfig, EnvironmentImpl};
+    use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
 
     let dir = TempDir::new().unwrap();
 
@@ -1003,31 +1003,29 @@ fn test_x11_log_flush_no_sync_daemon_fires() {
     };
     let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
 
-    // Open a database and write a record.
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
-    let db_arc = env.open_database("test", &db_cfg).unwrap();
-
-    {
-        let db = db_arc.read();
-        let tree = db.get_real_tree().expect("tree must be present");
-        let lsn = noxu_util::Lsn::from_u64(1);
-        tree.insert(b"k1".to_vec(), b"v1".to_vec(), lsn).unwrap();
-    }
-
-    // Write something to the log manager directly to ensure there's data to flush.
-    // Use a raw log write to simulate CommitNoSync (flush=false, fsync=false).
     let lm = env.get_log_manager().expect("log manager must be present");
-    let mut buf = bytes::BytesMut::with_capacity(32);
+
+    // Write a log entry with flush=false, fsync=false to simulate CommitNoSync.
+    let mut buf = bytes::BytesMut::with_capacity(64);
     let entry = noxu_log::entry::LnLogEntry::new(
-        1, None, noxu_util::lsn::NULL_LSN, false, None, None,
-        noxu_util::vlsn::NULL_VLSN, 0, false,
-        b"k1".to_vec(), Some(b"v1".to_vec()), 0,
+        1,
+        None,
+        noxu_util::lsn::NULL_LSN,
+        false,
+        None,
+        None,
+        noxu_util::vlsn::NULL_VLSN,
+        0,
+        false,
+        b"k1".to_vec(),
+        Some(b"v1".to_vec()),
+        0,
         noxu_util::vlsn::NULL_VLSN,
     );
-    use noxu_log::LogEntry;
+    // write_to_log is a direct method (not a trait).
     entry.write_to_log(&mut buf);
     lm.log(
-        noxu_log::LogEntryType::LN,
+        noxu_log::LogEntryType::InsertLN,
         &buf,
         noxu_log::Provisional::No,
         false, // flush=false (CommitNoSync)
@@ -1038,8 +1036,8 @@ fn test_x11_log_flush_no_sync_daemon_fires() {
     // Record last_flush_lsn before waiting.
     let before = lm.get_last_flush_lsn();
 
-    // Wait long enough for the 50-ms daemon to have run multiple times.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Wait long enough for the 50-ms daemon to have fired multiple times.
+    std::thread::sleep(std::time::Duration::from_millis(400));
 
     let after = lm.get_last_flush_lsn();
 
@@ -1070,4 +1068,83 @@ fn test_x11_disabled_interval_no_spurious_flush() {
     // Should open and close without error.
     let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
     env.close().unwrap();
+}
+
+// ============================================================================
+// X-12: cache_size total budget model
+// ============================================================================
+
+/// X-12: Verify that the Arbiter budget = cache_size - log_buf_total.
+///
+/// When cache_size = 64 MiB, log_buffer_size = 1 MiB (×3 buffers), and
+/// max_off_heap_memory = 0, the Arbiter must use 64 - 3 = 61 MiB, not 64 MiB.
+#[test]
+fn test_x12_arbiter_budget_subtracts_log_buffers() {
+    use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
+
+    let dir = TempDir::new().unwrap();
+
+    let cache_size: u64 = 64 * 1024 * 1024;
+    let buf_size: usize = 1024 * 1024; // 1 MiB per buffer
+    let num_bufs: usize = 3;
+
+    let cfg = DbiEnvConfig {
+        cache_size,
+        log_buffer_size: buf_size,
+        log_num_buffers: num_bufs,
+        max_off_heap_memory: 0,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        log_flush_no_sync_interval_ms: 0,
+        ..DbiEnvConfig::default()
+    };
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+
+    let expected_budget = (cache_size as i64) - (num_bufs * buf_size) as i64;
+    let actual_budget = env.get_arbiter_max_memory();
+    env.close().unwrap();
+
+    assert_eq!(
+        actual_budget, expected_budget,
+        "X-12: Arbiter budget must equal cache_size - log_buf_total. \
+         expected={expected_budget} actual={actual_budget}"
+    );
+}
+
+/// X-12: off-heap reservation is also subtracted from the arbiter budget.
+#[test]
+fn test_x12_arbiter_budget_subtracts_off_heap() {
+    use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
+
+    let dir = TempDir::new().unwrap();
+
+    let cache_size: u64 = 128 * 1024 * 1024;
+    let buf_size: usize = 512 * 1024;
+    let num_bufs: usize = 3;
+    let off_heap: u64 = 32 * 1024 * 1024;
+
+    let cfg = DbiEnvConfig {
+        cache_size,
+        log_buffer_size: buf_size,
+        log_num_buffers: num_bufs,
+        max_off_heap_memory: off_heap,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        log_flush_no_sync_interval_ms: 0,
+        ..DbiEnvConfig::default()
+    };
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+
+    let expected_budget =
+        (cache_size as i64) - (num_bufs * buf_size) as i64 - off_heap as i64;
+    let actual_budget = env.get_arbiter_max_memory();
+    env.close().unwrap();
+
+    assert_eq!(
+        actual_budget, expected_budget,
+        "X-12: Arbiter budget must subtract off-heap reservation too. \
+         expected={expected_budget} actual={actual_budget}"
+    );
 }

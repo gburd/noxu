@@ -543,14 +543,12 @@ impl EnvironmentImpl {
         // cache_size is the ceiling for total memory use.
         //
         // log_buffer_size is the per-buffer size; log_num_buffers is the count.
-        let log_buf_total =
-            (cfg.log_num_buffers * cfg.log_buffer_size) as i64;
+        let log_buf_total = (cfg.log_num_buffers * cfg.log_buffer_size) as i64;
         let off_heap_reserved = cfg.max_off_heap_memory as i64;
         // Floor at 1 MiB so the arbiter remains functional even if the user
         // sets a cache_size smaller than the buffer + off-heap reservations.
-        let arbiter_budget =
-            (cache_bytes - log_buf_total - off_heap_reserved)
-                .max(1024 * 1024_i64);
+        let arbiter_budget = (cache_bytes - log_buf_total - off_heap_reserved)
+            .max(1024 * 1024_i64);
         let arbiter = Arbiter::new(
             arbiter_budget,
             Arc::clone(&cache_usage),
@@ -769,8 +767,7 @@ impl EnvironmentImpl {
                 if flush_interval_ms == 0 {
                     return; // disabled
                 }
-                while !log_flush_no_sync_shutdown_clone
-                    .load(Ordering::Relaxed)
+                while !log_flush_no_sync_shutdown_clone.load(Ordering::Relaxed)
                 {
                     let chunk_ms = 100u64;
                     let mut remaining = flush_interval_ms;
@@ -778,15 +775,12 @@ impl EnvironmentImpl {
                         && !log_flush_no_sync_shutdown_clone
                             .load(Ordering::Relaxed)
                     {
-                        std::thread::sleep(
-                            std::time::Duration::from_millis(
-                                chunk_ms.min(remaining),
-                            ),
-                        );
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            chunk_ms.min(remaining),
+                        ));
                         remaining = remaining.saturating_sub(chunk_ms);
                     }
-                    if log_flush_no_sync_shutdown_clone
-                        .load(Ordering::Relaxed)
+                    if log_flush_no_sync_shutdown_clone.load(Ordering::Relaxed)
                     {
                         break;
                     }
@@ -1446,7 +1440,14 @@ impl EnvironmentImpl {
         Arc::clone(&self.evictor)
     }
 
-    /// Returns a reference to the cleaner, if one was created.
+    /// X-12: Returns the Arbiter's configured maximum memory budget in bytes.
+    ///
+    /// Under the total-budget model the Arbiter budget equals
+    /// `cache_size - log_buf_total - off_heap_reserved`.
+    /// Used in tests to assert the allocation formula is correct.
+    pub fn get_arbiter_max_memory(&self) -> i64 {
+        self.evictor.get_arbiter().get_max_memory()
+    }
     ///
     /// Returns `None` for read-only environments.
     pub fn get_cleaner(&self) -> Option<Arc<Cleaner>> {
@@ -1681,8 +1682,7 @@ impl EnvironmentImpl {
         }
 
         // X-11: Signal the log-flush-no-sync daemon to stop and join.
-        self.log_flush_no_sync_shutdown
-            .store(true, Ordering::Relaxed);
+        self.log_flush_no_sync_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) =
             self.log_flush_no_sync_handle.lock().unwrap().take()
         {

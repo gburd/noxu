@@ -16,6 +16,41 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (v3.0.0 — Wave 11-X XA/config/cache-budget fixes)
+
+- **X-11 — `log_flush_no_sync_interval_ms` now wired to `LogFlushTask` daemon**:
+  setting `log_flush_no_sync_interval_ms` previously had no effect; data
+  committed with `CommitNoSync` stayed in write buffers indefinitely.
+  `EnvironmentImpl` now starts a `noxu-log-flusher` background thread that
+  calls `LogManager::flush_no_sync()` on the configured interval. (Wave 11-X X-11)
+
+- **X-4 — Recovered XA branch TOCTOU window closed**:
+  a concurrent `xa_start(JOIN, xid)` during `xa_commit`/`xa_rollback` I/O on a
+  recovered branch received `XaError::NotFound` instead of `XaError::Protocol`.
+  `XaEnvironment` now maintains a `resolving_xids` sentinel set; `xa_start(JOIN)`
+  checks it and returns `Protocol` (retryable) during the resolution window.
+  (Wave 11-X X-4)
+
+- **X-10 — Secondary index abort torn-state verified safe under READ_COMMITTED**:
+  the audit claimed a torn-state window during secondary+primary abort undo.
+  Investigation confirmed that the existing per-slot write locks prevent this
+  under READ_COMMITTED (the default): write locks are held across the entire
+  undo pass and released only after all before-images are restored. Under
+  READ_UNCOMMITTED the torn state is observable but is expected behaviour for
+  that isolation level.  Regression test added. (Wave 11-X X-10)
+
+### Changed (v3.0.0 — Wave 11-X — **BREAKING**)
+
+- **X-12 — `cache_size` is now the total memory budget**:
+  previously `cache_size` bounded only the BIN tree Arbiter; log write buffers
+  (`log_num_buffers × log_buffer_size`) and off-heap cache (`max_off_heap_memory`)
+  were independent pools, so actual memory could exceed `cache_size` significantly.
+  The Arbiter is now initialised with
+  `cache_size − log_buf_total − off_heap_reserved` (floored at 1 MiB).
+  Users who set `cache_size` to bound the BIN tree pool must add the log-buffer
+  and off-heap sizes to maintain the same allocation. (Wave 11-X X-12)
+  See [migration guide](docs/src/getting-started/migrating.md).
+
 ### Fixed (v3.0.0 — Wave 11-T cross-feature criticals)
 
 - **X-13 — `Database::check_open` and `CursorImpl::check_state` now verify env

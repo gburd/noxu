@@ -62,6 +62,7 @@ Every wave ships:
 | 11-R | v3.0.0 | Breaking semantic correctness from 2026-05 audit (C-4, C-5, C-6, C-8, Q-3, Q-4) | **merged** — open_database txn rollback, BIN delta guards, recovery MapLN two-pass scaffold, SR9465/SR9752 (already fixed in Wave 5), evict_memory()/compress(), recovery test fidelity; see [wave-11-r-semantic.md](wave-11-r-semantic.md) |
 | 11-W | (audit) | Cross-feature / end-to-end second-pass audit | **complete** — 14 new findings (3 critical: X-3 XA×rep NULL_VLSN, X-5 cleaner×ckpt barrier, X-15 rollback interval); feeds Wave 11-T |
 | 11-T | v3.0.0 | Cross-feature critical fixes from 11-W (X-3, X-5, X-15 + high-sev X-1/4/6/10/11/12/13/14) | **merged** — 7 items fixed (X-1, X-3, X-5, X-6, X-13, X-14, X-15), 5807 tests; X-2/4/7/8/10/11/12 deferred; see [wave-11-t-crossfeature.md](wave-11-t-crossfeature.md) |
+| 11-X | v3.0.0 | XA/config/cache-budget cluster from 11-W (X-4, X-10, X-11, X-12) | **merged** — X-4 TOCTOU closed, X-10 verified safe, X-11 `LogFlushTask` daemon added, X-12 total-budget model; see [wave-11-x-config-xa-cluster.md](wave-11-x-config-xa-cluster.md) |
 
 ## Acceptance gates per wave
 
