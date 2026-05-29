@@ -3123,8 +3123,7 @@ mod tests {
             "C-6 end-to-end: committed transactional db creation MUST be recovered"
         );
         assert_eq!(
-            info.recovered_db_names["committed_db"],
-            8,
+            info.recovered_db_names["committed_db"], 8,
             "C-6 end-to-end: committed_db must map to db_id 8"
         );
     }

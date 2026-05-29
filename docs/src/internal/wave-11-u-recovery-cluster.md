@@ -2,7 +2,7 @@
 
 **Branch**: `fix/wave11-u-recovery-cluster`  
 **Target**: v3.0.0  
-**Status**: Complete (X-8 ✓, X-2 ✓, X-7 ✓, C-6 partial ✓)
+**Status**: Complete (X-8 ✓, X-2 ✓, X-7 ✓, C-6 ✓)
 
 ---
 
@@ -141,28 +141,28 @@ which NameLNs belong to aborted transactions.
    check `recovered_db_txn_ids` against `aborted_txns` — now functionally
    removes NameLN entries with aborted txn_ids.
 
-**What remains (follow-up wave)**:
+**Completed in Wave 11-Y** (`docs/src/internal/wave-11-y-c6-endtoend.md`):
 
-Noxu currently writes the NameLN WAL entry **at commit time** (not inside the
-transaction).  So `recovered_db_txn_ids` is always empty for current WAL
-files — there are no NameLN entries with txn_ids to undo.  The full
-end-to-end fix requires:
-
-1. Writing `NameLNTxn` inside the transaction (with the live txn_id) instead
-   of deferring to commit.
-2. Not writing a second NameLN at commit (since it was already written).
-3. This interacts with the C-4 fix (committed-only visibility in
-   `get_database_names()`): writing the WAL entry inside the txn is safe
-   because `get_database_names()` reads from `name_map` (not the WAL).
+The write-path change was implemented: `NameLNTxn` is now written **inside**
+the creating transaction (`Provisional::Yes`) via the new
+`log_name_ln_txn` helper.  `commit_pending_database` no longer writes a
+second `NameLN`.  The undo predicate was also strengthened to remove
+crash-before-commit entries (txn_id absent from `committed_txns`, not just
+present in `aborted_txns`).  All end-to-end C-6 tests are now live (no
+`#[ignore]`).
 
 **Tests**:
 
 - `recovery_manager::tests::test_c6_mapping_tree_undo_removes_aborted_namelns`
-  — unit test that populates `AnalysisResult` synthetically and verifies the
-  undo predicate: aborted NameLN removed, committed and txn_id-less survive.
+  — unit test covering committed, explicit-abort, no-txn (old-format), and
+  crash-before-commit cases.
 - `recovery_manager::tests::test_c6_aborted_db_creation_not_recovered`
-  — `#[ignore]` end-to-end test that pins the intended post-fix behavior.
-  Un-ignore when the write-path change is implemented.
+  — end-to-end test: NameLn(txn_id=42) + TxnAbort(42) → absent from
+  `recovered_db_names`.  **Un-ignored in Wave 11-Y.**
+- `recovery_manager::tests::test_c6_committed_db_creation_is_recovered`
+  — regression guard: committed db survives recovery. **Added in Wave 11-Y.**
+- `recovery_manager::tests::test_c6_old_format_namelns_always_recovered`
+  — old-log compat: NameLN with no txn_id always survives. **Added in Wave 11-Y.**
 
 ---
 
@@ -185,5 +185,5 @@ a `txn_id` in the `LnLogEntry` parse correctly with `txn_id = None`.
 - `cargo fmt --all -- --check`: ✓
 - `cargo clippy --workspace --all-targets -- -D warnings`: ✓
 - `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps`: ✓
-- `cargo test --workspace --no-fail-fast`: ✓ (all pass, 2 C-6 tests ignored)
+- `cargo test --workspace --no-fail-fast`: ✓ (all pass, 0 C-6 tests ignored)
 - `make docs-check`: ✓

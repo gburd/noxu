@@ -64,6 +64,7 @@ Every wave ships:
 | 11-T | v3.0.0 | Cross-feature critical fixes from 11-W (X-3, X-5, X-15 + high-sev X-1/4/6/10/11/12/13/14) | **merged** — 7 items fixed (X-1, X-3, X-5, X-6, X-13, X-14, X-15), 5807 tests; X-2/4/7/8/10/11/12 deferred; see [wave-11-t-crossfeature.md](wave-11-t-crossfeature.md) |
 | 11-U | v3.0.0 | Recovery/checkpoint/cleaner/VLSN cluster (X-2, X-7, X-8, C-6) | **merged** — X-8 evictor/ckpt race, X-2 VLSN cap, X-7 secondary-DB cleaner dispatch (DatabaseImpl.real_tree → Arc<RwLock>), C-6 NameLnRecord txn_id partial; see [wave-11-u-recovery-cluster.md](wave-11-u-recovery-cluster.md) |
 | 11-X | v3.0.0 | XA/config/cache-budget cluster from 11-W (X-4, X-10, X-11, X-12) | **merged** — X-4 TOCTOU closed, X-10 verified safe, X-11 `LogFlushTask` daemon added, X-12 total-budget model; see [wave-11-x-config-xa-cluster.md](wave-11-x-config-xa-cluster.md) |
+| 11-Y | v3.0.0 | C-6 end-to-end: NameLNTxn inside creating transaction | **merged** — NameLNTxn written inside txn (Provisional::Yes), commit no longer double-writes, undo predicate covers crash-before-commit, 4 C-6 tests all live; see [wave-11-y-c6-endtoend.md](wave-11-y-c6-endtoend.md) |
 
 ## Acceptance gates per wave
 
