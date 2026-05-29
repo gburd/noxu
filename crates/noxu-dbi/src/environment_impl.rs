@@ -757,10 +757,10 @@ impl EnvironmentImpl {
         // (fsyncgate — fdatasync returned EIO and the environment must not
         // accept further commits).  We read the shared Arc<AtomicBool> that
         // LogManager::io_invalid points to; no circular Arc reference.
-        if let Some(lm) = &self.log_manager {
-            if lm.io_invalid.load(std::sync::atomic::Ordering::Acquire) {
-                return false;
-            }
+        if let Some(lm) = &self.log_manager
+            && lm.io_invalid.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
         }
         true
     }
@@ -1669,7 +1669,8 @@ mod tests {
 
         // Directly flip the io_invalid flag on the underlying LogManager,
         // simulating what `flush_sync()` does on EIO.
-        let lm = env.get_log_manager().expect("writable env must have log manager");
+        let lm =
+            env.get_log_manager().expect("writable env must have log manager");
         lm.io_invalid.store(true, Ordering::Release);
 
         // is_valid() must now return false even though invalidate() was never called.

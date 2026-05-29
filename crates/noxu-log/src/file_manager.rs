@@ -962,7 +962,11 @@ mod tests {
         // The file must be present in the directory listing — the same check
         // recovery performs when scanning for log files to replay.
         let listed = manager.list_file_numbers().unwrap();
-        assert_eq!(listed, vec![0], "file 0 must be visible in dir listing after create");
+        assert_eq!(
+            listed,
+            vec![0],
+            "file 0 must be visible in dir listing after create"
+        );
 
         // Create a second file (flip) to exercise the path for file_num > 0.
         manager.flip_file().unwrap();

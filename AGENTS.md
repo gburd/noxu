@@ -109,19 +109,35 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   a justification.
 - **No async**: Core engine uses blocking I/O with explicit threading. Only
   `noxu-rep` networking uses tokio.
-- **Limited unsafe**: Core data-path crates (`noxu-tree`, `noxu-txn`,
+- **Limited unsafe**: Twelve core data-path crates (`noxu-tree`, `noxu-txn`,
   `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`,
   `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`,
-  `noxu-config`, `noxu-util`) target zero `unsafe`. The exceptions
-  are `noxu-sync` (FFI to `libc` futex and `parking_lot` raw
-  locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O
-  glue and `parking_lot` raw locking in elections), and a single
-  `unsafe` block each in `noxu-latch` (RAII force-unlock),
-  `noxu-db` (`unsafe impl Send for SecondaryConfig`), and `noxu-xa`
-  (transaction-pointer dereference); each is documented inline.
-  `noxu-evictor::off_heap` originally used raw `mmap` ops but has
-  been refactored to go through `memmap2` and `lru` safe wrappers
-  and now contains no `unsafe`. Adding new `unsafe` requires review.
+  `noxu-config`, `noxu-util`) carry `#![forbid(unsafe_code)]` and
+  contain zero `unsafe`. The crates that do contain `unsafe`:
+
+  | Crate | Production `unsafe` blocks | Reason |
+  |---|---:|---|
+  | `noxu-sync` | ~20 (mostly small) | FFI to `libc` futex and `parking_lot` raw locking primitives. |
+  | `noxu-log` | 6 | Memory-mapped I/O via `Mmap::map`; raw-pointer writes into pinned `LogBuffer` segments; one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` (sound: the `Arc<FileHandle>` outlives the guard). One `unsafe impl Send for LogBufferSegment` (sound: pin-count + latch protocol). |
+  | `noxu-rep` | 1 | Single `unsafe` FFI in `net/channel.rs` for socket-option setup. |
+  | `noxu-latch` | 1 | RAII force-unlock for poison-recovery. |
+  | `noxu-xa` | 1 | Transaction-pointer dereference in `environment.rs`; documented inline. |
+
+  Test-only or bench-only `unsafe`:
+
+  | Path | Reason |
+  |---|---|
+  | `noxu-persist/tests/txn_threading_tests.rs` | edition-2024 `std::env::set_var` for debug-assert silencing. |
+  | `benches/comparison/benches/comparison.rs` | LMDB / `heed` env open (external FFI). |
+
+  Every production `unsafe` block has a `// SAFETY: …` comment.
+  `noxu-evictor::off_heap` was refactored to go through `memmap2`
+  and `lru` safe wrappers and now contains no `unsafe`.
+  `secondary_config.rs`'s former `unsafe impl Send` was removed when
+  the secondary key creator was changed to an owned name. Three
+  `unsafe impl Send + Sync` blocks in `noxu-rep::elections` were
+  removed in v2.4.2: their interior fields auto-derive the bounds.
+  Adding any new `unsafe` requires review.
 - **CRC32**: Uses `crc32fast` (CLMUL/PCLMULQDQ hardware acceleration, 15.8
   GiB/s at 1KiB). Not CRC32C — see `docs/src/internal/checksum-selection.md`.
 
