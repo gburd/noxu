@@ -9,9 +9,6 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 description = "Derive macros for the Noxu DB Direct Persistence Layer (Entity, PrimaryKey, SecondaryKey)"
-# v2.3.0: every crate is `publish = false` while the workspace dependency graph
-# still uses `path = "..."` deps. See docs/src/internal/wave-10-e-cratesio-prep.md.
-publish = false
 
 [lib]
 proc-macro = true

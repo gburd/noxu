@@ -92,6 +92,7 @@
   - [Release Process](contributing/release.md)
   - [API Stability](contributing/api-stability.md)
   - [SemVer Policy](contributing/semver-policy.md)
+  - [Publishing to crates.io](contributing/publishing.md)
 
 ---
 
