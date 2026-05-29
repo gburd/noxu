@@ -57,7 +57,7 @@ for v in list.iter(None)? {
 list.clear(None)?;
 ```
 
-## Compaction (Wave 2B / v1.6)
+## Compaction
 
 `list.remove(idx)` performs **shift-down compaction**: every record
 at index `i > idx` moves down to `i - 1`, and `next_index` is

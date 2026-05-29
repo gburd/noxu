@@ -1,6 +1,6 @@
 //! Typed map view of a database.
 //!
-//! Wave 2B redesign (v1.6).  `StoredMap<K, V, KB, VB>` is the typed
+//! `StoredMap<K, V, KB, VB>` is the typed
 //! map surface: keys and values are arbitrary Rust types, with
 //! [`EntryBinding`] implementations doing the byte ↔ typed conversion.
 //!
@@ -219,7 +219,7 @@ where
 
     /// Returns the number of records.
     ///
-    /// Goes to [`Database::count`] which Sprint 1A fixed for
+    /// Goes to [`Database::count`] which was fixed for
     /// sorted-duplicate databases.
     pub fn len(&self, _txn: Option<&Transaction>) -> Result<usize> {
         // `Database::count` does not currently take a txn; the count
@@ -548,7 +548,7 @@ mod tests {
 
         // Open a typed map over the same database; iter() must see
         // every record without any "register_key" call.  This is the
-        // central point of the Wave 2B redesign.
+        // central point of the typed-collection redesign.
         let map: StoredMap<'_, Vec<u8>, Vec<u8>, _, _> =
             StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
         let items: Vec<_> =

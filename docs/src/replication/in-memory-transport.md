@@ -1,7 +1,6 @@
 # In-Memory Transport
 
-> **v2.4 — GA (Wave 11-D).**  The in-memory transport, originally a
-> `cfg(test)` test fixture (Wave 8), is now a first-class production
+> **v2.4 — GA.**  The in-memory transport is a first-class production
 > transport alongside [TCP, TLS, and QUIC](transport.md).
 
 `noxu_rep::net::InMemoryTransport` lets you compose multi-node
@@ -89,8 +88,8 @@ group.shutdown_all();
 ## RepConfig integration
 
 `RepConfig` exposes `transport_kind: RepTransportKind` so callers can
-declare their intent.  The default is `Tcp` to preserve pre-Wave-11-D
-behaviour.
+declare their intent.  The default is `Tcp` to preserve backward
+compatibility.
 
 ```rust
 use noxu_rep::{RepConfig, RepTransportKind};
@@ -107,7 +106,7 @@ relevant transport factory.  `transport_kind` lets observability /
 chaos / harness layers introspect the transport choice without
 inspecting individual channel types.
 
-## Public API surface (Wave 11-D)
+## Public API surface
 
 | Symbol | Module | Notes |
 |---|---|---|
@@ -120,7 +119,7 @@ inspecting individual channel types.
 
 The pre-existing `noxu_rep::test_harness::RepTestBase` /
 `RepEnvInfo` / `CountingListener` types are also lifted out of the
-`cfg(test) / feature = "test-harness"` gate as part of Wave 11-D.
+`cfg(test) / feature = "test-harness"` gate.
 The `test-harness` feature flag is retained as a no-op for backward
 compatibility with downstream `Cargo.toml` entries.
 
@@ -145,7 +144,7 @@ compatibility with downstream `Cargo.toml` entries.
 
 ## Tests
 
-Wave 11-D ships:
+The in-memory transport ships with:
 
 * 11 unit tests in `crates/noxu-rep/src/net/inmem.rs` covering
   pair / group / crash / reconnect / handle-lifetime invariants.
@@ -155,5 +154,4 @@ Wave 11-D ships:
   network-restore catch-up of a 100-entry partition, mesh
   round-trip, crash + reconnect cycle, `RepConfig` round-trip,
   end-to-end smoke with clean shutdown.
-* All test invocations run in well under the wave-gate
-  `timeout 60`.
+* All test invocations complete in under 60 seconds.

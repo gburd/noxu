@@ -58,7 +58,7 @@ pub struct SecondaryCursor<'a> {
     /// the cursor is forwarded under this txn so the whole cursor —
     /// including the [`SecondaryCursor::delete`] cascade — participates
     /// in the caller's transaction.  `None` selects auto-commit
-    /// behaviour (Wave 1B / audit F5).
+    /// behaviour.
     txn: Option<&'a Transaction>,
 }
 
@@ -71,10 +71,10 @@ impl<'a> SecondaryCursor<'a> {
     /// secondary-join finding F4: the previous signature dropped both
     /// arguments on the floor and ran every secondary cursor auto-commit.
     ///
-    /// Wave 1B (audit F5 follow-up): the txn handle is now also stored on
+    /// The txn handle is also stored on
     /// the `SecondaryCursor` itself so that primary lookups and the
     /// [`SecondaryCursor::delete`] cascade execute under the same
-    /// transaction as the inner secondary cursor.  Pre-Wave-1B these
+    /// transaction as the inner secondary cursor.  Previously these
     /// out-of-band primary operations always ran auto-committed, leaking
     /// secondary-cleanup writes around an aborted user txn.
     pub(crate) fn new(
@@ -124,18 +124,17 @@ impl<'a> SecondaryCursor<'a> {
     /// 4. The primary record itself is deleted — also under the
     ///    cursor's stored txn.
     ///
-    /// # Atomicity (Wave 1B / audit F5)
+    /// # Atomicity
     ///
     /// When the cursor was opened with `Some(&txn)` (see
     /// [`SecondaryDatabase::open_cursor`]), every step above runs
     /// inside `txn`.  Aborting the txn rolls back **both** the primary
     /// delete and every secondary cleanup performed by this method;
-    /// committing the txn persists both.  Pre-Wave-1B this method
+    /// committing the txn persists both.  Before v1.6 this method
     /// dropped the txn on the floor and ran the cascade
     /// auto-committed, so an aborted user txn could leave the primary
     /// behind while still removing the secondary entries (or vice
-    /// versa) — the residual sub-item the Sprint 4½ deliverables
-    /// flagged for follow-up.
+    /// versa.
     ///
     /// When the cursor was opened with `None`, every step runs
     /// auto-committed, which preserves the v1.4 behaviour.
@@ -339,7 +338,7 @@ impl<'a> SecondaryCursor<'a> {
     /// Searches for the first secondary key >= `search_key`.
     ///
     /// `search_key` is updated in place with the actual key found (which
-    /// may be strictly greater than the input).  See Wave 1C audit
+    /// may be strictly greater than the input).  See
     /// cleanup (secondary-join “fragile two-step get_search_key_range”
     /// Low) — the v1.5.0 implementation issued a redundant `Get::Current`
     /// probe after the SearchGte to re-read the key, which silently

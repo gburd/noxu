@@ -1,6 +1,6 @@
 //! Internal helpers shared by the typed Stored* views.
 //!
-//! Wave 2B redesign (v1.6).  These helpers centralise the
+//! These helpers centralise the
 //! cursor-scan / encode / decode plumbing that the four typed views
 //! (`StoredMap`, `StoredSortedMap`, `StoredKeySet`, `StoredValueSet`)
 //! all need.  Keeping it in one place means the txn-threading shape

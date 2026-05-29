@@ -585,7 +585,7 @@ impl FkReferrer for SecondaryHookState {
 ///
 /// # Atomicity with the primary write
 ///
-/// As of v1.5 (Sprint 4½) `update_secondary` participates in the
+/// `update_secondary` participates in the
 /// caller's transaction when one is supplied.  Threading the same
 /// `txn` through both [`Database::put`] and
 /// [`update_secondary`](Self::update_secondary) makes the primary +
@@ -768,7 +768,7 @@ impl SecondaryDatabase {
     ///
     /// Equivalent to `Database::count` on the underlying inner index
     /// database; included on `SecondaryDatabase` for symmetry with JE's
-    /// `SecondaryDatabase.count()` method.  See Wave 1C audit cleanup
+    /// `SecondaryDatabase.count()` method.  See
     /// (secondary-join “missing count/exists/truncate” Low).
     ///
     /// # Errors
@@ -808,8 +808,7 @@ impl SecondaryDatabase {
     /// `SecondaryDatabase.truncate(...)`.
     ///
     /// Returns the number of records that were in the index before the
-    /// truncate.  See Wave 1C audit cleanup (secondary-join “missing
-    /// count/exists/truncate” Low).
+    /// truncate.
     ///
     /// # Errors
     /// Returns [`NoxuError::DatabaseClosed`] if the secondary handle has
@@ -972,7 +971,7 @@ impl SecondaryDatabase {
     /// When `txn` is `Some(_)`, the inner cursor over the secondary
     /// index participates in the supplied transaction — reads acquire
     /// shared locks via the txn's locker and writes acquire exclusive
-    /// locks tracked by the txn.  Wave 1B (audit F5 follow-up) extends
+    /// locks tracked by the txn.  Secondary cursors also
     /// this to the *primary* lookups and the
     /// [`SecondaryCursor::delete`] cascade as well: the cursor stores
     /// the txn handle and forwards it to every primary `get` /
@@ -985,7 +984,7 @@ impl SecondaryDatabase {
     /// `config` is forwarded to the inner `Database::open_cursor` call so
     /// `read_uncommitted` and other cursor-level flags propagate correctly.
     ///
-    /// # Lifetime contract (breaking change in Wave 1B)
+    /// # Lifetime contract
     ///
     /// The returned [`SecondaryCursor`] borrows both the
     /// `SecondaryDatabase` and — when supplied — the `Transaction`,
@@ -1040,7 +1039,7 @@ impl SecondaryDatabase {
     /// manually (v1.5 has no automatic `associate()`-style hook — that is
     /// v1.6 work).
     ///
-    /// # Atomicity (Sprint 4½)
+    /// # Atomicity
     ///
     /// When `txn` is `Some(&t)`, **all** I/O performed by this method
     /// (cursor opens, `insert_sec_key`, `delete_sec_key`) is executed
@@ -1085,7 +1084,7 @@ impl SecondaryDatabase {
     ///
     /// Called when a primary record is deleted.  `txn` is forwarded to
     /// [`Self::update_secondary`] so the cleanup participates in the
-    /// caller's transaction (Sprint 4½).
+    /// caller's transaction.
     pub(crate) fn delete_all_for_primary(
         &self,
         txn: Option<&Transaction>,
@@ -1147,7 +1146,7 @@ impl SecondaryDatabase {
     ///
     /// `txn` is forwarded to [`SecondaryCursor::new`] so all inner-database
     /// reads and the cascade primary delete participate in the caller's
-    /// transaction (Wave 1B / audit F5).  Used from
+    /// transaction.  Used from
     /// [`SecondaryDatabase::delete`] to drive the secondary scan under
     /// the caller's txn.
     fn open_cursor_internal<'a>(
@@ -1564,7 +1563,7 @@ mod tests {
         assert_eq!(data.get_data().unwrap(), b"Grape");
     }
 
-    /// Wave 1C audit cleanup (secondary-join "missing count/exists/truncate"
+    /// Note:
     /// Low) — the new convenience methods on SecondaryDatabase delegate
     /// to the inner index DB and surface the JE-shape API for the
     /// secondary side.

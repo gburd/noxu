@@ -1,7 +1,7 @@
 //! Transaction execution helper with deadlock-aware retry and
 //! exponential backoff.
 //!
-//! Wave 2B redesign (v1.6).  In v1.5 the `&Transaction` supplied to
+//! In v1.5 the `&Transaction` supplied to
 //! the closure could not be threaded into any `Stored*` method
 //! (every Stored* method ignored its txn argument because there was
 //! no txn argument).  In v1.6 every Stored* method takes
@@ -45,7 +45,7 @@ pub struct RetryConfig {
 }
 
 impl RetryConfig {
-    /// The Wave 2B default: 10 retries, 10 ms base, 1 s ceiling,
+    /// Default: 10 retries, 10 ms base, 1 s ceiling,
     /// ±25% jitter.
     pub const DEFAULT: RetryConfig = RetryConfig {
         max_retries: 10,

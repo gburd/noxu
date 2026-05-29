@@ -56,6 +56,7 @@ Every wave ships:
 | 11-BF | v2.3.2 | Bug-fix wave: 6 regressions from Wave 11-E/G | **merged** — all 6 `#[ignore]`'d tests fixed and promoted; see [wave-11-bugfix-v232.md](wave-11-bugfix-v232.md): record_active_txn guard, txn-cursor-on-non-txn-db, NoOverwrite dup-DB semantics, db-name registry WAL persistence, checkpoint data-loss, truncate durability |
 | 11-L | v3.0.0 | API stability commitment + SemVer policy + deprecation cycle | **merged** — 376 stable items catalogued, 19 #[deprecated] markers added, advisory cargo-semver-checks CI gate (see [wave-11-l-api-stability.md](wave-11-l-api-stability.md)) |
 | 11-M | v3.0.0 | Path-dep restructuring + actual crates.io publish | **prep merged** — workspace dep graph restructured, dry-runs pass for leaf crates, runbook in `docs/src/contributing/publishing.md`; actual `cargo publish` deferred to v3.0.0 release tagging (see [wave-11-m-cratesio-prep.md](wave-11-m-cratesio-prep.md)) |
+| 11-V | v3.0.0 | Voice cleanup: remove agent-process artifacts and boastful language from user-facing docs and public rustdocs | **merged** — see [wave-11-v-cleanup.md](wave-11-v-cleanup.md) |
 
 ## Acceptance gates per wave
 

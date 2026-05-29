@@ -1,11 +1,11 @@
 # Transport Layer
 
 > **v2.0 status — GA.** The TCP service-name handshake is bounded
-> at 256 bytes (Wave 3-3, F3).  Network restore via the dispatcher's
-> `RESTORE` service is wired end-to-end via
-> `ReplicatedEnvironment::bootstrap_via_dispatcher` (Wave 4-A, F2/F4).
+> at 256 bytes.  Network restore via the dispatcher's `RESTORE`
+> service is wired end-to-end via
+> `ReplicatedEnvironment::bootstrap_via_dispatcher`.
 >
-> **v2.4 update — Wave 11-D.** The in-memory transport, originally
+> **v2.4 update.** The in-memory transport, originally
 > a `cfg(test)` test fixture, is now a first-class production
 > transport.  See [In-Memory Transport](in-memory-transport.md).
 
@@ -16,7 +16,7 @@ Noxu DB supports four network transports for replication:
 | **TCP**       | `TcpChannel`        | Plain LAN/WAN replication (default) |
 | **TLS**       | `TlsTcpChannel`     | Encrypted WAN (`tls-rustls` or `tls-native`) |
 | **QUIC**      | `QuicMultiplexedChannel` | Multiplexed UDP (`quic` feature) |
-| **In-memory** | `InMemoryEndpoint`  | In-process clusters & tests (Wave 11-D) |
+| **In-memory** | `InMemoryEndpoint`  | In-process clusters & tests (v2.4) |
 
 All four implement the same `Channel` trait and are interchangeable
 at the protocol layer; higher-level code (feeder, replica stream,
@@ -106,7 +106,7 @@ Connection attempts use a 30s timeout each.
 
 ## In-Memory Transport
 
-`InMemoryTransport` (Wave 11-D) provides an in-process channel mesh
+`InMemoryTransport` provides an in-process channel mesh
 with the same `Channel` trait as TCP / TLS / QUIC.  Use it for
 embedded multi-node deployments, integration tests, and Stateright
 property-test driver harnesses.  Full chapter:

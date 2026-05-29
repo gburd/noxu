@@ -37,7 +37,7 @@ pub struct StoreConfig {
     /// Whether the store operates in transactional mode.
     pub transactional: bool,
 
-    /// Schema-evolution mutations applied on the open path (Wave 2C-2).
+    /// Schema-evolution mutations applied on the open path.
     ///
     /// When `EntityStore::get_primary_index<E>` is called, the persisted
     /// catalog version is compared against `E::class_version()`.  If they
@@ -92,7 +92,7 @@ impl StoreConfig {
     }
 
     /// Registers a [`Mutations`] config to drive open-path schema evolution
-    /// (Wave 2C-2).
+    ///
     ///
     /// The mutations are also exposed to [`EntitySerializer::deserialize_versioned`]
     /// so user serializers can do field-level evolution on read.

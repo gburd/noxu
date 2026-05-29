@@ -37,7 +37,7 @@ pub enum XaError {
     #[error("XA_HEURRB: heuristic rollback")]
     HeuristicRollback,
 
-    /// **Wave 3-2 / v2.0**: this variant is retained for SemVer
+    /// This variant is retained for SemVer
     /// compatibility but is no longer returned by the engine.  Crash-
     /// durable XA is now supported — a `TxnPrepare` WAL frame is
     /// written by `xa_prepare`, recovery surfaces in-doubt XIDs via

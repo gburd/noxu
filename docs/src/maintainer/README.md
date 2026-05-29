@@ -29,9 +29,9 @@ transactional key-value store — the same architecture as SQLite, but with
 Noxu DB-style B-tree storage, record-level locking, and optional multi-node
 replication.
 
-**Why does it exist?** To provide a production-grade, dependency-light,
+**Why does it exist?** To provide a dependency-light,
 idiomatically Rust embedded database with the same API contract, algorithm
-fidelity, and operational characteristics as Noxu DB — without a JVM.
+fidelity, and operational characteristics as Berkeley DB Java Edition — without a JVM.
 
 **Where does the code live?**
 

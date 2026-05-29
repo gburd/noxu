@@ -59,7 +59,7 @@ pub trait Entity: Sized {
     /// [`crate::store_config::StoreConfig::with_mutations`] so that older
     /// records can be read or rewritten on store open.
     ///
-    /// Wave 2C-2: per-record class versions are persisted in a 2-byte BE
+    /// Per-record class versions are persisted in a 2-byte BE
     /// prefix on every entity record (see
     /// [`crate::evolve::envelope`]).
     fn class_version() -> u16 {

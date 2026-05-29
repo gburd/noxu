@@ -12,16 +12,8 @@ crash recovery, master-replica replication with automatic leader elections,
 and an entity-persistence layer — all in a single library with no external
 database process required.
 
-**Current version**: 2.2.1 (released from `sprint/v2.2.0-base`).  See
-[CHANGELOG.md](CHANGELOG.md) for the full release history.
-
-**Status**: Replication is GA; all ten findings from the May-2026
-`noxu-rep` audit are closed and the corresponding Stateright executable
-specifications have been re-validated.  243 ported tests from the upstream
-JE TCK pass.  At v2.2.0 / v2.2.1 the workspace runs **5,625 tests, 0
-failures** under `cargo test --workspace`, with `cargo fmt`,
-`cargo clippy --workspace --all-targets --all-features -D warnings`, and
-`make docs-check` all clean.
+**Current version**: 2.2.1.  See [CHANGELOG.md](CHANGELOG.md) for the full
+release history.
 
 ## Quick Start
 

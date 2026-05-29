@@ -16,7 +16,7 @@
 //! Noxu does not carry an external class catalog because it does not
 //! need Java's per-class serialization metadata: the type is a generic
 //! parameter on the binding.  The 2-byte version header (added in
-//! Sprint 3C, see `SerdeBinding`'s module docs) is what guards
+//! The 2-byte header (see `SerdeBinding`'s module docs) is what guards
 //! against decoding a payload written with a different wire format.
 //! See `tck_serde_version_header` below.
 

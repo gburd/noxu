@@ -445,7 +445,7 @@ fn db_cursor_duplicate_test_duplicate_creation_backwards() {
 /// Walk the fixture; at every position `cursor.count()` must report
 /// `DUP_N_PER_KEY` (every primary has the same dup-set size).
 ///
-/// TODO(noxu-bug, wave-11-A): on a multi-primary sorted-dup DB,
+/// TODO(bug): on a multi-primary sorted-dup DB,
 /// `Cursor::count()` over-counts whenever the cursor is positioned past
 /// the first dup of the current primary.  Empirically count returns
 /// `DUP_N_PER_KEY + offset_within_primary` (e.g. for a 5-dup primary,
@@ -489,7 +489,7 @@ fn db_cursor_duplicate_test_duplicate_count() {
 /// exactly `DUP_N_PER_KEY` data values come back in sorted order and the
 /// next `NextDup` returns NotFound (boundary at next primary).
 ///
-/// TODO(noxu-bug, wave-11-A): on a multi-primary sorted-dup DB,
+/// TODO(bug): on a multi-primary sorted-dup DB,
 /// `Get::Search` positions on the smallest dup of the requested
 /// primary, but the immediately-following `Get::NextDup` returns
 /// NotFound for every primary except the lexicographically smallest.

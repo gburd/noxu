@@ -1312,7 +1312,7 @@ impl Database {
     /// are pulled into the in-memory cache.  Useful for warming the
     /// cache before a workload begins.
     ///
-    /// # Limitations (audit database F9/F10, Wave 2C-4)
+    /// # Limitations
     /// * The current implementation warms the BIN/IN structure only;
     ///   `PreloadConfig::load_lns` therefore makes `lns_loaded` report
     ///   the *number of LN slots in the tree* rather than the number
@@ -1503,7 +1503,7 @@ impl Database {
         Ok(())
     }
 
-    /// Audit database F11 (Wave 2C-4): unify the empty-key contract
+    /// Unify the empty-key contract
     /// across `get` / `put` / `put_no_overwrite` / `put_with_options`
     /// / `delete`.  Returns the key bytes if the entry has data set
     /// (even if zero-length); rejects `None`-data keys with a typed
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(result, OperationStatus::NotFound);
     }
 
-    /// Wave 1C audit cleanup (database Low "partial-put length
+    /// ("partial-put length
     /// mismatch silent truncation"): a partial put whose `data` slice
     /// differs in length from the configured partial-length must be
     /// rejected with a typed error instead of silently truncating or

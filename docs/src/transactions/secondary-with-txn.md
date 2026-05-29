@@ -20,9 +20,8 @@
   opened with `with_sorted_duplicates(true)` so multiple primaries
   may share a secondary key.
 * `secondary.open_cursor(Some(&txn), config)` — secondary reads
-  participate in `txn` correctly (Sprint 1C threaded the txn through;
-  Wave 1B extended the same plumbing to the cursor's primary lookups
-  and the cursor's `delete()` cascade).
+  participate in `txn` correctly.  Cursor operations on a secondary
+  acquire locks on behalf of the transaction.
 * `secondary.update_secondary(Some(&txn), pri_key, old_data, new_data)`
   — manual maintenance for population paths.  Application code that
   goes through `Database::put` / `Database::delete` no longer has to

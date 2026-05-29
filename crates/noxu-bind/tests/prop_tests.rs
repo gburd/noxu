@@ -169,7 +169,7 @@ proptest! {
 }
 
 // =====================================================================
-// Wave 11-E: SortKey reverse properties.
+// SortKey reverse properties.
 //
 // For each SortKey impl, encode-then-decode round-trips, AND the encoded
 // bytes preserve order: a < b implies encode(a) < encode(b)

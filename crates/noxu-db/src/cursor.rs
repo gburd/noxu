@@ -77,8 +77,6 @@ impl Cursor {
     ///   surrounding transaction's isolation level (set on
     ///   [`crate::transaction_config::TransactionConfig`]).  Per-call
     ///   read-uncommitted is not yet implemented; pass `None` for now.
-    ///   Wave 1C audit cleanup (cursor F17) keeps the parameter so the
-    ///   ABI is stable for the v1.6 wiring.
     ///
     /// # Returns
     /// * `OperationStatus::Success` if the cursor positioned on a record.
@@ -306,8 +304,7 @@ impl Cursor {
     /// * [`NoxuError::DatabaseClosed`] if the underlying database has
     ///   been closed.
     /// * [`NoxuError::OperationNotAllowed`] if the cursor was opened
-    ///   read-only (Wave 1C audit cleanup, cursor F18 — typed error
-    ///   instead of the previous bare boolean), or if the call uses
+    ///   read-only, or if the call uses
     ///   `Put::Current` before the cursor was positioned.
     pub fn put(
         &mut self,
@@ -425,7 +422,7 @@ impl Cursor {
     ///
     /// `close()` itself is idempotent: calling it more than once is a
     /// no-op and returns `Ok(())`.  This matches BDB-JE's
-    /// `Cursor.close()` contract (audit cursor F13/F14, Wave 2C-4).
+    /// `Cursor.close()` contract — calling it more than once is safe.
     ///
     /// # Errors
     /// Returns the inner-cursor close error if the underlying
@@ -952,7 +949,7 @@ mod tests {
 
     /// Get::SearchGte with empty key positions at the first record.
     ///
-    /// Audit cursor F10 (Wave 2C-4): empty keys are valid input under
+    /// Empty keys are valid input under
     /// the unified contract — SearchGte with the empty key starts the
     /// range scan at the smallest record, matching BDB-JE.
     #[test]
@@ -1296,7 +1293,7 @@ mod tests {
     }
 
     /// Get::SearchBothRange wires through to `SearchMode::BothRange` on
-    /// a sorted-dup database (audit cursor F12, Wave 2C-4).
+    /// a sorted-dup database.
     #[test]
     fn test_search_both_range_on_dup_db() {
         use noxu_dbi::{
