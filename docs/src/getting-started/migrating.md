@@ -560,3 +560,43 @@ where `tree` is passed to a function expecting `&Tree` explicitly — change
 
 A new method `get_real_tree_arc()` returns `Option<Arc<RwLock<Tree>>>` for
 callers that need the shared Arc (e.g. the cleaner registry).
+
+### X-12: `cache_size` is now the total memory budget (BREAKING)
+
+**Previously**: `cache_size` bounded only the BIN tree Arbiter pool.
+Log write buffers (`log_num_buffers × log_buffer_size`, default 3 MiB)
+and off-heap cache (`max_off_heap_memory`, default 0) were independent
+pools.  Actual memory use = `cache_size + log_buffers + off_heap`.
+
+**Now**: `cache_size` is the **total** ceiling.  The Arbiter receives
+`cache_size − log_buf_total − off_heap_reserved` (floored at 1 MiB).
+
+**Impact**: If your `cache_size` was sized to give the BIN tree a specific
+budget, the BIN tree pool is now smaller by `log_buf_total + off_heap_reserved`.
+
+**Migration**:
+
+```rust
+// Before (v2.x): cache_size=256 MiB meant BIN tree got 256 MiB,
+// plus 3 MiB log buffers on top = 259 MiB total.
+.with_cache_size(256 * MiB)
+
+// After (v3.0): to give the BIN tree 256 MiB, increase cache_size:
+// cache_size = 256 MiB + 3 MiB (log buffers) = 259 MiB
+.with_cache_size(259 * MiB)
+
+// Or equivalently, check the formula:
+// bin_tree = cache_size - log_num_buffers * log_buffer_size - max_off_heap_memory
+```
+
+If you are using the default `log_num_buffers = 3` and `log_buffer_size = 1 MiB`
+and `max_off_heap_memory = 0`, add **3 MiB** to your `cache_size` to maintain
+the same BIN tree allocation.
+
+### X-11: `log_flush_no_sync_interval_ms` now active
+
+Previously this parameter was stored but never consumed.  As of v3.0.0,
+setting a non-zero value starts the `noxu-log-flusher` background daemon.
+This is a **behaviour change** (not a source-level breaking change): code
+that previously set this parameter expecting it to be ignored will now see
+background flushes.  Default is 0 (disabled, same as before).

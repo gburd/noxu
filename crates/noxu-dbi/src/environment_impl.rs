@@ -1486,7 +1486,14 @@ impl EnvironmentImpl {
         Arc::clone(&self.evictor)
     }
 
-    /// Returns a reference to the cleaner, if one was created.
+    /// X-12: Returns the Arbiter's configured maximum memory budget in bytes.
+    ///
+    /// Under the total-budget model the Arbiter budget equals
+    /// `cache_size - log_buf_total - off_heap_reserved`.
+    /// Used in tests to assert the allocation formula is correct.
+    pub fn get_arbiter_max_memory(&self) -> i64 {
+        self.evictor.get_arbiter().get_max_memory()
+    }
     ///
     /// Returns `None` for read-only environments.
     pub fn get_cleaner(&self) -> Option<Arc<Cleaner>> {
