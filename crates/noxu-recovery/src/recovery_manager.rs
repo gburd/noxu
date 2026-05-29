@@ -246,13 +246,17 @@ pub struct RecoveryManager {
     /// # TODO (C-6 full implementation)
     /// JE phases A–D (buildINs + undoLNs + redoLNs for the mapping tree)
     /// are not yet fully replicated.  What IS guaranteed here:
+    ///
     /// - NameLNs with a `txn_id` belonging to an aborted transaction are
     ///   removed from `recovered_db_names` before data redo begins.
     /// - All NameLN processing (analysis) finishes before any data LN redo.
+    ///
     /// What is NOT yet implemented:
+    ///
     /// - A full MapLN B-tree undo pass (requires a dedicated on-disk mapping
     ///   tree, not just a HashMap).
-    /// Tracked in: docs/src/internal/wave-11-r-semantic.md § C-6.
+    ///
+    /// Tracked in: `docs/src/internal/wave-11-r-semantic.md` § C-6.
     mapping_tree_db_names: HashMap<String, u64>,
 }
 

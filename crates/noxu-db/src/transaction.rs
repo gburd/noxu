@@ -771,7 +771,9 @@ impl Transaction {
         // Run commit callbacks (e.g. transactional database registration).
         let cbs: Vec<Box<dyn FnOnce() + Send>> =
             std::mem::take(&mut *self.commit_callbacks.lock().unwrap());
-        for cb in cbs { cb(); }
+        for cb in cbs {
+            cb();
+        }
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }
@@ -863,7 +865,9 @@ impl Transaction {
         // Run abort callbacks (e.g. transactional database registration rollback).
         let cbs: Vec<Box<dyn FnOnce() + Send>> =
             std::mem::take(&mut *self.abort_callbacks.lock().unwrap());
-        for cb in cbs { cb(); }
+        for cb in cbs {
+            cb();
+        }
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }

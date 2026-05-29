@@ -942,11 +942,7 @@ impl EnvironmentImpl {
             }
             // Look up the db_id we assigned during open_database_inner.
             self.db_map.read().iter().find_map(|(id, db_arc)| {
-                if db_arc.read().get_name() == name {
-                    Some(*id)
-                } else {
-                    None
-                }
+                if db_arc.read().get_name() == name { Some(*id) } else { None }
             })
         };
         if let Some(db_id) = db_id {
@@ -970,11 +966,7 @@ impl EnvironmentImpl {
         drop(pending);
         // Remove from db_map: find by name, then remove by id.
         let db_id = self.db_map.read().iter().find_map(|(id, db_arc)| {
-            if db_arc.read().get_name() == name {
-                Some(*id)
-            } else {
-                None
-            }
+            if db_arc.read().get_name() == name { Some(*id) } else { None }
         });
         if let Some(id) = db_id {
             self.db_map.write().remove(&id);
