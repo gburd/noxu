@@ -290,17 +290,24 @@ impl LogBuffer {
     ///
     /// Called without holding the latch.
     pub fn free(&self) {
-        self.write_pin_count.fetch_sub(1, Ordering::Relaxed);
+        // C-7 (audit-2026-05-jonhoo.md 4.4): use Release so that the writes
+        // into the buffer segment (visible to this thread) are ordered
+        // before the decrement.  The Acquire load in wait_for_zero_and_latch
+        // then guarantees the reader sees the completed writes before it
+        // re-uses the buffer.
+        self.write_pin_count.fetch_sub(1, Ordering::Release);
     }
 
     /// Acquires the buffer latched and with the buffer pin count equal to zero.
     pub fn wait_for_zero_and_latch(&self) {
         loop {
-            if self.write_pin_count.load(Ordering::Relaxed) > 0 {
+            // C-7: Acquire pairs with the Release in free() / LogBufferSegment::put()
+            // to ensure we see all completed segment writes before re-using the buffer.
+            if self.write_pin_count.load(Ordering::Acquire) > 0 {
                 thread::park_timeout(Duration::from_nanos(100));
             } else {
                 self.latch_for_write();
-                if self.write_pin_count.load(Ordering::Relaxed) == 0 {
+                if self.write_pin_count.load(Ordering::Acquire) == 0 {
                     return;
                 } else {
                     self.release();
@@ -373,7 +380,10 @@ impl LogBufferSegment {
         unsafe {
             (*self.latch_held).store(false, Ordering::Relaxed);
             (*self.latch).unlock();
-            (*self.pin_count).fetch_sub(1, Ordering::Relaxed);
+            // C-7: Release ensures the copy_nonoverlapping above is visible
+            // to any thread that Acquire-loads the pin_count in
+            // wait_for_zero_and_latch() and observes zero.
+            (*self.pin_count).fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -579,5 +589,56 @@ mod tests {
         assert!(!buffer.get_rewrite_allowed());
         buffer.set_rewrite_allowed();
         assert!(buffer.get_rewrite_allowed());
+    }
+
+    /// C-7 regression: the pin_count Release/Acquire ordering must guarantee
+    /// that a reader waiting in `wait_for_zero_and_latch()` sees the complete
+    /// segment write once the pin count reaches zero.
+    ///
+    /// The test spawns a writer thread that allocates a segment, writes a
+    /// known pattern, then calls `put()` (which decrements pin_count with
+    /// Release).  The main thread calls `wait_for_zero_and_latch()` (which
+    /// Acquire-loads pin_count) and then asserts the pattern is visible.
+    ///
+    /// Without Release/Acquire (i.e. with pure Relaxed), the Rust/C++
+    /// memory model does NOT guarantee this and Miri / hardware could
+    /// observe a stale value.  With Release/Acquire the guarantee is
+    /// unconditional.
+    #[test]
+    fn test_pin_count_release_acquire_ordering() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let buf = Arc::new(Mutex::new(LogBuffer::new(256)));
+
+        // Allocate a segment while holding the latch.
+        let segment = {
+            let mut b = buf.lock().unwrap();
+            b.latch_for_write();
+            let seg = b.allocate(64).expect("must allocate 64 bytes");
+            b.release(); // release latch; writer can now copy data
+            seg
+        };
+
+        // Spawn a writer that fills the segment and calls put().
+        let written_pattern = [0xABu8; 64];
+        let t = thread::spawn(move || {
+            segment.put(&written_pattern);
+        });
+
+        // Wait for writer to complete and latch the buffer.
+        {
+            let mut b = buf.lock().unwrap();
+            b.wait_for_zero_and_latch(); // Acquire-loads pin_count
+            let data = b.get_data();
+            assert_eq!(
+                &data[..64],
+                &[0xABu8; 64],
+                "C-7: writer's data must be visible after pin_count reaches zero"
+            );
+            b.release();
+        }
+
+        t.join().unwrap();
     }
 }
