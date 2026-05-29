@@ -1,19 +1,20 @@
 # Porting Guidelines
 
-Noxu DB is an embedded transactional database — Noxu DB 7.5.11 plus all 10
-Noxu extensions. Fidelity to Noxu's algorithms and behaviour is the
-primary quality criterion — not idiomatic Rust style.
+Noxu DB is an embedded transactional database modeled on Berkeley DB
+Java Edition 7.5.11 plus all 10 of its extended-fork enhancements.
+Fidelity to those algorithms and behaviours is the primary quality
+criterion — not idiomatic Rust style.
 
 ## Guiding Principle
 
 > When the Rust code diverges from intended logic, it is likely a bug, not an
 > improvement.
 
-Noxu's implementation has been battle-tested in production systems for over 20
-years. Its algorithms — the B-tree latch-coupling traversal, the three-phase
-recovery, the VLSN tracking, the phi accrual failure detector — are correct and
-have known complexity bounds. Before "simplifying" any ported code, verify
-against the algorithm specification.
+The reference implementations in `_/je/` and `_/nosql/` carry decades
+of production experience in the embedded database field.  Noxu DB
+attempts to inherit that algorithmic maturity through faithful algorithm
+porting and test-suite porting.  When the Rust code diverges from the
+intended logic, it is a bug.
 
 ## Java → Rust Naming Rules
 
