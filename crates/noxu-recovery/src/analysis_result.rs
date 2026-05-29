@@ -182,6 +182,14 @@ pub struct AnalysisResult {
     /// Database name → ID mappings accumulated from NameLN entries.
     /// Populated by `record_name_ln`; consumed by `RecoveryManager`.
     pub recovered_db_names: hashbrown::HashMap<String, u64>,
+
+    /// Database name → creating-txn-id, for NameLN entries that carried a
+    /// txn_id (C-6 fix).  Only present for `NameLNTxn` WAL entries; absent
+    /// for non-transactional `NameLN` entries (pre-C6 or commit-time writes).
+    ///
+    /// Used by `run_mapping_tree_undo_pass` to remove names whose creating
+    /// transaction aborted.
+    pub recovered_db_txn_ids: hashbrown::HashMap<String, u64>,
 }
 
 impl AnalysisResult {
@@ -201,6 +209,7 @@ impl AnalysisResult {
             first_active_lsn: NULL_LSN,
             use_root_lsn: NULL_LSN,
             recovered_db_names: hashbrown::HashMap::new(),
+            recovered_db_txn_ids: hashbrown::HashMap::new(),
         }
     }
 

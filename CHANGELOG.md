@@ -16,6 +16,42 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (v3.0.0 — Wave 11-U recovery/checkpoint/cleaner/VLSN cluster)
+
+- **X-8 — Checkpointer no longer writes redundant empty BINDelta after evictor
+  flushes a BIN**: the dirty-BIN snapshot taken under the tree read lock could
+  contain BINs that the evictor cleared before the per-node write-lock was
+  acquired.  The previous guard only skipped empty-AND-clean nodes; the fix
+  adds `if !b.dirty && dirty == 0 { continue; }` which correctly skips any
+  already-clean BIN regardless of entry count.  (Wave 11-U X-8)
+
+- **X-2 — VLSN index persistence now capped at the last checkpoint boundary**:
+  `vlsn.idx` was flushed periodically with no coordination with the
+  checkpointer.  After a crash the B-tree could recover to VLSN N while
+  `vlsn.idx` claimed M > N, causing a feedgap mismatch.  The VLSN flush
+  daemon now calls `flush_to_disk_capped(cap_lsn)` where `cap_lsn` is the
+  last durable checkpoint end LSN; entries beyond that position are filtered
+  out before writing.  (Wave 11-U X-2)
+
+- **X-7 — Cleaner now dispatches secondary-LN liveness checks to the correct
+  tree**: `SharedTreeLookup` previously ignored `db_id` and always looked up
+  keys in the primary tree.  Secondary keys not found in the primary tree were
+  misclassified as `Obsolete` and silently dropped during cleaning.
+  `DatabaseImpl.real_tree` is now `Arc<RwLock<Tree>>` (shared), and the
+  environment wires a live `db_trees_registry` to the cleaner so
+  `lookup_parent_bin`/`migrate_ln_slot` dispatch to the correct tree per
+  db_id.  (Wave 11-U X-7; **breaking**: `DatabaseImpl::get_real_tree()`
+  return type changed to `Option<RwLockReadGuard<'_, Tree>>`)
+
+- **C-6 (partial) — `NameLnRecord` carries `txn_id`; mapping-tree undo pass
+  is functional**: `NameLnRecord` gains a `txn_id: Option<u64>` field
+  populated from `LnLogEntry.txn_id` during recovery scanning.  The analysis
+  pass now builds `recovered_db_txn_ids` alongside `recovered_db_names`.
+  `run_mapping_tree_undo_pass` removes NameLN entries whose txn_id is in the
+  aborted-transactions set.  The pass remains a structural no-op for current
+  WAL files because Noxu writes NameLNs at commit time (no txn_id); the
+  write-path change is tracked separately.  (Wave 11-U C-6)
+
 ### Fixed (v3.0.0 — Wave 11-T cross-feature criticals)
 
 - **X-13 — `Database::check_open` and `CursorImpl::check_state` now verify env
