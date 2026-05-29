@@ -39,39 +39,28 @@ pub trait XaResource: Send + Sync {
     ///
     /// If `flags` contains `ONEPHASE`, this is a one-phase commit optimization.
     ///
-    /// # v1.5 limitation
-    ///
-    /// If `xid` exists only in the persistent prepared log (i.e. it was
-    /// prepared in a previous process and the in-memory branch was lost on
-    /// restart), this returns `XaError::CrashDurabilityNotSupported`.
-    /// Crash-durable XA is planned for v2.0.
+    /// Crash-durable XA is supported as of v2.0 (Wave 3-2): a `TxnPrepare`
+    /// WAL frame is written during `xa_prepare`, and recovery surfaces
+    /// in-doubt XIDs via `xa_recover()`.  The deprecated variant
+    /// [`crate::error::XaError::CrashDurabilityNotSupported`] is no longer returned.
     fn xa_commit(&self, xid: &Xid, flags: XaFlags) -> XaResult<()>;
 
     /// Roll back the transaction branch.
     ///
-    /// # v1.5 limitation
-    ///
-    /// As with `xa_commit`, calling `xa_rollback` on a XID that survives
-    /// only in the persistent prepared log returns
-    /// `XaError::CrashDurabilityNotSupported`. Use
-    /// [`XaResource::xa_forget`] to discard the persistent record.
+    /// Crash-durable XA is supported as of v2.0 (Wave 3-2).
+    /// The deprecated variant
+    /// [`crate::error::XaError::CrashDurabilityNotSupported`] is no
+    /// longer returned; use [`XaResource::xa_forget`] to discard a heuristic
+    /// record from the persistent log.
     fn xa_rollback(&self, xid: &Xid, flags: XaFlags) -> XaResult<()>;
 
     /// Recover prepared transaction branches after a crash.
     ///
     /// Returns a list of XIDs that are in PREPARED state and need resolution.
-    ///
-    /// # v1.5 honesty caveat
-    ///
-    /// In v1.5, XA is in-process only: the persistent prepared log is
-    /// fsync'd by `xa_prepare`, but the engine does not write a
-    /// `TxnPrepare` WAL record and `noxu-recovery` does not reconstruct the
-    /// in-memory `Transaction` on restart. After a fresh process start the
-    /// returned list may include XIDs that *cannot* be committed or rolled
-    /// back — attempting to do so returns
-    /// `XaError::CrashDurabilityNotSupported`. Use `xa_forget` to discard
-    /// such entries from the persistent log. Crash-durable XA is planned
-    /// for v2.0.
+    /// As of v2.0 (Wave 3-2) the engine writes a `TxnPrepare` WAL record
+    /// on `xa_prepare` and `noxu-recovery` reconstructs the in-memory
+    /// `Transaction` on restart.  The deprecated variant
+    /// [`crate::error::XaError::CrashDurabilityNotSupported`] is no longer returned.
     fn xa_recover(&self, flags: XaFlags) -> XaResult<Vec<Xid>>;
 
     /// Forget a heuristically completed transaction branch.

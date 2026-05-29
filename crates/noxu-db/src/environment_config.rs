@@ -560,10 +560,16 @@ pub struct EnvironmentConfig {
 
     /// Commits do not wait for the log to reach disk.
     /// Mirrors `TXN_NO_SYNC` / default false.
+    ///
+    /// **Deprecated since 2.4.1** — use the [`durability`][Self::durability]
+    /// field with `Durability::commit_no_sync()` instead.
     pub txn_no_sync: bool,
 
     /// Commits write the log to the OS buffer but skip `fdatasync`.
     /// Mirrors `TXN_WRITE_NO_SYNC` / default false.
+    ///
+    /// **Deprecated since 2.4.1** — use the [`durability`][Self::durability]
+    /// field with `Durability::commit_write_no_sync()` instead.
     pub txn_write_no_sync: bool,
 
     /// When `true`, all transactions default to **serializable**
@@ -1510,14 +1516,36 @@ impl EnvironmentConfig {
         self.durability = d;
         self
     }
+    /// Sets `txn_no_sync`.
+    ///
+    /// **Deprecated** — use [`set_durability`][Self::set_durability] /
+    /// [`with_durability`][Self::with_durability] instead.
+    #[deprecated(
+        since = "2.4.1",
+        note = "use set_durability(Durability::commit_no_sync()) instead"
+    )]
     pub fn set_txn_no_sync(&mut self, v: bool) -> &mut Self {
         self.txn_no_sync = v;
         self
     }
+    /// Builder-style `txn_no_sync`.
+    ///
+    /// **Deprecated** — use [`with_durability`][Self::with_durability] instead.
+    #[deprecated(
+        since = "2.4.1",
+        note = "use with_durability(Durability::commit_no_sync()) instead"
+    )]
     pub fn with_txn_no_sync(mut self, v: bool) -> Self {
         self.txn_no_sync = v;
         self
     }
+    /// Sets `txn_write_no_sync`.
+    ///
+    /// **Deprecated** — use [`set_durability`][Self::set_durability] instead.
+    #[deprecated(
+        since = "2.4.1",
+        note = "use set_durability(Durability::commit_write_no_sync()) instead"
+    )]
     pub fn set_txn_write_no_sync(&mut self, v: bool) -> &mut Self {
         self.txn_write_no_sync = v;
         self
@@ -2055,6 +2083,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated txn_no_sync / txn_write_no_sync setters
     fn test_set_txn_params() {
         let mut c = EnvironmentConfig::default();
         c.set_txn_timeout(5000);
@@ -2141,6 +2170,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises deprecated with_txn_no_sync in builder chain
     fn test_builder_chain() {
         let c = EnvironmentConfig::new(PathBuf::from("/data"))
             .with_allow_create(true)
