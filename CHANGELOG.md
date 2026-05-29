@@ -16,6 +16,58 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (v2.5.0 — Wave 11-S)
+
+- **`Database::iter(txn)` + `Database::range(txn, range)`**: lazy forward
+  iterators that implement `Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>`.
+  Records are fetched one at a time; the entire database is NOT eagerly
+  materialised (addresses audit-2026-05-jonhoo.md findings 2.1 / 2.3).
+  See `docs/src/internal/wave-11-s-ux-cleanup.md`. (Wave 11-S Q-1)
+
+### Fixed (v2.5.0 — Wave 11-S)
+
+- **`Transaction::abort` env-lock hold** (H-1): the abort undo loop no longer
+  holds the `EnvironmentImpl` mutex for the full undo duration. Each database
+  handle is looked up with a brief per-record env lock acquisition; all undo
+  application happens lock-free. Eliminates reader-starvation latency spikes
+  during large-transaction aborts.
+  (Wave 11-S H-1, audit-2026-05-keith.md F-2.2)
+
+- **`CursorImpl::search` `current_index = 0` bug**: after a `Search` or
+  `SearchGte` operation the cursor's `current_index` was always reset to 0,
+  causing the subsequent `Get::Next` to advance from the second key in the
+  BIN rather than from the found position. Fixed by propagating the actual
+  BIN slot index from `search_with_data` and `find_range_entry`.
+  (Wave 11-S Q-1 bonus, affects any code combining Search with Next)
+
+- **`log_manager.rs` per-call `Vec` allocation** (H-3): the scratch buffer for
+  log-entry encoding is now embedded in the LWL mutex (reused across calls).
+  Eliminates a heap allocation on every log write.
+  (Wave 11-S H-3, audit-2026-05-keith.md F-1.1)
+
+### Documentation (v2.5.0 — Wave 11-S)
+
+- **`docs/src/reference/on-disk-format.md`**: complete entry-type table
+  regenerated from `crates/noxu-log/src/entry_type.rs` (H-6); endianness
+  section rewritten per-field-category to accurately reflect that BIN/IN
+  payloads are big-endian while entry headers are little-endian (H-7).
+
+- **`docs/src/maintainer/algorithms.md`**: corrected `waiter_graph` direction
+  (was "blocker->[waiters]", is "waiter->[owner_ids it is blocked by]") (H-5).
+
+- **README.md Quick Start**: fixed `cursor.get_next` (non-existent) to
+  `cursor.get(..., Get::Next, ...)` (H-8).
+
+- **`lib.rs` / `transaction.rs` doc examples**: converted from ignore to no_run
+  so they are compiled by `cargo test`. Fixed stale builder method names in
+  `transaction.rs` example (H-8).
+
+- **`docs/src/contributing/testing-guide.md`**: added "Slow / Stress Tests"
+  section documenting the ignore inventory and how to run them (Q-2).
+
+- All bare `#[ignore]` attributes in slow/stress/perf tests replaced with
+  `#[ignore = "<reason>"]` (Q-2).
+
 ### Added (v3.0.0 candidate)
 
 - **API stability commitment**: `docs/src/contributing/api-stability.md` enumerates
