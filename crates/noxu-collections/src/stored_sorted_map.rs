@@ -1,6 +1,6 @@
 //! Typed sorted-map view of a database.
 //!
-//! Wave 2B redesign (v1.6).  `StoredSortedMap<K, V, KB, VB>` adds
+//! `StoredSortedMap<K, V, KB, VB>` adds
 //! sorted-map operations (`first_key`, `last_key`, `iter_from`,
 //! `iter_reverse`) on top of [`StoredMap`].  Every operation accepts
 //! `txn: Option<&Transaction>`, matching the BDB-JE shape.

@@ -1,6 +1,6 @@
 //! Typed value-collection view of a database.
 //!
-//! Wave 2B redesign (v1.6).  `StoredValueSet<V, VB>` is a collection
+//! `StoredValueSet<V, VB>` is a collection
 //! view focused on the *values* of a Noxu database.  It mirrors
 //! BDB-JE's `StoredValueSet` and is most useful in conjunction with a
 //! sorted-duplicate database (one logical key, many values), although

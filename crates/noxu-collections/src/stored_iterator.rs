@@ -1,6 +1,6 @@
 //! Typed iterators for `noxu-collections` Stored* views.
 //!
-//! Wave 2B redesign (v1.6).  The pre-1.6 iterator was a snapshot-of-keys
+//! The pre-1.6 iterator was a snapshot-of-keys
 //! type that lazily fetched values, parameterised over `&[u8]` keys.
 //! In v1.6 the Stored* surface is fully typed (parameterised by
 //! `EntryBinding<K>` / `EntryBinding<V>`), so the iterator is now
