@@ -376,7 +376,7 @@ fn test_xa_recover_multi_cluster() {
 /// - Rolled-back data is never readable
 /// - xa_recover returns only genuinely prepared XIDs
 #[test]
-#[ignore] // Run with: cargo test -p noxu-xa --test xa_chaos_test -- --ignored
+#[ignore = "stress: concurrent XA chaos (60 s by default, configurable via XA_CHAOS_SECS); run with --ignored"]
 fn test_xa_chaos_concurrent() {
     let chaos_secs: u64 = std::env::var("XA_CHAOS_SECS")
         .ok()
@@ -792,7 +792,7 @@ fn test_xa_scale_concurrent_threads() {
 
 /// Performance: compare XA 2PC commit throughput vs single-phase commit.
 #[test]
-#[ignore]
+#[ignore = "perf-benchmark: XA 2PC vs single-phase throughput (5000 ops); run with --ignored"]
 fn test_xa_perf_2pc_vs_single_phase() {
     let n = 5000;
     let cluster = Cluster::new("perf");
@@ -901,7 +901,7 @@ fn test_xa_perf_2pc_vs_single_phase() {
 
 /// Performance: concurrent XA 2PC throughput across 2 clusters.
 #[test]
-#[ignore]
+#[ignore = "perf-benchmark: concurrent XA 2PC across 2 clusters, 8 threads; run with --ignored"]
 fn test_xa_perf_concurrent_multi_cluster() {
     let num_threads = 8;
     let ops_per_thread = 500;
