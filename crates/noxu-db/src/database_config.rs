@@ -35,7 +35,7 @@ pub struct DatabaseConfig {
 
     /// Override the B-tree key comparator.
     ///
-    /// **Inert as of v1.6.0** (audit database F6 / F7, Wave 2C-4):
+    /// **Inert as of v1.6.0**:
     /// the public API has no setter for an actual comparator function,
     /// so this flag has nothing to consume.  The flag and the
     /// `ByteComparator` trait are scheduled for removal in v2.0.
@@ -49,7 +49,7 @@ pub struct DatabaseConfig {
 
     /// Whether this database is exclusive to a single thread.
     ///
-    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// **Inert as of v1.6.0**: the
     /// `noxu_dbi` engine has no per-database thread-affinity
     /// enforcement; this flag is recorded but never consulted.
     pub exclusive: bool,
@@ -59,7 +59,7 @@ pub struct DatabaseConfig {
 
     /// Whether this database participates in replication.
     ///
-    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// **Inert as of v1.6.0**: the
     /// `noxu_dbi::DatabaseConfig` has no `replicated` field; the
     /// replication scope is set at the env level via `noxu-rep`.
     pub replicated: bool,
@@ -67,26 +67,26 @@ pub struct DatabaseConfig {
     /// Enable key prefix compression in BIN nodes.
     ///
     /// **Plumbed through to `noxu_dbi::DatabaseConfig` as of v1.6.0**
-    /// (audit database F7, Wave 2C-4).
+    ///.
     pub key_prefixing: bool,
 
     /// Per-database cache eviction hint.
     ///
-    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// **Inert as of v1.6.0**: the
     /// per-DB hint is not yet honoured by the evictor; the env-level
     /// cache mode is.
     pub cache_mode: CacheMode,
 
     /// Write BIN-deltas to the log instead of full BINs (space optimization).
     ///
-    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// **Inert as of v1.6.0**: the
     /// engine always emits BIN-deltas where applicable.
     pub bin_delta: bool,
 
     /// When true, opening an existing database reuses its stored config
     /// rather than applying this config.
     ///
-    /// **Inert as of v1.6.0** (audit database F7, Wave 2C-4): the
+    /// **Inert as of v1.6.0**: the
     /// engine does not yet persist per-DB config across runs in a way
     /// that can be selectively re-applied.
     pub use_existing_config: bool,

@@ -103,7 +103,7 @@ impl PhiAccrualDetector {
     /// elapsed time since the previous heartbeat is appended to the
     /// sample window (older samples are evicted once the window is full).
     ///
-    /// # Diagnostic note (audit rep F33, Wave 2C-4)
+    /// # Diagnostic note
     ///
     /// Until at least two heartbeats have been observed the detector
     /// reports `phi() == 0.0` (i.e. "available") because there is no

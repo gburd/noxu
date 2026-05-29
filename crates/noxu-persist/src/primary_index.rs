@@ -32,7 +32,7 @@ use crate::secondary_index::{
 /// * `E` - The entity type (must implement `Entity` with `PrimaryKey = K`)
 pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     db: &'db Database,
-    /// Schema-evolution mutations (Wave 2C-2).
+    /// Schema-evolution mutations.
     ///
     /// Plumbed in from `EntityStore` via [`PrimaryIndex::with_mutations`].
     /// On every `get` / iteration, the per-record class version peeled
@@ -239,7 +239,7 @@ where
     /// per-record class-version envelope and dispatching to
     /// [`EntitySerializer::deserialize_versioned`].
     ///
-    /// Pre-Wave-2C-2 records had no envelope; the migration guide
+    /// Pre-v1.6 records had no envelope; the migration guide
     /// describes the dump-and-reload procedure.  We fail loudly
     /// (rather than silently misinterpreting old bytes) when the
     /// embedded class tag does not match `E::entity_name()`,

@@ -65,7 +65,7 @@ pub trait EntitySerializer<E: Entity> {
 
     /// Deserializes an entity given the class version the bytes were
     /// written under, plus a reference to the registered
-    /// [`Mutations`] (Wave 2C-2).
+    /// [`Mutations`].
     ///
     /// The default implementation ignores the version and the
     /// mutations and delegates to [`Self::deserialize`].  Override
