@@ -15,6 +15,7 @@
 "crc32fast" = "crc32fast"  # crate name
 "nextest"   = "nextest"    # cargo-nextest
 "ser"       = "ser"        # EntitySerializer variable name in code samples
+"DNE"       = "DNE"        # "does not exist" (audit shorthand)
 
 [files]
 extend-exclude = [
