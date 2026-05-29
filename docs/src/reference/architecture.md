@@ -1,7 +1,8 @@
 # Architecture
 
-Noxu DB is a Rust port of Noxu DB (Noxu DB), an embedded
-transactional key-value database. This chapter documents the system
+Noxu DB is an embedded transactional key-value database engine written
+in Rust, derived from the design of Berkeley DB Java Edition.
+This chapter documents the system
 architecture, data flow, crate structure, and subsystem interactions.
 
 The canonical prose version of this document is also maintained at
@@ -10,9 +11,7 @@ in the repository root.
 
 ## Heritage
 
-Noxu DB is a mature, production-grade embedded database with a
-well-tested architecture built around a write-ahead log, a B+tree, and
-checkpoint-based recovery. Noxu DB preserves this architecture faithfully: the
+Noxu DB preserves the architecture of Berkeley DB Java Edition faithfully: the
 same subsystem boundaries, the same algorithms, and the same naming conventions.
 Noxu uses `parking_lot`
 latches, and enums and traits for class hierarchies. The
