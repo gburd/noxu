@@ -1084,8 +1084,12 @@ impl EnvironmentImpl {
                 // transaction so crash recovery can undo it if the transaction
                 // aborts or the process crashes before commit.
                 if let Some(lm) = &self.log_manager {
-                    let _ =
-                        Self::log_name_ln_txn(lm, name, db_id.id() as u64, txn_id);
+                    let _ = Self::log_name_ln_txn(
+                        lm,
+                        name,
+                        db_id.id() as u64,
+                        txn_id,
+                    );
                 }
             }
             // recovered_db_id.is_some(): db already in name_map from recovery;
@@ -1171,8 +1175,8 @@ impl EnvironmentImpl {
         let key = name.as_bytes().to_vec();
         let data = db_id.to_le_bytes().to_vec();
         let entry = LnLogEntry::new(
-            0,                          // db_id header field (unused for NameLN)
-            Some(txn_id as i64),        // txn_id: creating transaction
+            0,                   // db_id header field (unused for NameLN)
+            Some(txn_id as i64), // txn_id: creating transaction
             NULL_LSN,
             false,
             None,

@@ -48,9 +48,23 @@ listed in [References](#references).
   populated from `LnLogEntry.txn_id` during recovery scanning.  The analysis
   pass now builds `recovered_db_txn_ids` alongside `recovered_db_names`.
   `run_mapping_tree_undo_pass` removes NameLN entries whose txn_id is in the
-  aborted-transactions set.  The pass remains a structural no-op for current
-  WAL files because Noxu writes NameLNs at commit time (no txn_id); the
-  write-path change is tracked separately.  (Wave 11-U C-6)
+  aborted-transactions set.  Completed end-to-end in Wave 11-Y below.
+  (Wave 11-U C-6)
+
+### Fixed (v3.0.0 — Wave 11-Y C-6 end-to-end)
+
+- **C-6 (complete) — `NameLNTxn` now written inside the creating transaction**:
+  `EnvironmentImpl::open_database_transactional` now accepts a `txn_id: u64`
+  parameter and calls the new `log_name_ln_txn` helper to write a
+  `LogEntryType::NameLNTxn` entry (`Provisional::Yes`) **inside** the creating
+  transaction.  `commit_pending_database` no longer writes a second `NameLN`;
+  the `TxnCommit` record from the normal commit path serves as the durability
+  marker.  The mapping-tree undo predicate was also strengthened to remove
+  crash-before-commit entries (txn_id absent from `committed_txns`, not just
+  present in `aborted_txns`).  Old WAL files (NameLN with txn_id=None) are
+  treated as committed and always survive recovery.  The previously `#[ignore]`d
+  end-to-end test `test_c6_aborted_db_creation_not_recovered` is now live.
+  (Wave 11-Y C-6)
 
 ### Fixed (v3.0.0 — Wave 11-X XA/config/cache-budget fixes)
 
