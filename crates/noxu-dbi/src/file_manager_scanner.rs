@@ -257,10 +257,16 @@ impl FileManagerLogScanner {
                         let db_id = u64::from_le_bytes(
                             data_bytes[..8].try_into().ok()?,
                         );
+                        // C-6: propagate txn_id from the LN entry so the
+                        // mapping-tree undo pass can remove NameLNs whose
+                        // creating transaction aborted.
+                        let txn_id =
+                            r.txn_id.map(|id| id.unsigned_abs());
                         Some(LogEntry::NameLn(noxu_recovery::NameLnRecord {
                             name,
                             db_id,
                             is_deleted: false,
+                            txn_id,
                         }))
                     } else {
                         None
@@ -272,6 +278,7 @@ impl FileManagerLogScanner {
                         name,
                         db_id: 0,
                         is_deleted: true,
+                        txn_id: None,
                     }))
                 }
             }
