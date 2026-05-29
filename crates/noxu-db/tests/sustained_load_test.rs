@@ -83,7 +83,7 @@ fn open_env(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
 /// - at least one write and one read scan complete (liveness)
 /// - writers collectively complete > 1 000 commits (throughput sanity)
 #[test]
-#[ignore]
+#[ignore = "stress: 8r/8w sustained load for 60 s; run with --ignored"]
 fn test_sustained_8r8w_60s() {
     let dir = scratch_dir("noxu_sustained_8r8w_");
     let (env, db) = open_env(&dir);
@@ -197,7 +197,7 @@ fn test_sustained_8r8w_60s() {
 /// - every checkpoint completes in < 5 s (no checkpoint deadlock)
 /// - at least 50 checkpoints complete in 30 s (≈ 1 every 600 ms budget)
 #[test]
-#[ignore]
+#[ignore = "stress: checkpoint under 8r/8w load for 30 s; run with --ignored"]
 fn test_checkpoint_under_load_30s() {
     let dir = scratch_dir("noxu_checkpoint_load_");
     let (env, db) = open_env(&dir);

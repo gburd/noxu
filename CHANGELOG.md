@@ -16,7 +16,51 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-### Added (v3.0.0 candidate)
+### Added (v3.0.0 candidate — Wave 11-R)
+
+- **`Environment::compress()`** — synchronous BIN-compression trigger,
+  mirroring JE `Environment.compress()`.  Drains the INCompressor queue in
+  one pass; returns the count of BINs compressed.  Useful in tests and for
+  applications that want deterministic memory reclamation after bulk deletes.
+  (Q-3)
+
+- **`Environment::evict_memory()`** — explicit evictor trigger, mirroring
+  JE `Environment.evictMemory()`.  Requests the cache evictor to free pages
+  toward the configured cache size; returns bytes freed.  (Q-3)
+
+### Fixed (v3.0.0 candidate — Wave 11-R)
+
+- **C-4 `open_database` transactional semantics**: the `txn` parameter is
+  now honoured.  When a transaction is supplied and `allow_create = true`,
+  the database creation is rolled back on `txn.abort()` and is invisible to
+  `get_database_names()` until the transaction commits.  (Breaking: `_txn`
+  renamed to `txn`; see `docs/src/getting-started/migrating.md`.)
+
+- **C-5 `BIN::should_log_delta()` guard clauses**: three predicates from
+  JE `BIN.shouldLogDelta()` were missing and are now added: (1) already-delta
+  BINs always re-log as deltas; (2) `prohibit_next_delta` set by `compress()`
+  forces a full BIN; (3) `last_full_version == NULL_LSN` forces a full BIN.
+  Checkpoint output may differ in compress-then-checkpoint scenarios; recovery
+  is strictly safer.
+
+- **C-6 recovery two-pass structural scaffolding**: `RecoveryManager` now
+  has an explicit `run_mapping_tree_undo_pass()` phase called after analysis
+  and before data-LN redo, mirroring JE `buildTree()` phases B/D.  The
+  aborted-NameLN removal loop is structurally correct; full JE parity
+  (storing `txn_id` in NameLN WAL entries) is a follow-up.
+
+- **C-8 SR9465/SR9752 TSV resolution**: four `PORTED-PARTIAL` entries in
+  `je-tck-port-2026-05-enumeration-je.recovery.tsv` updated to
+  `PORTED-EQUIVALENT`.  The underlying bugs (aborted delete+reinsert corrupts
+  BIN; aborted dup inserts persist) were fixed in Wave 5; this wave audited
+  and confirmed the fixes.
+
+- **Q-4 recovery test fidelity**: `recovery_abort_test_inserts_three_phase_no_dups`
+  now calls `env.compress()` after the abort phase, matching JE's
+  `RecoveryAbortTest.testInserts`.  Previously the compressor-drain step was
+  omitted due to the absence of a synchronous compress API.
+
+
 
 - **API stability commitment**: `docs/src/contributing/api-stability.md` enumerates
   the v3.0 stable public surface for `noxu-db`, `noxu-bind`, `noxu-collections`,

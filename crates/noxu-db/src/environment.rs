@@ -447,7 +447,7 @@ impl Environment {
     ///   (`DatabaseAlreadyExists`)
     pub fn open_database(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         name: &str,
         config: &DatabaseConfig,
     ) -> Result<Database> {
@@ -510,9 +510,18 @@ impl Environment {
         }
 
         // Open the database via EnvironmentImpl (creates if allow_create, else errors)
+        // C-4 / JE 1-I: if a transaction is supplied and this is a new
+        // creation, use the transactional path so the name registration is
+        // deferred until commit.
+        let is_transactional_create = txn.is_some() && config.allow_create;
         let db_impl_arc = {
             let env_impl = self.env_impl.lock();
-            env_impl.open_database(name, &dbi_config).map_err(|e| {
+            let open_fn = if is_transactional_create {
+                noxu_dbi::EnvironmentImpl::open_database_transactional
+            } else {
+                noxu_dbi::EnvironmentImpl::open_database
+            };
+            open_fn(&env_impl, name, &dbi_config).map_err(|e| {
                 match &e {
                     noxu_dbi::DbiError::DatabaseNotFound(_) => {
                         NoxuError::DatabaseNotFound(format!(
@@ -524,6 +533,25 @@ impl Environment {
                 }
             })?
         };
+
+        // Register abort/commit callbacks on the transaction so that
+        // transactional database creation is properly rolled back or
+        // finalised when the transaction resolves (C-4 / JE 1-I).
+        if is_transactional_create {
+            let env_impl_arc = Arc::clone(&self.env_impl);
+            let db_name_abort = name.to_string();
+            let db_name_commit = name.to_string();
+            let env_impl_arc2 = Arc::clone(&self.env_impl);
+            // SAFETY: is_transactional_create implies txn.is_some().
+            let txn_ref = txn
+                .expect("invariant: txn is Some when is_transactional_create");
+            txn_ref.register_abort_callback(move || {
+                env_impl_arc.lock().abort_pending_database(&db_name_abort);
+            });
+            txn_ref.register_commit_callback(move || {
+                env_impl_arc2.lock().commit_pending_database(&db_name_commit);
+            });
+        }
 
         let db_id = db_impl_arc.read().get_id().id() as u64;
 
@@ -1345,7 +1373,39 @@ impl Environment {
         Ok(merged)
     }
 
-    /// Internal method to mark a database as closed.
+    /// Explicitly trigger BIN compression for all open databases.
+    ///
+    /// Mirrors `Environment.compress()` in JE (`Environment.java:1887`).
+    /// Synchronously runs one pass of the INCompressor logic: finds every
+    /// BIN with known-deleted slots and compresses them.  Useful in tests
+    /// to drain the compressor queue before taking a checkpoint, and for
+    /// applications that want deterministic memory reclamation after bulk
+    /// deletes.
+    ///
+    /// Returns `Ok(n)` where `n` is the number of BINs compressed.  Returns
+    /// `Err` if the environment is closed or invalid.
+    pub fn compress(&self) -> Result<usize> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let n = env_impl.compress_all();
+        Ok(n)
+    }
+
+    /// Explicitly trigger the memory evictor.
+    ///
+    /// Mirrors `Environment.evictMemory()` in JE (`Environment.java:1860`).
+    /// Requests that the cache evictor free cache pages down toward the
+    /// configured cache size.  Useful after bulk inserts to reclaim memory
+    /// proactively rather than waiting for the background daemon.
+    ///
+    /// Returns `Ok(bytes_evicted)`.  Returns `Err` if the environment is
+    /// closed or invalid.
+    pub fn evict_memory(&self) -> Result<usize> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let bytes = env_impl.evict_memory();
+        Ok(bytes)
+    }
     ///
     /// Called by Database::close().
     pub(crate) fn mark_database_closed(&self, name: &str) {
@@ -1686,17 +1746,81 @@ mod tests {
         assert!(names.contains(&"db2".to_string()));
     }
 
+    /// C-4 / JE 1-I: a database opened inside an explicit transaction that is
+    /// subsequently aborted must NOT persist after env close + reopen.
     #[test]
-    fn test_begin_transaction() {
+    fn test_transactional_open_database_abort_removes_db() {
+        let (temp_dir, config) = temp_env_config();
+        {
+            let env = Environment::open(config).unwrap();
+            let txn = env.begin_transaction(None).unwrap();
+            let db_config = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true);
+            let _db = env
+                .open_database(Some(&txn), "aborted_db", &db_config)
+                .unwrap();
+            txn.abort().unwrap();
+            // After abort the database must not appear in the committed list.
+            let names = env.get_database_names().unwrap();
+            assert!(
+                !names.contains(&"aborted_db".to_string()),
+                "aborted database must not appear in get_database_names() \
+                 (C-4 committed-only semantics), got: {:?}",
+                names
+            );
+            drop(env);
+        }
+        // Reopen: the aborted database must NOT have been written to the WAL.
+        let env2 = Environment::open(
+            EnvironmentConfig::new(temp_dir.path().to_path_buf())
+                .with_allow_create(false)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let names2 = env2.get_database_names().unwrap();
+        assert!(
+            !names2.contains(&"aborted_db".to_string()),
+            "after env reopen, aborted database must not appear: {:?}",
+            names2
+        );
+    }
+
+    /// C-4 / JE 1-I: `get_database_names()` must NOT return a database that
+    /// was opened inside a concurrent uncommitted transaction.
+    #[test]
+    fn test_get_database_names_excludes_uncommitted() {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let txn = env.begin_transaction(None).unwrap();
-        assert!(txn.is_valid());
+        let _db =
+            env.open_database(Some(&txn), "pending_db", &db_config).unwrap();
+
+        // While txn is still uncommitted, another observer must not see
+        // the database in the committed-names list.
+        let names = env.get_database_names().unwrap();
+        assert!(
+            !names.contains(&"pending_db".to_string()),
+            "uncommitted database must be invisible to get_database_names() \
+             (C-4 / JE 1-J): got {:?}",
+            names
+        );
+
+        // After commit the database must appear.
+        txn.commit().unwrap();
+        let names_after = env.get_database_names().unwrap();
+        assert!(
+            names_after.contains(&"pending_db".to_string()),
+            "committed database must appear in get_database_names()"
+        );
     }
 
     #[test]
-    fn test_begin_transaction_non_transactional_fails() {
+    fn test_begin_transaction() {
         let temp_dir = TempDir::new().unwrap();
         let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
             .with_allow_create(true)

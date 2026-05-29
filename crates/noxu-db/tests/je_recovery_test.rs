@@ -282,9 +282,11 @@ fn recovery_sr8984_part2_different_key_dups_no_resurrect() {
 // JE invariant: alternating commit / abort / commit insert phases
 // followed by a clean close+recover yield the union of the committed
 // inserts — aborted inserts must NOT resurrect after recovery.
-// JE additionally drains the IN-compressor queue to force the recovery
-// to replay IN-deletes; Noxu has no equivalent public probe, so this
-// port relies on the recovery pipeline doing the equivalent work.
+// JE additionally calls `env.compress()` after the abort phase to drain
+// the IN-compressor queue; this forces recovery to replay IN-deletes,
+// verifying that slot compression after abort interacts correctly.
+// Q-4 / Wave 11-R: now that `Environment::compress()` is available (Q-3),
+// this port explicitly calls it after the abort phase to match JE fidelity.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -309,6 +311,14 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
             db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
         }
         t.abort().unwrap();
+
+        // Q-4 / 2-E: explicitly drain the IN-compressor queue after abort,
+        // matching JE's `env.compress()` call in RecoveryAbortTest.testInserts.
+        // This forces BIN-slot compression before the recovery phase so the
+        // recovery pipeline must replay the compressed state correctly.
+        // Previously this step was omitted ("no equivalent public probe");
+        // now that Environment::compress() is available it is exercised here.
+        env.compress().expect("compress() after abort phase");
 
         // Verify aborted inserts are gone.
         for i in n..(3 * n) {

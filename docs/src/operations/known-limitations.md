@@ -54,6 +54,10 @@ Recommended deployment until these are remediated:
 | **`ReplicatedEnvironment::new` does not start the replication group** | Identified by May-2026 claim audit. The doc claims `new()` initiates an election and contacts peers; the body only constructs state and starts the TCP service dispatcher. | The replication subsystem requires further wiring (election trigger, peer contact) before it provides the documented behaviour. |
 | **`become_master`, `transfer_master`, `shutdown_group` are partially or entirely stubbed** | Identified by May-2026 claim audit. None of these run the full HA semantics described in their docs. | These APIs should be considered design placeholders, not functional in v1.3.0. |
 | **No built-in metrics export** | `env.get_stats()` returns a snapshot; there is no Prometheus/OpenTelemetry integration | Wrap `get_stats()` in your own scraper thread |
+| **`JoinCursor` over sorted-dup secondaries** | `test_join_intersection_finds_single_match` is `#[ignore]`; `JoinCursor` requires sorted-dup secondary indexes which are a v1.6 feature (Decision 1B). | Planned for a dedicated follow-up wave. Use multiple single-key cursors and intersect results in application code. |
+| **`Get::SearchLte`, `Get::FirstDup`, `Get::LastDup`** | These `Get` enum variants return `NoxuError::Unsupported` at runtime (Wave 11-R audit finding 3-D). | Use `Get::SearchBothRange` + manual iteration for LTE, or position with `Get::Search` and step backward. |
+| **`Environment::get_lock_stats()` / `get_transaction_stats()`** | JE exposes separate lock-table and transaction-subsystem stat surfaces. Noxu has only `get_stats()` (Wave 11-R audit finding 3-C). | Use `get_stats()` for aggregate numbers; per-lock-table granularity is not available. |
+| **`LogFlushTask` — no public type** | Background log-flush daemon (`LOG_FLUSH_NO_SYNC_INTERVAL`) runs internally but is not exposed as a public API (Wave 11-R audit finding 3-F). | Set `with_log_group_commit` + `with_durability(CommitNoSync)` and rely on the daemon; no manual flush handle is available. |
 
 ---
 
