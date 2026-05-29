@@ -16,6 +16,27 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Changed
+
+- **crates.io publish preparation** (Wave 11-M): the workspace dependency
+  graph has been restructured so every public `noxu-*` crate now carries
+  `version = "2.4.1"` alongside its `path` entry in
+  `[workspace.dependencies]`. The 19 crates intended for crates.io
+  (see list below) have had `publish = false` removed. `noxu-spec` and
+  `noxu-observe` remain private for now.
+  
+  v3.0.0 will be the **first crates.io release**. The full publish runbook
+  (dep order, 60-second wait between publishes, docs.rs verification,
+  badge updates, yank procedure) is documented at
+  `docs/src/contributing/publishing.md`.
+  
+  Public crates in publish order:
+  `noxu-util` → `noxu-sync` → `noxu-latch` → `noxu-config` → `noxu-log`
+  → `noxu-tree` → `noxu-txn` → `noxu-evictor` → `noxu-cleaner`
+  → `noxu-recovery` → `noxu-dbi` → `noxu-engine` → `noxu-db`
+  → `noxu-bind` → `noxu-collections` → `noxu-persist-derive`
+  → `noxu-persist` → `noxu-xa` → `noxu-rep`.
+
 ## [v2.4.1] — 2026-05-29
 
 ### Fixed
