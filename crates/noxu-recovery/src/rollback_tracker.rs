@@ -162,10 +162,27 @@ impl RollbackTracker {
 
     /// Check if an LSN falls within any rollback period.
     ///
-    /// This is used during recovery to determine if an LN should be
-    /// processed specially due to being in a rolled-back section of the log.
+    /// X-15 fix: also checks incomplete (open-ended) rollback periods in
+    /// `pending_rollback_starts`.  An open-ended period has a known
+    /// `matchpoint_lsn` and `rollback_start_lsn` (the LSN of the
+    /// `RollbackStart` record) but no `RollbackEnd`.  If a replica crashes
+    /// mid-rollback before `RollbackEnd` is written, entries in the range
+    /// `(matchpoint_lsn, rollback_start_lsn)` must still be skipped during
+    /// redo/undo so the B-tree is left at the matchpoint state.
+    ///
+    /// Previously, pending periods were silently ignored, causing recovered
+    /// entries in an incomplete rollback window to be re-applied during redo.
     pub fn is_in_rollback_period(&self, lsn: Lsn) -> bool {
-        self.rollback_periods.iter().any(|p| p.contains(lsn))
+        // Check completed periods first (fast path).
+        if self.rollback_periods.iter().any(|p| p.contains(lsn)) {
+            return true;
+        }
+        // X-15: also check pending (open-ended) periods whose rollback_start_lsn
+        // is valid (not NULL_LSN).  An incomplete period covers
+        // matchpoint_lsn < lsn < rollback_start_lsn, same as a complete one.
+        self.pending_rollback_starts.values().any(|p| {
+            p.rollback_start_lsn != NULL_LSN && p.contains(lsn)
+        })
     }
 
     /// Get all rollback periods (completed only).
@@ -264,6 +281,26 @@ impl RollbackTracker {
             .iter()
             .map(|p| p.rollback_start_lsn)
             .min_by_key(|lsn| lsn.as_u64())
+    }
+
+    /// Returns the lowest `matchpoint_lsn` across all completed rollback
+    /// periods, or `None` if there are none.
+    ///
+    /// This is the "safe high watermark" for the VLSN index: after
+    /// recovery, the VLSN index should be truncated to the VLSN
+    /// corresponding to this LSN so it matches the recovered B-tree state.
+    /// Used by the X-1 / X-14 VLSN-index rebuild path in `ReplicatedEnvironment`.
+    pub fn safe_matchpoint_lsn(&self) -> Option<Lsn> {
+        self.rollback_periods
+            .iter()
+            .map(|p| p.matchpoint_lsn)
+            .min_by_key(|lsn| lsn.as_u64())
+    }
+
+    /// Returns the number of pending (incomplete) rollback starts,
+    /// i.e. open-ended periods without a matching `RollbackEnd`.
+    pub fn incomplete_period_count(&self) -> usize {
+        self.pending_rollback_starts.len()
     }
 }
 
@@ -685,5 +722,92 @@ mod tests {
         assert!(!tracker.is_in_rollback_period(make_lsn(1, 50)));
         // LSN 400 is the boundary (rollback_start) — not inside
         assert!(!tracker.is_in_rollback_period(make_lsn(1, 400)));
+    }
+
+    // ── X-15: open-ended rollback interval ─────────────────────────────
+
+    /// X-15: a `RollbackStart` with no matching `RollbackEnd` (open-ended
+    /// interval) must still mark LSNs in `(matchpoint_lsn, rollback_start_lsn)`
+    /// as being inside the rollback period.  Before the fix,
+    /// `is_in_rollback_period` only checked completed periods, so the
+    /// open-ended window was silently ignored and mid-rollback entries were
+    /// re-applied during redo.
+    #[test]
+    fn test_x15_open_ended_rollback_period_is_detected() {
+        let mut tracker = RollbackTracker::new();
+
+        // Inject a RollbackStart (matchpoint=100, start=400) with no
+        // matching RollbackEnd — simulates a crash mid-rollback.
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+
+        // The period is incomplete (no RollbackEnd).
+        assert_eq!(tracker.period_count(), 0, "no completed periods yet");
+        assert!(tracker.has_incomplete_rollbacks());
+        assert_eq!(tracker.incomplete_period_count(), 1);
+
+        // LSNs in the open-ended window (100 < lsn < 400) MUST be detected.
+        assert!(
+            tracker.is_in_rollback_period(make_lsn(1, 150)),
+            "lsn 150 should be in open-ended rollback period"
+        );
+        assert!(
+            tracker.is_in_rollback_period(make_lsn(1, 250)),
+            "lsn 250 should be in open-ended rollback period"
+        );
+        assert!(
+            tracker.is_in_rollback_period(make_lsn(1, 399)),
+            "lsn 399 should be in open-ended rollback period"
+        );
+
+        // Boundaries and entries outside must NOT be detected.
+        assert!(
+            !tracker.is_in_rollback_period(make_lsn(1, 100)),
+            "matchpoint_lsn itself is not in the period"
+        );
+        assert!(
+            !tracker.is_in_rollback_period(make_lsn(1, 400)),
+            "rollback_start_lsn itself is not inside the period"
+        );
+        assert!(
+            !tracker.is_in_rollback_period(make_lsn(1, 50)),
+            "before matchpoint is not in period"
+        );
+        assert!(
+            !tracker.is_in_rollback_period(make_lsn(1, 450)),
+            "after rollback_start is not in open-ended period"
+        );
+    }
+
+    /// X-15: completing an open-ended period (adding RollbackEnd) moves it
+    /// to the completed set and `is_in_rollback_period` continues to work.
+    #[test]
+    fn test_x15_open_ended_period_becomes_complete_on_end() {
+        let mut tracker = RollbackTracker::new();
+
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+        assert_eq!(tracker.period_count(), 0);
+        assert!(tracker.is_in_rollback_period(make_lsn(1, 200))); // open-ended
+
+        // Now close it.
+        tracker.register_rollback_end(make_lsn(1, 100), make_lsn(1, 500));
+        assert_eq!(tracker.period_count(), 1, "period should be complete now");
+        assert!(!tracker.has_incomplete_rollbacks());
+
+        // Still detectable as a completed period.
+        assert!(tracker.is_in_rollback_period(make_lsn(1, 200)));
+    }
+
+    /// X-15: multiple open-ended periods all checked independently.
+    #[test]
+    fn test_x15_multiple_open_ended_periods() {
+        let mut tracker = RollbackTracker::new();
+
+        tracker.register_rollback_start(make_lsn(1, 100), make_lsn(1, 400));
+        tracker.register_rollback_start(make_lsn(2, 0), make_lsn(2, 200));
+
+        assert_eq!(tracker.incomplete_period_count(), 2);
+        assert!(tracker.is_in_rollback_period(make_lsn(1, 200))); // in first period
+        assert!(tracker.is_in_rollback_period(make_lsn(2, 100))); // in second period
+        assert!(!tracker.is_in_rollback_period(make_lsn(1, 500))); // after first period
     }
 }
