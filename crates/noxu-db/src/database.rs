@@ -461,7 +461,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The search key
     /// * `data` - Output parameter to receive the data
     ///
@@ -627,7 +627,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The key to insert/update
     /// * `data` - The data to store
     ///
@@ -869,7 +869,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The key to insert
     /// * `data` - The data to store
     ///
@@ -931,7 +931,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The key to delete
     ///
     /// # Returns
