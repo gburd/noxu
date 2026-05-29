@@ -51,7 +51,7 @@ in lockstep with the workspace.
 
 ## Dependency graph (publish order)
 
-```
+```text
 Layer 0 (leaf):  noxu-util, noxu-sync
 Layer 1:         noxu-latch, noxu-config
 Layer 2:         noxu-log
