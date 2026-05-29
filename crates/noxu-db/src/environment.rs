@@ -1189,7 +1189,7 @@ impl Environment {
     /// the previous shutdown / crash.  An empty `Vec` means there are
     /// no in-doubt transactions to resolve.
     ///
-    /// See [`crate::xa`] for XA two-phase commit.
+    /// See `noxu_xa` for XA two-phase commit.
     pub fn recovered_prepared_txns(
         &self,
     ) -> Vec<noxu_recovery::PreparedTxnInfo> {
@@ -1228,7 +1228,7 @@ impl Environment {
     /// LNs into the in-memory tree via
     /// [`Self::take_recovered_prepared_lns`] and applied them.
     ///
-    /// See [`crate::xa`] for XA two-phase commit.
+    /// See `noxu_xa` for XA two-phase commit.
     pub fn write_txn_commit_for_recovered(&self, txn_id: u64) -> Result<()> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
