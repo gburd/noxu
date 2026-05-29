@@ -1130,7 +1130,7 @@ const ALL_ALGOS: [EvictionAlgorithm; 5] = [
 // ============================================================================
 
 #[test]
-#[ignore]
+#[ignore = "torture: multi-node replication election/failover loop, duration varies (60–600 s); run with --ignored"]
 fn torture_replication() {
     let duration = torture_duration();
     let transports = node_transports();
