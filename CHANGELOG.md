@@ -16,6 +16,62 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (v3.0.0 — Wave 11-T cross-feature criticals)
+
+- **X-13 — `Database::check_open` and `CursorImpl::check_state` now verify env
+  validity**: after a C-2 fsync failure (`io_invalid = true`) or explicit
+  `EnvironmentImpl::invalidate()`, reads and cursor operations now return
+  `EnvironmentFailure` instead of silently succeeding on stale data.
+  `EnvironmentImpl::is_invalid` changed from `AtomicBool` to
+  `Arc<AtomicBool>` so callers cache the flag without locking.
+  `map_cursor_err()` added to `cursor.rs` to propagate env-failure errors
+  correctly. (Wave 11-T X-13)
+
+- **X-15 — Open-ended rollback interval now detected during recovery**:
+  `RollbackTracker::is_in_rollback_period()` previously ignored
+  `pending_rollback_starts` (incomplete rollback periods), allowing
+  entries in an open-ended window to be re-applied during redo after a
+  crash mid-rollback.  Now both completed and incomplete periods are
+  consulted. (Wave 11-T X-15)
+
+- **X-5 — Cleaner checkpoint barrier wired end-to-end (critical data-loss fix)**:
+  the three-state deletion barrier (`cleaned → checkpointed → safe_to_delete`)
+  was fully implemented in `FileSelector` but never called from outside the
+  cleaner.  Files were deleted in the same cleaning pass before any checkpoint,
+  making before-image undo reads fail silently (slot deleted instead of
+  restored).  `Checkpointer` now holds an optional `Arc<Cleaner>` and calls
+  `cleaner.after_checkpoint(&state)` after each successful checkpoint, activating
+  the two-checkpoint deletion barrier. (Wave 11-T X-5)
+
+- **X-6 — Cleaner migration writes real WAL LN entry**: `migrate_ln_slot` now
+  writes a non-transactional `UpdateLN` WAL entry via `write_migration_ln()`
+  and uses the returned LSN for the tree slot, ensuring recovery can find
+  migrated data after a crash before the next checkpoint. (Wave 11-T X-6)
+
+- **X-3 — Recovered XA commit allocates real VLSN in replicated env**:
+  `write_txn_commit_for_recovered` now calls
+  `coordinator.alloc_vlsn_for_recovered_commit(commit_lsn)` after writing
+  the `TxnCommit` WAL frame.  `ReplicatedEnvironment` increments the VLSN
+  counter and registers the commit in the VLSN index so replicas learn about
+  the recovered XA transaction. (Wave 11-T X-3)
+
+- **X-1 + X-14 — VLSN index rebuilt and truncated after recovery**:
+  `RecoveryManager::run_redo_all` now collects `(vlsn, lsn)` pairs from all
+  replayed LN entries (`RecoveryInfo::recovered_vlsns`).  After recovery,
+  `ReplicatedEnvironment::with_environment()` re-registers these pairs into
+  the VLSN index (X-14) and then calls `truncate_after(safe_vlsn)` based on
+  the rollback matchpoint (X-1), ensuring the index is consistent with the
+  recovered B-tree state. (Wave 11-T X-1, X-14)
+
+### Breaking Changes (v3.0.0 — Wave 11-T)
+
+- `CleanResult::files_deleted` now reflects the two-checkpoint barrier:
+  files are only counted when they are actually removed after passing the
+  barrier, not in the same cleaning pass.  Tests expecting immediate deletion
+  must be updated (see `noxu-cleaner/src/cleaner.rs` for examples).
+- `ReplicaAckCoordinator` has a new default method
+  `alloc_vlsn_for_recovered_commit`; no action needed for existing impls.
+
 ### Added (v2.5.0 — Wave 11-S)
 
 - **`Database::iter(txn)` + `Database::range(txn, range)`**: lazy forward

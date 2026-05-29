@@ -24,8 +24,11 @@ runtime test to confirm.
 **Severity**: High  
 **Interaction**: `noxu-rep::vlsn::VlsnIndex` × `noxu-recovery::RollbackTracker`  
 **Files**:
+
 - `crates/noxu-rep/src/vlsn/vlsn_index.rs` (`VlsnIndex::truncate_after`)
+
 - `crates/noxu-recovery/src/rollback_tracker.rs` (`RollbackTracker`)
+
 - `crates/noxu-rep/src/replicated_environment.rs:224–263` (VLSN index init)
 
 **Gap**: When a replica crashes mid-syncup, recovery's `RollbackTracker` marks
@@ -48,12 +51,17 @@ either re-sending already-applied entries (benign) or, if N is beyond the
 master's current log tip, triggering an erroneous network restore.
 
 **Repro sketch**:
+
 1. Replica syncs to VLSN 1000.
+
 2. Replica enters syncup with new master; master rolls back VLSNs 900–1000
    (partial network restore).
+
 3. Replica crashes (kill -9) mid-rollback before recovery writes `RollbackEnd`.
+
 4. Replica restarts; recovery marks VLSNs 900–1000 as rolled back but leaves
    `vlsn.idx` intact (loaded at step 4 with latest=1000).
+
 5. Replica connects to master; claims it has VLSN 1000; master refuses because
    its log doesn't have 1000 anymore → unexpected network restore.
 
@@ -69,8 +77,11 @@ mid-rollback and verifies the VLSN index is consistent with the recovered log.
 **Severity**: Medium  
 **Interaction**: `noxu-rep::vlsn::persist` × `noxu-recovery::checkpointer`  
 **Files**:
+
 - `crates/noxu-rep/src/replicated_environment.rs:467–535` (flush daemon)
+
 - `crates/noxu-rep/src/vlsn/persist.rs:93` (`flush_to_disk`)
+
 - `crates/noxu-recovery/src/checkpointer.rs` (checkpoint lifecycle)
 
 **Gap**: `vlsn.idx` is flushed periodically in a background thread keyed on
@@ -101,8 +112,11 @@ Alternatively, on load, walk the log backward from the loaded
 **Severity**: Critical  
 **Interaction**: `noxu-xa::environment::xa_commit` × `noxu-rep` VLSN tracking  
 **Files**:
+
 - `crates/noxu-db/src/environment.rs:1397–1455` (`write_txn_end_for_recovered`)
+
 - `crates/noxu-db/src/environment.rs:1267–1305` (`apply_recovered_prepared_lns`)
+
 - `crates/noxu-rep/src/vlsn/vlsn_index.rs` (`VlsnIndex::put`)
 
 **Gap**: `write_txn_end_for_recovered()` writes the durable `TxnCommit` WAL
@@ -118,6 +132,7 @@ let entry = if is_commit {
         0,
         NULL_VLSN,   // ← no VLSN assigned
     )
+
 ```
 
 In a replicated environment, every committed transaction must carry a real VLSN
@@ -135,11 +150,17 @@ old log files that replicas may or may not have).  Replicas that were
 mid-syncup at crash time have a gap.
 
 **Repro sketch**:
+
 1. Open `XaEnvironment` over a `ReplicatedEnvironment` (master).
+
 2. `xa_start` → insert 100 keys → `xa_end` → `xa_prepare` → crash master.
+
 3. Restart master (becomes master again after election).
+
 4. `xa_recover()` returns the XID.  `xa_commit(xid)`.
+
 5. Connect a fresh replica.  Verify replica has the 100 keys.
+
 6. Observe: VLSN tracker shows stale watermark; replica may not receive
    the 100 keys without a full network restore.
 
@@ -156,7 +177,9 @@ can stream the resolved data.
 **Severity**: High  
 **Interaction**: `noxu-xa::environment` `xa_start` × `recovered_branches` map  
 **Files**:
+
 - `crates/noxu-xa/src/environment.rs:241–264` (`xa_start`)
+
 - `crates/noxu-xa/src/environment.rs:304–356` (`xa_commit` recovered path)
 
 **Gap**: `xa_start` correctly rejects a duplicate XID if it exists in
@@ -188,8 +211,11 @@ or use a distinct in-progress-resolution state.
 **Severity**: Critical  
 **Interaction**: `noxu-cleaner::FileSelector` × `noxu-recovery::Checkpointer`  
 **Files**:
+
 - `crates/noxu-cleaner/src/file_selector.rs:359–455` (`mark_file_checkpointed`, `process_checkpoint_end`, `get_safe_to_delete`)
+
 - `crates/noxu-cleaner/src/cleaner.rs:321–342` (`do_clean` and `delete_pending_files`)
+
 - `crates/noxu-recovery/src/checkpointer.rs:416` (`do_checkpoint`)
 
 **Gap**: `FileSelector` has a correct three-state checkpoint barrier:
@@ -201,8 +227,10 @@ or use a distinct in-progress-resolution state.
 **These methods are never called from outside `noxu-cleaner`.**
 
 ```
+
 grep -rn "process_checkpoint_end|mark_file_checkpointed|get_safe_to_delete" crates/
 # Results: only crates/noxu-cleaner/src/file_selector.rs and its own tests.
+
 ```
 
 The actual deletion path in `Cleaner::do_clean()` (`cleaner.rs:340`) is:
@@ -213,6 +241,7 @@ self.file_selector.lock().mark_file_cleaned(file_number);
 
 // Mark file for deletion
 self.pending_deletions.lock().push(file_number);
+
 ```
 
 And `delete_pending_files()` (`cleaner.rs:731–750`) deletes files as soon as
@@ -226,9 +255,11 @@ data), Noxu embeds data inline in BINs.  This makes many paths safe after the
 deletion — but NOT the undo path.
 
 During recovery undo (`recovery_manager.rs:632`, `1491`):
+
 ```rust
 // Non-embedded: read before-image from log.
 let before_image = scanner.read_at_lsn(*abort_lsn);
+
 ```
 
 If an uncommitted transaction's before-image LN lives in a log file that the
@@ -238,17 +269,27 @@ undo path deletes the slot instead of restoring it.  This is silent data
 corruption: the record is lost rather than reverted.
 
 The path for corruption:
+
 1. Transaction T updates key K (before-image at abort_lsn=5:100 in file 5).
+
 2. Transaction T's next LN entry is in file 6 (after file 5).
+
 3. Cleaner processes file 5, migrates active LNs, marks file 5 for deletion.
+
 4. File 5 deleted (before any checkpoint — no barrier enforced).
+
 5. T is still in flight (uncommitted).
+
 6. Crash.
+
 7. Recovery undo: tries `scanner.read_at_lsn(5:100)` → file 5 deleted → `None`.
+
 8. Recovery `else { t.delete(&rec.key); }` — KEY K IS DELETED INSTEAD OF RESTORED.
 
 **Repro sketch**:
+
 ```
+
 env.open() with run_cleaner=true
 db1 = env.open_database("primary")
 txn = begin()
@@ -257,6 +298,7 @@ db1.put(&txn, "K", "after")  // LN in file 6
 // Let cleaner run and delete file 5 before txn commits
 // kill -9 process
 // Reopen: verify K == "before" (it will be MISSING)
+
 ```
 
 **Fix**: Wire the checkpoint callback: after each `do_checkpoint()` succeeds,
@@ -273,6 +315,7 @@ is JE's `Checkpointer.hook(CleanerFileSelector.afterCheckpoint())` pattern.
 **Severity**: High  
 **Interaction**: `noxu-cleaner::file_processor::SharedTreeLookup::migrate_ln_slot` × WAL  
 **Files**:
+
 - `crates/noxu-cleaner/src/file_processor.rs:686–720` (`SharedTreeLookup::migrate_ln_slot`)
 
 **Gap**: The cleaner's shared-tree migration path does NOT write a WAL entry
@@ -285,6 +328,7 @@ let _ = log_lsn;                                    // old LSN discarded
 // ... (get data from tree)
 
 let result = self.tree.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
+
 ```
 
 `get_end_of_log()` returns the current log head position; it is NOT a freshly
@@ -293,9 +337,12 @@ only marked dirty (via `insert`), which defers durability to the next
 checkpoint or evictor flush.
 
 If a crash occurs between migration and the next checkpoint:
+
 - Recovery loads the BIN from the last checkpoint; the slot shows the
   pre-migration LSN pointing to the old (potentially deleted) file.
+
 - Recovery's LN redo finds no "migration" WAL entry.
+
 - With the X-5 checkpoint-barrier gap, the old file may be gone.
 
 Even without X-5, the fake `new_lsn` means the slot's LSN-ordering is wrong:
@@ -322,7 +369,9 @@ migration path.
 **Severity**: Medium  
 **Interaction**: `noxu-cleaner::file_processor` × `noxu-db::secondary_database`  
 **Files**:
+
 - `crates/noxu-cleaner/src/file_processor.rs:184–300` (`migrate_ln_slot`)
+
 - `crates/noxu-db/src/secondary_database.rs:4–16` (data model doc comment)
 
 **Gap**: `migrate_ln_slot` uses a single `SharedTreeLookup` backed by the
@@ -341,9 +390,13 @@ separate tree, and the cleaner is currently only wired to the primary tree
 files but may not correctly handle secondary databases' files.
 
 **Repro sketch**:
+
 1. Create a primary DB and a secondary DB.
+
 2. Insert 10000 records.
+
 3. Run the cleaner on a log file that has secondary LN entries.
+
 4. Verify secondary entries are still accessible after cleaning.
 
 **Suggested test**: unverified — needs a runtime cleaner test with secondary
@@ -363,7 +416,9 @@ classification is the primary risk here.
 **Severity**: Medium  
 **Interaction**: `noxu-evictor::Evictor::flush_dirty_node_to_log` × `noxu-recovery::Checkpointer::flush_dirty_bins_internal`  
 **Files**:
+
 - `crates/noxu-evictor/src/evictor.rs:591–637` (`flush_dirty_node_to_log`)
+
 - `crates/noxu-recovery/src/checkpointer.rs:598–705` (`flush_dirty_bins_internal`)
 
 **Gap**: Both the evictor and the checkpointer flush dirty BINs to the WAL
@@ -372,16 +427,23 @@ write lock, so the data written is always consistent.  However:
 
 1. Checkpointer's `flush_dirty_bins_internal()` calls `collect_dirty_bins()`
    under a **tree read lock** to build the dirty-BIN list (snapshotted Arcs).
+
 2. Before the checkpointer acquires the **node write lock** for a specific BIN,
    the evictor may have already flushed and cleared it (`dirty = false`,
    `last_full_lsn = X`).
+
 3. The checkpointer then acquires the write lock and checks:
+
    ```rust
    if total == 0 && !b.dirty { continue; }  // skips ONLY empty-AND-clean nodes
+
    ```
+
    A node with `total > 0` and `!b.dirty` (cleaned by evictor) is NOT skipped.
+
 4. With `dirty_count = 0` and `last_full_lsn != NULL_LSN`, `use_delta = true`
    (`0/total = 0.0 ≤ 0.25 = TREE_BIN_DELTA`).
+
 5. Checkpointer writes an **empty BINDelta** (0 dirty entries) for a BIN that
    the evictor already flushed.  This is a no-op entry but wastes log space and
    updates `b.last_delta_lsn` unnecessarily.
@@ -407,11 +469,14 @@ delta-vs-full decision in `flush_dirty_bins_internal`.
 **Files**: `crates/noxu-tree/src/tree.rs:313–328` (`BinStub::strip_lns`)
 
 `strip_lns` opens with:
+
 ```rust
 if self.cursor_count > 0 {
     return 0;
 }
+
 ```
+
 This correctly protects any cursor positioned on the BIN.  The `cursor_count`
 is incremented by `Tree::pin_bin()` (cursor acquisition) and decremented by
 `Tree::unpin_bin()`.  The evictor's `strip_lns_from_node()` acquires a write
@@ -421,8 +486,11 @@ increment the count.
 
 **Cross-BIN cursor boundary during eviction**: When a cursor is mid-`get_next`
 at a BIN boundary, it:
+
 1. Releases the old BIN's write lock (via `update_bin_pin`).
+
 2. Calls `Tree::get_next_bin()`, traverses the tree to locate the sibling.
+
 3. Re-pins the new BIN.
 
 Between steps 1 and 3 the old BIN's `cursor_count = 0` and the new BIN is not
@@ -443,12 +511,17 @@ No new issue — this area is sound.
 **Severity**: High  
 **Interaction**: `noxu-db::Database::put` secondary hooks × `noxu-db::SecondaryCursor`  
 **Files**:
+
 - `crates/noxu-db/src/database.rs:766–790` (secondary hook fanout under txn)
+
 - `crates/noxu-db/src/secondary_database.rs:160–260` (`update_secondary`)
+
 - `crates/noxu-db/src/secondary_cursor.rs:72–79` (auto-commit note)
 
 **Gap**: When `Database::put(&txn, key, new_value)` runs:
+
 1. The primary record is written under `txn`.
+
 2. The secondary hook loop (`database.rs:766–790`) calls each secondary's
    `update_secondary(&txn, old_key, new_key, pri_key)`, which calls
    `delete_sec_key(&txn, old_sec_key, pri_key)` then
@@ -465,6 +538,7 @@ individually in reverse order.  Between the undo of the secondary delete
 old primary value), a snapshot window exists where:
 
 - Secondary cursor sees `old_sec_key → pri_key` (restored).
+
 - Primary read for `pri_key` yields the NEW value (not yet reverted).
 
 This is a classic read-isolation torn-state window in the abort path.  It is
@@ -478,13 +552,16 @@ inserts within a single txn.  This finding concerns CROSS-txn visibility
 during abort's multi-step undo.
 
 **Repro sketch**:
+
 ```
+
 txn1 = begin()
 db_primary.put(&txn1, "K", "V_new")  // was "V_old"
 // secondary key changes from sec("V_old") to sec("V_new")
 // Thread 2 immediately opens secondary cursor on sec("V_new")
 txn1.abort()  // undo secondary, then primary
 // Thread 2 cursor on secondary sees old sec key → new primary value momentarily
+
 ```
 
 **Fix**: The abort undo pass must hold a write lock on the secondary database
@@ -501,9 +578,13 @@ traversal.
 **Severity**: High  
 **Interaction**: `EnvironmentConfig` → `DbiConfig` → **nowhere**  
 **Files**:
+
 - `crates/noxu-db/src/environment_config.rs:272–273` (field definition)
+
 - `crates/noxu-db/src/environment.rs:262` (passed to DbiConfig)
+
 - `crates/noxu-dbi/src/dbi_config.rs:64` (stored)
+
 - `crates/noxu-dbi/src/environment_impl.rs` (not consumed anywhere)
 
 **Gap**: `EnvironmentConfig::log_flush_no_sync_interval_ms` is documented as
@@ -513,9 +594,12 @@ or acted upon** by the `EnvironmentImpl` daemon startup, the `LogManager`, or
 any background thread.
 
 A user who sets:
+
 ```rust
 config.set_log_flush_no_sync_interval_ms(100);
+
 ```
+
 and uses `CommitNoSync` transactions gets NO background flush; data remains in
 application write buffers indefinitely.  The documented `LogFlushTask` daemon
 (Q-3 from first pass) is the missing consumer.  The cross-feature aspect is
@@ -538,7 +622,9 @@ non-zero.
 **Severity**: High (budget fracture); Informational (lock_timeout)  
 **Interaction**: `EnvironmentConfig` cache budget → `Arbiter` × `LogManager` × `OffHeapCache`  
 **Files**:
+
 - `crates/noxu-dbi/src/environment_impl.rs:484–502` (budget allocation)
+
 - `crates/noxu-evictor/src/arbiter.rs:38–56` (`Arbiter`)
 
 **`lock_timeout_ms` — CORRECT**: `EnvironmentImpl::new()` at line 288 calls
@@ -551,14 +637,18 @@ created with `cache_bytes = cfg.cache_size` only:
 ```rust
 let cache_bytes = cfg.cache_size as i64;
 let arbiter = Arbiter::new(cache_bytes, ...);
+
 ```
 
 The `LogManager` independently allocates `cfg.log_buffer_size` bytes.
 The `OffHeapCache` independently allows `cfg.max_off_heap_memory` bytes.
 
 The three pools are:
+
 - BIN tree heap: bounded by `cache_size` via Arbiter
+
 - Log write buffers: bounded by `log_buffer_size` (separate pool)
+
 - Off-heap BIN store: bounded by `max_off_heap_memory` (separate pool)
 
 Total actual memory usage = `cache_size + log_buffer_size + max_off_heap_memory`.
@@ -582,9 +672,13 @@ from it rather than maintaining an independent counter.
 **Severity**: High  
 **Interaction**: `noxu-dbi::EnvironmentImpl::is_valid()` × `noxu-db::Database::check_open()` × `noxu-dbi::CursorImpl::check_state()`  
 **Files**:
+
 - `crates/noxu-dbi/src/environment_impl.rs:752–765` (`is_valid`)
+
 - `crates/noxu-db/src/database.rs:1470–1476` (`check_open`)
+
 - `crates/noxu-dbi/src/cursor_impl.rs:646–655` (`check_state`)
+
 - `crates/noxu-log/src/log_manager.rs:273` (io_invalid guard on write)
 
 **Gap**: After C-2's fix (env invalidation on fsync failure) set
@@ -594,6 +688,7 @@ checks `io_invalid` at entry).  However, **reads** and **cursor operations**
 bypass the validity check entirely.
 
 `Database::check_open()` (`database.rs:1470`):
+
 ```rust
 fn check_open(&self) -> Result<()> {
     if !self.open.load(Ordering::Acquire) {
@@ -601,9 +696,11 @@ fn check_open(&self) -> Result<()> {
     }
     Ok(())  // ← env validity NOT checked
 }
+
 ```
 
 `CursorImpl::check_state()` (`cursor_impl.rs:646`):
+
 ```rust
 fn check_state(&self) -> Result<(), DbiError> {
     match self.state {
@@ -611,12 +708,16 @@ fn check_state(&self) -> Result<(), DbiError> {
         _ => Ok(()),   // ← env validity NOT checked
     }
 }
+
 ```
 
 After an fsync failure:
+
 - `db.get()`, `db.put()` (read path), `cursor.get_next()` all succeed at the
   check-open level.
+
 - Only the `lm.log()` call inside the write path returns an error.
+
 - Read-only operations on an invalidated environment continue silently.
 
 A replication feeder (`crates/noxu-rep/src/stream/feeder.rs`) has **no
@@ -624,11 +725,17 @@ env-validity check** at all — it continues streaming from a log that may be
 corrupt because `io_invalid` was set after an fdatasync failure.
 
 **Repro sketch**:
+
 1. Open environment with WAL.
+
 2. Inject `io_invalid = true` (or trigger an fdatasync failure).
+
 3. Verify `env.is_valid()` returns `false`.
+
 4. Call `db.get(None, &key, &mut val)` — succeeds (reads stale BIN data).
+
 5. Call `db.put(None, &key, &val)` — fails at `lm.log()` but NOT at `check_open()`.
+
 6. The caller's error handling sees two different error origins for reads
    vs. writes, making it hard to fence all access uniformly.
 
@@ -644,15 +751,20 @@ time so the hot path does not acquire `env_impl.lock()`.  Add a
 
 ### Finding X-14 (HIGH): Env Open → Primary + Secondary Txn → Checkpoint → Crash → Recover — VLSN Not Rebuilt
 
-**Severity**: High  
-**Interaction**: `noxu-recovery` × `noxu-rep` VLSN rebuild on recovery  
+**Severity**: High
+**Interaction**: `noxu-recovery` × `noxu-rep` VLSN rebuild on recovery
 **Files**:
+
 - `crates/noxu-rep/src/replicated_environment.rs:224–263` (VLSN index init)
+
 - `crates/noxu-recovery/src/recovery_manager.rs:432–540` (analysis pass)
 
 **Gap**: When a `ReplicatedEnvironment` opens after a crash:
+
 1. `vlsn.idx` is loaded from disk.
+
 2. `RecoveryManager::recover_all()` is called on the B-tree.
+
 3. The recovery analysis pass processes `LogEntry::Ln` records but does NOT
    populate or update the VLSN index.
 
@@ -665,11 +777,16 @@ JE's `RepImpl.buildTree()` rebuilds the VLSN index as part of recovery by
 re-scanning VLSN entries from the log.  Noxu has no equivalent.
 
 **Repro sketch**:
+
 1. Replica at VLSN 500 (vlsn.idx has latest=500).
+
 2. Replica receives VLSNs 501–600 but crashes before persisting vlsn.idx
    (index is still at 500 on disk).
+
 3. Restart: recovery replays VLSNs 501–600 into the B-tree.
+
 4. VLSN index shows latest=500 but B-tree has data from 501–600.
+
 5. Feeder reconnects at VLSN 501 and re-sends all of 501–600 — harmless but
    wasteful.  Or, if vlsn.idx was flushed at 600 but recovery only reaches 550
    (X-2), the feeder skips 551–600 entirely.
@@ -682,10 +799,12 @@ cheaply in a second pass over `redo_entries` collected during analysis.
 
 ### Finding X-15 (CRITICAL): Replica Sync-Up → Master Failover During Syncup — Matchpoint LSN Not Validated Against Recovered Log
 
-**Severity**: Critical (unverified — needs runtime test)  
-**Interaction**: `noxu-rep::stream::replica_stream` × `noxu-recovery::RollbackTracker`  
+**Severity**: Critical (unverified — needs runtime test)
+**Interaction**: `noxu-rep::stream::replica_stream` × `noxu-recovery::RollbackTracker`
 **Files**:
+
 - `crates/noxu-rep/src/stream/replica_stream.rs:173–196` (stream recovery)
+
 - `crates/noxu-recovery/src/rollback_tracker.rs`
 
 **Gap**: When the master fails over mid-syncup, a replica that was receiving a
@@ -696,6 +815,7 @@ entries but BEFORE `RollbackEnd` is written, the `RollbackTracker` has a
 `RollbackStart` with no matching `RollbackEnd`.
 
 In `recovery_manager.rs`:
+
 ```rust
 LogEntry::RollbackStart(rec) => {
     self.rollback_tracker.register_rollback_start(rec.matchpoint_lsn, rec.lsn);
@@ -703,6 +823,7 @@ LogEntry::RollbackStart(rec) => {
 LogEntry::RollbackEnd(rec) => {
     self.rollback_tracker.register_rollback_end(rec.matchpoint_lsn, rec.lsn);
 }
+
 ```
 
 The recovery redo phase calls `rollback_tracker.is_in_rollback_period(lsn)`
@@ -712,10 +833,15 @@ treated as a rollback period?  The behavior of
 is **unverified** from static analysis alone.
 
 **Repro sketch**:
+
 1. Replica receives VLSNs 1–1000.  Master fails.
+
 2. New master triggers syncup; sends `RollbackStart(matchpoint=900)`.
+
 3. Replica writes `RollbackStart` to its log, starts rolling back.
+
 4. Replica crashes at VLSN 950 (during rollback, before `RollbackEnd`).
+
 5. Restart recovery: is `is_in_rollback_period(950..1000)` correctly handled?
 
 **Suggested test**: Add a test that injects a `RollbackStart` without a
@@ -729,13 +855,20 @@ open-ended rollback interval.
 ### Finding X-16: Spec Coverage Gaps in Cross-Feature Interactions
 
 The 11 existing Stateright specs cover:
-- `btree_latching` — single-crate, no cross-feature  
-- `cache_vs_cleaner` — evictor × cleaner dirty-bit ordering (in-process race)  
-- `cleaner_safety` — reader refs preventing file deletion (NOT the checkpoint barrier)  
-- `flexible_paxos`, `vlsn_streaming`, `master_transfer`, `network_restore` — replication protocols  
-- `recovery_three_phase` — analysis → redo → undo (single-threaded, no XA, no cleaner)  
-- `wal_commit` — log group-commit  
-- `xa_two_phase_commit` — XA state machine (single RM, no replication)  
+
+- `btree_latching` — single-crate, no cross-feature
+
+- `cache_vs_cleaner` — evictor × cleaner dirty-bit ordering (in-process race)
+
+- `cleaner_safety` — reader refs preventing file deletion (NOT the checkpoint barrier)
+
+- `flexible_paxos`, `vlsn_streaming`, `master_transfer`, `network_restore` — replication protocols
+
+- `recovery_three_phase` — analysis → redo → undo (single-threaded, no XA, no cleaner)
+
+- `wal_commit` — log group-commit
+
+- `xa_two_phase_commit` — XA state machine (single RM, no replication)
 
 **Gaps confirmed by this audit**:
 
@@ -786,22 +919,37 @@ The 11 existing Stateright specs cover:
 The following findings are NOT covered by C-1..C-9, H-1..H-10, or Q-1..Q-7:
 
 1. **X-3** (Critical): Recovered XA commit uses NULL_VLSN — silent VLSN gap in replication.
+
 2. **X-5** (Critical): Cleaner checkpoint barrier fully implemented in `FileSelector` but never called from any other component; before-image undo can fail on deleted files.
+
 3. **X-15** (Critical, unverified): Replica mid-rollback crash leaves open-ended `RollbackStart` with unknown recovery behavior.
+
 4. **X-1** (High): VLSN index not truncated to match B-tree rollback on replica restart.
+
 5. **X-6** (High): Cleaner migration writes no WAL entry and inserts a fake LSN into the tree slot.
+
 6. **X-4** (High): Recovered XA branch TOCTOU window in `xa_commit` resolution.
+
 7. **X-10** (High): Secondary index abort undo has cross-cursor torn-state window.
+
 8. **X-12** (High): Memory budget is fractured — cache_size + log_buffer + off_heap are three independent ceilings.
+
 9. **X-13** (High): `Database::check_open()` and `CursorImpl::check_state()` do not check `env.is_valid()`.
+
 10. **X-14** (High): VLSN index not rebuilt during B-tree recovery.
+
 11. **X-8** (Medium): Redundant empty BINDelta when evictor races checkpointer.
+
 12. **X-11** (High): `log_flush_no_sync_interval_ms` flows to `DbiConfig` but is never consumed.
+
 13. **X-2** (Medium): `vlsn.idx` persistence not tied to checkpoint boundaries.
+
 14. **X-7** (Medium): Cleaner uses primary tree for secondary LN liveness check.
 
 **Partially overlaps first-pass**:
+
 - X-10 partially overlaps C-8 (SR9465/SR9752 area — single-txn rollback) but the cross-cursor torn-state during abort is a new dimension.
+
 - X-11 overlaps Q-3 (LogFlushTask missing) but the dead config propagation path through multiple crates is a new cross-layer observation.
 
 ---
@@ -833,6 +981,7 @@ The following findings are NOT covered by C-1..C-9, H-1..H-10, or Q-1..Q-7:
 ## Top 5 Most-Actionable New Findings
 
 ### 1. X-5 — Cleaner Checkpoint Barrier Disconnected (Critical)
+
 **Why top**: Silent data corruption in the undo recovery path when before-image
 LNs live in a deleted log file.  The checkpoint barrier infrastructure exists
 in `FileSelector` (it just isn't called).  Fix requires wiring
@@ -840,14 +989,18 @@ in `FileSelector` (it just isn't called).  Fix requires wiring
 lines of plumbing.
 
 **Immediate action**:
+
 - Add `assert!(!process_checkpoint_end_was_called)` CI instrumentation to
   confirm nobody is calling these methods.
+
 - Wire `Cleaner::process_checkpoint_end(state)` from
   `Checkpointer::do_checkpoint()` at step 6.
+
 - Change `delete_pending_files()` to use `file_selector.get_safe_to_delete()`
   as the authoritative deletion list, not `pending_deletions`.
 
 ### 2. X-3 — Recovered XA Commit Uses NULL_VLSN (Critical)
+
 **Why top**: A prepared XA transaction that survives a master crash and is
 committed via `xa_commit` on restart is invisible to replicas' VLSN tracking.
 Replicas never learn the commit happened; the committed data is accessible
@@ -858,12 +1011,14 @@ the environment's VLSN generator (same codepath as a normal commit in
 replicated mode) and register it via `vlsn_index.put(vlsn, lsn)`.
 
 ### 3. X-13 — DB/Cursor check_open Bypasses Env Validity (High)
+
 **Why top**: After the C-2 fix (env invalidation on fsync failure), reads can
 continue on a potentially corrupt environment.  This is a single-line fix per
 check function, and the `io_invalid` AtomicBool is already cached in
 `LogManager` which `Database` holds.
 
 **Immediate action**: In `Database::check_open()`:
+
 ```rust
 fn check_open(&self) -> Result<()> {
     if self.log_manager.as_ref()
@@ -876,9 +1031,11 @@ fn check_open(&self) -> Result<()> {
     }
     Ok(())
 }
+
 ```
 
 ### 4. X-6 — Cleaner Migration Writes No WAL Entry (High)
+
 **Why top**: Directly amplifies X-5.  Even with X-5 fixed (checkpoint barrier),
 if the migration doesn't write a WAL LN entry, recovery after crash-before-
 checkpoint cannot find the migrated data in the WAL.  The BIN dirty flag is the
@@ -887,6 +1044,7 @@ Fix: write a non-transactional LN WAL entry in `migrate_ln_slot` before
 updating the tree slot.
 
 ### 5. X-1 — VLSN Index Not Truncated After Rollback Recovery (High)
+
 **Why top**: After a replica crashes mid-rollback, the VLSN index is inconsistent
 with the recovered B-tree state.  The feeder reconnects at the wrong VLSN,
 causing unnecessary re-syncs or silent data gaps.  `VlsnIndex::truncate_after()`

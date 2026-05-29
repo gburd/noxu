@@ -124,7 +124,8 @@ impl Cursor {
                 // which simply reports `NotFound` because no record can
                 // exist under an empty key on a writable database.
                 let key_bytes = key.get_data().unwrap_or(&[]);
-                self.inner.search(key_bytes, None, SearchMode::Set)
+                self.inner
+                    .search(key_bytes, None, SearchMode::Set)
                     .map_err(map_cursor_err)?
             }
             Get::SearchGte | Get::SearchRange => {
@@ -133,20 +134,16 @@ impl Cursor {
                     .search(key_bytes, None, SearchMode::SetRange)
                     .map_err(map_cursor_err)?
             }
-            Get::First => self
-                .inner
-                .get_first()
-                .map_err(map_cursor_err)?,
-            Get::Last => self
-                .inner
-                .get_last()
-                .map_err(map_cursor_err)?,
+            Get::First => self.inner.get_first().map_err(map_cursor_err)?,
+            Get::Last => self.inner.get_last().map_err(map_cursor_err)?,
             Get::Next => {
                 if self.state == CursorState::NotInitialized {
                     // Next from uninitialized positions at the first record.
                     self.inner.get_first().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::Next).map_err(map_cursor_err)?
+                    self.inner
+                        .retrieve_next(GetMode::Next)
+                        .map_err(map_cursor_err)?
                 }
             }
             Get::Prev => {
@@ -154,22 +151,29 @@ impl Cursor {
                     // Prev from uninitialized positions at the last record.
                     self.inner.get_last().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::Prev).map_err(map_cursor_err)?
+                    self.inner
+                        .retrieve_next(GetMode::Prev)
+                        .map_err(map_cursor_err)?
                 }
             }
             Get::NextDup => {
                 self.check_initialized()?;
-                self.inner.retrieve_next(GetMode::NextDup).map_err(map_cursor_err)?
+                self.inner
+                    .retrieve_next(GetMode::NextDup)
+                    .map_err(map_cursor_err)?
             }
             Get::PrevDup => {
                 self.check_initialized()?;
-                self.inner.retrieve_next(GetMode::PrevDup).map_err(map_cursor_err)?
+                self.inner
+                    .retrieve_next(GetMode::PrevDup)
+                    .map_err(map_cursor_err)?
             }
             Get::NextNoDup => {
                 if self.state == CursorState::NotInitialized {
                     self.inner.get_first().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::NextNoDup)
+                    self.inner
+                        .retrieve_next(GetMode::NextNoDup)
                         .map_err(map_cursor_err)?
                 }
             }
@@ -177,7 +181,8 @@ impl Cursor {
                 if self.state == CursorState::NotInitialized {
                     self.inner.get_last().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::PrevNoDup)
+                    self.inner
+                        .retrieve_next(GetMode::PrevNoDup)
                         .map_err(map_cursor_err)?
                 }
             }
@@ -206,7 +211,8 @@ impl Cursor {
                 if self.inner.is_current_slot_deleted() {
                     return Ok(OperationStatus::NotFound);
                 }
-                let (k, v) = self.inner.get_current().map_err(map_cursor_err)?;
+                let (k, v) =
+                    self.inner.get_current().map_err(map_cursor_err)?;
                 data.set_data(&v);
                 key.set_data(&k);
                 self.state = CursorState::Initialized;
@@ -238,7 +244,8 @@ impl Cursor {
 
         match status {
             noxu_dbi::OperationStatus::Success => {
-                let (k, v) = self.inner.get_current().map_err(map_cursor_err)?;
+                let (k, v) =
+                    self.inner.get_current().map_err(map_cursor_err)?;
                 data.set_data(&v);
                 // Write back the current key for navigation operations.
                 // `key` is always an output parameter for positioning ops.
@@ -353,9 +360,7 @@ impl Cursor {
             ));
         }
 
-        self.inner
-            .delete()
-            .map_err(map_cursor_err)?;
+        self.inner.delete().map_err(map_cursor_err)?;
         self.state = CursorState::NotInitialized;
         Ok(OperationStatus::Success)
     }
@@ -388,10 +393,7 @@ impl Cursor {
         // cursor is positioned (one record at minimum); a 0 from the
         // inner is therefore a real bug and must surface, not be silently
         // promoted to 1.
-        let n = self
-            .inner
-            .count()
-            .map_err(map_cursor_err)?;
+        let n = self.inner.count().map_err(map_cursor_err)?;
         if n < 1 {
             return Err(NoxuError::OperationNotAllowed(format!(
                 "cursor count() returned {n} while positioned (invariant violated)",
@@ -423,9 +425,7 @@ impl Cursor {
         // Audit cursor F14 (Wave 2C-4): propagate close to the inner
         // CursorImpl so its BIN pin is released immediately rather than
         // at outer-`Cursor::Drop` time.
-        self.inner
-            .close()
-            .map_err(map_cursor_err)
+        self.inner.close().map_err(map_cursor_err)
     }
 
     /// Check if the cursor is valid (not closed).

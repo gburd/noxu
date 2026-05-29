@@ -180,9 +180,9 @@ impl RollbackTracker {
         // X-15: also check pending (open-ended) periods whose rollback_start_lsn
         // is valid (not NULL_LSN).  An incomplete period covers
         // matchpoint_lsn < lsn < rollback_start_lsn, same as a complete one.
-        self.pending_rollback_starts.values().any(|p| {
-            p.rollback_start_lsn != NULL_LSN && p.contains(lsn)
-        })
+        self.pending_rollback_starts
+            .values()
+            .any(|p| p.rollback_start_lsn != NULL_LSN && p.contains(lsn))
     }
 
     /// Get all rollback periods (completed only).

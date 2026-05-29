@@ -850,7 +850,11 @@ impl ReplicatedEnvironment {
             );
             for &(vlsn, lsn_u64) in &env.recovery_vlsns {
                 let lsn = noxu_util::Lsn::from_u64(lsn_u64);
-                self.vlsn_index.register(vlsn, lsn.file_number(), lsn.file_offset());
+                self.vlsn_index.register(
+                    vlsn,
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                );
             }
         }
 
@@ -2071,21 +2075,22 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
     /// Increments off the current latest VLSN so the new VLSN is strictly
     /// monotonically increasing.  In a single-node or master-less environment
     /// (not master) returns 0 (NULL_VLSN — harmless, the default).
-    fn alloc_vlsn_for_recovered_commit(
-        &self,
-        lsn: noxu_util::Lsn,
-    ) -> u64 {
+    fn alloc_vlsn_for_recovered_commit(&self, lsn: noxu_util::Lsn) -> u64 {
         // Only allocate a VLSN when we are the master; on a replica the
         // recovered XA should have been replicated by the original master.
         if !self.is_master() {
             return 0;
         }
         let next_vlsn = self.vlsn_index.get_latest_vlsn() + 1;
-        self.vlsn_index
-            .register(next_vlsn, lsn.file_number(), lsn.file_offset());
+        self.vlsn_index.register(
+            next_vlsn,
+            lsn.file_number(),
+            lsn.file_offset(),
+        );
         log::debug!(
             "alloc_vlsn_for_recovered_commit: allocated vlsn={} for lsn={:?}",
-            next_vlsn, lsn
+            next_vlsn,
+            lsn
         );
         next_vlsn
     }
