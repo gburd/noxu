@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "noxu-sustained-baseline"
 path = "src/sustained_main.rs"
 
+[[bin]]
+name = "noxu-w10-bench"
+path = "src/w10_bench.rs"
+
 [dependencies]
 noxu-db = { workspace = true }
 noxu-sync = { path = "../../crates/noxu-sync" }

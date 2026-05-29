@@ -50,7 +50,7 @@ Every wave ships:
 | 11-G | v2.4.0 | Continue JE TCK long-tail port (~30-50 more tests) | merged: +49 PORTED-EQUIVALENT/PARTIAL ([wave-11-g-je-tck-longtail.md](wave-11-g-je-tck-longtail.md)) |
 | 11-H | v2.4.0 | Performance investigation on JE-wins workloads (W03/W04/W10/W11) | merged: per-workload analysis + ROI plan in [wave-11-h-perf-investigation.md](wave-11-h-perf-investigation.md) |
 | 11-I | v2.4.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | **merged**: W03 +115%, W04 +135%; both now beat JE ([wave-11-i-cursor-double-descent.md](wave-11-i-cursor-double-descent.md)) |
-| 11-J | v2.5.0 | Optimize fsync coalescing (closes W10 gap) | gated on 11-H findings |
+| 11-J | v2.4.0 | Optimize fsync coalescing (closes W10 gap) | **investigation complete**: Treiber-stack rewrite prototyped and reverted (10–46 % regression); property test added; see [wave-11-j-fsync-coalescing.md](wave-11-j-fsync-coalescing.md) |
 | 11-K | v2.5.0 | Optimize log scanner (closes W11 gap) | gated on 11-H findings |
 | 11-N | v2.3.1 | Sorted-dup cursor bug fixes (4 bugs Wave 11-A/B surfaced) | merged — see `wave-11-n-sorted-dup-cursor-bugs.md`; the 4 #[ignore]'d / safety-cap regression tests are now passing live tests |
 | 11-BF | v2.3.2 | Bug-fix wave: 6 regressions from Wave 11-E/G | **merged** — all 6 `#[ignore]`'d tests fixed and promoted; see [wave-11-bugfix-v232.md](wave-11-bugfix-v232.md): record_active_txn guard, txn-cursor-on-non-txn-db, NoOverwrite dup-DB semantics, db-name registry WAL persistence, checkpoint data-loss, truncate durability |
@@ -179,13 +179,19 @@ Acceptance:
 * No regression on Noxu-wins workloads (W01/W05/W06/W09).
 * All correctness tests still pass.
 
-### 11-J — fsync coalescing (W10)
+### 11-J — fsync coalescing investigation (W10)
 
-Acceptance:
+**Status**: investigation complete; full rewrite deferred.
 
-* W10 closes to within 1.3× of JE on real NVMe (per the 11-C
-  numbers).
-* No regression on durability tests.
+A Treiber-stack + per-waiter condvar replacement for `Mutex<FsyncState>` was
+implemented, tested correct (all 5765 workspace tests pass + 1 new property
+test), but showed 10–46 % performance regressions due to per-call `Arc`
+allocation overhead.  The rewrite was reverted.  Acceptance gate not met.
+
+Deliverable: `test_fsync_before_commit_invariant` added to `noxu-log` — a new
+`#[test]` that verifies every committed LSN is fsync’d before `commit()`
+returns.  See [wave-11-j-fsync-coalescing.md](wave-11-j-fsync-coalescing.md)
+for the full diagnosis and recommended next steps.
 
 ### 11-K — Log scanner optimization (W11)
 
