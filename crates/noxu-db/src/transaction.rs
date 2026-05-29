@@ -122,6 +122,20 @@ pub struct Transaction {
     /// `EnvironmentConfig::replica_ack_timeout_ms`) when the
     /// coordinator is installed.
     replica_ack_timeout: std::time::Duration,
+
+    /// Callbacks to run when this transaction aborts.
+    ///
+    /// C-4 / JE 1-I: used to undo transactional database registrations
+    /// when `open_database(Some(txn), ...)` is followed by `txn.abort()`.
+    /// Each callback is a `Box<dyn FnOnce() + Send>` so it can capture
+    /// shared state without requiring the caller to hold locks.
+    abort_callbacks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+
+    /// Callbacks to run when this transaction commits.
+    ///
+    /// C-4 / JE 1-I: used to finalise transactional database registrations
+    /// by moving the database name from `pending_names` to `name_map`.
+    commit_callbacks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Transaction {
@@ -157,6 +171,8 @@ impl Transaction {
             active_txns: None,
             replica_coordinator: None,
             replica_ack_timeout: std::time::Duration::from_secs(5),
+            abort_callbacks: Mutex::new(Vec::new()),
+            commit_callbacks: Mutex::new(Vec::new()),
         }
     }
 
@@ -190,6 +206,8 @@ impl Transaction {
             active_txns: None,
             replica_coordinator: None,
             replica_ack_timeout: std::time::Duration::from_secs(5),
+            abort_callbacks: Mutex::new(Vec::new()),
+            commit_callbacks: Mutex::new(Vec::new()),
         }
     }
 
@@ -256,6 +274,32 @@ impl Transaction {
     /// **Internal** — `noxu_txn::Txn` is not re-exported by `noxu-db`.
     pub fn get_inner_txn(&self) -> Option<Arc<Mutex<Txn>>> {
         self.inner_txn.clone()
+    }
+
+    /// Register a callback to run when this transaction aborts.
+    ///
+    /// Used by `Environment::open_database()` to roll back a transactional
+    /// database creation if the owning transaction is aborted (C-4 / JE 1-I).
+    /// The callback is invoked from within `abort()`, after WAL writes but
+    /// before the outer state is marked `Aborted`.
+    pub fn register_abort_callback<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.abort_callbacks.lock().unwrap().push(Box::new(f));
+    }
+
+    /// Register a callback to run when this transaction commits.
+    ///
+    /// Used by `Environment::open_database()` to finalise a transactional
+    /// database creation when the owning transaction commits (C-4 / JE 1-I).
+    /// The callback is invoked from within `commit_with_durability()`, after
+    /// the WAL entry is written and locks are released.
+    pub fn register_commit_callback<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.commit_callbacks.lock().unwrap().push(Box::new(f));
     }
 
     /// Commit the transaction.
@@ -422,6 +466,14 @@ impl Transaction {
         *state = TransactionState::Committed;
         drop(state);
 
+        // C-4 / JE 1-I: run commit callbacks (transactional database
+        // registration finalisation).
+        let callbacks: Vec<Box<dyn FnOnce() + Send>> =
+            std::mem::take(&mut *self.commit_callbacks.lock().unwrap());
+        for cb in callbacks {
+            cb();
+        }
+
         // Prune our entry from the environment's active-txns registry so
         // that `Environment::close()` can succeed (F1).  Decrement the
         // active-transactions gauge here (rather than in `commit()`) so
@@ -560,6 +612,16 @@ impl Transaction {
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Aborted;
+        drop(state);
+
+        // C-4 / JE 1-I: run abort callbacks (transactional database
+        // registration rollback).
+        let callbacks: Vec<Box<dyn FnOnce() + Send>> =
+            std::mem::take(&mut *self.abort_callbacks.lock().unwrap());
+        for cb in callbacks {
+            cb();
+        }
+
         // Prune our entry from the environment's active-txns registry so
         // that `Environment::close()` can succeed (F1).
         if let Some(registry) = &self.active_txns {
@@ -705,6 +767,13 @@ impl Transaction {
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Committed;
+        drop(state);
+        // Run commit callbacks (e.g. transactional database registration).
+        let cbs: Vec<Box<dyn FnOnce() + Send>> =
+            std::mem::take(&mut *self.commit_callbacks.lock().unwrap());
+        for cb in cbs {
+            cb();
+        }
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }
@@ -792,6 +861,13 @@ impl Transaction {
 
         let mut state = self.state.lock().unwrap();
         *state = TransactionState::Aborted;
+        drop(state);
+        // Run abort callbacks (e.g. transactional database registration rollback).
+        let cbs: Vec<Box<dyn FnOnce() + Send>> =
+            std::mem::take(&mut *self.abort_callbacks.lock().unwrap());
+        for cb in cbs {
+            cb();
+        }
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }

@@ -627,7 +627,7 @@ fn test_8r8w_all_committed_data_visible() {
 /// than the 32-thread test above, verifying that the 64-shard lock manager
 /// does not deadlock or corrupt results.
 #[test]
-#[ignore]
+#[ignore = "stress: 64 concurrent readers × 1000 keys × 1000 txns; run with --ignored"]
 fn test_64_thread_concurrent_readers() {
     use std::time::Instant;
     const KEYS: u32 = 1_000;
@@ -722,7 +722,7 @@ fn test_64_thread_concurrent_readers() {
 ///
 /// After all writers finish every written key must be visible.
 #[test]
-#[ignore]
+#[ignore = "stress: 32 reader + 32 writer threads × 5000 ops each; run with --ignored"]
 fn test_32r32w_concurrent() {
     const WRITERS: usize = 32;
     const READERS: usize = 32;
@@ -834,7 +834,7 @@ fn test_32r32w_concurrent() {
 ///   order, spot-checked at 100 positions)
 /// - total wall time < 120 s (throughput sanity floor)
 #[test]
-#[ignore]
+#[ignore = "stress: 200 threads × disjoint writers, up to 120 s wall time; run with --ignored"]
 fn test_200_thread_disjoint_writers() {
     use std::time::Instant;
     const THREADS: usize = 200;

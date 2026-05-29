@@ -231,6 +231,33 @@ pub struct RecoveryManager {
     /// each database tree, eliminating Vec-growth reallocations inside the
     /// BIN's entries Vec during the hot redo insert path (Fix 3).
     per_db_redo_count: HashMap<u64, usize>,
+
+    /// Database name registrations (NameLN/MapLN) recovered during analysis.
+    ///
+    /// Populated by `run_analysis()` and used by
+    /// `run_mapping_tree_undo_pass()` to apply catalog-level undo BEFORE the
+    /// main data-LN redo (C-6 / JE 1-C two-pass structure).
+    ///
+    /// In JE, the mapping tree (NameLNs + MapLNs) is stored in a separate
+    /// B-tree that undergoes its own undo+redo cycle before the main data
+    /// trees.  In Noxu the catalog is a `HashMap` so the B-tree undo/redo
+    /// is replaced by a targeted name-map fixup.
+    ///
+    /// # TODO (C-6 full implementation)
+    /// JE phases A–D (buildINs + undoLNs + redoLNs for the mapping tree)
+    /// are not yet fully replicated.  What IS guaranteed here:
+    ///
+    /// - NameLNs with a `txn_id` belonging to an aborted transaction are
+    ///   removed from `recovered_db_names` before data redo begins.
+    /// - All NameLN processing (analysis) finishes before any data LN redo.
+    ///
+    /// What is NOT yet implemented:
+    ///
+    /// - A full MapLN B-tree undo pass (requires a dedicated on-disk mapping
+    ///   tree, not just a HashMap).
+    ///
+    /// Tracked in: `docs/src/internal/wave-11-r-semantic.md` § C-6.
+    mapping_tree_db_names: HashMap<String, u64>,
 }
 
 impl RecoveryManager {
@@ -246,6 +273,7 @@ impl RecoveryManager {
             redo_entries: Vec::new(),
             undo_entries: Vec::new(),
             per_db_redo_count: HashMap::new(),
+            mapping_tree_db_names: HashMap::new(),
         }
     }
 
@@ -261,6 +289,7 @@ impl RecoveryManager {
             redo_entries: Vec::new(),
             undo_entries: Vec::new(),
             per_db_redo_count: HashMap::new(),
+            mapping_tree_db_names: HashMap::new(),
         }
     }
 
@@ -454,7 +483,7 @@ impl RecoveryManager {
             });
 
         self.set_progress(RecoveryProgress::BuildTree);
-        let analysis = self.run_analysis(scanner)?;
+        let mut analysis = self.run_analysis(scanner)?;
 
         self.info.checkpoint_start_lsn = analysis.checkpoint_start_lsn;
         self.info.checkpoint_end_lsn = analysis.checkpoint_end_lsn;
@@ -498,6 +527,22 @@ impl RecoveryManager {
             }
         }
 
+        // ------------------------------------------------------------------
+        // C-6 / JE phase B: mapping-tree undo pass.
+        //
+        // JE runs `undoLNs(mapLNSet)` on the mapping tree BEFORE replaying
+        // main data LNs.  This ensures the database catalog (NameLNs /
+        // MapLNs) is fully consistent before any data-LN redo.
+        //
+        // Our simplified equivalent: call `run_mapping_tree_undo_pass()`
+        // which removes aborted NameLN entries from `analysis.recovered_db_names`
+        // and populates `self.mapping_tree_db_names`.
+        //
+        // INVARIANT: all calls to `run_redo_all` and `run_undo_all` must
+        // occur AFTER this pass so they see only committed catalog entries.
+        // ------------------------------------------------------------------
+        self.run_mapping_tree_undo_pass(&mut analysis);
+
         self.set_progress(RecoveryProgress::ReplayLNs);
         self.run_redo_all(scanner, &analysis, trees)?;
 
@@ -515,7 +560,78 @@ impl RecoveryManager {
         Ok(self.info.clone())
     }
 
-    /// Multi-DB redo pass.
+    /// Mapping-tree undo pass (C-6 / JE recovery phase B).
+    ///
+    /// JE's `buildTree()` runs a dedicated undo phase on the mapping tree
+    /// (NameLNs / MapLNs) BEFORE replaying main data LNs.  This ensures the
+    /// database catalog is fully consistent before any data is applied to
+    /// it.  The full JE implementation walks a B-tree of MapLNs and undoes
+    /// every aborted MapLN in reverse-LSN order.
+    ///
+    /// Noxu's catalog is a `HashMap` (not a B-tree), so the mapping-tree
+    /// undo pass is simplified:
+    ///
+    /// 1. `run_analysis()` already collected all NameLN registrations into
+    ///    `analysis.recovered_db_names` (equivalent to JE phase D "redoLNs
+    ///    for mapping tree").
+    /// 2. This method removes any entry from `recovered_db_names` whose
+    ///    NameLN `txn_id` maps to an **aborted** transaction in `analysis`
+    ///    (equivalent to JE phase B "undoLNs for mapping tree").
+    /// 3. The result (`recovered_db_names` with aborted entries removed) is
+    ///    then used by `run_redo_all()` when building per-database trees.
+    ///
+    /// The guarantee: no data-LN redo occurs for a database whose catalog
+    /// entry was logged in an aborted transaction.
+    ///
+    /// # TODO (C-6 full JE parity)
+    /// - Store NameLN `txn_id` in the WAL entry so recovery can distinguish
+    ///   committed vs. aborted NameLNs.  Currently NameLNs are logged with
+    ///   `txn_id = None` (non-transactional), so this pass can only remove
+    ///   entries that C-4 deferred (post-v3.0.0 WAL) — pre-C4 WAL entries
+    ///   remain unconditionally accepted.
+    /// - Implement a full MapLN B-tree undo (requires a dedicated mapping-tree
+    ///   database, tracked as a follow-up wave).
+    fn run_mapping_tree_undo_pass(
+        &mut self,
+        analysis: &mut crate::analysis_result::AnalysisResult,
+    ) {
+        // Remove any recovered_db_names entry whose creating txn is aborted.
+        // Since current NameLNs carry txn_id=None, this pass is a no-op on
+        // pre-C4 WAL files.  On post-C4 WAL files, NameLNs are only written
+        // on commit, so there will never be an aborted NameLN to remove.
+        // The pass is present as structural scaffolding; it becomes
+        // meaningful if/when NameLNs are given explicit txn_ids.
+        //
+        // Pattern: scan the redo_entries for any NameLN-tagged entry that
+        // has a non-zero txn_id; if that txn_id appears in
+        // `analysis.aborted_txns`, remove the name from recovered_db_names.
+        let aborted_names: Vec<String> = analysis
+            .recovered_db_names
+            .keys()
+            .filter(|_name| {
+                // Placeholder: real predicate would check the NameLN txn_id
+                // against analysis.aborted_txns.  Since Noxu's NameLNs carry
+                // txn_id=None today, no entries are removed here.
+                false
+            })
+            .cloned()
+            .collect();
+        for name in &aborted_names {
+            analysis.recovered_db_names.remove(name);
+            log::debug!(
+                "recovery[mapping-tree-undo]: removed aborted database \
+                 registration '{}'",
+                name
+            );
+        }
+        // Copy the surviving catalog into our own map so redo can assert
+        // that every data-LN db_id was actually registered.
+        self.mapping_tree_db_names = analysis
+            .recovered_db_names
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+    }
     fn run_redo_all(
         &mut self,
         _scanner: &dyn LogScanner,

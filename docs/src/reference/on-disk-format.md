@@ -53,25 +53,61 @@ A `Vlsn` is a signed `i64`, little-endian. `NULL_VLSN = i64::MIN`.
 
 ## Endianness
 
-All multi-byte integers in entry headers are **little-endian**. Most payload
-fields also use little-endian. Big-endian hosts are not currently supported.
+Endianness varies by field category:
 
-## Entry Type Codes (selection)
-
-| Code | Name | Description |
+| Field category | Encoding | Source |
 |---|---|---|
-| 0x01 | `LN` | Leaf node (key/value record) |
-| 0x02 | `DEL_LN` | Deleted leaf node tombstone |
-| 0x10 | `BIN` | Bottom internal node (full) |
-| 0x11 | `BIN_DELTA` | Incremental BIN update |
-| 0x12 | `IN` | Upper internal node |
-| 0x20 | `COMMIT` | Transaction commit |
-| 0x21 | `ABORT` | Transaction abort |
-| 0x30 | `CHECKPOINT_START` | Begin checkpoint |
-| 0x31 | `CHECKPOINT_END` | End checkpoint |
-| 0x40 | `MAP_LN` | Database name→id mapping |
-| 0x50 | `MATCHPOINT` | Replication sync point |
-| 0x60 | `EXTINCT_LN` | TTL-expired record (Noxu) |
+| Entry header integers (CRC32, prev\_offset, payload\_size, VLSN) | **little-endian** | `to_le_bytes()` / `get_u32_le()` in `log_manager.rs` |
+| BIN / IN node payload integers (`u32`, `u64` fields such as entry counts and child LSNs) | **big-endian** | `BytesMut::put_u64()` / `to_be_bytes()` in `noxu-tree` serializers |
+| LSN packed field (`u64` stored as `file_num:32 ++ file_offset:32`) | **big-endian** | `Lsn::as_u64()` bit layout |
+| VLSN (signed `i64` in the header extension) | **little-endian** | `get_i64_le()` |
+
+Summary: **headers are little-endian; tree-node payloads (BIN/IN) are
+big-endian**. Big-endian hosts are not currently supported (the engine is
+designed for x86-64 / aarch64 little-endian hosts, but the B-tree payloads
+are intentionally big-endian so that byte-wise key comparison preserves
+numeric sort order without extra transformation).
+
+## Entry Type Codes
+
+The following table is generated from `crates/noxu-log/src/entry_type.rs`.
+Each `Code` is the decimal discriminant of the `LogEntryType` enum; the
+hex equivalent is shown for readability.
+
+| Code | Hex | Name | Description |
+|---|---|---|---|
+| 1 | 0x01 | `FileHeader` | Log file header |
+| 2 | 0x02 | `IN` | Upper internal node (full) |
+| 3 | 0x03 | `BIN` | Bottom internal node (full) |
+| 4 | 0x04 | `BINDelta` | Incremental BIN update |
+| 10 | 0x0a | `InsertLN` | Non-txn insert leaf node |
+| 11 | 0x0b | `UpdateLN` | Non-txn update leaf node |
+| 12 | 0x0c | `DeleteLN` | Non-txn delete leaf node tombstone |
+| 13 | 0x0d | `InsertLNTxn` | Transactional insert leaf node |
+| 14 | 0x0e | `UpdateLNTxn` | Transactional update leaf node |
+| 15 | 0x0f | `DeleteLNTxn` | Transactional delete leaf node |
+| 20 | 0x14 | `MapLN` | Database id→root mapping |
+| 21 | 0x15 | `NameLN` | Database name→id mapping |
+| 22 | 0x16 | `NameLNTxn` | Transactional name→id mapping |
+| 23 | 0x17 | `FileSummaryLN` | Per-file utilization summary |
+| 30 | 0x1e | `TxnCommit` | Transaction commit record |
+| 31 | 0x1f | `TxnAbort` | Transaction abort record |
+| 32 | 0x20 | `TxnPrepare` | XA two-phase commit prepare (v2+) |
+| 40 | 0x28 | `CkptStart` | Begin checkpoint |
+| 41 | 0x29 | `CkptEnd` | End checkpoint |
+| 50 | 0x32 | `DbTree` | Database tree root record |
+| 60 | 0x3c | `Trace` | Debug trace entry |
+| 61 | 0x3d | `Matchpoint` | Replication sync point |
+| 62 | 0x3e | `RollbackStart` | HA rollback start marker |
+| 63 | 0x3f | `RollbackEnd` | HA rollback end marker |
+| 64 | 0x40 | `INDeleteInfo` | Tree compression delete info |
+| 65 | 0x41 | `INDupDeleteInfo` | Tree compression dup-delete info |
+| 66 | 0x42 | `OldBINDelta` | Legacy BIN-delta (recovery compat) |
+| 67 | 0x43 | `OldLN` | Legacy LN format (recovery compat) |
+| 68 | 0x44 | `DelDupLN` | Legacy dup-delete LN |
+| 69 | 0x45 | `DupCountLN` | Legacy dup-count LN |
+| 70 | 0x46 | `ImmutableFile` | Immutable file lifecycle marker |
 
 > **Not binary compatible with other database formats.**
-> serialization and different type codes; Noxu `.ndb` files are not readable
+> Noxu uses different serialization and different type codes;
+> `.ndb` files are not readable by any other database engine.

@@ -797,6 +797,31 @@ impl Bin {
     ///
     /// A delta is logged when <= 25% of slots are dirty.
     pub fn should_log_delta(&self) -> bool {
+        // JE guard 1 (`BIN.shouldLogDelta` line 1892): if this node is
+        // already a BIN-delta, always re-log it as a delta — do not
+        // revert to a full BIN based on the dirty-ratio heuristic.
+        if self.is_bin_delta() {
+            return true;
+        }
+
+        // JE guard 2 (`isDeltaProhibited` / `prohibitNextDelta` flag):
+        // `compress()` sets this flag when it removes a dirty slot so
+        // that the next checkpoint write cannot produce a delta that
+        // silently omits the compressed slot.  The flag is also checked
+        // by `can_mutate_to_bin_delta()`, but checkpoint code calls
+        // `should_log_delta()` directly, so the guard must live here.
+        if self.inner.get_prohibit_next_delta() {
+            return false;
+        }
+
+        // JE guard 3 (`lastFullLsn == NULL_LSN` check): a delta must be
+        // applied on top of a base full BIN.  If no full BIN has ever
+        // been written (`last_full_version` is still `NULL_LSN`) there
+        // is no base to reference, so we must write a full BIN instead.
+        if self.last_full_version == NULL_LSN {
+            return false;
+        }
+
         let dirty_count = self.count_dirty_slots();
         if dirty_count == 0 || self.inner.get_n_entries() == 0 {
             return false;
@@ -1579,6 +1604,13 @@ mod tests {
         bin.inner.states[0] = DIRTY_BIT;
         bin.inner.states[1] = DIRTY_BIT;
 
+        // Guard 3 active: last_full_version == NULL_LSN — must not log delta
+        // even though the dirty ratio would otherwise qualify.
+        assert!(!bin.should_log_delta());
+
+        // Simulate that a full BIN was previously written.
+        bin.set_last_full_version(Lsn::from_u64(50));
+
         // Exactly 25% dirty - should log delta
         assert!(bin.should_log_delta());
         assert_eq!(bin.count_dirty_slots(), 2);
@@ -1589,6 +1621,82 @@ mod tests {
         // More than 25% dirty - should not log delta
         assert!(!bin.should_log_delta());
         assert_eq!(bin.count_dirty_slots(), 3);
+    }
+
+    /// Guard clause 1: an already-delta BIN always re-logs as a delta
+    /// regardless of the dirty-slot ratio.
+    #[test]
+    fn test_should_log_delta_guard_already_delta() {
+        let mut bin = Bin::new(1, 128);
+        // Insert 8 clean entries (would fail the ratio check: 0/8).
+        for i in 0..8 {
+            let key = format!("key{}", i).into_bytes();
+            bin.insert_entry(key, Lsn::from_u64(100 + i as u64), 0, None)
+                .unwrap();
+        }
+        // A BIN with no dirty entries would normally return false.
+        assert!(!bin.should_log_delta());
+        // Set the last_full_version so guard-3 doesn't fire.
+        bin.set_last_full_version(Lsn::from_u64(50));
+        // Flip into delta mode — guard-1 must now return true immediately.
+        bin.set_bin_delta(true);
+        assert!(
+            bin.should_log_delta(),
+            "BIN-delta must always re-log as delta (guard 1)"
+        );
+    }
+
+    /// Guard clause 2: `prohibit_next_delta` (set by `compress()`) prevents
+    /// the next checkpoint from writing a delta — it must write a full BIN.
+    #[test]
+    fn test_should_log_delta_guard_prohibit_next_delta() {
+        let mut bin = Bin::new(1, 128);
+        // Insert 8 entries, set last_full_version, mark 2 dirty (25% → would pass).
+        for i in 0..8 {
+            let key = format!("key{}", i).into_bytes();
+            bin.insert_entry(key, Lsn::from_u64(100 + i as u64), 0, None)
+                .unwrap();
+        }
+        bin.set_last_full_version(Lsn::from_u64(50));
+        bin.inner.states[0] = DIRTY_BIT;
+        bin.inner.states[1] = DIRTY_BIT;
+        assert!(
+            bin.should_log_delta(),
+            "without prohibit_next_delta, should log delta"
+        );
+        // Set the prohibit flag (as compress() does).
+        bin.inner.set_prohibit_next_delta(true);
+        assert!(
+            !bin.should_log_delta(),
+            "prohibit_next_delta must force a full BIN (guard 2)"
+        );
+    }
+
+    /// Guard clause 3: no full BIN has been written yet (`last_full_version ==
+    /// NULL_LSN`) — a delta has no base to reference, so a full BIN is required.
+    #[test]
+    fn test_should_log_delta_guard_no_full_bin_yet() {
+        let mut bin = Bin::new(1, 128);
+        // Insert 8 entries with 2 dirty (25%).
+        for i in 0..8 {
+            let key = format!("key{}", i).into_bytes();
+            bin.insert_entry(key, Lsn::from_u64(100 + i as u64), 0, None)
+                .unwrap();
+        }
+        bin.inner.states[0] = DIRTY_BIT;
+        bin.inner.states[1] = DIRTY_BIT;
+        // last_full_version is still NULL_LSN (default) — must not log delta.
+        assert_eq!(bin.get_last_full_version(), NULL_LSN);
+        assert!(
+            !bin.should_log_delta(),
+            "NULL_LSN last_full_version must force a full BIN (guard 3)"
+        );
+        // Once a full BIN has been logged, delta is eligible again.
+        bin.set_last_full_version(Lsn::from_u64(200));
+        assert!(
+            bin.should_log_delta(),
+            "after first full BIN, delta should be eligible"
+        );
     }
 
     #[test]
