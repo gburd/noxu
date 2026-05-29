@@ -114,7 +114,7 @@ pub enum EnvironmentFailureReason {
     // ── Catch-all ──────────────────────────────────────────────────────────
     /// Recovery (WAL replay during environment open) failed.
     ///
-    /// Wave 1C audit cleanup (transaction-env F22): the v1.5.0 layer
+    /// The v1.5.0 layer
     /// surfaced every recovery failure as `UnexpectedState`, which
     /// forced callers to string-match the prefix "recovery failed:"
     /// to distinguish it from other unexpected-state errors.  This

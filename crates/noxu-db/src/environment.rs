@@ -70,7 +70,7 @@ pub struct Environment {
     log_manager: Option<Arc<LogManager>>,
     /// Bookkeeping for `Environment::checkpoint(CheckpointConfig)` so that
     /// `force` / `k_bytes` / `minutes` can gate whether the call actually
-    /// runs a checkpoint.  Audit transaction-env F6 (Wave 2C-4).
+    /// runs a checkpoint.
     last_checkpoint_time: Mutex<Option<Instant>>,
     last_checkpoint_end_lsn: Mutex<noxu_util::Lsn>,
     /// Optional replica-ack coordinator (typically a
@@ -690,7 +690,7 @@ impl Environment {
     /// took an `Option<&Transaction>` `parent` argument that was rejected
     /// at runtime with [`NoxuError::Unsupported`] (Decision 3B in
     /// `docs/src/internal/v1.5-decisions-2026-05.md`, audit finding F11).
-    /// In v2.0 the parameter has been removed entirely (Wave 3-1) — the
+    /// In v2.0 the parameter has been removed entirely — the
     /// type system now enforces the constraint, so what was a runtime
     /// error is now a compile error.
     #[allow(deprecated)] // Transaction::new / with_log_manager / with_inner_txn / with_env_impl are pub(internal)
@@ -1189,7 +1189,7 @@ impl Environment {
     /// the previous shutdown / crash.  An empty `Vec` means there are
     /// no in-doubt transactions to resolve.
     ///
-    /// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
+    /// See `noxu_xa` for XA two-phase commit.
     pub fn recovered_prepared_txns(
         &self,
     ) -> Vec<noxu_recovery::PreparedTxnInfo> {
@@ -1228,7 +1228,7 @@ impl Environment {
     /// LNs into the in-memory tree via
     /// [`Self::take_recovered_prepared_lns`] and applied them.
     ///
-    /// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
+    /// See `noxu_xa` for XA two-phase commit.
     pub fn write_txn_commit_for_recovered(&self, txn_id: u64) -> Result<()> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
@@ -1379,7 +1379,7 @@ impl Environment {
         Ok(())
     }
 
-    /// Audit transaction-env F5 (Wave 2C-4): every mutating env-layer
+    /// Every mutating env-layer
     /// operation funnels through this helper so a `read_only=true`
     /// environment cannot create / remove / rename / truncate databases
     /// nor begin a (writable) transaction.
@@ -1400,7 +1400,7 @@ impl Environment {
 /// process crashed before it could commit; recovery surfaced it via
 /// `recovered_prepared_txns`).
 ///
-/// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.
+/// XA two-phase commit support.
 fn write_txn_end_for_recovered(
     lm: &LogManager,
     txn_id: u64,

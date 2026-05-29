@@ -8,9 +8,9 @@
 > [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md).
 > Headlines: secondary indexes are in-memory only; secondary updates
 > are not atomic with the user txn; primary writes do thread `txn`
-> through correctly (Sprint 3B).
+> through correctly.
 >
-> **v1.6 (Wave 2C-1) update:** the `#[derive(Entity)]`,
+> **v1.6 update:** the `#[derive(Entity)]`,
 > `#[derive(PrimaryKey)]`, and `#[derive(SecondaryKey)]` proc-macros
 > are now implemented in the `noxu-persist-derive` crate (re-exported
 > from `noxu-persist`). The annotation-style API documented in this
@@ -231,7 +231,7 @@ Edition's `SecondaryDatabase`: `get`, `contains`, `delete`,
 modelled by having multiple primary keys map to the same secondary
 key — the underlying map is `BTreeMap<SK, BTreeSet<PK>>`.
 
-## Schema evolution (Wave 2C-2)
+## Schema evolution
 
 Noxu DB v1.6 wires schema evolution into the **open path** of
 `EntityStore`.  When you call `EntityStore::open` with a non-empty
@@ -368,10 +368,10 @@ state.
 ### Explicit eager evolve
 
 `EntityStore::evolve(&mut self, &mutations, &config)` is still
-available for callers that want to drive evolution explicitly
-(matches the JE `EntityStore.evolve(EvolveConfig)` shape).  Wave 2C-2
-rewrote it to use the same streamed transactional path — it no
-longer materialises the database into RAM.  Calling it twice is
+available for callers that want to drive evolution explicitly.
+It uses the same streamed transactional path as the open-path
+evolution — it does not materialise the database into RAM.
+Calling it twice is
 harmless: the second call sees no records that match v0 mutations
 and returns `EvolveStats { n_read: total, n_converted: 0 }`.
 

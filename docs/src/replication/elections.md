@@ -1,9 +1,8 @@
 # Leader Elections
 
-> **v2.0 status — GA.** The election driver is now started by
-> `ReplicatedEnvironment::open` (Wave 3-3, F6) and the acceptor's
-> promise state is persisted to `<env_home>/acceptor.state` across
-> restarts (Wave 4-A, F5/F31).
+> **v2.0 status — GA.** The election driver is started by
+> `ReplicatedEnvironment::open` and the acceptor's promise state is
+> persisted to `<env_home>/acceptor.state` across restarts.
 
 Noxu DB uses **Flexible Paxos (FPaxos)** for leader election, augmented by
 the **phi accrual failure detector** for adaptive master failure detection.

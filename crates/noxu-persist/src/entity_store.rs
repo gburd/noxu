@@ -1,6 +1,6 @@
 //! Entity store for managing databases of typed entities.
 //!
-//! Wave 2C-2 wires schema evolution into the open path:
+//! Schema evolution is wired into the open path:
 //!
 //! * `EntityStore::open` opens a hidden
 //!   [`crate::evolve::ClassCatalog`] alongside the entity databases.
@@ -61,7 +61,7 @@ pub struct EntityStore<'env> {
     env: &'env Environment,
     config: StoreConfig,
     databases: HashMap<String, Database>,
-    /// The persistent class-version catalog (Wave 2C-2).
+    /// The persistent class-version catalog.
     ///
     /// Lazily opened on first access to avoid disturbing recovery of
     /// pre-existing entity databases.  Opening a NEW database (the
@@ -159,7 +159,7 @@ impl<'env> EntityStore<'env> {
     /// in the store configuration, it will be created. The database name is
     /// formed as `"{store_name}_{entity_name}"`.
     ///
-    /// **Wave 2C-2:** the first call to `get_primary_index<E>` for a given
+    /// The first call to `get_primary_index<E>` for a given
     /// `E` checks the persistent class catalog.  If the persisted class
     /// version differs from `E::class_version()` and a non-empty
     /// [`crate::evolve::Mutations`] set was attached to the
@@ -423,7 +423,7 @@ impl<'env> EntityStore<'env> {
     /// Eagerly evolves all entity databases known to this store, applying
     /// the supplied [`Mutations`] in a single transaction per database.
     ///
-    /// **Wave 2C-2 rewrite:** unlike v1.5.1's implementation this method
+    /// Unlike the v1.5.1 implementation this method
     /// no longer materialises the entire database into RAM via
     /// `scan_all_kv`; it streams records through a transactional
     /// cursor, decoding the per-record class version envelope and
@@ -713,7 +713,7 @@ fn stream_evolve_class(
 ///
 /// Decoding the envelope yields the on-disk class version and tag.  We
 /// look up class-level mutations for `(entity_class, on_disk_version)`
-/// (rather than always version 0 like the pre-Wave-2C-2 stub).
+/// (rather than always version 0).
 ///
 /// Priority of actions, modeled on JE:
 ///

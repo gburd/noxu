@@ -2,7 +2,7 @@
 
 > **v2.0 status — GA.** Adding/removing peers via `add_peer` /
 > `remove_peer` is fully supported.  Master promotions automatically
-> dispatch a `Feeder` per known replica (Wave 4-A, F9).
+> dispatch a `Feeder` per known replica.
 
 Noxu DB supports adding and removing nodes from the replication group while
 the group is actively serving traffic.

@@ -10,21 +10,16 @@
 //! databases, allowing database records to be accessed through
 //! familiar Rust collection patterns.
 //!
-//! # v1.6 API shape (Wave 2B)
-//!
-//! Every Stored* type is parameterised by [`noxu_bind::EntryBinding`]
+//! Every `Stored*` type is parameterised by [`noxu_bind::EntryBinding`]
 //! implementations for keys and/or values; the public methods are
 //! generic over the typed `K` / `V` rather than over `&[u8]`.  Every
 //! method accepts `txn: Option<&noxu_db::Transaction>` as the leading
-//! argument:
+//! argument — the same convention as `noxu_db::Database` /
+//! `noxu_db::SecondaryDatabase`:
 //!
 //! - `None` runs the operation as auto-commit (the engine allocates
 //!   a synthetic auto-txn for each call).
 //! - `Some(&t)` participates in the caller's transaction.
-//!
-//! This is the BDB-JE shape and matches `noxu_db::Database` /
-//! `noxu_db::SecondaryDatabase`, so a typed Stored* view composes
-//! cleanly with the rest of the engine.
 //!
 //! # Overview
 //!
@@ -71,7 +66,7 @@
 //!
 //! # Migration from v1.5
 //!
-//! The Wave 2B redesign breaks the v1.5 `&[u8]`-keyed surface.  See
+//! The v1.5 → v1.6 transition breaks the v1.5 `&[u8]`-keyed surface.  See
 //! `docs/src/getting-started/migrating.md` for the detailed
 //! before/after.  In short:
 //!

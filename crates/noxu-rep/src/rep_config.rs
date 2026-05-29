@@ -17,7 +17,7 @@ const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// Default replication port.
 ///
-/// Wave 1C audit cleanup (rep low "default port collision"):
+/// Default port:
 /// changed from `5001` (which collides with PostgreSQL's REPMGR
 /// default and various Cisco services) to `14_001`, an unprivileged
 /// IANA-unassigned default.  Most production deployments override
@@ -31,7 +31,7 @@ const DEFAULT_PHI_WINDOW_SIZE: usize = 200;
 
 /// Wire-level transport selected for replication traffic.
 ///
-/// Wave 11-D promoted the in-memory transport into a first-class
+/// The in-memory transport is a first-class
 /// production option alongside TCP / TLS / QUIC.  This enum lets a
 /// caller declare the transport choice in [`RepConfig`] so higher-level
 /// orchestration code (e.g., the test harness, the `RepTestBase`
@@ -62,7 +62,7 @@ pub enum RepTransportKind {
 
 impl Default for RepTransportKind {
     /// Defaults to [`RepTransportKind::Tcp`] to preserve
-    /// pre-Wave-11-D behaviour.
+    /// backward compatibility.
     fn default() -> Self {
         Self::Tcp
     }
@@ -125,11 +125,11 @@ pub struct RepConfig {
     pub reconnect_config: ReconnectConfig,
     /// Wire-level transport this node will use.
     ///
-    /// Wave 11-D added this field so callers can declare whether they
+    /// This field lets callers declare whether they
     /// intend to drive replication over TCP, TLS, QUIC, or the
     /// in-process [`crate::net::InMemoryTransport`].  See
     /// [`RepTransportKind`] for the variants.  Defaults to
-    /// [`RepTransportKind::Tcp`] to preserve pre-Wave-11-D behaviour.
+    /// [`RepTransportKind::Tcp`] for backward compatibility.
     pub transport_kind: RepTransportKind,
 }
 
@@ -165,7 +165,7 @@ impl RepConfig {
     ///
     /// Equivalent to `builder(group, node, host).node_port(port).build()`.
     /// Provided so doc snippets and short tests don't need to write the
-    /// full builder chain.  Wave 1C audit cleanup (rep low
+    /// full builder chain.
     /// "`RepConfig::new` example").
     pub fn new(
         group_name: impl Into<String>,
@@ -292,7 +292,7 @@ impl RepConfigBuilder {
 
     /// Sets the wire-level transport this node will use.
     ///
-    /// Defaults to [`RepTransportKind::Tcp`].  Wave 11-D added
+    /// Defaults to [`RepTransportKind::Tcp`].
     /// [`RepTransportKind::InMemory`] for in-process clusters.
     pub fn transport_kind(mut self, kind: RepTransportKind) -> Self {
         self.transport_kind = kind;

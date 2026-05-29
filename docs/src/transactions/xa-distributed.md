@@ -5,7 +5,7 @@
 
 Noxu DB supports the **X/Open XA** two-phase commit (2PC) protocol for
 coordinating distributed transactions across multiple independent database
-environments.  As of v2.0 (wave 3-2 of the v1.5+ remediation plan), XA is
+environments.  As of v2.0, XA is
 **crash-durable**: a prepared branch survives a process crash and can be
 resolved via `xa_recover` → `xa_commit` / `xa_rollback` after restart.
 

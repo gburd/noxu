@@ -7,9 +7,8 @@ ordering and isolation for raw scan throughput, which is exactly what
 applications like full-database export, replication catch-up, and
 analytical scans need.
 
-This API was added in Noxu DB v1.6 (Wave 2C-3) and matches the shape of
-BDB JE's `DiskOrderedCursor` plus a small Rust-idiomatic extension
-(`dedup_keys`).
+This API was added in Noxu DB v1.6.  It provides high-throughput
+unordered scans with an optional `dedup_keys` facility.
 
 ## When to use a disk-ordered cursor
 

@@ -1,6 +1,6 @@
 //! Typed list view of a database.
 //!
-//! Wave 2B redesign (v1.6).  `StoredList<V, VB>` is a sequence-indexed
+//! `StoredList<V, VB>` is a sequence-indexed
 //! list backed by a Noxu database.  Indices are 0-based `usize`
 //! values encoded as 8-byte big-endian keys; iteration order matches
 //! insertion order.
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(list.pop(None).unwrap(), None);
     }
 
-    /// Wave 2B compaction test: insert 10 items, remove every other
+    /// Compaction test: insert 10 items, remove every other
     /// element, iterate, assert no gaps and the values are in the
     /// expected order.  This is the contract the prompt specifies.
     #[test]

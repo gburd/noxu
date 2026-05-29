@@ -17,13 +17,12 @@
 //! # Models
 //!
 //! All eleven specs carry a `VALIDATED-AS-OF` stamp in their
-//! module preamble.  Wave 9-B brought the four post-Wave-4-A
-//! replication specs (`flexible_paxos`, `vlsn_streaming`,
-//! `master_transfer`, `network_restore`) up to v2.0.0 reality.
-//! Wave 11-F annotated the remaining specs at v2.4.0 and
-//! strengthened five of them with new or upgraded invariants;
-//! see `docs/src/internal/wave-11-f-stateright-coverage.md` for
-//! the per-protocol report.
+//! module preamble.  The four replication specs (`flexible_paxos`,
+//! `vlsn_streaming`, `master_transfer`, `network_restore`) were
+//! re-validated at v2.0.0.  The remaining specs were annotated and
+//! strengthened at v2.4.0; see
+//! `docs/src/internal/wave-11-f-stateright-coverage.md` for the
+//! per-protocol report.
 //!
 //! | Module | Production code under model |
 //! |---|---|

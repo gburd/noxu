@@ -58,7 +58,7 @@ pub struct EnvironmentMutableConfig {
     /// To explicitly clear a previously-configured timeout, set
     /// `Some(0)` (which JE interprets as "no timeout").  v1.5.0 used a
     /// `u64` with `0` as the unchanged sentinel which made it
-    /// impossible to clear a timeout — see Wave 1C audit-cleanup
+    /// impossible to clear a timeout; see
     /// (Transaction-Env F19/F20).
     pub lock_timeout_ms: Option<u64>,
 

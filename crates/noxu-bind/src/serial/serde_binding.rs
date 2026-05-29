@@ -65,7 +65,7 @@ pub const SERDE_BINDING_HEADER_LEN: usize = 2;
 /// retrieved from database entries using this binding.  Each entry is
 /// prefixed with a 2-byte header; see the module docs for the format.
 ///
-/// # Schema management caveat (audit collections-bind F19, Wave 2C-4)
+/// # Schema management caveat
 ///
 /// `SerdeBinding` does **not** carry a per-record schema descriptor.
 /// The 2-byte header guards against decoding records produced by an

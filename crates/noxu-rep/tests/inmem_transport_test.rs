@@ -1,5 +1,4 @@
-//! Wave 11-D integration tests for the production-grade
-//! [`noxu_rep::net::InMemoryTransport`].
+//! Integration tests for [`noxu_rep::net::InMemoryTransport`].
 //!
 //! These tests exercise the in-memory transport at three levels:
 //!

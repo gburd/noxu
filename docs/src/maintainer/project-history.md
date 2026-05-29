@@ -5,12 +5,13 @@ page documents why the project exists and how it evolved session by session.
 
 ## Why Noxu DB Exists
 
-Noxu DB is battle-tested, with 20+ years of production use and a
-well-documented architecture. The goal is to provide a dependency-light,
-production-grade embedded database in Rust with:
+Noxu DB is an embedded transactional key-value database engine written
+in Rust, modeled on Berkeley DB Java Edition 7.5.11 plus 10
+extended-fork enhancements.  The goal is to provide a dependency-light
+embedded database with:
 
 - The same API contract (familiar to embedded database users)
-- The same algorithm fidelity (trusted, proven storage engineering)
+- The same algorithm fidelity (proven storage engineering)
 - No JVM — eliminates GC pauses, JVM startup overhead, and deployment complexity
 - Idiomatic Rust — `thiserror`, `parking_lot`, `Arc<RwLock<T>>`, RAII latches
 

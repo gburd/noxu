@@ -1745,7 +1745,7 @@ mod tests {
         round_trip(&Wrapper::Pair(10, 20));
     }
 
-    /// Audit collections-bind F20 (Wave 2C-4): serialize_str /
+    /// `serialize_str` /
     /// serialize_bytes return an error when the payload length
     /// exceeds u32::MAX, instead of silently truncating the length
     /// prefix.  We can't realistically construct a > 4 GiB string in

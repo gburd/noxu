@@ -7,8 +7,8 @@
 >
 > * `Database::open_cursor(Some(&txn), …)` and
 >   `SecondaryDatabase::open_cursor(Some(&txn), …)` correctly thread
->   the supplied transaction through to the underlying cursor in v1.5
->   (Sprint 1C). Pre-1.5 release candidates silently ignored the
+>   the supplied transaction through to the underlying cursor in v1.5.
+>   Pre-1.5 release candidates silently ignored the
 >   transaction; if you are upgrading, see
 >   [Migrating from v1.4.x](migrating.md) for the lock-conflict
 >   surface that change can expose.
@@ -44,11 +44,11 @@ cursor.close()?;
 The first argument is an optional transaction. The second is an optional `CursorConfig`. Both are
 typically `None` for simple use cases.
 
-The transaction argument **is honoured** in v1.5 (Sprint 1C): passing
+The transaction argument **is honoured** in v1.5: passing
 `Some(&txn)` causes the cursor's reads and writes to acquire locks on
 behalf of `txn`, and the cursor must be closed before `txn.commit()` /
 `txn.abort()`. Passing `None` opens an auto-commit cursor whose writes
-still go through the lock manager (Sprint 1 / F12) but whose locks are
+still go through the lock manager but whose locks are
 released per-operation.
 
 Cursors must be closed before the database they belong to is closed. Failing to close cursors
