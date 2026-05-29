@@ -48,13 +48,13 @@ pub enum TransactionState {
 /// be used for any further operations.
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
 /// use noxu_db::{Environment, EnvironmentConfig};
 /// use std::path::PathBuf;
 ///
 /// let config = EnvironmentConfig::new(PathBuf::from("/tmp/mydb"))
-///     .allow_create(true)
-///     .transactional(true);
+///     .with_allow_create(true)
+///     .with_transactional(true);
 /// let env = Environment::open(config).unwrap();
 /// let txn = env.begin_transaction(None).unwrap();
 /// // ... do operations ...
