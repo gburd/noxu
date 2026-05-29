@@ -1,0 +1,17 @@
+# Audit reports inherit free-form review style from external persona reviewers.
+# We accept long lines and bare code fences in those documents to preserve the
+# original review text faithfully.
+default: true
+
+MD013: false   # long lines OK in raw audit reports
+MD040: false   # bare ``` OK in raw audit reports
+MD024:
+  siblings_only: true
+MD025: false
+MD029:
+  style: ordered
+MD033: false
+MD041: false
+MD060: false
+MD036: false   # bold-as-pseudo-heading OK in raw audit reports
+MD051: false   # link-fragment validation OK in raw audit reports
