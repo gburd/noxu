@@ -162,6 +162,43 @@ pub struct RecoveryStats {
 }
 
 // ============================================================================
+// RecoveryScratch
+// ============================================================================
+
+/// Scratch buffers reused across multiple LN parses in the redo loop.
+///
+/// Holding a pair of pre-allocated `Vec<u8>` here and clearing them between
+/// records eliminates the repeated small-buffer `Vec::new()` allocation
+/// inside `redo_ln` when temporary key/data work needs to be done.
+///
+/// Wave 11-K optimisation (Fix 2).  In the current implementation the redo
+/// loop passes `Bytes`-backed `&[u8]` slices directly to `Tree::redo_insert`
+/// without materialising intermediate owned buffers, so the scratch is
+/// primarily a hook for future use and a documentation artefact that makes
+/// the zero-copy intent explicit.
+#[derive(Debug, Default)]
+pub struct RecoveryScratch {
+    /// Scratch buffer for key processing (cleared between records).
+    pub key_buf: Vec<u8>,
+    /// Scratch buffer for data processing (cleared between records).
+    pub data_buf: Vec<u8>,
+}
+
+impl RecoveryScratch {
+    /// Create a new scratch instance with no pre-allocated capacity.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clear both buffers without releasing their heap allocation.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.key_buf.clear();
+        self.data_buf.clear();
+    }
+}
+
+// ============================================================================
 // RecoveryManager
 // ============================================================================
 
@@ -188,6 +225,12 @@ pub struct RecoveryManager {
     redo_entries: Vec<(Lsn, LnRecord)>,
     /// Log from analysis: undo entries (collected during backward scan).
     undo_entries: Vec<(Lsn, LnRecord)>,
+    /// Per-database count of LN redo entries, built during analysis.
+    ///
+    /// Used before the redo loop to call `Tree::reserve_redo_capacity` on
+    /// each database tree, eliminating Vec-growth reallocations inside the
+    /// BIN's entries Vec during the hot redo insert path (Fix 3).
+    per_db_redo_count: HashMap<u64, usize>,
 }
 
 impl RecoveryManager {
@@ -202,6 +245,7 @@ impl RecoveryManager {
             dirty_in_map: DirtyINMap::new(),
             redo_entries: Vec::new(),
             undo_entries: Vec::new(),
+            per_db_redo_count: HashMap::new(),
         }
     }
 
@@ -216,6 +260,7 @@ impl RecoveryManager {
             dirty_in_map: DirtyINMap::new(),
             redo_entries: Vec::new(),
             undo_entries: Vec::new(),
+            per_db_redo_count: HashMap::new(),
         }
     }
 
@@ -438,10 +483,19 @@ impl RecoveryManager {
 
         // Auto-insert trees for any db_id encountered in the redo entries.
         // DbTree.dbIdToDb is populated during analysis.
+        //
+        // Wave 11-K (Fix 3): call hint_redo_capacity on each new tree so
+        // that redo_insert pre-allocates the initial BIN at
+        // min(count, max_entries) capacity, eliminating Vec-resize doublings.
         for (_lsn, rec) in &self.redo_entries {
-            trees
+            let count =
+                self.per_db_redo_count.get(&rec.db_id).copied().unwrap_or(0);
+            let tree = trees
                 .entry(rec.db_id)
                 .or_insert_with(|| noxu_tree::Tree::new(rec.db_id, 256));
+            if count > 0 && tree.get_redo_capacity_hint() == 0 {
+                tree.hint_redo_capacity(count);
+            }
         }
 
         self.set_progress(RecoveryProgress::ReplayLNs);
@@ -761,8 +815,15 @@ impl RecoveryManager {
 
         let entries = scanner.scan_forward(scan_start, scan_end);
 
-        for pe in &entries {
-            match &pe.entry {
+        // Consume entries by value to avoid `LnRecord::clone()` (which bumps
+        // the `Bytes` Arc refcount for key and data on every LN record).
+        // Moving the LnRecord directly into `redo_entries` eliminates the
+        // `bytes::owned_clone` / `owned_drop` allocation profile cost.
+        //
+        // Wave 11-K optimisation (Fix 2).
+        for pe in entries {
+            let entry_lsn = pe.lsn;
+            match pe.entry {
                 // ----------------------------------------------------------
                 // IN/BIN entries → build dirty-IN map
                 // ----------------------------------------------------------
@@ -775,17 +836,23 @@ impl RecoveryManager {
                     //
                     // Reader.isProvisional checks in INFileReader.
                     let after_ckpt = result.checkpoint_start_lsn == NULL_LSN
-                        || pe.lsn >= result.checkpoint_start_lsn;
+                        || entry_lsn >= result.checkpoint_start_lsn;
                     if after_ckpt {
-                        result.record_dirty_in(rec.clone(), pe.lsn);
+                        // Extract fields before moving rec into record_dirty_in.
+                        let node_id = rec.node_id;
+                        let db_id = rec.db_id;
+                        let is_delta = rec.is_delta;
+                        let level = rec.level;
+
+                        result.record_dirty_in(rec, entry_lsn);
 
                         // Track in the DirtyINMap (for bottom-up redo ordering).
                         self.dirty_in_map.add_dirty_in(
                             CheckpointReference::new(
-                                rec.node_id,
-                                rec.db_id as i64,
-                                rec.is_delta,
-                                rec.level,
+                                node_id,
+                                db_id as i64,
+                                is_delta,
+                                level,
                             ),
                         );
                     }
@@ -795,19 +862,22 @@ impl RecoveryManager {
                 // LN entries → track txn state for undo/redo
                 // ----------------------------------------------------------
                 LogEntry::Ln(rec) => {
-                    if let Some(txn_id) = rec.txn_id {
-                        // Collect for redo pass: eligible if txn committed.
-                        // We record all LN entries here; eligibility is checked
-                        // during the redo/undo passes.
-                        self.redo_entries.push((pe.lsn, rec.clone()));
+                    let db_id = rec.db_id;
+                    let txn_id = rec.txn_id;
 
+                    // Move rec into redo_entries — no clone, no Arc bump.
+                    self.redo_entries.push((entry_lsn, rec));
+
+                    // Track per-db count for BIN capacity pre-warming (Fix 3).
+                    *self.per_db_redo_count.entry(db_id).or_insert(0) += 1;
+
+                    if let Some(txn_id) = txn_id {
                         // Track this txn as active until we see its commit/abort.
                         // record_active_txn() also updates max_txn_id.
                         result.record_active_txn(txn_id);
-                    } else {
-                        // Non-transactional LN: always redo after checkpoint.
-                        self.redo_entries.push((pe.lsn, rec.clone()));
                     }
+                    // Non-transactional LNs (txn_id == None) need no extra
+                    // tracking; they are always redo'd after checkpoint start.
                 }
 
                 // ----------------------------------------------------------
@@ -835,8 +905,8 @@ impl RecoveryManager {
                             first_lsn: rec.first_lsn,
                             last_lsn: rec.last_lsn,
                             xid_format_id: rec.xid_format_id,
-                            xid_gtrid: rec.xid_gtrid.clone(),
-                            xid_bqual: rec.xid_bqual.clone(),
+                            xid_gtrid: rec.xid_gtrid,
+                            xid_bqual: rec.xid_bqual,
                         },
                     );
                     self.stats.prepared_txns += 1;
@@ -852,9 +922,9 @@ impl RecoveryManager {
                     // result.checkpoint_end_lsn was already set to this same LSN
                     // by find_last_checkpoint (their LSNs are equal).
                     let is_latest = result.checkpoint_end_lsn == NULL_LSN
-                        || pe.lsn >= result.checkpoint_end_lsn;
+                        || entry_lsn >= result.checkpoint_end_lsn;
                     if is_latest {
-                        result.checkpoint_end_lsn = pe.lsn;
+                        result.checkpoint_end_lsn = entry_lsn;
                         result.checkpoint_start_lsn = rec.checkpoint_start_lsn;
                         result.first_active_lsn = rec.first_active_lsn;
                         if rec.root_lsn != NULL_LSN {
@@ -896,9 +966,7 @@ impl RecoveryManager {
                     if rec.is_deleted {
                         result.recovered_db_names.remove(&rec.name);
                     } else {
-                        result
-                            .recovered_db_names
-                            .insert(rec.name.clone(), rec.db_id);
+                        result.recovered_db_names.insert(rec.name, rec.db_id);
                     }
                 }
 
@@ -1040,6 +1108,21 @@ impl RecoveryManager {
         // Track the count from the drain above.
         self.stats.ins_replayed += in_entries.len() as u64;
 
+        // ---- Wave 11-K (Fix 3): pre-warm BIN capacity before LN redo ----
+        //
+        // If this is a single-database recovery, look up the per-db count
+        // and call hint_redo_capacity on the tree before inserting.
+        // This sets the redo_capacity_hint so the first redo_insert call
+        // will pre-allocate the initial BIN at the right size.
+        if let Some(t) = tree.as_deref_mut() {
+            let db_id = t.get_database_id();
+            let count =
+                self.per_db_redo_count.get(&db_id).copied().unwrap_or(0);
+            if count > 0 && t.get_redo_capacity_hint() == 0 {
+                t.hint_redo_capacity(count);
+            }
+        }
+
         // ---- Redo LNs (forward scan) ----
         //
         // LNFileReader(forward=true, start=firstActiveLsn) loop.
@@ -1140,17 +1223,21 @@ impl RecoveryManager {
         }
         match rec.operation {
             LnOperation::Insert | LnOperation::Update => {
-                // Insert the logged version.  `tree.insert` updates the slot
+                // Insert the logged version.  `tree.redo_insert` updates the slot
                 // if the key already exists, which gives us the "logrecLsn >
                 // treeLsn → replace" semantics from the.  If the tree already
                 // holds a *newer* entry for this key (another committed write
                 // that arrived after the log was scanned), the overwrite is
                 // still safe here because recovery runs before any new
                 // transactions are admitted.
-                // Materialise Bytes → Vec<u8> at the tree boundary.
-                let data =
-                    rec.data.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
-                // Recovery design call: tree.insert errors during redo
+                //
+                // Wave 11-K (Fix 1): pass &[u8] slices directly instead of
+                // materialising two intermediate Vec<u8> (rec.key.to_vec() +
+                // rec.data.to_vec()).  The compressed key suffix and the data
+                // bytes are copied into the BinEntry exactly once inside
+                // BinStub::insert_with_prefix_slice.
+                let data_slice = rec.data.as_deref().unwrap_or(&[]);
+                // Recovery design call: tree.redo_insert errors during redo
                 // are logged and we continue. The TreeError variants
                 // (SplitRequired, Lookup, MemoryAllocFailure) on a
                 // single key indicate a failure to materialise that
@@ -1160,7 +1247,7 @@ impl RecoveryManager {
                 // operator sees the failure via log::error! and can
                 // decide whether to escalate (e.g. restore from
                 // backup) based on the breadth of failures.
-                if let Err(e) = tree.insert(rec.key.to_vec(), data, lsn) {
+                if let Err(e) = tree.redo_insert(&rec.key, data_slice, lsn) {
                     log::error!(
                         "noxu-recovery: redo failed at lsn={lsn:?}, db={}, \
                          op={:?}: {e:?}; recovery will continue but this \
