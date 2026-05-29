@@ -157,3 +157,4 @@
   - [Wave 11-H — Performance investigation on JE-wins workloads](internal/wave-11-h-perf-investigation.md)
   - [Wave 11 Bug-Fix Wave — v2.3.2](internal/wave-11-bugfix-v232.md)
   - [Wave 11-I — Cursor / BIN scan optimization](internal/wave-11-i-cursor-double-descent.md)
+  - [Wave 11-K — Recovery / log-scanner allocation reduction](internal/wave-11-k-recovery-alloc.md)
