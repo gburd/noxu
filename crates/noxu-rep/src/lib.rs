@@ -109,11 +109,9 @@ pub mod replicated_environment;
 pub mod state_change_listener;
 
 // In-memory `RepTestBase` / `RepEnvInfo` harness for porting JE rep
-// tests and for production in-process clusters.  Originally gated
-// behind `cfg(any(test, feature = "test-harness"))`; Wave 11-D
-// promoted it to first-class production status alongside the new
-// [`net::InMemoryTransport`] (see
-// `docs/src/internal/wave-11-d-inmem-transport.md`).  The
+// tests and for production in-process clusters.  Available under
+// `cfg(any(test, feature = "test-harness"))` and as a first-class
+// production module via [`net::InMemoryTransport`].  The
 // `test-harness` feature flag is retained as a no-op for backward
 // compatibility with downstream Cargo.toml entries.
 pub mod test_harness;

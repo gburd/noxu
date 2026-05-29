@@ -1,6 +1,6 @@
 //! Typed key-set view of a database.
 //!
-//! Wave 2B redesign (v1.6).  `StoredKeySet<K, KB>` exposes a set
+//! `StoredKeySet<K, KB>` exposes a set
 //! interface over the *keys* of a Noxu database.  Values stored
 //! under those keys are opaque payloads (the canonical use is
 //! `()` / a single byte) and are never decoded.

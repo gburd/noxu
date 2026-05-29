@@ -1,6 +1,6 @@
 //! Entity store for managing databases of typed entities.
 //!
-//! Wave 2C-2 wires schema evolution into the open path:
+//! Schema evolution is wired into the open path:
 //!
 //! * `EntityStore::open` opens a hidden
 //!   [`crate::evolve::ClassCatalog`] alongside the entity databases.

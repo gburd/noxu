@@ -7,8 +7,8 @@
 //! Derive-macro-based entity persistence for Noxu DB.
 //!
 //! Direct Persistence Layer — provides trait-based entity-to-database
-//! mapping with a proc-macro derive shortcut.  As of v1.6 (Wave 2C-1) users
-//! can opt in to a derive-driven shape:
+//! mapping with a proc-macro derive shortcut.  Users can opt in to a
+//! derive-driven shape:
 //!
 //! ```ignore
 //! use noxu_persist::{Entity, SecondaryKey};
