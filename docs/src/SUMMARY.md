@@ -90,6 +90,7 @@
   - [Testing Guide](contributing/testing-guide.md)
   - [PR Process](contributing/pr-process.md)
   - [Release Process](contributing/release.md)
+  - [Publishing to crates.io](contributing/publishing.md)
 
 ---
 
