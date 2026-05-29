@@ -695,10 +695,7 @@ impl SharedTreeLookup {
 
     /// Resolve the correct tree for `db_id`: use the extra tree if registered,
     /// otherwise fall back to the primary tree.
-    fn resolve_tree(
-        &self,
-        db_id: i64,
-    ) -> &Arc<RwLock<noxu_tree::Tree>> {
+    fn resolve_tree(&self, db_id: i64) -> &Arc<RwLock<noxu_tree::Tree>> {
         self.extra_trees.get(&db_id).unwrap_or(&self.tree)
     }
 }
