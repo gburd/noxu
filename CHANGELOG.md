@@ -16,6 +16,19 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Changed
+
+- **Voice cleanup.** Removed agent-process artifacts (wave/sprint labels,
+  boastful adjectives, false provenance claims) from all user-facing
+  documentation and public-crate rustdocs.  No API or behaviour change.
+  `README.md`, `docs/src/introduction.md`, `docs/src/getting-started/`,
+  `docs/src/transactions/`, `docs/src/replication/`, `docs/src/collections/`,
+  `docs/src/operations/benchmarks.md`, `docs/src/reference/architecture.md`,
+  `docs/src/contributing/porting-guidelines.md`,
+  `docs/src/maintainer/project-history.md`, and public `///` rustdocs in
+  `noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-rep`,
+  `noxu-xa`.
+
 ### Added (v3.0.0 candidate)
 
 - **API stability commitment**: `docs/src/contributing/api-stability.md` enumerates
