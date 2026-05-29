@@ -7,21 +7,8 @@ memory-mapped I/O, and for a handful of `parking_lot`/`Send` shims.
 
 ## Capability matrix (v1.5 → v2.2)
 
-This matrix is the canonical statement of what each released line actually
-delivers.  Columns are git tags (`v1.5.0`, `v1.6.0`, `v2.0.0`, `v2.2.1`),
-not roadmap entries.
-
-The matrix was reconciled against the released source plus the audit and
-wave reports under [`internal/`](internal/) — in particular
-[`api-audit-2026-05-rep.md`](internal/api-audit-2026-05-rep.md) (the 10
-GA-blocker findings closed in Wave 4-A), the JE-port enumeration
-([`je-port-audit-2026-05-overview.md`](internal/je-port-audit-2026-05-overview.md),
-[`je-tck-port-2026-05-overview.md`](internal/je-tck-port-2026-05-overview.md)),
-the Wave 2A–4-A series, the Wave 7–9 follow-ups
-([`wave-9-a-rep-fixes.md`](internal/wave-9-a-rep-fixes.md),
-[`wave-9-b-stateright-revalidation.md`](internal/wave-9-b-stateright-revalidation.md),
-[`wave-9-c-je-tck-ports.md`](internal/wave-9-c-je-tck-ports.md)),
-and the Sprint 1–3 restriction notes.
+This matrix states what each released line delivers.  Columns are
+git tags (`v1.5.0`, `v1.6.0`, `v2.0.0`, `v2.2.1`).
 
 | Feature | v1.5 | v1.6 | v2.0 | v2.2 (current) |
 |---|---|---|---|---|

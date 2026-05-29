@@ -373,7 +373,7 @@ fn _force_use_imports() {
 /// has_active_txns should be false (the only txn committed); the impl says
 /// it's true.
 ///
-/// TODO(wave 11-E followup): decide whether `record_active_txn` should be
+/// TODO: decide whether `record_active_txn` should be
 /// hardened with a defensive `if is_committed || is_aborted { return; }`,
 /// or whether the precondition should be promoted to a `debug_assert!` and
 /// callers audited.  Tracked under the post-v2.3.0 roadmap.
