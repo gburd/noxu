@@ -1,7 +1,7 @@
-//! Lazy iterator adapters for [`Database`].
+//! Lazy iterator adapters for [`crate::Database`].
 //!
 //! Provides [`DbIter`] (full-scan, forward) and [`DbRange`] (key-range scan)
-//! as convenience wrappers around the underlying [`Cursor`] API.
+//! as convenience wrappers around the underlying [`crate::Cursor`] API.
 //!
 //! # Design
 //!
@@ -62,7 +62,7 @@ use std::ops::Bound;
 
 /// A forward-scanning iterator over all records in a database.
 ///
-/// Returned by [`Database::iter`].  Holds a live [`Cursor`]; records are
+/// Returned by [`crate::Database::iter`].  Holds a live [`crate::Cursor`]; records are
 /// fetched one at a time (lazy) — the full database is **not** materialised
 /// into memory.
 ///
@@ -116,7 +116,7 @@ impl Iterator for DbIter {
 
 /// A lazy key-range iterator over a database.
 ///
-/// Returned by [`Database::range`].  Holds a live [`Cursor`] positioned at
+/// Returned by [`crate::Database::range`].  Holds a live [`crate::Cursor`] positioned at
 /// the first key ≥ `start_bound` and stops when the current key exceeds
 /// `end_bound`.  Records are fetched lazily — one per `next()` call.
 pub struct DbRange {
