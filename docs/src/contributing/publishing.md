@@ -126,7 +126,7 @@ sleep 60
 After publishing each crate, docs.rs starts building it automatically.
 Check the build status at:
 
-```
+```text
 https://docs.rs/<crate-name>/<version>
 ```
 
