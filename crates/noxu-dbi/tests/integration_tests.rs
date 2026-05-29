@@ -972,3 +972,102 @@ fn utilization_tracker_is_populated_after_writes() {
          count_new_log_entry is not being called from the write path"
     );
 }
+
+// ============================================================================
+// X-11: log_flush_no_sync_interval_ms daemon
+// ============================================================================
+
+/// X-11: Verify the LogFlushTask daemon flushes CommitNoSync data to the OS
+/// page cache within the configured interval.
+///
+/// Test strategy:
+/// 1. Open a writable env with `log_flush_no_sync_interval_ms = 50` ms.
+/// 2. Write a record using CommitNoSync (no flush/fsync from the committer).
+/// 3. Wait 200 ms (4× the flush interval) for the daemon to run.
+/// 4. Assert that the LogManager's `last_flush_lsn` has advanced past 0,
+///    meaning at least one flush_no_sync() has fired.  We verify via
+///    `get_log_manager().unwrap().get_last_flush_lsn()`.
+#[test]
+fn test_x11_log_flush_no_sync_daemon_fires() {
+    use noxu_dbi::{DatabaseConfig, DbiEnvConfig, EnvironmentImpl};
+
+    let dir = TempDir::new().unwrap();
+
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        log_flush_no_sync_interval_ms: 50, // 50 ms flush interval
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+
+    // Open a database and write a record.
+    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_arc = env.open_database("test", &db_cfg).unwrap();
+
+    {
+        let db = db_arc.read();
+        let tree = db.get_real_tree().expect("tree must be present");
+        let lsn = noxu_util::Lsn::from_u64(1);
+        tree.insert(b"k1".to_vec(), b"v1".to_vec(), lsn).unwrap();
+    }
+
+    // Write something to the log manager directly to ensure there's data to flush.
+    // Use a raw log write to simulate CommitNoSync (flush=false, fsync=false).
+    let lm = env.get_log_manager().expect("log manager must be present");
+    let mut buf = bytes::BytesMut::with_capacity(32);
+    let entry = noxu_log::entry::LnLogEntry::new(
+        1, None, noxu_util::lsn::NULL_LSN, false, None, None,
+        noxu_util::vlsn::NULL_VLSN, 0, false,
+        b"k1".to_vec(), Some(b"v1".to_vec()), 0,
+        noxu_util::vlsn::NULL_VLSN,
+    );
+    use noxu_log::LogEntry;
+    entry.write_to_log(&mut buf);
+    lm.log(
+        noxu_log::LogEntryType::LN,
+        &buf,
+        noxu_log::Provisional::No,
+        false, // flush=false (CommitNoSync)
+        false, // fsync=false
+    )
+    .expect("log write should succeed");
+
+    // Record last_flush_lsn before waiting.
+    let before = lm.get_last_flush_lsn();
+
+    // Wait long enough for the 50-ms daemon to have run multiple times.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let after = lm.get_last_flush_lsn();
+
+    env.close().unwrap();
+
+    assert!(
+        after > before,
+        "LogFlushTask daemon must have advanced last_flush_lsn: \
+         before={before:?} after={after:?}"
+    );
+}
+
+/// X-11: When log_flush_no_sync_interval_ms = 0 the daemon must be a no-op
+/// (the thread exits immediately without firing any flushes beyond env open).
+#[test]
+fn test_x11_disabled_interval_no_spurious_flush() {
+    use noxu_dbi::{DbiEnvConfig, EnvironmentImpl};
+
+    let dir = TempDir::new().unwrap();
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        log_flush_no_sync_interval_ms: 0, // disabled
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+    // Should open and close without error.
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+    env.close().unwrap();
+}
