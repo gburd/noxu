@@ -2,11 +2,7 @@
 //!
 //! audit-2026-05-jonhoo.md findings 2.1 and 2.3.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
-use std::path::PathBuf;
+use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use tempfile::TempDir;
 
 fn open_env_db(dir: &TempDir) -> (Environment, noxu_db::Database) {
@@ -157,7 +153,7 @@ fn range_empty_result() {
     let lo = 50u32.to_be_bytes();
     let hi = 60u32.to_be_bytes();
     let items: Vec<_> = db
-        .range(None, lo..hi)  // K = [u8; 4]
+        .range(None, lo..hi) // K = [u8; 4]
         .unwrap()
         .collect();
     assert!(items.is_empty(), "range outside data must return nothing");
@@ -178,7 +174,7 @@ fn range_subset_inclusive() {
     let lo = 20u32.to_be_bytes();
     let hi = 30u32.to_be_bytes();
     let keys: Vec<Vec<u8>> = db
-        .range(None, lo..=hi)  // K = [u8; 4]
+        .range(None, lo..=hi) // K = [u8; 4]
         .unwrap()
         .map(|r| r.unwrap().0)
         .collect();
@@ -201,7 +197,7 @@ fn range_subset_exclusive_end() {
     let lo = 10u32.to_be_bytes();
     let hi = 20u32.to_be_bytes();
     let keys: Vec<Vec<u8>> = db
-        .range(None, lo..hi)  // K = [u8; 4]
+        .range(None, lo..hi) // K = [u8; 4]
         .unwrap()
         .map(|r| r.unwrap().0)
         .collect();
@@ -271,11 +267,8 @@ fn range_single_record() {
     insert_n(&db, 10);
 
     let key5 = 5u32.to_be_bytes(); // [u8; 4] — Copy, works as range bound
-    let items: Vec<_> = db
-        .range(None, key5..=key5)
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let items: Vec<_> =
+        db.range(None, key5..=key5).unwrap().map(|r| r.unwrap()).collect();
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].0.as_slice(), key5.as_slice());
@@ -304,4 +297,3 @@ fn iter_idiomatic_for_loop() {
     db.close().unwrap();
     env.close().unwrap();
 }
-

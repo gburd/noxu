@@ -551,8 +551,8 @@ impl Transaction {
                     }
                     // Brief env lock: lookup only.
                     let guard = env.lock();
-                    if let Some(arc) = guard
-                        .get_database_by_id(DatabaseId::new(db_id_raw))
+                    if let Some(arc) =
+                        guard.get_database_by_id(DatabaseId::new(db_id_raw))
                     {
                         db_handles.insert(db_id_raw, arc);
                     }
