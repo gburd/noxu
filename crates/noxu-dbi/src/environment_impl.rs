@@ -75,7 +75,11 @@ pub struct EnvironmentImpl {
     pending_names: RwLock<std::collections::HashSet<String>>,
 
     /// Whether the environment has been invalidated.
-    is_invalid: AtomicBool,
+    ///
+    /// Stored as `Arc<AtomicBool>` so that `Database` and `CursorImpl`
+    /// can cache a cheap clone and check validity on every hot-path
+    /// operation without acquiring `env_impl.lock()`.
+    is_invalid: Arc<AtomicBool>,
     /// If invalidated, the reason.
     invalid_reason: RwLock<Option<EnvironmentFailureReason>>,
 
@@ -706,7 +710,7 @@ impl EnvironmentImpl {
             db_map,
             name_map: RwLock::new(recovered_names),
             pending_names: RwLock::new(std::collections::HashSet::new()),
-            is_invalid: AtomicBool::new(false),
+            is_invalid: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -803,6 +807,16 @@ impl EnvironmentImpl {
         self.is_invalid.store(true, Ordering::Relaxed);
         *self.invalid_reason.write() = Some(reason);
         *self.state.write() = EnvState::Invalid;
+    }
+
+    /// Returns a cheap `Arc<AtomicBool>` clone of the invalidation flag.
+    ///
+    /// Callers (`Database`, `CursorImpl`) cache this at open time so
+    /// `check_open` / `check_state` can detect environment invalidity
+    /// without acquiring `env_impl.lock()` on every operation.
+    /// X-13 fix.
+    pub fn is_invalid_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_invalid)
     }
 
     // Database operations
