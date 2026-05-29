@@ -960,12 +960,16 @@ impl EnvironmentImpl {
     ///
     /// `creating_txn_id`: when `Some`, the database is created under a
     /// transaction and the name registration is deferred (C-4 / JE 1-I fix):
+    /// - A `NameLNTxn` WAL entry (`Provisional::Yes`) is written inside the
+    ///   creating transaction (C-6).
     /// - The name is added to `pending_names` but NOT to `name_map` yet.
     /// - `get_database_names()` excludes pending names.
     /// - Call `commit_pending_database(name)` when the txn commits to move
-    ///   the name into `name_map` and persist the NameLN to the WAL.
+    ///   the name into `name_map` (no additional WAL write — the TxnCommit
+    ///   record makes the provisional NameLNTxn durable).
     /// - Call `abort_pending_database(name)` when the txn aborts to remove
-    ///   the db from `db_map` and `pending_names`.
+    ///   the db from `db_map` and `pending_names`.  Recovery's
+    ///   `run_mapping_tree_undo_pass` removes the NameLNTxn.
     ///
     /// When `None` (non-transactional), behaviour is unchanged: the name
     /// is inserted into `name_map` immediately and a NameLN is written.
@@ -974,7 +978,7 @@ impl EnvironmentImpl {
         name: &str,
         config: &DatabaseConfig,
     ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
-        self.open_database_inner(name, config, false)
+        self.open_database_inner(name, config, None)
     }
 
     /// Transactional variant: creates the database under a transaction.
@@ -982,19 +986,24 @@ impl EnvironmentImpl {
     /// The name is added to `pending_names` (not yet to `name_map`).  The
     /// caller is responsible for calling `commit_pending_database` or
     /// `abort_pending_database` when the transaction resolves.
+    ///
+    /// `txn_id` is the ID of the creating transaction.  A `NameLNTxn` WAL
+    /// entry (with `Provisional::Yes`) is written **inside** the transaction
+    /// so that crash recovery can undo it if the transaction never commits.
     pub fn open_database_transactional(
         &self,
         name: &str,
         config: &DatabaseConfig,
+        txn_id: u64,
     ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
-        self.open_database_inner(name, config, true)
+        self.open_database_inner(name, config, Some(txn_id))
     }
 
     fn open_database_inner(
         &self,
         name: &str,
         config: &DatabaseConfig,
-        transactional_create: bool,
+        creating_txn_id: Option<u64>,
     ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
         self.check_open()?;
 
@@ -1065,11 +1074,22 @@ impl EnvironmentImpl {
 
         self.db_map.write().insert(db_id, db.clone());
 
-        if transactional_create && recovered_db_id.is_none() {
-            // C-4 / JE 1-I fix: defer name_map insertion until commit.
-            // The name is visible within the creating txn (via db_map) but
-            // not to other callers of get_database_names() until committed.
-            self.pending_names.write().insert(name.to_string());
+        if let Some(txn_id) = creating_txn_id {
+            if recovered_db_id.is_none() {
+                // C-4 / JE 1-I fix + C-6: defer name_map insertion until commit.
+                // The name is visible within the creating txn (via db_map) but
+                // not to other callers of get_database_names() until committed.
+                self.pending_names.write().insert(name.to_string());
+                // C-6: write NameLNTxn (Provisional::Yes) inside the creating
+                // transaction so crash recovery can undo it if the transaction
+                // aborts or the process crashes before commit.
+                if let Some(lm) = &self.log_manager {
+                    let _ =
+                        Self::log_name_ln_txn(lm, name, db_id.id() as u64, txn_id);
+                }
+            }
+            // recovered_db_id.is_some(): db already in name_map from recovery;
+            // name_map insertion is a no-op and no new WAL entry is needed.
         } else {
             // Non-transactional path (or reopening a recovered db): insert
             // into name_map immediately, as before.
@@ -1090,9 +1110,11 @@ impl EnvironmentImpl {
 
     /// Called when the transaction that created `name` commits.
     ///
-    /// Moves the name from `pending_names` to `name_map` and persists the
-    /// NameLN to the WAL.  No-op if the name is not in `pending_names`
-    /// (safe to call idempotently).
+    /// Moves the name from `pending_names` to `name_map`.  The WAL entry
+    /// (`NameLNTxn`, `Provisional::Yes`) was already written inside the
+    /// creating transaction; the `TxnCommit` record written by the normal
+    /// commit path makes it durable.  No-op if the name is not in
+    /// `pending_names` (safe to call idempotently).
     pub fn commit_pending_database(&self, name: &str) {
         let db_id = {
             let mut pending = self.pending_names.write();
@@ -1105,10 +1127,10 @@ impl EnvironmentImpl {
             })
         };
         if let Some(db_id) = db_id {
+            // C-6: do NOT write a second NameLN here.  The NameLNTxn was
+            // already written inside the transaction; the TxnCommit record
+            // (written by Transaction::commit) is the durability marker.
             self.name_map.write().insert(name.to_string(), db_id);
-            if let Some(lm) = &self.log_manager {
-                let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
-            }
         }
     }
 
@@ -1130,6 +1152,50 @@ impl EnvironmentImpl {
         if let Some(id) = db_id {
             self.db_map.write().remove(&id);
         }
+    }
+
+    /// Write a transactional NameLNTxn entry to the WAL mapping `name` → `db_id`.
+    ///
+    /// Written **inside** the creating transaction with `Provisional::Yes`
+    /// so that crash recovery treats it as uncommitted until a `TxnCommit`
+    /// is seen.  `txn_id` must be the ID of the creating transaction.
+    ///
+    /// Format: `LnLogEntry` with key=name bytes, data=8-byte LE db_id,
+    /// `txn_id=Some(txn_id as i64)`, `LogEntryType::NameLNTxn`.
+    fn log_name_ln_txn(
+        lm: &Arc<LogManager>,
+        name: &str,
+        db_id: u64,
+        txn_id: u64,
+    ) -> Result<(), DbiError> {
+        let key = name.as_bytes().to_vec();
+        let data = db_id.to_le_bytes().to_vec();
+        let entry = LnLogEntry::new(
+            0,                          // db_id header field (unused for NameLN)
+            Some(txn_id as i64),        // txn_id: creating transaction
+            NULL_LSN,
+            false,
+            None,
+            None,
+            noxu_util::vlsn::NULL_VLSN,
+            0,
+            false,
+            key,
+            Some(data),
+            0,
+            noxu_util::vlsn::NULL_VLSN,
+        );
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        lm.log(
+            LogEntryType::NameLNTxn,
+            &buf,
+            Provisional::Yes,
+            false, // flush: lazy
+            false, // fsync: lazy
+        )
+        .map(|_| ())
+        .map_err(DbiError::from)
     }
 
     /// Write a NameLN entry to the WAL mapping `name` → `db_id`.
