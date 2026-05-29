@@ -271,6 +271,29 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   - Secondary-index / sorted-dup path unchanged.
   - See `docs/src/internal/wave-11-i-cursor-double-descent.md`.
 
+### Performance (v2.4.0 — Wave 11-K)
+
+- Recovery redo path: reduced per-record allocations (Wave-11-K).
+  Three complementary changes in `noxu-tree` and `noxu-recovery`:
+  - `Tree::redo_insert(&[u8], &[u8], Lsn)` + `BinStub::insert_with_prefix_slice`:
+    eliminates one intermediate `Vec<u8>` per LN record by passing `Bytes`-backed
+    `&[u8]` slices directly to the BIN insertion code (Fix 1).
+  - Consuming iteration in `run_analysis`: moves `LnRecord` into `redo_entries`
+    without `Bytes::clone()` Arc-refcount bumps (Fix 2 — eliminates 200K+
+    atomic increment/decrement pairs at 100K-record scale).
+  - `Tree::hint_redo_capacity` + pre-allocated BIN split halves in `split_child`:
+    eliminates Vec-resize doublings in the initial BIN and in each new BIN
+    created during redo (Fix 3).
+  - Add `RecoveryScratch` struct documenting the zero-copy redo loop intent.
+  - All 5764 tests pass; gate: fmt + clippy + doc all clean.
+  - W11 wall-clock improvement is within measurement noise at 100K on this
+    machine (≈251ms vs ≈254ms baseline, ratio 2.9× JE).  Root-cause analysis
+    in `docs/src/internal/wave-11-k-recovery-alloc.md` explains why the gap
+    remains: the dominant ≈200ms cost is env-open overhead outside the redo loop,
+    not allocator pressure in the redo path itself.  A follow-up (BIN
+    deserialization from dirty_in_map, or lazy env-open) would be needed to
+    reach the 1.5× acceptance gate.
+
 ## [2.2.1] - 2026-05-27
 
 CI-green release.  Unblocks GitHub Pages and Codeberg Pages publishing.
