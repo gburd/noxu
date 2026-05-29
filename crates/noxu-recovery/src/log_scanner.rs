@@ -271,6 +271,16 @@ pub struct NameLnRecord {
     pub name: String,
     pub db_id: u64,
     pub is_deleted: bool,
+    /// Transaction ID of the creating transaction, if any.
+    ///
+    /// `None` means the NameLN was written outside of a transaction (or the
+    /// WAL entry predates C-6 and did not carry a txn_id).
+    ///
+    /// Used by `run_mapping_tree_undo_pass` to remove NameLNs whose creating
+    /// transaction is in the aborted-transaction set.  A `None` txn_id is
+    /// treated as committed (no undo needed) to preserve backward compat with
+    /// pre-C6 WAL files.
+    pub txn_id: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

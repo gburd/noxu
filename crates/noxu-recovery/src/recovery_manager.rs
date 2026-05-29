@@ -257,7 +257,7 @@ pub struct RecoveryManager {
     ///   tree, not just a HashMap).
     ///
     /// Tracked in: `docs/src/internal/wave-11-r-semantic.md` § C-6.
-    mapping_tree_db_names: HashMap<String, u64>,
+    pub(crate) mapping_tree_db_names: HashMap<String, u64>,
 }
 
 impl RecoveryManager {
@@ -596,33 +596,39 @@ impl RecoveryManager {
     ///   remain unconditionally accepted.
     /// - Implement a full MapLN B-tree undo (requires a dedicated mapping-tree
     ///   database, tracked as a follow-up wave).
-    fn run_mapping_tree_undo_pass(
+    pub(crate) fn run_mapping_tree_undo_pass(
         &mut self,
         analysis: &mut crate::analysis_result::AnalysisResult,
     ) {
-        // Remove any recovered_db_names entry whose creating txn is aborted.
-        // Since current NameLNs carry txn_id=None, this pass is a no-op on
-        // pre-C4 WAL files.  On post-C4 WAL files, NameLNs are only written
-        // on commit, so there will never be an aborted NameLN to remove.
-        // The pass is present as structural scaffolding; it becomes
-        // meaningful if/when NameLNs are given explicit txn_ids.
+        // C-6: remove any recovered_db_names entry whose creating transaction
+        // is in the aborted set.  This requires the NameLN WAL entry to carry
+        // a txn_id (populated in `recovered_db_txn_ids` by the analysis pass).
         //
-        // Pattern: scan the redo_entries for any NameLN-tagged entry that
-        // has a non-zero txn_id; if that txn_id appears in
-        // `analysis.aborted_txns`, remove the name from recovered_db_names.
+        // With Noxu's current write-on-commit design, NameLNs never carry a
+        // txn_id (they are written after TxnCommit), so `recovered_db_txn_ids`
+        // is always empty and this pass remains a structural no-op for today's
+        // WAL files.  When a future wave writes `NameLNTxn` inside transactions
+        // (with a live txn_id), this pass will become active automatically.
+        //
+        // Pre-C6 WAL compatibility: entries absent from `recovered_db_txn_ids`
+        // have txn_id=None and are treated as committed (no undo).
         let aborted_names: Vec<String> = analysis
             .recovered_db_names
             .keys()
-            .filter(|_name| {
-                // Placeholder: real predicate would check the NameLN txn_id
-                // against analysis.aborted_txns.  Since Noxu's NameLNs carry
-                // txn_id=None today, no entries are removed here.
-                false
+            .filter(|name| {
+                // A name is aborted only if its txn_id is non-zero AND that
+                // txn_id appears in the aborted-transactions set.
+                analysis
+                    .recovered_db_txn_ids
+                    .get(*name)
+                    .map(|&tid| analysis.aborted_txns.contains(&tid))
+                    .unwrap_or(false)
             })
             .cloned()
             .collect();
         for name in &aborted_names {
             analysis.recovered_db_names.remove(name);
+            analysis.recovered_db_txn_ids.remove(name);
             log::debug!(
                 "recovery[mapping-tree-undo]: removed aborted database \
                  registration '{}'",
@@ -1098,8 +1104,17 @@ impl RecoveryManager {
                 LogEntry::NameLn(rec) => {
                     if rec.is_deleted {
                         result.recovered_db_names.remove(&rec.name);
+                        result.recovered_db_txn_ids.remove(&rec.name);
                     } else {
-                        result.recovered_db_names.insert(rec.name, rec.db_id);
+                        result.recovered_db_names
+                            .insert(rec.name.clone(), rec.db_id);
+                        // C-6: record the creating txn_id so that
+                        // run_mapping_tree_undo_pass can undo NameLNs whose
+                        // transaction aborted.
+                        if let Some(tid) = rec.txn_id {
+                            result.recovered_db_txn_ids
+                                .insert(rec.name, tid);
+                        }
                     }
                 }
 
@@ -2970,5 +2985,90 @@ mod tests {
             lsn(1, 50).as_u64(),
             "X-1: rollback matchpoint must match the period's matchpoint_lsn"
         );
+    }
+
+    /// C-6 pin test: run_mapping_tree_undo_pass removes NameLN entries whose
+    /// creating transaction ID appears in the aborted set.
+    ///
+    /// This test exercises the undo logic with synthetic AnalysisResult data
+    /// where `recovered_db_txn_ids` is populated (as it would be after a WAL
+    /// that writes NameLNTxn entries inside transactions).
+    ///
+    /// The full end-to-end scenario (create DB in txn, abort, recover, assert
+    /// DB absent) requires writing NameLNTxn inside the transaction rather
+    /// than at commit time.  That write-path change is tracked as a follow-up.
+    /// See docs/src/internal/wave-11-u-recovery-cluster.md §C-6.
+    ///
+    /// # What this tests
+    /// The undo predicate: a name in `recovered_db_txn_ids` whose txn_id is
+    /// in `aborted_txns` is removed from `recovered_db_names`.  Names with
+    /// no txn_id or with committed txn_ids survive.
+    #[test]
+    fn test_c6_mapping_tree_undo_removes_aborted_namelns() {
+        let mut analysis = crate::analysis_result::AnalysisResult::new();
+
+        // Simulate three databases recovered from NameLN entries:
+        // 1. "committed_db" — written with txn_id 10 (committed).
+        // 2. "aborted_db"   — written with txn_id 20 (aborted).
+        // 3. "no_txn_db"    — written without txn_id (old-format NameLN).
+        analysis.recovered_db_names.insert("committed_db".to_string(), 1);
+        analysis.recovered_db_names.insert("aborted_db".to_string(), 2);
+        analysis.recovered_db_names.insert("no_txn_db".to_string(), 3);
+
+        analysis.recovered_db_txn_ids.insert("committed_db".to_string(), 10);
+        analysis.recovered_db_txn_ids.insert("aborted_db".to_string(), 20);
+        // "no_txn_db" has no txn_id entry.
+
+        analysis.committed_txns.insert(10, noxu_util::Lsn::new(0, 100));
+        analysis.aborted_txns.insert(20);
+
+        let mut mgr = RecoveryManager::new();
+        mgr.run_mapping_tree_undo_pass(&mut analysis);
+
+        assert!(
+            analysis.recovered_db_names.contains_key("committed_db"),
+            "C-6: committed_db must survive the undo pass"
+        );
+        assert!(
+            !analysis.recovered_db_names.contains_key("aborted_db"),
+            "C-6: aborted_db must be removed by the undo pass"
+        );
+        assert!(
+            analysis.recovered_db_names.contains_key("no_txn_db"),
+            "C-6: no_txn_db (no txn_id) must survive the undo pass (old format)"
+        );
+
+        // Confirm mapping_tree_db_names mirrors the surviving names.
+        assert_eq!(mgr.mapping_tree_db_names.len(), 2);
+        assert!(mgr.mapping_tree_db_names.contains_key("committed_db"));
+        assert!(mgr.mapping_tree_db_names.contains_key("no_txn_db"));
+    }
+
+    /// C-6 end-to-end pin: create a database inside an aborted transaction,
+    /// recover, and assert the database does not appear in the recovered names.
+    ///
+    /// # Why this is ignored
+    ///
+    /// Noxu currently writes the NameLN WAL entry at commit time (not inside
+    /// the transaction), so an aborted `open_database_transactional` leaves
+    /// no NameLN in the WAL — the undo pass has nothing to remove.  The full
+    /// fix requires writing `NameLNTxn` inside the transaction before commit,
+    /// which is tracked as a follow-up.  See:
+    ///   docs/src/internal/wave-11-u-recovery-cluster.md §C-6
+    ///
+    /// This test pins the intended post-fix behavior: after recovery, an
+    /// aborted transactional database creation must not appear in
+    /// `recovered_db_names`.
+    #[test]
+    #[ignore = "C-6: full end-to-end undo requires writing NameLNTxn inside the transaction; see wave-11-u-recovery-cluster.md"]
+    fn test_c6_aborted_db_creation_not_recovered() {
+        // Full scenario (requires write-path change):
+        // 1. Open env, begin txn T1.
+        // 2. open_database_transactional writes NameLNTxn with txn_id=T1.
+        // 3. Abort T1 (TxnAbort written after NameLNTxn).
+        // 4. Checkpoint so the WAL contains the NameLNTxn + TxnAbort.
+        // 5. Simulate crash + recovery.
+        // 6. Assert: recovered_db_names does NOT contain the aborted database.
+        todo!("implement after write-path change: NameLNTxn inside transaction");
     }
 }
