@@ -1717,7 +1717,13 @@ impl Tree {
                 // Release the BIN read guard before returning so the caller
                 // can call lock_ln (which may block) without holding a latch.
                 drop(guard);
-                return Some(SlotFetch { found, data, lsn, slot_index, bin_arc });
+                return Some(SlotFetch {
+                    found,
+                    data,
+                    lsn,
+                    slot_index,
+                    bin_arc,
+                });
             }
 
             // Upper IN: same hand-over-hand descent as `Tree::search`.

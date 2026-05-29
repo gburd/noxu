@@ -46,12 +46,12 @@ pub use noxu_observe as observe_crate;
 pub mod cache_mode;
 pub mod checkpoint_config;
 pub mod cursor;
-pub mod db_iter;
 pub mod cursor_config;
 pub mod database;
 pub mod database_config;
 pub mod database_entry;
 pub mod database_stats;
+pub mod db_iter;
 pub mod disk_ordered_cursor;
 pub mod durability;
 pub mod environment;
@@ -85,11 +85,11 @@ pub use cache_mode::CacheMode;
 pub use checkpoint_config::CheckpointConfig;
 pub use cursor::Cursor;
 pub use cursor_config::CursorConfig;
-pub use db_iter::{DbIter, DbRange};
 pub use database::Database;
 pub use database_config::DatabaseConfig;
 pub use database_entry::DatabaseEntry;
 pub use database_stats::{BtreeStats, DatabaseStats};
+pub use db_iter::{DbIter, DbRange};
 pub use disk_ordered_cursor::{
     DiskOrderedCursor, DiskOrderedCursorConfig, open_disk_ordered_cursor_multi,
 };

@@ -126,6 +126,8 @@ pub struct DbRange {
     /// Whether the cursor has been positioned at the start yet.
     positioned: bool,
     start_key: Option<Vec<u8>>,
+    /// When true, skip a record whose key exactly equals `start_key` (Excluded bound).
+    exclude_start: bool,
 }
 
 impl DbRange {
@@ -134,27 +136,18 @@ impl DbRange {
         start_bound: Bound<Vec<u8>>,
         end_bound: Bound<Vec<u8>>,
     ) -> Self {
-        let start_key = match &start_bound {
-            Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
-            Bound::Unbounded => None,
+        let (start_key, exclude_start) = match start_bound {
+            Bound::Included(k) => (Some(k), false),
+            Bound::Excluded(k) => (Some(k), true),
+            Bound::Unbounded => (None, false),
         };
-        // When the start bound is Excluded we advance one record past
-        // the start key; this is handled in the first `next()` call.
-        let excluded_start = matches!(start_bound, Bound::Excluded(_));
         Self {
             cursor,
             end_bound,
             done: false,
             positioned: false,
-            start_key: if excluded_start {
-                start_key.map(|k| {
-                    // Tag so we know to skip it.
-                    // We'll compare after positioning.
-                    k
-                })
-            } else {
-                start_key
-            },
+            start_key,
+            exclude_start,
         }
     }
 
@@ -183,9 +176,19 @@ impl Iterator for DbRange {
             // Position the cursor at the start of the range.
             let status = if let Some(ref sk) = self.start_key {
                 key_entry.set_data(sk);
-                self.cursor.get(&mut key_entry, &mut val_entry, Get::SearchGte, None)
+                self.cursor.get(
+                    &mut key_entry,
+                    &mut val_entry,
+                    Get::SearchGte,
+                    None,
+                )
             } else {
-                self.cursor.get(&mut key_entry, &mut val_entry, Get::First, None)
+                self.cursor.get(
+                    &mut key_entry,
+                    &mut val_entry,
+                    Get::First,
+                    None,
+                )
             };
 
             match status {
@@ -200,7 +203,18 @@ impl Iterator for DbRange {
                         self.done = true;
                         return None;
                     }
-                    return Some(Ok((k, v)));
+                    // Excluded start: skip the exact start key.
+                    if self.exclude_start
+                        && self
+                            .start_key
+                            .as_ref()
+                            .is_some_and(|sk| k.as_slice() == sk.as_slice())
+                    {
+                        // Fall through to the Get::Next block below.
+                        self.positioned = true;
+                    } else {
+                        return Some(Ok((k, v)));
+                    }
                 }
                 Ok(_) => {
                     self.done = true;
