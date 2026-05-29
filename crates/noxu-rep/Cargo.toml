@@ -9,9 +9,6 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 description = "Replication and high availability for Noxu DB"
-# v2.3.0: every crate is `publish = false` while the workspace dependency graph
-# still uses `path = "..."` deps. See docs/src/internal/wave-10-e-cratesio-prep.md.
-publish = false
 
 [features]
 # In-memory `RepTestBase` / `RepEnvInfo` harness for porting JE rep tests.
@@ -66,3 +63,8 @@ noxu-rep = { path = ".", features = ["test-harness"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# Use the pure-Rust TLS backend so docs.rs does not need C libssl/libcrypto.
+features = ["tls-rustls"]
+targets = ["x86_64-unknown-linux-gnu"]

@@ -3,6 +3,8 @@
 [![license](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 [![rust](https://img.shields.io/badge/rust-stable%201.95+-orange.svg)](rust-toolchain.toml)
 [![docs](https://img.shields.io/badge/docs-codeberg.page-blue.svg)](https://codeberg.page/gregburd/noxu/)
+[![crates.io](https://img.shields.io/crates/v/noxu-db.svg)](https://crates.io/crates/noxu-db)
+[![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
 
 Noxu DB is an embedded transactional key-value database engine, written in
 Rust.  It provides ACID transactions, a log-structured B+tree, checkpoint-based
@@ -23,12 +25,19 @@ failures** under `cargo test --workspace`, with `cargo fmt`,
 
 ## Quick Start
 
-Add to your `Cargo.toml` (until the crate is published to crates.io, depend
-on it via the Codeberg git URL):
+Add `noxu-db` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu-db = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v2.2.1" }
+noxu-db = "2"  # or pin to a specific version, e.g. "2.4.1"
+```
+
+Alternatively, depend on the git source directly (useful before a crates.io
+release, or to track unreleased commits):
+
+```toml
+[dependencies]
+noxu-db = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v2.4.1" }
 ```
 
 Open an environment, write a record, and read it back:

@@ -54,8 +54,8 @@ Every wave ships:
 | 11-K | v2.4.0 | Optimize log scanner (closes W11 gap) | **landed (partial)**: 3 alloc reductions in redo path (Tree::redo_insert + zero-copy LnRecord + BIN capacity hint); ~1 % wall-clock improvement on W11 (env-open dominates, not redo loop); follow-up needed for full gap closure — see [wave-11-k-recovery-alloc.md](wave-11-k-recovery-alloc.md) |
 | 11-N | v2.3.1 | Sorted-dup cursor bug fixes (4 bugs Wave 11-A/B surfaced) | merged — see `wave-11-n-sorted-dup-cursor-bugs.md`; the 4 #[ignore]'d / safety-cap regression tests are now passing live tests |
 | 11-BF | v2.3.2 | Bug-fix wave: 6 regressions from Wave 11-E/G | **merged** — all 6 `#[ignore]`'d tests fixed and promoted; see [wave-11-bugfix-v232.md](wave-11-bugfix-v232.md): record_active_txn guard, txn-cursor-on-non-txn-db, NoOverwrite dup-DB semantics, db-name registry WAL persistence, checkpoint data-loss, truncate durability |
-| 11-L | v3.0.0 | API stability commitment + SemVer policy + deprecation cycle | dispatched |
-| 11-M | v3.0.0 | Path-dep restructuring + actual crates.io publish | queued |
+| 11-L | v3.0.0 | API stability commitment + SemVer policy + deprecation cycle | **merged** — 376 stable items catalogued, 19 #[deprecated] markers added, advisory cargo-semver-checks CI gate (see [wave-11-l-api-stability.md](wave-11-l-api-stability.md)) |
+| 11-M | v3.0.0 | Path-dep restructuring + actual crates.io publish | **prep merged** — workspace dep graph restructured, dry-runs pass for leaf crates, runbook in `docs/src/contributing/publishing.md`; actual `cargo publish` deferred to v3.0.0 release tagging (see [wave-11-m-cratesio-prep.md](wave-11-m-cratesio-prep.md)) |
 
 ## Acceptance gates per wave
 
