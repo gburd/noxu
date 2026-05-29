@@ -1,28 +1,16 @@
 # Introduction
 
-> **v1.5 capability matrix:** see
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
->
-> **v1.5 / v2.0 limitations relevant to this chapter:**
+> **Limitations relevant to this chapter:**
 >
 > * **Nested / child transactions are not supported.** In v1.5 the
 >   `parent` parameter to `Environment::begin_transaction` was
->   rejected at runtime with `NoxuError::Unsupported`. **In v2.0
->   (Wave 3-1) the parameter has been removed entirely** — the type
->   system now enforces the constraint and the misuse is a compile
->   error. See
->   [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
->   Decision 3B,
->   [`sprint-3-decisions-enforced.md`](../internal/sprint-3-decisions-enforced.md),
->   and
->   [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md).
-> * **Auto-commit “warning” clarification.** Cursors and auto-commit
->   *do* coexist correctly in v1.5 — auto-commit cursor writes
->   acquire write locks via the lock manager and block on competing
->   explicit-txn write/read locks. See
->   [`sprint-1-followup-f12.md`](../internal/sprint-1-followup-f12.md)
->   for the verified F12 contract and the two diagnostic gaps that
->   remain.
+>   rejected at runtime with `NoxuError::Unsupported`; in v2.0 the
+>   parameter has been removed entirely — the type system now
+>   enforces the constraint and the misuse is a compile error.
+>   See [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md).
+> * **Auto-commit and cursors coexist correctly.** Auto-commit cursor
+>   writes acquire write locks via the lock manager and block on
+>   competing explicit-txn write/read locks.
 
 This guide provides a thorough introduction to transactions as used with Noxu DB,
 a Rust port of Noxu DB (Noxu DB 7.5.11). It covers the guarantees
@@ -215,12 +203,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Key rules:
 
 * Obtain a transaction with `env.begin_transaction(config)`. Nested
-  (child) transactions are **not supported**; in v2.0 (Wave 3-1) the
+  (child) transactions are **not supported**; in v2.0 the
   `parent` parameter has been removed entirely from the signature — the
-  type system now enforces the constraint. See
-  [`docs/src/internal/v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
-  Decision 3B and
-  [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md).
+  type system now enforces the constraint.
 * Pass `Some(&txn)` as the first argument to `db.put()`, `db.get()`,
   `db.delete()`, and `db.open_cursor()`.
 * Commit with `txn.commit()` or roll back with `txn.abort()`.
@@ -427,13 +412,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-> **Note:** Cursors and auto-commit interoperate correctly in v1.5
-> (Sprint 1C / F12). Opening a cursor with `db.open_cursor(None, None)`
+> **Note:** Cursors and auto-commit interoperate correctly. Opening a cursor
+> with `db.open_cursor(None, None)`
 > threads the cursor's writes through the lock manager exactly the
 > same way an explicit-txn cursor does, and auto-commit writes
 > against an unrelated key do not block on an explicit txn's locks.
-> Earlier wording suggested auto-commit was unavailable for cursors;
-> that referred to a v1.4.x bug that has been fixed.
 >
 > **Warning:** Never have more than one active explicit transaction
 > in your thread at a time. Mixing an explicit transaction with an
