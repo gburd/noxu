@@ -122,6 +122,17 @@ pub struct Tree {
     /// `Arc<AtomicI64>` shared with the `Arbiter` (and later `MemoryBudget`)
     /// to avoid a circular crate dependency (`noxu-tree` → `noxu-dbi`).
     pub memory_counter: Option<Arc<AtomicI64>>,
+
+    /// Capacity hint for the recovery redo path.
+    ///
+    /// When non-zero, the first BIN created by `redo_insert` (the first-key
+    /// path) pre-allocates its `entries` Vec with this capacity so that
+    /// redo insertions proceed without Vec-resize doublings.  The value is
+    /// clamped to `max_entries_per_node` at use.
+    ///
+    /// Set by `hint_redo_capacity` before the redo loop.
+    /// Wave 11-K optimisation (Fix 3).
+    redo_capacity_hint: usize,
 }
 
 /// A node in the tree.
@@ -534,6 +545,85 @@ impl BinStub {
                     },
                 );
                 // After insertion, if there is no prefix yet, try to establish one.
+                if self.key_prefix.is_empty() && self.entries.len() >= 2 {
+                    self.recompute_key_prefix();
+                }
+                (idx, true)
+            }
+        }
+    }
+
+    /// Slice-based variant of [`BinStub::insert_with_prefix`] for the recovery redo path.
+    ///
+    /// Accepts `key` and `data` as `&[u8]` slices instead of owned `Vec<u8>`,
+    /// eliminating the intermediate `Vec<u8>` that `redo_ln` would otherwise
+    /// allocate before crossing the BIN boundary.  The compressed suffix and
+    /// the data bytes are each copied into the `BinEntry` exactly once.
+    ///
+    /// Semantics are identical to `insert_with_prefix`:
+    /// - Updates the slot in place when the key already exists.
+    /// - Inserts a new sorted entry when absent, recomputing the key prefix.
+    ///
+    /// Wave 11-K optimisation (Fix 1).
+    pub fn insert_with_prefix_slice(
+        &mut self,
+        full_key: &[u8],
+        lsn: Lsn,
+        data: Option<&[u8]>,
+    ) -> (usize, bool) {
+        let plen = self.key_prefix.len();
+        let new_len = if plen > 0 {
+            get_key_prefix_length(&self.key_prefix, full_key)
+        } else {
+            0
+        };
+
+        if plen > 0 && new_len < plen {
+            let mut candidate = self.compute_key_prefix(None);
+            if !candidate.is_empty() {
+                let cl = get_key_prefix_length(&candidate, full_key);
+                candidate.truncate(cl);
+            } else {
+                if !self.entries.is_empty()
+                    && let Some(first_full) = self.get_full_key(0)
+                {
+                    candidate = create_key_prefix(&first_full, full_key)
+                        .unwrap_or_default();
+                    for i in 1..self.entries.len() {
+                        if candidate.is_empty() {
+                            break;
+                        }
+                        if let Some(fk) = self.get_full_key(i) {
+                            let l = get_key_prefix_length(&candidate, &fk);
+                            candidate.truncate(l);
+                        }
+                    }
+                }
+            }
+            self.apply_new_prefix(candidate);
+        }
+
+        let suffix = self.compress_key(full_key);
+
+        match self.entries.binary_search_by(|e| e.key.as_slice().cmp(&suffix)) {
+            Ok(idx) => {
+                self.entries[idx].lsn = lsn;
+                self.entries[idx].data = data.map(|d| d.to_vec());
+                self.entries[idx].dirty = true;
+                (idx, false)
+            }
+            Err(idx) => {
+                self.entries.insert(
+                    idx,
+                    BinEntry {
+                        key: suffix,
+                        lsn,
+                        data: data.map(|d| d.to_vec()),
+                        known_deleted: false,
+                        dirty: true,
+                        expiration_time: 0,
+                    },
+                );
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
                     self.recompute_key_prefix();
                 }
@@ -1260,6 +1350,7 @@ impl Tree {
             relatches_required: AtomicU64::new(0),
             key_comparator: None,
             memory_counter: None,
+            redo_capacity_hint: 0,
         }
     }
 
@@ -1291,12 +1382,34 @@ impl Tree {
             relatches_required: AtomicU64::new(0),
             key_comparator: Some(comparator),
             memory_counter: None,
+            redo_capacity_hint: 0,
         }
     }
 
     /// Sets the key comparator, replacing any existing one.
     pub fn set_comparator(&mut self, comparator: KeyComparatorFn) {
         self.key_comparator = Some(comparator);
+    }
+
+    /// Store a capacity hint used by `redo_insert` when it creates the first
+    /// BIN for this tree (the first-key path).
+    ///
+    /// The first BIN's `entries` Vec is pre-allocated with
+    /// `capacity.min(max_entries_per_node)` slots, eliminating the
+    /// Vec-resize doubling cycle (1 → 2 → 4 → … → cap) that would
+    /// otherwise occur during the redo loop.
+    ///
+    /// Call once before the redo loop.  Has no effect on `insert` (the
+    /// normal, non-recovery path).
+    ///
+    /// Wave 11-K optimisation (Fix 3).
+    pub fn hint_redo_capacity(&mut self, capacity: usize) {
+        self.redo_capacity_hint = capacity;
+    }
+
+    /// Returns the current redo capacity hint (0 = no hint set).
+    pub fn get_redo_capacity_hint(&self) -> usize {
+        self.redo_capacity_hint
     }
 
     /// Takes the key comparator out of this tree (leaving None).
@@ -1973,6 +2086,121 @@ impl Tree {
         Ok(result)
     }
 
+    /// Recovery-redo variant of [`Tree::insert`] that accepts `&[u8]` slices.
+    ///
+    /// Eliminates the two intermediate `Vec<u8>` allocations that the normal
+    /// insert path requires at the `redo_ln` call site (one for the key, one
+    /// for the data).  The compressed key suffix and the data bytes are each
+    /// materialised into their `BinEntry` slots exactly once.
+    ///
+    /// Semantics are identical to `insert`:
+    /// - Updates the existing slot when the key is already present.
+    /// - Inserts a new sorted entry when the key is absent.
+    /// - Triggers the same root-split and proactive-split logic.
+    ///
+    /// `data` should be the raw value bytes, or an empty slice for a
+    /// deletion (which should not normally arrive here during redo, but is
+    /// handled gracefully).
+    ///
+    /// Wave 11-K optimisation (Fix 1).
+    pub fn redo_insert(
+        &self,
+        key: &[u8],
+        data: &[u8],
+        lsn: Lsn,
+    ) -> Result<bool, TreeError> {
+        let key_len = key.len();
+        let data_len = data.len();
+        let data_opt: Option<&[u8]> =
+            if data.is_empty() { None } else { Some(data) };
+
+        // First-key path: initialise a two-level tree from scratch.
+        {
+            let mut root_guard = self.root.write();
+            if root_guard.is_none() {
+                // Pre-allocate the BIN's entries Vec using the redo capacity
+                // hint (Fix 3).  Without the hint the first BIN starts at
+                // capacity 1 and doubles on each insert; with the hint it
+                // starts at min(hint, max_entries) entries, eliminating
+                // ~log2(max_entries) Vec-resize doublings.
+                let initial_cap = if self.redo_capacity_hint > 0 {
+                    self.redo_capacity_hint.min(self.max_entries_per_node)
+                } else {
+                    1
+                };
+                let mut initial_entries = Vec::with_capacity(initial_cap);
+                initial_entries.push(BinEntry {
+                    key: key.to_vec(),
+                    lsn,
+                    data: data_opt.map(|d| d.to_vec()),
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                });
+                let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
+                    node_id: generate_node_id(),
+                    level: BIN_LEVEL,
+                    entries: initial_entries,
+                    key_prefix: Vec::new(),
+                    dirty: true,
+                    is_delta: false,
+                    last_full_lsn: NULL_LSN,
+                    last_delta_lsn: NULL_LSN,
+                    generation: 0,
+                    parent: None,
+                    expiration_in_hours: false,
+                    cursor_count: 0,
+                })));
+
+                let root_arc =
+                    Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
+                        node_id: generate_node_id(),
+                        level: MAIN_LEVEL | 2,
+                        entries: vec![InEntry {
+                            key: vec![],
+                            lsn,
+                            child: Some(bin.clone()),
+                        }],
+                        dirty: true,
+                        generation: 0,
+                        parent: None,
+                    })));
+
+                {
+                    let mut g = bin.write();
+                    g.set_parent(Some(Arc::downgrade(&root_arc)));
+                }
+
+                *root_guard = Some(root_arc);
+
+                if let Some(counter) = &self.memory_counter {
+                    let delta = (key_len + data_len + 48) as i64;
+                    counter.fetch_add(delta, Ordering::Relaxed);
+                }
+                return Ok(true);
+            }
+        }
+
+        self.split_root_if_needed(lsn)?;
+
+        let root_arc = self.get_root().unwrap();
+        let result = Self::redo_insert_recursive(
+            &root_arc,
+            key,
+            data_opt,
+            lsn,
+            self.max_entries_per_node,
+            self.key_comparator.as_ref(),
+        )?;
+
+        if result && let Some(counter) = &self.memory_counter {
+            let delta = (key_len + data_len + 48) as i64;
+            counter.fetch_add(delta, Ordering::Relaxed);
+        }
+
+        Ok(result)
+    }
+
     /// Splits the root node if it is full (needsSplitting).
     ///
     ///
@@ -2075,7 +2303,7 @@ impl Tree {
     fn split_child(
         parent: &Arc<RwLock<TreeNode>>,
         child_index: usize,
-        _max_entries: usize,
+        max_entries: usize,
         lsn: Lsn,
     ) -> Result<(), TreeError> {
         // The split is performed under `parent.write()` for the entire
@@ -2171,7 +2399,11 @@ impl Tree {
             (TreeNode::Bottom(b), SplitEntries::Bottom(le)) => {
                 // Reset prefix; entries are full keys.
                 b.key_prefix = Vec::new();
-                b.entries = le.clone();
+                // Pre-allocate at max_entries capacity so the left half
+                // does not need to reallocate on the next insert (Fix 3).
+                let mut left = Vec::with_capacity(max_entries);
+                left.extend_from_slice(le);
+                b.entries = left;
                 // Recompute prefix on each half after split.
                 if b.entries.len() >= 2 {
                     b.recompute_key_prefix();
@@ -2198,10 +2430,14 @@ impl Tree {
             SplitEntries::Bottom(re) => {
                 // Entries are full keys; build BinStub with no prefix then
                 // recompute key prefix for the new sibling.
+                // Pre-allocate at max_entries capacity so the right half
+                // does not need to reallocate on the next insert (Fix 3).
+                let mut right = Vec::with_capacity(max_entries);
+                right.extend(re);
                 let mut sibling_bin = BinStub {
                     node_id: generate_node_id(),
                     level: child_level,
-                    entries: re,
+                    entries: right,
                     key_prefix: Vec::new(),
                     dirty: true,
                     is_delta: false,
@@ -2413,6 +2649,161 @@ impl Tree {
             );
             drop(parent_guard);
             r
+        }
+    }
+
+    /// Slice-based variant of [`Tree::insert_recursive`] for the recovery redo path.
+    ///
+    /// Accepts `key: &[u8]` and `data: Option<&[u8]>` instead of owned
+    /// `Vec<u8>` values.  At the BIN leaf, calls
+    /// [`BinStub::insert_with_prefix_slice`] which copies bytes into the
+    /// `BinEntry` exactly once.
+    ///
+    /// For the comparator path (custom key comparator), falls back to
+    /// `insert_cmp` with a one-time `to_vec()` conversion — that path is
+    /// rare in practice (sorted-dup databases only) and is not on the
+    /// W11 hot path.
+    ///
+    /// Wave 11-K optimisation (Fix 1).
+    fn redo_insert_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        key: &[u8],
+        data: Option<&[u8]>,
+        lsn: Lsn,
+        max_entries: usize,
+        key_comparator: Option<&KeyComparatorFn>,
+    ) -> Result<bool, TreeError> {
+        let parent_guard = node_arc.read();
+        let is_bin = parent_guard.is_bin();
+
+        if is_bin {
+            drop(parent_guard);
+            let mut guard = node_arc.write();
+            match &mut *guard {
+                TreeNode::Bottom(bin) => {
+                    let is_new = if let Some(cmp) = key_comparator {
+                        // Comparator path: fall back to owned-Vec variant.
+                        let (_idx, new) = bin.insert_cmp(
+                            key.to_vec(),
+                            lsn,
+                            data.map(|d| d.to_vec()),
+                            cmp.as_ref(),
+                        );
+                        new
+                    } else {
+                        let (_idx, new) =
+                            bin.insert_with_prefix_slice(key, lsn, data);
+                        new
+                    };
+                    bin.dirty = true;
+                    Ok(is_new)
+                }
+                TreeNode::Internal(_) => Err(TreeError::SplitRequired),
+            }
+        } else {
+            let (child_index, child_arc) = match &*parent_guard {
+                TreeNode::Internal(n) => {
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else {
+                            let ord = match key_comparator {
+                                Some(cmp) => cmp(entry.key.as_slice(), key),
+                                None => entry.key.as_slice().cmp(key),
+                            };
+                            if ord != std::cmp::Ordering::Greater {
+                                idx = i;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let child = n
+                        .entries
+                        .get(idx)
+                        .and_then(|e| e.child.clone())
+                        .ok_or(TreeError::SplitRequired)?;
+                    (idx, child)
+                }
+                TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
+            };
+
+            let child_full = {
+                let g = child_arc.read();
+                g.get_n_entries() >= max_entries
+            };
+
+            if child_full {
+                drop(parent_guard);
+                Self::split_child(node_arc, child_index, max_entries, lsn)?;
+                return Self::redo_insert_recursive(
+                    node_arc,
+                    key,
+                    data,
+                    lsn,
+                    max_entries,
+                    key_comparator,
+                );
+            }
+
+            let r = Self::redo_insert_recursive(
+                &child_arc,
+                key,
+                data,
+                lsn,
+                max_entries,
+                key_comparator,
+            );
+            drop(parent_guard);
+            r
+        }
+    }
+
+    /// Pre-warm the tree's internal `Vec<BinEntry>` capacity before a redo
+    /// pass that will insert approximately `n` records.
+    ///
+    /// If the tree is empty, this is a no-op (there is no BIN yet to reserve
+    /// capacity on).  If the tree already has a root BIN (from a previous
+    /// checkpoint), reserves `n.min(max_entries_per_node)` additional slots
+    /// in that BIN's entries vector, eliminating the resize-double cycle
+    /// during the redo loop.
+    ///
+    /// Wave 11-K optimisation (Fix 3).
+    pub fn reserve_redo_capacity(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let root = match self.get_root() {
+            Some(r) => r,
+            None => return,
+        };
+        // Descend to the leftmost BIN and reserve there.
+        let mut arc = root;
+        loop {
+            let guard = arc.read();
+            match &*guard {
+                TreeNode::Bottom(bin_guard) => {
+                    let additional = n
+                        .min(self.max_entries_per_node)
+                        .saturating_sub(bin_guard.entries.len());
+                    drop(guard);
+                    let mut wguard = arc.write();
+                    if let TreeNode::Bottom(bin) = &mut *wguard {
+                        bin.entries.reserve(additional);
+                    }
+                    return;
+                }
+                TreeNode::Internal(inner) => {
+                    let child =
+                        inner.entries.first().and_then(|e| e.child.clone());
+                    drop(guard);
+                    match child {
+                        Some(c) => arc = c,
+                        None => return,
+                    }
+                }
+            }
         }
     }
 
