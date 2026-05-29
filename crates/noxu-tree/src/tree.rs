@@ -63,6 +63,12 @@ pub struct SlotFetch {
     pub data: Option<Vec<u8>>,
     /// Raw slot LSN as `u64`; zero when `found` is `false`.
     pub lsn: u64,
+    /// Slot index within the BIN.  Set to the actual BIN slot index when
+    /// `found` is `true`; `0` otherwise.
+    ///
+    /// Used by `CursorImpl` to set `current_index` correctly so that
+    /// `retrieve_next` advances to the right slot after a search.
+    pub slot_index: usize,
     /// Arc to the BIN that the descent reached.  Always `Some` when the
     /// tree has at least one node, regardless of whether `found` is `true`.
     pub bin_arc: Arc<RwLock<TreeNode>>,
@@ -1677,7 +1683,7 @@ impl Tree {
                 let bin_arc =
                     parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
 
-                let (found, data, lsn) = match &*guard {
+                let (found, data, lsn, slot_index) = match &*guard {
                     TreeNode::Bottom(bin) => {
                         let (idx, exact) = match &self.key_comparator {
                             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
@@ -1698,20 +1704,26 @@ impl Tree {
                                 .unwrap_or(false);
                             if live {
                                 let e = &bin.entries[idx];
-                                (true, e.data.clone(), e.lsn.as_u64())
+                                (true, e.data.clone(), e.lsn.as_u64(), idx)
                             } else {
-                                (false, None, 0u64)
+                                (false, None, 0u64, 0)
                             }
                         } else {
-                            (false, None, 0u64)
+                            (false, None, 0u64, 0)
                         }
                     }
-                    _ => (false, None, 0u64),
+                    _ => (false, None, 0u64, 0),
                 };
                 // Release the BIN read guard before returning so the caller
                 // can call lock_ln (which may block) without holding a latch.
                 drop(guard);
-                return Some(SlotFetch { found, data, lsn, bin_arc });
+                return Some(SlotFetch {
+                    found,
+                    data,
+                    lsn,
+                    slot_index,
+                    bin_arc,
+                });
             }
 
             // Upper IN: same hand-over-hand descent as `Tree::search`.

@@ -69,7 +69,14 @@ pub struct LogManager {
     /// their kernel writes before entering `FsyncManager`, so they arrive
     /// simultaneously and the leader/waiter algorithm can coalesce multiple
     /// commits into a single fdatasync.
-    log_write_latch: Mutex<()>,
+    ///
+    /// H-3 (audit-2026-05-keith.md F-1.1): the inner `Vec<u8>` is a
+    /// per-`LogManager` scratch buffer reused across calls.  Because the LWL
+    /// serialises all log writes there is at most one active `log_internal`
+    /// call per `LogManager` at any time, so a single Vec is sufficient.
+    /// The Vec grows on demand (amortised O(1)) and is never shrunk; it
+    /// reaches its steady-state capacity after a few large writes.
+    log_write_latch: Mutex<Vec<u8>>,
 
     /// Last flushed LSN (updated when buffers are written to disk).
     last_flush_lsn: AtomicU64,
@@ -127,7 +134,7 @@ impl LogManager {
 
         LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
-            log_write_latch: Mutex::new(()),
+            log_write_latch: Mutex::new(Vec::new()),
             // 0 means "nothing flushed yet". NULL_LSN = u64::MAX would make
             // flush_sync_if_needed's `already_flushed >= lsn` always true,
             // causing all flushes to be skipped.
@@ -281,38 +288,40 @@ impl LogManager {
         let item_size = payload.len() as u32;
         let header_size = MIN_HEADER_SIZE; // no VLSN for non-replicated entries
 
-        // Pre-allocate the full buffer: [header | payload]
+        // Full buffer: [header | payload]
         let entry_size = header_size + item_size as usize;
-        // TODO(wave-11-q H-3): replace this per-call `vec![0u8; entry_size]`
-        // with a per-thread or per-LogManager scratch buffer reused across
-        // calls.  Currently 3-5% of CPU on all log-write paths and the
-        // largest single allocator-pressure source per the 2026-05 audit
-        // (Keith F-1.1).  Refactor deferred because the buffer must outlive
-        // the LWL-protected region: the encoded bytes are copied into the
-        // log buffer / file under LWL but the scratch reuse needs careful
-        // lifetime handling so the next caller's encoding doesn't trample
-        // a still-in-flight buffer.
-        let mut entry_buf = vec![0u8; entry_size];
 
-        // Fill in the header fields (checksum and prev_offset filled later).
-        // Layout: [checksum:4][type:1][flags:1][prev_offset:4][item_size:4]
-        entry_buf[4] = entry_type.type_num(); // type
-
-        let flags: u8 = match provisional {
-            Provisional::Yes => 0x80,
-            Provisional::BeforeCkptEnd => 0x40,
-            Provisional::No => 0x00,
-        };
-        entry_buf[5] = flags; // flags
-        // prev_offset at [6..10] filled after we know it
-        entry_buf[10..14].copy_from_slice(&item_size.to_le_bytes()); // item_size
-        // payload
-        entry_buf[header_size..].copy_from_slice(payload);
-
-        // Acquire the LWL - all LSN assignment and file position advancement
+        // Acquire the LWL — all LSN assignment and file position advancement
         // happens under this latch, matching serialLog/serialLogWork.
+        //
+        // H-3 (audit-2026-05-keith.md F-1.1): we now reuse the scratch Vec<u8>
+        // embedded in the LWL guard instead of allocating a fresh
+        // `vec![0u8; entry_size]` on every call.  The Vec is cleared and
+        // resized to `entry_size` under the LWL.  Because the LWL serialises
+        // all writes, there is exactly one in-flight encoding at a time.
         let lsn = {
-            let _lwl = self.log_write_latch.lock();
+            let mut entry_buf = self.log_write_latch.lock();
+
+            // Reuse the scratch buffer: clear and resize to entry_size.
+            // `resize` keeps existing capacity — no allocation if the Vec is
+            // already large enough.
+            entry_buf.clear();
+            entry_buf.resize(entry_size, 0u8);
+
+            // Fill in the header fields (checksum and prev_offset filled later).
+            // Layout: [checksum:4][type:1][flags:1][prev_offset:4][item_size:4]
+            entry_buf[4] = entry_type.type_num(); // type
+
+            let flags: u8 = match provisional {
+                Provisional::Yes => 0x80,
+                Provisional::BeforeCkptEnd => 0x40,
+                Provisional::No => 0x00,
+            };
+            entry_buf[5] = flags; // flags
+            // prev_offset at [6..10] filled after we know it
+            entry_buf[10..14].copy_from_slice(&item_size.to_le_bytes()); // item_size
+            // payload
+            entry_buf[header_size..].copy_from_slice(payload);
 
             // Determine whether a file flip is needed before assigning the LSN.
             // ShouldFlipFile -> calculateNextLsn -> advanceLsn

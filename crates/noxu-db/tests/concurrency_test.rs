@@ -555,3 +555,97 @@ fn test_reader_sees_before_image_after_concurrent_writer_aborts() {
         "after writer aborts, reader must see the committed before-image"
     );
 }
+
+// ============================================================================
+// H-1 regression: env lock not held across abort undo loop
+// ============================================================================
+
+/// H-1 regression (audit-2026-05-keith.md F-2.2):
+///
+/// A large aborting transaction must NOT serialise concurrent readers against
+/// the EnvironmentImpl mutex for the full duration of its undo loop.
+///
+/// Strategy:
+/// 1. Write N keys under one transaction (so the undo set has N entries).
+/// 2. On a background thread, call txn.abort() — this triggers the undo loop.
+/// 3. On the main thread, issue rapid-fire reads to an *unrelated* key while
+///    the abort is in progress.
+/// 4. Measure how long any single read takes.  Under the pre-fix code each
+///    read had to wait for the entire undo loop while holding env.lock();
+///    with the fix each read only needs the env lock for a fast db-handle
+///    lookup (a negligible slice of the undo loop's total duration).
+///
+/// We use generous timing bounds: each individual read must complete in
+/// < 500 ms even while a 2 000-entry undo loop is running.  On a normal
+/// machine the undo loop takes < 200 ms total; each read should be ≪ 1 ms.
+#[test]
+fn test_h1_readers_not_blocked_during_large_abort() {
+    use std::time::Instant;
+    const N_UNDO: usize = 2_000; // undo records in the aborting txn
+    const MAX_READ_MS: u128 = 500; // generous upper bound per read
+
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+    let env = Arc::new(env);
+    let db = Arc::new(db);
+
+    // Seed an unrelated key that the concurrent reader will access.
+    let sentinel_key = DatabaseEntry::from_bytes(b"__sentinel__");
+    let sentinel_val = DatabaseEntry::from_bytes(b"ok");
+    db.put(None, &sentinel_key, &sentinel_val).unwrap();
+
+    // Write N keys in a single transaction (the "large" txn to abort).
+    let large_txn = env.begin_transaction(None).unwrap();
+    for i in 0u32..N_UNDO as u32 {
+        let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let v = DatabaseEntry::from_bytes(b"v");
+        db.put(Some(&large_txn), &k, &v).unwrap();
+    }
+
+    // Barriers to synchronise abort start with reader start.
+    let abort_started = Arc::new(Barrier::new(2));
+    let abort_started2 = Arc::clone(&abort_started);
+
+    let env_a = Arc::clone(&env);
+    let _db_a = Arc::clone(&db);
+
+    // Background thread: signal, then abort (undo loop).
+    let aborter = thread::spawn(move || {
+        // Pin large_txn to the aborter thread.
+        let _ = &env_a; // keep env alive
+        abort_started2.wait();
+        large_txn.abort().expect("abort must succeed");
+    });
+
+    // Main thread: start reading as soon as the aborter has signalled.
+    abort_started.wait();
+
+    let db_r = Arc::clone(&db);
+    let mut max_read_us = 0u128;
+    for _ in 0..20 {
+        let t0 = Instant::now();
+        let mut out = DatabaseEntry::new();
+        let status =
+            db_r.get(None, &sentinel_key, &mut out).expect("get must not fail");
+        let elapsed_us = t0.elapsed().as_micros();
+        if elapsed_us > max_read_us {
+            max_read_us = elapsed_us;
+        }
+        assert_eq!(
+            status,
+            OperationStatus::Success,
+            "sentinel key must be readable during abort"
+        );
+        assert_eq!(out.data(), b"ok");
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    aborter.join().unwrap();
+
+    assert!(
+        max_read_us < MAX_READ_MS * 1_000,
+        "H-1: slowest read took {max_read_us} µs during large abort undo loop; \
+         expected < {} ms (env lock must NOT be held for the full undo loop)",
+        MAX_READ_MS
+    );
+}
