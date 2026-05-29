@@ -135,3 +135,45 @@ When porting a Noxu feature, locate its Java tests in `_/je/` under the same
 package path. Port
 each `@Test` method to a Rust `#[test]`. Preserve the test names (translated to
 snake_case) and the intent of each assertion.
+
+## Slow / Stress Tests
+
+Several tests are marked `#[ignore]` because they are too slow for routine
+CI runs (stress tests, torture tests, performance benchmarks).  Each ignored
+test includes a reason string documenting why it is ignored:
+
+```rust
+#[test]
+#[ignore = "stress: 200 threads × disjoint writers, up to 120 s wall time; run with --ignored"]
+fn test_200_thread_disjoint_writers() { ... }
+```
+
+To run all ignored tests in a crate:
+
+```bash
+cargo test -p noxu-db -- --ignored
+cargo test -p noxu-rep -- --ignored
+cargo test -p noxu-xa -- --ignored
+```
+
+To run a specific ignored test:
+
+```bash
+cargo test -p noxu-db --test isolation_test test_64_thread_concurrent_readers -- --ignored
+```
+
+The slow test inventory (as of Wave 11-S):
+
+| Crate | Test | Reason |
+|---|---|---|
+| `noxu-db` | `test_64_thread_concurrent_readers` | stress: 64 readers × 1000 keys × 1000 txns |
+| `noxu-db` | `test_32r32w_concurrent` | stress: 32r/32w × 5000 ops |
+| `noxu-db` | `test_200_thread_disjoint_writers` | stress: 200 threads, up to 120 s |
+| `noxu-db` | `test_sustained_8r8w_60s` | stress: sustained load 60 s |
+| `noxu-db` | `test_checkpoint_under_load_30s` | stress: checkpoint under load 30 s |
+| `noxu-rep` | `torture_replication` | torture: multi-node election/failover loop |
+| `noxu-xa` | `test_xa_chaos_concurrent` | stress: concurrent XA chaos (≥ 60 s) |
+| `noxu-xa` | `test_xa_perf_2pc_vs_single_phase` | perf-benchmark |
+| `noxu-xa` | `test_xa_perf_concurrent_multi_cluster` | perf-benchmark |
+
+These tests are intended to run in a nightly CI job via `cargo test --workspace -- --ignored`.
