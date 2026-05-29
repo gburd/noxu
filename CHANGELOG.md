@@ -271,6 +271,20 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   - Secondary-index / sorted-dup path unchanged.
   - See `docs/src/internal/wave-11-i-cursor-double-descent.md`.
 
+### Performance (v2.4.0 — Wave 11-J)
+
+- `FsyncManager` crash-safety property test added
+  (`test_fsync_before_commit_invariant`): verifies that every committed
+  transaction's LSN is fdatasync’d before `txn.commit()` returns, using
+  8 concurrent committers and 200 ops each.  The test is not `#[ignore]`
+  and runs in `cargo test -p noxu-log`.
+- Performance investigation: a Treiber-stack + per-waiter condvar rewrite
+  was prototyped but reverted after back-to-back benchmarks showed 10–46 %
+  regressions attributable to per-call `Arc` allocation overhead and
+  coalescing-window changes.  See
+  `docs/src/internal/wave-11-j-fsync-coalescing.md` for the full diagnosis
+  and recommended next steps.
+
 ## [2.2.1] - 2026-05-27
 
 CI-green release.  Unblocks GitHub Pages and Codeberg Pages publishing.
