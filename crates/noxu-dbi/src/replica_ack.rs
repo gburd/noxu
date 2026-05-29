@@ -132,6 +132,23 @@ pub trait ReplicaAckCoordinator: Send + Sync {
         policy: ReplicaAckPolicyKind,
         timeout: Duration,
     ) -> std::result::Result<u32, AckWaitError>;
+
+    /// Allocate the next commit VLSN and register `lsn` in the VLSN index.
+    ///
+    /// Called by `Environment::write_txn_commit_for_recovered` after
+    /// writing a `TxnCommit` WAL frame for a recovered prepared (XA)
+    /// transaction.  In a replicated environment the commit must be visible
+    /// to feeders and replicas, so it needs a real VLSN assigned and
+    /// registered in the `VlsnIndex`.
+    ///
+    /// Returns the allocated VLSN (> 0) on success, or 0
+    /// (`NULL_VLSN`) if this node is not in a replicated or master
+    /// state where VLSN assignment makes sense.
+    ///
+    /// The default implementation returns 0 (non-replicated env).  X-3 fix.
+    fn alloc_vlsn_for_recovered_commit(&self, _lsn: noxu_util::Lsn) -> u64 {
+        0
+    }
 }
 
 /// Type alias used in `noxu-db::Environment` to hold the optional

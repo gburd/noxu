@@ -1262,11 +1262,26 @@ impl Environment {
             Some(lm) => lm,
             None => return Ok(()), // Non-transactional env (shouldn't happen).
         };
-        write_txn_end_for_recovered(
+        let commit_lsn = write_txn_end_for_recovered(
             lm, txn_id, true, /* is_commit */
             true, /* fsync */
             true, /* flush */
-        )
+        )?;
+        // X-3: if a replica coordinator is installed (replicated env),
+        // allocate a real VLSN for this recovered commit so that feeders
+        // and replicas see it.  In a non-replicated env the default impl
+        // returns NULL_VLSN (0) and this is a no-op.
+        if let Some(coord) = self.replica_coordinator.lock().as_ref() {
+            let vlsn = coord.alloc_vlsn_for_recovered_commit(commit_lsn);
+            if vlsn > 0 {
+                log::debug!(
+                    "write_txn_commit_for_recovered: txn_id={} commit_lsn={:?} \
+                     assigned vlsn={}",
+                    txn_id, commit_lsn, vlsn
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Writes a `TxnAbort` WAL frame for `txn_id`.  Used by `xa_rollback(xid)`
@@ -1281,6 +1296,7 @@ impl Environment {
             false, /* fsync */
             false, /* flush */
         )
+        .map(|_| ())
     }
 
     /// Replays a recovered prepared transaction’s LNs into the in-memory
@@ -1467,7 +1483,7 @@ fn write_txn_end_for_recovered(
     is_commit: bool,
     fsync: bool,
     flush: bool,
-) -> Result<()> {
+) -> Result<noxu_util::Lsn> {
     use bytes::BytesMut;
     use noxu_log::{LogEntryType, Provisional, entry::TxnEndEntry};
     use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
@@ -1498,7 +1514,7 @@ fn write_txn_end_for_recovered(
     let mut buf = BytesMut::with_capacity(entry.log_size());
     entry.write_to_log(&mut buf);
 
-    lm.log(entry_type, &buf, Provisional::No, flush, fsync).map(|_| ()).map_err(
+    lm.log(entry_type, &buf, Provisional::No, flush, fsync).map_err(
         |e| {
             NoxuError::environment_with_reason(
                 crate::error::EnvironmentFailureReason::LogWrite,
@@ -2340,5 +2356,58 @@ mod tests {
         );
         // close() must succeed because no txns remain registered.
         env.close().unwrap();
+    }
+
+    // ── X-3: recovered XA commit assigns real VLSN ─────────────────────
+
+    /// X-3: after calling `write_txn_commit_for_recovered` on an environment
+    /// wired with a mock replica coordinator, the coordinator's
+    /// `alloc_vlsn_for_recovered_commit` must be called with a non-NULL LSN.
+    #[test]
+    fn test_x3_recovered_commit_calls_alloc_vlsn() {
+        use std::sync::atomic::{AtomicU64, Ordering as AO};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use noxu_dbi::{AckWaitError, ReplicaAckCoordinator, ReplicaAckPolicyKind};
+        use noxu_util::Lsn;
+
+        // Mock coordinator that records the LSN passed to alloc_vlsn_for_recovered_commit.
+        struct MockCoord {
+            last_lsn: AtomicU64,
+        }
+        impl ReplicaAckCoordinator for MockCoord {
+            fn await_replica_acks(
+                &self,
+                _policy: ReplicaAckPolicyKind,
+                _timeout: Duration,
+            ) -> std::result::Result<u32, AckWaitError> {
+                Ok(0)
+            }
+            fn alloc_vlsn_for_recovered_commit(&self, lsn: Lsn) -> u64 {
+                self.last_lsn.store(lsn.as_u64(), AO::SeqCst);
+                // Return the file_number as a fake VLSN (non-zero = success).
+                lsn.file_number() as u64 + 1
+            }
+        }
+
+        let (tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+
+        // Wire the mock coordinator.
+        let coord = Arc::new(MockCoord { last_lsn: AtomicU64::new(0) });
+        env.set_replica_coordinator(coord.clone());
+
+        // Write a fake txn_id=42 commit (simulates recovered XA).
+        env.write_txn_commit_for_recovered(42).unwrap();
+
+        // The coordinator must have been called with a non-zero LSN.
+        let recorded_lsn = coord.last_lsn.load(AO::SeqCst);
+        assert_ne!(
+            recorded_lsn, 0,
+            "X-3: alloc_vlsn_for_recovered_commit must be called with the commit LSN"
+        );
+
+        env.close().unwrap();
+        drop(tmp);
     }
 }
