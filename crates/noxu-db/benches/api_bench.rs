@@ -154,6 +154,7 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
 fn bench_txn_commit(c: &mut Criterion) {
     c.bench_function("txn_commit", |b| {
         b.iter(|| {
+            #[allow(deprecated)]
             let txn =
                 Transaction::new(black_box(1), TransactionConfig::default());
             txn.commit().unwrap();
@@ -165,6 +166,7 @@ fn bench_txn_commit(c: &mut Criterion) {
 fn bench_txn_abort(c: &mut Criterion) {
     c.bench_function("txn_abort", |b| {
         b.iter(|| {
+            #[allow(deprecated)]
             let txn =
                 Transaction::new(black_box(1), TransactionConfig::default());
             txn.abort().unwrap();
