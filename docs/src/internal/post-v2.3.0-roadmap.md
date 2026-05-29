@@ -57,6 +57,7 @@ Every wave ships:
 | 11-L | v3.0.0 | API stability commitment + SemVer policy + deprecation cycle | **merged** — 376 stable items catalogued, 19 #[deprecated] markers added, advisory cargo-semver-checks CI gate (see [wave-11-l-api-stability.md](wave-11-l-api-stability.md)) |
 | 11-M | v3.0.0 | Path-dep restructuring + actual crates.io publish | **prep merged** — workspace dep graph restructured, dry-runs pass for leaf crates, runbook in `docs/src/contributing/publishing.md`; actual `cargo publish` deferred to v3.0.0 release tagging (see [wave-11-m-cratesio-prep.md](wave-11-m-cratesio-prep.md)) |
 | 11-V | v3.0.0 | Voice cleanup: remove agent-process artifacts and boastful language from user-facing docs and public rustdocs | **merged** — see [wave-11-v-cleanup.md](wave-11-v-cleanup.md) |
+| 11-Q | v2.4.2 | Correctness fixes from 2026-05 audit (C-1, C-2, C-3, C-7, H-2, H-4, H-9, C-9, Q-5) | **merged** — 8 cross-confirmed audit findings closed; +8 regression tests; `#![forbid(unsafe_code)]` on 12 zero-unsafe crates; see [wave-11-q-correctness.md](wave-11-q-correctness.md) |
 
 ## Acceptance gates per wave
 

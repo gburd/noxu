@@ -12,10 +12,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use noxu_log::{
     FileManager,
+    checksum::ChecksumValidator,
     entry::{
         BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry, TxnPrepareEntry,
     },
-    entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE},
+    entry_header::{CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     entry_type::LogEntryType,
     file_header::FILE_HEADER_SIZE,
 };
@@ -339,6 +340,34 @@ impl FileManagerLogScanner {
         // slice() is O(1): just bumps the Bytes Arc refcount.
         let payload =
             file_bytes.slice(offset + header_size..offset + entry_size);
+
+        // C-3 (audit-2026-05-keith.md F-3.5 / F-9.1): verify CRC32 before
+        // returning a parsed entry.  The non-recovery reader (file_reader.rs)
+        // already validates CRCs; skipping it here was an asymmetric gap that
+        // silently injected corrupted entries into the recovered B-tree.
+        //
+        // Layout: checksum (4 bytes LE) at header[0..4] covers bytes [4..entry_size].
+        // A stored checksum of 0 means "not computed" (synthetic test entries);
+        // skip validation in that case, matching file_reader.rs behaviour.
+        let stored_checksum =
+            u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if stored_checksum != 0 {
+            let entry_bytes = &data[offset..offset + entry_size];
+            let computed = ChecksumValidator::compute_range(
+                entry_bytes,
+                CHECKSUM_BYTES,
+                entry_size - CHECKSUM_BYTES,
+            );
+            if computed != stored_checksum {
+                // Return a sentinel that the scanner loop interprets as a
+                // hard parse failure; the caller in scan_files_forward / scan
+                // treats this as end-of-valid-log for recovery purposes, which
+                // is the safe conservative action (better than replaying
+                // corrupted data into the B-tree).
+                return None;
+            }
+        }
+
         let log_entry = Self::parse_payload(entry_type_num, payload, vlsn_opt);
 
         Some((entry_size, log_entry))
@@ -703,5 +732,56 @@ mod tests {
         // After find_end_of_log, the file manager should reflect those LSNs.
         assert_eq!(fm.get_last_used_lsn(), last);
         assert_eq!(fm.get_next_available_lsn(), next);
+    }
+
+    /// C-3 regression: the recovery scanner must reject entries with a bad
+    /// CRC32.  Before this fix, `parse_entry_from_bytes` skipped checksum
+    /// validation and silently loaded corrupted data into the B-tree.
+    ///
+    /// The test writes a real log entry (with a valid CRC), then overwrites
+    /// one byte in its payload on disk and verifies the scanner skips the
+    /// corrupted entry rather than returning it.
+    #[test]
+    fn test_recovery_scanner_rejects_corrupted_crc() {
+        use noxu_log::entry_header::MIN_HEADER_SIZE;
+        use std::io::{Seek, SeekFrom, Write as _};
+
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_manager(dir.path());
+
+        // Write one commit entry with a real CRC.
+        let entry = TxnEndEntry::new_commit(55, NULL_LSN, 0, 0, NULL_VLSN);
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        let commit_lsn = lm
+            .log(LogEntryType::TxnCommit, &buf, Provisional::No, true, false)
+            .unwrap();
+        lm.flush_sync().unwrap();
+        let fm_for_path = Arc::clone(&fm);
+        drop(lm);
+
+        // Corrupt one byte in the entry payload (past the header).
+        let file_name = format!("{:08x}.ndb", commit_lsn.file_number());
+        let file_path = dir.path().join(&file_name);
+        let mut f =
+            std::fs::OpenOptions::new().write(true).open(&file_path).unwrap();
+        let payload_byte_offset =
+            commit_lsn.file_offset() as u64 + MIN_HEADER_SIZE as u64 + 1;
+        f.seek(SeekFrom::Start(payload_byte_offset)).unwrap();
+        f.write_all(&[0xDE]).unwrap(); // flip a byte
+        f.sync_all().unwrap();
+        drop(f);
+        drop(fm_for_path);
+
+        // Scanner must not return the corrupted entry.
+        let scanner = FileManagerLogScanner::new(Arc::clone(&fm));
+        let entries = scanner.scan_forward(NULL_LSN, NULL_LSN);
+        let found = entries.iter().any(
+            |e| matches!(e.entry, LogEntry::TxnCommit(ref r) if r.txn_id == 55),
+        );
+        assert!(
+            !found,
+            "corrupted entry must not appear in scan results (C-3 regression)"
+        );
     }
 }

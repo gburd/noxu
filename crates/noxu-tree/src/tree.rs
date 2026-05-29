@@ -296,6 +296,36 @@ impl BinStub {
     // IN.computeKeyPrefix / IN.recalcSuffixes / IN.getKey
     // ========================================================================
 
+    /// Strips embedded LN data from non-dirty slots, freeing the heap
+    /// allocations of the per-slot value bytes while keeping the slot keys
+    /// and LSNs addressable.  Used by the evictor's PartialEvict path: a
+    /// hot BIN is kept in cache so its descent path stays warm, but the LN
+    /// data is dropped to make room for hotter content.  Subsequent reads
+    /// re-fetch the data from the log via the slot LSN.
+    ///
+    /// Skips slots that are still dirty (their data has not been written
+    /// to the log yet, so dropping the in-memory copy would lose the
+    /// update).  Returns the number of bytes freed (sum of the lengths
+    /// of the dropped `Vec<u8>` data fields).
+    ///
+    /// Returns 0 if the BIN has any open cursors (the cursor may be
+    /// reading the data right now).
+    pub fn strip_lns(&mut self) -> usize {
+        if self.cursor_count > 0 {
+            return 0;
+        }
+        let mut freed = 0usize;
+        for entry in &mut self.entries {
+            if entry.dirty {
+                continue;
+            }
+            if let Some(data) = entry.data.take() {
+                freed = freed.saturating_add(data.len());
+            }
+        }
+        freed
+    }
+
     /// Reconstruct the full key for slot `idx` by prepending the BIN's
     /// current prefix to the stored suffix.
     ///
@@ -8649,5 +8679,72 @@ mod tests {
                 "parent of a BIN must be an Internal node"
             );
         }
+    }
+
+    /// H-9 regression: BinStub::strip_lns actually drops the slot data
+    /// (not just stats accounting).
+    #[test]
+    fn test_h9_strip_lns_actually_frees_data() {
+        use crate::tree::{BinEntry, BinStub};
+        use noxu_util::lsn::Lsn;
+        let mut bin = BinStub {
+            node_id: 1,
+            level: 1,
+            entries: Vec::new(),
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: Lsn::from_u64(0),
+            last_delta_lsn: Lsn::from_u64(0),
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+        // Two non-dirty slots with embedded data, one dirty slot.
+        bin.entries.push(BinEntry {
+            key: b"a".to_vec(),
+            lsn: Lsn::from_u64(100),
+            data: Some(vec![0u8; 64]),
+            known_deleted: false,
+            dirty: false,
+            expiration_time: 0,
+        });
+        bin.entries.push(BinEntry {
+            key: b"b".to_vec(),
+            lsn: Lsn::from_u64(200),
+            data: Some(vec![0u8; 32]),
+            known_deleted: false,
+            dirty: false,
+            expiration_time: 0,
+        });
+        bin.entries.push(BinEntry {
+            key: b"c".to_vec(),
+            lsn: Lsn::from_u64(300),
+            data: Some(vec![0u8; 16]),
+            known_deleted: false,
+            dirty: true, // dirty slot must be skipped
+            expiration_time: 0,
+        });
+
+        let freed = bin.strip_lns();
+        assert_eq!(freed, 64 + 32, "freed bytes must sum non-dirty slot data");
+        assert!(bin.entries[0].data.is_none(), "non-dirty slot data dropped");
+        assert!(bin.entries[1].data.is_none(), "non-dirty slot data dropped");
+        assert!(bin.entries[2].data.is_some(), "dirty slot data preserved");
+
+        // Cursor pin prevents stripping.
+        bin.entries[0].data = Some(vec![0u8; 64]);
+        bin.entries[0].dirty = false;
+        bin.cursor_count = 1;
+        let freed_with_cursor = bin.strip_lns();
+        assert_eq!(
+            freed_with_cursor, 0,
+            "strip_lns must skip when cursor pinned"
+        );
+        assert!(
+            bin.entries[0].data.is_some(),
+            "data preserved while cursor pinned"
+        );
     }
 }

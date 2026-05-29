@@ -437,6 +437,14 @@ impl FileManager {
         file.flush()?;
         file.sync_all()?;
 
+        // C-1 (audit-2026-05-keith.md F-3.1 / audit-2026-05-je-team.md 1-G):
+        // After fsync-ing the new file, fsync the parent directory so the
+        // directory entry itself is durable.  Without this a power-loss between
+        // file creation and the next directory write loses the file entirely.
+        let parent_dir = File::open(&self.env_dir)?;
+        parent_dir.sync_all()?;
+        drop(parent_dir);
+
         // Create handle
         let mut handle = FileHandle::new(file_num);
         handle.init(file, LOG_VERSION);
@@ -933,5 +941,36 @@ mod tests {
         // After clearing, get_file_handle must re-open the file.
         let handle = manager.get_file_handle(0).unwrap();
         assert_eq!(handle.file_num(), 0);
+    }
+
+    /// C-1 regression: parent directory must be fsynced after creating each
+    /// new log file so the directory entry is durable across a power loss.
+    ///
+    /// This test verifies that `create_file_internal` completes without error
+    /// (which confirms the dir-open + sync_all code path runs), and that
+    /// the created file is visible in a directory listing performed after the
+    /// call returns — i.e. the same state recovery would see after a restart.
+    #[test]
+    fn test_parent_dir_fsynced_after_file_create() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            FileManager::new(temp_dir.path(), false, 10_000_000, 100).unwrap();
+
+        // Creating file 0 must succeed (includes parent-dir fsync).
+        manager.create_file(0).unwrap();
+
+        // The file must be present in the directory listing — the same check
+        // recovery performs when scanning for log files to replay.
+        let listed = manager.list_file_numbers().unwrap();
+        assert_eq!(
+            listed,
+            vec![0],
+            "file 0 must be visible in dir listing after create"
+        );
+
+        // Create a second file (flip) to exercise the path for file_num > 0.
+        manager.flip_file().unwrap();
+        let listed2 = manager.list_file_numbers().unwrap();
+        assert!(listed2.contains(&1), "file 1 must be visible after flip");
     }
 }

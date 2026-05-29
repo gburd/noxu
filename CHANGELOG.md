@@ -16,19 +16,6 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-### Changed
-
-- **Voice cleanup.** Removed agent-process artifacts (wave/sprint labels,
-  boastful adjectives, false provenance claims) from all user-facing
-  documentation and public-crate rustdocs.  No API or behaviour change.
-  `README.md`, `docs/src/introduction.md`, `docs/src/getting-started/`,
-  `docs/src/transactions/`, `docs/src/replication/`, `docs/src/collections/`,
-  `docs/src/operations/benchmarks.md`, `docs/src/reference/architecture.md`,
-  `docs/src/contributing/porting-guidelines.md`,
-  `docs/src/maintainer/project-history.md`, and public `///` rustdocs in
-  `noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-rep`,
-  `noxu-xa`.
-
 ### Added (v3.0.0 candidate)
 
 - **API stability commitment**: `docs/src/contributing/api-stability.md` enumerates
@@ -87,6 +74,95 @@ removed in v3.0.0.  Each has a `note` pointing to the replacement.
   `EVICTOR_DEADLOCK_RETRY`, `EVICTOR_LRU_ONLY`, `LOG_DIRECT_NIO`,
   `LOG_CHUNKED_NIO`, `LOG_USE_NIO`, `LOG_DEFERREDWRITE_TEMP`,
   `OLD_REP_RUN_LOG_FLUSH_TASK`, `OLD_REP_LOG_FLUSH_TASK_INTERVAL`.
+
+## [v2.4.2] — 2026-05-29
+
+### Fixed
+
+- **C-1** — fsync the parent directory after creating a new log file
+  (`noxu-log/src/file_manager.rs`).  POSIX requires the parent directory
+  fsync after `creat`/`rename` for the directory entry to be durable;
+  without it a power loss between file creation and the next directory
+  write loses the file from the directory entirely, taking all data
+  written to it with it. Cross-confirmed by the JE-team and Keith
+  audits.
+
+- **C-2** — fsync error permanently invalidates the environment.
+  `LogManager` now carries an `Arc<AtomicBool> io_invalid` checked at
+  every `log()` entry; on any `fdatasync` error the flag is set and all
+  subsequent commits fail fast.  Closes the fsyncgate-class window where
+  the engine would continue accepting writes after a kernel I/O error.
+
+- **C-3** — verify CRC32 in the recovery log scanner
+  (`noxu-dbi/src/file_manager_scanner.rs`).  The scanner previously
+  parsed entries without checking the stored CRC; bit-flip corruption
+  silently injected garbage into the recovered B-tree.  CRC mismatches
+  now cause the scanner to treat the entry as end-of-valid-log (the
+  conservative recovery posture).
+
+- **C-7** — `Release`/`Acquire` ordering on log-buffer pin-count
+  (`noxu-log/src/log_buffer.rs`).  The `pin_count.fetch_sub` was
+  `Relaxed`; under the C++/Rust memory model, a thread observing
+  `pin_count == 0` could be reordered before the writer's segment
+  writes, losing data.  Now `Release` on the decrement, `Acquire` on
+  the zero-check.
+
+- **H-2** — establish shard-before-waiter-graph lock ordering in
+  `noxu-txn/src/lock_manager.rs`.  Documented the canonical order;
+  added `flush_and_clear_waiter()` helper used by all six victim-cleanup
+  paths so the ordering is mechanically enforced.
+
+- **H-4** — deadlock victim selection now populates `lock_counts`
+  (`noxu-txn/src/lock_manager.rs::compute_lock_counts`).  Previously
+  `select_victim` always received an empty `HashMap`, falling through
+  to the youngest-tiebreaker; the documented primary criterion (fewest
+  locks held) was dead code.  The shard scan only runs on the rare
+  cycle path; no cost on the common no-cycle path.
+
+- **H-9** — `PartialEvict` now actually frees slot data.  Added
+  `BinStub::strip_lns` (clears `data: Option<Vec<u8>>` on non-dirty
+  slots, returns bytes freed) and `Evictor::strip_lns_from_node`
+  (locates and strips the BIN).  Previously the evictor incremented
+  stats and credited bytes against the budget without freeing any
+  heap; the budget tracker drifted below reality and the evictor
+  under-fired under pressure.
+
+### Changed
+
+- **C-9** — reorganized the `unsafe` inventory in `AGENTS.md` as a
+  per-crate table.  Added the `std::mem::transmute` in
+  `noxu-log/log_source.rs:61` (sound: `Arc<FileHandle>` outlives the
+  guard) and the `unsafe impl Send for LogBufferSegment`.  Removed three
+  stale `unsafe impl Send + Sync` blocks in
+  `noxu-rep::elections::{election, master_tracker, phi_detector}` whose
+  fields auto-derive the bounds.
+
+- **Q-5** — added `#![forbid(unsafe_code)]` to the 12 zero-unsafe
+  crates: `noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`,
+  `noxu-recovery`, `noxu-dbi`, `noxu-engine`, `noxu-bind`,
+  `noxu-collections`, `noxu-persist`, `noxu-config`, `noxu-util`.  The
+  zero-unsafe claim is now machine-enforced.
+
+- **Voice cleanup.** Removed agent-process artifacts (wave/sprint labels,
+  boastful adjectives, false provenance claims) from all user-facing
+  documentation and public-crate rustdocs.  No API or behaviour change.
+  `README.md`, `docs/src/introduction.md`, `docs/src/getting-started/`,
+  `docs/src/transactions/`, `docs/src/replication/`, `docs/src/collections/`,
+  `docs/src/operations/benchmarks.md`, `docs/src/reference/architecture.md`,
+  `docs/src/contributing/porting-guidelines.md`,
+  `docs/src/maintainer/project-history.md`, and public `///` rustdocs in
+  `noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-rep`,
+  `noxu-xa`.
+
+### Deferred
+
+- **H-3** (per-log-entry allocation reduction), **H-1** (abort lock-hold),
+  **H-5–H-8** (documentation accuracy fixes), **Q-1–Q-4, Q-6, Q-7**
+  (UX + cleanup) — wave 11-S.
+- **C-4, C-5, C-6, C-8** (breaking semantic fixes) — wave 11-R / v3.0.0.
+
+See [`docs/src/internal/wave-11-q-correctness.md`](docs/src/internal/wave-11-q-correctness.md)
+for the full per-fix details.
 
 ## [v2.4.1] — 2026-05-29
 
