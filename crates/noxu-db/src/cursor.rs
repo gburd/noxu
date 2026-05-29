@@ -7,7 +7,22 @@ use crate::get::Get;
 use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
 use crate::put::Put;
-use noxu_dbi::{CursorImpl, GetMode, PutMode, SearchMode};
+use noxu_dbi::{CursorImpl, DbiError, GetMode, PutMode, SearchMode};
+
+/// Map a `DbiError` from a cursor inner operation to the appropriate
+/// public `NoxuError`.
+///
+/// `EnvironmentFailure` propagates as-is (via `From<DbiError>`) so the
+/// caller sees `NoxuError::EnvironmentFailure` rather than
+/// `NoxuError::OperationNotAllowed`. All other errors are wrapped as
+/// `OperationNotAllowed` to preserve backward compatibility.  X-13 fix.
+#[inline]
+fn map_cursor_err(e: DbiError) -> NoxuError {
+    match e {
+        DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
+        _ => NoxuError::OperationNotAllowed(e.to_string()),
+    }
+}
 
 /// Cursor state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,82 +124,61 @@ impl Cursor {
                 // which simply reports `NotFound` because no record can
                 // exist under an empty key on a writable database.
                 let key_bytes = key.get_data().unwrap_or(&[]);
-                self.inner.search(key_bytes, None, SearchMode::Set).map_err(
-                    |e| NoxuError::OperationNotAllowed(e.to_string()),
-                )?
+                self.inner.search(key_bytes, None, SearchMode::Set)
+                    .map_err(map_cursor_err)?
             }
             Get::SearchGte | Get::SearchRange => {
                 let key_bytes = key.get_data().unwrap_or(&[]);
                 self.inner
                     .search(key_bytes, None, SearchMode::SetRange)
-                    .map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    .map_err(map_cursor_err)?
             }
             Get::First => self
                 .inner
                 .get_first()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?,
+                .map_err(map_cursor_err)?,
             Get::Last => self
                 .inner
                 .get_last()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?,
+                .map_err(map_cursor_err)?,
             Get::Next => {
                 if self.state == CursorState::NotInitialized {
                     // Next from uninitialized positions at the first record.
-                    self.inner.get_first().map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    self.inner.get_first().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::Next).map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    self.inner.retrieve_next(GetMode::Next).map_err(map_cursor_err)?
                 }
             }
             Get::Prev => {
                 if self.state == CursorState::NotInitialized {
                     // Prev from uninitialized positions at the last record.
-                    self.inner.get_last().map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    self.inner.get_last().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::Prev).map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    self.inner.retrieve_next(GetMode::Prev).map_err(map_cursor_err)?
                 }
             }
             Get::NextDup => {
                 self.check_initialized()?;
-                self.inner.retrieve_next(GetMode::NextDup).map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?
+                self.inner.retrieve_next(GetMode::NextDup).map_err(map_cursor_err)?
             }
             Get::PrevDup => {
                 self.check_initialized()?;
-                self.inner.retrieve_next(GetMode::PrevDup).map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?
+                self.inner.retrieve_next(GetMode::PrevDup).map_err(map_cursor_err)?
             }
             Get::NextNoDup => {
                 if self.state == CursorState::NotInitialized {
-                    self.inner.get_first().map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    self.inner.get_first().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::NextNoDup).map_err(
-                        |e| NoxuError::OperationNotAllowed(e.to_string()),
-                    )?
+                    self.inner.retrieve_next(GetMode::NextNoDup)
+                        .map_err(map_cursor_err)?
                 }
             }
             Get::PrevNoDup => {
                 if self.state == CursorState::NotInitialized {
-                    self.inner.get_last().map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    self.inner.get_last().map_err(map_cursor_err)?
                 } else {
-                    self.inner.retrieve_next(GetMode::PrevNoDup).map_err(
-                        |e| NoxuError::OperationNotAllowed(e.to_string()),
-                    )?
+                    self.inner.retrieve_next(GetMode::PrevNoDup)
+                        .map_err(map_cursor_err)?
                 }
             }
             Get::SearchBoth => {
@@ -192,9 +186,7 @@ impl Cursor {
                 let data_bytes = data.get_data();
                 self.inner
                     .search(key_bytes, data_bytes, SearchMode::Both)
-                    .map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    .map_err(map_cursor_err)?
             }
             // Audit cursor F12 (Wave 2C-4): expose `SearchBothRange` to the
             // public API; the inner `SearchMode::BothRange` was already
@@ -204,9 +196,7 @@ impl Cursor {
                 let data_bytes = data.get_data();
                 self.inner
                     .search(key_bytes, data_bytes, SearchMode::BothRange)
-                    .map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?
+                    .map_err(map_cursor_err)?
             }
             Get::Current => {
                 // Already checked initialized above.
@@ -216,9 +206,7 @@ impl Cursor {
                 if self.inner.is_current_slot_deleted() {
                     return Ok(OperationStatus::NotFound);
                 }
-                let (k, v) = self.inner.get_current().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
+                let (k, v) = self.inner.get_current().map_err(map_cursor_err)?;
                 data.set_data(&v);
                 key.set_data(&k);
                 self.state = CursorState::Initialized;
@@ -250,9 +238,7 @@ impl Cursor {
 
         match status {
             noxu_dbi::OperationStatus::Success => {
-                let (k, v) = self.inner.get_current().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
+                let (k, v) = self.inner.get_current().map_err(map_cursor_err)?;
                 data.set_data(&v);
                 // Write back the current key for navigation operations.
                 // `key` is always an output parameter for positioning ops.
@@ -340,7 +326,7 @@ impl Cursor {
         match self
             .inner
             .put(key_bytes, data_bytes, put_mode)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            .map_err(map_cursor_err)?
         {
             noxu_dbi::OperationStatus::KeyExist => {
                 Ok(OperationStatus::KeyExists)
@@ -369,7 +355,7 @@ impl Cursor {
 
         self.inner
             .delete()
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            .map_err(map_cursor_err)?;
         self.state = CursorState::NotInitialized;
         Ok(OperationStatus::Success)
     }
@@ -405,7 +391,7 @@ impl Cursor {
         let n = self
             .inner
             .count()
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            .map_err(map_cursor_err)?;
         if n < 1 {
             return Err(NoxuError::OperationNotAllowed(format!(
                 "cursor count() returned {n} while positioned (invariant violated)",
@@ -439,7 +425,7 @@ impl Cursor {
         // at outer-`Cursor::Drop` time.
         self.inner
             .close()
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
+            .map_err(map_cursor_err)
     }
 
     /// Check if the cursor is valid (not closed).

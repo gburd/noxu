@@ -157,6 +157,12 @@ pub struct CursorImpl {
     /// Write-ahead log manager for recording data operations.
     /// None for read-only cursors or cursors created outside a real env.
     log_manager: Option<Arc<LogManager>>,
+    /// Cached environment-invalidity flag (X-13).
+    ///
+    /// Cloned from `EnvironmentImpl::is_invalid_flag()` at cursor open time
+    /// so `check_state()` can detect a failed environment without locking.
+    /// `None` for cursors constructed outside a real environment (unit tests).
+    env_invalid: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Lock manager for per-record read/write locking.
     /// None for cursors created outside a real env (e.g., unit tests).
     ///
@@ -204,6 +210,7 @@ impl CursorImpl {
             current_index: -1,
             current_bin_arc: None,
             log_manager: None,
+            env_invalid: None,
             lock_manager: None,
             txn_ref: None,
             throughput,
@@ -231,10 +238,24 @@ impl CursorImpl {
             current_index: -1,
             current_bin_arc: None,
             log_manager: Some(log_manager),
+            env_invalid: None,
             lock_manager: None,
             txn_ref: None,
             throughput,
         }
+    }
+
+    /// Wires the environment-invalidity flag for hot-path validity checks.
+    ///
+    /// Stores a clone of `EnvironmentImpl::is_invalid_flag()` so that
+    /// `check_state()` can detect a failed environment on every cursor
+    /// operation without acquiring the environment lock.  X-13 fix.
+    pub fn with_env_invalid(
+        mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.env_invalid = Some(flag);
+        self
     }
 
     /// Wires a lock manager for per-record locking.
@@ -647,6 +668,29 @@ impl CursorImpl {
         #[cfg(any(test, feature = "testing"))]
         if tick_fail() {
             return Err(DbiError::CursorClosed);
+        }
+        // X-13: check environment validity before cursor state.
+        // Both the explicit invalidation flag and the I/O-failure flag
+        // (io_invalid) are tested so that reads on a failed environment
+        // return EnvironmentFailure rather than stale BIN data.
+        if self
+            .env_invalid
+            .as_ref()
+            .map_or(false, |f| f.load(Ordering::Acquire))
+        {
+            return Err(DbiError::EnvironmentFailure {
+                reason: "environment has been invalidated".into(),
+            });
+        }
+        if self
+            .log_manager
+            .as_ref()
+            .map_or(false, |lm| lm.io_invalid.load(Ordering::Acquire))
+        {
+            return Err(DbiError::EnvironmentFailure {
+                reason: "I/O failure: environment invalidated by fsync error"
+                    .into(),
+            });
         }
         match self.state {
             CursorState::Closed => Err(DbiError::CursorClosed),

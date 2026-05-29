@@ -83,6 +83,12 @@ pub struct Database {
     /// Cached log manager — acquired once at open, None for no-WAL envs.
     /// Eliminates per-operation `env_impl.lock()` on the hot read/write path.
     log_manager: Option<Arc<LogManager>>,
+    /// Cached environment-invalidity flag (X-13).
+    ///
+    /// Cloned from `EnvironmentImpl::is_invalid_flag()` at `Database::new()`
+    /// time so `check_open()` can detect a failed environment without
+    /// acquiring `env_impl.lock()` on every read/write operation.
+    env_invalid: Arc<std::sync::atomic::AtomicBool>,
     /// Cached cleaner throttle — acquired once at open, None when no cleaner.
     /// Used by put() for write-path backpressure without locking env_impl.
     cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
@@ -177,8 +183,10 @@ impl Database {
                 locker_id,
                 Arc::clone(lm),
             )
+            .with_env_invalid(Arc::clone(&self.env_invalid))
             .with_lock_manager(Arc::clone(&self.lock_manager)),
             None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
+                .with_env_invalid(Arc::clone(&self.env_invalid))
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
         }
     }
@@ -194,8 +202,10 @@ impl Database {
                 Arc::clone(&self.db_impl),
                 0,
                 Arc::clone(lm),
-            ),
-            None => CursorImpl::new(Arc::clone(&self.db_impl), 0),
+            )
+            .with_env_invalid(Arc::clone(&self.env_invalid)),
+            None => CursorImpl::new(Arc::clone(&self.db_impl), 0)
+                .with_env_invalid(Arc::clone(&self.env_invalid)),
         }
     }
 
@@ -429,13 +439,14 @@ impl Database {
         let throughput = db_impl.read().throughput.clone();
         // Cache the manager Arcs at construction so hot-path operations
         // (get/put/delete) never need to re-acquire env_impl.lock().
-        let (lock_manager, log_manager, cleaner_throttle, txn_manager) = {
+        let (lock_manager, log_manager, cleaner_throttle, txn_manager, env_invalid) = {
             let env = env_impl.lock();
             let lm = Arc::clone(env.get_lock_manager());
             let logm = env.get_log_manager();
             let ct = env.get_cleaner_throttle();
             let txnm = Arc::clone(env.get_txn_manager());
-            (lm, logm, ct, txnm)
+            let inv = env.is_invalid_flag();
+            (lm, logm, ct, txnm, inv)
         };
         Database {
             name,
@@ -447,6 +458,7 @@ impl Database {
             throughput,
             lock_manager,
             log_manager,
+            env_invalid,
             cleaner_throttle,
             txn_manager,
             no_sync,
@@ -1086,6 +1098,7 @@ impl Database {
 
         let cursor_impl = if read_only {
             CursorImpl::new(Arc::clone(&self.db_impl), 0)
+                .with_env_invalid(Arc::clone(&self.env_invalid))
         } else {
             // Plumb the caller's txn through to the cursor so that
             // cursor reads acquire shared locks via the txn's locker and
@@ -1323,7 +1336,8 @@ impl Database {
     pub fn scan_all_kv(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
 
-        let mut cursor = CursorImpl::new(Arc::clone(&self.db_impl), 0);
+        let mut cursor = CursorImpl::new(Arc::clone(&self.db_impl), 0)
+            .with_env_invalid(Arc::clone(&self.env_invalid));
         let first_status = cursor
             .get_first()
             .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
@@ -1549,7 +1563,30 @@ impl Database {
     }
 
     /// Checks if the database is open, returns an error if not.
+    ///
+    /// X-13: also checks the environment validity flags so that reads and
+    /// writes return `EnvironmentFailure` after an fsync error or explicit
+    /// `EnvironmentImpl::invalidate()` call rather than silently succeeding
+    /// on stale BIN data.
     fn check_open(&self) -> Result<()> {
+        // Check environment validity first — explicit invalidation.
+        if self.env_invalid.load(Ordering::Acquire) {
+            return Err(NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::UnexpectedStateFatal,
+                "environment has been invalidated".to_string(),
+            ));
+        }
+        // Check I/O failure (C-2 / fsync-gate).
+        if self
+            .log_manager
+            .as_ref()
+            .map_or(false, |lm| lm.io_invalid.load(Ordering::Acquire))
+        {
+            return Err(NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::LogWrite,
+                "I/O failure: environment invalidated by fsync error".to_string(),
+            ));
+        }
         if !self.open.load(Ordering::Acquire) {
             return Err(NoxuError::DatabaseClosed);
         }
@@ -2491,5 +2528,75 @@ mod tests {
         let val = DatabaseEntry::from_bytes(b"v");
         let status = db.put(None, &empty_key, &val).unwrap();
         assert_eq!(status, OperationStatus::Success);
+    }
+
+    // ── X-13: env-invalidity checks propagate through check_open ──────────────
+
+    /// X-13: after the `io_invalid` flag is set, `db.get` must return
+    /// `EnvironmentFailure` rather than silently reading stale BIN data.
+    #[test]
+    fn test_x13_io_invalid_blocks_db_get() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, env, db) = temp_env_and_db();
+
+        // Write a record so there is something to read.
+        let key = DatabaseEntry::from_bytes(b"k");
+        let val = DatabaseEntry::from_bytes(b"v");
+        db.put(None, &key, &val).unwrap();
+
+        // Flip io_invalid via the cached LogManager.
+        let lm = db.log_manager.as_ref().expect("WAL env must have LogManager");
+        lm.io_invalid.store(true, Ordering::Release);
+
+        // db.get must now fail.
+        let mut out = DatabaseEntry::new();
+        let result = db.get(None, &key, &mut out);
+        assert!(
+            matches!(result, Err(NoxuError::EnvironmentFailure { .. })),
+            "expected EnvironmentFailure, got {result:?}"
+        );
+
+        // db.put must also fail.
+        let result2 = db.put(None, &key, &val);
+        assert!(
+            matches!(result2, Err(NoxuError::EnvironmentFailure { .. })),
+            "expected EnvironmentFailure on put, got {result2:?}"
+        );
+
+        // Restore flag so env closes cleanly.
+        lm.io_invalid.store(false, Ordering::Release);
+        drop(env);
+    }
+
+    /// X-13: after `EnvironmentImpl::invalidate()`, cursor `get_first`
+    /// must return `EnvironmentFailure`.
+    #[test]
+    fn test_x13_env_invalid_blocks_cursor_get() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, env, db) = temp_env_and_db();
+
+        // Insert a record.
+        let key = DatabaseEntry::from_bytes(b"ck");
+        let val = DatabaseEntry::from_bytes(b"cv");
+        db.put(None, &key, &val).unwrap();
+
+        // Open a cursor BEFORE invalidating.
+        let mut cursor = db.open_cursor(None, None).unwrap();
+
+        // Now directly flip the env_invalid flag.
+        db.env_invalid.store(true, Ordering::Release);
+
+        // The cursor's check_state should detect the flag.
+        let mut key = DatabaseEntry::new();
+        let mut out = DatabaseEntry::new();
+        let result = cursor.get(&mut key, &mut out, crate::get::Get::First, None);
+        assert!(
+            matches!(result, Err(NoxuError::EnvironmentFailure { .. })),
+            "expected EnvironmentFailure from cursor, got {result:?}"
+        );
+
+        // Restore so env drops cleanly.
+        db.env_invalid.store(false, Ordering::Release);
+        drop(env);
     }
 }
