@@ -206,6 +206,21 @@ pub struct EnvironmentImpl {
     cleaner_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 
     // =========================================================================
+    // X-11: LogFlushTask — background no-sync flush daemon
+    // =========================================================================
+    /// Shutdown flag for the `noxu-log-flusher` daemon.
+    ///
+    /// When `log_flush_no_sync_interval_ms > 0` in the environment config the
+    /// daemon wakes on the configured interval and calls
+    /// `LogManager::flush_no_sync()`.  This ensures that data committed with
+    /// `CommitNoSync` durability reaches the OS page cache within the bounded
+    /// interval even if no subsequent commit triggers a flush.
+    log_flush_no_sync_shutdown: Arc<AtomicBool>,
+
+    /// Background log-flush-no-sync daemon thread handle.
+    log_flush_no_sync_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+
+    // =========================================================================
     // extended fork: additional background services
     // =========================================================================
     /// Background data-erasure daemon.
@@ -521,11 +536,26 @@ impl EnvironmentImpl {
             Arc::new(std::sync::RwLock::new(primary_tree_inner));
 
         let cache_bytes = cfg.cache_size as i64;
+        // X-12: cache_size is the TOTAL memory budget. Subtract the log
+        // write-buffer pool and off-heap reservation so that the three
+        // independent pools (BIN tree, log buffers, off-heap) together
+        // do not exceed cache_size. This matches JE semantics where
+        // cache_size is the ceiling for total memory use.
+        //
+        // log_buffer_size is the per-buffer size; log_num_buffers is the count.
+        let log_buf_total =
+            (cfg.log_num_buffers * cfg.log_buffer_size) as i64;
+        let off_heap_reserved = cfg.max_off_heap_memory as i64;
+        // Floor at 1 MiB so the arbiter remains functional even if the user
+        // sets a cache_size smaller than the buffer + off-heap reservations.
+        let arbiter_budget =
+            (cache_bytes - log_buf_total - off_heap_reserved)
+                .max(1024 * 1024_i64);
         let arbiter = Arbiter::new(
-            cache_bytes,
+            arbiter_budget,
             Arc::clone(&cache_usage),
-            128 * 1024_i64,   // 128 KiB hysteresis (fixed)
-            cache_bytes / 16, // critical threshold: 1/16 of cache
+            128 * 1024_i64,      // 128 KiB hysteresis (fixed)
+            arbiter_budget / 16, // critical threshold: 1/16 of arbiter budget
         );
         // Build optional off-heap cache from config ( MAX_OFF_HEAP_MEMORY).
         let off_heap_cache = Arc::new(noxu_evictor::OffHeapCache::new(
@@ -722,6 +752,51 @@ impl EnvironmentImpl {
             })
             .expect("failed to spawn noxu-cleaner thread");
 
+        // X-11: Start the background LogFlushTask daemon (LogFlushTask).
+        // When log_flush_no_sync_interval_ms > 0 the daemon wakes on the
+        // configured interval and calls flush_no_sync() so data committed
+        // with CommitNoSync (SyncPolicy::NoSync) is drained from the in-process
+        // write buffers to the OS page cache within a bounded time.
+        // If the interval is 0 the thread exits immediately (disabled path).
+        let log_flush_no_sync_shutdown = Arc::new(AtomicBool::new(false));
+        let log_flush_no_sync_shutdown_clone =
+            Arc::clone(&log_flush_no_sync_shutdown);
+        let flush_interval_ms = cfg.log_flush_no_sync_interval_ms;
+        let lm_for_flush = log_manager.as_ref().map(Arc::clone);
+        let log_flush_no_sync_handle = std::thread::Builder::new()
+            .name("noxu-log-flusher".to_string())
+            .spawn(move || {
+                if flush_interval_ms == 0 {
+                    return; // disabled
+                }
+                while !log_flush_no_sync_shutdown_clone
+                    .load(Ordering::Relaxed)
+                {
+                    let chunk_ms = 100u64;
+                    let mut remaining = flush_interval_ms;
+                    while remaining > 0
+                        && !log_flush_no_sync_shutdown_clone
+                            .load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(
+                            std::time::Duration::from_millis(
+                                chunk_ms.min(remaining),
+                            ),
+                        );
+                        remaining = remaining.saturating_sub(chunk_ms);
+                    }
+                    if log_flush_no_sync_shutdown_clone
+                        .load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    if let Some(ref lm) = lm_for_flush {
+                        let _ = lm.flush_no_sync();
+                    }
+                }
+            })
+            .expect("failed to spawn noxu-log-flusher thread");
+
         let env = EnvironmentImpl {
             env_home,
             state: RwLock::new(EnvState::Init),
@@ -757,6 +832,10 @@ impl EnvironmentImpl {
             in_compressor_handle: Mutex::new(Some(in_compressor_handle)),
             cleaner_shutdown,
             cleaner_handle: Mutex::new(Some(cleaner_handle)),
+            log_flush_no_sync_shutdown,
+            log_flush_no_sync_handle: Mutex::new(Some(
+                log_flush_no_sync_handle,
+            )),
             data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
             extinction_scanner: Mutex::new(
                 noxu_cleaner::ExtinctionScanner::new(),
@@ -1598,6 +1677,15 @@ impl EnvironmentImpl {
         // Signal the cleaner daemon to stop and wait for it to exit.
         self.cleaner_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // X-11: Signal the log-flush-no-sync daemon to stop and join.
+        self.log_flush_no_sync_shutdown
+            .store(true, Ordering::Relaxed);
+        if let Some(handle) =
+            self.log_flush_no_sync_handle.lock().unwrap().take()
+        {
             let _ = handle.join();
         }
 
