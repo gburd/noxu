@@ -521,13 +521,49 @@ impl Transaction {
             undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
 
             // Phase 2: apply undo to the B-tree (write locks still held).
+            //
+            // H-1 (audit-2026-05-keith.md F-2.2): acquire env lock only for
+            // the fast database-handle lookup, then drop it immediately.
+            // This prevents the entire abort undo loop from serialising all
+            // concurrent readers/writers against the EnvironmentImpl mutex.
+            //
+            // Algorithm:
+            //   a) Collect unique database IDs referenced by the undo set.
+            //   b) For each ID, briefly lock env, clone the Arc<RwLock<DatabaseImpl>>,
+            //      and immediately release the env lock.
+            //   c) Apply all undo records without ever holding the env lock.
+            //
+            // Safety: the database Arcs are ref-counted; even if a concurrent
+            // `env.remove_database()` call drops the EnvironmentImpl's own Arc,
+            // our cloned Arc keeps the DatabaseImpl alive for the duration of
+            // the undo loop.
             if let Some(env) = &self.env_impl {
-                let env_guard = env.lock();
+                // Step (a+b): collect database handles with minimal lock hold time.
+                use std::collections::HashMap;
+                let mut db_handles: HashMap<
+                    i64,
+                    Arc<noxu_sync::RwLock<noxu_dbi::DatabaseImpl>>,
+                > = HashMap::new();
+                for undo in &undo_records {
+                    let db_id_raw = undo.database_id as i64;
+                    if db_handles.contains_key(&db_id_raw) {
+                        continue;
+                    }
+                    // Brief env lock: lookup only.
+                    let guard = env.lock();
+                    if let Some(arc) = guard
+                        .get_database_by_id(DatabaseId::new(db_id_raw))
+                    {
+                        db_handles.insert(db_id_raw, arc);
+                    }
+                    // env lock released here — drop(guard) implicit at end of block
+                }
+
+                // Step (c): apply undo records without holding env lock.
                 for undo in undo_records {
                     let Some(abort_key) = undo.abort_key else { continue };
-                    let db_id = DatabaseId::new(undo.database_id as i64);
-                    let Some(db_arc) = env_guard.get_database_by_id(db_id)
-                    else {
+                    let db_id_raw = undo.database_id as i64;
+                    let Some(db_arc) = db_handles.get(&db_id_raw) else {
                         continue;
                     };
                     let db_guard = db_arc.read();
