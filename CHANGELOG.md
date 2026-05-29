@@ -16,7 +16,9 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-### Known issues (v2.4.0 prep)
+## [v2.4.0] — 2026-05-28
+
+### Known issues
 
 - `noxu-rep::phi_detector_test::test_master_tracker_phi_mode` is `#[ignore]`'d
   with a fresh TODO. Wave 9-A's de-flake reduced the miss rate but a ~20 %
@@ -66,6 +68,17 @@ listed in [References](#references).
   `DeleteLN` entries for every key; recovery replays them after the original
   inserts, leaving an empty tree.
   ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+
+<!-- ============================================================== -->
+<!-- Note: the Added (v2.4.0 — Wave 11-D) and subsequent v2.4.0      -->
+<!-- entries below are LOGICALLY part of the [v2.4.0] section above. -->
+<!-- They were authored under [Unreleased] before the v2.3.2 patch   -->
+<!-- release was inserted in front of v2.4.0; rather than re-order   -->
+<!-- the entire file (which would lose `git blame` history) we leave -->
+<!-- them in place and rely on the per-entry section headers         -->
+<!-- ("Wave 11-D", "Wave 11-E", …) to identify which release each    -->
+<!-- belongs to.                                                     -->
+<!-- ============================================================== -->
 
 ### Added (v2.4.0 — Wave 11-D)
 
