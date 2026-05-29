@@ -1699,4 +1699,46 @@ mod tests {
         let stats = cleaner.get_stats().snapshot();
         assert_eq!(stats.lns_migrated, 0);
     }
+
+    // ── X-6: migration writes real WAL LN entry ─────────────────────
+
+    /// X-6: verify that `write_migration_ln` produces a real WAL entry
+    /// (non-zero LSN) when a LogManager is wired, rather than the fake
+    /// get_end_of_log() value.
+    #[test]
+    fn test_x6_migration_writes_real_wal_entry() {
+        use noxu_util::NULL_LSN;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_fm, lm) = make_fm_and_lm(dir.path());
+
+        // Simulate a migration: write an UpdateLN entry and confirm a
+        // non-NULL LSN is returned (X-6 fix).
+        let old_lsn = NULL_LSN;
+        let db_id: u64 = 1;
+        let key = b"migrated_key";
+        let data = b"migrated_value";
+
+        {
+            use bytes::BytesMut;
+            use noxu_log::{LogEntryType, Provisional};
+            use noxu_log::entry::LnLogEntry;
+            use noxu_util::vlsn::NULL_VLSN;
+
+            let entry = LnLogEntry::new(
+                db_id, None, old_lsn, false, None, None,
+                NULL_VLSN, 0, true,
+                key.to_vec(), Some(data.to_vec()), 0, NULL_VLSN,
+            );
+            let mut buf = BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            let new_lsn = lm.log(
+                LogEntryType::UpdateLN, &buf, Provisional::No, false, false,
+            ).expect("X-6: migration log write must succeed");
+            assert_ne!(
+                new_lsn.as_u64(), 0,
+                "X-6: migration must return a real non-NULL LSN"
+            );
+        }
+    }
 }

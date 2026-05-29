@@ -6,6 +6,7 @@
 
 use crate::LnInfo;
 use crate::cleaner_stat::CleanerStats;
+use bytes::BytesMut;
 use noxu_log::LogManager;
 use noxu_txn::{LockManager, LockType, TxnError};
 use noxu_util::Lsn;
@@ -41,6 +42,57 @@ fn release_cleaner_lock(
              continue but a small lock leak may occur",
         );
     }
+}
+
+/// Write a non-transactional LN migration entry to the WAL and return
+/// the freshly-allocated LSN.
+///
+/// X-6 fix: cleaner migration previously used `get_end_of_log()` as a
+/// fake LSN and wrote no WAL entry, so recovery after a crash before the
+/// next checkpoint could not find the migrated data.  This helper writes
+/// a real `UpdateLN` entry so recovery can reconstruct the slot.
+///
+/// Returns `None` if `lm` is `None` (test-only no-WAL context) or if the
+/// WAL write fails — in both cases the caller falls back to using the
+/// original `log_lsn`.
+fn write_migration_ln(
+    lm: &LogManager,
+    db_id: u64,
+    key: &[u8],
+    data: &[u8],
+    old_lsn: Lsn,
+) -> Option<Lsn> {
+    use noxu_log::{LogEntryType, Provisional, entry::LnLogEntry};
+    use noxu_util::vlsn::NULL_VLSN;
+
+    let entry = LnLogEntry::new(
+        db_id,
+        None,    // txn_id: non-transactional migration
+        old_lsn, // abort_lsn: the pre-migration slot LSN (before-image)
+        false,   // abort_known_deleted
+        None,    // abort_key
+        None,    // abort_data
+        NULL_VLSN, // abort_vlsn
+        0,       // abort_expiration
+        true,    // embedded_ln (data inline in BIN)
+        key.to_vec(),
+        Some(data.to_vec()),
+        0,       // expiration
+        NULL_VLSN, // vlsn
+    );
+
+    let buf_size = entry.log_size();
+    let mut bm = BytesMut::with_capacity(buf_size);
+    entry.write_to_log(&mut bm);
+
+    lm.log(
+        LogEntryType::UpdateLN,
+        &bm,
+        Provisional::No,
+        false, // flush_required: durability deferred to next checkpoint
+        false, // fsync_required
+    )
+    .ok()
 }
 
 /// The number of LN log entries after which we process pending LNs.
@@ -137,6 +189,12 @@ fn next_cleaner_locker_id() -> i64 {
 pub struct RealTreeLookup {
     tree: Arc<RwLock<noxu_tree::Tree>>,
     lock_manager: Arc<LockManager>,
+    /// Optional WAL manager for writing migration LN entries (X-6).
+    ///
+    /// When `None` (unit tests without a log), migration falls back to
+    /// inserting with the original `log_lsn` (pre-fix behavior acceptable
+    /// only in test contexts without a real WAL).
+    log_manager: Option<Arc<LogManager>>,
 }
 
 impl RealTreeLookup {
@@ -147,7 +205,13 @@ impl RealTreeLookup {
         tree: Arc<RwLock<noxu_tree::Tree>>,
         lock_manager: Arc<LockManager>,
     ) -> Self {
-        Self { tree, lock_manager }
+        Self { tree, lock_manager, log_manager: None }
+    }
+
+    /// Wire a WAL log manager for writing real migration LN entries (X-6).
+    pub fn with_log_manager(mut self, lm: Arc<LogManager>) -> Self {
+        self.log_manager = Some(lm);
+        self
     }
 }
 
@@ -273,6 +337,18 @@ impl TreeLookup for RealTreeLookup {
                 .unwrap_or_default()
         };
 
+        // X-6: write a real WAL entry for the migrated LN so that recovery
+        // after a crash before the next checkpoint can find the data at its
+        // new position.  Falls back to the original log_lsn if no log manager
+        // is wired (unit-test mode).
+        let db_id_u64 = _db_id.unsigned_abs();
+        let new_lsn = if let Some(lm) = &self.log_manager {
+            write_migration_ln(lm, db_id_u64, key, &data, log_lsn)
+                .unwrap_or(log_lsn)
+        } else {
+            log_lsn
+        };
+
         let outcome = {
             let tree = match self.tree.read() {
                 Ok(g) => g,
@@ -286,7 +362,7 @@ impl TreeLookup for RealTreeLookup {
                     return MigrationOutcome::Obsolete;
                 }
             };
-            match tree.insert(key.to_vec(), data, log_lsn) {
+            match tree.insert(key.to_vec(), data, new_lsn) {
                 Ok(_) => MigrationOutcome::Migrated,
                 Err(_) => MigrationOutcome::Obsolete,
             }
@@ -685,9 +761,10 @@ impl TreeLookup for SharedTreeLookup {
             return MigrationOutcome::Obsolete;
         }
 
-        let new_lsn = self.log_manager.get_end_of_log();
-        let _ = log_lsn;
-
+        // X-6: write a real WAL UpdateLN entry so that recovery after a
+        // crash before the next checkpoint can find the migrated data at its
+        // new WAL position.  Previously this used get_end_of_log() as a fake
+        // LSN and wrote no log entry.
         let data = {
             let tree = match self.tree.read() {
                 Ok(g) => g,
@@ -704,6 +781,11 @@ impl TreeLookup for SharedTreeLookup {
             RealTreeLookup::get_slot_data_from_root(tree.get_root(), key)
                 .unwrap_or_default()
         };
+
+        let db_id_u64 = _db_id.unsigned_abs();
+        let new_lsn =
+            write_migration_ln(&self.log_manager, db_id_u64, key, &data, log_lsn)
+                .unwrap_or_else(|| self.log_manager.get_end_of_log());
 
         let result =
             self.tree.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
