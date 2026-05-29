@@ -1336,10 +1336,8 @@ mod tests {
 
         // Build a tree with a dirty BIN.
         let tree = Tree::new(1, 256);
-        tree.insert(b"alpha".to_vec(), b"v1".to_vec(), Lsn::new(1, 1))
-            .unwrap();
-        tree.insert(b"beta".to_vec(), b"v2".to_vec(), Lsn::new(1, 2))
-            .unwrap();
+        tree.insert(b"alpha".to_vec(), b"v1".to_vec(), Lsn::new(1, 1)).unwrap();
+        tree.insert(b"beta".to_vec(), b"v2".to_vec(), Lsn::new(1, 2)).unwrap();
 
         let tree_arc = Arc::new(RwLock::new(tree));
 
@@ -1373,13 +1371,11 @@ mod tests {
         // the checkpointer must skip the already-clean BINs entirely.  No
         // BINDelta or full-BIN entries should be written.
         assert_eq!(
-            result.delta_ins_flushed,
-            0,
+            result.delta_ins_flushed, 0,
             "X-8: checkpointer must not write a redundant BINDelta for a BIN the evictor already flushed"
         );
         assert_eq!(
-            result.full_bins_flushed,
-            0,
+            result.full_bins_flushed, 0,
             "X-8: checkpointer must not write a redundant full-BIN for a BIN the evictor already flushed"
         );
     }

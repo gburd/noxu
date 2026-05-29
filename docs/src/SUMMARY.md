@@ -174,3 +174,4 @@
   - [Wave 11-V — Voice cleanup (agent-cruft + provenance)](internal/wave-11-v-cleanup.md)
   - [Audit (2026-05) — 2nd-pass cross-feature](internal/audit-2026-05-2ndpass-crossfeature.md)
   - [Wave 11-T — cross-feature critical correctness fixes](internal/wave-11-t-crossfeature.md)
+  - [Wave 11-X — XA/config/cache-budget fixes](internal/wave-11-x-config-xa-cluster.md)

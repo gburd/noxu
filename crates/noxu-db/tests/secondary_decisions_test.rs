@@ -1583,3 +1583,142 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
         OperationStatus::NotFound
     );
 }
+
+// ─── X-10: Secondary index abort torn-state isolation tests ───────────────
+
+/// X-10: Under READ_COMMITTED isolation (the default), a concurrent
+/// `SecondaryCursor` reader must never see torn state during a transaction
+/// abort that reverts both the primary record and the secondary index entry.
+///
+/// **Mechanism**: The abort undo loop holds write locks on all modified slots
+/// (both primary and secondary) until Phase 3 (`Txn::release_all_locks`).
+/// A READ_COMMITTED reader that acquires a read lock on any such slot blocks
+/// until the write locks are released, at which point all undo has been
+/// applied and the state is consistent.  No torn state is possible.
+///
+/// **READ_UNCOMMITTED**: Dirty reads bypass locking, so interim state IS
+/// observable.  That is by-design for that isolation level and is NOT a bug.
+///
+/// **Finding X-10 conclusion**: The existing per-slot write locks already
+/// prevent torn state under READ_COMMITTED.  This test is the regression guard.
+#[test]
+fn test_x10_secondary_abort_read_committed_no_torn_state() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+
+    let pri_db = env
+        .open_database(
+            None,
+            "x10_primary",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+    let pri_arc = Arc::new(noxu_sync::Mutex::new(pri_db));
+
+    let sec_inner = env
+        .open_database(
+            None,
+            "x10_secondary",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true)
+                .with_sorted_duplicates(true),
+        )
+        .unwrap();
+    let sec_cfg = noxu_db::SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_key_creator(Box::new(FirstByteCreator));
+    let sec_db = noxu_db::SecondaryDatabase::open(
+        Arc::clone(&pri_arc),
+        sec_inner,
+        sec_cfg,
+    )
+    .unwrap();
+    let sec_db = Arc::new(sec_db);
+
+    // Seed: key="K" data="Avalue" → sec_key="A"
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        pri_arc
+            .lock()
+            .put(
+                Some(&txn),
+                &noxu_db::DatabaseEntry::from_bytes(b"K"),
+                &noxu_db::DatabaseEntry::from_bytes(b"Avalue"),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let torn_seen = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let iterations = Arc::new(AtomicUsize::new(0));
+
+    // Reader: continuously reads via the secondary cursor under READ_COMMITTED.
+    // Invariant: if we find sec_key="A", the primary data must start with b"A".
+    let sec_clone = Arc::clone(&sec_db);
+    let pri_clone = Arc::clone(&pri_arc);
+    let torn_clone = Arc::clone(&torn_seen);
+    let done_clone = Arc::clone(&done);
+    let iter_clone = Arc::clone(&iterations);
+
+    let reader = std::thread::spawn(move || {
+        while !done_clone.load(Ordering::Relaxed) {
+            let Ok(mut cursor) = sec_clone.open_cursor(None, None) else {
+                continue;
+            };
+            let sec_key_a = noxu_db::DatabaseEntry::from_bytes(b"A");
+            let mut pk_entry = noxu_db::DatabaseEntry::new();
+            let mut data_entry = noxu_db::DatabaseEntry::new();
+            if let Ok(noxu_db::OperationStatus::Success) =
+                cursor.get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
+            {
+                let mut pri_data = noxu_db::DatabaseEntry::new();
+                let found = pri_clone
+                    .lock()
+                    .get(None, &pk_entry, &mut pri_data)
+                    .map(|s| s == noxu_db::OperationStatus::Success)
+                    .unwrap_or(false);
+                if found
+                    && let Some(pri_bytes) = pri_data.get_data()
+                    && (pri_bytes.is_empty() || pri_bytes[0] != b'A')
+                {
+                    torn_clone.store(true, Ordering::Relaxed);
+                }
+            }
+            iter_clone.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // Writer: abort cycle — update primary (changing sec_key A→B), then abort.
+    for _ in 0..300 {
+        let txn = env.begin_transaction(None).unwrap();
+        pri_arc
+            .lock()
+            .put(
+                Some(&txn),
+                &noxu_db::DatabaseEntry::from_bytes(b"K"),
+                &noxu_db::DatabaseEntry::from_bytes(b"Bvalue"),
+            )
+            .unwrap();
+        txn.abort().unwrap();
+    }
+
+    done.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+
+    assert!(
+        !torn_seen.load(Ordering::Relaxed),
+        "X-10: READ_COMMITTED secondary cursor must never see torn state \
+         during abort. iterations={}",
+        iterations.load(Ordering::Relaxed)
+    );
+}
