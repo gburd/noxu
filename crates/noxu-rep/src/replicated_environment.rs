@@ -195,7 +195,7 @@ pub struct ReplicatedEnvironment {
     /// Self-referential `Weak` populated once the env has been wrapped
     /// in an `Arc`.  Used by the replica I/O thread spawned in
     /// `become_replica` so it can call `bootstrap_via_dispatcher` when
-    /// the master signals `NeedsRestore` (Wave 9-A fix 2).
+    /// the master signals `NeedsRestore`.
     ///
     /// Populated lazily via [`Self::init_self_weak`] from `open()` and
     /// the test harness.  When unset (callers that build the env via
@@ -991,7 +991,7 @@ impl ReplicatedEnvironment {
     /// If the quorum policy is `Flexible` or `Expression`, the quorum system
     /// is rebuilt to reflect the new capacity/latency weights.
     ///
-    /// # Audit residual (rep F34, Wave 2C-4)
+    /// # Note
     ///
     /// `update_peer_metadata` does not currently re-run
     /// `QuorumPolicy::validate(electable_count)` after the metadata
@@ -1655,7 +1655,7 @@ impl ReplicatedEnvironment {
     /// `PEER_FEEDER` service can re-stream it; the local log is **not**
     /// updated.  This is documented behaviour rather than a stub — see
     /// `api-audit-2026-05-rep.md` finding #26 (medium) for the
-    /// `with_environment`-required local-apply path.  Wave 1C audit
+    /// `with_environment`-required local-apply path.
     /// cleanup (rep info F35: `_data` placeholder) renames the leading
     /// underscore so reviewers don't read it as a TODO.
     pub fn apply_entry(

@@ -74,7 +74,7 @@ pub struct Transaction {
     ///
     /// The name is purely diagnostic: it is included in `Debug`
     /// output and structured logs, and may be queried via
-    /// [`Transaction::get_name`].  Wave 1C audit cleanup
+    /// [`Transaction::get_name`].
     /// (transaction-env F22 `setName/getName missing`).
     name: Mutex<Option<String>>,
     /// Durability override (None = use environment default)
@@ -910,7 +910,7 @@ impl Transaction {
     ///
     /// Mirrors `Transaction.setName(String)`.  The name is purely
     /// diagnostic — it appears in `Debug` output, structured log
-    /// records, and lock-conflict reports.  Wave 1C audit cleanup
+    /// records, and lock-conflict reports.
     /// (transaction-env F22).
     pub fn set_name<S: Into<String>>(&self, name: S) {
         *self.name.lock().unwrap() = Some(name.into());
@@ -931,7 +931,7 @@ impl Transaction {
     /// LSN rather than per record).  Returns `0` for transactions that
     /// have not acquired any locks (or for read-only transactions
     /// running with read-uncommitted isolation, which skip lock
-    /// acquisition entirely).  Wave 1C audit cleanup
+    /// acquisition entirely).
     /// (transaction-env F23 "lock-stat reporting missing").
     pub fn lock_count(&self) -> usize {
         match &self.inner_txn {
@@ -1088,7 +1088,7 @@ mod tests {
         assert!(!txn.is_read_only());
     }
 
-    /// Wave 1C audit cleanup (transaction-env F22): set_name / get_name
+    /// `set_name` / `get_name`
     /// round-trip and survives commit (the JE shape stays valid until
     /// the txn is dropped).
     #[test]
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(txn.get_name().as_deref(), Some("workload-import-2"));
     }
 
-    /// Wave 1C audit cleanup (transaction-env F23): lock_count and
+    /// `lock_count` and
     /// lock_counts return zero when there is no inner Txn (i.e., the
     /// transaction is decorative — unit-test mode without an
     /// EnvironmentImpl wired in).

@@ -43,7 +43,7 @@ struct Branch {
 /// Branch reconstructed from a recovered (post-crash) prepared
 /// transaction.
 ///
-/// Wave 3-2 of the v1.5+ remediation plan, audit Critical C5.  Used to
+/// Used to
 /// resolve `xa_commit(xid)` / `xa_rollback(xid)` calls for XIDs that
 /// were prepared in a previous process and survived the crash via the
 /// `TxnPrepare` WAL frame.
@@ -68,13 +68,13 @@ struct RecoveredBranch {
 pub struct XaEnvironment {
     env: Environment,
     branches: Mutex<HashMap<Xid, Branch>>,
-    /// Wave 3-2: branches restored from the WAL `TxnPrepare` frames
+    /// Branches restored from the WAL `TxnPrepare` frames
     /// during the most recent `Environment::open()` recovery pass.
     /// Resolved via `xa_commit(xid)` / `xa_rollback(xid)`.
     recovered_branches: Mutex<HashMap<Xid, RecoveredBranch>>,
     prepared_log: Option<PreparedLog>,
     /// Recovery-scan cursor state for `xa_recover` (audit
-    /// persist-xa F5, Wave 2C-4).  X/Open requires `STARTRSCAN` to
+    /// X/Open requires `STARTRSCAN` to
     /// rewind the cursor and `ENDRSCAN` to release it; calls
     /// without `STARTRSCAN` resume from the saved cursor.  Stored
     /// here so a paginating TM no longer sees duplicates.
@@ -97,7 +97,7 @@ struct RecoverScan {
 impl XaEnvironment {
     /// Creates a new XaEnvironment wrapping the given environment.
     ///
-    /// Wave 3-2: also seeds the `recovered_branches` map from the
+    /// Also seeds the `recovered_branches` map from the
     /// engine's recovered prepared-txn list (the durable WAL
     /// `TxnPrepare` frames are the source of truth for crash
     /// durability), so `xa_recover()` returns in-doubt XIDs even when
@@ -113,7 +113,7 @@ impl XaEnvironment {
         }
     }
 
-    /// Wave 3-2: pull the recovered prepared-txn list out of the
+    /// Pull the recovered prepared-txn list out of the
     /// engine's `EnvironmentImpl` and rebuild the (Xid →
     /// RecoveredBranch) map.
     ///
@@ -809,7 +809,7 @@ mod tests {
         xa.xa_commit(&xid, XaFlags::NOFLAGS).unwrap();
     }
 
-    /// Audit persist-xa F5 (Wave 2C-4): STARTRSCAN / ENDRSCAN
+    /// STARTRSCAN / ENDRSCAN
     /// pagination. A second `xa_recover` call without STARTRSCAN
     /// (i.e. resume) returns the empty list because the previous
     /// call drained the cursor.

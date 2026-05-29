@@ -5,13 +5,13 @@
 ///
 /// Specifies the configuration parameters used to open a cursor on a database.
 ///
-/// # v1.5.1 changes (Wave 1C — F20)
+/// # Changes in v1.5.1
 ///
 /// Four fields that used to live on this struct (`read_committed`,
 /// `non_sticky`, `evict_ln`, `prefix_constraint`) were removed because
 /// the engine never consulted them.  See
-/// `docs/src/internal/v1.5-decisions-2026-05.md` (api-audit Wave 1C
-/// finding F20) for the full rationale and migration notes.
+/// `docs/src/internal/v1.5-decisions-2026-05.md` for the full rationale
+/// and migration notes.
 ///
 /// * `read_committed` — to use read-committed isolation, set it on the
 ///   surrounding [`crate::transaction_config::TransactionConfig`] (it

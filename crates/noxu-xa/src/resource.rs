@@ -39,7 +39,7 @@ pub trait XaResource: Send + Sync {
     ///
     /// If `flags` contains `ONEPHASE`, this is a one-phase commit optimization.
     ///
-    /// Crash-durable XA is supported as of v2.0 (Wave 3-2): a `TxnPrepare`
+    /// Crash-durable XA is supported as of v2.0: a `TxnPrepare`
     /// WAL frame is written during `xa_prepare`, and recovery surfaces
     /// in-doubt XIDs via `xa_recover()`.  The deprecated variant
     /// [`crate::error::XaError::CrashDurabilityNotSupported`] is no longer returned.
@@ -47,7 +47,7 @@ pub trait XaResource: Send + Sync {
 
     /// Roll back the transaction branch.
     ///
-    /// Crash-durable XA is supported as of v2.0 (Wave 3-2).
+    /// Crash-durable XA is supported as of v2.0.
     /// The deprecated variant
     /// [`crate::error::XaError::CrashDurabilityNotSupported`] is no
     /// longer returned; use [`XaResource::xa_forget`] to discard a heuristic
@@ -57,7 +57,7 @@ pub trait XaResource: Send + Sync {
     /// Recover prepared transaction branches after a crash.
     ///
     /// Returns a list of XIDs that are in PREPARED state and need resolution.
-    /// As of v2.0 (Wave 3-2) the engine writes a `TxnPrepare` WAL record
+    /// As of v2.0 the engine writes a `TxnPrepare` WAL record
     /// on `xa_prepare` and `noxu-recovery` reconstructs the in-memory
     /// `Transaction` on restart.  The deprecated variant
     /// [`crate::error::XaError::CrashDurabilityNotSupported`] is no longer returned.
