@@ -333,16 +333,25 @@ impl Cleaner {
                 // Update statistics
                 self.update_stats(&result);
 
-                // Mark file as cleaned in selector
+                // Mark file as cleaned in selector.
+                // X-5: do NOT immediately push to pending_deletions.
+                // The file will only become deletable after it passes
+                // through the two-checkpoint barrier in FileSelector.
+                // The checkpointer calls after_checkpoint() which advances
+                // cleaned → checkpointed → safe_to_delete over two
+                // successive checkpoints.
                 self.file_selector.lock().mark_file_cleaned(file_number);
-
-                // Mark file for deletion
-                self.pending_deletions.lock().push(file_number);
             }
         }
 
-        // Attempt to delete pending files
-        let files_deleted = self.delete_pending_files();
+        // X-5: only delete files that have passed the two-checkpoint barrier.
+        // `delete_safe_files()` reads `FileSelector::get_safe_to_delete()`
+        // which contains files that survived two checkpoints since cleaning.
+        let files_deleted = self.delete_safe_files();
+
+        // Legacy pending_deletions: still try any files that were queued
+        // via the old request_delete_files() API or by other callers.
+        let _legacy = self.delete_pending_files();
 
         // Adaptive throttle update (CleanerThrottle.update()).
         // Pull current cumulative write bytes from the LogManager and pass
@@ -764,6 +773,67 @@ impl Cleaner {
         &self.file_selector
     }
 
+    /// Notify the cleaner that a checkpoint has completed.
+    ///
+    /// Called by the checkpointer after `do_checkpoint()` succeeds.  This
+    /// method advances the three-state checkpoint barrier:
+    ///
+    /// * Files in `checkpointed` (captured by the prior checkpoint) move to
+    ///   `safe_to_delete`.
+    /// * Files in `cleaned_files` (snapshotted at checkpoint *start*) move
+    ///   to `checkpointed`.
+    ///
+    /// After this call, `delete_safe_files()` will remove files that have
+    /// survived two checkpoints.
+    ///
+    /// X-5 fix: `FileSelector::process_checkpoint_end` was fully implemented
+    /// but never called from outside the cleaner.
+    pub fn after_checkpoint(
+        &self,
+        state: &crate::file_selector::CheckpointStartCleanerState,
+    ) {
+        self.file_selector.lock().process_checkpoint_end(state);
+    }
+
+    /// Delete files that have passed the two-checkpoint barrier
+    /// (`safe_to_delete`).
+    ///
+    /// X-5 fix: replaces the old `delete_pending_files` call in `do_clean`
+    /// which deleted files immediately after cleaning without waiting for
+    /// a checkpoint.  Now only files returned by
+    /// `FileSelector::get_safe_to_delete()` are eligible.
+    pub fn delete_safe_files(&self) -> u32 {
+        let files_to_delete = {
+            let mut selector = self.file_selector.lock();
+            let to_delete = selector.get_safe_to_delete();
+            // Remove each file from the selector's tracking state after
+            // we decide to delete it so that a concurrent cleaning pass
+            // doesn't see a ghost entry.
+            for &f in &to_delete {
+                selector.remove_deleted_file(f);
+            }
+            to_delete
+        };
+
+        let mut deleted = 0u32;
+        for file_number in files_to_delete {
+            if !self.file_protector.is_protected(file_number) {
+                if let Some(fm) = &self.file_manager {
+                    let _ = fm.delete_file(file_number);
+                }
+                deleted += 1;
+                self.stats.deletions.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // File is still protected — re-queue for later deletion.
+                self.pending_deletions.lock().push(file_number);
+                // Also restore in the selector so the barrier is not lost.
+                self.file_selector.lock()
+                    .add_safe_to_delete_back(file_number);
+            }
+        }
+        deleted
+    }
+
     /// Returns a reference to the file protector.
     pub fn get_file_protector(&self) -> &FileProtector {
         &self.file_protector
@@ -1015,8 +1085,12 @@ mod tests {
         let result = cleaner.do_clean(5, false).unwrap();
         // process_single_file calls process_file_no_entries → completed=true
         assert_eq!(result.files_cleaned, 1);
-        // The file was not protected so it should be deleted immediately.
-        assert_eq!(result.files_deleted, 1);
+        // X-5: files are NOT deleted in the same cleaning pass.
+        // They wait for two checkpoints before appearing in safe_to_delete.
+        assert_eq!(
+            result.files_deleted, 0,
+            "X-5: file must not be deleted before checkpoint barrier"
+        );
         assert_eq!(result.total_entries_read, 0);
     }
 
@@ -1029,7 +1103,8 @@ mod tests {
 
         let result = cleaner.do_clean(10, false).unwrap();
         assert_eq!(result.files_cleaned, 3);
-        assert_eq!(result.files_deleted, 3);
+        // X-5: no deletions without checkpoint barrier.
+        assert_eq!(result.files_deleted, 0);
     }
 
     #[test]
@@ -1063,9 +1138,12 @@ mod tests {
 
         // process_file_no_entries returns 0 entries_read but completed=true.
         let snapshot = cleaner.get_stats().snapshot();
-        // runs incremented, deletions incremented
+        // runs incremented; X-5: deletions are 0 until checkpoint barrier fires.
         assert_eq!(snapshot.runs, 1);
-        assert_eq!(snapshot.deletions, 1);
+        assert_eq!(
+            snapshot.deletions, 0,
+            "X-5: no deletion before checkpoint barrier"
+        );
     }
 
     #[test]
@@ -1089,11 +1167,18 @@ mod tests {
 
         let result = cleaner.do_clean(5, false).unwrap();
         assert_eq!(result.files_cleaned, 1); // cleaned (processed)
-        assert_eq!(result.files_deleted, 0); // but not deleted yet
+        // X-5: even without protection, files wait for the checkpoint barrier.
+        // With protection, they also can't be deleted. Either way, 0 deletions.
+        assert_eq!(result.files_deleted, 0);
 
-        // Still in pending list.
-        let pending = cleaner.pending_deletions.lock();
-        assert!(pending.contains(&42));
+        // X-5: the file is in the 'cleaned' state in the FileSelector,
+        // waiting for a checkpoint before it becomes 'safe_to_delete'.
+        let status = cleaner.get_file_selector().lock().get_file_status(42);
+        assert_eq!(
+            status,
+            Some(crate::FileStatus::Cleaned),
+            "file should be in Cleaned state awaiting checkpoint barrier"
+        );
     }
 
     #[test]
@@ -1332,10 +1417,31 @@ mod tests {
         let result = cleaner.do_clean(5, false).unwrap();
 
         assert_eq!(result.files_cleaned, 1, "one file must be cleaned");
-        assert_eq!(result.files_deleted, 1, "one file must be deleted");
+        // X-5: files are NOT deleted in the same pass — barrier not yet active.
+        assert_eq!(
+            result.files_deleted, 0,
+            "X-5: file must not be deleted before checkpoint barrier"
+        );
+        // File still exists because no checkpoint has fired yet.
+        assert!(
+            file_path.exists(),
+            "log file must still exist before checkpoint barrier fires"
+        );
+
+        // Simulate two checkpoints to advance the barrier.
+        {
+            let state1 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            cleaner.after_checkpoint(&state1);
+            let state2 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            cleaner.after_checkpoint(&state2);
+        }
+
+        // Now delete_safe_files should remove the file.
+        let deleted = cleaner.delete_safe_files();
+        assert_eq!(deleted, 1, "one file must be deleted after two checkpoints");
         assert!(
             !file_path.exists(),
-            "log file must be gone from disk after do_clean"
+            "log file must be gone from disk after checkpoint barrier fires"
         );
     }
 
@@ -1574,8 +1680,20 @@ mod tests {
         let result = cleaner.do_clean(5, false).unwrap();
 
         assert_eq!(result.files_cleaned, 1);
-        assert_eq!(result.files_deleted, 1);
-        assert!(!file_path.exists(), "cleaned file must be removed from disk");
+        // X-5: no deletion without checkpoint barrier.
+        assert_eq!(result.files_deleted, 0);
+        assert!(file_path.exists(), "file must still exist before checkpoints");
+
+        // Advance through the two-checkpoint barrier.
+        {
+            let state1 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            cleaner.after_checkpoint(&state1);
+            let state2 = cleaner.get_file_selector().lock().get_checkpoint_state();
+            cleaner.after_checkpoint(&state2);
+        }
+        let deleted = cleaner.delete_safe_files();
+        assert_eq!(deleted, 1);
+        assert!(!file_path.exists(), "cleaned file must be removed from disk after barrier");
 
         // TxnCommit entries are classified as Other → not migrated.
         let stats = cleaner.get_stats().snapshot();

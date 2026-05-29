@@ -564,14 +564,18 @@ impl EnvironmentImpl {
         // `Checkpointer(env, DbEnvPool.CHECKPOINT_TIMEOUT_MS)`.
         let checkpointer = log_manager.as_ref().map(|lm| {
             use noxu_recovery::checkpointer::{CheckpointConfig, Checkpointer};
-            Arc::new(
-                Checkpointer::new(
-                    CheckpointConfig::new()
-                        .bytes_interval(cfg.checkpointer_bytes_interval),
-                )
-                .with_log_manager(Arc::clone(lm))
-                .with_tree(Arc::clone(&primary_tree), 1),
+            let mut builder = Checkpointer::new(
+                CheckpointConfig::new()
+                    .bytes_interval(cfg.checkpointer_bytes_interval),
             )
+            .with_log_manager(Arc::clone(lm))
+            .with_tree(Arc::clone(&primary_tree), 1);
+            // X-5: wire the cleaner so do_checkpoint calls after_checkpoint()
+            // and activates the three-state deletion barrier.
+            if let Some(ref c) = cleaner {
+                builder = builder.with_cleaner(Arc::clone(c));
+            }
+            Arc::new(builder)
         });
 
         // Start the background checkpointer daemon thread.

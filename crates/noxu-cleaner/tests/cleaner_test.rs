@@ -346,3 +346,94 @@ fn throttle_sleep_bounded_below() {
     let (sleep, _) = t.update(u64::MAX / 2, true);
     assert!(sleep >= 100, "sleep must be ≥ MIN_SLEEP_MS (100ms)");
 }
+
+// ─── X-5: Cleaner checkpoint barrier ──────────────────────────────────────────
+
+/// X-5: after cleaning, a file must NOT move to safe_to_delete until
+/// process_checkpoint_end has been called TWICE.  Verifies the two-checkpoint
+/// deletion barrier works end-to-end.
+#[test]
+fn x5_file_not_safe_to_delete_before_checkpoint() {
+    use noxu_cleaner::{CheckpointStartCleanerState, FileSelector};
+
+    let mut fs = FileSelector::new();
+
+    // Simulate: file 1 is tracked and cleaned.
+    fs.add_file_to_clean(1);
+    let _ = fs.select_file_for_cleaning(); // transitions to BeingCleaned
+    fs.mark_file_cleaned(1);
+
+    // Before any checkpoint: safe_to_delete must be empty.
+    assert!(
+        fs.get_safe_to_delete().is_empty(),
+        "file must not be safe_to_delete before any checkpoint"
+    );
+
+    // First checkpoint: snapshot state at start, then call process_checkpoint_end.
+    let state1 = fs.get_checkpoint_state();
+    assert_eq!(
+        state1.cleaned_files,
+        vec![1],
+        "checkpoint state should capture cleaned file"
+    );
+    fs.process_checkpoint_end(&state1);
+
+    // After first checkpoint: file moves cleaned → checkpointed, not safe_to_delete yet.
+    assert_eq!(
+        fs.get_file_status(1),
+        Some(noxu_cleaner::FileStatus::Checkpointed)
+    );
+    assert!(
+        fs.get_safe_to_delete().is_empty(),
+        "file must not be safe_to_delete after only one checkpoint"
+    );
+
+    // Second checkpoint: no new cleaned files, but the checkpointed file
+    // must advance to safe_to_delete.
+    let state2 = fs.get_checkpoint_state(); // cleaned_files is now empty
+    assert!(state2.cleaned_files.is_empty());
+    fs.process_checkpoint_end(&state2);
+
+    // After second checkpoint: file is safe_to_delete.
+    let safe = fs.get_safe_to_delete();
+    assert_eq!(safe, vec![1], "file must be safe_to_delete after two checkpoints");
+}
+
+/// X-5: files cleaned AFTER the first checkpoint start are NOT advanced to
+/// safe_to_delete after the first checkpoint end — they wait for the next cycle.
+#[test]
+fn x5_file_cleaned_after_checkpoint_start_waits() {
+    use noxu_cleaner::{CheckpointStartCleanerState, FileSelector};
+
+    let mut fs = FileSelector::new();
+
+    // First checkpoint: no cleaned files at start.
+    let state1 = fs.get_checkpoint_state();
+    assert!(state1.cleaned_files.is_empty());
+
+    // File 2 is cleaned AFTER the checkpoint start snapshot.
+    fs.add_file_to_clean(2);
+    let _ = fs.select_file_for_cleaning(); // transitions to BeingCleaned
+    fs.mark_file_cleaned(2);
+
+    fs.process_checkpoint_end(&state1);
+
+    // File 2 is NOT in the checkpoint state snapshot, so it stays in cleaned.
+    assert_eq!(fs.get_file_status(2), Some(noxu_cleaner::FileStatus::Cleaned));
+    assert!(fs.get_safe_to_delete().is_empty());
+
+    // Second checkpoint captures file 2.
+    let state2 = fs.get_checkpoint_state();
+    assert_eq!(state2.cleaned_files, vec![2]);
+    fs.process_checkpoint_end(&state2);
+
+    // File 2 moves to checkpointed.
+    assert_eq!(fs.get_file_status(2), Some(noxu_cleaner::FileStatus::Checkpointed));
+    assert!(fs.get_safe_to_delete().is_empty()); // still not ready
+
+    // Third checkpoint: file 2 advances to safe_to_delete.
+    let state3 = fs.get_checkpoint_state();
+    fs.process_checkpoint_end(&state3);
+    let safe = fs.get_safe_to_delete();
+    assert_eq!(safe, vec![2]);
+}

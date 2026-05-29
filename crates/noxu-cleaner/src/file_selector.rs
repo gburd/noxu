@@ -411,6 +411,15 @@ impl FileSelector {
         self.file_info.remove(&file_number);
     }
 
+    /// Re-inserts a file into the `safe_to_delete` set after it was removed
+    /// but could not be deleted yet because it was protected.
+    ///
+    /// Used by `Cleaner::delete_safe_files` to restore the deletion-pending
+    /// state for a file that was still protected at delete time.
+    pub fn add_safe_to_delete_back(&mut self, file_number: u32) {
+        self.safe_to_delete.insert(file_number);
+    }
+
     /// Returns a checkpoint state snapshot.
     pub fn get_checkpoint_state(&self) -> CheckpointStartCleanerState {
         let mut cleaned_files: Vec<u32> =
@@ -422,11 +431,36 @@ impl FileSelector {
 
     /// Processes files at checkpoint end.
     ///
-    /// Moves cleaned files to checkpointed status.
+    /// Implements the two-checkpoint deletion barrier (JE
+    /// `CleanerFileSelector.afterCheckpoint()`):
+    ///
+    /// 1. Files that were already in the `checkpointed` state (captured by a
+    ///    *prior* checkpoint) are advanced to `safe_to_delete`.  They have now
+    ///    survived two checkpoint intervals and recovery no longer needs their
+    ///    before-image data — any committed migration is captured by the
+    ///    current checkpoint.
+    ///
+    /// 2. Files that were in the `cleaned` state when the *current* checkpoint
+    ///    started (`state.cleaned_files`) are advanced to `checkpointed`.  They
+    ///    will become `safe_to_delete` after the next checkpoint.
+    ///
+    /// X-5 fix: the three-state barrier was previously never called from
+    /// outside the cleaner, so files were deleted in the same cleaning pass
+    /// before any checkpoint.
     pub fn process_checkpoint_end(
         &mut self,
         state: &CheckpointStartCleanerState,
     ) {
+        // Step 1: advance already-checkpointed files to safe_to_delete.
+        // Collect first to avoid modifying checkpointed while iterating.
+        let already_checkpointed: Vec<u32> =
+            self.checkpointed.iter().copied().collect();
+        for file_number in already_checkpointed {
+            self.mark_file_fully_processed(file_number);
+        }
+
+        // Step 2: advance cleaned files (from checkpoint-start snapshot)
+        // to checkpointed.
         for &file_number in &state.cleaned_files {
             if self.cleaned.contains(&file_number) {
                 self.mark_file_checkpointed(file_number);

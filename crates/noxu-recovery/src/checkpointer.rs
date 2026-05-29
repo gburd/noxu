@@ -181,6 +181,12 @@ pub struct Checkpointer {
     /// When set, `persist_file_summaries()` iterates tracked summaries and
     /// writes `FileSummaryLN` WAL entries.
     utilization_tracker: Option<Arc<std::sync::Mutex<UtilizationTracker>>>,
+    /// Optional cleaner reference for the post-checkpoint callback.
+    ///
+    /// After each successful `do_checkpoint`, the checkpointer calls
+    /// `cleaner.after_checkpoint(&state)` to advance the three-state
+    /// checkpoint barrier in `FileSelector`.  X-5 fix.
+    cleaner: Option<Arc<noxu_cleaner::Cleaner>>,
 }
 
 impl Checkpointer {
@@ -206,6 +212,7 @@ impl Checkpointer {
             bytes_since_checkpoint: AtomicU64::new(0),
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
             utilization_tracker: None,
+            cleaner: None,
         }
     }
 
@@ -245,6 +252,18 @@ impl Checkpointer {
         tracker: Arc<std::sync::Mutex<UtilizationTracker>>,
     ) -> Self {
         self.utilization_tracker = Some(tracker);
+        self
+    }
+
+    /// Wire a cleaner so that `do_checkpoint` calls
+    /// `cleaner.after_checkpoint()` after a successful checkpoint.
+    ///
+    /// This is the X-5 fix: it activates the three-state checkpoint barrier
+    /// (`cleaned → checkpointed → safe_to_delete`) in `FileSelector` so that
+    /// log files are only deleted after their migrations have been captured by
+    /// two successive checkpoints.
+    pub fn with_cleaner(mut self, cleaner: Arc<noxu_cleaner::Cleaner>) -> Self {
+        self.cleaner = Some(cleaner);
         self
     }
 
@@ -376,6 +395,15 @@ impl Checkpointer {
         let checkpoint_id =
             self.next_checkpoint_id.fetch_add(1, Ordering::SeqCst);
 
+        // X-5: snapshot the cleaner's "cleaned" file set at checkpoint START
+        // (before we write CkptStart) so we know which files were in the
+        // cleaned state when this checkpoint began.  Passed to
+        // `after_checkpoint` at the end of this function.
+        let cleaner_state =
+            self.cleaner.as_ref().map(|c| {
+                c.get_file_selector().lock().get_checkpoint_state()
+            });
+
         // Step 2: Write CkptStart entry to WAL (or synthesise a fake LSN when
         // no LogManager is wired — used by unit tests that don't need I/O).
         let start_lsn = if let Some(lm) = &self.log_manager {
@@ -498,6 +526,18 @@ impl Checkpointer {
         self.stats.last_ckpt_start.store(start_lsn.as_u64(), Ordering::Relaxed);
         self.stats.last_ckpt_end.store(end_lsn.as_u64(), Ordering::Relaxed);
         self.stats.last_ckpt_interval.store(elapsed_ms, Ordering::Relaxed);
+
+        // X-5: advance the cleaner's three-state checkpoint barrier now that
+        // a checkpoint has successfully completed.  Cleaned files that were
+        // snapshotted at checkpoint-start (`cleaner_state`) move to
+        // `checkpointed`; previously-checkpointed files move to
+        // `safe_to_delete` and will be removed on the next `delete_safe_files`
+        // call.
+        if let (Some(cleaner), Some(state)) =
+            (&self.cleaner, cleaner_state)
+        {
+            cleaner.after_checkpoint(&state);
+        }
 
         Ok(CheckpointResult {
             checkpoint_id,
