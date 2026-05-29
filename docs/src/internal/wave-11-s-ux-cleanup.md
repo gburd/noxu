@@ -86,10 +86,11 @@ discriminants.
 **Fix**: The doc said "most payload fields use little-endian" which is false —
 BIN/IN tree-node payloads use big-endian (`to_be_bytes()` / `put_u64()`).
 Replaced the endianness section with a per-field-category table:
-- Entry header integers → little-endian
-- B-tree node payloads (BIN/IN) → big-endian
-- VLSN → little-endian
-- LSN packed field → big-endian
+
+- Entry header integers: little-endian
+- B-tree node payloads (BIN/IN): big-endian
+- VLSN: little-endian
+- LSN packed field: big-endian
 
 ---
 
@@ -138,11 +139,11 @@ for-loop.
 
 **Fix**: All bare `#[ignore]` attributes replaced with
 `#[ignore = "<reason>"]` in:
+
 - `crates/noxu-db/tests/isolation_test.rs` (3 tests)
 - `crates/noxu-db/tests/sustained_load_test.rs` (2 tests)
 - `crates/noxu-rep/tests/torture_test.rs` (1 test)
-- `crates/noxu-xa/tests/xa_chaos_test.rs` (3 tests — including the
-  `test_xa_chaos_concurrent` which had a comment but no reason string)
+- `crates/noxu-xa/tests/xa_chaos_test.rs` (3 tests)
 
 `docs/src/contributing/testing-guide.md` updated with a "Slow / Stress Tests"
 section documenting the full inventory and how to run them.
@@ -182,25 +183,27 @@ cargo test --workspace --no-fail-fast        PASS — 5792 tests, 0 failures
 ```
 
 Previous baseline: 5774 tests. Wave 11-S adds +18:
+
 - H-1: 1 new test
 - Q-1: 12 new iter/range tests
 - Q-1 cursor_index fix: 5 previously-failing cursor tests now pass
-  (implicitly, confirmed by running noxu-dbi suite)
 
 ---
 
 ## W01/W06 Before/After (H-3)
 
-Benchmark run on dev workstation (AMD Ryzen 9, Linux, NOXU_MAX_SCALE=10000):
+Benchmark run on dev workstation (AMD Ryzen 9, Linux, NOXU_MAX_SCALE=10000).
 
 **Before** (main@4c33d28):
-```
+
+```text
 w01_seq_write   10000   1   5614.6ms   561461 ops/s
 w06_write_heavy 10000   1   5472.1ms   547211 ops/s
 ```
 
 **After** (this branch):
-```
+
+```text
 w01_seq_write   10000   1   5725.1ms   572515 ops/s
 w06_write_heavy 10000   1   5245.1ms   524506 ops/s
 ```
