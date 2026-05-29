@@ -521,7 +521,7 @@ impl Environment {
             } else {
                 noxu_dbi::EnvironmentImpl::open_database
             };
-            open_fn(&*env_impl, name, &dbi_config).map_err(|e| {
+            open_fn(&env_impl, name, &dbi_config).map_err(|e| {
                 match &e {
                     noxu_dbi::DbiError::DatabaseNotFound(_) => {
                         NoxuError::DatabaseNotFound(format!(
@@ -543,7 +543,8 @@ impl Environment {
             let db_name_commit = name.to_string();
             let env_impl_arc2 = Arc::clone(&self.env_impl);
             // SAFETY: is_transactional_create implies txn.is_some().
-            let txn_ref = txn.expect("invariant: txn is Some when is_transactional_create");
+            let txn_ref = txn
+                .expect("invariant: txn is Some when is_transactional_create");
             txn_ref.register_abort_callback(move || {
                 env_impl_arc.lock().abort_pending_database(&db_name_abort);
             });
@@ -1751,11 +1752,14 @@ mod tests {
     fn test_transactional_open_database_abort_removes_db() {
         let (temp_dir, config) = temp_env_config();
         {
-            let env = Environment::open(config.clone()).unwrap();
+            let env = Environment::open(config).unwrap();
             let txn = env.begin_transaction(None).unwrap();
-            let db_config =
-                DatabaseConfig::new().with_allow_create(true).with_transactional(true);
-            let _db = env.open_database(Some(&txn), "aborted_db", &db_config).unwrap();
+            let db_config = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true);
+            let _db = env
+                .open_database(Some(&txn), "aborted_db", &db_config)
+                .unwrap();
             txn.abort().unwrap();
             // After abort the database must not appear in the committed list.
             let names = env.get_database_names().unwrap();
@@ -1789,10 +1793,12 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config =
-            DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let txn = env.begin_transaction(None).unwrap();
-        let _db = env.open_database(Some(&txn), "pending_db", &db_config).unwrap();
+        let _db =
+            env.open_database(Some(&txn), "pending_db", &db_config).unwrap();
 
         // While txn is still uncommitted, another observer must not see
         // the database in the committed-names list.

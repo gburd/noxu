@@ -168,5 +168,6 @@
   - [Audit (2026-05) — Keith (perf + correctness)](internal/audit-2026-05-keith.md)
   - [Audit (2026-05) — Jonhoo (Rust idiom + soundness)](internal/audit-2026-05-jonhoo.md)
   - [Wave 11-Q — correctness fixes from 2026-05 audit](internal/wave-11-q-correctness.md)
+  - [Wave 11-R — semantic correctness fixes (v3.0.0)](internal/wave-11-r-semantic.md)
   - [Wave 11-L — API stability commitment + SemVer policy](internal/wave-11-l-api-stability.md)
   - [Wave 11-V — Voice cleanup (agent-cruft + provenance)](internal/wave-11-v-cleanup.md)

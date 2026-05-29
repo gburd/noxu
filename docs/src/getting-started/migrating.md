@@ -445,3 +445,70 @@ See
 for details.
 
 ---
+
+## v2.x → v3.0 — Wave 11-R breaking changes
+
+### C-4: `Environment::open_database` — `txn` parameter is now honoured
+
+The `_txn` parameter was silently ignored in v2.x.  In v3.0 it is renamed
+to `txn` and is functional:
+
+* When `txn: Some(&txn)` is supplied and `config.allow_create = true`, the
+  database creation is **transactional**.  If the transaction is subsequently
+  aborted, the database is rolled back and does not appear in the WAL.
+* `Environment::get_database_names()` now returns **committed names only**.
+  A database created inside an uncommitted transaction is not visible to
+  other callers until the transaction commits.
+
+#### Mechanical migration (no code change required for most users)
+
+If you pass `None` as the transaction argument, behaviour is unchanged.
+If you previously passed `Some(&txn)` expecting the parameter to be
+ignored (i.e. relied on non-transactional creation inside a txn scope),
+you must either:
+
+1. Pass `None` to preserve the old non-transactional semantics.
+2. Accept the new transactional semantics: call `txn.commit()` to persist
+   the database creation, or `txn.abort()` to roll it back.
+
+```rust
+// v2.x — txn ignored; database always created immediately
+let db = env.open_database(Some(&txn), "mydb", &cfg)?;
+// ...
+txn.abort(); // database still existed despite abort!
+
+// v3.0 — txn honoured; abort rolls back the creation
+let db = env.open_database(Some(&txn), "mydb", &cfg)?;
+// ...
+txn.abort(); // database registration is rolled back
+```
+
+### C-5: BIN delta log behaviour changes in checkpoint traces
+
+`BIN::should_log_delta()` gained three JE-equivalent guard clauses:
+
+1. BINs already in delta form always re-log as a delta (no change for
+   users; previously a spurious full BIN could be written).
+2. After `compress()` removes a dirty slot (`prohibit_next_delta = true`),
+   the next checkpoint writes a full BIN instead of a delta.
+3. A BIN whose full version has never been written (`last_full_version ==
+   NULL_LSN`) always writes a full BIN.
+
+On-disk format is unchanged; recovery is strictly safer.  Checkpoint
+output may differ (more full BINs in specific compress-then-checkpoint
+scenarios).  No application code changes are required.
+
+### Q-3: New API — `Environment::compress()` and `Environment::evict_memory()`
+
+Two new methods mirror JE's `Environment.compress()` and
+`Environment.evictMemory()`:
+
+```rust
+// Synchronously compress BINs with known-deleted slots.
+let n_bins_compressed: usize = env.compress()?;
+
+// Trigger the memory evictor.
+let bytes_freed: usize = env.evict_memory()?;
+```
+
+These are additive (non-breaking) additions to the public API.
