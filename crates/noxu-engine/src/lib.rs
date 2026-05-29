@@ -3,7 +3,6 @@
 // Apache License, Version 2.0 or the MIT license, at your option.
 // See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
 //! Engine orchestration for Noxu DB.
 //!

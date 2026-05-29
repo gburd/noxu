@@ -985,8 +985,14 @@ impl LockManager {
         };
 
         let cycle = DeadlockDetector::detect(locker_id, owner_ids, &waits_for)?;
-        // Pass empty lock_counts: select_victim falls back to youngest (highest ID).
-        let victim = DeadlockDetector::select_victim(&cycle, &HashMap::new());
+        // Compute per-locker lock counts for the cycle so select_victim can
+        // apply its primary criterion (fewest locks held) instead of falling
+        // through to the youngest-locker tiebreaker.  This walks every shard,
+        // but it only runs when a deadlock cycle has been detected (a rare
+        // event), so the scan cost is amortized over the rare deadlock
+        // event and is not on the common no-cycle path.
+        let lock_counts = self.compute_lock_counts(&cycle);
+        let victim = DeadlockDetector::select_victim(&cycle, &lock_counts);
 
         if victim == locker_id {
             // Format the cycle as typed locker IDs (e.g.
@@ -1002,6 +1008,32 @@ impl LockManager {
         } else {
             None
         }
+    }
+
+    /// Tallies, for every locker_id in `cycle`, the number of locks they
+    /// currently hold across all shards.
+    ///
+    /// Used by deadlock victim selection so the primary criterion (fewest
+    /// locks held = least work to roll back) can be applied.  Walks every
+    /// shard but is only called after a deadlock cycle has been detected,
+    /// so the scan cost is paid only on the rare cycle path, never on the
+    /// common no-cycle path.
+    fn compute_lock_counts(&self, cycle: &[i64]) -> HashMap<i64, usize> {
+        use std::collections::HashSet;
+        let cycle_set: HashSet<i64> = cycle.iter().copied().collect();
+        let mut counts: HashMap<i64, usize> =
+            cycle.iter().copied().map(|id| (id, 0usize)).collect();
+        for shard in &self.lock_tables {
+            let table = shard.lock();
+            for lock in table.values() {
+                for owner_id in lock.get_owner_ids() {
+                    if cycle_set.contains(&owner_id) {
+                        *counts.entry(owner_id).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        counts
     }
 }
 
@@ -1982,5 +2014,51 @@ mod tests {
             "expected at least one deadlock error, got: n_deadlocks={n_deadlocks} n_success={n_success}"
         );
         let _ = Duration::from_secs(0); // suppress unused import warning
+    }
+
+    /// H-4 regression: when select_victim has populated lock_counts, the
+    /// transaction holding the fewest locks is chosen, regardless of which
+    /// is youngest.
+    ///
+    /// Construct a 2-locker cycle where the *older* (lower-id) locker holds
+    /// many additional locks and the *younger* (higher-id) locker holds
+    /// only the cycle lock plus a couple more, then verify the younger
+    /// locker is selected.  (With the previous bug, lock_counts was always
+    /// empty so select_victim fell through to the youngest-tiebreaker; the
+    /// younger would be chosen *for the wrong reason*.  This test pins the
+    /// counts so the primary criterion drives the choice.)
+    #[test]
+    fn test_h4_victim_selection_uses_lock_counts() {
+        let lm = Arc::new(LockManager::new());
+        // L_OLD is held by locker 1 (older, holds 5 unrelated locks).
+        const L_OLD: u64 = 0x6001;
+        // L_NEW is held by locker 2 (younger, holds 0 unrelated locks).
+        const L_NEW: u64 = 0x6002;
+
+        // Locker 1 owns 5 unrelated locks then takes L_OLD.
+        for i in 0..5 {
+            lm.lock(0x7000 + i, 1, LockType::Write, false, false).unwrap();
+        }
+        lm.lock(L_OLD, 1, LockType::Write, false, false).unwrap();
+
+        // Locker 2 owns 0 unrelated locks, then takes L_NEW.
+        lm.lock(L_NEW, 2, LockType::Write, false, false).unwrap();
+
+        // Compute counts on the cycle [1, 2].
+        let counts = lm.compute_lock_counts(&[1, 2]);
+        assert_eq!(
+            counts.get(&1).copied().unwrap_or(0),
+            6,
+            "locker 1 holds 6 locks"
+        );
+        assert_eq!(
+            counts.get(&2).copied().unwrap_or(0),
+            1,
+            "locker 2 holds 1 lock"
+        );
+
+        // select_victim with these counts must pick locker 2 (fewest locks).
+        let victim = DeadlockDetector::select_victim(&[1, 2], &counts);
+        assert_eq!(victim, 2, "victim must be locker 2 (fewest locks held)");
     }
 }

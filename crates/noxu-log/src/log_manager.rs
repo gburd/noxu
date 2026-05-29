@@ -283,6 +283,15 @@ impl LogManager {
 
         // Pre-allocate the full buffer: [header | payload]
         let entry_size = header_size + item_size as usize;
+        // TODO(wave-11-q H-3): replace this per-call `vec![0u8; entry_size]`
+        // with a per-thread or per-LogManager scratch buffer reused across
+        // calls.  Currently 3-5% of CPU on all log-write paths and the
+        // largest single allocator-pressure source per the 2026-05 audit
+        // (Keith F-1.1).  Refactor deferred because the buffer must outlive
+        // the LWL-protected region: the encoded bytes are copied into the
+        // log buffer / file under LWL but the scratch reuse needs careful
+        // lifetime handling so the next caller's encoding doesn't trample
+        // a still-in-flight buffer.
         let mut entry_buf = vec![0u8; entry_size];
 
         // Fill in the header fields (checksum and prev_offset filled later).
