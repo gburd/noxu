@@ -117,30 +117,38 @@ categories = ["database-implementations", "data-structures", "concurrency"]
 readme = "README.md"
 
 [workspace.dependencies]
-# Internal crates
-noxu-sync = { path = "crates/noxu-sync" }
-noxu-util = { path = "crates/noxu-util" }
-noxu-latch = { path = "crates/noxu-latch" }
-noxu-config = { path = "crates/noxu-config" }
-noxu-log = { path = "crates/noxu-log" }
-noxu-tree = { path = "crates/noxu-tree" }
-noxu-txn = { path = "crates/noxu-txn" }
-noxu-evictor = { path = "crates/noxu-evictor" }
-noxu-cleaner = { path = "crates/noxu-cleaner" }
-noxu-recovery = { path = "crates/noxu-recovery" }
-noxu-dbi = { path = "crates/noxu-dbi" }
-noxu-engine = { path = "crates/noxu-engine" }
-noxu-db = { path = "crates/noxu-db" }
-noxu-bind = { path = "crates/noxu-bind" }
-noxu-collections = { path = "crates/noxu-collections" }
-noxu-persist = { path = "crates/noxu-persist" }
-noxu-persist-derive = { path = "crates/noxu-persist-derive" }
-noxu-xa = { path = "crates/noxu-xa" }
-noxu-rep = { path = "crates/noxu-rep" }
-noxu-observe = { path = "crates/noxu-observe" }
+# Public crates (published to crates.io in dep order at v3.0.0).
+# Both `version` and `path` are required: `version` is used by crates.io,
+# `path` is used for local development inside the workspace.
+noxu-sync         = { version = "2.4.1", path = "crates/noxu-sync" }
+noxu-util         = { version = "2.4.1", path = "crates/noxu-util" }
+noxu-latch        = { version = "2.4.1", path = "crates/noxu-latch" }
+noxu-config       = { version = "2.4.1", path = "crates/noxu-config" }
+noxu-log          = { version = "2.4.1", path = "crates/noxu-log" }
+noxu-tree         = { version = "2.4.1", path = "crates/noxu-tree" }
+noxu-txn          = { version = "2.4.1", path = "crates/noxu-txn" }
+noxu-evictor      = { version = "2.4.1", path = "crates/noxu-evictor" }
+noxu-cleaner      = { version = "2.4.1", path = "crates/noxu-cleaner" }
+noxu-recovery     = { version = "2.4.1", path = "crates/noxu-recovery" }
+noxu-dbi          = { version = "2.4.1", path = "crates/noxu-dbi" }
+noxu-engine       = { version = "2.4.1", path = "crates/noxu-engine" }
+noxu-db           = { version = "2.4.1", path = "crates/noxu-db" }
+noxu-bind         = { version = "2.4.1", path = "crates/noxu-bind" }
+noxu-collections  = { version = "2.4.1", path = "crates/noxu-collections" }
+noxu-persist      = { version = "2.4.1", path = "crates/noxu-persist" }
+noxu-persist-derive = { version = "2.4.1", path = "crates/noxu-persist-derive" }
+noxu-xa           = { version = "2.4.1", path = "crates/noxu-xa" }
+noxu-rep          = { version = "2.4.1", path = "crates/noxu-rep" }
+# Private / optional crates (not in the v3.0.0 publish list).
+# noxu-observe must have a version so that the noxu-db `observability` feature
+# can be dry-run published; the orchestrator must publish noxu-observe before
+# enabling that feature for crates.io users (see docs/src/contributing/publishing.md).
+noxu-observe      = { version = "2.4.1", path = "crates/noxu-observe" }
 
-# Quorum system library (authored by Greg Burd — path dep from local copy)
-quoracle = { path = "crates/noxu-rep/quoracle" }
+# Quorum system library (authored by Greg Burd — published at crates.io before
+# noxu-rep can be published; path dep used for local development).
+# If quoracle is not yet on crates.io, publish it first (see publishing.md).
+quoracle = { version = "1.2.1", path = "crates/noxu-rep/quoracle" }
 
 # QUIC transport (optional, pulled in by noxu-rep's "quic" feature)
 quinn   = { version = "0.11" }

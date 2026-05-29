@@ -9,7 +9,6 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 description = "Log file garbage collection for Noxu DB"
-publish = false  # internal implementation detail; consume via noxu-db
 
 [dependencies]
 parking_lot = { workspace = true }
