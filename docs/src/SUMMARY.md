@@ -172,3 +172,5 @@
   - [Wave 11-S — UX improvements + docs accuracy + cleanup](internal/wave-11-s-ux-cleanup.md)
   - [Wave 11-L — API stability commitment + SemVer policy](internal/wave-11-l-api-stability.md)
   - [Wave 11-V — Voice cleanup (agent-cruft + provenance)](internal/wave-11-v-cleanup.md)
+  - [Audit (2026-05) — 2nd-pass cross-feature](internal/audit-2026-05-2ndpass-crossfeature.md)
+  - [Wave 11-T — cross-feature critical correctness fixes](internal/wave-11-t-crossfeature.md)
