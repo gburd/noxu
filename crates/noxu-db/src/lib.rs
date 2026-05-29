@@ -21,7 +21,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use noxu_db::{EnvironmentConfig, DatabaseConfig};
 //! use std::path::PathBuf;
 //!

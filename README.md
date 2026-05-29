@@ -36,7 +36,7 @@ Open an environment, write a record, and read it back:
 
 ```rust
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };
 use std::path::PathBuf;
@@ -78,7 +78,7 @@ fn main() -> noxu_db::Result<()> {
     let mut cursor = db.open_cursor(None, None)?;
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
-    while cursor.get_next(&mut k, &mut v, None)? == OperationStatus::Success {
+    while cursor.get(&mut k, &mut v, Get::Next, None)? == OperationStatus::Success {
         println!("{:?} => {:?}", k.data(), v.data());
     }
     cursor.close()?;
