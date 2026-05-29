@@ -57,7 +57,22 @@ pub struct EnvironmentImpl {
     /// All open databases, keyed by DatabaseId.
     db_map: Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>>,
     /// Name -> DatabaseId mapping.
+    ///
+    /// Only contains **committed** database registrations.  Databases opened
+    /// inside an uncommitted transaction are held in `pending_names` until
+    /// the transaction commits; on abort they are removed without ever
+    /// appearing here.  This gives `get_database_names()` committed-only
+    /// visibility (JE `DbTree.getDbNames()` / 1-J fix).
     name_map: RwLock<HashMap<String, DatabaseId>>,
+
+    /// Names of databases whose creating transaction has not yet committed.
+    ///
+    /// Entries are added by `open_database()` when a transaction id is
+    /// supplied and removed when the transaction commits (moved to
+    /// `name_map`) or aborts (removed entirely).  `get_database_names()`
+    /// excludes names in this set so callers see only committed databases
+    /// (C-4 / JE 1-I / 1-J fix).
+    pending_names: RwLock<std::collections::HashSet<String>>,
 
     /// Whether the environment has been invalidated.
     is_invalid: AtomicBool,
@@ -690,6 +705,7 @@ impl EnvironmentImpl {
             txn_manager,
             db_map,
             name_map: RwLock::new(recovered_names),
+            pending_names: RwLock::new(std::collections::HashSet::new()),
             is_invalid: AtomicBool::new(false),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
@@ -792,10 +808,44 @@ impl EnvironmentImpl {
     // Database operations
 
     /// Creates or opens a database.
+    ///
+    /// `creating_txn_id`: when `Some`, the database is created under a
+    /// transaction and the name registration is deferred (C-4 / JE 1-I fix):
+    /// - The name is added to `pending_names` but NOT to `name_map` yet.
+    /// - `get_database_names()` excludes pending names.
+    /// - Call `commit_pending_database(name)` when the txn commits to move
+    ///   the name into `name_map` and persist the NameLN to the WAL.
+    /// - Call `abort_pending_database(name)` when the txn aborts to remove
+    ///   the db from `db_map` and `pending_names`.
+    ///
+    /// When `None` (non-transactional), behaviour is unchanged: the name
+    /// is inserted into `name_map` immediately and a NameLN is written.
     pub fn open_database(
         &self,
         name: &str,
         config: &DatabaseConfig,
+    ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
+        self.open_database_inner(name, config, false)
+    }
+
+    /// Transactional variant: creates the database under a transaction.
+    ///
+    /// The name is added to `pending_names` (not yet to `name_map`).  The
+    /// caller is responsible for calling `commit_pending_database` or
+    /// `abort_pending_database` when the transaction resolves.
+    pub fn open_database_transactional(
+        &self,
+        name: &str,
+        config: &DatabaseConfig,
+    ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
+        self.open_database_inner(name, config, true)
+    }
+
+    fn open_database_inner(
+        &self,
+        name: &str,
+        config: &DatabaseConfig,
+        transactional_create: bool,
     ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
         self.check_open()?;
 
@@ -855,18 +905,80 @@ impl EnvironmentImpl {
         db.read().increment_reference_count();
 
         self.db_map.write().insert(db_id, db.clone());
-        self.name_map.write().insert(name.to_string(), db_id);
 
-        // Persist the name → id mapping to the WAL (only for new creations
-        // and writable environments) so that subsequent reopens — including
-        // read-only ones with allow_create=false — can reconstruct name_map.
-        if recovered_db_id.is_none()
-            && let Some(lm) = &self.log_manager
-        {
-            let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
+        if transactional_create && recovered_db_id.is_none() {
+            // C-4 / JE 1-I fix: defer name_map insertion until commit.
+            // The name is visible within the creating txn (via db_map) but
+            // not to other callers of get_database_names() until committed.
+            self.pending_names.write().insert(name.to_string());
+        } else {
+            // Non-transactional path (or reopening a recovered db): insert
+            // into name_map immediately, as before.
+            self.name_map.write().insert(name.to_string(), db_id);
+
+            // Persist the name → id mapping to the WAL (only for new
+            // creations and writable environments) so that subsequent
+            // reopens can reconstruct name_map.
+            if recovered_db_id.is_none()
+                && let Some(lm) = &self.log_manager
+            {
+                let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
+            }
         }
 
         Ok(db)
+    }
+
+    /// Called when the transaction that created `name` commits.
+    ///
+    /// Moves the name from `pending_names` to `name_map` and persists the
+    /// NameLN to the WAL.  No-op if the name is not in `pending_names`
+    /// (safe to call idempotently).
+    pub fn commit_pending_database(&self, name: &str) {
+        let db_id = {
+            let mut pending = self.pending_names.write();
+            if !pending.remove(name) {
+                return; // not a pending transactional creation
+            }
+            // Look up the db_id we assigned during open_database_inner.
+            self.db_map.read().iter().find_map(|(id, db_arc)| {
+                if db_arc.read().get_name() == name {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(db_id) = db_id {
+            self.name_map.write().insert(name.to_string(), db_id);
+            if let Some(lm) = &self.log_manager {
+                let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
+            }
+        }
+    }
+
+    /// Called when the transaction that created `name` aborts.
+    ///
+    /// Removes the name from `pending_names` and removes the corresponding
+    /// `DatabaseImpl` from `db_map`, as though it was never created.  No-op
+    /// if the name is not pending.
+    pub fn abort_pending_database(&self, name: &str) {
+        let mut pending = self.pending_names.write();
+        if !pending.remove(name) {
+            return; // not a pending transactional creation
+        }
+        drop(pending);
+        // Remove from db_map: find by name, then remove by id.
+        let db_id = self.db_map.read().iter().find_map(|(id, db_arc)| {
+            if db_arc.read().get_name() == name {
+                Some(*id)
+            } else {
+                None
+            }
+        });
+        if let Some(id) = db_id {
+            self.db_map.write().remove(&id);
+        }
     }
 
     /// Write a NameLN entry to the WAL mapping `name` → `db_id`.
@@ -1114,7 +1226,11 @@ impl EnvironmentImpl {
             .map_err(DbiError::from)
     }
 
-    /// Returns the list of database names.
+    /// Returns the list of committed database names.
+    ///
+    /// Only databases whose creating transaction has committed are returned
+    /// (C-4 / JE 1-J fix).  Databases created inside an active transaction
+    /// are held in `pending_names` and excluded until the transaction commits.
     pub fn get_database_names(&self) -> Vec<String> {
         self.name_map.read().keys().cloned().collect()
     }
@@ -1359,6 +1475,48 @@ impl EnvironmentImpl {
     /// Returns the number of active transactions.
     pub fn n_active_txns(&self) -> usize {
         self.txn_manager.n_active_txns()
+    }
+
+    /// Synchronously compress all BINs that have known-deleted slots.
+    ///
+    /// Mirrors `Environment.compress()` in JE (`Environment.java:1887`).
+    /// Iterates every open database and calls `Tree::compress_bin` on each
+    /// BIN that has at least one known-deleted slot, exactly as the
+    /// background INCompressor daemon would.  Useful in tests to drain the
+    /// compression queue before taking a checkpoint, and in applications
+    /// that want deterministic memory reclamation after bulk deletes.
+    ///
+    /// Returns the total number of BINs that were compressed.
+    pub fn compress_all(&self) -> usize {
+        let mut total = 0usize;
+        let db_list: Vec<Arc<RwLock<DatabaseImpl>>> =
+            self.db_map.read().values().cloned().collect();
+        for db_arc in db_list {
+            let db = db_arc.read();
+            if let Some(tree) = db.get_real_tree() {
+                let bins = tree.collect_bins_with_known_deleted();
+                total += bins.len();
+                for bin_arc in bins {
+                    tree.compress_bin(&bin_arc);
+                }
+            }
+        }
+        total
+    }
+
+    /// Explicitly trigger the cache evictor to free memory.
+    ///
+    /// Mirrors `Environment.evictMemory()` in JE (`Environment.java:1860`).
+    /// Forwards the request to the `Evictor` / `Arbiter` subsystem.  The
+    /// evictor selects and evicts nodes from the in-memory B+tree cache
+    /// down toward the configured cache size, then returns the number of
+    /// bytes freed.  Useful when the application has just completed a bulk
+    /// load and wants to reclaim memory proactively.
+    ///
+    /// Returns the number of cache bytes evicted (0 if nothing was evicted
+    /// or no cache is active).
+    pub fn evict_memory(&self) -> usize {
+        self.evictor.do_evict(EvictionSource::Manual).bytes_evicted as usize
     }
 
     /// Returns the number of open databases.
