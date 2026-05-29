@@ -1,22 +1,13 @@
 # Migrating from v1.4.x
 
 This page lists every observable behaviour change between v1.4.x and
-v1.5 that is likely to surface in user code. The list is grouped by
-sprint so you can correlate each item with its audit finding and
-restriction note.
+v1.5 (and later releases) that is likely to surface in user code.
 
-> **v1.5 capability matrix:** see
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
-> for the canonical "what is supported in v1.5 vs planned for v1.6 /
-> v2.0" table.
+> **Capability matrix:** see
+> [Introduction → capability matrix](../introduction.md#capability-matrix-v15--v22)
+> for the canonical "what is supported in which release" table.
 
-## Wave 2B — Collections typed API and txn threading (v1.5 → v1.6)
-
-Wave 2B closes audit findings #1, #3, #4, #5, #11, and #12 from
-the May 2026 collections / bind audit.  This is the largest user-visible
-breaking change in the v1.5 → v1.6 transition.  See
-[`docs/src/internal/wave-2b-collections-typed.md`](../internal/wave-2b-collections-typed.md)
-for the full scope.
+## Collections API (v1.5 → v1.6)
 
 ### Source-level breaking changes
 
@@ -152,18 +143,18 @@ for the full scope.
   to `FnMut`.**  Closures may now capture mutable state (e.g. retry
   counters).
 
-## Behaviour changes (Sprint 1 — txn wiring)
+## Transaction wiring (v1.4.x → v1.5)
 
 These are previously-broken paths that the engine now executes
 correctly. Code that *depended* on the v1.4.x bug will break.
 
-* **`Database::open_cursor(Some(&txn), …)` now threads `txn` through
+* **`Database::open_cursor(Some(&txn), ...)` now threads `txn` through
   to the cursor.** Cursors opened on a transactional database
   participate in the transaction as documented. v1.4.x silently
-  ignored the argument — every cursor was effectively auto-commit.
+  ignored the argument - every cursor was effectively auto-commit.
   The change can surface as new lock conflicts on workloads that were
   accidentally racing against themselves.
-* **`SecondaryDatabase::open_cursor(Some(&txn), …)`** — same fix.
+* **`SecondaryDatabase::open_cursor(Some(&txn), ...)`** - same fix.
 * **`Database::count()` on a sorted-dup database** is now correct;
   v1.4.x returned 0.
 * **`Database::delete(key)` on a sorted-dup database** now removes
@@ -176,7 +167,7 @@ correctly. Code that *depended* on the v1.4.x bug will break.
   policy on the config but never threaded it into the txn manager.
 * **`TransactionConfig::read_uncommitted` is honoured.** Same shape.
 
-## Behaviour changes (Sprint 1 — cursor `Get` variants)
+## Cursor `Get` variants (v1.4.x → v1.5)
 
 * **`Get::SearchBoth` on a non-duplicates database now validates the
   data argument.** A non-matching data returns `NotFound` instead of
@@ -190,16 +181,11 @@ correctly. Code that *depended* on the v1.4.x bug will break.
   db shape); v1.5 surfaces a typed error so callers can match against
   it. Planned for v1.6.
 
-## Behaviour changes (Sprint 3D — v1.5 architectural decisions)
+## Architectural decisions (v1.5)
 
-These changes reject configurations the engine cannot honour today.
-The breakage radius for each is described in
-[`docs/src/internal/sprint-3-decisions-enforced.md`](../internal/sprint-3-decisions-enforced.md);
-none of them have non-test callers in the repository.
-
-* **`Environment::begin_transaction(Some(&parent), …)` returns
-  `NoxuError::Unsupported` (v1.5) — and the `parent` parameter has been
-  removed entirely in v2.0 (Wave 3-1).** Decision 3B. See the v1.5 →
+* **`Environment::begin_transaction(Some(&parent), ...)` returns
+  `NoxuError::Unsupported` (v1.5) - and the `parent` parameter has been
+  removed entirely in v2.0.**  See the v1.5 →
   v2.0 section below for the source-compatibility break.
 * **`SecondaryConfig::with_foreign_key_database` /
   `with_foreign_key_delete_action` /
@@ -211,16 +197,16 @@ none of them have non-test callers in the repository.
   on v1.5; the rejection fires only when an FK-configured config
   reaches `open`.
 
-  > **v1.6 (Wave 2A) update.** Foreign-key constraints are now
+  > **v1.6 update.** Foreign-key constraints are now
   > enforced.  Use the new
   > `SecondaryConfig::with_foreign_key_database_handle(Arc<Mutex<Database>>)`
   > setter to register the foreign primary's runtime handle; the
   > legacy `with_foreign_key_database(name)` setter is retained as
   > advisory but combining `name` *without* `handle` is rejected with
-  > `NoxuError::IllegalArgument`.  All three actions — Abort,
+  > `NoxuError::IllegalArgument`.  All three actions - Abort,
   > Cascade (transitive, with cycle detection), Nullify (single-key
-  > and multi-key) — work end-to-end under the caller's txn.  See
-  > [Wave 2A — Secondary database unification](../internal/wave-2a-secondary-unification.md).
+  > and multi-key) - work end-to-end under the caller's txn.  See
+  > [Secondary database unification](../internal/wave-2a-secondary-unification.md).
 
 * **`SecondaryDatabase` cross-primary collisions return
   `NoxuError::Unsupported`.** Decision 1B. v1.4.x silently overwrote
@@ -231,7 +217,7 @@ none of them have non-test callers in the repository.
   v1.4 callers that relied on `update_secondary(pk, None, Some(d))`
   twice for the same primary keep working.
 
-  > **v1.6 (Wave 2A) update.** v1.6 secondaries are sorted-dup, so
+  > **v1.6 update.** v1.6 secondaries are sorted-dup, so
   > many primaries may share a secondary key.  The inner secondary
   > database **must** be opened with
   > `DatabaseConfig::with_sorted_duplicates(true)`; without it,
@@ -240,10 +226,10 @@ none of them have non-test callers in the repository.
   > `get_next_dup_full` / `get_prev_dup_full` walk the duplicate run.
   > Additionally, `Database::put` / `Database::delete` now drive
   > every registered secondary automatically under the caller's
-  > txn — manual `update_secondary` calls are no longer required
+  > txn - manual `update_secondary` calls are no longer required
   > (but still supported for population paths).
 
-## Behaviour changes (Sprint 3A — XA in-process only)
+## XA in-process only (v1.5)
 
 See [`docs/src/internal/sprint-3-xa-restriction.md`](../internal/sprint-3-xa-restriction.md).
 
@@ -257,9 +243,9 @@ See [`docs/src/internal/sprint-3-xa-restriction.md`](../internal/sprint-3-xa-res
   writes via `Transaction::has_logged_entries`. `mark_write` is kept
   as a no-op for source compatibility.
 
-## Source-level breaking changes (Sprint 3B — DPL `txn` threading)
+## DPL transaction threading (v1.5)
 
-This is the only Sprint 3 change with a non-trivial source-level
+This is the only v1.5 change with a non-trivial source-level
 migration. See
 [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md).
 
@@ -276,7 +262,7 @@ migration. See
   Suppress in tests with `NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES=1`.
   Closes alongside Decision 1's sorted-dup work in v1.6.
 
-## On-disk breaking changes (Sprint 3C — collections & bind)
+## Collections and bind (v1.5)
 
 * **`SerdeBinding<T>` payloads now carry a 2-byte
   `[0xCB, 0x01]` magic + version header.** Records written by
@@ -295,10 +281,10 @@ migration. See
   but **does not recover** `next_index`; using it against an existing
   list re-uses slot 0 and overwrites the first record.
 
-## On-disk breaking changes (Wave 2C-2 — DPL entity record envelope)
+## DPL entity record envelope (v1.6)
 
 * **Every entity record stored by `noxu-persist::PrimaryIndex` now
-  carries a per-record class-version envelope.**  Pre-Wave-2C-2
+  carries a per-record class-version envelope.**  Pre-v1.6
   records were the raw output of
   `EntitySerializer::serialize`; v1.6 records prepend
 
@@ -312,15 +298,15 @@ migration. See
   This is **not backward-compatible** with pre-v1.6 entity stores.
   Reading a pre-v1.6 record under v1.6 fails with
   `PersistError::SerializationError("record too short for entity
-  envelope: ...")` or `"entity class tag mismatch: on-disk '…' !=
-  expected '…'"`.
+  envelope: ...")` or `"entity class tag mismatch: on-disk '...' !=
+  expected '...'"`.
 
   **Migration procedure (one-shot dump and reload):**
 
   1. While still on v1.5.x, run a dump utility that walks every
      entity database with the user's existing `EntitySerializer`
      and writes the deserialised entities to a sidecar file (any
-     format — JSON, ndjson, custom binary; the format is local to
+     format - JSON, ndjson, custom binary; the format is local to
      your migration).
   2. Take the application offline and bump to v1.6.
   3. Open the v1.6 environment with
@@ -330,7 +316,7 @@ migration. See
   4. Drop the v1.5 entity database files.
 
   Stores that opened the entity DBs **only** under v1.6 are
-  unaffected — the envelope is universal under v1.6.
+  unaffected - the envelope is universal under v1.6.
 
 * **`Entity` trait gained a default `class_version() -> u16` method.**
   Existing implementations need no change (the default is `0`).
@@ -343,7 +329,7 @@ migration. See
   method.**  Existing implementations work as-is.  Override
   `deserialize_versioned` when you want field-level evolution that
   reads old records lazily without rewriting them.  See
-  [Schema evolution](../collections/entity-persistence.md#schema-evolution-wave-2c-2).
+  [Schema evolution](../collections/entity-persistence.md#schema-evolution).
 
 * **A hidden catalog database
   `__noxu_persist_catalog__<store_name>` is now created in every
@@ -368,14 +354,12 @@ of any method.
   for v1.6 alongside Decision 1's sorted-dup + `associate` work. See
   [Secondary Indices with Transactions](../transactions/secondary-with-txn.md).
 * **`Stored*` collection methods now thread `Option<&Transaction>`
-  through every operation** — v1.5's auto-commit-only restriction is
-  closed by Wave 2B (see [Wave 2B — Collections typed API and txn
-  threading](#wave-2b--collections-typed-api-and-txn-threading-v15--v16)
+  through every operation** - v1.5's auto-commit-only restriction is
+  closed by v1.6 (see [Collections API (v1.5 → v1.6)](#collections-api-v15--v16)
   above).  `TransactionRunner` is now the recommended way to drive
   multi-statement `Stored*` sequences.
-* **Replication is GA in v2.0.** All ten GA blockers identified in
-  [`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md)
-  were closed across Waves 3-3 and 4-A.  See the
+* **Replication is GA in v2.0.** All ten pre-v2.0 blockers were
+  closed.  See the
   [Wave 4-A report](../internal/wave-4-a-rep-ga-finish.md) for
   per-finding resolution notes.
 
@@ -400,7 +384,7 @@ let txn2 = env.begin_transaction(Some(&txn), None)?; // returns
                                                      // NoxuError::Unsupported
                                                      // (v1.5; in v2.0 this
                                                      //  is a compile error
-                                                     //  — see the v1.5 →
+                                                     //  - see the v1.5 →
                                                      //  v2.0 section below)
 
 // DPL (breaking source-level signature change)
@@ -416,13 +400,12 @@ index.put(Some(&txn), &ser, &user)?;
 
 ---
 
-## v1.5 → v2.0 — nested-transaction parameter removed (Wave 3-1)
+## v1.5 → v2.0 — nested-transaction parameter removed
 
-Decision 3B in
-[`v1.5-decisions-2026-05.md`](../internal/v1.5-decisions-2026-05.md)
-staged the deprecation of the nested-transaction `parent` argument in
-two phases: v1.5 rejected `Some(_)` at runtime, and v2.0 removes the
-parameter from the signature entirely.  Wave 3-1 lands the v2.0 path.
+The `parent` parameter to `Environment::begin_transaction` was rejected
+at runtime in v1.5 and removed from the signature entirely in v2.0 —
+the type system now enforces the constraint and the misuse is a
+compile error.
 
 ### Breaking signature change
 
@@ -434,7 +417,7 @@ fn begin_transaction(
     config: Option<&TransactionConfig>,
 ) -> Result<Transaction>;
 
-// v2.0 (Wave 3-1)
+// v2.0
 fn begin_transaction(
     &self,
     config: Option<&TransactionConfig>,
@@ -453,13 +436,11 @@ let bad  = env.begin_transaction(Some(&parent), None)?;
 // after
 let txn  = env.begin_transaction(None)?;
 let txn2 = env.begin_transaction(Some(&cfg))?;
-// no v2.0 equivalent for nested txns — they remain unsupported, and the
+// no v2.0 equivalent for nested txns - they remain unsupported, and the
 // type system now enforces it.
 ```
 
-The blast radius for this change is small in practice because Decision
-3B's v1.5 path already rejected the `Some(parent)` form at runtime; in
-v2.0 the same misuse is caught at compile time instead.  See
+See
 [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md)
 for details.
 
