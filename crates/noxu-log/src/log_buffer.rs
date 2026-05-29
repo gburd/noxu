@@ -628,7 +628,7 @@ mod tests {
 
         // Wait for writer to complete and latch the buffer.
         {
-            let mut b = buf.lock().unwrap();
+            let b = buf.lock().unwrap();
             b.wait_for_zero_and_latch(); // Acquire-loads pin_count
             let data = b.get_data();
             assert_eq!(

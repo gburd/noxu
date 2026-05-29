@@ -1223,12 +1223,14 @@ mod tests {
         lm.io_invalid.store(true, Ordering::Release);
 
         // Post-condition: all subsequent log() calls must be rejected.
-        let result =
-            lm.log(LogEntryType::Trace, b"after", Provisional::No, false, false);
-        assert!(
-            result.is_err(),
-            "log() must fail after io_invalid is set"
+        let result = lm.log(
+            LogEntryType::Trace,
+            b"after",
+            Provisional::No,
+            false,
+            false,
         );
+        assert!(result.is_err(), "log() must fail after io_invalid is set");
 
         // is_io_invalid() accessor must agree.
         assert!(lm.is_io_invalid(), "is_io_invalid() must return true");

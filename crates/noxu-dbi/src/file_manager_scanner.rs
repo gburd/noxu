@@ -763,10 +763,8 @@ mod tests {
         // Corrupt one byte in the entry payload (past the header).
         let file_name = format!("{:08x}.ndb", commit_lsn.file_number());
         let file_path = dir.path().join(&file_name);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&file_path)
-            .unwrap();
+        let mut f =
+            std::fs::OpenOptions::new().write(true).open(&file_path).unwrap();
         let payload_byte_offset =
             commit_lsn.file_offset() as u64 + MIN_HEADER_SIZE as u64 + 1;
         f.seek(SeekFrom::Start(payload_byte_offset)).unwrap();
@@ -776,7 +774,7 @@ mod tests {
         drop(fm_for_path);
 
         // Scanner must not return the corrupted entry.
-        let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
+        let scanner = FileManagerLogScanner::new(Arc::clone(&fm));
         let entries = scanner.scan_forward(NULL_LSN, NULL_LSN);
         let found = entries.iter().any(
             |e| matches!(e.entry, LogEntry::TxnCommit(ref r) if r.txn_id == 55),

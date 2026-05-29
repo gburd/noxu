@@ -298,9 +298,6 @@ impl Election {
     }
 }
 
-// Safety: all interior mutability is behind noxu_sync Mutexes.
-unsafe impl Send for Election {}
-unsafe impl Sync for Election {}
 
 #[cfg(test)]
 mod tests {

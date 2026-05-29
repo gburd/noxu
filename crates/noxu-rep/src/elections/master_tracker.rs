@@ -159,9 +159,6 @@ impl MasterTracker {
     }
 }
 
-// Safety: all interior mutability is behind noxu_sync RwLocks.
-unsafe impl Send for MasterTracker {}
-unsafe impl Sync for MasterTracker {}
 
 #[cfg(test)]
 mod tests {

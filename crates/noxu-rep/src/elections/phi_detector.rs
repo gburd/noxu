@@ -208,9 +208,6 @@ impl PhiAccrualDetector {
     }
 }
 
-// Safety: all interior mutability is behind noxu_sync RwLocks.
-unsafe impl Send for PhiAccrualDetector {}
-unsafe impl Sync for PhiAccrualDetector {}
 
 // ---------------------------------------------------------------------------
 // Tests

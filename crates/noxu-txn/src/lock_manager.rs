@@ -1953,8 +1953,7 @@ mod tests {
             // Locker A grabs LSN_A, then tries to grab LSN_B (held by B).
             lm_a.lock(LSN_A, LOCKER_A, LockType::Write, false, false).unwrap();
             barrier_a.wait(); // both sides have their first lock
-            lm_a
-                .lock(LSN_B, LOCKER_A, LockType::Write, false, false)
+            lm_a.lock(LSN_B, LOCKER_A, LockType::Write, false, false)
         });
 
         let lm_b = Arc::clone(&lm);
@@ -1963,8 +1962,7 @@ mod tests {
             // Locker B grabs LSN_B, then tries to grab LSN_A (held by A).
             lm_b.lock(LSN_B, LOCKER_B, LockType::Write, false, false).unwrap();
             barrier_b.wait(); // both sides have their first lock
-            lm_b
-                .lock(LSN_A, LOCKER_B, LockType::Write, false, false)
+            lm_b.lock(LSN_A, LOCKER_B, LockType::Write, false, false)
         });
 
         // One thread must deadlock; the other must complete.  Neither should hang.
@@ -1973,12 +1971,11 @@ mod tests {
 
         // Exactly one of the two must be a deadlock error.
         let both = [res_a, res_b];
-        let n_deadlocks = both.iter().filter(|r| {
-            matches!(r, Ok(Err(TxnError::Deadlock(_))))
-        }).count();
-        let n_success = both.iter().filter(|r| {
-            matches!(r, Ok(Ok(_)))
-        }).count();
+        let n_deadlocks = both
+            .iter()
+            .filter(|r| matches!(r, Ok(Err(TxnError::Deadlock(_)))))
+            .count();
+        let n_success = both.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
         // Allow for timeout as well (one deadlock or one timeout + one success)
         assert!(
             (n_deadlocks == 1 && n_success <= 1) || n_deadlocks == 2,
