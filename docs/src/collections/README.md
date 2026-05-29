@@ -10,8 +10,7 @@ Noxu DB key-value store:
   `StoredKeySet<K>`, `StoredValueSet<V>`, and `StoredList<V>` views
   parameterised by `noxu_bind::EntryBinding` implementations.  Every
   method takes `txn: Option<&Transaction>` so the views compose with
-  user-driven transactions.  Corresponds to BDB-JE's
-  `com.sleepycat.collections`.
+  user-driven transactions.
 
 - **`noxu-persist`** — the Direct Persistence Layer (DPL), which lets
   you store Rust structs in Noxu databases through a typed
@@ -21,7 +20,7 @@ Noxu DB key-value store:
 
 ## v1.6 collections — what's in scope
 
-Wave 2B (v1.6) closes the v1.5 collections audit by:
+The v1.6 collections API provides:
 
 1. **Typed `Stored*` surface.**  `StoredMap<K, V, KB, VB>` is now
    parameterised by `EntryBinding`s for keys and values.  Same for
