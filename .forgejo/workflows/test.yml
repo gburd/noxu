@@ -174,3 +174,44 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  semver-checks:
+    # Advisory SemVer gate — mirrors the GitHub workflow job.  See
+    # docs/src/contributing/semver-policy.md for promotion criteria.
+    name: SemVer checks (advisory)
+    runs-on: lxc-bookworm
+    needs: check
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build prerequisites
+        run: |
+          apt-get update -q
+          apt-get install -qy curl build-essential pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-semver-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-semver-
+
+      - name: Install cargo-semver-checks (pinned)
+        run: cargo install cargo-semver-checks --version 0.47.0 --locked
+
+      - name: Run cargo-semver-checks
+        run: cargo semver-checks --workspace --baseline-rev main
