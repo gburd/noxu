@@ -631,7 +631,7 @@ impl Checkpointer {
     /// durable.
     ///
     /// `Checkpointer.processINList()` + `Checkpointer.logIN()`.
-    fn flush_dirty_bins_internal(&self) -> Result<FlushResult> {
+    pub(crate) fn flush_dirty_bins_internal(&self) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
         let lm = match &self.log_manager {
@@ -671,7 +671,14 @@ impl Checkpointer {
             let total = b.entries.len();
             let dirty = b.dirty_count();
 
-            if total == 0 && !b.dirty {
+            // X-8: skip nodes that the evictor already flushed and cleared
+            // between our dirty-BIN snapshot (under tree read lock) and the
+            // per-node write-lock acquisition.  The old guard `total == 0 &&
+            // !b.dirty` was too narrow: a node with entries but zero dirty
+            // slots and the node-level dirty flag clear is also clean.
+            // Writing an empty BINDelta for such a node is a no-op but wastes
+            // log space and incorrectly advances `last_delta_lsn`.
+            if !b.dirty && dirty == 0 {
                 continue;
             }
 
@@ -842,7 +849,7 @@ impl<'a> Drop for CheckpointGuard<'a> {
 
 /// Internal struct for tracking flush results.
 #[derive(Debug, Default)]
-struct FlushResult {
+pub(crate) struct FlushResult {
     full_ins_flushed: u64,
     full_bins_flushed: u64,
     delta_ins_flushed: u64,
@@ -1300,5 +1307,80 @@ mod tests {
         // After checkpoint, dirty BINs should be cleared.
         let dirty_after = tree_arc.read().unwrap().collect_dirty_bins(1);
         assert!(dirty_after.is_empty(), "no dirty BINs after checkpoint");
+    }
+
+    /// X-8 regression: checkpointer must not write a redundant empty BINDelta
+    /// for a node that the evictor already flushed and cleared between the
+    /// dirty-BIN snapshot and the per-node write-lock acquisition.
+    ///
+    /// Simulates the race by:
+    /// 1. Building a tree with dirty BINs.
+    /// 2. Collecting the dirty-BIN snapshot (as the checkpointer would).
+    /// 3. Acquiring each BIN's write lock and calling
+    ///    `clear_dirty_after_full_log` (simulating the evictor flushing).
+    /// 4. Running `flush_dirty_bins_internal` and asserting that zero
+    ///    BINDelta or full-BIN entries are written (nothing left to flush).
+    #[test]
+    fn test_x8_no_redundant_bindelta_after_evictor_flush() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::Tree;
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Build a tree with a dirty BIN.
+        let tree = Tree::new(1, 256);
+        tree.insert(b"alpha".to_vec(), b"v1".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree.insert(b"beta".to_vec(), b"v2".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // Snapshot dirty BINs (as the checkpointer does under tree read lock).
+        let dirty_bins = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(!dirty_bins.is_empty(), "precondition: must have dirty BINs");
+
+        // Simulate the evictor flushing every dirty BIN (writes a full BIN
+        // entry to WAL and clears the dirty flag) BEFORE the checkpointer
+        // acquires the per-node write lock.
+        let evictor_lsn = Lsn::new(2, 0); // fake "evictor-wrote" LSN
+        for (_db_id, bin_arc) in &dirty_bins {
+            let mut guard = bin_arc.write();
+            if let TreeNode::Bottom(ref mut b) = *guard {
+                // Mark the BIN as "already flushed" by the evictor.
+                b.clear_dirty_after_full_log(evictor_lsn);
+            }
+        }
+
+        // Now build the checkpointer and run the internal flush over the
+        // stale snapshot (all BINs are now clean).
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_tree(Arc::clone(&tree_arc), 1);
+
+        let result = checkpointer
+            .flush_dirty_bins_internal()
+            .expect("flush_dirty_bins_internal failed");
+
+        // X-8 fix: with the guard `if !b.dirty && dirty == 0 { continue; }`,
+        // the checkpointer must skip the already-clean BINs entirely.  No
+        // BINDelta or full-BIN entries should be written.
+        assert_eq!(
+            result.delta_ins_flushed,
+            0,
+            "X-8: checkpointer must not write a redundant BINDelta for a BIN the evictor already flushed"
+        );
+        assert_eq!(
+            result.full_bins_flushed,
+            0,
+            "X-8: checkpointer must not write a redundant full-BIN for a BIN the evictor already flushed"
+        );
     }
 }
