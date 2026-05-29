@@ -153,6 +153,17 @@ pub struct EnvironmentImpl {
     /// Database tree access for file processing.
     primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>>,
 
+    /// Per-database tree registry for secondary databases (X-7 fix).
+    ///
+    /// Maps `db_id.id() as i64` → `Arc<RwLock<Tree>>` for every non-primary
+    /// database that has been opened.  The cleaner's `SharedTreeLookup`
+    /// dispatches liveness checks for non-primary LNs to the correct tree
+    /// via `with_extra_trees`.
+    ///
+    /// The `Arc<Mutex<…>>` wrapper lets `open_database_inner` insert entries
+    /// after the cleaner has already been constructed.
+    db_trees_registry: Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<std::sync::RwLock<noxu_tree::Tree>>>>>,
+
     /// The log-file garbage collector.
     ///
     /// Created in `new()` for writable environments via
@@ -588,6 +599,12 @@ impl EnvironmentImpl {
         // Build the cleaner wired to the FileManager, primary tree, and
         // LogManager for writable environments.  Read-only envs get None.
         //
+        // Build the db_trees_registry that will be shared between this
+        // EnvironmentImpl and the Cleaner (X-7 fix).  Created here so we can
+        // pass it to the cleaner constructor before EnvironmentImpl is built.
+        let db_trees_registry: Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<std::sync::RwLock<noxu_tree::Tree>>>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
         let cleaner = log_manager.as_ref().map(|lm| {
@@ -595,15 +612,20 @@ impl EnvironmentImpl {
             // Pass the environment's shared LockManager so that cleaner-held
             // locks contend with user transactions for correct deadlock
             // detection. The cleaner uses the environment's shared lock manager.
-            Arc::new(Cleaner::with_file_manager_tree_and_lock_manager(
-                cfg.cleaner_min_utilization as u32,
-                cfg.cleaner_min_file_count,
-                cfg.cleaner_min_age as u64,
-                fm,
-                Arc::clone(&primary_tree),
-                Arc::clone(lm),
-                Arc::clone(&lock_manager),
-            ))
+            Arc::new(
+                Cleaner::with_file_manager_tree_and_lock_manager(
+                    cfg.cleaner_min_utilization as u32,
+                    cfg.cleaner_min_file_count,
+                    cfg.cleaner_min_age as u64,
+                    fm,
+                    Arc::clone(&primary_tree),
+                    Arc::clone(lm),
+                    Arc::clone(&lock_manager),
+                )
+                // X-7: wire the shared db-tree registry so the cleaner
+                // dispatches secondary-LN liveness checks to the correct tree.
+                .with_tree_registry(Arc::clone(&db_trees_registry)),
+            )
         });
 
         // Build the checkpointer, wired to the LogManager and the primary
@@ -824,6 +846,7 @@ impl EnvironmentImpl {
             recovery_vlsns,
             recovery_rollback_matchpoint,
             primary_tree,
+            db_trees_registry,
             cleaner,
             checkpointer,
             checkpointer_handle: Mutex::new(checkpointer_thread),
@@ -1022,6 +1045,16 @@ impl EnvironmentImpl {
 
         let db = Arc::new(RwLock::new(db_impl));
         db.read().increment_reference_count();
+
+        // X-7: register this database's tree in the shared registry so the
+        // cleaner can dispatch secondary-LN liveness checks to the correct
+        // tree.  Since the cleaner holds an Arc clone of db_trees_registry,
+        // it will automatically see this tree on its next clean cycle.
+        if let Some(tree_arc) = db.read().get_real_tree_arc() {
+            if let Ok(mut reg) = self.db_trees_registry.lock() {
+                reg.insert(db_id.id(), tree_arc);
+            }
+        }
 
         self.db_map.write().insert(db_id, db.clone());
 

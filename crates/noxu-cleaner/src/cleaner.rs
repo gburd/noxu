@@ -16,6 +16,7 @@ use noxu_log::{
     file_header::FILE_HEADER_SIZE,
 };
 use noxu_sync::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -96,6 +97,17 @@ pub struct Cleaner {
     /// Using `env.getTxnManager().getLockManager()`.
     lock_manager: Option<Arc<noxu_txn::LockManager>>,
 
+    /// Per-database tree registry for secondary databases (X-7 fix).
+    ///
+    /// Maps `db_id.id() as i64` → `Arc<RwLock<Tree>>` for every non-primary
+    /// database that has been opened.  The cleaner's `SharedTreeLookup`
+    /// dispatches liveness checks for non-primary LNs to the correct tree
+    /// via `with_extra_trees`.
+    ///
+    /// The `Arc<Mutex<…>>` wrapper lets `open_database_inner` insert entries
+    /// after the cleaner has already been constructed.
+    extra_trees: Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
+
     /// Adaptive throttle: tracks the log write rate and computes sleep
     /// intervals and files-per-pass recommendations for the daemon loop.
     ///
@@ -143,6 +155,7 @@ impl Cleaner {
             tree: None,
             log_manager: None,
             lock_manager: None,
+            extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
@@ -175,6 +188,7 @@ impl Cleaner {
             tree: None,
             log_manager: None,
             lock_manager: None,
+            extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
@@ -217,6 +231,7 @@ impl Cleaner {
             tree: Some(tree),
             log_manager: Some(log_manager),
             lock_manager: None,
+            extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
         }
     }
@@ -254,7 +269,33 @@ impl Cleaner {
             tree: Some(tree),
             log_manager: Some(log_manager),
             lock_manager: Some(lock_manager),
+            extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
+        }
+    }
+
+    /// Register per-database trees for secondary databases (X-7 fix).
+    ///
+    /// Accepts a shared registry `Arc` so the environment can dynamically add
+    /// trees as databases are opened after the cleaner is constructed.
+    pub fn with_tree_registry(
+        mut self,
+        registry: Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
+    ) -> Self {
+        self.extra_trees = registry;
+        self
+    }
+
+    /// Register a single additional tree for `db_id` (X-7 fix).
+    ///
+    /// Idempotent — calling with the same `db_id` replaces the previous entry.
+    pub fn register_db_tree(
+        &self,
+        db_id: i64,
+        tree: Arc<RwLock<noxu_tree::Tree>>,
+    ) {
+        if let Ok(mut reg) = self.extra_trees.lock() {
+            reg.insert(db_id, tree);
         }
     }
 
@@ -412,8 +453,20 @@ impl Cleaner {
                     Arc::clone(lm),
                     Arc::clone(shared_lm),
                 )
+                .with_extra_trees(
+                    self.extra_trees
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
+                )
             } else {
                 SharedTreeLookup::new(Arc::clone(tree), Arc::clone(lm))
+                    .with_extra_trees(
+                        self.extra_trees
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default(),
+                    )
             };
             return processor.process_file(
                 file_number,
@@ -1766,5 +1819,99 @@ mod tests {
                 "X-6: migration must return a real non-NULL LSN"
             );
         }
+    }
+
+    /// X-7: SharedTreeLookup dispatches secondary-LN liveness checks to the
+    /// correct tree (registered in extra_trees), not the primary tree.
+    ///
+    /// Without the fix, a secondary key looked up in the primary tree returns
+    /// NotFound, and the LN is misclassified as Obsolete (silently dropped).
+    /// With the fix, the lookup resolves to the secondary tree where the key
+    /// actually lives, and the LN is correctly migrated.
+    #[test]
+    fn test_x7_secondary_ln_migrated_in_correct_tree() {
+        use crate::file_processor::{
+            BinLookupResult, MigrationOutcome, SharedTreeLookup,
+            TreeLookup,
+        };
+        use noxu_log::{FileManager, LogManager};
+        use noxu_tree::tree::Tree;
+        use noxu_util::lsn::Lsn;
+        use std::sync::{Arc, RwLock};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100)
+                .unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Build a PRIMARY tree (db_id=1) with a primary key.
+        let primary = Tree::new(1, 256);
+        primary
+            .insert(b"pri_key".to_vec(), b"pri_data".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        let primary_arc: Arc<RwLock<Tree>> =
+            Arc::new(RwLock::new(primary));
+
+        // Build a SECONDARY tree (db_id=2) with a secondary key.
+        let sec = Tree::new(2, 256);
+        let sec_lsn = Lsn::new(1, 50);
+        sec.insert(
+            b"sec_key".to_vec(),
+            b"pri_key".to_vec(), // secondary value = primary key
+            sec_lsn,
+        )
+        .unwrap();
+        let sec_arc: Arc<RwLock<Tree>> = Arc::new(RwLock::new(sec));
+
+        // Wire both trees into the SharedTreeLookup.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(2i64, Arc::clone(&sec_arc));
+        let lookup = SharedTreeLookup::new(Arc::clone(&primary_arc), Arc::clone(&lm))
+            .with_extra_trees(extra);
+
+        // --- Test primary LN lookup (db_id=1) ---
+        let primary_result =
+            lookup.lookup_parent_bin(1, b"pri_key", Lsn::new(1, 1));
+        assert!(
+            matches!(primary_result, BinLookupResult::Found { .. }),
+            "X-7: primary key must be found in primary tree"
+        );
+
+        // --- Test secondary LN lookup (db_id=2) ---
+        let sec_result =
+            lookup.lookup_parent_bin(2, b"sec_key", Lsn::new(1, 50));
+        assert!(
+            matches!(sec_result, BinLookupResult::Found { .. }),
+            "X-7: secondary key must be found in secondary tree (not primary)"
+        );
+
+        // Without the fix (no extra_trees), looking up sec_key in primary
+        // would return NotFound.  Verify this expectation for documentation:
+        let lookup_no_extra =
+            SharedTreeLookup::new(Arc::clone(&primary_arc), Arc::clone(&lm));
+        let bad_result =
+            lookup_no_extra.lookup_parent_bin(2, b"sec_key", Lsn::new(1, 50));
+        assert!(
+            matches!(bad_result, BinLookupResult::NotFound),
+            "without extra_trees, secondary key is NotFound in primary (pre-fix behavior confirmed)"
+        );
+
+        // --- Verify migration outcome ---
+        // With the fix: migrate_ln_slot for db_id=2 resolves against the
+        // secondary tree.  sec_key has tree_lsn == sec_lsn, so it matches
+        // and the slot is migrated (or returns Migrated).
+        let BinLookupResult::Found { tree_lsn } = sec_result else {
+            panic!("lookup must succeed to test migration");
+        };
+        let outcome = lookup.migrate_ln_slot(2, b"sec_key", sec_lsn, tree_lsn);
+        assert_ne!(
+            outcome,
+            MigrationOutcome::Obsolete,
+            "X-7: secondary LN must not be misclassified as Obsolete"
+        );
     }
 }
