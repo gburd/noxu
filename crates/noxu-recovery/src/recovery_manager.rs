@@ -549,6 +549,13 @@ impl RecoveryManager {
         self.set_progress(RecoveryProgress::UndoLNs);
         self.run_undo_all(scanner, &analysis, trees)?;
 
+        // X-1: record the minimum rollback matchpoint so ReplicatedEnvironment
+        // can truncate the VLSN index to match the recovered B-tree state.
+        self.info.rollback_matchpoint_lsn = self
+            .rollback_tracker
+            .safe_matchpoint_lsn()
+            .map(|lsn| lsn.as_u64());
+
         // Wave 3-2: surface prepared (XA in-doubt) txns to the env layer.
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
         self.info.recovered_prepared_txns =
@@ -654,17 +661,29 @@ impl RecoveryManager {
         let redo_entries: Vec<(Lsn, LnRecord)> =
             std::mem::take(&mut self.redo_entries);
 
+        // X-14: collect VLSN→LSN pairs from replayed entries so that
+        // ReplicatedEnvironment::with_environment can rebuild the VLSN index.
+        let mut vlsn_pairs: Vec<(u64, u64)> = Vec::new();
+
         for (lsn, rec) in &redo_entries {
             self.stats.lns_read_redo += 1;
             let action =
                 self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
             if let RedoAction::Apply = action {
+                if let Some(curr) = rec.vlsn {
+                    vlsn_pairs.push((curr, lsn.as_u64()));
+                }
                 if let Some(t) = trees.get_mut(&rec.db_id) {
                     Self::redo_ln(t, rec, *lsn);
                 }
                 self.stats.lns_redone += 1;
             }
         }
+        // Sort and deduplicate (keep last occurrence per VLSN).
+        vlsn_pairs.sort_unstable_by_key(|&(vlsn, _)| vlsn);
+        vlsn_pairs.dedup_by_key(|t| t.0);
+        self.info.recovered_vlsns = vlsn_pairs;
+
         self.redo_entries = redo_entries;
         Ok(())
     }
@@ -1260,6 +1279,9 @@ impl RecoveryManager {
         // entry so the operator sees the corruption.
         let mut last_redone_vlsn: Option<u64> = None;
         let mut vlsn_violations: u64 = 0;
+        // X-14: collect (vlsn, lsn) pairs from redo entries so the VLSN
+        // index can be rebuilt after crash recovery on a replicated node.
+        let mut recovered_vlsn_pairs: Vec<(u64, u64)> = Vec::new();
 
         for (lsn, rec) in &redo_entries {
             self.stats.lns_read_redo += 1;
@@ -1283,6 +1305,8 @@ impl RecoveryManager {
                         continue;
                     }
                     last_redone_vlsn = Some(curr);
+                    // X-14: record the VLSN→LSN mapping for index rebuild.
+                    recovered_vlsn_pairs.push((curr, lsn.as_u64()));
                 }
 
                 // RecoveryManager.redoOneLN / redo().
@@ -1313,6 +1337,12 @@ impl RecoveryManager {
 
         // Put the entries back (they may be needed for undo diagnostics).
         self.redo_entries = redo_entries;
+
+        // X-14: store the collected VLSN→LSN pairs so recover_all() can
+        // publish them in RecoveryInfo for the VLSN index rebuild.
+        recovered_vlsn_pairs.sort_unstable_by_key(|&(vlsn, _)| vlsn);
+        recovered_vlsn_pairs.dedup_by_key(|t| t.0);
+        self.info.recovered_vlsns = recovered_vlsn_pairs;
 
         Ok(())
     }
@@ -2844,6 +2874,95 @@ mod tests {
                 .map(|r| r.exact_parent_found)
                 .unwrap_or(false),
             "uncommitted key2 must not be in tree"
+        );
+    }
+
+    // ── X-14 / X-1: VLSN rebuild and rollback truncation ────────────────
+
+    /// X-14: RecoveryInfo::recovered_vlsns must be populated with
+    /// (vlsn, lsn) pairs from every LN in the redo pass that carries a VLSN.
+    #[test]
+    fn test_x14_recovered_vlsns_populated() {
+        use crate::log_scanner::LnOperation;
+
+        let mut scanner = InMemoryLogScanner::new();
+
+        // Committed txn 1 with a VLSN on the LN.
+        scanner.push(
+            lsn(1, 100),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(1, 100) }),
+        );
+        // LN with vlsn=5.
+        let mut ln_with_vlsn = make_insert(1, Some(1), b"vkey", NULL_LSN);
+        ln_with_vlsn.vlsn = Some(5);
+        scanner.push(lsn(1, 200), LogEntry::Ln(ln_with_vlsn));
+
+        // Committed txn 2 with a different VLSN.
+        scanner.push(
+            lsn(1, 300),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 2, lsn: lsn(1, 300) }),
+        );
+        let mut ln_with_vlsn2 = make_insert(1, Some(2), b"vkey2", NULL_LSN);
+        ln_with_vlsn2.vlsn = Some(7);
+        scanner.push(lsn(1, 400), LogEntry::Ln(ln_with_vlsn2));
+
+        let mut trees = HashMap::new();
+        trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+        let mut mgr = RecoveryManager::new();
+        let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        // Both VLSN entries must be in recovered_vlsns.
+        let vlsns: Vec<u64> = info.recovered_vlsns.iter().map(|&(v, _)| v).collect();
+        assert!(
+            vlsns.contains(&5),
+            "X-14: vlsn=5 must be in recovered_vlsns, got: {vlsns:?}"
+        );
+        assert!(
+            vlsns.contains(&7),
+            "X-14: vlsn=7 must be in recovered_vlsns, got: {vlsns:?}"
+        );
+    }
+
+    /// X-1: after recovery with a completed rollback period,
+    /// rollback_matchpoint_lsn must be set.
+    #[test]
+    fn test_x1_rollback_matchpoint_lsn_set() {
+        let mut scanner = InMemoryLogScanner::new();
+
+        // A completed rollback: matchpoint at lsn(1,50), start at lsn(1,300),
+        // end at lsn(1,400).
+        scanner.push(
+            lsn(1, 50),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 99, lsn: lsn(1, 50) }),
+        );
+        scanner.push(
+            lsn(1, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_lsn: lsn(1, 50),
+                lsn: lsn(1, 300),
+            }),
+        );
+        scanner.push(
+            lsn(1, 400),
+            LogEntry::RollbackEnd(RollbackEndRecord {
+                matchpoint_lsn: lsn(1, 50),
+                lsn: lsn(1, 400),
+            }),
+        );
+
+        let mut trees = HashMap::new();
+        trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+        let mut mgr = RecoveryManager::new();
+        let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        assert!(
+            info.rollback_matchpoint_lsn.is_some(),
+            "X-1: rollback_matchpoint_lsn must be set after rollback recovery"
+        );
+        assert_eq!(
+            info.rollback_matchpoint_lsn.unwrap(),
+            lsn(1, 50).as_u64(),
+            "X-1: rollback matchpoint must match the period's matchpoint_lsn"
         );
     }
 }

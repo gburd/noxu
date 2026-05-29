@@ -129,6 +129,19 @@ pub struct EnvironmentImpl {
     recovered_prepared_lns:
         Mutex<HashMap<u64, Vec<noxu_recovery::PreparedLnReplay>>>,
 
+    /// VLSN→LSN pairs replayed during the redo phase (X-14 / X-1).
+    ///
+    /// Populated from `RecoveryInfo::recovered_vlsns` during `new()`.  Read
+    /// by `ReplicatedEnvironment::with_environment()` to rebuild the
+    /// in-memory VLSN index after crash recovery.
+    pub recovery_vlsns: Vec<(u64, u64)>,
+
+    /// Minimum rollback matchpoint LSN from recovery (X-1).
+    ///
+    /// `Some(lsn_u64)` when recovery detected a completed rollback; the
+    /// VLSN index should be truncated to the VLSN at or before this LSN.
+    pub recovery_rollback_matchpoint: Option<u64>,
+
     /// The primary (db_id=1) shared tree used for LN migration during
     /// log cleaning.
     ///
@@ -333,6 +346,9 @@ impl EnvironmentImpl {
             u64,
             Vec<noxu_recovery::PreparedLnReplay>,
         > = HashMap::new();
+        // X-14 / X-1: VLSN pairs and rollback matchpoint from recovery.
+        let mut recovery_vlsns: Vec<(u64, u64)> = Vec::new();
+        let mut recovery_rollback_matchpoint: Option<u64> = None;
 
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
@@ -398,6 +414,9 @@ impl EnvironmentImpl {
             // them via xa_commit / xa_rollback.
             recovered_prepared = recovery_info.recovered_prepared_txns.clone();
             recovered_prepared_lns = recovery_info.prepared_txn_lns;
+            // X-14 / X-1: stash VLSN rebuild data.
+            recovery_vlsns = recovery_info.recovered_vlsns;
+            recovery_rollback_matchpoint = recovery_info.rollback_matchpoint_lsn;
 
             // Install all recovered trees keyed by db_id so that
             // open_database() can transplant each into the matching DatabaseImpl.
@@ -726,6 +745,8 @@ impl EnvironmentImpl {
             recovered_trees: Mutex::new(recovered),
             recovered_prepared_txns: Mutex::new(recovered_prepared),
             recovered_prepared_lns: Mutex::new(recovered_prepared_lns),
+            recovery_vlsns,
+            recovery_rollback_matchpoint,
             primary_tree,
             cleaner,
             checkpointer,
