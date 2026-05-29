@@ -16,6 +16,44 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (v3.0.0 candidate)
+
+- **API stability commitment**: `docs/src/contributing/api-stability.md` enumerates
+  the v3.0 stable public surface for `noxu-db`, `noxu-bind`, `noxu-collections`,
+  `noxu-persist`, `noxu-xa`, `noxu-rep`, `noxu-util`, and `noxu-config`.
+  (Wave 11-L)
+
+- **SemVer policy**: `docs/src/contributing/semver-policy.md` documents the
+  pre-v3.0 (breaking-permitted) and v3.0+ (strict SemVer) policies, the
+  definition of "breaking" per the Rust Cargo reference, the compatibility
+  tier table, and the deprecation cycle.
+  (Wave 11-L)
+
+- **`cargo-semver-checks` CI gate**: advisory `semver-checks` job added to
+  both `.github/workflows/test.yml` and `.forgejo/workflows/test.yml`, pinned
+  at `cargo-semver-checks v0.47.0`.  Currently `continue-on-error: true`;
+  will be promoted to blocking after one clean minor-release cycle post-v3.0.0.
+  (Wave 11-L)
+
+### Deprecated (v2.4.1)
+
+The following items are marked `#[deprecated(since = "2.4.1")]` and will be
+removed in v3.0.0.  Each has a `note` pointing to the replacement.
+
+- **`noxu-db`**: `Transaction::new` (use `Environment::begin_transaction()`),
+  `EnvironmentConfig::set_txn_no_sync` / `with_txn_no_sync` /
+  `set_txn_write_no_sync` (use `set_durability` / `with_durability`),
+  `EnvironmentMutableConfig::with_txn_no_sync` / `with_txn_write_no_sync`
+  (use `with_durability`).
+- **`noxu-xa`**: `XaError::CrashDurabilityNotSupported` (already deprecated
+  since 2.0.0; removal confirmed for v3.0).
+- **`noxu-config::params`**: `CLEANER_ADJUST_UTILIZATION`,
+  `CLEANER_FOREGROUND_PROACTIVE_MIGRATION`, `CLEANER_LAZY_MIGRATION`,
+  `CLEANER_BACKGROUND_PROACTIVE_MIGRATION`, `EVICTOR_NODES_PER_SCAN`,
+  `EVICTOR_DEADLOCK_RETRY`, `EVICTOR_LRU_ONLY`, `LOG_DIRECT_NIO`,
+  `LOG_CHUNKED_NIO`, `LOG_USE_NIO`, `LOG_DEFERREDWRITE_TEMP`,
+  `OLD_REP_RUN_LOG_FLUSH_TASK`, `OLD_REP_LOG_FLUSH_TASK_INTERVAL`.
+
 ## [v2.4.1] — 2026-05-29
 
 ### Fixed
