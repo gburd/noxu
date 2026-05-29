@@ -750,7 +750,19 @@ impl EnvironmentImpl {
         self.state.read().is_open()
     }
     pub fn is_valid(&self) -> bool {
-        !self.is_invalid.load(Ordering::Relaxed)
+        if self.is_invalid.load(Ordering::Relaxed) {
+            return false;
+        }
+        // C-2: also check whether the log manager has detected an I/O failure
+        // (fsyncgate — fdatasync returned EIO and the environment must not
+        // accept further commits).  We read the shared Arc<AtomicBool> that
+        // LogManager::io_invalid points to; no circular Arc reference.
+        if let Some(lm) = &self.log_manager {
+            if lm.io_invalid.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Checks that the environment is open and valid.
@@ -1642,6 +1654,29 @@ mod tests {
 
         let result = env.begin_txn();
         assert!(matches!(result, Err(DbiError::EnvironmentFailure { .. })));
+    }
+
+    /// C-2 regression: an I/O failure reported by the LogManager must also
+    /// cause `is_valid()` to return `false`, so that all subsequent commit
+    /// attempts are rejected even before `EnvironmentImpl::invalidate()` is
+    /// called explicitly.
+    #[test]
+    fn test_log_io_failure_invalidates_environment() {
+        use std::sync::atomic::Ordering;
+        let (_dir, env) = make_env(false);
+
+        assert!(env.is_valid(), "env starts valid");
+
+        // Directly flip the io_invalid flag on the underlying LogManager,
+        // simulating what `flush_sync()` does on EIO.
+        let lm = env.get_log_manager().expect("writable env must have log manager");
+        lm.io_invalid.store(true, Ordering::Release);
+
+        // is_valid() must now return false even though invalidate() was never called.
+        assert!(
+            !env.is_valid(),
+            "is_valid() must return false after log I/O failure"
+        );
     }
 
     #[test]
