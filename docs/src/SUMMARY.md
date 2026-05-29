@@ -175,3 +175,4 @@
   - [Audit (2026-05) — 2nd-pass cross-feature](internal/audit-2026-05-2ndpass-crossfeature.md)
   - [Wave 11-T — cross-feature critical correctness fixes](internal/wave-11-t-crossfeature.md)
   - [Wave 11-U — recovery/checkpoint/cleaner/VLSN cluster fixes](internal/wave-11-u-recovery-cluster.md)
+  - [Wave 11-X — XA/config/cache-budget fixes](internal/wave-11-x-config-xa-cluster.md)

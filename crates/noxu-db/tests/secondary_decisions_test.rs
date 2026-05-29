@@ -1586,8 +1586,6 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
 
 // ─── X-10: Secondary index abort torn-state isolation tests ───────────────
 
-// ─── X-10: Secondary index abort torn-state isolation tests ───────────────
-
 /// X-10: Under READ_COMMITTED isolation (the default), a concurrent
 /// `SecondaryCursor` reader must never see torn state during a transaction
 /// abort that reverts both the primary record and the secondary index entry.
@@ -1599,11 +1597,10 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
 /// applied and the state is consistent.  No torn state is possible.
 ///
 /// **READ_UNCOMMITTED**: Dirty reads bypass locking, so interim state IS
-/// observable under READ_UNCOMMITTED.  That is by-design for that isolation
-/// level and is NOT a bug.
+/// observable.  That is by-design for that isolation level and is NOT a bug.
 ///
-/// **Finding X-10 conclusion**: The locking already prevents torn state under
-/// READ_COMMITTED.  This test is the regression guard for that claim.
+/// **Finding X-10 conclusion**: The existing per-slot write locks already
+/// prevent torn state under READ_COMMITTED.  This test is the regression guard.
 #[test]
 fn test_x10_secondary_abort_read_committed_no_torn_state() {
     use std::sync::Arc;
@@ -1615,7 +1612,6 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
 
-    // Primary: key -> data
     let pri_db = env
         .open_database(
             None,
@@ -1627,7 +1623,6 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         .unwrap();
     let pri_arc = Arc::new(noxu_sync::Mutex::new(pri_db));
 
-    // Secondary: sec_key (first byte of data) -> primary key
     let sec_inner = env
         .open_database(
             None,
@@ -1668,8 +1663,7 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
     let iterations = Arc::new(AtomicUsize::new(0));
 
     // Reader: continuously reads via the secondary cursor under READ_COMMITTED.
-    // Invariant: whenever we see a secondary entry with key "A", the
-    // corresponding primary data must start with b"A".
+    // Invariant: if we find sec_key="A", the primary data must start with b"A".
     let sec_clone = Arc::clone(&sec_db);
     let pri_clone = Arc::clone(&pri_arc);
     let torn_clone = Arc::clone(&torn_seen);
@@ -1687,14 +1681,13 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
             if let Ok(noxu_db::OperationStatus::Success) = cursor
                 .get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
             {
-                // Found secondary entry pointing to primary key.
-                // Re-read primary under READ_COMMITTED.
                 let mut pri_data = noxu_db::DatabaseEntry::new();
-                if pri_clone
+                let found = pri_clone
                     .lock()
                     .get(None, &pk_entry, &mut pri_data)
                     .map(|s| s == noxu_db::OperationStatus::Success)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if found
                     && let Some(pri_bytes) = pri_data.get_data()
                     && (pri_bytes.is_empty() || pri_bytes[0] != b'A')
                 {
@@ -1705,8 +1698,7 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         }
     });
 
-    // Writer: abort cycle — update primary data (changing secondary key from A→B),
-    // then abort.  After abort the secondary must still point to "A" → "Avalue".
+    // Writer: abort cycle — update primary (changing sec_key A→B), then abort.
     for _ in 0..300 {
         let txn = env.begin_transaction(None).unwrap();
         pri_arc
@@ -1717,7 +1709,6 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
                 &noxu_db::DatabaseEntry::from_bytes(b"Bvalue"),
             )
             .unwrap();
-        // Abort: reverts primary (Avalue) and secondary (A → B undo → A).
         txn.abort().unwrap();
     }
 
