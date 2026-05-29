@@ -51,7 +51,7 @@ use crate::write_observer::LogWriteObserver;
 use noxu_sync::Mutex;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The central coordinator for log operations.
 ///
@@ -98,6 +98,15 @@ pub struct LogManager {
     ///   - `count_obsolete()` when replacing a previous version
     ///
     write_observer: Option<Arc<dyn LogWriteObserver>>,
+
+    /// C-2 (audit-2026-05-keith.md F-3.2 / F-8.4 / F-9.4): set to `true`
+    /// the first time an fsync or file-sync I/O error is observed.  Once set,
+    /// `log()` refuses all further writes and `is_io_invalid()` returns `true`
+    /// so that `EnvironmentImpl::is_valid()` can detect the failure.
+    ///
+    /// Shared as an `Arc<AtomicBool>` so that `EnvironmentImpl` can hold the
+    /// same allocation without a circular `Arc` reference.
+    pub io_invalid: Arc<AtomicBool>,
 }
 
 impl LogManager {
@@ -132,6 +141,7 @@ impl LogManager {
             // defaults of 0.
             fsync_manager: FsyncManager::new(0, 0),
             write_observer: None,
+            io_invalid: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -156,6 +166,14 @@ impl LogManager {
     /// Receiving `envImpl.getUtilizationTracker()`.
     pub fn set_write_observer(&mut self, observer: Arc<dyn LogWriteObserver>) {
         self.write_observer = Some(observer);
+    }
+
+    /// Returns `true` if an I/O failure has permanently invalidated this log.
+    ///
+    /// C-2: once set, all subsequent `log()` and `flush_sync()` calls return
+    /// an error immediately without touching the kernel page-cache.
+    pub fn is_io_invalid(&self) -> bool {
+        self.io_invalid.load(Ordering::Acquire)
     }
 
     /// Logs a raw entry to the WAL, optionally marking an old LSN obsolete.
@@ -251,6 +269,13 @@ impl LogManager {
         fsync_required: bool,
         old_lsn: Option<Lsn>,
     ) -> Result<Lsn> {
+        // C-2: refuse all writes once a prior I/O error has invalidated the log.
+        if self.io_invalid.load(Ordering::Acquire) {
+            return Err(NoxuLogError::WriteFailed(
+                "environment permanently invalidated by prior I/O error"
+                    .to_string(),
+            ));
+        }
         // Build the header bytes + payload into one contiguous buffer so we
         // can compute the checksum in one pass (matching approach).
         let item_size = payload.len() as u32;
@@ -469,9 +494,18 @@ impl LogManager {
         // simultaneously, enabling coalesced fdatasync.
 
         let fm = &self.file_manager;
-        self.fsync_manager.fsync(|| {
+        let fsync_result = self.fsync_manager.fsync(|| {
             fm.sync_log_end().map_err(|e| std::io::Error::other(e.to_string()))
-        })?;
+        });
+        if let Err(ref e) = fsync_result {
+            // C-2 (audit-2026-05-keith.md F-3.2 / F-8.4 / F-9.4): any I/O
+            // error from fdatasync permanently invalidates the log; refuse
+            // all further writes (fsyncgate class).
+            self.io_invalid.store(true, Ordering::Release);
+            return Err(NoxuLogError::WriteFailed(format!(
+                "fdatasync failed, environment permanently invalidated: {e}"
+            )));
+        }
 
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
@@ -1168,5 +1202,35 @@ mod tests {
         let lm = make_log_manager(&dir);
         let result = lm.flush_no_sync();
         assert!(result.is_ok());
+    }
+
+    /// C-2 regression: once `io_invalid` is set, the LogManager must refuse
+    /// all further log writes.  This simulates what happens after an fdatasync
+    /// returns EIO — the environment is permanently invalidated and must not
+    /// accept commits that the kernel cannot guarantee are durable.
+    #[test]
+    fn test_fsync_failure_invalidates_log_manager() {
+        use std::sync::atomic::Ordering;
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        // Pre-condition: log works fine.
+        lm.log(LogEntryType::Trace, b"before", Provisional::No, false, false)
+            .expect("first write must succeed");
+
+        // Simulate an fdatasync failure by setting the io_invalid flag
+        // directly (equivalent to what flush_sync() sets on EIO).
+        lm.io_invalid.store(true, Ordering::Release);
+
+        // Post-condition: all subsequent log() calls must be rejected.
+        let result =
+            lm.log(LogEntryType::Trace, b"after", Provisional::No, false, false);
+        assert!(
+            result.is_err(),
+            "log() must fail after io_invalid is set"
+        );
+
+        // is_io_invalid() accessor must agree.
+        assert!(lm.is_io_invalid(), "is_io_invalid() must return true");
     }
 }
