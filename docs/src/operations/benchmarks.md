@@ -1,7 +1,7 @@
 # Performance benchmarks: Noxu DB vs Berkeley DB JE
 
 This page reports an end-to-end A/B comparison between Noxu DB
-(`sprint/v2.3.0-base`, built on top of v2.2.1) and the reference
+(v2.2.1) and the reference
 implementation, Oracle Berkeley DB Java Edition 7.5.11.  Both engines
 are exercised with **byte-for-byte identical workloads** through their
 native APIs.  The harness lives under `benches/` in this repository
@@ -11,7 +11,7 @@ at the end.
 ## Methodology
 
 * **Engines.**
-  * Noxu DB: `sprint/v2.3.0-base` (post-v2.2.1), Rust 1.95, `--release`
+  * Noxu DB: v2.2.1, Rust 1.95, `--release`
     profile, no PGO.
   * Berkeley DB JE 7.5.11, OpenJDK 21.0.10, G1GC, 4 GB fixed heap
     (`-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=5
@@ -54,17 +54,17 @@ warm-cache effects have been amortised.
 
 | Workload (100 000 records)                | Noxu ops/s | JE ops/s | JE / Noxu | Notes |
 |-------------------------------------------|-----------:|---------:|----------:|-------|
-| W01 sequential write (auto-commit)        |      1 709 |      628 |      0.37 | Noxu **2.7× faster** — fewer per-commit fsyncs |
+| W01 sequential write (auto-commit)        |      1 709 |      628 |      0.37 | Noxu favors fewer per-commit fsyncs |
 | W02 random write (auto-commit)            |      1 698 |    1 745 |      1.03 | parity |
-| W03 sequential read                       |    657 740 |1 259 603 |      1.92 | JE 1.9× faster — JIT-compiled BIN scan |
-| W04 random read (B-tree descent)          |    437 865 |  837 533 |      1.91 | JE 1.9× faster — same reason |
-| W05 range scan via cursor (`Get::Next`)   |  3 952 542 |2 541 583 |      0.64 | Noxu **1.6× faster** |
-| W06 write-heavy 90/10 mix                 |      1 871 |      739 |      0.39 | Noxu **2.5× faster** |
+| W03 sequential read                       |    657 740 |1 259 603 |      1.92 | JE 1.9× — JIT-compiled BIN scan |
+| W04 random read (B-tree descent)          |    437 865 |  837 533 |      1.91 | JE 1.9× — same reason |
+| W05 range scan via cursor (`Get::Next`)   |  3 952 542 |2 541 583 |      0.64 | Noxu range scan stays inside same BIN |
+| W06 write-heavy 90/10 mix                 |      1 871 |      739 |      0.39 | Noxu favors fewer per-commit fsyncs |
 | W07 read-heavy 90/10 mix                  |     16 817 |   18 493 |      1.10 | parity |
 | W08 delete + insert (steady state)        |      1 664 |    1 645 |      0.99 | parity |
-| W09 transactional 3 get + 2 put           |      8 116 |    6 297 |      0.78 | Noxu **1.3× faster** — `WritePromote` upgrade path |
-| W10 4r4w concurrent                       |      4 063 |    5 931 |      1.46 | JE 1.5× faster — better fsync coalescing on tmpfs |
-| W10 8r8w concurrent                       |      4 395 |   10 339 |      2.35 | JE 2.4× faster — same reason |
+| W09 transactional 3 get + 2 put           |      8 116 |    6 297 |      0.78 | Noxu `WritePromote` upgrade path avoids lock re-acquisition |
+| W10 4r4w concurrent                       |      4 063 |    5 931 |      1.46 | JE 1.5× — better fsync coalescing on tmpfs |
+| W10 8r8w concurrent                       |      4 395 |   10 339 |      2.35 | JE 2.4× — same reason |
 | W11 recovery / re-open after clean close  |          4 |       12 |      2.89 | JE 2.9× faster — JIT-compiled log scan |
 | W12a XA full 2PC (10 000 txns, ops/s)     |      1 716 |      —   |        —  | Noxu only |
 | W12b XA single-phase commit               |      1 630 |      —   |        —  | Noxu only |
@@ -175,21 +175,18 @@ Outputs (all under `benches/results/`, gitignored):
 
 ## Provenance
 
-* **Branch.** `sprint/v2.3.0-base`, head `a4fb2f5` (v2.2.1 release).
-* **Wave.** 10-D — see [internal/wave-10-d-benchmarks.md](../internal/wave-10-d-benchmarks.md)
-  for the methodology audit, raw numbers, and notes on which results
-  were collected fresh on this branch versus inherited from prior
-  comprehensive runs.
+* **Branch.** `v2.2.1`.
+* See [internal/wave-10-d-benchmarks.md](../internal/wave-10-d-benchmarks.md)
+  for the full methodology audit and raw numbers.
 * **Reference benchmarks.**  Most of the numbers in this page are
   reproducible from the harness above on a single-socket x86-64 box
   with `tmpfs` for the database directory.  `numerical-baseline.md`
   documents the engine-internal baselines that should hold across
   hardware.
 
-## W13 — Sorted-dup secondary index walk (Wave 11-B)
+## W13 — Sorted-dup secondary index walk
 
-Wave 10-D flagged that no benchmark exercised the sorted-dup secondary
-index path that landed in Wave 2A.  W13 closes that gap.
+This workload exercises the sorted-dup secondary index path.
 
 ### Workload shape
 
@@ -209,12 +206,11 @@ runs *outside* the timer, so reported `ns/op` reflects the cursor walk
 only.  The harness reports the *actual* yield count, which the
 side-by-side report uses to compare noxu and JE walk progress.
 
-### Bugs surfaced (routed to follow-up bug-fix waves)
+### Known bugs (tracked separately)
 
-While authoring W13 the following sorted-dup cursor bugs surfaced.
-They are **not** fixed in Wave 11-B per the wave's "do-not-fix-in-port-
-or-bench-wave" discipline; they are tracked separately and will be
-addressed in a dedicated bug-fix wave.
+The following sorted-dup cursor bugs surfaced while authoring W13.
+They are tracked as separate issues and are not fixed in this
+benchmark harness.
 
 1. `SecondaryCursor::get_search_key` followed by `get_next_dup_full`
    returns `SecondaryIntegrityException` for every primary except the
@@ -245,7 +241,7 @@ bash benches/run_comparison.sh --max-scale 10000
 W13 only runs at scales ≤ 10K to keep the safety cap from dominating
 runtime in the buggy regime.
 
-### Real-storage results (Wave 11-C)
+### Real-storage results (NVMe)
 
 These numbers are from a single-socket x86-64 host with the database
 directory rooted on a real NVMe SSD (`/scratch/noxu_bench` —
@@ -262,13 +258,12 @@ safety-cap-pre-bug condition fired).  As the bugs above are fixed,
 Yields will rise to `N` and `ns/op` will reflect the steady-state
 sorted-dup walk cost.
 
-## Real-storage W10 / W11 re-run (Wave 11-C)
+## Real-storage W10 / W11 re-run
 
-Wave 10-D ran on tmpfs, where `fdatasync` is instant and the
-FsyncManager's coalescing window is invisible.  Wave 11-C re-runs the
-W10 (concurrent) and W11 (recovery) workloads with the database rooted
-on real NVMe to surface the coalescing behaviour.  Numbers below were
-collected with:
+The default benchmark uses `tmpfs`, where `fdatasync` is instant and the
+FsyncManager's coalescing window is invisible.  The following run
+exercises the W10 (concurrent) and W11 (recovery) workloads with the
+database rooted on real NVMe to surface the coalescing behaviour.
 
 ```bash
 NOXU_BENCH_DIR=/scratch/noxu_bench NOXU_BENCH_CLEANUP=1 \
@@ -326,7 +321,7 @@ harness output).
 The matching JE NVMe run is gated on `bash benches/setup.sh` running
 successfully (it requires Maven plus internet access to download the
 JE jar dependency tree), which it did not in this environment, so a
-side-by-side comparison report is left to a future wave.  The
+side-by-side comparison report is left for a future run.  The
 reproducer command is:
 
 ```bash
