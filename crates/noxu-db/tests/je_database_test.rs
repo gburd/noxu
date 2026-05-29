@@ -598,7 +598,7 @@ fn multi_env_open_close_test_multi_open_close() {
 // database must fail (IllegalArgumentException in JE).  The non-txnal db
 // sits inside a transactional env in both cases.
 //
-// TODO(noxu-db bug, wave-11-G): Noxu currently permits this combination,
+// TODO(bug): Noxu currently permits this combination,
 // returning Ok(cursor) instead of Err.  Routed to a follow-up bug-fix wave.
 // See docs/src/internal/wave-11-g-je-tck-longtail.md.
 // ──────────────────────────────────────────────────────────────────────────────
@@ -634,7 +634,7 @@ fn database_txn_cursor_on_non_txn_db_rejected() {
 // putNoOverwrite again returns KEYEXISTS (because the key already has any
 // data).  Delete then re-putNoOverwrite returns SUCCESS.
 //
-// TODO(noxu-db bug, wave-11-G): Noxu's `put_no_overwrite` on sorted-dup
+// TODO(bug): Noxu's `put_no_overwrite` on sorted-dup
 // databases uses the (key, data) pair to determine "already exists" —
 // same semantics as `put_no_dup_data`.  JE's `putNoOverwrite` is key-only:
 // once *any* dup exists for that key, a second `putNoOverwrite` of the
@@ -801,7 +801,7 @@ fn database_close_idempotent() {
 // still readable through a read-only DB handle, and `count()` still returns
 // the previously-committed record count.
 //
-// TODO(noxu-engine, wave-11-G): Noxu's database-name registry is not
+// TODO(bug): Noxu's database-name registry is not
 // preserved across a clean close+reopen when the reopen is read-only
 // (`DatabaseNotFound: 'db1' does not exist and allow_create is false`).
 // See sibling `multi_env_open_close_test_multi_open_close` for the same
@@ -918,7 +918,7 @@ fn environment_checkpoint_forces_durability() {
 // (committed data is durable, regardless of when checkpoint runs) holds
 // in JE and must hold in Noxu too.
 //
-// TODO(noxu-engine bug, wave-11-G): tracked at
+// TODO(bug): tracked at
 // docs/src/internal/wave-11-g-je-tck-longtail.md.  Routed to a follow-up
 // bug-fix wave.
 // ──────────────────────────────────────────────────────────────────────────────
