@@ -1,7 +1,7 @@
 # Replication Durability Policies
 
-> **v2.0 status — GA.** `ReplicaAckPolicy` is honoured on commit
-> (Wave 3-3, F1).  `Transaction::commit_with_durability` blocks
+> **v2.0 status — GA.** `ReplicaAckPolicy` is honoured on commit.
+> `Transaction::commit_with_durability` blocks
 > until the configured number of replicas have acknowledged or the
 > commit timeout elapses.
 
