@@ -547,3 +547,16 @@ The `ReplicaAckCoordinator` trait gained
 implementation that returns 0 (NULL_VLSN — correct for non-replicated envs).
 No action is required unless you have a custom `ReplicaAckCoordinator` impl
 that should assign VLSNs to recovered XA commits.
+
+### X-7: `DatabaseImpl::get_real_tree()` return type changed
+
+Internal API only (`noxu-dbi`).  `get_real_tree()` previously returned
+`Option<&Tree>`.  It now returns `Option<std::sync::RwLockReadGuard<'_, Tree>>`.
+
+The guard implements `Deref<Target=Tree>`, so most call sites (method calls,
+deref coercions) require no change.  The only sites that need updating are
+where `tree` is passed to a function expecting `&Tree` explicitly — change
+`f(tree)` to `f(&tree)`.
+
+A new method `get_real_tree_arc()` returns `Option<Arc<RwLock<Tree>>>` for
+callers that need the shared Arc (e.g. the cleaner registry).

@@ -521,7 +521,7 @@ pub fn verify_database_impl(
 ) -> VerifyResult {
     let db_name = db_impl.get_name();
     match db_impl.get_real_tree() {
-        Some(tree) => verify_tree(&*tree, db_name, config),
+        Some(tree) => verify_tree(&tree, db_name, config),
         None => {
             // No real B-tree attached (e.g., stub / metadata DB) — treat as empty.
             VerifyResult {
@@ -874,7 +874,7 @@ mod tests {
         let cfg = VerifyConfig::default();
 
         if let Some(t) = guard.get_real_tree() {
-            let result = verify_tree(t, "verify_test", &cfg);
+            let result = verify_tree(&t, "verify_test", &cfg);
             assert!(
                 result.passed,
                 "empty tree should pass: {:?}",
@@ -932,7 +932,7 @@ mod tests {
         let cfg = VerifyConfig::default();
 
         if let Some(t) = guard.get_real_tree() {
-            let result = verify_tree(t, "pop_test", &cfg);
+            let result = verify_tree(&t, "pop_test", &cfg);
             assert!(
                 result.passed,
                 "populated tree should pass: {:?}",

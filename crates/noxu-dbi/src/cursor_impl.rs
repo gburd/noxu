@@ -293,7 +293,7 @@ impl CursorImpl {
     fn get_slot_before_image(&self, key: &[u8]) -> (Option<Vec<u8>>, u64) {
         let db = self.db_impl.read();
         if let Some(tree) = db.get_real_tree() {
-            match Self::get_data_from_tree(&*tree, key) {
+            match Self::get_data_from_tree(&tree, key) {
                 Some((data, lsn)) => (Some(data), lsn),
                 None => (None, noxu_util::NULL_LSN.as_u64()),
             }
@@ -780,7 +780,7 @@ impl CursorImpl {
                         let db = self.db_impl.read();
                         db.get_real_tree()
                             .and_then(|tree| {
-                                Self::get_data_from_tree(&*tree, key)
+                                Self::get_data_from_tree(&tree, key)
                             })
                             .map(|(d, _)| d)
                             .map(Some)
@@ -833,7 +833,7 @@ impl CursorImpl {
                         let db = self.db_impl.read();
                         db.get_real_tree()
                             .and_then(|tree| {
-                                Self::get_data_from_tree(&*tree, key)
+                                Self::get_data_from_tree(&tree, key)
                             })
                             .map(|(d, _)| d)
                             .map(Some)
@@ -854,7 +854,7 @@ impl CursorImpl {
                     let next_entry: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
-                            Self::find_range_entry(&*tree, key)
+                            Self::find_range_entry(&tree, key)
                         } else {
                             None
                         }
@@ -2184,7 +2184,7 @@ impl CursorImpl {
                     let db = self.db_impl.read();
                     db.get_real_tree()
                         .and_then(|tree| {
-                            Self::get_data_from_tree(&*tree, &two_part_key)
+                            Self::get_data_from_tree(&tree, &two_part_key)
                         })
                         .map(|(_, lsn)| lsn)
                         .unwrap_or(noxu_util::NULL_LSN.as_u64())

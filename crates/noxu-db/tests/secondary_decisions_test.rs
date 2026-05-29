@@ -1606,8 +1606,8 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
 /// READ_COMMITTED.  This test is the regression guard for that claim.
 #[test]
 fn test_x10_secondary_abort_read_committed_no_torn_state() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
@@ -1616,9 +1616,15 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
     let env = noxu_db::Environment::open(env_cfg).unwrap();
 
     // Primary: key -> data
-    let pri_db =
-        env.open_database(None, "x10_primary", &DatabaseConfig::new().with_allow_create(true).with_transactional(true))
-            .unwrap();
+    let pri_db = env
+        .open_database(
+            None,
+            "x10_primary",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
     let pri_arc = Arc::new(noxu_sync::Mutex::new(pri_db));
 
     // Secondary: sec_key (first byte of data) -> primary key
@@ -1635,19 +1641,25 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
     let sec_cfg = noxu_db::SecondaryConfig::new()
         .with_allow_create(true)
         .with_key_creator(Box::new(FirstByteCreator));
-    let sec_db =
-        noxu_db::SecondaryDatabase::open(Arc::clone(&pri_arc), sec_inner, sec_cfg)
-            .unwrap();
+    let sec_db = noxu_db::SecondaryDatabase::open(
+        Arc::clone(&pri_arc),
+        sec_inner,
+        sec_cfg,
+    )
+    .unwrap();
     let sec_db = Arc::new(sec_db);
 
     // Seed: key="K" data="Avalue" → sec_key="A"
     {
         let txn = env.begin_transaction(None).unwrap();
-        pri_arc.lock().put(
-            Some(&txn),
-            &noxu_db::DatabaseEntry::from_bytes(b"K"),
-            &noxu_db::DatabaseEntry::from_bytes(b"Avalue"),
-        ).unwrap();
+        pri_arc
+            .lock()
+            .put(
+                Some(&txn),
+                &noxu_db::DatabaseEntry::from_bytes(b"K"),
+                &noxu_db::DatabaseEntry::from_bytes(b"Avalue"),
+            )
+            .unwrap();
         txn.commit().unwrap();
     }
 
@@ -1672,24 +1684,22 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
             let sec_key_a = noxu_db::DatabaseEntry::from_bytes(b"A");
             let mut pk_entry = noxu_db::DatabaseEntry::new();
             let mut data_entry = noxu_db::DatabaseEntry::new();
-            match cursor.get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry) {
-                Ok(noxu_db::OperationStatus::Success) => {
-                    // Found secondary entry pointing to primary key.
-                    // Re-read primary under READ_COMMITTED.
-                    let mut pri_data = noxu_db::DatabaseEntry::new();
-                    if pri_clone.lock()
-                        .get(None, &pk_entry, &mut pri_data)
-                        .map(|s| s == noxu_db::OperationStatus::Success)
-                        .unwrap_or(false)
-                    {
-                        if let Some(pri_bytes) = pri_data.get_data() {
-                            if pri_bytes.is_empty() || pri_bytes[0] != b'A' {
-                                torn_clone.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
+            if let Ok(noxu_db::OperationStatus::Success) = cursor
+                .get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
+            {
+                // Found secondary entry pointing to primary key.
+                // Re-read primary under READ_COMMITTED.
+                let mut pri_data = noxu_db::DatabaseEntry::new();
+                if pri_clone
+                    .lock()
+                    .get(None, &pk_entry, &mut pri_data)
+                    .map(|s| s == noxu_db::OperationStatus::Success)
+                    .unwrap_or(false)
+                    && let Some(pri_bytes) = pri_data.get_data()
+                    && (pri_bytes.is_empty() || pri_bytes[0] != b'A')
+                {
+                    torn_clone.store(true, Ordering::Relaxed);
                 }
-                _ => {}
             }
             iter_clone.fetch_add(1, Ordering::Relaxed);
         }
@@ -1699,11 +1709,14 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
     // then abort.  After abort the secondary must still point to "A" → "Avalue".
     for _ in 0..300 {
         let txn = env.begin_transaction(None).unwrap();
-        pri_arc.lock().put(
-            Some(&txn),
-            &noxu_db::DatabaseEntry::from_bytes(b"K"),
-            &noxu_db::DatabaseEntry::from_bytes(b"Bvalue"),
-        ).unwrap();
+        pri_arc
+            .lock()
+            .put(
+                Some(&txn),
+                &noxu_db::DatabaseEntry::from_bytes(b"K"),
+                &noxu_db::DatabaseEntry::from_bytes(b"Bvalue"),
+            )
+            .unwrap();
         // Abort: reverts primary (Avalue) and secondary (A → B undo → A).
         txn.abort().unwrap();
     }

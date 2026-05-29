@@ -1106,14 +1106,14 @@ impl RecoveryManager {
                         result.recovered_db_names.remove(&rec.name);
                         result.recovered_db_txn_ids.remove(&rec.name);
                     } else {
-                        result.recovered_db_names
+                        result
+                            .recovered_db_names
                             .insert(rec.name.clone(), rec.db_id);
                         // C-6: record the creating txn_id so that
                         // run_mapping_tree_undo_pass can undo NameLNs whose
                         // transaction aborted.
                         if let Some(tid) = rec.txn_id {
-                            result.recovered_db_txn_ids
-                                .insert(rec.name, tid);
+                            result.recovered_db_txn_ids.insert(rec.name, tid);
                         }
                     }
                 }
@@ -3069,6 +3069,8 @@ mod tests {
         // 4. Checkpoint so the WAL contains the NameLNTxn + TxnAbort.
         // 5. Simulate crash + recovery.
         // 6. Assert: recovered_db_names does NOT contain the aborted database.
-        todo!("implement after write-path change: NameLNTxn inside transaction");
+        todo!(
+            "implement after write-path change: NameLNTxn inside transaction"
+        );
     }
 }

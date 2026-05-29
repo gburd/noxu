@@ -106,7 +106,8 @@ pub struct Cleaner {
     ///
     /// The `Arc<Mutex<…>>` wrapper lets `open_database_inner` insert entries
     /// after the cleaner has already been constructed.
-    extra_trees: Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
+    extra_trees:
+        Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
 
     /// Adaptive throttle: tracks the log write rate and computes sleep
     /// intervals and files-per-pass recommendations for the daemon loop.
@@ -280,7 +281,9 @@ impl Cleaner {
     /// trees as databases are opened after the cleaner is constructed.
     pub fn with_tree_registry(
         mut self,
-        registry: Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
+        registry: Arc<
+            std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>,
+        >,
     ) -> Self {
         self.extra_trees = registry;
         self
@@ -1831,8 +1834,7 @@ mod tests {
     #[test]
     fn test_x7_secondary_ln_migrated_in_correct_tree() {
         use crate::file_processor::{
-            BinLookupResult, MigrationOutcome, SharedTreeLookup,
-            TreeLookup,
+            BinLookupResult, MigrationOutcome, SharedTreeLookup, TreeLookup,
         };
         use noxu_log::{FileManager, LogManager};
         use noxu_tree::tree::Tree;
@@ -1842,8 +1844,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let fm = Arc::new(
-            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100)
-                .unwrap(),
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
         );
         let lm =
             Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
@@ -1853,8 +1854,7 @@ mod tests {
         primary
             .insert(b"pri_key".to_vec(), b"pri_data".to_vec(), Lsn::new(1, 1))
             .unwrap();
-        let primary_arc: Arc<RwLock<Tree>> =
-            Arc::new(RwLock::new(primary));
+        let primary_arc: Arc<RwLock<Tree>> = Arc::new(RwLock::new(primary));
 
         // Build a SECONDARY tree (db_id=2) with a secondary key.
         let sec = Tree::new(2, 256);
@@ -1870,8 +1870,9 @@ mod tests {
         // Wire both trees into the SharedTreeLookup.
         let mut extra = std::collections::HashMap::new();
         extra.insert(2i64, Arc::clone(&sec_arc));
-        let lookup = SharedTreeLookup::new(Arc::clone(&primary_arc), Arc::clone(&lm))
-            .with_extra_trees(extra);
+        let lookup =
+            SharedTreeLookup::new(Arc::clone(&primary_arc), Arc::clone(&lm))
+                .with_extra_trees(extra);
 
         // --- Test primary LN lookup (db_id=1) ---
         let primary_result =

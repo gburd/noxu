@@ -1004,7 +1004,7 @@ fn test_x11_log_flush_no_sync_daemon_fires() {
     let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
 
     // Open a database and write a record.
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_cfg = DatabaseConfig::new().set_allow_create(true).clone();
     let db_arc = env.open_database("test", &db_cfg).unwrap();
 
     {
@@ -1019,15 +1019,25 @@ fn test_x11_log_flush_no_sync_daemon_fires() {
     let lm = env.get_log_manager().expect("log manager must be present");
     let mut buf = bytes::BytesMut::with_capacity(32);
     let entry = noxu_log::entry::LnLogEntry::new(
-        1, None, noxu_util::lsn::NULL_LSN, false, None, None,
-        noxu_util::vlsn::NULL_VLSN, 0, false,
-        b"k1".to_vec(), Some(b"v1".to_vec()), 0,
+        1,
+        None,
+        noxu_util::lsn::NULL_LSN,
+        false,
+        None,
+        None,
+        noxu_util::vlsn::NULL_VLSN,
+        0,
+        false,
+        b"k1".to_vec(),
+        Some(b"v1".to_vec()),
+        0,
         noxu_util::vlsn::NULL_VLSN,
     );
-    use noxu_log::LogEntry;
+    use noxu_log::LogEntryType;
+    let _ = LogEntryType::UpdateLN; // fix import
     entry.write_to_log(&mut buf);
     lm.log(
-        noxu_log::LogEntryType::LN,
+        noxu_log::LogEntryType::UpdateLN,
         &buf,
         noxu_log::Provisional::No,
         false, // flush=false (CommitNoSync)

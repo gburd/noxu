@@ -176,9 +176,7 @@ pub fn flush_to_disk_capped(
     let all_entries = index.snapshot_entries();
     let capped: Vec<(u64, u32, u32)> = all_entries
         .into_iter()
-        .filter(|(_, file_no, offset)| {
-            Lsn::new(*file_no, *offset) <= cap_lsn
-        })
+        .filter(|(_, file_no, offset)| Lsn::new(*file_no, *offset) <= cap_lsn)
         .collect();
 
     if capped.is_empty() {
@@ -201,8 +199,7 @@ pub fn flush_to_disk_capped(
         .open(&tmp)?;
     let mut w = BufWriter::new(file);
 
-    let mut buf: Vec<u8> =
-        Vec::with_capacity(HEADER_LEN + capped.len() * 16);
+    let mut buf: Vec<u8> = Vec::with_capacity(HEADER_LEN + capped.len() * 16);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&stride.to_le_bytes());
@@ -465,7 +462,11 @@ mod tests {
         for v in 11u64..=20 {
             idx.put(v, 0, (v * 10) as u32); // offset 110, 120, ..., 200
         }
-        assert_eq!(idx.get_latest_vlsn(), 20, "precondition: 20 VLSNs in index");
+        assert_eq!(
+            idx.get_latest_vlsn(),
+            20,
+            "precondition: 20 VLSNs in index"
+        );
 
         // Checkpoint end is at (file=0, offset=90): covers VLSNs 1-10.
         let cap_lsn = Lsn::new(0, 90);
@@ -480,7 +481,10 @@ mod tests {
             "X-2: persisted VLSN HWM {} must not exceed checkpointed state (VLSN 10)",
             loaded_latest
         );
-        assert_eq!(loaded_latest, 10, "all 10 capped entries should load cleanly");
+        assert_eq!(
+            loaded_latest, 10,
+            "all 10 capped entries should load cleanly"
+        );
     }
 
     /// X-2: flush_to_disk_capped with NULL_LSN cap is a no-op (returns 0,

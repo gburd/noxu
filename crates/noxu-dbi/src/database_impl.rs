@@ -3,8 +3,8 @@
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use noxu_tree::{KeyComparatorFn, Tree};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::dup_key_data;
 use crate::throughput_stats::ThroughputStats;
@@ -345,12 +345,11 @@ impl DatabaseImpl {
         self.entry_count.store(count, std::sync::atomic::Ordering::Relaxed);
         // Transfer the key comparator from the current tree (if any) to the
         // recovered tree — RecoveryManager builds trees without db-level config.
-        if let Some(ref current_arc) = self.real_tree {
-            if let Ok(mut current) = current_arc.write() {
-                if let Some(cmp) = current.take_comparator() {
-                    tree.set_comparator(cmp);
-                }
-            }
+        if let Some(ref current_arc) = self.real_tree
+            && let Ok(mut current) = current_arc.write()
+            && let Some(cmp) = current.take_comparator()
+        {
+            tree.set_comparator(cmp);
         }
         self.real_tree = Some(Arc::new(RwLock::new(tree)));
     }
@@ -365,10 +364,10 @@ impl DatabaseImpl {
         &mut self,
         counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
     ) {
-        if let Some(tree_arc) = self.real_tree.as_ref() {
-            if let Ok(mut tree) = tree_arc.write() {
-                tree.set_memory_counter(counter);
-            }
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
+            tree.set_memory_counter(counter);
         }
     }
 
