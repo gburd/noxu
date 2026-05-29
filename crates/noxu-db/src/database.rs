@@ -461,7 +461,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The search key
     /// * `data` - Output parameter to receive the data
     ///
@@ -627,7 +627,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The key to insert/update
     /// * `data` - The data to store
     ///
@@ -869,7 +869,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The key to insert
     /// * `data` - The data to store
     ///
@@ -931,7 +931,7 @@ impl Database {
     ///
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle (used to scope locks and writes to the transaction)
     /// * `key` - The key to delete
     ///
     /// # Returns
@@ -1101,7 +1101,89 @@ impl Database {
         Ok(Cursor::from_impl(cursor_impl, read_only))
     }
 
-    /// Opens (and optionally creates) a sequence backed by this database.
+    /// Returns a lazy forward iterator over all records in the database.
+    ///
+    /// Records are fetched one at a time (the underlying cursor advances on
+    /// each `next()` call).  The full database is **not** eagerly materialised
+    /// into memory.
+    ///
+    /// Pass `txn = Some(&txn)` to iterate within an explicit transaction;
+    /// pass `None` for an auto-commit (non-transactional) scan.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use noxu_db::{Database, DatabaseConfig, DatabaseEntry,
+    /// #              Environment, EnvironmentConfig};
+    /// # use std::path::PathBuf;
+    /// # fn main() -> noxu_db::Result<()> {
+    /// # let env = Environment::open(EnvironmentConfig::new(PathBuf::from("/tmp/t")).with_allow_create(true))?;
+    /// # let db = env.open_database(None, "d", &DatabaseConfig::new().with_allow_create(true))?;
+    /// for result in db.iter(None)? {
+    ///     let (key, val) = result?;
+    ///     println!("{:?} => {:?}", key, val);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the database is closed.
+    pub fn iter(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<crate::db_iter::DbIter> {
+        let cursor = self.open_cursor(txn, None)?;
+        Ok(crate::db_iter::DbIter::new(cursor))
+    }
+
+    /// Returns a lazy iterator over the records whose keys fall within `range`.
+    ///
+    /// The iterator is positioned at the first key that satisfies the lower
+    /// bound (using `SearchGte`) and stops once the key exceeds the upper
+    /// bound.  All standard `RangeBounds` variants are supported:
+    /// `..`, `lo..`, `..=hi`, `lo..hi`, `lo..=hi`, etc.
+    ///
+    /// Pass `txn = Some(&txn)` to iterate within an explicit transaction;
+    /// pass `None` for a non-transactional scan.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use noxu_db::{Database, DatabaseConfig, DatabaseEntry,
+    /// #              Environment, EnvironmentConfig};
+    /// # use std::path::PathBuf;
+    /// # fn main() -> noxu_db::Result<()> {
+    /// # let env = Environment::open(EnvironmentConfig::new(PathBuf::from("/tmp/t")).with_allow_create(true))?;
+    /// # let db = env.open_database(None, "d", &DatabaseConfig::new().with_allow_create(true))?;
+    /// let lo = b"key010";
+    /// let hi = b"key020";
+    /// for result in db.range(None, lo.as_ref()..=hi.as_ref())? {
+    ///     let (key, _val) = result?;
+    ///     assert!(key.as_slice() >= lo.as_slice());
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the database is closed.
+    pub fn range<K: AsRef<[u8]>>(
+        &self,
+        txn: Option<&Transaction>,
+        range: impl std::ops::RangeBounds<K>,
+    ) -> Result<crate::db_iter::DbRange> {
+        use std::ops::Bound;
+        let map_bound = |b: std::ops::Bound<&K>| -> std::ops::Bound<Vec<u8>> {
+            match b {
+                Bound::Included(k) => Bound::Included(k.as_ref().to_vec()),
+                Bound::Excluded(k) => Bound::Excluded(k.as_ref().to_vec()),
+                Bound::Unbounded => Bound::Unbounded,
+            }
+        };
+        let start = map_bound(range.start_bound());
+        let end = map_bound(range.end_bound());
+        let cursor = self.open_cursor(txn, None)?;
+        Ok(crate::db_iter::DbRange::new(cursor, start, end))
+    }
     ///
     ///
     ///

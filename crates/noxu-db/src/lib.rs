@@ -21,7 +21,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use noxu_db::{EnvironmentConfig, DatabaseConfig};
 //! use std::path::PathBuf;
 //!
@@ -51,6 +51,7 @@ pub mod database;
 pub mod database_config;
 pub mod database_entry;
 pub mod database_stats;
+pub mod db_iter;
 pub mod disk_ordered_cursor;
 pub mod durability;
 pub mod environment;
@@ -88,6 +89,7 @@ pub use database::Database;
 pub use database_config::DatabaseConfig;
 pub use database_entry::DatabaseEntry;
 pub use database_stats::{BtreeStats, DatabaseStats};
+pub use db_iter::{DbIter, DbRange};
 pub use disk_ordered_cursor::{
     DiskOrderedCursor, DiskOrderedCursorConfig, open_disk_ordered_cursor_multi,
 };

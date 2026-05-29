@@ -765,7 +765,10 @@ impl CursorImpl {
                     self.current_key = Some(key.to_vec());
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
-                    self.current_index = 0;
+                    // Use the actual BIN slot index from search_with_data so
+                    // that retrieve_next() advances to the correct next slot
+                    // rather than always starting from index 1.
+                    self.current_index = slot.slot_index as i32;
                     self.state = CursorState::Initialized;
                     // BIN arc already obtained from the single descent.
                     self.update_bin_pin(Some(bin_arc));
@@ -800,13 +803,14 @@ impl CursorImpl {
                     self.current_key = Some(key.to_vec());
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
-                    self.current_index = 0;
+                    // Use the actual BIN slot index (same rationale as Set branch).
+                    self.current_index = slot.slot_index as i32;
                     self.state = CursorState::Initialized;
                     // BIN arc already obtained from the single descent.
                     self.update_bin_pin(Some(bin_arc));
                     Ok(OperationStatus::Success)
                 } else {
-                    let next_entry: Option<(Vec<u8>, Vec<u8>, u64)> = {
+                    let next_entry: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
                         let db = self.db_impl.read();
                         if let Some(tree) = db.get_real_tree() {
                             Self::find_range_entry(tree, key)
@@ -815,7 +819,7 @@ impl CursorImpl {
                         }
                     };
                     match next_entry {
-                        Some((k, v, lsn)) => {
+                        Some((k, v, lsn, slot_idx)) => {
                             self.lock_ln(lsn)?;
                             // Pin the BIN for the range-found key.
                             let bin_arc = {
@@ -829,7 +833,7 @@ impl CursorImpl {
                             self.current_key = Some(k);
                             self.current_data = Some(v);
                             self.current_lsn = lsn;
-                            self.current_index = 0;
+                            self.current_index = slot_idx as i32;
                             self.state = CursorState::Initialized;
                             self.update_bin_pin(bin_arc);
                             Ok(OperationStatus::Success)
@@ -1101,12 +1105,12 @@ impl CursorImpl {
     fn find_range_entry(
         tree: &Tree,
         key: &[u8],
-    ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    ) -> Option<(Vec<u8>, Vec<u8>, u64, usize)> {
         use noxu_tree::tree::TreeNode;
 
         // Step 1: scan the BIN that should contain `key`.  The read lock
         // is dropped at the end of this block before step 2 runs.
-        let in_current: Option<(Vec<u8>, Vec<u8>, u64)> = {
+        let in_current: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
             let root = tree.get_root()?;
             // Use find_bin_for_key so range searches also work for non-leftmost BINs.
             let bin_arc = Self::find_bin_for_key(root, key)?;
@@ -1128,6 +1132,7 @@ impl CursorImpl {
                                         fk,
                                         e.data.clone().unwrap_or_default(),
                                         e.lsn.as_u64(),
+                                        0usize,
                                     )
                                 })
                             })
@@ -1149,6 +1154,7 @@ impl CursorImpl {
                                         fk,
                                         e.data.clone().unwrap_or_default(),
                                         e.lsn.as_u64(),
+                                        i,
                                     )
                                 })
                             })
@@ -1166,9 +1172,10 @@ impl CursorImpl {
         // Step 2: chosen BIN had nothing >= key.  By B+tree invariants the
         // first entry of the next BIN is strictly > key, which satisfies
         // SearchGte.  No iteration: one call, one answer.
+        // The first entry of the next BIN is at slot index 0.
         let next = tree.get_next_bin(key)?;
         let e = next.into_iter().next()?;
-        Some((e.key, e.data.unwrap_or_default(), e.lsn.as_u64()))
+        Some((e.key, e.data.unwrap_or_default(), e.lsn.as_u64(), 0))
     }
 
     /// Descends from the given node to the leftmost BIN, returning its Arc.
