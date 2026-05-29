@@ -90,6 +90,8 @@
   - [Testing Guide](contributing/testing-guide.md)
   - [PR Process](contributing/pr-process.md)
   - [Release Process](contributing/release.md)
+  - [API Stability](contributing/api-stability.md)
+  - [SemVer Policy](contributing/semver-policy.md)
 
 ---
 
@@ -159,3 +161,4 @@
   - [Wave 11-I — Cursor / BIN scan optimization](internal/wave-11-i-cursor-double-descent.md)
   - [Wave 11-J — fsync coalescing investigation](internal/wave-11-j-fsync-coalescing.md)
   - [Wave 11-K — Recovery / log-scanner allocation reduction](internal/wave-11-k-recovery-alloc.md)
+  - [Wave 11-L — API stability commitment + SemVer policy](internal/wave-11-l-api-stability.md)

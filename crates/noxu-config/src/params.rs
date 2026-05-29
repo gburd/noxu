@@ -596,7 +596,13 @@ pub static LOG_USE_ODSYNC: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// If true, use Java NIO for log writes (deprecated, prefer write queue).
+/// If true, use Java NIO for log writes.
+///
+/// Deprecated — prefer [`LOG_USE_WRITE_QUEUE`] instead.
+#[deprecated(
+    since = "2.4.1",
+    note = "use LOG_USE_WRITE_QUEUE instead; NIO log writes are no longer the preferred path"
+)]
 pub static LOG_USE_NIO: ConfigParam = ConfigParam::bool_param(
     "noxu.log.useNIO",
     false, // default
@@ -622,7 +628,13 @@ pub static LOG_WRITE_QUEUE_SIZE: ConfigParam = ConfigParam::int_param(
     false,         // forReplication
 );
 
-/// Deprecated. Use deferred-write optimisation for temporary databases.
+/// Deferred-write flag for temporary databases.
+///
+/// Deprecated — per-database deferred-write is configured on the `DatabaseConfig` directly.
+#[deprecated(
+    since = "2.4.1",
+    note = "configure deferred-write per database via DatabaseConfig instead"
+)]
 pub static LOG_DEFERREDWRITE_TEMP: ConfigParam = ConfigParam::bool_param(
     "noxu.deferredWrite.temp",
     false, // default
@@ -630,7 +642,13 @@ pub static LOG_DEFERREDWRITE_TEMP: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// Deprecated compat: whether replication log-flush task is active.
+/// Compatibility parameter: whether the replication log-flush task is active.
+///
+/// Deprecated — the log-flush task is always managed by the replication layer.
+#[deprecated(
+    since = "2.4.1",
+    note = "the replication log-flush task is always controlled by the replication layer; this flag has no effect"
+)]
 pub static OLD_REP_RUN_LOG_FLUSH_TASK: ConfigParam = ConfigParam::bool_param(
     "noxu.rep.runLogFlushTask",
     true, // default
@@ -638,7 +656,13 @@ pub static OLD_REP_RUN_LOG_FLUSH_TASK: ConfigParam = ConfigParam::bool_param(
     true, // forReplication
 );
 
-/// Deprecated compat: interval for replication log-flush task.
+/// Compatibility parameter: interval for the replication log-flush task.
+///
+/// Deprecated — see [`OLD_REP_RUN_LOG_FLUSH_TASK`].
+#[deprecated(
+    since = "2.4.1",
+    note = "the replication log-flush task is always controlled by the replication layer; this interval has no effect"
+)]
 pub static OLD_REP_LOG_FLUSH_TASK_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.rep.logFlushTaskInterval",
     param_type: crate::param::ParamType::Duration,
@@ -1299,7 +1323,13 @@ pub static CLEANER_LOOK_AHEAD_CACHE_SIZE: ConfigParam = ConfigParam::int_param(
     false,   // forReplication
 );
 
-/// Deprecated. Retained to avoid errors in old noxu.properties files.
+/// Retained to avoid parse errors in old `noxu.properties` files.
+///
+/// Deprecated — this parameter has no effect.
+#[deprecated(
+    since = "2.4.1",
+    note = "this parameter is retained only for parse compatibility; it has no effect"
+)]
 pub static CLEANER_BACKGROUND_PROACTIVE_MIGRATION: ConfigParam =
     ConfigParam::bool_param(
         "noxu.cleaner.backgroundProactiveMigration",
@@ -1498,8 +1528,12 @@ pub static FILE_HANDLER_LEVEL: ConfigParam = ConfigParam::string_param(
 // Retained to avoid errors when old noxu.properties files are used.
 // =========================================================================
 
-/// Deprecated. Adjustments are no longer needed because LN log
-/// sizes are stored in the B-tree.
+/// Deprecated — utilisation adjustments are no longer needed because LN log sizes
+/// are stored directly in the B-tree.
+#[deprecated(
+    since = "2.4.1",
+    note = "utilisation adjustments are always applied automatically; this flag has no effect"
+)]
 pub static CLEANER_ADJUST_UTILIZATION: ConfigParam = ConfigParam::bool_param(
     "noxu.cleaner.adjustUtilization",
     false, // default
@@ -1507,7 +1541,13 @@ pub static CLEANER_ADJUST_UTILIZATION: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// @deprecated. Retained to avoid errors in old noxu.properties files.
+/// Retained to avoid parse errors in old `noxu.properties` files.
+///
+/// Deprecated — this parameter has no effect.
+#[deprecated(
+    since = "2.4.1",
+    note = "this parameter is retained only for parse compatibility; it has no effect"
+)]
 pub static CLEANER_FOREGROUND_PROACTIVE_MIGRATION: ConfigParam =
     ConfigParam::bool_param(
         "noxu.cleaner.foregroundProactiveMigration",
@@ -1516,7 +1556,13 @@ pub static CLEANER_FOREGROUND_PROACTIVE_MIGRATION: ConfigParam =
         false, // forReplication
     );
 
-/// @deprecated. Retained to avoid errors in old noxu.properties files.
+/// Retained to avoid parse errors in old `noxu.properties` files.
+///
+/// Deprecated — this parameter has no effect.
+#[deprecated(
+    since = "2.4.1",
+    note = "this parameter is retained only for parse compatibility; it has no effect"
+)]
 pub static CLEANER_LAZY_MIGRATION: ConfigParam = ConfigParam::bool_param(
     "noxu.cleaner.lazyMigration",
     false, // default
@@ -1533,7 +1579,10 @@ pub static COMPRESSOR_PURGE_ROOT: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// Deprecated. Replaced by EVICTOR_EVICT_BYTES.
+/// Deprecated — replaced by [`EVICTOR_EVICT_BYTES`].
+///
+/// The number of nodes per evictor scan is now derived from the bytes-to-evict target.
+#[deprecated(since = "2.4.1", note = "use EVICTOR_EVICT_BYTES instead")]
 pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
     "noxu.evictor.nodesPerScan",
     Some(1),    // min
@@ -1543,7 +1592,13 @@ pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
     false,      // forReplication
 );
 
-/// Deprecated. Use the evictor thread pool instead.
+/// Deprecated — per-pass deadlock retry count is no longer configurable.
+///
+/// The evictor thread pool handles retry scheduling automatically.
+#[deprecated(
+    since = "2.4.1",
+    note = "the evictor thread pool handles retries automatically; this parameter has no effect"
+)]
 pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
     "noxu.evictor.deadlockRetry",
     Some(0), // min
@@ -1553,7 +1608,11 @@ pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
     false,   // forReplication
 );
 
-/// Deprecated.
+/// Deprecated — cache eviction policy is always multi-queue; LRU-only mode is not supported.
+#[deprecated(
+    since = "2.4.1",
+    note = "cache eviction is always multi-queue; this flag has no effect"
+)]
 pub static EVICTOR_LRU_ONLY: ConfigParam = ConfigParam::bool_param(
     "noxu.evictor.lruOnly",
     true,  // default
@@ -1561,7 +1620,11 @@ pub static EVICTOR_LRU_ONLY: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// @deprecated. Use NIO directly; Java NIO direct buffers.
+/// Deprecated — this parameter has no effect in Noxu DB.
+#[deprecated(
+    since = "2.4.1",
+    note = "Java NIO direct buffers are not applicable to Noxu DB; this parameter has no effect"
+)]
 pub static LOG_DIRECT_NIO: ConfigParam = ConfigParam::bool_param(
     "noxu.log.directNIO",
     false, // default
@@ -1569,7 +1632,11 @@ pub static LOG_DIRECT_NIO: ConfigParam = ConfigParam::bool_param(
     false, // forReplication
 );
 
-/// @deprecated. NIO chunked write size in bytes. 0 = no chunking.
+/// Deprecated — this parameter has no effect in Noxu DB.
+#[deprecated(
+    since = "2.4.1",
+    note = "Java NIO chunked writes are not applicable to Noxu DB; this parameter has no effect"
+)]
 pub static LOG_CHUNKED_NIO: ConfigParam = ConfigParam::long_param(
     "noxu.log.chunkedNIO",
     Some(0),       // min
@@ -1630,7 +1697,8 @@ pub static TREE_SECONDARY_INTEGRITY_FATAL: ConfigParam =
         false, // forReplication
     );
 
-/// Returns all defined configuration parameters.
+/// Returns all defined configuration parameters, including deprecated compatibility entries.
+#[allow(deprecated)]
 pub fn all_params() -> Vec<&'static ConfigParam> {
     vec![
         // Memory
@@ -1823,6 +1891,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::time::Duration;
