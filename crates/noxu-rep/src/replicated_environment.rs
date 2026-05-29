@@ -837,6 +837,49 @@ impl ReplicatedEnvironment {
             );
         }
 
+        // X-14: rebuild the VLSN index from recovery-replayed LN entries.
+        // After a crash the on-disk vlsn.idx may be stale (either ahead of
+        // the recovered B-tree, or behind if vlsn.idx was not flushed
+        // after the last checkpoint).  Re-registering all (vlsn, lsn) pairs
+        // from the redo pass gives a consistent in-memory index.
+        if !env.recovery_vlsns.is_empty() {
+            log::info!(
+                "Node '{}': rebuilding VLSN index from {} recovered entries",
+                self.config.node_name,
+                env.recovery_vlsns.len(),
+            );
+            for &(vlsn, lsn_u64) in &env.recovery_vlsns {
+                let lsn = noxu_util::Lsn::from_u64(lsn_u64);
+                self.vlsn_index.register(vlsn, lsn.file_number(), lsn.file_offset());
+            }
+        }
+
+        // X-1: truncate the VLSN index to the rollback matchpoint if recovery
+        // detected a completed rollback period.  The matchpoint is the highest
+        // LSN that is still valid after the rollback; entries with higher VLSNs
+        // correspond to data that was rolled back and must not appear in the
+        // index.
+        if let Some(matchpoint_lsn_u64) = env.recovery_rollback_matchpoint {
+            // Find the latest VLSN whose LSN is at or before the matchpoint.
+            // Scan the recovered VLSN pairs (sorted ascending) to find the
+            // boundary.
+            let safe_vlsn = env
+                .recovery_vlsns
+                .iter()
+                .rev()
+                .find(|&&(_, lsn_u64)| lsn_u64 <= matchpoint_lsn_u64)
+                .map(|&(vlsn, _)| vlsn)
+                .unwrap_or(0);
+            log::info!(
+                "Node '{}': truncating VLSN index after vlsn={} \
+                 (rollback matchpoint lsn={:#x})",
+                self.config.node_name,
+                safe_vlsn,
+                matchpoint_lsn_u64,
+            );
+            self.vlsn_index.truncate_after(safe_vlsn);
+        }
+
         *self.env_impl.lock().unwrap() = Some(env);
     }
 

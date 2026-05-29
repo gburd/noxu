@@ -77,6 +77,22 @@ pub struct RecoveryInfo {
     ///
     /// A `None` value means the name was removed (NameLN with is_deleted=true).
     pub recovered_db_names: hashbrown::HashMap<String, u64>,
+
+    /// VLSN→LSN pairs replayed during the redo phase.
+    ///
+    /// X-14 fix: populated from every LN record that carries a non-zero
+    /// VLSN during the redo pass.  Used by `ReplicatedEnvironment::with_environment`
+    /// to rebuild the in-memory VLSN index after crash recovery.
+    ///
+    /// Pairs are (vlsn, lsn.as_u64()); sorted by vlsn ascending.
+    pub recovered_vlsns: Vec<(u64, u64)>,
+
+    /// Minimum matchpoint LSN across all completed rollback periods.
+    ///
+    /// X-1 fix: after recovery, the VLSN index must be truncated to the
+    /// VLSN corresponding to this LSN so it is consistent with the
+    /// recovered B-tree state.  `None` if no rollbacks were detected.
+    pub rollback_matchpoint_lsn: Option<u64>,
 }
 
 impl RecoveryInfo {
@@ -100,6 +116,8 @@ impl RecoveryInfo {
             recovered_prepared_txns: Vec::new(),
             prepared_txn_lns: hashbrown::HashMap::new(),
             recovered_db_names: hashbrown::HashMap::new(),
+            recovered_vlsns: Vec::new(),
+            rollback_matchpoint_lsn: None,
         }
     }
 }
