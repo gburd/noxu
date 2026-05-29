@@ -693,6 +693,7 @@ impl Environment {
     /// In v2.0 the parameter has been removed entirely (Wave 3-1) — the
     /// type system now enforces the constraint, so what was a runtime
     /// error is now a compile error.
+    #[allow(deprecated)] // Transaction::new / with_log_manager / with_inner_txn / with_env_impl are pub(internal)
     pub fn begin_transaction(
         &self,
         config: Option<&TransactionConfig>,
@@ -2173,6 +2174,7 @@ mod tests {
     /// inherit COMMIT_NO_SYNC when the caller does not specify a
     /// TransactionConfig.
     #[test]
+    #[allow(deprecated)] // tests the deprecated txn_no_sync flag
     fn test_env_txn_no_sync_applies_to_explicit_txn() {
         let temp_dir = TempDir::new().unwrap();
         let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())

@@ -33,13 +33,15 @@ pub struct EnvironmentMutableConfig {
 
     /// If `true`, committed transactions do not flush to disk (no-sync).
     ///
-    /// Deprecated in favour of `durability`; retained for compatibility.
+    /// **Deprecated since 2.4.1** — use [`durability`][Self::durability]
+    /// with `Durability::commit_no_sync()` instead.
     pub txn_no_sync: bool,
 
     /// If `true`, committed transactions flush to the OS buffer but do not
     /// call `fdatasync` (write-no-sync).
     ///
-    /// Deprecated in favour of `durability`; retained for compatibility.
+    /// **Deprecated since 2.4.1** — use [`durability`][Self::durability]
+    /// with `Durability::commit_write_no_sync()` instead.
     pub txn_write_no_sync: bool,
 
     /// Enable or disable the cleaner daemon.  `None` means unchanged.
@@ -85,12 +87,28 @@ impl EnvironmentMutableConfig {
     }
 
     /// Sets the `txn_no_sync` flag.
+    ///
+    /// **Deprecated** — use
+    /// [`with_durability`][Self::with_durability] with
+    /// `Durability::commit_no_sync()` instead.
+    #[deprecated(
+        since = "2.4.1",
+        note = "use with_durability(Durability::commit_no_sync()) instead"
+    )]
     pub fn with_txn_no_sync(mut self, no_sync: bool) -> Self {
         self.txn_no_sync = no_sync;
         self
     }
 
     /// Sets the `txn_write_no_sync` flag.
+    ///
+    /// **Deprecated** — use
+    /// [`with_durability`][Self::with_durability] with
+    /// `Durability::commit_write_no_sync()` instead.
+    #[deprecated(
+        since = "2.4.1",
+        note = "use with_durability(Durability::commit_write_no_sync()) instead"
+    )]
     pub fn with_txn_write_no_sync(mut self, write_no_sync: bool) -> Self {
         self.txn_write_no_sync = write_no_sync;
         self
