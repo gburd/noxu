@@ -44,6 +44,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use noxu_util::Lsn;
+
 use super::vlsn_index::VlsnIndex;
 
 /// File name used for the persisted VLSN index inside the env home.
@@ -142,6 +144,93 @@ pub fn flush_to_disk(index: &VlsnIndex, env_home: &Path) -> Result<u32> {
     std::fs::rename(&tmp, &final_path)?;
 
     Ok(entries.len() as u32)
+}
+
+/// Same as [`flush_to_disk`] but filters out entries whose log position
+/// (file_number, file_offset) exceeds `cap_lsn`.
+///
+/// # X-2 fix — VLSN index persistence tied to checkpoint boundaries
+///
+/// The periodic VLSN flush daemon calls this variant with the last
+/// durable checkpoint's end LSN as `cap_lsn`.  This ensures the
+/// persisted index never claims VLSNs beyond the durable B-tree state:
+/// after a crash the recovered tree and the VLSN index are coherent.
+///
+/// If `cap_lsn` is `NULL_LSN` (no checkpoint yet) the function is a
+/// no-op and returns `Ok(0)` — there is nothing durable to cap against.
+pub fn flush_to_disk_capped(
+    index: &VlsnIndex,
+    env_home: &Path,
+    cap_lsn: Lsn,
+) -> Result<u32> {
+    use noxu_util::NULL_LSN;
+    // If no checkpoint has been completed yet, do not persist — nothing
+    // in the tree is durably checkpointed, so there's nothing safe to
+    // record.
+    if cap_lsn == NULL_LSN {
+        return Ok(0);
+    }
+
+    // Filter entries whose WAL position (file_no, file_offset) is within
+    // the durable checkpoint range.
+    let all_entries = index.snapshot_entries();
+    let capped: Vec<(u64, u32, u32)> = all_entries
+        .into_iter()
+        .filter(|(_, file_no, offset)| Lsn::new(*file_no, *offset) <= cap_lsn)
+        .collect();
+
+    if capped.is_empty() {
+        // Nothing within the checkpoint range — no-op.
+        return Ok(0);
+    }
+
+    // Recompute the persisted range from the filtered entries.
+    let first_vlsn = capped.first().map(|e| e.0).unwrap_or(0);
+    let last_vlsn = capped.last().map(|e| e.0).unwrap_or(0);
+    let stride = index.bucket_stride();
+
+    let tmp = tmp_path(env_home);
+    let final_path = index_path(env_home);
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    let mut w = BufWriter::new(file);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(HEADER_LEN + capped.len() * 16);
+    buf.extend_from_slice(MAGIC);
+    buf.extend_from_slice(&VERSION.to_le_bytes());
+    buf.extend_from_slice(&stride.to_le_bytes());
+    buf.extend_from_slice(&(capped.len() as u32).to_le_bytes());
+
+    buf.extend_from_slice(&(first_vlsn as u32).to_le_bytes());
+    buf.extend_from_slice(&((first_vlsn >> 32) as u32).to_le_bytes());
+    buf.extend_from_slice(&(last_vlsn as u32).to_le_bytes());
+    buf.extend_from_slice(&((last_vlsn >> 32) as u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 2]); // reserved padding
+
+    debug_assert_eq!(buf.len(), HEADER_LEN);
+
+    for (vlsn, file_no, offset) in &capped {
+        buf.extend_from_slice(&vlsn.to_le_bytes());
+        buf.extend_from_slice(&file_no.to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+
+    w.write_all(&buf)?;
+    w.flush()?;
+    let f = w.into_inner().map_err(|e| io::Error::other(e.to_string()))?;
+    f.sync_all()?;
+    drop(f);
+
+    std::fs::rename(&tmp, &final_path)?;
+
+    Ok(capped.len() as u32)
 }
 
 /// Load a VLSN index from `env_home/vlsn.idx`.
@@ -347,5 +436,73 @@ mod tests {
         let loaded = load_from_disk(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.get_latest_vlsn(), 0);
         assert!(loaded.get_range().is_empty());
+    }
+
+    /// X-2: flush_to_disk_capped must not persist entries whose WAL position
+    /// exceeds the checkpoint LSN — this prevents a post-crash VLSN
+    /// high-watermark from exceeding the recovered tree state.
+    ///
+    /// Scenario:
+    ///   * VLSNs 1-10 are stored with WAL positions that fall within the
+    ///     checkpoint (file=0, offsets 0-90, checkpoint end = (0, 90)).
+    ///   * VLSNs 11-20 are stored with WAL positions beyond the checkpoint
+    ///     (file=0, offsets 110-200).
+    ///   * We flush with cap_lsn = Lsn::new(0, 90).
+    ///   * After loading, the index must contain only VLSNs 1-10.
+    #[test]
+    fn test_x2_flush_capped_excludes_post_checkpoint_entries() {
+        let dir = TempDir::new().unwrap();
+        let idx = VlsnIndex::new(1); // stride 1 — every VLSN is stored
+
+        // VLSNs 1-10: positions within checkpoint.
+        for v in 1u64..=10 {
+            idx.put(v, 0, (v * 9) as u32); // offset 9, 18, ..., 90
+        }
+        // VLSNs 11-20: positions beyond checkpoint.
+        for v in 11u64..=20 {
+            idx.put(v, 0, (v * 10) as u32); // offset 110, 120, ..., 200
+        }
+        assert_eq!(
+            idx.get_latest_vlsn(),
+            20,
+            "precondition: 20 VLSNs in index"
+        );
+
+        // Checkpoint end is at (file=0, offset=90): covers VLSNs 1-10.
+        let cap_lsn = Lsn::new(0, 90);
+        let n = flush_to_disk_capped(&idx, dir.path(), cap_lsn).unwrap();
+        assert_eq!(n, 10, "only 10 entries within cap should be persisted");
+
+        // After loading, the index high-watermark must be ≤ cap.
+        let loaded = load_from_disk(dir.path()).unwrap().unwrap();
+        let loaded_latest = loaded.get_latest_vlsn();
+        assert!(
+            loaded_latest <= 10,
+            "X-2: persisted VLSN HWM {} must not exceed checkpointed state (VLSN 10)",
+            loaded_latest
+        );
+        assert_eq!(
+            loaded_latest, 10,
+            "all 10 capped entries should load cleanly"
+        );
+    }
+
+    /// X-2: flush_to_disk_capped with NULL_LSN cap is a no-op (returns 0,
+    /// writes no file).
+    #[test]
+    fn test_x2_flush_capped_null_lsn_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let idx = VlsnIndex::new(1);
+        for v in 1u64..=5 {
+            idx.put(v, 0, v as u32 * 10);
+        }
+        let n = flush_to_disk_capped(&idx, dir.path(), noxu_util::NULL_LSN)
+            .unwrap();
+        assert_eq!(n, 0, "NULL_LSN cap must be a no-op");
+        // No file should have been written.
+        assert!(
+            !index_path(dir.path()).exists(),
+            "no vlsn.idx should be written for NULL_LSN cap"
+        );
     }
 }

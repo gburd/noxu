@@ -506,15 +506,29 @@ impl ReplicatedEnvironment {
                         // Nothing new to flush.
                         continue;
                     }
-                    match crate::vlsn::persist::flush_to_disk(
+                    // X-2: cap the flush at the last durable checkpoint's
+                    // end LSN so the persisted VLSN index never claims
+                    // VLSNs beyond the durable B-tree state.  After a crash
+                    // the recovered tree and the index will be coherent.
+                    let cap_lsn = me
+                        .env_impl
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|e| e.get_checkpointer())
+                        .map(|c| c.get_last_checkpoint_end())
+                        .unwrap_or(noxu_util::NULL_LSN);
+                    match crate::vlsn::persist::flush_to_disk_capped(
                         &vlsn_index,
                         &home,
+                        cap_lsn,
                     ) {
                         Ok(n) => {
                             log::trace!(
-                                "vlsn-flush: persisted {} entries (latest vlsn={})",
+                                "vlsn-flush: persisted {} entries (latest vlsn={}, cap_lsn={:?})",
                                 n,
                                 latest,
+                                cap_lsn,
                             );
                             last_persisted_vlsn = latest;
                         }
@@ -528,9 +542,19 @@ impl ReplicatedEnvironment {
                     }
                 }
                 // Final flush on shutdown so a clean close is recoverable.
-                if let Err(e) = crate::vlsn::persist::flush_to_disk(
+                // Cap at the last checkpoint even for the shutdown flush.
+                let cap_lsn = me
+                    .env_impl
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|e| e.get_checkpointer())
+                    .map(|c| c.get_last_checkpoint_end())
+                    .unwrap_or(noxu_util::NULL_LSN);
+                if let Err(e) = crate::vlsn::persist::flush_to_disk_capped(
                     &vlsn_index,
                     &home,
+                    cap_lsn,
                 ) {
                     log::warn!(
                         "vlsn-flush (final): failed to persist VLSN index: {}",

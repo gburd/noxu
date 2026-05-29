@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use noxu_log::LogManager;
 use noxu_txn::{LockManager, LockType, TxnError};
 use noxu_util::Lsn;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -643,6 +643,14 @@ pub struct SharedTreeLookup {
     tree: Arc<RwLock<noxu_tree::Tree>>,
     log_manager: Arc<LogManager>,
     lock_manager: Arc<LockManager>,
+    /// Per-database-id trees for secondary databases (X-7 fix).
+    ///
+    /// When `lookup_parent_bin` / `migrate_ln_slot` is called with a
+    /// `db_id` that appears in this map, the corresponding tree is used
+    /// instead of `self.tree` (the primary tree).  This ensures secondary
+    /// LNs are classified as live/obsolete against the correct tree, not
+    /// the primary tree where their keys do not exist.
+    extra_trees: HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>,
 }
 
 impl SharedTreeLookup {
@@ -656,7 +664,7 @@ impl SharedTreeLookup {
         log_manager: Arc<LogManager>,
     ) -> Self {
         let lock_manager = Arc::new(LockManager::new());
-        Self { tree, log_manager, lock_manager }
+        Self { tree, log_manager, lock_manager, extra_trees: HashMap::new() }
     }
 
     /// Creates a new `SharedTreeLookup` with a wired `LockManager`.
@@ -668,21 +676,44 @@ impl SharedTreeLookup {
         log_manager: Arc<LogManager>,
         lock_manager: Arc<LockManager>,
     ) -> Self {
-        Self { tree, log_manager, lock_manager }
+        Self { tree, log_manager, lock_manager, extra_trees: HashMap::new() }
+    }
+
+    /// Register per-database trees for secondary databases (X-7 fix).
+    ///
+    /// When `lookup_parent_bin` / `migrate_ln_slot` is called with a db_id
+    /// present in `extra_trees`, the corresponding tree is used for liveness
+    /// checks and migration instead of the primary tree.  Keys absent from
+    /// `extra_trees` fall back to the primary tree.
+    pub fn with_extra_trees(
+        mut self,
+        extra_trees: HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>,
+    ) -> Self {
+        self.extra_trees = extra_trees;
+        self
+    }
+
+    /// Resolve the correct tree for `db_id`: use the extra tree if registered,
+    /// otherwise fall back to the primary tree.
+    fn resolve_tree(&self, db_id: i64) -> &Arc<RwLock<noxu_tree::Tree>> {
+        self.extra_trees.get(&db_id).unwrap_or(&self.tree)
     }
 }
 
 impl TreeLookup for SharedTreeLookup {
     /// Look up the parent BIN slot for `key` in the shared tree.
     ///
-    ///
+    /// X-7: dispatches to the tree registered for `db_id` in `extra_trees`
+    /// (for secondary databases), falling back to the primary tree.
     fn lookup_parent_bin(
         &self,
-        _db_id: i64,
+        db_id: i64,
         key: &[u8],
         _log_lsn: Lsn,
     ) -> BinLookupResult {
-        let tree = match self.tree.read() {
+        // X-7: dispatch to the correct tree for this db_id.
+        let tree_arc = self.resolve_tree(db_id);
+        let tree = match tree_arc.read() {
             Ok(g) => g,
             Err(_) => return BinLookupResult::NotFound,
         };
@@ -709,11 +740,13 @@ impl TreeLookup for SharedTreeLookup {
     /// H-4 fix.
     fn migrate_ln_slot(
         &self,
-        _db_id: i64,
+        db_id: i64,
         key: &[u8],
         log_lsn: Lsn,
         tree_lsn: Lsn,
     ) -> MigrationOutcome {
+        // X-7: dispatch to the correct tree for this db_id.
+        let tree_arc = Arc::clone(self.resolve_tree(db_id));
         // H-4: non-blocking lock on tree_lsn before migrating.
         let locker_id = next_cleaner_locker_id();
         let lock_lsn = tree_lsn.as_u64();
@@ -733,7 +766,7 @@ impl TreeLookup for SharedTreeLookup {
 
         // Post-lock re-check.
         let current_lsn = {
-            let tree = match self.tree.read() {
+            let tree = match tree_arc.read() {
                 Ok(g) => g,
                 Err(_) => {
                     release_cleaner_lock(
@@ -766,7 +799,7 @@ impl TreeLookup for SharedTreeLookup {
         // new WAL position.  Previously this used get_end_of_log() as a fake
         // LSN and wrote no log entry.
         let data = {
-            let tree = match self.tree.read() {
+            let tree = match tree_arc.read() {
                 Ok(g) => g,
                 Err(_) => {
                     release_cleaner_lock(
@@ -782,7 +815,7 @@ impl TreeLookup for SharedTreeLookup {
                 .unwrap_or_default()
         };
 
-        let db_id_u64 = _db_id.unsigned_abs();
+        let db_id_u64 = db_id.unsigned_abs();
         let new_lsn = write_migration_ln(
             &self.log_manager,
             db_id_u64,
@@ -793,7 +826,7 @@ impl TreeLookup for SharedTreeLookup {
         .unwrap_or_else(|| self.log_manager.get_end_of_log());
 
         let result =
-            self.tree.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
+            tree_arc.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
 
         // H-4: release lock.
         release_cleaner_lock(

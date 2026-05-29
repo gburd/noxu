@@ -3,8 +3,8 @@
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use noxu_tree::{KeyComparatorFn, Tree};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::dup_key_data;
 use crate::throughput_stats::ThroughputStats;
@@ -55,7 +55,10 @@ pub struct DatabaseImpl {
     /// `None` only for read-only or freshly created databases before the first
     /// write; otherwise always `Some`.  Populated either from recovery via
     /// `set_recovered_tree()` or lazily on first write.
-    real_tree: Option<Tree>,
+    /// Wrapped in `Arc<RwLock<Tree>>` so the cleaner can share the same tree
+    /// instance for secondary-database LN liveness checks (X-7 fix).  All
+    /// cursor operations take a read guard; only setup calls need a write guard.
+    real_tree: Option<Arc<RwLock<Tree>>>,
     /// Whether writes are deferred (not WAL-logged immediately).
     ///
     ///
@@ -156,7 +159,7 @@ impl DatabaseImpl {
             max_tree_entries_per_node: config.node_max_entries,
             reference_count: AtomicI64::new(0),
             tree: Some(DatabaseTree::new()),
-            real_tree: Some(real_tree),
+            real_tree: Some(Arc::new(RwLock::new(real_tree))),
             deferred_write: config.deferred_write,
             entry_count: Arc::new(AtomicU64::new(0)),
             throughput: ThroughputStats::new(),
@@ -276,13 +279,28 @@ impl DatabaseImpl {
     }
 
     // Real B+tree access for cursor traversal and data operations.
-    /// Returns a reference to the real B+tree.
-    pub fn get_real_tree(&self) -> Option<&Tree> {
-        self.real_tree.as_ref()
+    /// Returns a read guard over the real B+tree.
+    ///
+    /// Returns `Option<RwLockReadGuard<'_, Tree>>` — the guard `Deref`s to
+    /// `&Tree`, so all existing cursor-code patterns (`tree.search(key)`,
+    /// `Self::get_data_from_tree(tree, key)`, etc.) continue to work without
+    /// modification through auto-deref coercion.
+    ///
+    /// Returns `None` if no tree is present or if the lock is poisoned.
+    ///
+    /// # X-7 fix
+    /// Use `get_real_tree_arc()` (below) to obtain the `Arc<RwLock<Tree>>`
+    /// for sharing with the cleaner's db-tree registry.
+    pub fn get_real_tree(
+        &self,
+    ) -> Option<std::sync::RwLockReadGuard<'_, Tree>> {
+        self.real_tree.as_ref()?.read().ok()
     }
-    /// Returns a mutable reference to the real B+tree.
-    pub fn get_real_tree_mut(&mut self) -> Option<&mut Tree> {
-        self.real_tree.as_mut()
+
+    /// Returns a clone of the `Arc<RwLock<Tree>>` for sharing with the
+    /// cleaner's per-database tree registry (X-7 fix).
+    pub fn get_real_tree_arc(&self) -> Option<Arc<RwLock<Tree>>> {
+        self.real_tree.clone()
     }
 
     /// Sets the expiration time (absolute hours since Unix epoch) for the
@@ -297,6 +315,7 @@ impl DatabaseImpl {
     ) -> bool {
         self.real_tree
             .as_ref()
+            .and_then(|arc| arc.read().ok())
             .map(|t| t.update_key_expiration(key, expiration_hours))
             .unwrap_or(false)
     }
@@ -309,7 +328,10 @@ impl DatabaseImpl {
     /// Returns `None` if this DatabaseImpl has no real tree (e.g. internal
     /// metadata databases).
     pub fn collect_btree_stats(&self) -> Option<noxu_tree::TreeStats> {
-        self.real_tree.as_ref().map(|t| t.collect_stats())
+        self.real_tree
+            .as_ref()
+            .and_then(|arc| arc.read().ok())
+            .map(|t| t.collect_stats())
     }
 
     /// Replace the real B+tree with a tree recovered from the log.
@@ -321,18 +343,15 @@ impl DatabaseImpl {
         // tree so that Database::count() returns the correct value after reopen.
         let count = tree.count_entries();
         self.entry_count.store(count, std::sync::atomic::Ordering::Relaxed);
-        // If the current (freshly-created) tree has a key comparator (e.g.
-        // TwoPartKeyComparator for sorted-dup databases), transfer it to the
-        // recovered tree.  The recovered tree was built by RecoveryManager
-        // which has no database-level config, so it always uses default byte
-        // comparison.  Without the comparator, lookups on two-part keys would
-        // fail because the BIN's find_entry_cmp path would not be used.
-        if let Some(ref mut current) = self.real_tree
+        // Transfer the key comparator from the current tree (if any) to the
+        // recovered tree — RecoveryManager builds trees without db-level config.
+        if let Some(ref current_arc) = self.real_tree
+            && let Ok(mut current) = current_arc.write()
             && let Some(cmp) = current.take_comparator()
         {
             tree.set_comparator(cmp);
         }
-        self.real_tree = Some(tree);
+        self.real_tree = Some(Arc::new(RwLock::new(tree)));
     }
 
     /// Wires the environment's shared memory-usage counter into this database's
@@ -345,7 +364,9 @@ impl DatabaseImpl {
         &mut self,
         counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
     ) {
-        if let Some(tree) = self.real_tree.as_mut() {
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
             tree.set_memory_counter(counter);
         }
     }
@@ -430,7 +451,7 @@ impl DatabaseImpl {
             max_tree_entries_per_node: max_entries,
             reference_count: AtomicI64::new(0),
             tree: Some(tree),
-            real_tree: Some(real_tree),
+            real_tree: Some(Arc::new(RwLock::new(real_tree))),
             deferred_write: false, // not persisted in log record; set after open if needed
             entry_count: Arc::new(AtomicU64::new(0)),
             throughput: ThroughputStats::new(),

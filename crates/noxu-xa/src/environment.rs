@@ -3,6 +3,7 @@
 use std::sync::Mutex;
 
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 use noxu_db::{Environment, Transaction, TransactionConfig};
 
 use crate::error::{PrepareResult, XaError, XaResult};
@@ -72,6 +73,16 @@ pub struct XaEnvironment {
     /// during the most recent `Environment::open()` recovery pass.
     /// Resolved via `xa_commit(xid)` / `xa_rollback(xid)`.
     recovered_branches: Mutex<HashMap<Xid, RecoveredBranch>>,
+    /// X-4: sentinel set tracking XIDs currently being resolved from a
+    /// recovered state (removed from `recovered_branches` but I/O not yet
+    /// complete).  A concurrent `xa_start(JOIN, xid)` during this window
+    /// must receive `XaError::Protocol` (retryable) rather than
+    /// `XaError::NotFound` (silently dropped join).
+    ///
+    /// Locking order: `recovered_branches` → `resolving_xids`.
+    /// `xa_start` acquires `branches` → `resolving_xids` → `recovered_branches`
+    /// (each held briefly, released before the next, so no cycle).
+    resolving_xids: Mutex<HashSet<Xid>>,
     prepared_log: Option<PreparedLog>,
     /// Recovery-scan cursor state for `xa_recover` (audit
     /// X/Open requires `STARTRSCAN` to
@@ -108,6 +119,7 @@ impl XaEnvironment {
             env,
             branches: Mutex::new(HashMap::new()),
             recovered_branches: Mutex::new(recovered),
+            resolving_xids: Mutex::new(HashSet::new()),
             prepared_log: None,
             recover_cursor: Mutex::new(None),
         }
@@ -239,6 +251,26 @@ impl XaResource for XaEnvironment {
 
         if flags.contains(XaFlags::JOIN) {
             // Join an existing branch — just verify it exists and is active.
+            //
+            // X-4: also guard the window where xa_commit/xa_rollback has
+            // already removed the XID from `recovered_branches` but I/O is
+            // still in-flight (XID is in `resolving_xids`).  A JOIN on a
+            // recovered or in-resolution XID is always a protocol violation
+            // per X/Open: recovered branches are PREPARED, not Active.
+            if self.resolving_xids.lock().unwrap().contains(xid) {
+                return Err(XaError::Protocol(
+                    "cannot join: XID is being resolved from a recovered \
+                     state; retry after xa_commit/xa_rollback completes"
+                        .to_string(),
+                ));
+            }
+            if self.recovered_branches.lock().unwrap().contains_key(xid) {
+                return Err(XaError::Protocol(
+                    "cannot join: XID is a recovered (prepared) branch; \
+                     xa_commit or xa_rollback must be called instead"
+                        .to_string(),
+                ));
+            }
             let branch = branches.get(xid).ok_or(XaError::NotFound)?;
             if branch.state != BranchState::Active {
                 return Err(XaError::Protocol(
@@ -411,18 +443,29 @@ impl XaResource for XaEnvironment {
         let mut recovered = self.recovered_branches.lock().unwrap();
         let recovered_branch =
             recovered.remove(xid).ok_or(XaError::NotFound)?;
+        // X-4: insert into resolving_xids BEFORE dropping recovered_branches
+        // so a concurrent xa_start(JOIN, xid) never sees a window where the
+        // XID has been removed from recovered_branches but I/O is not yet
+        // complete and returns XaError::NotFound.  With the sentinel in place
+        // xa_start(JOIN) returns XaError::Protocol (retryable) instead.
+        self.resolving_xids.lock().unwrap().insert(xid.clone());
         drop(recovered);
 
         // Replay the prepared txn's LNs into the in-memory tree so
         // subsequent reads see the committed data without waiting for
         // the next environment open.
         let lns = self.env.take_recovered_prepared_lns(recovered_branch.txn_id);
-        self.env.apply_recovered_prepared_lns(&lns).map_err(XaError::Db)?;
+        let apply_result =
+            self.env.apply_recovered_prepared_lns(&lns).map_err(XaError::Db);
 
         // Write the durable TxnCommit WAL frame.
-        self.env
-            .write_txn_commit_for_recovered(recovered_branch.txn_id)
-            .map_err(XaError::Db)?;
+        let commit_result = if apply_result.is_ok() {
+            self.env
+                .write_txn_commit_for_recovered(recovered_branch.txn_id)
+                .map_err(XaError::Db)
+        } else {
+            apply_result
+        };
 
         // Drop from the engine's recovered list and from the
         // operator-facing PreparedLog.
@@ -431,6 +474,11 @@ impl XaResource for XaEnvironment {
             let _ = log.remove(xid);
         }
 
+        // X-4: remove the in-resolution sentinel.  At this point any
+        // concurrent xa_start(JOIN) will correctly receive NotFound.
+        self.resolving_xids.lock().unwrap().remove(xid);
+
+        commit_result?;
         log::debug!("xa_commit: {xid:?} (recovered)");
         Ok(())
     }
@@ -473,21 +521,28 @@ impl XaResource for XaEnvironment {
         let mut recovered = self.recovered_branches.lock().unwrap();
         let recovered_branch =
             recovered.remove(xid).ok_or(XaError::NotFound)?;
+        // X-4: same sentinel pattern as xa_commit's recovered path.
+        self.resolving_xids.lock().unwrap().insert(xid.clone());
         drop(recovered);
 
         // Discard the prepared LN replay list — nothing to apply.
         let _ = self.env.take_recovered_prepared_lns(recovered_branch.txn_id);
 
         // Write the durable TxnAbort WAL frame.
-        self.env
+        let abort_result = self
+            .env
             .write_txn_abort_for_recovered(recovered_branch.txn_id)
-            .map_err(XaError::Db)?;
+            .map_err(XaError::Db);
 
         self.env.forget_recovered_prepared_txn(recovered_branch.txn_id);
         if let Some(ref log) = self.prepared_log {
             let _ = log.remove(xid);
         }
 
+        // X-4: remove the in-resolution sentinel.
+        self.resolving_xids.lock().unwrap().remove(xid);
+
+        abort_result?;
         log::debug!("xa_rollback: {xid:?} (recovered)");
         Ok(())
     }
@@ -856,5 +911,70 @@ mod tests {
         for xid in &xids {
             xa.xa_rollback(xid, XaFlags::NOFLAGS).unwrap();
         }
+    }
+
+    /// X-4: Recovered XA branch TOCTOU — xa_start(JOIN) during resolution
+    /// must return Protocol (retryable), never NotFound.
+    ///
+    /// Simulates the race by directly injecting a synthetic entry into
+    /// `recovered_branches` and `resolving_xids` (via the Mutex fields),
+    /// then verifying that xa_start(JOIN, xid) returns the correct errors.
+    ///
+    /// The full concurrent scenario (xa_commit racing xa_start) would require
+    /// carefully interleaved threads; this test verifies the invariants that
+    /// the sentinel-based fix relies on.
+    #[test]
+    fn test_xa4_join_on_recovered_xid_returns_protocol_not_notfound() {
+        let (xa, _dir) = make_xa_env();
+        let xid = Xid::new(1, b"xa4-gtrid", b"xa4-bqual").unwrap();
+
+        // Phase A: XID is in recovered_branches (before resolution starts).
+        // xa_start(JOIN) must return Protocol, not NotFound.
+        {
+            let mut rec = xa.recovered_branches.lock().unwrap();
+            rec.insert(xid.clone(), RecoveredBranch { txn_id: 9999 });
+        }
+        let result = xa.xa_start(&xid, XaFlags::JOIN);
+        assert!(
+            matches!(result, Err(XaError::Protocol(_))),
+            "xa_start(JOIN) on a recovered XID must return Protocol: {result:?}"
+        );
+        // Clean up
+        xa.recovered_branches.lock().unwrap().remove(&xid);
+
+        // Phase B: XID is in resolving_xids (mid-resolution I/O window).
+        // xa_start(JOIN) must return Protocol, not NotFound.
+        {
+            xa.resolving_xids.lock().unwrap().insert(xid.clone());
+        }
+        let result = xa.xa_start(&xid, XaFlags::JOIN);
+        assert!(
+            matches!(result, Err(XaError::Protocol(_))),
+            "xa_start(JOIN) while XID is being resolved must return Protocol: \
+             {result:?}"
+        );
+        xa.resolving_xids.lock().unwrap().remove(&xid);
+
+        // Phase C: XID is gone from both maps (resolution complete).
+        // xa_start(JOIN) must return NotFound (correct: no active branch).
+        let result = xa.xa_start(&xid, XaFlags::JOIN);
+        assert!(
+            matches!(result, Err(XaError::NotFound)),
+            "xa_start(JOIN) after resolution must return NotFound: {result:?}"
+        );
+    }
+
+    /// X-4: Verify that xa_start(JOIN) on an active in-memory branch still works.
+    #[test]
+    fn test_xa4_join_active_branch_still_works() {
+        let (xa, _dir) = make_xa_env();
+        let xid = Xid::new(1, b"xa4join", b"active").unwrap();
+
+        xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
+        // JOIN from another logical thread should succeed.
+        xa.xa_start(&xid, XaFlags::JOIN).unwrap();
+
+        xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
+        xa.xa_rollback(&xid, XaFlags::NOFLAGS).unwrap();
     }
 }
