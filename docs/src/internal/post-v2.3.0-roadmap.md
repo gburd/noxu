@@ -51,7 +51,7 @@ Every wave ships:
 | 11-H | v2.4.0 | Performance investigation on JE-wins workloads (W03/W04/W10/W11) | merged: per-workload analysis + ROI plan in [wave-11-h-perf-investigation.md](wave-11-h-perf-investigation.md) |
 | 11-I | v2.4.0 | Optimize cursor descent / BIN scan (closes W03/W04 gap) | **merged**: W03 +115%, W04 +135%; both now beat JE ([wave-11-i-cursor-double-descent.md](wave-11-i-cursor-double-descent.md)) |
 | 11-J | v2.4.0 | Optimize fsync coalescing (closes W10 gap) | **investigation complete**: Treiber-stack rewrite prototyped and reverted (10–46 % regression); property test added; see [wave-11-j-fsync-coalescing.md](wave-11-j-fsync-coalescing.md) |
-| 11-K | v2.5.0 | Optimize log scanner (closes W11 gap) | gated on 11-H findings |
+| 11-K | v2.4.0 | Optimize log scanner (closes W11 gap) | **landed (partial)**: 3 alloc reductions in redo path (Tree::redo_insert + zero-copy LnRecord + BIN capacity hint); ~1 % wall-clock improvement on W11 (env-open dominates, not redo loop); follow-up needed for full gap closure — see [wave-11-k-recovery-alloc.md](wave-11-k-recovery-alloc.md) |
 | 11-N | v2.3.1 | Sorted-dup cursor bug fixes (4 bugs Wave 11-A/B surfaced) | merged — see `wave-11-n-sorted-dup-cursor-bugs.md`; the 4 #[ignore]'d / safety-cap regression tests are now passing live tests |
 | 11-BF | v2.3.2 | Bug-fix wave: 6 regressions from Wave 11-E/G | **merged** — all 6 `#[ignore]`'d tests fixed and promoted; see [wave-11-bugfix-v232.md](wave-11-bugfix-v232.md): record_active_txn guard, txn-cursor-on-non-txn-db, NoOverwrite dup-DB semantics, db-name registry WAL persistence, checkpoint data-loss, truncate durability |
 | 11-L | v3.0.0 | API stability commitment + SemVer policy + deprecation cycle | queued |
@@ -193,12 +193,40 @@ Deliverable: `test_fsync_before_commit_invariant` added to `noxu-log` — a new
 returns.  See [wave-11-j-fsync-coalescing.md](wave-11-j-fsync-coalescing.md)
 for the full diagnosis and recommended next steps.
 
-### 11-K — Log scanner optimization (W11)
+### 11-K — Log scanner / recovery allocation reduction (W11)
 
-Acceptance:
+**Status:** landed on `fix/wave11-k-recovery-alloc`.
 
-* W11 closes to within 1.5× of JE.
-* Recovery correctness tests still pass.
+Three allocation-reduction changes merged:
+
+* Fix 1: `Tree::redo_insert(&[u8], &[u8], Lsn)` — eliminates one intermediate
+  `Vec<u8>` per LN record during redo (previously `rec.key.to_vec()` before
+  calling `Tree::insert`).
+* Fix 2: consuming iteration in `run_analysis` — moves `LnRecord` into
+  `redo_entries` without `Bytes::clone()`, eliminating 200K+ Arc
+  refcount bumps at 100K scale.
+* Fix 3: `Tree::hint_redo_capacity` + pre-allocated BIN split halves —
+  eliminates Vec-resize doublings in the initial BIN and in each BIN
+  created by `split_child`.
+
+Measured improvement (tmpfs, this machine):
+
+| Scale | Baseline | After 11-K | JE | Ratio |
+|------:|---------:|-----------:|----:|------:|
+| 1 K   | ~202ms   | ~202ms     | 28ms | 7.2× |
+| 10 K  | ~214ms   | ~214ms     | 45ms | 4.7× |
+| 100 K | ~254ms   | ~251ms     | 87ms | 2.9× |
+
+The allocator-path changes are confirmed by the refactoring (fewer
+calls to `to_vec()`, no `Bytes::clone()` in the analysis hot loop).
+The measured W11 wall-clock improvement at 100K is within the
+benchmark noise band (~1%) — see the wave doc for root-cause analysis.
+
+Acceptance gate (1.5× of JE on tmpfs) is NOT yet met.  The wave doc
+explains why: the dominant remaining cost is the ~200ms env-open
+overhead that is NOT in the recovery path, not the LN redo loop itself.
+A follow-up (e.g., lazy env-open optimisation or BIN deserialization
+from the dirty_in_map) would be needed to close the gap.
 
 ### 11-N — Sorted-dup cursor bug fixes
 
