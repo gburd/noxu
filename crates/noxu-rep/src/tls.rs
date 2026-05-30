@@ -47,7 +47,6 @@
 //! );
 //! ```
 
-#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
 use crate::error::{RepError, Result};
 
 // ─── TlsIdentity ─────────────────────────────────────────────────────────────
@@ -214,6 +213,79 @@ impl TlsConfig {
             trusted_certs: TrustedCerts::CaBytes(vec![ca_pem]),
             server_name: server_name.into(),
         }
+    }
+
+    /// Create a TLS configuration intended for **replication**:
+    /// requires both a non-self-signed identity and a non-empty
+    /// CA list. Returns `Err` for any input that would
+    /// produce a configuration where the peer cannot be
+    /// authenticated.
+    ///
+    /// This is the documented path for production replication
+    /// per `docs/src/internal/auth-mtls-design-2026-05.md`. It
+    /// is stricter than the `from_pem_files` and `from_pkcs12`
+    /// constructors:
+    ///
+    ///   - Rejects `TlsIdentity::SelfSigned` (a runtime-generated
+    ///     cert has no consistent subject across restarts —
+    ///     incompatible with subject-based authorisation).
+    ///   - Rejects `TrustedCerts::SkipVerification` (skip-verify
+    ///     is a development-only path).
+    ///   - Rejects empty `CaFiles` / `CaBytes` lists.
+    ///
+    /// `[`TlsConfig::insecure`]` remains available for tests and
+    /// trusted-network deployments where the operator
+    /// explicitly accepts an unauthenticated transport.
+    pub fn for_replication(
+        identity: TlsIdentity,
+        trusted_certs: TrustedCerts,
+        server_name: impl Into<String>,
+    ) -> Result<Self> {
+        // Validate identity.
+        if matches!(identity, TlsIdentity::SelfSigned { .. }) {
+            return Err(RepError::ConfigError(
+                "TlsConfig::for_replication rejects TlsIdentity::SelfSigned: \
+                 runtime-generated certs have no stable subject and cannot \
+                 be matched against a peer allowlist. Use PemFiles, \
+                 PemBytes, or Pkcs12 with a real CA-issued cert."
+                    .into(),
+            ));
+        }
+        // Validate trust.
+        match &trusted_certs {
+            TrustedCerts::SkipVerification => {
+                return Err(RepError::ConfigError(
+                    "TlsConfig::for_replication rejects \
+                     TrustedCerts::SkipVerification: replication peer \
+                     authentication requires CA-rooted chain validation. \
+                     Use TrustedCerts::CaFiles or CaBytes with the \
+                     replication CA's certificate."
+                        .into(),
+                ));
+            }
+            TrustedCerts::CaFiles(v) if v.is_empty() => {
+                return Err(RepError::ConfigError(
+                    "TlsConfig::for_replication rejects empty CaFiles: \
+                     at least one CA must be provided for peer cert \
+                     validation."
+                        .into(),
+                ));
+            }
+            TrustedCerts::CaBytes(v) if v.is_empty() => {
+                return Err(RepError::ConfigError(
+                    "TlsConfig::for_replication rejects empty CaBytes: \
+                     at least one CA must be provided for peer cert \
+                     validation."
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(TlsConfig {
+            identity,
+            trusted_certs,
+            server_name: server_name.into(),
+        })
     }
 }
 
@@ -1398,5 +1470,98 @@ mod tests {
         };
         let qc = cfg.to_quinn_client_config();
         assert!(qc.is_ok(), "quinn client config with CA: {:?}", qc.err());
+    }
+
+    // ── for_replication: stricter constructor for production
+    //    replication. Rejects every shape that would produce
+    //    an unauthenticated transport.
+
+    #[test]
+    fn for_replication_rejects_self_signed_identity() {
+        let r = TlsConfig::for_replication(
+            TlsIdentity::SelfSigned { subject_alt_names: vec!["x".into()] },
+            TrustedCerts::CaBytes(vec![
+                b"-----BEGIN CERTIFICATE-----".to_vec(),
+            ]),
+            "x",
+        );
+        assert!(r.is_err(), "self-signed identity must be rejected");
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("SelfSigned") || msg.contains("self-signed"),
+            "error must mention SelfSigned, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn for_replication_rejects_skip_verification() {
+        let r = TlsConfig::for_replication(
+            TlsIdentity::PemBytes { cert: vec![], key: vec![] },
+            TrustedCerts::SkipVerification,
+            "x",
+        );
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("SkipVerification") || msg.contains("skip"),
+            "error must mention SkipVerification, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn for_replication_rejects_empty_ca_files() {
+        let r = TlsConfig::for_replication(
+            TlsIdentity::PemFiles {
+                cert: "/tmp/cert.pem".into(),
+                key: "/tmp/key.pem".into(),
+            },
+            TrustedCerts::CaFiles(vec![]),
+            "x",
+        );
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(msg.contains("empty CaFiles"));
+    }
+
+    #[test]
+    fn for_replication_rejects_empty_ca_bytes() {
+        let r = TlsConfig::for_replication(
+            TlsIdentity::PemFiles {
+                cert: "/tmp/cert.pem".into(),
+                key: "/tmp/key.pem".into(),
+            },
+            TrustedCerts::CaBytes(vec![]),
+            "x",
+        );
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(msg.contains("empty CaBytes"));
+    }
+
+    #[test]
+    fn for_replication_accepts_pem_files_with_real_ca() {
+        let r = TlsConfig::for_replication(
+            TlsIdentity::PemFiles {
+                cert: "/etc/noxu/cert.pem".into(),
+                key: "/etc/noxu/key.pem".into(),
+            },
+            TrustedCerts::CaFiles(vec!["/etc/noxu/ca.pem".into()]),
+            "node-1.cluster.example",
+        );
+        assert!(r.is_ok());
+        let cfg = r.unwrap();
+        assert_eq!(cfg.server_name, "node-1.cluster.example");
+    }
+
+    #[test]
+    fn for_replication_accepts_pkcs12_with_ca() {
+        let r = TlsConfig::for_replication(
+            TlsIdentity::Pkcs12 { der: vec![0; 128], password: "p".into() },
+            TrustedCerts::CaBytes(vec![
+                b"-----BEGIN CERTIFICATE-----".to_vec(),
+            ]),
+            "node-2",
+        );
+        assert!(r.is_ok());
     }
 }
