@@ -10,8 +10,8 @@
 //!   - Perform full put / get / scan workflows
 //!   - Query inventory for items supplied by a specific vendor
 
-use noxu_bind::{EntryBinding, TupleInput, TupleOutput};
-use noxu_db::{
+use noxu::bind::{EntryBinding, TupleInput, TupleOutput};
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };
@@ -58,7 +58,7 @@ impl EntryBinding<Vendor> for VendorBinding {
         &self,
         vendor: &Vendor,
         entry: &mut DatabaseEntry,
-    ) -> noxu_bind::Result<()> {
+    ) -> noxu::bind::Result<()> {
         let mut out = TupleOutput::new();
         out.write_string(&vendor.name);
         out.write_string(&vendor.street);
@@ -71,7 +71,7 @@ impl EntryBinding<Vendor> for VendorBinding {
     fn entry_to_object(
         &self,
         entry: &DatabaseEntry,
-    ) -> noxu_bind::Result<Vendor> {
+    ) -> noxu::bind::Result<Vendor> {
         let mut input = TupleInput::new(entry.data());
         let name = input.read_string()?;
         let street = input.read_string()?;
@@ -93,7 +93,7 @@ impl EntryBinding<Item> for ItemBinding {
         &self,
         item: &Item,
         entry: &mut DatabaseEntry,
-    ) -> noxu_bind::Result<()> {
+    ) -> noxu::bind::Result<()> {
         let mut out = TupleOutput::new();
         out.write_string(&item.sku);
         out.write_string(&item.item_name);
@@ -107,7 +107,7 @@ impl EntryBinding<Item> for ItemBinding {
     fn entry_to_object(
         &self,
         entry: &DatabaseEntry,
-    ) -> noxu_bind::Result<Item> {
+    ) -> noxu::bind::Result<Item> {
         let mut input = TupleInput::new(entry.data());
         let sku = input.read_string()?;
         let item_name = input.read_string()?;

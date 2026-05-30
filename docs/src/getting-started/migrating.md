@@ -21,7 +21,7 @@ v1.5 (and later releases) that is likely to surface in user code.
   map.put(b"key", b"value")?;
 
   // v1.6
-  use noxu_bind::ByteArrayBinding;
+  use noxu::bind::ByteArrayBinding;
   let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
       StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
   map.put(None, &b"key".to_vec(), &b"value".to_vec())?;
@@ -92,7 +92,7 @@ v1.5 (and later releases) that is likely to surface in user code.
   let list = StoredList::open(&db)?;
 
   // v1.6
-  use noxu_bind::ByteArrayBinding;
+  use noxu::bind::ByteArrayBinding;
   let list: StoredList<Vec<u8>, _> =
       StoredList::new(&db, ByteArrayBinding);
   let list: StoredList<Vec<u8>, _> =
@@ -321,7 +321,7 @@ migration. See
 * **`Entity` trait gained a default `class_version() -> u16` method.**
   Existing implementations need no change (the default is `0`).
   Bump `class_version()` whenever you change the on-disk shape of an
-  entity and supply matching `noxu_persist::evolve::Mutations` via
+  entity and supply matching `noxu::persist::evolve::Mutations` via
   `StoreConfig::with_mutations(...)` so the open path can run
   schema evolution for older records.
 

@@ -34,7 +34,7 @@ Secondary reads under a user transaction work as expected. Open the
 cursor with `Some(&txn)` and close it before committing or aborting:
 
 ```rust
-use noxu_db::{Get, OperationStatus};
+use noxu::{Get, OperationStatus};
 
 let txn = env.begin_transaction(None)?;
 let mut cursor = secondary.open_cursor(Some(&txn), None)?;
@@ -59,7 +59,7 @@ secondary is updated under the same caller-supplied txn, so commit /
 abort is atomic across the primary record and every index entry.
 
 ```rust
-use noxu_db::DatabaseEntry;
+use noxu::DatabaseEntry;
 
 let key = DatabaseEntry::from_bytes(b"alice");
 let new_value = DatabaseEntry::from_bytes(b"Engineering|Senior Engineer");

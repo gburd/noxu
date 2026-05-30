@@ -3,7 +3,7 @@
 > **v2.4 — GA.**  The in-memory transport is a first-class production
 > transport alongside [TCP, TLS, and QUIC](transport.md).
 
-`noxu_rep::net::InMemoryTransport` lets you compose multi-node
+`noxu::replication::net::InMemoryTransport` lets you compose multi-node
 replication clusters inside a single process.  It is a real
 implementation of the same `Channel` trait that the wire transports
 use, so every higher layer (elections, feeder, replica stream,
@@ -38,7 +38,7 @@ Production cluster tests need to exercise crash recovery without
 tearing down the entire process.
 
 ```rust
-use noxu_rep::net::InMemoryTransport;
+use noxu::replication::net::InMemoryTransport;
 
 let mesh = InMemoryTransport::new_group(3);
 mesh.simulate_crash(0);          // node 0 down: every channel touching it is closed
@@ -55,8 +55,8 @@ socket disconnect would.
 ## End-to-end example
 
 ```rust
-use noxu_rep::net::{Channel, InMemoryTransport};
-use noxu_rep::test_harness::RepTestBase;
+use noxu::replication::net::{Channel, InMemoryTransport};
+use noxu::replication::test_harness::RepTestBase;
 use std::time::Duration;
 
 // 1. Build a 3-node fully-connected mesh.
@@ -92,7 +92,7 @@ declare their intent.  The default is `Tcp` to preserve backward
 compatibility.
 
 ```rust
-use noxu_rep::{RepConfig, RepTransportKind};
+use noxu::replication::{RepConfig, RepTransportKind};
 
 let cfg = RepConfig::builder("g", "n", "127.0.0.1")
     .transport_kind(RepTransportKind::InMemory)
@@ -110,14 +110,14 @@ inspecting individual channel types.
 
 | Symbol | Module | Notes |
 |---|---|---|
-| `InMemoryTransport` | `noxu_rep::net::inmem` | factory ZST |
-| `InMemoryEndpoint`  | `noxu_rep::net::inmem` | implements `Channel` |
-| `InMemoryGroup`     | `noxu_rep::net::inmem` | `n`-node mesh; `simulate_crash`, `reconnect` |
-| `RepTransportKind`  | `noxu_rep::rep_config` | enum: `Tcp`, `Tls`, `Quic`, `InMemory` |
-| `RepConfig::transport_kind` | `noxu_rep::rep_config` | declarative selector |
-| `RepConfigBuilder::transport_kind` | `noxu_rep::rep_config` | builder method |
+| `InMemoryTransport` | `noxu::replication::net::inmem` | factory ZST |
+| `InMemoryEndpoint`  | `noxu::replication::net::inmem` | implements `Channel` |
+| `InMemoryGroup`     | `noxu::replication::net::inmem` | `n`-node mesh; `simulate_crash`, `reconnect` |
+| `RepTransportKind`  | `noxu::replication::rep_config` | enum: `Tcp`, `Tls`, `Quic`, `InMemory` |
+| `RepConfig::transport_kind` | `noxu::replication::rep_config` | declarative selector |
+| `RepConfigBuilder::transport_kind` | `noxu::replication::rep_config` | builder method |
 
-The pre-existing `noxu_rep::test_harness::RepTestBase` /
+The pre-existing `noxu::replication::test_harness::RepTestBase` /
 `RepEnvInfo` / `CountingListener` types are also lifted out of the
 `cfg(test) / feature = "test-harness"` gate.
 The `test-harness` feature flag is retained as a no-op for backward

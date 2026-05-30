@@ -6,13 +6,13 @@
 This chapter covers the higher-level APIs built on top of the core
 Noxu DB key-value store:
 
-- **`noxu-collections`** — typed `StoredMap<K, V>`, `StoredSortedMap<K, V>`,
+- **`noxu::collections`** (via the `noxu` umbrella crate) — typed `StoredMap<K, V>`, `StoredSortedMap<K, V>`,
   `StoredKeySet<K>`, `StoredValueSet<V>`, and `StoredList<V>` views
-  parameterised by `noxu_bind::EntryBinding` implementations.  Every
+  parameterised by `noxu::bind::EntryBinding` implementations.  Every
   method takes `txn: Option<&Transaction>` so the views compose with
   user-driven transactions.
 
-- **`noxu-persist`** — the Direct Persistence Layer (DPL), which lets
+- **`noxu::persist`** (via the `noxu` umbrella crate) — the Direct Persistence Layer (DPL), which lets
   you store Rust structs in Noxu databases through a typed
   `PrimaryIndex<K, E>` instead of hand-written `DatabaseEntry` byte
   slices.  The wiring is explicit (you implement `Entity` and an

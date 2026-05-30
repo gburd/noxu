@@ -59,7 +59,7 @@ before closing a database returns an error.
 All cursor navigation is done through a single method with a `Get` enum that specifies the movement:
 
 ```rust
-use noxu_db::Get;
+use noxu::Get;
 
 let mut key  = DatabaseEntry::new();
 let mut data = DatabaseEntry::new();
@@ -184,7 +184,7 @@ cursor.close()?;
 to control overwrite behavior:
 
 ```rust
-use noxu_db::Put;
+use noxu::Put;
 
 let key  = DatabaseEntry::from_bytes(b"user:dave");
 let data = DatabaseEntry::from_bytes(b"Dave Brown, Finance");

@@ -3,7 +3,7 @@
 //! Demonstrates cursor operations: forward scan, reverse scan, search
 //! positioning, and cursor-based deletion.
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };

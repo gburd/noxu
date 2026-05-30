@@ -17,7 +17,7 @@ there are no separate per-database files.
 Databases are opened through the environment handle:
 
 ```rust
-use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 
 let env = Environment::open(
     EnvironmentConfig::new(PathBuf::from("/data"))
@@ -39,7 +39,7 @@ By default Noxu DB will not create a database that does not exist. You must set
 ## Database Configuration
 
 ```rust
-use noxu_db::DatabaseConfig;
+use noxu::DatabaseConfig;
 
 let config = DatabaseConfig::new()
     .with_allow_create(true)    // create if it does not exist

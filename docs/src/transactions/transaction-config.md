@@ -5,7 +5,7 @@ handling, timeouts, and durability. It uses a builder pattern and is passed to
 `env.begin_transaction()`.
 
 ```rust
-use noxu_db::TransactionConfig;
+use noxu::TransactionConfig;
 
 let config = TransactionConfig::new()
     .with_read_committed(true)
@@ -150,7 +150,7 @@ override it per-transaction to trade durability for performance on
 latency-sensitive writes.
 
 ```rust
-use noxu_db::{Durability, TransactionConfig};
+use noxu::{Durability, TransactionConfig};
 
 // Fast commit — data is buffered in the OS page cache but not fsynced.
 let config = TransactionConfig::new()

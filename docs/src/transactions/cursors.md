@@ -7,7 +7,7 @@ all subsequent cursor operations automatically participate in the transaction.
 **You must close the cursor before committing or aborting the transaction.**
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     LockMode, OperationStatus,
 };
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
-    let result = (|| -> Result<(), noxu_db::NoxuError> {
+    let result = (|| -> Result<(), noxu::NoxuError> {
         loop {
             let status = cursor.get(
                 &mut key,

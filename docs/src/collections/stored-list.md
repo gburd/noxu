@@ -8,9 +8,9 @@ sort numerically.
 ## Creating a StoredList
 
 ```rust,ignore
-use noxu_bind::StringBinding;
-use noxu_collections::StoredList;
-use noxu_db::{DatabaseConfig, Environment};
+use noxu::bind::StringBinding;
+use noxu::collections::StoredList;
+use noxu::{DatabaseConfig, Environment};
 
 let db_config = DatabaseConfig::new().with_allow_create(true);
 let db  = env.open_database(None, "events", &db_config)?;
@@ -93,7 +93,7 @@ A typical pattern is to wrap a sequence of list operations in a
 [`TransactionRunner`](../collections/index.html#v16-collections--whats-in-scope):
 
 ```rust,ignore
-use noxu_collections::TransactionRunner;
+use noxu::collections::TransactionRunner;
 let runner = TransactionRunner::new(&env);
 runner.run(|txn| {
     list.push(Some(txn), &"a".to_string())?;
@@ -121,7 +121,7 @@ let v: Option<Vec<u8>> = list.get(0)?;
 list.remove(1)?;            // no compaction; left a hole
 
 // v1.6
-use noxu_bind::ByteArrayBinding;
+use noxu::bind::ByteArrayBinding;
 let list: StoredList<Vec<u8>, _> = StoredList::new(&db, ByteArrayBinding);
 list.push(None, &b"event".to_vec())?;
 let v: Option<Vec<u8>> = list.get(None, 0)?;

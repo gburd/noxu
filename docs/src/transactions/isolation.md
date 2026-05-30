@@ -27,7 +27,7 @@ eliminating read locks, but the data you read may subsequently be rolled back.
 Configure uncommitted reads at the transaction level:
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     TransactionConfig,
 };
@@ -67,7 +67,7 @@ You can also request uncommitted reads on a per-operation basis using
 `LockMode::ReadUncommitted`:
 
 ```rust
-use noxu_db::{DatabaseEntry, LockMode};
+use noxu::{DatabaseEntry, LockMode};
 
 // (env, db, txn assumed to be open)
 let key = DatabaseEntry::from_bytes(b"thekey");
@@ -86,7 +86,7 @@ past, potentially improving throughput when you are scanning forward through dat
 and do not need to re-read previous records.
 
 ```rust
-use noxu_db::TransactionConfig;
+use noxu::TransactionConfig;
 
 // Use read committed isolation for this transaction.
 let txn_config = TransactionConfig::new().with_read_committed(true);
@@ -96,7 +96,7 @@ let txn = env.begin_transaction(Some(&txn_config))?;
 Or per-operation:
 
 ```rust
-use noxu_db::LockMode;
+use noxu::LockMode;
 
 db.get_with_lock_mode(Some(&txn), &key, &mut data, LockMode::ReadCommitted)?;
 ```
@@ -122,7 +122,7 @@ Configure serializable isolation environment-wide by setting
 `with_txn_serializable_isolation(true)` on `EnvironmentConfig`:
 
 ```rust
-use noxu_db::{Environment, EnvironmentConfig};
+use noxu::{Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 let env = Environment::open(
@@ -136,7 +136,7 @@ let env = Environment::open(
 Or configure serializable isolation for a single transaction:
 
 ```rust
-use noxu_db::TransactionConfig;
+use noxu::TransactionConfig;
 
 // Serializable isolation is achieved by combining serializable flag
 // with the transaction config.

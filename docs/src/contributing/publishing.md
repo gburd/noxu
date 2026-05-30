@@ -130,7 +130,7 @@ Check the build status at:
 https://docs.rs/<crate-name>/<version>
 ```
 
-For example: `https://docs.rs/noxu-db/2.4.1`
+For example: `https://docs.rs/noxu/3.0.2`
 
 If a docs.rs build fails, check the build log for missing feature flags
 and update `[package.metadata.docs.rs]` accordingly, then publish a
@@ -142,8 +142,8 @@ Once all 19 crates are indexed, update `README.md` to add the
 crates.io and docs.rs badges:
 
 ```markdown
-[![crates.io](https://img.shields.io/crates/v/noxu-db.svg)](https://crates.io/crates/noxu-db)
-[![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
+[![crates.io](https://img.shields.io/crates/v/noxu.svg)](https://crates.io/crates/noxu)
+[![docs.rs](https://docs.rs/noxu/badge.svg)](https://docs.rs/noxu)
 ```
 
 ### Step 4 — Tag the release
