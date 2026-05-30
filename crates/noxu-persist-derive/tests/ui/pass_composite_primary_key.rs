@@ -1,4 +1,4 @@
-use noxu_persist::PrimaryKey;
+use noxu::persist::PrimaryKey;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PrimaryKey)]
 struct CompositeKey {

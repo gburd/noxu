@@ -30,6 +30,7 @@ members = [
     "crates/noxu-rep",
     "crates/noxu-xa",
     "crates/noxu-observe",
+    "crates/noxu",
     "crates/noxu-spec",
     "benches/comparison",
     "benches/noxu-bench",
@@ -41,6 +42,7 @@ members = [
 
 [dependencies]
 noxu-db = { workspace = true }
+noxu = { workspace = true }
 noxu-xa = { path = "crates/noxu-xa" }
 noxu-bind = { workspace = true }
 noxu-collections = { workspace = true }
@@ -144,6 +146,7 @@ noxu-rep          = { version = "3.0.1", path = "crates/noxu-rep" }
 # can be dry-run published; the orchestrator must publish noxu-observe before
 # enabling that feature for crates.io users (see docs/src/contributing/publishing.md).
 noxu-observe      = { version = "3.0.1", path = "crates/noxu-observe" }
+noxu              = { version = "3.0.1", path = "crates/noxu" }
 
 # Quorum system library (authored by Greg Burd — published at crates.io before
 # noxu-rep can be published; path dep used for local development).
