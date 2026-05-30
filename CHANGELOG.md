@@ -66,6 +66,14 @@ for each breaking change.
 - `#![forbid(unsafe_code)]` on the 12 zero-unsafe core crates.
 - API-stability surface enumerated; advisory `cargo-semver-checks` CI gate.
 - All 19 public crates restructured for crates.io publication.
+- **mTLS Phase 1 (design + foundation)** for replication: a `peer_allowlist`
+  config field and an `auth` module are plumbed through `noxu-rep`. This is
+  foundation only — the dispatcher does not yet enforce mTLS; enforcement is
+  planned for a later release. See `docs/src/internal/auth-mtls-design-2026-05.md`
+  and `security-review-2026-05.md`.
+- **Public API audit (May 2026)** documented across seven internal reports
+  (overview, database, cursor, transaction/environment, secondary/join,
+  collections/bind, persist/xa) under `docs/src/internal/`.
 
 ### Detailed changes
 
