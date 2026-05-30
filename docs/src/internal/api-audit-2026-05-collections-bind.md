@@ -66,6 +66,7 @@ deadlock-retrying `TransactionRunner`, sortable tuple encoding).
 ## Findings table
 
 Severity legend:
+
 - **High** — observable correctness gap, contract violation, or doc lying
   about reality.
 - **Medium** — semantic divergence from the BDB-JE contract or a foot-gun

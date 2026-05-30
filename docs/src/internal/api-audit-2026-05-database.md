@@ -635,12 +635,12 @@ which also delegates to the env-level fsync).
 - line 178: `": TXN_WRITE_NO_SYNC — flush to OS buffer, no fdatasync"`.
 - line 182: `": flushTo(lsn) — skip if already covered by another flush."`.
 - line 519: `": Environment.truncateDatabase(txn, dbName, returnCount)"`.
-- line 893: `"Mirrors `Database.join(SecondaryCursor[], JoinConfig)` from ."`.
+- line 893: `"Mirrors`Database.join(SecondaryCursor[], JoinConfig)`from ."`.
 
 Cosmetic but pervasive. The same pattern appears in
 `database_config.rs`, `database_stats.rs`, and `database_impl.rs`.
 
-**Suggested fix.** Sweep `crates/noxu-db/src/*.rs` for `: ` at
+**Suggested fix.** Sweep `crates/noxu-db/src/*.rs` for `:` at
 sentence starts and `from .` at sentence ends and rewrite, or replace
 with explicit `// Equivalent to BDB-JE Foo.bar()`.
 
@@ -759,7 +759,7 @@ record instead.
   counters fire under op="put", not "put_with_options".
 
 Not a correctness issue; just means metrics dashboards under-count
-or mis-attribute the `_with_options` paths.
+or misattribute the `_with_options` paths.
 
 ---
 
@@ -830,8 +830,8 @@ The five High-severity findings cluster in two themes:
    not.
 
 The Medium findings are dominated by `DatabaseConfig` flags that are
-declared but unused (#6, #7) and documentation gaps (#9, #10, #11,
-#12, #13, #14). The Low findings are mostly cosmetic / dead-code.
+declared but unused (#6, #7) and documentation gaps
+(#9, #10, #11, #12, #13, #14). The Low findings are mostly cosmetic / dead-code.
 
 Recommended immediate follow-up in priority order:
 

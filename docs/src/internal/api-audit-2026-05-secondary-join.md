@@ -154,7 +154,7 @@ exclusive; `ForeignKeyNullifier` cannot pair with a multi-key creator).
 repo-wide search:
 
 ```text
-$ rg 'foreign_key_(database|delete_action|nullifier)|nullify_foreign_key'
+rg 'foreign_key_(database|delete_action|nullifier)|nullify_foreign_key'
 ```
 
 returns only hits inside `secondary_config.rs` (definitions, builders,
@@ -322,6 +322,7 @@ The existing unit tests never pass a `Transaction` to
 entirely untested.
 
 **Recommended action:** route the txn through. Specifically:
+
 * Plumb `txn: Option<&Transaction>` through `update_secondary`,
   `insert_sec_key`, `delete_sec_key`, and `populate_from_primary_scan`.
 * Have `SecondaryCursor::new` accept the user's txn and pass it to
