@@ -13,13 +13,13 @@
 > **v1.6 update:** the `#[derive(Entity)]`,
 > `#[derive(PrimaryKey)]`, and `#[derive(SecondaryKey)]` proc-macros
 > are now implemented in the `noxu-persist-derive` crate (re-exported
-> from `noxu-persist`). The annotation-style API documented in this
+> from `noxu::persist`; available via the `noxu` umbrella crate). The annotation-style API documented in this
 > chapter is therefore live; the manual trait-impl path is preserved
 > as the [legacy/no-derive shape](#legacy-manual-trait-impl-path) for
 > users that need to opt out (e.g. for crate-graph reasons or to write
 > a custom `Entity` impl).
 
-The Direct Persistence Layer (`noxu-persist`) lets you store and retrieve
+The Direct Persistence Layer (`noxu::persist`) lets you store and retrieve
 Rust structs through a typed primary index instead of writing
 `DatabaseEntry` byte slices by hand. You opt your type in by deriving
 the `Entity` macro (and optionally `SecondaryKey`) and supplying an
@@ -33,11 +33,11 @@ indexes) `#[derive(SecondaryKey)]`. Mark the primary-key field with
 `#[secondary_key(name = "...", relate = ..., …)]`:
 
 ```rust
-use noxu_persist::{Entity, EntitySerializer, PersistError, Result, SecondaryKey};
+use noxu::persist::{Entity, EntitySerializer, PersistError, Result, SecondaryKey};
 
 #[derive(Clone, Debug, PartialEq, Entity, SecondaryKey)]
 struct User {
-    /// Primary key.  Field type must implement `noxu_persist::PrimaryKey`
+    /// Primary key.  Field type must implement `noxu::persist::PrimaryKey`
     /// (built-in for all common scalars + `String` / `Vec<u8>`).
     #[primary_key]
     id: u64,
@@ -69,7 +69,7 @@ struct UserSerializer;
 
 impl EntitySerializer<User> for UserSerializer {
     fn serialize(&self, u: &User) -> Result<Vec<u8>> {
-        use noxu_persist::FieldEncoder;
+        use noxu::persist::FieldEncoder;
         let mut enc = FieldEncoder::new();
         enc.write_u64(u.id);
         enc.write_string(&u.email);
@@ -81,7 +81,7 @@ impl EntitySerializer<User> for UserSerializer {
         Ok(enc.finish())
     }
     fn deserialize(&self, bytes: &[u8]) -> Result<User> {
-        use noxu_persist::FieldDecoder;
+        use noxu::persist::FieldDecoder;
         let mut dec = FieldDecoder::new(bytes);
         let id = dec.read_u64()?;
         let email = dec.read_string()?;
@@ -97,10 +97,10 @@ impl EntitySerializer<User> for UserSerializer {
 
 | Attribute | Where | Purpose |
 |---|---|---|
-| `#[derive(Entity)]` | struct | Implements `noxu_persist::Entity`. Requires exactly one `#[primary_key]` field. |
+| `#[derive(Entity)]` | struct | Implements `noxu::persist::Entity`. Requires exactly one `#[primary_key]` field. |
 | `#[entity(name = "...")]` | struct | Overrides the entity-name (default = struct name). Used as part of the underlying database name. |
 | `#[primary_key]` | field | Marks the primary-key field. The field's type becomes `Entity::PrimaryKey`. |
-| `#[derive(PrimaryKey)]` | struct | Implements `noxu_persist::PrimaryKey` for a custom newtype or composite key struct. |
+| `#[derive(PrimaryKey)]` | struct | Implements `noxu::persist::PrimaryKey` for a custom newtype or composite key struct. |
 | `#[derive(SecondaryKey)]` | struct | For each `#[secondary_key(...)]` field, emits a typed `Foo::open_<name>_index` helper plus a `pub const SECONDARY_INDEXES` metadata table. |
 | `#[secondary_key(name = "...", relate = ...)]` | field | Declares a secondary index over the field. `relate` is one of `OneToOne`, `ManyToOne`, `OneToMany`, `ManyToMany`. |
 | `#[secondary_key(..., related_entity = "Foo")]` | field | Optional foreign-key reference to another entity class name. |
@@ -112,7 +112,7 @@ A composite key is just a struct with `#[derive(PrimaryKey)]` whose
 field types each already implement `PrimaryKey`:
 
 ```rust
-use noxu_persist::PrimaryKey;
+use noxu::persist::PrimaryKey;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
 struct OrderKey {
@@ -120,7 +120,7 @@ struct OrderKey {
     customer_id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, noxu_persist::Entity)]
+#[derive(Clone, Debug, PartialEq, noxu::persist::Entity)]
 struct Order {
     #[primary_key]
     key: OrderKey,
@@ -141,8 +141,8 @@ without a sort-order penalty.
 ## Opening an `EntityStore` and a `PrimaryIndex`
 
 ```rust
-use noxu_db::{Environment, EnvironmentConfig};
-use noxu_persist::{EntityStore, PrimaryIndex, StoreConfig};
+use noxu::{Environment, EnvironmentConfig};
+use noxu::persist::{EntityStore, PrimaryIndex, StoreConfig};
 
 let env = Environment::open(
     EnvironmentConfig::new("/var/lib/users".into())
@@ -178,7 +178,7 @@ Every `PrimaryIndex` operation takes a leading
 in a user transaction (the underlying database write commits or aborts
 atomically with the txn). Pass `None` to keep the historical
 auto-commit behaviour. This mirrors the
-`noxu_db::Database::{get, put, delete}` shape and matches BDB-JE's
+`noxu::Database::{get, put, delete}` shape and matches BDB-JE's
 `PrimaryIndex` surface.
 
 ```rust
@@ -302,8 +302,8 @@ Compose mutations into a `Mutations` set, attach it to the
 `StoreConfig`:
 
 ```rust,ignore
-use noxu_persist::evolve::{Mutations, Converter, Deleter, Renamer};
-use noxu_persist::StoreConfig;
+use noxu::persist::evolve::{Mutations, Converter, Deleter, Renamer};
+use noxu::persist::StoreConfig;
 
 let mut mutations = Mutations::new();
 // Class-level converter: bump v0 records of "User" to the new shape.
@@ -378,7 +378,7 @@ and returns `EvolveStats { n_read: total, n_converted: 0 }`.
 ## Sequences
 
 For numeric primary keys you don't want to assign by hand,
-`noxu_persist::sequence::Sequence` provides a thread-safe counter
+`noxu::persist::sequence::Sequence` provides a thread-safe counter
 that is persisted in the same environment. `MemorySequence` is an
 in-memory variant for tests.
 
@@ -428,12 +428,12 @@ in-memory variant for tests.
 The derive macros are syntactic sugar over the same traits the engine
 exposes. If you cannot use them — for example, if you need to
 implement `Entity` for a foreign type via a wrapper, or you want to
-keep `noxu-persist-derive` out of your dependency graph — you can
+keep the proc-macros out of your dependency graph — you can
 still write the impls by hand. This is the shape every Noxu DB
 release before v1.6 supported:
 
 ```rust
-use noxu_persist::{Entity, PrimaryKey, Result};
+use noxu::persist::{Entity, PrimaryKey, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 struct User { id: u64, email: String, name: String }
@@ -445,8 +445,8 @@ impl Entity for User {
 }
 
 // Open a secondary index by hand.
-# fn doc(env: &noxu_db::Environment) -> Result<()> {
-# use noxu_persist::{EntityStore, PrimaryIndex, SecondaryIndex, StoreConfig};
+# fn doc(env: &noxu::Environment) -> Result<()> {
+# use noxu::persist::{EntityStore, PrimaryIndex, SecondaryIndex, StoreConfig};
 # let mut store = EntityStore::open(env, StoreConfig::new("s").with_allow_create(true))?;
 let mut index: PrimaryIndex<u64, User> = store.get_primary_index()?;
 let by_email: SecondaryIndex<String, u64, User> =

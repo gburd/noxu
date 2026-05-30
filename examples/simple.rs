@@ -6,7 +6,7 @@
 //! inserting key-value pairs, retrieving them, deleting one, and iterating
 //! with a cursor.
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };

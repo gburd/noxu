@@ -29,8 +29,8 @@ can resume the protocol.
 ## Quick Start
 
 ```rust,ignore
-use noxu_xa::{XaEnvironment, XaResource, Xid, XaFlags, PrepareResult};
-use noxu_db::{Environment, EnvironmentConfig, DatabaseConfig, DatabaseEntry};
+use noxu::xa::{XaEnvironment, XaResource, Xid, XaFlags, PrepareResult};
+use noxu::{Environment, EnvironmentConfig, DatabaseConfig, DatabaseEntry};
 
 // Open two environments (representing two clusters in the same process)
 let env1 = Environment::open(config1).unwrap();

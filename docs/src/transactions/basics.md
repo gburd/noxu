@@ -113,7 +113,7 @@ To use transactions you must:
 ## Opening a Transactional Environment and Database
 
 ```rust
-use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -153,7 +153,7 @@ by acquiring a transaction handle and passing it to the database methods you wan
 to include in that transaction.
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };
@@ -254,7 +254,7 @@ txn.abort()?;
 A typical write-retry loop:
 
 ```rust
-use noxu_db::{DatabaseEntry, NoxuError};
+use noxu::{DatabaseEntry, NoxuError};
 
 const MAX_RETRIES: u32 = 10;
 let mut retries = 0;
@@ -306,7 +306,7 @@ You can set the default durability on the environment, or override it
 per-transaction using `TransactionConfig`:
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Durability, Environment, EnvironmentConfig,
     SyncPolicy, ReplicaAckPolicy, TransactionConfig,
 };
@@ -360,7 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The three named constants on `Durability` cover the most common cases:
 
 ```rust
-use noxu_db::Durability;
+use noxu::Durability;
 
 // Equivalent to SyncPolicy::Sync (the default): maximum durability.
 let _d = Durability::COMMIT_SYNC;
@@ -381,7 +381,7 @@ passing `None` as the transaction argument to a write operation on a transaction
 database.
 
 ```rust
-use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

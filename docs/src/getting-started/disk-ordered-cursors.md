@@ -40,12 +40,12 @@ Use a regular [`Cursor`](./cursors.md) when:
 ## Basic usage
 
 ```rust,ignore
-use noxu_db::{
+use noxu::{
     DatabaseEntry, DiskOrderedCursorConfig, Environment, EnvironmentConfig,
     OperationStatus,
 };
 
-# fn main() -> noxu_db::Result<()> {
+# fn main() -> noxu::Result<()> {
 let env = Environment::open(
     EnvironmentConfig::new("/path/to/env".into())
         .with_allow_create(true)
@@ -54,7 +54,7 @@ let env = Environment::open(
 let db = env.open_database(
     None,
     "users",
-    &noxu_db::DatabaseConfig::new().with_allow_create(true),
+    &noxu::DatabaseConfig::new().with_allow_create(true),
 )?;
 
 // ... populate db ...
@@ -81,10 +81,10 @@ Pass a slice of database references to scan multiple databases as one
 unified stream:
 
 ```rust,ignore
-use noxu_db::{open_disk_ordered_cursor_multi, DiskOrderedCursorConfig};
+use noxu::{open_disk_ordered_cursor_multi, DiskOrderedCursorConfig};
 
-# fn example(db_a: &noxu_db::Database, db_b: &noxu_db::Database)
-#     -> noxu_db::Result<()> {
+# fn example(db_a: &noxu::Database, db_b: &noxu::Database)
+#     -> noxu::Result<()> {
 let dbs = [db_a, db_b];
 let mut cursor =
     open_disk_ordered_cursor_multi(&dbs, DiskOrderedCursorConfig::new())?;
@@ -100,7 +100,7 @@ closed while the cursor is still scanning.
 ## Configuration knobs
 
 ```rust,ignore
-use noxu_db::DiskOrderedCursorConfig;
+use noxu::DiskOrderedCursorConfig;
 
 let cfg = DiskOrderedCursorConfig::new()
     // Producer thread blocks when this many entries are queued.

@@ -3,7 +3,7 @@
 use crate::account::Account;
 use crate::error::FtdbError;
 use crate::transfer::Transfer;
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus, Transaction,
 };

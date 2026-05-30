@@ -209,7 +209,7 @@ fn exec_transaction(
 fn execute_in_txn(
     cmd: &QueuedCommand,
     store: &Arc<CaskStore>,
-    txn: &noxu_db::Transaction,
+    txn: &noxu::Transaction,
 ) -> RespValue {
     match cmd.name.as_str() {
         "SET" => {

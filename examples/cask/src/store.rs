@@ -1,7 +1,7 @@
 //! Storage layer wrapping Noxu DB.
 
 use bytes::Bytes;
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     Get, OperationStatus, Transaction,
 };
@@ -14,7 +14,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("noxu db error: {0}")]
-    Db(#[from] noxu_db::NoxuError),
+    Db(#[from] noxu::NoxuError),
     #[error("value is not a valid integer")]
     NotAnInteger,
     #[error("integer overflow")]

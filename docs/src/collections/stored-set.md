@@ -13,9 +13,9 @@ to the database.
 ## Creating a StoredKeySet
 
 ```rust,ignore
-use noxu_bind::IntBinding;
-use noxu_collections::StoredKeySet;
-use noxu_db::{DatabaseConfig, Environment};
+use noxu::bind::IntBinding;
+use noxu::collections::StoredKeySet;
+use noxu::{DatabaseConfig, Environment};
 
 let db_config = DatabaseConfig::new().with_allow_create(true);
 let db  = env.open_database(None, "tags", &db_config)?;
@@ -66,8 +66,8 @@ stored in the database.  Iteration walks the cursor and decodes
 each value via the supplied binding:
 
 ```rust,ignore
-use noxu_bind::StringBinding;
-use noxu_collections::StoredValueSet;
+use noxu::bind::StringBinding;
+use noxu::collections::StoredValueSet;
 
 let vs: StoredValueSet<String, _> = StoredValueSet::new(&db, StringBinding);
 
@@ -91,7 +91,7 @@ ks.contains(b"key")?;
 ks.register_keys(&[b"a", b"b", b"c"]);   // register_key/known_keys removed
 
 // v1.6
-use noxu_bind::ByteArrayBinding;
+use noxu::bind::ByteArrayBinding;
 let ks: StoredKeySet<Vec<u8>, _> = StoredKeySet::new(&db, ByteArrayBinding);
 ks.contains(None, &b"key".to_vec())?;
 // No registration step — `iter()` walks the database directly.

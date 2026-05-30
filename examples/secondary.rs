@@ -11,7 +11,7 @@
 //!   - Iterate all entries via SecondaryCursor
 //!   - Show that deleting from the primary cascades to the secondary
 
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus, SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator,
 };

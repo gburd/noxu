@@ -9,13 +9,13 @@ This page covers how to configure and start a Noxu DB replicated environment.
 
 ## Dependencies
 
-Add `noxu-rep` to your `Cargo.toml`:
+Enable the `replication` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu-rep = { version = "0.1", features = [] }
+noxu = { version = "3", features = ["replication"] }
 # For QUIC transport:
-# noxu-rep = { version = "0.1", features = ["quic"] }
+# noxu = { version = "3", features = ["replication"] }  # QUIC is bundled with replication
 ```
 
 ## Group Topology
@@ -33,7 +33,7 @@ A 5-node group tolerates 2 failures.
 Configure the replicated environment via `RepConfigBuilder`:
 
 ```rust
-use noxu_rep::{RepConfig, RepNode, QuorumPolicy};
+use noxu::replication::{RepConfig, RepNode, QuorumPolicy};
 
 let rep_config = RepConfig::builder()
     .node_name("node-1")
@@ -55,7 +55,7 @@ let rep_config = RepConfig::builder()
 Open a replicated environment by wrapping a normal `Environment`:
 
 ```rust
-use noxu_rep::ReplicatedEnvironment;
+use noxu::replication::ReplicatedEnvironment;
 
 let env = Environment::open(Path::new("./data"), EnvironmentConfig::default())?;
 let rep_env = ReplicatedEnvironment::new(env, rep_config)?;

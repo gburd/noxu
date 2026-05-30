@@ -20,7 +20,7 @@
 //! | `--threads` | `8`                        |
 //! | `--dir`     | temp dir under `/scratch`  |
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
 };
 use std::path::{Path, PathBuf};
@@ -146,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     // Phase 1: parallel insert
     // ------------------------------------------------------------------
-    let env = Arc::new(noxu_db::Environment::open(
+    let env = Arc::new(noxu::Environment::open(
         EnvironmentConfig::new(db_path.clone())
             .with_allow_create(true)
             .with_transactional(true),
@@ -252,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     println!("Reopening via WAL recovery...");
     let t_recovery = Instant::now();
-    let env2 = noxu_db::Environment::open(
+    let env2 = noxu::Environment::open(
         EnvironmentConfig::new(db_path.clone())
             .with_allow_create(false)
             .with_transactional(true),
