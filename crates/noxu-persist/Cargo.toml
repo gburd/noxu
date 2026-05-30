@@ -22,3 +22,6 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The derive macros emit ::noxu::persist::… paths; the umbrella must be
+# present in dev-dependency tests that exercise derived code.
+noxu = { workspace = true, features = ["persist"] }
