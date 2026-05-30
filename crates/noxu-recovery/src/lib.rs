@@ -4,6 +4,13 @@
 // See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 #![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+//! > **Internal component of the [`noxu`](https://crates.io/crates/noxu) database.**
+//! >
+//! > This crate is published only so the `noxu` umbrella crate can depend on it.
+//! > Use `noxu` (`noxu = "3"`) in applications; depend on this crate directly only
+//! > if you are extending the engine internals. Its API may change without a major
+//! > version bump.
+//!
 //! Checkpoint-based crash recovery for Noxu DB.
 //!
 //! performs recovery during Environment
