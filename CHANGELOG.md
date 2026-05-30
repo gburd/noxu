@@ -26,6 +26,13 @@ listed in [References](#references).
 - **Public API audit (May 2026)** documented across seven internal reports
   (overview, database, cursor, transaction/environment, secondary/join,
   collections/bind, persist/xa) under `docs/src/internal/`.
+- **`noxu::Mutex` / `noxu::MutexGuard` re-export** — `noxu-db` now re-exports
+  the `noxu_sync::Mutex` type that appears in its public API
+  (`SecondaryDatabase::open` takes `Arc<Mutex<Database>>`). Callers can now
+  name it as `noxu::Mutex` and no longer need a direct dependency on the
+  internal `noxu-sync` crate. The `secondary` example was updated to
+  `use noxu::Mutex;` and the `noxu-sync` dev-dependency was dropped from the
+  examples package.
 
 ## [v3.0.2] — 2026-05-30
 
