@@ -15,7 +15,7 @@ use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus, SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator,
 };
-use noxu_sync::Mutex;
+use noxu::Mutex;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

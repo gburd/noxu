@@ -50,6 +50,13 @@ mod observe;
 #[cfg(feature = "observability")]
 pub use noxu_observe as observe_crate;
 
+/// Re-export of the synchronization primitive that appears in this crate's
+/// public API.  `SecondaryDatabase::open` takes the primary database wrapped
+/// in `Arc<Mutex<Database>>`; this re-export lets callers name that `Mutex`
+/// (and its guard) without depending on the internal `noxu-sync` crate
+/// directly — reachable as `noxu::Mutex` through the umbrella.
+pub use noxu_sync::{Mutex, MutexGuard};
+
 pub mod cache_mode;
 pub mod checkpoint_config;
 pub mod cursor;

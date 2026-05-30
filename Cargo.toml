@@ -42,7 +42,6 @@ members = [
 
 [dependencies]
 noxu = { workspace = true }
-noxu-sync = { workspace = true }
 tempfile = "3"
 
 [[example]]
