@@ -16,11 +16,11 @@
 //! For the manual `impl Entity for User { … }` shape see `persist.rs`
 //! in the same directory.
 
-use noxu_db::{Environment, EnvironmentConfig};
-use noxu_persist::{
+use noxu::persist::{
     Entity, EntitySerializer, EntityStore, PersistError, PrimaryIndex,
     SecondaryKey, StoreConfig,
 };
+use noxu::{Environment, EnvironmentConfig};
 
 // ---------------------------------------------------------------------------
 // Entity declared with derive macros
@@ -61,7 +61,7 @@ struct Person {
 struct PersonSerializer;
 
 impl EntitySerializer<Person> for PersonSerializer {
-    fn serialize(&self, p: &Person) -> noxu_persist::Result<Vec<u8>> {
+    fn serialize(&self, p: &Person) -> noxu::persist::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&p.person_id.to_be_bytes());
         write_str(&mut buf, &p.email);
@@ -77,7 +77,7 @@ impl EntitySerializer<Person> for PersonSerializer {
         Ok(buf)
     }
 
-    fn deserialize(&self, bytes: &[u8]) -> noxu_persist::Result<Person> {
+    fn deserialize(&self, bytes: &[u8]) -> noxu::persist::Result<Person> {
         if bytes.len() < 4 {
             return Err(PersistError::SerializationError("short".into()));
         }
@@ -111,7 +111,7 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(b);
 }
 
-fn read_str(bytes: &[u8], pos: &mut usize) -> noxu_persist::Result<String> {
+fn read_str(bytes: &[u8], pos: &mut usize) -> noxu::persist::Result<String> {
     if bytes.len() < *pos + 4 {
         return Err(PersistError::SerializationError("short str".into()));
     }
@@ -252,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 9. Final scan in primary-key order.
     println!("\nFinal primary scan:");
     let all: Vec<Person> =
-        primary.entities(None, &ser)?.collect::<noxu_persist::Result<_>>()?;
+        primary.entities(None, &ser)?.collect::<noxu::persist::Result<_>>()?;
     for p in &all {
         println!(
             "  id={} {} {} <{}> dept={:?}",

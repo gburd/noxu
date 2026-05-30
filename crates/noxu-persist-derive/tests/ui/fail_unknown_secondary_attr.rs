@@ -1,4 +1,4 @@
-use noxu_persist::{Entity, SecondaryKey};
+use noxu::persist::{Entity, SecondaryKey};
 
 #[derive(Entity, SecondaryKey)]
 struct UnknownAttr {

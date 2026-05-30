@@ -1,4 +1,4 @@
-use noxu_persist::Entity;
+use noxu::persist::Entity;
 
 #[derive(Clone, Entity)]
 struct User {
