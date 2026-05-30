@@ -1,3 +1,8 @@
+[default.extend-identifiers]
+# Short git commit hashes referenced in internal audit docs that tokenize
+# into letter-runs typos mistakes for words (e.g. "ba" inside f2ba3d5).
+"f2ba3d5" = "f2ba3d5"
+
 [default.extend-words]
 # Noxu DB proper nouns and technical identifiers
 "Noxu"      = "Noxu"

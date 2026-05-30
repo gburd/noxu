@@ -104,7 +104,7 @@ For each public surface element I:
 | 13 | **Medium** | `Cursor::close()` is **not** idempotent at the public layer | rustdoc: "The cursor handle may not be used again after this call" — silent on double-close | `cursor.rs:295-302` returns `Err(OperationNotAllowed("Cursor already closed"))` on second close. The inner `CursorImpl::close()` is idempotent (`cursor_impl.rs:2207-2222` returns `Ok` on already-closed). The outer test `test_close_twice` codifies the error-on-double-close as intended, but it diverges from BDB-JE (`Cursor.close()` is documented idempotent) and from the layer below | Make outer `close()` idempotent (return `Ok` on already-closed), or document the divergence loudly. Consider also that `test_close_twice` may need updating |
 | 14 | **Medium** | Outer `Cursor::close()` does **not** propagate to inner `CursorImpl::close()` | rustdoc: "The cursor handle may not be used again" implies resource release | `cursor.rs:295-302` only sets `self.state = Closed`. The BIN pin (`current_bin_arc`) is held by the inner `CursorImpl` and only released when the inner is dropped. If the outer `Cursor` is moved/leaked or kept alive between `close()` and drop, the evictor cannot free the BIN | Forward `close()` to `self.inner.close()` in the outer wrapper |
 | 15 | **Medium** | `Cursor::Drop` warning fires even on normal explicit close | rustdoc on `close`: "The cursor handle may not be used again" | `cursor.rs:317-321`: `if self.state != CursorState::Closed { log::warn!("Cursor dropped without close"); }`. After `close()` outer state is `Closed` → no warning. But after `delete()` state is `NotInitialized` → warning fires when the cursor is dropped, even though the cursor was used correctly | Only warn when `state == Initialized` and the user did not call `close()`; or drop the warning entirely (Drop already runs `inner.close()` via `CursorImpl::Drop`) |
-| 16 | **Medium** | `Cursor::count()` `.max(1)` mask | rustdoc: "For databases without duplicates, this always returns 1 if positioned" | `cursor.rs:281-283` does `.map(|c| c.max(1) as u64)`. For sorted-dup, if `inner.count()` ever returned 0 (it cannot today, but the API permits a future change), the public layer would silently report 1. This is pure defence in depth, but it hides correctness regressions in the dup-count path | Remove the `.max(1)`; if `inner.count()` is documented to return ≥1 when initialized, let it. Otherwise, log when the cap fires |
+| 16 | **Medium** | `Cursor::count()` `.max(1)` mask | rustdoc: "For databases without duplicates, this always returns 1 if positioned" | `cursor.rs:281-283` does `.map(\|c\| c.max(1) as u64)`. For sorted-dup, if`inner.count()` ever returned 0 (it cannot today, but the API permits a future change), the public layer would silently report 1. This is pure defence in depth, but it hides correctness regressions in the dup-count path | Remove the `.max(1)`; if `inner.count()` is documented to return ≥1 when initialized, let it. Otherwise, log when the cap fires |
 | 17 | **Low** | `Cursor::put(_, _, Put::*)` on a closed cursor returns `OperationNotAllowed` rather than `CursorClosed`-shaped error | rustdoc on `Cursor::put`: silent | `cursor.rs:226` calls `check_open()` which returns `NoxuError::OperationNotAllowed("Cursor has been closed")` — this is fine, but the *typed* error is the same one returned for "tried to put with a read-only cursor", "operation not allowed", etc. The caller cannot distinguish "closed" from "read-only" without parsing the message string | Introduce explicit `NoxuError::CursorClosed` and `NoxuError::CursorReadOnly` variants |
 | 18 | **Low** | `Cursor::get` writes user-supplied `key` even on `Get::Current` | rustdoc: "Returns the record at the current cursor position" | `cursor.rs:194-195`: `data.set_data(&v); key.set_data(&k);`. For `Get::Current` this means the user's key buffer is overwritten with the canonical stored key (which may differ from what they passed in if they had used `set_data` for some reason). Mostly harmless but undocumented | Document that `Get::Current` overwrites both buffers, matching the other arms |
 | 19 | **Low** | `Cursor::put(.., Put::Overwrite)` on a *previously-deleted* cursor | rustdoc: silent | After `delete()` outer state is `NotInitialized`, `read_only` is whatever it was. `put(.., Put::Overwrite)` does **not** call `check_initialized` (correct — Overwrite doesn't require positioning), so it inserts at `key`. Inner cursor moves to the inserted key. This is fine but noteworthy when reading `cursor_test.rs::cursor_delete_removes_current_record` — the inner state machine is more permissive than docs suggest | Add a doc note in the iterate-and-delete section of `getting-started/cursors.md` |
@@ -120,6 +120,7 @@ For each public surface element I:
 
 * **File:** `crates/noxu-db/src/database.rs:648-666`
 * **Doc claim:** `docs/src/transactions/cursors.md` teaches:
+
   ```rust
   let txn = env.begin_transaction(None, None)?;
   let mut cursor = db.open_cursor(Some(&txn), None)?;
@@ -128,9 +129,11 @@ For each public surface element I:
   …
   txn.commit()?;
   ```
+
   The intent is that **all** cursor operations join the txn — writes are
   rolled back on `txn.abort()` and reads pick up the txn's read locks.
 * **Actual behaviour:**
+
   ```rust
   pub fn open_cursor(
       &self,
@@ -144,6 +147,7 @@ For each public surface element I:
           self.make_cursor()                //  ← not make_cursor_for_txn
       };
   ```
+
   `make_cursor_for_txn` exists (database.rs:151-156) and is used by
   `db.get()`, `db.put()`, `db.delete()` — but **not** by `open_cursor`.
   Result: cursor writes are auto-commit, cursor reads are not txn-locked.
@@ -151,6 +155,7 @@ For each public surface element I:
   every `get` / `put` / `delete` to the txn; the cursor must be closed
   before `txn.commit/abort`.
 * **Reproducer sketch:**
+
   ```rust
   let txn = env.begin_transaction(None, None)?;
   let mut cursor = db.open_cursor(Some(&txn), None)?;
@@ -160,13 +165,16 @@ For each public surface element I:
   // BDB-JE: db.get(None, &k("a"), &mut out) -> NotFound
   // Noxu DB today: returns Success with v="1" (write was auto-committed)
   ```
+
 * **Recommendation:** Plumb `txn` through:
+
   ```rust
   let cursor_impl = match txn {
       Some(t) => self.make_cursor_for_txn(t),
       None    => self.make_cursor(),
   };
   ```
+
   Add an integration test asserting that aborting a txn rolls back
   cursor writes.
 
@@ -193,9 +201,11 @@ For each public surface element I:
 ### Finding 3 — `Get::SearchLte` / `Get::FirstDup` / `Get::LastDup` silently return `NotFound` (HIGH)
 
 * **File:** `crates/noxu-db/src/cursor.rs:206`
+
   ```rust
   _ => return Ok(OperationStatus::NotFound),
   ```
+
 * **Doc claim:** `crates/noxu-db/src/get.rs:73-89, 91-99`
   document each variant as a working positioning operator.
 * **Actual:** None of these variants have a match arm in
@@ -204,6 +214,7 @@ For each public surface element I:
 * **Expected (BDB-JE):** `getSearchKeyRange` (LTE), `getFirstDup`,
   `getLastDup` are real operations.
 * **Reproducer:**
+
   ```rust
   // DB contains [("a","1"), ("b","2"), ("c","3")]
   let mut k = DatabaseEntry::from_bytes(b"b");
@@ -211,13 +222,16 @@ For each public surface element I:
   cursor.get(&mut k, &mut v, Get::SearchLte, None).unwrap();
   // Returns NotFound — should return ("b","2") or ("a","1")
   ```
+
 * **Recommendation:** Either implement (the existing
   `find_range_entry` in `cursor_impl.rs:756-810` adapts
   straightforwardly to LTE by walking left), or change the wildcard
   arm to:
+
   ```rust
   _ => return Err(NoxuError::Unimplemented(format!("{:?}", get_type))),
   ```
+
   so users see a loud error instead of a silent miss.
 
 ---
@@ -238,6 +252,7 @@ For each public surface element I:
 * **Expected (BDB-JE):** `getSearchBoth` returns `NotFound` if the
   data does not match the slot's data even on a non-dup DB.
 * **Reproducer sketch:**
+
   ```rust
   // Non-dup DB: insert ("k","stored")
   let mut k = DatabaseEntry::from_bytes(b"k");
@@ -245,6 +260,7 @@ For each public surface element I:
   let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
   assert_eq!(s, OperationStatus::NotFound);   // currently fails — returns Success
   ```
+
 * **Recommendation:** In the non-dup `search` arm under
   `SearchMode::Both`, compare `slot_data` against `data.unwrap_or(&[])`
   and return `NotFound` if they differ. Add a regression test in
@@ -265,6 +281,7 @@ For each public surface element I:
   means `Get::NextDup` quietly returns the next record (i.e., a
   *different* key), violating the documented contract.
 * **Reproducer:**
+
   ```rust
   // Non-dup DB: insert ("a","1"), ("b","2")
   cursor.get(&mut k_of_a, &mut v, Get::Search, None);
@@ -272,6 +289,7 @@ For each public surface element I:
   // BDB-JE: NotFound
   // Noxu DB today: Success, key=="b"
   ```
+
 * **Recommendation:** Early-return `NotFound` from `retrieve_next`
   when `mode` is `NextDup` / `PrevDup` and the DB is non-dup, before
   any traversal.
@@ -285,9 +303,11 @@ For each public surface element I:
 * **Doc claim:** rustdoc on `Cursor::put` and `CursorImpl::put`: "the
   cursor is positioned at the newly written record".
 * **Actual:** Each non-`Current` put assigns
+
   ```rust
   self.current_index = 0;
   ```
+
   *unconditionally*, regardless of where the inserted/updated key
   actually lives in its BIN. None of these arms call
   `update_bin_pin(...)`. Two consequences:
@@ -299,6 +319,7 @@ For each public surface element I:
   2. The evictor's `cursor_count` invariant is violated: the BIN the
      cursor is logically positioned on is not pinned.
 * **Reproducer (sketch):**
+
   ```rust
   // DB pre-populated with 100 records so the leaf has multiple slots
   cursor.put(&k("z"), &v("v"), Put::Overwrite)?;        // ends up at slot 99
@@ -306,6 +327,7 @@ For each public surface element I:
   let s = cursor.get(&mut k, &mut d, Get::Next, None)?;
   // Expectation: NotFound (z was last); actual: returns slot 1 of stale BIN.
   ```
+
 * **Recommendation:** After a successful insert, look up the actual
   slot index in the resulting BIN (via `find_bin_for_key` + binary
   search on the suffix) and call `update_bin_pin(Some(bin_arc))`.
@@ -333,6 +355,7 @@ For each public surface element I:
   at" the deleted record; `getNext` moves to the record that
   followed it.
 * **Reproducer:**
+
   ```rust
   // DB = [("a","1"), ("b","2"), ("c","3")]
   let mut k = DatabaseEntry::from_bytes(b"b");
@@ -343,7 +366,9 @@ For each public surface element I:
   // BDB-JE: returns ("c","3")
   // Noxu DB: returns ("a","1") — back to first
   ```
+
   This breaks the canonical sweep-and-delete loop:
+
   ```rust
   let mut s = cursor.get(.., Get::First, None)?;
   while s == Success {
@@ -351,6 +376,7 @@ For each public surface element I:
       s = cursor.get(.., Get::Next, None)?;        // ← will infinite-loop on first match
   }
   ```
+
 * **Recommendation:** On delete, store the deleted key as a separate
   `anchor_after_delete: Option<Vec<u8>>` field. In `retrieve_next` /
   `Get::Next` from `NotInitialized`, if the anchor is set, use
@@ -386,10 +412,12 @@ For each public surface element I:
 ### Finding 9 — `CursorConfig::{read_committed, non_sticky, evict_ln, prefix_constraint}` are silently ignored (HIGH)
 
 * **File:** `crates/noxu-db/src/database.rs:655-657`
+
   ```rust
   let read_only = config.map(|c| c.read_uncommitted).unwrap_or(false)
       || self.config.read_only;
   ```
+
 * **Doc claim:** `cursor_config.rs:13-44` documents all five fields.
   In particular:
   * `read_committed` — "Read locks are released when the cursor moves
@@ -467,6 +495,7 @@ For each public surface element I:
      the parent txn itself. The scratch cursor's lock manager call
      may dead-lock.
 * **Reproducer (sketch):**
+
   ```rust
   let txn = env.begin_transaction(None, None)?;
   let mut cur = db.open_cursor(Some(&txn), None)?;     // (also see Finding 1)
@@ -477,6 +506,7 @@ For each public surface element I:
           Get::Search, None)?;
   let n = cur.count()?;        // expected 3 — may block forever
   ```
+
 * **Recommendation:** In `dup()` propagate `txn_ref` whenever
   `same_position == true`, or have `count()` walk the dups in-place
   using a saved key + `find_range_entry` rather than allocating a
@@ -521,6 +551,7 @@ For each public surface element I:
   released only when the outer `Cursor` is dropped (which fires
   `CursorImpl::Drop` → `close()`).
 * **Recommendation:**
+
   ```rust
   pub fn close(&mut self) -> Result<()> {
       if self.state == CursorState::Closed { return Ok(()); }
@@ -555,7 +586,7 @@ For each public surface element I:
 
 ---
 
-### Findings 17–22 — see findings table for low-severity / informational items.
+### Findings 17–22 — see findings table for low-severity / informational items
 
 ---
 

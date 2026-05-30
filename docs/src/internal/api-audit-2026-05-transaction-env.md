@@ -127,25 +127,33 @@ Reference shape: BDB-JE (`Environment`, `Transaction`, `Sequence`,
 ### F1 (High) — `Environment::active_txns` is never pruned; explicit `env.close()` after `txn.commit()` fails
 
 **Location:**
+
 * `crates/noxu-db/src/environment.rs:50-51` — declaration
+
   ```rust
   /// Active transactions
   active_txns: Mutex<HashMap<u64, Arc<TransactionState>>>,
   ```
+
 * `crates/noxu-db/src/environment.rs:617-623` — insertion in
   `begin_transaction`:
+
   ```rust
   let mut active_txns = self.active_txns.lock();
   active_txns.insert(txn_id, txn_state);
   ```
+
 * `crates/noxu-db/src/environment.rs:920-929` — removal:
+
   ```rust
   pub(crate) fn mark_transaction_complete(&self, txn_id: u64) {
       let mut active_txns = self.active_txns.lock();
       active_txns.remove(&txn_id);
   }
   ```
+
 * `crates/noxu-db/src/environment.rs:355-362` — close logic:
+
   ```rust
   let active_txns = self.active_txns.lock();
   if !active_txns.is_empty() {
@@ -231,15 +239,19 @@ need to be added (the field exists at
 ### F3 (High) — `EnvironmentConfig::durability` is dead config
 
 **Location:**
+
 * Declaration: `crates/noxu-db/src/environment_config.rs:557-559`
+
   ```rust
   /// Default durability policy for transactions.
   /// : `TXN_DURABILITY`.
   pub durability: Durability,
   ```
+
 * Default initialisation: `environment_config.rs:859`
 * Builder: `environment_config.rs:1498-1504`
 * Total uses in commit path:
+
   ```text
   $ grep -n "config\.durability\|self\.config\.durability" \
        crates/noxu-db/src/environment.rs
@@ -258,6 +270,7 @@ consulted.
 `docs/src/transactions/basics.md` claims:
 
 > Set a default durability of WRITE_NO_SYNC for the entire environment.
+>
 > ```rust
 > EnvironmentConfig::new(home).with_durability(no_sync)
 > ```
@@ -274,6 +287,7 @@ caller passes `None` and the per-txn default has not been overridden.
 ### F4 (Medium) — `txn_no_sync` / `txn_write_no_sync` apply only to auto-commit
 
 **Location:**
+
 * `crates/noxu-db/src/environment.rs:455-465` — values are forwarded
   into `Database::new(no_sync, write_no_sync)` only.
 * `crates/noxu-db/src/database.rs:160-194` — `auto_commit_sync`
@@ -292,6 +306,7 @@ auto-commit. Combined with F3 above, an explicit transaction in a
 ### F5 (Medium) — `Environment::read_only` is not enforced at the env layer
 
 **Location:**
+
 * `crates/noxu-db/src/environment.rs:115-141` — `open()` checks the
   on-disk directory is *writable* unless `read_only`, but never stores
   a "no-write" guard for later operations.
@@ -389,8 +404,10 @@ either way.
 ### F8 (Medium) — `Durability::replica_sync` and `replica_ack` are not wired
 
 **Location:**
+
 * `crates/noxu-db/src/durability.rs:60-99` — fields and named constants.
 * `crates/noxu-db/src/transaction.rs:213-220` —
+
   ```rust
   let (fsync, flush) = match durability.local_sync {
       SyncPolicy::Sync => (true, true),
@@ -398,8 +415,10 @@ either way.
       SyncPolicy::NoSync => (false, false),
   };
   ```
+
   No reference to `durability.replica_sync` or `durability.replica_ack`.
 * Repository-wide consumption:
+
   ```text
   $ grep -rn "replica_sync\|replica_ack" crates/noxu-db crates/noxu-dbi crates/noxu-engine
   (only struct declarations and tests in noxu-db/src/durability.rs)
@@ -416,6 +435,7 @@ the user-supplied `Durability` or substitutes its own policy).
 ### F9 (Medium) — `commit_with_durability` skips the active-transactions gauge dec
 
 **Location:**
+
 * `crates/noxu-db/src/transaction.rs:180-189` — `commit()` calls
   `commit_with_durability(durability)` then unconditionally
   `observe_gauge_dec!("noxu_db_active_transactions");`
@@ -495,6 +515,7 @@ nested transaction.
 ### F12 (Medium) — Auto-commit does not acquire per-record locks
 
 **Location:**
+
 * `crates/noxu-db/src/database.rs:160-194` — `auto_commit_sync`
   is the *entire* "auto-commit" surface; it only gates the WAL fsync.
 * `crates/noxu-db/src/database.rs:455-635` — `put` / `put_no_overwrite`
