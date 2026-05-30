@@ -12,7 +12,7 @@
 //!   - Use sequence IDs as database keys to store string records
 //!   - Retrieve those records back by their auto-assigned IDs
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus, SequenceConfig,
 };

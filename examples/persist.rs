@@ -10,11 +10,11 @@
 //!   - Store, retrieve, update, and delete entities
 //!   - Iterate over all entities in key order
 
-use noxu_db::{Environment, EnvironmentConfig};
-use noxu_persist::{
+use noxu::persist::{
     Entity, EntitySerializer, EntityStore, PersistError, PrimaryIndex,
     StoreConfig,
 };
+use noxu::{Environment, EnvironmentConfig};
 
 // ---------------------------------------------------------------------------
 // Entity definition
@@ -59,7 +59,7 @@ impl Entity for Person {
 struct PersonSerializer;
 
 impl EntitySerializer<Person> for PersonSerializer {
-    fn serialize(&self, entity: &Person) -> noxu_persist::Result<Vec<u8>> {
+    fn serialize(&self, entity: &Person) -> noxu::persist::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&entity.person_id.to_be_bytes());
         buf.extend_from_slice(&entity.age.to_be_bytes());
@@ -75,7 +75,7 @@ impl EntitySerializer<Person> for PersonSerializer {
         Ok(buf)
     }
 
-    fn deserialize(&self, bytes: &[u8]) -> noxu_persist::Result<Person> {
+    fn deserialize(&self, bytes: &[u8]) -> noxu::persist::Result<Person> {
         if bytes.len() < 8 {
             return Err(PersistError::SerializationError(
                 "Person record too short".to_string(),
@@ -101,7 +101,7 @@ impl EntitySerializer<Person> for PersonSerializer {
     }
 }
 
-fn read_u32(bytes: &[u8], pos: usize) -> noxu_persist::Result<u32> {
+fn read_u32(bytes: &[u8], pos: usize) -> noxu::persist::Result<u32> {
     if bytes.len() < pos + 4 {
         return Err(PersistError::SerializationError(
             "unexpected end of buffer reading u32".to_string(),
@@ -119,7 +119,7 @@ fn read_string(
     bytes: &[u8],
     pos: usize,
     len: usize,
-) -> noxu_persist::Result<String> {
+) -> noxu::persist::Result<String> {
     if bytes.len() < pos + len {
         return Err(PersistError::SerializationError(
             "unexpected end of buffer reading string".to_string(),
@@ -232,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nAll persons in key order:");
     let all: Vec<Person> = index
         .entities(None, &ser)?
-        .collect::<noxu_persist::Result<Vec<_>>>()?;
+        .collect::<noxu::persist::Result<Vec<_>>>()?;
     for p in &all {
         println!(
             "  id={}: {} {}, age={}",
@@ -256,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nFinal scan:");
     let remaining: Vec<Person> = index
         .entities(None, &ser)?
-        .collect::<noxu_persist::Result<Vec<_>>>()?;
+        .collect::<noxu::persist::Result<Vec<_>>>()?;
     for p in &remaining {
         println!(
             "  id={}: {} {}, age={}",

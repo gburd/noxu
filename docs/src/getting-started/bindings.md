@@ -3,7 +3,7 @@
 ## Why Bindings?
 
 `DatabaseEntry` holds raw bytes. To store typed Rust values with sort-preserving key encodings,
-Noxu DB provides the `noxu-bind` crate. The binding layer converts typed values to and from byte
+Noxu DB provides the `noxu::bind` module. The binding layer converts typed values to and from byte
 arrays in a way that:
 
 - Preserves sort order: sorted byte comparison produces the same order as sorted value comparison.
@@ -12,14 +12,14 @@ arrays in a way that:
 
 ## Available Bindings
 
-Add `noxu-bind` to your `Cargo.toml`:
+Bindings are available through the `noxu` umbrella crate (enabled by default):
 
 ```toml
 [dependencies]
-noxu-bind = { path = "crates/noxu-bind" }
+noxu = "3"
 ```
 
-Available bindings in `noxu_bind`:
+Available bindings in `noxu::bind`:
 
 ### Primitive numeric bindings (sort-preserving)
 
@@ -87,8 +87,8 @@ All bindings implement the `EntryBinding<T>` trait with two methods:
 ## Integer Keys
 
 ```rust
-use noxu_bind::{EntryBinding, IntBinding};
-use noxu_db::{DatabaseEntry, OperationStatus};
+use noxu::bind::{EntryBinding, IntBinding};
+use noxu::{DatabaseEntry, OperationStatus};
 
 let binding = IntBinding::new();
 
@@ -113,7 +113,7 @@ numeric order. `i32::MIN` sorts before -1 sorts before 0 sorts before 1 sorts be
 ## String Keys
 
 ```rust
-use noxu_bind::{EntryBinding, StringBinding};
+use noxu::bind::{EntryBinding, StringBinding};
 
 let binding = StringBinding::new();
 
@@ -129,7 +129,7 @@ assert_eq!(recovered, "Alice");
 ## Sorted Double Keys
 
 ```rust
-use noxu_bind::{EntryBinding, SortedDoubleBinding};
+use noxu::bind::{EntryBinding, SortedDoubleBinding};
 
 let binding = SortedDoubleBinding::new();
 
@@ -146,7 +146,7 @@ for &temp in &temperatures {
 ## Long Keys with Round-Trip
 
 ```rust
-use noxu_bind::{EntryBinding, LongBinding};
+use noxu::bind::{EntryBinding, LongBinding};
 
 let binding = LongBinding::new();
 
@@ -188,12 +188,12 @@ This technique (XOR with `MIN` before big-endian encoding) is the same approach 
 
 ## Using bindings with Stored* collection views (v1.6)
 
-The `noxu-collections` typed Stored* views consume `EntryBinding`
+The `noxu::collections` typed Stored* views consume `EntryBinding`
 implementations directly:
 
 ```rust,ignore
-use noxu_bind::{IntBinding, StringBinding};
-use noxu_collections::StoredMap;
+use noxu::bind::{IntBinding, StringBinding};
+use noxu::collections::StoredMap;
 
 // `StoredMap<K, V, KB, VB>` — the binding values are passed by value
 // at construction time, then used internally for every operation.
@@ -207,8 +207,8 @@ let value: Option<String> = map.get(None, &42)?;
 For raw byte slices (the v1.5 default), use `ByteArrayBinding`:
 
 ```rust,ignore
-use noxu_bind::ByteArrayBinding;
-use noxu_collections::StoredMap;
+use noxu::bind::ByteArrayBinding;
+use noxu::collections::StoredMap;
 
 let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
     StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
@@ -267,7 +267,7 @@ Migration options:
   affected by this change — their wire format is stable.
 - **Stay on the pre-3C build** until you have a maintenance window;
   the version-prefix work is opt-in only in the sense that you opt
-  in by upgrading `noxu-bind`.
+  in by upgrading `noxu` (which includes `noxu-bind` as an internal dep).
 
 Full schema-evolution (versioned bindings that can read older
 layouts of the same struct) is on the v1.6 roadmap.

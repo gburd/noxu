@@ -6,10 +6,10 @@
 //! (integers, strings, floats) as sortable keys and read them back
 //! with proper deserialization.
 
-use noxu_bind::{
+use noxu::bind::{
     EntryBinding, IntBinding, LongBinding, SortedDoubleBinding, StringBinding,
 };
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };

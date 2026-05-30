@@ -4,7 +4,7 @@ Add Noxu DB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu-db = "0.1"
+noxu = "3"
 ```
 
 Noxu DB has no runtime dependencies beyond the Rust standard library.
@@ -18,7 +18,23 @@ Noxu DB requires Rust 1.85 or later.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| (none required) | — | Core embedded DB is always available |
+| `collections` | yes | `noxu::collections` — `StoredMap`, `StoredSet`, `StoredList` |
+| `persist` | yes | `noxu::persist` — `#[derive(Entity)]`, `PrimaryIndex`, `EntityStore` |
+| `xa` | yes | `noxu::xa` — XA two-phase-commit (`XaEnvironment`) |
+| `replication` | no | `noxu::replication` — master-replica HA, elections |
+| `replication-tls-rustls` | no | TLS for replication via `rustls` |
+| `replication-tls-native` | no | TLS for replication via OS/OpenSSL |
+| `observability` | no | `noxu::observe` — `tracing` + `metrics` glue |
+
+To enable optional features, e.g. replication:
+
+```toml
+[dependencies]
+noxu = { version = "3", features = ["replication"] }
+```
+
+The default feature set (`collections`, `persist`, `xa`) is appropriate for
+most applications.
 
 ---
 
@@ -61,10 +77,15 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu-db = { path = "crates/noxu-db" }
+noxu = "3"
+```
 
-# Optional: typed bindings for integers, floats, strings
-noxu-bind = { path = "crates/noxu-bind" }
+For development from the repository, use a path dependency pointing at the
+umbrella crate:
+
+```toml
+[dependencies]
+noxu = { path = "crates/noxu" }
 ```
 
 ---
