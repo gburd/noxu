@@ -78,7 +78,7 @@ lock before returning a `LockConflict` error. You can configure this per
 environment or per transaction:
 
 ```rust
-use noxu_db::{Environment, EnvironmentConfig, TransactionConfig};
+use noxu::{Environment, EnvironmentConfig, TransactionConfig};
 use std::path::PathBuf;
 
 // Set a 500 ms lock timeout for the entire environment.

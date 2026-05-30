@@ -16,6 +16,46 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [v3.0.2] — 2026-05-30
+
+Docs-correction release. No engine code or public API change.
+
+### Changed
+
+- **Documentation**: all user-facing docs, the README, and examples now
+  recommend the `noxu` umbrella crate (`noxu = "3"`, `use noxu::…`) instead
+  of the internal `noxu-db` component crate. The umbrella was introduced in
+  v3.0.1; this release corrects the misdirection.
+- **Version bump**: workspace version `3.0.1` → `3.0.2`.
+- **README**: crates.io / docs.rs badges now point at `noxu` (not `noxu-db`);
+  Quick Start uses `noxu = "3"` and `use noxu::…`.
+- **Examples**: all workspace example `[[example]]` targets and standalone
+  projects (`cash`, `cask`, `ftdb`) use `noxu = …` as their dependency and
+  `use noxu::…` imports.
+- All `use noxu_db::`, `use noxu_collections::`, `use noxu_persist::`,
+  `use noxu_xa::`, `use noxu_rep::`, `use noxu_bind::` import examples in
+  docs/src/ rewritten to `use noxu::…` equivalents.
+
+## [v3.0.1] — 2026-05-30
+
+Umbrella release. No engine behavior change from v3.0.0.
+
+### Added
+
+- **`noxu` umbrella crate** — the single crate applications depend on
+  (`noxu = "3"`). Re-exports the engine (`noxu-db`) at its root and the
+  higher layers as modules behind features: `collections`, `persist`, `xa`
+  (default on); `replication`, `observability` (opt-in); `bind` (always).
+- The DPL derive macros (`#[derive(Entity)]`, `PrimaryKey`, `SecondaryKey`)
+  now emit `::noxu::persist::…` paths and work with only `noxu = "3"` in
+  scope (`noxu-persist-derive` is the lone companion crate).
+
+### Changed
+
+- Every component crate (`noxu-db`, `noxu-tree`, …, `noxu-rep`) now carries a
+  doc notice stating it is an internal component of `noxu`. The components
+  remain published as `noxu`'s dependencies but are marked internal.
+
 ## [v3.0.0] — 2026-05-29
 
 First crates.io release. This is the first major version to commit to the

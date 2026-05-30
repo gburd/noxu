@@ -3,8 +3,8 @@
 [![license](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 [![rust](https://img.shields.io/badge/rust-stable%201.95+-orange.svg)](rust-toolchain.toml)
 [![docs](https://img.shields.io/badge/docs-codeberg.page-blue.svg)](https://codeberg.page/gregburd/noxu/)
-[![crates.io](https://img.shields.io/crates/v/noxu-db.svg)](https://crates.io/crates/noxu-db)
-[![docs.rs](https://docs.rs/noxu-db/badge.svg)](https://docs.rs/noxu-db)
+[![crates.io](https://img.shields.io/crates/v/noxu.svg)](https://crates.io/crates/noxu)
+[![docs.rs](https://docs.rs/noxu/badge.svg)](https://docs.rs/noxu)
 
 Noxu DB is an embedded transactional key-value database engine, written in
 Rust.  It provides ACID transactions, a log-structured B+tree, checkpoint-based
@@ -12,16 +12,16 @@ crash recovery, master-replica replication with automatic leader elections,
 and an entity-persistence layer — all in a single library with no external
 database process required.
 
-**Current version**: 2.2.1.  See [CHANGELOG.md](CHANGELOG.md) for the full
+**Current version**: 3.0.2.  See [CHANGELOG.md](CHANGELOG.md) for the full
 release history.
 
 ## Quick Start
 
-Add `noxu-db` to your `Cargo.toml`:
+Add `noxu` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu-db = "2"  # or pin to a specific version, e.g. "2.4.1"
+noxu = "3"  # or pin to a specific version, e.g. "3.0.2"
 ```
 
 Alternatively, depend on the git source directly (useful before a crates.io
@@ -29,19 +29,23 @@ release, or to track unreleased commits):
 
 ```toml
 [dependencies]
-noxu-db = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v2.4.1" }
+noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v3.0.2" }
 ```
+
+The engine is composed of `noxu-*` component crates published as internal
+dependencies; applications should depend on `noxu`, not on a component crate
+directly.
 
 Open an environment, write a record, and read it back:
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };
 use std::path::PathBuf;
 
-fn main() -> noxu_db::Result<()> {
+fn main() -> noxu::Result<()> {
     // Open (or create) a transactional environment on disk.
     let env_config = EnvironmentConfig::new(PathBuf::from("/tmp/mydb"))
         .with_allow_create(true)
@@ -137,7 +141,7 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
   Phi Accrual Failure Detection, VLSN-based log streaming, network restore,
   master transfer, dynamic membership, and configurable
   `ReplicaAckPolicy` / `ReplicaConsistencyPolicy`.  Transport over TCP or
-  QUIC (`rustls`-based).  **Security note**: as of v2.2.1 the replication
+  QUIC (`rustls`-based).  **Security note**: as of v3.0.2 the replication
   wire protocol has no authentication; deploy only across a trusted network
   boundary.  See
   [`docs/src/operations/known-limitations.md`](docs/src/operations/known-limitations.md)
@@ -149,6 +153,7 @@ Noxu DB is a Cargo workspace of **21 crates**:
 
 | Layer | Crates |
 |---|---|
+| **Umbrella** | `noxu` (the crate users depend on) |
 | Foundation | `noxu-util`, `noxu-sync`, `noxu-latch`, `noxu-config` |
 | Storage / log / recovery | `noxu-log`, `noxu-tree`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery` |
 | Transactions / engine | `noxu-txn`, `noxu-dbi`, `noxu-engine`, `noxu-db` |
@@ -158,7 +163,7 @@ Noxu DB is a Cargo workspace of **21 crates**:
 
 See the [crate guide](https://codeberg.page/gregburd/noxu/maintainer/crate-guide.html)
 for a per-crate purpose statement and the
-[v2.2.1 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#v22-current-capability-matrix).
+[v3.0.2 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix).
 
 ## Building and Testing
 
@@ -169,7 +174,7 @@ git submodule update --init --recursive
 cargo build                    # Build all crates
 cargo nextest run --workspace  # Run all tests (preferred)
 cargo test --workspace         # Run all tests (fallback)
-cargo test -p noxu-db          # Test a single crate
+cargo test -p noxu          # Test via the umbrella crate
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 cargo doc --workspace --no-deps

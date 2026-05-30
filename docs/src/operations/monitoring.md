@@ -38,7 +38,7 @@ Register an `ExceptionListener` to receive callbacks on environment
 invalidation events (log corruption, disk full, latch timeout):
 
 ```rust
-use noxu_db::{ExceptionListener, ExceptionEvent};
+use noxu::{ExceptionListener, ExceptionEvent};
 
 struct MyListener;
 impl ExceptionListener for MyListener {

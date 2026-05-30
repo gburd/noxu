@@ -25,7 +25,7 @@ repository root if you have local copies. Do NOT modify them.
 | `noxu-evictor` | `noxu_evictor::` | `evictor.rs` |
 | `noxu-cleaner` | `noxu_cleaner::` | `cleaner.rs`, `utilization_profile.rs`, `file_selector.rs` |
 | `noxu-recovery` | `noxu_recovery::` | `recovery_manager.rs`, `checkpointer.rs` |
-| `noxu-rep` | `noxu_rep::` | `replicated_environment.rs`, `stream/peer_feeder.rs`, `elections/paxos.rs` |
+| `noxu-rep` | `noxu::replication::` | `replicated_environment.rs`, `stream/peer_feeder.rs`, `elections/paxos.rs` |
 | `noxu-config` | `noxu_config::` | `params.rs` |
 
 ## Naming Conventions

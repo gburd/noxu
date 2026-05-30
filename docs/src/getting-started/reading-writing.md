@@ -5,7 +5,7 @@
 Use `db.put` to insert or overwrite a record:
 
 ```rust
-use noxu_db::{DatabaseEntry, OperationStatus};
+use noxu::{DatabaseEntry, OperationStatus};
 
 let key  = DatabaseEntry::from_bytes(b"user:alice");
 let data = DatabaseEntry::from_bytes(b"Alice Smith");
@@ -74,7 +74,7 @@ Errors (I/O failures, lock timeouts, closed handles, etc.) are returned as `Err(
 ## A Complete Read/Write Example
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };

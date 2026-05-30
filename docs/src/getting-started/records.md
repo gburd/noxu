@@ -11,7 +11,7 @@ that can be serialized to bytes can be stored in Noxu DB.
 ## Creating DatabaseEntry Objects
 
 ```rust
-use noxu_db::DatabaseEntry;
+use noxu::DatabaseEntry;
 
 // From a byte literal
 let key = DatabaseEntry::from_bytes(b"employee:1001");

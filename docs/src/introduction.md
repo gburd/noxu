@@ -90,24 +90,30 @@ for the per-finding notes.
 
 ## Quick Start
 
-Until the crate is published to crates.io, depend on Noxu DB via the
-Codeberg git URL:
+Add `noxu` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu-db = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v2.2.1" }
+noxu = "3"
+```
+
+Or depend on the git source directly:
+
+```toml
+[dependencies]
+noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v3.0.2" }
 ```
 
 Open an environment, write a record, and read it back:
 
 ```rust
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };
 use std::path::PathBuf;
 
-fn main() -> noxu_db::Result<()> {
+fn main() -> noxu::Result<()> {
     // Open (or create) a transactional environment on disk.
     let env_config = EnvironmentConfig::new(PathBuf::from("./mydb"))
         .with_allow_create(true)
