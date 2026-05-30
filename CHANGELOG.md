@@ -16,6 +16,59 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [v3.0.0] — 2026-05-29
+
+First crates.io release. This is the first major version to commit to the
+SemVer stability policy (`docs/src/contributing/semver-policy.md`): from v3.0
+onward, no breaking public-API change ships in a minor or patch release.
+
+v3.0.0 lands the full remediation of the 2026-05 audit (first per-subsystem
+pass and second cross-feature pass) plus the API-stability, crates.io, and
+voice-cleanup work. See the per-wave reports under `docs/src/internal/`.
+
+### Breaking changes
+
+- **`Environment::open_database` is transactional** (C-4). When a transaction
+  is supplied, database creation participates in the transaction: it rolls
+  back on `txn.abort()` and is invisible to `get_database_names()` until the
+  transaction commits. Database-creation now logs a provisional `NameLNTxn`
+  inside the creating transaction (C-6); recovery undoes the NameLN for
+  aborted or crash-before-commit creations. Old logs (commit-time `NameLN`,
+  no txn_id) still recover unchanged.
+- **`cache_size` is the total memory budget** (X-12). Previously it bounded
+  only the BIN-tree Arbiter; log write buffers and the off-heap cache were
+  separate pools. The Arbiter now receives
+  `cache_size − log_buf_total − off_heap_reserved` (floored at 1 MiB). To
+  preserve a prior BIN-tree allocation, increase `cache_size` by the log-buffer
+  and off-heap sizes. See the migration guide.
+- **`log_flush_no_sync_interval_ms` is now active** (X-11). Previously stored
+  but never consumed; a non-zero value now starts the `noxu-log-flusher`
+  background daemon that flushes `CommitNoSync` data on the configured interval.
+- **Deprecated items scheduled for removal** (Wave 11-L): `Transaction::new`
+  (use `Environment::begin_transaction()`), `EnvironmentConfig::set_txn_no_sync`
+  / `with_txn_no_sync` / `set_txn_write_no_sync` and the
+  `EnvironmentMutableConfig` equivalents (use `set_durability`/`with_durability`),
+  `XaError::CrashDurabilityNotSupported`, and 13 obsolete `noxu-config::params`
+  statics. These carry `#[deprecated(since = "2.4.1")]`.
+
+See `docs/src/getting-started/migrating.md` for code-level migration recipes
+for each breaking change.
+
+### Highlights
+
+- Full 2026-05 audit remediation across Waves 11-Q through 11-Y: WAL/recovery
+  crash-safety (parent-dir fsync, fsync-failure env invalidation, recovery
+  CRC32, log-buffer memory ordering), lock-manager ordering and victim
+  selection, evictor `PartialEvict` actually freeing memory, cursor/database
+  lazy `iter()`/`range()`, on-disk-format documentation accuracy, and the
+  cross-feature criticals (recovered-XA-commit VLSN, cleaner×checkpoint
+  deletion barrier, open-ended rollback intervals).
+- `#![forbid(unsafe_code)]` on the 12 zero-unsafe core crates.
+- API-stability surface enumerated; advisory `cargo-semver-checks` CI gate.
+- All 19 public crates restructured for crates.io publication.
+
+### Detailed changes
+
 ### Fixed (v3.0.0 — Wave 11-U recovery/checkpoint/cleaner/VLSN cluster)
 
 - **X-8 — Checkpointer no longer writes redundant empty BINDelta after evictor
