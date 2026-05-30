@@ -20,10 +20,10 @@ mod metrics;
 mod workloads;
 
 use metrics::{cpu_time_ms, dir_size_kb, proc_io, rss_kb};
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
 };
-use noxu_xa::XaEnvironment;
+use noxu::xa::XaEnvironment;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};

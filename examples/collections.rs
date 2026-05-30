@@ -4,9 +4,9 @@
 //! provide a familiar map-like interface over a Noxu DB database
 //! with typed keys and values.
 
-use noxu_bind::StringBinding;
-use noxu_collections::StoredMap;
-use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
+use noxu::bind::StringBinding;
+use noxu::collections::StoredMap;
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_dir = std::env::temp_dir().join("noxu_collections_example");

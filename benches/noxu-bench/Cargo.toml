@@ -17,9 +17,7 @@ name = "noxu-w10-bench"
 path = "src/w10_bench.rs"
 
 [dependencies]
-noxu-db = { workspace = true }
-noxu-sync = { path = "../../crates/noxu-sync" }
-noxu-xa = { path = "../../crates/noxu-xa" }
+noxu = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = "3"
 rand = { version = "0.8", features = ["small_rng"] }

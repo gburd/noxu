@@ -15,13 +15,11 @@ publish = false
 # Stateright is the core model checker.
 stateright = { workspace = true }
 
-# Production crates whose public types the specs import. The point is
+# Production crate whose public types the specs import. The point is
 # coupling: a refactor that changes a variant of LockType, removes an
 # XaFlags constant, etc. will break the noxu-spec build via the
-# exhaustive matches inside each spec module. Without this, the
-# specs would silently model a stale version of the enum.
-noxu-txn = { workspace = true }
-noxu-xa = { workspace = true }
+# exhaustive matches inside each spec module.
+noxu = { workspace = true }
 
 [dev-dependencies]
 # Specs are validated as ordinary `cargo test` cases — no external

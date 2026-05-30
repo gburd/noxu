@@ -11,7 +11,7 @@ name = "ftdb"
 path = "src/main.rs"
 
 [dependencies]
-noxu-db = { path = "../../crates/noxu-db" }
+noxu = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "macros", "sync"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

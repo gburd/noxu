@@ -1,6 +1,6 @@
 [package]
 name = "noxu-persist-derive"
-version.workspace = true
+version = "3.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -23,7 +23,6 @@ workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-# noxu-persist is the runtime side of the macro; tests invoke it.
-noxu-persist = { workspace = true }
-noxu-db = { workspace = true }
+# noxu is the runtime side of the macro; tests invoke it.
+noxu = { workspace = true }
 tempfile = "3"

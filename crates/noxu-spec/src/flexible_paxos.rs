@@ -31,7 +31,7 @@
 //!     restarts without `acceptor.state` persisted. `assert_discovery`
 //!     finds a counterexample where two distinct leaders are elected
 //!     at the same term — this is the F5/F31 split-brain that
-//!     `noxu_rep::elections::acceptor_state::PersistentAcceptorState`
+//!     `noxu::rep::elections::acceptor_state::PersistentAcceptorState`
 //!     closes.
 //!
 //! Properties:

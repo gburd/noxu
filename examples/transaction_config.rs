@@ -5,7 +5,7 @@
 //!
 //! Run with: cargo run --example transaction_config
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     TransactionConfig,
 };

@@ -27,7 +27,7 @@ use criterion::{
 };
 use heed::types::Bytes as HeedBytes;
 use heed::{Database as HeedDatabase, EnvOpenOptions};
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
     OperationStatus,
 };
@@ -55,7 +55,7 @@ fn key(i: usize) -> Vec<u8> {
 // Noxu helpers
 // ---------------------------------------------------------------------------
 
-fn noxu_open() -> (TempDir, Environment, noxu_db::Database) {
+fn noxu_open() -> (TempDir, Environment, noxu::Database) {
     let dir = TempDir::new().unwrap();
     let cfg = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true);
@@ -65,7 +65,7 @@ fn noxu_open() -> (TempDir, Environment, noxu_db::Database) {
     (dir, env, db)
 }
 
-fn noxu_populate(db: &noxu_db::Database) {
+fn noxu_populate(db: &noxu::Database) {
     for i in 0..N {
         let k = DatabaseEntry::from_vec(key(i));
         let v = DatabaseEntry::from_bytes(VALUE);

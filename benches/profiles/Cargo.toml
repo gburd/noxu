@@ -10,6 +10,6 @@ name = "noxu-perf-profiler"
 path = "src/main.rs"
 
 [dependencies]
-noxu-db = { workspace = true }
+noxu = { workspace = true }
 tempfile = "3"
 rand = { version = "0.8", features = ["small_rng"] }

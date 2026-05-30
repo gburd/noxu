@@ -4,7 +4,7 @@
 //! All threads synchronise at a Barrier before starting, so that wall-clock
 //! time measures pure throughput rather than thread-startup latency.
 
-use noxu_db::{Database, DatabaseEntry, Environment};
+use noxu::{Database, DatabaseEntry, Environment};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Barrier};

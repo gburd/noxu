@@ -54,14 +54,14 @@
 //! the spec build:
 //!
 //!   - [`lock_manager_deadlock`] re-exports
-//!     [`noxu_txn::LockType`] as `HeldKind`. Its
+//!     [`noxu::txn::LockType`] as `HeldKind`. Its
 //!     `spec_lock_kind()` projection uses an exhaustive `match`
 //!     over every `LockType` variant — adding a new variant
 //!     forces a build break and a spec-level decision (extend
 //!     the alphabet, or map onto the existing read/write set).
 //!   - [`xa_two_phase_commit`] declares a compile-time anchor
 //!     `_FLAG_ANCHOR` referencing every public constant on
-//!     [`noxu_xa::XaFlags`]. Removing or renaming any of them on
+//!     [`noxu::xa::XaFlags`]. Removing or renaming any of them on
 //!     the production side breaks the spec build.
 //!
 //! For specs whose state/action types have no direct production

@@ -1,0 +1,106 @@
+[package]
+name = "noxu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Noxu DB — An embedded transactional key-value database engine in Rust"
+
+[lib]
+name = "noxu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crash_worker"
+path = "src/bin/crash_worker.rs"
+
+[features]
+default = []
+
+# Testing-only: exposes cursor-failure injection hooks used by integration tests.
+# Never enable in production builds.
+testing = []
+
+# Observability: opt-in OpenTelemetry support.
+observability = []
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
+# Replication / HA (gates the `rep` module).
+replication = []
+
+# XA distributed transactions (gates the `xa` module).
+xa = []
+
+# Higher-level binding / collections / DPL (always compiled)
+bind = []
+collections = ["bind"]
+persist = []
+
+# TLS backends (for replication networking).
+tls-rustls = ["dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
+tls-native = ["dep:native-tls"]
+
+# QUIC transport for replication.
+quic = ["dep:quinn", "dep:tokio", "tls-rustls"]
+
+# Test harness for replication integration tests.
+test-harness = []
+
+
+[dependencies]
+# Core dependencies (always present)
+hashbrown = { workspace = true }
+lock_api = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+byteorder = { workspace = true }
+memmap2 = { workspace = true }
+fs2 = { workspace = true }
+libc = { workspace = true }
+lru = "0.12"
+
+# Serialization (always present - used by noxu::bind)
+serde = { workspace = true }
+
+# Proc-macro for DPL (always required)
+noxu-persist-derive = { version = "3.0.1", path = "../noxu-persist-derive" }
+
+# Observability (always required - observe module always compiled)
+tracing = { workspace = true }
+metrics = { workspace = true }
+# OpenTelemetry support (observability + otel feature)
+opentelemetry = { version = "0.27", optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+
+# QUIC transport (quic feature)
+quinn = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+# TLS backends
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
+
+# Quorum system library (used by rep module)
+quoracle = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = "3"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu"]

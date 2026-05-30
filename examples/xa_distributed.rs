@@ -5,8 +5,8 @@
 //!
 //! Run with: cargo run --example xa_distributed
 
-use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
-use noxu_xa::{PrepareResult, XaEnvironment, XaFlags, XaResource, Xid};
+use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu::xa::{PrepareResult, XaEnvironment, XaFlags, XaResource, Xid};
 use tempfile::TempDir;
 
 fn main() {

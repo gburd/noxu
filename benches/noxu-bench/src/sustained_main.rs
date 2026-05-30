@@ -33,7 +33,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::io::Write;

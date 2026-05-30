@@ -4,7 +4,7 @@
 ///   cargo run --release -p noxu-w10-bench -- [--nvme] [--scale 1000,10000,100000]
 ///
 /// By default uses tmpfs TempDir.  With --nvme writes to /scratch/noxu_w10bench.
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
 };
 use std::path::Path;

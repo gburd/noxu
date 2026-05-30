@@ -11,7 +11,7 @@ publish = false
 # within Noxu and for comparing the workload *shape* across engines.
 
 [dev-dependencies]
-noxu-db = { workspace = true }
+noxu = { workspace = true }
 criterion = { workspace = true }
 tempfile = "3"
 

@@ -3,7 +3,7 @@
 //! Each function returns the number of logical operations performed so that
 //! the caller can compute ns/op and ops/sec.
 
-use noxu_db::{Database, DatabaseEntry, Environment, Get, OperationStatus};
+use noxu::{Database, DatabaseEntry, Environment, Get, OperationStatus};
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -237,12 +237,12 @@ pub fn w09_txn_multi(
 /// Each iteration is one complete distributed transaction branch.
 /// Returns `n` (one 2PC round trip per iteration).
 pub fn w12_xa_2pc(
-    xa: &noxu_xa::XaEnvironment,
+    xa: &noxu::xa::XaEnvironment,
     db: &Database,
     n: usize,
     value: &[u8],
 ) -> usize {
-    use noxu_xa::{XaFlags, XaResource, Xid};
+    use noxu::xa::{XaFlags, XaResource, Xid};
 
     let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
@@ -270,12 +270,12 @@ pub fn w12_xa_2pc(
 /// xa_start → put → xa_end → xa_commit(ONEPHASE).
 /// Returns `n`.
 pub fn w12_xa_1pc(
-    xa: &noxu_xa::XaEnvironment,
+    xa: &noxu::xa::XaEnvironment,
     db: &Database,
     n: usize,
     value: &[u8],
 ) -> usize {
-    use noxu_xa::{XaFlags, XaResource, Xid};
+    use noxu::xa::{XaFlags, XaResource, Xid};
 
     let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
@@ -336,11 +336,11 @@ pub fn w12_xa_1pc(
 // SecondaryDatabase with a SecondaryKeyCreator that buckets the primary
 // key the same way and walks via `Cursor.getFirst` + `Cursor.getNext`.
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, EnvironmentConfig, SecondaryConfig, SecondaryDatabase,
     SecondaryKeyCreator,
 };
-use noxu_sync::Mutex;
+use noxu::sync::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 

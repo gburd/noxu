@@ -20,7 +20,7 @@
 //! W11 populates, closes the env, then re-opens it so recovery is the
 //! only timed work.
 
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
 };
 use rand::rngs::SmallRng;
