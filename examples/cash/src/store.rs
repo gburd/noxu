@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use noxu_db::{
+use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };
@@ -15,7 +15,7 @@ use crate::config::CashConfig;
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("noxu db error: {0}")]
-    Db(#[from] noxu_db::NoxuError),
+    Db(#[from] noxu::NoxuError),
 
     #[error("store initialization failed: {0}")]
     Init(String),

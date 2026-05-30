@@ -5,7 +5,7 @@
 //! Demonstrates transactional operations: beginning transactions, committing,
 //! aborting, and verifying that only committed data persists.
 
-use noxu_db::{
+use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus,
 };

@@ -1,7 +1,7 @@
 # StoredMap
 
 `StoredMap<K, V, KB, VB>` provides a `BTreeMap`-like view over a Noxu
-primary database, parameterised by [`noxu_bind::EntryBinding`]
+primary database, parameterised by [`noxu::bind::EntryBinding`]
 implementations for keys and values.  Use it when you want familiar
 collection ergonomics with typed Rust keys and values, without writing
 the cursor / `DatabaseEntry` boilerplate by hand.
@@ -13,9 +13,9 @@ Every `len()`, `iter()`, `contains_key()` call goes to the database.
 ## Creating a StoredMap
 
 ```rust,ignore
-use noxu_bind::{IntBinding, StringBinding};
-use noxu_collections::StoredMap;
-use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
+use noxu::bind::{IntBinding, StringBinding};
+use noxu::collections::StoredMap;
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 
 let env = Environment::open(env_config)?;
 let db_config = DatabaseConfig::new().with_allow_create(true);
@@ -91,7 +91,7 @@ modifications after the iterator is constructed are *not* reflected.
 
 Iteration order is the natural order of the on-disk byte
 representation, which depends on the binding.  Bindings in
-`noxu-bind`:
+`noxu::bind`:
 
 | Binding | Sorts in… |
 |---|---|
@@ -119,7 +119,7 @@ map.put(b"key", b"value")?;
 let v: Option<Vec<u8>> = map.get(b"key")?;
 
 // v1.6
-use noxu_bind::ByteArrayBinding;
+use noxu::bind::ByteArrayBinding;
 let map: StoredMap<Vec<u8>, Vec<u8>, _, _> =
     StoredMap::new(&db, ByteArrayBinding, ByteArrayBinding);
 map.put(None, &b"key".to_vec(), &b"value".to_vec())?;

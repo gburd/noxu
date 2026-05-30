@@ -16,19 +16,19 @@ how the CI gate enforces the commitment.
 
 | Tier | Crates | Commitment |
 |------|--------|-----------|
-| **Stable** | `noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`, `noxu-rep` | No breaking change in a minor or patch release from v3.0.0 onward. |
+| **Stable** | `noxu` (umbrella), `noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`, `noxu-rep` | No breaking change in a minor or patch release from v3.0.0 onward. Applications should depend on `noxu`. |
 | **Stable (foundational)** | `noxu-util`, `noxu-config` | Stable from v3.0.0 for the items listed; the full `params` catalogue is stable for *names and defaults* only — new params may be added (additive). |
-| **Internal** | `noxu-engine`, `noxu-dbi`, `noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-log`, `noxu-latch`, `noxu-sync`, `noxu-observe`, `noxu-spec`, `noxu-persist-derive` | These crates are engine internals or tooling. Their public Rust APIs may change in any release. `noxu-persist-derive` is a proc-macro support crate accessed only through `noxu-persist`; its standalone API is internal. |
+| **Internal** | `noxu-engine`, `noxu-dbi`, `noxu-tree`, `noxu-txn`, `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-log`, `noxu-latch`, `noxu-sync`, `noxu-observe`, `noxu-spec`, `noxu-persist-derive` | These crates are engine internals or tooling. Their public Rust APIs may change in any release. `noxu-persist-derive` is a proc-macro support crate accessed only through `noxu::persist`; its standalone API is internal. |
 
 > **Note — `noxu-engine` items re-exported by `noxu-db`**: Four items from
 > `noxu-engine` (`EnvironmentStats`, `VerifyConfig`, `VerifyError`,
-> `VerifyResult`) are re-exported at the `noxu-db` crate root.  Because they
-> are part of `noxu-db`'s stable surface they are stable; the rest of
-> `noxu-engine`'s pub API is not.
+> `VerifyResult`) are re-exported at the `noxu-db` crate root and therefore
+> at the `noxu` umbrella root.  Because they are part of `noxu`'s stable
+> surface they are stable; the rest of `noxu-engine`'s pub API is not.
 
 ---
 
-## `noxu-db` — public API
+## `noxu-db` / `noxu` — public API
 
 Primary entry point for all embedded-database users.  All items listed
 here are committed to v3.0+ stability.
@@ -120,7 +120,7 @@ here are committed to v3.0+ stability.
 
 | Item | Feature | Description |
 |------|---------|-------------|
-| `noxu_db::observe_crate` (module) | `observability` | Re-exports `noxu_observe` for subscriber setup. |
+| `noxu::observe_crate` (module) | `observability` | Re-exports `noxu_observe` for subscriber setup. |
 
 ### Pub-but-internal items (to be restricted in v3.0)
 
@@ -141,7 +141,7 @@ removed in the next major version.
 
 ---
 
-## `noxu-bind` — public API
+## `noxu::bind` — public API (via `noxu` umbrella)
 
 Serialization bindings between Rust types and `DatabaseEntry` byte
 representations.
@@ -190,7 +190,7 @@ All implement `TupleBinding` and/or `EntryBinding`.
 
 ---
 
-## `noxu-collections` — public API
+## `noxu::collections` — public API (via `noxu` umbrella)
 
 Iterator-based typed views over Noxu DB databases.
 
@@ -221,7 +221,7 @@ Iterator-based typed views over Noxu DB databases.
 
 ---
 
-## `noxu-persist` — public API
+## `noxu::persist` — public API (via `noxu` umbrella)
 
 Derive-macro-based entity persistence layer (Direct Persistence Layer).
 
@@ -291,7 +291,7 @@ Derive-macro-based entity persistence layer (Direct Persistence Layer).
 
 ---
 
-## `noxu-xa` — public API
+## `noxu::xa` — public API (via `noxu` umbrella)
 
 X/Open XA distributed transactions.
 
@@ -326,7 +326,7 @@ X/Open XA distributed transactions.
 
 ---
 
-## `noxu-rep` — public API
+## `noxu::replication` — public API (via `noxu` umbrella)
 
 Master-replica HA replication with elections, VLSN tracking, and subscriptions.
 

@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum FtdbError {
     #[error("storage error: {0}")]
-    Storage(#[from] noxu_db::NoxuError),
+    Storage(#[from] noxu::NoxuError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

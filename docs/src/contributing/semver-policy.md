@@ -81,7 +81,8 @@ The following changes are **not breaking** (allowed in minor releases):
 ## Compatibility tier table
 
 | Crate | Tier | v3.0+ guarantee |
-|-------|------|-----------------|
+|-------|------|------------------|
+| `noxu` | **Stable (umbrella)** | Full SemVer from v3.0.0. **This is the crate applications should depend on.** |
 | `noxu-db` | Stable | Full SemVer from v3.0.0. |
 | `noxu-bind` | Stable | Full SemVer from v3.0.0. |
 | `noxu-collections` | Stable | Full SemVer from v3.0.0. |

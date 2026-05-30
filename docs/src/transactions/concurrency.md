@@ -102,7 +102,7 @@ lock before returning a `LockConflict` error. You can configure this per
 environment or per transaction:
 
 ```rust
-use noxu_db::{Environment, EnvironmentConfig, TransactionConfig};
+use noxu::{Environment, EnvironmentConfig, TransactionConfig};
 use std::path::PathBuf;
 
 // Set a 500 ms lock timeout for the entire environment.
@@ -141,7 +141,7 @@ deadlock at the cost of reduced read concurrency.
 > shared. Use RMW only if you are seeing high rates of deadlocking.
 
 ```rust
-use noxu_db::{DatabaseEntry, LockMode, NoxuError};
+use noxu::{DatabaseEntry, LockMode, NoxuError};
 
 const MAX_RETRIES: u32 = 10;
 let mut retries = 0;

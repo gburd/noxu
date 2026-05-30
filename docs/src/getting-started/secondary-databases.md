@@ -71,7 +71,7 @@ A key creator extracts the secondary key from a primary record. Implement
 the `SecondaryKeyCreator` trait:
 
 ```rust
-use noxu_db::{Database, DatabaseEntry, SecondaryKeyCreator};
+use noxu::{Database, DatabaseEntry, SecondaryKeyCreator};
 
 struct DepartmentKeyCreator;
 
@@ -106,7 +106,7 @@ For records that produce more than one secondary key (e.g. tags), use the
 ## Opening a Secondary Database
 
 ```rust
-use noxu_db::{SecondaryConfig, SecondaryDatabase};
+use noxu::{SecondaryConfig, SecondaryDatabase};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
@@ -190,7 +190,7 @@ duplicate of the cursor's current secondary key and return
 ## Foreign-key constraints
 
 ```rust
-use noxu_db::secondary_config::ForeignKeyDeleteAction;
+use noxu::secondary_config::ForeignKeyDeleteAction;
 
 // Open the foreign primary (e.g. a "departments" lookup table).
 let depts = Arc::new(Mutex::new(env.open_database(

@@ -16,7 +16,7 @@ environment:
 Use `Environment::open` with an `EnvironmentConfig`:
 
 ```rust
-use noxu_db::{Environment, EnvironmentConfig};
+use noxu::{Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 let config = EnvironmentConfig::new(PathBuf::from("/var/data/myapp"))
@@ -35,7 +35,7 @@ error. The directory must exist, or `allow_create` must be `true`.
 changed while the environment is open.
 
 ```rust
-use noxu_db::{Environment, EnvironmentConfig};
+use noxu::{Environment, EnvironmentConfig};
 
 let config = EnvironmentConfig::new(PathBuf::from("/var/data/myapp"))
     .with_allow_create(true)
