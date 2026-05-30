@@ -3,6 +3,13 @@
 // See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+//! > **Internal component of the [`noxu`](https://crates.io/crates/noxu) database.**
+//! >
+//! > This crate is published only so the `noxu` umbrella crate can depend on it.
+//! > Use `noxu` (`noxu = "3"`) in applications; depend on this crate directly only
+//! > if you are extending the engine internals. Its API may change without a major
+//! > version bump.
+//!
 //! Derive macros for the Noxu DB Direct Persistence Layer (DPL).
 //!
 //! This crate provides three `#[derive(...)]` macros that generate the
@@ -117,7 +124,7 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let entity_name = entity_name_from_attrs(&input.attrs, struct_ident)?;
 
     Ok(quote! {
-        impl #impl_generics ::noxu_persist::Entity for #struct_ident #ty_generics #where_clause {
+        impl #impl_generics ::noxu::persist::Entity for #struct_ident #ty_generics #where_clause {
             type PrimaryKey = #pk_ty;
 
             fn primary_key(&self) -> &#pk_ty {
@@ -180,10 +187,10 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
             let inner_ty = &unnamed.unnamed[0].ty;
             (
                 quote! {
-                    <#inner_ty as ::noxu_persist::PrimaryKey>::to_bytes(&self.0)
+                    <#inner_ty as ::noxu::persist::PrimaryKey>::to_bytes(&self.0)
                 },
                 quote! {
-                    Ok(Self(<#inner_ty as ::noxu_persist::PrimaryKey>::from_bytes(bytes)?))
+                    Ok(Self(<#inner_ty as ::noxu::persist::PrimaryKey>::from_bytes(bytes)?))
                 },
             )
         }
@@ -217,12 +224,12 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     Ok(quote! {
-        impl #impl_generics ::noxu_persist::PrimaryKey for #struct_ident #ty_generics #where_clause {
+        impl #impl_generics ::noxu::persist::PrimaryKey for #struct_ident #ty_generics #where_clause {
             fn to_bytes(&self) -> ::std::vec::Vec<u8> {
                 #to_bytes_body
             }
 
-            fn from_bytes(bytes: &[u8]) -> ::noxu_persist::Result<Self> {
+            fn from_bytes(bytes: &[u8]) -> ::noxu::persist::Result<Self> {
                 #from_bytes_body
             }
         }
@@ -235,7 +242,7 @@ fn composite_to_bytes_tuple(
 ) -> TokenStream2 {
     let pieces = idxs.iter().zip(tys.iter()).map(|(i, ty)| {
         quote! {
-            let part = <#ty as ::noxu_persist::PrimaryKey>::to_bytes(&self.#i);
+            let part = <#ty as ::noxu::persist::PrimaryKey>::to_bytes(&self.#i);
             buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
             buf.extend_from_slice(&part);
         }
@@ -258,15 +265,15 @@ fn composite_from_bytes_tuple(
         quote! {
             let len = read_u32(bytes, &mut pos)? as usize;
             check_remaining(bytes, pos, len)?;
-            let #var = <#ty as ::noxu_persist::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
+            let #var = <#ty as ::noxu::persist::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
             pos += len;
         }
     });
     let var_uses = (0..n).map(|i| format_ident!("_part_{}", i));
     quote! {
-        fn read_u32(bytes: &[u8], pos: &mut usize) -> ::noxu_persist::Result<u32> {
+        fn read_u32(bytes: &[u8], pos: &mut usize) -> ::noxu::persist::Result<u32> {
             if bytes.len() < *pos + 4 {
-                return Err(::noxu_persist::PersistError::SerializationError(
+                return Err(::noxu::persist::PersistError::SerializationError(
                     "short read decoding composite key length prefix".into(),
                 ));
             }
@@ -276,9 +283,9 @@ fn composite_from_bytes_tuple(
             *pos += 4;
             Ok(v)
         }
-        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> ::noxu_persist::Result<()> {
+        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> ::noxu::persist::Result<()> {
             if bytes.len() < pos + need {
-                return Err(::noxu_persist::PersistError::SerializationError(
+                return Err(::noxu::persist::PersistError::SerializationError(
                     "short read decoding composite key field".into(),
                 ));
             }
@@ -296,7 +303,7 @@ fn composite_to_bytes_named(
 ) -> TokenStream2 {
     let pieces = idents.iter().zip(tys.iter()).map(|(name, ty)| {
         quote! {
-            let part = <#ty as ::noxu_persist::PrimaryKey>::to_bytes(&self.#name);
+            let part = <#ty as ::noxu::persist::PrimaryKey>::to_bytes(&self.#name);
             buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
             buf.extend_from_slice(&part);
         }
@@ -316,14 +323,14 @@ fn composite_from_bytes_named(
         quote! {
             let len = read_u32(bytes, &mut pos)? as usize;
             check_remaining(bytes, pos, len)?;
-            let #name = <#ty as ::noxu_persist::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
+            let #name = <#ty as ::noxu::persist::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
             pos += len;
         }
     });
     quote! {
-        fn read_u32(bytes: &[u8], pos: &mut usize) -> ::noxu_persist::Result<u32> {
+        fn read_u32(bytes: &[u8], pos: &mut usize) -> ::noxu::persist::Result<u32> {
             if bytes.len() < *pos + 4 {
-                return Err(::noxu_persist::PersistError::SerializationError(
+                return Err(::noxu::persist::PersistError::SerializationError(
                     "short read decoding composite key length prefix".into(),
                 ));
             }
@@ -333,9 +340,9 @@ fn composite_from_bytes_named(
             *pos += 4;
             Ok(v)
         }
-        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> ::noxu_persist::Result<()> {
+        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> ::noxu::persist::Result<()> {
             if bytes.len() < pos + need {
-                return Err(::noxu_persist::PersistError::SerializationError(
+                return Err(::noxu::persist::PersistError::SerializationError(
                     "short read decoding composite key field".into(),
                 ));
             }
@@ -447,14 +454,14 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
                  Auto-generated by `#[derive(SecondaryKey)]`.",
             )]
             pub fn #helper_name<'__pidx>(
-                primary: &mut ::noxu_persist::PrimaryIndex<'__pidx, #pk_ty, Self>,
-            ) -> ::noxu_persist::SecondaryIndex<#sk_ty, #pk_ty, Self> {
+                primary: &mut ::noxu::persist::PrimaryIndex<'__pidx, #pk_ty, Self>,
+            ) -> ::noxu::persist::SecondaryIndex<#sk_ty, #pk_ty, Self> {
                 primary.open_secondary_index(#extractor)
             }
         });
 
         spec_consts.push(quote! {
-            ::noxu_persist::SecondarySpec {
+            ::noxu::persist::SecondarySpec {
                 name: #name_lit,
                 relate: #relate_tok,
                 related_entity: #related_tok,
@@ -470,7 +477,7 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
             /// Compile-time metadata for every `#[secondary_key(...)]` field
             /// declared on this entity.  Auto-generated by
             /// `#[derive(SecondaryKey)]`.
-            pub const SECONDARY_INDEXES: &'static [::noxu_persist::SecondarySpec; #n] = &[
+            pub const SECONDARY_INDEXES: &'static [::noxu::persist::SecondarySpec; #n] = &[
                 #(#spec_consts),*
             ];
 
@@ -723,12 +730,12 @@ fn expr_to_ident_string(expr: &Expr) -> syn::Result<String> {
 
 fn relate_to_tokens(s: &str) -> TokenStream2 {
     let id = format_ident!("{}", s);
-    quote! { ::noxu_persist::Relate::#id }
+    quote! { ::noxu::persist::Relate::#id }
 }
 
 fn delete_action_to_tokens(s: &str) -> TokenStream2 {
     let id = format_ident!("{}", s);
-    quote! { ::noxu_persist::DeleteAction::#id }
+    quote! { ::noxu::persist::DeleteAction::#id }
 }
 
 /// Returns `(is_option, inner_ty_or_self)` for the supplied type.

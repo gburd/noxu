@@ -3,6 +3,13 @@
 // See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+//! > **Internal component of the [`noxu`](https://crates.io/crates/noxu) database.**
+//! >
+//! > This crate is published only so the `noxu` umbrella crate can depend on it.
+//! > Use `noxu` (`noxu = "3"`) in applications; depend on this crate directly only
+//! > if you are extending the engine internals. Its API may change without a major
+//! > version bump.
+//!
 //! Optional observability integration for Noxu DB.
 //!
 //! Enable with `features = ["observability"]` on the `noxu-db` crate.
