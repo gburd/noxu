@@ -108,9 +108,13 @@ impl FileManagerLogScanner {
             // Transaction end ─────────────────────────────────────────
             LogEntryType::TxnCommit => {
                 let e = TxnEndEntry::read_from_log(&payload).ok()?;
+                // R-3: extract dtvlsn so the X-14 VLSN rebuild includes it.
+                let dtvlsn_seq = e.dtvlsn.sequence();
+                let dtvlsn = if dtvlsn_seq > 0 { Some(dtvlsn_seq as u64) } else { None };
                 Some(LogEntry::TxnCommit(TxnCommitRecord {
                     txn_id: e.txn_id as u64,
                     lsn: NULL_LSN, // Filled in by caller with actual LSN.
+                    dtvlsn,
                 }))
             }
             LogEntryType::TxnAbort => {

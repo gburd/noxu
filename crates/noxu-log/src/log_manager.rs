@@ -53,6 +53,30 @@ use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// ── LWL scratch state ────────────────────────────────────────────────────────────────
+
+/// State protected by the Log Write Latch (LWL).
+///
+/// Groups the per-call scratch buffers that are safe to share because the LWL
+/// serialises all callers.  Storing them here eliminates per-call allocation:
+///
+/// * `entry_buf` — H-3 fix: scratch buffer for encoding each log entry.
+/// * `flush_pending` — R-1 fix: reused list of (data, file_offset) pairs.
+///   `flush_sync` iterates this Vec while holding the LWL, preserving capacity.
+///   `flush_no_sync` uses `std::mem::take` (see R-2 comment).
+struct LwlScratch {
+    /// Scratch buffer for encoding log entries (H-3 fix).
+    entry_buf: Vec<u8>,
+    /// Reusable pending-flush list (R-1 fix).
+    flush_pending: Vec<(Vec<u8>, u64)>,
+}
+
+impl LwlScratch {
+    fn new() -> Self {
+        LwlScratch { entry_buf: Vec::new(), flush_pending: Vec::new() }
+    }
+}
+
 /// The central coordinator for log operations.
 ///
 ///
@@ -63,20 +87,18 @@ pub struct LogManager {
     /// Serializes all log writes so entries appear in LSN order.
     /// this the "Log Write Latch" (LWL).
     ///
-    /// Held through LSN assignment, memcpy into the write buffer, and the
-    /// pwrite64 syscall (correct's `logWriteMutex` design).  Holding the
-    /// latch through pwrite64 ensures that all concurrent writers complete
-    /// their kernel writes before entering `FsyncManager`, so they arrive
-    /// simultaneously and the leader/waiter algorithm can coalesce multiple
-    /// commits into a single fdatasync.
+    /// **Foreground commit path (`flush_sync`)**: held through LSN assignment,
+    /// memcpy into the write buffer, AND the pwrite64 syscall.  Holding through
+    /// pwrite64 ensures all concurrent committers complete kernel writes before
+    /// entering `FsyncManager` together → fsync coalescing (correct design).
     ///
-    /// H-3 (audit-2026-05-keith.md F-1.1): the inner `Vec<u8>` is a
-    /// per-`LogManager` scratch buffer reused across calls.  Because the LWL
-    /// serialises all log writes there is at most one active `log_internal`
-    /// call per `LogManager` at any time, so a single Vec is sufficient.
-    /// The Vec grows on demand (amortised O(1)) and is never shrunk; it
-    /// reaches its steady-state capacity after a few large writes.
-    log_write_latch: Mutex<Vec<u8>>,
+    /// **Background flush path (`flush_no_sync`, R-2 fix)**: the LWL is
+    /// released BEFORE pwrite64.  Background flush has no coalescing
+    /// requirement; holding through I/O blocks ALL foreground commits.
+    ///
+    /// H-3 fix: `entry_buf` inside `LwlScratch` is the per-call encoding
+    /// scratch buffer.  R-1 fix: `flush_pending` is the reusable flush list.
+    log_write_latch: Mutex<LwlScratch>,
 
     /// Last flushed LSN (updated when buffers are written to disk).
     last_flush_lsn: AtomicU64,
@@ -134,7 +156,7 @@ impl LogManager {
 
         LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
-            log_write_latch: Mutex::new(Vec::new()),
+            log_write_latch: Mutex::new(LwlScratch::new()),
             // 0 means "nothing flushed yet". NULL_LSN = u64::MAX would make
             // flush_sync_if_needed's `already_flushed >= lsn` always true,
             // causing all flushes to be skipped.
@@ -300,11 +322,11 @@ impl LogManager {
         // resized to `entry_size` under the LWL.  Because the LWL serialises
         // all writes, there is exactly one in-flight encoding at a time.
         let lsn = {
-            let mut entry_buf = self.log_write_latch.lock();
+            let mut lwl_guard = self.log_write_latch.lock();
+            let entry_buf = &mut lwl_guard.entry_buf;
 
             // Reuse the scratch buffer: clear and resize to entry_size.
-            // `resize` keeps existing capacity — no allocation if the Vec is
-            // already large enough.
+            // `resize` keeps existing capacity — no allocation if already large.
             entry_buf.clear();
             entry_buf.resize(entry_size, 0u8);
 
@@ -495,14 +517,18 @@ impl LogManager {
     pub fn flush_sync(&self) -> Result<Lsn> {
         // Under LWL: snapshot dirty buffers and pwrite64 ( logWriteMutex
         // design).  Holding through pwrite64 ensures threads serialise their
-        // kernel writes and then all arrive at FsyncManager simultaneously,
-        // allowing the leader/waiter algorithm to coalesce fsyncs.
+        // Under LWL: collect dirty buffers and pwrite64 (correct logWriteMutex
+        // design).  Holding through pwrite64 ensures threads serialise kernel
+        // writes and arrive at FsyncManager simultaneously for coalescing.
+        // R-1: guard.flush_pending is reused across calls (outer Vec alloc
+        // eliminated after warm-up; clear() retains capacity).
         let eol = {
-            let _lwl = self.log_write_latch.lock();
-            let pending = self.collect_dirty_buffers();
+            let mut guard = self.log_write_latch.lock();
+            guard.flush_pending.clear();
+            Self::fill_flush_pending(&self.buffer_pool, &mut guard.flush_pending);
             let eol = self.file_manager.get_next_available_lsn();
-            for (data, offset) in pending {
-                self.file_manager.write_buffer(&data, offset)?;
+            for (data, offset) in &guard.flush_pending {
+                self.file_manager.write_buffer(data, *offset)?;
             }
             eol
         };
@@ -565,38 +591,62 @@ impl LogManager {
         self.flush_sync()
     }
 
-    /// Flushes all dirty write buffers to disk without an fsync.
+    /// Flushes all dirty write buffers to the OS page cache (no fsync).
+    ///
+    /// # R-2 fix (Keith re-audit)
+    ///
+    /// The LWL is released **before** the pwrite64 calls.  Holding the LWL
+    /// through I/O in the background flush task would block ALL concurrent
+    /// foreground transaction commits for the duration of each kernel write,
+    /// injecting periodic multi-ms latency spikes whenever
+    /// `log_flush_no_sync_interval_ms > 0`.
+    ///
+    /// **Correctness argument**: `fill_flush_pending()` advances each buffer's
+    /// `flushed_len` watermark under the per-buffer latch before returning.
+    /// After that advance, concurrent foreground writers may only append at
+    /// file positions ≥ `new_flushed_len` — strictly after the range we
+    /// captured.  The pwrite64 calls below therefore write to disjoint file
+    /// regions from any concurrent foreground write.  `write_buffer()`
+    /// serialises its own file-handle access internally.
     pub fn flush_no_sync(&self) -> Result<Lsn> {
-        let eol = {
-            let _lwl = self.log_write_latch.lock();
-            let pending = self.collect_dirty_buffers();
+        // Phase 1 — under LWL: snapshot buffer data and capture EOL.
+        let (pending_snapshot, eol) = {
+            let mut guard = self.log_write_latch.lock();
+            // R-1: reuse flush_pending Vec.  We take ownership here to move
+            // items out before releasing the LWL.  flush_no_sync is called
+            // infrequently (background daemon), so losing outer-Vec capacity
+            // on take is acceptable.
+            guard.flush_pending.clear();
+            Self::fill_flush_pending(&self.buffer_pool, &mut guard.flush_pending);
             let eol = self.file_manager.get_next_available_lsn();
-            for (data, offset) in pending {
-                self.file_manager.write_buffer(&data, offset)?;
-            }
-            eol
-        };
+            (std::mem::take(&mut guard.flush_pending), eol)
+        }; // ← LWL released; foreground writers unblocked before pwrite64
+
+        // Phase 2 — outside LWL: write to OS page cache.
+        for (data, offset) in &pending_snapshot {
+            self.file_manager.write_buffer(data, *offset)?;
+        }
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
     }
 
-    /// Collects each dirty write buffer's pending bytes under the caller's LWL.
+    /// Collects each dirty write buffer's pending bytes into `pending`.
     ///
-    /// For each dirty buffer:
-    ///   1. Latches the buffer (waits for any in-progress writer to finish).
-    ///   2. Snapshots the unflushed byte slice and the current file offset.
-    ///   3. Calls `mark_flushed()` so the watermark advances immediately.
-    ///   4. Releases the buffer latch.
+    /// **R-1 fix**: takes `pending` by mutable reference so callers can reuse
+    /// the outer `Vec` allocation across flush calls.  The inner `Vec<u8>` per
+    /// dirty buffer is still a memcpy — zero-copy would require holding the
+    /// buffer latch through the write, which conflicts with the R-2 goal of
+    /// releasing the LWL before I/O (see `docs/src/internal/wave-zc-crash-perf.md`).
     ///
-    /// Returns a `Vec<(data, file_offset)>` for the caller to write to disk.
-    /// Must be called under the LWL; the caller does pwrite64 before releasing
-    /// the LWL ( logWriteMutex design).
-    fn collect_dirty_buffers(&self) -> Vec<(Vec<u8>, u64)> {
-        let pool = self.buffer_pool.lock();
+    /// Must be called under the LWL.  Takes the `buffer_pool` explicitly to
+    /// avoid a `&self` borrow conflict while the LWL guard is live.
+    fn fill_flush_pending(
+        buffer_pool: &Arc<Mutex<LogBufferPool>>,
+        pending: &mut Vec<(Vec<u8>, u64)>,
+    ) {
+        let pool = buffer_pool.lock();
         let buffers = pool.get_all_buffers();
         drop(pool);
-
-        let mut pending: Vec<(Vec<u8>, u64)> = Vec::new();
 
         for buf_arc in buffers {
             let mut buf = buf_arc.lock();
@@ -609,7 +659,7 @@ impl LogManager {
                     let data = unflushed.to_vec();
                     let offset = buf.flushed_file_offset();
                     // Advance the watermark now (under the buffer latch) so a
-                    // subsequent collect_dirty_buffers() call sees this range as
+                    // subsequent fill_flush_pending() call sees this range as
                     // already flushed and does not re-collect it.
                     buf.mark_flushed();
                     buf.release();
@@ -621,8 +671,6 @@ impl LogManager {
             buf.release();
             drop(buf);
         }
-
-        pending
     }
 
     /// Reads a single log entry from the given LSN.

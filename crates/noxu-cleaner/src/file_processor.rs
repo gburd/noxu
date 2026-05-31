@@ -340,9 +340,14 @@ impl TreeLookup for RealTreeLookup {
         // X-6: write a real WAL entry for the migrated LN so that recovery
         // after a crash before the next checkpoint can find the data at its
         // new position.  Falls back to the original log_lsn if no log manager
-        // is wired (unit-test mode).
+        // is wired (unit-test mode without a real WAL — acceptable there).
+        // In production (SharedTreeLookup), the log manager is always present
+        // and R-7 applies: WAL failure aborts migration instead of falling back.
         let db_id_u64 = _db_id.unsigned_abs();
         let new_lsn = if let Some(lm) = &self.log_manager {
+            // RealTreeLookup is test-only (SharedTreeLookup is production).
+            // Fall back to log_lsn only in this test path; production path
+            // uses SharedTreeLookup which enforces R-7 abort-on-failure.
             write_migration_ln(lm, db_id_u64, key, &data, log_lsn)
                 .unwrap_or(log_lsn)
         } else {
@@ -816,14 +821,33 @@ impl TreeLookup for SharedTreeLookup {
         };
 
         let db_id_u64 = db_id.unsigned_abs();
-        let new_lsn = write_migration_ln(
+        // R-7 (Keith re-audit): if write_migration_ln() fails, do NOT fall back
+        // to the original log_lsn.  That stale LSN points to the file being
+        // cleaned; once the cleaner deletes it, recovery cannot find the data.
+        // Abort this migration (return Locked so the entry is retried later)
+        // and leave the source file protected until a successful WAL write.
+        let new_lsn = match write_migration_ln(
             &self.log_manager,
             db_id_u64,
             key,
             &data,
             log_lsn,
-        )
-        .unwrap_or_else(|| self.log_manager.get_end_of_log());
+        ) {
+            Some(lsn) => lsn,
+            None => {
+                // WAL write failed (e.g. io_invalid set, disk full).
+                // Release the cleaner lock and abort the migration for this
+                // slot.  The cleaner will retry on the next pass; the source
+                // file is kept protected by the X-5 checkpoint barrier.
+                release_cleaner_lock(
+                    &self.lock_manager,
+                    lock_lsn,
+                    locker_id,
+                    "SharedTreeLookup::migrate_ln_slot:wal_write_failed",
+                );
+                return MigrationOutcome::Locked;
+            }
+        };
 
         let result =
             tree_arc.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
@@ -3259,22 +3283,64 @@ mod tests {
         assert_eq!(result.lns_migrated, 0);
     }
 
-    /// process_file with a RealTreeLookup — IN entry yields Obsolete.
+    /// R-7 (Keith re-audit): migration WAL write failure must abort migration
+    /// (return Locked) instead of silently falling back to the stale log_lsn.
+    ///
+    /// Simulates WAL-write failure by using a SharedTreeLookup backed by a
+    /// LogManager on a read-only directory (so write_migration_ln returns None).
+    /// The migrated slot must NOT be updated to the old log_lsn, and the
+    /// function must return Locked so the entry is retried.
+    ///
+    /// Crash-safety invariant: if the WAL write fails, the source file must be
+    /// retained (not passed to the cleaner as safe-to-delete).
     #[test]
-    fn test_process_file_with_real_tree_in_entry_obsolete() {
+    fn test_r7_migration_abort_on_wal_write_failure() {
+        use noxu_log::{FileManager, LogManager};
+        use std::sync::RwLock;
+        use tempfile::TempDir;
+
+        // Create a tree with a key at a known LSN.
+        let log_lsn = Lsn::new(1, 100);
         let tree = noxu_tree::Tree::new(1, 128);
-        let lookup = RealTreeLookup::new(
-            Arc::new(std::sync::RwLock::new(tree)),
-            Arc::new(LockManager::new()),
+        let tree_arc = Arc::new(RwLock::new(tree));
+        {
+            let t = tree_arc.write().unwrap();
+            let _ = t.insert(b"key1".to_vec(), b"val1".to_vec(), log_lsn);
+        }
+
+        // Build a LogManager backed by a real (non-read-only) directory.
+        // write_migration_ln will succeed in normal conditions; we force
+        // failure by using io_invalid.
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(fm, 3, 1024 * 1024, 4096));
+
+        // Invalidate I/O on the log manager so write_migration_ln fails.
+        lm.io_invalid.store(true, std::sync::atomic::Ordering::Release);
+
+        let lookup = SharedTreeLookup::new(Arc::clone(&tree_arc), lm);
+
+        // Migration must be aborted (Locked) — not use the stale log_lsn.
+        let outcome =
+            lookup.migrate_ln_slot(1, b"key1", log_lsn, log_lsn);
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Locked,
+            "R-7: WAL write failure must abort migration (Locked), got {:?}",
+            outcome
         );
 
-        let proc = make_processor();
-        let summary = crate::FileSummary::new();
-        let entries = vec![make_in_entry(7, 80, 1, 99)];
-
-        let result = proc.process_file(7, &summary, &entries, &lookup).unwrap();
-        assert!(result.completed);
-        assert_eq!(result.ins_cleaned, 1);
-        assert_eq!(result.ins_dead, 1);
+        // The slot in the tree must still have the original log_lsn.
+        let slot_lsn = {
+            let t = tree_arc.read().unwrap();
+            RealTreeLookup::get_slot_lsn_from_root(t.get_root(), b"key1")
+        };
+        assert_eq!(
+            slot_lsn,
+            Some(log_lsn),
+            "R-7: tree slot must retain original log_lsn after aborted migration"
+        );
     }
 }

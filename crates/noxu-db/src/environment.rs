@@ -1267,25 +1267,51 @@ impl Environment {
             Some(lm) => lm,
             None => return Ok(()), // Non-transactional env (shouldn't happen).
         };
+        // R-3: pre-allocate the VLSN BEFORE writing the WAL entry so the
+        // TxnCommit record carries it.  On a second crash, the X-14 VLSN
+        // rebuild scans TxnCommit records with non-NULL dtvlsn and includes
+        // them — fixing the double-crash VLSN loss reported in Keith R-3.
+        let pre_vlsn = if let Some(coord) =
+            self.replica_coordinator.lock().as_ref()
+        {
+            coord.pre_alloc_vlsn_for_recovered_commit()
+        } else {
+            0
+        };
+
         let commit_lsn = write_txn_end_for_recovered(
             lm, txn_id, true, /* is_commit */
             true, /* fsync */
             true, /* flush */
+            pre_vlsn,
         )?;
-        // X-3: if a replica coordinator is installed (replicated env),
-        // allocate a real VLSN for this recovered commit so that feeders
-        // and replicas see it.  In a non-replicated env the default impl
-        // returns NULL_VLSN (0) and this is a no-op.
+
+        // Register the pre-allocated VLSN in the VlsnIndex now that we have
+        // the actual commit LSN.  Also keep the legacy alloc path for any
+        // coordinator that doesn't implement pre_alloc (returns 0).
         if let Some(coord) = self.replica_coordinator.lock().as_ref() {
-            let vlsn = coord.alloc_vlsn_for_recovered_commit(commit_lsn);
-            if vlsn > 0 {
+            if pre_vlsn > 0 {
+                coord.register_recovered_commit_vlsn(pre_vlsn, commit_lsn);
                 log::debug!(
                     "write_txn_commit_for_recovered: txn_id={} commit_lsn={:?} \
-                     assigned vlsn={}",
+                     embedded+registered vlsn={} (R-3)",
                     txn_id,
                     commit_lsn,
-                    vlsn
+                    pre_vlsn
                 );
+            } else {
+                // Fallback: coordinator returned 0 for pre_alloc (non-master
+                // or non-replicated); try the legacy single-step allocator.
+                let vlsn = coord.alloc_vlsn_for_recovered_commit(commit_lsn);
+                if vlsn > 0 {
+                    log::debug!(
+                        "write_txn_commit_for_recovered: txn_id={} commit_lsn={:?} \
+                         assigned vlsn={} (X-3 legacy path)",
+                        txn_id,
+                        commit_lsn,
+                        vlsn
+                    );
+                }
             }
         }
         Ok(())
@@ -1302,6 +1328,7 @@ impl Environment {
             lm, txn_id, false, /* is_commit */
             false, /* fsync */
             false, /* flush */
+            0,     /* vlsn: NULL_VLSN for abort */
         )
         .map(|_| ())
     }
@@ -1483,6 +1510,11 @@ impl Environment {
 /// process crashed before it could commit; recovery surfaced it via
 /// `recovered_prepared_txns`).
 ///
+/// `vlsn` is the pre-allocated VLSN to embed in the `dtvlsn` field of the
+/// TxnEndEntry payload.  Pass `NULL_VLSN` (0) for non-replicated environments.
+/// The R-3 fix requires the VLSN to be embedded so the X-14 VLSN rebuild
+/// on a second crash can reconstruct the VLSN index from TxnCommit records.
+///
 /// XA two-phase commit support.
 fn write_txn_end_for_recovered(
     lm: &LogManager,
@@ -1490,15 +1522,20 @@ fn write_txn_end_for_recovered(
     is_commit: bool,
     fsync: bool,
     flush: bool,
+    vlsn: u64,
 ) -> Result<noxu_util::Lsn> {
     use bytes::BytesMut;
     use noxu_log::{LogEntryType, Provisional, entry::TxnEndEntry};
-    use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
+    use noxu_util::{lsn::NULL_LSN, vlsn::{NULL_VLSN, Vlsn}};
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
+    // R-3: embed the pre-allocated VLSN (if any) in the dtvlsn field so the
+    // X-14 VLSN rebuild on second crash can find it in TxnCommit records.
+    let dtvlsn = if vlsn > 0 { Vlsn::new(vlsn as i64) } else { NULL_VLSN };
 
     let entry = if is_commit {
         TxnEndEntry::new_commit(
@@ -1506,7 +1543,7 @@ fn write_txn_end_for_recovered(
             NULL_LSN,
             timestamp,
             0,
-            NULL_VLSN,
+            dtvlsn,
         )
     } else {
         TxnEndEntry::new_abort(txn_id as i64, NULL_LSN, timestamp, 0, NULL_VLSN)
