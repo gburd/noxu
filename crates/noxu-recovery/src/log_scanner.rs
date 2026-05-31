@@ -500,7 +500,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
-                    dtvlsn: None,
+                dtvlsn: None,
             }),
         );
         scanner.push(
@@ -508,7 +508,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 2,
                 lsn: lsn(0, 200),
-                    dtvlsn: None,
+                dtvlsn: None,
             }),
         );
 

@@ -383,7 +383,7 @@ impl LogManager {
             // skips the first 4 bytes (the checksum field itself) when
             // computing the checksum.
             let crc = ChecksumValidator::compute_range(
-                &entry_buf,
+                entry_buf,
                 CHECKSUM_BYTES,
                 entry_size - CHECKSUM_BYTES,
             );
@@ -440,7 +440,7 @@ impl LogManager {
                     drop(buffer);
 
                     // Copy bytes into the buffer segment outside the latch.
-                    segment.put(&entry_buf);
+                    segment.put(entry_buf);
                 }
                 None => {
                     // Entry is too large for any pool buffer - write directly
@@ -451,7 +451,7 @@ impl LogManager {
                     self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
 
                     self.file_manager.write_buffer(
-                        &entry_buf,
+                        entry_buf,
                         current_lsn.file_offset() as u64,
                     )?;
                 }
@@ -525,7 +525,10 @@ impl LogManager {
         let eol = {
             let mut guard = self.log_write_latch.lock();
             guard.flush_pending.clear();
-            Self::fill_flush_pending(&self.buffer_pool, &mut guard.flush_pending);
+            Self::fill_flush_pending(
+                &self.buffer_pool,
+                &mut guard.flush_pending,
+            );
             let eol = self.file_manager.get_next_available_lsn();
             for (data, offset) in &guard.flush_pending {
                 self.file_manager.write_buffer(data, *offset)?;
@@ -617,7 +620,10 @@ impl LogManager {
             // infrequently (background daemon), so losing outer-Vec capacity
             // on take is acceptable.
             guard.flush_pending.clear();
-            Self::fill_flush_pending(&self.buffer_pool, &mut guard.flush_pending);
+            Self::fill_flush_pending(
+                &self.buffer_pool,
+                &mut guard.flush_pending,
+            );
             let eol = self.file_manager.get_next_available_lsn();
             (std::mem::take(&mut guard.flush_pending), eol)
         }; // ← LWL released; foreground writers unblocked before pwrite64
