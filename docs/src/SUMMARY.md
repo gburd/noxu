@@ -195,3 +195,4 @@
   - [Re-Audit (2026-05) — Jonhoo (Rust idiom + soundness)](internal/reaudit-2026-05-jonhoo.md)
   - [Wave ZB — stale docs, comments, examples, Cargo hygiene](internal/wave-zb-stale-docs.md)
   - [Wave ZC — crash-safety + performance fixes](internal/wave-zc-crash-perf.md)
+  - [Wave FC — P-2 recovery BIN-restore investigation (deferred)](internal/wave-fc-p2-recovery.md)
