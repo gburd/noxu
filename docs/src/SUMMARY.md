@@ -194,3 +194,4 @@
   - [Re-Audit (2026-05) — Keith (perf + correctness)](internal/reaudit-2026-05-keith.md)
   - [Re-Audit (2026-05) — Jonhoo (Rust idiom + soundness)](internal/reaudit-2026-05-jonhoo.md)
   - [Wave ZB — stale docs, comments, examples, Cargo hygiene](internal/wave-zb-stale-docs.md)
+  - [Wave ZC — crash-safety + performance fixes](internal/wave-zc-crash-perf.md)
