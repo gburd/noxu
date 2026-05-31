@@ -169,22 +169,29 @@ initialized at the 1 MiB floor. Increase `cache_size` or reduce
 `log_num_buffers` × `log_buffer_size` to restore the previous balance.
 See `docs/src/operations/configuration.md` and `docs/src/operations/sizing.md`.
 
-## 11. mTLS Phase 1 Landed; Phase 2 (Peer Enforcement) Not Yet Merged
+## 11. mTLS Phase 2 Landed — peer_allowlist Enforced (v3.1.0)
 
-**Decision**: mTLS infrastructure is implemented in phases. Phase 1 (v3.0.2)
-provides `TlsConfig::for_replication()`, `RepConfig::with_peer_allowlist()`,
-and `PeerAllowlistVerifier` (`ClientCertVerifier` + `ServerCertVerifier`).
-Phase 2 (planned: v3.1) wires `PeerAllowlistVerifier` to the
-`TcpServiceDispatcher` server config; until then the server still accepts
-unauthenticated connections (`with_no_client_auth()`).
+**Decision**: mTLS peer enforcement landed in v3.1.0 (branch
+`fix/fb-mtls-phase2`).  `PeerAllowlistVerifier` implements
+`rustls::server::danger::ClientCertVerifier` and is wired into the
+rustls `ServerConfig` via
+`TlsConfig::to_rustls_server_config_with_allowlist` and
+`TlsTcpChannelListener::bind_with_tls_and_allowlist`.
 
-**Why phase 2 was deferred**: Integration with the QUIC multiplexer and the
-dispatcher required changes to the handshake flow that were descoped to keep
-the v3.0 release focused. The Phase 1 API surface was stabilized to let users
-prepare certificate infrastructure before Phase 2 lands.
+**Enforcement model**:
 
-**Consequence**: Setting `with_peer_allowlist(…)` currently has **no effect on
-connection acceptance**. The allowlist is stored and validated structurally,
-but the verifier is not wired to the TLS stack. Deploy replication only on
-trusted networks until Phase 2 is merged. See
-`docs/src/operations/known-limitations.md`.
+1. The server requests a client certificate (mandatory).
+2. Chain validation via `WebPkiClientVerifier` against the configured CA.
+3. Subject CN and DNS SANs extracted via a minimal DER parser (no new deps).
+4. At least one name must match a `peer_allowlist` entry
+   (case-insensitive, exact match, no wildcards).
+5. Empty allowlist = `ConfigError` at construction (fail-closed per design
+   doc).
+
+**Client-side**: `to_rustls_client_config` calls `with_client_auth_cert`
+for `PemFiles`/`PemBytes` identities so the server can verify the peer.
+
+**Remaining gap (Phase 3)**: `ReplicatedEnvironment::new` uses a plain
+`TcpServiceDispatcher`.  Full end-to-end enforcement requires callers to
+use `TlsTcpChannelListener::bind_with_tls_and_allowlist` directly.
+See `docs/src/internal/auth-mtls-design-2026-05.md`.

@@ -219,19 +219,27 @@ impl ReplicatedEnvironment {
     /// it is the very first electable node that is creating the group. In that
     /// case it joins as the Master of the newly formed singleton group.
     pub fn new(config: RepConfig) -> Result<Self> {
-        // mTLS Phase 1 honesty check (re-audit JE F-2 / margo #4):
-        // peer_allowlist is accepted and stored but the server TLS config
-        // still uses with_no_client_auth() — Phase 2 dispatcher wiring is
-        // not yet implemented.  Warn loudly so operators are not misled.
+        // mTLS Phase 2 (v3.1.0): peer_allowlist enforcement is real at the
+        // TLS channel layer (TlsTcpChannelListener::bind_with_tls_and_allowlist).
+        // With plain TCP transport there is no TLS handshake and the allowlist
+        // has no effect — emit a warn to alert operators.
         if !config.peer_allowlist.is_empty() {
-            log::warn!(
-                "[{}] peer_allowlist is configured ({} entries) but mTLS \
-                 enforcement is NOT yet implemented (Phase 2 pending). \
-                 Connections are NOT authenticated by peer certificate. \
-                 Deploy only on trusted networks until Phase 2 is merged.",
-                config.node_name,
-                config.peer_allowlist.len(),
-            );
+            match config.transport_kind {
+                crate::rep_config::RepTransportKind::Tls => {
+                    log::info!(
+                        "[{}] peer_allowlist configured ({} entries); attach                          TlsTcpChannelListener::bind_with_tls_and_allowlist                          to activate mTLS enforcement on the listener.",
+                        config.node_name,
+                        config.peer_allowlist.len(),
+                    );
+                }
+                _ => {
+                    log::warn!(
+                        "[{}] peer_allowlist is configured ({} entries) but                          transport_kind is not Tls — the allowlist has no                          effect without TLS transport. Set                          RepTransportKind::Tls to activate mTLS enforcement.",
+                        config.node_name,
+                        config.peer_allowlist.len(),
+                    );
+                }
+            }
         }
         let node_state = NodeStateMachine::new();
         let group_service = GroupService::new(config.group_name.clone());

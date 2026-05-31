@@ -295,7 +295,13 @@ impl TlsConfig {
 impl TlsConfig {
     /// Build a `rustls::ServerConfig` from this configuration.
     ///
+    /// The server does **not** request a client certificate (no mTLS).
+    /// Use [`to_rustls_server_config_with_allowlist`] when
+    /// `RepConfig::peer_allowlist` is configured.
+    ///
     /// Used by [`TlsTcpChannelListener`] and the QUIC server path.
+    ///
+    /// [`to_rustls_server_config_with_allowlist`]: Self::to_rustls_server_config_with_allowlist
     pub(crate) fn to_rustls_server_config(
         &self,
     ) -> Result<std::sync::Arc<rustls::ServerConfig>> {
@@ -310,12 +316,68 @@ impl TlsConfig {
         Ok(std::sync::Arc::new(cfg))
     }
 
+    /// Build a `rustls::ServerConfig` that enforces `peer_allowlist`.
+    ///
+    /// This is the **mTLS enforcement path** introduced in Phase 2 (v3.1.0).
+    /// Compared to [`to_rustls_server_config`]:
+    ///
+    /// - The server requests a client certificate (`client_auth_mandatory = true`).
+    /// - The client certificate chain is validated against the CA roots in
+    ///   this `TlsConfig`.
+    /// - The peer's Subject CN and DNS SANs are extracted and checked against
+    ///   `allowlist`; the TLS handshake is aborted if no name matches.
+    ///
+    /// # Errors
+    ///
+    /// - `RepError::ConfigError` if `trusted_certs` is
+    ///   [`TrustedCerts::SkipVerification`] (no CA to validate client certs).
+    /// - `RepError::ConfigError` if `allowlist` is empty (fail-closed per
+    ///   design doc: an empty allowlist admits no peer).
+    /// - `RepError::NetworkError` if the cert/key material fails to parse.
+    ///
+    /// [`to_rustls_server_config`]: Self::to_rustls_server_config
+    pub(crate) fn to_rustls_server_config_with_allowlist(
+        &self,
+        allowlist: crate::auth::PeerAllowlist,
+    ) -> Result<std::sync::Arc<rustls::ServerConfig>> {
+        if matches!(&self.trusted_certs, TrustedCerts::SkipVerification) {
+            return Err(RepError::ConfigError(
+                "to_rustls_server_config_with_allowlist requires a                  CA-rooted TrustedCerts configuration (CaFiles or CaBytes);                  SkipVerification cannot be used for mTLS enforcement because                  there is no CA to validate peer certificates against."
+                    .into(),
+            ));
+        }
+        let (certs, key) = self.rustls_cert_and_key()?;
+        let root_store = self.rustls_root_store()?;
+        let verifier = crate::auth::PeerAllowlistVerifier::new(
+            std::sync::Arc::new(root_store),
+            allowlist,
+        )?;
+        let cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(std::sync::Arc::new(verifier))
+            .with_single_cert(certs, key)
+            .map_err(|e| {
+                RepError::NetworkError(format!("TLS server config (mTLS): {e}"))
+            })?;
+        Ok(std::sync::Arc::new(cfg))
+    }
+
     /// Build a `rustls::ClientConfig` from this configuration.
+    ///
+    /// **mTLS client-auth behaviour (Phase 2, v3.1.0)**:  When the identity
+    /// is [`TlsIdentity::PemFiles`] or [`TlsIdentity::PemBytes`] and
+    /// `trusted_certs` is not [`TrustedCerts::SkipVerification`], the client
+    /// presents its own certificate during the TLS handshake so that a server
+    /// running [`crate::auth::PeerAllowlistVerifier`] can verify it.
+    ///
+    /// [`TlsIdentity::SelfSigned`] always uses `with_no_client_auth` — a
+    /// runtime-generated self-signed cert would fail CA chain validation on
+    /// the server side regardless.
     ///
     /// Used by [`TlsTcpChannel`] and the QUIC client path.
     pub(crate) fn to_rustls_client_config(
         &self,
     ) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+        // Insecure (dev) path: skip server-cert verification, no client cert.
         if matches!(&self.trusted_certs, TrustedCerts::SkipVerification) {
             let cfg = rustls::ClientConfig::builder()
                 .dangerous()
@@ -327,10 +389,35 @@ impl TlsConfig {
         }
 
         let root_store = self.rustls_root_store()?;
-        let cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        Ok(std::sync::Arc::new(cfg))
+
+        // Production mTLS path: present client cert for PemFiles / PemBytes.
+        // SelfSigned identity stays with_no_client_auth — a runtime-generated
+        // self-signed cert would fail CA chain validation on the server side
+        // anyway; keeping the dev-convenience path functional without change.
+        match &self.identity {
+            TlsIdentity::SelfSigned { .. } => {
+                let cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+                Ok(std::sync::Arc::new(cfg))
+            }
+            TlsIdentity::PemFiles { .. } | TlsIdentity::PemBytes { .. } => {
+                let (certs, key) = self.rustls_cert_and_key()?;
+                let cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| {
+                        RepError::NetworkError(format!(
+                            "TLS client auth cert: {e}"
+                        ))
+                    })?;
+                Ok(std::sync::Arc::new(cfg))
+            }
+            TlsIdentity::Pkcs12 { .. } => Err(RepError::NetworkError(
+                "Pkcs12 identity is not supported by the tls-rustls                  backend; use PemFiles or PemBytes instead"
+                    .into(),
+            )),
+        }
     }
 
     /// Build a `quinn::ServerConfig` backed by this `TlsConfig`.

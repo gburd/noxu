@@ -132,22 +132,37 @@ pub struct RepConfig {
     /// [`RepTransportKind::Tcp`] for backward compatibility.
     pub transport_kind: RepTransportKind,
 
-    /// Allowlist of peer subject names for planned mTLS enforcement.
+    /// Allowlist of peer subject names for mTLS enforcement (Phase 2, v3.1.0).
     ///
-    /// # **NOT YET ENFORCED — Phase 2 is pending**
+    /// When non-empty and [`RepTransportKind::Tls`] is configured, the
+    /// server will:
     ///
-    /// This field is accepted and stored but has **no effect** on connection
-    /// acceptance.  The server TLS config still uses `.with_no_client_auth()` —
-    /// any peer can connect regardless of this list.
+    /// 1. **Require a client certificate** on every incoming TLS connection.
+    /// 2. **Validate the chain** against the CA roots in the `TlsConfig`.
+    /// 3. **Check subject names** — the peer's Subject Common Name (CN) and
+    ///    every DNS Subject Alternative Name (SAN) entry are compared
+    ///    case-insensitively against this list.  If none match, the
+    ///    handshake is aborted before any application data is exchanged.
     ///
-    /// When Phase 2 (dispatcher wiring) is complete, incoming connections will
-    /// be rejected unless the peer's leaf certificate Subject Common Name or
-    /// Subject Alternative Name DNS entry matches one of these strings
-    /// case-insensitively.
+    /// Matching is exact (no wildcards).  Names are compared
+    /// case-insensitively.  Whitespace-only and empty entries are ignored.
     ///
-    /// Setting a non-empty list currently emits a `log::warn!` at node startup
-    /// so operators are alerted that the allowlist has no security effect.
-    /// See `docs/src/operations/known-limitations.md` for the tracking entry.
+    /// The client side automatically presents its own certificate when the
+    /// `TlsConfig` identity is `PemFiles` or `PemBytes`.
+    ///
+    /// ## Empty list
+    ///
+    /// An empty list means no peers are admitted (`PeerAllowlistVerifier`
+    /// returns an error at construction time, which surfaces as a
+    /// `RepError::ConfigError` from `TlsConfig::to_rustls_server_config_with_allowlist`).
+    /// This is intentional fail-closed behaviour: an empty allowlist is
+    /// almost certainly a misconfiguration.
+    ///
+    /// ## Transport requirement
+    ///
+    /// Enforcement requires `transport_kind = RepTransportKind::Tls`.  With
+    /// plain TCP there is no TLS handshake and therefore no cert to inspect.
+    /// Setting this field with a non-TLS transport emits a `log::warn!`.
     pub peer_allowlist: Vec<String>,
 }
 
@@ -319,16 +334,15 @@ impl RepConfigBuilder {
         self
     }
 
-    /// Set the planned mTLS peer allowlist.
+    /// Set the mTLS peer allowlist (Phase 2, v3.1.0).
     ///
-    /// # **NOT YET ENFORCED — Phase 2 pending**
+    /// When non-empty and `transport_kind` is [`RepTransportKind::Tls`],
+    /// incoming TLS connections must present a certificate whose Subject CN
+    /// or DNS SAN matches at least one entry here (case-insensitive, exact
+    /// match).  Connections that fail the check are rejected at the TLS
+    /// handshake layer.
     ///
-    /// Stores the list for future Phase 2 dispatcher wiring but **does not
-    /// currently restrict connections in any way**.  A `log::warn!` is emitted
-    /// at node startup when a non-empty list is provided, alerting operators
-    /// that the allowlist has no security effect until Phase 2 lands.
-    ///
-    /// See [`RepConfig::peer_allowlist`] field doc for full details.
+    /// See [`RepConfig::peer_allowlist`] for full details.
     pub fn peer_allowlist(mut self, names: Vec<String>) -> Self {
         self.peer_allowlist = names;
         self
