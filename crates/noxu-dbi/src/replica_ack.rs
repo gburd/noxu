@@ -149,6 +149,33 @@ pub trait ReplicaAckCoordinator: Send + Sync {
     fn alloc_vlsn_for_recovered_commit(&self, _lsn: noxu_util::Lsn) -> u64 {
         0
     }
+
+    /// Pre-allocate the next VLSN for a recovered XA commit *without*
+    /// registering it in the VLSN index yet.
+    ///
+    /// R-3 fix: called BEFORE writing the `TxnCommit` WAL entry so the entry
+    /// can carry the allocated VLSN.  The caller then writes the entry and
+    /// calls `register_recovered_commit_vlsn` with the resulting commit LSN.
+    ///
+    /// Returns 0 (NULL_VLSN) for non-replicated environments.
+    fn pre_alloc_vlsn_for_recovered_commit(&self) -> u64 {
+        0
+    }
+
+    /// Register a previously pre-allocated VLSN in the VLSN index, mapping
+    /// it to the actual WAL commit LSN.
+    ///
+    /// R-3 fix: called AFTER writing the `TxnCommit` WAL entry with the
+    /// pre-allocated VLSN.  The `commit_lsn` is the LSN of the TxnCommit
+    /// entry just written to the log.
+    ///
+    /// No-op for non-replicated environments (default).
+    fn register_recovered_commit_vlsn(
+        &self,
+        _vlsn: u64,
+        _commit_lsn: noxu_util::Lsn,
+    ) {
+    }
 }
 
 /// Type alias used in `noxu-db::Environment` to hold the optional

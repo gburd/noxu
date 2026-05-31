@@ -684,6 +684,11 @@ impl RecoveryManager {
                 self.stats.lns_redone += 1;
             }
         }
+        // R-3: also include TxnCommit-derived VLSNs (recovered XA commits
+        // that embedded a dtvlsn with the R-3 fix).  On a second crash these
+        // VLSNs would otherwise be lost because TxnCommit records were not
+        // previously scanned for VLSNs.
+        vlsn_pairs.extend_from_slice(&analysis.txncommit_vlsns);
         // Sort and deduplicate (keep last occurrence per VLSN).
         vlsn_pairs.sort_unstable_by_key(|&(vlsn, _)| vlsn);
         vlsn_pairs.dedup_by_key(|t| t.0);
@@ -1027,6 +1032,14 @@ impl RecoveryManager {
                     // CommittedTxnIds.put(reader.getTxnCommitId(), ...)
                     result.record_commit(rec.txn_id, rec.lsn);
                     self.stats.committed_txns += 1;
+                    // R-3: collect TxnCommit dtvlsn for VLSN index rebuild.
+                    // Only non-zero for recovered XA commits written with the
+                    // R-3 fix; ignored for normal commits and old WAL files.
+                    if let Some(vlsn) = rec.dtvlsn {
+                        if vlsn > 0 {
+                            result.txncommit_vlsns.push((vlsn, rec.lsn.as_u64()));
+                        }
+                    }
                 }
                 LogEntry::TxnAbort(rec) => {
                     // AbortedTxnIds.add(reader.getTxnAbortId())
@@ -1354,6 +1367,8 @@ impl RecoveryManager {
 
         // X-14: store the collected VLSN→LSN pairs so recover_all() can
         // publish them in RecoveryInfo for the VLSN index rebuild.
+        // R-3: also include TxnCommit-derived VLSNs from the analysis pass.
+        recovered_vlsn_pairs.extend_from_slice(&analysis.txncommit_vlsns);
         recovered_vlsn_pairs.sort_unstable_by_key(|&(vlsn, _)| vlsn);
         recovered_vlsn_pairs.dedup_by_key(|t| t.0);
         self.info.recovered_vlsns = recovered_vlsn_pairs;
@@ -1935,6 +1950,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
 
@@ -2000,6 +2016,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
 
@@ -2029,6 +2046,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 5,
                 lsn: lsn(0, 400),
+                    dtvlsn: None,
             }),
         );
 
@@ -2053,6 +2071,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -2114,6 +2133,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 42,
                 lsn: lsn(0, 400),
+                    dtvlsn: None,
             }),
         );
 
@@ -2214,6 +2234,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 42,
                 lsn: lsn(0, 400),
+                    dtvlsn: None,
             }),
         );
 
@@ -2313,6 +2334,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 3,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -2354,7 +2376,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20), dtvlsn: None }),
         );
 
         // txn 2 LN + abort
@@ -2527,6 +2549,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -2588,6 +2611,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
 
@@ -2658,7 +2682,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20), dtvlsn: None }),
         );
 
         let mut tree = make_tree();
@@ -2792,7 +2816,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 2, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 2, lsn: lsn(0, 20), dtvlsn: None }),
         );
 
         let mut mgr = RecoveryManager::new();
@@ -2821,6 +2845,7 @@ mod tests {
                 LogEntry::TxnCommit(TxnCommitRecord {
                     txn_id,
                     lsn: lsn(0, txn_id as u32 * 10 + 5),
+                    dtvlsn: None,
                 }),
             );
         }
@@ -2856,7 +2881,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20), dtvlsn: None }),
         );
         // txn=2: NOT committed → active
         scanner.push(
@@ -2905,6 +2930,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(1, 100),
+                    dtvlsn: None,
             }),
         );
         // LN with vlsn=5.
@@ -2918,6 +2944,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 2,
                 lsn: lsn(1, 300),
+                    dtvlsn: None,
             }),
         );
         let mut ln_with_vlsn2 = make_insert(1, Some(2), b"vkey2", NULL_LSN);
@@ -2942,6 +2969,58 @@ mod tests {
         );
     }
 
+    /// R-3: TxnCommit records with non-NULL dtvlsn must be included in
+    /// recovered_vlsns so a second crash after XA resolution doesn't lose
+    /// the VLSN.
+    #[test]
+    fn test_r3_txncommit_dtvlsn_in_recovered_vlsns() {
+        let mut scanner = InMemoryLogScanner::new();
+
+        // Simulate a recovered XA commit written with R-3 fix: the TxnCommit
+        // entry carries dtvlsn=42.
+        scanner.push(
+            lsn(1, 100),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 99,
+                lsn: lsn(1, 100),
+                dtvlsn: Some(42),
+            }),
+        );
+
+        // A regular committed txn with an LN carrying vlsn=3 (control).
+        scanner.push(
+            lsn(1, 200),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 1,
+                lsn: lsn(1, 200),
+                dtvlsn: None,
+            }),
+        );
+        let mut ln_vlsn3 = make_insert(1, Some(1), b"rkey", NULL_LSN);
+        ln_vlsn3.vlsn = Some(3);
+        scanner.push(lsn(1, 300), LogEntry::Ln(ln_vlsn3));
+
+        let mut trees = HashMap::new();
+        trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+        let mut mgr = RecoveryManager::new();
+        let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        let vlsns: Vec<u64> =
+            info.recovered_vlsns.iter().map(|&(v, _)| v).collect();
+
+        // The XA TxnCommit dtvlsn=42 must be included.
+        assert!(
+            vlsns.contains(&42),
+            "R-3: TxnCommit dtvlsn=42 must be in recovered_vlsns after second \
+             crash; got: {vlsns:?}"
+        );
+        // Control: the LN vlsn=3 must also be present.
+        assert!(
+            vlsns.contains(&3),
+            "R-3 control: LN vlsn=3 must be in recovered_vlsns, got: {vlsns:?}"
+        );
+    }
+
     /// X-1: after recovery with a completed rollback period,
     /// rollback_matchpoint_lsn must be set.
     #[test]
@@ -2955,6 +3034,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 99,
                 lsn: lsn(1, 50),
+                    dtvlsn: None,
             }),
         );
         scanner.push(
@@ -3111,6 +3191,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 43,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
