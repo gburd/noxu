@@ -16,6 +16,31 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (Wave ZC — crash-safety + perf, v3.1.0 candidate)
+
+- **R-2 (regression)**: the `LogFlushTask` background daemon (added for
+  `log_flush_no_sync_interval_ms`, X-11) held the log-write-latch across
+  `pwrite64`, stalling all foreground commits during each background flush.
+  `flush_no_sync` now snapshots state under the LWL, releases it, then does
+  the write I/O — no more periodic commit-latency spikes.
+- **R-7 (crash-safety)**: the log cleaner no longer silently falls back to a
+  stale LSN when a migration WAL write fails; it aborts that slot's migration
+  and retains the source file, preventing recovery data loss.
+- **R-3 (crash-safety)**: recovered XA `TxnCommit` records now carry a real
+  VLSN in replicated mode, and the recovery VLSN rebuild includes
+  `TxnCommit`-derived VLSNs, so an XA-resolved commit is not lost to
+  replication after a subsequent crash.
+- **R-5**: documented and tested the non-transactional `NameLN` invariant
+  (a non-transactional `open_database` create is durably committed at write
+  time; recovery correctly treats it as committed).
+- **R-1 (perf)**: `collect_dirty_buffers` reuses a flush buffer instead of
+  allocating + copying per dirty buffer on every flush.
+- **P-1 (perf)**: `FSyncGroup` gained an `AtomicBool` fast-path that
+  eliminates the group-commit thundering-herd re-lock.
+- **P-2**: W11 recovery throughput gap (~2.9× JE) scoped as a design note
+  for a dedicated follow-up wave (BIN restore from the dirty-IN map). See
+  `docs/src/internal/wave-zc-crash-perf.md`.
+
 ### Added (v3.1.0 candidate)
 
 - **Wave ZB: Re-audit reports archived** — four independent re-audit reports
