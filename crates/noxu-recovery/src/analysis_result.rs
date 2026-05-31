@@ -190,6 +190,15 @@ pub struct AnalysisResult {
     /// Used by `run_mapping_tree_undo_pass` to remove names whose creating
     /// transaction aborted.
     pub recovered_db_txn_ids: hashbrown::HashMap<String, u64>,
+
+    /// R-3: (vlsn, commit_lsn_u64) pairs from TxnCommit records whose
+    /// `dtvlsn` payload field is non-zero.
+    ///
+    /// Populated during the analysis pass when processing TxnCommit records
+    /// written with the R-3 fix (recovered XA commits that pre-allocated a
+    /// VLSN before writing the WAL entry).  Merged into `recovered_vlsns` by
+    /// the redo pass so a second crash does not lose these VLSNs.
+    pub txncommit_vlsns: Vec<(u64, u64)>,
 }
 
 impl AnalysisResult {
@@ -210,6 +219,7 @@ impl AnalysisResult {
             use_root_lsn: NULL_LSN,
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_txn_ids: hashbrown::HashMap::new(),
+            txncommit_vlsns: Vec::new(),
         }
     }
 
