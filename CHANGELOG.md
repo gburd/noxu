@@ -47,6 +47,16 @@ listed in [References](#references).
 
 ### Added (v3.1.0 candidate)
 
+- **Wave FA: `#[entity(crate = "…")]` escape hatch for direct `noxu-persist`
+  users** — the three DPL derive macros (`Entity`, `PrimaryKey`,
+  `SecondaryKey`) now accept `#[entity(crate = "noxu_persist")]` on each
+  annotated struct to redirect generated code from `::noxu::persist::…` to
+  `::noxu_persist::…`.  Users who depend on `noxu-persist` directly (without
+  the `noxu` umbrella) can now use the derive macros without requiring the
+  umbrella crate in their dependency graph.  Default behaviour (umbrella
+  path) is unchanged; existing code requires no modifications.  Follows the
+  `serde` / `#[serde(crate = "…")]` pattern.  Design Decision 9 escape-hatch
+  deferral is now resolved.
 - **Wave ZB: Re-audit reports archived** — four independent re-audit reports
   (`reaudit-2026-05-{je,margo,keith,jonhoo}.md`) copied into
   `docs/src/internal/` with a synthesis index.

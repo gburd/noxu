@@ -23,8 +23,11 @@ workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-# The noxu umbrella crate is the runtime side of the macro; tests invoke it.
-# Using `noxu` (not `noxu-persist` directly) because the derive emits
-# `::noxu::persist::…` paths — the umbrella must be in scope.
+# The noxu umbrella crate is the runtime side of the macro; umbrella-path
+# trybuild fixtures use `noxu`.
 noxu = { workspace = true, features = ["persist"] }
+# Direct-noxu-persist trybuild fixtures use `noxu-persist` (no umbrella).
+# This mirrors the `serde` / `serde_derive` circular-dev-dep pattern;
+# Cargo allows it because dev-dependencies don't create hard build cycles.
+noxu-persist = { workspace = true }
 tempfile = "3"
