@@ -25,7 +25,7 @@
 //! replaces `state.next_fsync_waiters` with a fresh group, so waiting threads
 //! retain their `Arc` to the *old* group and can still be woken through it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,12 @@ use std::time::{Duration, Instant};
 /// that threads that joined a group keep a reference even after the leader has
 /// swapped in a fresh `FSyncGroup` for the next cohort.
 struct FSyncGroup {
+    /// P-1 fast path: set to `true` (Release) by `wakeup_all` / `wakeup_all_with_error`
+    /// before acquiring `inner`.  Waiters check this atomic (Acquire) BEFORE
+    /// acquiring `inner`, eliminating the N-way mutex race when the fsync is
+    /// already done on arrival at `wait_for_event`.  This is the AtomicBool
+    /// fast-path that Wave 11-J identified but never shipped.
+    work_done_atomic: AtomicBool,
     inner: Mutex<FsyncGroupInner>,
     condvar: Condvar,
 }
@@ -66,6 +72,7 @@ enum WaitStatus {
 impl FSyncGroup {
     fn new() -> Arc<Self> {
         Arc::new(FSyncGroup {
+            work_done_atomic: AtomicBool::new(false),
             inner: Mutex::new(FsyncGroupInner {
                 work_done: false,
                 leader_exists: false,
@@ -77,8 +84,16 @@ impl FSyncGroup {
 
     /// Block until work is done, this thread becomes leader, or we time out.
     ///
-    ///
+    /// P-1 fast path: checks `work_done_atomic` (Acquire) BEFORE acquiring
+    /// `inner`.  In the common post-fsync case, all N waiters see `true` and
+    /// return without ever contending on the mutex — eliminating the
+    /// thundering-herd mutex storm documented in Keith re-audit P-1.
     fn wait_for_event(&self, timeout: Duration) -> WaitStatus {
+        // P-1 fast path: if the fsync is already done, return without locking.
+        if self.work_done_atomic.load(Ordering::Acquire) {
+            return WaitStatus::NoFsyncNeeded;
+        }
+
         let mut inner = self.inner.lock().unwrap();
 
         // Fast path: already done before we even enter.
@@ -117,7 +132,13 @@ impl FSyncGroup {
     }
 
     /// Wake all waiters with success.
+    ///
+    /// P-1: sets `work_done_atomic` with Release ordering BEFORE acquiring
+    /// `inner`, so any waiter that checks the atomic after this point returns
+    /// immediately without locking.
     fn wakeup_all(&self) {
+        // P-1: set atomic first so late-arriving waiters skip the mutex.
+        self.work_done_atomic.store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         inner.work_done = true;
         inner.error = None;
@@ -126,7 +147,13 @@ impl FSyncGroup {
     }
 
     /// Wake all waiters recording an error.
+    ///
+    /// P-1: same atomic-first pattern as `wakeup_all`.
     fn wakeup_all_with_error(&self, msg: String) {
+        // P-1: set atomic first so late-arriving waiters skip the mutex.
+        // They still need to acquire the mutex to read the error string, but
+        // at least they can tell "something happened" without the race.
+        self.work_done_atomic.store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         inner.work_done = true;
         inner.error = Some(msg);

@@ -2118,6 +2118,43 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         );
         next_vlsn
     }
+
+    /// R-3: pre-allocate the next commit VLSN WITHOUT registering in the index.
+    ///
+    /// The caller writes the `TxnCommit` WAL entry with this VLSN embedded,
+    /// then calls `register_recovered_commit_vlsn` with the actual commit LSN.
+    /// This two-step approach ensures the WAL entry carries the VLSN so the
+    /// X-14 VLSN rebuild on second crash can find it.
+    fn pre_alloc_vlsn_for_recovered_commit(&self) -> u64 {
+        if !self.is_master() {
+            return 0;
+        }
+        // Peek at the next VLSN without registering.  The actual registration
+        // happens in register_recovered_commit_vlsn() after the WAL write.
+        self.vlsn_index.get_latest_vlsn() + 1
+    }
+
+    /// R-3: register a pre-allocated VLSN in the VLSN index with the actual
+    /// commit LSN.  Called after writing the `TxnCommit` WAL entry.
+    fn register_recovered_commit_vlsn(
+        &self,
+        vlsn: u64,
+        commit_lsn: noxu_util::Lsn,
+    ) {
+        if vlsn == 0 || !self.is_master() {
+            return;
+        }
+        self.vlsn_index.register(
+            vlsn,
+            commit_lsn.file_number(),
+            commit_lsn.file_offset(),
+        );
+        log::debug!(
+            "register_recovered_commit_vlsn: registered vlsn={} for commit_lsn={:?}",
+            vlsn,
+            commit_lsn
+        );
+    }
 }
 
 #[cfg(test)]

@@ -596,6 +596,29 @@ impl RecoveryManager {
     ///   remain unconditionally accepted.
     /// - Implement a full MapLN B-tree undo (requires a dedicated mapping-tree
     ///   database, tracked as a follow-up wave).
+    /// Undo aborted database name registrations collected during analysis.
+    ///
+    /// # R-5 invariant (Keith re-audit): non-transactional `NameLN` entries
+    ///
+    /// The non-transactional `open_database(None, ...)` path writes a plain
+    /// `NameLN` entry (not `NameLNTxn`) at call time WITHOUT a `txn_id`.
+    /// Because there is no wrapping transaction, the write is durably
+    /// committed at the moment it is written to the log — there is no
+    /// in-progress transaction to abort and no Provisional flag.
+    ///
+    /// Consequence for recovery: a `NameLN` with `txn_id = None` is absent
+    /// from `recovered_db_txn_ids`, and the filter below (`unwrap_or(false)`)
+    /// correctly treats it as committed (undo skipped).  This is correct:
+    /// non-transactional database creation is immediately durable.
+    ///
+    /// # C-6 invariant: transactional `NameLNTxn` entries
+    ///
+    /// The transactional path (`open_database(Some(txn), ...)`) writes a
+    /// `NameLNTxn` entry with `Provisional::Yes` and the creating `txn_id`.
+    /// Such entries ARE in `recovered_db_txn_ids`.  If the wrapping
+    /// transaction never committed, the filter below removes the name from
+    /// `recovered_db_names`, preventing the database from appearing after
+    /// recovery.
     pub(crate) fn run_mapping_tree_undo_pass(
         &mut self,
         analysis: &mut crate::analysis_result::AnalysisResult,
@@ -610,9 +633,11 @@ impl RecoveryManager {
         // A NameLNTxn entry is "safe" only when its creating txn_id appears
         // in `committed_txns`.  Everything else is treated as aborted.
         //
-        // Pre-C6 WAL compatibility: entries absent from `recovered_db_txn_ids`
-        // have txn_id=None (written at commit time with no txn_id, or from an
-        // old WAL).  These are treated as committed (no undo needed).
+        // R-5 / Pre-C6 WAL compatibility: entries absent from
+        // `recovered_db_txn_ids` have txn_id=None (non-transactional NameLN,
+        // written at commit time with no txn_id, or from an old WAL).
+        // These are treated as committed (no undo needed) — see R-5 invariant
+        // documented above.
         let aborted_names: Vec<String> = analysis
             .recovered_db_names
             .keys()
@@ -684,6 +709,11 @@ impl RecoveryManager {
                 self.stats.lns_redone += 1;
             }
         }
+        // R-3: also include TxnCommit-derived VLSNs (recovered XA commits
+        // that embedded a dtvlsn with the R-3 fix).  On a second crash these
+        // VLSNs would otherwise be lost because TxnCommit records were not
+        // previously scanned for VLSNs.
+        vlsn_pairs.extend_from_slice(&analysis.txncommit_vlsns);
         // Sort and deduplicate (keep last occurrence per VLSN).
         vlsn_pairs.sort_unstable_by_key(|&(vlsn, _)| vlsn);
         vlsn_pairs.dedup_by_key(|t| t.0);
@@ -1027,6 +1057,14 @@ impl RecoveryManager {
                     // CommittedTxnIds.put(reader.getTxnCommitId(), ...)
                     result.record_commit(rec.txn_id, rec.lsn);
                     self.stats.committed_txns += 1;
+                    // R-3: collect TxnCommit dtvlsn for VLSN index rebuild.
+                    // Only non-zero for recovered XA commits written with the
+                    // R-3 fix; ignored for normal commits and old WAL files.
+                    if let Some(vlsn) = rec.dtvlsn {
+                        if vlsn > 0 {
+                            result.txncommit_vlsns.push((vlsn, rec.lsn.as_u64()));
+                        }
+                    }
                 }
                 LogEntry::TxnAbort(rec) => {
                     // AbortedTxnIds.add(reader.getTxnAbortId())
@@ -1354,6 +1392,8 @@ impl RecoveryManager {
 
         // X-14: store the collected VLSN→LSN pairs so recover_all() can
         // publish them in RecoveryInfo for the VLSN index rebuild.
+        // R-3: also include TxnCommit-derived VLSNs from the analysis pass.
+        recovered_vlsn_pairs.extend_from_slice(&analysis.txncommit_vlsns);
         recovered_vlsn_pairs.sort_unstable_by_key(|&(vlsn, _)| vlsn);
         recovered_vlsn_pairs.dedup_by_key(|t| t.0);
         self.info.recovered_vlsns = recovered_vlsn_pairs;
@@ -1935,6 +1975,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
 
@@ -2000,6 +2041,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
 
@@ -2029,6 +2071,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 5,
                 lsn: lsn(0, 400),
+                    dtvlsn: None,
             }),
         );
 
@@ -2053,6 +2096,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -2114,6 +2158,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 42,
                 lsn: lsn(0, 400),
+                    dtvlsn: None,
             }),
         );
 
@@ -2214,6 +2259,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 42,
                 lsn: lsn(0, 400),
+                    dtvlsn: None,
             }),
         );
 
@@ -2313,6 +2359,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 3,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -2354,7 +2401,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20), dtvlsn: None }),
         );
 
         // txn 2 LN + abort
@@ -2527,6 +2574,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -2588,6 +2636,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
 
@@ -2658,7 +2707,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20), dtvlsn: None }),
         );
 
         let mut tree = make_tree();
@@ -2792,7 +2841,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 2, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 2, lsn: lsn(0, 20), dtvlsn: None }),
         );
 
         let mut mgr = RecoveryManager::new();
@@ -2821,6 +2870,7 @@ mod tests {
                 LogEntry::TxnCommit(TxnCommitRecord {
                     txn_id,
                     lsn: lsn(0, txn_id as u32 * 10 + 5),
+                    dtvlsn: None,
                 }),
             );
         }
@@ -2856,7 +2906,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 20),
-            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20) }),
+            LogEntry::TxnCommit(TxnCommitRecord { txn_id: 1, lsn: lsn(0, 20), dtvlsn: None }),
         );
         // txn=2: NOT committed → active
         scanner.push(
@@ -2905,6 +2955,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(1, 100),
+                    dtvlsn: None,
             }),
         );
         // LN with vlsn=5.
@@ -2918,6 +2969,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 2,
                 lsn: lsn(1, 300),
+                    dtvlsn: None,
             }),
         );
         let mut ln_with_vlsn2 = make_insert(1, Some(2), b"vkey2", NULL_LSN);
@@ -2942,6 +2994,58 @@ mod tests {
         );
     }
 
+    /// R-3: TxnCommit records with non-NULL dtvlsn must be included in
+    /// recovered_vlsns so a second crash after XA resolution doesn't lose
+    /// the VLSN.
+    #[test]
+    fn test_r3_txncommit_dtvlsn_in_recovered_vlsns() {
+        let mut scanner = InMemoryLogScanner::new();
+
+        // Simulate a recovered XA commit written with R-3 fix: the TxnCommit
+        // entry carries dtvlsn=42.
+        scanner.push(
+            lsn(1, 100),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 99,
+                lsn: lsn(1, 100),
+                dtvlsn: Some(42),
+            }),
+        );
+
+        // A regular committed txn with an LN carrying vlsn=3 (control).
+        scanner.push(
+            lsn(1, 200),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 1,
+                lsn: lsn(1, 200),
+                dtvlsn: None,
+            }),
+        );
+        let mut ln_vlsn3 = make_insert(1, Some(1), b"rkey", NULL_LSN);
+        ln_vlsn3.vlsn = Some(3);
+        scanner.push(lsn(1, 300), LogEntry::Ln(ln_vlsn3));
+
+        let mut trees = HashMap::new();
+        trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+        let mut mgr = RecoveryManager::new();
+        let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        let vlsns: Vec<u64> =
+            info.recovered_vlsns.iter().map(|&(v, _)| v).collect();
+
+        // The XA TxnCommit dtvlsn=42 must be included.
+        assert!(
+            vlsns.contains(&42),
+            "R-3: TxnCommit dtvlsn=42 must be in recovered_vlsns after second \
+             crash; got: {vlsns:?}"
+        );
+        // Control: the LN vlsn=3 must also be present.
+        assert!(
+            vlsns.contains(&3),
+            "R-3 control: LN vlsn=3 must be in recovered_vlsns, got: {vlsns:?}"
+        );
+    }
+
     /// X-1: after recovery with a completed rollback period,
     /// rollback_matchpoint_lsn must be set.
     #[test]
@@ -2955,6 +3059,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 99,
                 lsn: lsn(1, 50),
+                    dtvlsn: None,
             }),
         );
         scanner.push(
@@ -3111,6 +3216,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 43,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -3129,30 +3235,59 @@ mod tests {
     }
 
     /// C-6 old-log compat: a NameLn with txn_id=None (pre-C6 WAL written at
-    /// commit time with LogEntryType::NameLN) must survive recovery regardless
-    /// of the txn tracking state — treated as committed.
+    /// R-5 (Keith re-audit): non-transactional open_database writes NameLN
+    /// without txn_id and is immediately durable (auto-committed).  After a
+    /// crash, recovery treats it as committed regardless of txn state because
+    /// `run_mapping_tree_undo_pass` only undoes entries with a txn_id that did
+    /// not commit.
+    ///
+    /// This test pins the R-5 invariant: a NameLN with txn_id=None must always
+    /// survive recovery, even when other transactions are active or aborted.
     #[test]
-    fn test_c6_old_format_namelns_always_recovered() {
+    fn test_r5_non_txn_namelns_always_survive_recovery() {
         let mut scanner = InMemoryLogScanner::new();
 
-        // Old-format NameLN: no txn_id (written at commit time).
+        // Non-transactional NameLN (txn_id=None): immediately durable.
         scanner.push(
-            lsn(0, 100),
+            lsn(0, 10),
             LogEntry::NameLn(crate::log_scanner::NameLnRecord {
-                name: "legacy_db".to_string(),
-                db_id: 9,
+                name: "non_txn_db".to_string(),
+                db_id: 77,
                 is_deleted: false,
                 txn_id: None,
             }),
+        );
+
+        // An aborted transactional NameLNTxn that should be undone.
+        scanner.push(
+            lsn(0, 20),
+            LogEntry::NameLn(crate::log_scanner::NameLnRecord {
+                name: "aborted_txn_db".to_string(),
+                db_id: 78,
+                is_deleted: false,
+                txn_id: Some(55),
+            }),
+        );
+        scanner.push(
+            lsn(0, 30),
+            LogEntry::TxnAbort(crate::log_scanner::TxnAbortRecord { txn_id: 55 }),
         );
 
         let mut mgr = RecoveryManager::new();
         let mut trees = HashMap::new();
         let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
 
+        // R-5 invariant: non-txn NameLN must survive.
         assert!(
-            info.recovered_db_names.contains_key("legacy_db"),
-            "C-6 old-log compat: NameLN with no txn_id must survive recovery"
+            info.recovered_db_names.contains_key("non_txn_db"),
+            "R-5: non-transactional NameLN (txn_id=None) must survive recovery; \
+             got names: {:?}",
+            info.recovered_db_names.keys().collect::<Vec<_>>()
+        );
+        // C-6 invariant: aborted txn NameLNTxn must be undone.
+        assert!(
+            !info.recovered_db_names.contains_key("aborted_txn_db"),
+            "C-6: aborted transactional NameLN must be removed by undo pass"
         );
     }
 }

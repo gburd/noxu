@@ -162,6 +162,13 @@ pub struct TxnCommitRecord {
     pub txn_id: u64,
     /// LSN of this commit record.
     pub lsn: Lsn,
+    /// R-3: durable-transaction VLSN embedded in the WAL entry payload.
+    ///
+    /// Non-zero only for recovered XA commits written with R-3 fix
+    /// (`write_txn_commit_for_recovered` pre-allocates and embeds the VLSN).
+    /// The X-14 VLSN rebuild includes this VLSN in `recovered_vlsns` so a
+    /// second crash after XA resolution does not lose the VLSN.
+    pub dtvlsn: Option<u64>,
 }
 
 /// A transaction-abort record.
@@ -493,6 +500,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 1,
                 lsn: lsn(0, 100),
+                    dtvlsn: None,
             }),
         );
         scanner.push(
@@ -500,6 +508,7 @@ mod tests {
             LogEntry::TxnCommit(TxnCommitRecord {
                 txn_id: 2,
                 lsn: lsn(0, 200),
+                    dtvlsn: None,
             }),
         );
 
@@ -517,6 +526,7 @@ mod tests {
                 LogEntry::TxnCommit(TxnCommitRecord {
                     txn_id: i as u64,
                     lsn: lsn(0, i * 100),
+                    dtvlsn: None,
                 }),
             );
         }
@@ -537,6 +547,7 @@ mod tests {
                 LogEntry::TxnCommit(TxnCommitRecord {
                     txn_id: i as u64,
                     lsn: lsn(0, i * 100),
+                    dtvlsn: None,
                 }),
             );
         }
