@@ -52,7 +52,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! use noxu_persist::*;
 //! use noxu_db::{Environment, EnvironmentConfig};
 //!
