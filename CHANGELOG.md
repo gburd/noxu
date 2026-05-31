@@ -33,8 +33,12 @@ listed in [References](#references).
 - **R-5**: documented and tested the non-transactional `NameLN` invariant
   (a non-transactional `open_database` create is durably committed at write
   time; recovery correctly treats it as committed).
-- **R-1 (perf)**: `collect_dirty_buffers` reuses a flush buffer instead of
-  allocating + copying per dirty buffer on every flush.
+- **R-1 (perf, partial)**: `collect_dirty_buffers` reuses the outer buffer
+  collection across `flush_sync` calls instead of reallocating it each time.
+  The inner per-buffer `to_vec()` copy remains — it is unavoidable while the
+  LWL is released before I/O for R-2 (the bytes must be owned snapshots once
+  the latch is dropped). Net: one fewer allocation per flush; the per-buffer
+  copy is retained by design.
 - **P-1 (perf)**: `FSyncGroup` gained an `AtomicBool` fast-path that
   eliminates the group-commit thundering-herd re-lock.
 - **P-2**: W11 recovery throughput gap (~2.9× JE) scoped as a design note
