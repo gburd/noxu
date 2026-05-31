@@ -16,7 +16,15 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-### Security (Wave FB — mTLS Phase 2, v3.1.0)
+## [v3.1.0] — 2026-05-31
+
+Feature + remediation release on the umbrella line. Adds enforced mTLS
+peer-authentication for replication, the DPL derive crate-path escape hatch,
+and the full 2026-05 re-audit remediation (config completeness, umbrella API
+gaps, crash-safety, the LogFlushTask latch regression, doc/spec accuracy).
+No breaking change to the engine's on-disk format. Builds on v3.0.2.
+
+### Security (Wave FB — mTLS Phase 2)
 
 - **`peer_allowlist` enforcement** (`noxu-rep`): `RepConfig::peer_allowlist`
   is now enforced at the TLS handshake layer.
