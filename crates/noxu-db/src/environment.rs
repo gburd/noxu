@@ -1275,13 +1275,12 @@ impl Environment {
         // TxnCommit record carries it.  On a second crash, the X-14 VLSN
         // rebuild scans TxnCommit records with non-NULL dtvlsn and includes
         // them — fixing the double-crash VLSN loss reported in Keith R-3.
-        let pre_vlsn = if let Some(coord) =
-            self.replica_coordinator.lock().as_ref()
-        {
-            coord.pre_alloc_vlsn_for_recovered_commit()
-        } else {
-            0
-        };
+        let pre_vlsn =
+            if let Some(coord) = self.replica_coordinator.lock().as_ref() {
+                coord.pre_alloc_vlsn_for_recovered_commit()
+            } else {
+                0
+            };
 
         let commit_lsn = write_txn_end_for_recovered(
             lm, txn_id, true, /* is_commit */
@@ -1530,7 +1529,10 @@ fn write_txn_end_for_recovered(
 ) -> Result<noxu_util::Lsn> {
     use bytes::BytesMut;
     use noxu_log::{LogEntryType, Provisional, entry::TxnEndEntry};
-    use noxu_util::{lsn::NULL_LSN, vlsn::{NULL_VLSN, Vlsn}};
+    use noxu_util::{
+        lsn::NULL_LSN,
+        vlsn::{NULL_VLSN, Vlsn},
+    };
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1542,13 +1544,7 @@ fn write_txn_end_for_recovered(
     let dtvlsn = if vlsn > 0 { Vlsn::new(vlsn as i64) } else { NULL_VLSN };
 
     let entry = if is_commit {
-        TxnEndEntry::new_commit(
-            txn_id as i64,
-            NULL_LSN,
-            timestamp,
-            0,
-            dtvlsn,
-        )
+        TxnEndEntry::new_commit(txn_id as i64, NULL_LSN, timestamp, 0, dtvlsn)
     } else {
         TxnEndEntry::new_abort(txn_id as i64, NULL_LSN, timestamp, 0, NULL_VLSN)
     };
