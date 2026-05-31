@@ -151,9 +151,8 @@ fn parse_entity_container_attrs(
             } else if meta.path.is_ident("crate") {
                 let value = meta.value()?;
                 let lit: syn::LitStr = value.parse()?;
-                let path = lit
-                    .parse_with(syn::Path::parse_mod_style)
-                    .map_err(|_| {
+                let path = lit.parse_with(syn::Path::parse_mod_style).map_err(
+                    |_| {
                         syn::Error::new(
                             lit.span(),
                             format!(
@@ -163,7 +162,8 @@ fn parse_entity_container_attrs(
                                 v = lit.value(),
                             ),
                         )
-                    })?;
+                    },
+                )?;
                 krate = Some(path);
                 Ok(())
             } else {
@@ -176,14 +176,14 @@ fn parse_entity_container_attrs(
     }
 
     // Validate name is non-empty when explicitly set.
-    if let Some(ref n) = name {
-        if n.is_empty() {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "`#[entity(name = \"\")]` is empty; entity names are \
-                 used as part of database names and must be non-empty",
-            ));
-        }
+    if let Some(ref n) = name
+        && n.is_empty()
+    {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[entity(name = \"\")]` is empty; entity names are \
+             used as part of database names and must be non-empty",
+        ));
     }
 
     let name = name.unwrap_or_else(|| fallback_ident.to_string());
@@ -210,9 +210,8 @@ fn parse_krate_from_entity_attr(attrs: &[Attribute]) -> syn::Result<Path> {
             if meta.path.is_ident("crate") {
                 let value = meta.value()?;
                 let lit: syn::LitStr = value.parse()?;
-                let path = lit
-                    .parse_with(syn::Path::parse_mod_style)
-                    .map_err(|_| {
+                let path = lit.parse_with(syn::Path::parse_mod_style).map_err(
+                    |_| {
                         syn::Error::new(
                             lit.span(),
                             format!(
@@ -222,7 +221,8 @@ fn parse_krate_from_entity_attr(attrs: &[Attribute]) -> syn::Result<Path> {
                                 v = lit.value(),
                             ),
                         )
-                    })?;
+                    },
+                )?;
                 krate = Some(path);
                 Ok(())
             } else if meta.path.is_ident("name") {

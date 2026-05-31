@@ -129,8 +129,8 @@ set of well-understood subsystems makes correctness easier to audit.
 
 **Decision**: All component crates are accessible through a single `noxu`
 umbrella crate. `noxu-persist-derive` emits `::noxu::persist::` paths in
-generated code so derive-macro users must depend on `noxu` directly (not
-only on `noxu-persist`). Components remain individually publishable for
+generated code by default so derive-macro users can depend on `noxu` without
+additional configuration. Components remain individually publishable for
 engine-internal extension work.
 
 **Why**: Reduces dependency graph complexity for users; a single version pin
@@ -138,10 +138,19 @@ captures the entire engine. Derive macro path coupling is a deliberate
 trade-off: it guarantees generated code always resolves against the
 user-visible umbrella namespace rather than an internal crate path.
 
-**Consequence**: Any user of `#[derive(Entity)]`, `#[derive(PrimaryKey)]`, or
-`#[derive(SecondaryKey)]` must have `noxu = "3"` in their `Cargo.toml`.
-A future escape hatch (`#[entity(crate = "...")]`, following the `serde`
-pattern) can relax this for users who depend on `noxu-persist` directly.
+**Consequence**: By default, users of `#[derive(Entity)]`,
+`#[derive(PrimaryKey)]`, or `#[derive(SecondaryKey)]` must have
+`noxu = "3"` in their `Cargo.toml` — unless they use the escape hatch
+described below.
+
+**v3.1.0 — Escape hatch implemented** (Wave FA): Users who depend on
+`noxu-persist` directly (without the umbrella) can add
+`#[entity(crate = "noxu_persist")]` to each annotated struct.  Generated
+code then uses `::noxu_persist::…` paths instead of `::noxu::persist::…`,
+following the `serde` / `#[serde(crate = "…")]` pattern.  The attribute is
+recognised by all three derives; the default behaviour is unchanged.  See
+`docs/src/collections/entity-persistence.md` § *Crate-path override* and
+`docs/src/internal/wave-fa-derive-crate-attr.md`.
 
 ## 10. `cache_size` = Total Memory Budget (v3.0, X-12)
 
