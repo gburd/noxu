@@ -99,6 +99,7 @@ impl EntitySerializer<User> for UserSerializer {
 |---|---|---|
 | `#[derive(Entity)]` | struct | Implements `noxu::persist::Entity`. Requires exactly one `#[primary_key]` field. |
 | `#[entity(name = "...")]` | struct | Overrides the entity-name (default = struct name). Used as part of the underlying database name. |
+| `#[entity(crate = "...")]` | struct | **Crate-path override** — see [below](#crate-path-override-for-direct-noxu-persist-users). |
 | `#[primary_key]` | field | Marks the primary-key field. The field's type becomes `Entity::PrimaryKey`. |
 | `#[derive(PrimaryKey)]` | struct | Implements `noxu::persist::PrimaryKey` for a custom newtype or composite key struct. |
 | `#[derive(SecondaryKey)]` | struct | For each `#[secondary_key(...)]` field, emits a typed `Foo::open_<name>_index` helper plus a `pub const SECONDARY_INDEXES` metadata table. |
@@ -137,6 +138,43 @@ A **newtype** primary key (`struct UserId(u64);`) delegates directly
 to the inner type's `PrimaryKey` impl, so the on-disk bytes are
 identical to using `u64` directly — useful when you want type-safety
 without a sort-order penalty.
+
+### Crate-path override for direct `noxu-persist` users
+
+By default the derive macros emit `::noxu::persist::…` paths in their
+generated `impl` blocks, which means the `noxu` umbrella crate must be
+present in the dependency graph.  Users who add `noxu-persist` directly
+(without the umbrella) get a compile error because `::noxu` is not
+resolvable.
+
+The escape hatch mirrors the `serde` pattern (`#[serde(crate = "…")]`):
+add `#[entity(crate = "noxu_persist")]` to each annotated struct.  The
+attribute is recognised by all three derives and redirects generated
+code to `::noxu_persist::…`.
+
+```rust
+// Cargo.toml:
+//   [dependencies]
+//   noxu-persist = "3"   # no noxu umbrella needed
+use noxu_persist::{Entity, PrimaryKey, SecondaryKey};
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
+#[entity(crate = "noxu_persist")]
+struct UserId(u64);
+
+#[derive(Clone, Debug, Entity, SecondaryKey)]
+#[entity(crate = "noxu_persist", name = "DirectUser")]
+struct User {
+    #[primary_key]
+    id: UserId,
+    #[secondary_key(name = "by_email", relate = OneToOne)]
+    email: String,
+}
+```
+
+The `crate` key accepts any valid Rust module path as a string literal.
+A malformed path produces a descriptive compile-time error.  The `name`
+key and `crate` key can appear together in any order.
 
 ## Opening an `EntityStore` and a `PrimaryIndex`
 
