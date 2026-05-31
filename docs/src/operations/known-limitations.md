@@ -12,6 +12,12 @@ boundary**:
 - The replication wire protocol has no authentication. A peer
   identity (`group_name`, `node_name`) is self-claimed
   plaintext and not verified.
+- **`peer_allowlist` (mTLS Phase 1)**: `RepConfig::peer_allowlist` and
+  `RepConfigBuilder::peer_allowlist()` are accepted and stored, but
+  **have no effect** on connection acceptance.  The server TLS config
+  still uses `.with_no_client_auth()`.  Setting a non-empty allowlist
+  emits a `WARN`-level log at node startup.  Phase 2 dispatcher wiring
+  is planned for v3.1.  Until then, deploy only on trusted networks.
 - `NetworkRestoreServer` streams the entire on-disk
   environment to anyone who connects to its port.
 - `PeerFeederService` streams the WAL to anyone who connects.
@@ -58,6 +64,13 @@ Recommended deployment until these are remediated:
 | **`Get::SearchLte`, `Get::FirstDup`, `Get::LastDup`** | These `Get` enum variants return `NoxuError::Unsupported` at runtime (Wave 11-R audit finding 3-D). | Use `Get::SearchBothRange` + manual iteration for LTE, or position with `Get::Search` and step backward. |
 | **`Environment::get_lock_stats()` / `get_transaction_stats()`** | JE exposes separate lock-table and transaction-subsystem stat surfaces. Noxu has only `get_stats()` (Wave 11-R audit finding 3-C). | Use `get_stats()` for aggregate numbers; per-lock-table granularity is not available. |
 | **`LogFlushTask` — no public type** | Background log-flush daemon (`LOG_FLUSH_NO_SYNC_INTERVAL`) runs internally but is not exposed as a public API (Wave 11-R audit finding 3-F). | Set `with_log_group_commit` + `with_durability(CommitNoSync)` and rely on the daemon; no manual flush handle is available. |
+| **`env_check_leaks` (reserved, v3.1)** | Stored but never read; lock-leak detection at database close is not implemented. Setting to `false` emits a `WARN` log. | No action needed for correctness; lock leaks are not currently detected. |
+| **`env_forced_yield` (reserved, v3.1)** | Stored but never read; yield-point injection in critical sections is not implemented. Setting to `true` emits a `WARN` log. | Has no effect; intended for testing fairness in a future release. |
+| **`env_fair_latches` (reserved, v3.1)** | Stored but never read; FIFO-ordered latch construction is not implemented. Setting to `true` emits a `WARN` log. | Has no effect; latches do not guarantee FIFO order. |
+| **`env_latch_timeout_ms` (reserved, v3.1)** | Stored but never read by the latch layer. Setting to a value other than 300,000 emits a `WARN` log. | Has no effect; latches block indefinitely. |
+| **`env_ttl_clock_tolerance_ms` (reserved, v3.1)** | Stored but never read; TTL expiration is not implemented. Setting to non-zero emits a `WARN` log. | Has no effect; records are never expired by the engine. |
+| **`env_expiration_enabled` (reserved, v3.1)** | Stored but never read; TTL-based record expiration is not implemented. Setting to `true` emits a `WARN` log. | Has no effect; records are never expired by the engine. |
+| **`env_db_eviction` (reserved, v3.1)** | Stored but never read; per-database node eviction is not implemented. Setting to `true` emits a `WARN` log. | Has no effect; eviction does not differentiate by database. |
 
 ---
 

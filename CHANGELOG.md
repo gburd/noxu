@@ -33,6 +33,42 @@ listed in [References](#references).
   internal `noxu-sync` crate. The `secondary` example was updated to
   `use noxu::Mutex;` and the `noxu-sync` dev-dependency was dropped from the
   examples package.
+- **Wave ZA** (fix/za-config-api): Config API gaps and silent-ignore elimination.
+  - `noxu::PreparedTxnInfo`, `noxu::PreparedLnReplay`, `noxu::PreparedLnOperation`
+    re-exported from `noxu-db` (closes jonhoo #3, JE F-6).
+  - `noxu::SharedReplicaAckCoordinator`, `noxu::ReplicaAckCoordinator`,
+    `noxu::AckWaitError`, `noxu::AckWaitErrorKind`, `noxu::ReplicaAckPolicyKind`
+    re-exported from `noxu-db` (closes JE F-6).
+  - `unimplemented_params` registry: 7 config parameters (`env_latch_timeout_ms`,
+    `env_expiration_enabled`, `env_db_eviction`, `env_fair_latches`,
+    `env_check_leaks`, `env_forced_yield`, `env_ttl_clock_tolerance_ms`) now
+    emit `WARN`-level log at `Environment::open` when set to non-default values.
+  - `RepConfig::peer_allowlist` emits `WARN` at `ReplicatedEnvironment::new`
+    when non-empty (mTLS Phase 2 not yet implemented).
+
+### Fixed (v3.1.0 candidate)
+
+- **Wave ZA** (fix/za-config-api):
+  - `DbIter` / `DbRange` now carry a `'txn` lifetime parameter, making
+    use-after-commit a compile-time error (closes jonhoo #4).
+  - `commit_pending_database` TOCTOU: `pending_names` changed from
+    `HashSet<String>` to `HashMap<String, DatabaseId>`; the pending→committed
+    transition is now atomic under the `pending_names` write lock; O(N) db_map
+    linear scan eliminated; concurrent `open_database` for a pending name
+    returns `DatabaseAlreadyExists` instead of silently creating a duplicate
+    (closes keith R-4).
+
+### Changed (v3.1.0 candidate)
+
+- **Wave ZA** (fix/za-config-api):
+  - Rustdoc for 7 unimplemented `EnvironmentConfig` fields updated to state
+    "Reserved / not yet implemented as of v3.1" with explicit warning note.
+  - `RepConfig::peer_allowlist` and `RepConfigBuilder::peer_allowlist` rustdoc
+    rewritten to state the allowlist has no effect until Phase 2.
+  - `known-limitations.md` updated with `peer_allowlist` and all 7 reserved
+    config params explicitly listed.
+  - `migrating.md` updated with Wave ZA breaking changes (`DbIter` lifetime,
+    `pending_names` internal API change, new re-exports).
 
 ## [v3.0.2] — 2026-05-30
 
