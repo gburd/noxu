@@ -14,6 +14,50 @@
 
 use std::fs::File;
 use std::io;
+use std::path::Path;
+
+/// Fsyncs a directory so that file creations/renames within it are durable.
+///
+/// On Unix this opens the directory and `sync_all()`s it (POSIX requires a
+/// directory fsync after `creat`/`rename` for the entry to survive a crash —
+/// the C-1 durability fix). On Windows a directory handle must be opened with
+/// `FILE_FLAG_BACKUP_SEMANTICS`; the flush is best-effort because NTFS journals
+/// metadata and not all volumes support `FlushFileBuffers` on a directory
+/// handle. A directory-flush failure must NOT fail the surrounding file
+/// creation.
+#[cfg(unix)]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// See the Unix variant. Best-effort on Windows.
+#[cfg(windows)]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS — required to obtain a handle to a directory.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        // Some filesystems / Windows versions reject FlushFileBuffers on a
+        // directory handle (ERROR_ACCESS_DENIED / ERROR_INVALID_FUNCTION).
+        // NTFS metadata journaling already orders the directory entry, so
+        // treat these as a successful best-effort flush rather than failing
+        // file creation.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Reads up to `buf.len()` bytes at `offset`; returns the number read.
 #[cfg(unix)]
