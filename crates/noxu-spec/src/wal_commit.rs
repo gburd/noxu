@@ -10,14 +10,12 @@
 //!   - `crates/noxu-txn/src/group_commit.rs`
 //!   - `crates/noxu-txn/src/txn.rs::commit_with_durability`
 //!
-//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
-//! production entry points (`LogManager::log`, `LogBuffer::flush`,
-//! `Txn::commit_with_durability`, `GroupCommitState`) still follow
-//! the same write-LSN → fsync-or-coalesce → mark-committed
-//! pipeline. Wave 11-F also strengthened `FsyncedNeverDecreases`
-//! from a coarse termination check (`fsynced_lsn < next_lsn`) to a
-//! true 2-state monotonicity invariant by tracking
-//! `previous_fsynced_lsn` in state.
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! WAL group-commit protocol unchanged since v2.4.0. The production entry
+//! points (`LogManager::log`, `LogBuffer::flush`, `Txn::commit_with_durability`,
+//! `GroupCommitState`) still follow the same write-LSN → fsync-or-coalesce
+//! → mark-committed pipeline. Properties DurableImpliesLogged and
+//! FsyncedNeverDecreases remain accurate models.
 //!
 //! Properties:
 //!   - `DurableImpliesLogged` — every transaction reported as

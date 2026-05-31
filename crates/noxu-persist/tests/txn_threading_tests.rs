@@ -328,6 +328,8 @@ fn secondary_index_update_is_not_atomic_with_txn_v1_5() {
          back on txn.abort(); see PersistError::SecondariesNotTransactional"
     );
 
+    // SAFETY: edition-2024 requires unsafe for std::env::remove_var;
+    // this is test-only code that resets the env var set earlier in this test.
     unsafe {
         std::env::remove_var("NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES");
     }
