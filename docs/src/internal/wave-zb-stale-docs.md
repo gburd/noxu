@@ -130,9 +130,11 @@ All 7 specs with `VALIDATED-AS-OF: v2.4.0` stamps updated to `v3.1.0`:
 **Source**: reaudit-jonhoo C-1/C-2
 
 `Cargo.toml` (`[workspace.package]`):
+
 - Added `rust-version = "1.85"` (edition 2024 minimum; toolchain pins 1.95).
 
 `Cargo.toml` (`[workspace.lints]`):
+
 - Added `[workspace.lints.rust]` section with `unsafe_op_in_unsafe_fn = "deny"`.
 - Added `clippy::undocumented_unsafe_blocks = "warn"`.
 
