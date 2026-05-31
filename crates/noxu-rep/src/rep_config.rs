@@ -132,21 +132,22 @@ pub struct RepConfig {
     /// [`RepTransportKind::Tcp`] for backward compatibility.
     pub transport_kind: RepTransportKind,
 
-    /// Allowlist of peer subject names authorised to participate in
-    /// the replication group.
+    /// Allowlist of peer subject names for planned mTLS enforcement.
     ///
-    /// When the dispatcher's mTLS path is in use (planned for v1.5.0,
-    /// see `docs/src/internal/auth-mtls-design-2026-05.md`),
-    /// incoming connections are accepted only if the peer's leaf
-    /// certificate carries a Subject Common Name or Subject
-    /// Alternative Name DNS entry that matches one of these strings
+    /// # **NOT YET ENFORCED — Phase 2 is pending**
+    ///
+    /// This field is accepted and stored but has **no effect** on connection
+    /// acceptance.  The server TLS config still uses `.with_no_client_auth()` —
+    /// any peer can connect regardless of this list.
+    ///
+    /// When Phase 2 (dispatcher wiring) is complete, incoming connections will
+    /// be rejected unless the peer's leaf certificate Subject Common Name or
+    /// Subject Alternative Name DNS entry matches one of these strings
     /// case-insensitively.
     ///
-    /// An empty allowlist (the default) means "no peers authorised";
-    /// in v1.5.0 this becomes a hard error at dispatcher
-    /// construction time. In v1.4.x this field is *unused* — the
-    /// dispatcher does not yet enforce mTLS — so an empty list is
-    /// the documented temporary default.
+    /// Setting a non-empty list currently emits a `log::warn!` at node startup
+    /// so operators are alerted that the allowlist has no security effect.
+    /// See `docs/src/operations/known-limitations.md` for the tracking entry.
     pub peer_allowlist: Vec<String>,
 }
 
@@ -318,17 +319,16 @@ impl RepConfigBuilder {
         self
     }
 
-    /// Set the allowlist of peer subject names authorised to
-    /// participate in the replication group. Each entry is
-    /// matched case-insensitively against the peer cert's
-    /// Subject Common Name and Subject Alternative Name DNS
-    /// entries during the mTLS handshake.
+    /// Set the planned mTLS peer allowlist.
     ///
-    /// Phase 1 of the mTLS-by-default plan (v1.5.0+) — see
-    /// `docs/src/internal/auth-mtls-design-2026-05.md`. In
-    /// v1.4.x this field is plumbed through the config but
-    /// not enforced; the dispatcher does not yet require
-    /// mTLS.
+    /// # **NOT YET ENFORCED — Phase 2 pending**
+    ///
+    /// Stores the list for future Phase 2 dispatcher wiring but **does not
+    /// currently restrict connections in any way**.  A `log::warn!` is emitted
+    /// at node startup when a non-empty list is provided, alerting operators
+    /// that the allowlist has no security effect until Phase 2 lands.
+    ///
+    /// See [`RepConfig::peer_allowlist`] field doc for full details.
     pub fn peer_allowlist(mut self, names: Vec<String>) -> Self {
         self.peer_allowlist = names;
         self

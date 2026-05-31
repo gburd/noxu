@@ -43,6 +43,7 @@
 
 #[macro_use]
 mod observe;
+pub mod unimplemented_params;
 
 /// Re-export of the observability crate when the `observability` feature is enabled.
 /// Users can access `noxu_db::observe_crate::{metrics, tracing}` for their own
@@ -56,6 +57,32 @@ pub use noxu_observe as observe_crate;
 /// (and its guard) without depending on the internal `noxu-sync` crate
 /// directly — reachable as `noxu::Mutex` through the umbrella.
 pub use noxu_sync::{Mutex, MutexGuard};
+
+/// Re-exports of `noxu-dbi` types that appear in public API signatures.
+///
+/// `Environment::set_replica_coordinator` takes a
+/// `SharedReplicaAckCoordinator`; users implementing a custom
+/// `ReplicaAckCoordinator` for testing need `ReplicaAckCoordinator` and
+/// `AckWaitError`/`AckWaitErrorKind` without depending on the internal
+/// `noxu-dbi` crate directly.  All are reachable as `noxu::Type` through
+/// the umbrella crate.
+///
+/// Closes re-audit JE F-6 and the partial fix noted in reaudit-jonhoo #3.
+pub use noxu_dbi::{
+    AckWaitError, AckWaitErrorKind, ReplicaAckCoordinator,
+    ReplicaAckPolicyKind, SharedReplicaAckCoordinator,
+};
+
+/// Re-exports of `noxu-recovery` types that appear in public API signatures.
+///
+/// `Environment::recovered_prepared_txns` returns `Vec<PreparedTxnInfo>`;
+/// `Environment::take_recovered_prepared_lns` returns
+/// `Vec<PreparedLnReplay>`, and `apply_recovered_prepared_lns` takes
+/// `&[PreparedLnReplay]`.  XA users need these types to name return values
+/// without depending on the internal `noxu-recovery` crate directly.
+///
+/// Closes reaudit-jonhoo #3.
+pub use noxu_recovery::{PreparedLnOperation, PreparedLnReplay, PreparedTxnInfo};
 
 pub mod cache_mode;
 pub mod checkpoint_config;
