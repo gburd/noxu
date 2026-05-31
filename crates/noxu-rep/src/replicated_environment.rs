@@ -219,6 +219,20 @@ impl ReplicatedEnvironment {
     /// it is the very first electable node that is creating the group. In that
     /// case it joins as the Master of the newly formed singleton group.
     pub fn new(config: RepConfig) -> Result<Self> {
+        // mTLS Phase 1 honesty check (re-audit JE F-2 / margo #4):
+        // peer_allowlist is accepted and stored but the server TLS config
+        // still uses with_no_client_auth() — Phase 2 dispatcher wiring is
+        // not yet implemented.  Warn loudly so operators are not misled.
+        if !config.peer_allowlist.is_empty() {
+            log::warn!(
+                "[{}] peer_allowlist is configured ({} entries) but mTLS \
+                 enforcement is NOT yet implemented (Phase 2 pending). \
+                 Connections are NOT authenticated by peer certificate. \
+                 Deploy only on trusted networks until Phase 2 is merged.",
+                config.node_name,
+                config.peer_allowlist.len(),
+            );
+        }
         let node_state = NodeStateMachine::new();
         let group_service = GroupService::new(config.group_name.clone());
         let vlsn_index = {

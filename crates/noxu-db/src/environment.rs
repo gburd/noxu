@@ -208,6 +208,10 @@ impl Environment {
             let _ = std::fs::remove_file(&test_file);
         }
 
+        // Warn about any unimplemented config parameters that have been set
+        // to non-default values (re-audit JE F-1: no silently-ignored params).
+        crate::unimplemented_params::warn_unimplemented_params(&config);
+
         // Translate EnvironmentConfig into DbiEnvConfig (the noxu-dbi struct)
         // to avoid a circular dependency between the two crates.
         let buf_size = if config.log_buffer_size > 0 {

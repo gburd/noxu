@@ -21,13 +21,27 @@ pub struct DbiEnvConfig {
     pub env_recovery_force_checkpoint: bool,
     pub env_recovery_force_new_file: bool,
     pub halt_on_commit_after_checksum_exception: bool,
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by any subsystem.
     pub env_check_leaks: bool,
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by any subsystem.
     pub env_forced_yield: bool,
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by any subsystem.
     pub env_fair_latches: bool,
     /// Latch acquisition timeout in milliseconds.  0 = block forever.
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by the latch layer.
     pub env_latch_timeout_ms: u64,
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by any subsystem.
     pub env_ttl_clock_tolerance_ms: u64,
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by any subsystem.
     pub env_expiration_enabled: bool,
+    /// Reserved / not yet implemented as of v3.1.
+    /// Stored for future use; not read by the evictor.
     pub env_db_eviction: bool,
 
     // -----------------------------------------------------------------------
