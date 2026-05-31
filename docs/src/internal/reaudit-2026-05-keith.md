@@ -1,5 +1,7 @@
 # Noxu DB Re-Audit — Keith Bostic
+
 ## Performance and Correctness: Lingering and New Issues
+
 **Date**: 2026-05-30  
 **Reviewer**: Keith Bostic (re-review persona)  
 **Branch examined**: `origin/main` at commit 8f63f6e  

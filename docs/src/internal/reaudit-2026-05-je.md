@@ -20,7 +20,9 @@
 **Severity**: High  
 **Subsystem**: Config / Core  
 **Files**:
+
 - `crates/noxu-db/src/environment_config.rs` (public API)
+
 - `crates/noxu-dbi/src/dbi_config.rs` (transfer struct)
 
 **Description**: Seven config parameters are accepted, validated, and
@@ -50,8 +52,11 @@ Verification: `grep -rn "\.env_latch_timeout_ms\|\.env_expiration_enabled\|\.env
 **Severity**: High  
 **Subsystem**: Replication / Security  
 **Files**:
+
 - `crates/noxu-rep/src/rep_config.rs:150` (`peer_allowlist: Vec<String>`)
+
 - `crates/noxu-rep/src/auth.rs` (Phase 1 — allowlist matching logic only)
+
 - `docs/src/internal/security-review-2026-05.md:380-390` (NA-1..NA-6 still open)
 
 **Description**: `RepConfig::peer_allowlist` is a public config field with
@@ -87,7 +92,9 @@ flag `peer_allowlist` as a noop.
 **Severity**: Medium  
 **Subsystem**: Tests / Documentation accuracy  
 **Files**:
+
 - `crates/noxu-db/tests/je_database_test.rs:601-605, 637-643, 804-810, 921-923`
+
 - `crates/noxu-db/tests/je_truncate_test.rs:124-126`
 
 **Description**: Five tests carry `TODO(bug)` comment blocks that describe
@@ -121,7 +128,9 @@ entries still showing `PORTED-PARTIAL` in wave-11-g's reasoning.
 **Severity**: Medium  
 **Subsystem**: Recovery  
 **Files**:
+
 - `crates/noxu-recovery/src/recovery_manager.rs:246-259` (`mapping_tree_db_names` doc)
+
 - `crates/noxu-recovery/src/recovery_manager.rs:591-598` (`run_mapping_tree_undo_pass` doc)
 
 **Description**: Wave-11-y marks C-6 as "Complete ✓". The wave-11-y doc
@@ -132,10 +141,12 @@ reading "# TODO (C-6 full implementation)" and "# TODO (C-6 full JE parity)"
 that say a **full MapLN B-tree undo pass** is not implemented:
 
 ```
+
 /// # TODO (C-6 full JE parity)
 /// - Store NameLN txn_id in the WAL entry … (done in wave-11-y)
 /// - Implement a full MapLN B-tree undo (requires a dedicated mapping-tree
 ///   database, tracked as a follow-up wave).
+
 ```
 
 The second bullet is genuine: JE stores catalog entries in a separate
@@ -190,10 +201,13 @@ Specific high-value missing tests (from `je.test.tsv`):
   `deferred_write` is a supported `DatabaseConfig` field in Noxu but the JE
   regression tests for crash/eviction/cleaning in deferred-write mode are
   entirely absent.
+
 - **`JoinTest`** (2): `testJoin` and `testWriteDuringJoin` — `JoinCursor`
   exists but the core `testJoin` test is not ported (the only join test is
   `#[ignore]`'d due to the sorted-dup gap).
+
 - **`ForeignKeyTest`** (4): cascade delete / nullify / illegal-nullifier tests.
+
 - **`je.txn.tsv`**: `CursorTxnTest::testNullTxnLockRelease` and
   `DeadlockTest::testDeadlockBetweenTwoLockers` are both listed as
   `priority: critical` / NOT-PORTED.
@@ -213,9 +227,13 @@ tests by the `priority: critical` label in the TSV. Port `DeadlockTest::testDead
 **Severity**: Medium  
 **Subsystem**: Umbrella crate / Public API surface  
 **Files**:
+
 - `crates/noxu-db/src/environment.rs:912-915` (public `set_replica_coordinator`)
+
 - `crates/noxu-dbi/src/lib.rs:71-72` (`SharedReplicaAckCoordinator` exported from noxu-dbi)
+
 - `crates/noxu-db/src/lib.rs` (does NOT re-export `SharedReplicaAckCoordinator` or `ReplicaAckCoordinator`)
+
 - `crates/noxu/src/lib.rs` (umbrella — does NOT expose these)
 
 **Description**: `Environment::set_replica_coordinator` is a `pub` method whose
@@ -236,10 +254,13 @@ depending on an internal crate.
 a Rust layering issue specific to the Noxu crate structure.
 
 **Suggested action**: Add to `crates/noxu-db/src/lib.rs`:
+
 ```rust
 pub use noxu_dbi::{ReplicaAckCoordinator, SharedReplicaAckCoordinator,
                    AckWaitError, AckWaitErrorKind};
+
 ```
+
 Then the `noxu` umbrella inherits them via `pub use noxu_db::*`. This is a
 small non-breaking addition; `SharedReplicaAckCoordinator` is already part
 of the public API by virtue of being the parameter type of a `pub fn`.
@@ -251,7 +272,9 @@ of the public API by virtue of being the parameter type of a `pub fn`.
 **Severity**: Low  
 **Subsystem**: Recovery / Tests  
 **Files**:
+
 - `crates/noxu-recovery/tests/prop_tests.rs:352-395`
+
 - `crates/noxu-recovery/src/analysis_result.rs:282-299` (defensive guard)
 
 **Description**: The prop test `prop_active_txn_after_terminal_resurrects_phantom_active`
@@ -261,13 +284,16 @@ and describing a phantom-active-txn bug where calling `record_active_txn` after
 
 The **bug is fixed**: `record_active_txn` (line 295-297 of `analysis_result.rs`)
 carries an explicit defensive guard:
+
 ```rust
 if self.committed_txns.contains_key(&txn_id)
     || self.aborted_txns.contains(&txn_id)
 {
     return;
 }
+
 ```
+
 The prop test is therefore a passing **regression guard**, not a
 live-bug documentation. The "Bug observation" framing leads readers to believe
 the bug is still open. The test has no `#[ignore]` and passes in CI.
@@ -286,7 +312,9 @@ hardened…") is also stale — the hardening was applied.
 **Severity**: Low (documented in `known-limitations.md`)  
 **Subsystem**: Engine / Verify  
 **Files**:
+
 - `crates/noxu-engine/src/verify.rs:453-467` (`verify_environment`)
+
 - `crates/noxu-engine/src/verify.rs:487-499` (`verify_database`)
 
 **Description**: `verify_environment` and `verify_database` return
@@ -305,7 +333,7 @@ The `VerifyConfig` parameter's inner boolean fields (`verify_btree` etc.) sugges
 granular verification is on offer — an operator reading only the rustdoc would
 not know the whole thing is a no-op.
 
-**Suggested action**: Add `#[doc = "**Stub** — returns a passing `VerifyResult` without performing any verification. See `docs/src/operations/known-limitations.md`."]` to the function signatures, or at minimum add an inline `log::warn!("verify_environment called but verification is not yet implemented")` so operators see the stub in logs. The existing `known-limitations.md` coverage is necessary but not sufficient for production safety.
+**Suggested action**: Add a doc attribute `#[doc = "**Stub** — returns a passing VerifyResult without performing any verification. See docs/src/operations/known-limitations.md."]` to the function signatures, or at minimum add an inline `log::warn!("verify_environment called but verification is not yet implemented")` so operators see the stub in logs. The existing `known-limitations.md` coverage is necessary but not sufficient for production safety.
 
 ---
 
@@ -314,7 +342,9 @@ not know the whole thing is a no-op.
 **Severity**: Low  
 **Subsystem**: WAL / Performance  
 **Files**:
+
 - `docs/src/internal/wave-11-j-fsync-coalescing.md` ("full rewrite deferred pending allocator investigation")
+
 - `crates/noxu-log/src/fsync_manager.rs` (still has thundering-herd wakeup)
 
 **Description**: Wave-11-J investigated replacing `FsyncManager`'s group-condvar
@@ -393,9 +423,13 @@ test where the recovery setup differs from JE to explain the reasoning.
 | F-10 | Low | Tests | Clean-drop vs. abrupt-close in recovery tests (structural; partially addressed) |
 
 **Counts by severity**:
+
 - Critical: 0
+
 - High: 2 (F-1, F-2)
+
 - Medium: 4 (F-3, F-4, F-5, F-6)
+
 - Low: 4 (F-7, F-8, F-9, F-10)
 
 ---

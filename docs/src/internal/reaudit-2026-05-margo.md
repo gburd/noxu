@@ -59,6 +59,7 @@ multi-DB recovery uses `recover_all()` which does run the pass."
 | **File:line** | `crates/noxu-recovery/src/recovery_manager.rs:591–597` |
 
 **What the comment says**:
+
 ```
 # TODO (C-6 full JE parity)
 - Store NameLN `txn_id` in the WAL entry so recovery can distinguish
@@ -66,6 +67,7 @@ multi-DB recovery uses `recover_all()` which does run the pass."
   `txn_id = None` (non-transactional), so this pass can only remove
   entries that C-4 deferred (post-v3.0.0 WAL) — pre-C4 WAL entries
   remain unconditionally accepted.
+
 ```
 
 **What wave 11-Y actually did**: `environment_impl.rs:1083–1087` now calls
@@ -77,11 +79,13 @@ with a `txn_id` inside the transaction.
 **The live TODO**: Only the second bullet (MapLN B-tree undo) remains valid.
 
 **Suggested action**: Remove the first bullet point from the TODO. Rewrite to:
+
 ```
 # TODO (C-6 partial — MapLN B-tree undo not yet implemented)
 A full MapLN undo pass (JE phases A–D on the mapping tree B-tree) requires
 a dedicated on-disk mapping tree, not a HashMap.  The current implementation
 covers only NameLNTxn undo; tracked as a future follow-up.
+
 ```
 
 ---
@@ -165,6 +169,7 @@ real but more nuanced than stated.
 2: Build Tree from Checkpoint, Phase 3: Replay and Undo LNs.
 
 **What `recover_all()` actually does** (post-wave-11-U and 11-Y):
+
 1. Find end of log
 2. Find last checkpoint
 3. Analysis (build dirty-IN map and transaction sets)
@@ -199,8 +204,8 @@ The section currently makes no mention of the catalog consistency step.
 
 **Suggested action**: Expand step 3 to read:
 > "2b. Mapping-tree undo (multi-DB only): for each NameLNTxn entry whose
->     `txn_id` did not commit, remove the database registration before data-LN
->     redo. Prevents data recovery for databases whose creation was rolled back."
+> `txn_id` did not commit, remove the database registration before data-LN
+> redo. Prevents data recovery for databases whose creation was rolled back."
 >
 > "3. Redo committed / undo uncommitted LNs: scan from `first_active_lsn`."
 
@@ -276,7 +281,8 @@ find-checkpoint, analysis, mapping-tree-undo, redo, undo). The module and
 function docs use inconsistent labels ("3-phase" vs "five sub-phases") that
 are both now wrong for the multi-DB path.
 
-**Suggested action**: 
+**Suggested action**:
+
 - Module preamble: "Performs crash recovery (analysis → redo → undo) when an
   Environment is opened. Multi-DB environments also run a mapping-tree undo
   pass (C-6) between analysis and main redo."
@@ -303,8 +309,10 @@ a 6th daemon thread `noxu-log-flusher` starts and wakes on the configured
 interval.
 
 **Suggested action**: Add a row:
+
 ```
 | LogFlushTask | 0 or 1 | conditional on log_flush_no_sync_interval_ms > 0 |
+
 ```
 
 ---
@@ -318,6 +326,7 @@ interval.
 | **File:line** | `docs/src/operations/known-limitations.md:58–60` |
 
 **What the doc says** (three rows in the limitations table):
+
 - "These `Get` enum variants return `NoxuError::Unsupported` at runtime
   (**Wave 11-R audit finding 3-D**)."
 - "Noxu has only `get_stats()` (**Wave 11-R audit finding 3-C**)."
@@ -344,9 +353,11 @@ The limitation itself is correctly stated; the process provenance is internal.
 | **[prior]** | [prior: Margo findings 5.4; synthesis H-6] |
 
 **What the spec says**:
+
 ```
 //!   - `crates/noxu-recovery/src/transaction_table.rs`
 //!   - `crates/noxu-recovery/src/dirty_page_table.rs`
+
 ```
 
 **What exists**: `ls crates/noxu-recovery/src/` shows:
@@ -358,9 +369,11 @@ synthesis (noting "ARIES terminology that doesn't match Noxu's naming"). It was
 NOT fixed in any subsequent wave (checked 11-Q, 11-R, 11-S, 11-U, 11-V).
 
 **Suggested action**: Update lines 10–11 to:
+
 ```
 //!   - `crates/noxu-recovery/src/analysis_result.rs`   (≈ ARIES transaction table)
 //!   - `crates/noxu-recovery/src/dirty_in_map.rs`       (≈ ARIES dirty page table)
+
 ```
 
 ---
@@ -414,6 +427,7 @@ property that verifies data LNs. After C-6 there is a new catalog invariant:
 transactions committed." No spec property covers this.
 
 **Suggested action**:
+
 1. Update all 11 `VALIDATED-AS-OF` stamps to the current version after
    re-validation with `make spec`.
 2. Add a `CatalogConsistency` property to `recovery_three_phase.rs` modelling
@@ -525,8 +539,10 @@ entry.
 | **[prior]** | [prior: Margo finding 4.6] |
 
 **What the doc says** (Decision 8 unsafe table):
+
 ```
 | `crates/noxu-evictor/src/off_heap.rs` | Off-heap BIN storage |
+
 ```
 
 **What the code does**: `noxu-evictor/src/lib.rs` carries
@@ -643,13 +659,17 @@ This needs to either be removed or clearly marked as a design placeholder.
 | **File:line** | `crates/noxu/src/lib.rs:25` |
 
 **What the example says** (in a `//! ```ignore` block):
+
 ```rust
 let db = env.open_database(None, "kv", true)?;
+
 ```
 
 **What the signature requires**:
+
 ```rust
 pub fn open_database(&self, txn: Option<&Transaction>, name: &str, config: &DatabaseConfig) -> Result<Database>
+
 ```
 
 The example passes `true` (a `bool`) where `&DatabaseConfig` is required. The
@@ -659,9 +679,12 @@ and `transaction.rs` examples but the new umbrella crate's quick-start was
 introduced after that wave and was never validated.
 
 **Suggested action**: Replace with:
+
 ```rust
 let db = env.open_database(None, "kv", &DatabaseConfig::default().with_allow_create(true))?;
+
 ```
+
 and change `ignore` to `no_run` so it at least compiles on `cargo test`.
 
 ---
@@ -705,8 +728,10 @@ stating the `txn_id=None` → committed interpretation and the
 | **File:line** | `crates/noxu-dbi/src/environment_impl.rs` (Arbiter budget calculation, X-12) |
 
 The X-12 fix computes:
+
 ```
 arbiter_budget = max(cache_size − log_buf_total − off_heap_reserved, 1 MiB)
+
 ```
 
 The 1 MiB floor prevents a non-positive Arbiter budget when user configuration
@@ -716,9 +741,12 @@ it is passed to the Arbiter constructor. A negative or zero value would silently
 initialize the Arbiter with an invalid budget.
 
 **Suggested action**: Add:
+
 ```rust
 debug_assert!(arbiter_budget >= 1, "arbiter budget must be positive after floor");
+
 ```
+
 at the calculation site, plus a test that triggers the floor condition.
 
 ---
