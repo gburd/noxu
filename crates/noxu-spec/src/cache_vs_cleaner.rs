@@ -10,15 +10,12 @@
 //!   - `crates/noxu-evictor/src/evictor.rs`
 //!   - `crates/noxu-cleaner/src/file_processor.rs::migrate_ln_slot`
 //!
-//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
-//! evictor still flushes a BIN before clearing its dirty bit, and
-//! the cleaner still snapshots the disk version before migrating.
-//! The Wave 11-F update adds a third invariant `MigratedReflectsDisk`
-//! that exercises the full snapshot → migrate handshake: when the
-//! cleaner has migrated a slot, the migrated version must equal
-//! the disk version observed at snapshot time, and that version
-//! must equal disk_version when migration completes (no
-//! intervening dirty/evict cycle without a re-snapshot).
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! NOTE: Wave 11-U (X-7) added per-database tree dispatch to the cleaner
+//! migration path (`file_processor.rs`). The spec models the abstract
+//! snapshot → migrate ordering which is unchanged; the per-db dispatch is
+//! not yet modelled. The three invariants (DirtyBitPreserved, EvictionSafe,
+//! MigratedReflectsDisk) still hold for the modelled protocol.
 //!
 //! Properties:
 //!   - `DirtyBitPreserved` — the cleaner never observes a clean BIN

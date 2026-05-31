@@ -10,16 +10,15 @@
 //!   - `crates/noxu-txn/src/deadlock_detector.rs`
 //!   - `crates/noxu-txn/src/lock_type.rs` (compatibility matrix)
 //!
-//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
-//! production lock manager / deadlock detector still expose the
-//! same `LockType` alphabet (`Read`, `Write`, `RangeRead`,
-//! `RangeWrite`, `RangeInsert`, `Restart`, `None`) and follow the
-//! same wait-for / abort-victim discipline. The compile-time anchor
-//! `spec_lock_kind` enforces an exhaustive match over `LockType`,
-//! so a future variant addition forces a spec-level decision before
-//! the build succeeds. The model + the `lock_manager_drives_production`
-//! integration tests in `tests/lock_manager_drives_production.rs`
-//! together pin the spec to production behaviour.
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! NOTE: Wave 11-Q (H-4) wired `compute_lock_counts()` so that victim
+//! selection now uses fewest-locks-held as the PRIMARY criterion (youngest
+//! locker ID as tiebreaker). The spec's `VictimIsYoungest` property models
+//! the pre-H4 youngest-only heuristic and may now be over-specified for the
+//! production protocol. A `VictimHasFewestLocks` property would more closely
+//! model the current behaviour; tracked as a follow-up spec update.
+//! The `LockType` alphabet, `WriteLocksExclusive`, `DeadlockDetected`, and
+//! `NoOrphanedWaiters` properties are unaffected by H-4.
 //!
 //! Properties:
 //!   - `WriteLocksExclusive` — at most one writer per LSN, and

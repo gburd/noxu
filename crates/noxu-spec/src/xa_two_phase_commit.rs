@@ -9,19 +9,12 @@
 //!   - `crates/noxu-xa/src/internal.rs`
 //!   - `crates/noxu-xa/src/types.rs`
 //!
-//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
-//! production state machine (Idle → Preparing → CommitDecided/
-//! AbortDecided) and the recovery rule (presumed-abort if no RM is
-//! Committed at recovery time) are unchanged. The compile-time
-//! `_FLAG_ANCHOR` already pins the public `XaFlags` constants.
-//!
-//! Wave 11-F closes the original RecoveryConsistent TODO: the
-//! model now snapshots the TM's pre-crash decision into
-//! `tm_decision_before_crash` and asserts that the post-recovery
-//! decision equals the pre-crash decision (when a decision had
-//! been made before the crash). This is the 2-state recovery-
-//! consistency property the original preamble flagged as future
-//! work.
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! XA two-phase commit protocol is unchanged since v2.4.0. Wave 11-U (X-4)
+//! fixed a `resolving_xids` sentinel TOCTOU in the production code;
+//! the spec models the abstract Prepare → Commit/Abort state machine
+//! which is unaffected by that fix. Properties GlobalCommitDecidability,
+//! RecoveryConsistent, and NoOrphanBranch remain accurate models.
 //!
 //! Properties:
 //!   - `PreparedImpliesDecided` — an RM in the `Committed` state

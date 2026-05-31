@@ -466,6 +466,9 @@ impl TcpChannelListener {
                 },
                 None => libc::timeval { tv_sec: 0, tv_usec: 0 },
             };
+            // SAFETY: `fd` is a valid open socket descriptor; `tv` is a valid
+            // `libc::timeval` value on the stack. The pointer cast to `c_void`
+            // is the canonical FFI pattern for `setsockopt`.
             let rc = unsafe {
                 libc::setsockopt(
                     fd,

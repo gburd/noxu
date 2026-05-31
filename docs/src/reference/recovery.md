@@ -1,8 +1,11 @@
 # Recovery Protocol
 
 When an environment is opened, `RecoveryManager` in `noxu-recovery` performs
-three-phase crash recovery to bring the database to a transaction-consistent
-state.
+crash recovery to bring the database to a transaction-consistent state.
+
+Single-database environments use 3-phase recovery (analysis → redo → undo).
+Multi-database environments (`recover_all`) use 4 logical phases, adding a
+catalog-consistency pass (C-6 mapping-tree undo) between analysis and data-LN redo.
 
 ## Phase 1 — Find End of Log
 
@@ -18,6 +21,29 @@ of the log. Any partially written entries are discarded.
    to reconstruct the in-memory B+tree.
 
 At the end of Phase 2, the tree reflects all writes that had been checkpointed.
+
+## Phase 2b — Mapping-Tree Undo Pass (multi-DB only, v3.0.0+)
+
+*This phase runs only in `recover_all()` (multi-database environments).
+Single-database `recover()` has no catalog entries to process.*
+
+After analysis, before data-LN redo, `run_mapping_tree_undo_pass()` removes
+aborted `NameLNTxn` entries from the recovered database name registry.
+
+**Why this matters**: `open_database(Some(&txn), name, ...)` logs a `NameLNTxn`
+entry with `Provisional::Yes` inside the creating transaction. If that
+transaction is rolled back (explicit abort or crash-before-commit), the database
+name must not survive recovery. The mapping-tree undo pass removes any
+`NameLNTxn` whose creating transaction ID is absent from `committed_txns`.
+
+**Invariant**: after this pass, the database name registry contains only
+databases whose creation was committed. No data-LN redo occurs for a database
+whose creation was rolled back.
+
+This is Noxu’s simplified equivalent of JE’s `buildTree()` phases A–D, which
+walk a separate on-disk `_jeNameTree` B-tree. Noxu uses a `HashMap` for the
+catalog, so the structural MapLN undo pass is replaced by a targeted name-map
+fixup.
 
 ## Phase 3 — Replay and Undo LNs
 

@@ -7,17 +7,27 @@
 //!
 //! Production code under model:
 //!   - `crates/noxu-recovery/src/recovery_manager.rs`
-//!   - `crates/noxu-recovery/src/transaction_table.rs`
-//!   - `crates/noxu-recovery/src/dirty_page_table.rs`
+//!   - `crates/noxu-recovery/src/analysis_result.rs`   (≈ ARIES transaction table)
+//!   - `crates/noxu-recovery/src/dirty_in_map.rs`       (≈ ARIES dirty page table)
 //!
-//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
-//! production phases (analysis, redo, undo) are unchanged. The
-//! Wave 11-F update strengthens `IdempotentReplay`: the model now
-//! snapshots `materialised` after the first redo into
-//! `materialised_after_first_redo` and asserts the snapshot equals
-//! the post-RedoAgain materialisation, so the property is a true
-//! invariant under repeated redo runs (production rewinds the WAL
-//! head if recovery is interrupted; idempotent replay must hold).
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! The production phases (analysis, redo, undo) are unchanged.
+//! IdempotentReplay and AllAndOnlyCommitted still hold for the modelled
+//! protocol.
+//!
+//! NOTE: Wave 11-U / 11-Y (C-6) added a mapping-tree undo pass between
+//! analysis and data-LN redo for multi-DB environments. This pass enforces
+//! the invariant: "after recovery, the database name registry contains only
+//! databases whose creation was committed."
+//!
+//! TODO: model CatalogConsistency (C-6) — a `CatalogConsistency` property
+//! analogous to `AllAndOnlyCommitted` but for NameLNTxn entries would
+//! catch bugs in the undo predicate (e.g. a predicate that fails to remove
+//! aborted database registrations). The mapping-tree undo pass is not yet
+//! modelled here; the production correctness relies on the unit tests in
+//! `recovery_manager.rs::test_c6_mapping_tree_undo_*` and the integration
+//! test `test_c6_aborted_db_creation_not_recovered`. Tracked as a follow-up
+//! spec update.
 //!
 //! Properties:
 //!   - `AllAndOnlyCommitted` — after recovery, the live tree

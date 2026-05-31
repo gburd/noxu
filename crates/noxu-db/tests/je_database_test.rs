@@ -598,9 +598,9 @@ fn multi_env_open_close_test_multi_open_close() {
 // database must fail (IllegalArgumentException in JE).  The non-txnal db
 // sits inside a transactional env in both cases.
 //
-// TODO(bug): Noxu currently permits this combination,
-// returning Ok(cursor) instead of Err.  Routed to a follow-up bug-fix wave.
-// See docs/src/internal/wave-11-g-je-tck-longtail.md.
+// Regression guard: was a bug (Noxu incorrectly permitted opening a
+// transactional cursor on a non-transactional database, returning Ok instead
+// of Err). Fixed in commit 90918c5; retained as a regression guard.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -634,13 +634,9 @@ fn database_txn_cursor_on_non_txn_db_rejected() {
 // putNoOverwrite again returns KEYEXISTS (because the key already has any
 // data).  Delete then re-putNoOverwrite returns SUCCESS.
 //
-// TODO(bug): Noxu's `put_no_overwrite` on sorted-dup
-// databases uses the (key, data) pair to determine "already exists" —
-// same semantics as `put_no_dup_data`.  JE's `putNoOverwrite` is key-only:
-// once *any* dup exists for that key, a second `putNoOverwrite` of the
-// same key (regardless of data) must return KEYEXIST.  See `put_dup` in
-// `crates/noxu-dbi/src/cursor_impl.rs` (PutMode::NoDupData | NoOverwrite
-// arm).  Routed to a follow-up bug-fix wave.
+// Regression guard: was a bug (put_no_overwrite on sorted-dup databases
+// incorrectly used (key,data) pair semantics instead of key-only semantics).
+// Fixed in commit e21effb; retained as a regression guard.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -801,13 +797,9 @@ fn database_close_idempotent() {
 // still readable through a read-only DB handle, and `count()` still returns
 // the previously-committed record count.
 //
-// TODO(bug): Noxu's database-name registry is not
-// preserved across a clean close+reopen when the reopen is read-only
-// (`DatabaseNotFound: 'db1' does not exist and allow_create is false`).
-// See sibling `multi_env_open_close_test_multi_open_close` for the same
-// gap when reopening read-write — it side-steps with allow_create=true,
-// but read-only cannot use that escape hatch.  Routed to a follow-up
-// bug-fix wave.
+// Regression guard: was a bug (database-name registry was not preserved
+// across a clean close+reopen in read-only mode). Fixed in commit d9bc4c1;
+// retained as a regression guard.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -912,15 +904,11 @@ fn environment_checkpoint_forces_durability() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// `env.checkpoint(None)` invoked after a committed write and before the
-// env is dropped causes the most recently committed records to be lost on
-// the next open.  This is a real Noxu regression — the invariant
-// (committed data is durable, regardless of when checkpoint runs) holds
-// in JE and must hold in Noxu too.
-//
-// TODO(bug): tracked at
-// docs/src/internal/wave-11-g-je-tck-longtail.md.  Routed to a follow-up
-// bug-fix wave.
+// Regression guard: `env.checkpoint(None)` after a committed write must NOT
+// lose recently committed records on the next open. Was a real Noxu bug:
+// the invariant (committed data is durable, regardless of when checkpoint
+// runs) held in JE but was violated here. Fixed in commit 81c1f42; retained
+// as a regression guard.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]

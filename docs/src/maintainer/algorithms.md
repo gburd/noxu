@@ -36,12 +36,16 @@ increase on concurrent write workloads.
 **Reference**: Gray & Reuter, *Transaction Processing: Concepts and Techniques*,
 Chapter 9.
 
-## Three-Phase Recovery
+## Recovery Protocol
 
 **Source**: `crates/noxu-recovery/src/recovery_manager.rs`
 
 1. **Find end of log**: scan backward, validate CRC32
 2. **Build tree from checkpoint**: read `CheckpointEnd → root_lsn`, reconstruct INs/BINs
+2b. **Mapping-tree undo** (multi-DB only, C-6): for each `NameLNTxn` entry whose
+    `txn_id` did not commit, remove the database registration before data-LN
+    redo. Prevents data recovery for databases whose creation was rolled back.
+    Run only in `recover_all()`; single-DB `recover()` has no catalog entries.
 3. **Redo committed / undo uncommitted**: scan from `first_active_lsn`
 
 **Reference**: Noxu DB Architecture Notes; Ramakrishnan & Gehrke, Chapter 18.
@@ -65,8 +69,10 @@ Merge-Tree (LSM-Tree)", *Acta Informatica* 1996.
 `waiter_graph: Mutex<HashMap<i64, Vec<i64>>>` maps waiter→[owner_ids it is blocked by].
 Maintained incrementally (O(1) per lock acquisition/release).
 
-Cycle detection: DFS from each node. Youngest transaction (by txn_id) in the
-cycle is selected as victim. `NoxuError::LockDeadlock` returned to victim.
+Cycle detection: DFS from each node. Victim is the locker holding the
+fewest locks (primary criterion, computed via `compute_lock_counts()` — O(shards)
+on the rare cycle path); ties are broken by youngest locker ID (highest ID).
+`NoxuError::LockDeadlock` returned to victim.
 
 **Reference**: Bernstein, Hadzilacos & Goodman, *Concurrency Control and
 Recovery in Database Systems*, Chapter 2.

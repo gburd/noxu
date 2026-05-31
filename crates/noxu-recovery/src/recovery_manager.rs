@@ -1,7 +1,10 @@
 //! Main recovery manager for Noxu DB.
 //!
 //!
-//! Performs 3-phase recovery when an Environment is opened:
+//! Performs crash recovery when an Environment is opened.  Single-database
+//! environments use 3-phase recovery (analysis → redo → undo).  Multi-database
+//! environments (`recover_all`) add a catalog-consistency pass between analysis
+//! and data-LN redo (C-6 mapping-tree undo pass).
 //!
 //! ## Phase 1 — Analysis
 //! Scan the log forward from the last checkpoint.  Build:
@@ -150,7 +153,7 @@ pub struct RecoveryStats {
     /// Number of aborted transactions found.
     pub aborted_txns: u64,
     /// Number of prepared (XA in-doubt) transactions found in the log.
-    /// Wave 3-2 of the v1.5+ remediation plan.
+    /// Surfaced to the environment layer for XA in-doubt recovery.
     pub prepared_txns: u64,
     /// Number of active (uncommitted) transactions that were undone.
     pub active_txns_undone: u64,
@@ -171,11 +174,12 @@ pub struct RecoveryStats {
 /// records eliminates the repeated small-buffer `Vec::new()` allocation
 /// inside `redo_ln` when temporary key/data work needs to be done.
 ///
-/// Wave 11-K optimisation (Fix 2).  In the current implementation the redo
-/// loop passes `Bytes`-backed `&[u8]` slices directly to `Tree::redo_insert`
-/// without materialising intermediate owned buffers, so the scratch is
-/// primarily a hook for future use and a documentation artefact that makes
-/// the zero-copy intent explicit.
+/// Pre-allocated scratch buffers for LN parsing.
+///
+/// In the current implementation the redo loop passes `Bytes`-backed `&[u8]`
+/// slices directly to `Tree::redo_insert` without materialising intermediate
+/// owned buffers, so the scratch is primarily a forward-compatibility hook
+/// and a zero-copy intent marker.
 #[derive(Debug, Default)]
 pub struct RecoveryScratch {
     /// Scratch buffer for key processing (cleared between records).
@@ -202,12 +206,12 @@ impl RecoveryScratch {
 // RecoveryManager
 // ============================================================================
 
-/// Performs 3-phase recovery when an Environment is opened.
+/// Recovery manager for Noxu DB.
 ///
-///
-///
-/// The manager is generic over a `LogScanner` implementation so that the real
-/// log-reading path and in-memory test fixtures share the same logic.
+/// Drives crash recovery when an Environment is opened.  Single-database
+/// environments use `recover()` (analysis → redo → undo).  Multi-database
+/// environments use `recover_all()` which adds the C-6 catalog-consistency
+/// (mapping-tree undo) pass between analysis and data-LN redo.
 pub struct RecoveryManager {
     /// Recovery info accumulated during processing.
     info: RecoveryInfo,
@@ -243,20 +247,18 @@ pub struct RecoveryManager {
     /// trees.  In Noxu the catalog is a `HashMap` so the B-tree undo/redo
     /// is replaced by a targeted name-map fixup.
     ///
-    /// # TODO (C-6 full implementation)
-    /// JE phases A–D (buildINs + undoLNs + redoLNs for the mapping tree)
-    /// are not yet fully replicated.  What IS guaranteed here:
+    /// # C-6 status (completed in wave-11-y)
+    /// `NameLN` entries are now written with a `txn_id` inside the creating
+    /// transaction (`NameLNTxn`, `Provisional::Yes`) via
+    /// `log_name_ln_txn` — so the undo predicate in `run_mapping_tree_undo_pass`
+    /// correctly fires on aborted database creations.
     ///
-    /// - NameLNs with a `txn_id` belonging to an aborted transaction are
-    ///   removed from `recovered_db_names` before data redo begins.
-    /// - All NameLN processing (analysis) finishes before any data LN redo.
-    ///
-    /// What is NOT yet implemented:
-    ///
-    /// - A full MapLN B-tree undo pass (requires a dedicated on-disk mapping
-    ///   tree, not just a HashMap).
-    ///
-    /// Tracked in: `docs/src/internal/wave-11-r-semantic.md` § C-6.
+    /// # Known gap (MapLN B-tree undo — follow-up wave)
+    /// A full MapLN B-tree undo pass (JE phases A–D on the `_jeNameTree`
+    /// B-tree) requires a dedicated on-disk mapping tree, not a `HashMap`.
+    /// The current implementation covers NameLNTxn undo only; the MapLN
+    /// structural undo is tracked as a future follow-up.
+    /// See: `docs/src/internal/wave-11-y-c6-endtoend.md`.
     pub(crate) mapping_tree_db_names: HashMap<String, u64>,
 }
 
@@ -328,8 +330,15 @@ impl RecoveryManager {
 
     /// Perform full 3-phase recovery using the supplied log scanner.
     ///
-    /// This is the main entry point.  It mirrors `RecoveryManager.recover()`
-    /// in the, orchestrating all five sub-phases.
+    /// This is the single-database entry point.  It mirrors `RecoveryManager.recover()`
+    /// in the reference implementation, orchestrating three phases: analysis, redo,
+    /// and undo.
+    ///
+    /// **Note on catalog (NameLN) entries**: this path is used for single-database
+    /// environments which have no catalog entries (NameLNs / MapLNs), so the
+    /// mapping-tree undo pass is omitted here. Multi-database environments use
+    /// `recover_all()`, which runs the catalog-consistency pass between analysis
+    /// and data-LN redo. See `run_mapping_tree_undo_pass` for details.
     ///
     /// # Arguments
     /// * `scanner` — Provides access to the log.
@@ -402,7 +411,7 @@ impl RecoveryManager {
         self.run_undo(scanner, &analysis, tree)?;
 
         // ------------------------------------------------------------------
-        // Wave 3-2: surface prepared (XA in-doubt) txns to the env layer.
+        // XA in-doubt recovery: surface prepared txns to the env layer.
         // ------------------------------------------------------------------
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
         self.info.recovered_prepared_txns =
@@ -416,14 +425,23 @@ impl RecoveryManager {
         Ok(self.info.clone())
     }
 
-    /// Multi-database 3-phase recovery.
+    /// Multi-database recovery with 4 logical phases.
     ///
-    /// Identical to `recover()` but accepts a `HashMap<u64, Tree>` keyed by
-    /// database ID.  During redo and undo, each LN is routed to the tree
-    /// whose key matches `rec.db_id`, rather than being gated on a single
+    /// Identical to `recover()` in structure but dispatches each LN to the
+    /// per-database tree whose key matches `rec.db_id`, rather than a single
     /// database.  New `db_id` values encountered in the log are auto-inserted
     /// into `trees` (with max_entries=256) so that all databases discovered
     /// during recovery are fully reconstructed.
+    ///
+    /// The four phases are:
+    /// 1. **Analysis** — build dirty-IN map and transaction sets
+    /// 2. **Mapping-tree undo** (C-6 catalog-consistency pass) — remove aborted
+    ///    NameLNTxn entries from the recovered database name registry BEFORE data
+    ///    redo begins.  This ensures that databases whose creation was rolled back
+    ///    are never reconstructed from data-LN redo.  Only `recover_all` runs
+    ///    this pass; single-DB `recover()` has no catalog entries to undo.
+    /// 3. **Redo** — replay committed LNs into each per-database tree
+    /// 4. **Undo** — reverse uncommitted LNs
     ///
     /// Mirrors `DbTree.dbIdToDb`: the map is populated during the analysis phase
     /// and every redo / undo entry is dispatched to the correct per-database tree.
@@ -513,7 +531,7 @@ impl RecoveryManager {
         // Auto-insert trees for any db_id encountered in the redo entries.
         // DbTree.dbIdToDb is populated during analysis.
         //
-        // Wave 11-K (Fix 3): call hint_redo_capacity on each new tree so
+        // Recovery alloc optimisation: call hint_redo_capacity on each new tree so
         // that redo_insert pre-allocates the initial BIN at
         // min(count, max_entries) capacity, eliminating Vec-resize doublings.
         for (_lsn, rec) in &self.redo_entries {
@@ -554,7 +572,7 @@ impl RecoveryManager {
         self.info.rollback_matchpoint_lsn =
             self.rollback_tracker.safe_matchpoint_lsn().map(|lsn| lsn.as_u64());
 
-        // Wave 3-2: surface prepared (XA in-doubt) txns to the env layer.
+        // XA in-doubt recovery: surface prepared txns to the env layer.
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
@@ -588,14 +606,18 @@ impl RecoveryManager {
     /// The guarantee: no data-LN redo occurs for a database whose catalog
     /// entry was logged in an aborted transaction.
     ///
-    /// # TODO (C-6 full JE parity)
-    /// - Store NameLN `txn_id` in the WAL entry so recovery can distinguish
-    ///   committed vs. aborted NameLNs.  Currently NameLNs are logged with
-    ///   `txn_id = None` (non-transactional), so this pass can only remove
-    ///   entries that C-4 deferred (post-v3.0.0 WAL) — pre-C4 WAL entries
-    ///   remain unconditionally accepted.
-    /// - Implement a full MapLN B-tree undo (requires a dedicated mapping-tree
-    ///   database, tracked as a follow-up wave).
+    /// # C-6 status (write-path txn_id — completed in wave-11-y)
+    /// NameLNs are now written via `log_name_ln_txn` inside the creating
+    /// transaction with `Provisional::Yes`, so `recovered_db_txn_ids` is
+    /// populated for new-format WAL files and the undo predicate fires
+    /// correctly on aborted database creations.
+    ///
+    /// # Known gap (MapLN B-tree undo — follow-up wave)
+    /// A full MapLN B-tree undo (JE phases A–D on `_jeNameTree`) requires
+    /// a dedicated on-disk mapping tree, not a HashMap.  The current
+    /// implementation covers NameLNTxn undo only; the structural MapLN
+    /// pass is tracked as a future follow-up.
+    /// See: `docs/src/internal/wave-11-y-c6-endtoend.md`.
     pub(crate) fn run_mapping_tree_undo_pass(
         &mut self,
         analysis: &mut crate::analysis_result::AnalysisResult,
@@ -728,7 +750,7 @@ impl RecoveryManager {
                 if analysis.is_committed(txn_id) {
                     continue;
                 }
-                // Wave 3-2: skip prepared (XA in-doubt) txns; resolved
+                // XA in-doubt recovery: skip prepared txns; resolved
                 // through xa_commit / xa_rollback.
                 if analysis.is_prepared(txn_id) {
                     continue;
@@ -960,7 +982,7 @@ impl RecoveryManager {
         // Moving the LnRecord directly into `redo_entries` eliminates the
         // `bytes::owned_clone` / `owned_drop` allocation profile cost.
         //
-        // Wave 11-K optimisation (Fix 2).
+        // Recovery alloc optimisation:
         for pe in entries {
             let entry_lsn = pe.lsn;
             match pe.entry {
@@ -1145,7 +1167,8 @@ impl RecoveryManager {
     /// into the in-memory tree at resolution time, and so that the
     /// redo/undo phases can skip prepared LNs without further work.
     ///
-    /// Wave 3-2 of the v1.5+ remediation plan.
+    /// Part of XA in-doubt recovery: prepared txns are surfaced to the
+    /// environment layer for application-level resolution.
     fn collect_prepared_txn_lns(
         &self,
         analysis: &AnalysisResult,
@@ -1257,7 +1280,7 @@ impl RecoveryManager {
         // Track the count from the drain above.
         self.stats.ins_replayed += in_entries.len() as u64;
 
-        // ---- Wave 11-K (Fix 3): pre-warm BIN capacity before LN redo ----
+        // ---- Recovery alloc optimisation: pre-warm BIN capacity before LN redo ----
         //
         // If this is a single-database recovery, look up the per-db count
         // and call hint_redo_capacity on the tree before inserting.
@@ -1391,7 +1414,7 @@ impl RecoveryManager {
                 // still safe here because recovery runs before any new
                 // transactions are admitted.
                 //
-                // Wave 11-K (Fix 1): pass &[u8] slices directly instead of
+                // Recovery alloc optimisation: pass &[u8] slices directly instead of
                 // materialising two intermediate Vec<u8> (rec.key.to_vec() +
                 // rec.data.to_vec()).  The compressed key suffix and the data
                 // bytes are copied into the BinEntry exactly once inside
@@ -1562,7 +1585,7 @@ impl RecoveryManager {
                 if analysis.is_committed(txn_id) {
                     continue;
                 }
-                // Wave 3-2: skip prepared (XA in-doubt) transactions
+                // XA in-doubt recovery: skip prepared (XA in-doubt) transactions
                 // — the resolved_commit / resolved_abort path will
                 // either replay them into the tree (xa_commit) or
                 // discard them (xa_rollback).
