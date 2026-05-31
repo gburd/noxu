@@ -1,4 +1,4 @@
-error: unrecognised attribute on `#[entity(...)]`; only `name = "..."` is supported
+error: unrecognised attribute on `#[entity(...)]`; allowed keys: `name = "..."`, `crate = "..."`
  --> tests/ui/fail_unknown_entity_attr.rs:4:10
   |
 4 | #[entity(version = "wat")]

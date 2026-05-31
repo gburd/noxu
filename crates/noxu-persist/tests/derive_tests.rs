@@ -314,3 +314,100 @@ fn derived_secondary_helper_extractor_handles_option_none() {
     assert!(by_dept.keys_index().is_empty());
     assert!(!by_dept.contains(&0u64));
 }
+
+// ---------------------------------------------------------------------------
+// Standalone crate-override tests: #[entity(crate = "noxu_persist")]
+//
+// These tests use `noxu_persist` directly (no umbrella) with the
+// crate-path override attribute.  They document and verify the Wave FA
+// escape hatch for direct noxu-persist users.
+// ---------------------------------------------------------------------------
+
+/// Newtype PrimaryKey with `#[entity(crate = "noxu_persist")]` round-trips
+/// correctly when the generated code resolves to `::noxu_persist::…`
+/// instead of `::noxu::persist::…`.
+#[test]
+fn standalone_crate_override_newtype_primary_key_round_trip() {
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, PrimaryKey)]
+    #[entity(crate = "noxu_persist")]
+    struct StandaloneId(u64);
+
+    let key = StandaloneId(0xDEAD_BEEF);
+    let bytes = key.to_bytes();
+    assert_eq!(bytes.len(), 8); // delegates to u64 → 8 bytes
+    let decoded = StandaloneId::from_bytes(&bytes).unwrap();
+    assert_eq!(key, decoded);
+}
+
+/// Composite PrimaryKey with `#[entity(crate = "noxu_persist")]` encodes
+/// and decodes correctly.
+#[test]
+fn standalone_crate_override_composite_primary_key_round_trip() {
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, PrimaryKey)]
+    #[entity(crate = "noxu_persist")]
+    struct RegionKey {
+        region: String,
+        shard: u64,
+    }
+
+    let key = RegionKey { region: "eu-west-1".into(), shard: 7 };
+    let bytes = key.to_bytes();
+    let decoded = RegionKey::from_bytes(&bytes).unwrap();
+    assert_eq!(key, decoded);
+
+    // Truncated input must fail cleanly, not panic.
+    let result = RegionKey::from_bytes(&bytes[..3]);
+    assert!(matches!(result, Err(PersistError::SerializationError(_))));
+}
+
+/// `derive(Entity)` with `#[entity(crate = "noxu_persist")]` produces the
+/// correct entity name and primary-key accessor.
+#[test]
+fn standalone_crate_override_entity_derive_compiles_and_name_resolves() {
+    #[derive(Clone, Debug, PartialEq, Entity)]
+    #[entity(crate = "noxu_persist", name = "StandaloneWidget")]
+    struct Widget {
+        #[primary_key]
+        id: u64,
+        label: String,
+    }
+
+    assert_eq!(<Widget as Entity>::entity_name(), "StandaloneWidget");
+
+    let w = Widget { id: 5, label: "bolt".into() };
+    assert_eq!(*w.primary_key(), 5u64);
+}
+
+/// `derive(SecondaryKey)` with `#[entity(crate = "noxu_persist")]` emits
+/// the `SECONDARY_INDEXES` const and `open_*_index` helpers correctly.
+#[test]
+fn standalone_crate_override_secondary_key_metadata() {
+    #[derive(Clone, Debug, PartialEq, Entity, SecondaryKey)]
+    #[entity(crate = "noxu_persist")]
+    struct Product {
+        #[primary_key]
+        sku: u64,
+        #[secondary_key(name = "by_category", relate = ManyToOne)]
+        category: String,
+        #[secondary_key(
+            name = "by_supplier",
+            relate = ManyToOne,
+            related_entity = "Supplier",
+            on_related_entity_delete = Cascade
+        )]
+        supplier_id: Option<u64>,
+    }
+
+    let specs = Product::SECONDARY_INDEXES;
+    assert_eq!(specs.len(), 2);
+
+    let cat = specs.iter().find(|s| s.name == "by_category").unwrap();
+    assert_eq!(cat.relate, Relate::ManyToOne);
+    assert_eq!(cat.related_entity, None);
+    assert_eq!(cat.on_related_entity_delete, DeleteAction::Abort);
+
+    let sup = specs.iter().find(|s| s.name == "by_supplier").unwrap();
+    assert_eq!(sup.relate, Relate::ManyToOne);
+    assert_eq!(sup.related_entity, Some("Supplier"));
+    assert_eq!(sup.on_related_entity_delete, DeleteAction::Cascade);
+}

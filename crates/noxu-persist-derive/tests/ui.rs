@@ -13,6 +13,8 @@ fn ui_compile_fail_and_pass() {
     t.pass("tests/ui/pass_basic_entity.rs");
     t.pass("tests/ui/pass_secondary_with_options.rs");
     t.pass("tests/ui/pass_composite_primary_key.rs");
+    t.pass("tests/ui/pass_crate_override_standalone.rs");
+    t.pass("tests/ui/pass_crate_override_composite_key.rs");
     t.compile_fail("tests/ui/fail_missing_primary_key.rs");
     t.compile_fail("tests/ui/fail_two_primary_keys.rs");
     t.compile_fail("tests/ui/fail_invalid_relate.rs");
