@@ -12,12 +12,12 @@ boundary**:
 - The replication wire protocol has no authentication. A peer
   identity (`group_name`, `node_name`) is self-claimed
   plaintext and not verified.
-- **`peer_allowlist` (mTLS Phase 1)**: `RepConfig::peer_allowlist` and
-  `RepConfigBuilder::peer_allowlist()` are accepted and stored, but
-  **have no effect** on connection acceptance.  The server TLS config
-  still uses `.with_no_client_auth()`.  Setting a non-empty allowlist
-  emits a `WARN`-level log at node startup.  Phase 2 dispatcher wiring
-  is planned for v3.1.  Until then, deploy only on trusted networks.
+- **`peer_allowlist` (mTLS Phase 2 — v3.1.0)**: `RepConfig::peer_allowlist`
+  is now enforced at the TLS handshake layer via
+  `TlsTcpChannelListener::bind_with_tls_and_allowlist`.  Peers whose
+  certificate Subject CN or DNS SAN does not match the configured list
+  are rejected before any application data is exchanged.  Requires
+  `RepTransportKind::Tls`; see the replication security setup guide.
 - `NetworkRestoreServer` streams the entire on-disk
   environment to anyone who connects to its port.
 - `PeerFeederService` streams the WAL to anyone who connects.

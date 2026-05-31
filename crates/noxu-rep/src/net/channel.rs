@@ -432,6 +432,21 @@ impl TcpChannelListener {
         Ok(Self { listener })
     }
 
+    /// Bind `addr`, configure TLS from `tls`, and enforce `allowlist`.
+    ///
+    /// This is the **mTLS enforcement constructor** (Phase 2, v3.1.0).  Only
+    /// available under the `tls-rustls` feature.
+    ///
+    /// The server will **require** a client certificate on every incoming
+    /// connection.  The cert must:
+    /// 1. Chain to a CA in `tls`'s trusted-cert roots, AND
+    /// 2. Have a Subject CN or DNS SAN that matches an entry in `allowlist`.
+    ///
+    /// A peer that fails either check is rejected during the TLS handshake,
+    /// before any application data is exchanged.
+    ///
+    /// # Errors
+    ///
     /// Return the local address the listener is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener
@@ -814,6 +829,23 @@ impl TlsTcpChannelListener {
             TlsAcceptorImpl::Native(a)
         };
         Ok(Self { listener, acceptor })
+    }
+
+    /// Propagates errors from
+    /// `TlsConfig::to_rustls_server_config_with_allowlist`, including:
+    /// - `allowlist` is empty (fail-closed: no peers admitted).
+    /// - `trusted_certs` is `SkipVerification` (no CA for chain validation).
+    /// - cert/key material cannot be parsed.
+    #[cfg(feature = "tls-rustls")]
+    pub fn bind_with_tls_and_allowlist(
+        addr: SocketAddr,
+        tls: &TlsConfig,
+        allowlist: crate::auth::PeerAllowlist,
+    ) -> Result<Self> {
+        let listener = TcpListener::bind(addr)
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        let cfg = tls.to_rustls_server_config_with_allowlist(allowlist)?;
+        Ok(Self { listener, acceptor: TlsAcceptorImpl::Rustls(cfg) })
     }
 
     /// Return the local address the listener is bound to.
