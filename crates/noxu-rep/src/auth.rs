@@ -15,7 +15,7 @@
 //!
 //! **Phase 1** added the allowlist matching logic in isolation.
 //! **Phase 2** (v3.1.0) wires the verifier through the rustls
-//! `ServerConfig` via [`PeerAllowlistVerifier`] and updates the
+//! `ServerConfig` via `PeerAllowlistVerifier` and updates the
 //! client config to present a client certificate.  Both changes
 //! are guarded by the `tls-rustls` feature flag.
 //!
@@ -169,7 +169,7 @@ pub(crate) fn extract_cert_names(cert_der: &[u8]) -> Vec<String> {
     try_extract_cert_names(cert_der).unwrap_or_default()
 }
 
-/// Public re-export of [`extract_cert_names`] for integration tests.
+/// Public re-export of `extract_cert_names` for integration tests.
 ///
 /// This function is only available under the `tls-rustls` feature and is
 /// intended for use in `tests/` integration tests that verify the DER
@@ -232,19 +232,17 @@ fn try_extract_cert_names(cert_der: &[u8]) -> Option<Vec<String>> {
         while let Some((0x30, atv, rest3)) = der_tlv(atvs) {
             atvs = rest3;
             // ATV: OID (0x06) + DirectoryString value.
-            if let Some((0x06, oid_bytes, val_rest)) = der_tlv(atv) {
-                // OID 2.5.4.3 (id-at-commonName) = 0x55 0x04 0x03.
-                if oid_bytes == [0x55, 0x04, 0x03] {
-                    if let Some((_vtag, vval, _)) = der_tlv(val_rest) {
-                        // Accept any DirectoryString variant:
-                        // UTF8String(0x0C), PrintableString(0x13),
-                        // TeletexString(0x14), IA5String(0x16), BMPString(0x1E).
-                        if let Ok(s) = std::str::from_utf8(vval) {
-                            if !s.is_empty() {
-                                names.push(s.to_ascii_lowercase());
-                            }
-                        }
-                    }
+            if let Some((0x06, oid_bytes, val_rest)) = der_tlv(atv)
+                && oid_bytes == [0x55, 0x04, 0x03]
+            {
+                // Accept any DirectoryString variant:
+                // UTF8String(0x0C), PrintableString(0x13),
+                // TeletexString(0x14), IA5String(0x16), BMPString(0x1E).
+                if let Some((_vtag, vval, _)) = der_tlv(val_rest)
+                    && let Ok(s) = std::str::from_utf8(vval)
+                    && !s.is_empty()
+                {
+                    names.push(s.to_ascii_lowercase());
                 }
             }
         }
@@ -287,9 +285,7 @@ fn try_extract_cert_names(cert_der: &[u8]) -> Option<Vec<String>> {
             }
             // Skip optional critical BOOLEAN (tag 0x01).
             let san_octet_rest = if ext_rest.first() == Some(&0x01) {
-                der_tlv(ext_rest)
-                    .map(|(_, _, r)| r)
-                    .unwrap_or(ext_rest)
+                der_tlv(ext_rest).map(|(_, _, r)| r).unwrap_or(ext_rest)
             } else {
                 ext_rest
             };
@@ -305,12 +301,11 @@ fn try_extract_cert_names(cert_der: &[u8]) -> Option<Vec<String>> {
             while let Some((gtag, gval, rest3)) = der_tlv(san_p) {
                 san_p = rest3;
                 // dNSName = [2] IMPLICIT IA5String, tag byte = 0x82.
-                if gtag == 0x82 {
-                    if let Ok(s) = std::str::from_utf8(gval) {
-                        if !s.is_empty() {
-                            names.push(s.to_ascii_lowercase());
-                        }
-                    }
+                if gtag == 0x82
+                    && let Ok(s) = std::str::from_utf8(gval)
+                    && !s.is_empty()
+                {
+                    names.push(s.to_ascii_lowercase());
                 }
             }
         }
@@ -380,8 +375,7 @@ impl PeerAllowlistVerifier {
             std::sync::Arc::new(rustls::crypto::ring::default_provider());
         let inner =
             rustls::server::WebPkiClientVerifier::builder_with_provider(
-                root_store,
-                provider,
+                root_store, provider,
             )
             .build()
             .map_err(|e| {

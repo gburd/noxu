@@ -41,25 +41,21 @@ impl TestPki {
     /// Generate a fresh self-signed CA.
     fn new() -> Self {
         let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "test-ca");
+        ca_params.is_ca =
+            rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "test-ca");
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
         let ca_cert_pem = ca_cert.pem().into_bytes();
-        Self {
-            ca_cert_pem,
-            ca_key_pair: ca_key,
-            ca_cert,
-        }
+        Self { ca_cert_pem, ca_key_pair: ca_key, ca_cert }
     }
 
     /// Sign a node certificate with the given DNS SANs.
     ///
     /// Returns `(cert_pem, key_pem)`.
     fn sign_node(&self, dns_names: &[&str]) -> (Vec<u8>, Vec<u8>) {
-        let sans: Vec<String> = dns_names.iter().map(|s| s.to_string()).collect();
+        let sans: Vec<String> =
+            dns_names.iter().map(|s| s.to_string()).collect();
         let node_key = rcgen::KeyPair::generate().unwrap();
         let node_params = rcgen::CertificateParams::new(sans).unwrap();
         let node_cert = node_params
@@ -72,11 +68,10 @@ impl TestPki {
     fn node_tls_config(&self, node_name: &str) -> TlsConfig {
         let (cert_pem, key_pem) = self.sign_node(&[node_name]);
         TlsConfig {
-            identity: TlsIdentity::PemBytes {
-                cert: cert_pem,
-                key: key_pem,
-            },
-            trusted_certs: TrustedCerts::CaBytes(vec![self.ca_cert_pem.clone()]),
+            identity: TlsIdentity::PemBytes { cert: cert_pem, key: key_pem },
+            trusted_certs: TrustedCerts::CaBytes(vec![
+                self.ca_cert_pem.clone(),
+            ]),
             server_name: node_name.to_string(),
         }
     }
@@ -86,14 +81,17 @@ impl TestPki {
     ///
     /// This separates the client identity (cert name) from the server it is
     /// connecting to.
-    fn client_tls_config(&self, cert_name: &str, connect_to: &str) -> TlsConfig {
+    fn client_tls_config(
+        &self,
+        cert_name: &str,
+        connect_to: &str,
+    ) -> TlsConfig {
         let (cert_pem, key_pem) = self.sign_node(&[cert_name]);
         TlsConfig {
-            identity: TlsIdentity::PemBytes {
-                cert: cert_pem,
-                key: key_pem,
-            },
-            trusted_certs: TrustedCerts::CaBytes(vec![self.ca_cert_pem.clone()]),
+            identity: TlsIdentity::PemBytes { cert: cert_pem, key: key_pem },
+            trusted_certs: TrustedCerts::CaBytes(vec![
+                self.ca_cert_pem.clone(),
+            ]),
             server_name: connect_to.to_string(),
         }
     }
@@ -101,8 +99,6 @@ impl TestPki {
 
 /// Short timeout for receive — keeps failing tests snappy.
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Very short timeout used when we *expect* no data to arrive.
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -137,9 +133,7 @@ fn admitted_peer_connects_and_exchanges_data() {
 
     let client = TlsTcpChannel::connect_with_tls(addr, &client_tls)
         .expect("client connect failed");
-    client
-        .send(b"hello from node-1")
-        .expect("client send failed");
+    client.send(b"hello from node-1").expect("client send failed");
 
     server_thread.join().expect("server thread panicked");
 }
@@ -162,7 +156,8 @@ fn rejected_peer_fails_at_handshake() {
     let addr = listener.local_addr().unwrap();
 
     // Client: cert with SAN "evil-peer.cluster" — NOT in the allowlist.
-    let client_tls = pki.client_tls_config("evil-peer.cluster", "server.cluster");
+    let client_tls =
+        pki.client_tls_config("evil-peer.cluster", "server.cluster");
 
     // The server thread should see an error (handshake abort).
     let server_thread = std::thread::spawn(move || {
@@ -233,7 +228,7 @@ fn foreign_ca_peer_is_rejected_despite_allowlisted_name() {
         },
         // Use the server_pki CA so client validates server cert, but the
         // foreign cert won't chain to server_pki — the server rejects it.
-        trusted_certs: TrustedCerts::CaBytes(vec![server_pki.ca_cert_pem.clone()]),
+        trusted_certs: TrustedCerts::CaBytes(vec![server_pki.ca_cert_pem]),
         server_name: "server.cluster".to_string(),
     };
 
@@ -250,8 +245,7 @@ fn foreign_ca_peer_is_rejected_despite_allowlisted_name() {
         }
     });
 
-    let result =
-        TlsTcpChannel::connect_with_tls(addr, &foreign_client_tls);
+    let result = TlsTcpChannel::connect_with_tls(addr, &foreign_client_tls);
     if let Ok(ch) = result {
         let _send = ch.send(b"foreign ca probe");
         std::thread::sleep(Duration::from_millis(50));
@@ -298,10 +292,7 @@ fn skip_verification_with_allowlist_errors() {
         &tls,
         allowlist,
     );
-    assert!(
-        result.is_err(),
-        "SkipVerification + allowlist must error, got Ok"
-    );
+    assert!(result.is_err(), "SkipVerification + allowlist must error, got Ok");
     let err = result.err().unwrap().to_string();
     assert!(
         err.contains("SkipVerification") || err.contains("CA"),
@@ -354,8 +345,7 @@ fn two_admitted_peers_connect_sequentially() {
         let client_tls = pki.client_tls_config(name, "server.cluster");
         let ch = TlsTcpChannel::connect_with_tls(addr, &client_tls)
             .unwrap_or_else(|e| panic!("connect as {name} failed: {e}"));
-        ch.send(probe)
-            .unwrap_or_else(|e| panic!("send as {name} failed: {e}"));
+        ch.send(probe).unwrap_or_else(|e| panic!("send as {name} failed: {e}"));
         // Wait for the server to confirm it received the message before
         // dropping the channel (avoids RST-before-data race).
         barrier.wait();
@@ -402,7 +392,8 @@ fn extract_cert_names_multiple_sans() {
     ];
     let ck = rcgen::generate_simple_self_signed(sans).unwrap();
     let names = extract_cert_names_for_test(ck.cert.der().as_ref());
-    for expected in ["primary.cluster", "secondary.cluster", "tertiary.cluster"] {
+    for expected in ["primary.cluster", "secondary.cluster", "tertiary.cluster"]
+    {
         assert!(
             names.iter().any(|n| n == expected),
             "expected '{expected}' in names, got: {names:?}"
