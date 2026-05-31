@@ -162,4 +162,5 @@ pub use subscription::{
     Subscription, SubscriptionCallback, SubscriptionConfig, SubscriptionState,
 };
 #[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
-pub use tls::TlsConfig;
+pub use auth::PeerAllowlist;
+pub use tls::{TlsConfig, TlsIdentity, TrustedCerts};
