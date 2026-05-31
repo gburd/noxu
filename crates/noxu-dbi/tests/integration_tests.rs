@@ -1179,14 +1179,17 @@ fn test_commit_pending_database_no_toctou() {
     };
     let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
 
-    let db_cfg = { let mut c = DatabaseConfig::new(); c.set_allow_create(true); c };
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
 
     // Simulate transactional database creation:
     // open with txn_id=42 → name goes to pending_names (not name_map)
     let txn_id: u64 = 42;
-    let _db_arc = env
-        .open_database_transactional("pending_db", &db_cfg, txn_id)
-        .unwrap();
+    let _db_arc =
+        env.open_database_transactional("pending_db", &db_cfg, txn_id).unwrap();
 
     // Database is not visible in committed names yet.
     assert!(
@@ -1222,11 +1225,14 @@ fn test_abort_pending_database() {
     };
     let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
 
-    let db_cfg = { let mut c = DatabaseConfig::new(); c.set_allow_create(true); c };
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
     let txn_id: u64 = 99;
-    let _db_arc = env
-        .open_database_transactional("aborted_db", &db_cfg, txn_id)
-        .unwrap();
+    let _db_arc =
+        env.open_database_transactional("aborted_db", &db_cfg, txn_id).unwrap();
 
     // Abort: name is removed from pending_names and db_map.
     env.abort_pending_database("aborted_db");
@@ -1259,14 +1265,18 @@ fn test_commit_pending_concurrent_open_no_duplicate_db_id() {
         run_in_compressor: false,
         ..DbiEnvConfig::default()
     };
-    let env = Arc::new(EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap());
+    let env =
+        Arc::new(EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap());
 
-    let db_cfg = { let mut c = DatabaseConfig::new(); c.set_allow_create(true); c };
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
     // Create the pending database in txn 1.
     let txn_id: u64 = 1;
-    let db_arc = env
-        .open_database_transactional("race_db", &db_cfg, txn_id)
-        .unwrap();
+    let db_arc =
+        env.open_database_transactional("race_db", &db_cfg, txn_id).unwrap();
     let committed_id = db_arc.read().get_id();
 
     // Barrier: both threads start at the same moment.
@@ -1277,12 +1287,9 @@ fn test_commit_pending_concurrent_open_no_duplicate_db_id() {
     let handle = std::thread::spawn(move || {
         bar2.wait();
         // This open may race with commit below.
-        let result = env2.open_database_transactional(
-            "race_db",
-            &{ let mut c = DatabaseConfig::new(); c.set_allow_create(true); c },
-            2,
-        );
-        result
+        let mut cfg = DatabaseConfig::new();
+        cfg.set_allow_create(true);
+        env2.open_database_transactional("race_db", &cfg, 2)
     });
 
     barrier.wait();
