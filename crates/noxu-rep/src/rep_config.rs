@@ -154,7 +154,7 @@ pub struct RepConfig {
     ///
     /// An empty list means no peers are admitted (`PeerAllowlistVerifier`
     /// returns an error at construction time, which surfaces as a
-    /// `RepError::ConfigError` from [`TlsConfig::to_rustls_server_config_with_allowlist`]).
+    /// `RepError::ConfigError` from `TlsConfig::to_rustls_server_config_with_allowlist`).
     /// This is intentional fail-closed behaviour: an empty allowlist is
     /// almost certainly a misconfiguration.
     ///

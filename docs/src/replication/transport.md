@@ -76,6 +76,86 @@ duplicate/corrupt injection (they trigger a `quinn-proto` assertion at
 the `Endpoint` and `Runtime`. `connect_with_token(token, addr, name)` reuses
 the endpoint for 0-RTT reconnect (no new TLS handshake required).
 
+## TLS Transport and mTLS Peer Enforcement (v3.1.0)
+
+`TlsTcpChannel` provides encrypted TCP replication.  Use the `tls-rustls`
+feature for a pure-Rust implementation (no system library dependency).
+
+### Quick setup (server)
+
+```rust
+use noxu_rep::{PeerAllowlist, TlsConfig, TlsIdentity, TrustedCerts};
+use noxu_rep::net::TlsTcpChannelListener;
+
+let server_tls = TlsConfig::for_replication(
+    TlsIdentity::PemFiles {
+        cert: "/etc/noxu/cert.pem".into(),
+        key:  "/etc/noxu/key.pem".into(),
+    },
+    TrustedCerts::CaFiles(vec!["/etc/noxu/ca.pem".into()]),
+    "node-1.cluster.example",
+)?;
+
+// mTLS enforcement: only listed peers admitted.
+let allowlist = PeerAllowlist::new([
+    "node-1.cluster.example",
+    "node-2.cluster.example",
+    "node-3.cluster.example",
+]);
+let listener = TlsTcpChannelListener::bind_with_tls_and_allowlist(
+    "0.0.0.0:5001".parse()?,
+    &server_tls,
+    allowlist,
+)?;
+```
+
+### Quick setup (client)
+
+```rust
+use noxu_rep::{TlsConfig, TlsIdentity, TrustedCerts};
+use noxu_rep::net::TlsTcpChannel;
+
+let client_tls = TlsConfig::for_replication(
+    TlsIdentity::PemFiles {
+        cert: "/etc/noxu/cert.pem".into(),
+        key:  "/etc/noxu/key.pem".into(),
+    },
+    TrustedCerts::CaFiles(vec!["/etc/noxu/ca.pem".into()]),
+    "node-2.cluster.example",  // server name to validate against
+)?;
+
+// Client automatically presents its certificate (mTLS client-auth).
+let channel = TlsTcpChannel::connect_with_tls(addr, &client_tls)?;
+```
+
+### How `peer_allowlist` enforcement works
+
+When `bind_with_tls_and_allowlist` is used, the server installs a
+`PeerAllowlistVerifier` (`rustls::server::danger::ClientCertVerifier`):
+
+1. **Chain validation** — client cert must chain to the configured CA.
+2. **Name check** — the cert's Subject CN and all DNS SANs are extracted.
+   At least one must match an entry in the allowlist
+   (case-insensitive, exact match, no wildcards).
+3. **Fail-closed** — an empty allowlist is rejected at construction time
+   with a `ConfigError`; a peer with no matching name fails the handshake.
+
+### Certificate requirements
+
+| Party | Must have | Notes |
+|-------|-----------|-------|
+| Server cert | SAN / CN matching `server_name` | Validated by client |
+| Client cert | SAN / CN in server's `peer_allowlist` | Validated by server |
+| Both certs | Signed by a common CA | Configured via `TrustedCerts::CaFiles` |
+
+### `tls-native` limitation
+
+The `tls-native` backend (OpenSSL/LibreSSL) does not support server-side
+client-cert verification (`native_tls::TlsAcceptorBuilder` has no such API).
+`bind_with_tls_and_allowlist` is only available under `tls-rustls`.
+If you attempt to use mTLS intent (non-empty `TrustedCerts`) with a
+`tls-native` server, construction returns a `ConfigError`.
+
 ## ReplicationChannel Trait
 
 Both transports implement:

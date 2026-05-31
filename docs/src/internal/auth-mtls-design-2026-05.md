@@ -1,11 +1,12 @@
 # Authentication via mTLS-by-default — Design
 
-Status: **draft, in flight.** This document describes the
-intended end-state for closing the auth-class blockers
-NA-1 / NA-2 / NA-3 / NA-5 / NA-6 / TLS-1 from
-`security-review-2026-05.md`. The final implementation is
-expected to land across multiple commits on the
-`chore/auth-mtls-by-default` branch.
+Status: **Phase 1 complete; Phase 2 landed in v3.1.0** on
+branch `fix/fb-mtls-phase2`.
+
+Phase 1 added the allowlist matching logic and the
+`PeerAllowlist` data structure.  Phase 2 wired
+`PeerAllowlistVerifier` into the rustls `ServerConfig` and
+enabled client-cert presentation in the rustls `ClientConfig`.
 
 ## Goal
 
@@ -86,23 +87,31 @@ Three coordinated changes:
   constructor; keep `insecure` available for now but
   document it as deprecated.
 
-### Phase 2 — Dispatcher integration
+### Phase 2 — Wire enforcement (v3.1.0) ✓ LANDED
 
-- Change `TcpServiceDispatcher` to require a `TlsConfig`.
-- Rename the plain-TCP constructor.
-- Wire `PeerAllowlistVerifier` through to the rustls config.
-- Update `ReplicatedEnvironment::new` and tests.
-- Backward-compat note: v1.5.0 peers cannot talk to v1.4.x
-  peers without coordination; document the migration path.
+- **`PeerAllowlistVerifier`** implemented in `auth.rs` as a
+  `rustls::server::danger::ClientCertVerifier`.  Chain validation
+  delegates to `WebPkiClientVerifier`; name check uses DER-parsed
+  CN + DNS SANs.  Empty allowlist = `ConfigError` at construction
+  (fail-closed).
+- **`TlsConfig::to_rustls_server_config_with_allowlist`** builds a
+  `ServerConfig` with client-cert verification enabled.
+- **`TlsTcpChannelListener::bind_with_tls_and_allowlist`** is the
+  enforcement entry-point for server listeners.
+- **Client-cert presentation**: `to_rustls_client_config` now calls
+  `with_client_auth_cert` for `PemFiles`/`PemBytes` identities.
+- **`known-limitations.md`** updated; Phase-1 inert warn removed.
+- **Tests**: 10 integration tests in
+  `crates/noxu-rep/tests/peer_allowlist_tls_test.rs`.
 
-### Phase 3 — Server-side verification + cleanup
+### Phase 3 — Full dispatcher integration (planned)
 
-- Make `ClientCertVerifier` actually run (currently
-  rustls server config is built with `with_no_client_auth`).
+- Wire `TlsTcpServiceDispatcher` (TLS-capable service dispatcher)
+  so `ReplicatedEnvironment::new` enforces the allowlist
+  automatically when `RepTransportKind::Tls` is configured.
 - Remove the deprecated `TlsConfig::insecure` alias.
-- Update the README and `known-limitations.md` to reflect
-  that replication is no longer "deploy only on a trusted
-  network" — assuming Phase 1 + Phase 2 both land.
+- Update the README to reflect deployment without trusted-network
+  requirement.
 
 ## API shape (target)
 

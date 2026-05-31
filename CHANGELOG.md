@@ -16,6 +16,23 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Security (Wave FB — mTLS Phase 2, v3.1.0)
+
+- **`peer_allowlist` enforcement** (`noxu-rep`): `RepConfig::peer_allowlist`
+  is now enforced at the TLS handshake layer.
+  `TlsTcpChannelListener::bind_with_tls_and_allowlist` installs a
+  `PeerAllowlistVerifier` (`rustls::server::danger::ClientCertVerifier`)
+  that rejects peers whose certificate Subject CN or DNS SAN is not in the
+  configured list.  This closes the "peer_allowlist is inert" re-audit trap
+  (mTLS Phase 1 honesty check removed).
+- **Client-cert presentation**: `TlsConfig::to_rustls_client_config` now
+  presents the client certificate for `PemFiles`/`PemBytes` identities,
+  enabling server-side verification without API changes.
+- Empty `peer_allowlist` is a `ConfigError` at construction (fail-closed).
+- New public API: `TlsTcpChannelListener::bind_with_tls_and_allowlist`,
+  `PeerAllowlist`, `TlsIdentity`, `TrustedCerts` re-exported from
+  `noxu_rep`.
+
 ### Fixed (Wave ZC — crash-safety + perf, v3.1.0 candidate)
 
 - **R-2 (regression)**: the `LogFlushTask` background daemon (added for

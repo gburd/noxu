@@ -832,7 +832,7 @@ impl TlsTcpChannelListener {
     }
 
     /// Propagates errors from
-    /// [`TlsConfig::to_rustls_server_config_with_allowlist`], including:
+    /// `TlsConfig::to_rustls_server_config_with_allowlist`, including:
     /// - `allowlist` is empty (fail-closed: no peers admitted).
     /// - `trusted_certs` is `SkipVerification` (no CA for chain validation).
     /// - cert/key material cannot be parsed.
@@ -845,10 +845,7 @@ impl TlsTcpChannelListener {
         let listener = TcpListener::bind(addr)
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
         let cfg = tls.to_rustls_server_config_with_allowlist(allowlist)?;
-        Ok(Self {
-            listener,
-            acceptor: TlsAcceptorImpl::Rustls(cfg),
-        })
+        Ok(Self { listener, acceptor: TlsAcceptorImpl::Rustls(cfg) })
     }
 
     /// Return the local address the listener is bound to.
