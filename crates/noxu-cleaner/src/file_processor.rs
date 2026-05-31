@@ -3323,8 +3323,7 @@ mod tests {
         let lookup = SharedTreeLookup::new(Arc::clone(&tree_arc), lm);
 
         // Migration must be aborted (Locked) — not use the stale log_lsn.
-        let outcome =
-            lookup.migrate_ln_slot(1, b"key1", log_lsn, log_lsn);
+        let outcome = lookup.migrate_ln_slot(1, b"key1", log_lsn, log_lsn);
         assert_eq!(
             outcome,
             MigrationOutcome::Locked,

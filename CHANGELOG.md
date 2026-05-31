@@ -110,6 +110,38 @@ for each breaking change.
 
 ### Detailed changes
 
+### Fixed (Wave ZC — crash-safety and performance, targeting v3.1.0)
+
+- **R-2 — `flush_no_sync()` no longer holds LWL during `pwrite64`**
+  (`noxu-log`): The background `LogFlushTask` daemon previously held the
+  log-write-latch (LWL) across all `pwrite64` kernel calls, blocking ALL
+  foreground transaction commits for the full I/O duration.  The fix snapshots
+  dirty-buffer data and EOL under the LWL, releases the LWL, then issues
+  `pwrite64` without the LWL.  See `docs/src/internal/wave-zc-crash-perf.md`
+  for the full correctness argument.
+- **R-1 — `flush_sync` reuses flush-pending Vec across calls** (`noxu-log`):
+  `LwlScratch` groups the entry-encoding scratch buffer (H-3 fix) and a
+  reusable flush-pending Vec (R-1 fix) inside the LWL mutex.  `flush_sync`
+  (hot commit path) retains Vec capacity between calls via `clear()`.
+- **R-7 — Cleaner migration aborts on WAL write failure** (`noxu-cleaner`):
+  `SharedTreeLookup::migrate_ln_slot` previously fell back to the original
+  (stale) `log_lsn` when `write_migration_ln()` failed, risking silent data
+  loss after the source file was cleaned.  Now returns `MigrationOutcome::Locked`
+  to abort the migration safely.
+- **R-3 — Recovered XA `TxnCommit` embeds real VLSN** (`noxu-db`,
+  `noxu-recovery`, `noxu-rep`): `write_txn_commit_for_recovered()` now
+  pre-allocates the VLSN before writing the WAL entry so the `dtvlsn` field is
+  non-NULL.  The X-14 VLSN rebuild during recovery now includes
+  TxnCommit-derived VLSNs, fixing the double-crash VLSN loss.
+- **R-5 — Non-transactional `NameLN` recovery invariant documented and
+  tested** (`noxu-recovery`): Confirmed that `NameLN` entries with
+  `txn_id=None` are correctly treated as committed by
+  `run_mapping_tree_undo_pass()`.  Added test pinning the invariant.
+- **P-1 — `FSyncGroup` thundering-herd eliminated** (`noxu-log`): Added
+  `work_done_atomic: AtomicBool` to `FSyncGroup`.  Waiters check the atomic
+  (Acquire) before acquiring the inner Mutex; after a completed fsync all N
+  waiters return immediately without a mutex race.
+
 ### Fixed (v3.0.0 — Wave 11-U recovery/checkpoint/cleaner/VLSN cluster)
 
 - **X-8 — Checkpointer no longer writes redundant empty BINDelta after evictor

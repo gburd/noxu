@@ -186,4 +186,5 @@
   - [Wave 11-U — recovery/checkpoint/cleaner/VLSN cluster fixes](internal/wave-11-u-recovery-cluster.md)
   - [Wave 11-X — XA/config/cache-budget fixes](internal/wave-11-x-config-xa-cluster.md)
   - [Wave 11-Y — C-6 end-to-end: NameLNTxn inside creating transaction](internal/wave-11-y-c6-endtoend.md)
+  - [Wave ZC — crash-safety and performance fixes (R-1,R-2,R-3,R-5,R-7,P-1,P-2)](internal/wave-zc-crash-perf.md)
   - [noxu umbrella crate (v3.0.1)](internal/noxu-umbrella.md)
