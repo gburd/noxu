@@ -82,7 +82,9 @@ pub use noxu_dbi::{
 /// without depending on the internal `noxu-recovery` crate directly.
 ///
 /// Closes reaudit-jonhoo #3.
-pub use noxu_recovery::{PreparedLnOperation, PreparedLnReplay, PreparedTxnInfo};
+pub use noxu_recovery::{
+    PreparedLnOperation, PreparedLnReplay, PreparedTxnInfo,
+};
 
 pub mod cache_mode;
 pub mod checkpoint_config;
