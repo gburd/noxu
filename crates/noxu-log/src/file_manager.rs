@@ -341,14 +341,9 @@ impl FileManager {
         file: &File,
         file_num: u32,
     ) -> Result<u32> {
-        #[cfg(unix)]
-        use std::os::unix::fs::FileExt as PosixFileExt;
-        #[cfg(windows)]
-        use std::os::windows::fs::FileExt as PosixFileExt;
-
-        // Read the header bytes
+        // Read the header bytes (cross-platform positioned read).
         let mut header_buf = vec![0u8; FILE_HEADER_SIZE];
-        file.read_exact_at(&mut header_buf, 0)?;
+        crate::posio::read_exact_at(file, &mut header_buf, 0)?;
 
         // Parse header
         let mut cursor = std::io::Cursor::new(header_buf);

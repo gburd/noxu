@@ -10,12 +10,7 @@ use noxu_sync::Mutex;
 use std::fs::File;
 use std::sync::Arc;
 
-// Positional I/O: maps to pread64 / pwrite64 on Linux (single syscall, no
-// seek needed).
-#[cfg(unix)]
-use std::os::unix::fs::FileExt as PosFileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as PosFileExt;
+use crate::posio;
 
 /// A file handle with latch protection for thread-safe I/O.
 ///
@@ -131,7 +126,7 @@ impl<'a> FileHandleGuard<'a> {
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-        Ok(PosFileExt::read_at(file, buf, offset)?)
+        Ok(posio::read_at(file, buf, offset)?)
     }
 
     /// Reads exactly `buf.len()` bytes from the file at the given offset.
@@ -143,7 +138,7 @@ impl<'a> FileHandleGuard<'a> {
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-        PosFileExt::read_exact_at(file, buf, offset)?;
+        posio::read_exact_at(file, buf, offset)?;
         Ok(())
     }
 
@@ -168,7 +163,7 @@ impl<'a> FileHandleGuard<'a> {
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
-        PosFileExt::write_all_at(file, buf, offset)?;
+        posio::write_all_at(file, buf, offset)?;
         Ok(buf.len())
     }
 
