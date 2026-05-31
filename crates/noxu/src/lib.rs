@@ -16,16 +16,29 @@
 //!
 //! ## Quick-start
 //!
-//! ```ignore
-//! use noxu::{Environment, EnvironmentConfig};
+//! ```no_run
+//! use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+//! use std::path::PathBuf;
 //!
+//! # fn main() -> noxu::Result<()> {
 //! let env = Environment::open(
-//!     EnvironmentConfig::new("/tmp/mydb".into()).with_allow_create(true)
+//!     EnvironmentConfig::new(PathBuf::from("/tmp/mydb"))
+//!         .with_allow_create(true)
+//!         .with_transactional(true),
 //! )?;
-//! let db = env.open_database(None, "kv", true)?;
+//! let db_config = DatabaseConfig::new()
+//!     .with_allow_create(true)
+//!     .with_transactional(true);
+//! let db = env.open_database(None, "kv", &db_config)?;
 //! let txn = env.begin_transaction(None)?;
-//! db.put(&txn, b"hello", b"world")?;
+//! db.put(
+//!     Some(&txn),
+//!     &DatabaseEntry::from_bytes(b"hello"),
+//!     &DatabaseEntry::from_bytes(b"world"),
+//! )?;
 //! txn.commit()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Feature flags
@@ -46,7 +59,7 @@
 //! `Entity`, `PrimaryKey`, and `SecondaryKey` are available directly
 //! through this crate:
 //!
-//! ```ignore
+//! ```no_run
 //! use noxu::persist::{Entity, SecondaryKey};
 //!
 //! #[derive(Clone, Entity, SecondaryKey)]

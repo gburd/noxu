@@ -1,6 +1,6 @@
 # Crate Guide
 
-All 19 crates in the Noxu DB workspace, with purpose, key files, critical
+All 22 crates in the Noxu DB workspace, with purpose, key files, critical
 types, and crate purpose.
 
 ## Phase 0 — Foundation
@@ -193,9 +193,17 @@ implement `Entity` (declaring the primary-key type and entity name) and
 an `EntitySerializer` (manual byte serialization) for their types.
 `PrimaryIndex<K, E>` and `SecondaryIndex<K, E>` provide typed CRUD and
 range scans on top of `Database`. Schema evolution mutations live in
-`src/evolve/` (`Renamer`, `Deleter`, `Converter`). There are no derive
-macros today — all wiring is by trait impl.
+`src/evolve/` (`Renamer`, `Deleter`, `Converter`). Derive macros are
+provided by `noxu-persist-derive` (see below) and re-exported by the `noxu`
+umbrella at `noxu::persist::*`.
 Key type: `EntityStore`.
+
+### `noxu-persist-derive`
+
+Procedural macro crate that provides `#[derive(Entity)]`, `#[derive(PrimaryKey)]`,
+and `#[derive(SecondaryKey)]`. These derive macros emit `::noxu::persist::` paths
+in generated code, so users must depend on the `noxu` umbrella crate (not
+`noxu-persist` alone). The umbrella re-exports the derives at `noxu::persist::*`.
 
 ## Phase 7b — Distributed Transactions
 
@@ -257,3 +265,33 @@ OpenTelemetry export without each crate growing its own observability
 dependency tree. Off by default — only pulled in when the consuming
 crate enables the `observability` (or `otel`) feature. No public API
 beyond a few thin wrappers; see `crates/noxu-observe/src/lib.rs`.
+
+### `noxu` (umbrella)
+
+The single user-facing crate. Re-exports the entire public API of all
+component crates under one name and version. Users add `noxu = "3"` to
+their `Cargo.toml` and receive everything: core engine, collections,
+persistence layer, XA, and optionally replication and observability via
+feature flags.
+
+The umbrella is also necessary for the `#[derive(Entity)]` / `#[derive(PrimaryKey)]`
+/ `#[derive(SecondaryKey)]` macros, because the generated code references
+`::noxu::persist::` paths.
+
+Key file: `crates/noxu/src/lib.rs` — all re-exports.
+
+### `noxu-spec`
+
+Stateright executable specifications for the protocols the engine implements.
+Each spec is a `cargo test` case; failures print a counterexample trace.
+Run with `make spec`.
+
+Covers: B+tree latching, Flexible Paxos elections, WAL group-commit,
+crash recovery (analysis/redo/undo), lock manager deadlock detection,
+VLSN streaming, master transfer, network restore, XA two-phase commit,
+cleaner safety, cache\u2194cleaner ordering.
+
+All specs carry a `VALIDATED-AS-OF` stamp (see spec headers) indicating
+the last version at which the spec was confirmed to match the production
+code. Re-run `make spec` when updating a modelled subsystem and update the
+stamp accordingly.

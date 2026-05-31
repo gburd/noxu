@@ -11,14 +11,21 @@
 //! > if you are extending the engine internals. Its API may change without a major
 //! > version bump.
 //!
+//! > **Note on derive macros**: `#[derive(Entity)]`, `#[derive(PrimaryKey)]`, and
+//! > `#[derive(SecondaryKey)]` emit `::noxu::persist::` paths in generated code.
+//! > They require the `noxu` umbrella crate — not `noxu-persist` alone — in your
+//! > dependency tree. Use `use noxu::persist::…` import paths in your code.
+//!
 //! Derive-macro-based entity persistence for Noxu DB.
 //!
 //! Direct Persistence Layer — provides trait-based entity-to-database
 //! mapping with a proc-macro derive shortcut.  Users can opt in to a
-//! derive-driven shape:
+//! derive-driven shape via the `noxu` umbrella crate:
 //!
-//! ```ignore
-//! use noxu_persist::{Entity, SecondaryKey};
+//! ```no_run
+//! // Depend on `noxu = "3"`, not `noxu-persist` directly.
+//! // The derive macros emit `::noxu::persist::` paths.
+//! use noxu::persist::{Entity, SecondaryKey};
 //!
 //! #[derive(Clone, Debug, Entity, SecondaryKey)]
 //! struct User {

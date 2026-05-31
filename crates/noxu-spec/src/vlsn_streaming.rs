@@ -9,12 +9,20 @@
 //!   - `crates/noxu-rep/src/stream/feeder.rs`
 //!   - `crates/noxu-rep/src/stream/peer_feeder.rs`
 //!   - `crates/noxu-rep/src/stream/replica_stream.rs`
-//!   - `crates/noxu-rep/src/vlsn.rs`
+//!   - `crates/noxu-rep/src/vlsn/mod.rs`
 //!   - `crates/noxu-rep/src/vlsn/persist.rs`
-//!     (audit finding F11: persists the VLSN index to
-//!     `<env_home>/vlsn.idx` so a clean shutdown + restart resumes
-//!     from the last persisted vlsn rather than forcing a full
-//!     network restore.)
+//!     (persists the VLSN index to `<env_home>/vlsn.idx` so a clean
+//!     shutdown + restart resumes from the last persisted vlsn rather
+//!     than forcing a full network restore.)
+//!
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! NOTE: Wave 11-U (X-2) caps VLSN persistence at the checkpoint end LSN:
+//! a VLSN may be written to the index only if its LSN is ≤ the most recent
+//! checkpoint end. This prevents the persisted VLSN from advancing past a
+//! checkpoint boundary that has not yet been written. The spec models the
+//! abstract monotone VLSN streaming protocol; the checkpoint-cap constraint
+//! is not yet modelled. The VlsnMonotone, NoOverflow, and AckTracksReceived
+//! properties still hold for the modelled protocol.
 //!
 //! # Variants
 //!

@@ -449,8 +449,28 @@ fn verify_bin_stub(
 ///
 /// # Returns
 ///
+/// Verify all databases in the environment for structural integrity.
+///
+/// **Stub — not yet implemented.** This function always returns a passing
+/// `VerifyResult` without performing any verification work. The `verify_btree`,
+/// `verify_log`, `verify_data_checksums`, and `repair` fields of `VerifyConfig`
+/// are accepted but have no effect. Do not rely on the result for production
+/// integrity checking.
+///
+/// See `docs/src/operations/known-limitations.md` for the current status.
+///
+/// # Arguments
+///
+/// * `config` - Configuration controlling what to verify.
+///
+/// # Returns
+///
 /// A `VerifyResult` containing any errors found and verification statistics.
 pub fn verify_environment(config: &VerifyConfig) -> VerifyResult {
+    log::warn!(
+        "verify_environment called but verification is not yet implemented; \
+         the result does not reflect a real integrity check"
+    );
     if config.verbose {
         log::info!("Starting environment verification");
         log::info!("  B-tree: {}", config.verify_btree);
@@ -470,11 +490,15 @@ pub fn verify_environment(config: &VerifyConfig) -> VerifyResult {
 
 /// Verify a specific database by name.
 ///
+/// **Stub — not yet implemented.** This function always returns a passing
+/// `VerifyResult` without performing any verification work. Do not rely on
+/// the result for production integrity checking.
+///
 /// When a live tree reference is available, call `verify_tree()` directly to
 /// perform full structural verification (key-range checks, LSN validity).
 /// This entry point validates database-level metadata without a tree handle.
 ///
-///
+/// See `docs/src/operations/known-limitations.md` for the current status.
 ///
 /// # Arguments
 ///
@@ -485,6 +509,10 @@ pub fn verify_environment(config: &VerifyConfig) -> VerifyResult {
 ///
 /// A `VerifyResult` containing any errors found and verification statistics.
 pub fn verify_database(db_name: &str, config: &VerifyConfig) -> VerifyResult {
+    log::warn!(
+        "verify_database({db_name}) called but verification is not yet implemented; \
+         the result does not reflect a real integrity check"
+    );
     if config.verbose {
         log::info!("Verifying database: {}", db_name);
     }

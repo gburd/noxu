@@ -121,9 +121,9 @@ fn truncate_then_write_succeeds_no_deadlock() {
 // JE invariant: truncate-then-recovery yields an empty DB; the truncate is
 // durable across a clean close+reopen.
 //
-// TODO(bug): Noxu's truncate_database is not
-// durable — after a clean close+reopen, the previously-truncated records
-// re-appear.  Routed to a follow-up bug-fix wave.
+// Regression guard: was a bug (truncate_database was not durable — after a
+// clean close+reopen, previously-truncated records reappeared). Fixed in
+// commit b947b34; retained as a regression guard.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
