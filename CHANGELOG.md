@@ -18,6 +18,9 @@ listed in [References](#references).
 
 ### Added (v3.1.0 candidate)
 
+- **Wave ZB: Re-audit reports archived** — four independent re-audit reports
+  (`reaudit-2026-05-{je,margo,keith,jonhoo}.md`) copied into
+  `docs/src/internal/` with a synthesis index.
 - **mTLS Phase 1 (design + foundation)** for replication: a `peer_allowlist`
   config field and an `auth` module are plumbed through `noxu-rep`. This is
   foundation only — the dispatcher does not yet enforce mTLS; enforcement is
@@ -28,6 +31,41 @@ listed in [References](#references).
   collections/bind, persist/xa) under `docs/src/internal/`.
 - **`noxu::Mutex` / `noxu::MutexGuard` re-export** — `noxu-db` now re-exports
   the `noxu_sync::Mutex` type that appears in its public API
+
+### Changed (Wave ZB, v3.1.0 candidate)
+
+- **Umbrella Quick-start example fixed** (`crates/noxu/src/lib.rs`): corrected
+  `open_database` third arg (`bool` -> `&DatabaseConfig`) and `db.put` arg
+  types; changed `\`\`\`ignore` to `\`\`\`no_run` so examples are compile-checked.
+- **README `db.get` call fixed** (`README.md`): removed spurious fourth arg;
+  `Database::get` takes 3 args.
+- **`noxu-persist` doc examples corrected**: use `noxu::persist::` import paths;
+  added derive-macro umbrella-dependency notice.
+- **`verify_environment` / `verify_database` stubs now honest**: emit a
+  `log::warn!` at call time and carry rustdoc noting they are stubs.
+- **Stale `TODO(bug)` comments updated** in 5 `noxu-db` test files: now say
+  "regression guard" (bugs fixed in commits 90918c5-b947b34).
+- **C-6 TODO comments updated** in `recovery_manager.rs`: stale wave-11-r link
+  updated to wave-11-y; write-path txn_id completion acknowledged; MapLN
+  B-tree undo documented as known gap.
+- **`recover()` / `recover_all()` docs updated**: documents the intentional
+  asymmetry (single-DB has no catalog entries; multi-DB runs the C-6
+  mapping-tree undo pass).
+- **`recovery.md` updated**: added Phase 2b (Mapping-Tree Undo Pass, C-6).
+- **`crate-guide.md` updated**: crate count 19 -> 22; added `noxu-persist-derive`,
+  `noxu` (umbrella), `noxu-spec` sections; removed false "no derive macros" claim.
+- **`algorithms.md` updated**: victim selection documents H-4 fix (fewest locks
+  primary; youngest tiebreaker); recovery section updated with mapping-tree undo.
+- **`design-decisions.md` updated**: fixed "Noxu and Noxu" in Decision 3;
+  removed stale `off_heap.rs` unsafe row; added Decisions 9 (umbrella + derive
+  coupling), 10 (`cache_size` total budget), 11 (mTLS Phase 2 not yet wired).
+- **Stateright spec stamps updated**: all 7 v2.4.0-stamped specs re-stamped to
+  v3.1.0 with per-spec notes; file citations in `recovery_three_phase.rs` and
+  `vlsn_streaming.rs` corrected.
+- **Workspace MSRV declared**: `rust-version = "1.85"` in `[workspace.package]`.
+- **Workspace lints strengthened**: `unsafe_op_in_unsafe_fn = "deny"`;
+  `clippy::undocumented_unsafe_blocks = "warn"`.
+- **Wave-reference comments cleaned** in `recovery_manager.rs`
   (`SecondaryDatabase::open` takes `Arc<Mutex<Database>>`). Callers can now
   name it as `noxu::Mutex` and no longer need a direct dependency on the
   internal `noxu-sync` crate. The `secondary` example was updated to

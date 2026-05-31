@@ -49,8 +49,8 @@ serialization protocol — complex, brittle, and not idiomatic Rust.
 The log format is an internal implementation detail; applications use the
 public API, not the log files.
 
-**Consequence**: Noxu tools cannot read Noxu log files. Migration between Noxu
-and Noxu requires an export/import step at the application level.
+**Consequence**: Noxu DB tools cannot read BDB-JE (`.jdb`) log files. Migration
+from BDB-JE to Noxu DB requires an export/import step at the application layer.
 
 ## 4. TupleSerdeBinding Uses Serde Binary Encoding
 
@@ -122,6 +122,60 @@ set of well-understood subsystems makes correctness easier to audit.
 |---|---|
 | `crates/noxu-sync/src/{raw_mutex,raw_rwlock,condvar,futex}.rs` | FFI to libc futex syscalls and `parking_lot` raw lock-API operations |
 | `crates/noxu-log/src/file_manager.rs` | Memory-mapped I/O for log files |
-| `crates/noxu-evictor/src/off_heap.rs` | Off-heap BIN storage |
 | `crates/noxu-rep/src/**` | Network I/O glue (TLS handshake, raw socket options) |
 | Single-line blocks in `noxu-latch`, `noxu-db`, `noxu-xa` | Each documented inline |
+
+## 9. Single Umbrella Crate (`noxu = "3"`)
+
+**Decision**: All component crates are accessible through a single `noxu`
+umbrella crate. `noxu-persist-derive` emits `::noxu::persist::` paths in
+generated code so derive-macro users must depend on `noxu` directly (not
+only on `noxu-persist`). Components remain individually publishable for
+engine-internal extension work.
+
+**Why**: Reduces dependency graph complexity for users; a single version pin
+captures the entire engine. Derive macro path coupling is a deliberate
+trade-off: it guarantees generated code always resolves against the
+user-visible umbrella namespace rather than an internal crate path.
+
+**Consequence**: Any user of `#[derive(Entity)]`, `#[derive(PrimaryKey)]`, or
+`#[derive(SecondaryKey)]` must have `noxu = "3"` in their `Cargo.toml`.
+A future escape hatch (`#[entity(crate = "...")]`, following the `serde`
+pattern) can relax this for users who depend on `noxu-persist` directly.
+
+## 10. `cache_size` = Total Memory Budget (v3.0, X-12)
+
+**Decision**: `EnvironmentConfig::with_cache_size(n)` sets the **total** memory
+ceiling for the environment: the Arbiter budget for the B-tree node pool is
+`n − log_buffer_total − off_heap_reserved` (floor: 1 MiB).
+
+**Why**: Matches JE semantics for `setCacheSize`. Users migrating from JE
+should not need to reason about sub-budget splits. Eliminates the previous
+surprise where log buffers and off-heap storage expanded silently beyond the
+configured cache ceiling.
+
+**Consequence (v3.0 breaking change from v2.x)**: Users who set a small
+`cache_size` with default log buffer settings may find the Arbiter
+initialized at the 1 MiB floor. Increase `cache_size` or reduce
+`log_num_buffers` × `log_buffer_size` to restore the previous balance.
+See `docs/src/operations/configuration.md` and `docs/src/operations/sizing.md`.
+
+## 11. mTLS Phase 1 Landed; Phase 2 (Peer Enforcement) Not Yet Merged
+
+**Decision**: mTLS infrastructure is implemented in phases. Phase 1 (v3.0.2)
+provides `TlsConfig::for_replication()`, `RepConfig::with_peer_allowlist()`,
+and `PeerAllowlistVerifier` (`ClientCertVerifier` + `ServerCertVerifier`).
+Phase 2 (planned: v3.1) wires `PeerAllowlistVerifier` to the
+`TcpServiceDispatcher` server config; until then the server still accepts
+unauthenticated connections (`with_no_client_auth()`).
+
+**Why phase 2 was deferred**: Integration with the QUIC multiplexer and the
+dispatcher required changes to the handshake flow that were descoped to keep
+the v3.0 release focused. The Phase 1 API surface was stabilized to let users
+prepare certificate infrastructure before Phase 2 lands.
+
+**Consequence**: Setting `with_peer_allowlist(…)` currently has **no effect on
+connection acceptance**. The allowlist is stored and validated structurally,
+but the verifier is not wired to the TLS stack. Deploy replication only on
+trusted networks until Phase 2 is merged. See
+`docs/src/operations/known-limitations.md`.

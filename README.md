@@ -65,7 +65,7 @@ fn main() -> noxu::Result<()> {
 
     // Auto-commit get.
     let mut result = DatabaseEntry::new();
-    let status = db.get(None, &key, &mut result, None)?;
+    let status = db.get(None, &key, &mut result)?;
     assert_eq!(status, OperationStatus::Success);
     assert_eq!(result.data(), b"world");
 

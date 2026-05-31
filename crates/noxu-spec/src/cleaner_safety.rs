@@ -11,15 +11,12 @@
 //!   - `crates/noxu-cleaner/src/file_processor.rs`
 //!   - `crates/noxu-cleaner/src/utilization_tracker.rs`
 //!
-//! VALIDATED-AS-OF: v2.4.0 — Wave 11-F audit confirmed the
-//! cleaner still performs a live-check immediately before deletion
-//! and the live-check is invalidated by any new `AcquireRef` that
-//! races with the cleaner; production does this via the protected
-//! file table and per-file reader counts in `FileProcessor`. The
-//! Wave 11-F update adds a second invariant `LiveCheckHonoured` so
-//! the model also catches a regression that performed a live-check
-//! and then deleted *without* re-checking the reader-ref vector at
-//! deletion time.
+//! VALIDATED-AS-OF: v3.1.0 — Re-stamped after Wave-ZB re-audit (2026-05-30).
+//! NOTE: Wave 11-U (X-7) added per-db secondary tree dispatch to cleaner
+//! migration. The spec models the abstract live-check → delete ordering
+//! which is unchanged. The per-db dispatch is not yet modelled.
+//! Properties NoLiveDelete and LiveCheckHonoured still hold for the modelled
+//! protocol.
 //!
 //! Properties:
 //!   - `NoLiveDelete` — a log file is never deleted while any reader

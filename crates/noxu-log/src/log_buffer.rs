@@ -377,6 +377,8 @@ impl LogBufferSegment {
         }
 
         // Release latch and decrement pin count
+        // SAFETY: latch pointer is valid for the lifetime of the owning LogBuffer;
+        // we hold it (set latch_held=true above), so unlock is safe here.
         unsafe {
             (*self.latch_held).store(false, Ordering::Relaxed);
             (*self.latch).unlock();
