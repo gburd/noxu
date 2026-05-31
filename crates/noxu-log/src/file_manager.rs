@@ -436,9 +436,10 @@ impl FileManager {
         // After fsync-ing the new file, fsync the parent directory so the
         // directory entry itself is durable.  Without this a power-loss between
         // file creation and the next directory write loses the file entirely.
-        let parent_dir = File::open(&self.env_dir)?;
-        parent_dir.sync_all()?;
-        drop(parent_dir);
+        // Cross-platform: real dir-fsync on Unix; best-effort on Windows
+        // (directory handle needs FILE_FLAG_BACKUP_SEMANTICS; NTFS journals
+        // the entry).  See `crate::posio::sync_dir`.
+        crate::posio::sync_dir(&self.env_dir)?;
 
         // Create handle
         let mut handle = FileHandle::new(file_num);
