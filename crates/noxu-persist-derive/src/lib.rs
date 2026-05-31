@@ -51,6 +51,37 @@
 //! | `@PrimaryKeyField` / `@KeyField` | `#[derive(PrimaryKey)]` (struct level for composite key types) |
 //! | `@SecondaryKey(name=…, relate=…, …)` | `#[secondary_key(name=…, relate=…, …)]` (field level, consumed by `SecondaryKey` derive) |
 //!
+//! # Crate-path escape hatch
+//!
+//! By default the generated code emits `::noxu::persist::…` paths, so
+//! the `noxu` umbrella crate must be in the dependency graph.  Users who
+//! depend on `noxu-persist` **directly** (without the umbrella) can
+//! override this with the `crate` key inside the `#[entity(…)]`
+//! container attribute:
+//!
+//! ```ignore
+//! // Cargo.toml: noxu-persist = "3"  (no noxu umbrella needed)
+//! use noxu_persist::{Entity, PrimaryKey, SecondaryKey};
+//!
+//! #[derive(Clone, PartialEq, Eq, Hash, PrimaryKey)]
+//! #[entity(crate = "noxu_persist")]
+//! struct UserId(u64);
+//!
+//! #[derive(Clone, Debug, Entity, SecondaryKey)]
+//! #[entity(crate = "noxu_persist")]
+//! struct User {
+//!     #[primary_key]
+//!     id: UserId,
+//!     #[secondary_key(name = "by_email", relate = OneToOne)]
+//!     email: String,
+//! }
+//! ```
+//!
+//! The `crate` key is accepted by all three derives via the
+//! `#[entity(crate = "…")]` form.  A string literal containing a valid
+//! Rust module path is required (validated at compile time); a malformed
+//! path produces a descriptive compile error.
+//!
 //! # Re-exports
 //!
 //! The `noxu-persist` crate re-exports all three derives so users only
@@ -60,6 +91,7 @@
 //! use noxu_persist::{Entity, PrimaryKey, SecondaryKey};
 //!
 //! #[derive(Clone, Debug, Entity, SecondaryKey)]
+//! #[entity(crate = "noxu_persist")]
 //! struct User {
 //!     #[primary_key]
 //!     id: u64,
@@ -76,9 +108,149 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
     Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Field, Fields,
-    GenericArgument, Lit, Meta, PathArguments, Token, Type, TypePath,
+    GenericArgument, Lit, Meta, Path, PathArguments, Token, Type, TypePath,
     parse_macro_input,
 };
+
+// ============================================================================
+// Crate-path helper
+// ============================================================================
+
+/// Parsed container-level `#[entity(…)]` attributes.
+struct EntityContainerAttrs {
+    /// Resolved entity name (either from `name = "…"` or struct ident).
+    name: String,
+    /// Crate root path for generated code (default: `::noxu::persist`).
+    krate: Path,
+}
+
+/// Parse ALL recognised keys in `#[entity(…)]` in a single pass:
+/// - `name = "…"` — entity name override
+/// - `crate = "…"` — crate-root path override (escape hatch for direct
+///   `noxu-persist` users; follows the `serde` `#[serde(crate = "…")]`
+///   pattern)
+///
+/// Unknown keys produce a compile error listing both valid keys.
+fn parse_entity_container_attrs(
+    attrs: &[Attribute],
+    fallback_ident: &syn::Ident,
+) -> syn::Result<EntityContainerAttrs> {
+    let mut name: Option<String> = None;
+    let mut krate: Option<Path> = None;
+
+    for attr in attrs {
+        if !attr.path().is_ident("entity") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                name = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("crate") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                let path = lit
+                    .parse_with(syn::Path::parse_mod_style)
+                    .map_err(|_| {
+                        syn::Error::new(
+                            lit.span(),
+                            format!(
+                                "`#[entity(crate = \"{v}\")]` is not a valid \
+                                 Rust module path; expected e.g. \
+                                 `\"noxu_persist\"` or `\"::noxu::persist\"`",
+                                v = lit.value(),
+                            ),
+                        )
+                    })?;
+                krate = Some(path);
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unrecognised attribute on `#[entity(...)]`; \
+                     allowed keys: `name = \"...\"`, `crate = \"...\"`",
+                ))
+            }
+        })?;
+    }
+
+    // Validate name is non-empty when explicitly set.
+    if let Some(ref n) = name {
+        if n.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`#[entity(name = \"\")]` is empty; entity names are \
+                 used as part of database names and must be non-empty",
+            ));
+        }
+    }
+
+    let name = name.unwrap_or_else(|| fallback_ident.to_string());
+    let krate = krate.unwrap_or_else(default_krate);
+
+    Ok(EntityContainerAttrs { name, krate })
+}
+
+/// Parse ONLY the `crate = "…"` key from `#[entity(…)]`.
+///
+/// Used by `derive(PrimaryKey)` and the crate-root extraction path for
+/// `derive(SecondaryKey)` when no full entity context is needed.
+/// `name = "…"` is silently accepted (not required by these derives) so
+/// that a struct carrying `#[entity(name = "…", crate = "…")]` compiles
+/// without extra boilerplate.
+fn parse_krate_from_entity_attr(attrs: &[Attribute]) -> syn::Result<Path> {
+    let mut krate: Option<Path> = None;
+
+    for attr in attrs {
+        if !attr.path().is_ident("entity") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                let path = lit
+                    .parse_with(syn::Path::parse_mod_style)
+                    .map_err(|_| {
+                        syn::Error::new(
+                            lit.span(),
+                            format!(
+                                "`#[entity(crate = \"{v}\")]` is not a valid \
+                                 Rust module path; expected e.g. \
+                                 `\"noxu_persist\"` or `\"::noxu::persist\"`",
+                                v = lit.value(),
+                            ),
+                        )
+                    })?;
+                krate = Some(path);
+                Ok(())
+            } else if meta.path.is_ident("name") {
+                // `name` is a valid Entity attr; skip it silently here.
+                let _: syn::LitStr = meta.value()?.parse()?;
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unrecognised attribute on `#[entity(...)]`; \
+                     allowed keys: `name = \"...\"`, `crate = \"...\"`",
+                ))
+            }
+        })?;
+        if krate.is_some() {
+            break;
+        }
+    }
+
+    Ok(krate.unwrap_or_else(default_krate))
+}
+
+/// The default generated-code crate root: `::noxu::persist`.
+///
+/// This keeps zero-annotation users (those depending on the `noxu`
+/// umbrella) working without any change.
+fn default_krate() -> Path {
+    syn::parse_str("::noxu::persist").expect("hardcoded default path is valid")
+}
 
 // ============================================================================
 // #[derive(Entity)]
@@ -96,6 +268,11 @@ use syn::{
 ///
 /// Field types must implement `Clone`; the primary-key field type must
 /// implement `noxu_persist::PrimaryKey`.
+///
+/// **Crate-path override**: add `#[entity(crate = "noxu_persist")]` to
+/// direct the generated `impl` to use `::noxu_persist::…` instead of
+/// `::noxu::persist::…`.  Required when depending on `noxu-persist`
+/// without the `noxu` umbrella crate.
 #[proc_macro_derive(Entity, attributes(entity, primary_key, secondary_key))]
 pub fn derive_entity(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -121,10 +298,11 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
         )
     })?;
 
-    let entity_name = entity_name_from_attrs(&input.attrs, struct_ident)?;
+    let EntityContainerAttrs { name: entity_name, krate } =
+        parse_entity_container_attrs(&input.attrs, struct_ident)?;
 
     Ok(quote! {
-        impl #impl_generics ::noxu::persist::Entity for #struct_ident #ty_generics #where_clause {
+        impl #impl_generics #krate::Entity for #struct_ident #ty_generics #where_clause {
             type PrimaryKey = #pk_ty;
 
             fn primary_key(&self) -> &#pk_ty {
@@ -157,7 +335,11 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
 /// The user must separately derive `Clone + PartialEq + Eq + Hash` to
 /// satisfy the `PrimaryKey` trait bounds; the macro does not emit those
 /// because they may interact with other custom impls.
-#[proc_macro_derive(PrimaryKey)]
+///
+/// **Crate-path override**: add `#[entity(crate = "noxu_persist")]` to
+/// the struct to direct generated code to `::noxu_persist::…` instead
+/// of `::noxu::persist::…`.
+#[proc_macro_derive(PrimaryKey, attributes(entity))]
 pub fn derive_primary_key(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand_primary_key(&input) {
@@ -170,6 +352,8 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let struct_ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) =
         input.generics.split_for_impl();
+
+    let krate = parse_krate_from_entity_attr(&input.attrs)?;
 
     let data = match &input.data {
         Data::Struct(s) => s,
@@ -187,10 +371,10 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
             let inner_ty = &unnamed.unnamed[0].ty;
             (
                 quote! {
-                    <#inner_ty as ::noxu::persist::PrimaryKey>::to_bytes(&self.0)
+                    <#inner_ty as #krate::PrimaryKey>::to_bytes(&self.0)
                 },
                 quote! {
-                    Ok(Self(<#inner_ty as ::noxu::persist::PrimaryKey>::from_bytes(bytes)?))
+                    Ok(Self(<#inner_ty as #krate::PrimaryKey>::from_bytes(bytes)?))
                 },
             )
         }
@@ -199,8 +383,8 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
             let n = unnamed.unnamed.len();
             let idxs = (0..n).map(syn::Index::from).collect::<Vec<_>>();
             let tys = unnamed.unnamed.iter().map(|f| &f.ty).collect::<Vec<_>>();
-            let to_bytes = composite_to_bytes_tuple(&idxs, &tys);
-            let from_bytes = composite_from_bytes_tuple(&idxs, &tys);
+            let to_bytes = composite_to_bytes_tuple(&idxs, &tys, &krate);
+            let from_bytes = composite_from_bytes_tuple(&idxs, &tys, &krate);
             (to_bytes, from_bytes)
         }
         Fields::Named(named) => {
@@ -210,8 +394,8 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 .map(|f| f.ident.as_ref().unwrap().clone())
                 .collect::<Vec<_>>();
             let tys = named.named.iter().map(|f| &f.ty).collect::<Vec<_>>();
-            let to_bytes = composite_to_bytes_named(&idents, &tys);
-            let from_bytes = composite_from_bytes_named(&idents, &tys);
+            let to_bytes = composite_to_bytes_named(&idents, &tys, &krate);
+            let from_bytes = composite_from_bytes_named(&idents, &tys, &krate);
             (to_bytes, from_bytes)
         }
         Fields::Unit => {
@@ -224,12 +408,12 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     Ok(quote! {
-        impl #impl_generics ::noxu::persist::PrimaryKey for #struct_ident #ty_generics #where_clause {
+        impl #impl_generics #krate::PrimaryKey for #struct_ident #ty_generics #where_clause {
             fn to_bytes(&self) -> ::std::vec::Vec<u8> {
                 #to_bytes_body
             }
 
-            fn from_bytes(bytes: &[u8]) -> ::noxu::persist::Result<Self> {
+            fn from_bytes(bytes: &[u8]) -> #krate::Result<Self> {
                 #from_bytes_body
             }
         }
@@ -239,10 +423,11 @@ fn expand_primary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
 fn composite_to_bytes_tuple(
     idxs: &[syn::Index],
     tys: &[&Type],
+    krate: &Path,
 ) -> TokenStream2 {
     let pieces = idxs.iter().zip(tys.iter()).map(|(i, ty)| {
         quote! {
-            let part = <#ty as ::noxu::persist::PrimaryKey>::to_bytes(&self.#i);
+            let part = <#ty as #krate::PrimaryKey>::to_bytes(&self.#i);
             buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
             buf.extend_from_slice(&part);
         }
@@ -257,6 +442,7 @@ fn composite_to_bytes_tuple(
 fn composite_from_bytes_tuple(
     idxs: &[syn::Index],
     tys: &[&Type],
+    krate: &Path,
 ) -> TokenStream2 {
     let n = idxs.len();
     let var_decls = (0..n).map(|i| {
@@ -265,15 +451,15 @@ fn composite_from_bytes_tuple(
         quote! {
             let len = read_u32(bytes, &mut pos)? as usize;
             check_remaining(bytes, pos, len)?;
-            let #var = <#ty as ::noxu::persist::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
+            let #var = <#ty as #krate::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
             pos += len;
         }
     });
     let var_uses = (0..n).map(|i| format_ident!("_part_{}", i));
     quote! {
-        fn read_u32(bytes: &[u8], pos: &mut usize) -> ::noxu::persist::Result<u32> {
+        fn read_u32(bytes: &[u8], pos: &mut usize) -> #krate::Result<u32> {
             if bytes.len() < *pos + 4 {
-                return Err(::noxu::persist::PersistError::SerializationError(
+                return Err(#krate::PersistError::SerializationError(
                     "short read decoding composite key length prefix".into(),
                 ));
             }
@@ -283,9 +469,9 @@ fn composite_from_bytes_tuple(
             *pos += 4;
             Ok(v)
         }
-        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> ::noxu::persist::Result<()> {
+        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> #krate::Result<()> {
             if bytes.len() < pos + need {
-                return Err(::noxu::persist::PersistError::SerializationError(
+                return Err(#krate::PersistError::SerializationError(
                     "short read decoding composite key field".into(),
                 ));
             }
@@ -300,10 +486,11 @@ fn composite_from_bytes_tuple(
 fn composite_to_bytes_named(
     idents: &[syn::Ident],
     tys: &[&Type],
+    krate: &Path,
 ) -> TokenStream2 {
     let pieces = idents.iter().zip(tys.iter()).map(|(name, ty)| {
         quote! {
-            let part = <#ty as ::noxu::persist::PrimaryKey>::to_bytes(&self.#name);
+            let part = <#ty as #krate::PrimaryKey>::to_bytes(&self.#name);
             buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
             buf.extend_from_slice(&part);
         }
@@ -318,19 +505,20 @@ fn composite_to_bytes_named(
 fn composite_from_bytes_named(
     idents: &[syn::Ident],
     tys: &[&Type],
+    krate: &Path,
 ) -> TokenStream2 {
     let var_decls = idents.iter().zip(tys.iter()).map(|(name, ty)| {
         quote! {
             let len = read_u32(bytes, &mut pos)? as usize;
             check_remaining(bytes, pos, len)?;
-            let #name = <#ty as ::noxu::persist::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
+            let #name = <#ty as #krate::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
             pos += len;
         }
     });
     quote! {
-        fn read_u32(bytes: &[u8], pos: &mut usize) -> ::noxu::persist::Result<u32> {
+        fn read_u32(bytes: &[u8], pos: &mut usize) -> #krate::Result<u32> {
             if bytes.len() < *pos + 4 {
-                return Err(::noxu::persist::PersistError::SerializationError(
+                return Err(#krate::PersistError::SerializationError(
                     "short read decoding composite key length prefix".into(),
                 ));
             }
@@ -340,9 +528,9 @@ fn composite_from_bytes_named(
             *pos += 4;
             Ok(v)
         }
-        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> ::noxu::persist::Result<()> {
+        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> #krate::Result<()> {
             if bytes.len() < pos + need {
-                return Err(::noxu::persist::PersistError::SerializationError(
+                return Err(#krate::PersistError::SerializationError(
                     "short read decoding composite key field".into(),
                 ));
             }
@@ -383,6 +571,10 @@ fn composite_from_bytes_named(
 ///
 /// Also emits `pub const SECONDARY_INDEXES: &'static [SecondarySpec]` on
 /// the struct, suitable for runtime introspection.
+///
+/// **Crate-path override**: add `#[entity(crate = "noxu_persist")]` to
+/// the struct to direct generated code to `::noxu_persist::…` instead
+/// of `::noxu::persist::…`.
 #[proc_macro_derive(
     SecondaryKey,
     attributes(secondary_key, primary_key, entity)
@@ -400,6 +592,8 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let (impl_generics, ty_generics, where_clause) =
         input.generics.split_for_impl();
     let fields = struct_fields(input)?;
+
+    let krate = parse_krate_from_entity_attr(&input.attrs)?;
 
     // Locate the primary-key field so we can type the helper signatures.
     let pk_field = find_primary_key_field(fields)?;
@@ -439,12 +633,12 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
         };
 
         let name_lit = &s.name;
-        let relate_tok = relate_to_tokens(&s.relate);
+        let relate_tok = relate_to_tokens(&s.relate, &krate);
         let related_tok = match &s.related_entity {
             Some(r) => quote! { ::std::option::Option::Some(#r) },
             None => quote! { ::std::option::Option::None },
         };
-        let action_tok = delete_action_to_tokens(&s.on_delete);
+        let action_tok = delete_action_to_tokens(&s.on_delete, &krate);
 
         helpers.push(quote! {
             #[doc = concat!(
@@ -454,14 +648,14 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
                  Auto-generated by `#[derive(SecondaryKey)]`.",
             )]
             pub fn #helper_name<'__pidx>(
-                primary: &mut ::noxu::persist::PrimaryIndex<'__pidx, #pk_ty, Self>,
-            ) -> ::noxu::persist::SecondaryIndex<#sk_ty, #pk_ty, Self> {
+                primary: &mut #krate::PrimaryIndex<'__pidx, #pk_ty, Self>,
+            ) -> #krate::SecondaryIndex<#sk_ty, #pk_ty, Self> {
                 primary.open_secondary_index(#extractor)
             }
         });
 
         spec_consts.push(quote! {
-            ::noxu::persist::SecondarySpec {
+            #krate::SecondarySpec {
                 name: #name_lit,
                 relate: #relate_tok,
                 related_entity: #related_tok,
@@ -477,7 +671,7 @@ fn expand_secondary_key(input: &DeriveInput) -> syn::Result<TokenStream2> {
             /// Compile-time metadata for every `#[secondary_key(...)]` field
             /// declared on this entity.  Auto-generated by
             /// `#[derive(SecondaryKey)]`.
-            pub const SECONDARY_INDEXES: &'static [::noxu::persist::SecondarySpec; #n] = &[
+            pub const SECONDARY_INDEXES: &'static [#krate::SecondarySpec; #n] = &[
                 #(#spec_consts),*
             ];
 
@@ -537,43 +731,6 @@ fn find_primary_key_field(
              annotated `#[primary_key]` on a `#[derive(Entity)]` struct",
         )
     })
-}
-
-fn entity_name_from_attrs(
-    attrs: &[Attribute],
-    fallback_ident: &syn::Ident,
-) -> syn::Result<String> {
-    for attr in attrs {
-        if !attr.path().is_ident("entity") {
-            continue;
-        }
-        // `#[entity(name = "Foo")]`
-        let mut name: Option<String> = None;
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                name = Some(lit.value());
-                Ok(())
-            } else {
-                Err(meta.error(
-                    "unrecognised attribute on `#[entity(...)]`; \
-                                only `name = \"...\"` is supported",
-                ))
-            }
-        })?;
-        if let Some(n) = name {
-            if n.is_empty() {
-                return Err(syn::Error::new(
-                    attr.span(),
-                    "`#[entity(name = \"\")]` is empty; entity names are \
-                     used as part of database names and must be non-empty",
-                ));
-            }
-            return Ok(n);
-        }
-    }
-    Ok(fallback_ident.to_string())
 }
 
 #[derive(Clone)]
@@ -728,14 +885,14 @@ fn expr_to_ident_string(expr: &Expr) -> syn::Result<String> {
     }
 }
 
-fn relate_to_tokens(s: &str) -> TokenStream2 {
+fn relate_to_tokens(s: &str, krate: &Path) -> TokenStream2 {
     let id = format_ident!("{}", s);
-    quote! { ::noxu::persist::Relate::#id }
+    quote! { #krate::Relate::#id }
 }
 
-fn delete_action_to_tokens(s: &str) -> TokenStream2 {
+fn delete_action_to_tokens(s: &str, krate: &Path) -> TokenStream2 {
     let id = format_ident!("{}", s);
-    quote! { ::noxu::persist::DeleteAction::#id }
+    quote! { #krate::DeleteAction::#id }
 }
 
 /// Returns `(is_option, inner_ty_or_self)` for the supplied type.

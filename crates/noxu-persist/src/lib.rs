@@ -12,19 +12,25 @@
 //! > version bump.
 //!
 //! > **Note on derive macros**: `#[derive(Entity)]`, `#[derive(PrimaryKey)]`, and
-//! > `#[derive(SecondaryKey)]` emit `::noxu::persist::` paths in generated code.
-//! > They require the `noxu` umbrella crate — not `noxu-persist` alone — in your
-//! > dependency tree. Use `use noxu::persist::…` import paths in your code.
+//! > `#[derive(SecondaryKey)]` emit `::noxu::persist::` paths in generated code by
+//! > default, so the `noxu` umbrella crate must be present.  Users who depend on
+//! > `noxu-persist` directly (without the umbrella) can add
+//! > `#[entity(crate = "noxu_persist")]` to each struct to redirect generated
+//! > code to `::noxu_persist::…` instead — see the
+//! > [crate-path escape hatch](#crate-path-escape-hatch) section below.
 //!
 //! Derive-macro-based entity persistence for Noxu DB.
 //!
 //! Direct Persistence Layer — provides trait-based entity-to-database
-//! mapping with a proc-macro derive shortcut.  Users can opt in to a
-//! derive-driven shape via the `noxu` umbrella crate:
+//! mapping with a proc-macro derive shortcut.
+//!
+//! ## Umbrella usage (recommended)
+//!
+//! Most users depend on the `noxu` umbrella crate and use `noxu::persist`
+//! as their import path.  The derive macros default to emitting
+//! `::noxu::persist::…` paths, which works automatically:
 //!
 //! ```no_run
-//! // Depend on `noxu = "3"`, not `noxu-persist` directly.
-//! // The derive macros emit `::noxu::persist::` paths.
 //! use noxu::persist::{Entity, SecondaryKey};
 //!
 //! #[derive(Clone, Debug, Entity, SecondaryKey)]
@@ -36,8 +42,31 @@
 //! }
 //! ```
 //!
-//! The manual `impl Entity for User { … }` path is still supported and is
-//! described in the legacy section of `docs/src/collections/entity-persistence.md`.
+//! ## Crate-path escape hatch
+//!
+//! Users who add `noxu-persist` as a **direct** dependency (without the
+//! `noxu` umbrella) can add `#[entity(crate = "noxu_persist")]` to each
+//! annotated struct.  Generated code then uses `::noxu_persist::…` paths
+//! instead, and the umbrella crate is not required.
+//!
+//! ```ignore
+//! // Cargo.toml: noxu-persist = "3"  (no noxu umbrella)
+//! use noxu_persist::{Entity, SecondaryKey};
+//!
+//! #[derive(Clone, Debug, Entity, SecondaryKey)]
+//! #[entity(crate = "noxu_persist")]
+//! struct Widget {
+//!     #[primary_key]
+//!     id: u64,
+//!     #[secondary_key(name = "by_kind", relate = ManyToOne)]
+//!     kind: String,
+//! }
+//! ```
+//!
+//! The same `#[entity(crate = "…")]` attribute is recognised by all three
+//! derives: `Entity`, `PrimaryKey`, and `SecondaryKey`.  Any valid Rust
+//! module path is accepted; a malformed path produces a descriptive
+//! compile error.
 //!
 //! # Overview
 //!
