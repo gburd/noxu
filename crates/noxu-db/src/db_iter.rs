@@ -56,6 +56,8 @@ use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
 use crate::get::Get;
 use crate::operation_status::OperationStatus;
+use crate::transaction::Transaction;
+use std::marker::PhantomData;
 use std::ops::Bound;
 
 // ── DbIter ────────────────────────────────────────────────────────────────────
@@ -66,23 +68,29 @@ use std::ops::Bound;
 /// fetched one at a time (lazy) — the full database is **not** materialised
 /// into memory.
 ///
+/// The lifetime `'txn` ensures the iterator cannot outlive the transaction
+/// it was opened against.  This prevents use-after-commit bugs at compile
+/// time: the borrow checker rejects any code that commits or drops the
+/// transaction while `DbIter` is still alive.
+///
 /// # Drop behaviour
 ///
 /// Dropping the iterator closes the underlying cursor.  For transactional
 /// cursors this releases any shared read locks the cursor holds.
-pub struct DbIter {
+pub struct DbIter<'txn> {
     cursor: Cursor,
     started: bool,
     done: bool,
+    _txn: PhantomData<&'txn Transaction>,
 }
 
-impl DbIter {
+impl<'txn> DbIter<'txn> {
     pub(crate) fn new(cursor: Cursor) -> Self {
-        Self { cursor, started: false, done: false }
+        Self { cursor, started: false, done: false, _txn: PhantomData }
     }
 }
 
-impl Iterator for DbIter {
+impl<'txn> Iterator for DbIter<'txn> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -119,7 +127,10 @@ impl Iterator for DbIter {
 /// Returned by [`crate::Database::range`].  Holds a live [`crate::Cursor`] positioned at
 /// the first key ≥ `start_bound` and stops when the current key exceeds
 /// `end_bound`.  Records are fetched lazily — one per `next()` call.
-pub struct DbRange {
+///
+/// The lifetime `'txn` ensures the iterator cannot outlive the transaction
+/// it was opened against.  See [`DbIter`] for the rationale.
+pub struct DbRange<'txn> {
     cursor: Cursor,
     end_bound: Bound<Vec<u8>>,
     done: bool,
@@ -128,9 +139,10 @@ pub struct DbRange {
     start_key: Option<Vec<u8>>,
     /// When true, skip a record whose key exactly equals `start_key` (Excluded bound).
     exclude_start: bool,
+    _txn: PhantomData<&'txn Transaction>,
 }
 
-impl DbRange {
+impl<'txn> DbRange<'txn> {
     pub(crate) fn new(
         cursor: Cursor,
         start_bound: Bound<Vec<u8>>,
@@ -148,6 +160,7 @@ impl DbRange {
             positioned: false,
             start_key,
             exclude_start,
+            _txn: PhantomData,
         }
     }
 
@@ -160,7 +173,7 @@ impl DbRange {
     }
 }
 
-impl Iterator for DbRange {
+impl<'txn> Iterator for DbRange<'txn> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {

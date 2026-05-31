@@ -1158,3 +1158,175 @@ fn test_x12_arbiter_budget_subtracts_off_heap() {
          expected={expected_budget} actual={actual_budget}"
     );
 }
+
+// ── R-4 TOCTOU / O(N) scan fix tests ─────────────────────────────────────────
+
+/// Regression test for re-audit-keith R-4.
+///
+/// Verifies that `commit_pending_database` + `abort_pending_database` are
+/// correct and that the pending_names HashMap stores the db_id so no O(N)
+/// scan is needed.
+#[test]
+fn test_commit_pending_database_no_toctou() {
+    use noxu_dbi::{DatabaseConfig, DbiEnvConfig, EnvironmentImpl};
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
+
+    // Simulate transactional database creation:
+    // open with txn_id=42 → name goes to pending_names (not name_map)
+    let txn_id: u64 = 42;
+    let _db_arc =
+        env.open_database_transactional("pending_db", &db_cfg, txn_id).unwrap();
+
+    // Database is not visible in committed names yet.
+    assert!(
+        !env.get_database_names().contains(&"pending_db".to_string()),
+        "pending db should not appear in committed names before commit"
+    );
+
+    // Commit: name moves atomically from pending_names → name_map.
+    env.commit_pending_database("pending_db");
+
+    // Database is now visible.
+    assert!(
+        env.get_database_names().contains(&"pending_db".to_string()),
+        "committed db should appear in get_database_names()"
+    );
+
+    // Idempotent: calling commit again is a no-op.
+    env.commit_pending_database("pending_db");
+
+    env.close().unwrap();
+}
+
+#[test]
+fn test_abort_pending_database() {
+    use noxu_dbi::{DatabaseConfig, DbiEnvConfig, EnvironmentImpl};
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
+    let txn_id: u64 = 99;
+    let _db_arc =
+        env.open_database_transactional("aborted_db", &db_cfg, txn_id).unwrap();
+
+    // Abort: name is removed from pending_names and db_map.
+    env.abort_pending_database("aborted_db");
+
+    // Database is not visible.
+    assert!(
+        !env.get_database_names().contains(&"aborted_db".to_string()),
+        "aborted db should not appear in committed names"
+    );
+
+    // Idempotent abort.
+    env.abort_pending_database("aborted_db");
+
+    env.close().unwrap();
+}
+
+/// Concurrent test: a thread committing a pending database races with a
+/// thread trying to open the same name.  The concurrent open must either
+/// see the committed name or get DatabaseAlreadyExists — never create a
+/// duplicate DatabaseImpl with a different db_id.
+#[test]
+fn test_commit_pending_concurrent_open_no_duplicate_db_id() {
+    use noxu_dbi::{DatabaseConfig, DbiEnvConfig, EnvironmentImpl};
+    use std::sync::Barrier;
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+    let env =
+        Arc::new(EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap());
+
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
+    // Create the pending database in txn 1.
+    let txn_id: u64 = 1;
+    let db_arc =
+        env.open_database_transactional("race_db", &db_cfg, txn_id).unwrap();
+    let committed_id = db_arc.read().get_id();
+
+    // Barrier: both threads start at the same moment.
+    let barrier = Arc::new(Barrier::new(2));
+
+    let env2 = Arc::clone(&env);
+    let bar2 = Arc::clone(&barrier);
+    let handle = std::thread::spawn(move || {
+        bar2.wait();
+        // This open may race with commit below.
+        let mut cfg = DatabaseConfig::new();
+        cfg.set_allow_create(true);
+        env2.open_database_transactional("race_db", &cfg, 2)
+    });
+
+    barrier.wait();
+    env.commit_pending_database("race_db");
+
+    let concurrent_result = handle.join().unwrap();
+
+    // The concurrent open must either succeed (returning the same db_id)
+    // or return DatabaseAlreadyExists — never silently create a second one.
+    match concurrent_result {
+        Ok(arc) => {
+            // If it succeeded, it must have returned the same db_id.
+            assert_eq!(
+                arc.read().get_id(),
+                committed_id,
+                "concurrent open returned a different db_id — duplicate!"
+            );
+        }
+        Err(e) => {
+            // DatabaseAlreadyExists is the expected failure mode.
+            assert!(
+                e.to_string().contains("already exists")
+                    || e.to_string().contains("AlreadyExists"),
+                "unexpected error: {e}"
+            );
+        }
+    }
+
+    // Exactly one database named "race_db" exists.
+    assert_eq!(
+        env.get_database_names()
+            .iter()
+            .filter(|n| n.as_str() == "race_db")
+            .count(),
+        1,
+        "exactly one race_db should exist after concurrent commit"
+    );
+
+    env.close().unwrap();
+}

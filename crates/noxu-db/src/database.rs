@@ -1147,10 +1147,10 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error if the database is closed.
-    pub fn iter(
+    pub fn iter<'txn>(
         &self,
-        txn: Option<&Transaction>,
-    ) -> Result<crate::db_iter::DbIter> {
+        txn: Option<&'txn Transaction>,
+    ) -> Result<crate::db_iter::DbIter<'txn>> {
         let cursor = self.open_cursor(txn, None)?;
         Ok(crate::db_iter::DbIter::new(cursor))
     }
@@ -1185,11 +1185,11 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error if the database is closed.
-    pub fn range<K: AsRef<[u8]>>(
+    pub fn range<'txn, K: AsRef<[u8]>>(
         &self,
-        txn: Option<&Transaction>,
+        txn: Option<&'txn Transaction>,
         range: impl std::ops::RangeBounds<K>,
-    ) -> Result<crate::db_iter::DbRange> {
+    ) -> Result<crate::db_iter::DbRange<'txn>> {
         use std::ops::Bound;
         let map_bound = |b: std::ops::Bound<&K>| -> std::ops::Bound<Vec<u8>> {
             match b {

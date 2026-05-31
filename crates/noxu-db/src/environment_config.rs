@@ -155,33 +155,68 @@ pub struct EnvironmentConfig {
     // Environment behaviour flags
     // -----------------------------------------------------------------------
     /// Check for lock leaks when databases are closed.
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (false) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.
+    ///
     /// Mirrors `ENV_CHECK_LEAKS` / default true.
     pub env_check_leaks: bool,
 
     /// Force thread yields in critical sections (useful for testing fairness).
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (true) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.
+    ///
     /// Mirrors `ENV_FORCED_YIELD` / default false.
     pub env_forced_yield: bool,
 
     /// Use fair (FIFO-ordered) latches.  May reduce throughput under low
     /// contention but prevents starvation.
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (true) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.
+    ///
     /// Mirrors `ENV_FAIR_LATCHES` / default false.
     pub env_fair_latches: bool,
 
     /// Latch acquisition timeout in milliseconds.  0 = no timeout (block
-    /// indefinitely).  A timeout causes `EnvironmentFailure`.
+    /// indefinitely).  In JE, a timeout causes `EnvironmentFailure`.
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (non-zero) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.  The latch layer always blocks indefinitely.
+    ///
     /// Mirrors `ENV_LATCH_TIMEOUT` / default 300_000 ms (5 min).
     pub env_latch_timeout_ms: u64,
 
     /// TTL clock tolerance — records within this many milliseconds of their
     /// expiration time are treated as expired.
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (non-zero) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.
+    ///
     /// Mirrors `ENV_TTL_CLOCK_TOLERANCE` / default 0.
     pub env_ttl_clock_tolerance_ms: u64,
 
     /// Enable TTL-based record expiration at the environment level.
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (true) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.
+    ///
     /// Mirrors `ENV_EXPIRATION_ENABLED` / default false.
     pub env_expiration_enabled: bool,
 
     /// Enable per-database node eviction.
+    ///
+    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// value (true) has no effect and emits a `WARN` log at
+    /// `Environment::open` time.
+    ///
     /// Mirrors `ENV_DB_EVICTION` / default false.
     pub env_db_eviction: bool,
 

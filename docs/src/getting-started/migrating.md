@@ -624,3 +624,68 @@ is unchanged.
 (txn_id=None, written at commit time) recover correctly — the undo predicate
 treats `txn_id=None` as committed.  No migration or log version bump is
 required for files created by earlier versions.
+
+---
+
+## Wave ZA — v3.1.0 (fix/za-config-api)
+
+### DbIter/DbRange acquire a `'txn` lifetime parameter (Item 4)
+
+`Database::iter` and `Database::range` now return `DbIter<'txn>` and
+`DbRange<'txn>` respectively.  Code that stores a `DbIter` or `DbRange` in a
+named variable with an explicit type annotation must add the lifetime:
+
+```rust
+// Before (v3.0):
+let it: DbIter = db.iter(None)?;
+
+// After (v3.1):
+let it: DbIter<'_> = db.iter(None)?;
+// or: let it = db.iter(None)?;  (inferred — no change needed)
+```
+
+The borrow checker will now reject any code that commits or drops a
+transaction while an iterator created from that transaction is still alive.
+This is a compile-time safety improvement; no runtime behaviour changes.
+
+If inference is sufficient (most cases), no source change is needed.
+
+### `commit_pending_database` atomic transition (Item 5)
+
+`EnvironmentImpl::commit_pending_database` in `noxu-dbi` now holds the
+`pending_names` write lock across the entire pending→committed transition.
+The field `pending_names` has changed from `HashSet<String>` to
+`HashMap<String, DatabaseId>`.  This is an internal API change; user-facing
+code using only `noxu-db` / `noxu` is unaffected.
+
+If you depend on `noxu-dbi` directly and call `commit_pending_database` or
+`abort_pending_database`, no call-site changes are required.
+
+### `noxu::PreparedTxnInfo`, `PreparedLnReplay`, `SharedReplicaAckCoordinator` (Item 3)
+
+These types previously required a direct dependency on `noxu-recovery` or
+`noxu-dbi` to name.  They are now re-exported from `noxu-db` and accessible
+as `noxu::PreparedTxnInfo`, `noxu::PreparedLnReplay`, `noxu::PreparedLnOperation`,
+`noxu::SharedReplicaAckCoordinator`, `noxu::ReplicaAckCoordinator`,
+`noxu::AckWaitError`, and `noxu::AckWaitErrorKind`.
+
+Remove any direct `noxu-recovery` / `noxu-dbi` dependency that was added
+solely to name these types.
+
+### Reserved `EnvironmentConfig` parameters now warn (Item 1)
+
+Seven parameters (`env_latch_timeout_ms`, `env_expiration_enabled`,
+`env_db_eviction`, `env_fair_latches`, `env_check_leaks`, `env_forced_yield`,
+`env_ttl_clock_tolerance_ms`) are accepted but not implemented.  Setting any
+to a non-default value now emits a `WARN`-level log message at
+`Environment::open` time.
+
+Previously these settings were silently ignored.  If your code sets any of
+them, expect a log warning until the underlying feature is implemented.
+See `docs/src/operations/known-limitations.md` for the full list.
+
+### `RepConfig::peer_allowlist` mTLS warn (Item 2)
+
+Setting a non-empty `peer_allowlist` now emits a `WARN`-level log at
+`ReplicatedEnvironment::new` time.  The allowlist has never been enforced
+(Phase 2 pending); the warning ensures operators are not misled.

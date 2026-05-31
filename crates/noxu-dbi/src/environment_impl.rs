@@ -67,12 +67,18 @@ pub struct EnvironmentImpl {
 
     /// Names of databases whose creating transaction has not yet committed.
     ///
-    /// Entries are added by `open_database()` when a transaction id is
-    /// supplied and removed when the transaction commits (moved to
-    /// `name_map`) or aborts (removed entirely).  `get_database_names()`
-    /// excludes names in this set so callers see only committed databases
-    /// (C-4 / JE 1-I / 1-J fix).
-    pending_names: RwLock<std::collections::HashSet<String>>,
+    /// Maps database name → the `DatabaseId` that was allocated at
+    /// `open_database_inner` time.  Storing the id here (rather than only in
+    /// `db_map`) enables:
+    /// - O(1) lookup in `commit_pending_database` / `abort_pending_database`
+    ///   (eliminates the former O(N) `db_map` scan).
+    /// - Atomic pending→committed transition: the write lock acquired to
+    ///   remove the name can be held until `name_map` is updated, closing
+    ///   the TOCTOU window described in re-audit-keith R-4.
+    ///
+    /// `get_database_names()` excludes names in this map so callers see only
+    /// committed databases (C-4 / JE 1-I / 1-J fix).
+    pending_names: RwLock<hashbrown::HashMap<String, DatabaseId>>,
 
     /// Whether the environment has been invalidated.
     ///
@@ -837,7 +843,7 @@ impl EnvironmentImpl {
             txn_manager,
             db_map,
             name_map: RwLock::new(recovered_names),
-            pending_names: RwLock::new(std::collections::HashSet::new()),
+            pending_names: RwLock::new(hashbrown::HashMap::new()),
             is_invalid: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
@@ -962,11 +968,12 @@ impl EnvironmentImpl {
     /// transaction and the name registration is deferred (C-4 / JE 1-I fix):
     /// - A `NameLNTxn` WAL entry (`Provisional::Yes`) is written inside the
     ///   creating transaction (C-6).
-    /// - The name is added to `pending_names` but NOT to `name_map` yet.
+    /// - The name and its `DatabaseId` are stored in `pending_names` (a
+    ///   `HashMap<String, DatabaseId>`) but NOT in `name_map` yet.
     /// - `get_database_names()` excludes pending names.
     /// - Call `commit_pending_database(name)` when the txn commits to move
-    ///   the name into `name_map` (no additional WAL write — the TxnCommit
-    ///   record makes the provisional NameLNTxn durable).
+    ///   the name into `name_map` atomically (no additional WAL write — the
+    ///   TxnCommit record makes the provisional NameLNTxn durable).
     /// - Call `abort_pending_database(name)` when the txn aborts to remove
     ///   the db from `db_map` and `pending_names`.  Recovery's
     ///   `run_mapping_tree_undo_pass` removes the NameLNTxn.
@@ -1013,6 +1020,16 @@ impl EnvironmentImpl {
         {
             db.read().increment_reference_count();
             return Ok(db.clone());
+        }
+
+        // R-4 TOCTOU guard: if the name is currently being committed from
+        // another transaction (name in pending_names but not yet in
+        // name_map), treat it as "already exists" rather than creating a
+        // second DatabaseImpl with a conflicting DatabaseId.  This check
+        // closes the race window complemented by commit_pending_database
+        // holding pending_names.write() across the name_map insert.
+        if self.pending_names.read().contains_key(name) {
+            return Err(DbiError::DatabaseAlreadyExists(name.to_string()));
         }
 
         // Check if the name was recovered from the WAL (name in name_map but
@@ -1079,7 +1096,7 @@ impl EnvironmentImpl {
                 // C-4 / JE 1-I fix + C-6: defer name_map insertion until commit.
                 // The name is visible within the creating txn (via db_map) but
                 // not to other callers of get_database_names() until committed.
-                self.pending_names.write().insert(name.to_string());
+                self.pending_names.write().insert(name.to_string(), db_id);
                 // C-6: write NameLNTxn (Provisional::Yes) inside the creating
                 // transaction so crash recovery can undo it if the transaction
                 // aborts or the process crashes before commit.
@@ -1114,48 +1131,45 @@ impl EnvironmentImpl {
 
     /// Called when the transaction that created `name` commits.
     ///
-    /// Moves the name from `pending_names` to `name_map`.  The WAL entry
-    /// (`NameLNTxn`, `Provisional::Yes`) was already written inside the
-    /// creating transaction; the `TxnCommit` record written by the normal
-    /// commit path makes it durable.  No-op if the name is not in
-    /// `pending_names` (safe to call idempotently).
+    /// Moves the name from `pending_names` to `name_map` atomically under the
+    /// `pending_names` write lock, eliminating the TOCTOU window described
+    /// in re-audit-keith R-4: there is no gap during which the name is absent
+    /// from both maps.  Also uses the O(1) stored `DatabaseId` rather than an
+    /// O(N) `db_map` linear scan.
+    ///
+    /// No-op if the name is not in `pending_names` (safe to call idempotently).
     pub fn commit_pending_database(&self, name: &str) {
-        let db_id = {
-            let mut pending = self.pending_names.write();
-            if !pending.remove(name) {
-                return; // not a pending transactional creation
-            }
-            // Look up the db_id we assigned during open_database_inner.
-            self.db_map.read().iter().find_map(|(id, db_arc)| {
-                if db_arc.read().get_name() == name { Some(*id) } else { None }
-            })
+        // Hold the pending_names write lock across the name_map insert so
+        // that a concurrent open_database cannot observe the name missing
+        // from both maps (R-4 TOCTOU fix).
+        let mut pending = self.pending_names.write();
+        let db_id = match pending.remove(name) {
+            Some(id) => id,
+            None => return, // not a pending transactional creation
         };
-        if let Some(db_id) = db_id {
-            // C-6: do NOT write a second NameLN here.  The NameLNTxn was
-            // already written inside the transaction; the TxnCommit record
-            // (written by Transaction::commit) is the durability marker.
-            self.name_map.write().insert(name.to_string(), db_id);
-        }
+        // C-6: do NOT write a second NameLN here.  The NameLNTxn was
+        // already written inside the transaction; the TxnCommit record
+        // (written by Transaction::commit) is the durability marker.
+        self.name_map.write().insert(name.to_string(), db_id);
+        // Release pending write lock only after name_map is updated.
+        drop(pending);
     }
 
     /// Called when the transaction that created `name` aborts.
     ///
     /// Removes the name from `pending_names` and removes the corresponding
-    /// `DatabaseImpl` from `db_map`, as though it was never created.  No-op
-    /// if the name is not pending.
+    /// `DatabaseImpl` from `db_map` using the O(1) stored `DatabaseId`
+    /// (eliminates the former O(N) `db_map` linear scan — R-4 fix).
+    /// No-op if the name is not pending.
     pub fn abort_pending_database(&self, name: &str) {
-        let mut pending = self.pending_names.write();
-        if !pending.remove(name) {
-            return; // not a pending transactional creation
-        }
-        drop(pending);
-        // Remove from db_map: find by name, then remove by id.
-        let db_id = self.db_map.read().iter().find_map(|(id, db_arc)| {
-            if db_arc.read().get_name() == name { Some(*id) } else { None }
-        });
-        if let Some(id) = db_id {
-            self.db_map.write().remove(&id);
-        }
+        let db_id = {
+            let mut pending = self.pending_names.write();
+            match pending.remove(name) {
+                Some(id) => id,
+                None => return, // not a pending transactional creation
+            }
+        };
+        self.db_map.write().remove(&db_id);
     }
 
     /// Write a transactional NameLNTxn entry to the WAL mapping `name` → `db_id`.
