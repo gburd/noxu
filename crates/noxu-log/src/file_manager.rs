@@ -341,14 +341,9 @@ impl FileManager {
         file: &File,
         file_num: u32,
     ) -> Result<u32> {
-        #[cfg(unix)]
-        use std::os::unix::fs::FileExt as PosixFileExt;
-        #[cfg(windows)]
-        use std::os::windows::fs::FileExt as PosixFileExt;
-
-        // Read the header bytes
+        // Read the header bytes (cross-platform positioned read).
         let mut header_buf = vec![0u8; FILE_HEADER_SIZE];
-        file.read_exact_at(&mut header_buf, 0)?;
+        crate::posio::read_exact_at(file, &mut header_buf, 0)?;
 
         // Parse header
         let mut cursor = std::io::Cursor::new(header_buf);
@@ -441,9 +436,10 @@ impl FileManager {
         // After fsync-ing the new file, fsync the parent directory so the
         // directory entry itself is durable.  Without this a power-loss between
         // file creation and the next directory write loses the file entirely.
-        let parent_dir = File::open(&self.env_dir)?;
-        parent_dir.sync_all()?;
-        drop(parent_dir);
+        // Cross-platform: real dir-fsync on Unix; best-effort on Windows
+        // (directory handle needs FILE_FLAG_BACKUP_SEMANTICS; NTFS journals
+        // the entry).  See `crate::posio::sync_dir`.
+        crate::posio::sync_dir(&self.env_dir)?;
 
         // Create handle
         let mut handle = FileHandle::new(file_num);

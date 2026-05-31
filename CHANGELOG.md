@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (portability — RISC-V 64 + Windows on ARM64)
+
+- **Windows (aarch64-pc-windows-msvc) support.** Validated the full workspace
+  builds and all tests pass on Windows on ARM64, with three fixes:
+  - `noxu-log`: a cross-platform positioned-I/O shim (`posio`) — Windows'
+    `FileExt` exposes `seek_read`/`seek_write` (no `*_exact`/`*_all`), so the
+    Unix `read_at`/`read_exact_at`/`write_all_at` calls didn't compile.
+  - `noxu-log`: cross-platform directory fsync (`posio::sync_dir`) — the C-1
+    parent-directory fsync opened the directory as a file, which fails on
+    Windows without `FILE_FLAG_BACKUP_SEMANTICS`; now real dir-fsync on Unix,
+    best-effort on Windows (NTFS journals the entry).
+  - `noxu-rep`: the unbindable-address test now uses a non-local IP
+    (RFC 5737 TEST-NET-1) instead of the privileged port 1 (Windows lets
+    unprivileged users bind low ports).
+- **RISC-V 64 (riscv64gc-unknown-linux-gnu)** validated: full workspace builds,
+  all 170 test-suites pass, no code changes required.
+- See `docs/src/internal/portability-rv-windows.md`.
+
 ## [v3.1.0] — 2026-05-31
 
 Feature + remediation release on the umbrella line. Adds enforced mTLS

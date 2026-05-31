@@ -50,6 +50,7 @@ pub mod entry;
 
 // File I/O
 pub mod file_handle;
+pub(crate) mod posio;
 pub mod file_header;
 pub mod file_manager;
 pub mod fsync_manager;

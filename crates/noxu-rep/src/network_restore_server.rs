@@ -727,9 +727,15 @@ mod tests {
     fn test_start_returns_error_for_unbindable_addr() {
         let dir = make_env_home(&[]);
         let server = Arc::new(NetworkRestoreServer::new(dir.path()));
-        // Port 1 should not be bindable for unprivileged user.
-        let r = server.start("127.0.0.1:1".parse().unwrap());
-        assert!(r.is_err(), "binding to port 1 should fail for non-root");
+        // 192.0.2.1 is RFC 5737 TEST-NET-1 — guaranteed not assigned to any
+        // local interface, so bind() fails with EADDRNOTAVAIL on both Unix
+        // and Windows. (Port 1 is unreliable cross-platform: privileged on
+        // Unix, but freely bindable by unprivileged users on Windows.)
+        let r = server.start("192.0.2.1:9999".parse().unwrap());
+        assert!(
+            r.is_err(),
+            "binding to a non-local address should fail on all platforms"
+        );
     }
 
     #[test]
