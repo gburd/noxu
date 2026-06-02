@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [v3.2.0] — 2026-06-02
+
 ### Added (replication — mTLS Phase 3)
 
 - **End-to-end mTLS for the replication service and QUIC.** Phase 3 extends
