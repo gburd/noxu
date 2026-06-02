@@ -13,6 +13,7 @@ use noxu_cleaner::UtilizationTracker;
 use noxu_log::entry::FileSummaryLnEntry;
 use noxu_log::entry::bin_delta_log_entry::BinDeltaLogEntry;
 use noxu_log::entry::in_log_entry::InLogEntry;
+use noxu_log::entry::{DbTreeBinRef, DbTreeEntry};
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_sync::Mutex;
 use noxu_tree::tree::{Tree, TreeNode};
@@ -456,13 +457,24 @@ impl Checkpointer {
         let upper_result = self.flush_upper_ins_internal()?;
         flush_result.full_ins_flushed += upper_result.full_ins_flushed;
 
+        // Step 4c: Write the DbTree BIN-version index.
+        //
+        // After all dirty BINs (and any remaining delta-state BINs) are fully
+        // flushed, collect every BIN's (node_id, last_full_lsn) and write a
+        // DbTreeEntry log record.  The LSN of that record is stored in
+        // CkptEnd.root_lsn so that recovery can locate the index without
+        // scanning the entire log.
+        //
+        // Wave GB: P-2 recovery BIN-version index.
+        let db_tree_lsn = self.write_db_tree_entry(start_lsn, checkpoint_id)?;
+
         // Step 5: Write CkptEnd entry to WAL.
         let end_lsn = if let Some(lm) = &self.log_manager {
             let ckpt_end = CheckpointEnd::new(
                 checkpoint_id,
                 invoker,
                 start_lsn,
-                None, // root_lsn  (P1/P2 will fill this)
+                db_tree_lsn, // root_lsn — None when no LogManager or tree
                 // Set first_active_lsn to Lsn::new(0, 0) (beginning of log)
                 // rather than NULL_LSN.  This tells recovery to scan from
                 // the start of the log, ensuring that committed LN entries
@@ -474,6 +486,16 @@ impl Checkpointer {
                 // earliest active txn at checkpoint time; Noxu conservatively
                 // uses Lsn::new(0,0) until the checkpoint wires the full
                 // db_map.)
+                //
+                // NOTE (Wave GB): even though we now write a DbTree entry, the
+                // scan range is deliberately kept at Lsn::new(0,0) because any
+                // transaction that started *before* start_lsn and is still
+                // uncommitted at crash time would be invisible to the reduced
+                // scan (its LN is before first_active_lsn, so the undo pass
+                // never sees it and cannot revert it).  Narrowing the scan
+                // requires tracking the earliest-active-txn LSN at checkpoint
+                // time, which is not yet implemented.  The DbTree entry is
+                // still written as a foundation for a future wave.
                 noxu_util::Lsn::new(0, 0), // first_active_lsn
                 0,
                 0,
@@ -833,6 +855,178 @@ impl Checkpointer {
         }
 
         Ok(result)
+    }
+
+    /// Build and write the DbTree BIN-version index to the WAL.
+    ///
+    /// Called after both dirty-BIN and upper-IN flush passes have completed,
+    /// so every BIN's `last_full_lsn` and `last_delta_lsn` reflect the latest
+    /// checkpoint interval.
+    ///
+    /// Algorithm:
+    /// 1. Walk every BIN in the tree (including stable, non-dirty ones).
+    /// 2. Any BIN still in delta state (`last_delta_lsn != NULL_LSN`) is
+    ///    force-flushed as a full BIN so the DbTree index can reference a
+    ///    single, self-contained log entry — no delta chain reconstruction
+    ///    needed at recovery time.
+    /// 3. Build a `DbTreeEntry` from (node_id, last_full_lsn) for each BIN
+    ///    that has ever been logged (`last_full_lsn != NULL_LSN`).
+    /// 4. Write the `DbTreeEntry` as `LogEntryType::DbTree`.
+    ///
+    /// Returns `Some(db_tree_lsn)` on success (the LSN is stored in
+    /// `CkptEnd.root_lsn`), or `None` when the tree or log manager is absent
+    /// (unit tests / no WAL).
+    ///
+    /// Wave GB — P-2 recovery foundation.
+    fn write_db_tree_entry(
+        &self,
+        _checkpoint_start_lsn: Lsn,
+        checkpoint_id: u64,
+    ) -> Result<Option<Lsn>> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(None),
+        };
+        let tree_arc = match &self.tree {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Phase 1: force-flush any BIN still in delta state as a full BIN.
+        //
+        // After flush_dirty_bins_internal a BIN may be in delta state because:
+        //   (a) It was dirty and the TREE_BIN_DELTA threshold chose the delta
+        //       path for this checkpoint cycle.
+        //   (b) It is a stable BIN (not dirty in this interval) but was logged
+        //       as a delta in a previous checkpoint cycle and never
+        //       subsequently re-logged as a full.
+        // In either case we need a self-contained full-BIN log entry that
+        // recovery can read with a single read_at_lsn call.
+        {
+            let all_bins = {
+                let tree_guard = tree_arc.read().map_err(|_| {
+                    RecoveryError::CheckpointError(
+                        "tree lock poisoned in write_db_tree_entry".to_string(),
+                    )
+                })?;
+                tree_guard.collect_all_bins(self.db_id)
+            };
+
+            for (_db_id, bin_arc) in &all_bins {
+                let mut bin_guard = bin_arc.write();
+                let b = match &mut *bin_guard {
+                    TreeNode::Bottom(b) => b,
+                    _ => continue,
+                };
+
+                // Only re-flush BINs that are in delta state.
+                if b.last_delta_lsn == NULL_LSN {
+                    continue;
+                }
+
+                // Force full-BIN log write to establish a clean baseline.
+                let full_bytes = b.serialize_full();
+                let entry = InLogEntry::new(
+                    self.db_id,
+                    b.last_full_lsn,
+                    NULL_LSN,
+                    full_bytes,
+                );
+                let mut buf =
+                    bytes::BytesMut::with_capacity(entry.log_size());
+                entry.write_to_log(&mut buf);
+                match lm.log(
+                    LogEntryType::BIN,
+                    &buf,
+                    Provisional::No,
+                    false,
+                    false,
+                ) {
+                    Ok(logged_lsn) => {
+                        b.last_delta_lsn = NULL_LSN;
+                        b.clear_dirty_after_full_log(logged_lsn);
+                    }
+                    Err(e) => {
+                        // Non-fatal: log the error and leave the BIN in
+                        // delta state.  It will be excluded from the
+                        // DbTreeEntry (last_full_lsn unchanged; the
+                        // old full LSN is still valid).
+                        log::warn!(
+                            "write_db_tree_entry: delta-to-full flush failed \
+                             for node {}: {e}; BIN excluded from DbTree",
+                            b.node_id
+                        );
+                    }
+                }
+            }
+        }
+
+        // Phase 2: collect all BINs and build the DbTreeEntry.
+        let all_bins2 = {
+            let tree_guard = tree_arc.read().map_err(|_| {
+                RecoveryError::CheckpointError(
+                    "tree lock poisoned in write_db_tree_entry (phase 2)"
+                        .to_string(),
+                )
+            })?;
+            tree_guard.collect_all_bins(self.db_id)
+        };
+
+        let mut bin_refs = Vec::with_capacity(all_bins2.len());
+        for (_db_id, bin_arc) in &all_bins2 {
+            let bin_guard = bin_arc.read();
+            let b = match &*bin_guard {
+                TreeNode::Bottom(b) => b,
+                _ => continue,
+            };
+
+            // Only include BINs that have a log representation.
+            // BINs with last_full_lsn == NULL_LSN have never been flushed;
+            // their keys will be recovered from the LN replay pass regardless.
+            if b.last_full_lsn == NULL_LSN {
+                continue;
+            }
+
+            // After the delta-to-full flush pass above,
+            // last_delta_lsn should be NULL_LSN for all included BINs.
+            // Record bin_lsn = last_full_lsn (always a full BIN).
+            bin_refs.push(DbTreeBinRef {
+                db_id: self.db_id,
+                node_id: b.node_id,
+                bin_lsn: b.last_full_lsn,
+                prev_full_lsn: b.last_full_lsn,
+                is_delta: false,
+            });
+        }
+
+        if bin_refs.is_empty() {
+            // Empty tree or no flushed BINs yet — no DbTree entry needed.
+            return Ok(None);
+        }
+
+        // Phase 3: serialize and write the DbTreeEntry.
+        let db_tree = DbTreeEntry::new(checkpoint_id, bin_refs);
+        let mut buf = Vec::with_capacity(db_tree.log_size());
+        db_tree.write_to_log(&mut buf);
+        let db_tree_lsn = lm
+            .log(
+                LogEntryType::DbTree,
+                &buf,
+                Provisional::No,
+                false,
+                false,
+            )
+            .map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "DbTree WAL write failed: {e}"
+                ))
+            })?;
+
+        log::debug!(
+            "write_db_tree_entry: wrote {} BIN refs at {db_tree_lsn:?}",
+            db_tree.bins.len()
+        );
+        Ok(Some(db_tree_lsn))
     }
 }
 

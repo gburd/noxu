@@ -2024,7 +2024,7 @@ mod tests {
         // DbTree root
         scanner.push(
             lsn(0, 60),
-            LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 60) }),
+            LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 60), bins: vec![] }),
         );
         // CkptEnd
         scanner.push(
@@ -2058,7 +2058,7 @@ mod tests {
         // Only a DbTree, no checkpoint
         scanner.push(
             lsn(0, 10),
-            LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 10) }),
+            LogEntry::DbTree(DbTreeRecord { lsn: lsn(0, 10), bins: vec![] }),
         );
         scanner.push(
             lsn(0, 100),

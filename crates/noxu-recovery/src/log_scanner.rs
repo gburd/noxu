@@ -225,11 +225,37 @@ pub struct RollbackEndRecord {
     pub lsn: Lsn,
 }
 
-/// A DbTree (mapping-tree root) record.
+/// A BIN reference carried in a DbTree record.
+///
+/// Wave GB: P-2 recovery foundation.  Each field mirrors `DbTreeBinRef` in
+/// `noxu_log::entry::db_tree_entry` but lives in the recovery crate to
+/// avoid a dependency cycle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbTreeBinRef {
+    /// Database ID that owns this BIN.
+    pub db_id: u64,
+    /// Node ID of the BIN.
+    pub node_id: u64,
+    /// LSN of the current-version BIN (full BIN after Wave GB force-flush).
+    pub bin_lsn: Lsn,
+    /// LSN of the last full BIN write (same as `bin_lsn` after force-flush).
+    pub prev_full_lsn: Lsn,
+    /// `true` if `bin_lsn` is a delta (always `false` after Wave GB
+    /// force-full-flush pass; kept for forward-compatibility).
+    pub is_delta: bool,
+}
+
+/// A DbTree BIN-version index record (Wave GB).
+///
+/// Written to the WAL just before each `CkptEnd` by the checkpointer.
+/// `CkptEnd.root_lsn` points to the `DbTree` entry so that recovery can
+/// locate the index without a full log scan.
 #[derive(Debug, Clone)]
 pub struct DbTreeRecord {
-    /// LSN at which the mapping tree root was logged.
+    /// LSN at which this DbTree entry was logged (filled in by the scanner).
     pub lsn: Lsn,
+    /// BIN references: one per BIN across all databases in the checkpoint.
+    pub bins: Vec<DbTreeBinRef>,
 }
 
 /// Union of all log entry types that the 3-phase recovery processes.

@@ -14,7 +14,8 @@ use noxu_log::{
     FileManager,
     checksum::ChecksumValidator,
     entry::{
-        BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry, TxnPrepareEntry,
+        BinDeltaLogEntry, DbTreeEntry, InLogEntry, LnLogEntry, TxnEndEntry,
+        TxnPrepareEntry,
     },
     entry_header::{CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     entry_type::LogEntryType,
@@ -285,6 +286,26 @@ impl FileManagerLogScanner {
                         txn_id: None,
                     }))
                 }
+            }
+
+            // DbTree BIN-version index (Wave GB) ─────────────────────
+            // Parse the DbTree payload and carry the BIN refs so that
+            // recovery can pre-load BINs without a full log scan.
+            // `DbTreeEntry.read_from_log` is infallible-on-correct-data;
+            // we return None on parse error so the scanner treats it as
+            // an unknown entry (graceful degradation).
+            LogEntryType::DbTree => {
+                let entry = DbTreeEntry::read_from_log(&payload).ok()?;
+                Some(LogEntry::DbTree(noxu_recovery::DbTreeRecord {
+                    lsn: NULL_LSN, // Filled in by caller with actual LSN.
+                    bins: entry.bins.into_iter().map(|b| noxu_recovery::DbTreeBinRef {
+                        db_id: b.db_id,
+                        node_id: b.node_id,
+                        bin_lsn: b.bin_lsn,
+                        prev_full_lsn: b.prev_full_lsn,
+                        is_delta: b.is_delta,
+                    }).collect(),
+                }))
             }
 
             // Everything else (FileHeader, Trace, MapLN, etc.) ─
