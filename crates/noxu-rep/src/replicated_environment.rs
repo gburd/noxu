@@ -46,7 +46,9 @@ use crate::elections::master_tracker::MasterTracker;
 use crate::error::{RepError, Result};
 use crate::group_service::GroupService;
 use crate::master_transfer::MasterTransferConfig;
-use crate::net::service_dispatcher::{AnyServiceDispatcher, TcpServiceDispatcher};
+use crate::net::service_dispatcher::{
+    AnyServiceDispatcher, TcpServiceDispatcher,
+};
 use crate::network_restore::{NetworkRestore, NetworkRestoreConfig};
 use crate::network_restore_server::{
     NetworkRestoreServer, RESTORE_SERVICE_NAME,
@@ -473,46 +475,37 @@ impl ReplicatedEnvironment {
     /// Returns `(dispatcher, bound_addr)` or a `RepError` on bind / TLS
     /// config failure.
     fn build_dispatcher(
+        #[cfg_attr(not(feature = "tls-rustls"), allow(unused_variables))]
         config: &RepConfig,
         addr: SocketAddr,
     ) -> Result<(AnyServiceDispatcher, SocketAddr)> {
         #[cfg(feature = "tls-rustls")]
         if config.transport_kind == crate::rep_config::RepTransportKind::Tls {
-            if let Some(ref tls) = config.tls_config {
-                use crate::auth::PeerAllowlist;
-                use crate::net::service_dispatcher::TlsTcpServiceDispatcher;
-                let allowlist =
-                    PeerAllowlist::new(config.peer_allowlist.iter().cloned());
-                if allowlist.is_empty() {
-                    // No allowlist entries: fall back to TLS without mTLS
-                    // enforcement (server cert only, no client cert required).
-                    // This is less strict but not a security regression vs.
-                    // the previous plain-TCP path.
-                    log::info!(
-                        "Node '{}' TLS configured but peer_allowlist is \
-                         empty — starting TLS dispatcher without client-cert \
-                         enforcement.",
-                        config.node_name,
-                    );
-                    // Fall through to plain TLS (no allowlist) below.
-                    // We reuse TlsTcpChannelListener::bind_with_tls directly
-                    // via a plain TcpServiceDispatcher with TLS not wired
-                    // (since TcpServiceDispatcher doesn't support TLS).
-                    // For now, emit a warn and fall back to plain TCP.
-                    // TODO(phase-4): add TlsTcpServiceDispatcher::new_no_allowlist.
-                    log::warn!(
-                        "Node '{}' TLS + empty allowlist: falling back to \
-                         plain-TCP dispatcher. Supply a non-empty \
-                         peer_allowlist to enable mTLS enforcement.",
-                        config.node_name,
-                    );
-                } else {
-                    let disp =
-                        TlsTcpServiceDispatcher::new(addr, tls, allowlist)?;
-                    let bound = disp.start()?;
-                    return Ok((AnyServiceDispatcher::Tls(disp), bound));
-                }
+            use crate::auth::PeerAllowlist;
+            use crate::net::service_dispatcher::TlsTcpServiceDispatcher;
+            let tls = config.tls_config.as_ref().ok_or_else(|| {
+                RepError::ConfigError(format!(
+                    "node '{}': transport_kind=Tls requires a tls_config",
+                    config.node_name,
+                ))
+            })?;
+            let allowlist =
+                PeerAllowlist::new(config.peer_allowlist.iter().cloned());
+            // Fail-closed: an empty allowlist with TLS transport is a
+            // misconfiguration. The same policy is enforced at the TLS
+            // listener and QUIC constructors; downgrading to plain TCP here
+            // would be a silent security regression for a node that asked
+            // for TLS.
+            if allowlist.is_empty() {
+                return Err(RepError::ConfigError(format!(
+                    "node '{}': transport_kind=Tls requires a non-empty \
+                     peer_allowlist (mTLS enforcement is fail-closed)",
+                    config.node_name,
+                )));
             }
+            let disp = TlsTcpServiceDispatcher::new(addr, tls, allowlist)?;
+            let bound = disp.start()?;
+            return Ok((AnyServiceDispatcher::Tls(disp), bound));
         }
         // Plain-TCP dispatcher (default or when TLS config is missing).
         let disp = TcpServiceDispatcher::new(addr).map_err(|e| {

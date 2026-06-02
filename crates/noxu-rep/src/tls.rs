@@ -69,7 +69,6 @@ use crate::error::{RepError, Result};
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum TlsIdentity {
-
     /// Generate a fresh self-signed certificate at runtime.
     ///
     /// Supported by the `tls-rustls` backend only.  Suitable for internal,
@@ -149,7 +148,6 @@ impl std::fmt::Debug for TlsIdentity {
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum TrustedCerts {
-
     /// Accept any certificate without verification.
     ///
     /// **Insecure.** Use only on private, trusted networks where all nodes
@@ -171,11 +169,8 @@ impl std::fmt::Debug for TrustedCerts {
                 f.debug_tuple("CaFiles").field(paths).finish()
             }
             Self::CaBytes(pems) => {
-                let sizes: Vec<usize> =
-                    pems.iter().map(|p| p.len()).collect();
-                f.debug_struct("CaBytes")
-                    .field("blob_sizes", &sizes)
-                    .finish()
+                let sizes: Vec<usize> = pems.iter().map(|p| p.len()).collect();
+                f.debug_struct("CaBytes").field("blob_sizes", &sizes).finish()
             }
         }
     }
@@ -537,9 +532,7 @@ impl TlsConfig {
             rustls::ServerConfig::clone(&rustls_cfg),
         )
         .map_err(|e| {
-            RepError::NetworkError(format!(
-                "QUIC server config (mTLS): {e}"
-            ))
+            RepError::NetworkError(format!("QUIC server config (mTLS): {e}"))
         })?;
         let mut cfg =
             quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_cfg));
