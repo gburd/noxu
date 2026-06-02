@@ -430,3 +430,104 @@ fn extract_cert_names_garbage_input_is_empty() {
         "garbage input must produce empty list, got: {names:?}"
     );
 }
+
+// ─── Phase 3: TlsTcpServiceDispatcher end-to-end mTLS ────────────────────────
+
+use noxu_rep::net::{
+    ServiceHandler, TlsTcpServiceDispatcher, connect_to_service_tls,
+};
+use std::sync::Arc;
+
+/// Echoes one received frame back to the peer, then returns.
+struct EchoService;
+impl ServiceHandler for EchoService {
+    fn handle(&self, channel: Box<dyn Channel>) -> noxu_rep::Result<()> {
+        if let Some(msg) = channel.receive(RECV_TIMEOUT)? {
+            channel.send(&msg)?;
+        }
+        Ok(())
+    }
+    fn service_name(&self) -> &str {
+        "echo"
+    }
+}
+
+/// An allowlisted peer reaches the dispatcher's service handler end-to-end:
+/// the mTLS handshake (allowlist check) passes, the service-name routing
+/// runs, and an application-level echo round-trips.
+#[test]
+fn tls_dispatcher_admits_allowlisted_peer_end_to_end() {
+    let pki = TestPki::new();
+    let server_tls = pki.node_tls_config("server.cluster");
+    let allowlist = PeerAllowlist::new(["client.cluster"]);
+    let dispatcher = TlsTcpServiceDispatcher::new(
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        &server_tls,
+        allowlist,
+    )
+    .expect("dispatcher bind failed");
+    dispatcher.register("echo", Arc::new(EchoService));
+    let addr = dispatcher.addr();
+    dispatcher.start().expect("dispatcher start failed");
+
+    let client_tls = pki.client_tls_config("client.cluster", "server.cluster");
+    let channel = connect_to_service_tls(addr, "echo", &client_tls)
+        .expect("admitted client must connect to the echo service");
+    channel.send(b"ping").expect("send failed");
+    let reply = channel
+        .receive(RECV_TIMEOUT)
+        .expect("receive errored")
+        .expect("no echo reply");
+    assert_eq!(&reply, b"ping", "echo service must round-trip the payload");
+    dispatcher.stop();
+}
+
+/// A peer whose cert name is NOT in the dispatcher allowlist is rejected at
+/// the mTLS handshake — it never reaches the service handler.
+#[test]
+fn tls_dispatcher_rejects_non_allowlisted_peer() {
+    let pki = TestPki::new();
+    let server_tls = pki.node_tls_config("server.cluster");
+    let allowlist = PeerAllowlist::new(["allowed.cluster"]);
+    let dispatcher = TlsTcpServiceDispatcher::new(
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        &server_tls,
+        allowlist,
+    )
+    .expect("dispatcher bind failed");
+    dispatcher.register("echo", Arc::new(EchoService));
+    let addr = dispatcher.addr();
+    dispatcher.start().expect("dispatcher start failed");
+
+    // Client cert "intruder.cluster" is signed by the same CA but not in the
+    // allowlist: the handshake must abort, so connect-or-first-exchange fails.
+    let client_tls =
+        pki.client_tls_config("intruder.cluster", "server.cluster");
+    let result = (|| -> noxu_rep::Result<Option<Vec<u8>>> {
+        let channel = connect_to_service_tls(addr, "echo", &client_tls)?;
+        channel.send(b"ping")?;
+        channel.receive(RECV_TIMEOUT)
+    })();
+    assert!(
+        result.is_err() || matches!(result, Ok(None)),
+        "non-allowlisted peer must be rejected at the mTLS handshake (no echo)"
+    );
+    dispatcher.stop();
+}
+
+/// `TlsTcpServiceDispatcher::new` is fail-closed: an empty allowlist is a
+/// configuration error (consistent with the listener and QUIC constructors).
+#[test]
+fn tls_dispatcher_empty_allowlist_errors() {
+    let pki = TestPki::new();
+    let server_tls = pki.node_tls_config("server.cluster");
+    let result = TlsTcpServiceDispatcher::new(
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        &server_tls,
+        PeerAllowlist::new(Vec::<String>::new()),
+    );
+    assert!(
+        result.is_err(),
+        "empty allowlist must be a ConfigError (fail-closed), got Ok"
+    );
+}
