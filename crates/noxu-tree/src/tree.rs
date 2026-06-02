@@ -4101,6 +4101,46 @@ impl Tree {
     /// BIN-delta threshold — whether to write a full `BIN` entry or a
     /// `BINDelta` entry.
     ///
+    /// Collect ALL BINs in the tree, regardless of dirty state.
+    ///
+    /// Used by the checkpoint writer to build the `DbTreeEntry` BIN-version
+    /// index that covers every BIN (stable *and* dirty).  The returned
+    /// `Arc<RwLock<TreeNode>>` values are read under read locks by the caller.
+    ///
+    /// Wave GB — DbTree prerequisite.
+    pub fn collect_all_bins(
+        &self,
+        db_id: u64,
+    ) -> Vec<(u64, Arc<RwLock<TreeNode>>)> {
+        let mut result = Vec::new();
+        if let Some(root) = self.get_root() {
+            Self::collect_all_bins_recursive(&root, db_id, &mut result);
+        }
+        result
+    }
+
+    fn collect_all_bins_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        db_id: u64,
+        out: &mut Vec<(u64, Arc<RwLock<TreeNode>>)>,
+    ) {
+        let guard = node_arc.read();
+        match &*guard {
+            TreeNode::Bottom(_) => {
+                // Include this BIN regardless of dirty state.
+                out.push((db_id, Arc::clone(node_arc)));
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                drop(guard);
+                for child in children {
+                    Self::collect_all_bins_recursive(&child, db_id, out);
+                }
+            }
+        }
+    }
+
     /// `Checkpointer.processINList()` which iterates the dirty
     /// IN list accumulated during normal operation.
     pub fn collect_dirty_bins(

@@ -15,7 +15,13 @@ use std::fmt;
 ///   On-disk frames written by v1 readers (no TxnPrepare possible) remain
 ///   readable by v2 readers; v1 readers reject TxnPrepare frames as
 ///   unknown-type errors.
-pub const LOG_VERSION: u8 = 2;
+/// * `3` — Wave GB: added `DbTree` (type 50) entry written just before each
+///   `CkptEnd`.  `CkptEnd.root_lsn` points to the DbTree entry; recovery
+///   uses it to locate all BINs (stable and dirty) without scanning from
+///   LSN 0, enabling P-2 scan-range narrowing.  Old logs (no DbTree entry,
+///   `root_lsn = None`) are fully readable by v3 readers via the unchanged
+///   conservative full-scan path (`first_active_lsn = Lsn::new(0,0)`).
+pub const LOG_VERSION: u8 = 3;
 
 /// First valid log version.
 pub const FIRST_LOG_VERSION: u8 = 1;

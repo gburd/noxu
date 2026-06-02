@@ -6,6 +6,7 @@
 //! log entry payloads.
 
 pub mod bin_delta_log_entry;
+pub mod db_tree_entry;
 pub mod commit_abort_entry;
 pub mod db_operation_type;
 pub mod del_dup_ln_entry;
@@ -30,6 +31,7 @@ pub mod trace_log_entry;
 pub mod txn_prepare_entry;
 
 pub use bin_delta_log_entry::BinDeltaLogEntry;
+pub use db_tree_entry::{DbTreeBinRef, DbTreeEntry, DbTreeEntryError};
 pub use commit_abort_entry::TxnEndEntry;
 pub use db_operation_type::DbOperationType;
 pub use del_dup_ln_entry::DelDupLnEntry;
