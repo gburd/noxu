@@ -116,6 +116,32 @@ pub enum TlsIdentity {
     },
 }
 
+impl std::fmt::Debug for TlsIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfSigned { subject_alt_names } => f
+                .debug_struct("SelfSigned")
+                .field("subject_alt_names", subject_alt_names)
+                .finish(),
+            Self::PemFiles { cert, key } => f
+                .debug_struct("PemFiles")
+                .field("cert", cert)
+                .field("key", key)
+                .finish(),
+            Self::PemBytes { cert, .. } => f
+                .debug_struct("PemBytes")
+                .field("cert_len", &cert.len())
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::Pkcs12 { .. } => f
+                .debug_struct("Pkcs12")
+                .field("der", &"<redacted>")
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 // ─── TrustedCerts ────────────────────────────────────────────────────────────
 
 /// Policy for verifying the remote peer's certificate.
@@ -133,6 +159,21 @@ pub enum TrustedCerts {
 
     /// Trust in-memory PEM-encoded CA certificates.
     CaBytes(Vec<Vec<u8>>),
+}
+
+impl std::fmt::Debug for TrustedCerts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SkipVerification => write!(f, "SkipVerification"),
+            Self::CaFiles(paths) => {
+                f.debug_tuple("CaFiles").field(paths).finish()
+            }
+            Self::CaBytes(pems) => {
+                let sizes: Vec<usize> = pems.iter().map(|p| p.len()).collect();
+                f.debug_struct("CaBytes").field("blob_sizes", &sizes).finish()
+            }
+        }
+    }
 }
 
 // ─── TlsConfig ───────────────────────────────────────────────────────────────
@@ -158,6 +199,16 @@ pub struct TlsConfig {
     /// Name`.  Use `"localhost"` when connecting to a `SelfSigned` cert with
     /// `subject_alt_names = ["localhost"]`.
     pub server_name: String,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("server_name", &self.server_name)
+            .field("identity", &self.identity)
+            .field("trusted_certs", &self.trusted_certs)
+            .finish()
+    }
 }
 
 impl TlsConfig {
@@ -439,6 +490,49 @@ impl TlsConfig {
         )
         .map_err(|e| {
             RepError::NetworkError(format!("QUIC server config: {e}"))
+        })?;
+        let mut cfg =
+            quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_cfg));
+        let mut transport = quinn::TransportConfig::default();
+        transport.mtu_discovery_config(None);
+        transport.datagram_receive_buffer_size(Some(64 * 1024));
+        cfg.transport_config(std::sync::Arc::new(transport));
+        Ok(cfg)
+    }
+
+    /// Build a `quinn::ServerConfig` that enforces `peer_allowlist` via mTLS.
+    ///
+    /// This is the **QUIC mTLS enforcement path** introduced in Phase 3.
+    /// Compared to [`to_quinn_server_config`]:
+    ///
+    /// - The server requests a client certificate (`client_auth_mandatory = true`).
+    /// - The client certificate chain is validated against the CA roots in this
+    ///   `TlsConfig`.
+    /// - The peer's Subject CN and DNS SANs are checked against `allowlist`;
+    ///   the QUIC (TLS 1.3) handshake is aborted if no name matches.
+    ///
+    /// The empty-allowlist fail-closed policy applies: constructing with an
+    /// empty `PeerAllowlist` returns `Err(RepError::ConfigError)`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`to_rustls_server_config_with_allowlist`] plus QUIC config
+    /// conversion errors.
+    ///
+    /// [`to_rustls_server_config_with_allowlist`]: Self::to_rustls_server_config_with_allowlist
+    /// [`to_quinn_server_config`]: Self::to_quinn_server_config
+    #[cfg(feature = "quic")]
+    pub fn to_quinn_server_config_with_allowlist(
+        &self,
+        allowlist: crate::auth::PeerAllowlist,
+    ) -> Result<quinn::ServerConfig> {
+        let rustls_cfg =
+            self.to_rustls_server_config_with_allowlist(allowlist)?;
+        let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(
+            rustls::ServerConfig::clone(&rustls_cfg),
+        )
+        .map_err(|e| {
+            RepError::NetworkError(format!("QUIC server config (mTLS): {e}"))
         })?;
         let mut cfg =
             quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_cfg));

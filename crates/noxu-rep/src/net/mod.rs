@@ -34,3 +34,5 @@ pub use service_dispatcher::{
     MAX_SERVICE_NAME_LEN, ServiceDispatcher, ServiceHandler,
     TcpServiceDispatcher, connect_to_service,
 };
+#[cfg(feature = "tls-rustls")]
+pub use service_dispatcher::{TlsTcpServiceDispatcher, connect_to_service_tls};

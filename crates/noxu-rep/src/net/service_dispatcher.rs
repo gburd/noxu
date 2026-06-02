@@ -354,6 +354,313 @@ pub fn connect_to_service(
     Ok(TcpChannel::new(stream))
 }
 
+// ---------------------------------------------------------------------------
+// TlsTcpServiceDispatcher  (requires tls-rustls)
+// ---------------------------------------------------------------------------
+
+/// Connect to a [`TlsTcpServiceDispatcher`] and request the named service
+/// over a TLS channel.
+///
+/// Performs the TLS handshake (including mTLS client-cert presentation if
+/// the identity is `PemFiles` / `PemBytes`), then sends the service name
+/// using the same `[len: u32 LE][utf8 bytes]` framing as
+/// [`connect_to_service`].  Returns the connected [`TlsTcpChannel`] ready
+/// for the service protocol.
+///
+/// # Errors
+///
+/// - `RepError::ConfigError` if `service_name` is empty or longer than
+///   [`MAX_SERVICE_NAME_LEN`].
+/// - `RepError::NetworkError` if the TLS handshake fails (e.g. peer not
+///   in allowlist).
+#[cfg(feature = "tls-rustls")]
+pub fn connect_to_service_tls(
+    addr: SocketAddr,
+    service_name: &str,
+    tls: &crate::tls::TlsConfig,
+) -> Result<super::channel::TlsTcpChannel> {
+    use super::channel::TlsTcpChannel;
+
+    let name_bytes = service_name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.len() > MAX_SERVICE_NAME_LEN {
+        return Err(RepError::ConfigError(format!(
+            "service name length {} out of range [1, {}]",
+            name_bytes.len(),
+            MAX_SERVICE_NAME_LEN,
+        )));
+    }
+
+    // TLS handshake (with mTLS client-cert presentation when configured).
+    let channel = TlsTcpChannel::connect_with_tls(addr, tls)?;
+    // Send service name using Channel framing = service-name protocol.
+    channel.send(name_bytes)?;
+    Ok(channel)
+}
+
+/// A TLS-capable service dispatcher that enforces `peer_allowlist` via mTLS.
+///
+/// Drop-in replacement for [`TcpServiceDispatcher`] when TLS is required.
+/// Uses [`super::channel::TlsTcpChannelListener::bind_with_tls_and_allowlist`]
+/// under the hood, so every incoming connection:
+///
+/// 1. Must complete a TLS 1.3 handshake presenting a client certificate.
+/// 2. That certificate must chain to the trusted CA and have a Subject CN
+///    or DNS SAN in the configured [`crate::auth::PeerAllowlist`].
+/// 3. Only then is the service-name framing read and the connection routed.
+///
+/// ## Empty-allowlist policy
+///
+/// Construction returns `Err(RepError::ConfigError)` if the allowlist is
+/// empty (fail-closed, consistent with the TCP-TLS path).
+///
+/// ## Feature gate
+///
+/// Requires the `tls-rustls` feature.
+#[cfg(feature = "tls-rustls")]
+pub struct TlsTcpServiceDispatcher {
+    /// Map from service name to handler.
+    services: Arc<Mutex<HashMap<String, Arc<dyn ServiceHandler>>>>,
+    /// Bound address (set at construction time when the listener binds).
+    bound_addr: SocketAddr,
+    /// The TLS listener — shared with the accept thread.
+    listener: Arc<super::channel::TlsTcpChannelListener>,
+    /// Whether the accept loop is running.
+    running: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "tls-rustls")]
+impl TlsTcpServiceDispatcher {
+    /// Bind to `addr`, set up TLS from `tls`, and enforce `allowlist`.
+    ///
+    /// Binds the socket and builds the mTLS-enforced `ServerConfig`
+    /// immediately at construction time (fail-fast on bad TLS config).
+    ///
+    /// # Errors
+    ///
+    /// - `RepError::ConfigError` if `allowlist` is empty.
+    /// - `RepError::ConfigError` if `trusted_certs` is `SkipVerification`.
+    /// - `RepError::NetworkError` if the socket bind fails.
+    pub fn new(
+        addr: SocketAddr,
+        tls: &crate::tls::TlsConfig,
+        allowlist: crate::auth::PeerAllowlist,
+    ) -> Result<Self> {
+        let listener =
+            super::channel::TlsTcpChannelListener::bind_with_tls_and_allowlist(
+                addr, tls, allowlist,
+            )?;
+        let bound_addr = listener.local_addr()?;
+        Ok(Self {
+            services: Arc::new(Mutex::new(HashMap::new())),
+            bound_addr,
+            listener: Arc::new(listener),
+            running: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Register a service handler by name.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        handler: Arc<dyn ServiceHandler>,
+    ) {
+        self.services.lock().insert(name.into(), handler);
+    }
+
+    /// Return the address this dispatcher is bound to.
+    pub fn addr(&self) -> SocketAddr {
+        self.bound_addr
+    }
+
+    /// Whether the dispatcher accept loop is running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Stop the accept loop.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Start the TLS accept loop in a background thread.
+    ///
+    /// The mTLS handshake (including allowlist check) runs inside
+    /// [`super::channel::TlsTcpChannelListener::accept`].  Only admitted
+    /// peers make it to the service-name routing step.
+    pub fn start(&self) -> Result<SocketAddr> {
+        let services = Arc::clone(&self.services);
+        let listener = Arc::clone(&self.listener);
+        let running = Arc::clone(&self.running);
+        running.store(true, Ordering::SeqCst);
+        let bound = self.bound_addr;
+
+        thread::spawn(move || {
+            while running.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok(channel) => {
+                        let svcs = Arc::clone(&services);
+                        thread::spawn(move || {
+                            handle_tls_incoming(channel, svcs);
+                        });
+                    }
+                    Err(e) => {
+                        // An error while running is likely a transient
+                        // handshake failure (rejected peer) — log and
+                        // continue.  Stop only on accept-loop termination
+                        // (i.e. when `running` is cleared).
+                        if running.load(Ordering::SeqCst) {
+                            log::debug!(
+                                "TlsTcpServiceDispatcher: accept error \
+                                 (continuing): {e}"
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+
+        Ok(bound)
+    }
+}
+
+/// Read the service name from a newly admitted TLS connection and dispatch.
+///
+/// Service name wire format: identical to [`connect_to_service`] /
+/// [`connect_to_service_tls`]: `[len: u32 LE][utf8 bytes]`, which is also
+/// the same framing the [`Channel::send`] / [`Channel::receive`] methods use.
+/// We use [`Channel::receive`] here so the length-bounding and framing logic
+/// is shared with the generic channel implementation.
+#[cfg(feature = "tls-rustls")]
+fn handle_tls_incoming(
+    channel: super::channel::TlsTcpChannel,
+    services: Arc<Mutex<HashMap<String, Arc<dyn ServiceHandler>>>>,
+) {
+    use crate::net::channel::Channel;
+
+    // Read service name via Channel::receive (same framing as plain TCP).
+    let name_bytes = match channel.receive(std::time::Duration::from_secs(10)) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            log::warn!("TlsTcpServiceDispatcher: timeout reading service name");
+            return;
+        }
+        Err(e) => {
+            log::debug!(
+                "TlsTcpServiceDispatcher: error reading service name: {e}"
+            );
+            return;
+        }
+    };
+
+    // Guard against oversized service names (same bound as plain TCP path).
+    if name_bytes.len() > MAX_SERVICE_NAME_LEN {
+        log::warn!(
+            "TlsTcpServiceDispatcher: rejected service-name length {} (max {})",
+            name_bytes.len(),
+            MAX_SERVICE_NAME_LEN
+        );
+        return;
+    }
+
+    let service_name = match String::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn!(
+                "TlsTcpServiceDispatcher: non-UTF-8 service name, closing"
+            );
+            return;
+        }
+    };
+
+    let handler = {
+        let guard = services.lock();
+        guard.get(&service_name).cloned()
+    };
+
+    if let Some(h) = handler {
+        let _ = h.handle(Box::new(channel));
+    } else {
+        log::warn!(
+            "TlsTcpServiceDispatcher: no handler for service '{service_name}'"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AnyServiceDispatcher
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the two dispatcher variants used by
+/// [`crate::replicated_environment::ReplicatedEnvironment`].
+///
+/// `Plain` wraps a [`TcpServiceDispatcher`] (plain TCP).
+/// `Tls` wraps a [`TlsTcpServiceDispatcher`] (TLS + mTLS enforcement).
+///
+/// Only available when the `tls-rustls` feature is enabled (the `Tls`
+/// variant requires it).  Under `no tls-rustls` only `Plain` exists.
+pub(crate) enum AnyServiceDispatcher {
+    /// Plain TCP (no TLS).
+    Plain(TcpServiceDispatcher),
+    /// TLS-encrypted TCP with mTLS peer-allowlist enforcement.
+    /// Requires the `tls-rustls` feature.
+    #[cfg(feature = "tls-rustls")]
+    Tls(TlsTcpServiceDispatcher),
+}
+
+impl AnyServiceDispatcher {
+    /// Register a service handler by name.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        handler: Arc<dyn ServiceHandler>,
+    ) {
+        match self {
+            Self::Plain(d) => d.register(name, handler),
+            #[cfg(feature = "tls-rustls")]
+            Self::Tls(d) => d.register(name, handler),
+        }
+    }
+
+    /// Stop the accept loop.
+    pub fn stop(&self) {
+        match self {
+            Self::Plain(d) => d.stop(),
+            #[cfg(feature = "tls-rustls")]
+            Self::Tls(d) => d.stop(),
+        }
+    }
+
+    /// Whether the accept loop is running.
+    pub fn is_running(&self) -> bool {
+        match self {
+            Self::Plain(d) => d.is_running(),
+            #[cfg(feature = "tls-rustls")]
+            Self::Tls(d) => d.is_running(),
+        }
+    }
+
+    /// The bound socket address.
+    pub fn addr(&self) -> SocketAddr {
+        match self {
+            Self::Plain(d) => d.addr(),
+            #[cfg(feature = "tls-rustls")]
+            Self::Tls(d) => d.addr(),
+        }
+    }
+
+    /// Whether this dispatcher enforces TLS + mTLS.
+    pub fn is_tls(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            #[cfg(feature = "tls-rustls")]
+            Self::Tls(_) => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

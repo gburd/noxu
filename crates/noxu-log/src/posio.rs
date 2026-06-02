@@ -61,21 +61,33 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
 
 /// Reads up to `buf.len()` bytes at `offset`; returns the number read.
 #[cfg(unix)]
-pub(crate) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_at(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buf, offset)
 }
 
 /// Reads up to `buf.len()` bytes at `offset`; returns the number read.
 #[cfg(windows)]
-pub(crate) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_at(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_read(buf, offset)
 }
 
 /// Reads exactly `buf.len()` bytes at `offset`.
 #[cfg(unix)]
-pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
 }
@@ -112,7 +124,11 @@ pub(crate) fn read_exact_at(
 
 /// Writes all of `buf` at `offset`.
 #[cfg(unix)]
-pub(crate) fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_at(
+    file: &File,
+    buf: &[u8],
+    offset: u64,
+) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
 }

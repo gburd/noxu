@@ -53,8 +53,8 @@ Propagates through `bind_with_tls_and_allowlist` as a `ConfigError`.
 | `TlsTcpChannelListener::bind_with_tls_and_allowlist` (server) | Enforced — client cert mandatory |
 | `TlsConfig::to_rustls_client_config` with `PemFiles`/`PemBytes` | Presents client cert |
 | `TlsConfig::to_rustls_client_config` with `SelfSigned` | No client cert (dev mode unchanged) |
-| QUIC channels (`to_quinn_server_config`) | Still uses `with_no_client_auth`; Phase 3 |
-| `ReplicatedEnvironment::new` / `TcpServiceDispatcher` | Plain TCP — no TLS handshake to inspect |
+| QUIC channels (`to_quinn_server_config`) | Phase 2: `with_no_client_auth`. **Phase 3: enforced** via `QuicChannelListener::bind_with_tls_and_allowlist` |
+| `ReplicatedEnvironment::new` / `TcpServiceDispatcher` | Phase 2: plain TCP. **Phase 3: `TlsTcpServiceDispatcher` enforces mTLS end-to-end when `transport_kind=Tls`** |
 
 ## rustls-vs-native gap
 
@@ -66,6 +66,11 @@ with a `tls-native` acceptor already returns a `ConfigError` (TLS-4 finding,
 closed in Phase 1).
 
 ## What is deferred to Phase 3
+
+> **Update (Wave GA):** the `ReplicatedEnvironment`/dispatcher wiring and QUIC
+> server-side enforcement listed below are now **done** — see
+> `wave-ga-mtls-phase3.md`. The remaining deferrals are the `tls-native`
+> client-cert gap and per-message auth (NA-5/NA-6).
 
 - **`ReplicatedEnvironment` end-to-end wiring**: The production flow uses
   `TcpServiceDispatcher` (plain TCP).  Full end-to-end enforcement requires

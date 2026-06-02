@@ -177,8 +177,8 @@ pub fn send_step_down(
 /// Shared helper: register the ADMIN service on `dispatcher`, holding a
 /// `Weak<ReplicatedEnvironment>` so the handler outlives no longer
 /// than the env itself.
-pub fn register_admin_service(
-    dispatcher: &crate::net::service_dispatcher::TcpServiceDispatcher,
+pub(crate) fn register_admin_service(
+    dispatcher: &crate::net::service_dispatcher::AnyServiceDispatcher,
     env: Weak<crate::replicated_environment::ReplicatedEnvironment>,
 ) {
     let svc = AdminService::new(env);
