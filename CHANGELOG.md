@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (replication — mTLS Phase 3)
+
+- **End-to-end mTLS for the replication service and QUIC.** Phase 3 extends
+  the Phase 2 peer-allowlist enforcement to the two paths that were still
+  unauthenticated:
+  - `TlsTcpServiceDispatcher` — the replication service dispatcher now binds
+    via `bind_with_tls_and_allowlist`, so a node with `transport_kind = Tls`
+    enforces mTLS end-to-end (was plain TCP).
+  - QUIC — `QuicChannelListener::bind_with_tls_and_allowlist` /
+    `TlsConfig::to_quinn_server_config_with_allowlist` wire the same
+    `PeerAllowlistVerifier`, requiring and validating client certs against the
+    CA + allowlist before any stream data (was `with_no_client_auth`).
+  - The empty-allowlist **fail-closed** policy is now consistent across the
+    TLS listener, dispatcher, and QUIC; a TLS node with an empty allowlist is
+    a `ConfigError` rather than a silent plain-TCP downgrade.
+  - Enforcement remains `tls-rustls`-only (`tls-native` has no client-cert
+    verification API). See `docs/src/internal/wave-ga-mtls-phase3.md`.
+
 ### Fixed (portability — RISC-V 64 + Windows on ARM64)
 
 - **Windows (aarch64-pc-windows-msvc) support.** Validated the full workspace

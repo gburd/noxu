@@ -169,7 +169,7 @@ pub struct RepConfig {
     ///
     /// When set and `transport_kind` is [`RepTransportKind::Tls`],
     /// [`crate::replicated_environment::ReplicatedEnvironment`] will
-    /// start a [`crate::net::service_dispatcher::TlsTcpServiceDispatcher`]
+    /// start a `TlsTcpServiceDispatcher` (feature `tls-rustls`)
     /// instead of the plain-TCP dispatcher.  Combined with a non-empty
     /// `peer_allowlist`, this enforces mTLS on every incoming replication
     /// connection at the dispatcher level.

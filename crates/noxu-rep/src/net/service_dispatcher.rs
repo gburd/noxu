@@ -423,8 +423,7 @@ pub struct TlsTcpServiceDispatcher {
     /// Bound address (set at construction time when the listener binds).
     bound_addr: SocketAddr,
     /// The TLS listener — shared with the accept thread.
-    listener:
-        Arc<super::channel::TlsTcpChannelListener>,
+    listener: Arc<super::channel::TlsTcpChannelListener>,
     /// Whether the accept loop is running.
     running: Arc<AtomicBool>,
 }
@@ -542,22 +541,19 @@ fn handle_tls_incoming(
     use crate::net::channel::Channel;
 
     // Read service name via Channel::receive (same framing as plain TCP).
-    let name_bytes =
-        match channel.receive(std::time::Duration::from_secs(10)) {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                log::warn!(
-                    "TlsTcpServiceDispatcher: timeout reading service name"
-                );
-                return;
-            }
-            Err(e) => {
-                log::debug!(
-                    "TlsTcpServiceDispatcher: error reading service name: {e}"
-                );
-                return;
-            }
-        };
+    let name_bytes = match channel.receive(std::time::Duration::from_secs(10)) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            log::warn!("TlsTcpServiceDispatcher: timeout reading service name");
+            return;
+        }
+        Err(e) => {
+            log::debug!(
+                "TlsTcpServiceDispatcher: error reading service name: {e}"
+            );
+            return;
+        }
+    };
 
     // Guard against oversized service names (same bound as plain TCP path).
     if name_bytes.len() > MAX_SERVICE_NAME_LEN {
