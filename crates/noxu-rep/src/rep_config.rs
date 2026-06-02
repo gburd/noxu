@@ -164,6 +164,20 @@ pub struct RepConfig {
     /// plain TCP there is no TLS handshake and therefore no cert to inspect.
     /// Setting this field with a non-TLS transport emits a `log::warn!`.
     pub peer_allowlist: Vec<String>,
+
+    /// TLS configuration for the service dispatcher (Phase 3).
+    ///
+    /// When set and `transport_kind` is [`RepTransportKind::Tls`],
+    /// [`crate::replicated_environment::ReplicatedEnvironment`] will
+    /// start a [`crate::net::service_dispatcher::TlsTcpServiceDispatcher`]
+    /// instead of the plain-TCP dispatcher.  Combined with a non-empty
+    /// `peer_allowlist`, this enforces mTLS on every incoming replication
+    /// connection at the dispatcher level.
+    ///
+    /// `None` (the default) preserves the Phase-2 behaviour: the
+    /// dispatcher uses plain TCP and the operator must wire
+    /// `TlsTcpChannelListener::bind_with_tls_and_allowlist` separately.
+    pub tls_config: Option<crate::tls::TlsConfig>,
 }
 
 impl RepConfig {
@@ -192,6 +206,7 @@ impl RepConfig {
             reconnect_config: ReconnectConfig::default(),
             transport_kind: RepTransportKind::default(),
             peer_allowlist: Vec::new(),
+            tls_config: None,
         }
     }
 
@@ -240,6 +255,7 @@ pub struct RepConfigBuilder {
     reconnect_config: ReconnectConfig,
     transport_kind: RepTransportKind,
     peer_allowlist: Vec<String>,
+    tls_config: Option<crate::tls::TlsConfig>,
 }
 
 impl RepConfigBuilder {
@@ -348,6 +364,19 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Set the TLS configuration for the service dispatcher (Phase 3).
+    ///
+    /// When set and `transport_kind` is [`RepTransportKind::Tls`],
+    /// [`crate::replicated_environment::ReplicatedEnvironment`] will use a
+    /// TLS-capable service dispatcher that enforces mTLS when
+    /// `peer_allowlist` is also non-empty.
+    ///
+    /// See [`RepConfig::tls_config`] for full details.
+    pub fn tls_config(mut self, tls: crate::tls::TlsConfig) -> Self {
+        self.tls_config = Some(tls);
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -369,6 +398,7 @@ impl RepConfigBuilder {
             reconnect_config: self.reconnect_config,
             transport_kind: self.transport_kind,
             peer_allowlist: self.peer_allowlist,
+            tls_config: self.tls_config,
         }
     }
 }

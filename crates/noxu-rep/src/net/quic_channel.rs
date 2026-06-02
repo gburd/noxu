@@ -482,6 +482,32 @@ impl QuicChannelListener {
         Ok(Self { endpoint, runtime })
     }
 
+    /// Bind to `addr` and enforce `allowlist` via mTLS.
+    ///
+    /// This is the **QUIC mTLS enforcement constructor** introduced in
+    /// Phase 3.  The QUIC server will:
+    ///
+    /// 1. Require a client certificate on every incoming connection.
+    /// 2. Validate the chain against the CA roots in `tls`.
+    /// 3. Reject the connection if the peer's Subject CN / DNS SANs are
+    ///    not in `allowlist` (before any application data is exchanged).
+    ///
+    /// The empty-allowlist fail-closed policy applies: an empty `allowlist`
+    /// returns `Err(RepError::ConfigError)`.
+    ///
+    /// `tls` must not use `TrustedCerts::SkipVerification` (same restriction
+    /// as the TCP-TLS path — `SkipVerification` provides no CA for chain
+    /// validation).
+    pub fn bind_with_tls_and_allowlist(
+        addr: SocketAddr,
+        tls: &crate::tls::TlsConfig,
+        allowlist: crate::auth::PeerAllowlist,
+    ) -> Result<Self> {
+        let server_cfg =
+            tls.to_quinn_server_config_with_allowlist(allowlist)?;
+        Self::with_server_config(addr, server_cfg)
+    }
+
     /// Return the local address the endpoint is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.endpoint
