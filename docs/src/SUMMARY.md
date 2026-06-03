@@ -200,3 +200,4 @@
   - [Wave FA — DPL derive crate-path override](internal/wave-fa-derive-crate-attr.md)
   - [Wave FB — mTLS Phase 2: peer_allowlist enforcement (v3.1.0)](internal/wave-fb-mtls-phase2.md)
   - [Wave GA — mTLS Phase 3: dispatcher + QUIC enforcement](internal/wave-ga-mtls-phase3.md)
+  - [Wave GB — DbTree foundation + P-2 recovery investigation](internal/wave-gb-dbtree-recovery.md)
