@@ -16,6 +16,28 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (durability — Critical)
+
+- **WAL fsync fast-path could skip the fdatasync for a SYNC commit, silently
+  losing committed data on power failure.** `flush_no_sync()` (used by
+  `WRITE_NO_SYNC` auto-commits and the optional background no-sync flush
+  daemon) advanced the same `last_flush_lsn` watermark that
+  `flush_sync_if_needed()` consults to coalesce/skip fsyncs. A mixed-durability
+  workload — a `WRITE_NO_SYNC` write to the page cache followed by a `SYNC`
+  commit at a lower LSN — would see `last_flush_lsn` already past the SYNC
+  commit and skip its `fdatasync`, leaving the commit in the OS page cache
+  only. Added a separate durable watermark `last_synced_lsn` that is advanced
+  *only* after a successful `fdatasync`; `flush_sync_if_needed` now keys its
+  skip decision off it. Regression test:
+  `test_flush_no_sync_does_not_satisfy_sync_durability`.
+
+### Changed (safety — defensive)
+
+- `BinStub::apply_delta` (noxu-tree) docstring corrected: it is dead code that
+  writes uncompressed keys into prefix-compressed slots and must not be used to
+  reconstitute a BIN (the live path is `mutate_to_full_bin`). Removed the
+  misleading `BIN.reconstituteBIN()` claim that invited misuse.
+
 ### Added (recovery correctness tests)
 
 - `open_txn_spanning_checkpoint_recovers_correctly` (crash/SIGKILL test):

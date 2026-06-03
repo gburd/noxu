@@ -990,13 +990,17 @@ impl BinStub {
 
     /// Deserialise a BIN delta from the bytes produced by `serialize_delta()`.
     ///
-    /// Applies the dirty slots carried by `delta_bytes` onto `base`, which
-    /// must be a previously deserialized full BIN (from `deserialize_full()`).
-    /// Slots not mentioned in the delta are left unchanged.
+    /// **DO NOT USE for BIN reconstruction.** This helper writes full
+    /// (uncompressed) keys directly into slots without recomputing the BIN
+    /// key prefix, so on a prefix-compressed BIN it corrupts the slot keys and
+    /// breaks the sorted-suffix invariant. It is NOT wired into any live path.
+    /// The correct delta-reconstruction path is
+    /// `mutate_to_full_bin` → `apply_delta_to_bin` → `insert_with_prefix`,
+    /// which recomputes the prefix. This function is retained only for the
+    /// raw byte-format round-trip and must not be used to reconstitute a BIN.
+    /// Tracked for removal — see the v3.x review synthesis (storage C-2).
     ///
     /// Returns `None` if `delta_bytes` is malformed.
-    ///
-    /// `BINDeltaLogEntry.readEntry()` / `BIN.reconstituteBIN()`.
     pub fn apply_delta(base: &mut BinStub, delta_bytes: &[u8]) -> Option<()> {
         if delta_bytes.len() < 12 {
             return None;
