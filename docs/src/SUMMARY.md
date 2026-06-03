@@ -201,3 +201,8 @@
   - [Wave FB — mTLS Phase 2: peer_allowlist enforcement (v3.1.0)](internal/wave-fb-mtls-phase2.md)
   - [Wave GA — mTLS Phase 3: dispatcher + QUIC enforcement](internal/wave-ga-mtls-phase3.md)
   - [Wave GB — DbTree foundation + P-2 recovery investigation](internal/wave-gb-dbtree-recovery.md)
+  - [v3.x production-readiness review — synthesis](internal/production-readiness-review-2026-06.md)
+    - [Review: transactions, isolation, recovery](internal/review-txn-isolation-2026-06.md)
+    - [Review: storage core (tree, log, cleaner, evictor)](internal/review-storage-core-2026-06.md)
+    - [Review: Rust correctness, unsafe, API](internal/review-rust-api-2026-06.md)
+    - [Review: claims, docs, tests, tooling](internal/review-claims-docs-tooling-2026-06.md)

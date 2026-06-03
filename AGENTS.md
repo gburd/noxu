@@ -17,7 +17,7 @@ crates under `crates/`.
 
 ## Crate Map
 
-The 19 crates are organized by implementation layer:
+The 22 crates are organized by implementation layer:
 
 ### Phase 0 — Foundation (complete)
 
@@ -26,7 +26,7 @@ The 19 crates are organized by implementation layer:
 | `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
 | `noxu-sync` | Internal sync primitives (raw mutex/rwlock, condvar, futex) |
 | `noxu-latch` | Exclusive and shared/exclusive latches (parking_lot) |
-| `noxu-config` | 400+ configuration parameters with validation |
+| `noxu-config` | 160+ configuration parameters with validation |
 
 ### Phase 1–6 — Core Engine (complete)
 
@@ -118,7 +118,7 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   | Crate | Production `unsafe` blocks | Reason |
   |---|---:|---|
   | `noxu-sync` | ~20 (mostly small) | FFI to `libc` futex and `parking_lot` raw locking primitives. |
-  | `noxu-log` | 6 | Memory-mapped I/O via `Mmap::map`; raw-pointer writes into pinned `LogBuffer` segments; one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` (sound: the `Arc<FileHandle>` outlives the guard). One `unsafe impl Send for LogBufferSegment` (sound: pin-count + latch protocol). |
+  | `noxu-log` | 8 | Memory-mapped I/O via `Mmap::map`; the three raw-pointer blocks in `LogBufferSegment::put` (latch lock, `copy_nonoverlapping`, pin-count/latch release); `as_mut_ptr().add` in `allocate`; `read_latch.unlock` in `release`; one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` (sound only because struct fields drop in declaration order — `guard` before `_handle`); one `unsafe impl Send for LogBufferSegment` (pin-count + latch protocol; see review finding F-01 on the move-safety caveat). |
   | `noxu-rep` | 1 | Single `unsafe` FFI in `net/channel.rs` for socket-option setup. |
   | `noxu-latch` | 1 | RAII force-unlock for poison-recovery. |
   | `noxu-xa` | 1 | Transaction-pointer dereference in `environment.rs`; documented inline. |
@@ -138,8 +138,10 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   `unsafe impl Send + Sync` blocks in `noxu-rep::elections` were
   removed in v2.4.2: their interior fields auto-derive the bounds.
   Adding any new `unsafe` requires review.
-- **CRC32**: Uses `crc32fast` (CLMUL/PCLMULQDQ hardware acceleration, 15.8
-  GiB/s at 1KiB). Not CRC32C — see `docs/src/internal/checksum-selection.md`.
+- **CRC32**: Uses `crc32fast` (CLMUL/PCLMULQDQ hardware acceleration, ~15.8
+  GiB/s at 1KiB on x86-64; ~500 MB/s on AArch64 / ~300 MB/s on ARMv7 where
+  `crc32fast` has no hardware path and falls back to software). Not CRC32C —
+  see `docs/src/internal/checksum-selection.md`.
 
 ## Reference Archives
 

@@ -39,7 +39,7 @@ application crash as well, use `SyncPolicy::NoSync`. See
 | Read Uncommitted | Lowest (no read locks) | Dirty reads, non-repeatable reads, phantoms |
 | Read Committed | Low (read locks released early) | Non-repeatable reads, phantoms |
 | Repeatable Read (default) | Medium | Phantoms |
-| Serializable | Highest (range locks) | None |
+| Serializable | Highest (intended: range locks) | Phantoms still possible — range locking not yet wired (see [isolation](isolation.md)) |
 
 Choose the weakest isolation level that your application's correctness requirements
 allow.
@@ -76,7 +76,7 @@ amplification against recovery time.
 | Relax durability for throughput | `Durability::COMMIT_WRITE_NO_SYNC` or `COMMIT_NO_SYNC` |
 | Reduce read lock pressure | `TransactionConfig::with_read_committed(true)` |
 | Allow dirty reads | `TransactionConfig::with_read_uncommitted(true)` |
-| Prevent phantom reads | `TransactionConfig::with_serializable_isolation(true)` |
+| Prevent phantom reads | *(intended via* `TransactionConfig::with_serializable_isolation(true)`*; not yet enforced — see [isolation](isolation.md))* |
 | Avoid lock-upgrade deadlocks | `LockMode::Rmw` on the initial read |
 | Set environment lock timeout | `EnvironmentConfig::with_lock_timeout(ms)` |
 | Set per-transaction lock timeout | `txn.set_lock_timeout(ms)` |
