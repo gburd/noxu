@@ -652,3 +652,65 @@ fn open_txn_spanning_checkpoint_recovers_correctly() {
          uncommitted data must never appear committed after recovery"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: aborted_then_committed_same_key_recovers_committed_value
+// ---------------------------------------------------------------------------
+//
+// Recovery currency-check (JE BIN.recoverRecord; review T-F1).
+//
+// Scenario (crash_worker mode "aborted_then_committed_same_key"):
+//   1. T1 inserts key "K" = "v1", then ABORTS (clean abort record).
+//   2. T3 inserts the SAME key "K" = "v3", then COMMITS.
+//   3. T2 writes an unrelated key and stays open (active at crash) so the undo
+//      pass is not short-circuited by the no-active-txns fast path.
+//   4. Parent SIGKILLs the worker.
+//
+// After recovery K must equal "v3". The undo pass now enforces the JE
+// currency check (apply an undo only when the slot still holds the logged
+// version), so reverting T1's aborted write cannot clobber T3's committed
+// write of the same key.
+//
+// NOTE: this exact interleaving is also handled correctly WITHOUT the currency
+// check on current `main` (runtime abort already reverted T1, redo replays
+// only committed LNs, and the slot ends at T3's version), so this is a
+// guard/regression test rather than a reproduction of a live corruption. The
+// currency check closes the theoretical hole and makes the code match the
+// behaviour its own comment previously (incorrectly) claimed.
+
+#[test]
+fn aborted_then_committed_same_key_recovers_committed_value() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "aborted_then_committed_same_key")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    assert!(
+        wait_for_flag(&dir_path, "abort_commit_ready", Duration::from_secs(60)),
+        "worker did not signal abort_commit_ready within timeout"
+    );
+
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    let (_env, db) = reopen_db(&dir_path);
+
+    let key = DatabaseEntry::from_bytes(b"K");
+    let mut val = DatabaseEntry::new();
+    let status = db.get(None, &key, &mut val).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::Success,
+        "committed key K must be present after recovery (T3's write must not \
+         be clobbered by the undo of T1's aborted write of the same key)"
+    );
+    assert_eq!(
+        val.data(),
+        b"v3",
+        "K must hold T3's committed value 'v3', not T1's aborted before-image"
+    );
+}

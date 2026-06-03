@@ -16,6 +16,22 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Changed (recovery — defensive correctness, review T-F1)
+
+- The recovery undo pass now enforces the JE `BIN.recoverRecord` currency
+  check: an undo (delete or revert-to-before-image) is applied to a tree slot
+  only when the slot still holds the exact version logged by the record being
+  undone (`slotLsn == logLsn`). Previously the undo applied unconditionally
+  and a code comment falsely claimed the check was "delegated to the tree
+  layer". This closes the theoretical hole where an aborted transaction's
+  before-image could overwrite a later committed write of the same key during
+  recovery. NOTE: the specific interleaving could not be reproduced as a live
+  failure on `main` (it is masked by runtime-abort reversion, the
+  redo-only-committed model, and the no-active-txns fast path), so this is a
+  defensive alignment with the reference algorithm rather than a fix for a
+  demonstrated live corruption. Added a recovery-correctness regression test
+  (`aborted_then_committed_same_key_recovers_committed_value`).
+
 ### Fixed (correctness + honesty — from the v3.x production-readiness review)
 
 - **noxu-latch**: `thread_id()` now sets `| 1` so a thread whose hash is 0 no
