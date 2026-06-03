@@ -254,7 +254,7 @@ pub fn w12_xa_2pc(
         {
             let txn = xa.get_transaction(&xid).unwrap();
             let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
-            db.put(Some(txn), &k, &v).unwrap();
+            db.put(Some(&*txn), &k, &v).unwrap();
             xa.mark_write(&xid).unwrap();
         }
 
@@ -287,7 +287,7 @@ pub fn w12_xa_1pc(
         {
             let txn = xa.get_transaction(&xid).unwrap();
             let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
-            db.put(Some(txn), &k, &v).unwrap();
+            db.put(Some(&*txn), &k, &v).unwrap();
             xa.mark_write(&xid).unwrap();
         }
 
