@@ -33,7 +33,7 @@ backlog.
 | ID | Area | Issue | Status |
 |----|------|-------|--------|
 | S-C1 | noxu-log durability | `flush_no_sync` advanced the same `last_flush_lsn` that `flush_sync_if_needed` uses to skip fsyncs → a SYNC commit after a WRITE_NO_SYNC write (or the no-sync flush daemon) could skip its `fdatasync` and be lost on power failure | **FIXED** (separate `last_synced_lsn` durable watermark + regression test) |
-| T-F1 | noxu-recovery | Undo pass applies before-images with **no `logLsn == slotLsn` currency check**; an aborted txn's before-image overwrites a later committed write of the same key during recovery → silent committed-data loss. The code comment claims the check is "delegated to the tree layer" — it is not. | **OPEN — top blocker** |
+| T-F1 | noxu-recovery | Undo pass applied before-images with **no `logLsn == slotLsn` currency check** (the code comment falsely claimed the check was "delegated to the tree layer"). Theoretically an aborted txn's before-image could overwrite a later committed write of the same key during recovery. | **MITIGATED** — the JE currency check is now enforced in `run_undo`/`run_undo_all`; the false comment is corrected. The specific interleaving could **not** be reproduced as a live failure on main (masked by runtime-abort reversion + redo-only-committed + the no-active-txns fast path), so this is defensive alignment with JE, not a demonstrated live-corruption fix. |
 | T-F2 | noxu-dbi / docs | `cursor_impl::lock_ln` always acquires `LockType::Read`, never `RangeRead`; the range-lock conflict matrix is dead code at the operational level. SERIALIZABLE does not prevent phantoms despite being documented to. | **OPEN** (docs corrected to stop claiming phantom prevention; code fix pending) |
 | R-F01 | noxu-log | `LogBufferSegment` stores raw pointers into inline `LogBuffer` fields; `unsafe impl Send` + no `Pin`/`!Unpin` → moving a stack `LogBuffer` after `allocate()` dangles the pointers (UB) | **OPEN** |
 | R-F03 | noxu-log / noxu-dbi | `mmap_file` SAFETY claims it is only used on complete files during recovery; the disk-ordered cursor maps the **current write file** during live operation, violating `memmap2`'s no-concurrent-modification contract (UB) | **OPEN** |
@@ -103,8 +103,9 @@ backlog.
 
 ## Recommended release gating order
 
-1. **T-F1** (recovery currency check) — data corruption; must fix + add the
-   exact `T1-abort → T3-commit-same-key → crash` regression test.
+1. **T-F1** (recovery currency check) — **mitigated** (JE currency check now
+   enforced; could not be reproduced as a live failure — defensive). Verify the
+   analysis above (runtime-abort reversion + redo-only-committed) is complete.
 2. **R-F01, R-F03** (noxu-log `unsafe` soundness) — UB under documented use.
 3. **R-F04** (XA use-after-free) — RAII guard.
 4. **T-F2** (range locks) — either implement, or keep the corrected docs and

@@ -788,6 +788,14 @@ impl RecoveryManager {
                 }
                 let action = Self::compute_undo_action(rec);
                 if let Some(t) = trees.get_mut(&rec.db_id) {
+                    // JE BIN.recoverRecord currency check: only undo when the
+                    // slot still holds THIS record's version. A later
+                    // committed write (higher slot LSN) must not be reverted.
+                    if !matches!(action, UndoAction::NoAction)
+                        && !Self::undo_slot_is_current(t, &rec.key, pe.lsn)
+                    {
+                        continue;
+                    }
                     match &action {
                         UndoAction::DeleteSlot => {
                             t.delete(&rec.key);
@@ -1646,8 +1654,11 @@ impl RecoveryManager {
                         // RecoveryManager.undo() → bin.deleteEntry()
                         //.  Delete the slot; if it was already removed by
                         // a later operation, this is a no-op.
+                        // Currency check (JE BIN.recoverRecord): only delete
+                        // when the slot still holds THIS record's version.
                         if let Some(t) = tree.as_deref_mut()
                             && t.get_database_id() == rec.db_id
+                            && Self::undo_slot_is_current(t, &rec.key, pe.lsn)
                         {
                             t.delete(&rec.key);
                         }
@@ -1676,6 +1687,7 @@ impl RecoveryManager {
                         //      this case.  We call scanner.read_at_lsn().
                         if let Some(t) = tree.as_deref_mut()
                             && t.get_database_id() == rec.db_id
+                            && Self::undo_slot_is_current(t, &rec.key, pe.lsn)
                         {
                             if rec.abort_known_deleted {
                                 // Before this write the slot was deleted.
@@ -1770,10 +1782,11 @@ impl RecoveryManager {
     /// abort_lsn is valid → revert to abort_lsn (before-image)
     /// ```
     ///
-    /// The "found in tree" and "logLsn == slotLsn" currency checks are
-    /// delegated to the tree layer (`Tree::delete` / `Tree::insert`) at the
-    /// call site; here we compute the *intended* action from the log record
-    /// metadata alone.
+    /// The `logLsn == slotLsn` currency check is enforced by the caller via
+    /// [`Self::undo_slot_is_current`] before this action is applied to the
+    /// tree (JE `BIN.recoverRecord`): an undo before-image is applied only
+    /// when the slot still holds the exact version this record logged. Here
+    /// we compute the *intended* action from the log record metadata alone.
     fn compute_undo_action(rec: &LnRecord) -> UndoAction {
         if rec.abort_lsn == NULL_LSN {
             // This was the first write of this key: undo by deleting the slot.
@@ -1781,6 +1794,28 @@ impl RecoveryManager {
         } else {
             // Revert to before-image.
             UndoAction::RevertToAbortLsn { abort_lsn: rec.abort_lsn }
+        }
+    }
+
+    /// JE `BIN.recoverRecord` currency check (`updateEntry = logLsn ==
+    /// slotLsn`). An undo action may modify the tree slot for `key` ONLY when
+    /// the slot currently holds the exact version logged at `log_lsn`.
+    ///
+    /// Recovery rebuilds user trees by redoing **committed** LNs only;
+    /// uncommitted/aborted LNs are never redone. So at undo time the slot
+    /// either (a) holds this record's version — apply the undo, (b) holds a
+    /// LATER committed version (higher LSN) — skip, or (c) is absent — skip.
+    /// Skipping (b) is the critical fix: without it, an aborted txn's
+    /// before-image overwrites a subsequently-committed write of the same key,
+    /// silently losing committed data on recovery.
+    fn undo_slot_is_current(
+        tree: &noxu_tree::Tree,
+        key: &[u8],
+        log_lsn: Lsn,
+    ) -> bool {
+        match tree.search_with_data(key) {
+            Some(sf) if sf.found => sf.lsn == log_lsn.as_u64(),
+            _ => false,
         }
     }
 

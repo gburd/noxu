@@ -197,6 +197,49 @@ fn main() {
             }
         }
 
+        // aborted_then_committed_same_key:
+        //
+        // T1 inserts key "K" = "v1" and ABORTS (clean abort record written).
+        // T3 then inserts the SAME key "K" = "v3" and COMMITS.
+        // T2 writes an unrelated key and stays OPEN (active at crash) so the
+        // recovery undo pass actually runs (it is skipped entirely when no txn
+        // is active at crash time).
+        // Signal ready; the parent SIGKILLs us.
+        //
+        // After recovery, K MUST equal "v3": T3's committed write must not be
+        // clobbered when the undo pass reverts T1's aborted write of the same
+        // key. This is the recovery currency-check (JE BIN.recoverRecord)
+        // scenario.
+        "aborted_then_committed_same_key" => {
+            let k = DatabaseEntry::from_bytes(b"K");
+
+            let t1 = env.begin_transaction(None).expect("begin t1");
+            db.put(Some(&t1), &k, &DatabaseEntry::from_bytes(b"v1"))
+                .expect("t1 put");
+            t1.abort().expect("t1 abort");
+
+            let t3 = env.begin_transaction(None).expect("begin t3");
+            db.put(Some(&t3), &k, &DatabaseEntry::from_bytes(b"v3"))
+                .expect("t3 put");
+            t3.commit().expect("t3 commit");
+
+            // T2 stays open (active at crash) so the undo pass is not skipped.
+            let t2 = env.begin_transaction(None).expect("begin t2");
+            db.put(
+                Some(&t2),
+                &DatabaseEntry::from_bytes(b"other"),
+                &DatabaseEntry::from_bytes(b"x"),
+            )
+            .expect("t2 put");
+            // Leak the handle so no abort/commit record is written on drop.
+            std::mem::forget(t2);
+
+            flag(&dir, "abort_commit_ready");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }
