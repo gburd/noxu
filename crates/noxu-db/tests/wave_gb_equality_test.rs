@@ -80,7 +80,10 @@ fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut val = DatabaseEntry::new();
     let mut status = cursor.get(&mut key, &mut val, Get::First, None).unwrap();
     while status == OperationStatus::Success {
-        map.insert(key.get_data().unwrap_or(&[]).to_vec(), val.get_data().unwrap_or(&[]).to_vec());
+        map.insert(
+            key.get_data().unwrap_or(&[]).to_vec(),
+            val.get_data().unwrap_or(&[]).to_vec(),
+        );
         status = cursor.get(&mut key, &mut val, Get::Next, None).unwrap();
     }
     cursor.close().unwrap();
@@ -92,8 +95,12 @@ fn write_n_keys(db: &noxu_db::Database, start: u32, n: u32) {
     for i in start..(start + n) {
         let k = format!("key_{i:06}");
         let v = format!("val_{i:06}");
-        db.put(None, &DatabaseEntry::from_bytes(k.as_bytes()), &DatabaseEntry::from_bytes(v.as_bytes()))
-            .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k.as_bytes()),
+            &DatabaseEntry::from_bytes(v.as_bytes()),
+        )
+        .unwrap();
     }
 }
 
@@ -200,19 +207,20 @@ fn write_workload_clean_close_recover(
 fn equality_small_workload() {
     let dir = TempDir::new().unwrap();
     let mut expected = BTreeMap::new();
-    let recovered = write_workload_clean_close_recover(dir.path(), |_env, db| {
-        for i in 0u32..100 {
-            let k = format!("key_{i:06}");
-            let v = format!("val_{i:06}");
-            db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
-            )
-            .unwrap();
-            expected.insert(k.into_bytes(), v.into_bytes());
-        }
-    });
+    let recovered =
+        write_workload_clean_close_recover(dir.path(), |_env, db| {
+            for i in 0u32..100 {
+                let k = format!("key_{i:06}");
+                let v = format!("val_{i:06}");
+                db.put(
+                    None,
+                    &DatabaseEntry::from_bytes(k.as_bytes()),
+                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                )
+                .unwrap();
+                expected.insert(k.into_bytes(), v.into_bytes());
+            }
+        });
     assert_eq!(
         recovered, expected,
         "small workload: recovered state does not match expected committed state"
@@ -225,19 +233,20 @@ fn equality_large_workload() {
     let dir = TempDir::new().unwrap();
     let n = 10_000u32;
     let mut expected = BTreeMap::new();
-    let recovered = write_workload_clean_close_recover(dir.path(), |_env, db| {
-        for i in 0..n {
-            let k = format!("key_{i:08}");
-            let v = format!("val_{i:08}");
-            db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
-            )
-            .unwrap();
-            expected.insert(k.into_bytes(), v.into_bytes());
-        }
-    });
+    let recovered =
+        write_workload_clean_close_recover(dir.path(), |_env, db| {
+            for i in 0..n {
+                let k = format!("key_{i:08}");
+                let v = format!("val_{i:08}");
+                db.put(
+                    None,
+                    &DatabaseEntry::from_bytes(k.as_bytes()),
+                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                )
+                .unwrap();
+                expected.insert(k.into_bytes(), v.into_bytes());
+            }
+        });
     assert_eq!(
         recovered.len(),
         expected.len(),
@@ -322,8 +331,10 @@ fn equality_mixed_pre_post_checkpoint() {
         let db = open_db(&env);
         write_n_txn_committed(&env, &db, 0, 100);
         for i in 0u32..100 {
-            expected
-                .insert(format!("txkey_{i:06}").into_bytes(), format!("txval_{i:06}").into_bytes());
+            expected.insert(
+                format!("txkey_{i:06}").into_bytes(),
+                format!("txval_{i:06}").into_bytes(),
+            );
         }
     } // checkpoint on close
 
@@ -333,8 +344,10 @@ fn equality_mixed_pre_post_checkpoint() {
         let db = open_db(&env);
         write_n_txn_committed(&env, &db, 200, 100);
         for i in 200u32..300 {
-            expected
-                .insert(format!("txkey_{i:06}").into_bytes(), format!("txval_{i:06}").into_bytes());
+            expected.insert(
+                format!("txkey_{i:06}").into_bytes(),
+                format!("txval_{i:06}").into_bytes(),
+            );
         }
     }
 
@@ -354,24 +367,29 @@ fn equality_aborted_txns() {
     let dir = TempDir::new().unwrap();
     let mut expected = BTreeMap::new();
 
-    let recovered = write_workload_clean_close_recover(dir.path(), |env, db| {
-        // Committed batch.
-        write_n_txn_committed(env, db, 0, 50);
-        for i in 0u32..50 {
-            expected
-                .insert(format!("txkey_{i:06}").into_bytes(), format!("txval_{i:06}").into_bytes());
-        }
+    let recovered =
+        write_workload_clean_close_recover(dir.path(), |env, db| {
+            // Committed batch.
+            write_n_txn_committed(env, db, 0, 50);
+            for i in 0u32..50 {
+                expected.insert(
+                    format!("txkey_{i:06}").into_bytes(),
+                    format!("txval_{i:06}").into_bytes(),
+                );
+            }
 
-        // Aborted batch — must NOT appear in recovered state.
-        write_n_txn_aborted(env, db, 0, 30);
+            // Aborted batch — must NOT appear in recovered state.
+            write_n_txn_aborted(env, db, 0, 30);
 
-        // Another committed batch after the aborted one.
-        write_n_txn_committed(env, db, 100, 20);
-        for i in 100u32..120 {
-            expected
-                .insert(format!("txkey_{i:06}").into_bytes(), format!("txval_{i:06}").into_bytes());
-        }
-    });
+            // Another committed batch after the aborted one.
+            write_n_txn_committed(env, db, 100, 20);
+            for i in 100u32..120 {
+                expected.insert(
+                    format!("txkey_{i:06}").into_bytes(),
+                    format!("txval_{i:06}").into_bytes(),
+                );
+            }
+        });
 
     // No "aborted_NNNNNN" keys should be present.
     for key in recovered.keys() {
@@ -403,8 +421,12 @@ fn equality_deletes() {
         for i in 0u32..100 {
             let k = format!("dk_{i:06}");
             let v = format!("dv_{i:06}");
-            db.put(None, &DatabaseEntry::from_bytes(k.as_bytes()), &DatabaseEntry::from_bytes(v.as_bytes()))
-                .unwrap();
+            db.put(
+                None,
+                &DatabaseEntry::from_bytes(k.as_bytes()),
+                &DatabaseEntry::from_bytes(v.as_bytes()),
+            )
+            .unwrap();
         }
         // Delete even-indexed keys.
         for i in (0u32..100).step_by(2) {
@@ -435,38 +457,40 @@ fn equality_bindelta_updates() {
     let dir = TempDir::new().unwrap();
     let mut expected = BTreeMap::new();
 
-    let recovered = write_workload_clean_close_recover(dir.path(), |_env, db| {
-        // Write a base set.
-        for i in 0u32..50 {
-            let k = format!("delta_{i:06}");
-            db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(format!("v0_{i}").as_bytes()),
-            )
-            .unwrap();
-        }
-        // Update a small fraction repeatedly to trigger the BINDelta path
-        // (dirty_count / total <= 25% → delta).
-        for round in 1u32..5 {
-            for i in 0u32..5 {
+    let recovered =
+        write_workload_clean_close_recover(dir.path(), |_env, db| {
+            // Write a base set.
+            for i in 0u32..50 {
                 let k = format!("delta_{i:06}");
-                let v = format!("v{round}_{i}");
                 db.put(
                     None,
                     &DatabaseEntry::from_bytes(k.as_bytes()),
-                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                    &DatabaseEntry::from_bytes(format!("v0_{i}").as_bytes()),
                 )
                 .unwrap();
             }
-        }
-        // Collect expected final state.
-        for i in 0u32..50 {
-            let k = format!("delta_{i:06}");
-            let v = if i < 5 { format!("v4_{i}") } else { format!("v0_{i}") };
-            expected.insert(k.into_bytes(), v.into_bytes());
-        }
-    });
+            // Update a small fraction repeatedly to trigger the BINDelta path
+            // (dirty_count / total <= 25% → delta).
+            for round in 1u32..5 {
+                for i in 0u32..5 {
+                    let k = format!("delta_{i:06}");
+                    let v = format!("v{round}_{i}");
+                    db.put(
+                        None,
+                        &DatabaseEntry::from_bytes(k.as_bytes()),
+                        &DatabaseEntry::from_bytes(v.as_bytes()),
+                    )
+                    .unwrap();
+                }
+            }
+            // Collect expected final state.
+            for i in 0u32..50 {
+                let k = format!("delta_{i:06}");
+                let v =
+                    if i < 5 { format!("v4_{i}") } else { format!("v0_{i}") };
+                expected.insert(k.into_bytes(), v.into_bytes());
+            }
+        });
 
     assert_eq!(
         recovered, expected,
@@ -484,19 +508,20 @@ fn equality_eviction_workload() {
     let n = 10_000u32;
     let mut expected = BTreeMap::new();
 
-    let recovered = write_workload_clean_close_recover(dir.path(), |_env, db| {
-        for i in 0..n {
-            let k = format!("evk_{i:08}");
-            let v = format!("evv_{i:08}");
-            db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
-            )
-            .unwrap();
-            expected.insert(k.into_bytes(), v.into_bytes());
-        }
-    });
+    let recovered =
+        write_workload_clean_close_recover(dir.path(), |_env, db| {
+            for i in 0..n {
+                let k = format!("evk_{i:08}");
+                let v = format!("evv_{i:08}");
+                db.put(
+                    None,
+                    &DatabaseEntry::from_bytes(k.as_bytes()),
+                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                )
+                .unwrap();
+                expected.insert(k.into_bytes(), v.into_bytes());
+            }
+        });
 
     assert_eq!(
         recovered.len(),
@@ -601,7 +626,11 @@ fn dbtree_entry_written_at_checkpoint() {
     let env2 = open_env(dir.path());
     let db2 = open_db(&env2);
     let result = collect_all(&db2);
-    assert_eq!(result.len(), 200, "all 200 keys must survive checkpoint+recovery");
+    assert_eq!(
+        result.len(),
+        200,
+        "all 200 keys must survive checkpoint+recovery"
+    );
     // Spot-check a few keys.
     assert_eq!(
         result.get(b"key_000000" as &[u8]).map(|v| v.as_slice()),

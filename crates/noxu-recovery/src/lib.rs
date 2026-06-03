@@ -39,11 +39,10 @@ pub use checkpointer::{CheckpointConfig, CheckpointResult, Checkpointer};
 pub use dirty_in_map::{CheckpointReference, CkptState, DirtyINMap};
 pub use error::{RecoveryError, Result};
 pub use log_scanner::{
-    CkptEndRecord, CkptStartRecord, DbTreeBinRef, DbTreeRecord, InMemoryLogScanner,
-    InRecord,
-    LnOperation, LnRecord, LogEntry, LogScanner, NameLnRecord, PositionedEntry,
-    RollbackEndRecord, RollbackStartRecord, TxnAbortRecord, TxnCommitRecord,
-    TxnPrepareRecord,
+    CkptEndRecord, CkptStartRecord, DbTreeBinRef, DbTreeRecord,
+    InMemoryLogScanner, InRecord, LnOperation, LnRecord, LogEntry, LogScanner,
+    NameLnRecord, PositionedEntry, RollbackEndRecord, RollbackStartRecord,
+    TxnAbortRecord, TxnCommitRecord, TxnPrepareRecord,
 };
 pub use recovery_info::RecoveryInfo;
 pub use recovery_manager::{

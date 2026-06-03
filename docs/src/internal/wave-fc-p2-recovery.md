@@ -188,21 +188,11 @@ When all prerequisites are in place:
 4. `cargo fmt`, `clippy -D warnings`, `doc -D warnings`, `cargo test --workspace`,
    `make docs-check` all pass.
 
-## Correctness verification for this wave (docs-only)
+## Status
 
-This wave made zero code changes to `noxu-recovery`, `noxu-tree`, or
-`noxu-dbi`.  The existing recovery/crash test suite therefore remains
-green with no regressions.
-
-- `timeout 600 cargo test -p noxu-recovery -p noxu-db -p noxu-dbi`: **PASS** (0 changes)
-- All other workspace tests: **PASS** (0 changes)
-
-## Gate results
-
-| Check | Result |
-|---|---|
-| `cargo fmt --all -- --check` | PASS (no changes) |
-| `cargo clippy --workspace --all-targets -- -D warnings` | PASS (no changes) |
-| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps` | PASS (no changes) |
-| `timeout 900 cargo test --workspace --no-fail-fast` | PASS (no changes) |
-| `make docs-check` | PASS (typos + markdownlint + mdbook build) |
+**Wave FC** investigated and documented the stable-BIN blocker.
+**Wave GB** implemented the DbTree foundation (BIN-version index at CkptEnd),
+LSN-aware redo_insert, and the equality test harness.  The scan-reduction
+remains deferred pending open-txn tracking in the checkpointer.
+See `docs/src/internal/wave-gb-dbtree-recovery.md` for the Wave GB STEP-0
+findings and the precise description of the remaining gap.

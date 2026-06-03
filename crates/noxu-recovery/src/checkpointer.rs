@@ -932,8 +932,7 @@ impl Checkpointer {
                     NULL_LSN,
                     full_bytes,
                 );
-                let mut buf =
-                    bytes::BytesMut::with_capacity(entry.log_size());
+                let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
                 entry.write_to_log(&mut buf);
                 match lm.log(
                     LogEntryType::BIN,
@@ -1009,13 +1008,7 @@ impl Checkpointer {
         let mut buf = Vec::with_capacity(db_tree.log_size());
         db_tree.write_to_log(&mut buf);
         let db_tree_lsn = lm
-            .log(
-                LogEntryType::DbTree,
-                &buf,
-                Provisional::No,
-                false,
-                false,
-            )
+            .log(LogEntryType::DbTree, &buf, Provisional::No, false, false)
             .map_err(|e| {
                 RecoveryError::CheckpointError(format!(
                     "DbTree WAL write failed: {e}"

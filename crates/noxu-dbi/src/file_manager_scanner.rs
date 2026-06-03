@@ -298,13 +298,17 @@ impl FileManagerLogScanner {
                 let entry = DbTreeEntry::read_from_log(&payload).ok()?;
                 Some(LogEntry::DbTree(noxu_recovery::DbTreeRecord {
                     lsn: NULL_LSN, // Filled in by caller with actual LSN.
-                    bins: entry.bins.into_iter().map(|b| noxu_recovery::DbTreeBinRef {
-                        db_id: b.db_id,
-                        node_id: b.node_id,
-                        bin_lsn: b.bin_lsn,
-                        prev_full_lsn: b.prev_full_lsn,
-                        is_delta: b.is_delta,
-                    }).collect(),
+                    bins: entry
+                        .bins
+                        .into_iter()
+                        .map(|b| noxu_recovery::DbTreeBinRef {
+                            db_id: b.db_id,
+                            node_id: b.node_id,
+                            bin_lsn: b.bin_lsn,
+                            prev_full_lsn: b.prev_full_lsn,
+                            is_delta: b.is_delta,
+                        })
+                        .collect(),
                 }))
             }
 

@@ -16,6 +16,41 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (Wave GB — DbTree foundation + P-2 recovery investigation)
+
+- **DbTree BIN-version index written at each checkpoint.** The checkpointer
+  now writes a `DbTreeEntry` log record (`LogEntryType::DbTree`, type 50)
+  immediately before each `CkptEnd`.  This record contains the LSN of the
+  last full-BIN log entry for every BIN in the tree (stable and dirty
+  alike), allowing future recovery to locate BIN state without scanning the
+  entire log.  `CkptEnd.root_lsn` is set to the DbTree entry's LSN.
+  **Behavior unchanged**: `first_active_lsn` remains `Lsn::new(0,0)` (full
+  log scan preserved).
+- **LOG_VERSION 3.** Bumped from 2 to 3 to mark the addition of the
+  `DbTree` entry type.  Old LOG_VERSION ≤ 2 files are fully readable;
+  old readers silently skip the new entry type.
+- **LSN-aware `redo_insert`.** `BinStub::get_slot_lsn()` + a pre-check in
+  `redo_insert_recursive` skip redo writes where the BIN slot already holds
+  a same-or-newer LSN.  Correctness fix: the code comment claiming
+  idempotency was aspirational; the implementation now enforces it.
+- **Wave GB equality harness** (`crates/noxu-db/tests/wave_gb_equality_test.rs`).
+  11 recovery-correctness tests covering: small/large workloads, stable
+  BINs, mixed pre/post-checkpoint commits, aborted txns, deletes,
+  BINDelta updates, eviction, DbTree foundation verification, and an
+  escape-hatch gap documentation test.
+- **DbTree entry parsing in the file scanner.** `FileManagerLogScanner`
+  now parses `LogEntryType::DbTree` payloads via `DbTreeEntry::read_from_log`
+  and carries the BIN refs in `DbTreeRecord.bins` for future use by the
+  recovery BIN pre-loading path.
+
+### Unchanged (P-2 scan-reduction: escape hatch applied)
+
+The scan-reduction (`first_active_lsn = CkptStart`) was investigated and
+not shipped.  A transaction that starts before `CkptStart` and is still
+active (uncommitted, no abort record) at crash time would have its
+uncommitted data undetected by the reduced scan.  Correct fix requires
+tracking the earliest-open-txn LSN in the checkpointer.  See
+`docs/src/internal/wave-gb-dbtree-recovery.md` §STEP-0.
 ### Fixed (portability — RISC-V 64 + Windows on ARM64)
 
 - **Windows (aarch64-pc-windows-msvc) support.** Validated the full workspace

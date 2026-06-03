@@ -197,5 +197,6 @@
   - [Wave ZC — crash-safety + performance fixes](internal/wave-zc-crash-perf.md)
   - [Portability validation — RISC-V 64 + Windows on ARM64](internal/portability-rv-windows.md)
   - [Wave FC — P-2 recovery BIN-restore investigation (deferred)](internal/wave-fc-p2-recovery.md)
+  - [Wave GB — DbTree foundation + P-2 recovery investigation](internal/wave-gb-dbtree-recovery.md)
   - [Wave FA — DPL derive crate-path override](internal/wave-fa-derive-crate-attr.md)
   - [Wave FB — mTLS Phase 2: peer_allowlist enforcement (v3.1.0)](internal/wave-fb-mtls-phase2.md)
