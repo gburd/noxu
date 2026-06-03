@@ -16,6 +16,26 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (recovery correctness tests)
+
+- `open_txn_spanning_checkpoint_recovers_correctly` (crash/SIGKILL test):
+  proves an open transaction whose writes precede a checkpoint does not leak
+  uncommitted data through crash recovery. Locks in the isolation/recovery
+  invariant against any future recovery scan-range optimization.
+- `recovery_correctness_test.rs`: a workload suite (stable BINs, eviction,
+  BINDelta chains, aborts spanning checkpoints, deletes, mixed pre/post
+  checkpoint commits) validating full-scan recovery reconstructs committed
+  state exactly.
+
+### Documentation
+
+- Recorded the true root cause blocking the P-2 recovery-scan optimization:
+  the checkpointer flushes only `primary_tree`, not per-database user trees,
+  so recovery is inherently a full scan. P-2 is a future optimization (needs a
+  checkpoint redesign), not a correctness blocker; current full-scan recovery
+  is correct. The full prototype is preserved on `fix/gb-proper-p2`. See
+  `docs/src/internal/wave-gb-dbtree-recovery.md`.
+
 ### Documentation
 
 - Wave GB (DbTree / P-2 recovery): documented the STEP-0 correctness analysis.

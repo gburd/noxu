@@ -50,7 +50,64 @@ The prototype on the branch contains:
 3. **Wave GB equality harness** (11 tests) — correctness regression battery
    covering all specified workloads.
 
-## Prerequisites to land this work (future)
+## Update — proper-fix investigation (branch `fix/gb-proper-p2`)
+
+A second pass implemented the open-transaction fix and a scalable
+tree-walk recovery, and uncovered the **true root cause** that supersedes the
+earlier framing:
+
+**The checkpointer only flushes `primary_tree` (db_id=1), never the
+per-database user `real_trees`.** The `db_trees_registry` is wired to the
+*cleaner* (for secondary-LN liveness checks), not the checkpointer
+(`crates/noxu-dbi/src/environment_impl.rs`: the checkpointer gets
+`.with_tree(primary_tree, 1)` only). User-database BINs reach the log via
+normal LN logging + eviction, not via checkpoint flushing. That is precisely
+why recovery is — and must remain — a full scan from the start: there is no
+per-database checkpoint of BIN state to begin from.
+
+Consequence: the P-2 scan-reduction (`first_active_lsn = CkptStart` + preload
+BINs from the checkpoint) **cannot fire** for user data without first
+redesigning the checkpoint subsystem to flush every open database's dirty
+BINs and record per-database root LSNs. The open-transaction fix
+(`first_active_lsn = min(TxnManager::get_first_active_lsn(), CkptStart)`,
+whose primitive already exists at `noxu-txn/src/txn_manager.rs`) is necessary
+but not sufficient — it only matters once the scan-reduction is active.
+
+P-2 is therefore a **recovery-time optimization**, not a correctness
+requirement: current full-scan recovery is correct and safe. It is not a
+blocker for a production release.
+
+### What landed on `main` from this investigation
+
+- **Recovery correctness regression tests** (active, valuable):
+  - `crates/noxu-db/tests/crash_recovery_test.rs::open_txn_spanning_checkpoint_recovers_correctly`
+    — a SIGKILL crash test proving an open transaction spanning a checkpoint
+    does not leak uncommitted data through recovery. Locks in the invariant
+    against any future broken scan-reduction.
+  - `crates/noxu-db/tests/recovery_correctness_test.rs` — a workload suite
+    (stable BINs, eviction, BINDelta chains, aborts spanning checkpoints,
+    deletes, mixed pre/post-checkpoint commits) validating full-scan recovery.
+- The full P-2 prototype (checkpoint cascade, per-DB root LSN, DbTree
+  index, recovery preload, LSN-aware `redo_insert`) is preserved on
+  `fix/gb-proper-p2` (commit `735de29`). It is correct and non-regressing but
+  inactive (`root_lsn` is `None` for the empty `primary_tree`), so it was not
+  merged — inactive infrastructure in the recovery hot path is not shipped.
+
+### Revised prerequisites to land P-2 (future, in order)
+
+1. **Checkpoint user `real_trees`.** Make the checkpointer flush every open
+   database's dirty BINs (cascade parent slot LSNs to each per-DB root) and
+   record per-database root LSNs in `CkptEnd`. This is the load-bearing change
+   and a substantial checkpoint-subsystem redesign.
+2. **Open-transaction-LSN tracking**: `CkptEnd.first_active_lsn =
+   min(TxnManager::get_first_active_lsn(), CkptStart)` (primitive exists).
+3. **Consume the per-DB roots at recovery**: walk each database's tree from
+   its root LSN to pre-populate BINs, then redo LNs from `first_active_lsn`
+   with the LSN-aware `redo_insert` for the overlap window.
+4. **Eviction-robust enumeration** (Finding 1 below): if a future evictor
+   nulls parent child pointers, pin BINs or maintain a persistent registry.
+
+## Prerequisites originally identified (superseded by the list above)
 
 1. **Open-transaction-LSN tracking**: wire the transaction manager into the
    checkpointer so `CkptEnd.first_active_lsn = min(earliest_open_txn_lsn,

@@ -552,3 +552,103 @@ fn test_clean_close_and_sigkill_produce_identical_state() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test: open_txn_spanning_checkpoint_recovers_correctly
+// ---------------------------------------------------------------------------
+//
+// Isolation/recovery invariant: an open (uncommitted) transaction whose first
+// log entry precedes a checkpoint must NOT leak its writes through crash
+// recovery.
+//
+// Scenario (crash_worker mode "open_txn_spanning_checkpoint"):
+//   1. Worker commits 20 keys ("committed_NNN").
+//   2. Worker opens a transaction and writes 10 keys ("open_NNN").
+//   3. Worker forces a checkpoint — CkptStart is logged AFTER the open txn's
+//      LNs, so the txn's firstLoggedLsn < CkptStart.
+//   4. Parent SIGKILLs the worker while the txn is still open (no
+//      commit/abort record).
+//
+// After recovery:
+//   - All 20 committed keys must be present.
+//   - None of the 10 "open_NNN" keys may appear (they were uncommitted).
+//
+// Current recovery scans the whole log from the start, so it sees the open
+// txn's LNs and the undo pass reverts them — this test passes. The test
+// exists to LOCK IN that invariant: a future recovery scan-range optimization
+// (P-2) that began at CkptStart without accounting for the open txn's earlier
+// first-LSN would miss the LNs, fail to undo them, and silently surface the
+// uncommitted keys. This test would catch that regression.
+
+#[test]
+fn open_txn_spanning_checkpoint_recovers_correctly() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "open_txn_spanning_checkpoint")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    // Wait for committed writes to complete.
+    assert!(
+        wait_for_flag(&dir_path, "phase1_done", Duration::from_secs(60)),
+        "worker did not complete phase 1 within timeout"
+    );
+
+    // Wait for the open txn + checkpoint to complete.
+    assert!(
+        wait_for_flag(&dir_path, "open_txn_ready", Duration::from_secs(60)),
+        "worker did not signal open_txn_ready within timeout"
+    );
+
+    // SIGKILL — txn is open, no commit/abort record written.
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    // Reopen — triggers crash recovery.
+    let (_env, db) = reopen_db(&dir_path);
+
+    // All 20 committed keys must be present.
+    let mut missing_committed = 0u32;
+    for i in 0u32..20 {
+        let k = format!("committed_{i:03}");
+        let key = DatabaseEntry::from_bytes(k.as_bytes());
+        let mut val = DatabaseEntry::new();
+        match db.get(None, &key, &mut val).unwrap() {
+            OperationStatus::Success => {}
+            OperationStatus::NotFound => {
+                missing_committed += 1;
+                eprintln!("committed key missing after recovery: {k}");
+            }
+            other => {
+                panic!("unexpected status {other:?} for committed key {k}")
+            }
+        }
+    }
+    assert_eq!(
+        missing_committed, 0,
+        "{missing_committed} committed key(s) were lost after crash recovery \
+         (open-txn-spanning-checkpoint scenario)"
+    );
+
+    // None of the 10 uncommitted "open_NNN" keys may appear.
+    let mut leaked = 0u32;
+    for i in 0u32..10 {
+        let k = format!("open_{i:03}");
+        let key = DatabaseEntry::from_bytes(k.as_bytes());
+        let mut val = DatabaseEntry::new();
+        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+            leaked += 1;
+            eprintln!(
+                "CORRECTNESS VIOLATION: uncommitted key '{k}' survived recovery"
+            );
+        }
+    }
+    assert_eq!(
+        leaked, 0,
+        "{leaked} uncommitted key(s) silently survived crash recovery — \
+         uncommitted data must never appear committed after recovery"
+    );
+}
