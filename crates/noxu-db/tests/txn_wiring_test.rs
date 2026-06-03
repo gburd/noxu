@@ -591,3 +591,56 @@ fn f11_nested_transaction_none_still_works() {
 
     env.close().expect("env.close() must succeed");
 }
+
+// ─── F-5: explicit txns unregister from TxnManager (no leak) ─────────
+//
+// Begin/commit/abort many explicit transactions, then assert the
+// TxnManager active-transaction count returns to zero and the commit/abort
+// stat counters reflect the work. Pre-fix, `TxnManager::all_txns` (and the
+// lock-manager locker-label map) grew without bound because the explicit
+// commit/abort paths never called `commit_txn`/`abort_txn`, so `n_active`
+// climbed monotonically and `n_commits`/`n_aborts` undercounted.
+#[test]
+fn f5_explicit_txns_unregister_from_txn_manager() {
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+    let db = open_db(&env, "f5");
+
+    let before = env.get_stats().unwrap().txn;
+
+    for i in 0u32..50 {
+        let txn = env.begin_transaction(None).unwrap();
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let val = DatabaseEntry::from_bytes(b"v");
+        db.put(Some(&txn), &key, &val).unwrap();
+        if i % 2 == 0 {
+            txn.commit().unwrap();
+        } else {
+            txn.abort().unwrap();
+        }
+    }
+
+    let after = env.get_stats().unwrap().txn;
+
+    // No active transactions leaked: the count must be back to its
+    // pre-loop value (zero, in this single-threaded test).
+    assert_eq!(
+        after.n_active, before.n_active,
+        "TxnManager active-txn count leaked: before={}, after={} \
+         (explicit commit/abort must unregister from TxnManager)",
+        before.n_active, after.n_active
+    );
+    assert_eq!(after.n_active, 0, "expected zero active txns after the loop");
+
+    // Commit/abort counters advanced by the work performed (25 each).
+    assert_eq!(
+        after.n_commits - before.n_commits,
+        25,
+        "n_commits must count the 25 explicit commits"
+    );
+    assert_eq!(
+        after.n_aborts - before.n_aborts,
+        25,
+        "n_aborts must count the 25 explicit aborts"
+    );
+}

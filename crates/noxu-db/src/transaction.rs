@@ -236,6 +236,36 @@ impl Transaction {
         self
     }
 
+    /// Removes the inner `Txn` from the environment's `TxnManager` (its
+    /// `all_txns` map and the lock manager's locker-label map) — the
+    /// counterpart to `TxnManager::begin_txn`, which the explicit-transaction
+    /// commit/abort paths previously never called (review F-5).
+    ///
+    /// Without this, `TxnManager::all_txns` and the locker-label map grow
+    /// without bound for the process lifetime, `n_active_txns()` reports a
+    /// monotonically increasing (wrong) count, and `n_commits`/`n_aborts`
+    /// undercount. The inner `Txn`'s locker id (a separate id space from
+    /// `Transaction::id`) is the `all_txns` key, so we use it here.
+    ///
+    /// Lock discipline: the inner-txn lock is read in a tight scope and
+    /// released before the (separate) environment lock is taken, and both
+    /// commit/abort paths have already released any env lock by this point.
+    fn unregister_inner_txn(&self, committed: bool) {
+        let Some(inner) = self.inner_txn.as_ref() else {
+            return;
+        };
+        let inner_id = inner.lock().unwrap().id_as_locker();
+        if let Some(env) = self.env_impl.as_ref() {
+            let guard = env.lock();
+            let tm = guard.get_txn_manager();
+            if committed {
+                tm.commit_txn(inner_id);
+            } else {
+                tm.abort_txn(inner_id);
+            }
+        }
+    }
+
     /// Wires the shared active-transactions registry so that `commit` /
     /// `abort` can prune their own entry on completion.
     ///
@@ -482,6 +512,9 @@ impl Transaction {
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }
+        // F-5: counterpart to begin_txn — remove the inner Txn from
+        // TxnManager (all_txns + locker label) to avoid an unbounded leak.
+        self.unregister_inner_txn(true);
         observe_gauge_dec!("noxu_db_active_transactions");
 
         if let Some(e) = inner_err {
@@ -663,6 +696,9 @@ impl Transaction {
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }
+        // F-5: counterpart to begin_txn — remove the inner Txn from
+        // TxnManager (all_txns + locker label) to avoid an unbounded leak.
+        self.unregister_inner_txn(false);
         observe_gauge_dec!("noxu_db_active_transactions");
         Ok(())
     }
@@ -813,6 +849,9 @@ impl Transaction {
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }
+        // F-5: counterpart to begin_txn — remove the inner Txn from
+        // TxnManager (all_txns + locker label) to avoid an unbounded leak.
+        self.unregister_inner_txn(true);
         observe_gauge_dec!("noxu_db_active_transactions");
         Ok(())
     }
@@ -907,6 +946,9 @@ impl Transaction {
         if let Some(registry) = &self.active_txns {
             registry.mark_complete(self.id);
         }
+        // F-5: counterpart to begin_txn — remove the inner Txn from
+        // TxnManager (all_txns + locker label) to avoid an unbounded leak.
+        self.unregister_inner_txn(false);
         observe_gauge_dec!("noxu_db_active_transactions");
         Ok(())
     }

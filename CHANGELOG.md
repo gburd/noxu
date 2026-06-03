@@ -16,6 +16,16 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (resource leak / stats — review T-F5)
+
+- Explicit transactions now unregister from the `TxnManager` on commit/abort
+  (and on the XA resolved-commit/resolved-abort paths). Previously only
+  auto-commit transactions called `commit_txn`/`abort_txn`, so
+  `TxnManager::all_txns` and the lock manager's locker-label map grew without
+  bound for the process lifetime, `n_active_txns()` climbed monotonically, and
+  `n_commits`/`n_aborts` undercounted. Regression test:
+  `f5_explicit_txns_unregister_from_txn_manager`.
+
 ### Fixed (memory safety — from the v3.x production-readiness review)
 
 - **noxu-xa (R-F04, use-after-free):** `XaEnvironment::get_transaction` returned
