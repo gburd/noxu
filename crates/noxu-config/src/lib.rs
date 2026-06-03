@@ -16,7 +16,7 @@
 //! Configuration parameter system — defines all configuration parameters,
 //! their types, defaults, ranges, and validation logic.
 //!
-//! Approximately 400 configuration parameters are defined here covering
+//! Approximately 165 configuration parameters are defined here covering
 //! environment, logging, locking, replication, and background daemon tuning.
 
 pub mod manager;

@@ -16,6 +16,36 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (correctness + honesty — from the v3.x production-readiness review)
+
+- **noxu-latch**: `thread_id()` now sets `| 1` so a thread whose hash is 0 no
+  longer collides with the "unowned" sentinel and false-panics "latch already
+  held" on first acquisition (review R-F05).
+- **noxu-log**: documented the load-bearing struct-field drop-order invariant
+  behind the `FileLogSource` lifetime `transmute` (review R-F02).
+- **noxu-tree**: corrected the `BinStub::apply_delta` docstring — it is dead
+  code that corrupts prefix-compressed keys and must not be used to
+  reconstitute a BIN (removed the misleading `reconstituteBIN` claim; review
+  St-C2/St-M3).
+- **Docs honesty**: SERIALIZABLE isolation docs no longer claim range locks /
+  phantom prevention — the cursor layer acquires plain read locks, so the
+  delivered guarantee is repeatable-read (phantoms not yet prevented; review
+  T-F2/T-F8). Corrected the config-parameter count (400+ → ~165), the crate
+  count (19/21 → 22), the CRC32 throughput claim (x86-64-only, with the
+  AArch64 software-fallback caveat), the README `unsafe` table (removed a
+  `noxu-db` block that no longer exists), and the AGENTS.md `noxu-log` unsafe
+  inventory (6 → 8).
+
+### Added (documentation)
+
+- `docs/src/internal/production-readiness-review-2026-06.md` — synthesis of a
+  four-domain, seven-persona production-readiness review, with the prioritized
+  blocker list, plus the four detailed source reports. The review found
+  Critical correctness/soundness issues that remain open (recovery undo
+  currency check, range-lock phantom prevention, two noxu-log `unsafe`
+  soundness defects, XA use-after-free, file-header checksum); these gate a
+  production major release and are tracked there.
+
 ### Fixed (durability — Critical)
 
 - **WAL fsync fast-path could skip the fdatasync for a SYNC commit, silently

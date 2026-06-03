@@ -53,9 +53,17 @@ impl FileLogSource {
         let file_num = handle.file_num();
         let log_version = handle.log_version();
 
-        // Acquire the latch on the handle
-        // SAFETY: We extend the lifetime of the guard to 'static because we keep
-        // the Arc<FileHandle> alive for as long as the guard exists.
+        // Acquire the latch on the handle.
+        // SAFETY: we transmute the guard's lifetime to 'static and store it in
+        // the same struct as the `Arc<FileHandle>` (`_handle`) it borrows from.
+        // Soundness rests on TWO invariants:
+        //   1. `_handle` (the Arc) keeps the borrowed `FileHandle` alive for as
+        //      long as this struct — and therefore the guard — exists.
+        //   2. Rust drops struct fields in declaration order, so `guard` (field
+        //      1) is dropped BEFORE `_handle` (field 2): the borrow ends before
+        //      the Arc refcount is dropped. The field order below is therefore
+        //      load-bearing — do NOT reorder `guard`/`_handle`, and do not add a
+        //      custom Drop that releases `_handle` first.
         let guard = unsafe {
             let guard = handle.acquire()?;
             std::mem::transmute::<FileHandleGuard<'_>, FileHandleGuard<'static>>(
@@ -64,6 +72,8 @@ impl FileLogSource {
         };
 
         Ok(FileLogSource {
+            // Field order is a SAFETY invariant (see transmute above):
+            // `guard` must be declared before `_handle` so it drops first.
             guard: Some(guard),
             _handle: handle,
             file_num,

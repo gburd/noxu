@@ -15,3 +15,6 @@ MD041: false
 MD060: false
 MD036: false   # bold-as-pseudo-heading OK in raw audit reports
 MD051: false   # link-fragment validation OK in raw audit reports
+MD022: false   # blank-lines-around-headings relaxed for raw review transcripts
+MD031: false   # blank-lines-around-fences relaxed for raw review transcripts
+MD032: false   # blank-lines-around-lists relaxed for raw review transcripts

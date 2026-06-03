@@ -150,7 +150,11 @@ fn thread_id() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     thread::current().id().hash(&mut hasher);
-    hasher.finish()
+    // `| 1` guarantees a non-zero id: 0 is the "unowned" sentinel for the
+    // `owner` atomic, so a thread whose hash is 0 would otherwise false-panic
+    // "latch already held" on its first acquisition. Matches
+    // `noxu-sync::raw_mutex`.
+    hasher.finish() | 1
 }
 
 #[cfg(test)]

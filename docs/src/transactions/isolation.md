@@ -12,7 +12,7 @@ application to anomalies.
 | 1 | READ UNCOMMITTED | Reads may see data modified but not yet committed by another transaction (dirty reads). A transaction may read data that is subsequently rolled back and never existed in the database. |
 | 2 | READ COMMITTED | Dirty reads are prevented. Read locks are released as soon as the cursor moves past a record, rather than being held for the life of the transaction. Data at the current cursor position will not change, but previously read data can change after the cursor moves. |
 | (default) | REPEATABLE READ | Read and write locks are held until the transaction completes. Data read by a transaction will not be modified by another transaction before the reading transaction completes. **This is the Noxu DB default.** |
-| 3 | SERIALIZABLE | Repeatable read is observed plus no phantom reads. Phantoms are records that appear in a search result on a second execution that were absent on the first. Noxu DB prevents phantoms with additional range locking. |
+| 3 | SERIALIZABLE | Repeatable read is observed: read locks are held for the full transaction duration (not released early as under read-committed). Phantoms are records that appear in a search result on a second execution that were absent on the first. **Note: range locking is not yet wired into the cursor layer, so phantom reads are NOT currently prevented — see the caveat under "Serializable Isolation" below.** |
 
 By default, Noxu DB transactions use repeatable read isolation. You can configure
 a lower level (uncommitted read, committed read) for performance or a higher level
@@ -106,16 +106,25 @@ re-read previously visited records.
 
 ## Serializable Isolation
 
-Serializable isolation prevents **phantom reads**: queries that return different
-results when executed a second time within the same transaction because another
-transaction inserted or deleted matching records in between.
+> **Current limitation (v3.x):** Serializable isolation is intended to prevent
+> **phantom reads** via range locking, but the cursor layer does not yet
+> acquire range locks — it acquires plain read locks held for the transaction
+> duration. In effect `with_serializable_isolation(true)` currently delivers
+> **repeatable-read** semantics (no dirty or non-repeatable reads), but
+> **phantoms are not prevented**. The range-lock conflict matrix exists in
+> `noxu-txn` but is not wired to cursor reads/inserts. Do not rely on
+> phantom prevention until this is addressed.
+
+Serializable isolation is intended to prevent **phantom reads**: queries that
+return different results when executed a second time within the same
+transaction because another transaction inserted or deleted matching records
+in between.
 
 Under repeatable read (the default), a transaction T can perform a search that
 returns `NotFound`, and then the same search can return `Success` later in the same
-transaction if another transaction inserted a matching record. With serializable
-isolation, this cannot happen.
+transaction if another transaction inserted a matching record.
 
-Serializable isolation causes additional locking (range locks) which can reduce
+Serializable isolation is intended to add range locking which can reduce
 concurrency. Use it only when your application requires it.
 
 Configure serializable isolation environment-wide by setting

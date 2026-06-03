@@ -108,7 +108,8 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
 - **B+tree storage** with key prefix encoding and BIN-deltas for incremental
   updates.  Sorted-duplicate values supported on primary databases.
 - **Write-ahead log** in a Rust-native `.ndb` format with CRC32 checksums
-  (15+ GiB/s on CLMUL hardware), configurable file sizes, group commit, and
+  (15+ GiB/s on x86-64 with CLMUL/PCLMULQDQ; ~500 MB/s on AArch64 where
+  `crc32fast` falls back to software), configurable file sizes, group commit, and
   fsync coalescing.
 - **Crash recovery** via three-phase checkpoint-based recovery; bounded by
   the configured checkpoint interval.
@@ -131,7 +132,7 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
   `Converter`, per-record class-version envelope).
 - **Serialization bindings**: tuple, entry, and serde bindings with
   version-checking magic headers.
-- **400+ configuration parameters** with typed validation.
+- **160+ configuration parameters** with typed validation.
 
 ### Distribution
 
@@ -149,7 +150,7 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
 
 ## Workspace Structure
 
-Noxu DB is a Cargo workspace of **21 crates**:
+Noxu DB is a Cargo workspace of **22 crates**:
 
 | Layer | Crates |
 |---|---|
@@ -225,8 +226,8 @@ Starting points:
   exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw
   locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O glue +
   `parking_lot` raw locking), and one `unsafe` block each in `noxu-latch`
-  (RAII force-unlock), `noxu-db` (`unsafe impl Send for SecondaryConfig`),
-  and `noxu-xa` (transaction-pointer dereference); each is documented inline.
+  (RAII force-unlock) and
+  `noxu-xa` (transaction-pointer dereference); each is documented inline.
 - **No async in the core.**  Core engine uses blocking I/O with explicit
   threading.  Only `noxu-rep` networking uses tokio.
 - **Own log format.**  `.ndb` files are Rust-native and not compatible with
