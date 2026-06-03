@@ -101,7 +101,7 @@ Worked through the blocker list after the initial review. Outcome per item:
 | St-H1 | noxu-log format | File header `byte_order = 0x00` claims big-endian, but log entry headers are little-endian — an external reader following the documented contract misparses | OPEN |
 | St-H2 | noxu-evictor | `real_node_size()` walks the entire tree per eviction decision (O(n) per node, O(n·batch) per batch) — no per-node in-memory-size tracking | OPEN |
 | St-H3 | noxu-log format | Entry headers little-endian, entry payloads (BINDelta, BinStub) big-endian — mixed on-disk endianness, undocumented | OPEN |
-| St-H4 | noxu-tree | Upper-IN descent uses an O(n) linear scan instead of binary search (JE uses binary search) | OPEN |
+| St-H4 | noxu-tree | Upper-IN descent used an O(n) linear scan instead of binary search | **FIXED** (unified `Tree::upper_in_floor_index` binary floor-search applied to all 8 descent sites; also fixed `search_with_coupling` ignoring a custom comparator; property test vs linear scan) |
 | St-H5 | noxu-tree | `TreeNode::find_entry` returns the insertion point, not the floor, for Internal nodes (non-exact) — wrong child routing if ever wired to descent (currently latent) | OPEN |
 | St-H6 | noxu-tree | `BinStub::deserialize_full` hardcodes `expiration_in_hours = true` regardless of what was logged → TTL read back 3600× wrong for seconds-granularity BINs | OPEN |
 | C-C2 | noxu-rep | `become_master` doc promises a `FeederRunner`/`EnvironmentLogScanner` thread per replica; the body only creates in-memory tracker structs → a master does not actively feed replicas | OPEN |

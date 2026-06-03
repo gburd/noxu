@@ -1466,6 +1466,21 @@ impl Tree {
         }
     }
 
+    /// Floor child slot index for descending an internal node: the largest
+    /// slot whose key is ≤ `key`. Slot 0 carries a virtual −∞ key (always
+    /// qualifies); `entries[1..]` are sorted ascending, so this binary-searches
+    /// the partition point instead of an O(n) linear walk (St-H4). Uses
+    /// `key_cmp` so a configured custom comparator is honoured on every descent
+    /// path. Returns 0 for an empty/single-slot node.
+    fn upper_in_floor_index(&self, entries: &[InEntry], key: &[u8]) -> usize {
+        if entries.len() <= 1 {
+            return 0;
+        }
+        entries[1..].partition_point(|e| {
+            self.key_cmp(e.key.as_slice(), key) != std::cmp::Ordering::Greater
+        })
+    }
+
     /// Returns true if the tree has no root (is empty).
     pub fn is_empty(&self) -> bool {
         self.root.read().is_none()
@@ -1627,18 +1642,7 @@ impl Tree {
                     // Walk forward as long as entry.key <= key, starting
                     // from slot 0 (which always qualifies because its key
                     // is the virtual -infinity key).
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if self.key_cmp(entry.key.as_slice(), key)
-                            != std::cmp::Ordering::Greater
-                        {
-                            idx = i;
-                        } else {
-                            break;
-                        }
-                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
                     n.entries.get(idx)?.child.clone()?
                 }
                 TreeNode::Bottom(_) => {
@@ -1737,18 +1741,7 @@ impl Tree {
                         return None;
                     }
                     // Slot 0 = virtual −∞; walk forward while entry.key ≤ key.
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if self.key_cmp(entry.key.as_slice(), key)
-                            != std::cmp::Ordering::Greater
-                        {
-                            idx = i;
-                        } else {
-                            break;
-                        }
-                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
                     n.entries.get(idx)?.child.clone()?
                 }
                 TreeNode::Bottom(_) => {
@@ -1814,18 +1807,7 @@ impl Tree {
                         if n.entries.is_empty() {
                             return false;
                         }
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
-                            } else if self.key_cmp(entry.key.as_slice(), key)
-                                != std::cmp::Ordering::Greater
-                            {
-                                idx = i;
-                            } else {
-                                break;
-                            }
-                        }
+                        let idx = self.upper_in_floor_index(&n.entries, key);
                         match n.entries.get(idx).and_then(|e| e.child.clone()) {
                             Some(c) => c,
                             None => return false,
@@ -1919,18 +1901,7 @@ impl Tree {
                     if n.entries.is_empty() {
                         return None;
                     }
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if self.key_cmp(entry.key.as_slice(), key)
-                            != std::cmp::Ordering::Greater
-                        {
-                            idx = i;
-                        } else {
-                            break;
-                        }
-                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
                     n.entries.get(idx)?.child.clone()?
                 }
                 TreeNode::Bottom(_) => unreachable!(),
@@ -1998,18 +1969,7 @@ impl Tree {
                         if n.entries.is_empty() {
                             return None;
                         }
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
-                            } else if self.key_cmp(entry.key.as_slice(), key)
-                                != std::cmp::Ordering::Greater
-                            {
-                                idx = i;
-                            } else {
-                                break;
-                            }
-                        }
+                        let idx = self.upper_in_floor_index(&n.entries, key);
                         n.entries.get(idx)?.child.clone()?
                     }
                     TreeNode::Bottom(_) => unreachable!(),
@@ -3572,16 +3532,7 @@ impl Tree {
                     if n.entries.is_empty() {
                         return None;
                     }
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if entry.key.as_slice() <= key {
-                            idx = i;
-                        } else {
-                            break;
-                        }
-                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
                     n.entries.get(idx)?.child.clone()?
                 }
                 TreeNode::Bottom(_) => {
@@ -3879,16 +3830,16 @@ impl Tree {
                     if n.entries.is_empty() {
                         return AdjacentBinOutcome::NoAdjacent;
                     }
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if entry.key.as_slice() <= current_key {
-                            idx = i;
-                        } else {
-                            break;
-                        }
-                    }
+                    // Floor descent (binary), slot 0 = virtual −∞. This is a
+                    // static fn with no comparator access, so it preserves the
+                    // raw byte comparison it has always used.
+                    let idx = if n.entries.len() <= 1 {
+                        0
+                    } else {
+                        n.entries[1..].partition_point(|e| {
+                            e.key.as_slice() <= current_key
+                        })
+                    };
                     let child = match n
                         .entries
                         .get(idx)
@@ -4344,18 +4295,7 @@ impl Tree {
                     if n.entries.is_empty() {
                         return None;
                     }
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else if self.key_cmp(entry.key.as_slice(), key)
-                            != std::cmp::Ordering::Greater
-                        {
-                            idx = i;
-                        } else {
-                            break;
-                        }
-                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
                     n.entries.get(idx)?.child.clone()?
                 }
                 TreeNode::Bottom(_) => {
@@ -8762,5 +8702,57 @@ mod tests {
             bin.entries[0].data.is_some(),
             "data preserved while cursor pinned"
         );
+    }
+
+    // St-H4: the binary upper_in_floor_index must return the same slot as a
+    // reference linear floor scan for all probe keys (incl. before-all,
+    // after-all, between, and exact matches).
+    #[test]
+    fn test_upper_in_floor_index_matches_linear_scan() {
+        // Reference linear floor scan (the pre-St-H4 algorithm): slot 0 is the
+        // virtual −∞ key; walk forward while entry.key ≤ key.
+        fn linear_floor(entries: &[InEntry], key: &[u8]) -> usize {
+            let mut idx = 0usize;
+            for (i, entry) in entries.iter().enumerate() {
+                if i == 0 {
+                    idx = 0;
+                } else if entry.key.as_slice() <= key {
+                    idx = i;
+                } else {
+                    break;
+                }
+            }
+            idx
+        }
+
+        let tree = Tree::new(1, 256);
+        // Build sorted IN slot key sets of varying size; slot 0 = virtual −∞
+        // (empty key sorts first), the rest strictly ascending.
+        for n_slots in 1usize..40 {
+            let mut entries: Vec<InEntry> = Vec::with_capacity(n_slots);
+            entries.push(InEntry {
+                key: vec![],
+                lsn: Lsn::from_u64(0),
+                child: None,
+            });
+            for i in 1..n_slots {
+                // Strictly-ascending two-byte keys with gaps so probes can
+                // fall between, on, before, and after them.
+                let v = (i as u16) * 4;
+                entries.push(InEntry {
+                    key: vec![(v >> 8) as u8, (v & 0xFF) as u8],
+                    lsn: Lsn::from_u64(0),
+                    child: None,
+                });
+            }
+            for probe in 0u16..=(n_slots as u16 * 4 + 4) {
+                let key = vec![(probe >> 8) as u8, (probe & 0xFF) as u8];
+                assert_eq!(
+                    tree.upper_in_floor_index(&entries, &key),
+                    linear_floor(&entries, &key),
+                    "floor mismatch: n_slots={n_slots}, key={key:?}"
+                );
+            }
+        }
     }
 }
