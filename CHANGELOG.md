@@ -16,6 +16,16 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Changed (performance + correctness — review St-H4)
+
+- Internal-node (upper-IN) tree descent now uses a binary floor-search
+  (`Tree::upper_in_floor_index`) instead of an O(n) linear scan, applied
+  uniformly across all eight descent sites. This also fixes a latent bug where
+  `search_with_coupling` used a raw byte comparison and ignored a configured
+  custom key comparator on that path. Verified by a property test comparing
+  the binary search to a reference linear floor scan (incl. before/after/
+  between/exact probes) and the full tree/db/dbi suites.
+
 ### Documentation (review follow-up)
 
 - `file_header.rs`: corrected the byte-order documentation (the `byte_order`
