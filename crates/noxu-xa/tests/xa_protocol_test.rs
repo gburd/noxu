@@ -51,7 +51,7 @@ impl TestEnv {
         let txn = self.xa.get_transaction(xid).unwrap();
         let k = DatabaseEntry::from_bytes(key);
         let v = DatabaseEntry::from_bytes(val);
-        self.db.put(Some(txn), &k, &v).unwrap();
+        self.db.put(Some(&*txn), &k, &v).unwrap();
         self.xa.mark_write(xid).unwrap();
     }
 
@@ -681,7 +681,7 @@ fn test_readonly_with_reads() {
         let txn = env.xa.get_transaction(&x).unwrap();
         let key = DatabaseEntry::from_bytes(b"preexist");
         let mut val = DatabaseEntry::new();
-        let _status = env.db.get(Some(txn), &key, &mut val).unwrap();
+        let _status = env.db.get(Some(&*txn), &key, &mut val).unwrap();
     }
     // Don't call mark_write
     env.xa.xa_end(&x, XaFlags::TMSUCCESS).unwrap();
@@ -794,7 +794,7 @@ fn test_concurrent_independent_xids() {
                         format!("conc_k{tid}").into_bytes(),
                     );
                     let val = DatabaseEntry::from_bytes(b"conc_val");
-                    env.db.put(Some(txn), &key, &val).unwrap();
+                    env.db.put(Some(&*txn), &key, &val).unwrap();
                     env.xa.mark_write(&x).unwrap();
                 }
                 env.xa.xa_end(&x, XaFlags::TMSUCCESS).unwrap();

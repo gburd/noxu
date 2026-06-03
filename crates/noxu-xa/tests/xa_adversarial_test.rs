@@ -86,7 +86,7 @@ fn test_crash_recovery_prepared_log_persists() {
             let key =
                 DatabaseEntry::from_vec(format!("crash_k{i}").into_bytes());
             let val = DatabaseEntry::from_bytes(b"crash_value");
-            db.put(Some(txn), &key, &val).unwrap();
+            db.put(Some(&*txn), &key, &val).unwrap();
             xa.mark_write(xid).unwrap();
             xa.xa_end(xid, XaFlags::TMSUCCESS).unwrap();
             xa.xa_prepare(xid, XaFlags::NOFLAGS).unwrap();
@@ -124,7 +124,7 @@ fn test_crash_recovery_committed_not_recovered() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"ck"),
             &DatabaseEntry::from_bytes(b"cv"),
         )
@@ -158,7 +158,7 @@ fn test_crash_recovery_rolled_back_not_recovered() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"rbk"),
             &DatabaseEntry::from_bytes(b"rbv"),
         )
@@ -217,7 +217,7 @@ fn test_concurrent_xid_reuse_race() {
                                 format!("race_t{tid}_i{i}").into_bytes(),
                             );
                             let val = DatabaseEntry::from_bytes(b"won");
-                            let _ = db.put(Some(txn), &key, &val);
+                            let _ = db.put(Some(&*txn), &key, &val);
                             xa.mark_write(&xid).unwrap();
                             xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
                             xa.xa_commit(&xid, XaFlags::ONEPHASE).unwrap();
@@ -277,7 +277,7 @@ fn test_rapid_fire_10k_cycles() {
             let key =
                 DatabaseEntry::from_vec(format!("rapid_{i:08}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
-            db.put(Some(txn), &key, &val).unwrap();
+            db.put(Some(&*txn), &key, &val).unwrap();
             xa.mark_write(&xid).unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -309,7 +309,7 @@ fn test_rapid_fire_10k_with_prepared_log() {
             let key =
                 DatabaseEntry::from_vec(format!("plog_{i:08}").into_bytes());
             let val = DatabaseEntry::from_bytes(b"v");
-            db.put(Some(txn), &key, &val).unwrap();
+            db.put(Some(&*txn), &key, &val).unwrap();
             xa.mark_write(&xid).unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -347,7 +347,7 @@ fn test_prepared_log_500_branches() {
         let key =
             DatabaseEntry::from_vec(format!("stress_k{i:04}").into_bytes());
         let val = DatabaseEntry::from_bytes(b"stress_val");
-        db.put(Some(txn), &key, &val).unwrap();
+        db.put(Some(&*txn), &key, &val).unwrap();
         xa.mark_write(xid).unwrap();
         xa.xa_end(xid, XaFlags::TMSUCCESS).unwrap();
         let result = xa.xa_prepare(xid, XaFlags::NOFLAGS).unwrap();
@@ -402,7 +402,7 @@ fn test_onephase_after_suspend_resume() {
     {
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"s1pc_k1"),
             &DatabaseEntry::from_bytes(b"v1"),
         )
@@ -420,7 +420,7 @@ fn test_onephase_after_suspend_resume() {
     {
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"s1pc_k2"),
             &DatabaseEntry::from_bytes(b"v2"),
         )
@@ -473,7 +473,7 @@ fn test_prepared_log_binary_max_length_xids() {
             let txn = xa.get_transaction(xid_ref).unwrap();
             let key =
                 DatabaseEntry::from_vec(format!("bin_key_{i}").into_bytes());
-            db.put(Some(txn), &key, &DatabaseEntry::from_bytes(b"bin_val"))
+            db.put(Some(&*txn), &key, &DatabaseEntry::from_bytes(b"bin_val"))
                 .unwrap();
             xa.mark_write(xid_ref).unwrap();
             xa.xa_end(xid_ref, XaFlags::TMSUCCESS).unwrap();
@@ -503,7 +503,7 @@ fn test_prepared_log_empty_xid_components() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"empty_k"),
             &DatabaseEntry::from_bytes(b"empty_v"),
         )
@@ -538,7 +538,7 @@ fn test_forget_removes_from_persistent_log() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"fk"),
             &DatabaseEntry::from_bytes(b"fv"),
         )
@@ -570,7 +570,7 @@ fn test_forget_persistent_only_xid() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"pof_k"),
             &DatabaseEntry::from_bytes(b"pof_v"),
         )
@@ -612,7 +612,8 @@ fn test_rollback_prepared_frees_locks_completely() {
     xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
     {
         let txn = xa.get_transaction(&xid).unwrap();
-        db.put(Some(txn), &key, &DatabaseEntry::from_bytes(b"first")).unwrap();
+        db.put(Some(&*txn), &key, &DatabaseEntry::from_bytes(b"first"))
+            .unwrap();
         xa.mark_write(&xid).unwrap();
     }
     xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -624,7 +625,8 @@ fn test_rollback_prepared_frees_locks_completely() {
     xa.xa_start(&xid2, XaFlags::NOFLAGS).unwrap();
     {
         let txn = xa.get_transaction(&xid2).unwrap();
-        db.put(Some(txn), &key, &DatabaseEntry::from_bytes(b"second")).unwrap();
+        db.put(Some(&*txn), &key, &DatabaseEntry::from_bytes(b"second"))
+            .unwrap();
         xa.mark_write(&xid2).unwrap();
     }
     xa.xa_end(&xid2, XaFlags::TMSUCCESS).unwrap();
@@ -657,7 +659,7 @@ fn test_concurrent_branches_disjoint_keys() {
     {
         let txn1 = xa.get_transaction(&xid1).unwrap();
         db.put(
-            Some(txn1),
+            Some(&*txn1),
             &DatabaseEntry::from_bytes(b"key_A"),
             &DatabaseEntry::from_bytes(b"val_A"),
         )
@@ -667,7 +669,7 @@ fn test_concurrent_branches_disjoint_keys() {
     {
         let txn2 = xa.get_transaction(&xid2).unwrap();
         db.put(
-            Some(txn2),
+            Some(&*txn2),
             &DatabaseEntry::from_bytes(b"key_B"),
             &DatabaseEntry::from_bytes(b"val_B"),
         )
@@ -742,7 +744,7 @@ fn test_concurrent_prepared_log_stress() {
                             format!("cpl_t{tid}_k{i:04}").into_bytes(),
                         );
                         let val = DatabaseEntry::from_bytes(b"cpl_val");
-                        db.put(Some(txn), &key, &val).unwrap();
+                        db.put(Some(&*txn), &key, &val).unwrap();
                         xa.mark_write(&xid).unwrap();
                     }
                     xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -783,7 +785,7 @@ fn test_abandoned_active_branches_not_in_recover() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         let txn = xa.get_transaction(&xid).unwrap();
         let key = DatabaseEntry::from_vec(format!("abn_{i}").into_bytes());
-        db.put(Some(txn), &key, &DatabaseEntry::from_bytes(b"v")).unwrap();
+        db.put(Some(&*txn), &key, &DatabaseEntry::from_bytes(b"v")).unwrap();
         xa.mark_write(&xid).unwrap();
         // Never call xa_end or xa_commit — branch is abandoned in Active state
     }
@@ -843,7 +845,7 @@ fn test_adversarial_mixed_operations_timed() {
                             format!("adv_t{tid}_{counter}").into_bytes(),
                         );
                         let val = DatabaseEntry::from_bytes(b"adversarial");
-                        let _ = db.put(Some(txn), &key, &val);
+                        let _ = db.put(Some(&*txn), &key, &val);
                         xa.mark_write(&xid).unwrap();
                     }
                     xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();

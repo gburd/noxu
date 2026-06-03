@@ -143,7 +143,7 @@ fn test_xa_multi_cluster_2pc() {
         let txn = cluster.xa.get_transaction(&xid).unwrap();
         let key = DatabaseEntry::from_vec(format!("key_{i}").into_bytes());
         let val = DatabaseEntry::from_vec(format!("val_{i}").into_bytes());
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(&xid).unwrap();
     }
 
@@ -184,7 +184,7 @@ fn test_xa_multi_cluster_rollback() {
         let key =
             DatabaseEntry::from_vec(format!("rollback_key_{i}").into_bytes());
         let val = DatabaseEntry::from_bytes(b"should_not_persist");
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(&xid).unwrap();
     }
 
@@ -228,7 +228,7 @@ fn test_xa_mixed_readonly_write() {
         let txn = c_write.xa.get_transaction(&xid).unwrap();
         let key = DatabaseEntry::from_bytes(b"mixed_key");
         let val = DatabaseEntry::from_bytes(b"mixed_val");
-        c_write.db.put(Some(txn), &key, &val).unwrap();
+        c_write.db.put(Some(&*txn), &key, &val).unwrap();
         c_write.xa.mark_write(&xid).unwrap();
     }
 
@@ -271,7 +271,7 @@ fn test_xa_many_independent_branches() {
         let txn = cluster.xa.get_transaction(xid).unwrap();
         let key = DatabaseEntry::from_vec(format!("multi_{i:04}").into_bytes());
         let val = DatabaseEntry::from_vec(format!("value_{i}").into_bytes());
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(xid).unwrap();
     }
 
@@ -317,7 +317,7 @@ fn test_xa_recover_multi_cluster() {
         let txn = c1.xa.get_transaction(&xid1).unwrap();
         c1.db
             .put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(b"rk"),
                 &DatabaseEntry::from_bytes(b"rv"),
             )
@@ -334,7 +334,7 @@ fn test_xa_recover_multi_cluster() {
         let txn = c2.xa.get_transaction(&xid2).unwrap();
         c2.db
             .put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(b"rk2"),
                 &DatabaseEntry::from_bytes(b"rv2"),
             )
@@ -465,7 +465,7 @@ fn test_xa_chaos_concurrent() {
                             let val = DatabaseEntry::from_vec(
                                 format!("v_{txn_counter}").into_bytes(),
                             );
-                            if cluster.db.put(Some(txn), &key, &val).is_ok() {
+                            if cluster.db.put(Some(&*txn), &key, &val).is_ok() {
                                 let _ = cluster.xa.mark_write(&xid);
                             }
                         }
@@ -581,7 +581,7 @@ fn test_xa_tmfail_branches_rollback_only() {
         let txn = cluster.xa.get_transaction(&xid).unwrap();
         let key = DatabaseEntry::from_bytes(b"fail_key");
         let val = DatabaseEntry::from_bytes(b"fail_val");
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(&xid).unwrap();
     }
 
@@ -619,7 +619,7 @@ fn test_xa_interleaved_suspend_resume() {
         let txn = cluster.xa.get_transaction(&xid1).unwrap();
         let key = DatabaseEntry::from_bytes(b"s1_key");
         let val = DatabaseEntry::from_bytes(b"s1_val");
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(&xid1).unwrap();
     }
     cluster.xa.xa_end(&xid1, XaFlags::TMSUSPEND).unwrap();
@@ -629,7 +629,7 @@ fn test_xa_interleaved_suspend_resume() {
         let txn = cluster.xa.get_transaction(&xid2).unwrap();
         let key = DatabaseEntry::from_bytes(b"s2_key");
         let val = DatabaseEntry::from_bytes(b"s2_val");
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(&xid2).unwrap();
     }
     cluster.xa.xa_end(&xid2, XaFlags::TMSUSPEND).unwrap();
@@ -640,7 +640,7 @@ fn test_xa_interleaved_suspend_resume() {
         let txn = cluster.xa.get_transaction(&xid1).unwrap();
         let key = DatabaseEntry::from_bytes(b"s1_key2");
         let val = DatabaseEntry::from_bytes(b"s1_val2");
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
     }
     cluster.xa.xa_end(&xid1, XaFlags::TMSUCCESS).unwrap();
 
@@ -701,7 +701,7 @@ fn test_xa_scale_1000_branches() {
         let txn = cluster.xa.get_transaction(xid).unwrap();
         let key = DatabaseEntry::from_vec(format!("scale_{i:06}").into_bytes());
         let val = DatabaseEntry::from_bytes(b"scale_value");
-        cluster.db.put(Some(txn), &key, &val).unwrap();
+        cluster.db.put(Some(&*txn), &key, &val).unwrap();
         cluster.xa.mark_write(xid).unwrap();
     }
 
@@ -762,7 +762,7 @@ fn test_xa_scale_concurrent_threads() {
                             format!("t{tid}_op{op:05}").into_bytes(),
                         );
                         let val = DatabaseEntry::from_bytes(b"thread_val");
-                        cluster.db.put(Some(txn), &key, &val).unwrap();
+                        cluster.db.put(Some(&*txn), &key, &val).unwrap();
                         cluster.xa.mark_write(&xid).unwrap();
                     }
                     cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -806,7 +806,7 @@ fn test_xa_perf_2pc_vs_single_phase() {
             let txn = cluster.xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_vec(format!("warm_{i}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
-            cluster.db.put(Some(txn), &key, &val).unwrap();
+            cluster.db.put(Some(&*txn), &key, &val).unwrap();
             cluster.xa.mark_write(&xid).unwrap();
         }
         cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -823,7 +823,7 @@ fn test_xa_perf_2pc_vs_single_phase() {
             let key =
                 DatabaseEntry::from_vec(format!("2pc_{i:06}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
-            cluster.db.put(Some(txn), &key, &val).unwrap();
+            cluster.db.put(Some(&*txn), &key, &val).unwrap();
             cluster.xa.mark_write(&xid).unwrap();
         }
         cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -842,7 +842,7 @@ fn test_xa_perf_2pc_vs_single_phase() {
             let key =
                 DatabaseEntry::from_vec(format!("1pc_{i:06}").into_bytes());
             let val = DatabaseEntry::from_bytes(&value);
-            cluster.db.put(Some(txn), &key, &val).unwrap();
+            cluster.db.put(Some(&*txn), &key, &val).unwrap();
             cluster.xa.mark_write(&xid).unwrap();
         }
         cluster.xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -942,7 +942,7 @@ fn test_xa_perf_concurrent_multi_cluster() {
                             format!("mc_t{tid}_op{op}").into_bytes(),
                         );
                         let val = DatabaseEntry::from_bytes(&value);
-                        c1.db.put(Some(txn), &key, &val).unwrap();
+                        c1.db.put(Some(&*txn), &key, &val).unwrap();
                         c1.xa.mark_write(&xid).unwrap();
                     }
                     {
@@ -951,7 +951,7 @@ fn test_xa_perf_concurrent_multi_cluster() {
                             format!("mc_t{tid}_op{op}").into_bytes(),
                         );
                         let val = DatabaseEntry::from_bytes(&value);
-                        c2.db.put(Some(txn), &key, &val).unwrap();
+                        c2.db.put(Some(&*txn), &key, &val).unwrap();
                         c2.xa.mark_write(&xid).unwrap();
                     }
 

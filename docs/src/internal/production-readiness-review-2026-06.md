@@ -36,14 +36,14 @@ backlog.
 | T-F1 | noxu-recovery | Undo pass applied before-images with **no `logLsn == slotLsn` currency check** (the code comment falsely claimed the check was "delegated to the tree layer"). Theoretically an aborted txn's before-image could overwrite a later committed write of the same key during recovery. | **MITIGATED** — the JE currency check is now enforced in `run_undo`/`run_undo_all`; the false comment is corrected. The specific interleaving could **not** be reproduced as a live failure on main (masked by runtime-abort reversion + redo-only-committed + the no-active-txns fast path), so this is defensive alignment with JE, not a demonstrated live-corruption fix. |
 | T-F2 | noxu-dbi / docs | `cursor_impl::lock_ln` always acquires `LockType::Read`, never `RangeRead`; the range-lock conflict matrix is dead code at the operational level. SERIALIZABLE does not prevent phantoms despite being documented to. | **OPEN** (docs corrected to stop claiming phantom prevention; code fix pending) |
 | R-F01 | noxu-log | `LogBufferSegment` stores raw pointers into inline `LogBuffer` fields; `unsafe impl Send` + no `Pin`/`!Unpin` → moving a stack `LogBuffer` after `allocate()` dangles the pointers (UB) | **OPEN** |
-| R-F03 | noxu-log / noxu-dbi | `mmap_file` SAFETY claims it is only used on complete files during recovery; the disk-ordered cursor maps the **current write file** during live operation, violating `memmap2`'s no-concurrent-modification contract (UB) | **OPEN** |
+| R-F03 | noxu-log / noxu-dbi | `mmap_file` SAFETY claims it is only used on complete files during recovery; the disk-ordered cursor maps the **current write file** during live operation, violating `memmap2`'s no-concurrent-modification contract (UB) | **FIXED** (`mmap_file` refuses the current write file; the scanner falls back to `pread`) |
 | St-C3 | noxu-log format | The 32-byte file header is written with **no checksum**; a torn write of the header is undetectable (JE wraps it as an Adler32-protected log entry) | **OPEN** |
 
 ## High
 
 | ID | Area | Issue | Status |
 |----|------|-------|--------|
-| R-F04 | noxu-xa | `get_transaction` returns `&Transaction` after dropping the `Mutex` guard; a concurrent `xa_rollback` frees the `Box` → use-after-free. Invariant not enforced by the type system. | OPEN (fix: RAII guard wrapper) |
+| R-F04 | noxu-xa | `get_transaction` returned `&Transaction` after dropping the `Mutex` guard; a concurrent `xa_rollback` frees the `Box` → use-after-free. | **FIXED** (returns `Arc<Transaction>`; the handle keeps the txn alive independently of the map; `unsafe` removed and noxu-xa now carries `#![forbid(unsafe_code)]`) |
 | R-F05 | noxu-latch | `thread_id()` lacked `\| 1`; a thread whose `DefaultHasher` output is 0 collides with the "unowned" sentinel and false-panics "latch already held" on first acquire | **FIXED** |
 | T-F3 | noxu-recovery | `CkptEnd.first_active_lsn` is hard-coded to `Lsn::new(0,0)` → recovery always scans the whole log from file 0 (O(total log), not O(checkpoint interval)). Correct but unbounded. Depends on T-F4. | OPEN (documented; see `wave-gb-dbtree-recovery.md`) |
 | T-F4 | noxu-txn/dbi | `TxnManager::update_first_lsn` is never called from the cursor layer → `get_first_active_lsn()` always returns NULL_LSN (the documented contract is unimplemented) | OPEN |
@@ -106,8 +106,9 @@ backlog.
 1. **T-F1** (recovery currency check) — **mitigated** (JE currency check now
    enforced; could not be reproduced as a live failure — defensive). Verify the
    analysis above (runtime-abort reversion + redo-only-committed) is complete.
-2. **R-F01, R-F03** (noxu-log `unsafe` soundness) — UB under documented use.
-3. **R-F04** (XA use-after-free) — RAII guard.
+2. **R-F01, R-F03** (noxu-log `unsafe` soundness) — R-F03 **fixed**; R-F01
+   (`LogBufferSegment` move-safety) remains.
+3. **R-F04** (XA use-after-free) — **fixed** (Arc<Transaction>).
 4. **T-F2** (range locks) — either implement, or keep the corrected docs and
    drop SERIALIZABLE from the advertised guarantees until implemented.
 5. **St-C3 / St-H1 / St-H3** (on-disk format: header checksum + endianness) —

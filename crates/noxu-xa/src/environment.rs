@@ -1,5 +1,6 @@
 //! XA Environment — wraps a Noxu Environment to provide XA resource management.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use hashbrown::HashMap;
@@ -37,7 +38,11 @@ enum BranchState {
 /// invalidating the outstanding reference.
 struct Branch {
     state: BranchState,
-    txn: Box<Transaction>,
+    // Arc (not Box): `get_transaction` hands out a clone so the inner
+    // Transaction stays alive even if a concurrent (protocol-violating)
+    // xa_rollback/xa_commit removes this branch from the map. Converts a
+    // would-be use-after-free into a safe (if logically-wrong) operation.
+    txn: Arc<Transaction>,
     has_writes: bool,
 }
 
@@ -162,15 +167,17 @@ impl XaEnvironment {
         &self.env
     }
 
-    /// Returns the transaction for an active branch (for use by application code).
+    /// Returns the inner transaction for an active branch (for use by
+    /// application code performing reads/writes under this XA branch).
     ///
-    /// The transaction is only accessible while the branch is Active.
-    /// `Branch::txn` is boxed, so the returned reference remains valid
-    /// even if a concurrent `xa_start` rehashes the underlying HashMap;
-    /// the caller is responsible for not invalidating the reference by
-    /// rolling back / committing this same `xid` from another thread
-    /// (the X/Open XA protocol forbids that anyway).
-    pub fn get_transaction(&self, xid: &Xid) -> XaResult<&Transaction> {
+    /// Returns an `Arc<Transaction>` clone, so the returned handle keeps the
+    /// transaction alive independently of the branch map: even if another
+    /// thread removes this branch (via a protocol-violating concurrent
+    /// `xa_rollback`/`xa_commit`), the returned handle remains valid. This is
+    /// memory-safe — no `unsafe`, no dangling reference. (Per the X/Open XA
+    /// protocol a branch must not be resolved from another thread while it is
+    /// associated, so in correct use the branch is not removed concurrently.)
+    pub fn get_transaction(&self, xid: &Xid) -> XaResult<Arc<Transaction>> {
         let branches = self.branches.lock().unwrap();
         let branch = branches.get(xid).ok_or(XaError::NotFound)?;
         if branch.state != BranchState::Active {
@@ -178,15 +185,7 @@ impl XaEnvironment {
                 "transaction not active".to_string(),
             ));
         }
-        // SAFETY: The Transaction is heap-allocated via Box, so its
-        // address is stable across HashMap rehashes triggered by other
-        // xa_start calls. The reference's lifetime is bounded by `&self`.
-        // We deliberately drop the `branches` lock guard at the end of
-        // this function — callers serialize their own xid through the
-        // XA state machine, so no other thread will remove this branch
-        // while the caller is using the returned reference.
-        let txn_ptr: *const Transaction = &*branch.txn;
-        Ok(unsafe { &*txn_ptr })
+        Ok(Arc::clone(&branch.txn))
     }
 
     /// Mark the branch as having performed writes.
@@ -299,7 +298,7 @@ impl XaResource for XaEnvironment {
             xid.clone(),
             Branch {
                 state: BranchState::Active,
-                txn: Box::new(txn),
+                txn: Arc::new(txn),
                 has_writes: false,
             },
         );
@@ -709,7 +708,7 @@ mod tests {
             let txn = xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_bytes(b"k1");
             let val = DatabaseEntry::from_bytes(b"v1");
-            db.put(Some(txn), &key, &val).unwrap();
+            db.put(Some(&*txn), &key, &val).unwrap();
         }
         xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -740,7 +739,7 @@ mod tests {
             let txn = xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_bytes(b"k2");
             let val = DatabaseEntry::from_bytes(b"v2");
-            db.put(Some(txn), &key, &val).unwrap();
+            db.put(Some(&*txn), &key, &val).unwrap();
         }
         xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -807,7 +806,7 @@ mod tests {
             let txn = xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_bytes(b"k3");
             let val = DatabaseEntry::from_bytes(b"v3");
-            db.put(Some(txn), &key, &val).unwrap();
+            db.put(Some(&*txn), &key, &val).unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
 
@@ -845,7 +844,7 @@ mod tests {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(b"rk"),
                 &DatabaseEntry::from_bytes(b"rv"),
             )

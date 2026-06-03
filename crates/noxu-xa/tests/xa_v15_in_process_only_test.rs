@@ -107,7 +107,7 @@ fn xa_commit_after_restart_succeeds() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(key),
                 &DatabaseEntry::from_bytes(b"v"),
             )
@@ -166,7 +166,7 @@ fn xa_rollback_after_restart_succeeds() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(key),
                 &DatabaseEntry::from_bytes(b"v"),
             )
@@ -223,7 +223,7 @@ fn xa_forget_after_restart_clears_persistent_log() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(b"k_forget"),
                 &DatabaseEntry::from_bytes(b"v"),
             )
@@ -264,7 +264,7 @@ fn xa_prepare_auto_detects_writes_without_mark_write() {
     {
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"auto_k"),
             &DatabaseEntry::from_bytes(b"auto_v"),
         )

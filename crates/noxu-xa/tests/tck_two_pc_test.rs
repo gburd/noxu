@@ -51,7 +51,7 @@ impl Harness {
         let txn = self.xa.get_transaction(xid).unwrap();
         let k = DatabaseEntry::from_bytes(key);
         let v = DatabaseEntry::from_bytes(val);
-        self.db.put(Some(txn), &k, &v).unwrap();
+        self.db.put(Some(&*txn), &k, &v).unwrap();
         self.xa.mark_write(xid).unwrap();
     }
 

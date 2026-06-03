@@ -38,6 +38,11 @@
 //! }
 //! ```
 
+// noxu-xa contains no `unsafe` (the former transaction-pointer dereference in
+// `environment.rs` was replaced by an `Arc<Transaction>` handle in the v3.x
+// soundness pass). Forbid it to keep the crate safe.
+#![forbid(unsafe_code)]
+
 pub mod environment;
 pub mod error;
 pub mod flags;
