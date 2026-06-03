@@ -19,16 +19,34 @@
 //!                               (0 for the first file in an environment)
 //! ```
 //!
-//! # Portability
+//! # Byte order
 //!
-//! Files written by this implementation always use big-endian byte order
-//! (`byte_order = 0x00`). The `byte_order` field is reserved for future
-//! little-endian native format support; current readers reject files with
-//! `byte_order != 0x00`.
+//! The fields **in this file header** are big-endian (`byte_order = 0x00`).
+//! NOTE: this byte-order marker describes the *file-header framing only*. Log
+//! **entry** headers and entry payloads are NOT all big-endian — entry headers
+//! (`entry_header.rs`) are little-endian, and some entry payloads (e.g.
+//! `BinDeltaLogEntry`, `BinStub` serialization) are big-endian. An external
+//! reader must therefore not assume the whole file uses the byte order
+//! advertised here; it applies to the 32-byte file header only. The
+//! `byte_order` field is reserved for a future little-endian native header
+//! format; current readers reject files with `byte_order != 0x00`.
 //!
 //! The magic bytes `NOXUDB\0\0` allow tools to identify Noxu DB log files
 //! without relying on file extension. The `log_version` field allows format
 //! evolution with a clear compatibility check at open time.
+//!
+//! # Integrity (known gap — review St-C3)
+//!
+//! The file header is currently written without its own checksum (only the
+//! magic + version are validated on read). A torn write of the header during
+//! a crash that corrupts `file_number` / `last_entry_in_prev_file` while
+//! leaving the magic + version intact would pass validation and supply wrong
+//! recovery metadata. The window is narrowed by the `sync_all` + parent-dir
+//! fsync performed at file creation, but not eliminated. Adding a header CRC32
+//! requires a `LOG_VERSION` bump and a larger, version-aware header (the
+//! 32-byte first-entry offset is part of the LSN space, so the change ripples
+//! into the log/cleaner/recovery offset computations); it is tracked as a
+//! dedicated on-disk-format-v3 effort, not done here.
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
