@@ -45,3 +45,7 @@ _
 # TLA+ TLC scratch directories and logs
 tla/states/
 docs/book/
+
+# perf record raw captures — regenerate locally; only text summaries are tracked
+*.perf.data
+benches/profiles/**/*.perf.data
