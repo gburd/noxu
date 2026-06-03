@@ -668,6 +668,32 @@ impl BinStub {
         }
     }
 
+    /// Returns the LSN stored for a given full key, without modifying the BIN.
+    ///
+    /// Used by `redo_insert_recursive` for the LSN-aware skip (Wave GB / P-2):
+    /// when a BIN is pre-loaded from a checkpoint tree-walk, any redo LN
+    /// whose key is already at a same-or-newer LSN in the BIN must not
+    /// clobber the existing (fresher) state.
+    ///
+    /// Returns `None` if the key is not present in this BIN.
+    ///
+    /// `IN.findEntry` / `BIN.getTarget` (LSN comparison only).
+    pub fn get_slot_lsn(&self, full_key: &[u8]) -> Option<Lsn> {
+        // If the key does not start with this BIN's common prefix it cannot
+        // be stored here.  Return None immediately to avoid the debug_assert!
+        // inside compress_key.  This is the common case during recovery redo
+        // when a newly-inserted key ends up in a different BIN after a split.
+        let plen = self.key_prefix.len();
+        if plen > 0 && !full_key.starts_with(self.key_prefix.as_slice()) {
+            return None;
+        }
+        let suffix = self.compress_key(full_key);
+        self.entries
+            .binary_search_by(|e| e.key.as_slice().cmp(&suffix))
+            .ok()
+            .map(|idx| self.entries[idx].lsn)
+    }
+
     /// Returns the number of slots that are marked dirty.
     ///
     /// `BIN.getNumDirtyEntries()`.
@@ -2723,6 +2749,25 @@ impl Tree {
             let mut guard = node_arc.write();
             match &mut *guard {
                 TreeNode::Bottom(bin) => {
+                    // LSN-aware skip (P-2): if the BIN was pre-loaded from a
+                    // checkpoint tree-walk, a slot already at >= `lsn` is
+                    // already current-or-newer.  Overwriting it would clobber a
+                    // fresher state with an older log record.
+                    //
+                    // This is also correct for the current full-scan path: the
+                    // tree starts empty so the check always falls through (no
+                    // existing slot), making it a pure no-op.
+                    //
+                    // `RecoveryManager.redo()` decision table:
+                    //   "if (logrecLsn > treeLsn) → replace slot".
+                    if bin
+                        .get_slot_lsn(key)
+                        .is_some_and(|slot_lsn| slot_lsn >= lsn)
+                    {
+                        // Slot already holds a same-or-newer version; skip.
+                        return Ok(false);
+                    }
+
                     let is_new = if let Some(cmp) = key_comparator {
                         // Comparator path: fall back to owned-Vec variant.
                         let (_idx, new) = bin.insert_cmp(

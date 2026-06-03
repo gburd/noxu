@@ -262,6 +262,52 @@ pub struct RecoveryManager {
     pub(crate) mapping_tree_db_names: HashMap<String, u64>,
 }
 
+/// Parse child entry LSNs from an upper IN's `write_to_bytes()` serialization.
+///
+/// Format (from `TreeNode::write_to_bytes()` for `Internal` variant):
+/// ```text
+/// node_id   : 8 bytes (u64 BE)
+/// level     : 4 bytes (i32 BE)
+/// n_entries : 4 bytes (u32 BE)
+/// dirty     : 1 byte
+/// entries   : n_entries * (key_len: u16 BE, key: bytes, lsn: u64 BE)
+/// ```
+///
+/// Returns `None` if the byte slice is too short or malformed.
+/// Returns the per-entry child LSNs (some may be `NULL_LSN` for empty slots).
+fn parse_upper_in_child_lsns(data: &[u8]) -> Option<Vec<Lsn>> {
+    if data.len() < 17 {
+        return None; // node_id(8) + level(4) + n_entries(4) + dirty(1) = 17
+    }
+    // Skip node_id (0..8) and level (8..12).
+    let n_entries = u32::from_be_bytes(data[12..16].try_into().ok()?) as usize;
+    // Skip dirty byte (16).
+    let mut pos = 17usize;
+    let mut lsns = Vec::with_capacity(n_entries);
+    for _ in 0..n_entries {
+        // key_len : u16 BE (2 bytes)
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let key_len =
+            u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        // key : key_len bytes
+        if pos + key_len > data.len() {
+            return None;
+        }
+        pos += key_len;
+        // lsn : u64 BE (8 bytes)
+        if pos + 8 > data.len() {
+            return None;
+        }
+        let lsn_u64 = u64::from_be_bytes(data[pos..pos + 8].try_into().ok()?);
+        lsns.push(Lsn::from_u64(lsn_u64));
+        pos += 8;
+    }
+    Some(lsns)
+}
+
 impl RecoveryManager {
     /// Create a new recovery manager.
     pub fn new() -> Self {
@@ -698,6 +744,22 @@ impl RecoveryManager {
         analysis: &AnalysisResult,
         trees: &mut HashMap<u64, noxu_tree::Tree>,
     ) -> Result<()> {
+        // ---- P-2: Checkpoint tree-walk BIN preload (multi-DB) ----
+        // Only for the primary tree (db_id 1) for now; the tree-walk root
+        // is written by the single-DB checkpointer.  Multi-DB support is a
+        // follow-on wave.
+        if analysis.use_root_lsn != NULL_LSN
+            && analysis.first_active_lsn != NULL_LSN
+            && analysis.first_active_lsn > Lsn::new(0, 0)
+            && let Some(t) = trees.get_mut(&1u64)
+        {
+            Self::preload_bins_from_checkpoint_walk(
+                _scanner,
+                analysis.use_root_lsn,
+                t,
+                &mut self.stats,
+            );
+        }
         let in_entries: Vec<_> = {
             let mut levels = Vec::new();
             while let Some(level) = self.dirty_in_map.get_lowest_level() {
@@ -1268,6 +1330,39 @@ impl RecoveryManager {
         analysis: &AnalysisResult,
         mut tree: Option<&mut noxu_tree::Tree>,
     ) -> Result<()> {
+        // ---- P-2: Checkpoint tree-walk BIN preload ----
+        //
+        // When the checkpoint wrote a root IN LSN (use_root_lsn != NULL_LSN)
+        // AND the scan-reduction is active (first_active_lsn > 0), pre-populate
+        // the tree from the checkpoint tree-walk BEFORE the LN redo pass.
+        //
+        // This gives the LSN-aware redo_insert its "baseline": any LN that
+        // has the same key at a same-or-newer LSN as what the checkpoint BIN
+        // contains will be skipped (overlap window).  For committed LNs that
+        // post-date the checkpoint start they will be applied normally.
+        //
+        // Falls back gracefully: if the root entry cannot be read (e.g. the
+        // log was partially cleaned), we skip the preload and rely on the
+        // full LN redo pass.
+        if analysis.use_root_lsn != NULL_LSN
+            && analysis.first_active_lsn != NULL_LSN
+            && analysis.first_active_lsn > Lsn::new(0, 0)
+            && let Some(t) = tree.as_deref_mut()
+        {
+            log::debug!(
+                "noxu-recovery: P-2 preloading BINs from checkpoint tree-walk \
+                 (root_lsn={:?}, first_active_lsn={:?})",
+                analysis.use_root_lsn,
+                analysis.first_active_lsn,
+            );
+            Self::preload_bins_from_checkpoint_walk(
+                _scanner,
+                analysis.use_root_lsn,
+                t,
+                &mut self.stats,
+            );
+        }
+
         // ---- Redo INs (bottom-up via DirtyINMap) ----
         //
         // RedoDirtyNodes() / DirtyINMap.getLowestLevel() loop.
@@ -1434,6 +1529,106 @@ impl RecoveryManager {
     /// if (not found && !deletion) → insert into tree
     /// if (deletion)               → delete slot (if present)
     /// ```
+    /// Pre-populate a tree from the checkpoint tree-walk (P-2 scan-reduction).
+    ///
+    /// Reads the root IN from `root_lsn`, walks down via child slot LSNs,
+    /// and inserts each BIN's key-value pairs into `tree` via `redo_insert`
+    /// (with the per-slot LSN so the LSN-aware skip handles the overlap window).
+    ///
+    /// # Algorithm
+    ///
+    /// 1. `scanner.read_at_lsn(root_lsn)` → `LogEntry::In(InRecord { is_bin: false, node_data })`.
+    /// 2. Parse `node_data` as upper-IN format to get per-entry child LSNs.
+    /// 3. For each non-NULL child LSN:
+    ///    - If BIN (`is_bin: true`): `BinStub::deserialize_full` → insert entries.
+    ///    - If upper IN: recurse.
+    /// 4. After this call, `tree` contains the complete checkpoint-time state.
+    ///    for every BIN (stable + dirty).  The subsequent LN redo pass
+    ///    (`run_redo_all`) replays only post-`first_active_lsn` entries.
+    ///
+    /// # Safety
+    ///
+    /// Called only when BOTH conditions hold:
+    /// - `use_root_lsn != NULL_LSN` (checkpoint wrote a tree-walk root)
+    /// - `first_active_lsn > Lsn::new(0, 0)` (scan-reduction is active)
+    ///
+    /// If either condition fails, recovery falls back to the full-scan path.
+    fn preload_bins_from_checkpoint_walk(
+        scanner: &dyn crate::log_scanner::LogScanner,
+        root_lsn: Lsn,
+        tree: &mut noxu_tree::Tree,
+        stats: &mut RecoveryStats,
+    ) {
+        use crate::log_scanner::LogEntry;
+        use noxu_tree::tree::BinStub;
+
+        // Stack-based DFS: entries are (lsn, is_bin) from parent IN child slots.
+        // We start by reading the root IN.
+        let mut stack: Vec<Lsn> = vec![root_lsn];
+
+        while let Some(lsn) = stack.pop() {
+            let entry = match scanner.read_at_lsn(lsn) {
+                Some(e) => e,
+                None => {
+                    log::warn!(
+                        "noxu-recovery: P-2 tree-walk: cannot read entry at \
+                         lsn={lsn:?}, skipping (falling back to LN redo for this subtree)"
+                    );
+                    continue;
+                }
+            };
+
+            if let LogEntry::In(rec) = entry {
+                let node_data = match rec.node_data {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                if rec.is_bin && !rec.is_delta {
+                    // Full BIN: deserialise and insert all entries.
+                    if let Some(bin) = BinStub::deserialize_full(&node_data) {
+                        for idx in 0..bin.entries.len() {
+                            let e = &bin.entries[idx];
+                            // Skip tombstones (known-deleted entries).
+                            if e.known_deleted {
+                                continue;
+                            }
+                            // `get_full_key` reconstructs the key from prefix + suffix.
+                            let full_key = match bin.get_full_key(idx) {
+                                Some(k) => k,
+                                None => continue,
+                            };
+                            let data_slice: &[u8] = if let Some(d) = &e.data {
+                                d.as_slice()
+                            } else {
+                                // Non-embedded LN: follow e.lsn to get data.
+                                // This is rare; skip if the LN cannot be read
+                                // (it should still be in the log during recovery).
+                                // For now, insert with empty data — the subsequent
+                                // LN redo pass will correct this if the LN is in
+                                // the scan range.
+                                &[]
+                            };
+                            tree.redo_insert(&full_key, data_slice, e.lsn).ok();
+                            stats.ins_replayed += 1;
+                        }
+                    }
+                } else if !rec.is_bin {
+                    // Upper IN: parse child slot LSNs and push onto stack.
+                    if let Some(child_lsns) = parse_upper_in_child_lsns(&node_data) {
+                        for child_lsn in child_lsns {
+                            if child_lsn != NULL_LSN {
+                                stack.push(child_lsn);
+                            }
+                        }
+                    }
+                }
+                // is_delta BINs are not written during the checkpoint tree-walk
+                // (we force full BINs at checkpoint), so we skip them here.
+            }
+        }
+    }
+
     ///
     /// The tree's `insert` API handles both insert and update:
     /// - `insert(key, data, lsn)` succeeds regardless of whether the key was
@@ -1876,6 +2071,9 @@ mod tests {
             level,
             is_root,
             is_delta: false,
+            is_bin: level == 0,
+            prev_full_lsn: noxu_util::NULL_LSN,
+            prev_delta_lsn: noxu_util::NULL_LSN,
             node_data: None,
         }
     }

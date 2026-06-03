@@ -658,7 +658,8 @@ impl EnvironmentImpl {
                     .bytes_interval(cfg.checkpointer_bytes_interval),
             )
             .with_log_manager(Arc::clone(lm))
-            .with_tree(Arc::clone(&primary_tree), 1);
+            .with_tree(Arc::clone(&primary_tree), 1)
+            .with_txn_manager(Arc::clone(&txn_manager));
             // X-5: wire the cleaner so do_checkpoint calls after_checkpoint()
             // and activates the three-state deletion barrier.
             if let Some(ref c) = cleaner {

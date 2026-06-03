@@ -552,3 +552,107 @@ fn test_clean_close_and_sigkill_produce_identical_state() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test: open_txn_spanning_checkpoint_recovers_correctly
+// ---------------------------------------------------------------------------
+//
+// This is the P-2 correctness test — the exact scenario that the Wave GB
+// escape hatch documented as blocked.
+//
+// Scenario (in crash_worker mode "open_txn_spanning_checkpoint"):
+//   1. Worker writes 20 committed keys ("committed_NNN").
+//   2. Worker opens a transaction and writes 10 keys ("open_NNN").
+//   3. Worker forces a checkpoint — CkptStart is logged AFTER the open
+//      txn's LNs, so the txn's firstLoggedLsn < CkptStart.
+//   4. Parent SIGKILLs the worker while the txn is still open.
+//
+// After recovery:
+//   - All 20 committed keys must be present.
+//   - None of the 10 "open_NNN" keys may appear (they were uncommitted).
+//
+// With the P-2 open-txn fix (first_active_lsn = min(txn_lsn, CkptStart)):
+//   - Recovery scans from the open txn's firstLoggedLsn (<= CkptStart).
+//   - The undo pass finds the open txn and reverts its writes.
+//   - No uncommitted data survives.
+//
+// Without the fix (first_active_lsn = CkptStart, old behaviour):
+//   - Recovery scans from CkptStart, misses the open txn's LNs.
+//   - Undo pass has no knowledge of the txn → does NOT revert its writes.
+//   - The BIN loaded from the checkpoint tree-walk already contains the
+//     uncommitted key → it silently survives recovery.  DATA CORRUPTION.
+
+#[test]
+fn open_txn_spanning_checkpoint_recovers_correctly() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "open_txn_spanning_checkpoint")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    // Wait for committed writes to complete.
+    assert!(
+        wait_for_flag(&dir_path, "phase1_done", Duration::from_secs(60)),
+        "worker did not complete phase 1 within timeout"
+    );
+
+    // Wait for the open txn + checkpoint to complete.
+    assert!(
+        wait_for_flag(&dir_path, "open_txn_ready", Duration::from_secs(60)),
+        "worker did not signal open_txn_ready within timeout"
+    );
+
+    // SIGKILL — txn is open, no commit/abort record written.
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    // Reopen — triggers crash recovery.
+    let (_env, db) = reopen_db(&dir_path);
+
+    // All 20 committed keys must be present.
+    let mut missing_committed = 0u32;
+    for i in 0u32..20 {
+        let k = format!("committed_{i:03}");
+        let key = DatabaseEntry::from_bytes(k.as_bytes());
+        let mut val = DatabaseEntry::new();
+        match db.get(None, &key, &mut val).unwrap() {
+            OperationStatus::Success => {}
+            OperationStatus::NotFound => {
+                missing_committed += 1;
+                eprintln!("committed key missing after recovery: {k}");
+            }
+            other => {
+                panic!("unexpected status {other:?} for committed key {k}")
+            }
+        }
+    }
+    assert_eq!(
+        missing_committed, 0,
+        "{missing_committed} committed key(s) were lost after crash recovery \
+         (open-txn-spanning-checkpoint scenario)"
+    );
+
+    // None of the 10 uncommitted "open_NNN" keys may appear.
+    let mut leaked = 0u32;
+    for i in 0u32..10 {
+        let k = format!("open_{i:03}");
+        let key = DatabaseEntry::from_bytes(k.as_bytes());
+        let mut val = DatabaseEntry::new();
+        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+            leaked += 1;
+            eprintln!(
+                "CORRECTNESS VIOLATION: uncommitted key '{k}' survived recovery \
+                 — the P-2 open-txn fix is not working correctly"
+            );
+        }
+    }
+    assert_eq!(
+        leaked, 0,
+        "{leaked} uncommitted key(s) silently survived crash recovery. \
+         This is a silent correctness violation (uncommitted data appears committed). \
+         Root cause: first_active_lsn is not covering the open txn's writes."
+    );
+}

@@ -399,6 +399,9 @@ mod tests {
             level,
             is_root,
             is_delta: false,
+            is_bin: level == 0, // test helper: level 0 = BIN
+            prev_full_lsn: noxu_util::NULL_LSN,
+            prev_delta_lsn: noxu_util::NULL_LSN,
             node_data: None,
         }
     }

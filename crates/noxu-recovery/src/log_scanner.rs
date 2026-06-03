@@ -117,6 +117,19 @@ pub struct InRecord {
     pub is_root: bool,
     /// Whether this is a BIN-delta.
     pub is_delta: bool,
+    /// Whether this entry is a BIN (vs. an upper IN).
+    ///
+    /// `true`  for `LogEntryType::BIN` and `LogEntryType::BINDelta`;
+    /// `false` for `LogEntryType::IN`.
+    /// Used by the P-2 checkpoint tree-walk to choose the correct
+    /// deserialisation path (`BinStub::deserialize_full` vs upper-IN format).
+    pub is_bin: bool,
+    /// For `BINDelta` entries: LSN of the last full BIN version.
+    /// `NULL_LSN` for full BIN or upper IN entries.
+    pub prev_full_lsn: noxu_util::Lsn,
+    /// For `BINDelta` entries: LSN of the previous delta in the chain.
+    /// `NULL_LSN` if the previous version was a full BIN.
+    pub prev_delta_lsn: noxu_util::Lsn,
     /// Raw serialized node bytes as written by `BinStub::serialize_full()` or
     /// `BinStub::serialize_delta()`.  Present when the log scanner can parse
     /// the payload; `None` for scanner stubs that don't carry node data.
@@ -613,6 +626,9 @@ mod tests {
             level: 2,
             is_root: true,
             is_delta: false,
+            is_bin: false,
+            prev_full_lsn: noxu_util::NULL_LSN,
+            prev_delta_lsn: noxu_util::NULL_LSN,
             node_data: None,
         };
         assert_eq!(rec.level, 2);

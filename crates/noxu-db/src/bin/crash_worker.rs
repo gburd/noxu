@@ -144,6 +144,63 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // open_txn_spanning_checkpoint:
+        //
+        // Phase 1: write 20 committed keys (key=b"committed_NNN"), signal
+        //          "phase1_done".
+        // Phase 2: begin a transaction, write 10 keys (key=b"open_NNN"),
+        //          FORCE a checkpoint (so CkptStart > the txn's first LN),
+        //          signal "open_txn_ready" (txn still open, not committed),
+        //          loop until killed.
+        //
+        // After SIGKILL, recovery must:
+        //   - See all 20 committed keys.
+        //   - NOT see any of the 10 open-txn keys.
+        //
+        // This is the exact P-2 correctness blocker: without the
+        // first_active_lsn fix, recovery scans from CkptStart, which is
+        // after the open txn's LNs, and the undo pass never sees them.
+        "open_txn_spanning_checkpoint" => {
+            use noxu_db::CheckpointConfig;
+
+            // Phase 1: committed writes.
+            for i in 0u32..20 {
+                let k = format!("committed_{i:03}");
+                let txn = env.begin_transaction(None).expect("begin txn");
+                let key = DatabaseEntry::from_bytes(k.as_bytes());
+                let val = DatabaseEntry::from_bytes(b"ok");
+                db.put(Some(&txn), &key, &val).expect("put");
+                txn.commit().expect("commit");
+            }
+            flag(&dir, "phase1_done");
+
+            // Phase 2: open transaction (keys written BEFORE the checkpoint).
+            let txn = env.begin_transaction(None).expect("begin txn");
+            for i in 0u32..10 {
+                let k = format!("open_{i:03}");
+                let key = DatabaseEntry::from_bytes(k.as_bytes());
+                let val = DatabaseEntry::from_bytes(b"should_not_survive");
+                db.put(Some(&txn), &key, &val).expect("put open key");
+            }
+
+            // Force a checkpoint AFTER the open txn has written its LNs.
+            // CkptStart will be > the txn's firstLoggedLsn.  Without the
+            // first_active_lsn fix, recovery would start from CkptStart and
+            // miss the txn's LNs — failing to undo the uncommitted writes.
+            env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                .expect("forced checkpoint");
+
+            // Signal that the txn is open and the checkpoint is done.
+            // The parent will now SIGKILL us.
+            flag(&dir, "open_txn_ready");
+
+            // txn intentionally NOT committed or aborted — crash here.
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

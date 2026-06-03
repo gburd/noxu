@@ -198,12 +198,16 @@ impl FileManagerLogScanner {
                 } else {
                     0
                 };
+                let is_bin = entry_type == LogEntryType::BIN;
                 Some(LogEntry::In(InRecord {
                     db_id: e.db_id,
                     node_id,
                     level: 0, // level not embedded in this format; 0 = BIN
                     is_root: false,
                     is_delta: false,
+                    is_bin,
+                    prev_full_lsn: e.prev_full_lsn,
+                    prev_delta_lsn: noxu_util::NULL_LSN,
                     node_data: Some(e.node_data),
                 }))
             }
@@ -220,6 +224,9 @@ impl FileManagerLogScanner {
                     level: 0,
                     is_root: false,
                     is_delta: true,
+                    is_bin: true,
+                    prev_full_lsn: e.prev_full_lsn,
+                    prev_delta_lsn: e.prev_delta_lsn,
                     node_data: Some(e.delta_data),
                 }))
             }
