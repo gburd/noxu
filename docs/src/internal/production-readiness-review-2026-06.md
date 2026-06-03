@@ -28,6 +28,56 @@ This document is the canonical blocker list. Items fixed in the same change set
 that introduced this document are marked **FIXED**; the rest are the prioritized
 backlog.
 
+## Remediation status (2026-06-03 follow-up)
+
+Worked through the blocker list after the initial review. Outcome per item:
+
+**Fixed and merged** (each with a regression test, full local gate green):
+
+- S-C1 (WAL fsync fast-path durability) — `defef9f`
+- T-F1 (recovery undo currency check, defensive/JE alignment) — `a4a7d5c`
+- R-F03 (mmap of live write file) + R-F04 (XA use-after-free; `noxu-xa` now
+  `#![forbid(unsafe_code)]`) — `9d02b28`
+- R-F05 (latch 0-hash panic) + honest-claim/doc corrections — `b1e6e69`
+- T-F5 (explicit txns leaked `TxnManager` entries) — `ddafb96`
+
+**Deferred with rationale** (not rushed — reason recorded):
+
+- **St-H4** (upper-IN O(n) descent) — *performance*, not correctness. There are
+  ~7 near-duplicate descent loops with differing comparison semantics
+  (`key_cmp` vs raw `<=`); converting them piecemeal leaves an inconsistent
+  state on the most critical data path. Needs ONE shared floor-index helper
+  applied uniformly. A partial conversion was written, verified equivalent
+  against the full suite, then reverted to avoid shipping a half-done state.
+- **St-H5** (`find_entry` returns insertion point, not floor, for Internal
+  nodes) — *latent*: the live descent paths call `find_entry` only with
+  `exact = true`, never the buggy non-exact arm. Fix alongside the St-H4
+  unified-helper refactor.
+- **St-H6** (`expiration_in_hours` not serialized) — *latent*: the production
+  write path only ever sets hours-granularity TTL
+  (`WriteOptions::with_expiration` → `current_time_hours()`), so the hardcoded
+  `true` on deserialize is correct today. Only manifests if seconds-
+  granularity TTL is added; serialize the flag at that time.
+- **T-F3 / T-F4** (checkpoint `first_active_lsn` + `update_first_lsn` wiring) —
+  prerequisites for the deferred P-2 recovery-scan optimization.
+  `get_first_active_lsn()` currently has **no production consumer** (the
+  checkpointer hardcodes `first_active_lsn = 0`), so wiring it now is premature
+  (YAGNI). Land together with P-2 (see `wave-gb-dbtree-recovery.md`).
+- **R-F01** (`LogBufferSegment` raw pointers into a movable `LogBuffer`) —
+  *latent*: in production `LogBuffer`s live in `Arc<Mutex<…>>` in the pool and
+  are never moved while a segment is alive; the UB requires a stack-allocated
+  `LogBuffer` (only tests do that). Real soundness landmine; warrants a
+  `Pin`/`Arc` refactor as a focused change.
+
+**Remaining dedicated efforts** (larger; each its own change):
+
+- **St-C3 / St-H1 / St-H3** — file-header checksum + on-disk endianness; an
+  on-disk-format-version decision (do not rush at scale).
+- **T-F2** — SERIALIZABLE range locks (docs already corrected to stop claiming
+  phantom prevention; implementing real range locking is an isolation feature).
+- **C-C2** — `become_master` feeder/log-streaming threads (a replication
+  feature, not a stub-to-tweak).
+
 ## Critical
 
 | ID | Area | Issue | Status |
