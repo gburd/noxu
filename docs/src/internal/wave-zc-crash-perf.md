@@ -35,9 +35,11 @@ checkpoint are not re-logged.  This means:
 
 - `dirty_ins` (the analysis-pass map) only contains BINs touched in the
   current recovery interval.
+
 - Keys in **stable** BINs (modified before the last checkpoint) are not in
   `dirty_ins` and not in `redo_entries` if the scan is narrowed to
   `checkpoint_start_lsn`.
+
 - Narrowing the scan would silently lose those keys.
 
 The current `first_active_lsn = Lsn::new(0, 0)` (scan from beginning of log)
@@ -45,29 +47,42 @@ is intentionally conservative and correct.  A "conservative P-2" that keeps
 the full scan but adds BIN pre-population provides ≤ 20 % improvement — not
 the 1.5× target — because the LN-redo loop still iterates all N entries.
 
-### What is needed for a correct full P-2
+### Current P-2 status (Wave GB outcome)
 
-1. **DbTree (BIN-version index)** — a mapping tree written at `CkptEnd` that
-   records the current-version LSN for every BIN (stable and dirty alike),
-   mirroring JE's `_jeNameTree` / `DbTree`.  Without this index there is no
-   way to fetch stable BINs at recovery time.
-2. **Correct `first_active_lsn`** — once the DbTree can supply all BINs,
-   the checkpoint writes `first_active_lsn = CkptStart` (not `Lsn::new(0,0)`),
-   and recovery replays only post-checkpoint LNs (providing the 3–5× speedup).
-3. **BINDelta chain tracking** — `AnalysisResult.dirty_ins` must keep the
-   full chain per node (last full BIN + subsequent deltas) and `InRecord`
-   must carry `prev_full_lsn` from `BinDeltaLogEntry`.
-4. **LSN-aware `redo_insert`** — skip writes where the BIN already has the
-   key at the same or newer LSN (overlap case from the CkptStart–BIN-lock
-   window).
-5. **Tree bulk-load API** — `Tree::build_from_checkpoint_bins(Vec<BinStub>)`
-   for O(N) BIN insertion instead of O(N log N) individual-key inserts.
+**Wave GB** implemented the DbTree foundation and applied the escape hatch.
+See `docs/src/internal/wave-gb-dbtree-recovery.md` for the full analysis.
 
-Estimated effort for the full correct P-2: **large** (new DbTree subsystem +
-all items above; touches `noxu-log`, `noxu-recovery`, `noxu-tree`, `noxu-dbi`).
-Risk: **high** (recovery correctness).  Acceptance: W11 within ~1.5× JE
-without regressing any existing recovery/crash test.  Tracked as a future wave
-requiring the DbTree prerequisite.
+Summary of Wave GB STEP-0 findings:
+
+| Property | Result |
+|---|---|
+| All BINs in memory at checkpoint (eviction) | Safe (fragile — child arcs never nulled) |
+| BINDelta chains | Handled via force-full-flush pass |
+| `InEntry.lsn` top-down walk | Does NOT work (slot LSNs not updated on BIN re-log) |
+| Scan-reduction (`first_active_lsn = CkptStart`) | DEFERRED — open-txn-at-crash correctness gap |
+
+**What Wave GB prototyped** (on the `fix/gb-dbtree-recovery` branch — **not
+merged to main**):
+
+- `DbTreeEntry` BIN-version index written at each `CkptEnd` (foundation only;
+  `first_active_lsn` unchanged; full scan preserved).
+
+- LSN-aware `redo_insert` (correctness fix).
+
+- Wave GB equality harness: 11 tests, all PASS.
+
+**Why it was not merged**: the write-side alone force-flushes delta BINs to
+full and walks the whole tree at every checkpoint, yet recovery still
+full-scans and never reads the index — pure overhead until the scan-reduction
+that consumes it is correct.
+
+**Remaining prerequisite for full P-2**:
+
+- `first_active_lsn = min(earliest_open_txn_lsn, CkptStart)` requires the
+  checkpointer to have access to the transaction manager (not yet wired).
+
+- Once implemented, the BIN pre-loading path in recovery can be enabled and
+  the W11 speedup target (~1.5×) becomes achievable.
 
 ## Gate
 

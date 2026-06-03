@@ -16,6 +16,18 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Documentation
+
+- Wave GB (DbTree / P-2 recovery): documented the STEP-0 correctness analysis.
+  The scan-reduction speedup is deferred — narrowing the recovery scan to
+  `CkptStart` is unsafe while a transaction can span the checkpoint without a
+  commit/abort record (it would surface uncommitted data as committed). The
+  full tested prototype (DbTree index, LSN-aware redo_insert, 11-test equality
+  harness) is preserved on the `fix/gb-dbtree-recovery` branch; nothing was
+  merged to main because the write-side alone is net checkpoint overhead until
+  recovery consumes the index. See
+  `docs/src/internal/wave-gb-dbtree-recovery.md`.
+
 ## [v3.2.0] — 2026-06-02
 
 ### Added (replication — mTLS Phase 3)
