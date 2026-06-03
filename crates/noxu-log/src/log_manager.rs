@@ -100,8 +100,18 @@ pub struct LogManager {
     /// scratch buffer.  R-1 fix: `flush_pending` is the reusable flush list.
     log_write_latch: Mutex<LwlScratch>,
 
-    /// Last flushed LSN (updated when buffers are written to disk).
+    /// Last flushed LSN (updated when buffers are written to the OS page
+    /// cache, by either `flush_sync` or `flush_no_sync`). This is a
+    /// *written-to-page-cache* watermark, NOT a durability watermark — a
+    /// `flush_no_sync` advances it without an fdatasync.
     last_flush_lsn: AtomicU64,
+
+    /// Last fdatasync'd (durable) LSN. Advanced ONLY by `flush_sync` after a
+    /// successful fdatasync. `flush_sync_if_needed` must consult THIS, never
+    /// `last_flush_lsn`: skipping an fsync because `flush_no_sync` advanced
+    /// `last_flush_lsn` past a SYNC commit would leave that commit in the page
+    /// cache only and silently lose it on power failure.
+    last_synced_lsn: AtomicU64,
 
     /// Statistics.
     n_repeat_fault_reads: AtomicU64,
@@ -161,6 +171,7 @@ impl LogManager {
             // flush_sync_if_needed's `already_flushed >= lsn` always true,
             // causing all flushes to be skipped.
             last_flush_lsn: AtomicU64::new(0),
+            last_synced_lsn: AtomicU64::new(0),
             n_repeat_fault_reads: AtomicU64::new(0),
             n_temp_buffer_writes: AtomicU64::new(0),
             read_buffer_size,
@@ -555,15 +566,24 @@ impl LogManager {
         }
 
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
+        // Durability watermark: only advanced here, after a successful
+        // fdatasync. `flush_sync_if_needed` keys its skip decision off this.
+        self.last_synced_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
     }
 
     /// Port of`LogManager.flushTo(lsn)`:
     /// flush and fsync only if `lsn` has not yet been flushed.
     ///
-    /// Fast path: if `last_flush_lsn >= lsn`, return immediately — a
-    /// concurrent or preceding `flush_sync()` already covers our data.
+    /// Fast path: if `last_synced_lsn >= lsn`, return immediately — a
+    /// concurrent or preceding `flush_sync()` already made our data durable.
     /// Slow path: call the full `flush_sync()`.
+    ///
+    /// NOTE: the skip decision keys off the *durable* watermark
+    /// (`last_synced_lsn`), never `last_flush_lsn`. A `flush_no_sync()`
+    /// advances `last_flush_lsn` without an fdatasync; consulting it here
+    /// would skip the fsync for a SYNC commit whose bytes are only in the OS
+    /// page cache, silently losing the commit on power failure.
     ///
     /// This is the key coalescing primitive for concurrent commit throughput.
     /// Example with 8 concurrent writers:
@@ -579,16 +599,20 @@ impl LogManager {
         // last_flush_lsn is initialised to 0 ("nothing flushed") so that a
         // fresh environment never skips the first flush.
         if lsn != NULL_LSN {
-            let already_flushed = self.last_flush_lsn.load(Ordering::Acquire);
+            // Consult the DURABLE watermark, not last_flush_lsn: a
+            // `flush_no_sync` advances last_flush_lsn without an fdatasync, so
+            // keying off it here would skip the fsync for a SYNC commit whose
+            // data is only in the page cache (silent data loss on crash).
+            let already_synced = self.last_synced_lsn.load(Ordering::Acquire);
             // Strict `>`: `eol` in flush_sync() is `get_next_available_lsn()`
             // AFTER the snapshot — the next LSN to be assigned, not the last
-            // one written.  So `last_flush_lsn = X` means everything up to
-            // (not including) X was flushed.  We need `already_flushed > lsn`
+            // one written.  So `last_synced_lsn = X` means everything up to
+            // (not including) X was synced.  We need `already_synced > lsn`
             // to guarantee `lsn` was included.  Equality means the previous
             // flush computed its eol just before our write was allocated — our
             // data was NOT in that flush.
-            if already_flushed > lsn.as_u64() {
-                return Ok(Lsn::from_u64(already_flushed));
+            if already_synced > lsn.as_u64() {
+                return Ok(Lsn::from_u64(already_synced));
             }
         }
         self.flush_sync()
@@ -871,6 +895,14 @@ impl LogManager {
     /// Returns the LSN of the last flushed entry.
     pub fn get_last_flush_lsn(&self) -> Lsn {
         Lsn::from_u64(self.last_flush_lsn.load(Ordering::Relaxed))
+    }
+
+    /// Returns the last fdatasync'd (durable) LSN watermark. Test-only:
+    /// exposed to assert the C-1 durability invariant (a `flush_no_sync` must
+    /// not advance this).
+    #[cfg(test)]
+    pub(crate) fn get_last_synced_lsn(&self) -> Lsn {
+        Lsn::from_u64(self.last_synced_lsn.load(Ordering::Relaxed))
     }
 
     /// Returns a reference to the shared FileManager.
@@ -1159,6 +1191,48 @@ mod tests {
         // After flushing the last_flush_lsn should advance.
         assert!(
             after.as_u64() > before.as_u64() || after == lm.get_end_of_log()
+        );
+    }
+
+    // C-1 regression: a `flush_no_sync` must NOT let a later SYNC commit skip
+    // its fdatasync. `flush_no_sync` advances the page-cache watermark
+    // (last_flush_lsn) but NOT the durable watermark (last_synced_lsn);
+    // `flush_sync_if_needed` keys its skip decision off the durable watermark,
+    // so it performs a real fsync even when last_flush_lsn is already past it.
+    #[test]
+    fn test_flush_no_sync_does_not_satisfy_sync_durability() {
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        // A WRITE_NO_SYNC-style op: data to page cache, no fdatasync.
+        lm.log(LogEntryType::Trace, b"nosync", Provisional::No, false, false)
+            .unwrap();
+        lm.flush_no_sync().unwrap();
+
+        // Durable watermark must still be 0 — nothing has been fdatasync'd.
+        assert_eq!(
+            lm.get_last_synced_lsn(),
+            Lsn::from_u64(0),
+            "flush_no_sync must not advance the durable (synced) watermark"
+        );
+        // ...even though the page-cache watermark advanced.
+        assert!(
+            lm.get_last_flush_lsn().as_u64() > 0,
+            "flush_no_sync should advance the page-cache watermark"
+        );
+
+        // A later SYNC commit at an LSN already covered by last_flush_lsn must
+        // NOT be skipped: flush_sync_if_needed must perform a real fsync,
+        // advancing the durable watermark.
+        let sync_lsn = lm
+            .log(LogEntryType::Trace, b"sync", Provisional::No, false, false)
+            .unwrap();
+        lm.flush_sync_if_needed(sync_lsn).unwrap();
+        assert!(
+            lm.get_last_synced_lsn().as_u64() > sync_lsn.as_u64(),
+            "flush_sync_if_needed must fdatasync (advance the durable \
+             watermark past the SYNC commit), not skip because flush_no_sync \
+             advanced last_flush_lsn"
         );
     }
 
