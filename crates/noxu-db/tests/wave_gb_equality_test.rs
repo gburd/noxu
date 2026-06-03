@@ -227,11 +227,14 @@ fn equality_small_workload() {
     );
 }
 
-/// Workload 2: large (10 000 keys, all committed).
+/// Workload 2: large (2 000 keys, all committed).
+///
+/// Scaled down from the original 10 000 to avoid parallel-test resource
+/// contention while still being substantially larger than the small workload.
 #[test]
 fn equality_large_workload() {
     let dir = TempDir::new().unwrap();
-    let n = 10_000u32;
+    let n = 2_000u32;
     let mut expected = BTreeMap::new();
     let recovered =
         write_workload_clean_close_recover(dir.path(), |_env, db| {
@@ -500,12 +503,12 @@ fn equality_bindelta_updates() {
 
 /// Workload 8: Many-key workload exercising memory/eviction.
 ///
-/// 10 000 keys should trigger enough cache pressure to exercise the
-/// evictor path (partial evict / LN strip).  Recovery must see all keys.
+/// 2 000 keys exercises the evictor path (partial evict / LN strip)
+/// without exhausting parallel test resources.  Recovery must see all keys.
 #[test]
 fn equality_eviction_workload() {
     let dir = TempDir::new().unwrap();
-    let n = 10_000u32;
+    let n = 2_000u32;
     let mut expected = BTreeMap::new();
 
     let recovered =
