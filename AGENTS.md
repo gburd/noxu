@@ -109,10 +109,10 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   a justification.
 - **No async**: Core engine uses blocking I/O with explicit threading. Only
   `noxu-rep` networking uses tokio.
-- **Limited unsafe**: Twelve core data-path crates (`noxu-tree`, `noxu-txn`,
+- **Limited unsafe**: Thirteen core data-path crates (`noxu-tree`, `noxu-txn`,
   `noxu-evictor`, `noxu-cleaner`, `noxu-recovery`, `noxu-dbi`,
   `noxu-engine`, `noxu-bind`, `noxu-collections`, `noxu-persist`,
-  `noxu-config`, `noxu-util`) carry `#![forbid(unsafe_code)]` and
+  `noxu-config`, `noxu-util`, `noxu-xa`) carry `#![forbid(unsafe_code)]` and
   contain zero `unsafe`. The crates that do contain `unsafe`:
 
   | Crate | Production `unsafe` blocks | Reason |
@@ -121,7 +121,6 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   | `noxu-log` | 8 | Memory-mapped I/O via `Mmap::map`; the three raw-pointer blocks in `LogBufferSegment::put` (latch lock, `copy_nonoverlapping`, pin-count/latch release); `as_mut_ptr().add` in `allocate`; `read_latch.unlock` in `release`; one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` (sound only because struct fields drop in declaration order — `guard` before `_handle`); one `unsafe impl Send for LogBufferSegment` (pin-count + latch protocol; see review finding F-01 on the move-safety caveat). |
   | `noxu-rep` | 1 | Single `unsafe` FFI in `net/channel.rs` for socket-option setup. |
   | `noxu-latch` | 1 | RAII force-unlock for poison-recovery. |
-  | `noxu-xa` | 1 | Transaction-pointer dereference in `environment.rs`; documented inline. |
 
   Test-only or bench-only `unsafe`:
 

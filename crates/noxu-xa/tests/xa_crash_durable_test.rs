@@ -68,7 +68,7 @@ fn prepare_crash_recover_commit_data_visible() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(key),
                 &DatabaseEntry::from_bytes(val),
             )
@@ -134,7 +134,7 @@ fn prepare_crash_recover_rollback_data_not_visible() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(key),
                 &DatabaseEntry::from_bytes(b"v"),
             )
@@ -190,7 +190,7 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
         {
             let txn = xa.get_transaction(&xid_commit).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(key_c),
                 &DatabaseEntry::from_bytes(b"vc"),
             )
@@ -203,7 +203,7 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
         {
             let txn = xa.get_transaction(&xid_rollback).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(key_r),
                 &DatabaseEntry::from_bytes(b"vr"),
             )
@@ -273,7 +273,7 @@ fn double_crash_before_resolution_keeps_xid_in_doubt() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(b"dc_k"),
                 &DatabaseEntry::from_bytes(b"dc_v"),
             )
@@ -319,7 +319,7 @@ fn prepare_after_commit_is_protocol_error() {
     {
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"k"),
             &DatabaseEntry::from_bytes(b"v"),
         )
@@ -349,7 +349,7 @@ fn prepare_before_end_is_protocol_error() {
     {
         let txn = xa.get_transaction(&xid).unwrap();
         db.put(
-            Some(txn),
+            Some(&*txn),
             &DatabaseEntry::from_bytes(b"k"),
             &DatabaseEntry::from_bytes(b"v"),
         )
@@ -380,7 +380,7 @@ fn xa_start_on_recovered_xid_is_duplicate() {
         {
             let txn = xa.get_transaction(&xid).unwrap();
             db.put(
-                Some(txn),
+                Some(&*txn),
                 &DatabaseEntry::from_bytes(b"k"),
                 &DatabaseEntry::from_bytes(b"v"),
             )
@@ -420,7 +420,7 @@ fn resolved_xid_disappears_from_xa_recover() {
                 let txn = xa.get_transaction(x).unwrap();
                 let key = format!("k{i}");
                 db.put(
-                    Some(txn),
+                    Some(&*txn),
                     &DatabaseEntry::from_bytes(key.as_bytes()),
                     &DatabaseEntry::from_bytes(b"v"),
                 )

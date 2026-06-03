@@ -226,8 +226,7 @@ Starting points:
   exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw
   locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O glue +
   `parking_lot` raw locking), and one `unsafe` block each in `noxu-latch`
-  (RAII force-unlock) and
-  `noxu-xa` (transaction-pointer dereference); each is documented inline.
+  (RAII force-unlock); each is documented inline.
 - **No async in the core.**  Core engine uses blocking I/O with explicit
   threading.  Only `noxu-rep` networking uses tokio.
 - **Own log format.**  `.ndb` files are Rust-native and not compatible with

@@ -606,6 +606,20 @@ impl FileManager {
     /// while other processes write to the file.  During recovery, log files
     /// are read-only, making this safe.
     pub fn mmap_file(&self, file_num: u32) -> Result<Mmap> {
+        // Never mmap the current write file. It can be appended to
+        // concurrently (pwrite64 on the log-writer thread) while a
+        // disk-ordered cursor reads it; `memmap2` requires that a mapped file
+        // is not modified for the lifetime of the mapping, so mapping the live
+        // write file would be undefined behaviour. Callers (e.g. the
+        // file-manager log scanner) fall back to positioned `pread` reads,
+        // which are safe under concurrent appends. Complete (sealed) files are
+        // never written again and are safe to map.
+        if file_num == self.get_current_file_num() {
+            return Err(LogError::Io(std::io::Error::other(format!(
+                "refusing to mmap the current write file {file_num} \
+                 (may be concurrently appended); use pread fallback"
+            ))));
+        }
         let path = self.file_path(file_num);
         let file = File::open(&path).map_err(|e| {
             LogError::FileNotFound(format!(
@@ -613,9 +627,9 @@ impl FileManager {
                 path, e
             ))
         })?;
-        // SAFETY: We only mmap files that are complete (not the current
-        // active write file) during recovery, so the underlying bytes do
-        // not change while the mapping is alive.
+        // SAFETY: `file_num` is not the current write file (checked above), so
+        // it is a sealed log file whose bytes do not change for the lifetime
+        // of the mapping.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
             LogError::Io(std::io::Error::other(format!(
                 "mmap {:?}: {}",

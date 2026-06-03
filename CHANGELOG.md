@@ -16,6 +16,25 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (memory safety — from the v3.x production-readiness review)
+
+- **noxu-xa (R-F04, use-after-free):** `XaEnvironment::get_transaction` returned
+  a `&Transaction` borrowed from a `Mutex`-guarded map after releasing the
+  guard; a concurrent (protocol-violating) `xa_rollback`/`xa_commit` could free
+  the boxed transaction, dangling the reference. It now returns an
+  `Arc<Transaction>` clone that keeps the transaction alive independently of
+  the branch map. The `unsafe` pointer dereference is removed and `noxu-xa` now
+  carries `#![forbid(unsafe_code)]` (zero unsafe). **Breaking:**
+  `get_transaction` returns `Arc<Transaction>` instead of `&Transaction`;
+  call sites that passed the result as `Option<&Transaction>` now write
+  `Some(&*txn)`.
+- **noxu-log (R-F03, undefined behaviour):** `FileManager::mmap_file` now
+  refuses to memory-map the current write file. That file can be appended
+  concurrently by the log writer while a disk-ordered cursor reads it, which
+  violates `memmap2`'s no-concurrent-modification contract (UB). The log
+  scanner already falls back to positioned `pread` reads, which are safe under
+  concurrent appends. Sealed files are still mapped.
+
 ### Changed (recovery — defensive correctness, review T-F1)
 
 - The recovery undo pass now enforces the JE `BIN.recoverRecord` currency
