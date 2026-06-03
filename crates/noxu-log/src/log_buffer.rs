@@ -22,6 +22,7 @@ use bytes::BytesMut;
 use noxu_sync::RawMutex;
 use noxu_sync::lock_api::RawMutex as RawMutexTrait;
 use noxu_util::lsn::{Lsn, NULL_LSN};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -45,14 +46,13 @@ pub struct LogBuffer {
     /// Total capacity of the buffer.
     capacity: usize,
 
-    /// Protects all modifications to the buffer and read access when LWL is not held.
-    read_latch: RawMutex,
-
-    /// Whether the latch is currently held.
-    latch_held: AtomicBool,
-
-    /// Number of writers currently pinning this buffer (actively writing to allocated segments).
-    write_pin_count: AtomicI32,
+    /// Latch + pin-count control block, shared (via `Arc`) with every
+    /// [`LogBufferSegment`] this buffer hands out. Holding it behind an `Arc`
+    /// (rather than inline) means a segment keeps the control block alive
+    /// independently of the `LogBuffer` value, so moving the `LogBuffer` (it
+    /// is a plain non-`Pin` struct) does not dangle a segment's references
+    /// (review R-F01).
+    control: Arc<LogBufferControl>,
 
     /// Buffer may be rewritten because an IOException previously occurred.
     rewrite_allowed: bool,
@@ -66,6 +66,32 @@ pub struct LogBuffer {
     flushed_len: usize,
 }
 
+/// Latch + pin-count control block for a [`LogBuffer`].
+///
+/// Stored behind an `Arc` so that a [`LogBufferSegment`] (which may be sent to
+/// another thread to perform its write) shares ownership of these
+/// synchronization primitives rather than holding raw pointers into the
+/// `LogBuffer`'s inline fields. This makes segment access sound even if the
+/// owning `LogBuffer` is moved.
+struct LogBufferControl {
+    /// Protects buffer modifications and read access when the LWL is not held.
+    read_latch: RawMutex,
+    /// Whether the latch is currently held.
+    latch_held: AtomicBool,
+    /// Number of writers currently pinning this buffer.
+    write_pin_count: AtomicI32,
+}
+
+impl LogBufferControl {
+    fn new() -> Self {
+        LogBufferControl {
+            read_latch: RawMutex::INIT,
+            latch_held: AtomicBool::new(false),
+            write_pin_count: AtomicI32::new(0),
+        }
+    }
+}
+
 impl LogBuffer {
     /// Creates a new LogBuffer with the specified capacity.
     pub fn new(capacity: usize) -> Self {
@@ -74,9 +100,7 @@ impl LogBuffer {
             first_lsn: NULL_LSN,
             last_lsn: NULL_LSN,
             capacity,
-            read_latch: RawMutex::INIT,
-            latch_held: AtomicBool::new(false),
-            write_pin_count: AtomicI32::new(0),
+            control: Arc::new(LogBufferControl::new()),
             rewrite_allowed: false,
             flushed_len: 0,
         }
@@ -92,9 +116,7 @@ impl LogBuffer {
             first_lsn,
             last_lsn: first_lsn,
             capacity,
-            read_latch: RawMutex::INIT,
-            latch_held: AtomicBool::new(false),
-            write_pin_count: AtomicI32::new(0),
+            control: Arc::new(LogBufferControl::new()),
             rewrite_allowed: false,
             flushed_len: 0,
         }
@@ -109,7 +131,7 @@ impl LogBuffer {
         self.first_lsn = NULL_LSN;
         self.last_lsn = NULL_LSN;
         self.rewrite_allowed = false;
-        self.write_pin_count.store(0, Ordering::Relaxed);
+        self.control.write_pin_count.store(0, Ordering::Relaxed);
         self.flushed_len = 0;
         self.release();
     }
@@ -150,7 +172,7 @@ impl LogBuffer {
     /// The LWL and read_latch must be held.
     pub fn register_lsn(&mut self, lsn: Lsn) {
         assert!(
-            self.latch_held.load(Ordering::Relaxed),
+            self.control.latch_held.load(Ordering::Relaxed),
             "read_latch must be held"
         );
 
@@ -231,16 +253,16 @@ impl LogBuffer {
     /// When modifying the buffer, both the LWL and buffer latch must be held.
     /// Call `release()` to release the latch.
     pub fn latch_for_write(&self) {
-        self.read_latch.lock();
-        self.latch_held.store(true, Ordering::Relaxed);
+        self.control.read_latch.lock();
+        self.control.latch_held.store(true, Ordering::Relaxed);
     }
 
     /// Releases the read_latch if held.
     pub fn release(&self) {
-        if self.latch_held.swap(false, Ordering::Relaxed) {
+        if self.control.latch_held.swap(false, Ordering::Relaxed) {
             // SAFETY: We hold the lock (verified by latch_held flag).
             unsafe {
-                self.read_latch.unlock();
+                self.control.read_latch.unlock();
             }
         }
     }
@@ -263,7 +285,7 @@ impl LogBuffer {
     /// for the data.
     pub fn allocate(&mut self, size: usize) -> Option<LogBufferSegment> {
         assert!(
-            self.latch_held.load(Ordering::Relaxed),
+            self.control.latch_held.load(Ordering::Relaxed),
             "read_latch must be held"
         );
 
@@ -271,14 +293,14 @@ impl LogBuffer {
             let offset = self.data.len();
             // Reserve space in the buffer
             self.data.resize(offset + size, 0);
-            self.write_pin_count.fetch_add(1, Ordering::Relaxed);
+            self.control.write_pin_count.fetch_add(1, Ordering::Relaxed);
             // SAFETY: offset is within the buffer we just resized.
             let data_ptr = unsafe { self.data.as_mut_ptr().add(offset) };
             Some(LogBufferSegment {
                 data_ptr,
-                pin_count: &self.write_pin_count as *const AtomicI32,
-                latch: &self.read_latch as *const RawMutex,
-                latch_held: &self.latch_held as *const AtomicBool,
+                // Share the control block (latch + pin count) so the segment
+                // is independent of the LogBuffer's location in memory.
+                control: Arc::clone(&self.control),
                 size,
             })
         } else {
@@ -295,7 +317,7 @@ impl LogBuffer {
         // before the decrement.  The Acquire load in wait_for_zero_and_latch
         // then guarantees the reader sees the completed writes before it
         // re-uses the buffer.
-        self.write_pin_count.fetch_sub(1, Ordering::Release);
+        self.control.write_pin_count.fetch_sub(1, Ordering::Release);
     }
 
     /// Acquires the buffer latched and with the buffer pin count equal to zero.
@@ -303,11 +325,11 @@ impl LogBuffer {
         loop {
             // C-7: Acquire pairs with the Release in free() / LogBufferSegment::put()
             // to ensure we see all completed segment writes before re-using the buffer.
-            if self.write_pin_count.load(Ordering::Acquire) > 0 {
+            if self.control.write_pin_count.load(Ordering::Acquire) > 0 {
                 thread::park_timeout(Duration::from_nanos(100));
             } else {
                 self.latch_for_write();
-                if self.write_pin_count.load(Ordering::Acquire) == 0 {
+                if self.control.write_pin_count.load(Ordering::Acquire) == 0 {
                     return;
                 } else {
                     self.release();
@@ -334,20 +356,25 @@ impl LogBuffer {
 /// latch and pin count protocol ensures the pointer remains valid for the
 /// lifetime of the segment.
 pub struct LogBufferSegment {
-    /// Raw pointer to the start of this segment's region in the buffer.
+    /// Raw pointer to the start of this segment's region in the buffer's heap
+    /// allocation. Survives a `LogBuffer` move (the `BytesMut` heap buffer is
+    /// not relocated by a move); validity for the segment's lifetime relies on
+    /// the pin-count protocol preventing reuse/realloc while pinned, and on
+    /// the pool keeping the owning `LogBuffer` alive.
     data_ptr: *mut u8,
-    /// Pointer to the LogBuffer's pin count for decrementing on completion.
-    pin_count: *const AtomicI32,
-    /// Pointer to the LogBuffer's latch for synchronization.
-    latch: *const RawMutex,
-    /// Pointer to the LogBuffer's latch_held flag.
-    latch_held: *const AtomicBool,
+    /// Shared latch + pin-count control block (see [`LogBufferControl`]).
+    /// Owning a clone here is what makes the segment independent of the
+    /// `LogBuffer`'s memory location (review R-F01).
+    control: Arc<LogBufferControl>,
     size: usize,
 }
 
-// SAFETY: The LogBuffer's latch and pin count protocol ensures safe concurrent access.
-// The raw pointers point into a LogBuffer that is kept alive by the caller (typically
-// wrapped in Arc<Mutex<LogBuffer>> in the pool).
+// SAFETY: `data_ptr` is a raw pointer (not auto-`Send`); the LogBuffer
+// latch + pin-count protocol (held via the `Arc<LogBufferControl>`) serializes
+// access to the pointed-to bytes, and the pool keeps the owning buffer alive
+// while any segment is pinned. The control block is itself `Send + Sync`
+// (atomics + raw mutex) and carried by `Arc`, so only `data_ptr` requires the
+// manual impl.
 unsafe impl Send for LogBufferSegment {}
 
 impl LogBufferSegment {
@@ -359,12 +386,12 @@ impl LogBufferSegment {
             "data size must match allocated segment size"
         );
 
-        // Acquire the latch to guarantee happens-before semantics
-        // SAFETY: latch pointer is valid for the lifetime of the owning LogBuffer
-        unsafe {
-            (*self.latch).lock();
-            (*self.latch_held).store(true, Ordering::Relaxed);
-        }
+        // Acquire the latch to guarantee happens-before semantics. The
+        // control block (latch, latch_held, pin_count) is owned via Arc, so
+        // these accesses are safe regardless of the owning LogBuffer's
+        // location — only the raw `data_ptr` copy below needs `unsafe`.
+        self.control.read_latch.lock();
+        self.control.latch_held.store(true, Ordering::Relaxed);
 
         // SAFETY: We allocated this segment, so we know the pointer and range are valid.
         // The latch ensures no concurrent modification.
@@ -376,17 +403,17 @@ impl LogBufferSegment {
             );
         }
 
-        // Release latch and decrement pin count
-        // SAFETY: latch pointer is valid for the lifetime of the owning LogBuffer;
-        // we hold it (set latch_held=true above), so unlock is safe here.
+        // Release latch and decrement pin count.
+        self.control.latch_held.store(false, Ordering::Relaxed);
+        // SAFETY: we hold the latch (set latch_held=true above), so unlock is
+        // sound here.
         unsafe {
-            (*self.latch_held).store(false, Ordering::Relaxed);
-            (*self.latch).unlock();
-            // C-7: Release ensures the copy_nonoverlapping above is visible
-            // to any thread that Acquire-loads the pin_count in
-            // wait_for_zero_and_latch() and observes zero.
-            (*self.pin_count).fetch_sub(1, Ordering::Release);
+            self.control.read_latch.unlock();
         }
+        // C-7: Release ensures the copy_nonoverlapping above is visible
+        // to any thread that Acquire-loads the pin_count in
+        // wait_for_zero_and_latch() and observes zero.
+        self.control.write_pin_count.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -418,6 +445,34 @@ mod tests {
         buffer.latch_for_write();
         assert_eq!(buffer.get_data()[0..100], data[..]);
         buffer.release();
+    }
+
+    // R-F01 regression: a LogBufferSegment must remain valid after the owning
+    // LogBuffer value is MOVED. Pre-fix, the segment held raw pointers into
+    // the LogBuffer's inline fields, so moving the buffer dangled them (UB).
+    // Now the control block is shared via Arc and data_ptr targets the
+    // (non-relocating) heap allocation, so this is sound.
+    #[test]
+    fn test_segment_survives_buffer_move() {
+        let mut buffer = LogBuffer::new(1024);
+        buffer.latch_for_write();
+        let segment = buffer.allocate(64).expect("should allocate");
+        buffer.release();
+
+        // Move the buffer to a new location (and behind a Box, a second move).
+        let moved = buffer;
+        let boxed = Box::new(moved);
+
+        // Use the segment AFTER the buffer moved: writes via the shared
+        // control block + heap data_ptr.
+        let data = vec![7u8; 64];
+        segment.put(&data);
+
+        // The moved/boxed buffer observes the written bytes and a settled
+        // pin count (put decremented it back to zero).
+        boxed.latch_for_write();
+        assert_eq!(boxed.get_data()[0..64], data[..]);
+        boxed.release();
     }
 
     #[test]

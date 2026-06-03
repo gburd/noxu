@@ -118,7 +118,7 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   | Crate | Production `unsafe` blocks | Reason |
   |---|---:|---|
   | `noxu-sync` | ~20 (mostly small) | FFI to `libc` futex and `parking_lot` raw locking primitives. |
-  | `noxu-log` | 8 | Memory-mapped I/O via `Mmap::map`; the three raw-pointer blocks in `LogBufferSegment::put` (latch lock, `copy_nonoverlapping`, pin-count/latch release); `as_mut_ptr().add` in `allocate`; `read_latch.unlock` in `release`; one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` (sound only because struct fields drop in declaration order — `guard` before `_handle`); one `unsafe impl Send for LogBufferSegment` (pin-count + latch protocol; see review finding F-01 on the move-safety caveat). |
+  | `noxu-log` | 7 | Memory-mapped I/O via `Mmap::map`; in `log_buffer.rs`: `as_mut_ptr().add` in `allocate`, `copy_nonoverlapping` in `LogBufferSegment::put`, the `read_latch.unlock` calls in `release`/`put`, and one `unsafe impl Send for LogBufferSegment` (now only the raw `data_ptr` requires it — the latch/pin-count control block is shared via `Arc`, so a `LogBuffer` move no longer dangles a segment; review R-F01); one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` in `log_source.rs` (sound only because struct fields drop in declaration order — `guard` before `_handle`). |
   | `noxu-rep` | 1 | Single `unsafe` FFI in `net/channel.rs` for socket-option setup. |
   | `noxu-latch` | 1 | RAII force-unlock for poison-recovery. |
 

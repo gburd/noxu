@@ -16,6 +16,17 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (memory safety — review R-F01)
+
+- `LogBufferSegment` no longer stores raw pointers into the owning
+  `LogBuffer`'s inline fields. The latch + pin-count are now a shared
+  `Arc<LogBufferControl>` cloned into each segment, so moving the `LogBuffer`
+  value no longer dangles a live segment's references (previously undefined
+  behaviour if a buffer were moved while a segment was outstanding). Only the
+  heap-backed `data_ptr` remains (it survives moves); `LogBufferSegment::put`
+  no longer needs raw-pointer dereferences. Move-safety regression test
+  `test_segment_survives_buffer_move`. noxu-log unsafe inventory 8 → 7.
+
 ### Changed (performance + correctness — review St-H4)
 
 - Internal-node (upper-IN) tree descent now uses a binary floor-search
