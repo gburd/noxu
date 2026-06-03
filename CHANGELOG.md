@@ -16,6 +16,18 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Documentation (review follow-up)
+
+- `file_header.rs`: corrected the byte-order documentation (the `byte_order`
+  marker describes the 32-byte file header only; entry headers are
+  little-endian and some payloads big-endian) and documented the missing
+  header-checksum gap (review St-H1/St-H3/St-C3).
+- Added `docs/src/internal/deferred-blocker-designs-2026-06.md`: concrete
+  implementation designs + qualification plans for the dedicated-effort
+  blockers (St-C3 on-disk format v3, St-H4/St-H5 unified IN floor-search,
+  T-F2 SERIALIZABLE next-key locking, C-C2 become_master feeder threads) and
+  the reaffirmed latent deferrals (R-F01, St-H6, T-F3/T-F4).
+
 ### Fixed (resource leak / stats — review T-F5)
 
 - Explicit transactions now unregister from the `TxnManager` on commit/abort
