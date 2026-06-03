@@ -67,7 +67,7 @@ fn main() {
         let txn = xa1.get_transaction(&xid).unwrap();
         let key = DatabaseEntry::from_bytes(b"account_alice");
         let val = DatabaseEntry::from_bytes(b"balance:-100");
-        db1.put(Some(txn), &key, &val).unwrap();
+        db1.put(Some(&*txn), &key, &val).unwrap();
         xa1.mark_write(&xid).unwrap();
     }
 
@@ -76,7 +76,7 @@ fn main() {
         let txn = xa2.get_transaction(&xid).unwrap();
         let key = DatabaseEntry::from_bytes(b"ledger_entry_001");
         let val = DatabaseEntry::from_bytes(b"alice->bob:100");
-        db2.put(Some(txn), &key, &val).unwrap();
+        db2.put(Some(&*txn), &key, &val).unwrap();
         xa2.mark_write(&xid).unwrap();
     }
 
