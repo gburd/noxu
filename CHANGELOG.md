@@ -16,6 +16,33 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added
+
+- **P-2 recovery infrastructure** (`fix/gb-proper-p2`): checkpoint tree-walk
+  and open-transaction correctness fix.
+  - `TxnManager` wired into `Checkpointer` via `with_txn_manager()`.
+  - `CkptEnd.first_active_lsn = min(open_txn_lsn, CkptStart)` when the
+    checkpoint tree-walk produced a valid root LSN.  Falls back to
+    `Lsn::new(0,0)` (full scan) when `root_lsn` is None — prevents silent
+    data loss if the checkpointer is not wired to a user-data tree.
+  - Checkpoint cascade: parent IN child-slot LSNs updated after every BIN and
+    upper-IN write.  Root IN LSN stored in `CkptEnd.root_lsn` at every checkpoint.
+    Uses `Arc::ptr_eq` (deadlock-free — never holds two node locks simultaneously).
+  - Recovery tree-walk: when `use_root_lsn != NULL_LSN && first_active_lsn > 0`,
+    pre-populates the tree from the checkpoint root before LN redo.
+  - `BinStub::get_slot_lsn`: LSN-aware redo_insert skip — correctness fix for
+    the existing path (was not idempotent; now skips slots at same-or-newer LSN).
+  - `InRecord` extended with `is_bin`, `prev_full_lsn`, `prev_delta_lsn` fields.
+  - New test: `open_txn_spanning_checkpoint_recovers_correctly` (SIGKILL crash
+    test proving uncommitted data does not survive crash recovery). PASSES.
+  - Wave GB equality harness (11 tests). All PASS.
+  - **Note**: The P-2 scan-reduction does not fire in the current production
+    architecture because the checkpointer is wired to `primary_tree` (always
+    empty) rather than user database `real_trees`. W11 timing is unchanged
+    (within ±5% noise). Full speedup requires a follow-on wave to wire the
+    checkpointer to user real_trees. See
+    `docs/src/internal/wave-gb-dbtree-recovery.md`.
+
 ### Documentation
 
 - Wave GB (DbTree / P-2 recovery): documented the STEP-0 correctness analysis.

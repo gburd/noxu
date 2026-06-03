@@ -191,10 +191,22 @@ When all prerequisites are in place:
 ## Status
 
 **Wave FC** investigated and documented the stable-BIN blocker.
-**Wave GB** prototyped the DbTree foundation (BIN-version index at CkptEnd),
-LSN-aware redo_insert, and the equality test harness on the
-`fix/gb-dbtree-recovery` branch. None of it was merged to main: the
-scan-reduction is unsafe pending open-txn tracking in the checkpointer, and
-the write-side alone is net checkpoint overhead until recovery consumes it.
-See `docs/src/internal/wave-gb-dbtree-recovery.md` for the Wave GB STEP-0
-findings and the precise description of the remaining gap.
+
+**Wave GB prototype** (`fix/gb-dbtree-recovery`): prototyped the flat-BIN-dump
+approach. Applied escape hatch: scan-reduction deferred pending open-txn tracking.
+
+**Wave GB proper** (`fix/gb-proper-p2`): implemented the correct parent-slot-LSN
+cascade and open-txn fix. Shipped the full P-2 infrastructure (checkpoint tree-walk,
+recovery preload, LSN-aware redo_insert, InRecord extensions).
+
+An architectural gap was discovered during implementation: the checkpointer is
+wired to `primary_tree` which is always empty in the current architecture. User
+database data goes into each database's `real_tree` (separate). The scan-reduction
+therefore does not fire in production. The safety guard (`first_active_lsn` only
+set to `CkptStart` when `root_lsn.is_some()`) prevents any correctness regression.
+
+W11 timing is unchanged (within ±5% noise). Full P-2 speedup requires wiring
+the checkpointer to user database real_trees — deferred to a follow-on wave.
+
+See `docs/src/internal/wave-gb-dbtree-recovery.md` for the complete Wave GB proper
+findings and the precise description of the remaining architectural gap.

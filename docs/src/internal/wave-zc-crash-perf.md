@@ -56,33 +56,18 @@ Summary of Wave GB STEP-0 findings:
 
 | Property | Result |
 |---|---|
-| All BINs in memory at checkpoint (eviction) | Safe (fragile — child arcs never nulled) |
-| BINDelta chains | Handled via force-full-flush pass |
-| `InEntry.lsn` top-down walk | Does NOT work (slot LSNs not updated on BIN re-log) |
-| Scan-reduction (`first_active_lsn = CkptStart`) | DEFERRED — open-txn-at-crash correctness gap |
+| Parent slot LSN cascade | SHIPPED (Wave GB proper) |
+| Open-txn `first_active_lsn` fix | SHIPPED (TxnManager wired) |
+| Recovery preload from root_lsn | SHIPPED (infrastructure) |
+| P-2 scan-reduction firing in production | NOT YET (primary_tree is empty) |
 
-**What Wave GB prototyped** (on the `fix/gb-dbtree-recovery` branch — **not
-merged to main**):
+**Wave GB proper** (`fix/gb-proper-p2`) shipped the full P-2 infrastructure.
+An architectural gap was discovered: the checkpointer is wired to `primary_tree`
+(always empty). Full P-2 speedup requires wiring the checkpointer to user database
+real_trees. See `docs/src/internal/wave-gb-dbtree-recovery.md` for full details.
 
-- `DbTreeEntry` BIN-version index written at each `CkptEnd` (foundation only;
-  `first_active_lsn` unchanged; full scan preserved).
-
-- LSN-aware `redo_insert` (correctness fix).
-
-- Wave GB equality harness: 11 tests, all PASS.
-
-**Why it was not merged**: the write-side alone force-flushes delta BINs to
-full and walks the whole tree at every checkpoint, yet recovery still
-full-scans and never reads the index — pure overhead until the scan-reduction
-that consumes it is correct.
-
-**Remaining prerequisite for full P-2**:
-
-- `first_active_lsn = min(earliest_open_txn_lsn, CkptStart)` requires the
-  checkpointer to have access to the transaction manager (not yet wired).
-
-- Once implemented, the BIN pre-loading path in recovery can be enabled and
-  the W11 speedup target (~1.5×) becomes achievable.
+**Remaining prerequisite for full P-2 speedup**:
+Wire the checkpointer to user database real_trees (not `primary_tree`).
 
 ## Gate
 

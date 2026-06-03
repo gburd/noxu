@@ -1615,7 +1615,9 @@ impl RecoveryManager {
                     }
                 } else if !rec.is_bin {
                     // Upper IN: parse child slot LSNs and push onto stack.
-                    if let Some(child_lsns) = parse_upper_in_child_lsns(&node_data) {
+                    if let Some(child_lsns) =
+                        parse_upper_in_child_lsns(&node_data)
+                    {
                         for child_lsn in child_lsns {
                             if child_lsn != NULL_LSN {
                                 stack.push(child_lsn);
