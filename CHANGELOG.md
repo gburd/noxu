@@ -16,6 +16,15 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (review St-H5)
+
+- `TreeNode::find_entry` now returns the FLOOR child slot (largest entry ≤ key)
+  for non-exact lookups on Internal nodes, instead of the insertion point
+  (which routes one child too far right). Consistent with the descent helper
+  `upper_in_floor_index` and JE `IN.findEntry`. Previously latent (the live
+  descent path does not use this arm); fixed to remove the landmine. Test
+  `test_find_entry_internal_nonexact_returns_floor`.
+
 ### Fixed (memory safety — review R-F01)
 
 - `LogBufferSegment` no longer stores raw pointers into the owning

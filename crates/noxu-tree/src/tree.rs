@@ -1149,7 +1149,13 @@ impl TreeNode {
                         if exact {
                             -1
                         } else {
-                            idx as i32
+                            // Floor (not insertion point): the child slot to
+                            // descend into is the largest entry ≤ key. Slot 0
+                            // is the leftmost child, so a key below every
+                            // separator floors to 0. (St-H5: previously
+                            // returned the insertion point `idx`, which routes
+                            // one child too far right.)
+                            (idx as i32 - 1).max(0)
                         }
                     }
                 }
@@ -5002,6 +5008,40 @@ mod tests {
         // No exact match with exact=true
         let r = internal.find_entry(b"kx", false, true);
         assert_eq!(r, -1);
+    }
+
+    // St-H5: non-exact `find_entry` on an Internal node must return the FLOOR
+    // child slot (largest entry ≤ key), not the insertion point. Entries are
+    // k0,k1,k2,k3; slot 0 is the leftmost child.
+    #[test]
+    fn test_find_entry_internal_nonexact_returns_floor() {
+        let mut entries = vec![];
+        for i in 0..4 {
+            entries.push(InEntry {
+                key: format!("k{}", i).into_bytes(),
+                lsn: Lsn::new(1, 10 + i),
+                child: None,
+            });
+        }
+        let internal = TreeNode::Internal(InNodeStub {
+            node_id: 1,
+            level: MAIN_LEVEL + 2,
+            entries,
+            dirty: false,
+            generation: 0,
+            parent: None,
+        });
+
+        // Key below every separator floors to slot 0 (leftmost child).
+        assert_eq!(internal.find_entry(b"a", false, false) & 0xFFFF, 0);
+        // Between k1 and k2 floors to k1 (slot 1).
+        assert_eq!(internal.find_entry(b"k1x", false, false) & 0xFFFF, 1);
+        // Above every separator floors to the last slot (k3 = slot 3).
+        assert_eq!(internal.find_entry(b"zzz", false, false) & 0xFFFF, 3);
+        // Exact match still reported as the exact slot.
+        let r = internal.find_entry(b"k2", false, false);
+        assert_ne!(r & EXACT_MATCH, 0);
+        assert_eq!(r & 0xFFFF, 2);
     }
 
     // ========================================================================
