@@ -913,7 +913,8 @@ impl Database {
                 let mut cursor = self.make_cursor_for_txn(t);
                 match cursor
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-                    .map_err(NoxuError::from)? {
+                    .map_err(NoxuError::from)?
+                {
                     noxu_dbi::OperationStatus::KeyExist => {
                         OperationStatus::KeyExists
                     }

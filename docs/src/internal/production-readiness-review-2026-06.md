@@ -54,8 +54,7 @@ That is every contained and medium-sized blocker from the review.
 `deferred-blocker-designs-2026-06.md`; not rushed because a half-correct
 version of each is *worse* than the current honest state):
 
-- **T-F2** — SERIALIZABLE next-key range locking (isolation feature; docs
-  already corrected to stop claiming phantom prevention).
+- **T-F2** — SERIALIZABLE next-key range locking — **FIXED** (fix/tf2-range-locks).
 - **C-C2** — `become_master` feeder / log-streaming threads (replication
   feature).
 - **St-C3 / St-H1 / St-H3** — file-header checksum + endianness; an on-disk
@@ -80,8 +79,8 @@ those are now **fixed** (see the list above).
 
 - **St-C3 / St-H1 / St-H3** — file-header checksum + on-disk endianness; an
   on-disk-format-version decision (do not rush at scale).
-- **T-F2** — SERIALIZABLE range locks (docs already corrected to stop claiming
-  phantom prevention; implementing real range locking is an isolation feature).
+- **T-F2** — SERIALIZABLE range locks — **FIXED** (fix/tf2-range-locks; phantom
+  prevention tests pass; docs restored).
 - **C-C2** — `become_master` feeder/log-streaming threads (a replication
   feature, not a stub-to-tweak).
 
@@ -91,7 +90,7 @@ those are now **fixed** (see the list above).
 |----|------|-------|--------|
 | S-C1 | noxu-log durability | `flush_no_sync` advanced the same `last_flush_lsn` that `flush_sync_if_needed` uses to skip fsyncs → a SYNC commit after a WRITE_NO_SYNC write (or the no-sync flush daemon) could skip its `fdatasync` and be lost on power failure | **FIXED** (separate `last_synced_lsn` durable watermark + regression test) |
 | T-F1 | noxu-recovery | Undo pass applied before-images with **no `logLsn == slotLsn` currency check** (the code comment falsely claimed the check was "delegated to the tree layer"). Theoretically an aborted txn's before-image could overwrite a later committed write of the same key during recovery. | **MITIGATED** — the JE currency check is now enforced in `run_undo`/`run_undo_all`; the false comment is corrected. The specific interleaving could **not** be reproduced as a live failure on main (masked by runtime-abort reversion + redo-only-committed + the no-active-txns fast path), so this is defensive alignment with JE, not a demonstrated live-corruption fix. |
-| T-F2 | noxu-dbi / docs | `cursor_impl::lock_ln` always acquires `LockType::Read`, never `RangeRead`; the range-lock conflict matrix is dead code at the operational level. SERIALIZABLE does not prevent phantoms despite being documented to. | **OPEN** (docs corrected to stop claiming phantom prevention; code fix pending) |
+| T-F2 | noxu-dbi / docs / noxu-txn | `cursor_impl::lock_ln` now acquires `LockType::RangeRead` for SERIALIZABLE; new-key inserts acquire `RangeInsert` on successor; EOF sentinel protection added. `WaitRestart` path fixed to return `RangeRestart`. All phantom tests pass. | **FIXED** (fix/tf2-range-locks) |
 | R-F01 | noxu-log | `LogBufferSegment` stored raw pointers into inline `LogBuffer` fields → moving the buffer dangled them (UB) | **FIXED** (latch + pin-count moved into an `Arc<LogBufferControl>` shared with each segment; only the heap-backed `data_ptr` remains, which survives moves; move-safety regression test) |
 | R-F03 | noxu-log / noxu-dbi | `mmap_file` SAFETY claims it is only used on complete files during recovery; the disk-ordered cursor maps the **current write file** during live operation, violating `memmap2`'s no-concurrent-modification contract (UB) | **FIXED** (`mmap_file` refuses the current write file; the scanner falls back to `pread`) |
 | St-C3 | noxu-log format | The 32-byte file header is written with **no checksum**; a torn write of the header is undetectable (JE wraps it as an Adler32-protected log entry) | **OPEN** |
@@ -166,8 +165,8 @@ those are now **fixed** (see the list above).
 2. **R-F01, R-F03** (noxu-log `unsafe` soundness) — R-F03 **fixed**; R-F01
    (`LogBufferSegment` move-safety) remains.
 3. **R-F04** (XA use-after-free) — **fixed** (Arc<Transaction>).
-4. **T-F2** (range locks) — either implement, or keep the corrected docs and
-   drop SERIALIZABLE from the advertised guarantees until implemented.
+4. **T-F2** (range locks) — **FIXED** in fix/tf2-range-locks; SERIALIZABLE
+   now prevents phantoms via next-key locking; docs restored.
 5. **St-C3 / St-H1 / St-H3** (on-disk format: header checksum + endianness) —
    format-version decision; fix before committing to on-disk stability.
 6. **T-F4 / T-F5** (txn manager wiring) — correctness of stats, eviction

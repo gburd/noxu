@@ -89,16 +89,15 @@ returned by getNext / getPrev. The remaining 7 tests cover:
 ### Spotcheck 1 verdict
 
 The Noxu cursor tests are **stronger than JE on cursor lifecycle and
-search positioning**, but **completely lack phantom-prevention
-testing under concurrent BIN mutation**. JE devotes 16 of its 23
-tests to this; Noxu has zero. There is some phantom coverage in
-`isolation_test.rs::test_serializable_prevents_non_repeatable_read`
-and `test_serializable_read_lock_blocks_writer_no_wait`, but those
-are not the same scenarios — they test single-record locking, not
-cursor-on-BIN-edge phantom insertion.
+search positioning**. The phantom-prevention gap (previously HIGH severity)
+has been closed by T-F2 (fix/tf2-range-locks):
+- `test_serializable_prevents_phantom_insert` — insert into scanned range
+- `test_serializable_prevents_phantom_eof_insert` — append past EOF
+- `test_default_isolation_allows_phantom_insert` — regression
+- `test_read_committed_allows_phantom_insert` — regression
+- `test_serializable_scan_then_insert_same_txn_no_panic` — same-txn guard
 
-**Severity: HIGH** for the phantom gap. This is a real
-data-correctness invariant family with no Noxu coverage.
+**Severity: RESOLVED.** The phantom gap is closed.
 
 ---
 

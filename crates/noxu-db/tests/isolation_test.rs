@@ -994,21 +994,18 @@ fn test_serializable_prevents_phantom_insert() {
 
     // T1: SERIALIZABLE scanner reads "a" and "c" (acquires RangeRead on
     // each key's LSN).  After this scan, T1 holds RangeRead on "c"'s LSN.
-    let ser_cfg =
-        TransactionConfig::new().with_serializable_isolation(true);
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
     // Read "a"
     assert_eq!(
-        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out)
-            .unwrap(),
+        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap(),
         OperationStatus::Success,
         "T1 should read 'a'"
     );
     // Read "c" -- this acquires RangeRead on "c"'s LSN
     assert_eq!(
-        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out)
-            .unwrap(),
+        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap(),
         OperationStatus::Success,
         "T1 should read 'c'"
     );
@@ -1209,12 +1206,10 @@ fn test_serializable_scan_then_insert_same_txn_no_panic() {
     // then inserts "bb" (successor = "c", would need RangeInsert on "c").
     // owns_any_lock guard must detect the existing RangeRead and skip the
     // RangeInsert acquisition, preventing the illegal upgrade panic.
-    let ser_cfg =
-        TransactionConfig::new().with_serializable_isolation(true);
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"c"), &mut out)
-        .unwrap();
+    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
     // Now insert "bb" (successor is "c" which we already hold RangeRead on).
     let result = db.put(
         Some(&txn),
@@ -1267,8 +1262,7 @@ fn test_serializable_prevents_phantom_eof_insert() {
 
     // T1: SERIALIZABLE cursor scans ALL keys forward until EOF.
     // On reaching EOF, lock_eof_for_scan acquires RangeRead on the EOF sentinel.
-    let ser_cfg =
-        TransactionConfig::new().with_serializable_isolation(true);
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut cursor = db.open_cursor(Some(&t1), None).unwrap();
     let mut k = DatabaseEntry::new();
@@ -1304,7 +1298,10 @@ fn test_serializable_prevents_phantom_eof_insert() {
         insert_result
     );
     assert!(
-        matches!(insert_result.unwrap_err(), noxu_db::NoxuError::LockNotAvailable),
+        matches!(
+            insert_result.unwrap_err(),
+            noxu_db::NoxuError::LockNotAvailable
+        ),
         "Expected LockNotAvailable from EOF sentinel conflict"
     );
 
