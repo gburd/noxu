@@ -496,10 +496,17 @@ impl LockManager {
         // Determine which grant type to report.  On wakeup the lock type we
         // actually hold is exactly what we requested (or a promotion of it).
         // Reconstruct the grant type from context.
+        //
+        // WaitRestart: the waiter's lock_type was changed to Restart in
+        // lock_impl::lock(), so the lock was never added to the owner set.
+        // Returning RangeRestart tells the caller (lock_ln / put) to abort
+        // the current scan and restart — mirroring JE's RangeRestartException.
         let grant = match initial_grant {
             LockGrantType::WaitNew => LockGrantType::New,
             LockGrantType::WaitPromotion => LockGrantType::Promotion,
-            LockGrantType::WaitRestart => LockGrantType::New,
+            LockGrantType::WaitRestart => {
+                return Err(TxnError::RangeRestart);
+            }
             other => other,
         };
 
@@ -891,10 +898,13 @@ impl LockManager {
         drop(granted_guard);
         self.clear_wait(locker_id);
 
+        // See lock_with_timeout for the WaitRestart rationale.
         let grant = match initial_grant {
             LockGrantType::WaitNew => LockGrantType::New,
             LockGrantType::WaitPromotion => LockGrantType::Promotion,
-            LockGrantType::WaitRestart => LockGrantType::New,
+            LockGrantType::WaitRestart => {
+                return Err(TxnError::RangeRestart);
+            }
             other => other,
         };
         Ok(grant)

@@ -50,6 +50,16 @@ pub trait Locker: Send + Sync {
     /// Returns true if this locker owns a write lock on the given LSN.
     fn owns_write_lock(&self, lsn: u64) -> bool;
 
+    /// Returns true if this locker owns ANY lock (read or write) on the given LSN.
+    ///
+    /// Used to guard against an illegal RangeRead → RangeInsert upgrade when
+    /// the same SERIALIZABLE transaction both scans and inserts into the same
+    /// key range.  The default implementation falls back to `owns_write_lock`;
+    /// `Txn` overrides this to also check `read_locks`.
+    fn owns_any_lock(&self, lsn: u64) -> bool {
+        self.owns_write_lock(lsn)
+    }
+
     /// Returns true if this locker is transactional (supports commit/abort).
     ///
     /// BasicLocker, ThreadLocker, and HandleLocker return false.

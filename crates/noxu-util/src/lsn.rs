@@ -180,6 +180,41 @@ impl Lsn {
         }
         Self::new(MAX_FILE_NUM, h).as_u64()
     }
+
+    /// Creates a synthetic LSN for end-of-range (EOF) range-lock protection.
+    ///
+    /// A SERIALIZABLE cursor acquires `RangeRead` on this sentinel when a
+    /// forward scan reaches the end of the key space, protecting against
+    /// phantom inserts of keys that sort after every currently-scanned key.
+    /// A concurrent inserter of such a key acquires `RangeInsert` on the same
+    /// sentinel, which conflicts with the scanner's `RangeRead` and either
+    /// blocks the insert (insert side) or causes a restart (scan side).
+    ///
+    /// # Encoding
+    ///
+    /// Uses file number `0xFFFF_FFFE` (`MAX_FILE_NUM - 1`), a value that is
+    /// reserved for synthetic per-database EOF locks.  Real WAL LSNs use file
+    /// numbers 0..N and never reach `MAX_FILE_NUM - 1`; synthetic key-lock ids
+    /// (`synthetic_key_lock_id`) use `MAX_FILE_NUM` (`0xFFFF_FFFF`).  The
+    /// offset is an FNV-1a hash of `db_id` so that EOF locks from different
+    /// databases occupy distinct lock-table slots.
+    pub fn eof_lock_lsn(db_id: u64) -> u64 {
+        const FNV_OFFSET: u32 = 0x811c_9dc5;
+        const FNV_PRIME: u32 = 0x0100_0193;
+        const EOF_FILE_NUM: u32 = 0xFFFF_FFFE;
+        let mut h = FNV_OFFSET;
+        for &b in db_id.to_le_bytes().iter() {
+            h ^= b as u32;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // Avoid hashing to u32::MAX: `Lsn::new(EOF_FILE_NUM, u32::MAX)` would
+        // produce `0xFFFF_FFFE_FFFF_FFFF` which is not NULL_LSN, but keeping
+        // the same convention as synthetic_key_lock_id is cleaner.
+        if h == u32::MAX {
+            h = 0;
+        }
+        Self::new(EOF_FILE_NUM, h).as_u64()
+    }
 }
 
 impl Ord for Lsn {
