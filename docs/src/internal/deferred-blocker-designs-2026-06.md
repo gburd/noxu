@@ -114,23 +114,81 @@ phantom prevention.
 
 ## C-C2 — `become_master` feeder / log-streaming threads
 
-**Problem.** `become_master` creates in-memory `Feeder` tracker structs but
-spawns no `FeederRunner`/`EnvironmentLogScanner` thread, so a master does not
-actively stream log entries to replicas. (The pull-based `PEER_FEEDER` service
-exists; the push/active-feed path does not.) Replication HA, ack policies, and
-VLSN streaming all depend on this.
+**Status (v3.2.0, branch `fix/cc2-become-master-feeders`):**
+**Push-feeder path SHIPPED; WAL-scanner auto-discovery DEFERRED.**
 
-**Design.** Spawn, per registered replica, a `FeederRunner` that owns an
-`EnvironmentLogScanner` positioned at the replica's acked VLSN, reads committed
-log entries in VLSN order, and pushes them over the established channel;
-integrate with `AckTracker` for `ReplicaAckPolicy` and with `shutdown_group`
-(which must then actually wait for replica catch-up — review M-4). Gate on
-`with_environment`. This is a replication feature, not a stub tweak.
+### What was implemented (v3.2.0)
 
-**Qualification.** Multi-node integration test: node A `become_master`, node B
-reads via the feed and converges to A's data; an ack-policy commit blocks until
-B acks; `shutdown_group` waits for B to reach A's VLSN. Until this lands,
-`become_master` / HA must be described as preview (see `known-limitations.md`).
+- `ReplicatedEnvironment::register_feeder_channel(replica_name, channel)` —
+  a new method that lets callers inject a `Channel` for a replica.  When
+  `become_master` is called (or when the node is already master), a
+  `FeederRunner` thread is spawned per registered channel.  The thread reads
+  from a dedicated `PeerLogScanner` queue populated by `replicate_entry` /
+  `apply_entry` fan-out and streams framed log entries to the replica.
+- `replicate_entry` / `apply_entry` now fan out to all registered per-replica
+  queues in addition to the shared `peer_scanner` (no competing-consumer
+  problem between push and pull paths).
+- `shutdown_group` now waits up to half the timeout for each `FeederRunner`
+  replica to ack the master’s current VLSN before sending `SHUTDOWN_GROUP`
+  (closes M-4 for the push path).
+- 6 integration tests in `crates/noxu-rep/tests/cc2_feeder_integration_test.rs`
+  demonstrate convergence, ack advancement, shutdown catch-up wait, late channel
+  registration, `apply_entry` fan-out, and a 50-entry batch.
+
+### What was NOT implemented (deferred as C-C2b)
+
+The original design called for an `EnvironmentLogScanner`-backed thread that
+automatically discovers replicated entries from the WAL **without requiring
+`replicate_entry` calls**.  This requires:
+
+1. `LogManager::log()` writing entries with VLSN tags (the `vlsn_present` flag
+   in the entry header, i.e. a `Provisional::Replicated` variant or similar).
+   Today `log()` always uses `MIN_HEADER_SIZE` (no VLSN field) because
+   standalone environments are non-replicated.
+2. `EnvironmentImpl`’s commit path calling `replicate_entry` or setting the
+   VLSN on committed log entries — analogous to JE’s `RepContext` integration.
+3. Possibly a `FeederReceiverService` on the replica side if pure push
+   (master-initiated connections) is desired rather than the existing pull
+   model.
+
+Without (1), `EnvironmentLogScanner::next_entry` always returns `None` because
+no WAL entries carry the `0x08 | 0x20` VLSN-present flags.
+
+**Qualification gap for C-C2b**: a convergence test that uses `EnvironmentImpl`
+commits (not `replicate_entry` calls) and asserts data propagation to the
+replica cannot be written until (1)+(2) land.  The push-feeder test in
+`cc2_feeder_integration_test.rs` demonstrates the channel / thread / ack
+infrastructure works; it uses `replicate_entry` as the entry source.
+
+### Ack-policy integration (partial)
+
+`await_replica_acks` (via `ReplicaAckCoordinator`) uses a synthetic
+`commit_ack_seq` counter tracked in `AckTracker`, not real VLSNs.  Wiring
+the `FeederRunner`’s VLSN-based acks into the `AckTracker` seq requires a
+`seq → vlsn` mapping.  This is deferred; the existing `record_ack(vlsn,
+replica)` API still works when the application calls it manually after
+receiving an ack.
+
+### Original problem statement
+
+`become_master` created in-memory `Feeder` tracker structs but spawned no
+`FeederRunner`/`EnvironmentLogScanner` thread, so a master did not actively
+stream log entries to replicas. (The pull-based `PEER_FEEDER` service existed;
+the push/active-feed path did not.) Replication HA, ack policies, and VLSN
+streaming all depend on this.
+
+### Remaining design (C-C2b)
+
+1. Add `Provisional::Replicated(vlsn: u64)` variant to `noxu-log`; thread
+   the VLSN through `LogManager::log_internal` to write the 8-byte VLSN
+   extension when replicated.
+2. Wire the `ReplicatedEnvironment` (or `noxu_db` layer) to call
+   `log_with_vlsn` at commit time, assigning the next VLSN from a shared
+   monotone counter.
+3. Then `EnvironmentLogScanner::next_entry` will find entries and the
+   background scanner thread can auto-populate the feeder queues.
+4. Optionally add a `FeederReceiverService` on the replica side for
+   fully master-initiated (push-only) topology if the pull path is deprecated.
 
 ## Reaffirmed latent deferrals
 
