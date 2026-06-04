@@ -67,7 +67,7 @@ The 22 crates are organized by implementation layer:
 | Crate | Purpose |
 |---|---|
 | `noxu-observe` | Optional `tracing` / `metrics` / OpenTelemetry glue (off by default) |
-| `noxu-spec` | Stateright executable specifications for the protocols the engine implements (B+tree latching, Flexible Paxos, WAL group-commit, recovery, lock manager + deadlock, VLSN streaming, master transfer, network restore, XA 2PC, cleaner safety, cache↔cleaner ordering). Each spec is a `cargo test` case; failures print a counterexample trace. Run with `make spec`. |
+| `noxu-spec` | Stateright executable specifications of the protocols the engine implements (B+tree latching, Flexible Paxos, WAL group-commit, recovery, lock manager + deadlock, VLSN streaming, master transfer, network restore, XA 2PC, cleaner safety, cache↔cleaner ordering). These are **abstract protocol models** that model-check the protocol *design*'s safety/liveness — they are NOT a mechanical refinement/conformance proof of the Rust implementation. Two specs anchor to production types at compile time (`lock_manager_deadlock` → `LockType`, `xa_two_phase_commit` → `XaFlags`); the rest are kept in sync with the code by review convention. Each spec is a `cargo test` case; failures print a counterexample trace. Run with `make spec`. |
 
 ## Build, Test, and Lint Commands
 

@@ -16,6 +16,18 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Documentation (Q&A-surfaced gaps)
+
+- Clarified that `noxu-spec` Stateright specs are **abstract protocol models**
+  (they model-check the protocol design's safety/liveness and are kept in sync
+  with the code by review convention; two anchor to production types) — NOT a
+  mechanical refinement/conformance proof of the Rust implementation. Updated
+  `AGENTS.md` and `docs/src/maintainer/crate-guide.md`.
+- Added known-limitations entries for genuine BDB-JE-parity gaps: chained
+  (replica-to-replica) log feeding, database/transaction triggers, admin
+  dump/load/print-log tooling, code coverage not tracked in CI, and the
+  spec-vs-implementation distinction.
+
 ### Fixed (isolation correctness — T-F2)
 
 - **SERIALIZABLE isolation now prevents phantom reads via next-key range

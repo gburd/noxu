@@ -282,7 +282,13 @@ Key file: `crates/noxu/src/lib.rs` — all re-exports.
 
 ### `noxu-spec`
 
-Stateright executable specifications for the protocols the engine implements.
+Stateright executable specifications of the protocols the engine implements.
+These are **abstract protocol models**: they model-check the protocol design's
+safety/liveness properties, not a mechanical refinement of the Rust code. Model
+↔ code correspondence is maintained by review convention (two specs —
+`lock_manager_deadlock` and `xa_two_phase_commit` — additionally anchor to
+production types at compile time). A passing spec proves the *protocol* is
+safe; it does not by itself prove the implementation matches the model.
 Each spec is a `cargo test` case; failures print a counterexample trace.
 Run with `make spec`.
 
