@@ -1131,8 +1131,7 @@ impl CursorImpl {
                             // in the database.  Use the per-database EOF
                             // sentinel so a concurrent scanner that called
                             // lock_eof_for_scan is protected.
-                            let db_id =
-                                db.get_id().id() as u64;
+                            let db_id = db.get_id().id() as u64;
                             noxu_util::Lsn::eof_lock_lsn(db_id)
                         }
                     }

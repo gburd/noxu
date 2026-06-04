@@ -464,7 +464,7 @@ is an INFO-severity gap (not a bug).
 | `MultiEnvOpenCloseTest` | (none) | MISSING | LOW |
 | `MultiKeyTxnTestCase` (fixture) | (n/a) | SKIPPED | INFO |
 | `OpStatsTest` | `noxu-dbi/src/throughput_stats.rs#[cfg(test)]` | PARTIAL | LOW |
-| `PhantomRestartTest` / `PhantomTest` | `noxu-db/tests/cursor_test.rs` (phantom-related cases sampled) | PARTIAL | HIGH (phantom-prevention is a key serializable invariant) |
+| `PhantomRestartTest` / `PhantomTest` | `noxu-db/tests/isolation_test.rs`: `test_serializable_prevents_phantom_insert`, `test_serializable_prevents_phantom_eof_insert`, `test_default_isolation_allows_phantom_insert`, `test_read_committed_allows_phantom_insert`, `test_serializable_scan_then_insert_same_txn_no_panic` | COVERED | RESOLVED (T-F2 fix/tf2-range-locks) |
 | `SecondaryAssociationTest` / `SecondaryDirtyReadTest` / `SecondaryMultiComplexTest` / `SecondaryMultiTest` / `SecondarySplitTestMain` / `SecondaryTest` | `noxu-db/src/secondary_database.rs#[cfg(test)]`, `secondary_cursor.rs#[cfg(test)]` (basic) | PARTIAL | MEDIUM (multi-key / split-during-secondary not tested) |
 | `SequenceTest` | `noxu-db/src/sequence.rs#[cfg(test)]`, `noxu-persist/src/sequence.rs#[cfg(test)]` | PARTIAL | LOW |
 | `SkipTest` | (none — Cursor.skipNext/skipPrev not ported) | MISSING | LOW (feature out of scope) |
