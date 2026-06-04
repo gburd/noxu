@@ -16,6 +16,33 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (isolation correctness — T-F2)
+
+- **SERIALIZABLE isolation now prevents phantom reads via next-key range
+  locking** (JE `Cursor.getLockType(rangeLock)` protocol).
+  - `cursor_impl::lock_ln` acquires `LockType::RangeRead` instead of `Read`
+    when `txn.is_serializable_isolation()`. `RangeRead` conflicts with
+    concurrent `RangeInsert` on the same key slot, blocking phantom inserts or
+    triggering a cursor restart.
+  - New `lock_range_insert`: all new-key txn inserts acquire `RangeInsert` on
+    the would-be successor key’s LSN. If a SERIALIZABLE scanner holds
+    `RangeRead` on that slot, the insert is blocked until the scanner commits.
+  - New `lock_eof_for_scan`: SERIALIZABLE forward scans that reach EOF acquire
+    `RangeRead` on a per-database EOF sentinel (`Lsn::eof_lock_lsn`), blocking
+    concurrent appends past the last scanned key.
+  - `lock_manager.rs`: `WaitRestart` wakeup now correctly returns
+    `Err(RangeRestart)` — the lock was never owned, and the scanner must
+    restart. Previously it incorrectly returned `Ok(New)`, silently granting a
+    lock the manager never added to the owner set.
+  - `Locker::owns_any_lock` guards the same-transaction scan+insert case
+    against an illegal `RangeRead`→`RangeInsert` upgrade.
+  - `Database::put`/`put_no_overwrite` now use `NoxuError::from(e)` so lock
+    errors surface as `LockNotAvailable`/`LockConflict` instead of
+    `OperationNotAllowed`. `NoxuError::LockTimeout` gains a `detail` field
+    preserving the owner/requester diagnostic.
+  - Five new isolation tests prove phantom prevention and non-interference
+    with lower isolation levels.
+
 ### Fixed (review St-H5)
 
 - `TreeNode::find_entry` now returns the FLOOR child slot (largest entry ≤ key)

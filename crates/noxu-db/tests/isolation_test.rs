@@ -943,3 +943,379 @@ fn test_200_thread_disjoint_writers() {
         "cursor scan returned {checked} entries, expected {TOTAL_KEYS}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-F2 — Phantom prevention via SERIALIZABLE range (next-key) locking
+// ---------------------------------------------------------------------------
+
+/// ACCEPTANCE TEST (T-F2)
+///
+/// A SERIALIZABLE cursor scans a range and acquires RangeRead locks on each
+/// key it visits.  A concurrent inserter tries to insert a key INTO that range
+/// (between two already-scanned keys) using no_wait=true.
+///
+/// Expected: the insert is blocked (LockNotAvailable) because the scanner
+/// holds RangeRead on the successor key, which conflicts with the inserter's
+/// RangeInsert on the same successor.
+///
+/// Proves: SERIALIZABLE range locking prevents phantom inserts.
+///
+/// Pre-fix behaviour (to demonstrate the test would fail without the change):
+/// the insert would succeed immediately because lock_ln acquired only Read
+/// (not RangeRead), leaving no conflict with RangeInsert.
+#[test]
+fn test_serializable_prevents_phantom_insert() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "phantom_test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    // Pre-populate: a, c  (so "bb" would be inserted between them).
+    for (k, v) in &[(b"a".as_ref(), b"val_a".as_ref()), (b"c", b"val_c")] {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // T1: SERIALIZABLE scanner reads "a" and "c" (acquires RangeRead on
+    // each key's LSN).  After this scan, T1 holds RangeRead on "c"'s LSN.
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
+    let mut out = DatabaseEntry::new();
+    // Read "a"
+    assert_eq!(
+        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap(),
+        OperationStatus::Success,
+        "T1 should read 'a'"
+    );
+    // Read "c" -- this acquires RangeRead on "c"'s LSN
+    assert_eq!(
+        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap(),
+        OperationStatus::Success,
+        "T1 should read 'c'"
+    );
+
+    // T2: no_wait inserter tries to insert "bb" (between "a" and "c").
+    // lock_range_insert will find "c" as the successor and try RangeInsert
+    // on "c"'s LSN.  T1 holds RangeRead on "c" → conflict → LockNotAvailable.
+    let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
+    let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    let insert_result = db.put(
+        Some(&t2),
+        &DatabaseEntry::from_bytes(b"bb"),
+        &DatabaseEntry::from_bytes(b"val_bb"),
+    );
+    let _ = t2.abort();
+
+    assert!(
+        insert_result.is_err(),
+        "T2's insert of 'bb' MUST fail (LockNotAvailable) while T1 holds \
+         RangeRead on the successor key 'c'.  Got: {:?}",
+        insert_result
+    );
+    let err = insert_result.unwrap_err();
+    assert!(
+        matches!(err, noxu_db::NoxuError::LockNotAvailable),
+        "Expected LockNotAvailable (RangeRead⇔RangeInsert conflict), got: {err:?}"
+    );
+
+    // After T1 commits, T2 should succeed.
+    t1.commit().unwrap();
+
+    let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    let result = db.put(
+        Some(&t3),
+        &DatabaseEntry::from_bytes(b"bb"),
+        &DatabaseEntry::from_bytes(b"val_bb"),
+    );
+    assert!(
+        result.is_ok(),
+        "After T1 commits, insert of 'bb' must succeed; got: {result:?}"
+    );
+    t3.commit().unwrap();
+}
+
+/// REGRESSION TEST (T-F2)
+///
+/// Under the DEFAULT isolation level (repeatable-read: read locks held but
+/// NO range locks), phantom inserts are ALLOWED.  This test verifies that
+/// the range-locking machinery does NOT interfere with non-serializable txns.
+#[test]
+fn test_default_isolation_allows_phantom_insert() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "phantom_rr_test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // T1: DEFAULT (repeatable-read) scanner reads "a" and "c".
+    // lock_ln acquires Read (NOT RangeRead) on each key's LSN.
+    let t1 = env.begin_transaction(None).unwrap(); // default = no serializable
+    let mut out = DatabaseEntry::new();
+    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
+    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+
+    // T2: no_wait inserter inserts "bb" (between "a" and "c").
+    // Under non-serializable isolation T1 holds only Read on "c".
+    // RangeInsert conflicts with RangeRead but NOT with plain Read.
+    // So T2's RangeInsert on "c" is immediately granted.
+    let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
+    let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    let result = db.put(
+        Some(&t2),
+        &DatabaseEntry::from_bytes(b"bb"),
+        &DatabaseEntry::from_bytes(b"val_bb"),
+    );
+    assert!(
+        result.is_ok(),
+        "Under default (non-serializable) isolation, phantom insert MUST \
+         succeed.  Got: {result:?}"
+    );
+    t2.commit().unwrap();
+    t1.commit().unwrap();
+}
+
+/// REGRESSION TEST (T-F2)
+///
+/// Under READ_COMMITTED isolation, read locks are released immediately after
+/// each operation, so RangeRead is never held during a concurrent insert.
+/// Phantom inserts must be allowed.
+#[test]
+fn test_read_committed_allows_phantom_insert() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "phantom_rc_test",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // T1: READ_COMMITTED reads "c" then immediately releases the lock.
+    let rc_cfg = TransactionConfig::read_committed();
+    let t1 = env.begin_transaction(Some(&rc_cfg)).unwrap();
+    let mut out = DatabaseEntry::new();
+    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
+    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    // After each get(), read_committed releases the lock immediately.
+    // No RangeRead is held on "c"'s LSN at this point.
+
+    // T2: no_wait inserter inserts "bb" — must succeed because T1 released.
+    let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
+    let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    let result = db.put(
+        Some(&t2),
+        &DatabaseEntry::from_bytes(b"bb"),
+        &DatabaseEntry::from_bytes(b"val_bb"),
+    );
+    assert!(
+        result.is_ok(),
+        "Under READ_COMMITTED isolation phantom insert must succeed \
+         (no RangeRead held after per-op release).  Got: {result:?}"
+    );
+    t2.commit().unwrap();
+    t1.commit().unwrap();
+}
+
+/// SCAN-THEN-INSERT regression: the same SERIALIZABLE transaction both scans
+/// a range AND inserts into the same range.  Verifies the `owns_any_lock`
+/// guard in `lock_range_insert` prevents an illegal RangeRead→RangeInsert
+/// upgrade panic.
+#[test]
+fn test_serializable_scan_then_insert_same_txn_no_panic() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "scan_insert_same_txn",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    // Pre-populate: "a", "c".
+    for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Single SERIALIZABLE txn: reads "c" (acquires RangeRead on "c"),
+    // then inserts "bb" (successor = "c", would need RangeInsert on "c").
+    // owns_any_lock guard must detect the existing RangeRead and skip the
+    // RangeInsert acquisition, preventing the illegal upgrade panic.
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
+    let mut out = DatabaseEntry::new();
+    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    // Now insert "bb" (successor is "c" which we already hold RangeRead on).
+    let result = db.put(
+        Some(&txn),
+        &DatabaseEntry::from_bytes(b"bb"),
+        &DatabaseEntry::from_bytes(b"val_bb"),
+    );
+    assert!(
+        result.is_ok(),
+        "Same-txn scan+insert must not panic (owns_any_lock guard).  Got: {result:?}"
+    );
+    txn.commit().unwrap();
+}
+
+/// SERIALIZABLE end-of-range (EOF) phantom test.
+///
+/// A SERIALIZABLE scan reads to the last key in the database and acquires
+/// RangeRead on the EOF sentinel.  A concurrent no_wait inserter tries to
+/// insert a key AFTER the last scanned key, which needs RangeInsert on the
+/// EOF sentinel — and must be blocked.
+#[test]
+fn test_serializable_prevents_phantom_eof_insert() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "phantom_eof_test",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+    // Pre-populate a single key "m".
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put(
+            Some(&txn),
+            &DatabaseEntry::from_bytes(b"m"),
+            &DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // T1: SERIALIZABLE cursor scans ALL keys forward until EOF.
+    // On reaching EOF, lock_eof_for_scan acquires RangeRead on the EOF sentinel.
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
+    let mut cursor = db.open_cursor(Some(&t1), None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut v = DatabaseEntry::new();
+    // Scan to EOF.
+    assert_eq!(
+        cursor.get(&mut k, &mut v, noxu_db::Get::First, None).unwrap(),
+        OperationStatus::Success
+    );
+    // Get next — should return NotFound (EOF) and lock the EOF sentinel.
+    assert_eq!(
+        cursor.get(&mut k, &mut v, noxu_db::Get::Next, None).unwrap(),
+        OperationStatus::NotFound
+    );
+    cursor.close().unwrap();
+
+    // T2: no_wait inserter inserts "z" (past "m", would be the new last key).
+    // successor of "z" = EOF sentinel.  T1 holds RangeRead on EOF sentinel.
+    // RangeRead × RangeInsert = Block → LockNotAvailable (no_wait).
+    let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
+    let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    let insert_result = db.put(
+        Some(&t2),
+        &DatabaseEntry::from_bytes(b"z"),
+        &DatabaseEntry::from_bytes(b"val_z"),
+    );
+    let _ = t2.abort();
+
+    assert!(
+        insert_result.is_err(),
+        "T2's append-past-EOF insert of 'z' MUST fail while T1 holds \
+         RangeRead on the EOF sentinel.  Got: {:?}",
+        insert_result
+    );
+    assert!(
+        matches!(
+            insert_result.unwrap_err(),
+            noxu_db::NoxuError::LockNotAvailable
+        ),
+        "Expected LockNotAvailable from EOF sentinel conflict"
+    );
+
+    // After T1 commits, T2 can insert.
+    t1.commit().unwrap();
+    let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    assert!(
+        db.put(
+            Some(&t3),
+            &DatabaseEntry::from_bytes(b"z"),
+            &DatabaseEntry::from_bytes(b"val_z"),
+        )
+        .is_ok(),
+        "After T1 commits, 'z' insert must succeed"
+    );
+    t3.commit().unwrap();
+}

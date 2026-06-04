@@ -405,10 +405,14 @@ pub enum NoxuError {
     /// A lock-wait timeout expired.
     ///
     /// Retryable.
-    #[error("lock timeout after {timeout_ms}ms")]
+    #[error("lock timeout after {timeout_ms}ms{detail}")]
     LockTimeout {
         /// How long the locker waited before giving up.
         timeout_ms: u64,
+        /// Full diagnostic message from the lock manager (owner, requester, LSN).
+        /// Empty string when not available.
+        #[allow(dead_code)]
+        detail: String,
     },
 
     /// A lock was requested with `no-wait` semantics and was not immediately
@@ -722,7 +726,7 @@ impl NoxuError {
 
     /// Creates a `LockTimeout` error.
     pub fn lock_timeout(timeout_ms: u64) -> Self {
-        NoxuError::LockTimeout { timeout_ms }
+        NoxuError::LockTimeout { timeout_ms, detail: String::new() }
     }
 
     /// Creates a `DatabaseNotFound` error.
@@ -792,9 +796,19 @@ impl From<noxu_txn::TxnError> for NoxuError {
         match e {
             TxnError::Deadlock(_) => NoxuError::DeadlockDetected,
             TxnError::LockConflict(s) => NoxuError::LockConflict(s),
-            TxnError::LockTimeout { timeout_ms, .. } => {
-                NoxuError::LockTimeout { timeout_ms }
-            }
+            TxnError::LockTimeout {
+                timeout_ms,
+                ref owner,
+                ref requester,
+                ref requested_type,
+                lsn,
+            } => NoxuError::LockTimeout {
+                timeout_ms,
+                detail: format!(
+                    " on LSN {lsn}: held by {owner}, \
+                         requested {requested_type:?} by locker {requester}"
+                ),
+            },
             TxnError::TransactionTimeout { timeout_ms, txn_id } => {
                 NoxuError::TransactionTimeout { timeout_ms, txn_id }
             }
@@ -950,7 +964,7 @@ mod tests {
             requester: "t2".into(),
         }
         .into();
-        assert!(matches!(e, NoxuError::LockTimeout { timeout_ms: 500 }));
+        assert!(matches!(e, NoxuError::LockTimeout { timeout_ms: 500, .. }));
 
         let e: NoxuError =
             TxnError::TransactionTimeout { timeout_ms: 1000, txn_id: 42 }
@@ -969,7 +983,10 @@ mod tests {
     fn test_is_retryable() {
         assert!(NoxuError::DeadlockDetected.is_retryable());
         assert!(NoxuError::LockConflict("x".into()).is_retryable());
-        assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_retryable());
+        assert!(
+            NoxuError::LockTimeout { timeout_ms: 500, detail: String::new() }
+                .is_retryable()
+        );
         assert!(
             NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }
                 .is_retryable()
@@ -1022,7 +1039,8 @@ mod tests {
 
     #[test]
     fn test_new_variants() {
-        let e = NoxuError::LockTimeout { timeout_ms: 250 };
+        let e =
+            NoxuError::LockTimeout { timeout_ms: 250, detail: String::new() };
         assert!(e.to_string().contains("250ms"));
 
         let e = NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 7 };
@@ -1136,7 +1154,7 @@ mod tests {
         ));
         assert!(matches!(
             NoxuError::lock_timeout(500),
-            NoxuError::LockTimeout { timeout_ms: 500 }
+            NoxuError::LockTimeout { timeout_ms: 500, .. }
         ));
         assert!(matches!(
             NoxuError::database_not_found("db"),
@@ -1154,13 +1172,19 @@ mod tests {
         assert!(NoxuError::DeadlockDetected.is_lock_conflict());
         assert!(NoxuError::LockPreempted.is_lock_conflict());
         assert!(NoxuError::LockNotAvailable.is_lock_conflict());
-        assert!(!NoxuError::LockTimeout { timeout_ms: 500 }.is_lock_conflict());
+        assert!(
+            !NoxuError::LockTimeout { timeout_ms: 500, detail: String::new() }
+                .is_lock_conflict()
+        );
         assert!(!NoxuError::NotFound.is_lock_conflict());
     }
 
     #[test]
     fn test_is_lock_timeout() {
-        assert!(NoxuError::LockTimeout { timeout_ms: 500 }.is_lock_timeout());
+        assert!(
+            NoxuError::LockTimeout { timeout_ms: 500, detail: String::new() }
+                .is_lock_timeout()
+        );
         assert!(
             NoxuError::TransactionTimeout { timeout_ms: 1000, txn_id: 1 }
                 .is_lock_timeout()

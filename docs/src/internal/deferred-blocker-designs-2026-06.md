@@ -82,7 +82,37 @@ searches) must stay green; add a property test comparing the helper's result
 to a reference linear floor scan over random sorted IN key sets, including a
 custom comparator.
 
-## T-F2 — SERIALIZABLE range (next-key) locking
+## T-F2 — SERIALIZABLE range (next-key) locking — **FIXED**
+
+**Status**: Implemented and merged in `fix/tf2-range-locks`.
+
+**Summary of changes:**
+- `lock_manager.rs`: `WaitRestart` wakeup now returns `Err(RangeRestart)` instead
+  of incorrectly granting the lock as `New`.
+- `locker.rs` / `txn.rs`: Added `owns_any_lock(lsn)` to guard against an illegal
+  `RangeRead`→`RangeInsert` upgrade when the same SERIALIZABLE transaction both
+  scans and inserts.
+- `lsn.rs`: Added `Lsn::eof_lock_lsn(db_id)` for per-database EOF sentinel.
+- `cursor_impl.rs`:
+  - `lock_ln` acquires `RangeRead` when `is_serializable_isolation()`, else `Read`.
+  - New `lock_range_insert`: acquires `RangeInsert` on the successor key's LSN
+    for all new-key txn inserts (regardless of inserter's isolation level).
+  - New `lock_eof_for_scan`: acquires `RangeRead` on the EOF sentinel when a
+    SERIALIZABLE forward scan reaches the end of the key space.
+- `database.rs`: `put` and `put_no_overwrite` now use `NoxuError::from(e)` for
+  proper lock-error surfacing (previously mapped all errors to
+  `OperationNotAllowed`).
+- `error.rs`: `NoxuError::LockTimeout` gains a `detail` field preserving the
+  full owner/requester diagnostic from `TxnError::LockTimeout`.
+
+**Qualification**: Five new isolation tests all pass:
+- `test_serializable_prevents_phantom_insert` (acceptance)
+- `test_serializable_prevents_phantom_eof_insert` (EOF acceptance)
+- `test_default_isolation_allows_phantom_insert` (regression: no over-locking)
+- `test_read_committed_allows_phantom_insert` (regression: RC unaffected)
+- `test_serializable_scan_then_insert_same_txn_no_panic` (same-txn guard)
+
+**Original design** (kept for reference below):
 
 **Problem.** `cursor_impl::lock_ln` always acquires `LockType::Read`, never
 `RangeRead`, so SERIALIZABLE does not prevent phantoms (docs have been
