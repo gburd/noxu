@@ -760,9 +760,9 @@ impl Database {
         match txn {
             Some(t) => {
                 let mut cursor = self.make_cursor_for_txn(t);
-                cursor.put(key_bytes, data_bytes, PutMode::Overwrite).map_err(
-                    |e| NoxuError::OperationNotAllowed(e.to_string()),
-                )?;
+                cursor
+                    .put(key_bytes, data_bytes, PutMode::Overwrite)
+                    .map_err(NoxuError::from)?;
             }
             None => {
                 // Wrap the write in a synthetic auto-commit `Txn` so the
@@ -772,9 +772,7 @@ impl Database {
                 self.with_auto_txn(|cursor| {
                     cursor
                         .put(key_bytes, data_bytes, PutMode::Overwrite)
-                        .map_err(|e| {
-                            NoxuError::OperationNotAllowed(e.to_string())
-                        })?;
+                        .map_err(NoxuError::from)?;
                     Ok(())
                 })?;
             }
@@ -915,9 +913,8 @@ impl Database {
                 let mut cursor = self.make_cursor_for_txn(t);
                 match cursor
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-                    .map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })? {
+                    .map_err(NoxuError::from)?
+                {
                     noxu_dbi::OperationStatus::KeyExist => {
                         OperationStatus::KeyExists
                     }
@@ -927,7 +924,7 @@ impl Database {
             None => self.with_auto_txn(|cursor| {
                 cursor
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-                    .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))
+                    .map_err(NoxuError::from)
                     .map(|s| match s {
                         noxu_dbi::OperationStatus::KeyExist => {
                             OperationStatus::KeyExists

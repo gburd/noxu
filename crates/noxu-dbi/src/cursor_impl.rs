@@ -984,6 +984,12 @@ impl CursorImpl {
     /// for any current exclusive writer to finish) and then released
     /// immediately — mirroring `AutoTxn` single-operation semantics.
     ///
+    /// **SERIALIZABLE isolation (T-F2)**: when the cursor's txn has
+    /// `is_serializable_isolation()` set, this acquires `LockType::RangeRead`
+    /// instead of `LockType::Read`, mirroring JE `Cursor.getLockType(rangeLock
+    /// = true)`.  `RangeRead` conflicts with a concurrent `RangeInsert` on the
+    /// same LSN, blocking or triggering a restart on phantom inserts.
+    ///
     /// Returns an error only when the lock would deadlock or the locker is
     /// invalid; `NULL_LSN` records are skipped (lock-free slots).
     ///
@@ -994,6 +1000,10 @@ impl CursorImpl {
     /// or aborted during the wait), and the caller should re-read from the BIN.
     /// When `contended` is `false`, the lock was granted immediately with no
     /// intervening write, so pre-fetched data remains valid.
+    ///
+    /// Returns `Err(DbiError::TxnError(TxnError::RangeRestart))` if a
+    /// concurrent `RangeInsert` owner caused a range restart — the caller
+    /// must abort the current scan position and restart the operation.
     fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
         if lsn == noxu_util::NULL_LSN.as_u64() {
             return Ok(false);
@@ -1007,16 +1017,26 @@ impl CursorImpl {
             if guard.is_read_uncommitted_default() {
                 return Ok(false);
             }
+            // T-F2: SERIALIZABLE cursors acquire RangeRead to protect against
+            // phantom inserts.  All other isolation levels use Read.
+            let lock_type = if guard.is_serializable_isolation() {
+                LockType::RangeRead
+            } else {
+                LockType::Read
+            };
             // Try non-blocking first to detect write contention without waiting.
-            let contended = match guard.lock(lsn, LockType::Read, true) {
+            let contended = match guard.lock(lsn, lock_type, true) {
                 Ok(_) => false, // granted immediately — no concurrent writer
                 Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
                     // A writer holds the lock; block until they commit/abort.
                     guard
-                        .lock(lsn, LockType::Read, false)
+                        .lock(lsn, lock_type, false)
                         .map_err(DbiError::TxnError)?;
                     true
                 }
+                // RangeRestart: a concurrent RangeInsert owner caused a
+                // restart signal — propagate immediately so the caller can
+                // restart the scan.  This is the JE RangeRestartException path.
                 Err(e) => return Err(DbiError::TxnError(e)),
             };
             // Read-committed: release the read lock immediately after each
@@ -1029,6 +1049,8 @@ impl CursorImpl {
             Ok(contended)
         } else if let Some(lm) = &self.lock_manager {
             // Auto-commit: detect contention via non-blocking attempt first.
+            // Auto-commit cursors do not provide serializable phantom protection
+            // across multiple operations; use Read regardless of isolation.
             let contended =
                 match lm.lock(lsn, self.id, LockType::Read, true, false) {
                     Ok(_) => {
@@ -1046,6 +1068,135 @@ impl CursorImpl {
             Ok(contended)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Acquires a `RangeInsert` lock on the successor key's LSN for a new
+    /// SERIALIZABLE insert, implementing JE's next-key locking protocol.
+    ///
+    /// When a transaction inserts a brand-new key `key` (i.e.
+    /// `old_lsn == NULL_LSN`), this method:
+    ///
+    /// 1. Looks up the first committed key at-or-after `key` in the tree
+    ///    (the would-be successor of the new key).
+    /// 2. Acquires `RangeInsert` on that successor's LSN so that any
+    ///    concurrent SERIALIZABLE scanner holding `RangeRead` on the same
+    ///    slot is either blocked (insert waits) or triggers a restart (scan
+    ///    gets `RangeRestart`).
+    /// 3. If no successor exists (the new key would be the last key in the
+    ///    database), acquires `RangeInsert` on the per-database EOF sentinel
+    ///    LSN so scans that called `lock_eof_for_scan` on the same sentinel
+    ///    are protected.
+    ///
+    /// Skipped when:
+    /// - `old_lsn != NULL_LSN` (this is an update, not a new insert; the
+    ///   existing `Write` lock on the old LSN already conflicts with any
+    ///   concurrent `RangeRead`).
+    /// - The cursor has no txn (auto-commit: locks released per-op; no
+    ///   cross-op phantom protection).
+    /// - The txn already owns any lock on the successor LSN (same-txn
+    ///   insert+scan: avoids an illegal RangeRead→RangeInsert upgrade).
+    ///
+    /// Note: `RangeInsert` is acquired for ALL new-key inserts, regardless of
+    /// the inserter's isolation level.  A concurrent SERIALIZABLE scanner
+    /// holding `RangeRead` on the successor will be blocked or restarted.
+    /// For non-serializable scanners, `RangeRead` is never held, so the
+    /// `RangeInsert` is granted immediately with no contention.
+    ///
+    /// Mirror of JE `CursorImpl.lockForInsert()` / next-key locking.
+    fn lock_range_insert(
+        &self,
+        key: &[u8],
+        old_lsn: u64,
+    ) -> Result<(), DbiError> {
+        // Only needed for genuinely new inserts.
+        if old_lsn != noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+        let txn = match &self.txn_ref {
+            Some(t) => t,
+            None => return Ok(()), // auto-commit: no cross-op protection
+        };
+        let mut guard = txn.lock().unwrap();
+        // Find the first committed key at-or-after `key` (the successor of
+        // the key being inserted).
+        let successor_lsn: u64 = {
+            let db = self.db_impl.read();
+            match db.get_real_tree() {
+                Some(tree) => {
+                    match tree.first_entry_at_or_after(key) {
+                        Some((_k, _v, lsn)) => lsn,
+                        None => {
+                            // No successor: the new key will be the last key
+                            // in the database.  Use the per-database EOF
+                            // sentinel so a concurrent scanner that called
+                            // lock_eof_for_scan is protected.
+                            let db_id = db.get_id().id() as u64;
+                            noxu_util::Lsn::eof_lock_lsn(db_id)
+                        }
+                    }
+                }
+                None => {
+                    // Empty tree: use EOF sentinel.
+                    let db_id = db.get_id().id() as u64;
+                    noxu_util::Lsn::eof_lock_lsn(db_id)
+                }
+            }
+        };
+        // Guard: if the same txn already owns any lock on the successor LSN
+        // (e.g. a RangeRead from scanning the successor key), skip acquisition
+        // to avoid an illegal RangeRead→RangeInsert upgrade in the lock manager.
+        // The existing RangeRead already blocks concurrent insertions from other
+        // transactions, so no additional protection is needed.
+        if guard.owns_any_lock(successor_lsn) {
+            return Ok(());
+        }
+        guard
+            .lock(successor_lsn, LockType::RangeInsert, false)
+            .map_err(DbiError::TxnError)?;
+        Ok(())
+    }
+
+    /// Acquires a `RangeRead` lock on the per-database EOF sentinel LSN.
+    ///
+    /// Called by a SERIALIZABLE forward scan when it reaches the end of the
+    /// key space (no more keys to read).  This protects against phantom
+    /// inserts of keys that sort after every currently-scanned key: a
+    /// concurrent inserter will acquire `RangeInsert` on the same sentinel
+    /// and be blocked until this scan's transaction commits.
+    ///
+    /// No-op unless the cursor is backed by a SERIALIZABLE transaction.
+    ///
+    /// Mirror of JE `CursorImpl.lockEof(LockType.RANGE_READ)`.
+    fn lock_eof_for_scan(&self) -> Result<(), DbiError> {
+        let txn = match &self.txn_ref {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let mut guard = txn.lock().unwrap();
+        if !guard.is_serializable_isolation() {
+            return Ok(());
+        }
+        let eof_lsn = {
+            let db = self.db_impl.read();
+            let db_id = db.get_id().id() as u64;
+            noxu_util::Lsn::eof_lock_lsn(db_id)
+        };
+        // If the txn already owns any lock on the EOF sentinel (e.g. from a
+        // prior scan that also reached EOF), skip acquisition.
+        if guard.owns_any_lock(eof_lsn) {
+            return Ok(());
+        }
+        // Non-blocking attempt first; on RangeInsert conflict we get Restart.
+        match guard.lock(eof_lsn, LockType::RangeRead, true) {
+            Ok(_) => Ok(()),
+            Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
+                guard
+                    .lock(eof_lsn, LockType::RangeRead, false)
+                    .map_err(DbiError::TxnError)?;
+                Ok(())
+            }
+            Err(e) => Err(DbiError::TxnError(e)),
         }
     }
 
@@ -1346,7 +1497,12 @@ impl CursorImpl {
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
-            None => Ok(OperationStatus::NotFound),
+            None => {
+                // Empty tree.  T-F2: for SERIALIZABLE, lock the EOF sentinel
+                // so inserts into the (currently empty) database are blocked.
+                self.lock_eof_for_scan()?;
+                Ok(OperationStatus::NotFound)
+            }
         }
     }
 
@@ -1737,7 +1893,17 @@ impl CursorImpl {
                 self.update_bin_pin(bin_arc);
                 Ok(OperationStatus::Success)
             }
-            _ => Ok(OperationStatus::NotFound),
+            _ => {
+                // Reached the end of the key space (no adjacent BIN).
+                // T-F2: for a SERIALIZABLE forward scan, acquire RangeRead
+                // on the per-database EOF sentinel so concurrent inserts of
+                // keys past the current last key are blocked until this
+                // transaction commits.
+                if forward {
+                    self.lock_eof_for_scan()?;
+                }
+                Ok(OperationStatus::NotFound)
+            }
         }
     }
 
@@ -2049,6 +2215,11 @@ impl CursorImpl {
                 // `key_exists_in_view` check above and our
                 // `get_slot_before_image` call here.
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
+                // T-F2: acquire RangeInsert on the successor key's LSN so
+                // concurrent SERIALIZABLE scanners that have already passed
+                // this key's position are blocked until we commit.  No-op
+                // for non-serializable txns or updates (old_lsn != NULL).
+                self.lock_range_insert(key, old_lsn)?;
                 self.lock_write_before_log(old_lsn, key)?;
                 // Re-check `key_exists_in_view` AFTER acquiring the
                 // synthetic-key / per-LSN write lock.  A concurrent
@@ -2088,6 +2259,8 @@ impl CursorImpl {
                     return Ok(OperationStatus::KeyExist);
                 }
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
+                // T-F2: same as NoOverwrite path.
+                self.lock_range_insert(key, old_lsn)?;
                 self.lock_write_before_log(old_lsn, key)?;
                 // See the NoOverwrite re-check above for rationale.
                 if self.key_exists_in_view(key) {
@@ -2111,6 +2284,10 @@ impl CursorImpl {
             }
             PutMode::Overwrite => {
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
+                // T-F2: acquire RangeInsert if this is a brand-new key
+                // (old_lsn == NULL_LSN).  For existing-key updates the
+                // Write lock on old_lsn already conflicts with RangeRead.
+                self.lock_range_insert(key, old_lsn)?;
                 self.lock_write_before_log(old_lsn, key)?;
                 let new_lsn =
                     self.log_ln_write(key, Some(data), self.locker_id)?;

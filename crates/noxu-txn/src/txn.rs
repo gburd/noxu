@@ -1351,6 +1351,10 @@ impl Locker for Txn {
         self.write_locks.contains_key(&lsn)
     }
 
+    fn owns_any_lock(&self, lsn: u64) -> bool {
+        self.read_locks.contains(&lsn) || self.write_locks.contains_key(&lsn)
+    }
+
     fn is_transactional(&self) -> bool {
         true
     }
