@@ -358,16 +358,25 @@ unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 
 **Log shipping architecture:**
 
-- **EnvironmentLogScanner** (master side): Implements the `LogScanner` trait. Reads
-  committed log entries from the master's log files starting at a given VLSN and feeds
-  them to `Feeder` threads — one per connected replica.
+- **Active push path (v3.2.0+)**: Call `register_feeder_channel(replica_name,
+  channel)` before `become_master`. A `FeederRunner` background thread is
+  spawned per channel. The thread reads from a dedicated in-memory queue
+  (fed by `replicate_entry` / `apply_entry` fan-out) and streams framed log
+  entries to the replica over the channel. Acks flow back and are tracked per
+  runner.
+- **Pull path (default)**: Replicas connect to the master’s `PEER_FEEDER`
+  service (registered on the `TcpServiceDispatcher`) and pull entries from
+  the shared `PeerLogScanner` queue (populated by `replicate_entry`).
+- **EnvironmentLogScanner** (deferred): Will scan master log files directly
+  once `LogManager` supports VLSN-tagged entries. See
+  `docs/src/internal/deferred-blocker-designs-2026-06.md` § C-C2b.
 - **EnvironmentLogWriter** (replica side): Receives log entries from the
-  `ReplicaStream` and writes them into the replica's local log, advancing the local
-  VLSN as entries are durably written.
-- **NetworkRestore:** Full file-set transfer for new replicas or replicas that have
-  fallen too far behind CBVLSN. Uses a dedicated TCP service
-  (`NetworkRestoreServer`) registered on the `TcpServiceDispatcher`, or stream 3 on
-  multiplexed QUIC connections.
+  `ReplicaStream` and writes them into the replica’s local log, advancing the
+  local VLSN as entries are durably written.
+- **NetworkRestore:** Full file-set transfer for new replicas or replicas that
+  have fallen too far behind CBVLSN. Uses a dedicated TCP service
+  (`NetworkRestoreServer`) registered on the `TcpServiceDispatcher`, or
+  stream 3 on multiplexed QUIC connections.
 
 ### References
 
