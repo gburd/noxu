@@ -16,6 +16,30 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (C-C2 — active push feeder)
+
+- `ReplicatedEnvironment::register_feeder_channel(replica_name, channel)`: new
+  method that registers a `Channel` for active-push log delivery to a specific
+  replica. When `become_master` is called (or if already master), a
+  `FeederRunner` background thread is spawned for each registered channel. The
+  thread reads from a dedicated in-memory queue populated by
+  `replicate_entry` / `apply_entry` fan-out and streams framed log entries to
+  the replica. Previously `become_master` only created in-memory `Feeder`
+  tracker structs without spawning any threads (C-C2 gap).
+- `ReplicatedEnvironment::active_feeder_runner_acked_vlsn(replica_name)`: new
+  method to inspect the last VLSN acknowledged by a replica's `FeederRunner`.
+- Integration tests `crates/noxu-rep/tests/cc2_feeder_integration_test.rs`
+  demonstrating convergence (6 tests including multi-entry, ack tracking,
+  shutdown catch-up, late-registration, and apply_entry fan-out).
+
+### Fixed (M-4 — `shutdown_group` replica catch-up wait)
+
+- `ReplicatedEnvironment::shutdown_group` now waits up to half the configured
+  timeout for `FeederRunner` replicas to acknowledge the master's current VLSN
+  before sending `SHUTDOWN_GROUP`. Replicas on the pull path (no registered
+  channel) are still sent `SHUTDOWN_GROUP` without a VLSN wait. Previously
+  `shutdown_group` never checked replica catch-up status (M-4 gap).
+
 ### Fixed (review St-H5)
 
 - `TreeNode::find_entry` now returns the FLOOR child slot (largest entry ≤ key)

@@ -58,12 +58,15 @@ use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
 use crate::state_change_listener::{StateChangeEvent, StateChangeListener};
 use crate::stream::feeder::Feeder;
+use crate::stream::feeder::FeederRunner;
+use crate::stream::peer_feeder::PeerScannerAdapter;
 use crate::stream::peer_feeder::{
     PEER_FEEDER_SERVICE_NAME, PeerFeederService, PeerLogScanner,
 };
 use crate::stream::replica_stream::{EnvironmentLogWriter, ReplicaStream};
 use crate::vlsn::vlsn_index::VlsnIndex;
 use crate::vlsn::vlsn_range::VlsnRange;
+use std::collections::HashMap;
 
 /// Default heartbeat timeout for master liveness detection.
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -206,6 +209,32 @@ pub struct ReplicatedEnvironment {
     /// raw `Arc::new(Self::new(...))` and never call `init_self_weak`)
     /// the I/O thread falls back to operator-driven bootstrap.
     self_weak: OnceLock<Weak<Self>>,
+
+    // -----------------------------------------------------------------------
+    // C-C2: active push-feeder infrastructure
+    // -----------------------------------------------------------------------
+    /// Per-replica channels injected via [`Self::register_feeder_channel`].
+    ///
+    /// When [`Self::become_master`] is called (or when the node is already
+    /// master), a [`FeederRunner`] thread is spawned for each registered
+    /// channel, actively streaming entries to that replica over the channel.
+    ///
+    /// Using `register_feeder_channel` is the primary integration point for
+    /// the push-based feeder path.  Production deployments wire in a
+    /// `TcpChannel`; test code uses `LocalChannelPair`.
+    feeder_channels: StdMutex<HashMap<String, Arc<dyn crate::net::Channel>>>,
+
+    /// Per-replica dedicated entry queues backing the push-feeder path.
+    ///
+    /// Each `FeederRunner` thread reads exclusively from its replica's queue.
+    /// [`Self::replicate_entry`] and [`Self::apply_entry`] fan out into all
+    /// registered queues so the push runners receive entries without competing
+    /// with [`PeerFeederService`] for ownership of `peer_scanner`.
+    feeder_queues: std::sync::RwLock<HashMap<String, Arc<PeerLogScanner>>>,
+
+    /// Active `FeederRunner` references for acked-VLSN queries and
+    /// clean shutdown (M-4: wait for replicas to catch up).
+    active_feeder_runners: StdMutex<HashMap<String, Arc<FeederRunner>>>,
 }
 
 impl ReplicatedEnvironment {
@@ -435,6 +464,9 @@ impl ReplicatedEnvironment {
             commit_ack_seq: std::sync::atomic::AtomicU64::new(1),
             election_state,
             self_weak: OnceLock::new(),
+            feeder_channels: StdMutex::new(HashMap::new()),
+            feeder_queues: std::sync::RwLock::new(HashMap::new()),
+            active_feeder_runners: StdMutex::new(HashMap::new()),
         };
 
         Ok(env)
@@ -1246,6 +1278,121 @@ impl ReplicatedEnvironment {
         self.feeders.read().iter().map(|f| f.get_replica_name()).collect()
     }
 
+    // -----------------------------------------------------------------------
+    // C-C2 — active push feeder API
+    // -----------------------------------------------------------------------
+
+    /// Register a channel for pushing log entries to a specific replica.
+    ///
+    /// When [`Self::become_master`] is called — or if the node is **already
+    /// master** — a [`FeederRunner`] background thread is immediately spawned
+    /// for this channel.  The thread reads from a dedicated in-memory queue
+    /// that is fed by [`Self::replicate_entry`] / [`Self::apply_entry`], and
+    /// sends framed log entries to the replica over `channel`.  Acks sent
+    /// back by the replica are visible via
+    /// [`Self::active_feeder_runner_acked_vlsn`].
+    ///
+    /// # Production vs. test use
+    ///
+    /// *Production*: pass a [`crate::net::TcpChannel`] connected to the
+    /// replica's inbound feeder service.  
+    /// *Tests*: pass one half of a [`crate::net::LocalChannelPair`].
+    ///
+    /// # Note on push vs. pull
+    ///
+    /// Registering a channel activates the **push** path: the master
+    /// initiates and owns the feeder connection.  The existing **pull** path
+    /// (`PeerFeederService` / `catch_up_from_peer`) continues to operate in
+    /// parallel for replicas that connect proactively.  Do not register a
+    /// channel for a replica that already connects via the pull path, or
+    /// entries may be delivered twice.
+    ///
+    /// If `become_master` was called *before* registering the channel, call
+    /// this method afterward; it will spawn the FeederRunner immediately.
+    pub fn register_feeder_channel(
+        &self,
+        replica_name: String,
+        channel: Arc<dyn crate::net::Channel>,
+    ) {
+        {
+            let mut ch = self.feeder_channels.lock().unwrap();
+            ch.insert(replica_name.clone(), Arc::clone(&channel));
+        }
+        if self.is_master() {
+            self.spawn_feeder_runner(replica_name, channel);
+        }
+    }
+
+    /// Return the last VLSN acknowledged by the FeederRunner for `replica_name`.
+    ///
+    /// Returns `0` if no FeederRunner is currently active for that replica
+    /// (either `become_master` was not called yet, or no channel was
+    /// registered).  Use this to poll catch-up progress before shutdown.
+    pub fn active_feeder_runner_acked_vlsn(&self, replica_name: &str) -> u64 {
+        self.active_feeder_runners
+            .lock()
+            .unwrap()
+            .get(replica_name)
+            .map(|r| r.known_replica_vlsn())
+            .unwrap_or(0)
+    }
+
+    /// Spawn a FeederRunner thread for `replica_name` using `channel`.
+    ///
+    /// Creates a dedicated `PeerLogScanner` queue for the replica, registers
+    /// it in `feeder_queues` so that future `replicate_entry` / `apply_entry`
+    /// calls fan out into it, spawns the `FeederRunner::run` loop, and
+    /// records the `Arc<FeederRunner>` in `active_feeder_runners`.
+    ///
+    /// Idempotent: if a FeederRunner is already active for `replica_name`
+    /// (from a prior `become_master` call), it is replaced — the old channel
+    /// should have been closed already via `close()`.
+    fn spawn_feeder_runner(
+        &self,
+        replica_name: String,
+        channel: Arc<dyn crate::net::Channel>,
+    ) {
+        // Dedicated entry queue: entries flowing from this master reach the
+        // FeederRunner without competing with PeerFeederService.
+        let queue = Arc::new(PeerLogScanner::new());
+        {
+            self.feeder_queues
+                .write()
+                .unwrap()
+                .insert(replica_name.clone(), Arc::clone(&queue));
+        }
+
+        let runner = Arc::new(FeederRunner::new(Arc::clone(&channel), 1));
+        let runner_clone = Arc::clone(&runner);
+        let replica_clone = replica_name.clone();
+
+        let handle = std::thread::Builder::new()
+            .name(format!("noxu-feeder-{}", replica_name))
+            .spawn(move || {
+                let mut source = PeerScannerAdapter::new(queue, 0);
+                let _ = runner_clone.run(&mut source);
+                log::debug!(
+                    "FeederRunner for replica '{}' exited cleanly",
+                    replica_clone
+                );
+            })
+            .expect("failed to spawn FeederRunner thread");
+
+        {
+            let mut runners = self.active_feeder_runners.lock().unwrap();
+            runners.insert(replica_name.clone(), Arc::clone(&runner));
+        }
+        self.io_threads.lock().unwrap().push(handle);
+
+        log::info!(
+            "Node '{}' (master): FeederRunner thread spawned for replica '{}'",
+            self.config.node_name.as_str(),
+            replica_name,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+
     /// Bootstrap this node's environment by network-restoring all `.ndb`
     /// files from `peer_name` via the dispatcher's RESTORE service.
     ///
@@ -1340,11 +1487,26 @@ impl ReplicatedEnvironment {
     /// As master, the node can accept write operations and feed log entries
     /// to replicas.
     ///
-    /// If a live `EnvironmentImpl` has been wired in via `with_environment`,
-    /// a `FeederRunner` + `EnvironmentLogScanner` background thread is spawned
-    /// for each currently-registered replica (feeder entries in `feeders`).
+    /// **Active push-feeder** (C-C2): if feeder channels have been registered
+    /// via [`Self::register_feeder_channel`] before this call, a
+    /// [`FeederRunner`] background thread is spawned per channel. Each thread
+    /// reads entries from a dedicated in-memory queue (populated by
+    /// [`Self::replicate_entry`] / [`Self::apply_entry`] fan-out) and pushes
+    /// framed log entries to the replica. Acks flow back from the replica and
+    /// are tracked per-runner; use
+    /// [`Self::active_feeder_runner_acked_vlsn`] to inspect progress.
     ///
-    /// In HA.
+    /// If no feeder channels are registered, this call registers per-replica
+    /// `Feeder` tracker structs for `AckTracker` bookkeeping only (same
+    /// behaviour as before C-C2). In that case replicas must connect
+    /// proactively to the `PEER_FEEDER` pull service to receive entries.
+    ///
+    /// **WAL-scanner path**: the `EnvironmentLogScanner`-backed automatic
+    /// log-file scanning path (where entries are auto-discovered from the
+    /// WAL regardless of `replicate_entry` calls) is deferred; it requires
+    /// `LogManager` to write VLSN-tagged entries, which is not yet
+    /// implemented. See `docs/src/internal/deferred-blocker-designs-2026-06.md`
+    /// § C-C2 for the design.
     pub fn become_master(&self, term: u64) -> Result<()> {
         if self.is_shutdown() {
             return Err(RepError::StateError(
@@ -1419,6 +1581,28 @@ impl ReplicatedEnvironment {
             term,
             self.feeders.read().len(),
         );
+
+        // C-C2: spawn FeederRunner threads for pre-registered channels.
+        //
+        // When `register_feeder_channel` was called before `become_master`,
+        // the channels are already in `feeder_channels`. Drain them and
+        // spawn a FeederRunner per replica.  The FeederRunner reads from a
+        // dedicated `PeerLogScanner` queue (populated by `replicate_entry`
+        // fan-out) and pushes framed log entries to the replica over the
+        // registered channel.  Acks from the replica are tracked in the
+        // FeederRunner and visible via `active_feeder_runner_acked_vlsn`.
+        {
+            let channels: Vec<(String, Arc<dyn crate::net::Channel>)> = self
+                .feeder_channels
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect();
+            for (replica_name, channel) in channels {
+                self.spawn_feeder_runner(replica_name, channel);
+            }
+        }
 
         // -------------------------------------------------------------------
 
@@ -1790,7 +1974,18 @@ impl ReplicatedEnvironment {
         data: Vec<u8>,
     ) {
         self.vlsn_index.register(vlsn, file_number, file_offset);
-        self.peer_scanner.push(vlsn, entry_type, data);
+        // Pull path: shared peer_scanner serves replicas connecting via
+        // PeerFeederService (catch_up_from_peer).
+        self.peer_scanner.push(vlsn, entry_type, data.clone());
+        // Push path (C-C2): fan out to per-replica FeederRunner queues so
+        // that threads spawned by become_master can stream entries to each
+        // registered replica without competing with PeerFeederService.
+        {
+            let queues = self.feeder_queues.read().unwrap();
+            for queue in queues.values() {
+                queue.push(vlsn, entry_type, data.clone());
+            }
+        }
         if !self.is_master() {
             log::trace!(
                 "replicate_entry called on non-master node '{}': vlsn={}, type={}",
@@ -1834,7 +2029,14 @@ impl ReplicatedEnvironment {
 
         // Push into the peer log scanner so downstream replicas can
         // receive this entry via the PEER_FEEDER service.
-        self.peer_scanner.push(vlsn, entry_type, data);
+        self.peer_scanner.push(vlsn, entry_type, data.clone());
+        // C-C2 push path: fan out to per-replica FeederRunner queues.
+        {
+            let queues = self.feeder_queues.read().unwrap();
+            for queue in queues.values() {
+                queue.push(vlsn, entry_type, data.clone());
+            }
+        }
 
         log::trace!(
             "Applied replicated entry: vlsn={}, type={}",
@@ -1914,6 +2116,24 @@ impl ReplicatedEnvironment {
             feeders.clear();
         }
 
+        // C-C2: close all registered feeder channels so FeederRunner threads
+        // observe ChannelClosed and exit their run() loops cleanly.
+        {
+            let channels = self.feeder_channels.lock().unwrap();
+            for (name, ch) in channels.iter() {
+                if let Err(e) = ch.close() {
+                    log::debug!(
+                        "close: feeder channel for '{}' already closed: {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+        // Drop all active runners and queues so their Arcs release.
+        self.active_feeder_runners.lock().unwrap().clear();
+        self.feeder_queues.write().unwrap().clear();
+
         // Signal and join all I/O threads spawned by become_master /
         // become_replica / start_vlsn_persistence_daemon.  The vlsn-flush
         // thread does a final flush on its way out so a clean close is
@@ -1966,9 +2186,20 @@ impl ReplicatedEnvironment {
     ///
     ///
     /// This method must be invoked on the node that's currently the Master
-    /// after all other outstanding handles have been closed. The Master waits
-    /// for all active Replicas to catch up so that they have a current set of
-    /// logs, and then shuts them down.
+    /// after all other outstanding handles have been closed.
+    ///
+    /// When push-feeder threads are active (registered via
+    /// [`Self::register_feeder_channel`]), the master first waits up to half
+    /// of `replica_shutdown_timeout_ms` for each FeederRunner replica to
+    /// acknowledge all outstanding log entries (VLSN catch-up).  Replicas
+    /// that do not catch up within the budget receive a warning; the master
+    /// proceeds to send `SHUTDOWN_GROUP` regardless.  This closes finding M-4
+    /// of the v3.x production-readiness review.
+    ///
+    /// Replicas that are not fed via a registered channel (pull-based
+    /// `PeerFeederService` path) are sent `SHUTDOWN_GROUP` without a
+    /// VLSN-level catch-up wait — that wait requires per-replica ack tracking
+    /// which the pull path does not yet provide.
     pub fn shutdown_group(
         &self,
         replica_shutdown_timeout_ms: u64,
@@ -1985,6 +2216,55 @@ impl ReplicatedEnvironment {
             self.config.group_name.as_str(),
             replica_shutdown_timeout_ms,
         );
+
+        // M-4: Wait for active FeederRunner replicas to ack the master's
+        // current VLSN before sending SHUTDOWN_GROUP.  We allow up to half
+        // the overall timeout for the catch-up phase so the second half
+        // remains for the SHUTDOWN_GROUP send loop.
+        let catchup_budget_ms = replica_shutdown_timeout_ms / 2;
+        if catchup_budget_ms > 0 {
+            let master_vlsn = self.vlsn_index.get_range().last();
+            if master_vlsn > 0 {
+                let runners: Vec<(String, Arc<FeederRunner>)> = self
+                    .active_feeder_runners
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect();
+                if !runners.is_empty() {
+                    let catchup_deadline = std::time::Instant::now()
+                        + Duration::from_millis(catchup_budget_ms);
+                    for (name, runner) in &runners {
+                        loop {
+                            let acked = runner.known_replica_vlsn();
+                            if acked >= master_vlsn
+                                || std::time::Instant::now() >= catchup_deadline
+                            {
+                                if acked < master_vlsn {
+                                    log::warn!(
+                                        "shutdown_group: replica '{}' acked \
+                                         VLSN {} < master VLSN {}; proceeding",
+                                        name,
+                                        acked,
+                                        master_vlsn,
+                                    );
+                                } else {
+                                    log::info!(
+                                        "shutdown_group: replica '{}' caught up \
+                                         to VLSN {}",
+                                        name,
+                                        acked,
+                                    );
+                                }
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            }
+        }
 
         // Closes finding F8 of `docs/src/internal/api-audit-2026-05-rep.md`.
         //

@@ -57,7 +57,8 @@ version of each is *worse* than the current honest state):
 - **T-F2** — SERIALIZABLE next-key range locking (isolation feature; docs
   already corrected to stop claiming phantom prevention).
 - **C-C2** — `become_master` feeder / log-streaming threads (replication
-  feature).
+  feature). **Partially fixed** in v3.2.0: push-feeder threads spawn via
+  `register_feeder_channel`; WAL-scanner auto-discovery deferred.
 - **St-C3 / St-H1 / St-H3** — file-header checksum + endianness; an on-disk
   format-v3 migration (St-H1/H3 documentation already corrected). The
   first-entry offset is part of the LSN space, so the size change ripples
@@ -82,8 +83,9 @@ those are now **fixed** (see the list above).
   on-disk-format-version decision (do not rush at scale).
 - **T-F2** — SERIALIZABLE range locks (docs already corrected to stop claiming
   phantom prevention; implementing real range locking is an isolation feature).
-- **C-C2** — `become_master` feeder/log-streaming threads (a replication
-  feature, not a stub-to-tweak).
+- **C-C2** — `become_master` feeder/log-streaming threads — **Partially fixed**
+  (v3.2.0): push threads via `register_feeder_channel`; WAL-scanner
+  auto-discovery deferred (requires VLSN-tagged `LogManager` entries).
 
 ## Critical
 
@@ -111,7 +113,7 @@ those are now **fixed** (see the list above).
 | St-H4 | noxu-tree | Upper-IN descent used an O(n) linear scan instead of binary search | **FIXED** (unified `Tree::upper_in_floor_index` binary floor-search applied to all 8 descent sites; also fixed `search_with_coupling` ignoring a custom comparator; property test vs linear scan) |
 | St-H5 | noxu-tree | `TreeNode::find_entry` returned the insertion point, not the floor, for Internal nodes (non-exact) | **FIXED** (returns `(idx-1).max(0)` floor, consistent with `upper_in_floor_index` + JE; test `test_find_entry_internal_nonexact_returns_floor`) |
 | St-H6 | noxu-tree | `BinStub::deserialize_full` hardcodes `expiration_in_hours = true` regardless of what was logged → TTL read back 3600× wrong for seconds-granularity BINs | OPEN |
-| C-C2 | noxu-rep | `become_master` doc promises a `FeederRunner`/`EnvironmentLogScanner` thread per replica; the body only creates in-memory tracker structs → a master does not actively feed replicas | OPEN |
+| C-C2 | noxu-rep | `become_master` doc promised a `FeederRunner`/`EnvironmentLogScanner` thread per replica; the body only created in-memory tracker structs → a master did not actively feed replicas | **PARTIALLY FIXED** (v3.2.0): `register_feeder_channel` + `become_master` now spawn `FeederRunner` threads per registered channel; `replicate_entry`/`apply_entry` fan out to dedicated per-replica queues; `shutdown_group` waits for replica ack catch-up (M-4). **Deferred**: WAL-scanner auto-discovery path (requires VLSN-tagged `LogManager` entries) — see `deferred-blocker-designs-2026-06.md` § C-C2. |
 | C-H4 | noxu-rep | (stale-branch finding) `peer_allowlist` no-op — **re-validated on main: FIXED** by mTLS Phase 2/3 (`PeerAllowlistVerifier` wired through the TLS listener, dispatcher, and QUIC) | RESOLVED on main |
 
 ## Medium / Low (summary — see source reports)

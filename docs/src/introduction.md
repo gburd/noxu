@@ -67,7 +67,8 @@ git tags (`v1.5.0`, `v1.6.0`, `v2.0.0`, `v2.2.1`).
 | Network restore via dispatcher (`ReplicatedEnvironment` bootstrap) | ❌ (broken framing) | ❌ | ✅ | ✅ |
 | Acceptor promise persistent across restart | ❌ | ❌ | ✅ | ✅ |
 | `transfer_master` / `shutdown_group` operator APIs | ❌ (silently no-op) | ❌ | ✅ | ✅ |
-| Master spawns Feeder per known replica on `become_master` | ❌ (no feeders dispatched) | ❌ | ✅ | ✅ |
+| Master spawns Feeder per known replica on `become_master` | ❌ (no feeders dispatched) | ❌ | ✅ (in-memory tracker structs only) | ✅ (tracker structs; active thread spawn deferred) |
+| `register_feeder_channel` + push-feeder threads (C-C2) | ❌ | ❌ | ❌ | ✅ (v3.2.0: push threads via `register_feeder_channel`; WAL-scanner deferred) |
 | VLSN index persistent across restart (no forced full restore) | ❌ (in-memory only) | ❌ | ✅ | ✅ |
 | `become_master` rejects non-`Electable` node types | ❌ (silently transitioned `Secondary` → `Master`) | ❌ | ❌ | ✅ |
 | Replica I/O thread auto-bootstraps on `NeedsRestore` | ❌ (manual `bootstrap_via_dispatcher` required) | ❌ | ❌ | ✅ |

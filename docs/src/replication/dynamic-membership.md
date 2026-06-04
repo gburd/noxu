@@ -1,8 +1,10 @@
 # Dynamic Membership
 
 > **v2.0 status — GA.** Adding/removing peers via `add_peer` /
-> `remove_peer` is fully supported.  Master promotions automatically
-> dispatch a `Feeder` per known replica.
+> `remove_peer` is fully supported.  When feeder channels are registered via
+> `register_feeder_channel`, master promotions automatically spawn a
+> `FeederRunner` thread per replica (push path, v3.2.0).  Without registered
+> channels, the pull path (`PeerFeederService`) remains the default.
 
 Noxu DB supports adding and removing nodes from the replication group while
 the group is actively serving traffic.
