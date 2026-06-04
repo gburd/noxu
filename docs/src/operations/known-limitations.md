@@ -73,6 +73,11 @@ Recommended deployment until these are remediated:
 | **`env_ttl_clock_tolerance_ms` (reserved, v3.1)** | Stored but never read; TTL expiration is not implemented. Setting to non-zero emits a `WARN` log. | Has no effect; records are never expired by the engine. |
 | **`env_expiration_enabled` (reserved, v3.1)** | Stored but never read; TTL-based record expiration is not implemented. Setting to `true` emits a `WARN` log. | Has no effect; records are never expired by the engine. |
 | **`env_db_eviction` (reserved, v3.1)** | Stored but never read; per-database node eviction is not implemented. Setting to `true` emits a `WARN` log. | Has no effect; eviction does not differentiate by database. |
+| **Chained / replica-to-replica log feeding** | The master is the only ongoing log-feed source. BDB-JE supports a replica feeding another replica (cascading feeders); Noxu does not. (Replica-to-replica *file-level* copy exists via network restore.) | All replicas stream from the master; size the master's outbound capacity accordingly. |
+| **Database/transaction triggers** | Not implemented. BDB-JE exposes `DatabaseTrigger` / transaction triggers for change notification; Noxu has no equivalent. | Implement change hooks in application code around `put`/`delete`/`commit`. |
+| **Admin tooling (dump / load / print-log)** | No `DbDump`/`DbLoad`/`DbPrintLog`-equivalent CLI utilities. | Use the public API for export/import; there is no offline log inspector. |
+| **Code coverage not tracked in CI** | A `make coverage` target (`cargo-llvm-cov`) exists but coverage is not measured or gated in CI; there is no committed coverage baseline. | Run `make coverage` locally to inspect coverage of changed code. |
+| **Spec models are protocol models, not conformance proofs** | The `noxu-spec` Stateright specs model-check the *protocol design*'s safety/liveness; they are abstract models kept in sync with the Rust by review convention (two anchor to production types), not a mechanical refinement proof of the implementation. | A green spec means the protocol is safe; rely on the unit/integration suites for implementation conformance. |
 
 ---
 
