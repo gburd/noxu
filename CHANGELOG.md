@@ -16,6 +16,41 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (data-loss correctness — St-H6)
+
+- **Silent data-loss on BIN split when records have TTL** (`noxu-tree`):
+  `Tree::split_child` hardcoded `expiration_in_hours: false` on the new
+  right-half sibling BIN instead of inheriting the flag from the splitting
+  BIN.  Because every public TTL write path (`WriteOptions::with_ttl` /
+  `with_expiration`) stores `expiration_time` as **hours** since the Unix
+  epoch, the right-sibling entries' hours-granularity values (~495 000 in
+  2026) were compared against `current_time_secs()` (~1.78 billion) by
+  `is_expired(…, false)` and treated as if they had expired in January 1970.
+  Any key that landed in the right half of a split returned `NotFound` for
+  the remainder of the environment's lifetime — **128 out of 256 TTL records
+  were silently lost in the benchmark scenario**.
+
+  Fix: capture `b.expiration_in_hours` from the splitting BIN before
+  `drop(child_guard)` and pass it to the sibling constructor.  Also corrected
+  the three other hardcoded-`false` sites (initial-BIN constructors in
+  `insert` / `redo_insert`, and a test-only BIN in `checkpointer.rs`) to
+  `true`, matching `tree.rs:980` and the `deserialize_full` default.
+  Added a `debug_assert!` at the split site to guard against future
+  flag divergence.
+
+  JE reference: `BIN.java::split()` propagates `expirationInHours` via
+  `setExpirationInHours(hours)` on the new sibling.
+
+  Regression tests:
+  - `noxu-db/tests/ttl_bin_split_regression_test.rs` — three integration
+    tests, two of which are FAIL-PRE/PASS-POST:
+    `test_ttl_records_survive_bin_split_right_sibling_256` (128 keys lost
+    pre-fix, 0 post-fix) and `test_ttl_and_no_ttl_keys_both_survive_bin_split`
+    (64 keys lost pre-fix, 0 post-fix).
+  - `noxu-tree/src/tree.rs` — two unit tests:
+    `test_split_child_sibling_inherits_expiration_in_hours` and
+    `test_hours_value_is_expired_only_with_false_flag`.
+
 ### Added (C-C2b — WAL-scanner auto-feed)
 
 - **`LogManager::log_with_vlsn`** (`noxu-log`): new write path that produces

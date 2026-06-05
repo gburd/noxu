@@ -2032,7 +2032,10 @@ impl Tree {
                     last_delta_lsn: NULL_LSN,
                     generation: 0,
                     parent: None, // set below after root_in is created
-                    expiration_in_hours: false,
+                    // St-H6: use true to match the engine-wide invariant that
+                    // every BIN which may hold TTL entries uses hours granularity
+                    // (JE BIN.java default; matches tree.rs:980 and read_from_log).
+                    expiration_in_hours: true,
                     cursor_count: 0,
                 })));
 
@@ -2160,7 +2163,9 @@ impl Tree {
                     last_delta_lsn: NULL_LSN,
                     generation: 0,
                     parent: None,
-                    expiration_in_hours: false,
+                    // St-H6: use true to match the engine-wide hours-only
+                    // invariant (JE BIN.java default; matches tree.rs:980).
+                    expiration_in_hours: true,
                     cursor_count: 0,
                 })));
 
@@ -2367,6 +2372,20 @@ impl Tree {
         // this avoids inside split_child.
         let mut child_guard = child_arc.write();
         let child_level = child_guard.level();
+        // St-H6: capture the splitting BIN's expiration_in_hours flag BEFORE
+        // drop(child_guard) so the right-half sibling inherits it.
+        // JE: BIN.java::setExpiration calls setExpirationInHours(hours) to
+        // propagate the flag on split/clone; the Rust split was hardcoding
+        // false instead of inheriting — this caused hours-granularity TTL
+        // entries in the right sibling to be read with in_hours=false, making
+        // the hours-since-epoch value compare as seconds-since-epoch (far in
+        // the past) and every right-sibling TTL record appear expired.
+        let bin_expiration_in_hours: bool = match &*child_guard {
+            TreeNode::Bottom(b) => b.expiration_in_hours,
+            // Internal nodes do not carry per-entry TTL; default to true
+            // (the engine-wide invariant for any BIN that may hold TTL data).
+            TreeNode::Internal(_) => true,
+        };
         let (all_entries, bin_old_prefix) = match &*child_guard {
             TreeNode::Internal(n) => {
                 (SplitEntries::Internal(n.entries.clone()), Vec::new())
@@ -2457,9 +2476,24 @@ impl Tree {
                     last_delta_lsn: NULL_LSN,
                     generation: 0,
                     parent: None, // set below
-                    expiration_in_hours: false,
+                    // St-H6 fix: inherit the splitting BIN's flag so that
+                    // is_expired() uses the correct granularity for entries
+                    // that were already in the BIN before the split.
+                    // JE reference: BIN.java::split() propagates
+                    // expirationInHours via setExpirationInHours(hours).
+                    expiration_in_hours: bin_expiration_in_hours,
                     cursor_count: 0,
                 };
+                // St-H6 debug guard: the sibling must carry the same flag as
+                // the splitting BIN so that in_hours-resolution entries are
+                // never silently expired by a mismatched false flag.
+                debug_assert_eq!(
+                    sibling_bin.expiration_in_hours, bin_expiration_in_hours,
+                    "St-H6 invariant: sibling BIN expiration_in_hours must \
+                     match the splitting BIN (got {}, expected {})",
+                    sibling_bin.expiration_in_hours, bin_expiration_in_hours
+                );
+
                 if sibling_bin.entries.len() >= 2 {
                     sibling_bin.recompute_key_prefix();
                 }
@@ -8795,4 +8829,149 @@ mod tests {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// St-H6: BIN split inherits expiration_in_hours from the splitting BIN.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Unit test for the St-H6 fix: the right-half sibling created by
+/// `split_child` inherits `expiration_in_hours` from the splitting BIN.
+///
+/// Before the fix, the sibling was always created with
+/// `expiration_in_hours = false`, causing hours-granularity TTL entries
+/// (expiration_time ~495k) to be compared against `current_time_secs()`
+/// (~1.78B) and treated as expired.
+///
+/// This test:
+///   1. Creates a tree with max_entries = 4 and inserts 4 entries directly
+///      (bypassing `update_key_expiration`) with non-zero `expiration_time`
+///      and `expiration_in_hours = true` on the BIN.
+///   2. Triggers a split.
+///   3. Asserts that the right-half sibling has `expiration_in_hours = true`
+///      (inherited, not hardcoded false).
+#[test]
+fn test_split_child_sibling_inherits_expiration_in_hours() {
+    use crate::tree::{BIN_LEVEL, BinEntry, BinStub, MAIN_LEVEL, TreeNode};
+    use noxu_util::{Lsn, NULL_LSN};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    // Manually build a tree with one BIN (4 entries, expiration_in_hours=true).
+    let tree = Tree::new(99, 4);
+
+    // Pre-populate the tree root for the test.
+    let entries: Vec<BinEntry> = (0u8..4u8)
+        .map(|k| BinEntry {
+            key: vec![k],
+            lsn: Lsn::new(1, (k as u32) * 100 + 100),
+            data: Some(vec![k, k]),
+            known_deleted: false,
+            dirty: true,
+            expiration_time: 495_630, // hours-since-epoch value, 2026
+        })
+        .collect();
+    let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
+        node_id: 1,
+        level: BIN_LEVEL,
+        entries,
+        key_prefix: Vec::new(),
+        dirty: true,
+        is_delta: false,
+        last_full_lsn: NULL_LSN,
+        last_delta_lsn: NULL_LSN,
+        generation: 0,
+        parent: None,
+        expiration_in_hours: true, // hours-granularity entries
+        cursor_count: 0,
+    })));
+
+    let root = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
+        node_id: 2,
+        level: MAIN_LEVEL | 2,
+        entries: vec![InEntry {
+            key: vec![], // virtual key for slot 0 (-infinity)
+            lsn: Lsn::new(1, 1),
+            child: Some(Arc::clone(&bin)),
+        }],
+        dirty: true,
+        generation: 0,
+        parent: None,
+    })));
+    {
+        let mut b = bin.write();
+        b.set_parent(Some(Arc::downgrade(&root)));
+    }
+    *tree.root.write() = Some(Arc::clone(&root));
+
+    // Trigger split_child on the root.
+    Tree::split_child(&root, 0, 4, Lsn::new(1, 500))
+        .expect("split_child should succeed");
+
+    // After the split: root has two children — left BIN and right sibling.
+    let root_guard = root.read();
+    let TreeNode::Internal(ref in_node) = *root_guard else {
+        panic!("root should be Internal after split");
+    };
+    assert_eq!(
+        in_node.entries.len(),
+        2,
+        "root should have 2 entries (children) after split"
+    );
+
+    // Right-half sibling is at slot 1.
+    let sibling_arc = in_node
+        .entries
+        .get(1)
+        .and_then(|e| e.child.clone())
+        .expect("right-half sibling should exist at slot 1");
+    let sibling_guard = sibling_arc.read();
+    let TreeNode::Bottom(ref sibling) = *sibling_guard else {
+        panic!("right sibling should be a BIN");
+    };
+
+    assert!(
+        sibling.expiration_in_hours,
+        "St-H6: right-half sibling expiration_in_hours must be true \
+             (inherited from splitting BIN); got false"
+    );
+
+    // Verify the sibling's entries have the expected expiration_time.
+    for e in &sibling.entries {
+        assert_eq!(
+            e.expiration_time, 495_630,
+            "sibling entry expiration_time should be preserved: got {}",
+            e.expiration_time
+        );
+        // With in_hours=true, is_expired should return false (future).
+        assert!(
+            !noxu_util::ttl::is_expired(
+                e.expiration_time,
+                sibling.expiration_in_hours
+            ),
+            "St-H6: sibling TTL entry ({}) should NOT appear expired \
+                 with expiration_in_hours={}",
+            e.expiration_time,
+            sibling.expiration_in_hours
+        );
+    }
+}
+
+/// Regression confirmation: `is_expired` with wrong `in_hours = false`
+/// would falsely expire hours-granularity values (~495k hours since epoch).
+#[test]
+fn test_hours_value_is_expired_only_with_false_flag() {
+    // Hours-since-epoch value for ~2026 + 1 000 h TTL.
+    let exp_hours: u32 = 495_630;
+    // Correctly treated as hours: not expired.
+    assert!(
+        !noxu_util::ttl::is_expired(exp_hours, true),
+        "exp_hours={exp_hours} should NOT be expired when in_hours=true"
+    );
+    // Incorrectly treated as seconds (pre-fix right sibling): expired.
+    assert!(
+        noxu_util::ttl::is_expired(exp_hours, false),
+        "exp_hours={exp_hours} should be expired when in_hours=false \
+             (St-H6 demonstrates the wrong-flag scenario)"
+    );
 }

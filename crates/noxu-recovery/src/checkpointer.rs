@@ -1174,7 +1174,10 @@ mod tests {
             last_delta_lsn: noxu_util::NULL_LSN,
             generation: 0,
             parent: None,
-            expiration_in_hours: false,
+            // St-H6: test-only BIN; use true to match the engine-wide
+            // hours-only invariant and avoid any accidental comparison with
+            // a non-zero expiration_time.
+            expiration_in_hours: true,
             cursor_count: 0,
         };
         let node = NodeRwLock::new(TreeNode::Bottom(bin));

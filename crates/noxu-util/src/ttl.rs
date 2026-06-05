@@ -25,7 +25,16 @@ pub fn current_time_secs() -> u32 {
 /// Returns true if the given packed expiration time has passed.
 ///
 /// `expiration_time == 0` means no expiration (never expires).
-/// `in_hours`: if true, `expiration_time` is in hours; if false, in seconds.
+///
+/// `in_hours`: if `true`, `expiration_time` is hours since the Unix epoch
+/// (the only granularity the public write API — `WriteOptions::with_ttl` /
+/// `with_expiration` — produces).  If `false`, `expiration_time` is seconds
+/// since the Unix epoch.  **The engine's `BinStub::expiration_in_hours` flag
+/// must always match the granularity of the stored values**: mixing them
+/// produces silent correctness failures (St-H6 — see `Tree::split_child`).
+///
+/// The seconds-granularity path (`in_hours = false`) exists for future use;
+/// it is **not reachable from the current public API** which is hours-only.
 pub fn is_expired(expiration_time: u32, in_hours: bool) -> bool {
     if expiration_time == 0 {
         return false;

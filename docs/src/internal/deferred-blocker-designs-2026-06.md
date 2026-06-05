@@ -248,10 +248,28 @@ proves non-replicated envs still write 14-byte headers with no VLSN bits set.
   with a `PhantomPinned`/`Pin<Box<…>>` boundary or by moving the three control
   fields into an `Arc<SegmentControl>` the segment clones — a focused
   log-buffer change, not bundled with unrelated work.
-- **St-H6** (`expiration_in_hours` not serialized): production only ever
-  writes hours-granularity TTL, so the hardcoded `true` on deserialize is
-  correct today; serialize the flag when seconds-granularity TTL is added
-  (itself a BIN wire-format change → version-gated).
+- **St-H6** (`expiration_in_hours` not serialized AND BIN split flag
+  inheritance bug): **CLOSED — live bug, fixed in this branch**.
+  The original classification was incomplete.  Two distinct defects were
+  present:
+  1. **Live data-loss bug** (NEW finding): `Tree::split_child` hardcoded
+     `expiration_in_hours: false` on the right-half sibling BIN.  Because
+     `update_key_expiration` only touches the BIN that receives the trigger
+     key, and the trigger key routes to the left half when it sorts below the
+     split midpoint, the right sibling permanently retained the wrong flag.
+     Any hours-granularity `expiration_time` value (~495 000 in 2026) was then
+     compared against `current_time_secs()` (~1.78 billion) by `is_expired`,
+     returning `true` — silent data loss on every get of a right-sibling key.
+     Regression test: `test_ttl_records_survive_bin_split_right_sibling_256`
+     (FAIL-PRE: 128/256 keys missing; PASS-POST: 0 missing).
+  2. **Latent deserialization concern** (original finding — confirmed
+     harmless): `expiration_in_hours` is not serialized in BIN records;
+     `deserialize_full` hardcodes `true` (the safe direction).  Since the
+     engine's only public TTL path writes hours-granularity values, `true`
+     is correct.  No bug — no action needed.
+  Fix: inherit `b.expiration_in_hours` from the splitting BIN; set the
+  other three hardcoded-`false` sites to `true`; add a `debug_assert!`
+  guard at the split site.  See CHANGELOG.md `[Unreleased] Fixed (St-H6)`.
 - **T-F3 / T-F4** (`first_active_lsn` + `update_first_lsn`): prerequisites for
   the deferred P-2 recovery-scan optimization; `get_first_active_lsn()` has no
   production consumer today. Land with P-2 (see `wave-gb-dbtree-recovery.md`).
