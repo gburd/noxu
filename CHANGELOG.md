@@ -16,6 +16,16 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (on-disk format — St-C3, LOG_VERSION 2→3)
+
+- The log file header now carries a CRC32 (v3 header = 36 bytes) so a torn
+  header write is detected at open time (`LogError::HeaderChecksumMismatch`).
+  Backward-compatible: legacy v2 files (32-byte header, no CRC) remain fully
+  readable — each file's first-entry offset is resolved from its own version
+  via `FileHeader::on_disk_size` (v2→32, v3→36), with no data migration.
+  New files are written as v3. Version-aware offset handling threads through
+  `file_manager`, `file_manager_scanner`, `cleaner`, and the recovery parser.
+
 ### Documentation (Q&A-surfaced gaps)
 
 - Clarified that `noxu-spec` Stateright specs are **abstract protocol models**

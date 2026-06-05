@@ -90,7 +90,10 @@ make docs-serve   # Live-reload docs at http://localhost:3000
 
 ## Key Design Decisions
 
-- **Log format**: Rust-native `.ndb` format. Not compatible with other database formats.
+- **Log format**: Rust-native `.ndb` format (`LOG_VERSION = 3`). Not compatible
+  with other database formats. The file header carries a CRC32 (v3); v2 files
+  (no header CRC, 32-byte header) remain readable — the first-entry offset is
+  resolved per file via `FileHeader::on_disk_size(version)`.
 - **External crates**: Core engine pulls in only `parking_lot`, `thiserror`,
   `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`, plus
   `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Replication

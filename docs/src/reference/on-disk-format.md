@@ -21,7 +21,15 @@ Gaps indicate cleaned (deleted) files.
 
 Each `.ndb` file:
 
-1. **File header** (fixed size): log format version (`u32`), file number (`u32`)
+1. **File header** (version-aware size): magic (`NOXUDB\0\0`), log format
+   version (`u32`), byte-order marker, timestamp, file number (`u32`),
+   previous-file last-entry offset, and — in `LOG_VERSION` 3 — a trailing CRC32
+   over the header. A v3 header is **36 bytes**; a legacy v2 header is
+   **32 bytes** (no CRC). The first log entry begins immediately after the
+   header, so the first-entry offset is resolved per file from its own
+   version via `FileHeader::on_disk_size(version)` (v2 → 32, v3 → 36). v2 files
+   remain fully readable; a torn/corrupt v3 header is detected by the CRC at
+   open time (`LogError::HeaderChecksumMismatch`).
 2. **Log entries** (variable length, packed with no alignment padding)
 
 ## Entry Header

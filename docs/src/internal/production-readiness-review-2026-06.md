@@ -58,10 +58,9 @@ version of each is *worse* than the current honest state):
 - **C-C2** — `become_master` feeder / log-streaming threads (replication
   feature). **Partially fixed** in v3.2.0: push-feeder threads spawn via
   `register_feeder_channel`; WAL-scanner auto-discovery deferred.
-- **St-C3 / St-H1 / St-H3** — file-header checksum + endianness; an on-disk
-  format-v3 migration (St-H1/H3 documentation already corrected). The
-  first-entry offset is part of the LSN space, so the size change ripples
-  through log/cleaner/recovery/dbi — recovery-corruption risk if rushed.
+- **St-C3 / St-H1 / St-H3** — **DONE**: St-H1/H3 docs corrected earlier; St-C3
+  shipped LOG_VERSION 2→3 (v3 header CRC32, version-aware first-entry offset,
+  v2 backward-compat).
 - **St-H6** — serialize `expiration_in_hours` (a BIN wire-format change, hence
   format-gated); *latent* today because production only writes hours-
   granularity TTL.
@@ -97,7 +96,7 @@ those are now **fixed** (see the list above).
 | T-F2 | noxu-dbi / docs / noxu-txn | `cursor_impl::lock_ln` now acquires `LockType::RangeRead` for SERIALIZABLE; new-key inserts acquire `RangeInsert` on successor; EOF sentinel protection added. `WaitRestart` path fixed to return `RangeRestart`. All phantom tests pass. | **FIXED** (fix/tf2-range-locks) |
 | R-F01 | noxu-log | `LogBufferSegment` stored raw pointers into inline `LogBuffer` fields → moving the buffer dangled them (UB) | **FIXED** (latch + pin-count moved into an `Arc<LogBufferControl>` shared with each segment; only the heap-backed `data_ptr` remains, which survives moves; move-safety regression test) |
 | R-F03 | noxu-log / noxu-dbi | `mmap_file` SAFETY claims it is only used on complete files during recovery; the disk-ordered cursor maps the **current write file** during live operation, violating `memmap2`'s no-concurrent-modification contract (UB) | **FIXED** (`mmap_file` refuses the current write file; the scanner falls back to `pread`) |
-| St-C3 | noxu-log format | The 32-byte file header is written with **no checksum**; a torn write of the header is undetectable (JE wraps it as an Adler32-protected log entry) | **OPEN** |
+| St-C3 | noxu-log format | The 32-byte file header was written with **no checksum**; a torn write of the header was undetectable | **FIXED** (LOG_VERSION 2→3: v3 header carries a CRC32; version-aware first-entry offset via `on_disk_size`; v2 files still readable; `HeaderChecksumMismatch` on corrupt v3 header) |
 
 ## High
 

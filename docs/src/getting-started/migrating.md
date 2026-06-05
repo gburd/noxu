@@ -689,3 +689,14 @@ See `docs/src/operations/known-limitations.md` for the full list.
 Setting a non-empty `peer_allowlist` now emits a `WARN`-level log at
 `ReplicatedEnvironment::new` time.  The allowlist has never been enforced
 (Phase 2 pending); the warning ensures operators are not misled.
+
+### Log format v2 → v3 (file-header checksum)
+
+`LOG_VERSION` is now **3**. v3 log files write a CRC32 over the file header
+(growing it from 32 to 36 bytes) so a torn header write is detected at open
+time. This is backward-compatible: existing **v2** files are read unchanged —
+the engine resolves each file's first-entry offset from that file's own
+version (`FileHeader::on_disk_size`), so v2 entries are still found at offset
+32 and v3 entries at offset 36. No migration step or dump/reload is required;
+new files are written as v3, old files continue to be read in place. A v3 file
+whose header fails its CRC is rejected with `LogError::HeaderChecksumMismatch`.
