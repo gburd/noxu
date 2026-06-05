@@ -877,10 +877,7 @@ struct NodeFull {
 /// (`find_node_info_recursive`, `find_node_size_recursive`,
 /// `find_node_arc_recursive`) with one, reducing the per-eviction
 /// tree-traversal count from up to three O(n) walks to one.
-fn find_node_full(
-    tree: &Tree,
-    node_id: u64,
-) -> Option<NodeFull> {
+fn find_node_full(tree: &Tree, node_id: u64) -> Option<NodeFull> {
     let root_arc = tree.get_root()?;
     find_node_full_recursive(&root_arc, node_id)
 }
@@ -939,8 +936,7 @@ fn find_node_full_recursive(
                 .collect();
             drop(guard);
             for child in children {
-                if let Some(full) =
-                    find_node_full_recursive(&child, target_id)
+                if let Some(full) = find_node_full_recursive(&child, target_id)
                 {
                     return Some(full);
                 }
@@ -1595,9 +1591,7 @@ mod tests {
         use std::mem::size_of;
         use std::sync::{Arc, RwLock};
 
-        let tree = Arc::new(RwLock::new(
-            noxu_tree::tree::Tree::new(1, 128),
-        ));
+        let tree = Arc::new(RwLock::new(noxu_tree::tree::Tree::new(1, 128)));
 
         // Insert three entries with known key and data lengths.
         // The tree always keeps an IN above the first BIN, so the root will
@@ -1683,9 +1677,7 @@ mod tests {
 
         // Force a root split so there is at least one IN node by using a
         // very small `max_entries_per_node`.
-        let tree = Arc::new(RwLock::new(
-            noxu_tree::tree::Tree::new(2, 2),
-        ));
+        let tree = Arc::new(RwLock::new(noxu_tree::tree::Tree::new(2, 2)));
         {
             let t = tree.write().unwrap();
             for i in 0u8..6 {
@@ -1795,14 +1787,10 @@ mod tests {
         let tree = Arc::new(RwLock::new(tree_inner));
         // Budget: usage > max so eviction fires immediately.
         let usage = Arc::new(AtomicI64::new(expected_size as i64 * 10));
-        let arbiter = Arbiter::new(
-            expected_size as i64,
-            Arc::clone(&usage),
-            100,
-            200,
-        );
-        let evictor = Evictor::new(arbiter, 10, false)
-            .with_tree(Arc::clone(&tree), 99);
+        let arbiter =
+            Arbiter::new(expected_size as i64, Arc::clone(&usage), 100, 200);
+        let evictor =
+            Evictor::new(arbiter, 10, false).with_tree(Arc::clone(&tree), 99);
 
         // Register the root IN in pri2 only (not primary).  If we added it
         // to primary first, the dirty-IN guard in decide_eviction would try
