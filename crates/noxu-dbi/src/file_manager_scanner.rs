@@ -432,14 +432,19 @@ impl FileManagerLogScanner {
             };
 
             // Determine where in this file to start parsing.
-            // Always start at FILE_HEADER_SIZE minimum: a start offset of 0
-            // would land inside the file header and break parsing.
+            // Always start at the file's header size minimum: a start offset
+            // of 0 would land inside the file header and break parsing.
+            // For v2 files the header is 32 bytes; v3 files 36 bytes.
+            let file_header_size = self
+                .file_manager
+                .file_header_size_for(file_num)
+                .unwrap_or(FILE_HEADER_SIZE);
             let file_start_offset: usize = if start_lsn != NULL_LSN
                 && file_num == start_lsn.file_number()
             {
-                (start_lsn.file_offset() as usize).max(FILE_HEADER_SIZE)
+                (start_lsn.file_offset() as usize).max(file_header_size)
             } else {
-                FILE_HEADER_SIZE
+                file_header_size
             };
 
             let mut offset = file_start_offset;
@@ -527,7 +532,10 @@ impl LogScanner for FileManagerLogScanner {
                 None => continue,
             };
 
-            let mut offset = FILE_HEADER_SIZE;
+            let mut offset = self
+                .file_manager
+                .file_header_size_for(file_num)
+                .unwrap_or(FILE_HEADER_SIZE);
             let mut last_valid_offset: Option<usize> = None;
             let mut last_entry_size = 0usize;
 
@@ -553,7 +561,14 @@ impl LogScanner for FileManagerLogScanner {
                     && file_nums.last().copied() != Some(file_num)
                 {
                     let next_file = file_num + 1;
-                    Lsn::new(next_file, FILE_HEADER_SIZE as u32)
+                    // Use next file's actual header size for the first-entry
+                    // offset (next_file always exists here since file_num is
+                    // not the last file in the list).
+                    let next_header_size = self
+                        .file_manager
+                        .file_header_size_for(next_file)
+                        .unwrap_or(FILE_HEADER_SIZE);
+                    Lsn::new(next_file, next_header_size as u32)
                 } else {
                     Lsn::new(file_num, end_offset as u32)
                 };

@@ -507,7 +507,12 @@ impl Cleaner {
             Err(_) => return entries,
         };
 
-        let mut offset = FILE_HEADER_SIZE as u64;
+        // Resolve the version-aware first-entry offset:
+        // v2 files start at byte 32; v3 files at byte 36.
+        let first_entry_offset =
+            fm.file_header_size_for(file_number).unwrap_or(FILE_HEADER_SIZE)
+                as u64;
+        let mut offset = first_entry_offset;
         while offset < file_len {
             let mut hdr = [0u8; MIN_HEADER_SIZE];
             let n = match fm.read_from_file(file_number, offset, &mut hdr) {
@@ -688,7 +693,12 @@ impl Cleaner {
         // Total size is the full file, including the file header.
         summary.total_size = file_len.min(i32::MAX as u64) as i32;
 
-        let mut offset = FILE_HEADER_SIZE as u64;
+        // Resolve the version-aware first-entry offset:
+        // v2 files start at byte 32; v3 files at byte 36.
+        let first_entry_offset =
+            fm.file_header_size_for(file_number).unwrap_or(FILE_HEADER_SIZE)
+                as u64;
+        let mut offset = first_entry_offset;
         while offset < file_len {
             let mut hdr = [0u8; MIN_HEADER_SIZE];
             let n = match fm.read_from_file(file_number, offset, &mut hdr) {

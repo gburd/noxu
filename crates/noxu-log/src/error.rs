@@ -61,6 +61,19 @@ pub enum NoxuLogError {
     #[error("Log corrupt: {0}")]
     LogCorrupt(String),
 
+    /// File header CRC32 checksum mismatch (torn header write).
+    ///
+    /// Returned when a v3 file header is opened and the trailing 4-byte
+    /// CRC32 over bytes `[0..32]` does not match the stored value.  A torn
+    /// header write can corrupt `file_number` or `last_entry_in_prev_file`
+    /// while leaving magic + version intact; this error makes such corruption
+    /// detectable rather than silently yielding wrong recovery metadata.
+    #[error(
+        "Header CRC32 mismatch in file {file_num:08x}: \
+         expected {expected:#010x}, found {found:#010x}"
+    )]
+    HeaderChecksumMismatch { file_num: u32, expected: u32, found: u32 },
+
     /// Latch acquisition timed out (maps to EnvironmentFailure/LatchTimeout).
     #[error("Latch acquisition timed out: {0}")]
     LatchTimeout(String),

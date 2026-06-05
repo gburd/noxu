@@ -56,9 +56,21 @@ fn last_complete_entry_end(file: &Path) -> u64 {
     let data = std::fs::read(file).unwrap();
     let len = data.len();
 
-    // Skip the 32-byte file header.
-    let mut pos: usize = 32;
-    let mut last_good: usize = 32;
+    // Skip the file header.  Determine the version-aware header size by
+    // peeking at the version field (bytes 8..12, big-endian u32):
+    // v2 → 32 bytes; v3 → 36 bytes.
+    let file_header_size: usize = if len >= 12 {
+        let ver = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        if ver >= noxu_log::file_header::LOG_VERSION {
+            noxu_log::file_header::FILE_HEADER_SIZE // 36
+        } else {
+            noxu_log::file_header::FILE_HEADER_SIZE_V2 // 32
+        }
+    } else {
+        noxu_log::file_header::FILE_HEADER_SIZE
+    };
+    let mut pos: usize = file_header_size;
+    let mut last_good: usize = file_header_size;
 
     while pos + MIN_HEADER <= len {
         // item_size is at bytes [pos+10 .. pos+14] (little-endian u32).

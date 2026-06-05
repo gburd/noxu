@@ -6,7 +6,9 @@
 
 use crate::error::{LogError, Result};
 use crate::file_handle::FileHandle;
-use crate::file_header::{FILE_HEADER_SIZE, FileHeader, LOG_VERSION};
+use crate::file_header::{
+    FILE_HEADER_SIZE, FileHeader, LOG_VERSION, on_disk_size,
+};
 use hashbrown::HashMap;
 use memmap2::Mmap;
 use noxu_latch::ExclusiveLatch;
@@ -34,7 +36,12 @@ pub enum FileMode {
     ReadWrite,
 }
 
-/// Returns the offset of the first log entry in a file (after the header).
+/// Returns the byte offset of the first log entry in a **new** log file.
+///
+/// New files are always written as the current `LOG_VERSION`, so this
+/// returns `FILE_HEADER_SIZE` (36 for v3).  When reading an **existing**
+/// file use [`FileManager::file_header_size_for`] to account for v2 files
+/// whose first entry is at offset 32.
 #[inline]
 pub fn first_log_entry_offset() -> u32 {
     FILE_HEADER_SIZE as u32
@@ -336,21 +343,49 @@ impl FileManager {
     }
 
     /// Reads and validates the file header.
+    ///
+    /// Handles both v2 (32-byte) and v3 (36-byte) files:
+    ///
+    /// - Reads up to `FILE_HEADER_SIZE` (36) bytes, capped at the actual file
+    ///   length. For a v2 file the 32-byte header is followed by entry bytes
+    ///   that are irrelevant; `FileHeader::read_from` stops consuming after
+    ///   32 bytes when it sees `log_version == 2`.
+    /// - A v2 header-only file (exactly 32 bytes) is read cleanly without
+    ///   over-reading.
     fn read_and_validate_header(
         &self,
         file: &File,
         file_num: u32,
     ) -> Result<u32> {
-        // Read the header bytes (cross-platform positioned read).
-        let mut header_buf = vec![0u8; FILE_HEADER_SIZE];
+        // Clamp to actual file length so we never over-read a legacy v2
+        // header-only file (exactly 32 bytes).
+        let file_len = file.metadata()?.len() as usize;
+        let read_size = FILE_HEADER_SIZE.min(file_len);
+        let mut header_buf = vec![0u8; read_size];
         crate::posio::read_exact_at(file, &mut header_buf, 0)?;
 
-        // Parse header
+        // Parse header — read_from branches on version.
         let mut cursor = std::io::Cursor::new(header_buf);
         let header = FileHeader::read_from(&mut cursor)?;
 
         // Validate
         header.validate(file_num)
+    }
+
+    /// Returns the on-disk header size (= first-entry byte offset) for a
+    /// given log file.
+    ///
+    /// Opens (or cache-hits) the file to read its `log_version`, then
+    /// returns `FileHeader::on_disk_size(version)`:
+    ///
+    /// - v2 file → 32 bytes → first entry at offset 32
+    /// - v3 file → 36 bytes → first entry at offset 36
+    ///
+    /// Use this whenever computing the "first entry offset" for an
+    /// **existing** file instead of the bare `FILE_HEADER_SIZE` constant.
+    pub fn file_header_size_for(&self, file_num: u32) -> Result<usize> {
+        let handle = self.get_file_handle(file_num)?;
+        Ok(on_disk_size(handle.log_version()))
     }
 
     /// Creates a new log file with the given file number.

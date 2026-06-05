@@ -15,7 +15,8 @@
 use noxu_dbi::EnvironmentImpl;
 use noxu_log::MAX_ITEM_SIZE;
 use noxu_log::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
-use noxu_log::file_header::FILE_HEADER_SIZE;
+use noxu_log::file_header::LOG_VERSION as LOG_FILE_VERSION;
+use noxu_log::file_header::on_disk_size as file_header_on_disk_size;
 use noxu_log::file_manager::FileManager;
 use noxu_sync::Mutex;
 use noxu_util::lsn::{Lsn, NULL_LSN};
@@ -72,7 +73,9 @@ impl EnvironmentLogScanner {
     /// Create a scanner that starts at `start_lsn`.
     ///
     /// If `start_lsn` is `NULL_LSN` the scanner begins at the very first log
-    /// entry (file 0, offset = FILE_HEADER_SIZE).
+    /// entry in file 0.  The correct first-entry offset is resolved from
+    /// file 0's `log_version` (32 for v2, 36 for v3).  If file 0 does not
+    /// exist yet (empty log) the current-version default (36) is used.
     ///
     /// Obtain the `FileManager` from `EnvironmentImpl::get_log_manager()` →
     /// `LogManager` is not directly accessible, but `EnvironmentImpl` exposes
@@ -97,8 +100,14 @@ impl EnvironmentLogScanner {
                 (lsn.file_number(), lsn.file_offset() as u64)
             }
             _ => {
-                // Start from file 0, first entry offset.
-                (0, FILE_HEADER_SIZE as u64)
+                // Start from file 0, first entry offset.  Use the actual
+                // header size of file 0 if it exists (v2 → 32, v3 → 36);
+                // fall back to current-version default (36) if it does not.
+                let file0_offset =
+                    fm.file_header_size_for(0).unwrap_or_else(|_| {
+                        file_header_on_disk_size(LOG_FILE_VERSION)
+                    }) as u64;
+                (0, file0_offset)
             }
         };
 
@@ -211,7 +220,12 @@ impl LogScanner for EnvironmentLogScanner {
                 match next {
                     Some(n) => {
                         self.cursor_file = n;
-                        self.cursor_offset = FILE_HEADER_SIZE as u64;
+                        self.cursor_offset =
+                            self.file_manager
+                                .file_header_size_for(n)
+                                .unwrap_or_else(|_| {
+                                    file_header_on_disk_size(LOG_FILE_VERSION)
+                                }) as u64;
                     }
                     None => return None, // No more files.
                 }
@@ -227,7 +241,12 @@ impl LogScanner for EnvironmentLogScanner {
                 match next {
                     Some(n) => {
                         self.cursor_file = n;
-                        self.cursor_offset = FILE_HEADER_SIZE as u64;
+                        self.cursor_offset =
+                            self.file_manager
+                                .file_header_size_for(n)
+                                .unwrap_or_else(|_| {
+                                    file_header_on_disk_size(LOG_FILE_VERSION)
+                                }) as u64;
                         continue;
                     }
                     None => return None, // End of log.
@@ -244,7 +263,13 @@ impl LogScanner for EnvironmentLogScanner {
                     match next {
                         Some(n) => {
                             self.cursor_file = n;
-                            self.cursor_offset = FILE_HEADER_SIZE as u64;
+                            self.cursor_offset = self
+                                .file_manager
+                                .file_header_size_for(n)
+                                .unwrap_or_else(|_| {
+                                    file_header_on_disk_size(LOG_FILE_VERSION)
+                                })
+                                as u64;
                             continue;
                         }
                         None => return None,

@@ -32,7 +32,6 @@ use crate::checksum::ChecksumValidator;
 use crate::entry_header::{CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::entry_type::LogEntryType;
 use crate::error::{NoxuLogError, Result};
-use crate::file_header::FILE_HEADER_SIZE;
 use crate::file_manager::FileManager;
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
@@ -49,8 +48,9 @@ pub struct LogFileReader {
     /// Which log file (0-based) we are reading.
     file_num: u32,
 
-    /// Current byte offset within the file.  Starts at `FILE_HEADER_SIZE`
-    /// (i.e. just after the file header), exactly as does.
+    /// Current byte offset within the file.  Starts immediately after the
+    /// file header (32 bytes for v2 files, 36 bytes for v3 files), exactly
+    /// as the original implementation does for the current version.
     current_offset: u64,
 
     /// Length of the file as determined at open time.
@@ -63,19 +63,23 @@ pub struct LogFileReader {
 impl LogFileReader {
     /// Opens the log file `file_num` for sequential reading.
     ///
-    /// The reader starts immediately after the file header
-    /// (`FILE_HEADER_SIZE` bytes in), matching positioning.
+    /// The reader starts immediately after the file header.  For v2 log
+    /// files that is byte 32; for v3 files byte 36.  The correct offset is
+    /// resolved by querying the `FileManager` for the file's `log_version`.
     ///
     /// # Errors
     /// Returns an error if the file does not exist or cannot be read.
     pub fn open(file_manager: Arc<FileManager>, file_num: u32) -> Result<Self> {
         let file_length = file_manager.get_file_length(file_num)?;
+        // Query the file's actual header size so v2 and v3 files both start
+        // scanning at the correct first-entry offset.
+        let first_entry_offset =
+            file_manager.file_header_size_for(file_num)? as u64;
 
         Ok(LogFileReader {
             file_manager,
             file_num,
-            // Skip the file header; first log entry follows immediately.
-            current_offset: FILE_HEADER_SIZE as u64,
+            current_offset: first_entry_offset,
             file_length,
             entries_read: 0,
         })
