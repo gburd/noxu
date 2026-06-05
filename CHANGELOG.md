@@ -34,6 +34,22 @@ listed in [References](#references).
   big-endian) and cross-references `docs/src/reference/on-disk-format.md`,
   whose "Endianness" table already specifies each layer.
 
+### Performance
+
+- **St-H2 — Evictor O(tree) node-size search eliminated** (`noxu-evictor`):
+  `do_evict` previously performed two independent root-down O(tree) searches
+  per eviction candidate — one for `NodeEvictionInfo` and a second for the
+  in-memory byte size — making eviction O(n·batch) for a tree with n nodes.
+  The new `find_node_full` helper does a **single** root-down walk that
+  extracts eviction metadata, the in-memory byte count, and the node `Arc`
+  together.  `do_evict` now caches the size in a `RefCell<HashMap>` during
+  the info walk and drains it O(1) when `node_size_fn` is called, eliminating
+  the second tree walk entirely.  The three prior separate recursive helpers
+  (`find_node_info_recursive`, `find_node_size_recursive`,
+  `find_node_arc_recursive`) have been removed.
+  Size formula, eviction policy, and memory-budget accounting are unchanged.
+  See `docs/src/internal/production-readiness-review-2026-06.md` for details.
+
 ### Fixed (data-loss correctness — St-H6, two sites)
 
 - **St-H6 Site 1 — Silent data-loss on BIN split when records have TTL** (`noxu-tree`):
