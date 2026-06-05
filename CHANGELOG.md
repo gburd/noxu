@@ -16,6 +16,35 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (C-C2b — WAL-scanner auto-feed)
+
+- **`LogManager::log_with_vlsn`** (`noxu-log`): new write path that produces
+  a 22-byte WAL header with `REPLICATED_MASK | VLSN_PRESENT_MASK` flags and
+  the 8-byte VLSN value at offset 14. The existing `log()` path is
+  byte-unchanged (14-byte header, no VLSN field).
+- **`EnvironmentImpl::set_replication_vlsn_counter`** (`noxu-dbi`): installs
+  a shared `Arc<AtomicU64>` VLSN counter. When set, `log_txn_commit`
+  increments the counter and calls `log_with_vlsn`, writing VLSN-tagged WAL
+  entries. Standalone envs are unaffected.
+- **`ReplicatedEnvironment::with_environment` now wires the VLSN counter**
+  (`noxu-rep`): calling `with_environment(env_impl)` installs the shared
+  VLSN counter on the env so every subsequent `log_txn_commit` on the master
+  is auto-tagged.
+- **`spawn_feeder_runner` WAL-scanner path** (`noxu-rep`): when an
+  `EnvironmentImpl` is wired, the `FeederRunner` background thread uses
+  `EnvironmentLogScanner` as its source instead of the in-memory
+  `PeerLogScanner` queue. Real commits are auto-fed to replicas without any
+  `replicate_entry` call.
+- **New convergence test** `test_wal_scanner_autofeed_convergence`: performs
+  real `EnvironmentImpl::log_txn_commit` calls and asserts that
+  all committed entries are received by the replica via WAL-scanner auto-feed.
+  This test **fails on `origin/main`** (scanner finds no VLSN-tagged entries)
+  and **passes with this change**. Closes the C-C2b qualification gap.
+- **Format regression test** `test_standalone_env_writes_no_vlsn_header`:
+  proves standalone envs still write 14-byte headers with no VLSN bits set.
+- **Header format test** `test_log_with_vlsn_header_format`:
+  asserts the 22-byte header layout, flags, and VLSN value on disk.
+
 ### Fixed (test robustness + stats accuracy)
 
 - **`LockManager::get_stats()` now reports real `n_waiters` / `n_owners`** by

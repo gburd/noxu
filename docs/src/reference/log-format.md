@@ -88,3 +88,17 @@ Base header: **14 bytes**. With VLSN: **22 bytes**.
 The `Vlsn` (in `noxu-util`) is a monotonically increasing `i64` assigned to
 each replicated log entry. It survives log cleaning because it is independent
 of physical LSN layout. The `VlsnIndex` in `noxu-rep` maps `Vlsn → Lsn`.
+
+### How VLSN tagging works (C-C2b)
+
+When `ReplicatedEnvironment::with_environment(env_impl)` is called, it installs
+a shared `AtomicU64` VLSN counter on the `EnvironmentImpl`. Every subsequent
+call to `EnvironmentImpl::log_txn_commit` increments the counter atomically
+and calls `LogManager::log_with_vlsn`, writing the 22-byte header form with
+`REPLICATED_MASK | VLSN_PRESENT_MASK` flags. Standalone (non-replicated)
+environments never call `log_with_vlsn`; their commit entries always use the
+14-byte header with no VLSN field — the on-disk format is byte-unchanged.
+
+The master's `EnvironmentLogScanner` then scans WAL files, recognises the
+`VLSN_PRESENT` flag, and auto-feeds the entries to each registered replica
+without any `replicate_entry` call from the application.

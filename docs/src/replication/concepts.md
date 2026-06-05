@@ -1,6 +1,6 @@
-# Noxu Replication — Design and Implementation
+# Noxu Replication - Design and Implementation
 
-> **v2.0 status — GA.** All ten noxu-rep GA blockers identified in
+> **v2.0 status - GA.** All ten noxu-rep GA blockers identified in
 > the May 2026 audit are closed (Waves 3-3 and 4-A).  The design
 > below now matches the production binary.
 
@@ -20,7 +20,7 @@ continuous phi accrual failure detector.
 
 ---
 
-## 1. Leader Election — Flexible Paxos (FPaxos)
+## 1. Leader Election - Flexible Paxos (FPaxos)
 
 ### What it does
 
@@ -51,7 +51,7 @@ differ as long as the intersection property holds.
 ### Why FPaxos
 
 FPaxos Theorem 1 states: for safety, it suffices that every Phase 1 quorum Q1
-intersects every Phase 2 quorum Q2 — i.e., for all Q1 in QS1, Q2 in QS2:
+intersects every Phase 2 quorum Q2 - i.e., for all Q1 in QS1, Q2 in QS2:
 Q1 intersection Q2 is non-empty. The classic constraint (both quorums = majority) is a
 special case.
 
@@ -70,7 +70,7 @@ This decoupling is valuable in practice:
   FPaxos-style decoupling without breaking the Raft invariants. Rejected for this
   reason.
 - **Multi-Paxos / distinguished-proposer optimization:** Would amortize Phase 1 across
-  multiple values. Deferred — out of scope for current cluster sizes (3-9 nodes) where
+  multiple values. Deferred - out of scope for current cluster sizes (3-9 nodes) where
   elections are infrequent.
 - **ZAB (Zookeeper Atomic Broadcast):** Production-proven total-order broadcast but
   tightly coupled to the ZooKeeper JVM ecosystem. Rejected due to JVM dependency and
@@ -86,7 +86,7 @@ This decoupling is valuable in practice:
 
 ---
 
-## 2. Failure Detection — Phi Accrual Detector
+## 2. Failure Detection - Phi Accrual Detector
 
 ### What it does
 
@@ -113,7 +113,7 @@ Implementation details:
 
 **Production defaults** (from the paper):
 
-- `threshold = 8.0` — mistake rate approximately 10^-8 per heartbeat interval
+- `threshold = 8.0` - mistake rate approximately 10^-8 per heartbeat interval
 - `window_size = 200` for LAN; `1000` for WAN
 
 ### Integration with MasterTracker
@@ -160,32 +160,32 @@ orders of magnitude.
 
 ---
 
-## 3. Quorum System — quoracle
+## 3. Quorum System - quoracle
 
 ### What it does
 
 The `QuorumPolicy` enum (`crates/noxu-rep/src/quorum_policy.rs`) provides three
 strategies for determining election quorums:
 
-1. **`SimpleMajority`** — Classic `(n/2)+1` for both phases. Default; matches Noxu's
+1. **`SimpleMajority`** - Classic `(n/2)+1` for both phases. Default; matches Noxu's
    `RepGroup.quorumSize()`.
 
-2. **`Flexible { phase1, phase2 }`** — Operator-chosen sizes with a built-in safety
+2. **`Flexible { phase1, phase2 }`** - Operator-chosen sizes with a built-in safety
    check: `validate()` enforces `phase1 + phase2 > n` (the FPaxos intersection
    invariant). Example: 5 nodes, phase1=4, phase2=2 gives fast commits with safe
    elections.
 
-3. **`Expression(QuorumSystem<String>)`** — A full quoracle `QuorumSystem` built from
+3. **`Expression(QuorumSystem<String>)`** - A full quoracle `QuorumSystem` built from
    AND/OR/Choose expressions. The intersection property is validated by quoracle at
    construction time. Supports arbitrary quorum structures including grid quorums,
    weighted voting, and hierarchical schemes.
 
 **Construction helpers:**
 
-- `build_expression(node_names, phase1_k, phase2_k)` — builds Phase 1 as
+- `build_expression(node_names, phase1_k, phase2_k)` - builds Phase 1 as
   `choose(phase1_k, nodes)` and Phase 2 as `choose(phase2_k, nodes)`, validated by
   `QuorumSystem::new()`.
-- `build_majority_expression(node_names)` — builds both phases as `majority(nodes)`;
+- `build_majority_expression(node_names)` - builds both phases as `majority(nodes)`;
   useful for testing quoracle integration without changing election behavior.
 
 **quoracle library** (`_/rs-quoracle`): A Rust port providing `QuorumSystem::new(reads,
@@ -218,16 +218,16 @@ load-optimal selection.
 `ReplicatedEnvironment` (`crates/noxu-rep/src/replicated_environment.rs`) exposes
 runtime membership management:
 
-- **`add_peer(node: RepNode)`** — Registers the node in the `GroupService` with its
+- **`add_peer(node: RepNode)`** - Registers the node in the `GroupService` with its
   name, type, host, port, node_id, and initial metadata (joined_at, last_seen,
   is_active=true, known_vlsn=0). Elections and quorum calculations immediately reflect
   the new membership.
 
-- **`remove_peer(name: &str)`** — Deregisters the node from the `GroupService`.
+- **`remove_peer(name: &str)`** - Deregisters the node from the `GroupService`.
   Elections initiated after this call will not include the removed node in quorum
   calculations.
 
-- **`get_rep_group()`** — Returns a snapshot `RepGroup` reflecting current membership
+- **`get_rep_group()`** - Returns a snapshot `RepGroup` reflecting current membership
   at the time of the call.
 
 ### Constraints
@@ -260,10 +260,10 @@ reads exactly that many payload bytes.
 
 **Timeouts:**
 
-- `TcpStream::connect_timeout(30s)` — prevents indefinite blocking from OS SYN backoff
+- `TcpStream::connect_timeout(30s)` - prevents indefinite blocking from OS SYN backoff
   (Linux default can reach ~127s under packet loss).
-- `set_write_timeout(Some(30s))` — caps send stalls under congestion.
-- `set_read_timeout(caller_timeout)` — applied before reading the length prefix;
+- `set_write_timeout(Some(30s))` - caps send stalls under congestion.
+- `set_read_timeout(caller_timeout)` - applied before reading the length prefix;
   WouldBlock/TimedOut returns `Ok(None)`.
 
 **Bugs found and fixed in 6-hour soak testing:**
@@ -280,7 +280,7 @@ trait over a single QUIC bidirectional stream using Quinn 0.11.
 
 **TLS:** QUIC mandates TLS 1.3. For intra-cluster replication, a self-signed
 certificate is generated at runtime via `rcgen`. The client uses a custom
-`SkipCertVerification` verifier — appropriate because replication peers are
+`SkipCertVerification` verifier - appropriate because replication peers are
 authenticated at the Paxos layer and operate on a private network.
 
 **Wire framing:** Identical to TCP: `[u32 LE length][payload]`.
@@ -307,7 +307,7 @@ four independent bidirectional streams:
 | Restore | 3 | Network restore file transfer |
 
 **Why separate streams matter:** QUIC enforces per-stream flow control. On TCP, a large
-log-shipping burst fills the socket send buffer and delays the next heartbeat — the
+log-shipping burst fills the socket send buffer and delays the next heartbeat - the
 classic head-of-line (HOL) blocking problem. With separate QUIC streams, log
 back-pressure on stream 1 has no effect on stream 0 heartbeats, so the
 `PhiAccrualDetector` sees a tighter inter-arrival distribution and is less prone to
@@ -358,20 +358,25 @@ unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 
 **Log shipping architecture:**
 
-- **Active push path (v3.2.0+)**: Call `register_feeder_channel(replica_name,
-  channel)` before `become_master`. A `FeederRunner` background thread is
-  spawned per channel. The thread reads from a dedicated in-memory queue
-  (fed by `replicate_entry` / `apply_entry` fan-out) and streams framed log
-  entries to the replica over the channel. Acks flow back and are tracked per
-  runner.
-- **Pull path (default)**: Replicas connect to the master’s `PEER_FEEDER`
+- **Active push path + WAL-scanner auto-feed (v3.2.0+, completed v3.3.0)**:
+  Call `register_feeder_channel(replica_name, channel)` and
+  `with_environment(env_impl)` before `become_master`. A `FeederRunner`
+  background thread is spawned per channel. When `with_environment` has
+  been called the thread uses an `EnvironmentLogScanner` that reads
+  VLSN-tagged WAL entries written by `log_txn_commit` directly—no
+  `replicate_entry` call needed. Without a wired `EnvironmentImpl` the
+  thread falls back to reading from the in-memory queue populated by
+  `replicate_entry` / `apply_entry`.
+- **Pull path (default)**: Replicas connect to the master's `PEER_FEEDER`
   service (registered on the `TcpServiceDispatcher`) and pull entries from
   the shared `PeerLogScanner` queue (populated by `replicate_entry`).
-- **EnvironmentLogScanner** (deferred): Will scan master log files directly
-  once `LogManager` supports VLSN-tagged entries. See
-  `docs/src/internal/deferred-blocker-designs-2026-06.md` § C-C2b.
+- **EnvironmentLogScanner** (active, v3.3.0): Scans master WAL files
+  directly for VLSN-tagged entries (`REPLICATED_MASK | VLSN_PRESENT_MASK`).
+  Entries are produced by `LogManager::log_with_vlsn` called from
+  `EnvironmentImpl::log_txn_commit` when a VLSN counter is installed via
+  `ReplicatedEnvironment::with_environment`. C-C2b qualification closed.
 - **EnvironmentLogWriter** (replica side): Receives log entries from the
-  `ReplicaStream` and writes them into the replica’s local log, advancing the
+  `ReplicaStream` and writes them into the replica's local log, advancing the
   local VLSN as entries are durably written.
 - **NetworkRestore:** Full file-set transfer for new replicas or replicas that
   have fallen too far behind CBVLSN. Uses a dedicated TCP service

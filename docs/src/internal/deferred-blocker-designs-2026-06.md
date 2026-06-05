@@ -207,18 +207,38 @@ stream log entries to replicas. (The pull-based `PEER_FEEDER` service existed;
 the push/active-feed path did not.) Replication HA, ack policies, and VLSN
 streaming all depend on this.
 
-### Remaining design (C-C2b)
+### Remaining design (C-C2b) — **IMPLEMENTED** (branch `fix/cc2b-wal-vlsn-autofeed`)
 
-1. Add `Provisional::Replicated(vlsn: u64)` variant to `noxu-log`; thread
-   the VLSN through `LogManager::log_internal` to write the 8-byte VLSN
-   extension when replicated.
-2. Wire the `ReplicatedEnvironment` (or `noxu_db` layer) to call
-   `log_with_vlsn` at commit time, assigning the next VLSN from a shared
-   monotone counter.
-3. Then `EnvironmentLogScanner::next_entry` will find entries and the
-   background scanner thread can auto-populate the feeder queues.
-4. Optionally add a `FeederReceiverService` on the replica side for
-   fully master-initiated (push-only) topology if the pull path is deprecated.
+**Status: CLOSED.**  All four steps landed:
+
+1. `LogManager::log_with_vlsn(entry_type, payload, vlsn, flush, fsync)` added
+   to `noxu-log`.  `log_internal` accepts `opt_vlsn: Option<u64>`; when
+   `Some(vlsn)` it writes the 22-byte header with `REPLICATED_MASK |
+   VLSN_PRESENT_MASK` flags and the 8-byte VLSN at offset 14.  The standalone
+   `log()` path is byte-unchanged (14-byte header, no flag bits set).
+2. `EnvironmentImpl::set_replication_vlsn_counter` (`noxu-dbi`) installs a
+   shared `Arc<AtomicU64>`.  `log_txn_commit` increments it atomically and
+   calls `log_with_vlsn` when set; standalone envs take the unchanged
+   `log()` branch.
+3. `ReplicatedEnvironment::with_environment` (`noxu-rep`) calls
+   `env.set_replication_vlsn_counter(wal_vlsn_counter)` so every subsequent
+   `log_txn_commit` is auto-tagged.  `spawn_feeder_runner` now uses
+   `EnvironmentLogScanner` as the feeder source when env is wired;
+   `EnvironmentLogScanner::next_entry` finds VLSN-tagged entries and
+   returns them to the `FeederRunner::run` loop automatically.
+4. `FeederReceiverService` on the replica side remains out of scope; the
+   existing pull path (`PeerFeederService` / `catch_up_from_peer`) handles
+   replica-initiated connections.
+
+**Convergence test**: `test_wal_scanner_autofeed_convergence` in
+`crates/noxu-rep/tests/cc2b_wal_vlsn_autofeed_test.rs` — performs real
+`EnvironmentImpl::log_txn_commit` calls and asserts all committed entries
+are received by the replica via WAL-scanner auto-feed.  The test **fails on
+`origin/main`** (scanner returns None; 0 entries received) and **passes with
+this branch** (≥ N_COMMITS entries received, VLSNs strictly increasing).
+
+**Standalone regression test**: `test_standalone_env_writes_no_vlsn_header`
+proves non-replicated envs still write 14-byte headers with no VLSN bits set.
 
 ## Reaffirmed latent deferrals
 

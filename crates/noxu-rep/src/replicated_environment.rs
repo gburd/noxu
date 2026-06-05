@@ -57,8 +57,8 @@ use crate::node_state::{NodeState, NodeStateMachine};
 use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
 use crate::state_change_listener::{StateChangeEvent, StateChangeListener};
-use crate::stream::feeder::Feeder;
 use crate::stream::feeder::EnvironmentLogScanner;
+use crate::stream::feeder::Feeder;
 use crate::stream::feeder::FeederRunner;
 use crate::stream::peer_feeder::PeerScannerAdapter;
 use crate::stream::peer_feeder::{
@@ -1546,24 +1546,24 @@ impl ReplicatedEnvironment {
     ///
     /// **Active push-feeder** (C-C2): if feeder channels have been registered
     /// via [`Self::register_feeder_channel`] before this call, a
-    /// [`FeederRunner`] background thread is spawned per channel. Each thread
-    /// reads entries from a dedicated in-memory queue (populated by
-    /// [`Self::replicate_entry`] / [`Self::apply_entry`] fan-out) and pushes
-    /// framed log entries to the replica. Acks flow back from the replica and
-    /// are tracked per-runner; use
-    /// [`Self::active_feeder_runner_acked_vlsn`] to inspect progress.
+    /// [`FeederRunner`] background thread is spawned per channel.
+    ///
+    /// **WAL-scanner auto-feed path (C-C2b, v3.3.0)**: when
+    /// [`Self::with_environment`] has been called before `become_master`,
+    /// each `FeederRunner` thread uses an [`EnvironmentLogScanner`] as its
+    /// source.  Every `log_txn_commit` on the master writes a VLSN-tagged
+    /// 22-byte WAL entry (via `LogManager::log_with_vlsn`); the scanner
+    /// discovers these entries and streams them to replicas automatically,
+    /// without any [`Self::replicate_entry`] call from the application.
+    ///
+    /// **Fallback path**: when no `EnvironmentImpl` is wired, the runner
+    /// reads from the in-memory queue populated by [`Self::replicate_entry`] /
+    /// [`Self::apply_entry`].
     ///
     /// If no feeder channels are registered, this call registers per-replica
-    /// `Feeder` tracker structs for `AckTracker` bookkeeping only (same
-    /// behaviour as before C-C2). In that case replicas must connect
-    /// proactively to the `PEER_FEEDER` pull service to receive entries.
-    ///
-    /// **WAL-scanner path**: the `EnvironmentLogScanner`-backed automatic
-    /// log-file scanning path (where entries are auto-discovered from the
-    /// WAL regardless of `replicate_entry` calls) is deferred; it requires
-    /// `LogManager` to write VLSN-tagged entries, which is not yet
-    /// implemented. See `docs/src/internal/deferred-blocker-designs-2026-06.md`
-    /// § C-C2 for the design.
+    /// `Feeder` tracker structs for `AckTracker` bookkeeping only.  In that
+    /// case replicas must connect proactively to the `PEER_FEEDER` pull
+    /// service to receive entries.
     pub fn become_master(&self, term: u64) -> Result<()> {
         if self.is_shutdown() {
             return Err(RepError::StateError(

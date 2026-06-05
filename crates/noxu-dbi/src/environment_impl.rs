@@ -297,8 +297,7 @@ pub struct EnvironmentImpl {
     /// that `EnvironmentLogScanner` can discover and stream committed entries
     /// automatically.  `None` for standalone (non-replicated) environments —
     /// those always write the 14-byte header and are byte-unchanged.
-    replication_vlsn_counter:
-        Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
+    replication_vlsn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl EnvironmentImpl {
@@ -1730,30 +1729,18 @@ impl EnvironmentImpl {
             );
             let mut buf = BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);
-            lm.log_with_vlsn(
-                LogEntryType::TxnCommit,
-                &buf,
-                vlsn,
-                flush,
-                fsync,
-            )
-            .map(|_| ())
-            .map_err(DbiError::from)
+            lm.log_with_vlsn(LogEntryType::TxnCommit, &buf, vlsn, flush, fsync)
+                .map(|_| ())
+                .map_err(DbiError::from)
         } else {
             let entry = TxnEndEntry::new_commit(
                 txn_id, NULL_LSN, timestamp, 0, NULL_VLSN,
             );
             let mut buf = BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);
-            lm.log(
-                LogEntryType::TxnCommit,
-                &buf,
-                Provisional::No,
-                flush,
-                fsync,
-            )
-            .map(|_| ())
-            .map_err(DbiError::from)
+            lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, flush, fsync)
+                .map(|_| ())
+                .map_err(DbiError::from)
         }
     }
 

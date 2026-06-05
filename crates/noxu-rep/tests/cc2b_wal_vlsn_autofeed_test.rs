@@ -58,7 +58,11 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn master_cfg(group: &str, name: &str, env_home: &std::path::Path) -> RepConfig {
+fn master_cfg(
+    group: &str,
+    name: &str,
+    env_home: &std::path::Path,
+) -> RepConfig {
     RepConfig::builder(group, name, "127.0.0.1")
         .node_port(0)
         .env_home(env_home.to_path_buf())
@@ -116,13 +120,15 @@ fn test_wal_scanner_autofeed_convergence() {
     let rep_env = Arc::new(
         ReplicatedEnvironment::new(cfg).expect("ReplicatedEnvironment::new"),
     );
-    rep_env.add_peer(RepNode::new(
-        "replica".to_string(),
-        NodeType::Electable,
-        "127.0.0.1".to_string(),
-        0,
-        2,
-    )).unwrap();
+    rep_env
+        .add_peer(RepNode::new(
+            "replica".to_string(),
+            NodeType::Electable,
+            "127.0.0.1".to_string(),
+            0,
+            2,
+        ))
+        .unwrap();
 
     // ── 3. Wire the env — installs VLSN counter on env_impl ──────────────
     rep_env.with_environment(Arc::clone(&env_impl));
@@ -260,8 +266,14 @@ fn test_standalone_env_writes_no_vlsn_header() {
         noxu_util::Lsn::new(0, file_hdr_size as u32),
     )
     .expect("read_from_log");
-    assert!(!hdr.vlsn_present(), "standalone header must not have vlsn_present");
-    assert!(!hdr.replicated(), "standalone header must not have replicated flag");
+    assert!(
+        !hdr.vlsn_present(),
+        "standalone header must not have vlsn_present"
+    );
+    assert!(
+        !hdr.replicated(),
+        "standalone header must not have replicated flag"
+    );
     assert_eq!(
         hdr.size(),
         MIN_HEADER_SIZE,
@@ -280,11 +292,9 @@ fn test_standalone_env_writes_no_vlsn_header() {
 /// flags and the correct VLSN value at offset 14.
 #[test]
 fn test_log_with_vlsn_header_format() {
-    use noxu_log::entry_header::{
-        LogEntryHeader, MAX_HEADER_SIZE,
-    };
-    use noxu_log::file_manager::FileManager;
     use noxu_log::LogEntryType;
+    use noxu_log::entry_header::{LogEntryHeader, MAX_HEADER_SIZE};
+    use noxu_log::file_manager::FileManager;
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let env =
@@ -306,7 +316,8 @@ fn test_log_with_vlsn_header_format() {
     // Read back raw bytes.
     let fm = FileManager::new(tmp.path(), true, 64 * 1024 * 1024, 8)
         .expect("FileManager");
-    let file_hdr_size = fm.file_header_size_for(0).expect("file_header_size_for");
+    let file_hdr_size =
+        fm.file_header_size_for(0).expect("file_header_size_for");
 
     let mut buf = vec![0u8; MAX_HEADER_SIZE + 16];
     let n = fm
@@ -351,8 +362,5 @@ fn test_log_with_vlsn_header_format() {
     assert!(hdr.vlsn_present());
     assert!(hdr.replicated());
     assert_eq!(hdr.size(), MAX_HEADER_SIZE);
-    assert_eq!(
-        hdr.vlsn(),
-        Some(noxu_util::vlsn::Vlsn::new(test_vlsn as i64))
-    );
+    assert_eq!(hdr.vlsn(), Some(noxu_util::vlsn::Vlsn::new(test_vlsn as i64)));
 }
