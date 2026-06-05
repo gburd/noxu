@@ -569,7 +569,7 @@ impl Evictor {
     /// O(tree) searches ran per eviction candidate — one for
     /// `NodeEvictionInfo` and a second for the in-memory byte size.  This
     /// method now performs **one** unified root-down search via
-    /// [`find_node_full`] that extracts both values in a single tree walk.
+    /// `find_node_full` that extracts both values in a single tree walk.
     /// The size is stashed in a thread-local `RefCell<HashMap>` by
     /// `node_info_fn` and retrieved in O(1) by `node_size_fn`, so no second
     /// tree walk is needed.  The `RefCell` borrow never overlaps because
@@ -948,7 +948,7 @@ fn find_node_full_recursive(
 
 /// Locate a node's `Arc` for write-lock operations (flush / LN strip).
 ///
-/// Delegates to [`find_node_full`] and discards the info/size fields;
+/// Delegates to `find_node_full` and discards the info/size fields;
 /// the marginal cost is only the size arithmetic on the found node
 /// (no extra tree traversal).
 fn find_node_arc(
