@@ -1529,16 +1529,28 @@ impl RecoveryManager {
         //
         // AfterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
         //           DbLsn.compareTo(reader.getLastLsn(), checkpointStartLsn) >= 0)
-        let after_ckpt_start = ckpt_start == NULL_LSN || lsn >= ckpt_start;
+        let _after_ckpt_start = ckpt_start == NULL_LSN || lsn >= ckpt_start;
 
         match rec.txn_id {
             None => {
-                // Non-transactional LN.  Redo if after checkpoint start.
-                if after_ckpt_start {
-                    RedoAction::Apply
-                } else {
-                    RedoAction::Skip
-                }
+                // Non-transactional LN.
+                //
+                // In standard JE, pre-checkpoint non-transactional LNs are
+                // skipped because the checkpoint's BIN records capture their
+                // committed state.  In Noxu, the checkpointer only flushes
+                // the internal `primary_tree` and does NOT flush the BINs of
+                // any open user databases.  Pre-checkpoint non-transactional
+                // LNs are therefore NOT represented in the checkpoint's BIN
+                // records.  Skipping them causes those records to vanish
+                // after a close+reopen whenever the background checkpointer
+                // thread runs between writes.
+                //
+                // St-H6 (recovery manifestation): always replay
+                // non-transactional LNs from the full scan range, same as
+                // committed transactional LNs.  `redo_ln` / `redo_insert` is
+                // idempotent (LSN comparison skips stale overwrites), so
+                // replaying redundantly is always correct.
+                RedoAction::Apply
             }
             Some(txn_id) => {
                 if analysis.is_committed(txn_id) {

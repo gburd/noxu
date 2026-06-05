@@ -249,27 +249,31 @@ proves non-replicated envs still write 14-byte headers with no VLSN bits set.
   fields into an `Arc<SegmentControl>` the segment clones — a focused
   log-buffer change, not bundled with unrelated work.
 - **St-H6** (`expiration_in_hours` not serialized AND BIN split flag
-  inheritance bug): **CLOSED — live bug, fixed in this branch**.
-  The original classification was incomplete.  Two distinct defects were
-  present:
-  1. **Live data-loss bug** (NEW finding): `Tree::split_child` hardcoded
-     `expiration_in_hours: false` on the right-half sibling BIN.  Because
-     `update_key_expiration` only touches the BIN that receives the trigger
-     key, and the trigger key routes to the left half when it sorts below the
-     split midpoint, the right sibling permanently retained the wrong flag.
-     Any hours-granularity `expiration_time` value (~495 000 in 2026) was then
-     compared against `current_time_secs()` (~1.78 billion) by `is_expired`,
-     returning `true` — silent data loss on every get of a right-sibling key.
+  inheritance bug): **CLOSED — two live bugs, both fixed in this branch**.
+  Three distinct defects were present:
+  1. **Site 1 — Split-path data-loss** (NEW finding): `Tree::split_child`
+     hardcoded `expiration_in_hours: false` on the right-half sibling BIN.
+     Any hours-granularity `expiration_time` value (~495 000 in 2026) was
+     then compared against `current_time_secs()` (~1.78 billion), returning
+     `true` — silent data loss on every get of a right-sibling key.
      Regression test: `test_ttl_records_survive_bin_split_right_sibling_256`
      (FAIL-PRE: 128/256 keys missing; PASS-POST: 0 missing).
-  2. **Latent deserialization concern** (original finding — confirmed
+  2. **Site 2 — Recovery-path data-loss** (NEW finding): `eligible_for_redo`
+     applied an `after_ckpt_start` guard to non-transactional LNs.  The
+     background checkpointer thread writes CkptStart between inserts;
+     `with_auto_txn` writes `locker_id = 0` (non-transactional) LNs;
+     pre-checkpoint LNs were skipped.  Variable 33–194/256 records missing
+     after close+reopen.
+     Regression test: `test_ttl_records_survive_close_and_reopen`
+     (FAIL-PRE: intermittent 33–194/256 missing; PASS-POST: stable 0).
+  3. **Latent deserialization concern** (original finding — confirmed
      harmless): `expiration_in_hours` is not serialized in BIN records;
-     `deserialize_full` hardcodes `true` (the safe direction).  Since the
-     engine's only public TTL path writes hours-granularity values, `true`
-     is correct.  No bug — no action needed.
+     `deserialize_full` hardcodes `true` (the safe direction).  No bug.
   Fix: inherit `b.expiration_in_hours` from the splitting BIN; set the
   other three hardcoded-`false` sites to `true`; add a `debug_assert!`
-  guard at the split site.  See CHANGELOG.md `[Unreleased] Fixed (St-H6)`.
+  guard at the split site; always replay non-transactional LNs in
+  `eligible_for_redo`.
+  See CHANGELOG.md `[Unreleased] Fixed (St-H6, two sites)`.
 - **T-F3 / T-F4** (`first_active_lsn` + `update_first_lsn`): prerequisites for
   the deferred P-2 recovery-scan optimization; `get_first_active_lsn()` has no
   production consumer today. Land with P-2 (see `wave-gb-dbtree-recovery.md`).

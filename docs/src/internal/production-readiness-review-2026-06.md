@@ -64,16 +64,14 @@ version of each is *worse* than the current honest state):
 - **St-C3 / St-H1 / St-H3** — **DONE**: St-H1/H3 docs corrected earlier; St-C3
   shipped LOG_VERSION 2→3 (v3 header CRC32, version-aware first-entry offset,
   v2 backward-compat).
-- **St-H6** — **CLOSED (live bug, fixed).** `Tree::split_child` hardcoded
-  `expiration_in_hours: false` on the right-half sibling BIN, causing
-  hours-granularity TTL records in the right half of every split to be
-  silently treated as expired on read (128/256 keys missing in the
-  benchmark scenario).  Fix: inherit the flag from the splitting BIN;
-  add three ancillary `true`-corrections and a `debug_assert!` guard.
-  Regression test: `test_ttl_records_survive_bin_split_right_sibling_256`
-  (FAIL-PRE / PASS-POST confirmed).  The original latent concern
-  (serialization omission) is confirmed harmless: `deserialize_full`
-  hardcodes `true` which is correct for the hours-only public API.
+- **St-H6** — **CLOSED (two live bugs, both fixed).** (1) `Tree::split_child`
+  hardcoded `expiration_in_hours: false` on the right-half sibling BIN,
+  causing hours-granularity TTL records to silently expire on read (128/256
+  keys missing in benchmark).  (2) `RecoveryManager::eligible_for_redo`
+  applied an `after_ckpt_start` guard to non-transactional LNs; when the
+  background checkpointer ran between inserts, pre-checkpoint records
+  vanished after close+reopen (33–194/256 missing, intermittent).  Both
+  fixed; see CHANGELOG.md.
 - **T-F3 / T-F4** — checkpoint `first_active_lsn` + `update_first_lsn` wiring;
   prerequisites for the deferred P-2 recovery-scan optimization, which has no
   production consumer yet (`get_first_active_lsn()` is unused; the checkpointer
@@ -123,7 +121,7 @@ those are now **fixed** (see the list above).
 | St-H3 | noxu-log format | Entry headers little-endian, entry payloads (BINDelta, BinStub) big-endian — mixed on-disk endianness, undocumented | OPEN |
 | St-H4 | noxu-tree | Upper-IN descent used an O(n) linear scan instead of binary search | **FIXED** (unified `Tree::upper_in_floor_index` binary floor-search applied to all 8 descent sites; also fixed `search_with_coupling` ignoring a custom comparator; property test vs linear scan) |
 | St-H5 | noxu-tree | `TreeNode::find_entry` returned the insertion point, not the floor, for Internal nodes (non-exact) | **FIXED** (returns `(idx-1).max(0)` floor, consistent with `upper_in_floor_index` + JE; test `test_find_entry_internal_nonexact_returns_floor`) |
-| St-H6 | noxu-tree | `Tree::split_child` hardcoded `expiration_in_hours: false` on the right-half sibling BIN → hours-granularity TTL records silently expired on read (128/256 lost in benchmark); original finding (deserialization default) was latent, the split bug was live | **FIXED** (`bin_expiration_in_hours` captured before `drop(child_guard)` and inherited by sibling; three ancillary `false→true` corrections; `debug_assert!` guard; regression tests `test_ttl_records_survive_bin_split_right_sibling_256` FAIL-PRE/PASS-POST) |
+| St-H6 | noxu-tree + noxu-recovery | **Site 1**: `Tree::split_child` hardcoded `expiration_in_hours: false` → 128/256 TTL records silently expired in the right-half sibling. **Site 2**: `eligible_for_redo` applied `after_ckpt_start` guard to non-transactional LNs → 33–194/256 records missing after close+reopen when background checkpointer ran between writes. Original latent concern (deserialize default) confirmed harmless. | **FIXED** (both sites): split sibling inherits flag; `eligible_for_redo` always replays non-txnal LNs; three ancillary `false→true` corrections; `debug_assert!` guard. Regression tests: `test_ttl_records_survive_bin_split_right_sibling_256` + `test_ttl_records_survive_close_and_reopen` FAIL-PRE/PASS-POST. |
 | C-C2 | noxu-rep | `become_master` doc promised a `FeederRunner`/`EnvironmentLogScanner` thread per replica; the body only created in-memory tracker structs → a master did not actively feed replicas | **FULLY FIXED** (v3.2.0 + v3.3.0 branch `fix/cc2b-wal-vlsn-autofeed`): push-feeder threads via `register_feeder_channel` (v3.2.0); WAL-scanner auto-feed via `with_environment` + `log_with_vlsn` + `EnvironmentLogScanner` (v3.3.0, C-C2b). Convergence test `test_wal_scanner_autofeed_convergence` proves end-to-end propagation with real `EnvironmentImpl` commits. Standalone format regression test confirms 14-byte headers unchanged. |
 | C-H4 | noxu-rep | (stale-branch finding) `peer_allowlist` no-op — **re-validated on main: FIXED** by mTLS Phase 2/3 (`PeerAllowlistVerifier` wired through the TLS listener, dispatcher, and QUIC) | RESOLVED on main |
 

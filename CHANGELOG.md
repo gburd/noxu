@@ -16,9 +16,9 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-### Fixed (data-loss correctness — St-H6)
+### Fixed (data-loss correctness — St-H6, two sites)
 
-- **Silent data-loss on BIN split when records have TTL** (`noxu-tree`):
+- **St-H6 Site 1 — Silent data-loss on BIN split when records have TTL** (`noxu-tree`):
   `Tree::split_child` hardcoded `expiration_in_hours: false` on the new
   right-half sibling BIN instead of inheriting the flag from the splitting
   BIN.  Because every public TTL write path (`WriteOptions::with_ttl` /
@@ -50,6 +50,29 @@ listed in [References](#references).
   - `noxu-tree/src/tree.rs` — two unit tests:
     `test_split_child_sibling_inherits_expiration_in_hours` and
     `test_hours_value_is_expired_only_with_false_flag`.
+
+- **St-H6 Site 2 — Records vanish after close+reopen if background
+  checkpoint ran during writes** (`noxu-recovery`):
+  `RecoveryManager::eligible_for_redo` applied a `after_ckpt_start` guard
+  to **non-transactional** LNs (those written by the `with_auto_txn` auto-
+  commit path, where `locker_id = 0`).  When the background checkpointer
+  thread (default 30-second interval) wrote a `CkptStart` record between
+  two batches of inserts, LN records written before that `CkptStart` were
+  skipped during recovery — **a variable number of records (observed
+  33–194 out of 256) silently vanished after close+reopen**.
+
+  Root cause: JE's checkpoint captures full BIN state so pre-checkpoint
+  non-transactional LNs are safely skipped.  Noxu's checkpointer only
+  flushes the internal `primary_tree` (not the open user-database trees),
+  so the checkpoint does NOT capture the pre-checkpoint records.  The fix
+  mirrors the existing logic for committed transactional LNs: non-
+  transactional LNs are now always replayed regardless of checkpoint start
+  position.  `redo_ln` / `redo_insert` is idempotent (skips if the tree
+  already has a newer LSN for the key).
+
+  Regression test: `test_ttl_records_survive_close_and_reopen` — FAIL-PRE
+  (intermittent: 33–194/256 records missing when background checkpointer
+  fires during the test), PASS-POST (stable 0 missing across 15+ runs).
 
 ### Added (C-C2b — WAL-scanner auto-feed)
 
