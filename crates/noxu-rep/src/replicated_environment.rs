@@ -58,6 +58,7 @@ use crate::rep_config::RepConfig;
 use crate::rep_stats::RepStats;
 use crate::state_change_listener::{StateChangeEvent, StateChangeListener};
 use crate::stream::feeder::Feeder;
+use crate::stream::feeder::EnvironmentLogScanner;
 use crate::stream::feeder::FeederRunner;
 use crate::stream::peer_feeder::PeerScannerAdapter;
 use crate::stream::peer_feeder::{
@@ -235,6 +236,16 @@ pub struct ReplicatedEnvironment {
     /// Active `FeederRunner` references for acked-VLSN queries and
     /// clean shutdown (M-4: wait for replicas to catch up).
     active_feeder_runners: StdMutex<HashMap<String, Arc<FeederRunner>>>,
+
+    /// Monotone VLSN counter shared with the wired `EnvironmentImpl`.
+    ///
+    /// Installed into the environment via
+    /// `EnvironmentImpl::set_replication_vlsn_counter()` when
+    /// `with_environment` is called.  Each `log_txn_commit` on the master
+    /// atomically increments this counter and writes a VLSN-tagged WAL entry,
+    /// which `EnvironmentLogScanner` then picks up without any
+    /// `replicate_entry` call from the application.
+    wal_vlsn_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ReplicatedEnvironment {
@@ -467,6 +478,7 @@ impl ReplicatedEnvironment {
             feeder_channels: StdMutex::new(HashMap::new()),
             feeder_queues: std::sync::RwLock::new(HashMap::new()),
             active_feeder_runners: StdMutex::new(HashMap::new()),
+            wal_vlsn_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         Ok(env)
@@ -1028,7 +1040,14 @@ impl ReplicatedEnvironment {
             self.vlsn_index.truncate_after(safe_vlsn);
         }
 
-        *self.env_impl.lock().unwrap() = Some(env);
+        *self.env_impl.lock().unwrap() = Some(Arc::clone(&env));
+
+        // C-C2b: install the VLSN counter so log_txn_commit writes
+        // VLSN-tagged headers.  When become_master then spawns an
+        // EnvironmentLogScanner-backed FeederRunner, it will find these
+        // entries and auto-feed them to replicas without any
+        // replicate_entry call from the application.
+        env.set_replication_vlsn_counter(Arc::clone(&self.wal_vlsn_counter));
     }
 
     /// Get the current node state.
@@ -1347,6 +1366,17 @@ impl ReplicatedEnvironment {
     /// Idempotent: if a FeederRunner is already active for `replica_name`
     /// (from a prior `become_master` call), it is replaced — the old channel
     /// should have been closed already via `close()`.
+    ///
+    /// **WAL-scanner auto-feed path (C-C2b)**: when a live `EnvironmentImpl`
+    /// has been wired via `with_environment`, the FeederRunner thread uses an
+    /// `EnvironmentLogScanner` as its source.  Every `log_txn_commit` on the
+    /// master writes a VLSN-tagged WAL entry (22-byte header); the scanner
+    /// finds these entries and streams them to the replica automatically,
+    /// without any `replicate_entry` call from the application.
+    ///
+    /// **Fallback path**: when no `EnvironmentImpl` is wired the runner reads
+    /// from the in-memory `PeerLogScanner` queue populated by
+    /// `replicate_entry` / `apply_entry` — the previous manual behaviour.
     fn spawn_feeder_runner(
         &self,
         replica_name: String,
@@ -1366,11 +1396,38 @@ impl ReplicatedEnvironment {
         let runner_clone = Arc::clone(&runner);
         let replica_clone = replica_name.clone();
 
+        // C-C2b: prefer EnvironmentLogScanner (WAL auto-feed) when env is
+        // wired; fall back to in-memory queue (manual replicate_entry path)
+        // otherwise.
+        let env_opt = self.env_impl.lock().unwrap().clone();
+
         let handle = std::thread::Builder::new()
             .name(format!("noxu-feeder-{}", replica_name))
             .spawn(move || {
-                let mut source = PeerScannerAdapter::new(queue, 0);
-                let _ = runner_clone.run(&mut source);
+                if let Some(env) = env_opt {
+                    if let Some(mut scanner) =
+                        EnvironmentLogScanner::new(&env, None)
+                    {
+                        log::info!(
+                            "FeederRunner for replica '{}': using \
+                             EnvironmentLogScanner (WAL auto-feed)",
+                            replica_clone,
+                        );
+                        let _ = runner_clone.run(&mut scanner);
+                    } else {
+                        log::warn!(
+                            "FeederRunner for replica '{}': \
+                             EnvironmentLogScanner unavailable, \
+                             falling back to in-memory queue",
+                            replica_clone,
+                        );
+                        let mut source = PeerScannerAdapter::new(queue, 0);
+                        let _ = runner_clone.run(&mut source);
+                    }
+                } else {
+                    let mut source = PeerScannerAdapter::new(queue, 0);
+                    let _ = runner_clone.run(&mut source);
+                }
                 log::debug!(
                     "FeederRunner for replica '{}' exited cleanly",
                     replica_clone

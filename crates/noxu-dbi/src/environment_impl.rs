@@ -289,6 +289,16 @@ pub struct EnvironmentImpl {
     ///
     /// MemoryBudget.updateTreeMemoryUsage(delta) path.
     cache_usage: Arc<AtomicI64>,
+
+    /// Optional VLSN counter installed by `ReplicatedEnvironment::with_environment`.
+    ///
+    /// When `Some`, `log_txn_commit` atomically increments this counter and
+    /// writes the commit WAL entry with the 22-byte VLSN-tagged header so
+    /// that `EnvironmentLogScanner` can discover and stream committed entries
+    /// automatically.  `None` for standalone (non-replicated) environments —
+    /// those always write the 14-byte header and are byte-unchanged.
+    replication_vlsn_counter:
+        Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl EnvironmentImpl {
@@ -881,6 +891,7 @@ impl EnvironmentImpl {
             ),
             utilization_tracker,
             cache_usage,
+            replication_vlsn_counter: Mutex::new(None),
         };
 
         // Mark as open
@@ -892,6 +903,23 @@ impl EnvironmentImpl {
     // Getters
     pub fn get_env_home(&self) -> &Path {
         &self.env_home
+    }
+
+    /// Install a VLSN counter for replicated commit tagging.
+    ///
+    /// Called by `ReplicatedEnvironment::with_environment` to enable automatic
+    /// VLSN assignment on every commit.  Once set, `log_txn_commit` atomically
+    /// increments the counter and writes the WAL entry with the 22-byte
+    /// VLSN-tagged header so that `EnvironmentLogScanner` discovers it
+    /// without any manual `replicate_entry` calls.
+    ///
+    /// Non-replicated (standalone) environments never call this; their commit
+    /// path is byte-unchanged (14-byte header, no VLSN field).
+    pub fn set_replication_vlsn_counter(
+        &self,
+        counter: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        *self.replication_vlsn_counter.lock().unwrap() = Some(counter);
     }
     pub fn is_read_only(&self) -> bool {
         self.is_read_only
@@ -1680,14 +1708,53 @@ impl EnvironmentImpl {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let entry =
-            TxnEndEntry::new_commit(txn_id, NULL_LSN, timestamp, 0, NULL_VLSN);
-        let mut buf = BytesMut::with_capacity(entry.log_size());
-        entry.write_to_log(&mut buf);
+        // C-C2b: when a VLSN counter is installed (replicated env), assign the
+        // next VLSN and write a 22-byte VLSN-tagged header so that
+        // EnvironmentLogScanner can discover and auto-feed this commit to
+        // replicas.  Standalone envs take the else branch — byte-unchanged.
+        let vlsn_opt = {
+            let guard = self.replication_vlsn_counter.lock().unwrap();
+            guard.as_ref().map(|c| {
+                c.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+            })
+        };
 
-        lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, flush, fsync)
+        if let Some(vlsn) = vlsn_opt {
+            use noxu_util::vlsn::Vlsn;
+            let entry = TxnEndEntry::new_commit(
+                txn_id,
+                NULL_LSN,
+                timestamp,
+                0,
+                Vlsn::new(vlsn as i64),
+            );
+            let mut buf = BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            lm.log_with_vlsn(
+                LogEntryType::TxnCommit,
+                &buf,
+                vlsn,
+                flush,
+                fsync,
+            )
             .map(|_| ())
             .map_err(DbiError::from)
+        } else {
+            let entry = TxnEndEntry::new_commit(
+                txn_id, NULL_LSN, timestamp, 0, NULL_VLSN,
+            );
+            let mut buf = BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            lm.log(
+                LogEntryType::TxnCommit,
+                &buf,
+                Provisional::No,
+                flush,
+                fsync,
+            )
+            .map(|_| ())
+            .map_err(DbiError::from)
+        }
     }
 
     /// Writes a TxnAbort entry to the WAL (no fsync needed on abort).

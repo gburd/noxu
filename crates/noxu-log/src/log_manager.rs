@@ -258,6 +258,7 @@ impl LogManager {
             flush_required,
             fsync_required,
             old_lsn,
+            None,
         )
     }
 
@@ -297,6 +298,38 @@ impl LogManager {
             flush_required,
             fsync_required,
             None,
+            None,
+        )
+    }
+
+    /// Logs a raw entry (header + payload already serialised) to the WAL.
+    ///
+    /// Identical to [`Self::log`] except that the on-disk header is the
+    /// 22-byte form with `REPLICATED_MASK | VLSN_PRESENT_MASK` set and the
+    /// 8-byte VLSN written at offset 14.
+    ///
+    /// **Standalone (non-replicated) environments must never call this
+    /// method.**  The `log()` path is byte-unchanged: it always writes a
+    /// 14-byte header with no VLSN field.
+    ///
+    /// Called by `EnvironmentImpl::log_txn_commit` when a VLSN counter has
+    /// been installed via `set_replication_vlsn_counter()`.
+    pub fn log_with_vlsn(
+        &self,
+        entry_type: LogEntryType,
+        payload: &[u8],
+        vlsn: u64,
+        flush_required: bool,
+        fsync_required: bool,
+    ) -> Result<Lsn> {
+        self.log_internal(
+            entry_type,
+            payload,
+            Provisional::No,
+            flush_required,
+            fsync_required,
+            None,
+            Some(vlsn),
         )
     }
 
@@ -308,6 +341,7 @@ impl LogManager {
         flush_required: bool,
         fsync_required: bool,
         old_lsn: Option<Lsn>,
+        opt_vlsn: Option<u64>,
     ) -> Result<Lsn> {
         // C-2: refuse all writes once a prior I/O error has invalidated the log.
         if self.io_invalid.load(Ordering::Acquire) {
@@ -319,7 +353,9 @@ impl LogManager {
         // Build the header bytes + payload into one contiguous buffer so we
         // can compute the checksum in one pass (matching approach).
         let item_size = payload.len() as u32;
-        let header_size = MIN_HEADER_SIZE; // no VLSN for non-replicated entries
+        // 14-byte header for non-replicated; 22-byte header when VLSN present.
+        let header_size =
+            if opt_vlsn.is_some() { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
 
         // Full buffer: [header | payload]
         let entry_size = header_size + item_size as usize;
@@ -345,15 +381,23 @@ impl LogManager {
             // Layout: [checksum:4][type:1][flags:1][prev_offset:4][item_size:4]
             entry_buf[4] = entry_type.type_num(); // type
 
-            let flags: u8 = match provisional {
+            let mut flags: u8 = match provisional {
                 Provisional::Yes => 0x80,
                 Provisional::BeforeCkptEnd => 0x40,
                 Provisional::No => 0x00,
             };
+            if opt_vlsn.is_some() {
+                flags |= 0x20; // REPLICATED_MASK
+                flags |= 0x08; // VLSN_PRESENT_MASK
+            }
             entry_buf[5] = flags; // flags
             // prev_offset at [6..10] filled after we know it
             entry_buf[10..14].copy_from_slice(&item_size.to_le_bytes()); // item_size
-            // payload
+            // VLSN at [14..22] when present (8-byte little-endian i64).
+            if let Some(vlsn) = opt_vlsn {
+                entry_buf[14..22].copy_from_slice(&(vlsn as i64).to_le_bytes());
+            }
+            // payload starts after the header
             entry_buf[header_size..].copy_from_slice(payload);
 
             // Determine whether a file flip is needed before assigning the LSN.
