@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Documentation (review-item honesty: T-F3, T-F4, St-H1, St-H3)
+
+- **T-F3 / T-F4** reclassified from OPEN to **won't-fix / documented**.
+  Recovery already uses `CkptEnd.first_active_lsn` as its scan boundary
+  (hard-coded to `0,0` = full scan = correct but unbounded). Bounding it at a
+  real `first_active_lsn` is **unsafe** under the current checkpointer, which
+  flushes only the internal `primary_tree` and never user-database BINs:
+  committed LNs before `first_active_lsn` would be silently dropped on
+  recovery (the St-H6 Site 2 data-loss class). `TxnManager::update_first_lsn`
+  and `get_first_active_lsn` rustdoc now state the machinery is intentionally
+  unwired and why; `get_first_active_lsn()` always returns `NULL_LSN` today.
+  No behavioural change — full-scan recovery is the correct, safe default.
+- **St-H1 / St-H3** (mixed on-disk endianness) confirmed **documented**:
+  `file_header.rs` now scopes the `byte_order = 0x00` marker to the
+  file-header fields only (entry headers are little-endian, some payloads
+  big-endian) and cross-references `docs/src/reference/on-disk-format.md`,
+  whose "Endianness" table already specifies each layer.
+
 ### Fixed (data-loss correctness — St-H6, two sites)
 
 - **St-H6 Site 1 — Silent data-loss on BIN split when records have TTL** (`noxu-tree`):

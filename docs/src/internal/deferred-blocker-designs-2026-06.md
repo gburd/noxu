@@ -274,6 +274,19 @@ proves non-replicated envs still write 14-byte headers with no VLSN bits set.
   guard at the split site; always replay non-transactional LNs in
   `eligible_for_redo`.
   See CHANGELOG.md `[Unreleased] Fixed (St-H6, two sites)`.
-- **T-F3 / T-F4** (`first_active_lsn` + `update_first_lsn`): prerequisites for
-  the deferred P-2 recovery-scan optimization; `get_first_active_lsn()` has no
-  production consumer today. Land with P-2 (see `wave-gb-dbtree-recovery.md`).
+- **T-F3 / T-F4** (`first_active_lsn` + `update_first_lsn`): **WON'T FIX in
+  the current architecture.** Recovery already uses `CkptEnd.first_active_lsn`
+  as its forward/backward scan boundary; it is hard-coded to `Lsn::new(0,0)`,
+  so recovery does a full scan (correct but unbounded). Setting a real,
+  non-zero `first_active_lsn` (the T-F3 "optimization", fed by wiring T-F4's
+  `update_first_lsn`) would bound the scan — but that is **unsafe** here: the
+  checkpointer flushes only the internal `primary_tree`, never user-database
+  BINs (the same finding behind P-2 being deferred). Committed LNs written
+  before `first_active_lsn` are therefore not captured in any flushed BIN, so
+  starting recovery at `first_active_lsn` would silently drop them — this is
+  exactly the St-H6 Site 2 data-loss class we just fixed. T-F3/T-F4 must NOT
+  be implemented until the checkpointer flushes user-database BINs (land with
+  P-2; see `wave-gb-dbtree-recovery.md`). The `TxnManager::update_first_lsn` /
+  `get_first_active_lsn` rustdoc documents this; `get_first_active_lsn()`
+  always returns `NULL_LSN` today and the full-scan recovery default is the
+  correct, safe behaviour.

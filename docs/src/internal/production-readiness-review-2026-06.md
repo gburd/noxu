@@ -72,10 +72,14 @@ version of each is *worse* than the current honest state):
   background checkpointer ran between inserts, pre-checkpoint records
   vanished after close+reopen (33–194/256 missing, intermittent).  Both
   fixed; see CHANGELOG.md.
-- **T-F3 / T-F4** — checkpoint `first_active_lsn` + `update_first_lsn` wiring;
-  prerequisites for the deferred P-2 recovery-scan optimization, which has no
-  production consumer yet (`get_first_active_lsn()` is unused; the checkpointer
-  hardcodes `first_active_lsn = 0`). Land with P-2.
+- **T-F3 / T-F4** — checkpoint `first_active_lsn` + `update_first_lsn` wiring.
+  **WON'T FIX in the current architecture / DOCUMENTED.** Bounding the
+  recovery scan at a non-zero `first_active_lsn` is unsafe while the
+  checkpointer flushes only `primary_tree` (not user BINs) — it would
+  reintroduce the St-H6 Site 2 data-loss class. The full-scan recovery default
+  is correct; `get_first_active_lsn()`/`update_first_lsn` rustdoc now documents
+  that the machinery is intentionally unwired pending the
+  checkpoint-flushes-user-BINs work. Land with P-2.
 
 ### Superseded notes
 
@@ -113,12 +117,12 @@ those are now **fixed** (see the list above).
 |----|------|-------|--------|
 | R-F04 | noxu-xa | `get_transaction` returned `&Transaction` after dropping the `Mutex` guard; a concurrent `xa_rollback` frees the `Box` → use-after-free. | **FIXED** (returns `Arc<Transaction>`; the handle keeps the txn alive independently of the map; `unsafe` removed and noxu-xa now carries `#![forbid(unsafe_code)]`) |
 | R-F05 | noxu-latch | `thread_id()` lacked `\| 1`; a thread whose `DefaultHasher` output is 0 collides with the "unowned" sentinel and false-panics "latch already held" on first acquire | **FIXED** |
-| T-F3 | noxu-recovery | `CkptEnd.first_active_lsn` is hard-coded to `Lsn::new(0,0)` → recovery always scans the whole log from file 0 (O(total log), not O(checkpoint interval)). Correct but unbounded. Depends on T-F4. | OPEN (documented; see `wave-gb-dbtree-recovery.md`) |
-| T-F4 | noxu-txn/dbi | `TxnManager::update_first_lsn` is never called from the cursor layer → `get_first_active_lsn()` always returns NULL_LSN (the documented contract is unimplemented) | OPEN |
+| T-F3 | noxu-recovery | `CkptEnd.first_active_lsn` is hard-coded to `Lsn::new(0,0)` → recovery always scans the whole log from file 0 (O(total log), not O(checkpoint interval)). Correct but unbounded. | **WON'T FIX (unsafe under current checkpointer)** — bounding the scan at a non-zero `first_active_lsn` would skip committed pre-checkpoint LNs that the checkpointer never flushes (it flushes only the internal `primary_tree`, not user-database BINs), reintroducing the St-H6 Site 2 data-loss class. Blocked on checkpoint-flushes-user-BINs work (same blocker as P-2). The full-scan default is correct; the rustdoc on `TxnManager::{update_first_lsn,get_first_active_lsn}` documents this. |
+| T-F4 | noxu-txn/dbi | `TxnManager::update_first_lsn` is never called from the cursor layer → `get_first_active_lsn()` always returns NULL_LSN | **DOCUMENTED (no safe consumer)** — the machinery is present and unit-tested but intentionally unwired: its only intended consumer is T-F3, which is unsafe (above). Rustdoc on both methods now states they are unwired and why; `get_first_active_lsn()` honestly documents that it always returns `NULL_LSN` today. |
 | T-F5 | noxu-txn/db | `TxnManager::commit_txn`/`abort_txn`/`unregister_*` were never called for **explicit** transactions → `all_txns` + locker-label maps grew unbounded; `n_active_txns()`/`n_commits`/`n_aborts` stats wrong | **FIXED** (`Transaction::unregister_inner_txn` called on commit/abort + both XA resolved paths; regression test `f5_explicit_txns_unregister_from_txn_manager`) |
-| St-H1 | noxu-log format | File header `byte_order = 0x00` claims big-endian, but log entry headers are little-endian — an external reader following the documented contract misparses | OPEN |
+| St-H1 | noxu-log format | File header `byte_order = 0x00` could be read as claiming the whole file is big-endian, but log entry headers are little-endian | **DOCUMENTED** — `file_header.rs` rustdoc now scopes the `byte_order` marker to the file-header fields only and cross-references the mixed-endianness note + `on-disk-format.md` |
 | St-H2 | noxu-evictor | `real_node_size()` walks the entire tree per eviction decision (O(n) per node, O(n·batch) per batch) — no per-node in-memory-size tracking | OPEN |
-| St-H3 | noxu-log format | Entry headers little-endian, entry payloads (BINDelta, BinStub) big-endian — mixed on-disk endianness, undocumented | OPEN |
+| St-H3 | noxu-log format | Entry headers little-endian, entry payloads (BINDelta, BinStub) big-endian — mixed on-disk endianness | **DOCUMENTED** — `docs/src/reference/on-disk-format.md` has an "Endianness" table (header LE / payload BE) and `file_header.rs` carries a "Mixed byte-order note" |
 | St-H4 | noxu-tree | Upper-IN descent used an O(n) linear scan instead of binary search | **FIXED** (unified `Tree::upper_in_floor_index` binary floor-search applied to all 8 descent sites; also fixed `search_with_coupling` ignoring a custom comparator; property test vs linear scan) |
 | St-H5 | noxu-tree | `TreeNode::find_entry` returned the insertion point, not the floor, for Internal nodes (non-exact) | **FIXED** (returns `(idx-1).max(0)` floor, consistent with `upper_in_floor_index` + JE; test `test_find_entry_internal_nonexact_returns_floor`) |
 | St-H6 | noxu-tree + noxu-recovery | **Site 1**: `Tree::split_child` hardcoded `expiration_in_hours: false` → 128/256 TTL records silently expired in the right-half sibling. **Site 2**: `eligible_for_redo` applied `after_ckpt_start` guard to non-transactional LNs → 33–194/256 records missing after close+reopen when background checkpointer ran between writes. Original latent concern (deserialize default) confirmed harmless. | **FIXED** (both sites): split sibling inherits flag; `eligible_for_redo` always replays non-txnal LNs; three ancillary `false→true` corrections; `debug_assert!` guard. Regression tests: `test_ttl_records_survive_bin_split_right_sibling_256` + `test_ttl_records_survive_close_and_reopen` FAIL-PRE/PASS-POST. |
@@ -179,10 +183,11 @@ those are now **fixed** (see the list above).
 3. **R-F04** (XA use-after-free) — **fixed** (Arc<Transaction>).
 4. **T-F2** (range locks) — **FIXED** in fix/tf2-range-locks; SERIALIZABLE
    now prevents phantoms via next-key locking; docs restored.
-5. **St-C3 / St-H1 / St-H3** (on-disk format: header checksum + endianness) —
-   format-version decision; fix before committing to on-disk stability.
-6. **T-F4 / T-F5** (txn manager wiring) — correctness of stats, eviction
-   signal, and a prerequisite for T-F3 (bounded recovery).
+5. **St-C3** (on-disk format header checksum) — **FIXED** (LOG_VERSION 2→3).
+   **St-H1 / St-H3** (mixed-endianness documentation) — **DOCUMENTED**
+   (`on-disk-format.md` endianness table + `file_header.rs` notes).
+6. **T-F5** (txn manager wiring) — **FIXED**. **T-F3 / T-F4** — won't-fix /
+   documented (unsafe under the current checkpointer; see above).
 7. The remaining High/Medium items and the config-param honesty pass.
 
 Until items 1–4 are closed and qualified, Noxu should be described as

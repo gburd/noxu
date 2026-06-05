@@ -35,10 +35,14 @@
 //!
 //! # Portability
 //!
-//! Files written by this implementation always use big-endian byte order
-//! (`byte_order = 0x00`). The `byte_order` field is reserved for future
-//! little-endian native format support; current readers reject files with
-//! `byte_order != 0x00`.
+//! Files written by this implementation set `byte_order = 0x00`. **This
+//! marker describes the byte order of the file-header fields only** (offsets
+//! 0..36, all big-endian); it does NOT describe the rest of the file. Log
+//! entry headers are little-endian and some entry payloads are big-endian —
+//! see the "Mixed byte-order note" below and
+//! `docs/src/reference/on-disk-format.md`. The `byte_order` field is reserved
+//! for a future fully little-endian native format; current readers reject
+//! files with `byte_order != 0x00`.
 //!
 //! The magic bytes `NOXUDB\0\0` allow tools to identify Noxu DB log files
 //! without relying on file extension. The `log_version` field allows format
