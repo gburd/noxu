@@ -16,6 +16,35 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [v4.0.0] — 2026-06-04
+
+Major release. It completes the production-readiness review remediation
+(every Critical and High blocker fixed or honestly resolved) and the
+WAL-scanner replication auto-feed (C-C2b). The version is **4.0.0** rather
+than 3.3.0 because, under the project's strict-SemVer-at-v3.0+ policy, one
+breaking public-API change (R-F04) landed since v3.2.0 and mandates a major
+bump.
+
+### Breaking Changes
+
+- **`noxu-xa`: `XaEnvironment::get_transaction()` now returns
+  `Arc<Transaction>` instead of `&Transaction`** (R-F04 soundness fix —
+  see the *Fixed (soundness)* section below). The previous `&Transaction`
+  borrowed into the XA branch map and could dangle if a protocol-violating
+  `xa_rollback`/`xa_commit` freed the transaction concurrently. Returning an
+  `Arc<Transaction>` keeps the transaction alive independently of the map,
+  removes the only `unsafe` in the crate (`noxu-xa` now carries
+  `#![forbid(unsafe_code)]`), and is the sole source-incompatible change in
+  this release. **Migration:** call sites that passed the result as
+  `Option<&Transaction>` now write `Some(&*txn)`. See
+  `docs/src/getting-started/migrating.md`.
+
+The on-disk log format adds an optional VLSN-tagged entry header for
+replicated commits (C-C2b) and the v3 file-header CRC32 (St-C3); both are
+backward compatible — standalone, non-replicated environments write
+byte-unchanged 14-byte entry headers, and legacy v2 files remain readable.
+No data migration is required.
+
 ### Documentation (review-item honesty: T-F3, T-F4, St-H1, St-H3)
 
 - **T-F3 / T-F4** reclassified from OPEN to **won't-fix / documented**.

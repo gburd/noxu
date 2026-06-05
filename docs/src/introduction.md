@@ -68,7 +68,7 @@ git tags (`v1.5.0`, `v1.6.0`, `v2.0.0`, `v2.2.1`).
 | Acceptor promise persistent across restart | ❌ | ❌ | ✅ | ✅ |
 | `transfer_master` / `shutdown_group` operator APIs | ❌ (silently no-op) | ❌ | ✅ | ✅ |
 | Master spawns Feeder per known replica on `become_master` | ❌ (no feeders dispatched) | ❌ | ✅ (in-memory tracker structs only) | ✅ (tracker structs; active thread spawn deferred) |
-| `register_feeder_channel` + push-feeder + WAL-scanner auto-feed (C-C2/C-C2b) | ❌ | ❌ | ❌ | ✅ (v3.2.0: push threads; v3.3.0: WAL-scanner auto-feed via `with_environment`) |
+| `register_feeder_channel` + push-feeder + WAL-scanner auto-feed (C-C2/C-C2b) | ❌ | ❌ | ❌ | ✅ (v3.2.0: push threads; v4.0.0: WAL-scanner auto-feed via `with_environment`) |
 | VLSN index persistent across restart (no forced full restore) | ❌ (in-memory only) | ❌ | ✅ | ✅ |
 | `become_master` rejects non-`Electable` node types | ❌ (silently transitioned `Secondary` → `Master`) | ❌ | ❌ | ✅ |
 | Replica I/O thread auto-bootstraps on `NeedsRestore` | ❌ (manual `bootstrap_via_dispatcher` required) | ❌ | ❌ | ✅ |

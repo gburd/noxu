@@ -56,7 +56,7 @@ version of each is *worse* than the current honest state):
 
 - **T-F2** — SERIALIZABLE next-key range locking — **FIXED** (fix/tf2-range-locks).
 - **C-C2** — `become_master` feeder / log-streaming threads (replication
-  feature). **FULLY FIXED** in v3.2.0 (push-feeder threads) + v3.3.0 branch
+  feature). **FULLY FIXED** in v3.2.0 (push-feeder threads) + v4.0.0 branch
   `fix/cc2b-wal-vlsn-autofeed` (C-C2b WAL-scanner auto-feed). `with_environment`
   now installs a VLSN counter; every `log_txn_commit` writes a VLSN-tagged
   22-byte WAL entry; `EnvironmentLogScanner` discovers and streams these to
@@ -94,7 +94,7 @@ those are now **fixed** (see the list above).
 - **T-F2** — SERIALIZABLE range locks — **FIXED** (fix/tf2-range-locks; next-key
   locking; phantom-prevention tests pass; isolation docs restored).
 - **C-C2** — `become_master` feeder/log-streaming threads — **FULLY FIXED**
-  (v3.2.0 push threads + v3.3.0 WAL-scanner auto-feed, branch
+  (v3.2.0 push threads + v4.0.0 WAL-scanner auto-feed, branch
   `fix/cc2b-wal-vlsn-autofeed`): real `EnvironmentImpl` commits write
   VLSN-tagged WAL entries; `EnvironmentLogScanner` auto-feeds them to
   replicas; end-to-end convergence test passes. C-C2b qualification gap
@@ -126,7 +126,7 @@ those are now **fixed** (see the list above).
 | St-H4 | noxu-tree | Upper-IN descent used an O(n) linear scan instead of binary search | **FIXED** (unified `Tree::upper_in_floor_index` binary floor-search applied to all 8 descent sites; also fixed `search_with_coupling` ignoring a custom comparator; property test vs linear scan) |
 | St-H5 | noxu-tree | `TreeNode::find_entry` returned the insertion point, not the floor, for Internal nodes (non-exact) | **FIXED** (returns `(idx-1).max(0)` floor, consistent with `upper_in_floor_index` + JE; test `test_find_entry_internal_nonexact_returns_floor`) |
 | St-H6 | noxu-tree + noxu-recovery | **Site 1**: `Tree::split_child` hardcoded `expiration_in_hours: false` → 128/256 TTL records silently expired in the right-half sibling. **Site 2**: `eligible_for_redo` applied `after_ckpt_start` guard to non-transactional LNs → 33–194/256 records missing after close+reopen when background checkpointer ran between writes. Original latent concern (deserialize default) confirmed harmless. | **FIXED** (both sites): split sibling inherits flag; `eligible_for_redo` always replays non-txnal LNs; three ancillary `false→true` corrections; `debug_assert!` guard. Regression tests: `test_ttl_records_survive_bin_split_right_sibling_256` + `test_ttl_records_survive_close_and_reopen` FAIL-PRE/PASS-POST. |
-| C-C2 | noxu-rep | `become_master` doc promised a `FeederRunner`/`EnvironmentLogScanner` thread per replica; the body only created in-memory tracker structs → a master did not actively feed replicas | **FULLY FIXED** (v3.2.0 + v3.3.0 branch `fix/cc2b-wal-vlsn-autofeed`): push-feeder threads via `register_feeder_channel` (v3.2.0); WAL-scanner auto-feed via `with_environment` + `log_with_vlsn` + `EnvironmentLogScanner` (v3.3.0, C-C2b). Convergence test `test_wal_scanner_autofeed_convergence` proves end-to-end propagation with real `EnvironmentImpl` commits. Standalone format regression test confirms 14-byte headers unchanged. |
+| C-C2 | noxu-rep | `become_master` doc promised a `FeederRunner`/`EnvironmentLogScanner` thread per replica; the body only created in-memory tracker structs → a master did not actively feed replicas | **FULLY FIXED** (v3.2.0 + v4.0.0 branch `fix/cc2b-wal-vlsn-autofeed`): push-feeder threads via `register_feeder_channel` (v3.2.0); WAL-scanner auto-feed via `with_environment` + `log_with_vlsn` + `EnvironmentLogScanner` (v4.0.0, C-C2b). Convergence test `test_wal_scanner_autofeed_convergence` proves end-to-end propagation with real `EnvironmentImpl` commits. Standalone format regression test confirms 14-byte headers unchanged. |
 | C-H4 | noxu-rep | (stale-branch finding) `peer_allowlist` no-op — **re-validated on main: FIXED** by mTLS Phase 2/3 (`PeerAllowlistVerifier` wired through the TLS listener, dispatcher, and QUIC) | RESOLVED on main |
 
 ## Medium / Low (summary — see source reports)

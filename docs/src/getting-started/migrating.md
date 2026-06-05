@@ -7,6 +7,43 @@ v1.5 (and later releases) that is likely to surface in user code.
 > [Introduction → capability matrix](../introduction.md#capability-matrix-v15--v22)
 > for the canonical "what is supported in which release" table.
 
+## v3.2 → v4.0 — XA `get_transaction` returns `Arc<Transaction>`
+
+v4.0.0 is a major release driven by a single source-incompatible change
+(review item R-F04, a soundness fix).
+
+### Source-level breaking change
+
+* **`XaEnvironment::get_transaction()` now returns `Arc<Transaction>`
+  instead of `&Transaction`.** The previous borrow pointed into the XA
+  branch map and could dangle if a protocol-violating
+  `xa_rollback`/`xa_commit` freed the transaction on another thread. The
+  `Arc<Transaction>` keeps the transaction alive independently of the map,
+  and removes the only `unsafe` block in `noxu-xa` (the crate now carries
+  `#![forbid(unsafe_code)]`).
+
+  ```rust,ignore
+  // v3.2: get_transaction returned XaResult<&Transaction>
+  let txn = xa_env.get_transaction(&xid)?;         // &Transaction
+  db.get(Some(txn), &key, &mut data)?;
+
+  // v4.0: get_transaction returns XaResult<Arc<Transaction>>
+  let txn = xa_env.get_transaction(&xid)?;         // Arc<Transaction>
+  db.get(Some(&*txn), &key, &mut data)?;           // deref the Arc
+  ```
+
+  Mechanically: `get_transaction` still returns a `Result`; where you
+  previously passed the `&Transaction` as `Some(txn)`, dereference the
+  `Arc` — `Some(&*txn)`.
+
+### On-disk format (backward compatible — no migration)
+
+v4.0 adds the v3 log file-header CRC32 (St-C3) and an optional VLSN-tagged
+entry header for replicated commits (C-C2b). Both are backward compatible:
+standalone, non-replicated environments write byte-unchanged 14-byte entry
+headers, and legacy v2 files remain fully readable. No data migration is
+required.
+
 ## Collections API (v1.5 → v1.6)
 
 ### Source-level breaking changes

@@ -358,7 +358,7 @@ unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 
 **Log shipping architecture:**
 
-- **Active push path + WAL-scanner auto-feed (v3.2.0+, completed v3.3.0)**:
+- **Active push path + WAL-scanner auto-feed (v3.2.0+, completed v4.0.0)**:
   Call `register_feeder_channel(replica_name, channel)` and
   `with_environment(env_impl)` before `become_master`. A `FeederRunner`
   background thread is spawned per channel. When `with_environment` has
@@ -370,7 +370,7 @@ unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 - **Pull path (default)**: Replicas connect to the master's `PEER_FEEDER`
   service (registered on the `TcpServiceDispatcher`) and pull entries from
   the shared `PeerLogScanner` queue (populated by `replicate_entry`).
-- **EnvironmentLogScanner** (active, v3.3.0): Scans master WAL files
+- **EnvironmentLogScanner** (active, v4.0.0): Scans master WAL files
   directly for VLSN-tagged entries (`REPLICATED_MASK | VLSN_PRESENT_MASK`).
   Entries are produced by `LogManager::log_with_vlsn` called from
   `EnvironmentImpl::log_txn_commit` when a VLSN counter is installed via
