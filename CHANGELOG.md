@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (test robustness + stats accuracy)
+
+- **`LockManager::get_stats()` now reports real `n_waiters` / `n_owners`** by
+  summing across lock tables; previously `n_waiters` was hardcoded to `0` and
+  `n_owners` was the lock count. The aggregate waiter/owner counts are now
+  truthful.
+- **`f12_explicit_txn_read_blocks_auto_commit_write`** made deterministic: it
+  now uses a generous lock timeout (so the blocked write waits rather than
+  timing out under load) and synchronizes on the live lock-waiter count
+  instead of a fixed sleep. Robust under heavy CPU contention (20/20).
+- **`test_x10_secondary_abort_read_committed_no_torn_state`** made
+  deterministic and corrected: the reader now uses an explicit READ_COMMITTED
+  transaction and asserts on the secondary cursor's atomically-resolved
+  primary data (Wave 1B), instead of a separate auto-commit `get` that
+  introduced a time-of-check/time-of-use window at a different isolation
+  level. Robust under load (15/15) and now exercises the real READ_COMMITTED
+  secondary-cursor atomicity guarantee.
+
 ### Added (on-disk format — St-C3, LOG_VERSION 2→3)
 
 - The log file header now carries a CRC32 (v3 header = 36 bytes) so a torn

@@ -1607,10 +1607,15 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let dir = TempDir::new().unwrap();
-    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+    let mut env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
-    let env = noxu_db::Environment::open(env_cfg).unwrap();
+    // Generous lock timeout: under heavy load a reader's read lock and the
+    // writer's write lock briefly contend; a long timeout ensures the
+    // contending operation waits (and reads committed state) rather than
+    // timing out, keeping the test deterministic.
+    env_cfg.set_lock_timeout(30_000);
+    let env = Arc::new(noxu_db::Environment::open(env_cfg).unwrap());
 
     let pri_db = env
         .open_database(
@@ -1665,35 +1670,47 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
     // Reader: continuously reads via the secondary cursor under READ_COMMITTED.
     // Invariant: if we find sec_key="A", the primary data must start with b"A".
     let sec_clone = Arc::clone(&sec_db);
-    let pri_clone = Arc::clone(&pri_arc);
+    let env_reader = Arc::clone(&env);
     let torn_clone = Arc::clone(&torn_seen);
     let done_clone = Arc::clone(&done);
     let iter_clone = Arc::clone(&iterations);
 
     let reader = std::thread::spawn(move || {
+        // READ_COMMITTED reader: the secondary cursor's get_search_key
+        // resolves the primary data atomically under THIS transaction (Wave
+        // 1B), so the secondary→primary resolution observes a single,
+        // lock-consistent view. The read of the primary blocks on the
+        // writer's write lock for the duration of the writer's txn, so it can
+        // never observe the uncommitted "Bvalue". We assert on the
+        // cursor-resolved `data_entry` directly — doing a SEPARATE auto-commit
+        // `get` (the prior approach) introduced an artificial
+        // time-of-check/time-of-use window with a different isolation level,
+        // which is what made this test flaky.
+        let rc = noxu_db::TransactionConfig::new().with_read_committed(true);
         while !done_clone.load(Ordering::Relaxed) {
-            let Ok(mut cursor) = sec_clone.open_cursor(None, None) else {
+            let Ok(txn) = env_reader.begin_transaction(Some(&rc)) else {
                 continue;
             };
-            let sec_key_a = noxu_db::DatabaseEntry::from_bytes(b"A");
-            let mut pk_entry = noxu_db::DatabaseEntry::new();
-            let mut data_entry = noxu_db::DatabaseEntry::new();
-            if let Ok(noxu_db::OperationStatus::Success) = cursor
-                .get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
             {
-                let mut pri_data = noxu_db::DatabaseEntry::new();
-                let found = pri_clone
-                    .lock()
-                    .get(None, &pk_entry, &mut pri_data)
-                    .map(|s| s == noxu_db::OperationStatus::Success)
-                    .unwrap_or(false);
-                if found
-                    && let Some(pri_bytes) = pri_data.get_data()
+                let Ok(mut cursor) = sec_clone.open_cursor(Some(&txn), None)
+                else {
+                    let _ = txn.abort();
+                    continue;
+                };
+                let sec_key_a = noxu_db::DatabaseEntry::from_bytes(b"A");
+                let mut pk_entry = noxu_db::DatabaseEntry::new();
+                let mut data_entry = noxu_db::DatabaseEntry::new();
+                if let Ok(noxu_db::OperationStatus::Success) = cursor
+                    .get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
+                    && let Some(pri_bytes) = data_entry.get_data()
                     && (pri_bytes.is_empty() || pri_bytes[0] != b'A')
                 {
+                    // sec_key "A" resolved, but the atomically-fetched primary
+                    // data does not start with 'A' — a torn read.
                     torn_clone.store(true, Ordering::Relaxed);
                 }
             }
+            let _ = txn.commit();
             iter_clone.fetch_add(1, Ordering::Relaxed);
         }
     });

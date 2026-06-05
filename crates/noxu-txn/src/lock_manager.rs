@@ -677,12 +677,26 @@ impl LockManager {
     ///
     ///
     pub fn get_stats(&self) -> LockStats {
+        // Single pass over all lock tables to compute live counts. n_waiters
+        // and n_owners were previously hardcoded to 0 / lock-count; report the
+        // real aggregate so callers (and tests) can observe contention.
+        let mut n_total_locks: u64 = 0;
+        let mut n_owners: u64 = 0;
+        let mut n_waiters: u64 = 0;
+        for table in &self.lock_tables {
+            let table = table.lock();
+            for lock in table.values() {
+                n_total_locks += 1;
+                n_owners += lock.n_owners() as u64;
+                n_waiters += lock.n_waiters() as u64;
+            }
+        }
         LockStats {
             lock_requests: self.stats.lock_requests.load(Ordering::Relaxed),
             lock_waits: self.stats.lock_waits.load(Ordering::Relaxed),
-            n_owners: self.n_total_locks() as u64,
-            n_waiters: 0,
-            n_total_locks: self.n_total_locks() as u64,
+            n_owners,
+            n_waiters,
+            n_total_locks,
             n_read_locks: 0,
             n_write_locks: 0,
             n_lock_timeouts: self.stats.lock_timeouts.load(Ordering::Relaxed),

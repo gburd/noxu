@@ -344,8 +344,18 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
     // Belt-and-braces variant of the F12 scenario: an explicit txn
     // takes a Read lock on K, and a concurrent auto-commit write to
     // K must block until the explicit txn releases its read lock.
+    //
+    // Determinism: a long lock timeout ensures the blocked write waits for
+    // the read lock to be released rather than timing out under load (the
+    // prior source of flakiness), and we synchronize on the lock manager's
+    // live waiter count (`n_waiters`) instead of a fixed sleep.
     let tmp = TempDir::new().unwrap();
-    let env = Arc::new(open_env(&tmp, Durability::COMMIT_NO_SYNC));
+    let mut cfg = EnvironmentConfig::new(tmp.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_durability(Durability::COMMIT_NO_SYNC);
+    cfg.set_lock_timeout(30_000);
+    let env = Arc::new(Environment::open(cfg).unwrap());
     let db = Arc::new(open_db(&env, "f12c"));
 
     // Seed K so a read can land on a real (non-NULL) LSN.
@@ -355,43 +365,56 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
 
     // Explicit txn under serializable isolation: read locks are held
     // until commit/abort.
-    let cfg = TransactionConfig::new().with_serializable_isolation(true);
-    let reader_txn = env.begin_transaction(Some(&cfg)).unwrap();
+    let tcfg = TransactionConfig::new().with_serializable_isolation(true);
+    let reader_txn = env.begin_transaction(Some(&tcfg)).unwrap();
     let mut data = DatabaseEntry::new();
     let key_lookup = DatabaseEntry::from_data(b"k");
     let status = db.get(Some(&reader_txn), &key_lookup, &mut data).unwrap();
     assert_eq!(status, OperationStatus::Success);
     assert_eq!(data.get_data(), Some(b"v0".as_slice()));
 
-    let started = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
-    let started_t = Arc::clone(&started);
     let finished_t = Arc::clone(&finished);
     let db_t = Arc::clone(&db);
     let handle = thread::spawn(move || {
-        started_t.store(true, Ordering::SeqCst);
         let key = DatabaseEntry::from_data(b"k");
         let val1 = DatabaseEntry::from_data(b"v1");
+        // Blocks on the write lock for K (conflicts with the reader's Read
+        // lock). With the 30 s timeout it waits until the reader commits.
         db_t.put(None, &key, &val1).unwrap();
         finished_t.store(true, Ordering::SeqCst);
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !started.load(Ordering::SeqCst)
-        && std::time::Instant::now() < deadline
-    {
-        thread::sleep(Duration::from_millis(5));
+    // Deterministically wait until the writer is actually BLOCKED on the
+    // lock (registered as a waiter). If it finishes instead, the read lock
+    // failed to block the write — the exact bug this test guards.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "auto-commit write completed while the explicit txn holds the \
+             read lock — the write was not blocked"
+        );
+        if env.get_stats().unwrap().lock.n_waiters >= 1 {
+            break; // writer confirmed blocked on the lock
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not register as a lock waiter within 10s"
+        );
+        thread::sleep(Duration::from_millis(2));
     }
-    thread::sleep(Duration::from_millis(200));
 
-    assert!(
-        !finished.load(Ordering::SeqCst),
-        "auto-commit write must block while explicit txn holds the read lock"
-    );
+    // Writer is confirmed blocked and has not completed.
+    assert!(!finished.load(Ordering::SeqCst));
 
+    // Releasing the read lock must let the write complete.
     reader_txn.commit().unwrap();
     handle.join().unwrap();
-    assert!(finished.load(Ordering::SeqCst));
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "write must complete after the read lock is released"
+    );
 
     drop(db);
     Arc::try_unwrap(env).ok().unwrap().close().unwrap();
