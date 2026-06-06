@@ -102,22 +102,42 @@ sleep 60
 cargo publish -p noxu-engine
 sleep 60
 
-# Layer 5 — public API + higher-level layers
+# Layer 5 — observability glue (optional dep of noxu-db), then public API
+# noxu-observe MUST be published before noxu-db: noxu-db has an optional
+# `noxu-observe` dependency, and `cargo publish` validates that every
+# dependency version (including optional ones) exists on crates.io.
+cargo publish -p noxu-observe
+sleep 60
 cargo publish -p noxu-db
 sleep 60
 cargo publish -p noxu-bind
 sleep 60
 cargo publish -p noxu-collections
 sleep 60
-cargo publish -p noxu-persist-derive
+# noxu-persist-derive and noxu-persist form a proc-macro circular
+# dev-dependency (the serde / serde_derive pattern): each has a
+# dev-dependency on the other (and on the `noxu` umbrella). Those circular
+# dev-dependencies are declared **path-only** (no version) in their
+# manifests, so `cargo publish` strips them — they only build these crates'
+# own trybuild tests and have no effect on downstream consumers. Publish
+# with `--no-verify` (the workspace is already fully built and tested; a
+# from-scratch verification build is redundant).
+cargo publish -p noxu-persist-derive --no-verify
 sleep 60
-cargo publish -p noxu-persist
+cargo publish -p noxu-persist --no-verify
 sleep 60
 cargo publish -p noxu-xa
 sleep 60
 
 # Layer 6 — replication (requires quoracle on crates.io — see above)
 cargo publish -p noxu-rep
+sleep 60
+
+# Layer 7 — the `noxu` umbrella crate (re-exports noxu-db and, behind
+# feature flags, noxu-collections / noxu-persist / noxu-xa / noxu-rep).
+# It must be LAST: cargo validates that every (optional) dependency version
+# is already on crates.io.
+cargo publish -p noxu
 sleep 60
 ```
 
@@ -155,15 +175,19 @@ git push origin "v3.0.0"
 
 ---
 
-## Notes on private crates
+## Notes on private and optional crates
 
-The following crates are **not** published to crates.io and remain
-`publish = false`:
+The following crate is **not** published to crates.io:
 
 | Crate | Reason |
 |---|---|
 | `noxu-spec` | Stateright executable specifications, dev-only. Not part of the public API. |
-| `noxu-observe` | Optional observability glue. The `observability` feature of `noxu-db` will not work for crates.io users until `noxu-observe` is also published. Publish decision deferred to a future release. |
+
+`noxu-observe` **is** published to crates.io as part of every release (it is
+an optional dependency of `noxu-db`, so its version must exist on the registry
+for `noxu-db` to publish). It is published immediately before `noxu-db` in the
+sequence above. The `observability` feature of `noxu-db` / `noxu` then works
+for crates.io users.
 
 ---
 

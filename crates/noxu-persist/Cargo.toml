@@ -23,5 +23,7 @@ workspace = true
 [dev-dependencies]
 tempfile = "3"
 # The derive macros emit ::noxu::persist::… paths; the umbrella must be
-# present in dev-dependency tests that exercise derived code.
-noxu = { workspace = true, features = ["persist"] }
+# present in dev-dependency tests that exercise derived code. Declared
+# path-only (no version) so cargo publish strips this circular
+# dev-dependency (serde / serde_derive pattern); resolves locally for tests.
+noxu = { path = "../noxu", features = ["persist"] }

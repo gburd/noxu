@@ -23,11 +23,11 @@ workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-# The noxu umbrella crate is the runtime side of the macro; umbrella-path
-# trybuild fixtures use `noxu`.
-noxu = { workspace = true, features = ["persist"] }
-# Direct-noxu-persist trybuild fixtures use `noxu-persist` (no umbrella).
-# This mirrors the `serde` / `serde_derive` circular-dev-dep pattern;
-# Cargo allows it because dev-dependencies don't create hard build cycles.
-noxu-persist = { workspace = true }
+# Circular dev-dependencies on the runtime side of the macro. Declared
+# path-only (no version) on purpose: this is the serde / serde_derive
+# pattern. cargo publish strips path-only dev-dependencies, which breaks the
+# otherwise-unpublishable cycle (these versions are not yet on crates.io when
+# this crate is published). They still resolve locally for trybuild tests.
+noxu = { path = "../noxu", features = ["persist"] }
+noxu-persist = { path = "../noxu-persist" }
 tempfile = "3"

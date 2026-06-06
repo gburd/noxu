@@ -136,11 +136,13 @@ noxu-persist      = { version = "4.0.0", path = "crates/noxu-persist" }
 noxu-persist-derive = { version = "4.0.0", path = "crates/noxu-persist-derive" }
 noxu-xa           = { version = "4.0.0", path = "crates/noxu-xa" }
 noxu-rep          = { version = "4.0.0", path = "crates/noxu-rep" }
-# Private / optional crates (not in the v3.1.0 publish list).
-# noxu-observe must have a version so that the noxu-db `observability` feature
-# can be dry-run published; the orchestrator must publish noxu-observe before
-# enabling that feature for crates.io users (see docs/src/contributing/publishing.md).
+# noxu-observe is published to crates.io (immediately before noxu-db in the
+# publish order) because noxu-db has an optional `noxu-observe` dependency and
+# cargo validates that every dependency version exists on the registry. This
+# also makes the noxu-db / noxu `observability` feature work for crates.io
+# users (see docs/src/contributing/publishing.md).
 noxu-observe      = { version = "4.0.0", path = "crates/noxu-observe" }
+# The `noxu` umbrella is published LAST (after noxu-rep).
 noxu              = { version = "4.0.0", path = "crates/noxu" }
 
 # Quorum system library (authored by Greg Burd — published at crates.io before
