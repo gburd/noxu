@@ -4,7 +4,7 @@
 //! `db_cursor_duplicate_test_get_next_dup`; bugs 3 and 4 are exercised
 //! here against the public `SecondaryCursor` API.
 //!
-//! See `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md` for the
+//! See the 2026 review for the
 //! per-bug analysis.
 //!
 //! Both regressions follow the same shape as Wave 11-B's W13 benchmark

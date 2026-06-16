@@ -8,7 +8,7 @@
 //! implements this trait; users wire an instance into a `noxu-db::Environment`
 //! via `Environment::set_replica_coordinator()`.
 //!
-//! Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes finding F1 of the 2026 review.
 
 use std::sync::Arc;
 use std::time::Duration;

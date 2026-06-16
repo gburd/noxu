@@ -4,7 +4,7 @@
 //! These tests replace the v1.5 Sprint 3C scope-down tests.  They
 //! pin down the audit findings *closed* (no longer just deferred)
 //! by Wave 2B, in a way that future refactors can't silently
-//! regress.  See `docs/src/internal/wave-2b-collections-typed.md`
+//! regress.  See the 2026 review
 //! for the full scope/narrative; per-test docstrings name the
 //! audit finding they cover.
 //!

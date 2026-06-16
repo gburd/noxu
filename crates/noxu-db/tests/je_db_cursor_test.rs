@@ -458,7 +458,7 @@ fn db_cursor_duplicate_test_duplicate_creation_backwards() {
 ///
 /// Fixed in Wave 11-N (Bug 1): the count formula is now `forward + 1`
 /// after the backward walk repositions scratch on the first dup; see
-/// `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.
+/// the 2026 review.
 #[test]
 fn db_cursor_duplicate_test_duplicate_count() {
     let (_dir, env, db) = open_dup_env_db();
@@ -502,7 +502,7 @@ fn db_cursor_duplicate_test_duplicate_count() {
 /// real BIN slot index of the located dup (and pins the BIN) instead
 /// of the previous hard-coded `current_index = 0`, so the subsequent
 /// `retrieve_next` increments the right slot.  See
-/// `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`.
+/// the 2026 review.
 #[test]
 fn db_cursor_duplicate_test_get_next_dup() {
     let (_dir, env, db) = open_dup_env_db();

@@ -1414,7 +1414,7 @@ mod tests {
     // ── Security-review hardening: TLS-2, TLS-3, TLS-4 ──
     //
     // Each test below targets a specific finding from
-    // docs/src/internal/security-review-2026-05.md. They fail before the
+    // the 2026 review. They fail before the
     // hardening change and pass after it.
 
     // TLS-2: empty `CaFiles(vec![])` is a misconfiguration, not a silent

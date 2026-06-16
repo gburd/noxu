@@ -46,7 +46,7 @@
 //! # References
 //! - JE: `BIN.java::setExpiration` always calls `setExpirationInHours(hours)`
 //!   to propagate granularity; JE's `split` / `clone` carry the flag.
-//! - St-H6 design-review entry.
+//! - St-H6 2026 review entry.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

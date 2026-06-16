@@ -243,7 +243,7 @@ correctly. Code that *depended* on the v1.4.x bug will break.
   > `NoxuError::IllegalArgument`.  All three actions - Abort,
   > Cascade (transitive, with cycle detection), Nullify (single-key
   > and multi-key) - work end-to-end under the caller's txn.  See
-  > [Secondary database unification](../internal/wave-2a-secondary-unification.md).
+  > Secondary database unification.
 
 * **`SecondaryDatabase` cross-primary collisions return
   `NoxuError::Unsupported`.** Decision 1B. v1.4.x silently overwrote
@@ -268,7 +268,7 @@ correctly. Code that *depended* on the v1.4.x bug will break.
 
 ## XA in-process only (v1.5)
 
-See [`docs/src/internal/sprint-3-xa-restriction.md`](../internal/sprint-3-xa-restriction.md).
+See the 2026 review.
 
 * **`xa_commit(xid)` / `xa_rollback(xid)` on an XID that exists in
   the persistent `_xa_prepared` log but not in the in-memory
@@ -284,7 +284,7 @@ See [`docs/src/internal/sprint-3-xa-restriction.md`](../internal/sprint-3-xa-res
 
 This is the only v1.5 change with a non-trivial source-level
 migration. See
-[`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md).
+the 2026 review.
 
 * **`PrimaryIndex::{put, put_no_overwrite, get, delete,
   delete_with_entity, contains, entities, keys}` now take
@@ -397,7 +397,7 @@ of any method.
   multi-statement `Stored*` sequences.
 * **Replication is GA in v2.0.** All ten pre-v2.0 blockers were
   closed.  See the
-  [Wave 4-A report](../internal/wave-4-a-rep-ga-finish.md) for
+  Wave 4-A report for
   per-finding resolution notes.
 
 ## Quick before/after summary
@@ -478,7 +478,7 @@ let txn2 = env.begin_transaction(Some(&cfg))?;
 ```
 
 See
-[`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md)
+the 2026 review
 for details.
 
 ---

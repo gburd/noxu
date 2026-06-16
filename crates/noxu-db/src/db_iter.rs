@@ -8,7 +8,7 @@
 //! Both types implement `Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>` and
 //! advance the cursor **lazily** — one record per `next()` call.  They do
 //! NOT eagerly materialise the scan into a `Vec` (that is the `StoredMap`
-//! anti-pattern flagged in audit-2026-05-jonhoo.md finding 2.2).
+//! anti-pattern flagged in 2026 audit finding 2.2).
 //!
 //! # Example
 //!

@@ -592,7 +592,7 @@ pub enum NoxuError {
     /// Returned by API arms that previously fell through to a silent
     /// `OperationStatus::NotFound`; users now see a loud, typed error
     /// instead of a misleading miss.  Tracked in
-    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
+    /// the 2026 review Finding 3.
     #[error("operation not yet supported: {0}")]
     Unsupported(String),
 }

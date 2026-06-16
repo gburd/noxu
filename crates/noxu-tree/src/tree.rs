@@ -1683,7 +1683,7 @@ impl Tree {
     /// before this method returns so callers may safely call `lock_ln`
     /// (which may block) without holding any tree latch.
     ///
-    /// Wave-11-I — see `docs/src/internal/wave-11-i-cursor-double-descent.md`.
+    /// Wave-11-I — see the 2026 review.
     pub fn search_with_data(&self, key: &[u8]) -> Option<SlotFetch> {
         let root = self.get_root()?;
         let mut guard: parking_lot::ArcRwLockReadGuard<

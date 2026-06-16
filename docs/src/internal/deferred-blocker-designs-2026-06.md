@@ -3,7 +3,7 @@
 **Date**: 2026-06-03
 
 The v3.x production-readiness review
-(`production-readiness-review-2026-06.md`) left a set of blockers that are
+(the 2026 review) left a set of blockers that are
 **not** safe quick fixes: they change the on-disk format, alter the isolation
 contract, implement a replication feature, or refactor a hot data path. Each
 is designed here so it can be implemented as a focused, individually-qualified

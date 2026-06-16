@@ -2,7 +2,7 @@
 
 > **v2.0 status — GA.** All ten noxu-rep GA blockers identified in the
 > May 2026 audit are closed in v2.0 (Waves 3-3 and 4-A). See
-> [Wave 4-A report](../internal/wave-4-a-rep-ga-finish.md) for
+> Wave 4-A report for
 > per-finding resolution notes.
 
 This page covers how to configure and start a Noxu DB replicated environment.

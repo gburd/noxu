@@ -5,7 +5,7 @@
 //! system. It manages N sharded lock tables, each protected by its own mutex,
 //! to allow concurrent lock operations on different LSNs.
 //!
-//! # Internal lock ordering (H-2, audit-2026-05-keith.md F-6.2)
+//! # Internal lock ordering (H-2, 2026 audit F-6.2)
 //!
 //! Two internal mutexes must never be held simultaneously, but when code
 //! paths need to update BOTH in sequence the canonical order is:
@@ -953,7 +953,7 @@ impl LockManager {
     /// Removes `locker_id` from the on-shard waiter list and from the
     /// incremental waiter graph, in canonical lock order (shard first).
     ///
-    /// H-2 (audit-2026-05-keith.md F-6.2): all victim-cleanup paths must
+    /// H-2 (2026 audit F-6.2): all victim-cleanup paths must
     /// acquire the shard mutex BEFORE (or without) the waiter_graph mutex.
     /// This helper enforces the ordering: it locks the shard, flushes the
     /// waiter entry, drops the shard guard, then calls `clear_wait()` to

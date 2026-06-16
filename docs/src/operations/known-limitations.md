@@ -3,7 +3,7 @@
 ## Replication security — **deploy only on a trusted network**
 
 The May-2026 security review (see
-`docs/src/internal/security-review-2026-05.md`) identified
+the 2026 review) identified
 six blocker-class security gaps in the replication wire
 protocol. Until those are closed, **the replication
 subsystem must not be deployed across an untrusted network

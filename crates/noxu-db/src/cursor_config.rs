@@ -10,7 +10,7 @@
 /// Four fields that used to live on this struct (`read_committed`,
 /// `non_sticky`, `evict_ln`, `prefix_constraint`) were removed because
 /// the engine never consulted them.  See
-/// `docs/src/internal/v1.5-decisions-2026-05.md` for the full rationale
+/// the 2026 review for the full rationale
 /// and migration notes.
 ///
 /// * `read_committed` — to use read-committed isolation, set it on the

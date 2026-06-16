@@ -1,7 +1,7 @@
 //! Sprint 3 / Wave 3-2 tests — XA crash-durable two-phase commit.
 //!
-//! See `docs/src/internal/sprint-3-xa-restriction.md` and
-//! `docs/src/internal/wave-3-2-crash-durable-xa.md` for the full
+//! See the 2026 review and
+//! the 2026 review for the full
 //! design.
 //!
 //! Wave 3-2 implemented crash-durable XA, removing the v1.5 in-process-

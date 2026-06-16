@@ -91,7 +91,7 @@ No data migration is required.
   (`find_node_info_recursive`, `find_node_size_recursive`,
   `find_node_arc_recursive`) have been removed.
   Size formula, eviction policy, and memory-budget accounting are unchanged.
-  See `docs/src/internal/production-readiness-review-2026-06.md` for details.
+  See the 2026 review for details.
 
 ### Fixed (data-loss correctness — St-H6, two sites)
 
@@ -379,7 +379,7 @@ No data migration is required.
 
 ### Added (documentation)
 
-- `docs/src/internal/production-readiness-review-2026-06.md` — synthesis of a
+- the 2026 review — synthesis of a
   four-domain, seven-persona production-readiness review, with the prioritized
   blocker list, plus the four detailed source reports. The review found
   Critical correctness/soundness issues that remain open (recovery undo
@@ -459,7 +459,7 @@ No data migration is required.
     TLS listener, dispatcher, and QUIC; a TLS node with an empty allowlist is
     a `ConfigError` rather than a silent plain-TCP downgrade.
   - Enforcement remains `tls-rustls`-only (`tls-native` has no client-cert
-    verification API). See `docs/src/internal/wave-ga-mtls-phase3.md`.
+    verification API). See the 2026 review.
 
 ### Fixed (portability — RISC-V 64 + Windows on ARM64)
 
@@ -531,7 +531,7 @@ No breaking change to the engine's on-disk format. Builds on v3.0.2.
   eliminates the group-commit thundering-herd re-lock.
 - **P-2**: W11 recovery throughput gap (~2.9× JE) scoped as a design note
   for a dedicated follow-up wave (BIN restore from the dirty-IN map). See
-  `docs/src/internal/wave-zc-crash-perf.md`.
+  the 2026 review.
 
 ### Added (v3.1.0 candidate)
 
@@ -552,7 +552,7 @@ No breaking change to the engine's on-disk format. Builds on v3.0.2.
   config field and an `auth` module are plumbed through `noxu-rep`. This is
   foundation only — the dispatcher does not yet enforce mTLS; enforcement is
   planned for a later release. See `docs/src/internal/auth-mtls-design-2026-05.md`
-  and `security-review-2026-05.md`.
+  and the 2026 review.
 - **Public API audit (May 2026)** documented across seven internal reports
   (overview, database, cursor, transaction/environment, secondary/join,
   collections/bind, persist/xa) under `docs/src/internal/`.
@@ -857,8 +857,8 @@ for each breaking change.
 - **`Database::iter(txn)` + `Database::range(txn, range)`**: lazy forward
   iterators that implement `Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>`.
   Records are fetched one at a time; the entire database is NOT eagerly
-  materialised (addresses audit-2026-05-jonhoo.md findings 2.1 / 2.3).
-  See `docs/src/internal/wave-11-s-ux-cleanup.md`. (Wave 11-S Q-1)
+  materialised (addresses the 2026 review findings 2.1 / 2.3).
+  See the 2026 review. (Wave 11-S Q-1)
 
 ### Fixed (v2.5.0 — Wave 11-S)
 
@@ -867,7 +867,7 @@ for each breaking change.
   handle is looked up with a brief per-record env lock acquisition; all undo
   application happens lock-free. Eliminates reader-starvation latency spikes
   during large-transaction aborts.
-  (Wave 11-S H-1, audit-2026-05-keith.md F-2.2)
+  (Wave 11-S H-1, the 2026 review F-2.2)
 
 - **`CursorImpl::search` `current_index = 0` bug**: after a `Search` or
   `SearchGte` operation the cursor's `current_index` was always reset to 0,
@@ -879,7 +879,7 @@ for each breaking change.
 - **`log_manager.rs` per-call `Vec` allocation** (H-3): the scratch buffer for
   log-entry encoding is now embedded in the LWL mutex (reused across calls).
   Eliminates a heap allocation on every log write.
-  (Wave 11-S H-3, audit-2026-05-keith.md F-1.1)
+  (Wave 11-S H-3, the 2026 review F-1.1)
 
 ### Documentation (v2.5.0 — Wave 11-S)
 
@@ -1095,7 +1095,7 @@ removed in v3.0.0.  Each has a `note` pointing to the replacement.
   (UX + cleanup) — wave 11-S.
 - **C-4, C-5, C-6, C-8** (breaking semantic fixes) — wave 11-R / v3.0.0.
 
-See [`docs/src/internal/wave-11-q-correctness.md`](docs/src/internal/wave-11-q-correctness.md)
+See the 2026 review
 for the full per-fix details.
 
 ## [v2.4.1] — 2026-05-29
@@ -1137,37 +1137,37 @@ for the full per-fix details.
   Calling `record_active_txn` after `record_commit` / `record_abort` for the
   same txn id re-inserted the txn into `active_txn_ids`, causing
   `has_active_txns()` to return a phantom `true`.  Added an early-return guard.
-  ([Wave 11-E regression](docs/src/internal/wave-11-e-property-tests.md))
+  (Wave 11-E regression)
 
 - **Transactional cursor on non-transactional database now rejected**
   (`noxu-db`).  `Database::open_cursor(Some(&txn), None)` now returns
   `IllegalArgument` when the database is non-transactional, matching JE.
-  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+  (Wave 11-G regression)
 
 - **`put_no_overwrite` on sorted-dup DB now checks key only** (`noxu-dbi`).
   `CursorImpl::put_dup` was checking the `(key, data)` pair for both
   `NoDupData` and `NoOverwrite`; per JE semantics `NoOverwrite` must check
   the key only.
-  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+  (Wave 11-G regression)
 
 - **Database name registry now persisted across clean close+reopen**
   (`noxu-dbi`, `noxu-recovery`).  Writes a `NameLN` WAL entry on database
   creation; recovery re-populates `name_map` from these entries.  Read-only
   reopens and non-transactional databases both survive the cycle.
-  ([Wave 11-G and Wave 10-A regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+  (Wave 11-G and Wave 10-A regression)
 
 - **Explicit checkpoint no longer loses committed data** (`noxu-recovery`).
   `Checkpointer::do_checkpoint()` was writing `NULL_LSN` as `first_active_lsn`
   in `CkptEnd`, causing recovery to skip committed LN entries before the
   checkpoint start.  Fixed by writing `Lsn::new(0, 0)` and always replaying
   committed LNs in `eligible_for_redo`.
-  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+  (Wave 11-G regression)
 
 - **`truncate_database` is now durable across clean close+reopen**
   (`noxu-dbi`).  Before replacing the in-memory tree, write non-transactional
   `DeleteLN` entries for every key; recovery replays them after the original
   inserts, leaving an empty tree.
-  ([Wave 11-G regression](docs/src/internal/wave-11-g-je-tck-longtail.md))
+  (Wave 11-G regression)
 
 <!-- ============================================================== -->
 <!-- Note: the Added (v2.4.0 — Wave 11-D) and subsequent v2.4.0      -->
@@ -1187,7 +1187,7 @@ for the full per-fix details.
   test fixture into a production transport alongside TCP, TLS, and QUIC.
   See [`docs/src/replication/in-memory-transport.md`](docs/src/replication/in-memory-transport.md)
   and the wave note at
-  [`docs/src/internal/wave-11-d-inmem-transport.md`](docs/src/internal/wave-11-d-inmem-transport.md).
+  the 2026 review.
   - New: `noxu_rep::net::InMemoryTransport` (factory) with
     `new_pair()` and `new_group(n)`.
   - New: `noxu_rep::net::InMemoryEndpoint` (implements the same
@@ -1254,7 +1254,7 @@ single-primary sorted-dup use, which has been covered by
    `update_bin_pin` call at every accept site in `apply_dup_filter`.
    Regression test `wave11n_bug4_get_first_get_next_full_walk_terminates`.
 
-See `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md` for the
+See the 2026 review for the
 full per-bug analysis.
 
 ### Tests
@@ -1280,10 +1280,10 @@ full per-bug analysis.
 
 ### Documentation
 
-* `docs/src/internal/wave-11-v231-followups.md`: narrative summary
+* the 2026 review: narrative summary
   of Waves 11-A / 11-B / 11-C, including the four sorted-dup cursor
   bugs surfaced (all closed in Wave 11-N — see `### Fixed` above).
-* `docs/src/internal/wave-11-n-sorted-dup-cursor-bugs.md`: per-bug
+* the 2026 review: per-bug
   analysis for the four sorted-dup cursor bugs closed in Wave 11-N.
 * `docs/src/operations/benchmarks.md`: new W13 and "Real-storage
 W10 / W11 re-run" sections.
@@ -1318,7 +1318,7 @@ W10 / W11 re-run" sections.
   (utilization tracker oracle and `FileSummary` arithmetic, 10),
   `noxu-recovery` (rollback periods and `AnalysisResult` txn state
   machine, 9), and `noxu-rep` (Paxos acceptor and VLSN streaming, 7).
-  See [`docs/src/internal/wave-11-e-property-tests.md`](docs/src/internal/wave-11-e-property-tests.md).
+  See the 2026 review.
   Adds `proptest` as a dev-dependency for `noxu-cleaner` and
   `noxu-recovery`.  No production-code changes.
 
@@ -1342,7 +1342,7 @@ W10 / W11 re-run" sections.
   (DbCursorDuplicate{,Delete}Test).  TSV row totals went from PE 263 /
   PP 99 / NOT 1580 to PE 306 / PP 105 / NOT 1531 (+43 PE, +6 PP, −49
   NOT).  See
-  [`docs/src/internal/wave-11-g-je-tck-longtail.md`](docs/src/internal/wave-11-g-je-tck-longtail.md).
+  the 2026 review.
 
 ### Tracked Noxu bugs surfaced (Wave 11-G; 5 total)
 
@@ -1367,7 +1367,7 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
 
 - Wave 11-H: per-workload `perf` profile captures (W03/W04/W10/W11)
   and a single-workload profiler harness under `benches/profiles/`.
-  See `docs/src/internal/wave-11-h-perf-investigation.md` for the
+  See the 2026 review for the
   per-workload root-cause analysis and the ROI ordering of waves
   11-I (cursor/BIN), 11-K (recovery), and 11-J (fsync).
 
@@ -1382,7 +1382,7 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   - W04 random read (100 K):     438 K → 1 030 K ops/s (+135%)
   - Both workloads now exceed JE on the same hardware.
   - Secondary-index / sorted-dup path unchanged.
-  - See `docs/src/internal/wave-11-i-cursor-double-descent.md`.
+  - See the 2026 review.
 
 ### Performance (v2.4.0 — Wave 11-J)
 
@@ -1395,7 +1395,7 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   was prototyped but reverted after back-to-back benchmarks showed 10–46 %
   regressions attributable to per-call `Arc` allocation overhead and
   coalescing-window changes.  See
-  `docs/src/internal/wave-11-j-fsync-coalescing.md` for the full diagnosis
+  the 2026 review for the full diagnosis
   and recommended next steps.
 
 ### Performance (v2.4.0 — Wave 11-K)
@@ -1415,7 +1415,7 @@ follow-up bug-fix wave (no production code changed in Wave 11-G).
   - All 5764 tests pass; gate: fmt + clippy + doc all clean.
   - W11 wall-clock improvement is within measurement noise at 100K on this
     machine (≈251ms vs ≈254ms baseline, ratio 2.9× JE).  Root-cause analysis
-    in `docs/src/internal/wave-11-k-recovery-alloc.md` explains why the gap
+    in the 2026 review explains why the gap
     remains: the dominant ≈200ms cost is env-open overhead outside the redo loop,
     not allocator pressure in the redo path itself.  A follow-up (BIN
     deserialization from dirty_in_map, or lazy env-open) would be needed to
@@ -1553,7 +1553,7 @@ v1.x → v2.0.0 upgrade path.
 ### Added
 
 - **Replication GA.**  All ten v2.0 GA blockers from
-  `api-audit-2026-05-rep.md` §7 are closed:
+  the 2026 review §7 are closed:
   - `ReplicaAckPolicy` honoured on commit (F1).
   - Dispatcher service-name length bounded (F3).
   - `NetworkRestore` wired through the dispatcher path (F2 / F4).
@@ -1851,8 +1851,8 @@ release notes.
   BIN's learned key prefix (affected prefix-bounded scans over tagged
   keyspaces).  Defensive guard added to `tree::delete_recursive` at
   the matching call site.  No on-disk or API changes.
-- **v1.4.1** (2026-05-25) — Closed 26 of 43 audit items from
-  `claim-audit-2026-05` and `security-review-2026-05`: all 16
+- **v1.4.1** (2026-05-25) — Closed 26 of 43 audit items from the 2026-05
+  claim audit and security review: all 16
   medium / low claim-audit items, 2 of 6 security blockers
   (LOG-2 4 GiB allocation bound, LOG-4 path-traversal closure in
   `NetworkRestore`), and 7 of 10 security important items (TLS-2/3/4
@@ -1879,21 +1879,21 @@ release notes.
 The May 2026 public-API audit drove the v1.5.x and v1.6.x sprints.
 The original audit reports recorded in this branch:
 
-- [`api-audit-2026-05-rep.md`](docs/src/internal/api-audit-2026-05-rep.md) —
+- the 2026 review —
   noxu-rep audit, 40 findings.
-- [`audit-report.md`](docs/src/internal/audit-report.md) — aggregate.
-- [`claim-audit-2026-05.md`](docs/src/internal/claim-audit-2026-05.md) —
+- the 2026 review — aggregate.
+- the 2026 review —
   doc-vs-code claim audit (43 items, drove v1.4.1).
-- [`je-port-audit-2026-05-overview.md`](docs/src/internal/je-port-audit-2026-05-overview.md)
+- the 2026 review
   — JE port-completeness audit overview (links to api-map / test-map /
   test-quality-spotcheck).
 
 ### Decisions
 
-- [`v1.5-decisions-2026-05.md`](docs/src/internal/v1.5-decisions-2026-05.md) —
+- the 2026 review —
   architectural decisions (1B / 2C / 3B) signed off by the project
   owner; enforced via Sprint 3D.
-- [`sprint-3-decisions-enforced.md`](docs/src/internal/sprint-3-decisions-enforced.md)
+- the 2026 review
   — typed `Unsupported` errors for restricted surfaces.
 
 ### Wave reports
@@ -1901,27 +1901,27 @@ The original audit reports recorded in this branch:
 Each sprint and wave landed an internal note documenting motivation,
 scope, and test gate.  In commit order:
 
-- [Wave 1C — audit Low/Info cleanup](docs/src/internal/wave1c-audit-low-info-cleanup-2026-05.md)
-- [Wave 2A — secondary database unification](docs/src/internal/wave-2a-secondary-unification.md)
-- [Wave 2B — collections typed API and txn threading](docs/src/internal/wave-2b-collections-typed.md)
-- [Wave 2C-1 — DPL derive macros](docs/src/internal/wave-2c-1-derive-macro.md)
-- [Wave 2C-2 — DPL schema evolution](docs/src/internal/wave-2c-2-dpl-evolution.md)
-- [Wave 2C-3 — DiskOrderedCursor](docs/src/internal/wave-2c-3-disk-ordered-cursor.md)
-- [Wave 3-1 — nested-transaction parameter removed](docs/src/internal/wave-3-1-nested-txn-removal.md)
-- [Wave 3-2 — crash-durable XA](docs/src/internal/wave-3-2-crash-durable-xa.md)
-- [Wave 4-A — noxu-rep GA finish](docs/src/internal/wave-4-a-rep-ga-finish.md)
-- [Wave 4-B — JE TCK port (priority 1)](docs/src/internal/wave-4-b-je-tck-port-priority1.md)
-- [Wave 4-C — JE TCK port (priority 2)](docs/src/internal/wave-4-c-je-tck-port-priority2.md)
-- [Wave 5 — Noxu correctness fixes (TCK regressions)](docs/src/internal/wave-5-noxu-correctness-fixes.md)
-- [Wave 6 — JE TCK port (priority 3 + 4)](docs/src/internal/wave-6-je-tck-port-priority-3-4.md)
-- [Wave 7 — v2.0.1 polish](docs/src/internal/wave-7-polish.md)
-- [Wave 8 — RepTestBase harness + heavy rep TCK port](docs/src/internal/wave-8-rep-testbase.md)
-- [Wave 9-A — noxu-rep fixes (v2.1.1 / v2.2.0)](docs/src/internal/wave-9-a-rep-fixes.md)
-- [Wave 9-B — Stateright spec re-validation](docs/src/internal/wave-9-b-stateright-revalidation.md)
-- [Wave 9-C — JE TCK port (additional rows)](docs/src/internal/wave-9-c-je-tck-ports.md)
+- Wave 1C — audit Low/Info cleanup
+- Wave 2A — secondary database unification
+- Wave 2B — collections typed API and txn threading
+- Wave 2C-1 — DPL derive macros
+- Wave 2C-2 — DPL schema evolution
+- Wave 2C-3 — DiskOrderedCursor
+- Wave 3-1 — nested-transaction parameter removed
+- Wave 3-2 — crash-durable XA
+- Wave 4-A — noxu-rep GA finish
+- Wave 4-B — JE TCK port (priority 1)
+- Wave 4-C — JE TCK port (priority 2)
+- Wave 5 — Noxu correctness fixes (TCK regressions)
+- Wave 6 — JE TCK port (priority 3 + 4)
+- Wave 7 — v2.0.1 polish
+- Wave 8 — RepTestBase harness + heavy rep TCK port
+- Wave 9-A — noxu-rep fixes (v2.1.1 / v2.2.0)
+- Wave 9-B — Stateright spec re-validation
+- Wave 9-C — JE TCK port (additional rows)
 
 ### How this file is maintained
 
-See [`docs/src/internal/wave-10-b-changelog.md`](docs/src/internal/wave-10-b-changelog.md)
+See the 2026 review
 for the format convention, the relationship to git tag annotations,
 and the workflow for updating this file on each future release.

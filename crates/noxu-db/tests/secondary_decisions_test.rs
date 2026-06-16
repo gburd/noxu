@@ -1,5 +1,5 @@
 //! Regression tests for Sprint 3D — Decisions 1B and 2C from
-//! `docs/src/internal/v1.5-decisions-2026-05.md`.
+//! the 2026 review.
 //!
 //! Each test asserts a documented v1.5 limitation:
 //!

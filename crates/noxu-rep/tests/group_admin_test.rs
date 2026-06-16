@@ -1,6 +1,6 @@
 //! Integration tests for F7 (transfer_master) and F8 (shutdown_group).
 //!
-//! Closes findings F7 and F8 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes findings F7 and F8 of the 2026 review.
 
 use noxu_rep::{
     NodeType, RepConfig, RepNode, ReplicatedEnvironment,

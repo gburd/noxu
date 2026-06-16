@@ -11,7 +11,7 @@
 //! same class of regression?  Where the two diverge in an interesting way it
 //! is documented inline.
 //!
-//! See `docs/src/internal/wave-4-b-je-tck-port-priority1.md` for the wave-4-B
+//! See the 2026 review for the wave-4-B
 //! port narrative and the `je-tck-port-2026-05-enumeration-*.tsv` files for
 //! per-test status.
 

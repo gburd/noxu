@@ -88,7 +88,7 @@ pub enum Get {
     /// **Not yet implemented.**  `Cursor::get` returns
     /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
     /// for a future sprint; see
-    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
+    /// the 2026 review Finding 3.
     SearchLte,
 
     /// Get the first duplicate of the current key.
@@ -99,7 +99,7 @@ pub enum Get {
     /// **Not yet implemented.**  `Cursor::get` returns
     /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
     /// for a future sprint; see
-    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
+    /// the 2026 review Finding 3.
     FirstDup,
 
     /// Get the last duplicate of the current key.
@@ -110,7 +110,7 @@ pub enum Get {
     /// **Not yet implemented.**  `Cursor::get` returns
     /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
     /// for a future sprint; see
-    /// `docs/src/internal/api-audit-2026-05-cursor.md` Finding 3.
+    /// the 2026 review Finding 3.
     LastDup,
 
     /// Get the next duplicate of the current key.

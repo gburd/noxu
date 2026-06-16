@@ -1,6 +1,6 @@
 //! Persistent acceptor state for the Paxos election protocol (F5/F31).
 //!
-//! Closes findings F5 and F31 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes findings F5 and F31 of the 2026 review.
 //!
 //! The Paxos safety property is "an acceptor never accepts a proposal at
 //! a term lower than its highest promise."  Without crash durability of

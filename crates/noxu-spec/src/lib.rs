@@ -21,7 +21,7 @@
 //! `vlsn_streaming`, `master_transfer`, `network_restore`) were
 //! re-validated at v2.0.0.  The remaining specs were annotated and
 //! strengthened at v2.4.0; see
-//! `docs/src/internal/wave-11-f-stateright-coverage.md` for the
+//! the 2026 review for the
 //! per-protocol report.
 //!
 //! | Module | Production code under model |

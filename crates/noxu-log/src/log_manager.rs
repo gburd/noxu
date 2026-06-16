@@ -138,7 +138,7 @@ pub struct LogManager {
     ///
     write_observer: Option<Arc<dyn LogWriteObserver>>,
 
-    /// C-2 (audit-2026-05-keith.md F-3.2 / F-8.4 / F-9.4): set to `true`
+    /// C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): set to `true`
     /// the first time an fsync or file-sync I/O error is observed.  Once set,
     /// `log()` refuses all further writes and `is_io_invalid()` returns `true`
     /// so that `EnvironmentImpl::is_valid()` can detect the failure.
@@ -363,7 +363,7 @@ impl LogManager {
         // Acquire the LWL — all LSN assignment and file position advancement
         // happens under this latch, matching serialLog/serialLogWork.
         //
-        // H-3 (audit-2026-05-keith.md F-1.1): we now reuse the scratch Vec<u8>
+        // H-3 (the 2026 review F-1.1): we now reuse the scratch Vec<u8>
         // embedded in the LWL guard instead of allocating a fresh
         // `vec![0u8; entry_size]` on every call.  The Vec is cleared and
         // resized to `entry_size` under the LWL.  Because the LWL serialises
@@ -600,7 +600,7 @@ impl LogManager {
             fm.sync_log_end().map_err(|e| std::io::Error::other(e.to_string()))
         });
         if let Err(ref e) = fsync_result {
-            // C-2 (audit-2026-05-keith.md F-3.2 / F-8.4 / F-9.4): any I/O
+            // C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): any I/O
             // error from fdatasync permanently invalidates the log; refuse
             // all further writes (fsyncgate class).
             self.io_invalid.store(true, Ordering::Release);
@@ -710,7 +710,7 @@ impl LogManager {
     /// the outer `Vec` allocation across flush calls.  The inner `Vec<u8>` per
     /// dirty buffer is still a memcpy — zero-copy would require holding the
     /// buffer latch through the write, which conflicts with the R-2 goal of
-    /// releasing the LWL before I/O (see `docs/src/internal/wave-zc-crash-perf.md`).
+    /// releasing the LWL before I/O (see the 2026 review).
     ///
     /// Must be called under the LWL.  Takes the `buffer_pool` explicitly to
     /// avoid a `&self` borrow conflict while the LWL guard is live.

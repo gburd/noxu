@@ -2,7 +2,7 @@
 
 > **v2.0 status — GA.** The replication subsystem reached GA in v2.0
 > with all ten pre-v2.0 blockers closed.  See
-> [`docs/src/internal/api-audit-2026-05-rep.md`](../internal/api-audit-2026-05-rep.md)
+> the 2026 review
 > for the per-finding details.
 
 This chapter describes Noxu DB's replication subsystem (`noxu-rep`), which

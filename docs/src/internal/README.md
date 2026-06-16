@@ -1,23 +1,25 @@
 # Internal Documents
 
-This section contains technical analysis documents written during the
-development of Noxu DB. They are intended for contributors and maintainers,
-not end users.
+This section contains technical reference written during the development of
+Noxu DB. It is intended for contributors and maintainers, not end users.
 
-> **Note:** These documents reflect the state of the codebase at the time
-> they were written. Check the date and the git log to understand whether
-> specific findings have been addressed since the document was produced.
+These are design and research notes that explain decisions still reflected in
+the code. Per-iteration development logs and point-in-time audit transcripts
+are intentionally not kept here.
 
 ## Documents
 
-- [Audit Report](audit-report.md) — historical snapshot of three
-  independent audits taken when the workspace had 16 crates and the
-  public API was still backed by an in-memory HashMap. Most of its
-  "Critical" findings have since been resolved; preserved for the
-  record. Do not treat its subsystem-completeness claims as current.
-- [Rust Code Review](rust-review.md) — historical Rust quality review (originally covered the
-  16-crate workspace state; current workspace has 19 crates). Grade: B+.
 - [Serialization Research](serialization-research.md) — zero-copy log entry
   parsing research and recommendations for `noxu-log`.
-- [Checksum Selection](checksum-selection.md) — CRC32 vs CRC32C benchmark and
-  selection rationale for the replication feeder protocol.
+- [Checksum Selection](checksum-selection.md) — CRC32 selection rationale for
+  the log and replication feeder protocol (referenced by `file_header.rs`).
+- [mTLS-by-default design (2026-05)](auth-mtls-design-2026-05.md) — the
+  replication transport-security design.
+- [noxu umbrella crate](noxu-umbrella.md) — rationale for the single `noxu`
+  facade crate and its feature flags.
+- [Portability validation — RISC-V 64 + Windows on ARM64](portability-rv-windows.md)
+  — cross-platform validation notes.
+- [Wave GB — DbTree foundation + P-2 recovery investigation](wave-gb-dbtree-recovery.md)
+  — the recovery-scan / checkpoint-user-BIN-flush investigation.
+  - [Deferred-blocker implementation designs](deferred-blocker-designs-2026-06.md)
+    — designs and status for deferred review items (T-F3/T-F4, P-2).

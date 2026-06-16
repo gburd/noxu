@@ -113,7 +113,7 @@ pub fn run_election_with_phi(
     // election and wedge the cluster, since it cannot serve reads or
     // generate VLSNs (`is_data_node() == false`).
     //
-    // See docs/src/internal/api-audit-2026-05-rep.md finding F22.
+    // See the 2026 review finding F22.
     // ---------------------------------------------------------------
     let our_node_can_be_master = group
         .get_node(node_name)
@@ -397,7 +397,7 @@ pub fn run_acceptor(
 /// Like `run_acceptor`, but routes the promise/accept decisions through a
 /// crash-durable `PersistentAcceptorState`.
 ///
-/// Closes findings F5 and F31 of `docs/src/internal/api-audit-2026-05-rep.md`.
+/// Closes findings F5 and F31 of the 2026 review.
 ///
 /// The Paxos invariant is that an acceptor never accepts a proposal at a
 /// term lower than its highest promise.  The legacy `run_acceptor` keeps

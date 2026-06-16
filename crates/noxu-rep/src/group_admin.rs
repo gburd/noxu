@@ -1,7 +1,7 @@
 //! Group-administration service: master transfer and group shutdown.
 //!
 //! Closes findings F7 (`transfer_master`) and F8 (`shutdown_group`)
-//! of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! of the 2026 review.
 //!
 //! # Wire protocol (over `TcpServiceDispatcher` `ADMIN` channel)
 //!

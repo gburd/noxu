@@ -5,7 +5,7 @@
 >
 > **v1.5 limitations** are detailed in the
 > ["v1.5 limitations" section below](#v15-limitations) and in
-> [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md).
+> the 2026 review.
 > Headlines: secondary indexes are in-memory only; secondary updates
 > are not atomic with the user txn; primary writes do thread `txn`
 > through correctly.
@@ -447,10 +447,10 @@ in-memory variant for tests.
   but is **not** enforced by the engine in v1.5/v1.6 (the secondary
   layer is in-memory and has no access to a foreign-key constraint
   graph). v2.0 will wire the actions into the cascade path.
-- See [`docs/src/internal/sprint-3-dpl-restriction.md`](../internal/sprint-3-dpl-restriction.md)
+- See the 2026 review
   for the full audit context, the rationale for shipping the
   in-memory secondaries unchanged in v1.5, and the v1.6 plan.
-- See [`docs/src/internal/wave-2c-1-derive-macro.md`](../internal/wave-2c-1-derive-macro.md)
+- See the 2026 review
   for the design of the v1.6 derive-macro layer.
 
 ## Other roadmap items

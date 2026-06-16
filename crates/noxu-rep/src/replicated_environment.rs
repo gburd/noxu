@@ -123,7 +123,7 @@ pub struct ReplicatedEnvironment {
     /// Wrapped in `Arc` so that background daemons (election driver,
     /// VLSN-index persistence flusher) can share access without
     /// borrowing the env.  Closes finding F11 (
-    /// `docs/src/internal/api-audit-2026-05-rep.md`).
+    /// the 2026 review).
     vlsn_index: Arc<VlsnIndex>,
     /// Tracks acknowledgments from replicas (used by master).
     ack_tracker: AckTracker,
@@ -190,7 +190,7 @@ pub struct ReplicatedEnvironment {
     /// production this should track the real master VLSN; until F11
     /// closes the VLSN<->commit linkage, the coordinator uses a
     /// synthetic sequence so that ack tracking is unique per commit.
-    /// See finding F1 in `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// See finding F1 in the 2026 review.
     commit_ack_seq: std::sync::atomic::AtomicU64,
 
     /// Shared acceptor state used by the ELECTION service handler.
@@ -494,7 +494,7 @@ impl ReplicatedEnvironment {
     /// known peers until the node has resolved into either Master or
     /// Replica state.
     ///
-    /// Closes finding F6 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// Closes finding F6 of the 2026 review.
     ///
     /// Use [`ReplicatedEnvironment::new`] directly only when the
     /// caller plans to drive state transitions explicitly (test
@@ -1453,7 +1453,7 @@ impl ReplicatedEnvironment {
     /// Bootstrap this node's environment by network-restoring all `.ndb`
     /// files from `peer_name` via the dispatcher's RESTORE service.
     ///
-    /// Closes findings F2 / F4 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// Closes findings F2 / F4 of the 2026 review.
     ///
     /// The standalone `NetworkRestore::execute()` opens raw TCP and
     /// expects to drive the legacy `NetworkRestoreServer::start` listener.
@@ -1592,7 +1592,7 @@ impl ReplicatedEnvironment {
 
         // --- F9: spawn Feeder trackers for each known replica -------------
         //
-        // Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        // Closes finding F9 of the 2026 review.
         // The architecture is pull-based: replicas pull from the master's
         // `PEER_FEEDER` service via `catch_up_from_peer`.  However, the
         // master must:
@@ -1918,7 +1918,7 @@ impl ReplicatedEnvironment {
             config.target_node,
         );
 
-        // Closes finding F7 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        // Closes finding F7 of the 2026 review.
         //
         // Steps:
         //   1. Locate the target's address.
@@ -2008,7 +2008,7 @@ impl ReplicatedEnvironment {
 
     /// Replicate a freshly committed log entry from the master.
     ///
-    /// Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// Closes finding F9 of the 2026 review.
     ///
     /// Combines `register_vlsn` with a push into the in-memory
     /// `peer_scanner` so that downstream replicas pulling from this
@@ -2065,7 +2065,7 @@ impl ReplicatedEnvironment {
     /// scanner so that downstream replicas attached to the
     /// `PEER_FEEDER` service can re-stream it; the local log is **not**
     /// updated.  This is documented behaviour rather than a stub — see
-    /// `api-audit-2026-05-rep.md` finding #26 (medium) for the
+    /// the 2026 review finding #26 (medium) for the
     /// `with_environment`-required local-apply path.
     /// cleanup (rep info F35: `_data` placeholder) renames the leading
     /// underscore so reviewers don't read it as a TODO.
@@ -2323,7 +2323,7 @@ impl ReplicatedEnvironment {
             }
         }
 
-        // Closes finding F8 of `docs/src/internal/api-audit-2026-05-rep.md`.
+        // Closes finding F8 of the 2026 review.
         //
         // Send SHUTDOWN_GROUP to every known peer.  The recipient calls
         // its own `close()` and the per-connection ADMIN handler
@@ -2417,7 +2417,7 @@ impl ReplicatedEnvironment {
 //      is satisfied.
 //   5. Cleans up the tracker entry on every exit path.
 //
-// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+// Closes finding F1 of the 2026 review.
 impl ReplicaAckCoordinator for ReplicatedEnvironment {
     fn await_replica_acks(
         &self,

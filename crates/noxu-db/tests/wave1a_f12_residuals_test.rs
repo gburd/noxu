@@ -1,5 +1,5 @@
 //! Wave 1A regression tests for the two F12 residuals from
-//! `docs/src/internal/sprint-1-followup-f12.md`:
+//! the 2026 review:
 //!
 //!   1. **NULL-LSN insert race** — two concurrent auto-commit inserts
 //!      of the same brand-new key now coordinate through the lock

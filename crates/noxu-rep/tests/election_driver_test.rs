@@ -13,7 +13,7 @@
 //!   - `ReplicatedEnvironment::open(config) -> Arc<Self>`, the
 //!     production entry point that does both.
 //!
-//! See `docs/src/internal/api-audit-2026-05-rep.md` finding F6.
+//! See the 2026 review finding F6.
 
 use std::time::{Duration, Instant};
 

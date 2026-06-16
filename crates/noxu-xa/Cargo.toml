@@ -4,7 +4,7 @@ version.workspace = true
 # Pinned to edition 2021 (workspace is 2024) until a follow-up wave can
 # address the edition-2024 clippy lints (`collapsible_if` for `if let` chains)
 # that fire under the new edition. Tracked in
-# docs/src/internal/wave-10-e-cratesio-prep.md.
+# the 2026 review.
 edition = "2021"
 license.workspace = true
 repository.workspace = true

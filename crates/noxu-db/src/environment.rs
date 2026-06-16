@@ -81,7 +81,7 @@ pub struct Environment {
     /// `ReplicaAckPolicy` is satisfied (or the configured timeout
     /// elapses, in which case `NoxuError::InsufficientReplicas` is
     /// returned).  Closes finding F1 of
-    /// `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// the 2026 review.
     replica_coordinator: Mutex<Option<noxu_dbi::SharedReplicaAckCoordinator>>,
     /// Per-commit timeout for replica acknowledgments.  Mirrors
     /// `noxu_rep::RepConfig::replica_ack_timeout`; defaults to 5s.
@@ -726,7 +726,7 @@ impl Environment {
     /// Nested (child) transactions are not supported.  In v1.5 this method
     /// took an `Option<&Transaction>` `parent` argument that was rejected
     /// at runtime with [`NoxuError::Unsupported`] (Decision 3B in
-    /// `docs/src/internal/v1.5-decisions-2026-05.md`, audit finding F11).
+    /// the 2026 review, audit finding F11).
     /// In v2.0 the parameter has been removed entirely — the
     /// type system now enforces the constraint, so what was a runtime
     /// error is now a compile error.
@@ -912,7 +912,7 @@ impl Environment {
     /// rep_env.with_environment(env_impl);
     /// ```
     ///
-    /// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// Closes finding F1 of the 2026 review.
     pub fn set_replica_coordinator(
         &self,
         coord: noxu_dbi::SharedReplicaAckCoordinator,

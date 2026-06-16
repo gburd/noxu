@@ -15,7 +15,7 @@
 //!     promises still count toward Phase 1 quorum but never as the
 //!     candidate value.
 //!
-//! See docs/src/internal/api-audit-2026-05-rep.md finding F22.
+//! See the 2026 review finding F22.
 
 use std::sync::Arc;
 

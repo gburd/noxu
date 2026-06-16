@@ -39,7 +39,7 @@
 //!
 //! # v1.5 limitations
 //!
-//! See `docs/src/internal/v1.5-decisions-2026-05.md`.
+//! See the 2026 review.
 //!
 //! - **Decision 1B** — v1.5 secondaries are honestly **one-to-one**: a given
 //!   secondary key may map to at most one primary key.  Two distinct
@@ -594,7 +594,7 @@ impl FkReferrer for SecondaryHookState {
 /// auto-committed, which restores the v1.4 behaviour and is acceptable
 /// when the caller does not need cross-database atomicity.
 ///
-/// See `docs/src/internal/v1.5-decisions-2026-05.md` and
+/// See the 2026 review and
 /// `docs/src/transactions/secondary-with-txn.md`.
 ///
 /// # Example
@@ -642,7 +642,7 @@ impl SecondaryDatabase {
     ///   `foreign_key_delete_action != Abort`, `foreign_key_nullifier`, or
     ///   `foreign_multi_key_nullifier`).  v1.5 does not enforce FK
     ///   constraints; full FK support is planned for v1.6 — see Decision 2C
-    ///   in `docs/src/internal/v1.5-decisions-2026-05.md` (closes audit
+    ///   in the 2026 review (closes audit
     ///   findings C2 / F1 / F16).
     pub fn open(
         primary: Arc<Mutex<Database>>,
@@ -665,7 +665,7 @@ impl SecondaryDatabase {
             return Err(NoxuError::IllegalArgument(
                 "v1.6 secondary databases require the inner index DB to \
                  be opened with DatabaseConfig::with_sorted_duplicates(true) \
-                 — see docs/src/internal/v1.5-decisions-2026-05.md Decision 1B"
+                 — see the 2026 review Decision 1B"
                     .to_string(),
             ));
         }

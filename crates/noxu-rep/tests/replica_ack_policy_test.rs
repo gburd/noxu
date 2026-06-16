@@ -12,7 +12,7 @@
 //! `noxu_db::Environment`, and makes `Transaction::commit_with_durability`
 //! block on the configured policy until the configured timeout fires.
 //!
-//! See `docs/src/internal/api-audit-2026-05-rep.md` finding F1.
+//! See the 2026 review finding F1.
 //!
 //! These tests build an `Arc<ReplicatedEnvironment>` directly (the
 //! coordinator does not require a real `noxu_db::Environment` to

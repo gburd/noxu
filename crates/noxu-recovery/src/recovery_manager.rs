@@ -258,7 +258,7 @@ pub struct RecoveryManager {
     /// B-tree) requires a dedicated on-disk mapping tree, not a `HashMap`.
     /// The current implementation covers NameLNTxn undo only; the MapLN
     /// structural undo is tracked as a future follow-up.
-    /// See: `docs/src/internal/wave-11-y-c6-endtoend.md`.
+    /// See: the 2026 review.
     pub(crate) mapping_tree_db_names: HashMap<String, u64>,
 }
 
@@ -641,7 +641,7 @@ impl RecoveryManager {
     /// a dedicated on-disk mapping tree, not a HashMap.  The current
     /// implementation covers NameLNTxn undo only; the structural MapLN
     /// pass is tracked as a future follow-up.
-    /// See: `docs/src/internal/wave-11-y-c6-endtoend.md`.
+    /// See: the 2026 review.
     pub(crate) fn run_mapping_tree_undo_pass(
         &mut self,
         analysis: &mut crate::analysis_result::AnalysisResult,

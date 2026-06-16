@@ -224,7 +224,7 @@ impl Cursor {
             // a wildcard `_ => Ok(NotFound)` arm, silently misleading users
             // who could not distinguish "no such record" from "this operator
             // is not implemented".  Surface a loud, typed error instead.
-            // See `docs/src/internal/api-audit-2026-05-cursor.md`.
+            // See the 2026 review.
             //
             // Implementing these properly is tracked for a later sprint.
             Get::SearchLte => {

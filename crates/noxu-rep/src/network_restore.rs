@@ -341,7 +341,7 @@ impl NetworkRestore {
     /// Execute a network restore against a peer's `RESTORE` service
     /// running on the `TcpServiceDispatcher`.
     ///
-    /// Closes findings F2 / F4 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// Closes findings F2 / F4 of the 2026 review.
     ///
     /// `execute()` (above) connects raw TCP and writes `RESTORE_MAGIC`,
     /// which works only against the standalone `NetworkRestoreServer::start`

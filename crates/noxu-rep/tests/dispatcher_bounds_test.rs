@@ -5,7 +5,7 @@
 //! 4-byte length prefix from any peer (or attacker on the replication
 //! port) caused up to a 4 GiB allocation per connection.
 //!
-//! See `docs/src/internal/api-audit-2026-05-rep.md` finding F3.
+//! See the 2026 review finding F3.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

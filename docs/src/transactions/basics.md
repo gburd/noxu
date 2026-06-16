@@ -7,7 +7,7 @@
 >   rejected at runtime with `NoxuError::Unsupported`; in v2.0 the
 >   parameter has been removed entirely — the type system now
 >   enforces the constraint and the misuse is a compile error.
->   See [`wave-3-1-nested-txn-removal.md`](../internal/wave-3-1-nested-txn-removal.md).
+>   See the 2026 review.
 > * **Auto-commit and cursors coexist correctly.** Auto-commit cursor
 >   writes acquire write locks via the lock manager and block on
 >   competing explicit-txn write/read locks.
@@ -424,6 +424,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 > deadlocks (the auto-commit cursor's locker id and the txn id are
 > tracked in disjoint id spaces, so a deadlock involving both is
 > reported by raw integer id rather than by transaction name — see
-> `docs/src/internal/sprint-1-followup-f12.md`).
+> the 2026 review).
 
 ---

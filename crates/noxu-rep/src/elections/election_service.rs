@@ -5,7 +5,7 @@
 //! service are passed to [`crate::elections::paxos::run_acceptor`]
 //! using the local node's current VLSN, priority, and term.
 //!
-//! Closes finding F6 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes finding F6 of the 2026 review.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

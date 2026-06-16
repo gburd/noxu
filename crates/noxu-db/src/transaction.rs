@@ -115,7 +115,7 @@ pub struct Transaction {
     /// `ReplicaAckPolicy` is satisfied or the durability ack-timeout
     /// elapses, in which case `NoxuError::InsufficientReplicas` is
     /// returned.  Closes finding F1 of
-    /// `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// the 2026 review.
     replica_coordinator: Option<SharedReplicaAckCoordinator>,
     /// Per-commit timeout for replica acknowledgments.  Default 5s; set
     /// from the environment's `replica_ack_timeout_ms` (see
@@ -285,7 +285,7 @@ impl Transaction {
     /// elapses, in which case `NoxuError::InsufficientReplicas` is
     /// returned.
     ///
-    /// Closes finding F1 of `docs/src/internal/api-audit-2026-05-rep.md`.
+    /// Closes finding F1 of the 2026 review.
     pub(crate) fn with_replica_coordinator(
         mut self,
         coord: SharedReplicaAckCoordinator,
@@ -607,7 +607,7 @@ impl Transaction {
 
             // Phase 2: apply undo to the B-tree (write locks still held).
             //
-            // H-1 (audit-2026-05-keith.md F-2.2): acquire env lock only for
+            // H-1 (the 2026 review F-2.2): acquire env lock only for
             // the fast database-handle lookup, then drop it immediately.
             // This prevents the entire abort undo loop from serialising all
             // concurrent readers/writers against the EnvironmentImpl mutex.

@@ -1,4 +1,4 @@
-//! Sprint 3B (api-audit-2026-05-persist-xa, C6 / #10 / #11 / #18) regression
+//! Sprint 3B (2026 audit: C6 / #10 / #11 / #18) regression
 //! tests for `txn`-threading through `PrimaryIndex` and `SecondaryIndex`.
 //!
 //! What this file proves:

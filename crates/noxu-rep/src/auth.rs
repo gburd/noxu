@@ -1,7 +1,7 @@
 //! Peer authentication and authorisation for replication.
 //!
 //! Replication in v1.4.x and earlier had no authentication on
-//! the wire (see `docs/src/internal/security-review-2026-05.md`,
+//! the wire (see the 2026 review,
 //! finding NA-1). The mTLS-by-default plan
 //! (`docs/src/internal/auth-mtls-design-2026-05.md`) closes
 //! NA-1 / NA-2 / NA-3 / NA-4 / NA-8 / TLS-1 by:

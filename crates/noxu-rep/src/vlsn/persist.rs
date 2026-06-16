@@ -1,6 +1,6 @@
 //! Persistence for the in-memory VLSN index.
 //!
-//! Closes finding F11 (`docs/src/internal/api-audit-2026-05-rep.md`).
+//! Closes finding F11 (the 2026 review).
 //!
 //! The VLSN index maps VLSNs to log positions (file_number, file_offset) and
 //! is rebuilt as entries are received from the master.  Without persistence,

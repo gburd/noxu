@@ -1,6 +1,6 @@
 //! Integration tests for F5 / F31: persistent acceptor promises.
 //!
-//! Closes findings F5 and F31 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes findings F5 and F31 of the 2026 review.
 //!
 //! The Paxos safety invariant is that an acceptor never accepts a
 //! proposal at a term lower than its highest promise.  Without

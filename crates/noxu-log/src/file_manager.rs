@@ -467,7 +467,7 @@ impl FileManager {
         file.flush()?;
         file.sync_all()?;
 
-        // C-1 (audit-2026-05-keith.md F-3.1 / audit-2026-05-je-team.md 1-G):
+        // C-1 (2026 audit F-3.1 / 2026 audit 1-G):
         // After fsync-ing the new file, fsync the parent directory so the
         // directory entry itself is durable.  Without this a power-loss between
         // file creation and the next directory write loses the file entirely.

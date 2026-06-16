@@ -1,6 +1,6 @@
 //! Tests for Database::iter() and Database::range() lazy iterators (Q-1).
 //!
-//! audit-2026-05-jonhoo.md findings 2.1 and 2.3.
+//! 2026 audit findings 2.1 and 2.3.
 
 use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use tempfile::TempDir;

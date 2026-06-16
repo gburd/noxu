@@ -795,7 +795,7 @@ impl CursorImpl {
                     // argument was silently dropped and `Success` was
                     // returned for any matching key, contradicting the
                     // documented contract on `Get::SearchBoth`.  See
-                    // `docs/src/internal/api-audit-2026-05-cursor.md`.
+                    // the 2026 review.
                     if matches!(search_mode, SearchMode::Both) {
                         let user_data = data.unwrap_or(&[]);
                         let stored = final_data.as_deref().unwrap_or(&[]);
@@ -1687,7 +1687,7 @@ impl CursorImpl {
         // gated on `is_dup` and the cursor would silently degenerate into
         // plain Next / Prev semantics, returning the next *different* key
         // and violating the documented contract.  See
-        // `docs/src/internal/api-audit-2026-05-cursor.md` Finding 5.
+        // the 2026 review Finding 5.
         if !is_dup && matches!(mode, GetMode::NextDup | GetMode::PrevDup) {
             return Ok(OperationStatus::NotFound);
         }

@@ -1,7 +1,7 @@
 //! Integration tests for F2 / F4: NetworkRestore wired through the
 //! dispatcher path.
 //!
-//! Closes findings F2 and F4 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes findings F2 and F4 of the 2026 review.
 //!
 //! The standalone `NetworkRestoreServer::start` listener works, but the
 //! production `ReplicatedEnvironment` registers the RESTORE handler on the

@@ -118,7 +118,7 @@ where
     // resets `current_index` to 0 after a SetRange match, which makes
     // a subsequent `Get::Next` walk from index 0 of the same BIN
     // instead of advancing from the actual found position.  That is a
-    // real engine bug (`docs/src/internal/wave-2b-collections-typed.md`),
+    // real engine bug (the 2026 review),
     // but it lives in `noxu-dbi` which is out of scope for this wave;
     // the v1.6 collections workaround is to walk from the appropriate
     // endpoint (`First` or `Last`) and skip records that fall outside

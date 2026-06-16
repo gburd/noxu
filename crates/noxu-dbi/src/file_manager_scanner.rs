@@ -352,7 +352,7 @@ impl FileManagerLogScanner {
         let payload =
             file_bytes.slice(offset + header_size..offset + entry_size);
 
-        // C-3 (audit-2026-05-keith.md F-3.5 / F-9.1): verify CRC32 before
+        // C-3 (2026 audit F-3.5 / F-9.1): verify CRC32 before
         // returning a parsed entry.  The non-recovery reader (file_reader.rs)
         // already validates CRCs; skipping it here was an asymmetric gap that
         // silently injected corrupted entries into the recovered B-tree.

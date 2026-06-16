@@ -312,7 +312,7 @@ impl LogBuffer {
     ///
     /// Called without holding the latch.
     pub fn free(&self) {
-        // C-7 (audit-2026-05-jonhoo.md 4.4): use Release so that the writes
+        // C-7 (2026 audit 4.4): use Release so that the writes
         // into the buffer segment (visible to this thread) are ordered
         // before the decrement.  The Acquire load in wait_for_zero_and_latch
         // then guarantees the reader sees the completed writes before it

@@ -1,6 +1,6 @@
 //! Integration test for F11: VLSN index persistence across env close/open.
 //!
-//! Closes finding F11 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes finding F11 of the 2026 review.
 
 use noxu_rep::{RepConfig, ReplicatedEnvironment};
 use std::sync::Arc;

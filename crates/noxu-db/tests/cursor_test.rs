@@ -1017,7 +1017,7 @@ mod prop_full_scan_order {
 // ─── Sprint 1 / Group A — Cursor non-dup hygiene ───────────────────────────
 //
 // Regression tests for the audit findings tracked in
-// `docs/src/internal/api-audit-2026-05-cursor.md`:
+// the 2026 review:
 //
 //   * Finding 5 — `Get::NextDup` / `Get::PrevDup` on a non-sorted-dup DB
 //     must return `NotFound` rather than silently degenerating into plain
@@ -1265,7 +1265,7 @@ fn cursor_last_dup_returns_unsupported_error() {
 // ─── 14. Cursor must participate in the txn passed to open_cursor ─────────────
 //
 // Regression for API audit 2026-05 cursor finding C1 / #1
-// (`docs/src/internal/api-audit-2026-05-cursor.md`):
+// (the 2026 review):
 // `Database::open_cursor(Some(&txn), None)` previously bound the txn argument
 // as `_txn` and dropped it on the floor.  Cursor writes auto-committed and
 // cursor reads bypassed the txn's lock set, silently breaking ACID isolation
@@ -1384,7 +1384,7 @@ fn cursor_with_txn_get_takes_read_lock_via_locker() {
 // ─── 15. Secondary cursor must thread its txn / config arguments ──────────────
 //
 // Regression for API audit 2026-05 secondary-join finding F4
-// (`docs/src/internal/api-audit-2026-05-secondary-join.md`):
+// (the 2026 review):
 // `SecondaryDatabase::open_cursor` previously accepted `_txn` and `_config`
 // and discarded both, so every secondary cursor ran auto-commit no matter
 // what the caller passed.

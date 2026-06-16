@@ -150,7 +150,7 @@ code then uses `::noxu_persist::…` paths instead of `::noxu::persist::…`,
 following the `serde` / `#[serde(crate = "…")]` pattern.  The attribute is
 recognised by all three derives; the default behaviour is unchanged.  See
 `docs/src/collections/entity-persistence.md` § *Crate-path override* and
-`docs/src/internal/wave-fa-derive-crate-attr.md`.
+the 2026 review.
 
 ## 10. `cache_size` = Total Memory Budget (v3.0, X-12)
 

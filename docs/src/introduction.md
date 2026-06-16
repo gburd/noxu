@@ -86,7 +86,7 @@ The replication subsystem reached GA in v2.0 with all ten pre-v2.0 blockers
 closed.  Two regressions identified post-v2.0 were fixed in v2.2.  The
 Stageright executable specifications were re-validated against the v2.0+
 code as part of that work.  See
-[`docs/src/internal/api-audit-2026-05-rep.md`](internal/api-audit-2026-05-rep.md)
+the 2026 review
 for the per-finding notes.
 
 ## Quick Start

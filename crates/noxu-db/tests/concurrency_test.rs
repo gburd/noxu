@@ -560,7 +560,7 @@ fn test_reader_sees_before_image_after_concurrent_writer_aborts() {
 // H-1 regression: env lock not held across abort undo loop
 // ============================================================================
 
-/// H-1 regression (audit-2026-05-keith.md F-2.2):
+/// H-1 regression (2026 audit F-2.2):
 ///
 /// A large aborting transaction must NOT serialise concurrent readers against
 /// the EnvironmentImpl mutex for the full duration of its undo loop.

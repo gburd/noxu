@@ -146,7 +146,7 @@ The Forgejo (Codeberg) mirror at `.forgejo/workflows/test.yml` runs
 `check`, `test`, `test-all-features`, and `doc` on a single Linux
 runner; macOS and Windows coverage live only on the GitHub side.
 
-See [Wave 10-F — CI matrix expansion](../internal/wave-10-f-ci-matrix.md)
+See Wave 10-F — CI matrix expansion
 for the design rationale (why `--all-features` runs on Linux only,
 why `cross` is `cargo check` only, and how the cache keys are
 partitioned across jobs).

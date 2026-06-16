@@ -387,7 +387,7 @@ mod tests {
     /// sec2 (last byte)  at 'B' → {pk1, pk3}  (in the one-to-one model: pk1 only)
     /// Intersection → {pk1}
     ///
-    /// Decision 1B (`docs/src/internal/v1.5-decisions-2026-05.md`):
+    /// Decision 1B (the 2026 review):
     /// v1.5 secondaries are one-to-one, so the second primary that
     /// resolves to the same secondary key now returns
     /// `NoxuError::Unsupported` from `update_secondary` rather than

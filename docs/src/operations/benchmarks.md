@@ -176,7 +176,7 @@ Outputs (all under `benches/results/`, gitignored):
 ## Provenance
 
 * **Branch.** `v2.2.1`.
-* See [internal/wave-10-d-benchmarks.md](../internal/wave-10-d-benchmarks.md)
+* See the 2026 review
   for the full methodology audit and raw numbers.
 * **Reference benchmarks.**  Most of the numbers in this page are
   reproducible from the harness above on a single-socket x86-64 box

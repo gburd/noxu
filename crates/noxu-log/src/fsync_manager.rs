@@ -727,7 +727,7 @@ mod tests {
     // for committer T at LSN L, we assert `flushed_lsn >= L`.
     //
     // This test was added in Wave 11-J as the crash-safety coverage required
-    // by `docs/src/internal/wave-11-h-perf-investigation.md` (W10 section).
+    // by the 2026 review (W10 section).
 
     /// Fsync-before-commit invariant: `flushed_lsn >= commit_lsn` after
     /// `FsyncManager::fsync()` returns for every concurrent committer.

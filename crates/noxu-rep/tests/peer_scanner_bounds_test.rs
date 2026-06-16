@@ -11,7 +11,7 @@
 //! Downstream peers that fall behind the eviction window must catch
 //! up via the durable on-disk log.
 //!
-//! See `docs/src/internal/api-audit-2026-05-rep.md` finding F10.
+//! See the 2026 review finding F10.
 
 use noxu_rep::stream::peer_feeder::{
     DEFAULT_PEER_SCANNER_MAX_BYTES, DEFAULT_PEER_SCANNER_MAX_ENTRIES,

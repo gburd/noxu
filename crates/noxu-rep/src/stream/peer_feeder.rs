@@ -95,7 +95,7 @@ pub const DEFAULT_PEER_SCANNER_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// HA semantics where peer-to-peer log distribution is
 /// best-effort and the on-disk log is the durable source.
 ///
-/// Closes finding F10 of `docs/src/internal/api-audit-2026-05-rep.md`.
+/// Closes finding F10 of the 2026 review.
 ///
 /// Thread safety: the queue is protected by a `Mutex` so that the receiver
 /// thread (writer) and the feeder thread (reader) can operate concurrently.

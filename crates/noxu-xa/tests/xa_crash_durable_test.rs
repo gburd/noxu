@@ -1,6 +1,6 @@
 //! Wave 3-2 tests: crash-durable XA two-phase commit.
 //!
-//! Closes audit Critical C5 (`docs/src/internal/api-audit-2026-05-persist-xa.md`):
+//! Closes audit Critical C5 (the 2026 review):
 //!
 //! > C5: xa_prepare records the XID in a fsync'd PreparedLog but never tells
 //! > the underlying noxu-db::Transaction.  After a crash, recovery rolls the

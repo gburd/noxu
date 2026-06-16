@@ -1,6 +1,6 @@
 //! Integration tests for F9: feeder spawn on become_master.
 //!
-//! Closes finding F9 of `docs/src/internal/api-audit-2026-05-rep.md`.
+//! Closes finding F9 of the 2026 review.
 
 use noxu_rep::{NodeType, RepConfig, RepNode, ReplicatedEnvironment};
 
