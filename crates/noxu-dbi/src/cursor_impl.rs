@@ -1724,26 +1724,122 @@ impl CursorImpl {
 
         if let Some(bin_arc) = &self.current_bin_arc {
             // Fast path: pinned BIN — no tree traversal.
-            {
+            //
+            // CC-1 split-adjustment (JE: BIN.java:883 adjustCursors /
+            // IN.java:4259 IN.split): if this BIN was split while the cursor
+            // was positioned in its upper half, the old BIN now has fewer
+            // entries than current_index.  current_index >= bin.entries.len()
+            // distinguishes a split-induced stale position (slot moved to the
+            // new sibling) from a legitimate BIN-exhaustion (cursor was at
+            // the last entry).  In the stale case we re-anchor by searching
+            // the tree for current_key, update current_bin_arc and
+            // current_index, then retry the within-BIN advance from there.
+            // This is functionally equivalent to JE's eager cursor adjustment
+            // inside split_child — it produces the same final state (cursor
+            // re-pointed at its slot in the new sibling) without requiring
+            // noxu-tree to hold live cursor references.
+            let stale_split: bool = {
                 let g = bin_arc.read();
                 if let TreeNode::Bottom(bin) = &*g {
-                    if next_index >= 0 && next_index < bin.entries.len() as i32
-                    {
-                        let idx = next_index as usize;
-                        entry = Some((
-                            bin.get_full_key(idx).unwrap_or_default(),
-                            bin.entries[idx].data.clone().unwrap_or_default(),
-                            next_index,
-                            bin.entries[idx].lsn.as_u64(),
-                        ));
-                    } else {
-                        entry = None; // BIN exhausted — fall through to cross-BIN
-                    }
+                    // current_index beyond current BIN length means the BIN
+                    // shrank due to a split (legitimate exhaustion never sets
+                    // current_index to a value >= the BIN's entry count).
+                    self.current_index >= bin.entries.len() as i32
                 } else {
-                    entry = None;
+                    false
                 }
+            };
+            if stale_split {
+                // Re-anchor: find the BIN that now contains current_key.
+                let reanchor_result: Option<(
+                    std::sync::Arc<
+                        noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+                    >,
+                    i32,
+                )> = self.current_key.as_deref().and_then(|ck| {
+                    let db = self.db_impl.read();
+                    let tree = db.get_real_tree()?;
+                    let root = tree.get_root()?;
+                    let found_arc = Self::find_bin_for_key(root, ck)?;
+                    let idx = {
+                        let g = found_arc.read();
+                        if let TreeNode::Bottom(bin) = &*g {
+                            // Binary-search for current_key within the new BIN.
+                            (0..bin.entries.len() as i32).find(|&i| {
+                                bin.get_full_key(i as usize)
+                                    .is_some_and(|k| k == ck)
+                            })
+                        } else {
+                            None
+                        }
+                    }?;
+                    Some((found_arc, idx))
+                });
+                if let Some((reanchored_arc, reanchored_idx)) = reanchor_result
+                {
+                    // Switch the pin to the new BIN.
+                    let arc_clone = reanchored_arc.clone();
+                    self.update_bin_pin(Some(reanchored_arc));
+                    self.current_index = reanchored_idx;
+                    // Now retry the advance from the re-anchored position.
+                    let retry_next = if forward {
+                        reanchored_idx + 1
+                    } else {
+                        reanchored_idx - 1
+                    };
+                    let g = arc_clone.read();
+                    if let TreeNode::Bottom(bin) = &*g {
+                        if retry_next >= 0
+                            && retry_next < bin.entries.len() as i32
+                        {
+                            let idx = retry_next as usize;
+                            entry = Some((
+                                bin.get_full_key(idx).unwrap_or_default(),
+                                bin.entries[idx]
+                                    .data
+                                    .clone()
+                                    .unwrap_or_default(),
+                                retry_next,
+                                bin.entries[idx].lsn.as_u64(),
+                            ));
+                        } else {
+                            entry = None;
+                        }
+                    } else {
+                        entry = None;
+                    }
+                    new_bin_arc = None; // already pinned via update_bin_pin
+                } else {
+                    // Re-anchor failed (tree is empty or key was deleted).
+                    entry = None;
+                    new_bin_arc = None;
+                }
+            } else {
+                {
+                    let g = bin_arc.read();
+                    if let TreeNode::Bottom(bin) = &*g {
+                        if next_index >= 0
+                            && next_index < bin.entries.len() as i32
+                        {
+                            let idx = next_index as usize;
+                            entry = Some((
+                                bin.get_full_key(idx).unwrap_or_default(),
+                                bin.entries[idx]
+                                    .data
+                                    .clone()
+                                    .unwrap_or_default(),
+                                next_index,
+                                bin.entries[idx].lsn.as_u64(),
+                            ));
+                        } else {
+                            entry = None; // BIN exhausted — fall through to cross-BIN
+                        }
+                    } else {
+                        entry = None;
+                    }
+                }
+                new_bin_arc = None;
             }
-            new_bin_arc = None;
         } else {
             // Slow path: traverse from root, then pin the discovered BIN.
             let current_key_slice_opt =
@@ -3611,6 +3707,153 @@ mod tests {
         assert_eq!(
             visited_back_rev, visited,
             "backward scan reversed must equal forward scan"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CC-1 regression: cursor repositioning after BIN split
+    //
+    // JE reference: BIN.java:883 adjustCursors(IN newSibling,
+    //               int newSiblingLow, int newSiblingHigh)
+    //               called from IN.java:4259 inside IN.split.
+    //
+    // Scenario: cursor is positioned at index k (k >= split_index) in a BIN
+    // that subsequently splits.  The old BIN retains entries [0..split_index),
+    // the new sibling takes [split_index..n).  Without adjustment the cursor's
+    // current_bin_arc still points at the old BIN; retrieve_next(Next) finds
+    // next_index >= old BIN length, falls to the cross-BIN path, and calls
+    // get_next_bin(anchor_key) where anchor_key is already in the new sibling.
+    // get_next_bin returns the BIN *after* the new sibling, silently skipping
+    // every entry in the new sibling that follows the cursor's slot.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a small-fanout database (max 4 entries per node).
+    fn make_small_fanout_db(id: i64) -> Arc<RwLock<DatabaseImpl>> {
+        let db_id = DatabaseId::new(id);
+        let mut config = DatabaseConfig::default();
+        config.set_node_max_entries(4);
+        let db_impl = DatabaseImpl::new(
+            db_id,
+            format!("split_test_{}", id),
+            DbType::User,
+            &config,
+        );
+        Arc::new(RwLock::new(db_impl))
+    }
+
+    /// CC-1 case (i): cursor slot migrates to new sibling after split.
+    ///
+    /// With max_entries=4 and keys ["00".."03"] the BIN is full.  Inserting
+    /// "04" triggers split_child: left BIN = ["00","01"], right sibling =
+    /// ["02","03"], then "04" is inserted into the right sibling.
+    /// A cursor positioned at "02" (index 2 in the pre-split BIN) must
+    /// visit "03" and "04" without skipping any record.
+    #[test]
+    fn test_cc1_cursor_repositioned_after_bin_split_upper_half() {
+        let db = make_small_fanout_db(101);
+
+        // Fill one BIN to capacity: keys "00".."03" at index 0..3.
+        {
+            let mut c = CursorImpl::new(db.clone(), 1);
+            for i in 0u32..4 {
+                let key = format!("{:02}", i).into_bytes();
+                c.put(&key, b"v", PutMode::Overwrite).unwrap();
+            }
+        }
+
+        // Position cursor at "02" (index 2 — upper half of the 4-entry BIN).
+        let mut cursor = CursorImpl::new(db.clone(), 2);
+        let status = cursor.search(b"02", Some(b"v"), SearchMode::Set).unwrap();
+        assert_eq!(status, OperationStatus::Success, "search for 02 failed");
+        assert_eq!(cursor.get_current_key(), Some(b"02".as_slice()));
+
+        // Insert "04": triggers split (left=[00,01], right=[02,03]) then
+        // inserts "04" into the right sibling.
+        {
+            let mut c = CursorImpl::new(db, 3);
+            c.put(b"04", b"v", PutMode::Overwrite).unwrap();
+        }
+
+        // The cursor is still at "02".  Advancing with Next must visit
+        // "03" then "04" — no skips.
+        let s1 = cursor.retrieve_next(GetMode::Next).unwrap();
+        assert_eq!(
+            s1,
+            OperationStatus::Success,
+            "expected Success for first Next after split"
+        );
+        assert_eq!(
+            cursor.get_current_key(),
+            Some(b"03".as_slice()),
+            "CC-1(i): expected key \"03\" after split, got {:?}; \
+             cursor skipped records in new sibling",
+            cursor.get_current_key(),
+        );
+
+        let s2 = cursor.retrieve_next(GetMode::Next).unwrap();
+        assert_eq!(
+            s2,
+            OperationStatus::Success,
+            "expected Success for second Next after split"
+        );
+        assert_eq!(
+            cursor.get_current_key(),
+            Some(b"04".as_slice()),
+            "CC-1(i): expected key \"04\" after split"
+        );
+
+        // No more records.
+        let s3 = cursor.retrieve_next(GetMode::Next).unwrap();
+        assert_eq!(s3, OperationStatus::NotFound, "expected end-of-scan");
+    }
+
+    /// CC-1 case (ii): cursor at split_index - 1 (stays in old BIN).
+    ///
+    /// Cursor at "01" (index 1, left half).  After split the old BIN is
+    /// ["00","01"] and the new sibling is ["02","03","04"] (after "04" is
+    /// inserted).  Advancing from "01" must reach "02","03","04" in order.
+    #[test]
+    fn test_cc1_cursor_stays_in_old_bin_after_split() {
+        let db = make_small_fanout_db(102);
+
+        {
+            let mut c = CursorImpl::new(db.clone(), 1);
+            for i in 0u32..4 {
+                let key = format!("{:02}", i).into_bytes();
+                c.put(&key, b"v", PutMode::Overwrite).unwrap();
+            }
+        }
+
+        // Position at "01" — index 1, will remain in old BIN after split.
+        let mut cursor = CursorImpl::new(db.clone(), 2);
+        cursor.search(b"01", Some(b"v"), SearchMode::Set).unwrap();
+        assert_eq!(cursor.get_current_key(), Some(b"01".as_slice()));
+
+        // Trigger split by inserting "04".
+        {
+            let mut c = CursorImpl::new(db, 3);
+            c.put(b"04", b"v", PutMode::Overwrite).unwrap();
+        }
+
+        // Advance: must visit "02", "03", "04".
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let s = cursor.retrieve_next(GetMode::Next).unwrap();
+            match s {
+                OperationStatus::Success => {
+                    visited.push(cursor.get_current_key().unwrap().to_vec());
+                }
+                OperationStatus::NotFound => break,
+                other => panic!("unexpected status {:?}", other),
+            }
+        }
+        let expected: Vec<Vec<u8>> =
+            ["02", "03", "04"].iter().map(|s| s.as_bytes().to_vec()).collect();
+        assert_eq!(
+            visited, expected,
+            "CC-1(ii): cursor in old BIN must traverse sibling records; \
+             got {:?}",
+            visited
         );
     }
 }

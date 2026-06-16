@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CC-1 / D-2 — cursor correctness on BIN split**: a cursor positioned in the
+  upper half of a BIN (index ≥ split_index) that split under it would silently
+  skip all records in the new sibling that follow the cursor's slot.
+  `retrieve_next` now detects a split-induced stale position
+  (`current_index ≥ bin.entries.len()`) and re-anchors the cursor to the
+  correct BIN via a tree search before advancing.  This is functionally
+  equivalent to JE's eager `BIN.adjustCursors` (BIN.java:883, called from
+  IN.java:4259) and produces the same final state without requiring
+  `noxu-tree` to hold live cursor references.
+  Regression tests `test_cc1_cursor_repositioned_after_bin_split_upper_half`
+  and `test_cc1_cursor_stays_in_old_bin_after_split` cover both cursor-position
+  cases and demonstrate fail-pre / pass-post behaviour.
 ## [v4.0.0] — 2026-06-04
 
 Major release. It completes the production-readiness review remediation
