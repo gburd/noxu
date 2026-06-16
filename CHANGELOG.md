@@ -18,6 +18,40 @@ listed in [References](#references).
 
 ### Fixed
 
+- **CC-5 — Per-latch read-hold counter** (`noxu-latch`): the global
+  `READ_HOLD_COUNT` thread-local was shared across all `SharedLatch`
+  instances, so holding a read guard on latch L1 and acquiring a read guard
+  on a different latch L2 on the same thread triggered a false-fatal
+  "already held in shared mode" panic.  Fixed by replacing the global
+  `Cell<u32>` with a `HashMap<latch_address, u32>` so only same-latch
+  reentrancy is blocked — matching JE `ReentrantReadWriteLock.getReadHoldCount()`
+  per-lock semantics (`SharedLatchImpl`).  The read-to-write upgrade deadlock
+  check is also now per-latch.  Tests: `test_two_independent_shared_latches_no_panic`
+  (fail-pre: panic; pass-post: ok), `test_same_latch_shared_reacquire_still_panics`,
+  `test_same_latch_read_to_write_still_panics`, `test_read_l1_write_l2_no_panic`.
+
+- **CC-2 — Coupled descent in `first_entry_at_or_after_with_index`**
+  (`noxu-tree`): the method did `arc.read().is_bin()` (lock acquired and
+  released) then a second `arc.read()` on the next line — a window in which a
+  concurrent split could promote the node (BIN→upper IN) or move the sought
+  key to a new sibling, yielding a false "not found".  Fixed by using the
+  same `read_arc()` hand-over-hand pattern as every other descent method
+  (`search`, `first_entry_at_or_after`, `get_first_node`, `get_last_node`,
+  `get_adjacent_bin_attempt`).  JE reference: `Tree.searchSubTree` /
+  `Tree.search` in `com/sleepycat/je/tree/Tree.java`.  Tests:
+  `test_split_boundary_key_found`, `test_key_at_exact_split_point_found`,
+  `test_returned_index_matches_slot`, `test_stress_concurrent_splits`.
+
+- **CC-3 — JE-correct daemon shutdown order** (`noxu-engine`): the previous
+  shutdown join order was evictor → cleaner → checkpointer.  JE
+  `EnvironmentImpl.shutdownDaemons` requires cleaner → checkpointer → evictor
+  ("Cleaner has to be shutdown before checkpointer because former calls the
+  latter"; the evictor must remain available to flush dirty nodes until the
+  final checkpoint completes).  Fixed by reordering the joins to match JE
+  exactly.  Tests: `test_cc3_shutdown_order_cleaner_checkpointer_evictor`
+  (uses blocking barriers to make a wrong order deadlock-deterministic),
+  `test_cc3_shutdown_no_deadlock_bounded_time`.
+
 - **Checkpointer now flushes all open user-database BINs** (`noxu-recovery`),
   not just the internal `primary_tree`. Previously a checkpoint walked only
   the primary tree, so dirty BINs in user databases were never written at

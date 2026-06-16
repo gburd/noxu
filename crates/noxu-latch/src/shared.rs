@@ -187,7 +187,10 @@ impl SharedLatch {
             })?;
             let latch_id = self as *const Self as usize;
             increment_read_hold(latch_id);
-            Ok(SharedLatchGuard::Read(SharedLatchReadGuard { latch_id, _guard: guard }))
+            Ok(SharedLatchGuard::Read(SharedLatchReadGuard {
+                latch_id,
+                _guard: guard,
+            }))
         }
     }
 
@@ -527,7 +530,9 @@ mod tests {
         let l2 = SharedLatch::named("cc5-l2", false);
         // Both guards held simultaneously on the same thread — must not panic.
         let _g1 = l1.acquire_shared().expect("l1 acquire_shared");
-        let _g2 = l2.acquire_shared().expect("l2 acquire_shared: cc5 fail-pre would panic here");
+        let _g2 = l2
+            .acquire_shared()
+            .expect("l2 acquire_shared: cc5 fail-pre would panic here");
         // Both guards still alive — drop order doesn't matter.
     }
 
@@ -539,7 +544,10 @@ mod tests {
             let _g1 = latch.acquire_shared().expect("first acquire");
             let _ = latch.acquire_shared(); // must still panic
         });
-        assert!(result.is_err(), "same-latch reentrant shared acquire must panic");
+        assert!(
+            result.is_err(),
+            "same-latch reentrant shared acquire must panic"
+        );
     }
 
     /// Read-to-write upgrade on the same latch still panics (deadlock prevention preserved).

@@ -87,11 +87,7 @@ fn test_key_at_exact_split_point_found() {
     // All keys must be reachable.
     for key in &keys {
         let r = tree.first_entry_at_or_after_with_index(key);
-        assert!(
-            r.is_some(),
-            "key {:?} not found after split",
-            key
-        );
+        assert!(r.is_some(), "key {:?} not found after split", key);
         let (found, ..) = r.unwrap();
         assert_eq!(&found, key);
     }
@@ -118,8 +114,15 @@ fn test_returned_index_matches_slot() {
         let guard = arc.read();
         if let noxu_tree::TreeNode::Bottom(bin) = &*guard {
             let entry_key = bin.get_full_key(idx).expect("entry at idx");
-            assert_eq!(entry_key, found_key, "idx mismatch: got {:?} at slot {}", entry_key, idx);
-            assert_eq!(bin.entries[idx].data.as_deref().unwrap_or(&[]), found_data.as_slice());
+            assert_eq!(
+                entry_key, found_key,
+                "idx mismatch: got {:?} at slot {}",
+                entry_key, idx
+            );
+            assert_eq!(
+                bin.entries[idx].data.as_deref().unwrap_or(&[]),
+                found_data.as_slice()
+            );
         } else {
             panic!("expected BIN node from returned Arc");
         }
@@ -172,15 +175,13 @@ fn test_stress_concurrent_splits() {
     // Reader: must always find the pre-populated keys.
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let reader = {
-        let tree = tree.clone();
-        let errors = errors.clone();
-        let done = done.clone();
+        let errors2 = errors.clone();
         std::thread::spawn(move || {
             for _ in 0..200 {
                 for i in 0u64..8 {
                     let key = format!("s{:04}", i).into_bytes();
                     if tree.first_entry_at_or_after_with_index(&key).is_none() {
-                        errors.fetch_add(1, Ordering::Relaxed);
+                        errors2.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 std::thread::yield_now();

@@ -1973,10 +1973,9 @@ impl Tree {
                         let lsn = bin.entries[idx].lsn.as_u64();
                         // Obtain the Arc for the BIN node the guard came from.
                         // `ArcRwLockReadGuard::rwlock()` returns the backing Arc.
-                        let bin_arc = parking_lot::ArcRwLockReadGuard::rwlock(
-                            &guard,
-                        )
-                        .clone();
+                        let bin_arc =
+                            parking_lot::ArcRwLockReadGuard::rwlock(&guard)
+                                .clone();
                         return Some((full_key, data, idx, lsn, bin_arc));
                     } else {
                         return None;

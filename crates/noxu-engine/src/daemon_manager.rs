@@ -619,12 +619,20 @@ mod tests {
         // Join cleaner first.
         cleaner_t.join().unwrap();
         join_seq.lock().unwrap().push("cleaner");
-        { let (l, cv) = &*cleaner_joined; *l.lock().unwrap() = true; cv.notify_all(); }
+        {
+            let (l, cv) = &*cleaner_joined;
+            *l.lock().unwrap() = true;
+            cv.notify_all();
+        }
 
         // Join checkpointer second.
         checkpointer_t.join().unwrap();
         join_seq.lock().unwrap().push("checkpointer");
-        { let (l, cv) = &*checkpointer_joined; *l.lock().unwrap() = true; cv.notify_all(); }
+        {
+            let (l, cv) = &*checkpointer_joined;
+            *l.lock().unwrap() = true;
+            cv.notify_all();
+        }
 
         // Join evictor last.
         evictor_t.join().unwrap();
