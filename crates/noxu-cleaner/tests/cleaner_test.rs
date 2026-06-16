@@ -577,3 +577,61 @@ fn cln1_pending_ln_added_mid_checkpoint_keeps_file_blocked() {
     assert_eq!(fs.get_file_status(7), Some(FileStatus::FullyProcessed));
     assert_eq!(fs.get_safe_to_delete(), vec![7]);
 }
+
+// ─── CLN-3: put_back_file_for_cleaning (stuck-state fix) ─────────────────────
+
+/// CLN-3 regression: when processing a file errors or is interrupted,
+/// the file must be returned to TO_BE_CLEANED (not stuck in BEING_CLEANED).
+///
+/// Pre-fix: `process_single_file` errors left the file in BEING_CLEANED
+/// indefinitely; the cleaner would never retry it.
+/// Post-fix: `put_back_file_for_cleaning` returns BEING_CLEANED → TO_BE_CLEANED.
+///
+/// JE: FileProcessor.java doClean() finally block (~line 591):
+///   `if (!finished && !fileDeleted) { fileSelector.putBackFileForCleaning(fileNum); }`
+#[test]
+fn cln3_failed_processing_puts_file_back_for_retry() {
+    use noxu_cleaner::{FileSelector, FileStatus};
+
+    let mut fs = FileSelector::new();
+
+    // File is queued and selected (now BEING_CLEANED).
+    fs.add_file_to_clean(20);
+    let selected = fs.select_file_for_cleaning();
+    assert_eq!(selected, Some((20, None)));
+    assert_eq!(fs.get_file_status(20), Some(FileStatus::BeingCleaned));
+
+    // Simulate processing failure: call put_back_file_for_cleaning.
+    fs.put_back_file_for_cleaning(20);
+
+    // File must be back in TO_BE_CLEANED, not stuck in BEING_CLEANED.
+    assert_eq!(
+        fs.get_file_status(20),
+        Some(FileStatus::ToBeCleaned),
+        "failed processing must return file to ToBeCleaned for retry"
+    );
+    assert!(
+        fs.has_files_to_clean(),
+        "file must be in the to_be_cleaned queue after put_back"
+    );
+
+    // File can be re-selected on the next pass.
+    let retry = fs.select_file_for_cleaning();
+    assert_eq!(retry, Some((20, None)), "file must be re-selectable after put_back");
+}
+
+/// CLN-3: put_back is a no-op if the file is not in BEING_CLEANED.
+#[test]
+fn cln3_put_back_noop_if_not_being_cleaned() {
+    use noxu_cleaner::{FileSelector, FileStatus};
+
+    let mut fs = FileSelector::new();
+    fs.add_file_to_clean(21);
+    // File is in TO_BE_CLEANED, not BEING_CLEANED.
+    assert_eq!(fs.get_file_status(21), Some(FileStatus::ToBeCleaned));
+
+    // Calling put_back on a file that is not BEING_CLEANED must not panic or corrupt state.
+    fs.put_back_file_for_cleaning(21);
+    // Status unchanged.
+    assert_eq!(fs.get_file_status(21), Some(FileStatus::ToBeCleaned));
+}
