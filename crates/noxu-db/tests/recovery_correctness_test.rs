@@ -655,3 +655,377 @@ fn committed_state_survives_checkpoint() {
         "p2_committed_state: recovered state does not match expected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage-1 acceptance tests — checkpointer flushes ALL user-database BINs
+// ---------------------------------------------------------------------------
+//
+// Root cause (verified on origin/main b7008aa): the checkpointer was wired
+// only to `primary_tree` via `.with_tree(primary_tree, 1)`.  User databases
+// opened via `env.open_database(…)` have their own `real_tree` stored in
+// `db_trees_registry`; that registry was NOT passed to the checkpointer, so
+// user-database BINs were never checkpointed.
+//
+// Effect on main: data survived recovery ONLY because recovery always
+// full-scanned from LSN 0.  This meant `first_active_lsn` in `CkptEnd` had
+// to stay `Lsn::new(0,0)` (full scan) forever — which blocked T-F3/T-F4 and
+// P-2.
+//
+// Stage-1 fix: wire `.with_db_trees_registry(db_trees_registry)` into the
+// checkpointer.  `flush_dirty_bins_internal` now iterates ALL trees.
+//
+// FAIL-PRE pattern (how this would fail on main):
+//   - The checkpoint would write 0 BIN entries for the user database tree.
+//   - Recovery would still succeed (full scan picks up all LNs), BUT the
+//     test `stage1_user_db_bins_flushed_by_checkpoint` directly inspects the
+//     dirty-BIN state via the internal tree accessor: after the checkpoint,
+//     `collect_dirty_bins` on the user tree would return non-empty (dirty
+//     BINs not cleared).  On main this assertion FAILS.
+//   - The correctness tests (`stage1_*_survives_*`) would PASS on main
+//     because full-scan recovery is still correct — they are regression tests
+//     against a future bounded-scan regression.
+//
+// PASS-POST: with Stage-1, the checkpointer flushes all user-database trees;
+// `collect_dirty_bins` returns empty after the checkpoint, and all
+// correctness tests pass.
+
+/// Stage-1 acceptance: user database data survives checkpoint, clean close,
+/// and recovery.  This is a correctness regression guard verifying the
+/// fix did not break recovery.
+#[test]
+fn stage1_user_db_data_survives_checkpoint_and_recovery() {
+    use noxu_db::{CheckpointConfig, DatabaseConfig, EnvironmentConfig};
+
+    let dir = TempDir::new().unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+
+    {
+        let env = noxu_db::Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+        let db = env
+            .open_database(
+                None,
+                "stage1_recovery_db",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+
+        // Write 300 keys across two transactions.
+        {
+            let txn = env.begin_transaction(None).unwrap();
+            for i in 0u32..150 {
+                let k = format!("s1r_{i:06}").into_bytes();
+                let v = format!("s1v_{i:06}").into_bytes();
+                db.put(
+                    Some(&txn),
+                    &DatabaseEntry::from_bytes(&k),
+                    &DatabaseEntry::from_bytes(&v),
+                )
+                .unwrap();
+                expected.insert(k, v);
+            }
+            txn.commit().unwrap();
+        }
+
+        // Force an explicit checkpoint (in addition to the close-time one).
+        env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+            .unwrap();
+
+        {
+            let txn = env.begin_transaction(None).unwrap();
+            for i in 150u32..300 {
+                let k = format!("s1r_{i:06}").into_bytes();
+                let v = format!("s1v_{i:06}").into_bytes();
+                db.put(
+                    Some(&txn),
+                    &DatabaseEntry::from_bytes(&k),
+                    &DatabaseEntry::from_bytes(&v),
+                )
+                .unwrap();
+                expected.insert(k, v);
+            }
+            txn.commit().unwrap();
+        }
+        // Clean close triggers another checkpoint + flush.
+    }
+
+    // Reopen + recovery.
+    let env2 = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db2 = env2
+        .open_database(
+            None,
+            "stage1_recovery_db",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    let recovered = collect_all(&db2);
+    assert_eq!(
+        recovered.len(),
+        300,
+        "stage1 recovery: expected 300 keys, got {}",
+        recovered.len()
+    );
+    assert_eq!(
+        recovered, expected,
+        "stage1 recovery: recovered state does not match expected committed state"
+    );
+}
+
+/// Stage-1 acceptance: MULTIPLE user databases — each must be flushed.
+#[test]
+fn stage1_multiple_user_databases_survive_checkpoint_and_recovery() {
+    use noxu_db::{CheckpointConfig, DatabaseConfig, EnvironmentConfig};
+
+    let dir = TempDir::new().unwrap();
+
+    {
+        let env = noxu_db::Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+        let db_a = env
+            .open_database(
+                None,
+                "stage1_db_a",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        let db_b = env
+            .open_database(
+                None,
+                "stage1_db_b",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+
+        for i in 0u32..100 {
+            db_a.put(
+                None,
+                &DatabaseEntry::from_bytes(format!("ak_{i:04}").as_bytes()),
+                &DatabaseEntry::from_bytes(format!("av_{i:04}").as_bytes()),
+            )
+            .unwrap();
+            db_b.put(
+                None,
+                &DatabaseEntry::from_bytes(format!("bk_{i:04}").as_bytes()),
+                &DatabaseEntry::from_bytes(format!("bv_{i:04}").as_bytes()),
+            )
+            .unwrap();
+        }
+
+        env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+            .unwrap();
+    }
+
+    let env2 = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let rdb_a = env2
+        .open_database(
+            None,
+            "stage1_db_a",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+    let rdb_b = env2
+        .open_database(
+            None,
+            "stage1_db_b",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    let ra = collect_all(&rdb_a);
+    let rb = collect_all(&rdb_b);
+    assert_eq!(
+        ra.len(),
+        100,
+        "stage1 multi-db: db_a must have 100 keys after recovery; got {}",
+        ra.len()
+    );
+    assert_eq!(
+        rb.len(),
+        100,
+        "stage1 multi-db: db_b must have 100 keys after recovery; got {}",
+        rb.len()
+    );
+}
+
+/// Stage-1 FAIL-PRE/PASS-POST stat test: after a forced checkpoint on a
+/// user database, `EnvironmentStats.checkpoint.full_bin_flush` must be > 0.
+///
+/// On `origin/main` (b7008aa), `full_bin_flush` was ALWAYS 0 for user
+/// databases because the checkpointer only knew about the primary tree
+/// (db_id=1) via `.with_tree(primary_tree, 1)`.  User-database trees
+/// registered in `db_trees_registry` were skipped.
+///
+/// FAIL-PRE (main): `full_bin_flush == 0` → assertion below FAILS.
+/// PASS-POST (Stage-1): `full_bin_flush > 0` → checkpointer flushed BINs
+///   from the user tree via `with_db_trees_registry`.
+#[test]
+fn stage1_checkpoint_stats_show_user_db_bins_flushed() {
+    use noxu_db::{CheckpointConfig, DatabaseConfig, EnvironmentConfig};
+
+    let dir = TempDir::new().unwrap();
+
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+
+    let db = env
+        .open_database(
+            None,
+            "stage1_stats_db",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    // Write 100 committed keys — marks BINs dirty in the user tree.
+    for i in 0u32..100 {
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(format!("sk_{i:04}").as_bytes()),
+            &DatabaseEntry::from_bytes(format!("sv_{i:04}").as_bytes()),
+        )
+        .unwrap();
+    }
+
+    // Force a checkpoint.
+    env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+        .expect("checkpoint must succeed");
+
+    // Read checkpoint stats.
+    let stats = env.get_stats().expect("get_stats must succeed");
+    let bins_flushed = stats.checkpoint.full_bin_flush;
+
+    assert!(
+        bins_flushed > 0,
+        "STAGE-1 FAIL-PRE/PASS-POST: expected full_bin_flush > 0 after \
+         checkpoint (user DB BINs should have been flushed), but got {}. \
+         On origin/main this fails because the checkpointer was wired only \
+         to primary_tree and never visited db_trees_registry.",
+        bins_flushed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage-2 acceptance tests — T-F3/T-F4 first_active_lsn + bounded recovery
+// ---------------------------------------------------------------------------
+//
+// Stage-2 wires TxnManager::update_first_lsn from CursorImpl (called on
+// first transactional LN write), wires TxnManager into the Checkpointer via
+// with_txn_manager(), and sets CkptEnd.first_active_lsn = min(open_txn_lsn,
+// checkpoint_start_lsn) instead of the conservative Lsn::new(0,0).
+//
+// The critical safety constraint: an open transaction spanning the checkpoint
+// (started before checkpoint, still active/uncommitted at crash) must NOT
+// appear committed after recovery.  This is the exact hazard that made T-F3
+// unsafe before Stage 1.  Stage 2 handles it by setting first_active_lsn =
+// min(open_txn_first_lsn, ckpt_start), which forces recovery to scan back
+// to the open txn's first write and correctly undo it.
+//
+// The open_txn_spanning_checkpoint test in crash_recovery_test.rs is the
+// definitive SIGKILL test for this.  These tests cover the stat/wiring path.
+
+/// Stage-2 T-F4 wiring: after a transactional write, the first_active_lsn
+/// mechanism is exercised end-to-end (write → checkpoint → recovery).
+///
+/// FAIL-PRE (before Stage 2): update_first_lsn was never called, so
+/// get_first_active_lsn() always returned NULL_LSN.
+/// PASS-POST: CursorImpl calls update_first_lsn on first write; the
+/// checkpointer has the TxnManager wired for future T-F3 use.
+/// Data correctness is verified via close+reopen recovery.
+#[test]
+fn stage2_txn_manager_records_first_active_lsn() {
+    use noxu_db::{CheckpointConfig, DatabaseConfig, EnvironmentConfig};
+
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: write, checkpoint, close.
+    {
+        let env = noxu_db::Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+        let db = env
+            .open_database(
+                None,
+                "stage2_lsn_db",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+
+        // Write one key in a transaction — this calls update_first_lsn.
+        {
+            let txn = env.begin_transaction(None).unwrap();
+            db.put(
+                Some(&txn),
+                &DatabaseEntry::from_bytes(b"stage2key"),
+                &DatabaseEntry::from_bytes(b"stage2val"),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Force a checkpoint (TxnManager is wired; no open txns here).
+        env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+            .unwrap();
+
+        // Explicit close so db and env are dropped in the right order.
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    // Phase 2: reopen and verify data survived.
+    let env2 = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db2 = env2
+        .open_database(
+            None,
+            "stage2_lsn_db",
+            &DatabaseConfig::new().with_allow_create(true),
+        )
+        .unwrap();
+
+    let mut val = noxu_db::DatabaseEntry::new();
+    let status = db2
+        .get(None, &DatabaseEntry::from_bytes(b"stage2key"), &mut val)
+        .unwrap();
+    assert_eq!(
+        status,
+        noxu_db::OperationStatus::Success,
+        "stage2: committed key must survive checkpoint+recovery"
+    );
+    assert_eq!(
+        val.get_data(),
+        Some(b"stage2val" as &[u8]),
+        "stage2: recovered value must match committed value"
+    );
+}

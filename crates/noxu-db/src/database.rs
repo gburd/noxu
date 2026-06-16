@@ -184,7 +184,8 @@ impl Database {
                 Arc::clone(lm),
             )
             .with_env_invalid(Arc::clone(&self.env_invalid))
-            .with_lock_manager(Arc::clone(&self.lock_manager)),
+            .with_lock_manager(Arc::clone(&self.lock_manager))
+            .with_txn_manager(Arc::clone(&self.txn_manager)),
             None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
                 .with_env_invalid(Arc::clone(&self.env_invalid))
                 .with_lock_manager(Arc::clone(&self.lock_manager)),

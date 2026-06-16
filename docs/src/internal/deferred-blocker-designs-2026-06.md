@@ -274,19 +274,17 @@ proves non-replicated envs still write 14-byte headers with no VLSN bits set.
   guard at the split site; always replay non-transactional LNs in
   `eligible_for_redo`.
   See CHANGELOG.md `[Unreleased] Fixed (St-H6, two sites)`.
-- **T-F3 / T-F4** (`first_active_lsn` + `update_first_lsn`): **WON'T FIX in
-  the current architecture.** Recovery already uses `CkptEnd.first_active_lsn`
-  as its forward/backward scan boundary; it is hard-coded to `Lsn::new(0,0)`,
-  so recovery does a full scan (correct but unbounded). Setting a real,
-  non-zero `first_active_lsn` (the T-F3 "optimization", fed by wiring T-F4's
-  `update_first_lsn`) would bound the scan — but that is **unsafe** here: the
-  checkpointer flushes only the internal `primary_tree`, never user-database
-  BINs (the same finding behind P-2 being deferred). Committed LNs written
-  before `first_active_lsn` are therefore not captured in any flushed BIN, so
-  starting recovery at `first_active_lsn` would silently drop them — this is
-  exactly the St-H6 Site 2 data-loss class we just fixed. T-F3/T-F4 must NOT
-  be implemented until the checkpointer flushes user-database BINs (land with
-  P-2; see `wave-gb-dbtree-recovery.md`). The `TxnManager::update_first_lsn` /
-  `get_first_active_lsn` rustdoc documents this; `get_first_active_lsn()`
-  always returns `NULL_LSN` today and the full-scan recovery default is the
-  correct, safe behaviour.
+- **T-F3 / T-F4** (`first_active_lsn` + `update_first_lsn`): **PARTIALLY SHIPPED in `fix/checkpoint-user-bins`.**
+  - **T-F4 (update_first_lsn wiring)**: SHIPPED. `CursorImpl` now accepts
+    `with_txn_manager(Arc<TxnManager>)` (wired from `Database::make_cursor_with_locker`)
+    and calls `txn_manager.update_first_lsn(txn_id, lsn)` alongside
+    `Txn::note_log_entry` on every first transactional write. `get_first_active_lsn()`
+    now returns a real LSN for active transactions.
+  - **T-F3 (scan bounding)**: NOT YET ACTIVE. `CkptEnd.first_active_lsn` still
+    emits `Lsn::new(0,0)` (full scan). Setting a non-zero value requires P-2
+    BIN-preload during recovery: without pre-populating the in-memory tree from
+    checkpointed BINs before the LN redo pass, starting from `first_active_lsn`
+    would skip pre-checkpoint committed LNs — silent data loss. The `txn_manager`
+    is wired into the checkpointer via `with_txn_manager()` and
+    `get_first_active_lsn()` is queried; the result is discarded until P-2 lands.
+    See `wave-gb-dbtree-recovery.md` for the P-2 redesign prerequisites.

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use bytes::BytesMut;
 use noxu_log::{LogEntryType, LogManager, Provisional, entry::LnLogEntry};
 use noxu_tree::{BinEntry, Tree};
-use noxu_txn::{LockManager, LockType, Locker, Txn};
+use noxu_txn::{LockManager, LockType, Locker, Txn, TxnManager};
 
 use crate::dup_key_data;
 use crate::throughput_stats::ThroughputStats;
@@ -182,6 +182,14 @@ pub struct CursorImpl {
     ///
     /// (Txn subtype).
     txn_ref: Option<Arc<Mutex<Txn>>>,
+    /// Transaction manager for recording per-txn first-logged LSN (T-F4).
+    ///
+    /// When `Some`, every transactional write calls
+    /// `txn_manager.update_first_lsn(txn_id, lsn)` alongside
+    /// `Txn::note_log_entry`.  This feeds `get_first_active_lsn()`, which
+    /// `do_checkpoint` uses to set `CkptEnd.first_active_lsn` (T-F3).
+    /// `None` for cursors opened outside a full environment (unit tests).
+    txn_manager: Option<Arc<TxnManager>>,
     /// Throughput counters shared with all cursors on this database.
     throughput: Arc<ThroughputStats>,
 }
@@ -213,6 +221,7 @@ impl CursorImpl {
             env_invalid: None,
             lock_manager: None,
             txn_ref: None,
+            txn_manager: None,
             throughput,
         }
     }
@@ -241,6 +250,7 @@ impl CursorImpl {
             env_invalid: None,
             lock_manager: None,
             txn_ref: None,
+            txn_manager: None,
             throughput,
         }
     }
@@ -277,6 +287,18 @@ impl CursorImpl {
     /// Returns `self` for builder-style chaining.
     pub fn with_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
         self.txn_ref = Some(txn);
+        self
+    }
+
+    /// Wire the transaction manager for T-F4: per-txn first-logged-LSN tracking.
+    ///
+    /// When set, every transactional write calls
+    /// `txn_manager.update_first_lsn(txn_id, lsn)` alongside
+    /// `Txn::note_log_entry` so that `get_first_active_lsn()` returns the
+    /// real oldest-active-transaction LSN.  Used by `do_checkpoint` to set
+    /// `CkptEnd.first_active_lsn` (T-F3).
+    pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
+        self.txn_manager = Some(txn_manager);
         self
     }
 
@@ -600,6 +622,14 @@ impl CursorImpl {
                 db_id,
             );
             guard.note_log_entry(new_lsn_u64);
+            // T-F4: record per-txn first-logged LSN so the checkpointer can
+            // compute the real first_active_lsn at checkpoint time (T-F3).
+            // Only update on the FIRST log entry (note_log_entry sets first_lsn
+            // only once); we mirror that guard here.
+            if let Some(tm) = &self.txn_manager {
+                let txn_id = guard.id();
+                tm.update_first_lsn(txn_id, new_lsn_u64);
+            }
         } else if let Some(lm) = &self.lock_manager {
             // Auto-commit: acquire write lock, then release immediately.
             lm.lock(new_lsn_u64, self.id, LockType::Write, false, false)
