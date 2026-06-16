@@ -18,6 +18,7 @@ noxu-latch = { workspace = true }
 noxu-tree = { workspace = true }
 noxu-log = { workspace = true }
 noxu-sync = { workspace = true }
+noxu-recovery = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 bytes = { workspace = true }

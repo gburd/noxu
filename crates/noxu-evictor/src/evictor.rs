@@ -37,6 +37,7 @@ use crate::policy::{EvictionAlgorithm, EvictionPolicy};
 use crate::slab::SlabList;
 use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
+use noxu_recovery::Checkpointer;
 use noxu_sync::Mutex;
 use noxu_tree::NodeRwLock;
 use noxu_tree::tree::{BinEntry, BinStub, InEntry, InNodeStub, Tree, TreeNode};
@@ -172,6 +173,15 @@ pub struct Evictor {
     tree: Option<Arc<RwLock<Tree>>>,
     db_id: u64,
     off_heap: Option<Arc<OffHeapCache>>,
+    /// Optional checkpointer reference for CC-4: provisional-flag coordination.
+    ///
+    /// When `Some`, `flush_dirty_node_to_log` queries the checkpointer's
+    /// `get_eviction_provisional` to decide whether to log the evicted BIN as
+    /// `Provisional::Yes` (checkpoint in progress, node below max flush level)
+    /// or `Provisional::No` (no checkpoint, or node at/above max flush level).
+    ///
+    /// JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` (CC-4 fix).
+    checkpointer: Option<Arc<Checkpointer>>,
 }
 
 impl Evictor {
@@ -212,6 +222,7 @@ impl Evictor {
             tree: None,
             db_id: 0,
             off_heap: None,
+            checkpointer: None,
         }
     }
 
@@ -235,6 +246,7 @@ impl Evictor {
         .with_opt_log_manager(self.log_manager)
         .with_opt_tree(self.tree, self.db_id)
         .with_opt_off_heap(self.off_heap)
+        .with_opt_checkpointer(self.checkpointer)
     }
 
     /// Set only the scan-resistant policy to a different algorithm.
@@ -265,6 +277,17 @@ impl Evictor {
         self
     }
 
+    /// Wire a checkpointer for CC-4 provisional-flag coordination.
+    ///
+    /// When set, `flush_dirty_node_to_log` queries
+    /// `checkpointer.get_eviction_provisional(node_level)` to choose
+    /// `Provisional::Yes` or `Provisional::No` for evicted BINs, matching JE
+    /// `Checkpointer.coordinateEvictionWithCheckpoint`.
+    pub fn with_checkpointer(mut self, ckpt: Arc<Checkpointer>) -> Self {
+        self.checkpointer = Some(ckpt);
+        self
+    }
+
     // Internal helpers for `with_algorithm` reconstruction.
     fn with_opt_log_manager(mut self, lm: Option<Arc<LogManager>>) -> Self {
         self.log_manager = lm;
@@ -281,6 +304,13 @@ impl Evictor {
     }
     fn with_opt_off_heap(mut self, oh: Option<Arc<OffHeapCache>>) -> Self {
         self.off_heap = oh;
+        self
+    }
+    fn with_opt_checkpointer(
+        mut self,
+        ckpt: Option<Arc<Checkpointer>>,
+    ) -> Self {
+        self.checkpointer = ckpt;
         self
     }
 
@@ -514,16 +544,35 @@ impl Evictor {
                     // evictor under-fired under pressure.  Strip the
                     // embedded LNs (writes any dirty LNs to the log first)
                     // and report the actual bytes freed.
-                    let freed_bytes = self.strip_lns_from_node(node_id);
-                    if freed_bytes > 0 {
-                        result.bytes_evicted += freed_bytes as u64;
-                        self.stats.increment(&self.stats.nodes_stripped);
-                        self.stats.increment(&self.stats.lns_evicted);
-                    }
-                    if from_pri2 {
-                        self.pri2.lock().add_back(node_id);
-                    } else {
-                        self.primary_policy.put_back(node_id);
+                    //
+                    // CC-6: strip_lns_from_node now uses a non-blocking
+                    // try_write latch and re-checks cursor_count under the
+                    // lock.  `None` means the node is busy or pinned — put
+                    // it back instead of blocking.
+                    match self.strip_lns_from_node(node_id) {
+                        Some(freed_bytes) => {
+                            if freed_bytes > 0 {
+                                result.bytes_evicted += freed_bytes as u64;
+                                self.stats
+                                    .increment(&self.stats.nodes_stripped);
+                                self.stats.increment(&self.stats.lns_evicted);
+                            }
+                            if from_pri2 {
+                                self.pri2.lock().add_back(node_id);
+                            } else {
+                                self.primary_policy.put_back(node_id);
+                            }
+                        }
+                        None => {
+                            // Node busy or pinned — put back without any
+                            // memory-budget change.
+                            if from_pri2 {
+                                self.pri2.lock().add_back(node_id);
+                            } else {
+                                self.primary_policy.put_back(node_id);
+                            }
+                            self.stats.increment(&self.stats.nodes_put_back);
+                        }
                     }
                 }
 
@@ -544,8 +593,22 @@ impl Evictor {
                         stored_off_heap = oh.store_node(node_id, serialized);
                     }
 
-                    if info.is_dirty() && !stored_off_heap {
-                        self.flush_dirty_node_to_log(node_id);
+                    // CC-6: flush_dirty_node_to_log uses a non-blocking
+                    // try_write latch and re-checks cursor_count.  `false`
+                    // means the node is busy or became pinned — put it back.
+                    if info.is_dirty()
+                        && !stored_off_heap
+                        && !self.flush_dirty_node_to_log(node_id)
+                    {
+                        // Node is latched by another thread or pinned.
+                        // Put it back; do NOT credit bytes evicted.
+                        if from_pri2 {
+                            self.pri2.lock().add_back(node_id);
+                        } else {
+                            self.primary_policy.put_back(node_id);
+                        }
+                        self.stats.increment(&self.stats.nodes_put_back);
+                        continue;
                     }
 
                     let freed = node_size_fn(node_id);
@@ -615,36 +678,81 @@ impl Evictor {
     }
 
     /// Flush a dirty node to the WAL before evicting it.
-    fn flush_dirty_node_to_log(&self, node_id: u64) {
-        let lm = match &self.log_manager {
-            Some(lm) => Arc::clone(lm),
-            None => return,
-        };
+    ///
+    /// Returns `false` if the node's write latch could not be acquired
+    /// immediately (another thread holds a read or write latch) **or** if,
+    /// after acquiring the latch, a cursor has pinned the BIN (cursor_count
+    /// is positive).  The caller must put the node back into the eviction
+    /// list in both cases.
+    ///
+    /// JE reference: `Evictor.java` `isPinned()` guard +
+    /// `latchNoWait`-style non-blocking latch attempt before any eviction
+    /// mutation (CC-6 fix).
+    fn flush_dirty_node_to_log(&self, node_id: u64) -> bool {
         let tree_arc = match &self.tree {
             Some(t) => Arc::clone(t),
-            None => return,
+            None => return true, // no tree — nothing to flush
         };
 
         let node_arc: Arc<NodeRwLock<TreeNode>> = {
             let tree_guard = match tree_arc.read() {
                 Ok(g) => g,
-                Err(_) => return,
+                Err(_) => return false, // tree lock poisoned; be conservative
             };
-            match find_node_arc(&tree_guard, node_id) {
-                Some(a) => a,
-                None => return,
+            // CC-6: non-blocking tree scan — if any node in the descent path
+            // is write-locked by another thread, treat the target as busy.
+            match find_node_arc_nonblocking(&tree_guard, node_id) {
+                Ok(Some(a)) => a,
+                Ok(None) => return true, // node already gone; allow eviction
+                Err(()) => return false, // descent blocked; put back
             }
         };
 
-        let mut node_guard = node_arc.write();
+        // CC-6: non-blocking latch attempt (JE `latchNoWait`-style).
+        // If the node is currently held by a reader or writer, put it back
+        // rather than blocking the evictor thread.
+        let mut node_guard = match node_arc.try_write() {
+            Some(g) => g,
+            None => return false, // node busy — put back
+        };
+
+        // CC-6: re-validate pin count under the lock.  Between the metadata
+        // snapshot taken by node_info_fn and acquiring the write latch a
+        // cursor may have pinned the BIN.  Mirrors JE `isPinned()` re-check.
         let bin = match &mut *node_guard {
-            TreeNode::Bottom(b) => b,
-            _ => return,
+            TreeNode::Bottom(b) => {
+                if b.cursor_count > 0 {
+                    return false; // pinned — put back
+                }
+                b
+            }
+            _ => return true, // non-BIN dirty node; nothing to flush here
         };
 
         if !bin.dirty && bin.dirty_count() == 0 {
-            return;
+            return true; // clean now; evict normally
         }
+
+        // Log manager check is after the safety guards so cursor-pin
+        // checking is always enforced regardless of test configuration.
+        let lm = match &self.log_manager {
+            Some(lm) => Arc::clone(lm),
+            None => return true, // no log manager (tests); allow eviction
+        };
+
+        // CC-4: choose Provisional::Yes when a checkpoint is in progress and
+        // this BIN's level is below the checkpoint's highest flush level, so
+        // the checkpoint's non-provisional ancestor subsumes this entry.
+        // When no checkpointer is wired (or no checkpoint is in progress, or
+        // the BIN is at/above the flush level), use Provisional::No.
+        //
+        // JE ref: Checkpointer.coordinateEvictionWithCheckpoint /
+        // DirtyINMap.coordinateEvictionWithCheckpoint.
+        let provisional = self
+            .checkpointer
+            .as_ref()
+            .map(|c| c.get_eviction_provisional(bin.level))
+            .unwrap_or(Provisional::No);
 
         let full_bytes = bin.serialize_full();
         let entry = InLogEntry::new(
@@ -657,11 +765,12 @@ impl Evictor {
         entry.write_to_log(&mut buf);
 
         if let Ok(logged_lsn) =
-            lm.log(LogEntryType::BIN, &buf, Provisional::No, false, false)
+            lm.log(LogEntryType::BIN, &buf, provisional, false, false)
         {
             bin.clear_dirty_after_full_log(logged_lsn);
             self.stats.increment(&self.stats.dirty_nodes_evicted);
         }
+        true
     }
 
     /// Strips the embedded-LN data from a BIN, freeing the heap allocations
@@ -670,33 +779,47 @@ impl Evictor {
     /// kept in the cache so its descent path stays warm, but the LN data
     /// is dropped to make room for hotter content.
     ///
-    /// Returns the number of bytes actually freed (delegates to
-    /// `BIN::evict_lns`, which writes any dirty embedded LNs to the log
-    /// before clearing them).  Returns 0 if the node cannot be located,
-    /// is not a BIN, or has open cursors.
-    fn strip_lns_from_node(&self, node_id: u64) -> usize {
+    /// Returns `Some(freed_bytes)` on success (0 is valid: nothing to strip).
+    /// Returns `None` if the write latch could not be acquired immediately or
+    /// if, under the latch, `cursor_count > 0` (BIN is pinned by a cursor).
+    /// The caller must put the node back into the eviction list on `None`.
+    ///
+    /// JE reference: `Evictor.java` `isPinned()` + `latchNoWait`-style
+    /// non-blocking latch (CC-6 fix).
+    fn strip_lns_from_node(&self, node_id: u64) -> Option<usize> {
         let tree_arc = match &self.tree {
             Some(t) => Arc::clone(t),
-            None => return 0,
+            None => return Some(0),
         };
         let node_arc: Arc<NodeRwLock<TreeNode>> = {
             let tree_guard = match tree_arc.read() {
                 Ok(g) => g,
-                Err(_) => return 0,
+                Err(_) => return None, // conservative: put back
             };
-            match find_node_arc(&tree_guard, node_id) {
-                Some(a) => a,
-                None => return 0,
+            // CC-6: non-blocking tree scan.
+            match find_node_arc_nonblocking(&tree_guard, node_id) {
+                Ok(Some(a)) => a,
+                Ok(None) => return Some(0), // already gone
+                Err(()) => return None,     // descent blocked; put back
             }
         };
-        let mut node_guard = node_arc.write();
+
+        // CC-6: non-blocking latch attempt (JE `latchNoWait`-style).
+        let mut node_guard = node_arc.try_write()?;
+
+        // CC-6: re-validate pin count under the lock (JE `isPinned()` re-check).
         let bin = match &mut *node_guard {
-            TreeNode::Bottom(b) => b,
-            _ => return 0,
+            TreeNode::Bottom(b) => {
+                if b.cursor_count > 0 {
+                    return None; // pinned — put back
+                }
+                b
+            }
+            _ => return Some(0),
         };
         let lm_ref = self.log_manager.as_deref();
         let _ = lm_ref;
-        bin.strip_lns()
+        Some(bin.strip_lns())
     }
 
     /// Perform an eviction run with caller-supplied node callbacks.
@@ -956,6 +1079,67 @@ fn find_node_arc(
     node_id: u64,
 ) -> Option<Arc<NodeRwLock<TreeNode>>> {
     find_node_full(tree, node_id).map(|f| f.arc)
+}
+
+/// Non-blocking variant of [`find_node_arc`] used by the CC-6 mutation paths.
+///
+/// Uses `try_read()` at every level so the evictor never blocks on a node
+/// that another thread holds exclusively.  Returns `Err(())` if any node in
+/// the descent path is currently write-locked (caller must put the eviction
+/// candidate back), `Ok(None)` if the target is simply not present, and
+/// `Ok(Some(arc))` on success.
+///
+/// JE ref: `Evictor.java` `latchNoWait`-style non-blocking scan before any
+/// eviction mutation (CC-6 fix).
+fn find_node_arc_nonblocking(
+    tree: &Tree,
+    node_id: u64,
+) -> Result<Option<Arc<NodeRwLock<TreeNode>>>, ()> {
+    let root_arc = match tree.get_root() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    find_node_arc_nonblocking_recursive(&root_arc, node_id)
+}
+
+fn find_node_arc_nonblocking_recursive(
+    node_arc: &Arc<NodeRwLock<TreeNode>>,
+    target_id: u64,
+) -> Result<Option<Arc<NodeRwLock<TreeNode>>>, ()> {
+    // CC-6: use try_read so the evictor never blocks a reader that is
+    // write-locked by another thread (cursor mutation, split, etc.).
+    let guard = node_arc.try_read().ok_or(())?;
+    match &*guard {
+        TreeNode::Bottom(b) => {
+            if b.node_id != target_id {
+                return Ok(None);
+            }
+            let arc = Arc::clone(node_arc);
+            drop(guard);
+            Ok(Some(arc))
+        }
+        TreeNode::Internal(n) => {
+            if n.node_id == target_id {
+                let arc = Arc::clone(node_arc);
+                drop(guard);
+                return Ok(Some(arc));
+            }
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n
+                .entries
+                .iter()
+                .filter_map(|e| e.child.as_ref().map(Arc::clone))
+                .collect();
+            drop(guard);
+            for child in children {
+                match find_node_arc_nonblocking_recursive(&child, target_id) {
+                    Ok(Some(arc)) => return Ok(Some(arc)),
+                    Ok(None) => continue,
+                    Err(()) => return Err(()), // propagate busy signal
+                }
+            }
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,5 +1996,360 @@ mod tests {
         // The IN was evicted (flushed to log is a no-op for INs without
         // a log manager wired).
         assert_eq!(result.nodes_evicted, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // CC-6: non-blocking latch + cursor-pin recheck tests
+    // -----------------------------------------------------------------------
+
+    /// CC-6 acceptance test 1: flush_dirty_node_to_log returns `false`
+    /// immediately when another thread holds the node's write latch.
+    ///
+    /// Without the CC-6 fix the old `node_arc.write()` would block
+    /// indefinitely, deadlocking this test.  With try_write the function
+    /// returns `false` promptly and the node is put back.
+    ///
+    /// JE ref: `Evictor.java` `latchNoWait`-style non-blocking latch before
+    /// any eviction mutation.
+    #[test]
+    fn test_cc6_flush_nonblocking_when_write_held() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+        use std::time::Duration;
+
+        // Build a two-node tree so the root is an IN and a BIN leaf exists.
+        let tree_inner = noxu_tree::tree::Tree::new(1, 128);
+        tree_inner
+            .insert(b"k1".to_vec(), b"v1".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree_inner
+            .insert(b"k2".to_vec(), b"v2".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        // Find the BIN node's Arc so we can hold its write latch.
+        let bin_arc = {
+            let root = tree_inner.get_root().expect("root");
+            let guard = root.read();
+            match &*guard {
+                TreeNode::Internal(n) => {
+                    n.entries[0].child.as_ref().cloned().expect("BIN child")
+                }
+                TreeNode::Bottom(_) => {
+                    // Single-node tree: root IS the BIN.
+                    Arc::clone(&root)
+                }
+            }
+        };
+
+        // Confirm it's the BIN and mark it dirty.
+        let bin_id = {
+            let mut g = bin_arc.write();
+            match &mut *g {
+                TreeNode::Bottom(b) => {
+                    b.dirty = true;
+                    b.node_id
+                }
+                _ => panic!("expected BIN leaf"),
+            }
+        };
+
+        let tree = Arc::new(RwLock::new(tree_inner));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let evictor = Arc::new(
+            Evictor::new(
+                Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+                100,
+                true, // lru_only: skip pri2, go straight to Evict decision
+            )
+            .with_tree(Arc::clone(&tree), 1),
+        );
+
+        // Register the BIN in the evictor's primary policy.
+        evictor.note_ins_added(bin_id, CacheMode::Default);
+
+        // Hold the BIN's READ latch from a background thread.
+        // A read latch allows node_info_fn's find_node_full scan to proceed
+        // (multiple readers OK), but blocks the evictor's try_write() in
+        // flush_dirty_node_to_log — exactly the contention CC-6 protects.
+        let bin_arc2 = Arc::clone(&bin_arc);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = bin_arc2.read();
+            ready_tx.send(()).unwrap(); // signal: latch is held
+            done_rx.recv().unwrap(); // wait: release when told
+        });
+
+        // Wait for holder to acquire the latch.
+        ready_rx.recv().unwrap();
+
+        // Evictor must NOT block: with try_write it should return immediately
+        // with the node put back.  The old blocking write() would deadlock.
+        // Bounded timeout: if do_evict doesn't return within 2 s the test
+        // fails (via the thread timeout below), proving the old blocking
+        // behaviour.
+        let (evict_tx, evict_rx) = std::sync::mpsc::channel::<EvictResult>();
+        let ev2 = Arc::clone(&evictor);
+        let evict_thread = std::thread::spawn(move || {
+            let r = ev2.do_evict(EvictionSource::Daemon);
+            evict_tx.send(r).unwrap();
+        });
+
+        let result = evict_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "CC-6: do_evict must return within 2 s (was blocking before fix)",
+        );
+
+        // Node was not evicted (it was put back).
+        assert_eq!(
+            result.nodes_evicted, 0,
+            "CC-6: busy-latched node must not be evicted"
+        );
+        // nodes_put_back incremented.
+        assert_eq!(
+            evictor.get_stats().get(&evictor.get_stats().nodes_put_back),
+            1,
+            "CC-6: nodes_put_back must be incremented when try_write fails"
+        );
+
+        // Release the holder and join.
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
+        evict_thread.join().unwrap();
+    }
+
+    /// CC-6 acceptance test 2: strip_lns_from_node returns `None` (put-back)
+    /// when the write latch is held by another thread (non-blocking).
+    ///
+    /// JE ref: `Evictor.java` `isPinned()` + `latchNoWait` for BIN partial
+    /// eviction.
+    #[test]
+    fn test_cc6_strip_nonblocking_when_write_held() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+        use std::time::Duration;
+
+        let tree_inner = noxu_tree::tree::Tree::new(1, 128);
+        tree_inner
+            .insert(b"a".to_vec(), b"aaa".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree_inner
+            .insert(b"b".to_vec(), b"bbb".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        let bin_arc = {
+            let root = tree_inner.get_root().expect("root");
+            let guard = root.read();
+            match &*guard {
+                TreeNode::Internal(n) => {
+                    n.entries[0].child.as_ref().cloned().expect("BIN child")
+                }
+                TreeNode::Bottom(_) => Arc::clone(&root),
+            }
+        };
+
+        let bin_id = {
+            let g = bin_arc.read();
+            match &*g {
+                TreeNode::Bottom(b) => b.node_id,
+                _ => panic!("expected BIN leaf"),
+            }
+        };
+
+        let tree = Arc::new(RwLock::new(tree_inner));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let evictor = Arc::new(
+            Evictor::new(
+                Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+                100,
+                true,
+            )
+            .with_tree(Arc::clone(&tree), 1),
+        );
+
+        let bin_arc2 = Arc::clone(&bin_arc);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _guard = bin_arc2.write();
+            ready_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        // strip_lns_from_node must return None promptly.
+        let (tx, rx) = std::sync::mpsc::channel::<Option<usize>>();
+        let ev2 = Arc::clone(&evictor);
+        std::thread::spawn(move || {
+            tx.send(ev2.strip_lns_from_node(bin_id)).unwrap();
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("CC-6: strip_lns_from_node must return within 2 s");
+
+        assert!(
+            outcome.is_none(),
+            "CC-6: strip must return None (busy) when write latch is held, got {:?}",
+            outcome
+        );
+
+        done_tx.send(()).unwrap();
+    }
+
+    /// CC-6 acceptance test 3: cursor-pin recheck under lock (strip path).
+    ///
+    /// When `cursor_count > 0` at write-lock time, `strip_lns_from_node`
+    /// returns `None` (put back) instead of stripping a pinned BIN.
+    ///
+    /// JE ref: `Evictor.java` `isPinned()` re-check after `latchNoWait`
+    /// succeeds.
+    #[test]
+    fn test_cc6_cursor_pin_recheck_under_lock_strip() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        let tree_inner = noxu_tree::tree::Tree::new(1, 128);
+        tree_inner
+            .insert(b"x".to_vec(), b"data".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree_inner
+            .insert(b"y".to_vec(), b"data2".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        let bin_arc = {
+            let root = tree_inner.get_root().expect("root");
+            let guard = root.read();
+            match &*guard {
+                TreeNode::Internal(n) => {
+                    n.entries[0].child.as_ref().cloned().expect("BIN child")
+                }
+                TreeNode::Bottom(_) => Arc::clone(&root),
+            }
+        };
+
+        // Set cursor_count > 0 directly (simulate cursor pinning between
+        // pre-lock snapshot and actual lock acquisition).
+        let bin_id = {
+            let mut g = bin_arc.write();
+            match &mut *g {
+                TreeNode::Bottom(b) => {
+                    b.cursor_count = 1;
+                    b.node_id
+                }
+                _ => panic!("expected BIN"),
+            }
+        };
+
+        let tree = Arc::new(RwLock::new(tree_inner));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let evictor = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            100,
+            true,
+        )
+        .with_tree(Arc::clone(&tree), 1);
+
+        let result = evictor.strip_lns_from_node(bin_id);
+        assert!(
+            result.is_none(),
+            "CC-6: must return None when cursor_count > 0 under lock; got {:?}",
+            result
+        );
+    }
+
+    /// CC-6 acceptance test 4: cursor-pin recheck under lock (flush path).
+    ///
+    /// `flush_dirty_node_to_log` returns `false` when `cursor_count > 0`
+    /// under the write lock.
+    #[test]
+    fn test_cc6_cursor_pin_recheck_under_lock_flush() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        let tree_inner = noxu_tree::tree::Tree::new(1, 128);
+        tree_inner
+            .insert(b"p".to_vec(), b"val".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree_inner
+            .insert(b"q".to_vec(), b"val2".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        let bin_arc = {
+            let root = tree_inner.get_root().expect("root");
+            let guard = root.read();
+            match &*guard {
+                TreeNode::Internal(n) => {
+                    n.entries[0].child.as_ref().cloned().expect("BIN child")
+                }
+                TreeNode::Bottom(_) => Arc::clone(&root),
+            }
+        };
+
+        let bin_id = {
+            let mut g = bin_arc.write();
+            match &mut *g {
+                TreeNode::Bottom(b) => {
+                    b.cursor_count = 2;
+                    b.dirty = true;
+                    b.node_id
+                }
+                _ => panic!("expected BIN"),
+            }
+        };
+
+        let tree = Arc::new(RwLock::new(tree_inner));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let evictor = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            100,
+            true,
+        )
+        .with_tree(Arc::clone(&tree), 1);
+
+        let result = evictor.flush_dirty_node_to_log(bin_id);
+        assert!(
+            !result,
+            "CC-6: flush must return false when cursor_count > 0 under lock"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CC-4: provisional-flag wiring tests
+    // -----------------------------------------------------------------------
+
+    /// CC-4 acceptance test: evictor accepts a checkpointer via
+    /// `with_checkpointer` and compiles with the CC-4 wiring.
+    ///
+    /// Correctness of the provisional-flag decision logic is proven by the
+    /// four `test_cc4_*` unit tests in `noxu_recovery::checkpointer::tests`;
+    /// this test verifies only that the wiring builds and the checkpointer
+    /// reference survives the builder chain.
+    ///
+    /// JE ref: Checkpointer.coordinateEvictionWithCheckpoint (CC-4 fix).
+    #[test]
+    fn test_cc4_evictor_wires_checkpointer() {
+        use noxu_recovery::{CheckpointConfig, Checkpointer};
+        use std::sync::Arc;
+
+        let ckpt = Arc::new(Checkpointer::new(CheckpointConfig::default()));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let evictor = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            100,
+            false,
+        )
+        .with_checkpointer(Arc::clone(&ckpt));
+
+        // Verify the evictor holds the checkpointer: Arc strong count is 2
+        // (ckpt + evictor's internal reference).
+        assert_eq!(
+            Arc::strong_count(&ckpt),
+            2,
+            "CC-4: evictor must hold an Arc reference to the checkpointer"
+        );
+
+        drop(evictor);
+        // After evictor drops, only our local Arc remains.
+        assert_eq!(Arc::strong_count(&ckpt), 1);
     }
 }
