@@ -207,4 +207,3 @@
     - [Review: storage core (tree, log, cleaner, evictor)](internal/review-storage-core-2026-06.md)
     - [Review: Rust correctness, unsafe, API](internal/review-rust-api-2026-06.md)
     - [Review: claims, docs, tests, tooling](internal/review-claims-docs-tooling-2026-06.md)
-  - [JE fidelity audit — cleaner, txn, locking, concurrency](internal/je-fidelity-audit-2026-06.md)
