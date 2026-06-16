@@ -1925,4 +1925,3 @@ scope, and test gate.  In commit order:
 See [`docs/src/internal/wave-10-b-changelog.md`](docs/src/internal/wave-10-b-changelog.md)
 for the format convention, the relationship to git tag annotations,
 and the workflow for updating this file on each future release.
-fix/cc1-cursor-split-adjust: placeholder
