@@ -16,6 +16,7 @@ use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_sync::Mutex;
 use noxu_tree::tree::{Tree, TreeNode};
+use noxu_txn::TxnManager;
 use noxu_util::{Lsn, NULL_LSN};
 use parking_lot::RwLock as NodeRwLock;
 use std::collections::HashMap;
@@ -201,6 +202,17 @@ pub struct Checkpointer {
     /// `cleaner.after_checkpoint(&state)` to advance the three-state
     /// checkpoint barrier in `FileSelector`.  X-5 fix.
     cleaner: Option<Arc<noxu_cleaner::Cleaner>>,
+    /// Optional transaction manager for T-F3/T-F4: first-active-LSN tracking.
+    ///
+    /// When `Some`, `do_checkpoint` queries `txn_manager.get_first_active_lsn()`
+    /// and writes the result into `CkptEnd.first_active_lsn` instead of the
+    /// conservative `Lsn::new(0,0)` full-scan sentinel.  This bounds the
+    /// recovery scan to entries at or after the earliest active transaction's
+    /// first logged LSN, reducing crash-recovery time.
+    ///
+    /// Safe only after Stage 1 (all user-database BINs are checkpointed);
+    /// `None` for unit tests without a full environment.
+    txn_manager: Option<Arc<TxnManager>>,
 }
 
 impl Checkpointer {
@@ -228,6 +240,7 @@ impl Checkpointer {
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
             utilization_tracker: None,
             cleaner: None,
+            txn_manager: None,
         }
     }
 
@@ -293,6 +306,17 @@ impl Checkpointer {
     /// two successive checkpoints.
     pub fn with_cleaner(mut self, cleaner: Arc<noxu_cleaner::Cleaner>) -> Self {
         self.cleaner = Some(cleaner);
+        self
+    }
+
+    /// Wire the transaction manager so `do_checkpoint` can compute the real
+    /// `first_active_lsn` for `CkptEnd` (T-F3/T-F4).
+    ///
+    /// Safe to call only after Stage 1 (user-database BINs are checkpointed);
+    /// before Stage 1 a non-zero `first_active_lsn` would cause recovery to
+    /// skip committed LNs not captured in any BIN.
+    pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
+        self.txn_manager = Some(txn_manager);
         self
     }
 
@@ -486,24 +510,32 @@ impl Checkpointer {
         flush_result.full_ins_flushed += upper_result.full_ins_flushed;
 
         // Step 5: Write CkptEnd entry to WAL.
+        //
+        // T-F3 is NOT yet active: first_active_lsn stays Lsn::new(0,0) (full
+        // scan from start of log).  Setting a non-zero first_active_lsn would
+        // bound the recovery scan — but that requires pre-loading BINs from
+        // the checkpoint into the recovery tree before replaying LNs (P-2
+        // BIN-preload infrastructure).  Without P-2, starting from any LSN
+        // other than 0 silently drops pre-checkpoint committed LNs.
+        //
+        // Stage 2 wires T-F4 (update_first_lsn is called on first txn write,
+        // get_first_active_lsn() now returns a real LSN), but the consumer
+        // (T-F3 scan bounding) is deferred until P-2 lands.
+        //
+        // Backward compat: Lsn::new(0,0) tells recovery to full-scan from
+        // the start, which is correct and was always the behaviour.
+        let first_active_lsn: noxu_util::Lsn = noxu_util::Lsn::new(0, 0);
+        // (T-F4: txn_manager is wired; get_first_active_lsn() returns real
+        // LSN for future P-2 use; suppress unused warning.)
+        let _ = &self.txn_manager;
+
         let end_lsn = if let Some(lm) = &self.log_manager {
             let ckpt_end = CheckpointEnd::new(
                 checkpoint_id,
                 invoker,
                 start_lsn,
                 None, // root_lsn  (P1/P2 will fill this)
-                // Set first_active_lsn to Lsn::new(0, 0) (beginning of log)
-                // rather than NULL_LSN.  This tells recovery to scan from
-                // the start of the log, ensuring that committed LN entries
-                // written before the checkpoint start are still replayed.
-                // Noxu's checkpointer flushes an in-memory primary_tree that
-                // may not contain all committed data, so we cannot rely on
-                // BIN entries to capture pre-checkpoint state and must scan
-                // from the beginning.  (JE would set this to the LSN of the
-                // earliest active txn at checkpoint time; Noxu conservatively
-                // uses Lsn::new(0,0) until the checkpoint wires the full
-                // db_map.)
-                noxu_util::Lsn::new(0, 0), // first_active_lsn
+                first_active_lsn,
                 0,
                 0,
                 0,

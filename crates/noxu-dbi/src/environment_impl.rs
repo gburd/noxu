@@ -678,6 +678,10 @@ impl EnvironmentImpl {
             if let Some(ref c) = cleaner {
                 builder = builder.with_cleaner(Arc::clone(c));
             }
+            // Stage-2 / T-F3: wire the txn manager so do_checkpoint can
+            // compute the real first_active_lsn for CkptEnd.  Safe now that
+            // Stage 1 checkpoints ALL user-database BINs.
+            builder = builder.with_txn_manager(Arc::clone(&txn_manager));
             Arc::new(builder)
         });
 

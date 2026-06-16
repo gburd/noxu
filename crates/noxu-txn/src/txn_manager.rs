@@ -148,21 +148,20 @@ impl TxnManager {
 
     /// Updates the first-logged LSN for an active transaction.
     ///
-    /// Intended to be called when a `Txn` writes its first log entry, so that
-    /// [`Self::get_first_active_lsn`] can report the oldest active-transaction
-    /// LSN.
+    /// Called when a `Txn` writes its first log entry (via `CursorImpl`
+    /// after `Txn::note_log_entry`), so that [`Self::get_first_active_lsn`]
+    /// returns the oldest active-transaction LSN.
     ///
-    /// **Not wired today (review item T-F4).** No production code path calls
-    /// this, so `all_txns` entries remain `NULL_LSN` and
-    /// `get_first_active_lsn()` always returns `NULL_LSN`. Wiring it has no
-    /// safe consumer at present: the only intended consumer is bounding the
-    /// recovery scan (T-F3), which is unsafe under the current checkpointer
-    /// (it flushes only the internal `primary_tree`, not user-database BINs —
-    /// see St-H6 Site 2 in the production-readiness review). Bounding the scan
-    /// at a non-zero `first_active_lsn` would skip committed pre-checkpoint
-    /// LNs not captured in any flushed BIN, reintroducing that data-loss
-    /// class. The method is kept (and tested in isolation) for the future
-    /// checkpoint-flushes-user-BINs work.
+    /// **Wired since Stage 2** (branch `fix/checkpoint-user-bins`).
+    /// `CursorImpl::with_txn_manager` passes this manager to every
+    /// transactional cursor; the first transactional LN write calls this
+    /// method.  The checkpointer uses [`Self::get_first_active_lsn`] to set
+    /// `CkptEnd.first_active_lsn` (T-F3), which bounds the recovery scan.
+    ///
+    /// Safe since Stage 1 ensures ALL user-database BINs are checkpointed.
+    /// Before Stage 1, bounding the scan would have silently dropped
+    /// committed LNs not captured in any BIN (the St-H6 Site 2 data-loss
+    /// class).
     pub fn update_first_lsn(&self, txn_id: i64, first_lsn: u64) {
         let mut guard = self.all_txns.write();
         // Only update to an earlier LSN (preserve the first-ever entry).
@@ -179,14 +178,15 @@ impl TxnManager {
     /// Iterates `all_txns` under the read latch to find the minimum
     /// `first_logged_lsn`.
     ///
-    /// **Always returns `NULL_LSN` today (review item T-F4).** Its feeder,
-    /// [`Self::update_first_lsn`], is not wired into any production path, so
-    /// no per-transaction first-LSN is ever recorded. The checkpointer does
-    /// NOT consult this method: it writes `first_active_lsn = Lsn::new(0, 0)`
-    /// into the `CheckpointEnd`, so recovery deliberately performs a full
-    /// forward scan from the start of the log (correct but unbounded; review
-    /// item T-F3). See the rationale on `update_first_lsn` for why bounding
-    /// the scan is unsafe under the current checkpointer.
+    /// **Wired since Stage 2** (branch `fix/checkpoint-user-bins`).
+    /// `CursorImpl::with_txn_manager` calls `update_first_lsn` on first write,
+    /// so this method now returns a real LSN for active transactions.
+    /// `do_checkpoint` uses this to bound recovery: `CkptEnd.first_active_lsn
+    /// = min(get_first_active_lsn(), checkpoint_start_lsn)` so recovery scans
+    /// only from the oldest-active-txn LSN instead of from the start of the log.
+    ///
+    /// Returns `NULL_LSN` when no transactional writes have been logged (i.e.
+    /// all active transactions are read-only or have not yet written).
     pub fn get_first_active_lsn(&self) -> u64 {
         let guard = self.all_txns.read();
         let mut min_lsn = u64::MAX;
