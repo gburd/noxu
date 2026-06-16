@@ -635,3 +635,91 @@ fn cln3_put_back_noop_if_not_being_cleaned() {
     // Status unchanged.
     assert_eq!(fs.get_file_status(21), Some(FileStatus::ToBeCleaned));
 }
+
+// ─── CLN-2: fully_processed_files in checkpoint snapshot ─────────────────────
+
+/// CLN-2: CheckpointStartCleanerState now captures both cleaned_files and
+/// fully_processed_files.  FULLY_PROCESSED files are already safe to delete
+/// and remain so regardless of the checkpoint; they are not subject to the
+/// pending-LN gate.
+///
+/// JE: getFilesAtCheckpointStart captures both CLEANED and FULLY_PROCESSED sets.
+#[test]
+fn cln2_checkpoint_state_captures_fully_processed_files() {
+    use noxu_cleaner::{FileSelector, FileStatus};
+
+    let mut fs = FileSelector::new();
+
+    // File 30: advance to FullyProcessed.
+    fs.add_file_to_clean(30);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(30);
+    let state = fs.get_checkpoint_state();
+    fs.process_checkpoint_end(&state); // no pending → goes to FullyProcessed
+
+    assert_eq!(fs.get_file_status(30), Some(FileStatus::FullyProcessed));
+
+    // File 31: cleaned but not yet checkpointed.
+    fs.add_file_to_clean(31);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(31);
+
+    // Snapshot: should capture file 30 in fully_processed_files and file 31 in cleaned_files.
+    let snap = fs.get_checkpoint_state();
+    assert!(
+        snap.fully_processed_files.contains(&30),
+        "fully_processed_files must include file 30"
+    );
+    assert!(
+        snap.cleaned_files.contains(&31),
+        "cleaned_files must include file 31"
+    );
+}
+
+/// CLN-2: FULLY_PROCESSED files in the snapshot are immediately reserved
+/// (already in safe_to_delete) regardless of pending LNs.
+#[test]
+fn cln2_fully_processed_files_always_safe_to_delete() {
+    use noxu_cleaner::{FileSelector, FileStatus, LnInfo};
+    use noxu_util::Lsn;
+
+    let mut fs = FileSelector::new();
+
+    // File 32: advance to FullyProcessed.
+    fs.add_file_to_clean(32);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(32);
+    let s = fs.get_checkpoint_state();
+    fs.process_checkpoint_end(&s);
+    assert_eq!(fs.get_file_status(32), Some(FileStatus::FullyProcessed));
+
+    // Add a pending LN for file 33.
+    let lsn = Lsn::new(33, 100);
+    fs.add_pending_ln(lsn, LnInfo::new(lsn, 1, vec![0x01], 32, false, 0));
+
+    // File 32 is already in safe_to_delete.  The pending LN must not remove it.
+    assert!(
+        fs.get_safe_to_delete().contains(&32),
+        "fully_processed file must remain safe_to_delete even with pending LNs"
+    );
+}
+
+/// CLN-2: a file with no pending items is freed after ONE checkpoint
+/// (the fast-path optimization).
+#[test]
+fn cln2_two_checkpoint_barrier_only_needed_when_pending() {
+    use noxu_cleaner::FileSelector;
+
+    let mut fs = FileSelector::new();
+
+    fs.add_file_to_clean(40);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(40);
+
+    // One checkpoint, no pending items → immediately FullyProcessed.
+    let s = fs.get_checkpoint_state();
+    assert!(!fs.any_pending_during_checkpoint());
+    fs.process_checkpoint_end(&s);
+
+    assert_eq!(fs.get_safe_to_delete(), vec![40]);
+}

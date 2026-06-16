@@ -869,6 +869,24 @@ impl Cleaner {
         &self.file_selector
     }
 
+    /// Returns the checkpoint start state, calling `process_pending` first.
+    ///
+    /// This is the correct entry point for the checkpointer to call instead
+    /// of `get_file_selector().lock().get_checkpoint_state()` directly.
+    /// Calling `process_pending` before snapshotting means any LNs that can
+    /// be migrated right now are drained before the snapshot, so
+    /// `any_pending_during_checkpoint` reflects only genuinely blocked LNs.
+    ///
+    /// JE: `FileSelector.getFilesAtCheckpointStart` is preceded by
+    /// `processPending()` in `Cleaner.doClean` (Cleaner.java ~line 1185).
+    pub fn get_checkpoint_start_state(
+        &self,
+    ) -> crate::file_selector::CheckpointStartCleanerState {
+        // JE: processPending() before snapshot (CLN-7 / CLN-2).
+        self.process_pending();
+        self.file_selector.lock().get_checkpoint_state()
+    }
+
     /// Notify the cleaner that a checkpoint has completed.
     ///
     /// Called by the checkpointer after `do_checkpoint()` succeeds.  This

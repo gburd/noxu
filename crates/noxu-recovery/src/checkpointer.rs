@@ -455,7 +455,7 @@ impl Checkpointer {
         let cleaner_state = self
             .cleaner
             .as_ref()
-            .map(|c| c.get_file_selector().lock().get_checkpoint_state());
+            .map(|c| c.get_checkpoint_start_state());
 
         // Step 2: Write CkptStart entry to WAL (or synthesise a fake LSN when
         // no LogManager is wired — used by unit tests that don't need I/O).
