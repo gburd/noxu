@@ -369,7 +369,9 @@ fn x5_file_not_safe_to_delete_before_checkpoint() {
         "file must not be safe_to_delete before any checkpoint"
     );
 
-    // First checkpoint: snapshot state at start, then call process_checkpoint_end.
+    // First checkpoint (no pending LNs/DBs): snapshot state at start, then call process_checkpoint_end.
+    // JE optimization: if anyPendingDuringCheckpoint = false, CLEANED goes directly to
+    // reserved (FullyProcessed) without needing a second checkpoint.
     let state1 = fs.get_checkpoint_state();
     assert_eq!(
         state1.cleaned_files,
@@ -378,28 +380,16 @@ fn x5_file_not_safe_to_delete_before_checkpoint() {
     );
     fs.process_checkpoint_end(&state1);
 
-    // After first checkpoint: file moves cleaned → checkpointed, not safe_to_delete yet.
+    // After first checkpoint with no pending items: file is immediately safe_to_delete.
     assert_eq!(
         fs.get_file_status(1),
-        Some(noxu_cleaner::FileStatus::Checkpointed)
+        Some(noxu_cleaner::FileStatus::FullyProcessed)
     );
-    assert!(
-        fs.get_safe_to_delete().is_empty(),
-        "file must not be safe_to_delete after only one checkpoint"
-    );
-
-    // Second checkpoint: no new cleaned files, but the checkpointed file
-    // must advance to safe_to_delete.
-    let state2 = fs.get_checkpoint_state(); // cleaned_files is now empty
-    assert!(state2.cleaned_files.is_empty());
-    fs.process_checkpoint_end(&state2);
-
-    // After second checkpoint: file is safe_to_delete.
     let safe = fs.get_safe_to_delete();
     assert_eq!(
         safe,
         vec![1],
-        "file must be safe_to_delete after two checkpoints"
+        "file must be safe_to_delete after one checkpoint when no pending items"
     );
 }
 
@@ -426,21 +416,164 @@ fn x5_file_cleaned_after_checkpoint_start_waits() {
     assert_eq!(fs.get_file_status(2), Some(noxu_cleaner::FileStatus::Cleaned));
     assert!(fs.get_safe_to_delete().is_empty());
 
-    // Second checkpoint captures file 2.
+    // Second checkpoint captures file 2 (no pending items).
+    // JE optimization: CLEANED → FullyProcessed directly when no pending.
     let state2 = fs.get_checkpoint_state();
     assert_eq!(state2.cleaned_files, vec![2]);
     fs.process_checkpoint_end(&state2);
 
-    // File 2 moves to checkpointed.
+    // File 2 is safe to delete after this checkpoint (no-pending fast path).
     assert_eq!(
         fs.get_file_status(2),
-        Some(noxu_cleaner::FileStatus::Checkpointed)
+        Some(noxu_cleaner::FileStatus::FullyProcessed)
     );
-    assert!(fs.get_safe_to_delete().is_empty()); // still not ready
-
-    // Third checkpoint: file 2 advances to safe_to_delete.
-    let state3 = fs.get_checkpoint_state();
-    fs.process_checkpoint_end(&state3);
     let safe = fs.get_safe_to_delete();
     assert_eq!(safe, vec![2]);
+}
+
+// ─── CLN-1: pending LN gates file deletion ───────────────────────────────────
+
+/// CLN-1 regression: a cleaned file must NOT become safe-to-delete while a
+/// pending LN (lock-denied during migration) remains unresolved.
+///
+/// Reproduction path (data-loss scenario on origin/main before this fix):
+///
+/// 1. The cleaner processes a file containing a live LN.
+/// 2. The LN's BIN slot is locked by a concurrent writer — migration is denied.
+/// 3. On pre-fix code: `lns_locked` was counted but the LN was NOT recorded
+///    anywhere, so the file advanced toward deletion with the BIN slot still
+///    pointing at it.  After a crash the slot would be dangling → data loss.
+/// 4. On post-fix code: the LN is added to `FileSelector::pending_lns`; the
+///    checkpoint barrier checks `any_pending_during_checkpoint` and keeps the
+///    file in CHECKPOINTED state until `remove_pending_ln` drains the set and
+///    `update_processed_files` promotes it.
+///
+/// This test verifies the gating behavior using the `FileSelector` API directly.
+#[test]
+fn cln1_pending_ln_gates_file_deletion() {
+    use noxu_cleaner::{FileSelector, FileStatus, LnInfo};
+    use noxu_util::Lsn;
+
+    let mut fs = FileSelector::new();
+
+    // ── Step 1: file 10 is cleaned.
+    fs.add_file_to_clean(10);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(10);
+
+    // ── Step 2: during processing, one LN lock was denied.  Add to pending.
+    // This is what FileProcessor now does when process_found_ln → Locked.
+    let lock_denied_lsn = Lsn::new(10, 128);
+    fs.add_pending_ln(
+        lock_denied_lsn,
+        LnInfo::new(lock_denied_lsn, 1, vec![0xAA, 0xBB], 64, false, 0),
+    );
+
+    // Verify: pending sets cause any_pending_during_checkpoint = true.
+    assert!(
+        !fs.all_pending_drained(),
+        "pending LN must block file deletion"
+    );
+
+    // ── Step 3: checkpoint starts and ends.  Because any_pending_during_checkpoint
+    // is true, the CLEANED file must only advance to CHECKPOINTED, not FullyProcessed.
+    let state = fs.get_checkpoint_state();
+    assert!(
+        fs.any_pending_during_checkpoint(),
+        "any_pending_during_checkpoint must be true before checkpoint"
+    );
+    fs.process_checkpoint_end(&state);
+
+    assert_eq!(
+        fs.get_file_status(10),
+        Some(FileStatus::Checkpointed),
+        "file must stay CHECKPOINTED while pending LN exists (CLN-1 gate)"
+    );
+    assert!(
+        fs.get_safe_to_delete().is_empty(),
+        "file must NOT be safe_to_delete while pending LN is unresolved"
+    );
+
+    // ── Step 4: pending LN is successfully retried (lock released by writer).
+    // remove_pending_ln calls update_processed_files which promotes CHECKPOINTED → FullyProcessed.
+    fs.remove_pending_ln(lock_denied_lsn);
+
+    assert!(
+        fs.all_pending_drained(),
+        "pending sets must be empty after removal"
+    );
+    assert_eq!(
+        fs.get_file_status(10),
+        Some(FileStatus::FullyProcessed),
+        "file must be FullyProcessed once pending LN is resolved"
+    );
+    assert_eq!(
+        fs.get_safe_to_delete(),
+        vec![10],
+        "file must be safe_to_delete after pending LN drains"
+    );
+}
+
+/// CLN-1 regression (pre-fix behavior demonstration):
+/// With no pending LNs, one checkpoint is sufficient (fast path).
+/// This is the normal case — we verify the fast path still works.
+#[test]
+fn cln1_no_pending_lns_fast_path_one_checkpoint() {
+    use noxu_cleaner::{FileSelector, FileStatus};
+
+    let mut fs = FileSelector::new();
+
+    fs.add_file_to_clean(5);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(5);
+
+    // No pending LNs: one checkpoint is enough (JE's anyPendingDuringCheckpoint = false path).
+    let state = fs.get_checkpoint_state();
+    assert!(!fs.any_pending_during_checkpoint());
+    fs.process_checkpoint_end(&state);
+
+    assert_eq!(fs.get_file_status(5), Some(FileStatus::FullyProcessed));
+    assert_eq!(fs.get_safe_to_delete(), vec![5]);
+}
+
+/// CLN-1: a pending LN added AFTER checkpoint snapshot but BEFORE
+/// checkpoint end still gates the cleaned file, because
+/// `any_pending_during_checkpoint` is a running flag that accumulates
+/// throughout the checkpoint window.
+#[test]
+fn cln1_pending_ln_added_mid_checkpoint_keeps_file_blocked() {
+    use noxu_cleaner::{FileSelector, FileStatus, LnInfo};
+    use noxu_util::Lsn;
+
+    let mut fs = FileSelector::new();
+
+    fs.add_file_to_clean(7);
+    let _ = fs.select_file_for_cleaning();
+    fs.mark_file_cleaned(7);
+
+    // Snapshot checkpoint start — no pending yet.
+    let state = fs.get_checkpoint_state();
+    assert!(!fs.any_pending_during_checkpoint());
+
+    // A pending LN is added AFTER the snapshot but BEFORE process_checkpoint_end.
+    // (This is the real scenario: file processing discovers a locked LN during
+    // the interval between checkpoint start and checkpoint end.)
+    let lsn = Lsn::new(7, 200);
+    fs.add_pending_ln(lsn, LnInfo::new(lsn, 2, vec![0x01], 32, false, 0));
+
+    // process_checkpoint_end reads self.any_pending_during_checkpoint which is now
+    // true (set by add_pending_ln) — the file stays CHECKPOINTED, not FullyProcessed.
+    fs.process_checkpoint_end(&state);
+
+    assert_eq!(
+        fs.get_file_status(7),
+        Some(FileStatus::Checkpointed),
+        "pending LN added after snapshot but before checkpoint end must still gate file"
+    );
+    assert!(fs.get_safe_to_delete().is_empty());
+
+    // Drain the pending LN — update_processed_files promotes CHECKPOINTED → FullyProcessed.
+    fs.remove_pending_ln(lsn);
+    assert_eq!(fs.get_file_status(7), Some(FileStatus::FullyProcessed));
+    assert_eq!(fs.get_safe_to_delete(), vec![7]);
 }

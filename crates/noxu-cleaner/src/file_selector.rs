@@ -30,8 +30,13 @@
 //! threshold and always returns the best file.
 
 use crate::file_summary::FileSummary;
+use crate::ln_info::LnInfo;
 use hashbrown::{HashMap, HashSet};
+use noxu_util::Lsn;
 use std::collections::{BTreeMap, VecDeque};
+
+/// Database ID type used in the cleaner (mirrors `DbId` as i64).
+type DbId = i64;
 
 /// Status of a file in the cleaning pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +63,11 @@ struct FileInfo {
 /// Checkpoint state snapshot for cleaned files.
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointStartCleanerState {
-    /// Files that were cleaned at checkpoint start.
+    /// Files that were in CLEANED state at checkpoint start.
     pub cleaned_files: Vec<u32>,
+    /// Files that were in FULLY_PROCESSED state at checkpoint start.
+    /// JE: `CheckpointStartCleanerState.fullyProcessedFiles`.
+    pub fully_processed_files: Vec<u32>,
 }
 
 /// Tracks the status of files for which cleaning is in progress.
@@ -90,6 +98,27 @@ pub struct FileSelector {
     ///
     ///
     force_cleaning: bool,
+
+    // ── Pending sets (CLN-1) ──────────────────────────────────────────────────
+    //
+    // LNs that could not be migrated because their BIN slot was locked by a
+    // concurrent writer.  The file they belong to cannot be deleted until all
+    // pending LNs are successfully retried and the pending set is drained.
+    // JE: `FileSelector.pendingLNs` (FileSelector.java ~line 133).
+    pending_lns: HashMap<Lsn, LnInfo>,
+
+    // Database IDs whose deletion is still in progress.  A file is not safe
+    // to delete while any of its databases still has pending deletion work.
+    // JE: `FileSelector.pendingDBs` (FileSelector.java ~line 141).
+    pending_dbs: HashSet<DbId>,
+
+    /// Whether any pending LN or pending DB was added *during* the current
+    /// checkpoint interval.  Set true in `add_pending_ln`/`add_pending_db`;
+    /// snapshot at `get_checkpoint_state`; used by `process_checkpoint_end`
+    /// to decide whether cleaned files must wait an extra checkpoint before
+    /// being reserved for deletion.
+    /// JE: `FileSelector.anyPendingDuringCheckpoint` (~line 152).
+    any_pending_during_checkpoint: bool,
 }
 
 impl FileSelector {
@@ -104,6 +133,9 @@ impl FileSelector {
             safe_to_delete: HashSet::new(),
             required_util: None,
             force_cleaning: false,
+            pending_lns: HashMap::new(),
+            pending_dbs: HashSet::new(),
+            any_pending_during_checkpoint: false,
         }
     }
 
@@ -421,42 +453,70 @@ impl FileSelector {
     }
 
     /// Returns a checkpoint state snapshot.
-    pub fn get_checkpoint_state(&self) -> CheckpointStartCleanerState {
+    ///
+    /// Also snapshots `any_pending_during_checkpoint` so that
+    /// `process_checkpoint_end` can decide whether CLEANED files may be
+    /// immediately reserved or must wait another checkpoint.
+    ///
+    /// JE: `FileSelector.getFilesAtCheckpointStart` (FileSelector.java ~line 369).
+    pub fn get_checkpoint_state(&mut self) -> CheckpointStartCleanerState {
+        // Snapshot the pending flag.  If either set is non-empty right now,
+        // the current checkpoint interval has pending items.
+        // JE lines 371-373: anyPendingDuringCheckpoint = !pendingLNs.isEmpty() || !pendingDBs.isEmpty()
+        self.any_pending_during_checkpoint =
+            !self.pending_lns.is_empty() || !self.pending_dbs.is_empty();
+
         let mut cleaned_files: Vec<u32> =
             self.cleaned.iter().copied().collect();
         cleaned_files.sort_unstable();
 
-        CheckpointStartCleanerState { cleaned_files }
+        let mut fully_processed_files: Vec<u32> =
+            self.safe_to_delete.iter().copied().collect();
+        fully_processed_files.sort_unstable();
+
+        CheckpointStartCleanerState { cleaned_files, fully_processed_files }
     }
 
     /// Processes files at checkpoint end.
     ///
     /// Implements the two-checkpoint deletion barrier (JE
-    /// `CleanerFileSelector.afterCheckpoint()`):
+    /// `FileSelector.updateFilesAtCheckpointEnd`):
     ///
-    /// 1. Files that were already in the `checkpointed` state (captured by a
-    ///    *prior* checkpoint) are advanced to `safe_to_delete`.  They have now
-    ///    survived two checkpoint intervals and recovery no longer needs their
-    ///    before-image data — any committed migration is captured by the
-    ///    current checkpoint.
+    /// 1. FULLY_PROCESSED files (those captured in `state.fully_processed_files`
+    ///    at checkpoint start) are already safe — keep them; they will be
+    ///    returned by `get_safe_to_delete()` as before.
     ///
-    /// 2. Files that were in the `cleaned` state when the *current* checkpoint
-    ///    started (`state.cleaned_files`) are advanced to `checkpointed`.  They
-    ///    will become `safe_to_delete` after the next checkpoint.
+    /// 2. Files that were in the `checkpointed` state *before* the current
+    ///    checkpoint started (i.e. NOT in `state.cleaned_files`) are advanced
+    ///    to `safe_to_delete` **only when** no pending items blocked the
+    ///    checkpoint (`!any_pending_during_checkpoint`).
+    ///    If pending items existed, they become FULLY_PROCESSED instead, which
+    ///    requires one more checkpoint via `update_processed_files`.
+    ///    JE `updateFilesAtCheckpointEnd` line 415: `if (anyPendingDuringCheckpoint)`.
     ///
-    /// X-5 fix: the three-state barrier was previously never called from
-    /// outside the cleaner, so files were deleted in the same cleaning pass
-    /// before any checkpoint.
+    /// 3. Files that were in the `cleaned` state when the *current* checkpoint
+    ///    started (`state.cleaned_files`) are advanced to `checkpointed`.
+    ///
+    /// JE: `FileSelector.updateFilesAtCheckpointEnd` (FileSelector.java ~line 398).
     pub fn process_checkpoint_end(
         &mut self,
         state: &CheckpointStartCleanerState,
     ) {
-        // Step 1: advance already-checkpointed files to safe_to_delete.
-        // Collect first to avoid modifying checkpointed while iterating.
+        // Step 1: advance already-checkpointed files to safe_to_delete,
+        // but only if no pending items were present during this checkpoint
+        // interval (JE line 415: if (anyPendingDuringCheckpoint) { CHECKPOINTED } else { reserved })
         let already_checkpointed: Vec<u32> =
             self.checkpointed.iter().copied().collect();
-        for file_number in already_checkpointed {
-            self.mark_file_fully_processed(file_number);
+        if self.any_pending_during_checkpoint {
+            // Pending items existed — cleaned files must wait another checkpoint.
+            // Do NOT advance checkpointed → safe_to_delete yet; they will be
+            // promoted by `update_processed_files` once the pending sets drain.
+            // (They remain in CHECKPOINTED state.)
+        } else {
+            // No pending items during this checkpoint — safe to reserve.
+            for file_number in already_checkpointed {
+                self.mark_file_fully_processed(file_number);
+            }
         }
 
         // Step 2: advance cleaned files (from checkpoint-start snapshot)
@@ -466,6 +526,9 @@ impl FileSelector {
                 self.mark_file_checkpointed(file_number);
             }
         }
+
+        // Step 3: attempt to drain pending → advance CHECKPOINTED → FULLY_PROCESSED.
+        self.update_processed_files();
     }
 
     /// Returns the number of files in each state.
@@ -487,6 +550,126 @@ impl FileSelector {
         self.cleaned.clear();
         self.checkpointed.clear();
         self.safe_to_delete.clear();
+        self.pending_lns.clear();
+        self.pending_dbs.clear();
+        self.any_pending_during_checkpoint = false;
+    }
+
+    // ── Pending LN / DB methods (CLN-1) ───────────────────────────────────────
+
+    /// Adds an LN that could not be migrated (lock denied) to the pending set.
+    ///
+    /// Returns `true` if the LSN was already in the set (duplicate), which
+    /// normally doesn’t happen but is harmless.
+    ///
+    /// Also sets `any_pending_during_checkpoint = true` so the next
+    /// `process_checkpoint_end` knows to gate the deletion barrier.
+    ///
+    /// JE: `FileSelector.addPendingLN` (FileSelector.java ~line 455).
+    pub fn add_pending_ln(&mut self, log_lsn: Lsn, info: LnInfo) -> bool {
+        self.any_pending_during_checkpoint = true;
+        self.pending_lns.insert(log_lsn, info).is_some()
+    }
+
+    /// Returns a snapshot of all pending LNs, or `None` if the set is empty.
+    ///
+    /// JE: `FileSelector.getPendingLNs` (FileSelector.java ~line 467).
+    pub fn get_pending_lns(&self) -> Option<Vec<(Lsn, LnInfo)>> {
+        if self.pending_lns.is_empty() {
+            None
+        } else {
+            Some(self.pending_lns.iter().map(|(&k, v)| (k, v.clone())).collect())
+        }
+    }
+
+    /// Removes a successfully-retried LN from the pending set.
+    ///
+    /// Calls `update_processed_files` afterwards so that if both pending sets
+    /// are now empty, CHECKPOINTED files are immediately promoted.
+    ///
+    /// JE: `FileSelector.removePendingLN` (FileSelector.java ~line 477).
+    pub fn remove_pending_ln(&mut self, log_lsn: Lsn) {
+        self.pending_lns.remove(&log_lsn);
+        self.update_processed_files();
+    }
+
+    /// Returns the number of pending LNs.
+    pub fn get_pending_ln_count(&self) -> usize {
+        self.pending_lns.len()
+    }
+
+    /// Adds a database whose deletion is still in progress.
+    ///
+    /// JE: `FileSelector.addPendingDB` (FileSelector.java ~line 493).
+    pub fn add_pending_db(&mut self, db_id: DbId) -> bool {
+        self.any_pending_during_checkpoint = true;
+        self.pending_dbs.insert(db_id)
+    }
+
+    /// Returns a snapshot of pending database IDs, or `None` if empty.
+    ///
+    /// JE: `FileSelector.getPendingDBs` (FileSelector.java ~line 507).
+    pub fn get_pending_dbs(&self) -> Option<Vec<DbId>> {
+        if self.pending_dbs.is_empty() {
+            None
+        } else {
+            Some(self.pending_dbs.iter().copied().collect())
+        }
+    }
+
+    /// Removes a database from the pending set.
+    ///
+    /// JE: `FileSelector.removePendingDB` (FileSelector.java ~line 521).
+    pub fn remove_pending_db(&mut self, db_id: DbId) {
+        self.pending_dbs.remove(&db_id);
+        self.update_processed_files();
+    }
+
+    /// Returns `true` if the pending-during-checkpoint flag is set.
+    pub fn any_pending_during_checkpoint(&self) -> bool {
+        self.any_pending_during_checkpoint
+    }
+
+    /// Returns whether both pending sets are empty.
+    pub fn all_pending_drained(&self) -> bool {
+        self.pending_lns.is_empty() && self.pending_dbs.is_empty()
+    }
+
+    /// Moves a file from BEING_CLEANED back to TO_BE_CLEANED.
+    ///
+    /// Called when `process_single_file` fails or is interrupted, so the file
+    /// is retried on the next cleaning pass rather than stuck forever in
+    /// `BEING_CLEANED`.
+    ///
+    /// JE: `FileSelector.putBackFileForCleaning` (FileSelector.java ~line 325).
+    pub fn put_back_file_for_cleaning(&mut self, file_number: u32) {
+        if !self.being_cleaned.contains(&file_number) {
+            // Already removed (e.g. by shutdown) — ignore.
+            return;
+        }
+        self.being_cleaned.remove(&file_number);
+        self.to_be_cleaned.push_back(file_number);
+        if let Some(info) = self.file_info.get_mut(&file_number) {
+            info.status = FileStatus::ToBeCleaned;
+        }
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────────
+
+    /// When both pending sets are empty, advance CHECKPOINTED → FULLY_PROCESSED.
+    ///
+    /// This is called after every `remove_pending_ln` and `remove_pending_db`
+    /// so that files are promoted as soon as the last blocker clears.
+    ///
+    /// JE: `FileSelector.updateProcessedFiles` (FileSelector.java ~line 549).
+    fn update_processed_files(&mut self) {
+        if self.pending_lns.is_empty() && self.pending_dbs.is_empty() {
+            let checkpointed: Vec<u32> =
+                self.checkpointed.iter().copied().collect();
+            for file_number in checkpointed {
+                self.mark_file_fully_processed(file_number);
+            }
+        }
     }
 }
 
@@ -663,11 +846,51 @@ mod tests {
         let state = selector.get_checkpoint_state();
         selector.process_checkpoint_end(&state);
 
-        assert_eq!(selector.get_file_status(1), Some(FileStatus::Checkpointed));
+        // With no pending LNs/DBs (anyPendingDuringCheckpoint = false),
+        // JE promotes CLEANED directly to reserved (FullyProcessed) in one
+        // checkpoint.  (JE updateFilesAtCheckpointEnd: else { makeReservedFiles }).
+        assert_eq!(
+            selector.get_file_status(1),
+            Some(FileStatus::FullyProcessed)
+        );
 
         let stats = selector.get_stats();
         assert_eq!(stats.cleaned, 0);
-        assert_eq!(stats.checkpointed, 1);
+        assert_eq!(stats.checkpointed, 0);
+        assert_eq!(stats.safe_to_delete, 1);
+    }
+
+    #[test]
+    fn test_process_checkpoint_end_with_pending_needs_two_checkpoints() {
+        // When pending LNs exist (anyPendingDuringCheckpoint = true),
+        // CLEANED files must pass through CHECKPOINTED and require a second
+        // checkpoint before becoming FullyProcessed.
+        let mut selector = FileSelector::new();
+
+        selector.add_file_to_clean(1);
+        selector.select_file_for_cleaning();
+        selector.mark_file_cleaned(1);
+
+        // Simulate a pending LN — this sets any_pending_during_checkpoint.
+        let lsn = noxu_util::Lsn::new(1, 100);
+        selector.add_pending_ln(
+            lsn,
+            crate::LnInfo::new(lsn, 1, vec![1u8], 64, false, 0),
+        );
+
+        // Checkpoint 1: file should only advance to CHECKPOINTED.
+        let state = selector.get_checkpoint_state();
+        selector.process_checkpoint_end(&state);
+
+        assert_eq!(selector.get_file_status(1), Some(FileStatus::Checkpointed));
+
+        // Drain the pending LN — this calls update_processed_files which promotes
+        // CHECKPOINTED → FullyProcessed immediately.
+        selector.remove_pending_ln(lsn);
+        assert_eq!(
+            selector.get_file_status(1),
+            Some(FileStatus::FullyProcessed)
+        );
     }
 
     #[test]

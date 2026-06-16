@@ -10,7 +10,7 @@ use noxu_util::Lsn;
 /// Used for pending LNs that are locked and must be migrated later, or
 /// cannot be migrated immediately during a split. Also used in a look-ahead
 /// cache in FileProcessor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LnInfo {
     /// The LSN of the LN entry in the log.
     pub lsn: Lsn,

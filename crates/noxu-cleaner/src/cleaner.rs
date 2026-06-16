@@ -6,7 +6,8 @@
 use crate::FileSelector;
 use crate::cleaner_stat::CleanerStats;
 use crate::file_processor::{
-    FileProcessResult, FileProcessor, LogEntry, LogEntryType, SharedTreeLookup,
+    BinLookupResult, FileProcessResult, FileProcessor, LogEntry, LogEntryType,
+    MigrateLnResult, SharedTreeLookup, TreeLookup,
 };
 use crate::file_protector::FileProtector;
 use crate::throttle::CleanerThrottle;
@@ -336,6 +337,11 @@ impl Cleaner {
         self.n_runs.fetch_add(1, Ordering::Relaxed);
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
 
+        // Retry pending LNs from prior passes before selecting new files.
+        // JE: Cleaner.processPending() called at start of processPending loop
+        // (Cleaner.java ~line 1185).
+        self.process_pending();
+
         let mut files_cleaned = 0u32;
         let mut total_entries = 0u64;
 
@@ -365,26 +371,50 @@ impl Cleaner {
             self.file_protector.protect_file(file_number, "CleanerProcessing");
 
             // Process the file
-            let result = self.process_single_file(file_number)?;
+            let result = self.process_single_file(file_number);
 
             // Unprotect after processing
             self.file_protector.unprotect_file(file_number);
 
-            if result.completed {
-                files_cleaned += 1;
-                total_entries += result.entries_read;
+            match result {
+                Err(e) => {
+                    // Processing failed or was interrupted — put file back so
+                    // it is retried on the next pass, not stuck in BEING_CLEANED.
+                    // JE: FileProcessor.java doClean() finally { putBackFileForCleaning }.
+                    self.file_selector.lock().put_back_file_for_cleaning(file_number);
+                    return Err(e);
+                }
+                Ok(result) => {
+                    // Record any LNs that could not be migrated due to lock denial.
+                    // JE: FileSelector.addPendingLN (FileSelector.java ~line 455).
+                    if !result.locked_lns.is_empty() {
+                        let mut selector = self.file_selector.lock();
+                        for (log_lsn, ln_info) in &result.locked_lns {
+                            selector.add_pending_ln(*log_lsn, ln_info.clone());
+                        }
+                    }
 
-                // Update statistics
-                self.update_stats(&result);
+                    if result.completed {
+                        files_cleaned += 1;
+                        total_entries += result.entries_read;
 
-                // Mark file as cleaned in selector.
-                // X-5: do NOT immediately push to pending_deletions.
-                // The file will only become deletable after it passes
-                // through the two-checkpoint barrier in FileSelector.
-                // The checkpointer calls after_checkpoint() which advances
-                // cleaned → checkpointed → safe_to_delete over two
-                // successive checkpoints.
-                self.file_selector.lock().mark_file_cleaned(file_number);
+                        // Update statistics
+                        self.update_stats(&result);
+
+                        // Mark file as cleaned in selector.
+                        // X-5: do NOT immediately push to pending_deletions.
+                        // The file will only become deletable after it passes
+                        // through the two-checkpoint barrier in FileSelector.
+                        // The checkpointer calls after_checkpoint() which advances
+                        // cleaned → checkpointed → safe_to_delete over two
+                        // successive checkpoints.
+                        self.file_selector.lock().mark_file_cleaned(file_number);
+                    } else {
+                        // Processing was interrupted (shutdown) — put file back.
+                        // JE: FileProcessor.java doClean() finally block.
+                        self.file_selector.lock().put_back_file_for_cleaning(file_number);
+                    }
+                }
             }
         }
 
@@ -859,6 +889,98 @@ impl Cleaner {
         state: &crate::file_selector::CheckpointStartCleanerState,
     ) {
         self.file_selector.lock().process_checkpoint_end(state);
+    }
+
+    /// Retry pending LNs whose migration was previously denied a lock.
+    ///
+    /// Iterates the `FileSelector::pending_lns` set and attempts to migrate
+    /// each one.  On success (`Migrated`), removes it from the pending set.
+    /// On `Locked` again, leaves it for the next call.  On `Dead`, removes it
+    /// (the LN is now obsolete in the tree — it was deleted or overwritten by
+    /// the transaction that held the lock).
+    ///
+    /// Called at the start of every `do_clean` pass and from the periodic
+    /// hook inside `FileProcessor` (every `PROCESS_PENDING_EVERY_N_LNS` LNs).
+    ///
+    /// JE: `Cleaner.processPending` (Cleaner.java ~line 1221).
+    pub fn process_pending(&self) {
+        if let (Some(tree), Some(lm)) = (&self.tree, &self.log_manager) {
+            let pending = self.file_selector.lock().get_pending_lns();
+            let Some(pending) = pending else { return };
+
+            // Build a tree lookup for migration (same as process_single_file).
+            let tree_lookup = if let Some(ref shared_lm) = self.lock_manager {
+                crate::file_processor::SharedTreeLookup::with_lock_manager(
+                    Arc::clone(tree),
+                    Arc::clone(lm),
+                    Arc::clone(shared_lm),
+                )
+                .with_extra_trees(
+                    self.extra_trees
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
+                )
+            } else {
+                crate::file_processor::SharedTreeLookup::new(
+                    Arc::clone(tree),
+                    Arc::clone(lm),
+                )
+                .with_extra_trees(
+                    self.extra_trees
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
+                )
+            };
+
+            let processor = crate::file_processor::FileProcessor::new(
+                self.stats.clone(),
+                self.shutdown.clone(),
+            );
+
+            for (log_lsn, ln_info) in pending {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Re-attempt lookup + migration.
+                let bin_result = tree_lookup.lookup_parent_bin(
+                    ln_info.db_id(),
+                    ln_info.key(),
+                    log_lsn,
+                );
+                let outcome = match bin_result {
+                    BinLookupResult::NotFound | BinLookupResult::KnownDeleted => {
+                        // LN is now dead — remove from pending.
+                        self.file_selector.lock().remove_pending_ln(log_lsn);
+                        self.stats
+                            .pending_lns_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    BinLookupResult::Found { tree_lsn } => processor
+                        .process_found_ln(&ln_info, log_lsn, tree_lsn, &tree_lookup),
+                };
+                match outcome {
+                    MigrateLnResult::Migrated | MigrateLnResult::Dead => {
+                        self.file_selector.lock().remove_pending_ln(log_lsn);
+                        self.stats
+                            .pending_lns_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    MigrateLnResult::Locked => {
+                        // Still locked — leave in pending for next call.
+                        self.stats
+                            .pending_lns_locked
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Update queue-size stat.
+            let q = self.file_selector.lock().get_pending_ln_count() as u64;
+            self.stats.pending_ln_queue_size.store(q, Ordering::Relaxed);
+        }
     }
 
     /// Delete files that have passed the two-checkpoint barrier
