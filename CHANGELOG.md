@@ -18,6 +18,28 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Checkpointer now flushes all open user-database BINs** (`noxu-recovery`),
+  not just the internal `primary_tree`. Previously a checkpoint walked only
+  the primary tree, so dirty BINs in user databases were never written at
+  checkpoint time — the checkpoint did not capture committed user data, which
+  is why recovery had to full-scan the log and why bounded recovery (T-F3) was
+  unsafe. The checkpointer now enumerates every open user-database tree from
+  the shared db-trees registry and flushes each tree's dirty BINs + upper INs
+  (faithful to JE's `Checkpointer.processINList` walking the env-wide INList).
+  Regression test `stage1_checkpoint_stats_show_user_db_bins_flushed`
+  (FAIL-PRE: 0 user BINs flushed on the old code / PASS-POST) plus
+  `stage1_user_db_data_survives_checkpoint_and_recovery` and the
+  multiple-database variant.
+- **T-F4 — `TxnManager::update_first_lsn` is now wired** from the cursor
+  write path, so `get_first_active_lsn()` returns the real oldest-active
+  transaction LSN (JE `Txn.firstLoggedLsn`). The value is recorded but the
+  recovery-scan consumer (T-F3) remains deferred: bounding the scan at a
+  non-zero `first_active_lsn` requires recovery to pre-load checkpointed BINs
+  before redo (P-2), which is not yet implemented. `CkptEnd.first_active_lsn`
+  therefore still records `Lsn::new(0,0)` (full scan) — correct and safe.
+  Test `stage2_txn_manager_records_first_active_lsn`; the open-txn-spanning-
+  checkpoint crash test continues to pass.
+
 - **CC-1 / D-2 — cursor correctness on BIN split**: a cursor positioned in the
   upper half of a BIN (index ≥ split_index) that split under it would silently
   skip all records in the new sibling that follow the cursor's slot.
