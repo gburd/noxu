@@ -3856,4 +3856,46 @@ mod tests {
             visited
         );
     }
+
+    // CC-1 adversarial (orchestrator qualification): a cursor whose slot
+    // MIGRATES to the new sibling, then iterates BACKWARD (Prev). The lazy
+    // re-anchor must fire for Prev too and step backward across the split
+    // boundary with no skip/repeat.
+    #[test]
+    fn test_cc1_prev_after_slot_migrates_to_sibling() {
+        let db = make_small_fanout_db(103);
+        {
+            let mut c = CursorImpl::new(db.clone(), 1);
+            for i in 0u32..4 {
+                let key = format!("{:02}", i).into_bytes();
+                c.put(&key, b"v", PutMode::Overwrite).unwrap();
+            }
+        }
+        let mut cursor = CursorImpl::new(db.clone(), 2);
+        cursor.search(b"03", Some(b"v"), SearchMode::Set).unwrap();
+        assert_eq!(cursor.get_current_key(), Some(b"03".as_slice()));
+        {
+            let mut c = CursorImpl::new(db, 3);
+            c.put(b"04", b"v", PutMode::Overwrite).unwrap();
+        }
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let s = cursor.retrieve_next(GetMode::Prev).unwrap();
+            match s {
+                OperationStatus::Success => {
+                    visited.push(cursor.get_current_key().unwrap().to_vec());
+                }
+                OperationStatus::NotFound => break,
+                other => panic!("unexpected status {:?}", other),
+            }
+        }
+        let expected: Vec<Vec<u8>> =
+            ["02", "01", "00"].iter().map(|s| s.as_bytes().to_vec()).collect();
+        assert_eq!(
+            visited, expected,
+            "CC-1 Prev-after-split: backward scan must cross the split \
+             boundary with no skip/repeat; got {:?}",
+            visited
+        );
+    }
 }
