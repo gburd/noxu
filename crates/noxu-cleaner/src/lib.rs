@@ -43,7 +43,7 @@ pub use cleaner_stat::{CleanerStats, CleanerStatsSnapshot};
 pub use data_eraser::{DataEraser, EraseRequest};
 pub use db_file_summary::DbFileSummary;
 pub use error::{CleanerError, Result};
-pub use expiration_profile::ExpirationProfile;
+pub use expiration_profile::{ExpirationProfile, ExpirationProfileStore};
 pub use expiration_tracker::ExpirationTracker;
 pub use extinction_scanner::{ExtinctionScanner, ExtinctionTask};
 pub use file_processor::{

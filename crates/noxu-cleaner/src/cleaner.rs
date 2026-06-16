@@ -42,8 +42,7 @@ struct ProcessPendingCtx {
 
 impl ProcessPendingCtx {
     fn call(&self) {
-        let pending =
-            self.file_selector.lock().get_pending_lns();
+        let pending = self.file_selector.lock().get_pending_lns();
         let Some(pending) = pending else { return };
 
         let tree_lookup = if let Some(ref shared_lm) = self.lock_manager {
@@ -53,10 +52,7 @@ impl ProcessPendingCtx {
                 Arc::clone(shared_lm),
             )
             .with_extra_trees(
-                self.extra_trees
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default(),
+                self.extra_trees.lock().map(|g| g.clone()).unwrap_or_default(),
             )
         } else {
             SharedTreeLookup::new(
@@ -64,10 +60,7 @@ impl ProcessPendingCtx {
                 Arc::clone(&self.log_manager),
             )
             .with_extra_trees(
-                self.extra_trees
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default(),
+                self.extra_trees.lock().map(|g| g.clone()).unwrap_or_default(),
             )
         };
 
@@ -93,14 +86,13 @@ impl ProcessPendingCtx {
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                BinLookupResult::Found { tree_lsn } => {
-                    processor.process_found_ln(
+                BinLookupResult::Found { tree_lsn } => processor
+                    .process_found_ln(
                         &ln_info,
                         log_lsn,
                         tree_lsn,
                         &tree_lookup,
-                    )
-                }
+                    ),
             };
             match outcome {
                 MigrateLnResult::Migrated | MigrateLnResult::Dead => {
@@ -229,6 +221,33 @@ pub struct Cleaner {
     /// `firstActiveFile = min(newest, firstActiveTxnFile)` before computing
     /// `lastFileToClean`.
     txn_manager: Option<Arc<TxnManager>>,
+
+    /// Optional callback invoked when the log is idle after cleaning
+    /// (CLN-14: `wakeupAfterNoWrites`).
+    ///
+    /// When `Some`, `do_clean` calls this function after completing a pass
+    /// with no active log writes, so the checkpointer is notified to run
+    /// promptly and delete cleaned files.
+    ///
+    /// The engine wires this to `Checkpointer::wakeup_after_write` or a
+    /// similar trigger.  Keeping it as a callback avoids a direct dependency
+    /// on `noxu-recovery` from `noxu-cleaner`.
+    ///
+    /// JE: `FileProcessor.doClean` calls
+    /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (~line 290).
+    checkpoint_wakeup_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+
+    /// Per-file expiration profile store (CLN-9).
+    ///
+    /// Maps file numbers to their expiration-time histograms.  Populated by
+    /// `two_pass_check` when a two-pass revisalRun completes.  Used to
+    /// improve TTL-adjusted utilization scoring during file selection.
+    ///
+    /// In-memory only — does not survive crashes.  Persistent storage is
+    /// deferred (see CLN-11 / known-limitations.md).
+    ///
+    /// JE: `Cleaner.getExpirationProfile()` (ExpirationProfile.java).
+    expiration_profile_store: noxu_sync::Mutex<crate::ExpirationProfileStore>,
 }
 
 /// Result of a cleaning operation.
@@ -274,6 +293,10 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
+            checkpoint_wakeup_fn: None,
+            expiration_profile_store: noxu_sync::Mutex::new(
+                crate::ExpirationProfileStore::new(),
+            ),
         }
     }
 
@@ -308,6 +331,10 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
+            checkpoint_wakeup_fn: None,
+            expiration_profile_store: noxu_sync::Mutex::new(
+                crate::ExpirationProfileStore::new(),
+            ),
         }
     }
 
@@ -352,6 +379,10 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
+            checkpoint_wakeup_fn: None,
+            expiration_profile_store: noxu_sync::Mutex::new(
+                crate::ExpirationProfileStore::new(),
+            ),
         }
     }
 
@@ -391,6 +422,10 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
+            checkpoint_wakeup_fn: None,
+            expiration_profile_store: noxu_sync::Mutex::new(
+                crate::ExpirationProfileStore::new(),
+            ),
         }
     }
 
@@ -429,6 +464,22 @@ impl Cleaner {
     /// `firstActiveFile = min(newest, firstActiveTxnFile)`.
     pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
         self.txn_manager = Some(txn_manager);
+        self
+    }
+
+    /// Wire a checkpoint wakeup callback for CLN-14 (`wakeupAfterNoWrites`).
+    ///
+    /// The callback is invoked at the end of a cleaning pass when no active
+    /// log writes were detected, prompting the checkpointer to run so that
+    /// cleaned files are deleted promptly.
+    ///
+    /// JE: `FileProcessor.doClean` calls
+    /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (~line 290).
+    pub fn with_checkpoint_wakeup_fn(
+        mut self,
+        f: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.checkpoint_wakeup_fn = Some(f);
         self
     }
 
@@ -509,11 +560,11 @@ impl Cleaner {
                     None => break, // no more files
                     Some((file_number, required_util)) => {
                         // CLN-4: skip files inside the active-txn window.
-                        if let Some(txn_file) = first_active_txn_file {
-                            if file_number >= txn_file {
-                                selector.put_back_file_for_cleaning(file_number);
-                                break;
-                            }
+                        if first_active_txn_file
+                            .is_some_and(|txn_file| file_number >= txn_file)
+                        {
+                            selector.put_back_file_for_cleaning(file_number);
+                            break;
                         }
                         (file_number, required_util)
                     }
@@ -619,25 +670,22 @@ impl Cleaner {
         let cleaning_needed = files_cleaned > 0;
         self.throttle.update(current_write_bytes, cleaning_needed);
 
+        // CLN-14: wakeupAfterNoWrites — if the log is idle (no writes since
+        // the last pass, or write rate is zero) and we cleaned files, wake up
+        // the checkpointer so cleaned files get deleted promptly.
+        // JE: FileProcessor.doClean ~line 290:
+        //   envImpl.getCheckpointer().wakeupAfterNoWrites()
+        if let (true, Some(cb)) = (cleaning_needed, &self.checkpoint_wakeup_fn)
+        {
+            cb();
+        }
+
         Ok(CleanResult {
             files_cleaned,
             files_deleted,
             total_entries_read: total_entries,
         })
     }
-
-    /// Processes a single file for cleaning.
-    ///
-    /// When a `FileManager` is available, this method scans the on-disk log
-    /// file entry-by-entry to populate a real `FileSummary`.  Each raw entry
-    /// is counted toward `total_count` / `total_size` and classified as LN
-    /// or IN based on the entry-type byte.  When no `FileManager` is attached
-    /// (unit-test mode) an empty summary is used, matching prior behaviour.
-    ///
-    /// When a tree and log manager are also available (via
-    /// `with_file_manager_and_tree`), decoded LN entries are passed to
-    /// `FileProcessor::process_file()` with a `SharedTreeLookup` so that
-    /// live LN entries are migrated.  Otherwise the no-op path is taken.
 
     /// CLN-5: Two-pass dry-run check.
     ///
@@ -646,10 +694,14 @@ impl Cleaner {
     /// threshold.  If so, returns `true` (skip this file) — JE calls this
     /// the "revisalRun".
     ///
+    /// Also stores the `ExpirationTracker` result in `expiration_profile_store`
+    /// (CLN-9) so that future selection passes can use per-file expiration data.
+    ///
     /// JE: `FileProcessor.doClean` two-pass block (~line 420-465):
     ///   processFile(fileNum, recalcSummary, inSummary, expTracker);  // dry run
     ///   recalcUtil = utilization(obsolete + expired, total);
     ///   if (recalcUtil > requiredUtil) { skip; }
+    ///   cleaner.getExpirationProfile().putFile(expTracker, expiredSize);
     fn two_pass_check(&self, file_number: u32, required_util: i32) -> bool {
         let summary = match &self.file_manager {
             None => return false, // no file to scan — don't skip
@@ -658,30 +710,27 @@ impl Cleaner {
         if summary.total_size <= 0 {
             return false;
         }
-        // Expired bytes: use ExpirationTracker if we have log entries.
-        // For now (expiration_time always 0 until CLN-10 live path is wired)
-        // expired_bytes = 0.  Structure is correct for when TTL is active.
-        let expired_bytes: i64 = if let Some(fm) = &self.file_manager {
+        // Build an ExpirationTracker from log entries (CLN-9 + CLN-5).
+        let hours_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 3600)
+            .unwrap_or(0);
+
+        let mut tracker = crate::ExpirationTracker::new(file_number);
+        if let Some(fm) = &self.file_manager {
             let entries = self.decode_ln_entries_from_file(fm, file_number);
-            let hours_now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() / 3600)
-                .unwrap_or(0);
-            let mut tracker = crate::ExpirationTracker::new(file_number);
             for entry in &entries {
-                if let LogEntryType::Ln { expiration_time, entry_size, .. } =
-                    entry.entry_type
+                if let LogEntryType::Ln {
+                    expiration_time, entry_size, ..
+                } = entry.entry_type
                 {
                     tracker.track(expiration_time, entry_size);
                 }
             }
-            tracker.get_expired_bytes(hours_now)
-        } else {
-            0
-        };
+        }
+        let expired_bytes = tracker.get_expired_bytes(hours_now);
 
         // recalcUtil = utilization(obsolete + expired, total)
-        // where utilization = (obsolete + expired) / total * 100.
         let obsolete = summary.get_obsolete_size() as i64;
         let total = summary.total_size as i64;
         let recalc_util = if total > 0 {
@@ -689,6 +738,10 @@ impl Cleaner {
         } else {
             0
         };
+
+        // CLN-9: store the tracker for future selection scoring.
+        // JE: cleaner.getExpirationProfile().putFile(expTracker, expiredSize).
+        self.expiration_profile_store.lock().put_file(tracker);
 
         // Skip if recalc_util > required_util (file still too utilized).
         recalc_util > required_util
@@ -2277,7 +2330,7 @@ mod tests {
         use noxu_txn::{LockManager, TxnManager};
 
         let lock_manager = Arc::new(LockManager::new());
-        let txn_manager = Arc::new(TxnManager::new(lock_manager.clone()));
+        let txn_manager = Arc::new(TxnManager::new(lock_manager));
 
         // Open a transaction, note its first LSN as file 3, offset 100.
         let _txn = txn_manager.begin_txn();
@@ -2387,7 +2440,8 @@ mod tests {
     #[test]
     fn test_cln12_pending_queue_processed_during_file_run() {
         use crate::file_processor::{
-            FileProcessor, LogEntry, LogEntryType, PROCESS_PENDING_EVERY_N_LNS_PUB,
+            FileProcessor, LogEntry, LogEntryType,
+            PROCESS_PENDING_EVERY_N_LNS_PUB,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2449,7 +2503,8 @@ mod tests {
             }
         }
 
-        let _result = processor.process_file(1, &summary, &entries, &Noop).unwrap();
+        let _result =
+            processor.process_file(1, &summary, &entries, &Noop).unwrap();
 
         // With n = PROCESS_PENDING_EVERY_N_LNS_PUB + 1, the counter must be
         // incremented exactly once at the interval boundary.
@@ -2459,6 +2514,61 @@ mod tests {
             "CLN-12: pending callback must be called once for {} LNs at interval {}",
             n,
             PROCESS_PENDING_EVERY_N_LNS_PUB
+        );
+    }
+
+    // ── CLN-14 acceptance tests ───────────────────────────────────────────────
+
+    /// When `checkpoint_wakeup_fn` is set and cleaning occurs, the callback
+    /// is invoked at the end of `do_clean`.
+    ///
+    /// JE: FileProcessor.doClean ~line 290 calls
+    /// `envImpl.getCheckpointer().wakeupAfterNoWrites()`.
+    #[test]
+    fn test_cln14_checkpoint_wakeup_called_after_cleaning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wakeup_count = Arc::new(AtomicUsize::new(0));
+        let wakeup_count2 = Arc::clone(&wakeup_count);
+
+        let cleaner = Cleaner::new(50, 0, 0).with_checkpoint_wakeup_fn(
+            Arc::new(move || {
+                wakeup_count2.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        cleaner.add_file_to_clean(1);
+        let result = cleaner.do_clean(1, false).unwrap();
+
+        assert_eq!(result.files_cleaned, 1);
+        assert_eq!(
+            wakeup_count.load(Ordering::Relaxed),
+            1,
+            "CLN-14: checkpoint wakeup callback must be called after cleaning"
+        );
+    }
+
+    /// When no files are cleaned, the callback is NOT invoked.
+    #[test]
+    fn test_cln14_no_wakeup_when_no_files_cleaned() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wakeup_count = Arc::new(AtomicUsize::new(0));
+        let wakeup_count2 = Arc::clone(&wakeup_count);
+
+        let cleaner = Cleaner::new(50, 0, 0).with_checkpoint_wakeup_fn(
+            Arc::new(move || {
+                wakeup_count2.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        // No files added — nothing to clean.
+        let result = cleaner.do_clean(1, false).unwrap();
+        assert_eq!(result.files_cleaned, 0);
+        assert_eq!(
+            wakeup_count.load(Ordering::Relaxed),
+            0,
+            "CLN-14: checkpoint wakeup must NOT be called when nothing cleaned"
         );
     }
 }

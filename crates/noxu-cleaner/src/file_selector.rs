@@ -227,7 +227,7 @@ impl FileSelector {
         file_summaries
             .values()
             .filter(|s| !s.is_empty())
-            .map(|s| Self::adjusted_utilization_pct(s))
+            .map(Self::adjusted_utilization_pct)
             .min()
             .unwrap_or(100)
     }
@@ -257,8 +257,8 @@ impl FileSelector {
             min_age,
             force_cleaning,
             first_active_txn_file,
-            None,  // predicted_total_threshold: None = no global gate
-            None,  // min_file_utilization_pct: None = no second tier
+            None, // predicted_total_threshold: None = no global gate
+            None, // min_file_utilization_pct: None = no second tier
         )
     }
 
@@ -302,12 +302,11 @@ impl FileSelector {
         // JE: `if (predictedMinUtil < totalThreshold) { fileChosen = ... }`
         // (~line 409).  We only apply this gate when force_cleaning is false.
         if !force_cleaning && !self.force_cleaning {
-            if let Some(total_threshold) = predicted_total_threshold {
-                let predicted_min =
-                    Self::compute_predicted_min_util(file_summaries);
-                if predicted_min >= total_threshold {
-                    return None;
-                }
+            let vetoed = predicted_total_threshold.is_some_and(|threshold| {
+                Self::compute_predicted_min_util(file_summaries) >= threshold
+            });
+            if vetoed {
+                return None;
             }
         }
 
@@ -1548,12 +1547,12 @@ mod tests {
         let mut selector = FileSelector::new();
         let result = selector.select_file_for_cleaning_with_policy(
             &map,
-            50,           // min_utilization_pct
-            1,            // min_age
-            false,        // force_cleaning
-            None,         // first_active_txn_file
-            Some(50),     // predicted_total_threshold = 50%
-            None,         // min_file_utilization_pct
+            50,       // min_utilization_pct
+            1,        // min_age
+            false,    // force_cleaning
+            None,     // first_active_txn_file
+            Some(50), // predicted_total_threshold = 50%
+            None,     // min_file_utilization_pct
         );
         assert_eq!(
             result, None,
@@ -1578,7 +1577,7 @@ mod tests {
             1,
             false,
             None,
-            Some(50),     // predicted_total_threshold
+            Some(50), // predicted_total_threshold
             None,
         );
         assert_eq!(
@@ -1610,8 +1609,8 @@ mod tests {
             1,
             false,
             None,
-            None,         // no global gate
-            Some(30),     // min_file_utilization_pct
+            None,     // no global gate
+            Some(30), // min_file_utilization_pct
         );
         assert_eq!(
             result.map(|(f, _)| f),
@@ -1633,10 +1632,10 @@ mod tests {
             &map,
             50,
             1,
-            true,         // force_cleaning
+            true, // force_cleaning
             None,
-            Some(50),     // global gate would veto
-            Some(30),     // second tier would exclude
+            Some(50), // global gate would veto
+            Some(30), // second tier would exclude
         );
         // force_cleaning bypasses all gates → file 1 (70%) is selected.
         assert_eq!(

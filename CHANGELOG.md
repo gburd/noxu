@@ -18,6 +18,78 @@ listed in [References](#references).
 
 ### Fixed
 
+- **CLN-4 (wiring) — first-active-transaction file clamping now live** (`noxu-cleaner`):
+  `Cleaner::do_clean` now reads `TxnManager::get_first_active_lsn()` and skips
+  files whose `file_number >= first_active_txn_file`, preventing the cleaner
+  from processing files still inside an open transaction's log window.
+  Added `with_txn_manager(Arc<TxnManager>)` builder.  The clamping logic
+  existed in `select_file_for_cleaning_with_profile_and_txn` but was dead
+  in the production path; now wired.
+  JE: `UtilizationCalculator.getBestFile` first-active clamp.
+
+- **CLN-5 — two-pass cleaning correctly skips over-utilized files** (`noxu-cleaner`):
+  When `required_util >= 0`, `do_clean` calls `two_pass_check` which
+  scans the file, computes `recalcUtil = (obsolete + expired) / total`,
+  and skips cleaning if `recalcUtil > required_util`.  Previously
+  `force_cleaning = true` was set instead, causing over-cleaning.
+  JE: `FileProcessor.doClean` revisalRun two-pass block (~line 420–465).
+
+- **CLN-10 — `LnInfo.expiration_time` unit corrected to hours** (`noxu-cleaner`):
+  The field was documented as "milliseconds since epoch" but the correct
+  unit (matching `ExpirationTracker`, the log format, and St-H6's
+  hours-only TTL invariant) is **hours since epoch**.  No live runtime
+  mismatch existed (`expiration_time` is always 0 in the current live path),
+  but the wrong doc would have caused 3600× errors if the field were
+  populated.  Both `LnInfo` and `ExpirationTracker` now explicitly document
+  the hours unit.
+
+- **CLN-12 — periodic `process_pending` now runs during file processing** (`noxu-cleaner`):
+  The periodic hook in `FileProcessor::process_file` previously drained
+  the look-ahead cache instead of calling `process_pending`.  It now
+  invokes a `process_pending_fn` callback (set by `Cleaner::process_single_file`
+  via `ProcessPendingCtx`) every `PROCESS_PENDING_EVERY_N_LNS` entries,
+  matching JE's `FileProcessor.processFile` behavior (~line 1004–1005).
+  Cache drain is now correctly triggered only on cache-full or end-of-file.
+
+### Added
+
+- **CLN-6 — three-tier file selection policy** (`noxu-cleaner`):
+  `FileSelector::select_file_for_cleaning_with_policy` adds:
+  1. Global gate: `predicted_total_threshold` — if `predictedMinUtil >= threshold`,
+     no file is selected.
+  2. Per-file primary threshold: `min_utilization_pct` (existing).
+  3. Per-file second tier: `min_file_utilization_pct` (JE `minFileUtilization`);
+     effective threshold is `min(primary, second_tier)` in normal mode.
+  `force_cleaning` bypasses all tiers.  Added `compute_predicted_min_util`
+  helper.
+  JE: `UtilizationCalculator.getBestFile` ~lines 174–425.
+
+- **CLN-9 (partial) — per-file `ExpirationProfileStore`** (`noxu-cleaner`):
+  `ExpirationProfileStore` (a `HashMap<u32, ExpirationTracker>`) is now
+  implemented and wired into `two_pass_check`.  The store accumulates
+  per-file expiration data from two-pass dry runs, improving future
+  TTL-adjusted utilization scoring.  In-memory only; persistence across
+  crashes is deferred (see CLN-11 in known-limitations.md).
+  JE: `ExpirationProfile.putFile` / `removeFile` / `getExpiredBytes`.
+
+- **CLN-13 — select-one/process-one loop** (`noxu-cleaner`):
+  `do_clean` now selects and processes one file at a time (instead of
+  batch-selecting then processing).  This ensures the file summary map
+  is re-evaluated after each cleaned file, matching JE semantics.
+  JE: `FileProcessor.doClean` loop (~line 386).
+
+- **CLN-14 (partial) — `wakeupAfterNoWrites` callback** (`noxu-cleaner`):
+  Added `Cleaner::with_checkpoint_wakeup_fn(Arc<dyn Fn()>)`.  When set,
+  the callback is invoked after each successful cleaning pass, allowing
+  the engine to trigger a prompt checkpoint so cleaned files are deleted
+  quickly.  The noxu-engine wiring is deferred (see known-limitations.md).
+  JE: `FileProcessor.doClean` ~line 290.
+
+- **Known limitations documented** (`docs/src/operations/known-limitations.md`):
+  Added rows for CLN-8 (`FilesToMigrate`/`forceCleanFiles` not implemented),
+  CLN-11 (`UtilizationProfile` not persisted), CLN-9 partial persistence
+  deferral, and CLN-14 engine wiring deferral.
+
 - **TXN-2 — serializable-active counter now wired** (`noxu-txn`, `noxu-db`):
   `TxnManager::register_serializable()` is now called from
   `Environment::begin_transaction()` whenever the transaction config

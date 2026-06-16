@@ -1386,14 +1386,12 @@ impl FileProcessor {
                     // PROCESS_PENDING_EVERY_N_LNS (FileProcessor.java ~line
                     // 1004-1005).
                     n_processed_lns += 1;
+                    // Cache drain is NOT triggered here; it happens when
+                    // the cache is full (above) or at end-of-file (below).
                     if n_processed_lns
                         .is_multiple_of(self.process_pending_interval)
                     {
-                        if let Some(ref cb) = self.process_pending_fn {
-                            cb();
-                        }
-                        // Cache drain is NOT triggered here; it happens when
-                        // the cache is full (above) or at end-of-file (below).
+                        self.process_pending_fn.as_deref().inspect(|cb| cb());
                     }
                 }
 
