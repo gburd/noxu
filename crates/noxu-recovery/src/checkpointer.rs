@@ -18,6 +18,7 @@ use noxu_sync::Mutex;
 use noxu_tree::tree::{Tree, TreeNode};
 use noxu_util::{Lsn, NULL_LSN};
 use parking_lot::RwLock as NodeRwLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, RwLock};
 
@@ -165,6 +166,19 @@ pub struct Checkpointer {
     tree: Option<Arc<RwLock<Tree>>>,
     /// Database ID to pass to `Tree::collect_dirty_bins()`.
     db_id: u64,
+    /// Registry of ALL open user-database trees (Stage-1 fix).
+    ///
+    /// Maps `db_id as i64` → `Arc<RwLock<Tree>>` for every database the
+    /// environment has opened.  The checkpointer must flush dirty BINs from
+    /// EVERY tree, not just the primary one, so that committed LNs written to
+    /// user databases are captured in a BIN entry before `CkptEnd` is written.
+    /// JE walks a single env-wide `INList` that covers all databases;
+    /// Noxu achieves the same effect by iterating this registry.
+    ///
+    /// `None` until `with_db_trees_registry` is called (unit tests without a
+    /// full environment).
+    db_trees_registry:
+        Option<Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<Tree>>>>>>,
     /// Bytes written to the log since the last checkpoint.
     ///
     /// Incremented by `wakeup_after_write()`. When this exceeds
@@ -209,6 +223,7 @@ impl Checkpointer {
             log_manager: None,
             tree: None,
             db_id: 0,
+            db_trees_registry: None,
             bytes_since_checkpoint: AtomicU64::new(0),
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
             utilization_tracker: None,
@@ -240,6 +255,20 @@ impl Checkpointer {
     pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
         self.tree = Some(tree);
         self.db_id = db_id;
+        self
+    }
+
+    /// Wire the env-wide db-tree registry so the checkpointer flushes ALL
+    /// user-database dirty BINs, not just the primary tree.
+    ///
+    /// This is the Stage-1 fix: JE's `Checkpointer.processINList` walks a
+    /// single env-wide `INList` covering all databases.  Noxu achieves the
+    /// same effect by iterating `db_trees_registry` and flushing each tree.
+    pub fn with_db_trees_registry(
+        mut self,
+        registry: Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<Tree>>>>>,
+    ) -> Self {
+        self.db_trees_registry = Some(registry);
         self
     }
 
@@ -620,12 +649,16 @@ impl Checkpointer {
 
     /// Internal flush all dirty BINs to the log.
     ///
+    /// Flushes dirty BINs from `self.tree` (primary tree) AND from every
+    /// tree in `self.db_trees_registry` (user databases).
+    ///
+    /// JE `Checkpointer.processINList` walks a single env-wide `INList`
+    /// covering all databases; Noxu achieves the same effect by iterating the
+    /// `db_trees_registry` and calling the per-tree BIN-flush logic for each.
+    ///
     /// For each dirty BIN the TREE_BIN_DELTA threshold (25 %) decides:
     /// - dirty_count / total ≤ 0.25 → write `BINDelta` entry (delta path)
     /// - otherwise                  → write full `BIN` entry (full path)
-    ///
-    /// After a successful write the BIN's dirty flags are cleared and (for
-    /// full writes) `last_full_lsn` is updated to the entry's LSN.
     ///
     /// Also calls `persist_file_summaries()` to ensure utilization data is
     /// durable.
@@ -640,11 +673,54 @@ impl Checkpointer {
             None => return Ok(result),
         };
 
-        let tree_arc = match &self.tree {
-            Some(t) => t,
-            // No tree attached — step 4 is a no-op.
-            None => return Ok(result),
-        };
+        // Stage-1: flush the primary tree (if wired) then every user-database
+        // tree from the registry.  JE's equivalent is processINList walking
+        // the single env-wide INList that covers all databases.
+        //
+        // IMPORTANT: the primary_tree (self.tree, db_id=1) and the user-database
+        // real_tree for db_id=1 are DIFFERENT Arc<RwLock<Tree>> objects.  The
+        // primary_tree is used by the cleaner for LN migration but is never
+        // written by user operations.  User data lives in the real_trees stored
+        // in db_trees_registry.  We flush both: primary_tree first (harmless
+        // if empty), then all registry trees (where user data lives).
+        // No skip guard — the registry trees are always distinct objects from
+        // self.tree even when their db_id happens to match self.db_id.
+        let mut trees_to_flush: Vec<(u64, Arc<RwLock<Tree>>)> = Vec::new();
+        if let Some(t) = &self.tree {
+            trees_to_flush.push((self.db_id, Arc::clone(t)));
+        }
+        if let Some(reg) = &self.db_trees_registry
+            && let Ok(guard) = reg.lock()
+        {
+            for (&db_id_i64, tree_arc) in guard.iter() {
+                let db_id = db_id_i64 as u64;
+                trees_to_flush.push((db_id, Arc::clone(tree_arc)));
+            }
+        }
+
+        for (db_id, tree_arc) in trees_to_flush {
+            let r = Self::flush_one_tree_bins(db_id, &tree_arc, lm)?;
+            result.full_bins_flushed += r.full_bins_flushed;
+            result.delta_ins_flushed += r.delta_ins_flushed;
+        }
+
+        // Persist file utilization summaries so they survive restarts.
+        self.persist_file_summaries()?;
+
+        Ok(result)
+    }
+
+    /// Flush dirty BINs for a single tree to the WAL.
+    ///
+    /// Extracted so both `flush_dirty_bins_internal` (primary tree) and the
+    /// per-user-database loop can share the same logic without duplicating the
+    /// TREE_BIN_DELTA decision or the X-8 early-exit guard.
+    fn flush_one_tree_bins(
+        db_id: u64,
+        tree_arc: &Arc<RwLock<Tree>>,
+        lm: &Arc<LogManager>,
+    ) -> Result<FlushResult> {
+        let mut result = FlushResult::default();
 
         // Collect dirty BINs under a read lock on the tree.
         let dirty_bins = {
@@ -653,13 +729,13 @@ impl Checkpointer {
                     "tree lock poisoned during checkpoint".to_string(),
                 )
             })?;
-            tree_guard.collect_dirty_bins(self.db_id)
+            tree_guard.collect_dirty_bins(db_id)
         };
 
         // TREE_BIN_DELTA: if dirty fraction ≤ 25 % write a delta.
         const TREE_BIN_DELTA: f64 = 0.25;
 
-        for (_db_id, bin_arc) in dirty_bins {
+        for (_node_db_id, bin_arc) in dirty_bins {
             // Acquire write lock to serialize + clear dirty flags.
             let mut bin_guard = bin_arc.write();
 
@@ -673,11 +749,7 @@ impl Checkpointer {
 
             // X-8: skip nodes that the evictor already flushed and cleared
             // between our dirty-BIN snapshot (under tree read lock) and the
-            // per-node write-lock acquisition.  The old guard `total == 0 &&
-            // !b.dirty` was too narrow: a node with entries but zero dirty
-            // slots and the node-level dirty flag clear is also clean.
-            // Writing an empty BINDelta for such a node is a no-op but wastes
-            // log space and incorrectly advances `last_delta_lsn`.
+            // per-node write-lock acquisition.
             if !b.dirty && dirty == 0 {
                 continue;
             }
@@ -690,7 +762,7 @@ impl Checkpointer {
                 // --- BIN-delta path ---
                 let delta_bytes = b.serialize_delta();
                 let entry = BinDeltaLogEntry::new(
-                    self.db_id,
+                    db_id,
                     b.last_full_lsn,
                     b.last_delta_lsn, // prev_delta_lsn
                     delta_bytes,
@@ -717,7 +789,7 @@ impl Checkpointer {
                 // --- Full BIN path ---
                 let full_bytes = b.serialize_full();
                 let entry = InLogEntry::new(
-                    self.db_id,
+                    db_id,
                     b.last_full_lsn,
                     NULL_LSN, // prev_delta_lsn
                     full_bytes,
@@ -743,20 +815,14 @@ impl Checkpointer {
             }
         }
 
-        // Persist file utilization summaries so they survive restarts.
-        self.persist_file_summaries()?;
-
         Ok(result)
     }
 
     /// Flush all dirty upper INs (level ≥ 2) bottom-up to the WAL.
     ///
-    /// Iterates `tree.collect_dirty_upper_ins()` (sorted lowest-level-first)
-    /// and writes each dirty upper IN using `LogEntryType::IN` with
-    /// `Provisional::Yes` for intermediate levels and `Provisional::No` for
-    /// the root (the level with the highest numeric value in the set).
-    ///
-    /// After a successful write the IN's dirty flag is cleared.
+    /// Flushes upper INs from `self.tree` (primary tree) AND from every tree
+    /// in `self.db_trees_registry` (user databases), mirroring
+    /// `flush_dirty_bins_internal`'s all-trees iteration.
     ///
     /// `Checkpointer.processINList()` upper-IN pass +
     /// `Checkpointer.logIN()` for `TreeNode::Internal` nodes.
@@ -768,10 +834,35 @@ impl Checkpointer {
             None => return Ok(result),
         };
 
-        let tree_arc = match &self.tree {
-            Some(t) => t,
-            None => return Ok(result),
-        };
+        let mut trees_to_flush: Vec<(u64, Arc<RwLock<Tree>>)> = Vec::new();
+        if let Some(t) = &self.tree {
+            trees_to_flush.push((self.db_id, Arc::clone(t)));
+        }
+        if let Some(reg) = &self.db_trees_registry
+            && let Ok(guard) = reg.lock()
+        {
+            for (&db_id_i64, tree_arc) in guard.iter() {
+                let db_id = db_id_i64 as u64;
+                // No skip guard: registry trees are distinct objects from self.tree.
+                trees_to_flush.push((db_id, Arc::clone(tree_arc)));
+            }
+        }
+
+        for (db_id, tree_arc) in trees_to_flush {
+            let r = Self::flush_one_tree_upper_ins(db_id, &tree_arc, lm)?;
+            result.full_ins_flushed += r.full_ins_flushed;
+        }
+
+        Ok(result)
+    }
+
+    /// Flush dirty upper INs for a single tree to the WAL.
+    fn flush_one_tree_upper_ins(
+        db_id: u64,
+        tree_arc: &Arc<RwLock<Tree>>,
+        lm: &Arc<LogManager>,
+    ) -> Result<FlushResult> {
+        let mut result = FlushResult::default();
 
         // Collect dirty upper INs under a read lock.
         let dirty_ins = {
@@ -780,7 +871,7 @@ impl Checkpointer {
                     "tree lock poisoned during upper-IN flush".to_string(),
                 )
             })?;
-            tree_guard.collect_dirty_upper_ins(self.db_id)
+            tree_guard.collect_dirty_upper_ins(db_id)
         };
 
         if dirty_ins.is_empty() {
@@ -808,7 +899,7 @@ impl Checkpointer {
             };
 
             let entry = InLogEntry::new(
-                self.db_id,
+                db_id,
                 noxu_util::NULL_LSN, // prev_full_lsn — no previous version tracking for upper INs yet
                 noxu_util::NULL_LSN, // prev_delta_lsn
                 node_bytes,

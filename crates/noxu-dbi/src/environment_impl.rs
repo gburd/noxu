@@ -667,7 +667,12 @@ impl EnvironmentImpl {
                     .bytes_interval(cfg.checkpointer_bytes_interval),
             )
             .with_log_manager(Arc::clone(lm))
-            .with_tree(Arc::clone(&primary_tree), 1);
+            .with_tree(Arc::clone(&primary_tree), 1)
+            // Stage-1: wire the db_trees_registry so the checkpointer flushes
+            // ALL open user-database dirty BINs, not just the primary tree.
+            // JE processINList walks a single env-wide INList covering all
+            // databases; this achieves the same effect.
+            .with_db_trees_registry(Arc::clone(&db_trees_registry));
             // X-5: wire the cleaner so do_checkpoint calls after_checkpoint()
             // and activates the three-state deletion barrier.
             if let Some(ref c) = cleaner {
