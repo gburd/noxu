@@ -9,28 +9,46 @@
 
 use crate::{LatchContext, LatchError};
 use noxu_sync::RwLock;
-use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-// Thread-local counter tracking how many read guards the current thread holds
-// across all SharedLatch instances.  Used to detect read-to-write upgrade
-// attempts that would deadlock with noxu_sync's non-reentrant RwLock.
+// Thread-local per-latch read-hold counter.
+//
+// JE alignment: `ReentrantReadWriteLock.getReadHoldCount()` is per-lock
+// instance (see `SharedLatchImpl`).  The original global counter falsely
+// panicked when a thread held a read guard on latch L1 and then tried to
+// acquire a read guard on a *different* latch L2 (CC-5).  We now key the
+// hold count by the latch's address so only same-latch reentrancy is caught.
 thread_local! {
-    static READ_HOLD_COUNT: Cell<u32> = const { Cell::new(0) };
+    static READ_HOLD_MAP: std::cell::RefCell<HashMap<usize, u32>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
-fn increment_read_hold() {
-    READ_HOLD_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+fn increment_read_hold(id: usize) {
+    READ_HOLD_MAP.with(|m| {
+        let mut map = m.borrow_mut();
+        let count = map.entry(id).or_insert(0);
+        *count = count.saturating_add(1);
+    });
 }
 
-fn decrement_read_hold() {
-    READ_HOLD_COUNT.with(|c| c.set(c.get().saturating_sub(1)));
+fn decrement_read_hold(id: usize) {
+    READ_HOLD_MAP.with(|m| {
+        let mut map = m.borrow_mut();
+        if let Some(count) = map.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&id);
+            }
+        }
+    });
 }
 
-fn read_hold_count() -> u32 {
-    READ_HOLD_COUNT.with(|c| c.get())
+/// Returns the read-hold count for a specific latch (by address).
+fn read_hold_count(id: usize) -> u32 {
+    READ_HOLD_MAP.with(|m| *m.borrow().get(&id).unwrap_or(&0))
 }
 
 /// A shared/exclusive (reader-writer) latch.
@@ -89,10 +107,12 @@ impl SharedLatch {
             );
         }
 
-        // Detect read-to-write upgrade: this thread already holds a read guard
-        // and attempting to acquire write would deadlock with noxu_sync's
-        // non-reentrant RwLock; attempting the upgrade would deadlock.
-        if read_hold_count() > 0 {
+        // Detect read-to-write upgrade on the SAME latch: this thread already
+        // holds a read guard on self and attempting write would deadlock.
+        // Holding a read guard on a *different* latch is fine (CC-5 fix).
+        // Mirrors JE `SharedLatchImpl` / `ReentrantReadWriteLock` per-lock
+        // hold-count semantics.
+        if read_hold_count(self as *const Self as usize) > 0 {
             panic!(
                 "Deadlock: thread holds read lock and requested write lock on latch {}",
                 self.context.name
@@ -146,10 +166,10 @@ impl SharedLatch {
         if self.exclusive_only {
             Ok(SharedLatchGuard::Write(self.acquire_exclusive()?))
         } else {
-            // Detect reentrant shared acquisition on the same thread.
-            // A thread must not acquire the latch in shared mode more than once
-            // (reentrancy is forbidden to prevent subtle ordering bugs).
-            if read_hold_count() > 0 {
+            // Detect reentrant shared acquisition on the SAME latch from the
+            // same thread.  Acquiring a shared guard on a *different* latch is
+            // legal (CC-5 fix; mirrors JE per-lock hold-count semantics).
+            if read_hold_count(self as *const Self as usize) > 0 {
                 panic!(
                     "Latch already held in shared mode: {} (thread {:?})",
                     self.context.name,
@@ -165,8 +185,12 @@ impl SharedLatch {
                     self.context.name
                 ))
             })?;
-            increment_read_hold();
-            Ok(SharedLatchGuard::Read(SharedLatchReadGuard { _guard: guard }))
+            let latch_id = self as *const Self as usize;
+            increment_read_hold(latch_id);
+            Ok(SharedLatchGuard::Read(SharedLatchReadGuard {
+                latch_id,
+                _guard: guard,
+            }))
         }
     }
 
@@ -199,6 +223,7 @@ pub enum SharedLatchGuard<'a> {
 
 /// RAII guard for shared/read access. Releases when dropped.
 pub struct SharedLatchReadGuard<'a> {
+    latch_id: usize,
     _guard: noxu_sync::RwLockReadGuard<'a, ()>,
 }
 
@@ -206,7 +231,7 @@ impl Drop for SharedLatchReadGuard<'_> {
     fn drop(&mut self) {
         // Decrement before the inner guard drops to keep the count accurate
         // for any code that runs between our drop and the lock release.
-        decrement_read_hold();
+        decrement_read_hold(self.latch_id);
     }
 }
 
@@ -489,6 +514,62 @@ mod tests {
             let _ = latch.acquire_exclusive(); // must panic
         });
         assert!(result.is_err(), "read-to-write upgrade should panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // CC-5: per-latch read-hold counter — two independent latches must not
+    // false-panic when both are held read on the same thread.
+    // -----------------------------------------------------------------------
+
+    /// fail-pre (before fix): second acquire_shared on a different latch would
+    /// panic "already held in shared mode" due to the global READ_HOLD_COUNT.
+    /// pass-post: both guards coexist on the same thread with no panic.
+    #[test]
+    fn test_two_independent_shared_latches_no_panic() {
+        let l1 = SharedLatch::named("cc5-l1", false);
+        let l2 = SharedLatch::named("cc5-l2", false);
+        // Both guards held simultaneously on the same thread — must not panic.
+        let _g1 = l1.acquire_shared().expect("l1 acquire_shared");
+        let _g2 = l2
+            .acquire_shared()
+            .expect("l2 acquire_shared: cc5 fail-pre would panic here");
+        // Both guards still alive — drop order doesn't matter.
+    }
+
+    /// Same-latch shared re-acquisition must still panic (reentrancy protection preserved).
+    #[test]
+    fn test_same_latch_shared_reacquire_still_panics() {
+        let result = std::panic::catch_unwind(|| {
+            let latch = SharedLatch::named("cc5-same", false);
+            let _g1 = latch.acquire_shared().expect("first acquire");
+            let _ = latch.acquire_shared(); // must still panic
+        });
+        assert!(
+            result.is_err(),
+            "same-latch reentrant shared acquire must panic"
+        );
+    }
+
+    /// Read-to-write upgrade on the same latch still panics (deadlock prevention preserved).
+    #[test]
+    fn test_same_latch_read_to_write_still_panics() {
+        let result = std::panic::catch_unwind(|| {
+            let latch = SharedLatch::named("cc5-rw", false);
+            let _g = latch.acquire_shared().expect("acquire_shared");
+            let _ = latch.acquire_exclusive(); // must still panic
+        });
+        assert!(result.is_err(), "same-latch read-to-write upgrade must panic");
+    }
+
+    /// Holding read on L1 and acquiring write on L2 is fine (only same-latch
+    /// read-while-write is blocked).
+    #[test]
+    fn test_read_l1_write_l2_no_panic() {
+        let l1 = SharedLatch::named("cc5-cross-r", false);
+        let l2 = SharedLatch::named("cc5-cross-w", false);
+        let _rg = l1.acquire_shared().expect("l1 read");
+        // Writing l2 while reading l1 must not panic.
+        let _wg = l2.acquire_exclusive().expect("l2 write: must not panic");
     }
 
     /// Releasing a latch that is not held (release_if_owner style) should be safe on exclusive path.

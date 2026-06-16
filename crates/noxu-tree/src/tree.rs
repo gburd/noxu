@@ -1929,6 +1929,17 @@ impl Tree {
     /// `next_index = current_index + 1` arithmetic) for any primary
     /// that was not the first slot of its BIN.  This helper hands back
     /// the real index so the cursor can be positioned correctly.
+    ///
+    /// CC-2 fix: uses the same `read_arc()` hand-over-hand latch coupling
+    /// as every other descent method (`search`, `first_entry_at_or_after`,
+    /// `get_first_node`, `get_adjacent_bin_attempt`).  The original
+    /// implementation did `arc.read().is_bin()` (lock acquired and released)
+    /// then a SECOND `arc.read()` on the next line — a gap in which a
+    /// concurrent split can promote the node (BIN→upper IN) or move the
+    /// sought key to a new sibling, yielding a false "not found" for an
+    /// existing key.  Mirrors JE `Tree.searchSubTree` / `Tree.search`
+    /// which hold the latch across the `is_bin()` test and the subsequent
+    /// entry lookup.
     pub fn first_entry_at_or_after_with_index(
         &self,
         key: &[u8],
@@ -1939,15 +1950,17 @@ impl Tree {
         u64,
         std::sync::Arc<crate::NodeRwLock<TreeNode>>,
     )> {
-        // Hand-over-hand latch coupling — same descent strategy as
-        // first_entry_at_or_after; we additionally retain the BIN's Arc
-        // so the caller can pin it.
-        let mut arc = self.get_root()?;
+        // Hand-over-hand latch coupling — identical strategy to
+        // first_entry_at_or_after; the guard is held continuously across
+        // is_bin() and the subsequent entry lookup so no split can
+        // restructure the path between the two observations.
+        let mut guard: parking_lot::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            TreeNode,
+        > = self.get_root()?.read_arc();
         loop {
-            let is_bin = arc.read().is_bin();
-            if is_bin {
-                let g = arc.read();
-                if let TreeNode::Bottom(bin) = &*g {
+            if guard.is_bin() {
+                if let TreeNode::Bottom(bin) = &*guard {
                     let (idx, _exact) = match &self.key_comparator {
                         Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                         None => bin.find_entry_compressed(key),
@@ -1958,7 +1971,11 @@ impl Tree {
                         let data =
                             bin.entries[idx].data.clone().unwrap_or_default();
                         let lsn = bin.entries[idx].lsn.as_u64();
-                        let bin_arc = arc.clone();
+                        // Obtain the Arc for the BIN node the guard came from.
+                        // `ArcRwLockReadGuard::rwlock()` returns the backing Arc.
+                        let bin_arc =
+                            parking_lot::ArcRwLockReadGuard::rwlock(&guard)
+                                .clone();
                         return Some((full_key, data, idx, lsn, bin_arc));
                     } else {
                         return None;
@@ -1966,22 +1983,24 @@ impl Tree {
                 }
                 return None;
             }
-            // Upper IN: same descent as `first_entry_at_or_after` /
-            // `search`.
-            let next_arc = {
-                let g = arc.read();
-                match &*g {
-                    TreeNode::Internal(n) => {
-                        if n.entries.is_empty() {
-                            return None;
-                        }
-                        let idx = self.upper_in_floor_index(&n.entries, key);
-                        n.entries.get(idx)?.child.clone()?
+
+            // Upper IN: descend as in first_entry_at_or_after / search.
+            let next_arc = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
                     }
-                    TreeNode::Bottom(_) => unreachable!(),
+                    let idx = self.upper_in_floor_index(&n.entries, key);
+                    n.entries.get(idx)?.child.clone()?
                 }
+                TreeNode::Bottom(_) => unreachable!(),
             };
-            arc = next_arc;
+            // Acquire child's read lock BEFORE releasing the parent's — this
+            // closes the window where a concurrent split could restructure
+            // the path between the two observations.
+            let next_guard = next_arc.read_arc();
+            drop(guard);
+            guard = next_guard;
         }
     }
 
