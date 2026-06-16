@@ -52,6 +52,47 @@ listed in [References](#references).
   Regression tests `test_cc1_cursor_repositioned_after_bin_split_upper_half`
   and `test_cc1_cursor_stays_in_old_bin_after_split` cover both cursor-position
   cases and demonstrate fail-pre / pass-post behaviour.
+
+- **CC-6 — evictor non-blocking latch + cursor-pin recheck** (`noxu-evictor`):
+  `flush_dirty_node_to_log` and `strip_lns_from_node` previously called
+  `node_arc.write()` (blocking write latch) after taking a metadata snapshot
+  without holding the lock, stalling the evictor thread under cursor read
+  pressure and allowing the memory budget to grow unbounded. Additionally,
+  no cursor-count re-validation was performed under the lock, so a cursor
+  that pinned a BIN between the pre-lock snapshot and the write-latch
+  acquisition could cause a pinned BIN to be evicted or stripped.
+  Fix: a new `find_node_arc_nonblocking` helper uses `try_read()` at every
+  tree level; `flush_dirty_node_to_log` and `strip_lns_from_node` now use
+  `try_write()` (non-blocking, JE `latchNoWait`-style) and re-check
+  `cursor_count > 0` under the lock before proceeding. If the latch is
+  contested or the node is pinned, the node is put back into the eviction
+  list rather than blocking.
+  JE ref: `Evictor.java` `isPinned()` + `latchNoWait`.
+  Acceptance tests: `test_cc6_flush_nonblocking_when_write_held`,
+  `test_cc6_strip_nonblocking_when_write_held`,
+  `test_cc6_cursor_pin_recheck_under_lock_strip`,
+  `test_cc6_cursor_pin_recheck_under_lock_flush`.
+
+- **CC-4 — evictor provisional-flag coordination** (`noxu-evictor`,
+  `noxu-recovery`): `flush_dirty_node_to_log` logged every evicted BIN as
+  `Provisional::No`, even during a checkpoint. If the checkpoint crashed
+  before writing `CkptEnd`, recovery treated the evictor's non-provisional
+  BIN entry as authoritative even though the checkpoint did not complete.
+  Fix: `Checkpointer` gains a new `AtomicI32` field
+  `checkpoint_max_flush_level` (published by `flush_upper_ins_internal`
+  before logging; reset to 0 by `CheckpointGuard::drop`). The new
+  `Checkpointer::get_eviction_provisional(node_level)` returns
+  `Provisional::Yes` when a checkpoint is in progress and the node is below
+  the max flush level, `Provisional::No` otherwise. `Evictor` accepts an
+  optional `Arc<Checkpointer>` via `with_checkpointer()`; when wired,
+  `flush_dirty_node_to_log` calls `get_eviction_provisional` instead of the
+  hardcoded `Provisional::No`.
+  JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` /
+  `DirtyINMap.coordinateEvictionWithCheckpoint`.
+  Acceptance tests: `test_cc4_no_checkpoint_in_progress_yields_provisional_no`,
+  `test_cc4_below_max_flush_level_yields_provisional_yes`,
+  `test_cc4_at_or_above_max_flush_level_yields_provisional_no`,
+  `test_cc4_guard_resets_max_flush_level`, `test_cc4_evictor_wires_checkpointer`.
 ## [v4.0.0] — 2026-06-04
 
 Major release. It completes the production-readiness review remediation

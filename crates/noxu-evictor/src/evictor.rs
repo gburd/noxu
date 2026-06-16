@@ -596,18 +596,19 @@ impl Evictor {
                     // CC-6: flush_dirty_node_to_log uses a non-blocking
                     // try_write latch and re-checks cursor_count.  `false`
                     // means the node is busy or became pinned — put it back.
-                    if info.is_dirty() && !stored_off_heap {
-                        if !self.flush_dirty_node_to_log(node_id) {
-                            // Node is latched by another thread or pinned.
-                            // Put it back; do NOT credit bytes evicted.
-                            if from_pri2 {
-                                self.pri2.lock().add_back(node_id);
-                            } else {
-                                self.primary_policy.put_back(node_id);
-                            }
-                            self.stats.increment(&self.stats.nodes_put_back);
-                            continue;
+                    if info.is_dirty()
+                        && !stored_off_heap
+                        && !self.flush_dirty_node_to_log(node_id)
+                    {
+                        // Node is latched by another thread or pinned.
+                        // Put it back; do NOT credit bytes evicted.
+                        if from_pri2 {
+                            self.pri2.lock().add_back(node_id);
+                        } else {
+                            self.primary_policy.put_back(node_id);
                         }
+                        self.stats.increment(&self.stats.nodes_put_back);
+                        continue;
                     }
 
                     let freed = node_size_fn(node_id);
@@ -680,9 +681,9 @@ impl Evictor {
     ///
     /// Returns `false` if the node's write latch could not be acquired
     /// immediately (another thread holds a read or write latch) **or** if,
-    /// after acquiring the latch, a cursor has pinned the BIN (`cursor_count
-    /// > 0`).  The caller must put the node back into the eviction list in
-    /// both cases.
+    /// after acquiring the latch, a cursor has pinned the BIN (cursor_count
+    /// is positive).  The caller must put the node back into the eviction
+    /// list in both cases.
     ///
     /// JE reference: `Evictor.java` `isPinned()` guard +
     /// `latchNoWait`-style non-blocking latch attempt before any eviction
@@ -804,10 +805,7 @@ impl Evictor {
         };
 
         // CC-6: non-blocking latch attempt (JE `latchNoWait`-style).
-        let mut node_guard = match node_arc.try_write() {
-            Some(g) => g,
-            None => return None, // node busy — put back
-        };
+        let mut node_guard = node_arc.try_write()?;
 
         // CC-6: re-validate pin count under the lock (JE `isPinned()` re-check).
         let bin = match &mut *node_guard {
