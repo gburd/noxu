@@ -245,6 +245,9 @@ impl TxnManager {
             n_commits: self.n_commits.load(Ordering::Relaxed),
             n_aborts: self.n_aborts.load(Ordering::Relaxed),
             n_active: self.n_active_txns() as u64,
+            n_active_serializable: self
+                .n_active_serializable
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -303,6 +306,10 @@ pub struct TxnStats {
     pub n_commits: u64,
     pub n_aborts: u64,
     pub n_active: u64,
+    /// Number of currently active serializable transactions.
+    ///
+    /// Mirrors JE `TxnManager.nActiveSerializable`.
+    pub n_active_serializable: u64,
 }
 
 #[cfg(test)]

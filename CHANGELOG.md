@@ -18,7 +18,30 @@ listed in [References](#references).
 
 ### Fixed
 
-- **Checkpointer now flushes all open user-database BINs** (`noxu-recovery`),
+- **TXN-2 — serializable-active counter now wired** (`noxu-txn`, `noxu-db`):
+  `TxnManager::register_serializable()` is now called from
+  `Environment::begin_transaction()` whenever the transaction config
+  requests serializable isolation, and `unregister_serializable()` is
+  called from `Transaction::unregister_inner_txn()` on every terminal path
+  (commit, abort, `resolved_commit_after_prepare`,
+  `resolved_abort_after_prepare`). Mirrors JE `TxnManager.registerTxn` /
+  `unRegisterTxn` `nActiveSerializable` logic. Pre-fix,
+  `are_other_serializable_transactions_active()` always returned false
+  regardless of how many serializable transactions were live.
+  Acceptance tests: `txn2_serializable_counter_commit`,
+  `txn2_serializable_counter_abort`, `txn2_non_serializable_counter_unaffected`,
+  `txn2_mixed_serializable_and_plain` (fail-pre: counter always 0;
+  pass-post: counter tracks live serializable txns exactly).
+  `TxnStats` / `TxnStatsSnapshot` gain `n_active_serializable` field.
+
+- **TXN-3 — explicit txns unregister from TxnManager (T-F5 verification)**:
+  T-F5 (`fix/checkpoint-user-bins`) already wired `unregister_inner_txn` at
+  all four terminal paths in `Transaction`. Confirmed: `all_txns` drains to
+  zero and `n_commits`/`n_aborts` are accurate. Test
+  `txn3_all_txns_drains_to_zero_commit_and_abort` (fail-pre: `all_txns` grew
+  without bound; pass-post: 0 after all explicit txns finish).
+
+ (`noxu-recovery`),
   not just the internal `primary_tree`. Previously a checkpoint walked only
   the primary tree, so dirty BINs in user databases were never written at
   checkpoint time — the checkpoint did not capture committed user data, which

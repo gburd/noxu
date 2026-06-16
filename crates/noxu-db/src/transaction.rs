@@ -254,7 +254,12 @@ impl Transaction {
         let Some(inner) = self.inner_txn.as_ref() else {
             return;
         };
-        let inner_id = inner.lock().unwrap().id_as_locker();
+        let g = inner.lock().unwrap();
+        let inner_id = g.id_as_locker();
+        // TXN-2: mirror JE TxnManager.unRegisterTxn nActiveSerializable path.
+        // Read the isolation level before releasing the txn from the manager.
+        let was_serializable = g.is_serializable();
+        drop(g);
         if let Some(env) = self.env_impl.as_ref() {
             let guard = env.lock();
             let tm = guard.get_txn_manager();
@@ -262,6 +267,13 @@ impl Transaction {
                 tm.commit_txn(inner_id);
             } else {
                 tm.abort_txn(inner_id);
+            }
+            // Decrement the serializable counter exactly once, after the
+            // all_txns entry is removed, so n_active_serializable ≤
+            // n_active at all times.  Matches JE TxnManager.unRegisterTxn
+            // `nActiveSerializable.decrementAndGet()` ordering.
+            if was_serializable {
+                tm.unregister_serializable();
             }
         }
     }

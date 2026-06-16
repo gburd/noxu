@@ -436,6 +436,11 @@ pub struct TxnStatsSnapshot {
     pub n_commits: u64,
     pub n_aborts: u64,
     pub n_active: u64,
+    /// Number of currently active serializable transactions.
+    ///
+    /// Mirrors JE `TxnManager.nActiveSerializable`. Accurate after
+    /// TXN-2 fix (fix/txn-manager-bookkeeping).
+    pub n_active_serializable: u64,
 }
 
 impl From<&TxnStats> for TxnStatsSnapshot {
@@ -445,6 +450,7 @@ impl From<&TxnStats> for TxnStatsSnapshot {
             n_commits: s.n_commits,
             n_aborts: s.n_aborts,
             n_active: s.n_active,
+            n_active_serializable: s.n_active_serializable,
         }
     }
 }

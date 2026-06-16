@@ -667,3 +667,151 @@ fn f5_explicit_txns_unregister_from_txn_manager() {
         "n_aborts must count the 25 explicit aborts"
     );
 }
+
+// ─── TXN-2: serializable-active counter wired correctly ──────────────────
+//
+// JE TxnManager.registerTxn increments nActiveSerializable when the txn is
+// serializable; unRegisterTxn decrements it.  Pre-fix, Noxu's counter was
+// never incremented, so are_other_serializable_transactions_active() always
+// returned false.  Post-fix it accurately tracks live serializable txns.
+//
+// Fail-pre: both asserts below failed (counter always 0).
+// Pass-post: counter == 1 while txn is live, 0 after commit/abort.
+
+#[test]
+fn txn2_serializable_counter_commit() {
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
+
+    // While the serializable txn is live the counter must be 1.
+    let mid = env.get_stats().unwrap().txn;
+    assert_eq!(
+        mid.n_active_serializable, 1,
+        "TXN-2 fail-pre: n_active_serializable must be 1 while serializable txn is open"
+    );
+
+    txn.commit().unwrap();
+
+    // After commit the counter must return to 0.
+    let after = env.get_stats().unwrap().txn;
+    assert_eq!(
+        after.n_active_serializable, 0,
+        "TXN-2: n_active_serializable must be 0 after serializable txn commits"
+    );
+}
+
+#[test]
+fn txn2_serializable_counter_abort() {
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
+
+    let mid = env.get_stats().unwrap().txn;
+    assert_eq!(
+        mid.n_active_serializable, 1,
+        "TXN-2 fail-pre: n_active_serializable must be 1 while serializable txn is open"
+    );
+
+    txn.abort().unwrap();
+
+    let after = env.get_stats().unwrap().txn;
+    assert_eq!(
+        after.n_active_serializable, 0,
+        "TXN-2: n_active_serializable must be 0 after serializable txn aborts"
+    );
+}
+
+#[test]
+fn txn2_non_serializable_counter_unaffected() {
+    // A plain (non-serializable) txn must not touch the serializable counter.
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+
+    let txn = env.begin_transaction(None).unwrap();
+
+    let mid = env.get_stats().unwrap().txn;
+    assert_eq!(
+        mid.n_active_serializable, 0,
+        "TXN-2: non-serializable txn must not increment n_active_serializable"
+    );
+
+    txn.commit().unwrap();
+
+    let after = env.get_stats().unwrap().txn;
+    assert_eq!(after.n_active_serializable, 0);
+}
+
+#[test]
+fn txn2_mixed_serializable_and_plain() {
+    // Two serializable txns and one plain: counter tracks only the
+    // serializable ones, and returns to 0 after all are done.
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let s1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
+    let s2 = env.begin_transaction(Some(&ser_cfg)).unwrap();
+    let plain = env.begin_transaction(None).unwrap();
+
+    let mid = env.get_stats().unwrap().txn;
+    assert_eq!(
+        mid.n_active_serializable, 2,
+        "TXN-2: two serializable txns must register a count of 2"
+    );
+
+    plain.commit().unwrap(); // plain commits: counter unchanged
+    let after_plain = env.get_stats().unwrap().txn;
+    assert_eq!(after_plain.n_active_serializable, 2);
+
+    s1.commit().unwrap();
+    let after_s1 = env.get_stats().unwrap().txn;
+    assert_eq!(after_s1.n_active_serializable, 1);
+
+    s2.abort().unwrap();
+    let after_s2 = env.get_stats().unwrap().txn;
+    assert_eq!(
+        after_s2.n_active_serializable, 0,
+        "TXN-2: counter must be 0 after all serializable txns finish"
+    );
+}
+
+// ─── TXN-3 verification: all_txns drains to zero ─────────────────────────
+//
+// T-F5 fixed the inner-txn unregister at the noxu-db Transaction layer.
+// This test re-verifies the contract holds (fail-pre: leaked N; pass-post: 0)
+// and also checks the XA resolved paths drain the counter.
+#[test]
+fn txn3_all_txns_drains_to_zero_commit_and_abort() {
+    let tmp = TempDir::new().unwrap();
+    let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+    let db = open_db(&env, "txn3");
+
+    let before = env.get_stats().unwrap().txn;
+    assert_eq!(before.n_active, 0);
+
+    // 10 commits + 10 aborts
+    for i in 0u32..20 {
+        let txn = env.begin_transaction(None).unwrap();
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let val = DatabaseEntry::from_bytes(b"x");
+        db.put(Some(&txn), &key, &val).unwrap();
+        if i % 2 == 0 {
+            txn.commit().unwrap();
+        } else {
+            txn.abort().unwrap();
+        }
+    }
+
+    let after = env.get_stats().unwrap().txn;
+    assert_eq!(
+        after.n_active, 0,
+        "TXN-3: all_txns must be empty after all explicit txns complete"
+    );
+    assert_eq!(after.n_commits - before.n_commits, 10);
+    assert_eq!(after.n_aborts - before.n_aborts, 10);
+}

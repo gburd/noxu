@@ -594,8 +594,21 @@ impl Txn {
     ///
     /// When true, read locks are held until commit/abort.
     ///
+    /// See `TxnManager::register_serializable` / `TxnManager::unregister_serializable`
+    /// (JE `TxnManager.registerTxn` / `unRegisterTxn` `nActiveSerializable` path).
     pub fn set_serializable_isolation(&mut self, v: bool) {
         self.serializable_isolation = v;
+    }
+
+    /// Returns true if this transaction uses serializable (repeatable-read)
+    /// isolation.
+    ///
+    /// Used by `TxnManager` bookkeeping: the manager increments
+    /// `n_active_serializable` when a serializable txn begins and decrements
+    /// it on commit / abort, mirroring JE `TxnManager.registerTxn` /
+    /// `unRegisterTxn` (`nActiveSerializable` path).
+    pub fn is_serializable(&self) -> bool {
+        self.serializable_isolation
     }
 
     /// Configures read-committed isolation.

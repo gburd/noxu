@@ -846,6 +846,16 @@ impl Environment {
                 Arc::new(std::sync::Mutex::new(t))
             })
             .ok();
+        // TXN-2 (JE TxnManager.registerTxn `nActiveSerializable` path):
+        // Increment the serializable counter exactly once per serializable
+        // explicit txn.  The counterpart decrement is in
+        // `Transaction::unregister_inner_txn`, which is called from every
+        // terminal path (commit, abort, resolved_commit/abort_after_prepare).
+        // Guard on `inner_txn.is_some()` so read-only or env-less contexts
+        // (which have no TxnManager) are not counted.
+        if txn_config.serializable_isolation && inner_txn.is_some() {
+            env_guard.get_txn_manager().register_serializable();
+        }
         let txn = if let Some(lm) = env_guard.get_log_manager() {
             Transaction::with_log_manager(txn_id, txn_config, lm)
         } else {
