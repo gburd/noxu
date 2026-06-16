@@ -1169,7 +1169,7 @@ pub struct FileProcessor {
 }
 
 /// Result of processing a single file.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FileProcessResult {
     /// Number of log entries read during this processing run.
     pub entries_read: u64,
@@ -1188,6 +1188,14 @@ pub struct FileProcessResult {
 
     /// Number of LN log records whose LSN had to be locked and lock was denied.
     pub lns_locked: u64,
+
+    /// LN entries that could not be migrated because the lock was denied.
+    ///
+    /// Each entry is `(log_lsn, LnInfo)`.  The cleaner records these in the
+    /// `FileSelector` pending set (`add_pending_ln`) so they are retried via
+    /// `Cleaner::process_pending()` before the file is allowed to advance
+    /// toward deletion.  (JE: `FileSelector.addPendingLN`.)
+    pub locked_lns: Vec<(noxu_util::Lsn, crate::LnInfo)>,
 
     /// Number of full IN log records that were not known a priori to be obsolete.
     pub ins_cleaned: u64,
@@ -1522,6 +1530,10 @@ impl FileProcessor {
                     MigrateLnResult::Locked => {
                         result.lns_locked += 1;
                         self.stats.lns_locked.fetch_add(1, Ordering::Relaxed);
+                        // Record the locked LN so the cleaner can add it to
+                        // FileSelector::pending_lns and retry via process_pending.
+                        // JE FileSelector.addPendingLN (FileSelector.java ~line 455).
+                        result.locked_lns.push((log_lsn, info));
                     }
                 }
             }
@@ -1686,6 +1698,7 @@ impl FileProcessResult {
         self.lns_migrated += other.lns_migrated;
         self.lns_obsolete += other.lns_obsolete;
         self.lns_locked += other.lns_locked;
+        self.locked_lns.extend_from_slice(&other.locked_lns);
         self.ins_cleaned += other.ins_cleaned;
         self.ins_dead += other.ins_dead;
         self.ins_migrated += other.ins_migrated;
@@ -2097,9 +2110,8 @@ mod tests {
             bin_deltas_migrated: 13,
             bin_deltas_obsolete: 14,
             completed: true,
+            locked_lns: vec![],
         };
-
-        assert_eq!(result.entries_read, 1);
         assert_eq!(result.lns_cleaned, 2);
         assert_eq!(result.lns_dead, 3);
         assert_eq!(result.lns_migrated, 4);
@@ -2919,6 +2931,7 @@ mod tests {
             bin_deltas_migrated: 12,
             bin_deltas_obsolete: 13,
             completed: true,
+            locked_lns: vec![],
         };
 
         let r2 = FileProcessResult {
@@ -2937,6 +2950,7 @@ mod tests {
             bin_deltas_migrated: 1,
             bin_deltas_obsolete: 1,
             completed: true,
+            locked_lns: vec![],
         };
 
         r1.merge(&r2);

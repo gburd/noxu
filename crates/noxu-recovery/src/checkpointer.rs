@@ -452,10 +452,8 @@ impl Checkpointer {
         // (before we write CkptStart) so we know which files were in the
         // cleaned state when this checkpoint began.  Passed to
         // `after_checkpoint` at the end of this function.
-        let cleaner_state = self
-            .cleaner
-            .as_ref()
-            .map(|c| c.get_file_selector().lock().get_checkpoint_state());
+        let cleaner_state =
+            self.cleaner.as_ref().map(|c| c.get_checkpoint_start_state());
 
         // Step 2: Write CkptStart entry to WAL (or synthesise a fake LSN when
         // no LogManager is wired — used by unit tests that don't need I/O).
