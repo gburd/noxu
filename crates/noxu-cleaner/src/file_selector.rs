@@ -210,6 +210,28 @@ impl FileSelector {
         )
     }
 
+    /// CLN-6: Compute the predicted minimum utilization across all candidate
+    /// files.
+    ///
+    /// Returns the utilization of the least-utilized file (0-100 integer %).
+    /// This is the "predictedMinUtil" gate from JE's `UtilizationCalculator`:
+    /// if `predictedMinUtil >= totalThreshold`, no file qualifies and the
+    /// global gate vetoes selection.
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` (~line 383):
+    ///   `predictedMinUtil = FileSummary.utilization(obsoleteSize, totalSize)`
+    ///   where `obsoleteSize` is summed over all files.
+    pub fn compute_predicted_min_util(
+        file_summaries: &BTreeMap<u32, FileSummary>,
+    ) -> i32 {
+        file_summaries
+            .values()
+            .filter(|s| !s.is_empty())
+            .map(|s| Self::adjusted_utilization_pct(s))
+            .min()
+            .unwrap_or(100)
+    }
+
     /// Selects the best file for cleaning, optionally clamped to a
     /// first-active-transaction file boundary (CLN-4).
     ///
@@ -229,6 +251,42 @@ impl FileSelector {
         force_cleaning: bool,
         first_active_txn_file: Option<u32>,
     ) -> Option<(u32, Option<i32>)> {
+        self.select_file_for_cleaning_with_policy(
+            file_summaries,
+            min_utilization_pct,
+            min_age,
+            force_cleaning,
+            first_active_txn_file,
+            None,  // predicted_total_threshold: None = no global gate
+            None,  // min_file_utilization_pct: None = no second tier
+        )
+    }
+
+    /// Full-policy file selection with CLN-4/CLN-6 support.
+    ///
+    /// # CLN-6 tiers (JE `UtilizationCalculator.getBestFile`)
+    /// 1. **Global gate**: if `predicted_total_threshold` is `Some(t)` and
+    ///    `predictedMinUtil >= t`, return `None` (no file qualifies globally).
+    /// 2. **Per-file threshold**: files with `adj_util >= min_utilization_pct`
+    ///    are excluded unless `force_cleaning` is `true`.
+    /// 3. **Second tier**: `min_file_utilization_pct` (JE `minFileUtilization`)
+    ///    is a second per-file threshold applied in addition to
+    ///    `min_utilization_pct`.  When set, the file must be below *both*
+    ///    thresholds to qualify in the normal pass (i.e. the effective
+    ///    threshold is `min(min_utilization_pct, min_file_utilization_pct)`).
+    ///    When `force_cleaning` is `true`, the second tier is bypassed.
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` ~lines 174-425.
+    pub fn select_file_for_cleaning_with_policy(
+        &mut self,
+        file_summaries: &BTreeMap<u32, FileSummary>,
+        min_utilization_pct: u32,
+        min_age: u32,
+        force_cleaning: bool,
+        first_active_txn_file: Option<u32>,
+        predicted_total_threshold: Option<i32>,
+        min_file_utilization_pct: Option<i32>,
+    ) -> Option<(u32, Option<i32>)> {
         // Step 1 -- if a file is already queued (from a previous scoring pass
         // that enqueued it but didn't immediately return), dequeue it now.
         if !self.to_be_cleaned.is_empty() {
@@ -237,6 +295,20 @@ impl FileSelector {
 
         if file_summaries.is_empty() {
             return None;
+        }
+
+        // CLN-6: global predicted-utilization gate.
+        // If predictedMinUtil >= totalThreshold, no file qualifies globally.
+        // JE: `if (predictedMinUtil < totalThreshold) { fileChosen = ... }`
+        // (~line 409).  We only apply this gate when force_cleaning is false.
+        if !force_cleaning && !self.force_cleaning {
+            if let Some(total_threshold) = predicted_total_threshold {
+                let predicted_min =
+                    Self::compute_predicted_min_util(file_summaries);
+                if predicted_min >= total_threshold {
+                    return None;
+                }
+            }
         }
 
         // The newest (highest-numbered) file is the "first active" file.
@@ -287,13 +359,24 @@ impl FileSelector {
             // TTL-adjusted utilization (0-100 integer percent).
             let avg_util = Self::adjusted_utilization_pct(summary);
 
-            // Apply the utilization threshold filter.
+            // CLN-6: compute the effective per-file threshold as the minimum of
+            // min_utilization_pct and min_file_utilization_pct (when set).
+            // JE: `fileThreshold = cleaner.minFileUtilization` is the second
+            // tier: a file must be below BOTH thresholds to qualify normally.
             let effective_threshold = if self.force_cleaning {
                 self.required_util
                     .unwrap_or(min_utilization_pct as i32)
                     .min(min_utilization_pct as i32)
             } else {
-                min_utilization_pct as i32
+                let base = min_utilization_pct as i32;
+                // CLN-6: apply minFileUtilization as a second tier.
+                // JE: `if (avgUtil < fileThreshold) { reason = minFileUtil... }`
+                // A file qualifies if it's below EITHER threshold when the
+                // global gate passed.  When only one threshold applies, use it.
+                match min_file_utilization_pct {
+                    Some(file_thresh) => base.min(file_thresh),
+                    None => base,
+                }
             };
             if !force_cleaning
                 && !self.force_cleaning
@@ -1412,6 +1495,172 @@ mod tests {
             selector.required_util(),
             None,
             "required_util should be None when target is met"
+        );
+    }
+
+    // ── CLN-5 acceptance tests ────────────────────────────────────────────────────
+
+    /// When `required_util` is set to a value >= 0, a file whose recalculated
+    /// utilization exceeds that threshold must NOT be cleaned (JE two-pass).
+    ///
+    /// This test validates `select_file_for_cleaning` returns the `required_util`
+    /// value so that `Cleaner::two_pass_check` can act on it.
+    #[test]
+    fn test_cln5_required_util_is_returned() {
+        let mut selector = FileSelector::new();
+        selector.add_file_to_clean_with_util(42, Some(60));
+        let result = selector.select_file_for_cleaning();
+        assert_eq!(
+            result,
+            Some((42, Some(60))),
+            "CLN-5: required_util must be returned from select_file_for_cleaning"
+        );
+    }
+
+    // ── CLN-6 acceptance tests ────────────────────────────────────────────────────
+
+    fn make_summary_sized(total: i32, obsolete: i32) -> FileSummary {
+        FileSummary {
+            total_count: 10,
+            total_size: total,
+            total_ln_count: 10,
+            total_ln_size: total,
+            obsolete_ln_count: 1,
+            obsolete_ln_size: obsolete,
+            obsolete_ln_size_counted: 1,
+            ..Default::default()
+        }
+    }
+
+    /// CLN-6 Tier 1: when `predictedMinUtil >= totalThreshold`, no file is
+    /// selected (global gate vetoes selection).
+    ///
+    /// JE: `if (predictedMinUtil < totalThreshold) { fileChosen = ... }`
+    /// (~UtilizationCalculator.java line 409).
+    #[test]
+    fn test_cln6_global_gate_vetoes_when_predicted_above_threshold() {
+        // Files at 80% util (low obsolete). predictedMinUtil = 80%.
+        // totalThreshold = 50%. Since 80% >= 50%, no file should be selected.
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 200)); // 80% util
+        map.insert(2u32, make_summary_sized(1000, 100)); // 90% util (newest)
+
+        let mut selector = FileSelector::new();
+        let result = selector.select_file_for_cleaning_with_policy(
+            &map,
+            50,           // min_utilization_pct
+            1,            // min_age
+            false,        // force_cleaning
+            None,         // first_active_txn_file
+            Some(50),     // predicted_total_threshold = 50%
+            None,         // min_file_utilization_pct
+        );
+        assert_eq!(
+            result, None,
+            "CLN-6: global gate must veto selection when predictedMinUtil >= totalThreshold"
+        );
+    }
+
+    /// CLN-6 Tier 1: when `predictedMinUtil < totalThreshold`, a file is
+    /// selected normally.
+    #[test]
+    fn test_cln6_global_gate_passes_when_predicted_below_threshold() {
+        // File 1 at 10% util (high obsolete). predictedMinUtil = 10%.
+        // totalThreshold = 50%. Since 10% < 50%, selection proceeds.
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 900)); // 10% util
+        map.insert(2u32, make_summary_sized(1000, 100)); // 90% util (newest)
+
+        let mut selector = FileSelector::new();
+        let result = selector.select_file_for_cleaning_with_policy(
+            &map,
+            50,
+            1,
+            false,
+            None,
+            Some(50),     // predicted_total_threshold
+            None,
+        );
+        assert_eq!(
+            result.map(|(f, _)| f),
+            Some(1),
+            "CLN-6: global gate should pass when predictedMinUtil < totalThreshold"
+        );
+    }
+
+    /// CLN-6 Tier 3: `min_file_utilization_pct` sets a stricter per-file
+    /// threshold.  Only files below BOTH thresholds qualify in normal mode.
+    #[test]
+    fn test_cln6_min_file_utilization_second_tier() {
+        // File 1: 40% util (below normal 50% threshold but above second-tier 30%)
+        // File 2: 20% util (below both thresholds) → should be selected
+        // File 3: newest, skipped by age filter
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 600)); // 40% util
+        map.insert(2u32, make_summary_sized(1000, 800)); // 20% util
+        map.insert(3u32, make_summary_sized(1000, 100)); // 90% util (newest)
+
+        let mut selector = FileSelector::new();
+        // With min_file_utilization_pct = 30:
+        // effective_threshold = min(50, 30) = 30%
+        // File 1 (40%) >= 30% → excluded; File 2 (20%) < 30% → selected.
+        let result = selector.select_file_for_cleaning_with_policy(
+            &map,
+            50,
+            1,
+            false,
+            None,
+            None,         // no global gate
+            Some(30),     // min_file_utilization_pct
+        );
+        assert_eq!(
+            result.map(|(f, _)| f),
+            Some(2),
+            "CLN-6: second-tier threshold should exclude file 1 (40%) and select file 2 (20%)"
+        );
+    }
+
+    /// CLN-6: `force_cleaning` bypasses both global gate and second tier.
+    #[test]
+    fn test_cln6_force_cleaning_bypasses_all_tiers() {
+        // All files above both thresholds.
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 300)); // 70% util
+        map.insert(2u32, make_summary_sized(1000, 100)); // 90% util (newest)
+
+        let mut selector = FileSelector::new();
+        let result = selector.select_file_for_cleaning_with_policy(
+            &map,
+            50,
+            1,
+            true,         // force_cleaning
+            None,
+            Some(50),     // global gate would veto
+            Some(30),     // second tier would exclude
+        );
+        // force_cleaning bypasses all gates → file 1 (70%) is selected.
+        assert_eq!(
+            result.map(|(f, _)| f),
+            Some(1),
+            "CLN-6: force_cleaning must bypass global gate and second tier"
+        );
+    }
+
+    // ── CLN-13 acceptance tests ──────────────────────────────────────────────────
+
+    /// `compute_predicted_min_util` returns the minimum adjusted utilization
+    /// across all non-empty files.
+    #[test]
+    fn test_cln13_compute_predicted_min_util() {
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 900)); // adj_util = 10%
+        map.insert(2u32, make_summary_sized(1000, 500)); // adj_util = 50%
+        map.insert(3u32, make_summary_sized(1000, 100)); // adj_util = 90%
+
+        let predicted = FileSelector::compute_predicted_min_util(&map);
+        assert_eq!(
+            predicted, 10,
+            "CLN-13: predictedMinUtil should be the minimum adj util = 10%"
         );
     }
 }

@@ -490,49 +490,63 @@ impl Cleaner {
                 }
             });
 
-        // Select files to clean (up to n_files)
-        let mut files_to_clean = Vec::new();
-        {
-            let mut selector = self.file_selector.lock();
-            for _ in 0..n_files {
-                if let Some((file_number, _required_util)) =
-                    selector.select_file_for_cleaning()
-                {
-                    // CLN-4: skip files that fall within the active transaction
-                    // window. Files >= first_active_txn_file may still be
-                    // referenced by the oldest open transaction.
-                    // JE: firstActiveFile = min(newest, firstActiveTxnFile);
-                    // lastFileToClean = firstActiveFile - minAge.
-                    if let Some(txn_file) = first_active_txn_file {
-                        if file_number >= txn_file {
-                            // Put it back and stop — files are FIFO-ordered,
-                            // so all remaining candidates are >= this one.
-                            selector
-                                .put_back_file_for_cleaning(file_number);
-                            break;
-                        }
-                    }
-                    files_to_clean.push(file_number);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Process each selected file
-        for file_number in files_to_clean {
-            // Check shutdown before processing each file
+        // CLN-13: select-one / process-one loop.
+        // JE refreshes the fileSummaryMap before each file selection inside
+        // the cleaning loop so a just-cleaned file's effect on remaining
+        // candidates is visible (FileProcessor.java doClean loop, ~line 386).
+        // We select one file at a time and process it immediately.
+        for _ in 0..n_files {
+            // Check shutdown before each iteration.
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Protect file during processing
+            // CLN-13: re-evaluate selection each iteration.
+            let (file_number, required_util) = {
+                let mut selector = self.file_selector.lock();
+                let sel = selector.select_file_for_cleaning();
+                match sel {
+                    None => break, // no more files
+                    Some((file_number, required_util)) => {
+                        // CLN-4: skip files inside the active-txn window.
+                        if let Some(txn_file) = first_active_txn_file {
+                            if file_number >= txn_file {
+                                selector.put_back_file_for_cleaning(file_number);
+                                break;
+                            }
+                        }
+                        (file_number, required_util)
+                    }
+                }
+            };
+
+            // CLN-5: two-pass cleaning.
+            // When required_util >= 0 (set by check_for_required_util when
+            // expiration uncertainty is high), run a dry-run first pass:
+            // scan the file to recompute true utilization including expired bytes.
+            // If recalc_util > required_util, skip this file (JE "revisalRun").
+            // JE: FileProcessor.java doClean twoPass block (~line 420-465).
+            if let Some(req) = required_util.filter(|&r| r >= 0) {
+                let skip = self.two_pass_check(file_number, req);
+                if skip {
+                    // The file's true utilization is still above the threshold;
+                    // put it back so the selector can try another candidate.
+                    // JE: fileSelector.removeFile(fileNum, budget) → effectively
+                    // removes from being-cleaned and skips this file.
+                    self.file_selector
+                        .lock()
+                        .put_back_file_for_cleaning(file_number);
+                    continue;
+                }
+            }
+
+            // Protect file during processing.
             self.file_protector.protect_file(file_number, "CleanerProcessing");
 
-            // Process the file
+            // Process the file.
             let result = self.process_single_file(file_number);
 
-            // Unprotect after processing
+            // Unprotect after processing.
             self.file_protector.unprotect_file(file_number);
 
             match result {
@@ -559,7 +573,7 @@ impl Cleaner {
                         files_cleaned += 1;
                         total_entries += result.entries_read;
 
-                        // Update statistics
+                        // Update statistics.
                         self.update_stats(&result);
 
                         // Mark file as cleaned in selector.
@@ -624,6 +638,62 @@ impl Cleaner {
     /// `with_file_manager_and_tree`), decoded LN entries are passed to
     /// `FileProcessor::process_file()` with a `SharedTreeLookup` so that
     /// live LN entries are migrated.  Otherwise the no-op path is taken.
+
+    /// CLN-5: Two-pass dry-run check.
+    ///
+    /// Called when `required_util >= 0` to determine whether the file's true
+    /// utilization (after accounting for expired bytes) is still above the
+    /// threshold.  If so, returns `true` (skip this file) — JE calls this
+    /// the "revisalRun".
+    ///
+    /// JE: `FileProcessor.doClean` two-pass block (~line 420-465):
+    ///   processFile(fileNum, recalcSummary, inSummary, expTracker);  // dry run
+    ///   recalcUtil = utilization(obsolete + expired, total);
+    ///   if (recalcUtil > requiredUtil) { skip; }
+    fn two_pass_check(&self, file_number: u32, required_util: i32) -> bool {
+        let summary = match &self.file_manager {
+            None => return false, // no file to scan — don't skip
+            Some(fm) => self.scan_file_summary(fm, file_number),
+        };
+        if summary.total_size <= 0 {
+            return false;
+        }
+        // Expired bytes: use ExpirationTracker if we have log entries.
+        // For now (expiration_time always 0 until CLN-10 live path is wired)
+        // expired_bytes = 0.  Structure is correct for when TTL is active.
+        let expired_bytes: i64 = if let Some(fm) = &self.file_manager {
+            let entries = self.decode_ln_entries_from_file(fm, file_number);
+            let hours_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() / 3600)
+                .unwrap_or(0);
+            let mut tracker = crate::ExpirationTracker::new(file_number);
+            for entry in &entries {
+                if let LogEntryType::Ln { expiration_time, entry_size, .. } =
+                    entry.entry_type
+                {
+                    tracker.track(expiration_time, entry_size);
+                }
+            }
+            tracker.get_expired_bytes(hours_now)
+        } else {
+            0
+        };
+
+        // recalcUtil = utilization(obsolete + expired, total)
+        // where utilization = (obsolete + expired) / total * 100.
+        let obsolete = summary.get_obsolete_size() as i64;
+        let total = summary.total_size as i64;
+        let recalc_util = if total > 0 {
+            ((obsolete + expired_bytes) * 100 / total) as i32
+        } else {
+            0
+        };
+
+        // Skip if recalc_util > required_util (file still too utilized).
+        recalc_util > required_util
+    }
+
     fn process_single_file(
         &self,
         file_number: u32,
