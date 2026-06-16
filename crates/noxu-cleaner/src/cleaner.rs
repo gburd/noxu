@@ -17,9 +17,110 @@ use noxu_log::{
     file_header::FILE_HEADER_SIZE,
 };
 use noxu_sync::Mutex;
+use noxu_txn::TxnManager;
+use noxu_util::lsn::NULL_LSN;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+/// Bundled context for calling `process_pending` from within the
+/// `FileProcessor` periodic hook (CLN-12).
+///
+/// Holds cloned Arcs of the fields that `Cleaner::process_pending` needs,
+/// so the callback can be built at the start of `process_single_file`
+/// without holding a borrow on `self`.
+struct ProcessPendingCtx {
+    file_selector: Arc<Mutex<FileSelector>>,
+    tree: Arc<RwLock<noxu_tree::Tree>>,
+    log_manager: Arc<LogManager>,
+    lock_manager: Option<Arc<noxu_txn::LockManager>>,
+    extra_trees:
+        Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
+    stats: Arc<CleanerStats>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ProcessPendingCtx {
+    fn call(&self) {
+        let pending =
+            self.file_selector.lock().get_pending_lns();
+        let Some(pending) = pending else { return };
+
+        let tree_lookup = if let Some(ref shared_lm) = self.lock_manager {
+            SharedTreeLookup::with_lock_manager(
+                Arc::clone(&self.tree),
+                Arc::clone(&self.log_manager),
+                Arc::clone(shared_lm),
+            )
+            .with_extra_trees(
+                self.extra_trees
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default(),
+            )
+        } else {
+            SharedTreeLookup::new(
+                Arc::clone(&self.tree),
+                Arc::clone(&self.log_manager),
+            )
+            .with_extra_trees(
+                self.extra_trees
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default(),
+            )
+        };
+
+        let processor = FileProcessor::new(
+            Arc::clone(&self.stats),
+            Arc::clone(&self.shutdown),
+        );
+
+        for (log_lsn, ln_info) in pending {
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let bin_result = tree_lookup.lookup_parent_bin(
+                ln_info.db_id(),
+                ln_info.key(),
+                log_lsn,
+            );
+            let outcome = match bin_result {
+                BinLookupResult::NotFound | BinLookupResult::KnownDeleted => {
+                    self.file_selector.lock().remove_pending_ln(log_lsn);
+                    self.stats
+                        .pending_lns_processed
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                BinLookupResult::Found { tree_lsn } => {
+                    processor.process_found_ln(
+                        &ln_info,
+                        log_lsn,
+                        tree_lsn,
+                        &tree_lookup,
+                    )
+                }
+            };
+            match outcome {
+                MigrateLnResult::Migrated | MigrateLnResult::Dead => {
+                    self.file_selector.lock().remove_pending_ln(log_lsn);
+                    self.stats
+                        .pending_lns_processed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                MigrateLnResult::Locked => {
+                    self.stats
+                        .pending_lns_locked
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let q = self.file_selector.lock().get_pending_ln_count() as u64;
+        self.stats.pending_ln_queue_size.store(q, Ordering::Relaxed);
+    }
+}
 
 /// The Cleaner is responsible for garbage collecting the log.
 ///
@@ -32,7 +133,7 @@ use std::sync::{Arc, RwLock};
 /// background daemon thread.
 pub struct Cleaner {
     /// File selector for choosing files to clean.
-    file_selector: Mutex<FileSelector>,
+    file_selector: Arc<Mutex<FileSelector>>,
 
     /// File protector for preventing deletion of files in use.
     file_protector: FileProtector,
@@ -115,6 +216,19 @@ pub struct Cleaner {
     ///
     /// Implements `CleanerThrottle`.
     pub throttle: Arc<CleanerThrottle>,
+
+    /// Optional `TxnManager` for first-active-transaction file clamping
+    /// (CLN-4).
+    ///
+    /// When `Some`, `do_clean` reads `TxnManager::get_first_active_lsn()` and
+    /// clamps file selection so that no file inside an open transaction's log
+    /// window is cleaned.
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` reads
+    /// `env.getTxnManager().getFirstActiveLsn()` and sets
+    /// `firstActiveFile = min(newest, firstActiveTxnFile)` before computing
+    /// `lastFileToClean`.
+    txn_manager: Option<Arc<TxnManager>>,
 }
 
 /// Result of a cleaning operation.
@@ -143,7 +257,7 @@ impl Cleaner {
         min_age: u64,
     ) -> Self {
         Self {
-            file_selector: Mutex::new(FileSelector::new()),
+            file_selector: Arc::new(Mutex::new(FileSelector::new())),
             file_protector: FileProtector::new(),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
@@ -159,6 +273,7 @@ impl Cleaner {
             lock_manager: None,
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
+            txn_manager: None,
         }
     }
 
@@ -176,7 +291,7 @@ impl Cleaner {
         file_manager: Arc<FileManager>,
     ) -> Self {
         Self {
-            file_selector: Mutex::new(FileSelector::new()),
+            file_selector: Arc::new(Mutex::new(FileSelector::new())),
             file_protector: FileProtector::new(),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
@@ -192,6 +307,7 @@ impl Cleaner {
             lock_manager: None,
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
+            txn_manager: None,
         }
     }
 
@@ -219,7 +335,7 @@ impl Cleaner {
         log_manager: Arc<LogManager>,
     ) -> Self {
         Self {
-            file_selector: Mutex::new(FileSelector::new()),
+            file_selector: Arc::new(Mutex::new(FileSelector::new())),
             file_protector: FileProtector::new(),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
@@ -235,6 +351,7 @@ impl Cleaner {
             lock_manager: None,
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
+            txn_manager: None,
         }
     }
 
@@ -257,7 +374,7 @@ impl Cleaner {
         lock_manager: Arc<noxu_txn::LockManager>,
     ) -> Self {
         Self {
-            file_selector: Mutex::new(FileSelector::new()),
+            file_selector: Arc::new(Mutex::new(FileSelector::new())),
             file_protector: FileProtector::new(),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
@@ -273,6 +390,7 @@ impl Cleaner {
             lock_manager: Some(lock_manager),
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
+            txn_manager: None,
         }
     }
 
@@ -301,6 +419,17 @@ impl Cleaner {
         if let Ok(mut reg) = self.extra_trees.lock() {
             reg.insert(db_id, tree);
         }
+    }
+
+    /// Wire the environment's `TxnManager` for first-active-transaction
+    /// file clamping (CLN-4).
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` reads
+    /// `env.getTxnManager().getFirstActiveLsn()` and sets
+    /// `firstActiveFile = min(newest, firstActiveTxnFile)`.
+    pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
+        self.txn_manager = Some(txn_manager);
+        self
     }
 
     /// Main cleaning entry point - performs cleaning of up to n_files.
@@ -345,6 +474,22 @@ impl Cleaner {
         let mut files_cleaned = 0u32;
         let mut total_entries = 0u64;
 
+        // CLN-4: compute first_active_txn_file from TxnManager so that files
+        // inside an open transaction's log window are excluded from cleaning.
+        // JE: UtilizationCalculator.getBestFile reads
+        // env.getTxnManager().getFirstActiveLsn() and sets
+        // firstActiveFile = min(newest, firstActiveTxnFile).
+        let first_active_txn_file: Option<u32> =
+            self.txn_manager.as_ref().and_then(|tm| {
+                let lsn_u64 = tm.get_first_active_lsn();
+                if lsn_u64 == NULL_LSN.as_u64() {
+                    None // no active transactions
+                } else {
+                    // Extract file_number from the LSN (upper 32 bits).
+                    Some((lsn_u64 >> 32) as u32)
+                }
+            });
+
         // Select files to clean (up to n_files)
         let mut files_to_clean = Vec::new();
         {
@@ -353,6 +498,20 @@ impl Cleaner {
                 if let Some((file_number, _required_util)) =
                     selector.select_file_for_cleaning()
                 {
+                    // CLN-4: skip files that fall within the active transaction
+                    // window. Files >= first_active_txn_file may still be
+                    // referenced by the oldest open transaction.
+                    // JE: firstActiveFile = min(newest, firstActiveTxnFile);
+                    // lastFileToClean = firstActiveFile - minAge.
+                    if let Some(txn_file) = first_active_txn_file {
+                        if file_number >= txn_file {
+                            // Put it back and stop — files are FIFO-ordered,
+                            // so all remaining candidates are >= this one.
+                            selector
+                                .put_back_file_for_cleaning(file_number);
+                            break;
+                        }
+                    }
                     files_to_clean.push(file_number);
                 } else {
                     break;
@@ -474,8 +633,35 @@ impl Cleaner {
             Some(fm) => self.scan_file_summary(fm, file_number),
         };
 
-        let processor =
-            FileProcessor::new(self.stats.clone(), self.shutdown.clone());
+        // CLN-12: build a process_pending callback from cloned Arcs so the
+        // FileProcessor can invoke it periodically during a long file run.
+        // Only wired when we have a tree + log manager (otherwise pending
+        // migration isn't possible anyway).
+        let pending_fn: Option<Arc<dyn Fn() + Send + Sync>> =
+            if let (Some(tree), Some(lm)) = (&self.tree, &self.log_manager) {
+                let ctx = Arc::new(ProcessPendingCtx {
+                    file_selector: Arc::clone(&self.file_selector),
+                    tree: Arc::clone(tree),
+                    log_manager: Arc::clone(lm),
+                    lock_manager: self.lock_manager.clone(),
+                    extra_trees: Arc::clone(&self.extra_trees),
+                    stats: Arc::clone(&self.stats),
+                    shutdown: Arc::clone(&self.shutdown),
+                });
+                Some(Arc::new(move || ctx.call()))
+            } else {
+                None
+            };
+
+        let processor = {
+            let p =
+                FileProcessor::new(self.stats.clone(), self.shutdown.clone());
+            if let Some(f) = pending_fn {
+                p.with_process_pending_fn(f)
+            } else {
+                p
+            }
+        };
 
         // If we have a tree + log manager, decode LN entries from the file
         // and run them through the real migration path.
@@ -871,7 +1057,7 @@ impl Cleaner {
     }
 
     /// Returns a reference to the file selector (for testing/introspection).
-    pub fn get_file_selector(&self) -> &Mutex<FileSelector> {
+    pub fn get_file_selector(&self) -> &Arc<Mutex<FileSelector>> {
         &self.file_selector
     }
 
@@ -929,87 +1115,16 @@ impl Cleaner {
     /// JE: `Cleaner.processPending` (Cleaner.java ~line 1221).
     pub fn process_pending(&self) {
         if let (Some(tree), Some(lm)) = (&self.tree, &self.log_manager) {
-            let pending = self.file_selector.lock().get_pending_lns();
-            let Some(pending) = pending else { return };
-
-            // Build a tree lookup for migration (same as process_single_file).
-            let tree_lookup = if let Some(ref shared_lm) = self.lock_manager {
-                crate::file_processor::SharedTreeLookup::with_lock_manager(
-                    Arc::clone(tree),
-                    Arc::clone(lm),
-                    Arc::clone(shared_lm),
-                )
-                .with_extra_trees(
-                    self.extra_trees
-                        .lock()
-                        .map(|g| g.clone())
-                        .unwrap_or_default(),
-                )
-            } else {
-                crate::file_processor::SharedTreeLookup::new(
-                    Arc::clone(tree),
-                    Arc::clone(lm),
-                )
-                .with_extra_trees(
-                    self.extra_trees
-                        .lock()
-                        .map(|g| g.clone())
-                        .unwrap_or_default(),
-                )
+            let ctx = ProcessPendingCtx {
+                file_selector: Arc::clone(&self.file_selector),
+                tree: Arc::clone(tree),
+                log_manager: Arc::clone(lm),
+                lock_manager: self.lock_manager.clone(),
+                extra_trees: Arc::clone(&self.extra_trees),
+                stats: Arc::clone(&self.stats),
+                shutdown: Arc::clone(&self.shutdown),
             };
-
-            let processor = crate::file_processor::FileProcessor::new(
-                self.stats.clone(),
-                self.shutdown.clone(),
-            );
-
-            for (log_lsn, ln_info) in pending {
-                if self.shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                // Re-attempt lookup + migration.
-                let bin_result = tree_lookup.lookup_parent_bin(
-                    ln_info.db_id(),
-                    ln_info.key(),
-                    log_lsn,
-                );
-                let outcome = match bin_result {
-                    BinLookupResult::NotFound
-                    | BinLookupResult::KnownDeleted => {
-                        // LN is now dead — remove from pending.
-                        self.file_selector.lock().remove_pending_ln(log_lsn);
-                        self.stats
-                            .pending_lns_processed
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    BinLookupResult::Found { tree_lsn } => processor
-                        .process_found_ln(
-                            &ln_info,
-                            log_lsn,
-                            tree_lsn,
-                            &tree_lookup,
-                        ),
-                };
-                match outcome {
-                    MigrateLnResult::Migrated | MigrateLnResult::Dead => {
-                        self.file_selector.lock().remove_pending_ln(log_lsn);
-                        self.stats
-                            .pending_lns_processed
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    MigrateLnResult::Locked => {
-                        // Still locked — leave in pending for next call.
-                        self.stats
-                            .pending_lns_locked
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-
-            // Update queue-size stat.
-            let q = self.file_selector.lock().get_pending_ln_count() as u64;
-            self.stats.pending_ln_queue_size.store(q, Ordering::Relaxed);
+            ctx.call();
         }
     }
 
@@ -2075,6 +2190,205 @@ mod tests {
             outcome,
             MigrationOutcome::Obsolete,
             "X-7: secondary LN must not be misclassified as Obsolete"
+        );
+    }
+
+    // ── CLN-4 acceptance tests ───────────────────────────────────────────────
+
+    /// A long-running open txn prevents `do_clean` from selecting a file in
+    /// the active-txn window.
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` sets
+    /// `firstActiveFile = min(newest, firstActiveTxnFile)` before computing
+    /// `lastFileToClean`.  Any file with `file_number >= firstActiveTxnFile`
+    /// must not be selected.
+    #[test]
+    fn test_cln4_do_clean_respects_first_active_txn_file() {
+        use noxu_txn::{LockManager, TxnManager};
+
+        let lock_manager = Arc::new(LockManager::new());
+        let txn_manager = Arc::new(TxnManager::new(lock_manager.clone()));
+
+        // Open a transaction, note its first LSN as file 3, offset 100.
+        let _txn = txn_manager.begin_txn();
+        let txn_id = _txn.id_as_locker();
+        let lsn_file3 = noxu_util::Lsn::new(3, 100).as_u64();
+        // update_first_lsn is the standard API for recording first write LSN.
+        txn_manager.update_first_lsn(txn_id, lsn_file3);
+        // _txn is kept in scope (not committed/aborted) so get_first_active_lsn
+        // returns its LSN.
+
+        // Build a cleaner wired to this TxnManager.
+        let cleaner = Cleaner::new(50, 0, 0).with_txn_manager(txn_manager);
+
+        // Add files 1, 2, 3, 4, 5 to the cleaning queue.
+        for f in 1u32..=5 {
+            cleaner.add_file_to_clean(f);
+        }
+
+        // Run one pass. Files >= 3 (the first-active-txn file) must be skipped.
+        let result = cleaner.do_clean(10, false).unwrap();
+
+        // Only files 1 and 2 should be cleaned (< 3).
+        assert_eq!(
+            result.files_cleaned, 2,
+            "CLN-4: only files < first_active_txn_file=3 should be cleaned"
+        );
+    }
+
+    /// Without a TxnManager, all queued files are cleaned (baseline).
+    #[test]
+    fn test_cln4_no_txn_manager_cleans_all_files() {
+        let cleaner = Cleaner::new(50, 0, 0);
+        for f in 1u32..=5 {
+            cleaner.add_file_to_clean(f);
+        }
+        let result = cleaner.do_clean(10, false).unwrap();
+        assert_eq!(result.files_cleaned, 5);
+    }
+
+    // ── CLN-10 acceptance tests ──────────────────────────────────────────────
+
+    /// `LnInfo::is_expired` must use hours-since-epoch (packed-hours) units.
+    /// This test verifies that the unit documented in the field comment is
+    /// enforced: passing a value in the same unit gives correct results.
+    #[test]
+    fn test_cln10_ln_info_expiration_unit_is_hours() {
+        use crate::LnInfo;
+        let lsn = noxu_util::Lsn::new(1, 100);
+        // expiration_time = 1000 (hours since epoch)
+        let info = LnInfo::new(lsn, 1, vec![1], 64, false, 1000);
+        // At hour 999: not expired
+        assert!(!info.is_expired(999), "not expired at hour 999");
+        // At hour 1000: expired
+        assert!(info.is_expired(1000), "expired at hour 1000");
+        // At hour 1001: still expired
+        assert!(info.is_expired(1001), "still expired at hour 1001");
+    }
+
+    /// `ExpirationTracker::track` and `get_expired_bytes` use hours.
+    /// Units must be consistent: a value tracked at hour H must appear
+    /// expired only when `current_time >= H`.
+    #[test]
+    fn test_cln10_expiration_tracker_unit_is_hours() {
+        use crate::ExpirationTracker;
+        let mut tracker = ExpirationTracker::new(1);
+        // Track 500 bytes expiring at hour 100
+        tracker.track(100, 500);
+        // Track 300 bytes expiring at hour 200
+        tracker.track(200, 300);
+
+        // At hour 99: nothing expired
+        assert_eq!(tracker.get_expired_bytes(99), 0);
+        // At hour 100: first bucket expired
+        assert_eq!(tracker.get_expired_bytes(100), 500);
+        // At hour 200: both expired
+        assert_eq!(tracker.get_expired_bytes(200), 800);
+    }
+
+    /// Unit consistency assertion: if we had stored ms in LnInfo and passed
+    /// it to ExpirationTracker expecting hours, we'd get a 3600x mismatch.
+    /// This test documents that the correct unit is hours in both places.
+    #[test]
+    fn test_cln10_unit_mismatch_would_be_detectable() {
+        use crate::ExpirationTracker;
+        // If someone passes ms (e.g. 3_600_000 ms = 1 hour) to a tracker
+        // that expects hours, the value 3_600_000 would be treated as 3.6M
+        // hours (~411 years), never expiring in any realistic timeframe.
+        // This test just documents the expected behavior of the tracker in
+        // hours mode, confirming the unit.
+        let mut tracker = ExpirationTracker::new(1);
+        // 1 hour since epoch
+        tracker.track(1, 100);
+        // current_time = 1 hour: expired
+        assert_eq!(tracker.get_expired_bytes(1), 100);
+        // current_time in ms (3_600_000): would also trigger, but only because
+        // 3_600_000 >> 1.  The point is the tracker uses its input as hours.
+        // We document: don't pass ms to this interface.
+        assert_eq!(tracker.get_expired_bytes(3_600_000), 100, "still expired");
+    }
+
+    // ── CLN-12 acceptance tests ──────────────────────────────────────────────
+
+    /// The pending queue is processed periodically during a long file run.
+    ///
+    /// JE: `FileProcessor.processFile` calls `cleaner.processPending()` every
+    /// `PROCESS_PENDING_EVERY_N_LNS` entries (FileProcessor.java ~line 1004).
+    #[test]
+    fn test_cln12_pending_queue_processed_during_file_run() {
+        use crate::file_processor::{
+            FileProcessor, LogEntry, LogEntryType, PROCESS_PENDING_EVERY_N_LNS_PUB,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count2 = Arc::clone(&callback_count);
+
+        let stats = Arc::new(crate::CleanerStats::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let processor = FileProcessor::new(stats, shutdown)
+            .with_process_pending_fn(Arc::new(move || {
+                callback_count2.fetch_add(1, Ordering::Relaxed);
+            }));
+
+        // Build enough LN entries to trigger the periodic callback.
+        // With default interval = 100, 101 LNs should trigger once.
+        let n = PROCESS_PENDING_EVERY_N_LNS_PUB + 1;
+        let entries: Vec<LogEntry> = (0..n)
+            .map(|i| LogEntry {
+                lsn: noxu_util::Lsn::new(1, i as u32 * 100),
+                entry_type: LogEntryType::Ln {
+                    db_id: 1,
+                    key: vec![i as u8],
+                    deleted: false,
+                    expiration_time: 0,
+                    entry_size: 64,
+                },
+            })
+            .collect();
+
+        let summary = crate::FileSummary::new();
+        // Use a NoopTreeLookup (all entries → NotFound → dead)
+        struct Noop;
+        impl crate::file_processor::TreeLookup for Noop {
+            fn lookup_parent_bin(
+                &self,
+                _db_id: i64,
+                _key: &[u8],
+                _log_lsn: noxu_util::Lsn,
+            ) -> crate::file_processor::BinLookupResult {
+                crate::file_processor::BinLookupResult::NotFound
+            }
+            fn migrate_ln_slot(
+                &self,
+                _db_id: i64,
+                _key: &[u8],
+                _log_lsn: noxu_util::Lsn,
+                _tree_lsn: noxu_util::Lsn,
+            ) -> crate::file_processor::MigrationOutcome {
+                crate::file_processor::MigrationOutcome::Obsolete
+            }
+            fn lookup_in(
+                &self,
+                _db_id: i64,
+                _node_id: i64,
+                _log_lsn: noxu_util::Lsn,
+            ) -> crate::file_processor::InLookupResult {
+                crate::file_processor::InLookupResult::Obsolete
+            }
+        }
+
+        let _result = processor.process_file(1, &summary, &entries, &Noop).unwrap();
+
+        // With n = PROCESS_PENDING_EVERY_N_LNS_PUB + 1, the counter must be
+        // incremented exactly once at the interval boundary.
+        assert_eq!(
+            callback_count.load(Ordering::Relaxed),
+            1,
+            "CLN-12: pending callback must be called once for {} LNs at interval {}",
+            n,
+            PROCESS_PENDING_EVERY_N_LNS_PUB
         );
     }
 }

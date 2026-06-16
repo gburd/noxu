@@ -104,6 +104,9 @@ fn write_migration_ln(
 /// request a non-blocking lock for the same locked node.
 const PROCESS_PENDING_EVERY_N_LNS: usize = 100;
 
+/// Public re-export of `PROCESS_PENDING_EVERY_N_LNS` for acceptance tests.
+pub const PROCESS_PENDING_EVERY_N_LNS_PUB: usize = PROCESS_PENDING_EVERY_N_LNS;
+
 // ─── Tree lookup abstraction ────────────────────────────────────────────────
 
 /// Result of looking up an LN's parent BIN slot in the tree.
@@ -1166,6 +1169,16 @@ pub struct FileProcessor {
     /// If we process it too often, we will repeatedly request a
     /// non-blocking lock for the same locked node.
     process_pending_interval: usize,
+
+    /// Optional callback invoked every `process_pending_interval` LNs.
+    ///
+    /// CLN-12: wires `Cleaner::process_pending()` into the file-processor
+    /// loop so the pending queue is drained periodically during a long file
+    /// run, not just at the start of each `do_clean` pass.
+    ///
+    /// JE: `FileProcessor.processFile` calls `cleaner.processPending()` every
+    /// `PROCESS_PENDING_EVERY_N_LNS` (FileProcessor.java ~line 1004–1005).
+    process_pending_fn: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Result of processing a single file.
@@ -1236,12 +1249,29 @@ impl FileProcessor {
             stats,
             shutdown,
             process_pending_interval: PROCESS_PENDING_EVERY_N_LNS,
+            process_pending_fn: None,
         }
     }
 
     /// Sets the interval for processing pending LNs.
     pub fn set_process_pending_interval(&mut self, interval: usize) {
         self.process_pending_interval = interval;
+    }
+
+    /// Wires the `process_pending` callback (CLN-12).
+    ///
+    /// The callback is invoked every `process_pending_interval` LNs during
+    /// `process_file`.  Pass `Arc::clone(&cleaner) as Arc<dyn Fn()>` by
+    /// wrapping the call in a closure.
+    ///
+    /// JE: `FileProcessor` holds a back-reference to `Cleaner` and calls
+    /// `cleaner.processPending()` (FileProcessor.java ~line 1004).
+    pub fn with_process_pending_fn(
+        mut self,
+        f: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.process_pending_fn = Some(f);
+        self
     }
 
     /// Main entry point — processes a single log file for cleaning.
@@ -1350,25 +1380,20 @@ impl FileProcessor {
                         );
                     }
 
-                    // Periodically drain pending LNs (the: cleaner.processPending()).
+                    // Periodically process pending LNs (CLN-12).
+                    // JE: FileProcessor.processFile calls
+                    // cleaner.processPending() every
+                    // PROCESS_PENDING_EVERY_N_LNS (FileProcessor.java ~line
+                    // 1004-1005).
                     n_processed_lns += 1;
                     if n_processed_lns
                         .is_multiple_of(self.process_pending_interval)
                     {
-                        // In the future: call cleaner.process_pending() here.
-                        // For now we drain the cache every interval to bound memory.
-                        while !look_ahead_cache.is_empty() {
-                            if self.shutdown.load(Ordering::Relaxed) {
-                                result.completed = false;
-                                return Ok(result);
-                            }
-                            self.process_ln(
-                                file_number,
-                                &mut look_ahead_cache,
-                                tree,
-                                &mut result,
-                            );
+                        if let Some(ref cb) = self.process_pending_fn {
+                            cb();
                         }
+                        // Cache drain is NOT triggered here; it happens when
+                        // the cache is full (above) or at end-of-file (below).
                     }
                 }
 

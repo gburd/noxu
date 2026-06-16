@@ -48,7 +48,8 @@ pub use expiration_tracker::ExpirationTracker;
 pub use extinction_scanner::{ExtinctionScanner, ExtinctionTask};
 pub use file_processor::{
     BinLookupResult, FileProcessResult, FileProcessor, InLookupResult,
-    MigrationOutcome, RealTreeLookup, SharedTreeLookup, TreeLookup,
+    MigrationOutcome, PROCESS_PENDING_EVERY_N_LNS_PUB, RealTreeLookup,
+    SharedTreeLookup, TreeLookup,
 };
 pub use file_protector::FileProtector;
 pub use file_selector::{

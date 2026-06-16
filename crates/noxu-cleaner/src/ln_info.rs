@@ -30,7 +30,16 @@ pub struct LnInfo {
     /// Whether this is a deleted LN.
     pub deleted: bool,
 
-    /// Expiration time (in milliseconds since epoch, or 0 if no expiration).
+    /// Expiration time in **hours since epoch** (packed-hours unit used
+    /// throughout the TTL subsystem and log format), or 0 if the record
+    /// never expires.
+    ///
+    /// Must match the unit used by `ExpirationTracker::track` and
+    /// `ExpirationTracker::get_expired_bytes` (both expect hours).
+    /// JE: `LNInfo.expirationTime` is stored in ms because it calls
+    /// `TTL.expirationToSystemTime(packed_hours)` before storing; Noxu keeps
+    /// the packed-hours value directly so callers must pass hours to
+    /// `is_expired`.  See CLN-10.
     pub expiration_time: u64,
 }
 
@@ -90,14 +99,18 @@ impl LnInfo {
         self.obsolete = obsolete;
     }
 
-    /// Returns the expiration time.
+    /// Returns the expiration time in **hours since epoch** (0 = never).
     pub fn expiration_time(&self) -> u64 {
         self.expiration_time
     }
 
-    /// Returns whether this LN has an expiration time.
-    pub fn is_expired(&self, current_time: u64) -> bool {
-        self.expiration_time > 0 && self.expiration_time <= current_time
+    /// Returns whether this LN has expired.
+    ///
+    /// # Arguments
+    /// * `current_time_hours` — current time expressed as **hours since epoch**.
+    ///   Must use the same packed-hours unit as `expiration_time`.
+    pub fn is_expired(&self, current_time_hours: u64) -> bool {
+        self.expiration_time > 0 && self.expiration_time <= current_time_hours
     }
 
     /// Estimates the memory size of this LN info.
