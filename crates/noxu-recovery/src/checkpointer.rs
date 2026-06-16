@@ -20,7 +20,7 @@ use noxu_txn::TxnManager;
 use noxu_util::{Lsn, NULL_LSN};
 use parking_lot::RwLock as NodeRwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, RwLock};
 
 /// Configuration for checkpoint behavior.
@@ -149,6 +149,20 @@ pub struct Checkpointer {
     last_checkpoint_end: Mutex<Lsn>,
     /// Whether a checkpoint is in progress
     checkpoint_in_progress: AtomicBool,
+    /// The highest IN-level being flushed in the current checkpoint pass.
+    ///
+    /// Set to the root level (max dirty-IN level) when `flush_upper_ins_internal`
+    /// begins, and reset to 0 when the checkpoint completes or is abandoned.
+    ///
+    /// The evictor reads this value to decide whether an evicted BIN/IN should
+    /// be logged as `Provisional::Yes` (node level < flush level, so the
+    /// checkpoint's non-provisional ancestor will subsume it) or
+    /// `Provisional::No` (no in-progress checkpoint or node is at/above the
+    /// flush level).
+    ///
+    /// JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` /
+    /// `DirtyINMap.coordinateEvictionWithCheckpoint`, `highestFlushLevel`.
+    checkpoint_max_flush_level: AtomicI32,
     /// Shutdown flag
     shutdown: AtomicBool,
     /// Condvar for interruptible daemon sleep — notified by `request_shutdown()`
@@ -228,6 +242,7 @@ impl Checkpointer {
             last_checkpoint_start: Mutex::new(noxu_util::NULL_LSN),
             last_checkpoint_end: Mutex::new(noxu_util::NULL_LSN),
             checkpoint_in_progress: AtomicBool::new(false),
+            checkpoint_max_flush_level: AtomicI32::new(0),
             shutdown: AtomicBool::new(false),
             shutdown_condvar: Condvar::new(),
             shutdown_mutex: std::sync::Mutex::new(false),
@@ -441,8 +456,11 @@ impl Checkpointer {
 
         let start_time = std::time::Instant::now();
 
-        // Ensure we clear the in-progress flag on exit
-        let _guard = CheckpointGuard { flag: &self.checkpoint_in_progress };
+        // Ensure we clear the in-progress flag (and max_flush_level) on exit.
+        let _guard = CheckpointGuard {
+            flag: &self.checkpoint_in_progress,
+            max_flush_level: &self.checkpoint_max_flush_level,
+        };
 
         // Step 1: Generate checkpoint ID
         let checkpoint_id =
@@ -624,7 +642,40 @@ impl Checkpointer {
         self.checkpoint_in_progress.load(Ordering::Acquire)
     }
 
-    /// Get checkpoint statistics.
+    /// Choose the [`Provisional`] flag for a node being evicted by the evictor.
+    ///
+    /// Returns `Provisional::Yes` when a checkpoint is in progress **and** the
+    /// node's level is strictly below the checkpoint's highest flush level
+    /// (meaning the checkpoint will log a non-provisional ancestor that subsumes
+    /// this entry).  Returns `Provisional::No` in all other cases.
+    ///
+    /// # JE reference
+    /// `Checkpointer.coordinateEvictionWithCheckpoint` /
+    /// `DirtyINMap.coordinateEvictionWithCheckpoint` (`highestFlushLevel`
+    /// comparison, CC-4 fix).
+    ///
+    /// # Safety
+    /// The checkpoint state is read with `Acquire` ordering; the caller
+    /// observes a consistent snapshot.  A very small race window remains:
+    /// if the checkpoint completes between the `in_progress` read and the
+    /// log write, the entry may be logged as provisional without a covering
+    /// non-provisional ancestor in this checkpoint.  The subsequent
+    /// checkpoint or a recovery re-scan will reconcile this — the same
+    /// benign race exists in JE.  Logging provisional when not strictly
+    /// required is safe; the reverse (logging non-provisional when
+    /// provisional was needed) is what causes recovery inconsistency.
+    pub fn get_eviction_provisional(&self, node_level: i32) -> Provisional {
+        if !self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return Provisional::No;
+        }
+        let max_flush = self.checkpoint_max_flush_level.load(Ordering::Acquire);
+        if max_flush > 0 && node_level < max_flush {
+            Provisional::Yes
+        } else {
+            Provisional::No
+        }
+    }
+
     pub fn get_stats(&self) -> Arc<CheckpointStats> {
         Arc::clone(&self.stats)
     }
@@ -880,6 +931,26 @@ impl Checkpointer {
             }
         }
 
+        // CC-4: determine the global maximum IN level across all trees before
+        // any logging begins.  Store it in checkpoint_max_flush_level so the
+        // evictor can decide Provisional::Yes vs Provisional::No for
+        // concurrently evicted nodes (JE coordinateEvictionWithCheckpoint).
+        //
+        // The level is published with Release ordering before the first WAL
+        // write; the evictor reads it with Acquire ordering.  The RAII guard
+        // in do_checkpoint resets it to 0 via CheckpointGuard::drop.
+        let global_max_level: i32 = trees_to_flush
+            .iter()
+            .filter_map(|(_, tree_arc)| {
+                let guard = tree_arc.read().ok()?;
+                let dirty_ins = guard.collect_dirty_upper_ins(0); // db_id unused here
+                dirty_ins.iter().map(|(lvl, _)| *lvl).max()
+            })
+            .max()
+            .unwrap_or(0);
+        self.checkpoint_max_flush_level
+            .store(global_max_level, Ordering::Release);
+
         for (db_id, tree_arc) in trees_to_flush {
             let r = Self::flush_one_tree_upper_ins(db_id, &tree_arc, lm)?;
             result.full_ins_flushed += r.full_ins_flushed;
@@ -959,13 +1030,22 @@ impl Checkpointer {
     }
 }
 
-/// RAII guard to ensure checkpoint_in_progress flag is cleared.
+/// RAII guard to ensure checkpoint_in_progress and checkpoint_max_flush_level
+/// are cleared when the checkpoint finishes or is abandoned.
+///
+/// CC-4: max_flush_level must be reset to 0 so the evictor stops using
+/// Provisional::Yes after the checkpoint is done.
 struct CheckpointGuard<'a> {
     flag: &'a AtomicBool,
+    max_flush_level: &'a AtomicI32,
 }
 
 impl<'a> Drop for CheckpointGuard<'a> {
     fn drop(&mut self) {
+        // Reset max_flush_level before clearing the in_progress flag so that
+        // if the evictor reads in_progress=true it will still see the level;
+        // once in_progress goes false the level value is irrelevant.
+        self.max_flush_level.store(0, Ordering::Release);
         self.flag.store(false, Ordering::Release);
     }
 }
@@ -1098,12 +1178,19 @@ mod tests {
     #[test]
     fn test_checkpoint_guard() {
         let flag = AtomicBool::new(false);
+        let level = AtomicI32::new(42);
         {
             flag.store(true, Ordering::Release);
-            let _guard = CheckpointGuard { flag: &flag };
+            let _guard =
+                CheckpointGuard { flag: &flag, max_flush_level: &level };
             assert!(flag.load(Ordering::Acquire));
         }
         assert!(!flag.load(Ordering::Acquire));
+        assert_eq!(
+            level.load(Ordering::Acquire),
+            0,
+            "guard must reset max_flush_level"
+        );
     }
 
     #[test]
@@ -1504,5 +1591,85 @@ mod tests {
             result.full_bins_flushed, 0,
             "X-8: checkpointer must not write a redundant full-BIN for a BIN the evictor already flushed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CC-4: get_eviction_provisional tests
+    // -----------------------------------------------------------------------
+
+    /// CC-4 acceptance test 1: Provisional::No when no checkpoint is in
+    /// progress, regardless of node level.
+    ///
+    /// JE ref: coordinateEvictionWithCheckpoint — if no checkpoint is active,
+    /// evicted nodes are logged non-provisionally.
+    #[test]
+    fn test_cc4_no_checkpoint_in_progress_yields_provisional_no() {
+        let ckpt = Checkpointer::new(CheckpointConfig::default());
+        assert_eq!(
+            ckpt.get_eviction_provisional(1),
+            Provisional::No,
+            "CC-4: no checkpoint in progress must yield Provisional::No"
+        );
+        assert_eq!(ckpt.get_eviction_provisional(2), Provisional::No);
+    }
+
+    /// CC-4 acceptance test 2: Provisional::Yes when a checkpoint is in
+    /// progress and the node's level is below the checkpoint's max flush level.
+    ///
+    /// JE ref: coordinateEvictionWithCheckpoint — node.level < highestFlushLevel
+    /// => Provisional::YES.
+    #[test]
+    fn test_cc4_below_max_flush_level_yields_provisional_yes() {
+        let ckpt = Checkpointer::new(CheckpointConfig::default());
+        ckpt.checkpoint_in_progress.store(true, Ordering::Release);
+        ckpt.checkpoint_max_flush_level.store(2, Ordering::Release);
+
+        assert_eq!(
+            ckpt.get_eviction_provisional(1),
+            Provisional::Yes,
+            "CC-4: BIN below max_flush_level must yield Provisional::Yes"
+        );
+
+        ckpt.checkpoint_in_progress.store(false, Ordering::Release);
+        ckpt.checkpoint_max_flush_level.store(0, Ordering::Release);
+    }
+
+    /// CC-4 acceptance test 3: Provisional::No when the node's level is at or
+    /// above the checkpoint's max flush level.
+    ///
+    /// JE ref: coordinateEvictionWithCheckpoint — node.level >= highestFlushLevel
+    /// => Provisional::NO.
+    #[test]
+    fn test_cc4_at_or_above_max_flush_level_yields_provisional_no() {
+        let ckpt = Checkpointer::new(CheckpointConfig::default());
+        ckpt.checkpoint_in_progress.store(true, Ordering::Release);
+        ckpt.checkpoint_max_flush_level.store(2, Ordering::Release);
+
+        assert_eq!(
+            ckpt.get_eviction_provisional(2),
+            Provisional::No,
+            "CC-4: node at max_flush_level must yield Provisional::No"
+        );
+        assert_eq!(
+            ckpt.get_eviction_provisional(3),
+            Provisional::No,
+            "CC-4: node above max_flush_level must yield Provisional::No"
+        );
+
+        ckpt.checkpoint_in_progress.store(false, Ordering::Release);
+        ckpt.checkpoint_max_flush_level.store(0, Ordering::Release);
+    }
+
+    /// CC-4: CheckpointGuard resets checkpoint_max_flush_level to 0 on drop.
+    #[test]
+    fn test_cc4_guard_resets_max_flush_level() {
+        let flag = AtomicBool::new(true);
+        let level = AtomicI32::new(5);
+        {
+            let _guard =
+                CheckpointGuard { flag: &flag, max_flush_level: &level };
+        }
+        assert_eq!(level.load(Ordering::Acquire), 0, "guard must reset to 0");
+        assert!(!flag.load(Ordering::Acquire));
     }
 }

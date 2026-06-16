@@ -37,6 +37,7 @@ use crate::policy::{EvictionAlgorithm, EvictionPolicy};
 use crate::slab::SlabList;
 use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
+use noxu_recovery::Checkpointer;
 use noxu_sync::Mutex;
 use noxu_tree::NodeRwLock;
 use noxu_tree::tree::{BinEntry, BinStub, InEntry, InNodeStub, Tree, TreeNode};
@@ -172,6 +173,15 @@ pub struct Evictor {
     tree: Option<Arc<RwLock<Tree>>>,
     db_id: u64,
     off_heap: Option<Arc<OffHeapCache>>,
+    /// Optional checkpointer reference for CC-4: provisional-flag coordination.
+    ///
+    /// When `Some`, `flush_dirty_node_to_log` queries the checkpointer's
+    /// `get_eviction_provisional` to decide whether to log the evicted BIN as
+    /// `Provisional::Yes` (checkpoint in progress, node below max flush level)
+    /// or `Provisional::No` (no checkpoint, or node at/above max flush level).
+    ///
+    /// JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` (CC-4 fix).
+    checkpointer: Option<Arc<Checkpointer>>,
 }
 
 impl Evictor {
@@ -212,6 +222,7 @@ impl Evictor {
             tree: None,
             db_id: 0,
             off_heap: None,
+            checkpointer: None,
         }
     }
 
@@ -235,6 +246,7 @@ impl Evictor {
         .with_opt_log_manager(self.log_manager)
         .with_opt_tree(self.tree, self.db_id)
         .with_opt_off_heap(self.off_heap)
+        .with_opt_checkpointer(self.checkpointer)
     }
 
     /// Set only the scan-resistant policy to a different algorithm.
@@ -265,6 +277,17 @@ impl Evictor {
         self
     }
 
+    /// Wire a checkpointer for CC-4 provisional-flag coordination.
+    ///
+    /// When set, `flush_dirty_node_to_log` queries
+    /// `checkpointer.get_eviction_provisional(node_level)` to choose
+    /// `Provisional::Yes` or `Provisional::No` for evicted BINs, matching JE
+    /// `Checkpointer.coordinateEvictionWithCheckpoint`.
+    pub fn with_checkpointer(mut self, ckpt: Arc<Checkpointer>) -> Self {
+        self.checkpointer = Some(ckpt);
+        self
+    }
+
     // Internal helpers for `with_algorithm` reconstruction.
     fn with_opt_log_manager(mut self, lm: Option<Arc<LogManager>>) -> Self {
         self.log_manager = lm;
@@ -281,6 +304,13 @@ impl Evictor {
     }
     fn with_opt_off_heap(mut self, oh: Option<Arc<OffHeapCache>>) -> Self {
         self.off_heap = oh;
+        self
+    }
+    fn with_opt_checkpointer(
+        mut self,
+        ckpt: Option<Arc<Checkpointer>>,
+    ) -> Self {
+        self.checkpointer = ckpt;
         self
     }
 
@@ -709,6 +739,20 @@ impl Evictor {
             None => return true, // no log manager (tests); allow eviction
         };
 
+        // CC-4: choose Provisional::Yes when a checkpoint is in progress and
+        // this BIN's level is below the checkpoint's highest flush level, so
+        // the checkpoint's non-provisional ancestor subsumes this entry.
+        // When no checkpointer is wired (or no checkpoint is in progress, or
+        // the BIN is at/above the flush level), use Provisional::No.
+        //
+        // JE ref: Checkpointer.coordinateEvictionWithCheckpoint /
+        // DirtyINMap.coordinateEvictionWithCheckpoint.
+        let provisional = self
+            .checkpointer
+            .as_ref()
+            .map(|c| c.get_eviction_provisional(bin.level))
+            .unwrap_or(Provisional::No);
+
         let full_bytes = bin.serialize_full();
         let entry = InLogEntry::new(
             self.db_id,
@@ -720,7 +764,7 @@ impl Evictor {
         entry.write_to_log(&mut buf);
 
         if let Ok(logged_lsn) =
-            lm.log(LogEntryType::BIN, &buf, Provisional::No, false, false)
+            lm.log(LogEntryType::BIN, &buf, provisional, false, false)
         {
             bin.clear_dirty_after_full_log(logged_lsn);
             self.stats.increment(&self.stats.dirty_nodes_evicted);
@@ -2269,5 +2313,45 @@ mod tests {
             !result,
             "CC-6: flush must return false when cursor_count > 0 under lock"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CC-4: provisional-flag wiring tests
+    // -----------------------------------------------------------------------
+
+    /// CC-4 acceptance test: evictor accepts a checkpointer via
+    /// `with_checkpointer` and compiles with the CC-4 wiring.
+    ///
+    /// Correctness of the provisional-flag decision logic is proven by the
+    /// four `test_cc4_*` unit tests in `noxu_recovery::checkpointer::tests`;
+    /// this test verifies only that the wiring builds and the checkpointer
+    /// reference survives the builder chain.
+    ///
+    /// JE ref: Checkpointer.coordinateEvictionWithCheckpoint (CC-4 fix).
+    #[test]
+    fn test_cc4_evictor_wires_checkpointer() {
+        use noxu_recovery::{CheckpointConfig, Checkpointer};
+        use std::sync::Arc;
+
+        let ckpt = Arc::new(Checkpointer::new(CheckpointConfig::default()));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let evictor = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            100,
+            false,
+        )
+        .with_checkpointer(Arc::clone(&ckpt));
+
+        // Verify the evictor holds the checkpointer: Arc strong count is 2
+        // (ckpt + evictor's internal reference).
+        assert_eq!(
+            Arc::strong_count(&ckpt),
+            2,
+            "CC-4: evictor must hold an Arc reference to the checkpointer"
+        );
+
+        drop(evictor);
+        // After evictor drops, only our local Arc remains.
+        assert_eq!(Arc::strong_count(&ckpt), 1);
     }
 }
