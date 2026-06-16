@@ -40,6 +40,9 @@ cargo-timing*
 !.agent/
 !.agent/skills/
 !.agent/skills/*.md
+# Archived audit/review transcripts kept for the record but NOT published
+# or committed (removed from docs/src/internal/ in the 2026-06 cleanup).
+.agent/archived-audits/
 _
 .jdb
 # TLA+ TLC scratch directories and logs
