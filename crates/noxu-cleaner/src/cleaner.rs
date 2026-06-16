@@ -381,7 +381,9 @@ impl Cleaner {
                     // Processing failed or was interrupted — put file back so
                     // it is retried on the next pass, not stuck in BEING_CLEANED.
                     // JE: FileProcessor.java doClean() finally { putBackFileForCleaning }.
-                    self.file_selector.lock().put_back_file_for_cleaning(file_number);
+                    self.file_selector
+                        .lock()
+                        .put_back_file_for_cleaning(file_number);
                     return Err(e);
                 }
                 Ok(result) => {
@@ -408,11 +410,15 @@ impl Cleaner {
                         // The checkpointer calls after_checkpoint() which advances
                         // cleaned → checkpointed → safe_to_delete over two
                         // successive checkpoints.
-                        self.file_selector.lock().mark_file_cleaned(file_number);
+                        self.file_selector
+                            .lock()
+                            .mark_file_cleaned(file_number);
                     } else {
                         // Processing was interrupted (shutdown) — put file back.
                         // JE: FileProcessor.java doClean() finally block.
-                        self.file_selector.lock().put_back_file_for_cleaning(file_number);
+                        self.file_selector
+                            .lock()
+                            .put_back_file_for_cleaning(file_number);
                     }
                 }
             }
@@ -968,7 +974,8 @@ impl Cleaner {
                     log_lsn,
                 );
                 let outcome = match bin_result {
-                    BinLookupResult::NotFound | BinLookupResult::KnownDeleted => {
+                    BinLookupResult::NotFound
+                    | BinLookupResult::KnownDeleted => {
                         // LN is now dead — remove from pending.
                         self.file_selector.lock().remove_pending_ln(log_lsn);
                         self.stats
@@ -977,7 +984,12 @@ impl Cleaner {
                         continue;
                     }
                     BinLookupResult::Found { tree_lsn } => processor
-                        .process_found_ln(&ln_info, log_lsn, tree_lsn, &tree_lookup),
+                        .process_found_ln(
+                            &ln_info,
+                            log_lsn,
+                            tree_lsn,
+                            &tree_lookup,
+                        ),
                 };
                 match outcome {
                     MigrateLnResult::Migrated | MigrateLnResult::Dead => {

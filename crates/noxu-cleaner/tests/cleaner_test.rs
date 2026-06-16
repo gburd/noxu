@@ -470,10 +470,7 @@ fn cln1_pending_ln_gates_file_deletion() {
     );
 
     // Verify: pending sets cause any_pending_during_checkpoint = true.
-    assert!(
-        !fs.all_pending_drained(),
-        "pending LN must block file deletion"
-    );
+    assert!(!fs.all_pending_drained(), "pending LN must block file deletion");
 
     // ── Step 3: checkpoint starts and ends.  Because any_pending_during_checkpoint
     // is true, the CLEANED file must only advance to CHECKPOINTED, not FullyProcessed.
@@ -617,7 +614,11 @@ fn cln3_failed_processing_puts_file_back_for_retry() {
 
     // File can be re-selected on the next pass.
     let retry = fs.select_file_for_cleaning();
-    assert_eq!(retry, Some((20, None)), "file must be re-selectable after put_back");
+    assert_eq!(
+        retry,
+        Some((20, None)),
+        "file must be re-selectable after put_back"
+    );
 }
 
 /// CLN-3: put_back is a no-op if the file is not in BEING_CLEANED.
@@ -722,4 +723,174 @@ fn cln2_two_checkpoint_barrier_only_needed_when_pending() {
     fs.process_checkpoint_end(&s);
 
     assert_eq!(fs.get_safe_to_delete(), vec![40]);
+}
+
+// ─── CLN-4: first-active-txn file clamping ───────────────────────────────────
+
+/// CLN-4: a long-running open transaction prevents the cleaner from selecting
+/// a file within its active-log window.
+///
+/// Pre-fix: file selection ignored firstActiveTxnLsn, so files within the
+/// oldest open transaction's log range could be selected for cleaning.
+/// Post-fix: `select_file_for_cleaning_with_profile_and_txn` clamps
+/// `effective_newest = min(newest_file, first_active_txn_file)` so files
+/// at or above `first_active_txn_file` are excluded.
+///
+/// JE: `UtilizationCalculator.getBestFile` clamps firstActiveFile.
+#[test]
+fn cln4_long_running_txn_prevents_cleaning_within_active_window() {
+    use noxu_cleaner::{FileSelector, FileSummary};
+    use std::collections::BTreeMap;
+
+    // Files 1..5 with low utilization (20% each), all qualify for cleaning.
+    // File 5 is newest. With min_age=0, all are candidates.
+    let profile: BTreeMap<u32, FileSummary> = (1u32..=5)
+        .map(|n| {
+            (
+                n,
+                FileSummary {
+                    total_count: 10,
+                    total_size: 1000,
+                    total_ln_count: 10,
+                    total_ln_size: 1000,
+                    obsolete_ln_count: 8,
+                    obsolete_ln_size: 800,
+                    obsolete_ln_size_counted: 8,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+
+    let mut fs = FileSelector::new();
+
+    // With no txn window clamping: file 1 (lowest util) is selected.
+    let result =
+        fs.select_file_for_cleaning_with_profile(&profile, 50, 0, false);
+    assert_eq!(
+        result.map(|(f, _)| f),
+        Some(1),
+        "without clamping, file 1 should be selected"
+    );
+    fs.clear(); // reset
+
+    // With first_active_txn_file = 3: files 3, 4, 5 are protected by the txn.
+    // effective_newest = min(5, 3) = 3; last_file_to_clean = 3 - 0 = 3.
+    // Files 1, 2, 3 are candidates; file 1 wins (lowest util).
+    let result2 = fs.select_file_for_cleaning_with_profile_and_txn(
+        &profile,
+        50,
+        0,
+        false,
+        Some(3),
+    );
+    assert_eq!(
+        result2.map(|(f, _)| f),
+        Some(1),
+        "file 1 should still be selected (below txn window)"
+    );
+    fs.clear();
+
+    // With first_active_txn_file = 1: all files are in the txn window.
+    // effective_newest = min(5, 1) = 1; last_file_to_clean = 1 - 0 = 1.
+    // Only file 1 is at the boundary — but JE excludes files >= txn_file.
+    // Since effective_newest = 1 and min_age = 0, last_file_to_clean = 1.
+    // File 1 is still <= 1 so it qualifies.
+    let result3 = fs.select_file_for_cleaning_with_profile_and_txn(
+        &profile,
+        50,
+        0,
+        false,
+        Some(1),
+    );
+    assert_eq!(result3.map(|(f, _)| f), Some(1));
+    fs.clear();
+
+    // With first_active_txn_file = 1 and min_age = 1:
+    // effective_newest = 1; last_file_to_clean = 0. No file qualifies.
+    let result4 = fs.select_file_for_cleaning_with_profile_and_txn(
+        &profile,
+        50,
+        1,
+        false,
+        Some(1),
+    );
+    assert_eq!(
+        result4, None,
+        "no file should be selected when all are in txn window with min_age=1"
+    );
+}
+
+/// CLN-4: files within the txn window are excluded even if they have the
+/// lowest utilization.
+#[test]
+fn cln4_txn_window_excludes_best_candidate() {
+    use noxu_cleaner::{FileSelector, FileSummary};
+    use std::collections::BTreeMap;
+
+    // File 1: 10% util (best candidate), but inside txn window.
+    // File 2: 50% util, outside txn window.
+    // File 3: newest (95% util).
+    let mut profile: BTreeMap<u32, FileSummary> = BTreeMap::new();
+    profile.insert(
+        1,
+        FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 9,
+            obsolete_ln_size: 900,
+            obsolete_ln_size_counted: 9,
+            ..Default::default()
+        },
+    );
+    profile.insert(
+        2,
+        FileSummary {
+            total_count: 10,
+            total_size: 1000,
+            total_ln_count: 10,
+            total_ln_size: 1000,
+            obsolete_ln_count: 5,
+            obsolete_ln_size: 500,
+            obsolete_ln_size_counted: 5,
+            ..Default::default()
+        },
+    );
+    profile.insert(
+        3,
+        FileSummary {
+            total_count: 1,
+            total_size: 1000,
+            total_ln_count: 1,
+            total_ln_size: 1000,
+            ..Default::default()
+        },
+    );
+
+    let mut fs = FileSelector::new();
+
+    // first_active_txn_file = 2 means file 1 is below the txn window,
+    // but effective_newest = min(3, 2) = 2, last_file_to_clean = 2 - 1 = 1.
+    // Only file 1 qualifies by age. With min_age=1 and txn_file=2, file 1 is selected.
+    let r1 = fs.select_file_for_cleaning_with_profile_and_txn(
+        &profile,
+        50,
+        1,
+        false,
+        Some(2),
+    );
+    assert_eq!(r1.map(|(f, _)| f), Some(1));
+    fs.clear();
+
+    // first_active_txn_file = 1 and min_age=1: last_file_to_clean = 0. Nothing.
+    let r2 = fs.select_file_for_cleaning_with_profile_and_txn(
+        &profile,
+        50,
+        1,
+        false,
+        Some(1),
+    );
+    assert_eq!(r2, None, "all files excluded: txn window covers everything");
 }

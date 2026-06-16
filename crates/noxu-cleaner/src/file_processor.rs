@@ -1533,7 +1533,7 @@ impl FileProcessor {
                         // Record the locked LN so the cleaner can add it to
                         // FileSelector::pending_lns and retry via process_pending.
                         // JE FileSelector.addPendingLN (FileSelector.java ~line 455).
-                        result.locked_lns.push((log_lsn, info.clone()));
+                        result.locked_lns.push((log_lsn, info));
                     }
                 }
             }

@@ -192,40 +192,8 @@ impl FileSelector {
 
     /// Selects the best file for cleaning using cost/benefit scoring.
     ///
-    /// File-selection logic.
-    /// `UtilizationCalculator.getBestFile()` and `FileSelector.selectFileForCleaning()`
-    ///.
-    ///
-    /// Algorithm:
-    /// 1. If there is already a file queued in `to_be_cleaned`, return it
-    ///    immediately (it was enqueued by a prior call).
-    /// 2. Otherwise, scan `file_summaries` (a sorted map of file_number →
-    ///    FileSummary) and pick the file with the lowest average utilization,
-    ///    subject to:
-    ///    - The file must not already be in-progress (being_cleaned / cleaned /
-    ///      checkpointed / safe_to_delete queues).
-    ///    - `file_number <= last_file_to_clean` (age filter).
-    ///    - The file must qualify: either `force_cleaning` is true, or the
-    ///      file's utilization is below `min_utilization_pct`.
-    /// 3. If a qualifying file is found, mark it as `BeingCleaned` and return
-    ///    it.
-    ///
-    /// # Arguments
-    /// * `file_summaries` — sorted (BTreeMap) map of file_number → summary.
-    ///   Must be sorted by file number so the last key gives the newest file
-    ///   (the: `fileSummaryMap.lastKey()`).
-    /// * `min_utilization_pct` — 0–100 integer threshold; files whose utilization
-    ///   is at or above this are not cleaned unless `force_cleaning`.
-    /// * `min_age` — minimum age (distance in file numbers from the newest file)
-    ///   before a file may be cleaned. default is 2.
-    /// * `force_cleaning` — if true, bypass the utilization threshold and always
-    ///   select the best file (used in testing).
-    ///
-    /// # Returns
-    /// `Some((file_number, required_util))` where `required_util` is the
-    /// utilization target from the two-pass cleaning logic (non-None when
-    /// `self.force_cleaning` is set after a first pass didn't meet the
-    /// target), or `None` if no file qualifies.
+    /// Convenience wrapper that calls `select_file_for_cleaning_with_profile_and_txn`
+    /// with `first_active_txn_file = None` (no transaction-window clamping).
     pub fn select_file_for_cleaning_with_profile(
         &mut self,
         file_summaries: &BTreeMap<u32, FileSummary>,
@@ -233,7 +201,35 @@ impl FileSelector {
         min_age: u32,
         force_cleaning: bool,
     ) -> Option<(u32, Option<i32>)> {
-        // Step 1 — if a file is already queued (from a previous scoring pass
+        self.select_file_for_cleaning_with_profile_and_txn(
+            file_summaries,
+            min_utilization_pct,
+            min_age,
+            force_cleaning,
+            None,
+        )
+    }
+
+    /// Selects the best file for cleaning, optionally clamped to a
+    /// first-active-transaction file boundary (CLN-4).
+    ///
+    /// See `select_file_for_cleaning_with_profile` for the full algorithm
+    /// description.  This variant adds the `first_active_txn_file` guard:
+    /// if `Some(n)`, files with `file_number >= n` are excluded because
+    /// they may still be needed by the oldest open transaction.
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` clamps
+    /// `firstActiveFile = min(fileSummaryMap.lastKey(), firstActiveTxnFile)`
+    /// before computing `lastFileToClean`.
+    pub fn select_file_for_cleaning_with_profile_and_txn(
+        &mut self,
+        file_summaries: &BTreeMap<u32, FileSummary>,
+        min_utilization_pct: u32,
+        min_age: u32,
+        force_cleaning: bool,
+        first_active_txn_file: Option<u32>,
+    ) -> Option<(u32, Option<i32>)> {
+        // Step 1 -- if a file is already queued (from a previous scoring pass
         // that enqueued it but didn't immediately return), dequeue it now.
         if !self.to_be_cleaned.is_empty() {
             return self.select_file_for_cleaning();
@@ -247,16 +243,24 @@ impl FileSelector {
         // FirstActiveFile = fileSummaryMap.lastKey()
         let newest_file = *file_summaries.keys().next_back()?;
 
+        // CLN-4: clamp by first_active_txn_file so we don't select a file
+        // that is still inside an open transaction's log window.
+        // JE: firstActiveFile = Math.min(fileSummaryMap.lastKey(), firstActiveTxnFile)
+        let effective_newest = match first_active_txn_file {
+            Some(txn_file) if txn_file < newest_file => txn_file,
+            _ => newest_file,
+        };
+
         // lastFileToClean = firstActiveFile - minAge
         // Any file with file_number > last_file_to_clean is too young to clean.
         // Use saturating_sub so that if min_age > newest_file we get 0.
-        let last_file_to_clean = newest_file.saturating_sub(min_age);
+        let last_file_to_clean = effective_newest.saturating_sub(min_age);
 
         // Collect all in-progress file numbers (not eligible for re-selection).
         let in_progress: HashSet<u32> =
             self.file_info.keys().copied().collect();
 
-        // Step 2 — find the file with lowest TTL-adjusted utilization.
+        // Step 2 -- find the file with lowest TTL-adjusted utilization.
         // `UtilizationCalculator.getBestFile()`: rank by
         // adjusted_utilization_pct() which subtracts expired bytes from the
         // "active bytes to migrate" numerator.  When no TTL data is present
@@ -280,16 +284,10 @@ impl FileSelector {
                 continue;
             }
 
-            // TTL-adjusted utilization (0–100 integer percent).
-            // expired records need not be
-            // migrated, so they reduce the effective "live bytes" to write.
+            // TTL-adjusted utilization (0-100 integer percent).
             let avg_util = Self::adjusted_utilization_pct(summary);
 
             // Apply the utilization threshold filter.
-            // During a second pass (`self.force_cleaning`), override the caller's
-            // threshold with `self.required_util` if it is stricter (lower).
-            // FileSelector picks files below requiredUtil when
-            // forceCleaning is active.
             let effective_threshold = if self.force_cleaning {
                 self.required_util
                     .unwrap_or(min_utilization_pct as i32)
@@ -312,7 +310,7 @@ impl FileSelector {
 
         let file_num = best_file?;
 
-        // Step 3 — mark the chosen file as being cleaned.
+        // Step 3 -- mark the chosen file as being cleaned.
         self.being_cleaned.insert(file_num);
         self.file_info.insert(
             file_num,
@@ -322,7 +320,6 @@ impl FileSelector {
         Some((file_num, None))
     }
 
-    /// Returns the raw (non-TTL-adjusted) utilization as an integer percentage 0–100.
     ///
     ///
     /// A file at 100% utilization has no obsolete bytes; 0% means all bytes
@@ -578,7 +575,9 @@ impl FileSelector {
         if self.pending_lns.is_empty() {
             None
         } else {
-            Some(self.pending_lns.iter().map(|(&k, v)| (k, v.clone())).collect())
+            Some(
+                self.pending_lns.iter().map(|(&k, v)| (k, v.clone())).collect(),
+            )
         }
     }
 

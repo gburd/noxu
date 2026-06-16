@@ -18,6 +18,59 @@ listed in [References](#references).
 
 ### Fixed
 
+- **CLN-1 — pending LN gating prevents data-loss file deletion** (`noxu-cleaner`):
+  `FileSelector` now tracks LNs that could not be migrated because their BIN slot
+  was locked by a concurrent writer (`pending_lns: HashMap<Lsn, LnInfo>`,
+  `pending_dbs: HashSet<DbId>`, `any_pending_during_checkpoint: bool`), faithful
+  to JE `FileSelector.java` lines 133–522.  When `process_found_ln` returns
+  `Locked`, `FileProcessResult::locked_lns` captures the entry and the cleaner
+  registers it via `add_pending_ln`.  The checkpoint barrier respects
+  `any_pending_during_checkpoint`: if pending items existed during the checkpoint
+  window, CLEANED files advance only to CHECKPOINTED (requiring another
+  checkpoint) rather than directly to FullyProcessed.  `update_processed_files`
+  promotes CHECKPOINTED → FullyProcessed the moment the pending set drains.
+  `Cleaner::process_pending` retries locked LNs at the start of each cleaning
+  pass (JE `Cleaner.processPending`).  Without this fix, a file whose live LN
+  could not be migrated would eventually be deleted, leaving a dangling BIN slot
+  after a crash (silent data loss).
+  Acceptance tests: `cln1_pending_ln_gates_file_deletion`,
+  `cln1_no_pending_lns_fast_path_one_checkpoint`,
+  `cln1_pending_ln_added_mid_checkpoint_keeps_file_blocked`,
+  `test_process_checkpoint_end_with_pending_needs_two_checkpoints`.
+
+- **CLN-3 — `put_back_file_for_cleaning` / finally-equivalent** (`noxu-cleaner`):
+  If `process_single_file` errors or is interrupted (non-completed result), the
+  file is now returned to `TO_BE_CLEANED` via `FileSelector::put_back_file_for_cleaning`
+  instead of remaining stuck in `BEING_CLEANED` forever.  Matches JE
+  `FileProcessor.java` doClean() `finally` block (~lines 591–593).
+  Acceptance tests: `cln3_failed_processing_puts_file_back_for_retry`,
+  `cln3_put_back_noop_if_not_being_cleaned`.
+
+- **CLN-2 — `fully_processed_files` snapshot in checkpoint state** (`noxu-cleaner`):
+  `CheckpointStartCleanerState` now captures both CLEANED and FULLY_PROCESSED
+  file sets (JE `FileSelector.getFilesAtCheckpointStart` snapshots both).
+  `Cleaner::get_checkpoint_start_state()` calls `process_pending()` before taking
+  the snapshot so avoidably-pending LNs are drained first (CLN-7 addressed
+  alongside CLN-2).  The checkpointer uses `get_checkpoint_start_state()` instead
+  of calling `get_checkpoint_state` directly.  When no pending items exist during
+  a checkpoint, CLEANED files advance to FullyProcessed in a single checkpoint
+  (JE fast-path: `else { makeReservedFiles(cleanedFiles) }`).  The two tests that
+  encoded the old incorrect two-checkpoint-always behavior were updated.
+  Acceptance tests: `cln2_checkpoint_state_captures_fully_processed_files`,
+  `cln2_fully_processed_files_always_safe_to_delete`,
+  `cln2_two_checkpoint_barrier_only_needed_when_pending`.
+
+- **CLN-4 — first-active-txn file clamping in file selection** (`noxu-cleaner`):
+  `FileSelector::select_file_for_cleaning_with_profile_and_txn` clamps the file
+  selection window to `effective_newest = min(newest_file, first_active_txn_file)`
+  before computing `last_file_to_clean`, so files within an open transaction’s
+  log window are not selected for cleaning.  Matches JE
+  `UtilizationCalculator.getBestFile`’s `firstActiveFile` clamping.
+  The existing `select_file_for_cleaning_with_profile` is now a convenience
+  wrapper passing `first_active_txn_file = None`.
+  Acceptance tests: `cln4_long_running_txn_prevents_cleaning_within_active_window`,
+  `cln4_txn_window_excludes_best_candidate`.
+
 - **Checkpointer now flushes all open user-database BINs** (`noxu-recovery`),
   not just the internal `primary_tree`. Previously a checkpoint walked only
   the primary tree, so dirty BINs in user databases were never written at
