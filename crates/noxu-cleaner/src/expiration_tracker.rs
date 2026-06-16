@@ -50,7 +50,8 @@ impl ExpirationTracker {
     /// Tracks an entry with the given expiration time and size.
     ///
     /// # Arguments
-    /// * `expiration_time` - Expiration time in hours since epoch (0 = never expires)
+    /// * `expiration_time` - Expiration time in **hours since epoch**
+    ///   (packed-hours unit from the log format; 0 = never expires)
     /// * `size` - Size of the entry in bytes
     pub fn track(&mut self, expiration_time: u64, size: i32) {
         if expiration_time == 0 {
@@ -70,10 +71,11 @@ impl ExpirationTracker {
     /// Returns the total size of expired bytes as of the given time.
     ///
     /// # Arguments
-    /// * `current_time` - Current time in hours since epoch
+    /// * `current_time` - Current time in **hours since epoch** (same unit as
+    ///   values passed to `track`)
     ///
     /// # Returns
-    /// Total size in bytes of all entries that have expired by current_time
+    /// Total size in bytes of all entries that have expired by `current_time`
     pub fn get_expired_bytes(&self, current_time: u64) -> i64 {
         let mut expired_size = 0i64;
 

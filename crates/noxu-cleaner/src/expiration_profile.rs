@@ -1,7 +1,23 @@
 //! TTL-aware expiration profile for log file utilization.
 //!
+//! Noxu's `ExpirationProfile` is a per-file histogram representing the
+//! byte distribution of expiration times.  `ExpirationProfileStore` is an
+//! in-memory map from file number to `ExpirationTracker`, used by the cleaner
+//! to carry per-file expiration data between the two-pass dry run and the
+//! subsequent file selection pass.
+//!
+//! **CLN-9 status**: the in-memory store is implemented here.  JE also
+//! persists this data to the `FileSummaryDB` (a dedicated internal BTree
+//! database) so that expiration data survives crashes.  The persistent
+//! store is deferred (see CLN-11 / known-limitations.md) — it requires a
+//! new internal database and recovery integration that is out of scope for
+//! this pass.
+//!
+//! JE: `ExpirationProfile.java` (per-file histogram store, `putFile`,
+//! `removeFile`, `getExpiredBytes`).
 
-use std::collections::BTreeMap;
+use crate::expiration_tracker::ExpirationTracker;
+use std::collections::{BTreeMap, HashMap};
 
 /// Tracks the distribution of expiration times for entries in a log file.
 ///
@@ -56,6 +72,81 @@ impl ExpirationProfile {
     }
 }
 
+/// In-memory store mapping file numbers to their `ExpirationTracker` data.
+///
+/// CLN-9: this is the Noxu equivalent of JE's per-file histogram store in
+/// `ExpirationProfile.java`.  Each entry represents the expiration-time
+/// distribution of LN records written to a specific log file.
+///
+/// **Usage**:
+/// - `put_file`: called after a two-pass dry-run with the resulting tracker.
+/// - `remove_file`: called when a file is cleaned or deleted.
+/// - `get_expired_bytes`: returns expired bytes for a file at a given time
+///   (hours since epoch).
+///
+/// **Limitations**: in-memory only; does not survive crashes.  JE persists
+/// this to `FileSummaryDB`.  See CLN-11 and `docs/src/operations/
+/// known-limitations.md` for the deferral rationale.
+///
+/// JE: `ExpirationProfile.putFile` / `removeFile` / `getExpiredBytes`.
+#[derive(Debug, Default)]
+pub struct ExpirationProfileStore {
+    /// Map of file_number → ExpirationTracker.
+    trackers: HashMap<u32, ExpirationTracker>,
+}
+
+impl ExpirationProfileStore {
+    /// Creates a new empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the expiration data for `file_number` from an `ExpirationTracker`.
+    ///
+    /// Replaces any existing entry for this file.
+    /// JE: `ExpirationProfile.putFile(tracker, expiredSize)`.
+    pub fn put_file(&mut self, tracker: ExpirationTracker) {
+        let file_number = tracker.get_file_number();
+        self.trackers.insert(file_number, tracker);
+    }
+
+    /// Removes all expiration data for `file_number`.
+    ///
+    /// Called when a file is cleaned or deleted.
+    /// JE: `ExpirationProfile.removeFile(fileNum)`.
+    pub fn remove_file(&mut self, file_number: u32) {
+        self.trackers.remove(&file_number);
+    }
+
+    /// Returns the number of expired bytes in `file_number` at
+    /// `current_time_hours`.
+    ///
+    /// Returns 0 if no data is recorded for this file.
+    /// JE: `ExpirationProfile.getExpiredBytes(fileNum)` — note JE converts
+    /// `TTL.currentSystemTime()` (ms) to hours internally; callers here must
+    /// pass hours directly.
+    pub fn get_expired_bytes(
+        &self,
+        file_number: u32,
+        current_time_hours: u64,
+    ) -> i64 {
+        self.trackers
+            .get(&file_number)
+            .map(|t| t.get_expired_bytes(current_time_hours))
+            .unwrap_or(0)
+    }
+
+    /// Returns whether any data is recorded for `file_number`.
+    pub fn has_file(&self, file_number: u32) -> bool {
+        self.trackers.contains_key(&file_number)
+    }
+
+    /// Returns the number of files tracked.
+    pub fn file_count(&self) -> usize {
+        self.trackers.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +197,58 @@ mod tests {
         assert!((frac - 0.6).abs() < 1e-9);
         // is_all_expired: bucket 10 <= 10, so all buckets expired.
         assert!(ep.is_all_expired(10));
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn test_cln9_put_and_get_expired_bytes() {
+        let mut store = ExpirationProfileStore::new();
+
+        let mut tracker = ExpirationTracker::new(1);
+        tracker.track(100, 500); // 500 bytes expire at hour 100
+        tracker.track(200, 300);
+        store.put_file(tracker);
+
+        assert!(store.has_file(1));
+        assert_eq!(store.get_expired_bytes(1, 100), 500);
+        assert_eq!(store.get_expired_bytes(1, 200), 800);
+    }
+
+    #[test]
+    fn test_cln9_remove_file() {
+        let mut store = ExpirationProfileStore::new();
+        let tracker = ExpirationTracker::new(42);
+        store.put_file(tracker);
+        assert!(store.has_file(42));
+
+        store.remove_file(42);
+        assert!(!store.has_file(42));
+        assert_eq!(store.get_expired_bytes(42, 1000), 0);
+    }
+
+    #[test]
+    fn test_cln9_missing_file_returns_zero() {
+        let store = ExpirationProfileStore::new();
+        assert_eq!(store.get_expired_bytes(99, 1000), 0);
+    }
+
+    #[test]
+    fn test_cln9_replaces_on_put() {
+        let mut store = ExpirationProfileStore::new();
+
+        let mut t1 = ExpirationTracker::new(5);
+        t1.track(100, 1000);
+        store.put_file(t1);
+
+        // Replace with new data
+        let mut t2 = ExpirationTracker::new(5);
+        t2.track(100, 2000); // different size
+        store.put_file(t2);
+
+        assert_eq!(store.get_expired_bytes(5, 100), 2000);
     }
 }
