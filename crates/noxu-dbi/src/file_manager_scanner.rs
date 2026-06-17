@@ -101,7 +101,14 @@ impl FileManagerLogScanner {
         entry_type_num: u8,
         payload: Bytes,
         vlsn: Option<u64>,
+        flags: u8,
     ) -> Option<LogEntry> {
+        // JE Provisional enum bits (entry_header.rs):
+        //   0x80 = PROVISIONAL_ALWAYS (always provisional, never replay)
+        //   0x40 = PROVISIONAL_BEFORE_CKPT_END (provisional until CkptEnd)
+        // Stage 2 (DRIFT-3): is_provisional is set for INs that must be
+        // filtered by the recovery redo pass.
+        let is_provisional = (flags & 0x80) != 0 || (flags & 0x40) != 0;
         let entry_type = LogEntryType::from_type_num(entry_type_num)?;
 
         match entry_type {
@@ -227,6 +234,7 @@ impl FileManagerLogScanner {
                     level,
                     is_root: false,
                     is_delta: false,
+                    is_provisional,
                     node_data: Some(e.node_data),
                     prev_full_lsn: e.prev_full_lsn,
                 }))
@@ -244,6 +252,7 @@ impl FileManagerLogScanner {
                     level: 0x10001i32, // BIN_LEVEL
                     is_root: false,
                     is_delta: true,
+                    is_provisional,
                     node_data: Some(e.delta_data),
                     prev_full_lsn: e.prev_full_lsn,
                 }))
@@ -404,7 +413,7 @@ impl FileManagerLogScanner {
             }
         }
 
-        let log_entry = Self::parse_payload(entry_type_num, payload, vlsn_opt);
+        let log_entry = Self::parse_payload(entry_type_num, payload, vlsn_opt, flags);
 
         Some((entry_size, log_entry))
     }

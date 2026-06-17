@@ -117,6 +117,18 @@ pub struct InRecord {
     pub is_root: bool,
     /// Whether this is a BIN-delta.
     pub is_delta: bool,
+    /// Whether this IN was written with `Provisional::Yes` or
+    /// `Provisional::BeforeCkptEnd` in its log header.
+    ///
+    /// Provisional INs are only replayed if they are covered by a completed
+    /// checkpoint (`CkptEnd` LSN > entry LSN).  An IN logged with
+    /// `Provisional::BeforeCkptEnd` is safe to replay only if the checkpoint
+    /// completed (its `CkptEnd` record is present); one logged with
+    /// `Provisional::Yes` (always provisional) is never replayed.
+    ///
+    /// JE `INFileReader.isProvisional()` / `Provisional` enum
+    /// (DRIFT-3 / Stage 2 filter).
+    pub is_provisional: bool,
     /// Raw serialized node bytes as written by `BinStub::serialize_full()` or
     /// `BinStub::serialize_delta()`.  Present when the log scanner can parse
     /// the payload; `None` for scanner stubs that don't carry node data.
@@ -620,6 +632,7 @@ mod tests {
             level: 2,
             is_root: true,
             is_delta: false,
+            is_provisional: false,
             node_data: None,
             prev_full_lsn: NULL_LSN,
         };

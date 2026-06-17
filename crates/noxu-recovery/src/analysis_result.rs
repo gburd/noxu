@@ -399,6 +399,7 @@ mod tests {
             level,
             is_root,
             is_delta: false,
+            is_provisional: false,
             node_data: None,
             prev_full_lsn: noxu_util::NULL_LSN,
         }
