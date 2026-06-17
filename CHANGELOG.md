@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (replication — commit freeze latch primitive, D3)
+
+- **`CommitFreezeLatch`** (`noxu-rep`, JE `CommitFreezeLatch`): a freeze
+  primitive that holds VLSN advancement on a node for the duration of an
+  election round so the VLSN/DTVLSN reported in a Paxos Promise does not move
+  mid-election (`freeze` / `vlsn_event` / `await_thaw` / `clear_latch`, condvar
+  -based, with the JE timeout and the older-proposal-ignored and
+  older-event-does-not-thaw rules). The primitive is complete and unit-tested;
+  wiring it into the replica replay path (`await_thaw` before VLSN advance) and
+  the acceptor/learner (`freeze` on promise, `vlsn_event` on result) is a
+  follow-on — until then VLSN can still advance mid-election (JE itself notes
+  the latch is a "good faith effort", not a hard guarantee). Tests cover
+  thaw-on-event, timeout, and the proposal-ordering guards.
+
 ### Fixed (replication — election ranking, D2)
 
 - **Elections now rank by DTVLSN, not raw VLSN** (`noxu-rep`, D2): the election

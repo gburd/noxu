@@ -14,6 +14,7 @@
 //!   liveness.
 
 pub mod acceptor_state;
+pub mod commit_freeze_latch;
 pub mod election;
 pub mod election_config;
 pub mod election_service;
