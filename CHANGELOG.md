@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Changed (replication — ack-quorum)
+
+- **Durable-commit ack wait no longer spin-polls** (`noxu-rep`, D6): the master
+  previously waited for replica acks with a sleep-poll loop (up to 20 ms added
+  latency per durable commit, CPU spin). `AckTracker` now carries a `Condvar`;
+  committers block in `wait_until_satisfied` and are woken the instant an ack
+  lands (JE `FeederTxns.TxnInfo` uses a per-transaction `CountDownLatch.await`).
+- **Non-electable acks no longer count toward durability quorum** (`noxu-rep`,
+  D6): `record_ack` now drops acks from Monitor / Secondary / unknown nodes
+  (JE `DurabilityQuorum.replicaAcksQualify` — only electable replicas qualify).
+  Regression tests `wait_until_satisfied_wakes_on_ack`,
+  `wait_until_satisfied_times_out_without_enough_acks`,
+  `test_record_ack_from_non_electable_does_not_qualify`.
+
 ### Fixed (replication — VLSN range semantics)
 
 - **`lastSync` / `lastTxnEnd` doc-comment inversion** (`noxu-rep`, D8): the

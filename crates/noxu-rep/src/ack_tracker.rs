@@ -5,7 +5,7 @@
 //! a transaction's durability requirements have been satisfied.
 
 use hashbrown::HashMap;
-use noxu_sync::Mutex;
+use noxu_sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Tracks transaction commit acknowledgments from replicas.
@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 pub struct AckTracker {
     /// Maps VLSN to pending ack info.
     pending_acks: Mutex<HashMap<u64, PendingAck>>,
+    /// Signalled whenever an ack is recorded so that committers blocked in
+    /// `wait_until_satisfied` wake immediately rather than spin-polling
+    /// (JE FeederTxns uses a per-transaction CountDownLatch; this condvar is
+    /// the shared-mutex equivalent over the pending-ack map).
+    ack_signal: Condvar,
     /// Total acks received across all VLSNs.
     total_acks: Mutex<u64>,
     /// Total ack timeouts.
@@ -65,6 +70,7 @@ impl AckTracker {
     pub fn new() -> Self {
         Self {
             pending_acks: Mutex::new(HashMap::new()),
+            ack_signal: Condvar::new(),
             total_acks: Mutex::new(0),
             total_timeouts: Mutex::new(0),
         }
@@ -98,12 +104,54 @@ impl AckTracker {
         }
 
         ack.received.insert(replica_name.to_string(), Instant::now());
+        let satisfied = ack.is_satisfied();
+        // Drop the borrow before releasing the lock + notifying.
+        drop(pending);
         *self.total_acks.lock() += 1;
+        // Wake any committer blocked in `wait_until_satisfied`. notify_all is
+        // cheap (a futex bump) and committers re-check their own predicate.
+        self.ack_signal.notify_all();
 
-        if ack.is_satisfied() {
-            AckResult::Satisfied
-        } else {
-            AckResult::Pending
+        if satisfied { AckResult::Satisfied } else { AckResult::Pending }
+    }
+
+    /// Block until `vlsn` has sufficient acks, the `timeout` elapses, or
+    /// `should_abort` returns true (e.g. shutdown). Returns true if the VLSN
+    /// became satisfied, false on timeout/abort. Replaces the prior
+    /// spin-sleep loop — committers park on the condvar and are woken by
+    /// `record_ack` (JE FeederTxns.TxnInfo CountDownLatch.await).
+    pub fn wait_until_satisfied<F: Fn() -> bool>(
+        &self,
+        vlsn: u64,
+        timeout: Duration,
+        should_abort: F,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.pending_acks.lock();
+        loop {
+            match guard.get(&vlsn) {
+                // Registration gone (cleaned up) -> treat as satisfied: the
+                // only path that removes it is cleanup after satisfaction.
+                None => return true,
+                Some(ack) if ack.is_satisfied() => return true,
+                _ => {}
+            }
+            if should_abort() {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let res = self.ack_signal.wait_for(&mut guard, deadline - now);
+            if res.timed_out() && Instant::now() >= deadline {
+                // Final predicate re-check before declaring timeout.
+                match guard.get(&vlsn) {
+                    None => return true,
+                    Some(ack) if ack.is_satisfied() => return true,
+                    _ => return false,
+                }
+            }
         }
     }
 
@@ -407,5 +455,41 @@ mod tests {
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AckTracker>();
+    }
+
+    #[test]
+    fn wait_until_satisfied_wakes_on_ack() {
+        use std::sync::Arc;
+        use std::thread;
+        let tracker = Arc::new(AckTracker::new());
+        tracker.register(42, 2);
+        let t2 = Arc::clone(&tracker);
+        // Committer blocks waiting for 2 acks.
+        let waiter = thread::spawn(move || {
+            t2.wait_until_satisfied(42, Duration::from_secs(5), || false)
+        });
+        // Deliver two acks; the waiter must wake and return true well before
+        // the 5s timeout.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(tracker.record_ack(42, "r1"), AckResult::Pending);
+        assert_eq!(tracker.record_ack(42, "r2"), AckResult::Satisfied);
+        let start = Instant::now();
+        let ok = waiter.join().unwrap();
+        assert!(ok, "wait_until_satisfied must return true once satisfied");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must wake on ack, not spin to timeout"
+        );
+    }
+
+    #[test]
+    fn wait_until_satisfied_times_out_without_enough_acks() {
+        let tracker = AckTracker::new();
+        tracker.register(7, 3);
+        tracker.record_ack(7, "only-one");
+        let ok =
+            tracker
+                .wait_until_satisfied(7, Duration::from_millis(50), || false);
+        assert!(!ok, "must time out when acks are insufficient");
     }
 }

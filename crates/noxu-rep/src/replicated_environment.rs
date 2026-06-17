@@ -2109,7 +2109,20 @@ impl ReplicatedEnvironment {
     /// the given VLSN. This is used by the master to track durability
     /// guarantees.
     pub fn record_ack(&self, vlsn: u64, replica_name: &str) {
-        self.ack_tracker.record_ack(vlsn, replica_name);
+        // Only acks from ELECTABLE replicas count toward the durability
+        // quorum (JE DurabilityQuorum.replicaAcksQualify: Monitors and
+        // Secondaries do not qualify). An ack from a non-electable / unknown
+        // node is recorded for stats elsewhere but must not satisfy the
+        // ReplicaAckPolicy. If the node is unknown to the group view we err
+        // toward NOT counting it.
+        let qualifies = self
+            .get_rep_group()
+            .get_node(replica_name)
+            .map(|n| n.node_type().is_electable())
+            .unwrap_or(false);
+        if qualifies {
+            self.ack_tracker.record_ack(vlsn, replica_name);
+        }
     }
 
     /// Set the state change listener.
@@ -2472,52 +2485,31 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.ack_tracker.register(commit_seq, needed);
 
-        // Poll-with-sleep loop. The poll interval is small enough that
-        // late acks satisfy the policy promptly, and large enough that
-        // a single commit waiting on a slow replica does not spin a
-        // CPU.
-        let poll_interval =
-            std::cmp::min(timeout / 50, Duration::from_millis(20));
-        let poll_interval = if poll_interval.is_zero() {
-            Duration::from_millis(1)
-        } else {
-            poll_interval
-        };
-        let deadline = std::time::Instant::now() + timeout;
-
-        loop {
-            if self.ack_tracker.is_satisfied(commit_seq) {
-                self.ack_tracker.cleanup_through(commit_seq);
-                return Ok(needed);
-            }
-            if self.is_shutdown() {
-                self.ack_tracker.cleanup_through(commit_seq);
-                return Err(AckWaitError {
-                    kind: AckWaitErrorKind::Shutdown,
-                    needed,
-                    received: 0,
-                });
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                // Tear down the registration so it doesn't accumulate;
-                // record the partial ack count so the caller can report
-                // a useful `InsufficientReplicas { required, available }`.
-                let received =
-                    self.ack_tracker.received_count(commit_seq).unwrap_or(0);
-                self.ack_tracker.cleanup_through(commit_seq);
-                return Err(AckWaitError {
-                    kind: AckWaitErrorKind::Timeout,
-                    needed,
-                    received,
-                });
-            }
-            let sleep_for = std::cmp::min(
-                poll_interval,
-                deadline.saturating_duration_since(now),
-            );
-            std::thread::sleep(sleep_for);
+        // Block on the ack condvar until satisfied, the timeout elapses, or
+        // shutdown is signalled — no spin-poll (JE FeederTxns.TxnInfo uses a
+        // per-transaction CountDownLatch.await; the AckTracker condvar is the
+        // shared-mutex equivalent). record_ack notifies us as acks arrive.
+        let satisfied =
+            self.ack_tracker.wait_until_satisfied(commit_seq, timeout, || {
+                self.is_shutdown()
+            });
+        if satisfied {
+            self.ack_tracker.cleanup_through(commit_seq);
+            return Ok(needed);
         }
+        if self.is_shutdown() {
+            self.ack_tracker.cleanup_through(commit_seq);
+            return Err(AckWaitError {
+                kind: AckWaitErrorKind::Shutdown,
+                needed,
+                received: 0,
+            });
+        }
+        // Timed out: tear down the registration and report the partial ack
+        // count so the caller can surface InsufficientReplicas.
+        let received = self.ack_tracker.received_count(commit_seq).unwrap_or(0);
+        self.ack_tracker.cleanup_through(commit_seq);
+        Err(AckWaitError { kind: AckWaitErrorKind::Timeout, needed, received })
     }
 
     /// X-3: allocate the next VLSN for a recovered XA commit and register
@@ -2662,8 +2654,20 @@ mod tests {
 
     #[test]
     fn test_record_ack() {
+        use crate::node_type::NodeType;
+        use crate::rep_node::RepNode;
         let env = ReplicatedEnvironment::new(test_config("master")).unwrap();
         env.become_master(1).unwrap();
+        // replicaAcksQualify: only ELECTABLE replicas count toward durability,
+        // so the replica must be a known electable member of the group.
+        env.add_peer(RepNode::new(
+            "replica1".to_string(),
+            NodeType::Electable,
+            "127.0.0.1".to_string(),
+            6001,
+            2,
+        ))
+        .unwrap();
 
         env.register_vlsn(1, 0, 100);
         // Register a pending ack requirement, then record ack
@@ -2671,6 +2675,34 @@ mod tests {
         env.record_ack(1, "replica1");
         // Ack should be satisfied
         assert!(env.get_ack_tracker().is_satisfied(1));
+    }
+
+    #[test]
+    fn test_record_ack_from_non_electable_does_not_qualify() {
+        use crate::node_type::NodeType;
+        use crate::rep_node::RepNode;
+        let env = ReplicatedEnvironment::new(test_config("master")).unwrap();
+        env.become_master(1).unwrap();
+        // A Monitor is NOT electable -> its ack must not count (JE
+        // DurabilityQuorum.replicaAcksQualify).
+        env.add_peer(RepNode::new(
+            "monitor1".to_string(),
+            NodeType::Monitor,
+            "127.0.0.1".to_string(),
+            6002,
+            3,
+        ))
+        .unwrap();
+        env.register_vlsn(1, 0, 100);
+        env.get_ack_tracker().register(1, 1);
+        env.record_ack(1, "monitor1");
+        assert!(
+            !env.get_ack_tracker().is_satisfied(1),
+            "non-electable ack must not satisfy durability quorum"
+        );
+        // An unknown replica likewise does not qualify.
+        env.record_ack(1, "ghost");
+        assert!(!env.get_ack_tracker().is_satisfied(1));
     }
 
     #[test]
