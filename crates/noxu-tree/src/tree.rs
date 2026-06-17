@@ -149,6 +149,19 @@ pub struct Tree {
     /// Set by `hint_redo_capacity` before the redo loop.
     /// Wave 11-K optimisation (Fix 3).
     redo_capacity_hint: usize,
+
+    /// Whether key-prefix compression is enabled for this tree's BINs.
+    ///
+    /// JE `DatabaseImpl.getKeyPrefixing()` / `DatabaseConfig.setKeyPrefixing()`.
+    /// When `false`, `IN.computeKeyPrefix` returns `null` in JE — no prefix
+    /// is ever set. Noxu mirrors this: `insert_with_prefix` is skipped in
+    /// favour of `insert_raw`, and `recompute_key_prefix` is not called on
+    /// BIN halves after a split.
+    ///
+    /// Default: `false` (matches JE's `DatabaseConfig.KEY_PREFIXING_DEFAULT`).
+    ///
+    /// Ref: `IN.java computeKeyPrefix` ~line 2456.
+    pub key_prefixing: bool,
 }
 
 /// A node in the tree.
@@ -726,6 +739,66 @@ impl BinStub {
             }) {
                 Ok(idx) => (idx, true),
                 Err(idx) => (idx, false),
+            }
+        }
+    }
+
+    /// Raw insert (no prefix compression) for databases with
+    /// `key_prefixing = false`.
+    ///
+    /// JE `IN.computeKeyPrefix` returns `null` when
+    /// `databaseImpl.getKeyPrefixing()` is `false`, so no prefix is ever
+    /// set on those BINs.  Noxu was previously ignoring the flag and always
+    /// calling `insert_with_prefix`; this method provides the faithful path.
+    ///
+    /// The key is stored verbatim (no suffix stripping). An existing
+    /// `key_prefix` on the BIN is left untouched; callers must ensure it is
+    /// empty (split_child already guarantees this for new BINs when
+    /// `key_prefixing = false`).
+    ///
+    /// Returns `(slot_index, is_new_insert)`.
+    ///
+    /// Ref: `IN.java computeKeyPrefix` ~line 2456,
+    ///      `DatabaseConfig.setKeyPrefixing` / `DatabaseImpl.getKeyPrefixing`.
+    pub fn insert_raw(
+        &mut self,
+        full_key: Vec<u8>,
+        lsn: Lsn,
+        data: Option<Vec<u8>>,
+    ) -> (usize, bool) {
+        // Binary search on the stored (full) keys.
+        match self.entries.binary_search_by(|e| {
+            // When key_prefix is empty entries store full keys directly.
+            // If somehow a prefix exists (shouldn't happen for key_prefixing
+            // DBs), reconstruct. ponytail: no prefix expected here — if we
+            // see one it is a configuration bug, not a data-path concern.
+            let stored: &[u8] = if self.key_prefix.is_empty() {
+                &e.key
+            } else {
+                // fallback: compare as if prefix is empty (best effort)
+                &e.key
+            };
+            stored.cmp(full_key.as_slice())
+        }) {
+            Ok(idx) => {
+                self.entries[idx].lsn = lsn;
+                self.entries[idx].data = data;
+                self.entries[idx].dirty = true;
+                (idx, false)
+            }
+            Err(idx) => {
+                self.entries.insert(
+                    idx,
+                    BinEntry {
+                        key: full_key,
+                        lsn,
+                        data,
+                        known_deleted: false,
+                        dirty: true,
+                        expiration_time: 0,
+                    },
+                );
+                (idx, true)
             }
         }
     }
@@ -1433,6 +1506,7 @@ impl Tree {
             key_comparator: None,
             memory_counter: None,
             redo_capacity_hint: 0,
+            key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
         }
     }
 
@@ -1466,7 +1540,21 @@ impl Tree {
             key_comparator: Some(comparator),
             memory_counter: None,
             redo_capacity_hint: 0,
+            key_prefixing: false,
         }
+    }
+
+    /// Sets the key-prefixing flag.
+    ///
+    /// When `true`, BIN key-prefix compression is enabled: shared leading
+    /// bytes are factored out of each slot's key.  When `false` (the
+    /// default), keys are stored verbatim — matching JE
+    /// `DatabaseConfig.setKeyPrefixing(false)` / `IN.computeKeyPrefix`
+    /// returning `null`.
+    ///
+    /// Ref: `IN.java computeKeyPrefix` ~line 2456.
+    pub fn set_key_prefixing(&mut self, enabled: bool) {
+        self.key_prefixing = enabled;
     }
 
     /// Sets the key comparator, replacing any existing one.
@@ -2153,6 +2241,7 @@ impl Tree {
             lsn,
             self.max_entries_per_node,
             self.key_comparator.as_ref(),
+            self.key_prefixing,
         )?;
 
         // Update the memory counter for new inserts.
@@ -2273,6 +2362,7 @@ impl Tree {
             lsn,
             self.max_entries_per_node,
             self.key_comparator.as_ref(),
+            self.key_prefixing,
         )?;
 
         if result && let Some(counter) = &self.memory_counter {
@@ -2362,6 +2452,7 @@ impl Tree {
             SplitHint::Normal,
             &[],              // no insertion key at root-init time
             self.key_comparator.as_ref(),
+            self.key_prefixing,
         )?;
 
         self.root_splits.fetch_add(1, Ordering::Relaxed);
@@ -2393,6 +2484,7 @@ impl Tree {
         hint: SplitHint,
         insert_key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
+        key_prefixing: bool,
     ) -> Result<(), TreeError> {
         // The split is performed under `parent.write()` for the entire
         // duration. This is a deliberate choice for correctness:
@@ -2548,8 +2640,12 @@ impl Tree {
                 let mut left = Vec::with_capacity(max_entries);
                 left.extend_from_slice(le);
                 b.entries = left;
-                // Recompute prefix on each half after split.
-                if b.entries.len() >= 2 {
+                // Recompute prefix on each half after split (only when
+                // key_prefixing is enabled for this database).
+                // JE: IN.computeKeyPrefix returns null when
+                // databaseImpl.getKeyPrefixing() is false.
+                // Ref: IN.java computeKeyPrefix ~line 2456.
+                if key_prefixing && b.entries.len() >= 2 {
                     b.recompute_key_prefix();
                 }
             }
@@ -2607,7 +2703,7 @@ impl Tree {
                     sibling_bin.expiration_in_hours, bin_expiration_in_hours
                 );
 
-                if sibling_bin.entries.len() >= 2 {
+                if key_prefixing && sibling_bin.entries.len() >= 2 {
                     sibling_bin.recompute_key_prefix();
                 }
                 Arc::new(RwLock::new(TreeNode::Bottom(sibling_bin)))
@@ -2670,6 +2766,7 @@ impl Tree {
         lsn: Lsn,
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
+        key_prefixing: bool,
     ) -> Result<bool, TreeError> {
         Self::insert_recursive_inner(
             node_arc,
@@ -2678,6 +2775,7 @@ impl Tree {
             lsn,
             max_entries,
             key_comparator,
+            key_prefixing,
             true,  // all_left_so_far
             true,  // all_right_so_far
         )
@@ -2698,6 +2796,7 @@ impl Tree {
         lsn: Lsn,
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
+        key_prefixing: bool,
         all_left_so_far: bool,
         all_right_so_far: bool,
     ) -> Result<bool, TreeError> {
@@ -2745,13 +2844,21 @@ impl Tree {
                         let (_idx, new) =
                             bin.insert_cmp(key, lsn, Some(data), cmp.as_ref());
                         new
-                    } else {
+                    } else if key_prefixing {
                         // insert_with_prefix handles prefix recomputation when
                         // the new key shrinks the existing prefix, and also
                         // initialises the prefix when 2 entries are present for
                         // the first time.
                         let (_idx, new) =
                             bin.insert_with_prefix(key, lsn, Some(data));
+                        new
+                    } else {
+                        // key_prefixing disabled: store full key, no prefix.
+                        // JE: IN.computeKeyPrefix returns null when
+                        // databaseImpl.getKeyPrefixing() is false.
+                        // Ref: IN.java computeKeyPrefix ~line 2456.
+                        let (_idx, new) =
+                            bin.insert_raw(key, lsn, Some(data));
                         new
                     };
                     // Mark dirty after any modification.
@@ -2842,6 +2949,7 @@ impl Tree {
                     hint,
                     &key,
                     key_comparator,
+                    key_prefixing,
                 )?;
 
                 // After the split, re-find which child now covers key.
@@ -2855,6 +2963,7 @@ impl Tree {
                     lsn,
                     max_entries,
                     key_comparator,
+                    key_prefixing,
                     all_left_so_far,
                     all_right_so_far,
                 );
@@ -2872,6 +2981,7 @@ impl Tree {
                 lsn,
                 max_entries,
                 key_comparator,
+                key_prefixing,
                 all_left,
                 all_right,
             );
@@ -2900,6 +3010,7 @@ impl Tree {
         lsn: Lsn,
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
+        key_prefixing: bool,
     ) -> Result<bool, TreeError> {
         Self::redo_insert_recursive_inner(
             node_arc,
@@ -2908,6 +3019,7 @@ impl Tree {
             lsn,
             max_entries,
             key_comparator,
+            key_prefixing,
             true,
             true,
         )
@@ -2921,6 +3033,7 @@ impl Tree {
         lsn: Lsn,
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
+        key_prefixing: bool,
         all_left_so_far: bool,
         all_right_so_far: bool,
     ) -> Result<bool, TreeError> {
@@ -2941,9 +3054,18 @@ impl Tree {
                             cmp.as_ref(),
                         );
                         new
-                    } else {
+                    } else if key_prefixing {
                         let (_idx, new) =
                             bin.insert_with_prefix_slice(key, lsn, data);
+                        new
+                    } else {
+                        // key_prefixing disabled: store full key verbatim.
+                        // Ref: IN.java computeKeyPrefix ~line 2456.
+                        let (_idx, new) = bin.insert_raw(
+                            key.to_vec(),
+                            lsn,
+                            data.map(|d| d.to_vec()),
+                        );
                         new
                     };
                     bin.dirty = true;
@@ -3009,6 +3131,7 @@ impl Tree {
                     hint,
                     key,
                     key_comparator,
+                    key_prefixing,
                 )?;
                 return Self::redo_insert_recursive_inner(
                     node_arc,
@@ -3017,6 +3140,7 @@ impl Tree {
                     lsn,
                     max_entries,
                     key_comparator,
+                    key_prefixing,
                     all_left_so_far,
                     all_right_so_far,
                 );
@@ -3029,6 +3153,7 @@ impl Tree {
                 lsn,
                 max_entries,
                 key_comparator,
+                key_prefixing,
                 all_left,
                 all_right,
             );
@@ -9548,7 +9673,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
     *tree.root.write() = Some(Arc::clone(&root));
 
     // Trigger split_child on the root.
-    Tree::split_child(&root, 0, 4, Lsn::new(1, 500), SplitHint::Normal, &[], None)
+    Tree::split_child(&root, 0, 4, Lsn::new(1, 500), SplitHint::Normal, &[], None, false)
         .expect("split_child should succeed");
 
     // After the split: root has two children — left BIN and right sibling.
@@ -9755,6 +9880,126 @@ mod in_redo_tests {
         assert_eq!(restored.entries.len(), 2);
         assert_eq!(restored.entries[0].key, vec![1, 2, 3]);
         assert_eq!(restored.entries[1].key, vec![4, 5, 6]);
+    }
+}
+
+// --- Part 2 acceptance tests: key_prefixing flag (DRIFT-3) ---
+//
+// JE `IN.computeKeyPrefix` returns null when `databaseImpl.getKeyPrefixing()`
+// is false, so no prefix compression is ever applied to those BINs. Noxu was
+// always applying prefix compression. This checks that the flag is honoured.
+//
+// Ref: `IN.java computeKeyPrefix` ~line 2456,
+//      `DatabaseConfig.setKeyPrefixing` / `DatabaseImpl.getKeyPrefixing`.
+#[cfg(test)]
+mod key_prefixing_tests {
+    use super::*;
+
+    /// Helper: find the first (leftmost) BIN in the tree.
+    fn find_first_bin(node: &Arc<RwLock<TreeNode>>) -> Arc<RwLock<TreeNode>> {
+        let child_opt = {
+            let g = node.read();
+            match &*g {
+                TreeNode::Bottom(_) => None,
+                TreeNode::Internal(n) => {
+                    Some(Arc::clone(n.entries[0].child.as_ref().expect("child")))
+                }
+            }
+        };
+        match child_opt {
+            None => Arc::clone(node),
+            Some(child) => find_first_bin(&child),
+        }
+    }
+
+    /// With `key_prefixing = false` (the default), keys must be stored without
+    /// any prefix: the BIN's `key_prefix` must remain empty after inserts.
+    #[test]
+    fn test_key_prefixing_false_stores_full_keys() {
+        // Default is key_prefixing = false.
+        let tree = Tree::new(1, 16);
+        assert!(!tree.key_prefixing, "default must be false");
+
+        let lsn = noxu_util::Lsn::new(1, 10);
+        // Insert keys with a long common prefix.
+        for i in 0u8..8 {
+            let key = vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', i];
+            tree.insert(key, vec![i], lsn).expect("insert");
+        }
+
+        let root = tree.get_root().expect("root");
+        let bin_arc = find_first_bin(&root);
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(ref bin) = *guard else {
+            panic!("must be a BIN");
+        };
+        assert!(
+            bin.key_prefix.is_empty(),
+            "key_prefix must be empty when key_prefixing=false, got {:?}",
+            bin.key_prefix
+        );
+        assert_eq!(bin.entries.len(), 8);
+        // Keys must be stored as full keys.
+        assert_eq!(bin.entries[0].key, vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', 0]);
+    }
+
+    /// With `key_prefixing = true`, keys with a common prefix are compressed:
+    /// the BIN's `key_prefix` must be non-empty.
+    #[test]
+    fn test_key_prefixing_true_compresses_keys() {
+        let mut tree = Tree::new(1, 16);
+        tree.set_key_prefixing(true);
+
+        let lsn = noxu_util::Lsn::new(1, 10);
+        for i in 0u8..8 {
+            let key = vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', i];
+            tree.insert(key, vec![i], lsn).expect("insert");
+        }
+
+        let root = tree.get_root().expect("root");
+        let bin_arc = find_first_bin(&root);
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(ref bin) = *guard else {
+            panic!("must be a BIN");
+        };
+        // Prefix compression must kick in: all keys share "record:".
+        assert!(
+            !bin.key_prefix.is_empty(),
+            "key_prefix must be non-empty when key_prefixing=true"
+        );
+        assert_eq!(
+            bin.key_prefix,
+            b"record:".to_vec(),
+            "prefix must be the common prefix of all inserted keys"
+        );
+    }
+
+    /// Custom-comparator databases (sorted-dup) always bypass prefix
+    /// regardless of key_prefixing: `insert_cmp` does not touch key_prefix.
+    #[test]
+    fn test_key_prefixing_custom_comparator_no_prefix() {
+        let cmp: KeyComparatorFn = Arc::new(|a: &[u8], b: &[u8]| a.cmp(b));
+        let mut tree = Tree::new_with_comparator(1, 16, cmp);
+        // Enable key_prefixing — should have no effect via insert_cmp path.
+        tree.set_key_prefixing(true);
+
+        let lsn = noxu_util::Lsn::new(1, 10);
+        for i in 0u8..8 {
+            let key = vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', i];
+            tree.insert(key, vec![i], lsn).expect("insert");
+        }
+
+        let root = tree.get_root().expect("root");
+        let bin_arc = find_first_bin(&root);
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(ref bin) = *guard else {
+            panic!("must be a BIN");
+        };
+        // Custom-comparator path (insert_cmp) does not set key_prefix.
+        assert!(
+            bin.key_prefix.is_empty(),
+            "custom-comparator path must not set key_prefix"
+        );
     }
 }
 
