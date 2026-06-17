@@ -810,7 +810,18 @@ impl CursorImpl {
         };
         let found = slot.as_ref().is_some_and(|s| s.found);
 
-        match search_mode {
+        // Non-dup path: JE Cursor.search() converts BOTH_RANGE to BOTH (exact
+        // key+data match) when the database has no duplicates.  The BOTH_RANGE
+        // range-on-data semantic only applies to sorted-dup databases where data
+        // is part of the two-part composite key.
+        // Ref: Cursor.java search() BOTH_RANGE → BOTH conversion.
+        let effective_mode = if search_mode == SearchMode::BothRange {
+            SearchMode::Both // exact match on non-dup DB
+        } else {
+            search_mode
+        };
+
+        match effective_mode {
             SearchMode::Set | SearchMode::Both => {
                 if found {
                     // SAFETY: found => slot.is_some() && slot.found
@@ -843,7 +854,7 @@ impl CursorImpl {
                     // returned for any matching key, contradicting the
                     // documented contract on `Get::SearchBoth`.  See
                     // the 2026 review.
-                    if matches!(search_mode, SearchMode::Both) {
+                    if matches!(effective_mode, SearchMode::Both) {
                         let user_data = data.unwrap_or(&[]);
                         let stored = final_data.as_deref().unwrap_or(&[]);
                         if stored != user_data {
