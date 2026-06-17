@@ -4652,7 +4652,8 @@ impl Tree {
         }
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
         let level = i32::from_be_bytes(bytes[8..12].try_into().ok()?);
-        let n_entries = u32::from_be_bytes(bytes[12..16].try_into().ok()?) as usize;
+        let n_entries =
+            u32::from_be_bytes(bytes[12..16].try_into().ok()?) as usize;
         // dirty byte (1 byte after n_entries)
         if bytes.len() < 17 {
             return None;
@@ -4664,7 +4665,8 @@ impl Tree {
                 return None;
             }
             let key_len =
-                u16::from_be_bytes(bytes[pos..pos + 2].try_into().ok()?) as usize;
+                u16::from_be_bytes(bytes[pos..pos + 2].try_into().ok()?)
+                    as usize;
             pos += 2;
             if pos + key_len > bytes.len() {
                 return None;
@@ -4674,13 +4676,20 @@ impl Tree {
             if pos + 8 > bytes.len() {
                 return None;
             }
-            let lsn = noxu_util::Lsn::from_u64(
-                u64::from_be_bytes(bytes[pos..pos + 8].try_into().ok()?),
-            );
+            let lsn = noxu_util::Lsn::from_u64(u64::from_be_bytes(
+                bytes[pos..pos + 8].try_into().ok()?,
+            ));
             pos += 8;
             entries.push(InEntry { key, lsn, child: None });
         }
-        Some(InNodeStub { node_id, level, entries, dirty: false, generation: 0, parent: None })
+        Some(InNodeStub {
+            node_id,
+            level,
+            entries,
+            dirty: false,
+            generation: 0,
+            parent: None,
+        })
     }
 
     /// Deserialise a BIN from bytes produced by `BinStub::serialize_full()`.
@@ -4743,7 +4752,11 @@ impl Tree {
     ///
     /// JE `RecoveryManager.recoverRootIN` / `RootUpdater.doWork`
     /// (RecoveryManager.java ~lines 1293–1410).
-    fn recover_root_bin(&self, log_lsn: noxu_util::Lsn, bin: BinStub) -> InRedoResult {
+    fn recover_root_bin(
+        &self,
+        log_lsn: noxu_util::Lsn,
+        bin: BinStub,
+    ) -> InRedoResult {
         let mut root_guard = self.root.write();
         let existing_lsn = *self.root_log_lsn.read();
         match &*root_guard {
@@ -9462,7 +9475,9 @@ mod in_redo_tests {
         assert!(tree.is_empty());
         let bytes = make_bin_bytes(1, 3);
         let log_lsn = Lsn::new(1, 100);
-        let result = tree.recover_in_redo(log_lsn, /*is_root=*/true, /*is_bin=*/true, &bytes);
+        let result = tree.recover_in_redo(
+            log_lsn, /*is_root=*/ true, /*is_bin=*/ true, &bytes,
+        );
         assert_eq!(result, InRedoResult::Inserted, "expected Inserted");
         // Tree should now have 3 entries.
         assert_eq!(tree.count_entries(), 3);
@@ -9526,15 +9541,24 @@ mod in_redo_tests {
             node_id: 77,
             level: 0x10002,
             entries: vec![
-                InEntry { key: vec![1, 2, 3], lsn: Lsn::new(1, 10), child: None },
-                InEntry { key: vec![4, 5, 6], lsn: Lsn::new(1, 20), child: None },
+                InEntry {
+                    key: vec![1, 2, 3],
+                    lsn: Lsn::new(1, 10),
+                    child: None,
+                },
+                InEntry {
+                    key: vec![4, 5, 6],
+                    lsn: Lsn::new(1, 20),
+                    child: None,
+                },
             ],
             dirty: false,
             generation: 0,
             parent: None,
         });
         let bytes = node.write_to_bytes();
-        let restored = Tree::deserialize_upper_in(&bytes).expect("must deserialize");
+        let restored =
+            Tree::deserialize_upper_in(&bytes).expect("must deserialize");
         assert_eq!(restored.node_id, 77);
         assert_eq!(restored.level, 0x10002);
         assert_eq!(restored.entries.len(), 2);

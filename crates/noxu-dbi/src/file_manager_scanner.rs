@@ -413,7 +413,8 @@ impl FileManagerLogScanner {
             }
         }
 
-        let log_entry = Self::parse_payload(entry_type_num, payload, vlsn_opt, flags);
+        let log_entry =
+            Self::parse_payload(entry_type_num, payload, vlsn_opt, flags);
 
         Some((entry_size, log_entry))
     }

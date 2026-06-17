@@ -18,7 +18,7 @@ of the log. Any partially written entries are discarded.
 1. Scan backward to find the last `CheckpointEnd` entry.
 2. Read its `root_lsn` and `checkpoint_start_lsn`.
 3. Scan forward from `checkpoint_start_lsn`, reading `IN` and `BIN` entries
-   to reconstruct the in-memory B+tree.
+   logged during the last checkpoint interval into the dirty-IN map.
 
 At the end of Phase 2, the tree reflects all writes that had been checkpointed.
 
@@ -40,19 +40,56 @@ name must not survive recovery. The mapping-tree undo pass removes any
 databases whose creation was committed. No data-LN redo occurs for a database
 whose creation was rolled back.
 
-This is Noxu’s simplified equivalent of JE’s `buildTree()` phases A–D, which
+This is Noxu's simplified equivalent of JE's `buildTree()` phases A–D, which
 walk a separate on-disk `_jeNameTree` B-tree. Noxu uses a `HashMap` for the
 catalog, so the structural MapLN undo pass is replaced by a targeted name-map
 fixup.
 
-## Phase 3 — Replay and Undo LNs
+## Phase 3 — IN-redo then LN-redo
+
+### IN-redo (JE `RecoveryManager.buildINs`)
+
+1. Collect all `IN`/`BIN`/`BINDelta` entries logged in
+   `[checkpointStartLsn, EOF)` from the dirty-IN map, deduped to the
+   latest logged version per node.
+2. Sort by level **descending** (root INs first) — mirrors JE's
+   `readRootINs` / `readNonRootINs` two-pass ordering so a post-checkpoint
+   split's new root wins over any sub-tree references.
+3. Filter provisional INs (entries logged with `Provisional::Yes` or
+   `Provisional::BeforeCkptEnd` that are not covered by a `CkptEnd` — JE
+   `INFileReader.isProvisional()`).
+4. Deserialise each non-provisional IN/BIN and splice into the in-memory tree
+   using the three-case LSN currency check (JE
+   `RecoveryManager.recoverChildIN`, `RecoveryManager.java` ~line 1412):
+   - slot LSN == log LSN → noop (physical match, case 2)
+   - slot LSN < log LSN → replace (tree older, case 3)
+   - slot LSN > log LSN → skip (tree already holds newer version)
+5. For root INs (`recover_root_bin` / `recover_root_upper_in`): install
+   logged IN as root when tree is empty, or when `log_lsn > root_log_lsn`.
+6. For `BINDelta` entries: reconstitute the full BIN by reading the base
+   full BIN at `prev_full_lsn` (JE `BINDelta.reconstituteBIN`), then
+   merging the delta slots via `BinStub::apply_delta` and recomputing the
+   key prefix.
+
+### LN-redo
 
 1. Start from `first_active_lsn` (recorded in `CheckpointEnd`).
 2. Scan forward to the end of the log.
 3. For committed transactions: **redo** their LN writes to the tree.
-4. For uncommitted transactions: collect and **undo** in reverse order.
+   `redo_ln` is idempotent: if the tree already holds an equal or newer
+   LSN for the key, the write is skipped.
+4. Note: the `afterCheckpointStart` gate (JE DRIFT-2) is intentionally
+   **not** enabled. Pre-checkpoint committed LNs are always re-applied
+   because the IN-redo pass only covers BINs logged in the current
+   checkpoint interval, not baseline BINs from prior checkpoints. Until a
+   "load tree from checkpoint snapshot" path is implemented, the full
+   LN scan range is required for correctness.
 
-After Phase 3, the database is transaction-consistent: committed writes are
+## Phase 4 — Undo
+
+1. For uncommitted transactions: collect and **undo** in reverse order.
+
+After Phase 4, the database is transaction-consistent: committed writes are
 visible, uncommitted writes are not.
 
 ## Checkpoint Protocol

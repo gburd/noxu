@@ -18,6 +18,37 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Recovery IN-redo (DRIFT-1/3/4/9/10)** (`noxu-recovery`, `noxu-tree`,
+  `noxu-dbi`): Previously the recovery redo pass discarded the dirty-IN map
+  after building it, rebuilding user trees purely from committed LN replay.
+  This diverged from JE's algorithm (`RecoveryManager.buildINs`/`recoverIN`/
+  `recoverChildIN`). Three stages shipped:
+  - **Stage 1** (DRIFT-1): Deserialise `InRecord.node_data` bytes and splice
+    each IN/BIN into the in-memory tree using the JE three-case LSN currency
+    check (`recoverChildIN`, `RecoveryManager.java` ~line 1412): slot LSN ==
+    log LSN → noop; slot older → replace; slot newer → skip.
+    Root INs use `recoverRootIN` semantics (insert if absent, replace if older).
+    New `Tree::recover_in_redo`, `Tree::recover_root_bin`,
+    `Tree::recover_child_bin`, `Tree::deserialize_upper_in`,
+    `Tree::deserialize_bin`; new `InRedoResult` enum.
+  - **Stage 2** (DRIFT-3/4): Sort dirty INs by level descending (root INs
+    first) mirroring JE's `readRootINs`/`readNonRootINs` two-pass ordering.
+    Filter provisional INs (`Provisional::Yes` always skipped;
+    `Provisional::BeforeCkptEnd` replayed only when `CkptEnd.lsn > entry.lsn`;
+    JE `INFileReader.isProvisional()`). Added `InRecord.is_provisional` field
+    populated from entry-header flags 0x80/0x40.
+  - **Stage 3** (DRIFT-10): BIN-delta reconstitution during IN-redo.
+    `Tree::reconstitute_bin_delta(base_bytes, delta_bytes)` merges a delta
+    onto its base full BIN and recomputes key prefix, implementing JE
+    `BINDelta.reconstituteBIN`. Graceful degradation when the base is not
+    in the scan range.
+  - **Stage 4** (DRIFT-2 / T-F3): Re-enabling the `afterCheckpointStart` gate
+    deferred. The gate requires loading baseline BINs from the checkpoint
+    snapshot (JE loads user-DB BINs from the mapping tree); until that path
+    exists the full LN scan range is kept for correctness.
+  New crash tests: `in_redo_bin_flushed_by_checkpoint_survives_crash`,
+  `in_redo_bin_delta_reconstituted_survives_crash`.
+
 - **CC-4 residual — per-tree provisional-flag coordination** (`noxu-recovery`,
   `noxu-evictor`): The prior CC-4 fix introduced a single `AtomicI32`
   `checkpoint_max_flush_level` holding the **global** maximum dirty upper-IN

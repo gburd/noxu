@@ -1338,7 +1338,7 @@ impl RecoveryManager {
                 .filter(|e| e.record.db_id == t.get_database_id())
                 .collect();
             in_entries_sorted
-                .sort_unstable_by(|a, b| b.record.level.cmp(&a.record.level));
+                .sort_unstable_by_key(|b| std::cmp::Reverse(b.record.level));
 
             for entry in in_entries_sorted {
                 let rec = &entry.record;
@@ -1377,7 +1377,9 @@ impl RecoveryManager {
                     if prev_lsn == NULL_LSN {
                         // No full BIN ever logged — treat delta as the full BIN.
                         // This is the degenerate first-write case.
-                        if let Some(bin) = noxu_tree::Tree::deserialize_bin(node_data) {
+                        if let Some(bin) =
+                            noxu_tree::Tree::deserialize_bin(node_data)
+                        {
                             let result = t.recover_in_redo(
                                 log_lsn,
                                 rec.is_root,
@@ -1395,34 +1397,34 @@ impl RecoveryManager {
                     }
                     // Read the full BIN at prev_full_lsn.
                     // scanner.read_at_lsn returns the LogEntry at that LSN.
-                    let base_bytes =
-                        match scanner.read_at_lsn(prev_lsn) {
-                            Some(LogEntry::In(base_rec))
-                                if !base_rec.is_delta =>
-                            {
-                                base_rec.node_data.unwrap_or_default()
-                            }
-                            _ => {
-                                // Full BIN not available (may have been cleaned
-                                // away or is before the scan range).  Graceful
-                                // degrade: treat the delta as the full BIN.  The
-                                // BIN will be re-logged as a full entry at the
-                                // next checkpoint.
-                                log::debug!(
-                                    "noxu-recovery: BIN-delta reconstitution: \
+                    let base_bytes = match scanner.read_at_lsn(prev_lsn) {
+                        Some(LogEntry::In(base_rec)) if !base_rec.is_delta => {
+                            base_rec.node_data.unwrap_or_default()
+                        }
+                        _ => {
+                            // Full BIN not available (may have been cleaned
+                            // away or is before the scan range).  Graceful
+                            // degrade: treat the delta as the full BIN.  The
+                            // BIN will be re-logged as a full entry at the
+                            // next checkpoint.
+                            log::debug!(
+                                "noxu-recovery: BIN-delta reconstitution: \
                                      full BIN at prev_lsn={prev_lsn:?} not found; \
                                      treating delta as full (node_id={})",
-                                    rec.node_id,
-                                );
-                                // Use the delta bytes directly as a stub BIN
-                                // (partial data, will be fixed at next checkpoint).
-                                // This is the graceful degradation path.
-                                node_data.to_vec()
-                            }
-                        };
+                                rec.node_id,
+                            );
+                            // Use the delta bytes directly as a stub BIN
+                            // (partial data, will be fixed at next checkpoint).
+                            // This is the graceful degradation path.
+                            node_data.to_vec()
+                        }
+                    };
                     // Reconstitute: merge delta onto base.
                     if let Some(reconstituted) =
-                        noxu_tree::Tree::reconstitute_bin_delta(&base_bytes, node_data)
+                        noxu_tree::Tree::reconstitute_bin_delta(
+                            &base_bytes,
+                            node_data,
+                        )
                     {
                         let recon_bytes = reconstituted.serialize_full();
                         let result = t.recover_in_redo(
@@ -1448,7 +1450,8 @@ impl RecoveryManager {
                 }
                 // noxu_tree::BIN_LEVEL = 0x10001; anything higher is an upper IN.
                 let is_bin = rec.level <= 0x10001;
-                let result = t.recover_in_redo(log_lsn, rec.is_root, is_bin, node_data);
+                let result =
+                    t.recover_in_redo(log_lsn, rec.is_root, is_bin, node_data);
                 match result {
                     noxu_tree::InRedoResult::Inserted
                     | noxu_tree::InRedoResult::Replaced => {
@@ -1670,12 +1673,35 @@ impl RecoveryManager {
             return RedoAction::Skip;
         }
 
-        // After-checkpoint-start flag: only evaluate entries at/after ckpt
-        // start (or all entries if there is no checkpoint).
+        // After-checkpoint-start flag (JE AfterCheckpointStart).
         //
-        // AfterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
-        //           DbLsn.compareTo(reader.getLastLsn(), checkpointStartLsn) >= 0)
+        // JE `RecoveryManager.eligible_for_redo` applies this gate:
+        //   AfterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
+        //       DbLsn.compareTo(reader.getLastLsn(), checkpointStartLsn) >= 0)
+        //
+        // Stage 4 / DRIFT-2 / T-F3: this gate is intentionally NOT enabled.
+        //
+        // Enabling it safely requires that ALL committed pre-checkpoint state
+        // is represented by IN-redo (logged BINs in the analysis scan range).
+        // In Noxu, dirty_ins only contains BINs logged >= checkpointStartLsn
+        // (the current checkpoint's interval).  A BIN that was clean before
+        // the current checkpoint (already logged by a prior checkpoint and not
+        // dirtied since) is NOT in dirty_ins.  If a committed LN was written
+        // at lsn < checkpointStartLsn and its BIN was NOT re-logged in the
+        // current checkpoint, enabling the gate would silently drop that LN.
+        //
+        // To safely enable this gate, recovery must also load the checkpoint's
+        // baseline BINs from the mapping tree root (equivalent to JE loading
+        // the full mapping tree and then user-DB BINs from the checkpoint
+        // snapshot).  This requires a "load tree from checkpoint" path that
+        // does not yet exist in Noxu.  Until that path exists, the full LN
+        // scan range is required for correctness.
+        //
+        // Condition to revisit: implement checkpoint-BIN load (JE
+        // RecoveryManager reads the mapping tree from checkpointEndLsn and
+        // then reads user-DB BINs from those pointers), then re-enable here.
         let _after_ckpt_start = ckpt_start == NULL_LSN || lsn >= ckpt_start;
+        let _ = _after_ckpt_start; // gate deliberately disabled, see above
 
         match rec.txn_id {
             None => {
@@ -3556,10 +3582,7 @@ mod tests {
     fn test_provisional_in_skipped_when_no_ckpt_end() {
         let mut scanner = InMemoryLogScanner::new();
         // Provisional IN, no CkptEnd in log.
-        scanner.push(
-            lsn(0, 100),
-            LogEntry::In(make_provisional_in(1, 10, 0)),
-        );
+        scanner.push(lsn(0, 100), LogEntry::In(make_provisional_in(1, 10, 0)));
 
         let mut mgr = RecoveryManager::new();
         mgr.recover(&mut scanner, None, false).unwrap();
@@ -3584,10 +3607,7 @@ mod tests {
             LogEntry::CkptStart(CkptStartRecord { id: 1, lsn: lsn(0, 50) }),
         );
         // Provisional IN at lsn(0,100).
-        scanner.push(
-            lsn(0, 100),
-            LogEntry::In(make_provisional_in(1, 10, 0)),
-        );
+        scanner.push(lsn(0, 100), LogEntry::In(make_provisional_in(1, 10, 0)));
         // CkptEnd at lsn(0,200) > entry lsn(0,100) — covers the provisional IN.
         scanner.push(
             lsn(0, 200),

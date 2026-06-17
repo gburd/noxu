@@ -840,7 +840,8 @@ fn in_redo_bin_delta_reconstituted_survives_crash() {
         let mut val = DatabaseEntry::new();
         match db.get(None, &key, &mut val).unwrap() {
             OperationStatus::Success => {
-                let expected = if i < 5 { b"v2" as &[u8] } else { b"v1" as &[u8] };
+                let expected =
+                    if i < 5 { b"v2" as &[u8] } else { b"v1" as &[u8] };
                 assert_eq!(
                     val.data(),
                     expected,
