@@ -193,6 +193,15 @@ pub struct ReplicatedEnvironment {
     /// See finding F1 in the 2026 review.
     commit_ack_seq: std::sync::atomic::AtomicU64,
 
+    /// Durable Transaction VLSN (D7, JE RepNode.dtvlsn): the highest VLSN
+    /// known to have been replicated to a *majority* of the electable
+    /// replicas. On a master it is computed from feeder ack/heartbeat progress
+    /// (`update_dtvlsn_from_feeders`); on a replica it is set from commit/abort
+    /// records in the stream (`set_dtvlsn`). It advances monotonically (an
+    /// `update_max`). 0 = NULL_VLSN. Used by the election ranking (D2) so the
+    /// most-durable node, not merely the highest-raw-VLSN node, wins.
+    dtvlsn: std::sync::atomic::AtomicU64,
+
     /// Shared acceptor state used by the ELECTION service handler.
     /// The election driver updates `own_vlsn` / `own_term` here as the
     /// node progresses; incoming acceptor sessions read it on every
@@ -473,6 +482,7 @@ impl ReplicatedEnvironment {
             restore_registered: AtomicBool::new(restore_registered_init),
             peer_scanner,
             commit_ack_seq: std::sync::atomic::AtomicU64::new(1),
+            dtvlsn: std::sync::atomic::AtomicU64::new(0),
             election_state,
             self_weak: OnceLock::new(),
             feeder_channels: StdMutex::new(HashMap::new()),
@@ -2123,6 +2133,102 @@ impl ReplicatedEnvironment {
         if qualifies {
             self.ack_tracker.record_ack(vlsn, replica_name);
         }
+        // Recompute the DTVLSN from feeder progress whenever an ack lands.
+        self.update_dtvlsn_from_feeders();
+    }
+
+    /// Returns the current Durable Transaction VLSN (D7, JE RepNode.getDTVLSN).
+    /// The highest VLSN replicated to a majority of electable replicas; 0 if
+    /// none yet. Used by the election ranking so the most-durable node wins.
+    pub fn get_dtvlsn(&self) -> u64 {
+        self.dtvlsn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Advance the DTVLSN to `candidate` if it is greater (JE
+    /// RepNode.updateDTVLSN — an `AtomicLongMax.updateMax`). The DTVLSN can
+    /// only move forward. Returns the resulting (possibly unchanged) value.
+    pub fn update_dtvlsn(&self, candidate: u64) -> u64 {
+        use std::sync::atomic::Ordering;
+        let mut cur = self.dtvlsn.load(Ordering::Acquire);
+        while candidate > cur {
+            match self.dtvlsn.compare_exchange_weak(
+                cur,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return candidate,
+                Err(observed) => cur = observed,
+            }
+        }
+        cur
+    }
+
+    /// Set the DTVLSN from the replication stream (JE RepNode.setDTVLSN —
+    /// used exclusively by the replica, which maintains the DTVLSN from
+    /// commit/abort records). Still enforced as advance-only via update_max so
+    /// an out-of-order or stale record cannot move it backward.
+    pub fn set_dtvlsn(&self, vlsn: u64) {
+        self.update_dtvlsn(vlsn);
+    }
+
+    /// Master-side DTVLSN computation (D7, JE FeederManager.updateDTVLSN):
+    /// across the *qualifying* (electable) feeders whose replica-txn-end VLSN
+    /// exceeds the current DTVLSN, take the minimum; once a SIMPLE_MAJORITY
+    /// ack-count of them exceeds the current value, advance the DTVLSN to that
+    /// minimum (a transaction is durable once a majority hold it).
+    fn update_dtvlsn_from_feeders(&self) {
+        if !self.is_master() {
+            return;
+        }
+        let curr = self.get_dtvlsn();
+
+        // SIMPLE_MAJORITY required-ack-count over the electable group,
+        // computed the same way as await_replica_acks.
+        let group = self.get_rep_group();
+        let electable_peers: u32 = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
+            .count() as u32;
+        let electable_count = electable_peers + 1; // +1 for self/master
+        // required electable acks for SIMPLE_MAJORITY = floor(n/2) replicas
+        // (the master self-acks; a majority is reached when this many peers
+        // also hold the VLSN).
+        let durable_ack_count = electable_count / 2;
+        if durable_ack_count == 0 {
+            // Single-node (or majority is self alone): the master's own log is
+            // immediately durable up to its latest VLSN.
+            self.update_dtvlsn(self.get_current_vlsn());
+            return;
+        }
+
+        let mut min = u64::MAX;
+        let mut ack_count: u32 = 0;
+        for feeder in self.feeders.read().iter() {
+            // replicaAcksQualify: only electable feeders count (D6).
+            let qualifies = group
+                .get_node(&feeder.get_replica_name())
+                .map(|n| n.node_type == crate::node_type::NodeType::Electable)
+                .unwrap_or(false);
+            if !qualifies {
+                continue;
+            }
+            let replica_vlsn = feeder.get_acked_vlsn();
+            if replica_vlsn <= curr {
+                continue;
+            }
+            if replica_vlsn < min {
+                min = replica_vlsn;
+            }
+            ack_count += 1;
+            if ack_count >= durable_ack_count {
+                // A majority of electable replicas hold >= min: durable.
+                self.update_dtvlsn(min);
+                return;
+            }
+        }
+        // DTVLSN unchanged.
     }
 
     /// Set the state change listener.
@@ -2703,6 +2809,61 @@ mod tests {
         // An unknown replica likewise does not qualify.
         env.record_ack(1, "ghost");
         assert!(!env.get_ack_tracker().is_satisfied(1));
+    }
+
+    #[test]
+    fn test_dtvlsn_update_max_advances_only() {
+        let env = ReplicatedEnvironment::new(test_config("master")).unwrap();
+        assert_eq!(env.get_dtvlsn(), 0);
+        assert_eq!(env.update_dtvlsn(10), 10);
+        assert_eq!(env.get_dtvlsn(), 10);
+        // A lower candidate must not move it backward.
+        assert_eq!(env.update_dtvlsn(5), 10);
+        assert_eq!(env.get_dtvlsn(), 10);
+        // Equal is a no-op.
+        assert_eq!(env.update_dtvlsn(10), 10);
+        // set_dtvlsn (replica path) is also advance-only.
+        env.set_dtvlsn(7);
+        assert_eq!(env.get_dtvlsn(), 10);
+        env.set_dtvlsn(20);
+        assert_eq!(env.get_dtvlsn(), 20);
+    }
+
+    #[test]
+    fn test_dtvlsn_majority_min_across_feeders() {
+        use crate::node_type::NodeType;
+        use crate::rep_node::RepNode;
+        let env = ReplicatedEnvironment::new(test_config("master")).unwrap();
+        env.become_master(1).unwrap();
+        // Three electable replicas → electable_count = 4 (incl. master) →
+        // durable_ack_count = 2. With master self-ack, DTVLSN advances to the
+        // min of the 2 highest qualifying feeders that exceed the current
+        // DTVLSN.
+        for (i, name) in ["r1", "r2", "r3"].iter().enumerate() {
+            env.add_peer(RepNode::new(
+                name.to_string(),
+                NodeType::Electable,
+                "127.0.0.1".to_string(),
+                6100 + i as u16,
+                (i + 2) as u32,
+            ))
+            .unwrap();
+        }
+        // Register feeders with differing acked VLSNs: r1=100, r2=80, r3=50.
+        for (name, vlsn) in [("r1", 100u64), ("r2", 80), ("r3", 50)] {
+            let f = crate::stream::feeder::Feeder::new(name.to_string());
+            f.record_ack(vlsn);
+            env.feeders.write().push(f);
+        }
+        env.update_dtvlsn_from_feeders();
+        // First two qualifying feeders encountered are r1(100), r2(80);
+        // min(100,80)=80 and that is a majority (2 of 4) → DTVLSN = 80.
+        // (r3=50 < 80 is not required for durability.)
+        assert!(
+            env.get_dtvlsn() >= 80,
+            "DTVLSN must reach the majority-min (>=80), got {}",
+            env.get_dtvlsn()
+        );
     }
 
     #[test]

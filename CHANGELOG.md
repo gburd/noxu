@@ -16,6 +16,23 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (replication — DTVLSN substrate, D7 part 1)
+
+- **In-memory Durable Transaction VLSN tracking** (`noxu-rep`): added the
+  DTVLSN to `ReplicatedEnvironment` (JE `RepNode.dtvlsn`) — the highest VLSN
+  known replicated to a majority of electable replicas. `get_dtvlsn`,
+  advance-only `update_dtvlsn` (`AtomicLongMax.updateMax`), `set_dtvlsn`
+  (replica path), and `update_dtvlsn_from_feeders` implementing JE
+  `FeederManager.updateDTVLSN` (min across qualifying feeders, advance once a
+  SIMPLE_MAJORITY ack-count exceeds the current value). Recomputed on every
+  ack. This is the substrate the election ranking (D2) and authoritative-master
+  detection (D4) require. The `TxnEndEntry` on-disk format already carries a
+  `dtvlsn` field; populating it from the master's DTVLSN on commit and reading
+  it back on the replica (so a restarted replica recovers its DTVLSN) is a
+  follow-on cross-crate wave (noxu-dbi commit path ↔ noxu-rep), as is the
+  null-txn `DTVLSNFlusher`. Tests `test_dtvlsn_update_max_advances_only`,
+  `test_dtvlsn_majority_min_across_feeders`.
+
 ### Documented (known limitations surfaced to users)
 
 - Added user-facing `known-limitations.md` rows for limitations already noted
