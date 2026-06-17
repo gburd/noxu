@@ -599,6 +599,24 @@ impl Bin {
         self.inner.max_entries()
     }
 
+    /// Grows the BIN's capacity to `new_max` entries.
+    ///
+    /// Called by `mutate_to_full_bin` (`reconstituteBIN` in JE) when applying
+    /// a delta would require more slots than the full BIN currently has.
+    /// The BIN is added to the compressor queue (outside this method — the
+    /// caller's responsibility) so it will be shrunk back after the delta is
+    /// applied and the excess slots become compressible.
+    ///
+    /// JE `BIN.reconstituteBIN` ~line 2383:
+    ///   `if maxEntries > fullBIN.getMaxEntries()) fullBIN.resize(maxEntries);`
+    ///
+    /// No-op if `new_max <= current max_entries`.
+    pub fn resize(&mut self, new_max: usize) {
+        if new_max > self.inner.max_entries() {
+            self.inner.max_entries = new_max;
+        }
+    }
+
     /// Gets the full (decompressed) key at the given slot index.
     ///
     /// When prefix compression is active the returned `Vec` is freshly
@@ -1429,7 +1447,17 @@ impl Bin {
     /// `full_bin` must be the full BIN matching `self.last_full_version`.
     /// After the call `self` is a full BIN.
     ///
+    /// Implements JE `BIN.reconstituteBIN` ~line 2383:
+    /// 1. Compress non-dirty deleted slots on the full BIN (handles the case
+    ///    where slots were compressed away before the delta was logged but the
+    ///    compressed full BIN was never re-written).
+    /// 2. Count how many delta slots are new insertions (key not in full BIN).
+    /// 3. If `n_insertions + full_bin.n_entries > full_bin.max_entries`, grow
+    ///    the full BIN so the delta application doesn't overflow.
+    /// 4. Apply all delta slots onto the resized full BIN.
     ///
+    /// Ref: JE `BIN.reconstituteBIN` ~line 2383,
+    ///      `BIN.mutateToFullBIN` ~line 2195.
     pub fn mutate_to_full_bin(
         &mut self,
         full_bin: &mut Bin,
@@ -1437,14 +1465,38 @@ impl Bin {
     ) {
         assert!(self.is_bin_delta(), "mutate_to_full_bin called on non-delta");
 
-        // Apply each delta slot onto the full BIN.
+        // Step 1: compress non-dirty deleted slots on the full BIN.
+        // JE `reconstituteBIN`: `if (!dbImpl.getEnv().isInInit())`
+        //   `fullBIN.compress(false /*compressDirtySlots*/, null);`
+        // Noxu has no recovery/init flag here; compress unconditionally
+        // (the guard against compressing during recovery is handled by the
+        // caller not calling mutate_to_full_bin during recovery init).
+        // No cursors on `full_bin` at this point (it was just fetched from log).
+        if full_bin.n_cursors() == 0 && !full_bin.is_bin_delta() {
+            full_bin.compress(false /*compress_dirty_slots*/);
+        }
+
+        // Step 2: count delta slots that are insertions (key absent from
+        // full BIN). We need to pre-size the full BIN to avoid overflowing
+        // its capacity mid-application.
+        // JE: `for (int i=0; i<getNEntries(); i++) { if (found < 0 || no exact) nInsertions++; }`
+        let mut n_insertions = if leave_free_slot { 1usize } else { 0 };
         let delta_n = self.get_n_entries();
         for i in 0..delta_n {
             let key = self.get_key(i).unwrap_or_default();
-            let lsn = self.inner.get_lsn(i);
-            let state = self.inner.get_state(i);
-            let embedded = self.slot_embedded_data.get(i).cloned().flatten();
-            full_bin.apply_delta_slot(key, lsn, state, embedded);
+            let (_, exact) = full_bin.find_entry_compressed(&key);
+            if !exact {
+                n_insertions += 1;
+            }
+        }
+
+        // Step 3: resize if necessary.
+        // JE: `if (maxEntries > fullBIN.getMaxEntries()) fullBIN.resize(maxEntries);`
+        let needed = n_insertions + full_bin.get_n_entries();
+        if needed > full_bin.max_entries() {
+            full_bin.resize(needed);
+            // (Caller should add full_bin to the compressor queue if it was
+            // enlarged, so excess empty slots are reclaimed.)
         }
 
         if leave_free_slot && full_bin.get_n_entries() >= full_bin.max_entries()
@@ -1453,6 +1505,15 @@ impl Bin {
                 "mutate_to_full_bin: leave_free_slot requested but BIN is full (n={})",
                 full_bin.get_n_entries()
             );
+        }
+
+        // Step 4: apply delta slots.
+        for i in 0..delta_n {
+            let key = self.get_key(i).unwrap_or_default();
+            let lsn = self.inner.get_lsn(i);
+            let state = self.inner.get_state(i);
+            let embedded = self.slot_embedded_data.get(i).cloned().flatten();
+            full_bin.apply_delta_slot(key, lsn, state, embedded);
         }
 
         // Swap contents so self becomes the full BIN.
@@ -3833,6 +3894,122 @@ mod tests {
         // Old formula (total/4 = 2) would have returned false here:
         // 3 > 2 → full BIN. The new formula returns true: 3 <= 3.
         // This confirms the fix is observable.
+    }
+
+    // --- Part 4 acceptance tests: reconstituteBIN pre-compression + resize (DRIFT-5) ---
+    //
+    // JE BIN.reconstituteBIN: before applying delta slots,
+    //  1. compress non-dirty deleted slots on the full BIN;
+    //  2. count new insertions; resize if n_insertions + n_entries > max_entries.
+    // Noxu mutate_to_full_bin previously skipped both steps.
+    //
+    // Ref: BIN.java reconstituteBIN ~line 2383, mutateToFullBIN ~line 2195.
+
+    /// Scenario: full BIN has a deleted slot (compressed away between full
+    /// write and delta write). The delta inserts a new key. Without resize,
+    /// applying the delta would overshoot max_entries.
+    ///
+    /// With the fix: compress() removes the defunct slot first, making room;
+    /// resize kicks in only if still needed.
+    #[test]
+    fn test_mutate_to_full_bin_resize_for_new_insertion() {
+        let max = 4usize;
+
+        // Build a full BIN at capacity with one known-deleted slot.
+        let mut full = Bin::new(1, max);
+        full.last_full_version = noxu_util::Lsn::new(1, 10);
+        for i in 0u8..max as u8 {
+            full.insert_entry(
+                vec![i],
+                noxu_util::Lsn::new(1, i as u32 + 1),
+                0,
+                None,
+            )
+            .expect("insert full");
+        }
+        assert_eq!(full.get_n_entries(), max);
+        // Mark slot 0 as known-deleted (defunct, non-dirty).
+        full.inner.states[0] = crate::entry_states::KNOWN_DELETED_BIT;
+        assert_eq!(full.max_entries(), max);
+
+        // Build a BIN-delta with ONE new key that is NOT in the full BIN.
+        let mut delta = Bin::new(2, 4);
+        delta.last_full_version = noxu_util::Lsn::new(1, 10);
+        delta.insert_entry(
+            vec![100u8],
+            noxu_util::Lsn::new(1, 20),
+            DIRTY_BIT,
+            None,
+        )
+        .expect("insert delta");
+        delta.inner.set_bin_delta(true);
+
+        // Merge: delta.mutate_to_full_bin(&mut full).
+        // After compress: slot 0 (known-deleted, non-dirty) is removed.
+        // n_entries = 3.  n_insertions = 1 (key=100 is new).
+        // needed = 4 = max_entries; no resize needed.
+        delta.mutate_to_full_bin(&mut full, false);
+
+        // Resulting BIN must contain the 3 surviving original keys + new key.
+        assert!(!delta.is_bin_delta(), "must be full BIN after mutation");
+        let n = delta.get_n_entries();
+        assert!(
+            n <= delta.max_entries(),
+            "entry count {n} must not exceed max_entries {}",
+            delta.max_entries()
+        );
+        // The new key must be present.
+        let (_, exact) = delta.find_entry_compressed(&[100u8]);
+        assert!(exact, "new key from delta must be in merged BIN");
+        // The deleted slot must be gone.
+        let (_, del_exact) = delta.find_entry_compressed(&[0u8]);
+        assert!(!del_exact, "deleted slot 0 must have been compressed away");
+    }
+
+    /// If compress doesn't free enough room and the delta has more new keys
+    /// than available slots, resize must enlarge max_entries.
+    #[test]
+    fn test_mutate_to_full_bin_resize_enlarges_bin() {
+        let max = 4usize;
+
+        // Full BIN at capacity, all slots live (no room to compress).
+        let mut full = Bin::new(1, max);
+        full.last_full_version = noxu_util::Lsn::new(1, 10);
+        for i in 0u8..max as u8 {
+            full.insert_entry(
+                vec![i],
+                noxu_util::Lsn::new(1, i as u32 + 1),
+                0,
+                None,
+            )
+            .expect("insert");
+        }
+        assert_eq!(full.get_n_entries(), max);
+
+        // Delta with 2 new keys.
+        let mut delta = Bin::new(2, 4);
+        delta.last_full_version = noxu_util::Lsn::new(1, 10);
+        for k in [100u8, 101u8] {
+            delta.insert_entry(
+                vec![k],
+                noxu_util::Lsn::new(1, 20),
+                DIRTY_BIT,
+                None,
+            )
+            .expect("insert delta");
+        }
+        delta.inner.set_bin_delta(true);
+
+        delta.mutate_to_full_bin(&mut full, false);
+
+        // max_entries must have grown (needed = 4+2 = 6 > original 4).
+        assert_eq!(
+            delta.max_entries(),
+            6,
+            "max_entries must be resized to accommodate all entries"
+        );
+        assert_eq!(delta.get_n_entries(), 6);
+        assert!(!delta.is_bin_delta());
     }
 }
 

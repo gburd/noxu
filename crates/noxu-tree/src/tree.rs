@@ -2461,20 +2461,26 @@ impl Tree {
 
     /// Splits the child at `child_index` in `parent`.
     ///
-    /// .
+    /// .  This implementation always keeps the **left** half in the
+    /// existing child node (`child_arc`) and puts the right half in the new
+    /// sibling, regardless of where the `identifierKey` falls.  JE's
+    /// `IN.splitInternal` (`idKeyIndex` logic ~line 4172) can place either
+    /// half in the existing node; Noxu's preemptive-split discipline ensures
+    /// the parent always has a free slot at split time (the split is done on
+    /// the way *down*, before the parent fills up), so the safe simplification
+    /// of always using the left half is correct here — no routing information
+    /// is lost.  This comment replaces the previous incorrect claim that
+    /// `idKeyIndex` drove the choice.
     ///
     /// Note: does not emit a split log entry; split nodes are marked dirty
     /// and flushed at the next checkpoint (flush_dirty_bins/upper_ins).
     ///
     /// ```text
-    /// 1. splitIndex = child.nEntries / 2
-    ///    (idKeyIndex determines which half keeps the identifier key)
+    /// 1. splitIndex = child.nEntries / 2  (or 1 / n-1 for splitSpecial)
     /// 2. Create newSibling at the same level.
-    /// 3. Move entries [low..high) from child to newSibling.
-    /// 4. If low == 0: replace parent slot childIndex -> newSibling,
-    ///    insert child (now right half) with its new first key.
-    ///    Else:        update parent slot childIndex -> child (left half),
-    ///    insert newSibling with newIdKey.
+    /// 3. Move entries [splitIndex..nEntries) to newSibling.
+    /// 4. Update parent slot childIndex -> child (left half),
+    ///    insert newSibling with newIdKey after childIndex.
     /// ```
     fn split_child(
         parent: &Arc<RwLock<TreeNode>>,
