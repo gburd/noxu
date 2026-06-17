@@ -51,6 +51,52 @@ listed in [References](#references).
   Updated existing tests: `test_cc4_below_max_flush_level_yields_provisional_yes`,
   `test_cc4_at_or_above_max_flush_level_yields_provisional_no`,
   `test_cc4_guard_resets_max_flush_level`, `test_checkpoint_guard`.
+- **R3 — comparator-aware BIN navigation in `get_next_bin` / `get_prev_bin`** (`noxu-tree`):
+  `get_adjacent_bin_attempt` was a `static fn` without comparator access, so
+  the IN-level descent used raw byte `<=` instead of the configured custom
+  comparator.  For sorted-dup / secondary-index databases where comparator order
+  ≠ byte order this produced wrong adjacent-BIN lookups and incorrect cursor
+  iteration across BIN boundaries.  Fixed by converting to `&self` methods and
+  routing through `upper_in_floor_index` (comparator-aware, St-H4 binary search).
+  JE: `Tree.getNextIN` / `Tree.getPrevIN` use comparator-aware `IN.findEntry`.
+
+- **R4 — comparator-aware descent in `cursor_impl::find_bin_for_key`** (`noxu-dbi`):
+  The cursor's own IN-routing helper used raw byte `<=` in its linear floor scan.
+  All seven call-sites now receive `tree.get_comparator()` and the comparison
+  honours the custom comparator.  Exposed `Tree::get_comparator(&self)` for this.
+  JE: `CursorImpl` descent helpers delegate to `IN.findEntry` (comparator-aware).
+
+- **TXN-1 — unconditional deadlock re-check in `lock_with_sharing_and_timeout`** (`noxu-txn`):
+  The sharing-path wait loop only re-ran deadlock detection on `timed_out.timed_out()`
+  (every 50 ms slice) and used stale owner IDs captured at Phase 1.  The plain
+  `lock_with_timeout` path already re-checked after every wakeup with fresh owner IDs;
+  now `lock_with_sharing_and_timeout` mirrors it exactly.
+  JE: `LockManager.waitForLock` checks deadlock every loop iteration unconditionally.
+
+- **TXN-4 — `lock_ln` validates txn state even for read-uncommitted** (`noxu-dbi`):
+  `CursorImpl::lock_ln` early-returned for read-uncommitted cursors without calling
+  `guard.lock()`, so an `Aborted` or `MustAbort` txn doing a dirty read was not
+  caught and silently returned stale data.  Now calls `guard.lock(lsn,
+  LockType::None, false)` before returning; `LockType::None` runs `check_state`
+  inside `Txn::lock` and returns `NoneNeeded` immediately (no real lock acquired).
+  Also added `NoneNeeded` early-return guard in `Txn::lock` to prevent phantom
+  `read_locks` tracking entries.
+  JE: `CursorImpl.lockLN` calls `locker.lock(lsn, LockType.NONE, ...)` even for
+  dirty reads so `checkState`/`checkPreempted` runs.
+
+- **TXN-5 — `HandleLocker` shares locks with non-transactional buddy** (`noxu-txn`):
+  `HandleLocker::with_buddy` previously set `share_with_txn_id = None` when the
+  buddy was non-transactional (dropping the buddy entirely), so
+  `shares_locks_with` always returned `false` for non-txn buddies.  Added
+  `share_with_non_txn_id` field; `with_buddy` now stores the buddy ID in the
+  correct field; `shares_locks_with` checks both.
+  JE: `HandleLocker.sharesLocksWith` checks `shareWithNonTxnlLocker` by identity.
+
+- **TXN-6 — documented `select_victim` vs JE anti-livelock rationale** (`noxu-txn`):
+  Added rustdoc to `DeadlockDetector::select_victim` explaining the Noxu
+  deterministic "fewest locks then youngest" criterion and the JE
+  `DeadlockChecker.chooseTargetedLocker` pseudo-random choice (anti-livelock
+  on repeated identical deadlocks).  No code change; both strategies are correct.
 
 - **CLN-4 (wiring) — first-active-transaction file clamping now live** (`noxu-cleaner`):
   `Cleaner::do_clean` now reads `TxnManager::get_first_active_lsn()` and skips

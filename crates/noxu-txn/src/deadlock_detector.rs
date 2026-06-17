@@ -86,7 +86,7 @@ impl DeadlockDetector {
 
     /// Selects the deadlock victim from a cycle.
     ///
-    /// algorithm:
+    /// ## Algorithm
     ///
     /// 1. Select the locker with the **fewest locks held**.  A transaction
     ///    with fewer locks has done less work, so aborting it wastes less.
@@ -95,8 +95,22 @@ impl DeadlockDetector {
     ///    created = youngest.  Aborting the youngest preserves the most
     ///    accumulated work in the system.
     ///
-    /// `LockManager.selectVictim()`:
-    /// `victim = locker with min(n_owners), ties broken by max(locker_id)`.
+    /// ## JE comparison (TXN-6, 2026-06-16)
+    ///
+    /// JE `DeadlockChecker.chooseTargetedLocker` picks the victim by
+    /// identity-hash pseudo-random selection from lockers sorted by thread ID,
+    /// deliberately varying the victim across repeated identical deadlocks to
+    /// avoid always aborting the same transaction (anti-livelock).
+    ///
+    /// Noxu uses a deterministic "fewest locks then youngest" criterion instead.
+    /// This is also correct (any victim breaks the cycle) and minimises rollback
+    /// work. The trade-off: on a repeated *identical* deadlock involving
+    /// transactions with the same lock counts, Noxu will always pick the same
+    /// victim, which could theoretically livelock a workload that immediately
+    /// re-forms the same cycle. In practice this is rare, and the deterministic
+    /// choice aids test reproducibility. If livelock on repeated identical
+    /// deadlocks becomes a problem in production, add a tie-break using
+    /// `locker_id % some_prime` or a per-cycle random salt.
     ///
     /// # Arguments
     ///
