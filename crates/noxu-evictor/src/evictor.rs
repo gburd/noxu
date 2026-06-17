@@ -280,9 +280,9 @@ impl Evictor {
     /// Wire a checkpointer for CC-4 provisional-flag coordination.
     ///
     /// When set, `flush_dirty_node_to_log` queries
-    /// `checkpointer.get_eviction_provisional(node_level)` to choose
+    /// `checkpointer.get_eviction_provisional(db_id, node_level)` to choose
     /// `Provisional::Yes` or `Provisional::No` for evicted BINs, matching JE
-    /// `Checkpointer.coordinateEvictionWithCheckpoint`.
+    /// `Checkpointer.coordinateEvictionWithCheckpoint` (per-tree lookup).
     pub fn with_checkpointer(mut self, ckpt: Arc<Checkpointer>) -> Self {
         self.checkpointer = Some(ckpt);
         self
@@ -751,7 +751,7 @@ impl Evictor {
         let provisional = self
             .checkpointer
             .as_ref()
-            .map(|c| c.get_eviction_provisional(bin.level))
+            .map(|c| c.get_eviction_provisional(self.db_id, bin.level))
             .unwrap_or(Provisional::No);
 
         let full_bytes = bin.serialize_full();

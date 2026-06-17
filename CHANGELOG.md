@@ -18,6 +18,40 @@ listed in [References](#references).
 
 ### Fixed
 
+- **CC-4 residual — per-tree provisional-flag coordination** (`noxu-recovery`,
+  `noxu-evictor`): The prior CC-4 fix introduced a single `AtomicI32`
+  `checkpoint_max_flush_level` holding the **global** maximum dirty upper-IN
+  level across all trees.  In a multi-database environment where tree A has no
+  dirty upper INs and tree B does, a dirty BIN evicted from tree A was logged
+  `Provisional::Yes` (because `node_level < global_max_level` from tree B).
+  However, the checkpoint writes no non-provisional ancestor for tree A, so
+  recovery discards the provisional BIN → if a crash occurs before the next
+  checkpoint re-logs that BIN, tree A's mutation is **silently lost**.
+
+  Root cause: JE's `DirtyINMap` holds a `Map<DatabaseImpl, Integer>`
+  (`highestFlushLevels`) keyed per-`DatabaseImpl`; `getHighestFlushLevel(db)`
+  returns `IN.MIN_LEVEL` (0) for databases absent from the map, making the
+  comparison false → `Provisional.NO`.  Noxu collapsed this to one global
+  value, breaking the per-tree guarantee.
+
+  Fix (option A — faithful): replace `checkpoint_max_flush_level: AtomicI32`
+  with `checkpoint_flush_levels: Mutex<HashMap<u64, i32>>`.  Only trees that
+  have dirty upper INs get an entry.  `get_eviction_provisional(db_id,
+  node_level)` looks up the tree's level; absent entry → 0 → `Provisional::No`.
+  `CheckpointGuard::drop` clears the map before clearing `in_progress`.
+  Evictor passes `self.db_id` to `get_eviction_provisional`.
+
+  JE ref: `DirtyINMap.coordinateEvictionWithCheckpoint` /
+  `DirtyINMap.getHighestFlushLevel` (per-`DatabaseImpl` lookup).
+
+  Acceptance test (fail-pre/pass-post):
+  `test_cc4_residual_tree_a_no_upper_ins_yields_provisional_no` — two trees,
+  tree A absent from flush-levels map, tree B present; asserts tree A's BIN
+  gets `Provisional::No`, tree B's BIN gets `Provisional::Yes`.
+  Updated existing tests: `test_cc4_below_max_flush_level_yields_provisional_yes`,
+  `test_cc4_at_or_above_max_flush_level_yields_provisional_no`,
+  `test_cc4_guard_resets_max_flush_level`, `test_checkpoint_guard`.
+
 - **CLN-4 (wiring) — first-active-transaction file clamping now live** (`noxu-cleaner`):
   `Cleaner::do_clean` now reads `TxnManager::get_first_active_lsn()` and skips
   files whose `file_number >= first_active_txn_file`, preventing the cleaner

@@ -20,7 +20,7 @@ use noxu_txn::TxnManager;
 use noxu_util::{Lsn, NULL_LSN};
 use parking_lot::RwLock as NodeRwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, RwLock};
 
 /// Configuration for checkpoint behavior.
@@ -149,20 +149,22 @@ pub struct Checkpointer {
     last_checkpoint_end: Mutex<Lsn>,
     /// Whether a checkpoint is in progress
     checkpoint_in_progress: AtomicBool,
-    /// The highest IN-level being flushed in the current checkpoint pass.
+    /// Per-database highest IN-level being flushed in the current checkpoint.
     ///
-    /// Set to the root level (max dirty-IN level) when `flush_upper_ins_internal`
-    /// begins, and reset to 0 when the checkpoint completes or is abandoned.
+    /// Maps `db_id → highest dirty upper-IN level` for every tree that has
+    /// dirty upper INs in this checkpoint pass.  A tree absent from the map
+    /// has no dirty upper INs → its highest flush level is 0 → an evicted BIN
+    /// from that tree gets `Provisional::No` (no covering ancestor will be
+    /// written).  Cleared when the checkpoint finishes or is abandoned.
     ///
-    /// The evictor reads this value to decide whether an evicted BIN/IN should
-    /// be logged as `Provisional::Yes` (node level < flush level, so the
-    /// checkpoint's non-provisional ancestor will subsume it) or
-    /// `Provisional::No` (no in-progress checkpoint or node is at/above the
-    /// flush level).
+    /// JE ref: `DirtyINMap.highestFlushLevels` (per-`DatabaseImpl` map) /
+    /// `DirtyINMap.coordinateEvictionWithCheckpoint` / `getHighestFlushLevel`.
     ///
-    /// JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` /
-    /// `DirtyINMap.coordinateEvictionWithCheckpoint`, `highestFlushLevel`.
-    checkpoint_max_flush_level: AtomicI32,
+    /// CC-4 residual fix: the old single `AtomicI32` held the *global* max
+    /// across all trees, causing a BIN evicted from a tree with **no** dirty
+    /// upper INs to be logged `Provisional::Yes` (covered by a non-provisional
+    /// ancestor that the checkpoint never actually writes for that tree).
+    checkpoint_flush_levels: std::sync::Mutex<HashMap<u64, i32>>,
     /// Shutdown flag
     shutdown: AtomicBool,
     /// Condvar for interruptible daemon sleep — notified by `request_shutdown()`
@@ -242,7 +244,7 @@ impl Checkpointer {
             last_checkpoint_start: Mutex::new(noxu_util::NULL_LSN),
             last_checkpoint_end: Mutex::new(noxu_util::NULL_LSN),
             checkpoint_in_progress: AtomicBool::new(false),
-            checkpoint_max_flush_level: AtomicI32::new(0),
+            checkpoint_flush_levels: std::sync::Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             shutdown_condvar: Condvar::new(),
             shutdown_mutex: std::sync::Mutex::new(false),
@@ -456,10 +458,10 @@ impl Checkpointer {
 
         let start_time = std::time::Instant::now();
 
-        // Ensure we clear the in-progress flag (and max_flush_level) on exit.
+        // Ensure we clear the in-progress flag (and flush_levels map) on exit.
         let _guard = CheckpointGuard {
             flag: &self.checkpoint_in_progress,
-            max_flush_level: &self.checkpoint_max_flush_level,
+            flush_levels: &self.checkpoint_flush_levels,
         };
 
         // Step 1: Generate checkpoint ID
@@ -643,30 +645,51 @@ impl Checkpointer {
     /// Choose the [`Provisional`] flag for a node being evicted by the evictor.
     ///
     /// Returns `Provisional::Yes` when a checkpoint is in progress **and** the
-    /// node's level is strictly below the checkpoint's highest flush level
-    /// (meaning the checkpoint will log a non-provisional ancestor that subsumes
-    /// this entry).  Returns `Provisional::No` in all other cases.
+    /// node's level is strictly below the **tree-specific** highest flush level
+    /// for `db_id` (meaning the checkpoint will write a non-provisional ancestor
+    /// for that tree that subsumes this entry).  Returns `Provisional::No` if
+    /// no checkpoint is in progress, or if `db_id` has no dirty upper INs in
+    /// this checkpoint (level absent from map → 0 → not covered).
     ///
     /// # JE reference
-    /// `Checkpointer.coordinateEvictionWithCheckpoint` /
-    /// `DirtyINMap.coordinateEvictionWithCheckpoint` (`highestFlushLevel`
-    /// comparison, CC-4 fix).
+    /// `Checkpointer.coordinateEvictionWithCheckpoint` →
+    /// `DirtyINMap.coordinateEvictionWithCheckpoint` which calls
+    /// `getHighestFlushLevel(db)` — **per-`DatabaseImpl`** lookup.  If the db
+    /// is absent from `highestFlushLevels`, `getHighestFlushLevel` returns
+    /// `IN.MIN_LEVEL` (≤ 0) making the comparison false → `Provisional::NO`.
     ///
-    /// # Safety
-    /// The checkpoint state is read with `Acquire` ordering; the caller
-    /// observes a consistent snapshot.  A very small race window remains:
-    /// if the checkpoint completes between the `in_progress` read and the
-    /// log write, the entry may be logged as provisional without a covering
-    /// non-provisional ancestor in this checkpoint.  The subsequent
-    /// checkpoint or a recovery re-scan will reconcile this — the same
-    /// benign race exists in JE.  Logging provisional when not strictly
-    /// required is safe; the reverse (logging non-provisional when
-    /// provisional was needed) is what causes recovery inconsistency.
-    pub fn get_eviction_provisional(&self, node_level: i32) -> Provisional {
+    /// # CC-4 residual
+    /// The prior implementation stored a single global max-level (`AtomicI32`)
+    /// that was the maximum across ALL trees.  A BIN evicted from tree A (no
+    /// dirty upper INs) got `Provisional::Yes` because tree B's level was
+    /// non-zero, but NO non-provisional ancestor was written for tree A →
+    /// recovery discards the provisional BIN → data loss on crash before the
+    /// next checkpoint.  Per-tree lookup (this method) fixes that: tree A's
+    /// level is absent → 0 → `Provisional::No` (authoritative log entry).
+    ///
+    /// # Race window
+    /// Same benign race as JE: if the checkpoint finishes between the
+    /// `in_progress` read and the log write, the BIN may be logged
+    /// `Provisional::Yes` without a covering ancestor in *this* checkpoint, but
+    /// the next checkpoint will cover it.  Logging `Yes` without strict need is
+    /// safe (log bloat only); the reverse is what causes recovery inconsistency.
+    pub fn get_eviction_provisional(
+        &self,
+        db_id: u64,
+        node_level: i32,
+    ) -> Provisional {
         if !self.checkpoint_in_progress.load(Ordering::Acquire) {
             return Provisional::No;
         }
-        let max_flush = self.checkpoint_max_flush_level.load(Ordering::Acquire);
+        // Look up this tree's flush level.  Missing entry means no dirty upper
+        // INs → level 0 → condition false → Provisional::No.
+        let max_flush = self
+            .checkpoint_flush_levels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&db_id)
+            .copied()
+            .unwrap_or(0);
         if max_flush > 0 && node_level < max_flush {
             Provisional::Yes
         } else {
@@ -929,25 +952,39 @@ impl Checkpointer {
             }
         }
 
-        // CC-4: determine the global maximum IN level across all trees before
-        // any logging begins.  Store it in checkpoint_max_flush_level so the
-        // evictor can decide Provisional::Yes vs Provisional::No for
-        // concurrently evicted nodes (JE coordinateEvictionWithCheckpoint).
+        // CC-4 residual fix: compute the per-tree highest flush level before
+        // any logging begins.  Populate checkpoint_flush_levels with one entry
+        // per tree that has dirty upper INs.  Trees absent from the map have
+        // no dirty upper INs → their BINs must NOT be logged Provisional::Yes.
         //
-        // The level is published with Release ordering before the first WAL
-        // write; the evictor reads it with Acquire ordering.  The RAII guard
-        // in do_checkpoint resets it to 0 via CheckpointGuard::drop.
-        let global_max_level: i32 = trees_to_flush
-            .iter()
-            .filter_map(|(_, tree_arc)| {
-                let guard = tree_arc.read().ok()?;
-                let dirty_ins = guard.collect_dirty_upper_ins(0); // db_id unused here
-                dirty_ins.iter().map(|(lvl, _)| *lvl).max()
-            })
-            .max()
-            .unwrap_or(0);
-        self.checkpoint_max_flush_level
-            .store(global_max_level, Ordering::Release);
+        // JE ref: DirtyINMap.highestFlushLevels (Map<DatabaseImpl, Integer>);
+        // getHighestFlushLevel(db) returns IN.MIN_LEVEL (0) for absent keys,
+        // making coordinateEvictionWithCheckpoint return Provisional.NO.
+        //
+        // Memory ordering: the map is populated inside the Mutex before the
+        // first WAL write.  The evictor acquires the same Mutex to read it
+        // (Mutex provides the necessary happens-before).  The RAII guard in
+        // do_checkpoint clears the map via CheckpointGuard::drop.
+        {
+            let mut levels = self
+                .checkpoint_flush_levels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            levels.clear();
+            for (db_id, tree_arc) in &trees_to_flush {
+                let max_level = tree_arc
+                    .read()
+                    .ok()
+                    .and_then(|guard| {
+                        let dirty_ins = guard.collect_dirty_upper_ins(*db_id);
+                        dirty_ins.iter().map(|(lvl, _)| *lvl).max()
+                    })
+                    .unwrap_or(0);
+                if max_level > 0 {
+                    levels.insert(*db_id, max_level);
+                }
+            }
+        }
 
         for (db_id, tree_arc) in trees_to_flush {
             let r = Self::flush_one_tree_upper_ins(db_id, &tree_arc, lm)?;
@@ -1028,22 +1065,24 @@ impl Checkpointer {
     }
 }
 
-/// RAII guard to ensure checkpoint_in_progress and checkpoint_max_flush_level
+/// RAII guard to ensure `checkpoint_in_progress` and `checkpoint_flush_levels`
 /// are cleared when the checkpoint finishes or is abandoned.
 ///
-/// CC-4: max_flush_level must be reset to 0 so the evictor stops using
-/// Provisional::Yes after the checkpoint is done.
+/// CC-4 residual: `flush_levels` must be cleared so the evictor stops
+/// returning `Provisional::Yes` for any tree after the checkpoint ends.
 struct CheckpointGuard<'a> {
     flag: &'a AtomicBool,
-    max_flush_level: &'a AtomicI32,
+    flush_levels: &'a std::sync::Mutex<HashMap<u64, i32>>,
 }
 
 impl<'a> Drop for CheckpointGuard<'a> {
     fn drop(&mut self) {
-        // Reset max_flush_level before clearing the in_progress flag so that
-        // if the evictor reads in_progress=true it will still see the level;
-        // once in_progress goes false the level value is irrelevant.
-        self.max_flush_level.store(0, Ordering::Release);
+        // Clear per-tree flush levels before clearing the in_progress flag.
+        // An evictor that reads in_progress=true will still see the (stale)
+        // map; once in_progress goes false the map contents are irrelevant.
+        if let Ok(mut levels) = self.flush_levels.lock() {
+            levels.clear();
+        }
         self.flag.store(false, Ordering::Release);
     }
 }
@@ -1176,18 +1215,17 @@ mod tests {
     #[test]
     fn test_checkpoint_guard() {
         let flag = AtomicBool::new(false);
-        let level = AtomicI32::new(42);
+        let levels: std::sync::Mutex<HashMap<u64, i32>> =
+            std::sync::Mutex::new(HashMap::from([(1u64, 3i32)]));
         {
             flag.store(true, Ordering::Release);
-            let _guard =
-                CheckpointGuard { flag: &flag, max_flush_level: &level };
+            let _guard = CheckpointGuard { flag: &flag, flush_levels: &levels };
             assert!(flag.load(Ordering::Acquire));
         }
         assert!(!flag.load(Ordering::Acquire));
-        assert_eq!(
-            level.load(Ordering::Acquire),
-            0,
-            "guard must reset max_flush_level"
+        assert!(
+            levels.lock().unwrap().is_empty(),
+            "guard must clear flush_levels map"
         );
     }
 
@@ -1592,11 +1630,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CC-4: get_eviction_provisional tests
+    // CC-4: get_eviction_provisional tests (per-tree after residual fix)
     // -----------------------------------------------------------------------
 
     /// CC-4 acceptance test 1: Provisional::No when no checkpoint is in
-    /// progress, regardless of node level.
+    /// progress, regardless of db_id or node level.
     ///
     /// JE ref: coordinateEvictionWithCheckpoint — if no checkpoint is active,
     /// evicted nodes are logged non-provisionally.
@@ -1604,36 +1642,36 @@ mod tests {
     fn test_cc4_no_checkpoint_in_progress_yields_provisional_no() {
         let ckpt = Checkpointer::new(CheckpointConfig::default());
         assert_eq!(
-            ckpt.get_eviction_provisional(1),
+            ckpt.get_eviction_provisional(1, 1),
             Provisional::No,
             "CC-4: no checkpoint in progress must yield Provisional::No"
         );
-        assert_eq!(ckpt.get_eviction_provisional(2), Provisional::No);
+        assert_eq!(ckpt.get_eviction_provisional(1, 2), Provisional::No);
     }
 
     /// CC-4 acceptance test 2: Provisional::Yes when a checkpoint is in
-    /// progress and the node's level is below the checkpoint's max flush level.
+    /// progress and the node's level is below the tree's max flush level.
     ///
     /// JE ref: coordinateEvictionWithCheckpoint — node.level < highestFlushLevel
-    /// => Provisional::YES.
+    /// (for THIS db) => Provisional::YES.
     #[test]
     fn test_cc4_below_max_flush_level_yields_provisional_yes() {
         let ckpt = Checkpointer::new(CheckpointConfig::default());
         ckpt.checkpoint_in_progress.store(true, Ordering::Release);
-        ckpt.checkpoint_max_flush_level.store(2, Ordering::Release);
+        ckpt.checkpoint_flush_levels.lock().unwrap().insert(42u64, 2i32);
 
         assert_eq!(
-            ckpt.get_eviction_provisional(1),
+            ckpt.get_eviction_provisional(42, 1),
             Provisional::Yes,
-            "CC-4: BIN below max_flush_level must yield Provisional::Yes"
+            "CC-4: BIN below tree's max_flush_level must yield Provisional::Yes"
         );
 
         ckpt.checkpoint_in_progress.store(false, Ordering::Release);
-        ckpt.checkpoint_max_flush_level.store(0, Ordering::Release);
+        ckpt.checkpoint_flush_levels.lock().unwrap().clear();
     }
 
     /// CC-4 acceptance test 3: Provisional::No when the node's level is at or
-    /// above the checkpoint's max flush level.
+    /// above the tree's max flush level.
     ///
     /// JE ref: coordinateEvictionWithCheckpoint — node.level >= highestFlushLevel
     /// => Provisional::NO.
@@ -1641,33 +1679,75 @@ mod tests {
     fn test_cc4_at_or_above_max_flush_level_yields_provisional_no() {
         let ckpt = Checkpointer::new(CheckpointConfig::default());
         ckpt.checkpoint_in_progress.store(true, Ordering::Release);
-        ckpt.checkpoint_max_flush_level.store(2, Ordering::Release);
+        ckpt.checkpoint_flush_levels.lock().unwrap().insert(42u64, 2i32);
 
         assert_eq!(
-            ckpt.get_eviction_provisional(2),
+            ckpt.get_eviction_provisional(42, 2),
             Provisional::No,
             "CC-4: node at max_flush_level must yield Provisional::No"
         );
         assert_eq!(
-            ckpt.get_eviction_provisional(3),
+            ckpt.get_eviction_provisional(42, 3),
             Provisional::No,
             "CC-4: node above max_flush_level must yield Provisional::No"
         );
 
         ckpt.checkpoint_in_progress.store(false, Ordering::Release);
-        ckpt.checkpoint_max_flush_level.store(0, Ordering::Release);
+        ckpt.checkpoint_flush_levels.lock().unwrap().clear();
     }
 
-    /// CC-4: CheckpointGuard resets checkpoint_max_flush_level to 0 on drop.
+    /// CC-4 residual acceptance test: a BIN from tree A (no dirty upper INs)
+    /// must NOT be logged Provisional::Yes even when tree B has dirty upper INs
+    /// at a higher level.  This is the exact scenario that caused data loss
+    /// with the old global `AtomicI32`.
+    ///
+    /// Fail-pre: on `origin/main` (global level) `get_eviction_provisional(DB_A, 1)`
+    /// returned `Provisional::Yes` — a lie, no covering ancestor was written for
+    /// tree A.  Pass-post: per-tree lookup returns `Provisional::No` for tree A.
+    ///
+    /// JE ref: DirtyINMap.getHighestFlushLevel returns IN.MIN_LEVEL (0) for a
+    /// DatabaseImpl absent from highestFlushLevels → comparison false → NO.
+    #[test]
+    fn test_cc4_residual_tree_a_no_upper_ins_yields_provisional_no() {
+        const DB_A: u64 = 1; // only BINs dirty; no dirty upper INs
+        const DB_B: u64 = 2; // has dirty upper INs at level 2
+
+        let ckpt = Checkpointer::new(CheckpointConfig::default());
+        ckpt.checkpoint_in_progress.store(true, Ordering::Release);
+
+        // Only tree B gets an entry in the per-tree flush levels map.
+        ckpt.checkpoint_flush_levels.lock().unwrap().insert(DB_B, 2i32);
+
+        // Tree A's BIN (level 1) must be non-provisional: no covering ancestor.
+        assert_eq!(
+            ckpt.get_eviction_provisional(DB_A, 1),
+            Provisional::No,
+            "CC-4 residual: tree A has no dirty upper INs; BIN must be \
+             Provisional::No (not covered by any ancestor in this checkpoint)"
+        );
+
+        // Tree B's BIN (level 1) may be provisional: its level-2 ancestor will
+        // be written non-provisionally.
+        assert_eq!(
+            ckpt.get_eviction_provisional(DB_B, 1),
+            Provisional::Yes,
+            "CC-4: tree B has a dirty upper IN at level 2; BIN must be Provisional::Yes"
+        );
+
+        ckpt.checkpoint_in_progress.store(false, Ordering::Release);
+        ckpt.checkpoint_flush_levels.lock().unwrap().clear();
+    }
+
+    /// CC-4: CheckpointGuard clears the flush_levels map on drop.
     #[test]
     fn test_cc4_guard_resets_max_flush_level() {
         let flag = AtomicBool::new(true);
-        let level = AtomicI32::new(5);
+        let levels: std::sync::Mutex<HashMap<u64, i32>> =
+            std::sync::Mutex::new(HashMap::from([(7u64, 5i32)]));
         {
-            let _guard =
-                CheckpointGuard { flag: &flag, max_flush_level: &level };
+            let _guard = CheckpointGuard { flag: &flag, flush_levels: &levels };
         }
-        assert_eq!(level.load(Ordering::Acquire), 0, "guard must reset to 0");
+        assert!(levels.lock().unwrap().is_empty(), "guard must clear map");
         assert!(!flag.load(Ordering::Acquire));
     }
 }
