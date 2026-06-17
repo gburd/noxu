@@ -1272,7 +1272,7 @@ impl RecoveryManager {
     ///
     fn run_redo(
         &mut self,
-        _scanner: &dyn LogScanner,
+        scanner: &dyn LogScanner,
         analysis: &AnalysisResult,
         mut tree: Option<&mut noxu_tree::Tree>,
     ) -> Result<()> {
@@ -1368,8 +1368,82 @@ impl RecoveryManager {
                 // LogEntryType::BIN and BINDelta; upper INs have level >= MAIN_LEVEL.
                 // Deltas are handled in Stage 3; skip here.
                 if rec.is_delta {
-                    // ponytail: BIN-deltas deferred to Stage 3 (DRIFT-10).
-                    // They need last-full-BIN reconstitution before splicing.
+                    // Stage 3 (DRIFT-10): BIN-delta reconstitution.
+                    // JE BINDelta.reconstituteBIN: read the last full BIN at
+                    // prev_full_lsn, merge the delta slots onto it, then splice.
+                    // RecoveryManager.java replayOneIN path through INFileReader
+                    // which calls reconstituteBIN before recoverIN.
+                    let prev_lsn = rec.prev_full_lsn;
+                    if prev_lsn == NULL_LSN {
+                        // No full BIN ever logged — treat delta as the full BIN.
+                        // This is the degenerate first-write case.
+                        if let Some(bin) = noxu_tree::Tree::deserialize_bin(node_data) {
+                            let result = t.recover_in_redo(
+                                log_lsn,
+                                rec.is_root,
+                                true,
+                                node_data,
+                            );
+                            if let noxu_tree::InRedoResult::Inserted
+                            | noxu_tree::InRedoResult::Replaced = result
+                            {
+                                self.stats.ins_replayed += 1;
+                            }
+                            let _ = bin;
+                        }
+                        continue;
+                    }
+                    // Read the full BIN at prev_full_lsn.
+                    // scanner.read_at_lsn returns the LogEntry at that LSN.
+                    let base_bytes =
+                        match scanner.read_at_lsn(prev_lsn) {
+                            Some(LogEntry::In(base_rec))
+                                if !base_rec.is_delta =>
+                            {
+                                base_rec.node_data.unwrap_or_default()
+                            }
+                            _ => {
+                                // Full BIN not available (may have been cleaned
+                                // away or is before the scan range).  Graceful
+                                // degrade: treat the delta as the full BIN.  The
+                                // BIN will be re-logged as a full entry at the
+                                // next checkpoint.
+                                log::debug!(
+                                    "noxu-recovery: BIN-delta reconstitution: \
+                                     full BIN at prev_lsn={prev_lsn:?} not found; \
+                                     treating delta as full (node_id={})",
+                                    rec.node_id,
+                                );
+                                // Use the delta bytes directly as a stub BIN
+                                // (partial data, will be fixed at next checkpoint).
+                                // This is the graceful degradation path.
+                                node_data.to_vec()
+                            }
+                        };
+                    // Reconstitute: merge delta onto base.
+                    if let Some(reconstituted) =
+                        noxu_tree::Tree::reconstitute_bin_delta(&base_bytes, node_data)
+                    {
+                        let recon_bytes = reconstituted.serialize_full();
+                        let result = t.recover_in_redo(
+                            log_lsn,
+                            rec.is_root,
+                            true,
+                            &recon_bytes,
+                        );
+                        if let noxu_tree::InRedoResult::Inserted
+                        | noxu_tree::InRedoResult::Replaced = result
+                        {
+                            self.stats.ins_replayed += 1;
+                        }
+                    } else {
+                        log::warn!(
+                            "noxu-recovery: BIN-delta reconstitution failed at \
+                             lsn={log_lsn:?} node_id={} db_id={}",
+                            rec.node_id,
+                            rec.db_id,
+                        );
+                    }
                     continue;
                 }
                 // noxu_tree::BIN_LEVEL = 0x10001; anything higher is an upper IN.

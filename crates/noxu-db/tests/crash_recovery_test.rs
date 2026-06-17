@@ -800,3 +800,62 @@ fn in_redo_bin_flushed_by_checkpoint_survives_crash() {
     );
     assert_eq!(post_val.data(), b"after_ckpt");
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3 acceptance test: BIN-delta reconstitution during IN-redo
+// ---------------------------------------------------------------------------
+
+/// BIN-deltas logged in the recovery interval must be reconstituted (merged
+/// with the last full BIN) rather than dropped.
+///
+/// Stage 3 of fix/recovery-faithful-in-redo (DRIFT-10):
+/// JE `BINDelta.reconstituteBIN` / `BINDelta.applyDelta`.
+#[test]
+fn in_redo_bin_delta_reconstituted_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "in_redo_bin_delta_reconstituted")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    assert!(
+        wait_for_flag(&dir_path, "phase1_done", Duration::from_secs(60)),
+        "worker did not complete phase1 within timeout"
+    );
+
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    let (_env, db) = reopen_db(&dir_path);
+
+    // Keys 0-4 were updated to v2; keys 5-19 remain v1.
+    // All must survive (via IN-redo, possibly with BIN-delta reconstitution).
+    let mut missing = 0u32;
+    for i in 0u32..20 {
+        let k = i.to_be_bytes();
+        let key = DatabaseEntry::from_bytes(&k);
+        let mut val = DatabaseEntry::new();
+        match db.get(None, &key, &mut val).unwrap() {
+            OperationStatus::Success => {
+                let expected = if i < 5 { b"v2" as &[u8] } else { b"v1" as &[u8] };
+                assert_eq!(
+                    val.data(),
+                    expected,
+                    "key {i} has wrong value after crash+recovery"
+                );
+            }
+            OperationStatus::NotFound => {
+                missing += 1;
+            }
+            other => panic!("unexpected status {other:?} for key {i}"),
+        }
+    }
+    assert_eq!(
+        missing, 0,
+        "{missing} keys lost after crash recovery \
+         (BIN-delta reconstitution must restore them, DRIFT-10)"
+    );
+}

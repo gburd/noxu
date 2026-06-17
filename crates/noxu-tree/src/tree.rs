@@ -4589,6 +4589,39 @@ impl Tree {
     ///
     /// In this happens through `IN.setDirty(true)` calls at each level
     /// during split/insert callbacks.  Here we walk the weak parent chain.
+    /// Reconstitute a BIN-delta by merging it onto a base full BIN.
+    ///
+    /// Implements JE `BINDelta.reconstituteBIN(databaseImpl)` for the recovery
+    /// path where the log manager is not available as a `LogManager` but as
+    /// raw serialized bytes.
+    ///
+    /// Algorithm:
+    /// 1. Deserialise `base_bytes` as a full `BinStub`.
+    /// 2. Apply `delta_bytes` slots onto the base using `BinStub::apply_delta`
+    ///    (raw slot overlay).
+    /// 3. Recompute key prefix so prefix-compressed entries are consistent.
+    ///
+    /// Returns `None` if either byte slice is malformed.
+    ///
+    /// JE `BINDelta.reconstituteBIN` / `BINDelta.applyDelta`
+    /// (DRIFT-10 / Stage 3).
+    pub fn reconstitute_bin_delta(
+        base_bytes: &[u8],
+        delta_bytes: &[u8],
+    ) -> Option<BinStub> {
+        let mut base = BinStub::deserialize_full(base_bytes)?;
+        // Apply the delta slots onto the base.
+        // Note: BinStub::apply_delta uses slot-index addressing into base.entries,
+        // extending with new entries when the slot_idx >= base.entries.len().
+        // After apply_delta we recompute the key prefix to fix prefix compression.
+        BinStub::apply_delta(&mut base, delta_bytes)?;
+        // Recompute prefix so prefix-compressed BINs are consistent after merge.
+        base.recompute_key_prefix();
+        base.is_delta = false;
+        base.dirty = false;
+        Some(base)
+    }
+
     pub fn propagate_dirty_to_root(node_arc: &Arc<RwLock<TreeNode>>) {
         let parent_weak = { node_arc.read().get_parent() };
 

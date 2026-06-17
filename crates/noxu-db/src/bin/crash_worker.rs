@@ -240,11 +240,46 @@ fn main() {
             }
         }
 
-        // in_redo_bin_flushed_by_checkpoint:
+        // in_redo_bin_delta_reconstituted:
         //
-        // 50 keys are committed and a checkpoint is forced (flushing BINs to
-        // WAL).  Then 1 more key is committed (so the log has a post-checkpoint
-        // LN).  Signal ready; parent SIGKILLs.
+        // Write keys to fill a BIN, then force a FULL checkpoint (BINs logged
+        // as full entries).  Then modify a few keys (making the BIN dirty) and
+        // force another checkpoint (which may write BIN-deltas).  SIGKILL.
+        //
+        // After recovery all keys must be present.  The Stage 3 BIN-delta
+        // reconstitution path (DRIFT-10) must handle the delta correctly.
+        "in_redo_bin_delta_reconstituted" => {
+            use noxu_db::CheckpointConfig;
+
+            // Phase 1: write 20 keys and force first full checkpoint.
+            for i in 0u32..20 {
+                let k = i.to_be_bytes();
+                let key = DatabaseEntry::from_bytes(&k);
+                let val = DatabaseEntry::from_bytes(b"v1");
+                db.put(None, &key, &val).expect("put v1");
+            }
+            env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                .expect("full checkpoint");
+
+            // Phase 2: modify a subset of keys (dirty some BIN slots)
+            // and force a second checkpoint (may produce BIN-deltas).
+            for i in 0u32..5 {
+                let k = i.to_be_bytes();
+                let key = DatabaseEntry::from_bytes(&k);
+                let val = DatabaseEntry::from_bytes(b"v2");
+                db.put(None, &key, &val).expect("put v2");
+            }
+            env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                .expect("delta checkpoint");
+
+            flag(&dir, "phase1_done");
+
+            // Hang until killed.
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         //
         // After recovery:
         //   - All 50 pre-checkpoint keys MUST be present (via IN-redo OR LN-redo).
