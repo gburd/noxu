@@ -863,7 +863,11 @@ impl LockManager {
             return Err(deadlock_err);
         }
 
-        // Phase 3: condvar wait (identical to lock_with_timeout).
+        // Phase 3: condvar wait — mirrors lock_with_timeout exactly.
+        // TXN-1 fix (2026-06-16): the previous code only checked for deadlock
+        // on timed_out.timed_out() and used STALE owner_ids captured at Phase 1.
+        // JE LockManager.waitForLock checks deadlock every loop iteration with
+        // fresh owner IDs; mirror that here.
         let start = std::time::Instant::now();
         let (mutex, condvar) = &*notify_pair;
         let mut granted_guard = mutex.lock();
@@ -895,18 +899,67 @@ impl LockManager {
             };
             let slice_ms =
                 if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
+
             let timed_out = condvar
-                .wait_for(&mut granted_guard, Duration::from_millis(slice_ms));
-            if timed_out.timed_out()
-                && let Some(dl_err) = self.check_deadlock_for_waiter(
-                    lsn, locker_id, lock_type, &owner_ids,
-                )
-            {
-                drop(granted_guard);
-                // H-2: shard before waiter_graph.
-                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-                return Err(dl_err);
+                .wait_for(&mut granted_guard, Duration::from_millis(slice_ms))
+                .timed_out();
+
+            if *granted_guard {
+                break;
             }
+
+            // Re-run deadlock detection after every wakeup with fresh owner
+            // IDs — mirrors JE LockManager.waitForLock (unconditional per
+            // iteration). The previous code only fired on timed_out.timed_out()
+            // and used stale owner_ids from Phase 1.
+            drop(granted_guard);
+            {
+                let cur_owner_ids = {
+                    let table = self.lock_tables[table_idx].lock();
+                    table
+                        .get(&lsn)
+                        .map(|l| l.get_owner_ids())
+                        .unwrap_or_default()
+                };
+                if let Some(deadlock_err) = self.check_deadlock_for_waiter(
+                    lsn,
+                    locker_id,
+                    lock_type,
+                    &cur_owner_ids,
+                ) {
+                    // H-2: shard before waiter_graph.
+                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                    return Err(deadlock_err);
+                }
+            }
+            granted_guard = mutex.lock();
+
+            if *granted_guard {
+                break;
+            }
+
+            if timed_out {
+                if timeout_ms > 0
+                    && start.elapsed().as_millis() as u64 >= timeout_ms
+                {
+                    drop(granted_guard);
+                    // H-2: shard before waiter_graph.
+                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                    self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                    return Err(TxnError::LockTimeout {
+                        timeout_ms,
+                        lsn,
+                        owner: format!(
+                            "[{}] on LSN {lsn}",
+                            self.format_lockers(&owner_ids)
+                        ),
+                        requested_type: lock_type,
+                        requester: self.format_locker(locker_id),
+                    });
+                }
+            }
+
+            // Spurious wakeup or slice expired; loop.
         }
 
         drop(granted_guard);
@@ -2084,5 +2137,68 @@ mod tests {
         // select_victim with these counts must pick locker 2 (fewest locks).
         let victim = DeadlockDetector::select_victim(&[1, 2], &counts);
         assert_eq!(victim, 2, "victim must be locker 2 (fewest locks held)");
+    }
+
+    /// TXN-1 regression test: `lock_with_sharing_and_timeout` must detect a
+    /// deadlock formed WHILE waiting (not only after a 50 ms slice).
+    ///
+    /// Setup: two lockers on the sharing path (HandleLocker-like) each hold
+    /// a lock the other wants. The deadlock must be detected and returned as
+    /// `DeadlockException` well within the test timeout, NOT after 50 ms.
+    ///
+    /// This is a structural test rather than a timing test: we form a clear
+    /// two-node cycle via `lock_with_sharing_and_timeout` and verify the error
+    /// is a deadlock (not a timeout). Prior to the fix, the check only fired
+    /// on `timed_out.timed_out()` with stale owner IDs, so a deadlock on the
+    /// sharing path could wait a full 50 ms slice before being detected.
+    #[test]
+    fn test_txn1_sharing_path_deadlock_detected_promptly() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let lm = Arc::new(LockManager::new());
+        const L1: u64 = 0xA001;
+        const L2: u64 = 0xA002;
+        const LOCKER_A: i64 = 101;
+        const LOCKER_B: i64 = 102;
+        const TIMEOUT_MS: u64 = 5_000;
+
+        // A holds L1; B holds L2.
+        lm.lock(L1, LOCKER_A, LockType::Write, false, false).unwrap();
+        lm.lock(L2, LOCKER_B, LockType::Write, false, false).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let lm_b = Arc::clone(&lm);
+        let barrier_b = Arc::clone(&barrier);
+
+        // Thread B tries to acquire L1 (blocked by A).
+        let handle = thread::spawn(move || {
+            barrier_b.wait();
+            lm_b.lock_with_sharing_and_timeout(
+                L1, LOCKER_B, LockType::Write,
+                false, false, TIMEOUT_MS,
+            )
+        });
+
+        // Main thread: wait until B is queued, then try L2 (blocked by B).
+        barrier.wait();
+        // Small yield to let B enter the wait loop before we enqueue ourselves.
+        std::thread::sleep(Duration::from_millis(5));
+        let result_a = lm.lock_with_sharing_and_timeout(
+            L2, LOCKER_A, LockType::Write,
+            false, false, TIMEOUT_MS,
+        );
+
+        let result_b = handle.join().expect("thread B panicked");
+
+        // Exactly one of the two must get a DeadlockException; the other
+        // should succeed or also get a deadlock. Both getting deadlock is fine.
+        let a_dl = matches!(result_a, Err(TxnError::Deadlock(..)));
+        let b_dl = matches!(result_b, Err(TxnError::Deadlock(..)));
+        assert!(
+            a_dl || b_dl,
+            "TXN-1: expected at least one DeadlockException on the sharing path; \
+             got A={result_a:?}, B={result_b:?}"
+        );
     }
 }

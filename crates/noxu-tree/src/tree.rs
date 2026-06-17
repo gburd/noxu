@@ -1463,6 +1463,15 @@ impl Tree {
         self.key_comparator.take()
     }
 
+    /// Returns a reference to the key comparator, if configured.
+    ///
+    /// Used by `CursorImpl::find_bin_for_key` (R4 fix) so the cursor's own
+    /// IN-level descent uses the same comparator-aware floor slot as the
+    /// tree's own search paths. Mirrors JE `DatabaseImpl.getKeyComparator()`.
+    pub fn get_comparator(&self) -> Option<&KeyComparatorFn> {
+        self.key_comparator.as_ref()
+    }
+
     /// Returns the key comparator if set, or performs lexicographic comparison.
     #[inline]
     fn key_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -3800,7 +3809,7 @@ impl Tree {
     /// 4. If no such parent exists, return `None` (no next BIN).
     pub fn get_next_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
         let root = self.get_root()?;
-        Self::get_adjacent_bin(&root, current_key, true)
+        self.get_adjacent_bin(&root, current_key, true)
     }
 
     /// Return the entries of the BIN immediately to the left of the BIN
@@ -3809,7 +3818,7 @@ impl Tree {
     /// → `Tree.getNextIN(forward=false)`.
     pub fn get_prev_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
         let root = self.get_root()?;
-        Self::get_adjacent_bin(&root, current_key, false)
+        self.get_adjacent_bin(&root, current_key, false)
     }
 
     /// Core implementation shared by `get_next_bin` and `get_prev_bin`.
@@ -3833,14 +3842,24 @@ impl Tree {
     /// either restart its scan or report end-of-iteration. The
     /// budget is finite so a pathological workload (a thread
     /// permanently splitting under us) cannot livelock the lookup.
+    /// JE `Tree.getNextIN` / `Tree.getPrevIN`.
+    ///
+    /// R3 fix (2026-06-16): converted from `static fn` to `&self` so that the
+    /// IN-level descent uses `self.upper_in_floor_index` (comparator-aware)
+    /// instead of a raw byte `<=`. Without this, databases with a custom
+    /// comparator (secondary indexes, sorted-dup) could descend to the wrong
+    /// child → wrong adjacent BIN → incorrect cursor iteration across BIN
+    /// boundaries. Mirrors `Tree.getNextIN`/`Tree.getPrevIN` using the
+    /// comparator-aware `IN.findEntry`.
     fn get_adjacent_bin(
+        &self,
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
     ) -> Option<Vec<BinEntry>> {
         const MAX_ASCENT_ATTEMPTS: u32 = 8;
         for attempt in 0..MAX_ASCENT_ATTEMPTS {
-            match Self::get_adjacent_bin_attempt(root, current_key, forward) {
+            match self.get_adjacent_bin_attempt(root, current_key, forward) {
                 AdjacentBinOutcome::Found(v) => return Some(v),
                 AdjacentBinOutcome::NoAdjacent => return None,
                 AdjacentBinOutcome::SplitRaceRetry => {
@@ -3862,6 +3881,7 @@ impl Tree {
     /// concurrent split invalidated our path" (which the caller
     /// should retry from root).
     fn get_adjacent_bin_attempt(
+        &self,
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
@@ -3889,16 +3909,11 @@ impl Tree {
                     if n.entries.is_empty() {
                         return AdjacentBinOutcome::NoAdjacent;
                     }
-                    // Floor descent (binary), slot 0 = virtual −∞. This is a
-                    // static fn with no comparator access, so it preserves the
-                    // raw byte comparison it has always used.
-                    let idx = if n.entries.len() <= 1 {
-                        0
-                    } else {
-                        n.entries[1..].partition_point(|e| {
-                            e.key.as_slice() <= current_key
-                        })
-                    };
+                    // R3 fix: use comparator-aware upper_in_floor_index so
+                    // that custom-comparator / sorted-dup databases descend
+                    // to the correct child. Mirrors JE Tree.getNextIN which
+                    // uses IN.findEntry (comparator-aware) not raw byte order.
+                    let idx = self.upper_in_floor_index(&n.entries, current_key);
                     let child = match n
                         .entries
                         .get(idx)
@@ -6541,9 +6556,97 @@ mod tests {
         assert!(tree.get_prev_bin(b"any").is_none());
     }
 
-    // ========================================================================
-    // Key prefix compression tests for BinStub / Tree
-    // IN key-prefix tests (KeyPrefixTest / TreeTest).
+    // =========================================================================
+    // R3 fix: get_next_bin / get_prev_bin honour the custom comparator
+    // =========================================================================
+
+    /// R3 regression test: with a custom comparator that reverses byte order
+    /// (descending), `get_next_bin` and `get_prev_bin` must use comparator
+    /// order when routing through internal nodes.
+    ///
+    /// Pre-fix: the static `get_adjacent_bin_attempt` used raw `<=` byte order
+    /// for IN routing, causing it to descend to the wrong child when comparator
+    /// order ≠ byte order.
+    ///
+    /// The tree is forced to split (max_entries = 4) so there IS an internal
+    /// node (IN) to route through. Under a reverse comparator the insertion
+    /// order and stored key order are reversed relative to byte order, so any
+    /// descent that uses raw byte comparison will pick the wrong slot.
+    ///
+    /// Pass-post invariant: iterating forward via repeated `get_next_bin` from
+    /// the leftmost BIN yields keys in COMPARATOR order (descending byte order
+    /// here), not in raw ascending byte order.
+    #[test]
+    fn test_get_next_prev_bin_custom_comparator_order() {
+        // Reverse-order comparator: larger bytes sort first.
+        let reverse_cmp: KeyComparatorFn =
+            Arc::new(|a: &[u8], b: &[u8]| b.cmp(a));
+        // Small max_entries so the tree splits and has internal nodes.
+        let mut tree = Tree::new(1, 4);
+        tree.set_comparator(reverse_cmp);
+
+        // Insert keys that are ascending in byte order ("a" < "b" < … < "i")
+        // but descending in comparator order (i > h > … > a).
+        let keys: &[&[u8]] = &[b"a", b"b", b"c", b"d", b"e", b"f",
+                                b"g", b"h", b"i"];
+        for (i, k) in keys.iter().enumerate() {
+            tree.insert(k.to_vec(), vec![i as u8], Lsn::from_u64((i + 1) as u64))
+                .unwrap();
+        }
+
+        // Collect all BINs by walking from the comparator-smallest key ("i"
+        // in reverse order) using get_next_bin. The anchor must be a key that
+        // is smaller than everything in comparator order, i.e. the largest
+        // byte-value key. We use the tree's search to find the actual leftmost
+        // key under the comparator by starting from "i" (comparator-min).
+        //
+        // Strategy: start at byte key b"\xff" (larger than any inserted key in
+        // byte order, so it lands in the last BIN in byte order, which under
+        // a reverse comparator is the leftmost BIN in comparator order). Then
+        // walk via get_next_bin.
+        let start_anchor = b"\xff".as_ref();
+        let mut bin_first_keys: Vec<Vec<u8>> = Vec::new();
+
+        // The first BIN in comparator order contains "i" (largest byte key).
+        // get_next_bin from a virtual start in that BIN gives the next one.
+        // Collect by walking from the comparator-last key leftward instead:
+        // use get_next_bin with anchor = b"\xff" to hop to the next BIN
+        // (comparator order: next = smaller byte value).
+        let mut anchor = start_anchor.to_vec();
+        loop {
+            match tree.get_next_bin(&anchor) {
+                None => break,
+                Some(entries) => {
+                    if let Some(first) = entries.first() {
+                        let fk = first.key.clone();
+                        bin_first_keys.push(fk.clone());
+                        anchor = fk;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // We must have visited at least 2 BINs (tree was forced to split).
+        assert!(
+            bin_first_keys.len() >= 2,
+            "R3: expected multiple BINs after split, got {}",
+            bin_first_keys.len()
+        );
+
+        // With a reverse comparator, bin_first_keys must be in descending byte
+        // order (each successive BIN starts at a smaller byte key).
+        for window in bin_first_keys.windows(2) {
+            assert!(
+                window[0] > window[1],
+                "R3: BIN boundary keys must be descending (comparator order); \
+                 got {:?} then {:?}",
+                window[0],
+                window[1]
+            );
+        }
+    }
     // ========================================================================
 
     /// Inserting keys with a common prefix causes the BIN to establish that

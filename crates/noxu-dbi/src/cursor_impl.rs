@@ -897,7 +897,7 @@ impl CursorImpl {
                                 let db = self.db_impl.read();
                                 db.get_real_tree().and_then(|tree| {
                                     tree.get_root().and_then(|r| {
-                                        Self::find_bin_for_key(r, &k)
+                                        Self::find_bin_for_key(r, &k, tree.get_comparator())
                                     })
                                 })
                             };
@@ -1041,10 +1041,15 @@ impl CursorImpl {
         if let Some(txn) = &self.txn_ref {
             let mut guard = txn.lock().unwrap();
             // F2: read-uncommitted txns skip read-lock acquisition
-            // entirely.  This mirrors the per-operation
-            // `LockMode::ReadUncommitted` path but applies to every
-            // read on the txn.
+            // entirely.  But we still call lock(NONE) to run check_state /
+            // check_preempted so an Aborted/MustAbort txn is caught here
+            // rather than silently returning dirty data.
+            // TXN-4 fix (2026-06-16): mirrors JE CursorImpl.lockLN which
+            // calls locker.lock(lsn, LockType.NONE, ...) even for dirty reads;
+            // NONE returns NoneNeeded immediately from the lock manager but
+            // first runs checkState/checkPreempted.
             if guard.is_read_uncommitted_default() {
+                guard.lock(lsn, LockType::None, false).map_err(DbiError::TxnError)?;
                 return Ok(false);
             }
             // T-F2: SERIALIZABLE cursors acquire RangeRead to protect against
@@ -1239,7 +1244,7 @@ impl CursorImpl {
         use noxu_tree::tree::TreeNode;
         let root = tree.get_root()?;
         // Descend to the BIN that should contain `key` (not always the leftmost).
-        let bin_arc = Self::find_bin_for_key(root, key)?;
+        let bin_arc = Self::find_bin_for_key(root, key, tree.get_comparator())?;
         let guard = bin_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
@@ -1335,7 +1340,7 @@ impl CursorImpl {
         let in_current: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
             let root = tree.get_root()?;
             // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-            let bin_arc = Self::find_bin_for_key(root, key)?;
+            let bin_arc = Self::find_bin_for_key(root, key, tree.get_comparator())?;
             let guard = bin_arc.read();
             match &*guard {
                 TreeNode::Bottom(bin) => {
@@ -1790,7 +1795,7 @@ impl CursorImpl {
                     let db = self.db_impl.read();
                     let tree = db.get_real_tree()?;
                     let root = tree.get_root()?;
-                    let found_arc = Self::find_bin_for_key(root, ck)?;
+                    let found_arc = Self::find_bin_for_key(root, ck, tree.get_comparator())?;
                     let idx = {
                         let g = found_arc.read();
                         if let TreeNode::Bottom(bin) = &*g {
@@ -1883,7 +1888,7 @@ impl CursorImpl {
                     (current_key_slice_opt.as_deref(), tree.get_root())
                 {
                     if let Some(bin_arc) =
-                        Self::find_bin_for_key(root, current_key)
+                        Self::find_bin_for_key(root, current_key, tree.get_comparator())
                     {
                         // Clone so we can move the arc after the read guard is dropped.
                         let arc_to_save = bin_arc.clone();
@@ -2008,7 +2013,7 @@ impl CursorImpl {
                     let db = self.db_impl.read();
                     db.get_real_tree().and_then(|tree| {
                         tree.get_root().and_then(|r| {
-                            Self::find_bin_for_key(r, &new_key_ref)
+                            Self::find_bin_for_key(r, &new_key_ref, tree.get_comparator())
                         })
                     })
                 };
@@ -2115,7 +2120,7 @@ impl CursorImpl {
                                 tree.get_root().and_then(|r| {
                                     // Use the current raw_key to find the BIN.
                                     let bin_arc =
-                                        Self::find_bin_for_key(r, &raw_key)?;
+                                        Self::find_bin_for_key(r, &raw_key, tree.get_comparator())?;
                                     let g = bin_arc.read();
                                     match &*g {
                                         TreeNode::Bottom(bin) => {
@@ -2222,9 +2227,16 @@ impl CursorImpl {
     /// This mirrors the search path in `Tree::search()` — at each upper IN
     /// we follow the child slot with the largest key <= `key`.  Returns the
     /// `Arc` of the matching BIN, or `None` if the tree is empty / malformed.
+    /// R4 fix (2026-06-16): added `key_comparator` so the IN-level descent
+    /// uses comparator-aware floor-slot selection rather than a raw byte `<=`.
+    /// Mirrors JE `CursorImpl`'s descent helpers which delegate to
+    /// `IN.findEntry` (comparator-aware). Without this, sorted-dup /
+    /// secondary-index databases could land in the wrong BIN on any descent
+    /// through a non-leaf internal node when comparator order ≠ byte order.
     fn find_bin_for_key(
         node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
         key: &[u8],
+        key_comparator: Option<&noxu_tree::KeyComparatorFn>,
     ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
     {
         use noxu_tree::tree::TreeNode;
@@ -2239,17 +2251,23 @@ impl CursorImpl {
                             if n.entries.is_empty() {
                                 return None;
                             }
-                            // Slot 0 carries a virtual key (-infinity); follow
-                            // the largest key <= search key (same logic as
-                            // Tree::search and Tree::insert_recursive).
+                            // R4 fix: honour the custom comparator when
+                            // selecting the floor slot. Mirrors JE
+                            // CursorImpl's use of IN.findEntry.
                             let mut idx = 0usize;
                             for (i, entry) in n.entries.iter().enumerate() {
                                 if i == 0 {
                                     idx = 0;
-                                } else if entry.key.as_slice() <= key {
-                                    idx = i;
                                 } else {
-                                    break;
+                                    let ord = match key_comparator {
+                                        Some(cmp) => cmp(entry.key.as_slice(), key),
+                                        None => entry.key.as_slice().cmp(key),
+                                    };
+                                    if ord != std::cmp::Ordering::Greater {
+                                        idx = i;
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                             n.entries.get(idx).and_then(|e| e.child.clone())
@@ -2829,7 +2847,7 @@ impl CursorImpl {
         let db = self.db_impl.read();
         let tree = db.get_real_tree()?;
         let root = tree.get_root()?;
-        Self::find_bin_for_key(root, key)
+        Self::find_bin_for_key(root, key, tree.get_comparator())
     }
 
     ///

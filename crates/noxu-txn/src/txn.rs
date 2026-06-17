@@ -14,7 +14,8 @@ use crate::txn_abort::TxnAbort;
 use crate::txn_commit::TxnCommit;
 use crate::txn_state::TxnState;
 use crate::{
-    LockManager, LockResult, LockType, Locker, TxnError, WriteLockInfo,
+    LockGrantType, LockManager, LockResult, LockType, Locker, TxnError,
+    WriteLockInfo,
 };
 
 /// A single undo record produced when a transaction aborts.
@@ -1333,6 +1334,12 @@ impl Locker for Txn {
         )?;
 
         // Track the lock.
+        // NoneNeeded means lock_type was None — check_state ran above but
+        // no lock was acquired; skip tracking so we don't insert a phantom
+        // entry into read_locks that would be released at commit.
+        if grant == LockGrantType::NoneNeeded {
+            return Ok(LockResult { grant, write_lock_info: None });
+        }
         // When a write lock is acquired (new or via promotion), the LSN
         // must be removed from read_locks if it was there, because a write lock
         // supersedes the read lock.  This mirrors LockManager.lock()
@@ -2264,5 +2271,42 @@ mod tests {
         txn.commit().unwrap();
         let res = txn.prepare(1, b"g".to_vec(), b"b".to_vec());
         assert!(matches!(res, Err(TxnError::InvalidTransaction { .. })));
+    }
+
+    /// TXN-4 regression test: `lock(NONE)` on a MustAbort txn must return
+    /// `InvalidTransaction`, not silently succeed.
+    ///
+    /// This exercises the state-check path that `CursorImpl::lock_ln` calls
+    /// for read-uncommitted transactions: it calls `guard.lock(lsn,
+    /// LockType::None, false)` which runs `check_state()` before returning
+    /// `NoneNeeded`. Pre-fix, read-uncommitted early-returned before calling
+    /// `lock` at all, so an Aborted/MustAbort txn doing a dirty read was not
+    /// caught. Post-fix, `lock(NONE)` surfaces the state error.
+    #[test]
+    fn test_txn4_lock_none_on_must_abort_returns_error() {
+        let mut txn = create_test_txn();
+
+        // Force into MustAbort state.
+        txn.set_only_abortable();
+        assert_eq!(txn.get_state(), TxnState::MustAbort);
+
+        // lock(NONE) must run check_state and return InvalidTransaction.
+        let result = txn.lock(999, LockType::None, false);
+        assert!(
+            matches!(result, Err(TxnError::InvalidTransaction { .. })),
+            "TXN-4: lock(NONE) on MustAbort must return InvalidTransaction; got {result:?}"
+        );
+    }
+
+    /// TXN-4: lock(NONE) on an Open txn returns NoneNeeded without tracking.
+    #[test]
+    fn test_txn4_lock_none_on_open_returns_none_needed() {
+        let mut txn = create_test_txn();
+        let result = txn.lock(999, LockType::None, false).unwrap();
+        assert_eq!(
+            result.grant,
+            LockGrantType::NoneNeeded,
+            "TXN-4: lock(NONE) on Open must return NoneNeeded"
+        );
     }
 }
