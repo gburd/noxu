@@ -694,21 +694,21 @@ impl RecoveryManager {
     }
     fn run_redo_all(
         &mut self,
-        _scanner: &dyn LogScanner,
+        scanner: &dyn LogScanner,
         analysis: &AnalysisResult,
         trees: &mut HashMap<u64, noxu_tree::Tree>,
     ) -> Result<()> {
-        let in_entries: Vec<_> = {
-            let mut levels = Vec::new();
-            while let Some(level) = self.dirty_in_map.get_lowest_level() {
-                let refs = self.dirty_in_map.select_dirty_ins_for_level(level);
-                for r in refs {
-                    levels.push((level, r));
-                }
-            }
-            levels
-        };
-        self.stats.ins_replayed += in_entries.len() as u64;
+        // ---- IN-redo (production multi-DB path) ----
+        //
+        // DRIFT-1 fix: apply logged INs/BINs to each per-database tree.
+        // Same algorithm as run_redo (single-DB path); dispatched per db_id.
+        // JE RecoveryManager.buildINs / recoverIN (RecoveryManager.java ~915-1500).
+        //
+        // drain the legacy map first (keeps DirtyINMap empty for checkpoint).
+        while let Some(level) = self.dirty_in_map.get_lowest_level() {
+            self.dirty_in_map.select_dirty_ins_for_level(level);
+        }
+        self.apply_in_redo_to_trees(scanner, analysis, trees);
 
         let ckpt_start = analysis.checkpoint_start_lsn;
         let redo_entries: Vec<(Lsn, LnRecord)> =
@@ -1270,6 +1270,161 @@ impl RecoveryManager {
     /// - **LN in an active (uncommitted) txn**: skip (will be undone).
     ///
     ///
+    /// Apply dirty INs from analysis to a single tree.
+    ///
+    /// Shared helper called by both `run_redo` (single-DB) and
+    /// `run_redo_all` (multi-DB).  Implements Stages 1-3:
+    ///
+    /// - **Stage 1 (DRIFT-1/9)**: deserialise `InRecord.node_data` and splice
+    ///   into the tree using JE `recoverChildIN` three-case LSN currency check
+    ///   (RecoveryManager.java ~line 1412).
+    /// - **Stage 2 (DRIFT-3/4)**: sort by level descending (roots first) +
+    ///   provisional filtering (`INFileReader.isProvisional()`).
+    /// - **Stage 3 (DRIFT-10)**: BIN-delta reconstitution via
+    ///   `Tree::reconstitute_bin_delta` (`BINDelta.reconstituteBIN`).
+    ///
+    /// `ins_replayed` in `self.stats` is incremented for each node actually
+    /// inserted or replaced.
+    ///
+    /// JE `RecoveryManager.buildINs` / `recoverIN` (RecoveryManager.java ~915-1500).
+    fn apply_in_redo_to_tree(
+        &mut self,
+        scanner: &dyn LogScanner,
+        analysis: &AnalysisResult,
+        t: &mut noxu_tree::Tree,
+    ) {
+        let ckpt_end_lsn = analysis.checkpoint_end_lsn;
+        let db_id = t.get_database_id();
+
+        // Sort by level descending (roots first). Stage 2 / DRIFT-4.
+        // JE RecoveryManager.buildINs: readRootINs pass before readNonRootINs.
+        let mut entries: Vec<_> = analysis
+            .dirty_ins
+            .values()
+            .filter(|e| e.record.db_id == db_id)
+            .collect();
+        entries.sort_unstable_by_key(|b| std::cmp::Reverse(b.record.level));
+
+        for entry in entries {
+            let rec = &entry.record;
+            let log_lsn = entry.lsn;
+            let Some(ref node_data) = rec.node_data else {
+                continue; // no bytes (unit-test stubs)
+            };
+            // Stage 2 / DRIFT-3: provisional filter.
+            // JE INFileReader.isProvisional().
+            if rec.is_provisional
+                && (ckpt_end_lsn == NULL_LSN || log_lsn >= ckpt_end_lsn)
+            {
+                continue;
+            }
+            if rec.is_delta {
+                // Stage 3 / DRIFT-10: BIN-delta reconstitution.
+                // JE BINDelta.reconstituteBIN / BINDelta.applyDelta.
+                let prev_lsn = rec.prev_full_lsn;
+                if prev_lsn == NULL_LSN {
+                    // Degenerate: delta with no base — treat as full BIN.
+                    if noxu_tree::Tree::deserialize_bin(node_data).is_some() {
+                        let r = t.recover_in_redo(
+                            log_lsn,
+                            rec.is_root,
+                            true,
+                            node_data,
+                        );
+                        if matches!(
+                            r,
+                            noxu_tree::InRedoResult::Inserted
+                                | noxu_tree::InRedoResult::Replaced
+                        ) {
+                            self.stats.ins_replayed += 1;
+                        }
+                    }
+                    continue;
+                }
+                let base_bytes = match scanner.read_at_lsn(prev_lsn) {
+                    Some(LogEntry::In(br)) if !br.is_delta => {
+                        br.node_data.unwrap_or_default()
+                    }
+                    _ => {
+                        log::debug!(
+                            "noxu-recovery: BIN-delta reconstitution: \
+                                 full BIN at {prev_lsn:?} not found; \
+                                 using delta as-is (node_id={})",
+                            rec.node_id
+                        );
+                        node_data.to_vec()
+                    }
+                };
+                match noxu_tree::Tree::reconstitute_bin_delta(
+                    &base_bytes,
+                    node_data,
+                ) {
+                    Some(full) => {
+                        let full_bytes = full.serialize_full();
+                        let r = t.recover_in_redo(
+                            log_lsn,
+                            rec.is_root,
+                            true,
+                            &full_bytes,
+                        );
+                        if matches!(
+                            r,
+                            noxu_tree::InRedoResult::Inserted
+                                | noxu_tree::InRedoResult::Replaced
+                        ) {
+                            self.stats.ins_replayed += 1;
+                        }
+                    }
+                    None => log::warn!(
+                        "noxu-recovery: BIN-delta reconstitution failed \
+                         lsn={log_lsn:?} node_id={} db_id={}",
+                        rec.node_id,
+                        rec.db_id
+                    ),
+                }
+                continue;
+            }
+            // Full IN or BIN.  BIN_LEVEL = 0x10001; anything higher is upper IN.
+            let is_bin = rec.level <= 0x10001;
+            let r = t.recover_in_redo(log_lsn, rec.is_root, is_bin, node_data);
+            match r {
+                noxu_tree::InRedoResult::Inserted
+                | noxu_tree::InRedoResult::Replaced => {
+                    self.stats.ins_replayed += 1;
+                }
+                noxu_tree::InRedoResult::Skipped
+                | noxu_tree::InRedoResult::NotInTree => {}
+                noxu_tree::InRedoResult::DeserializeFailed => {
+                    log::warn!(
+                        "noxu-recovery: IN-redo deserialise failed \
+                         lsn={log_lsn:?} node_id={} db_id={} is_bin={is_bin}",
+                        rec.node_id,
+                        rec.db_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Apply dirty INs from analysis to every tree in `trees` (multi-DB).
+    ///
+    /// Calls `apply_in_redo_to_tree` for each database whose tree is present
+    /// in `trees`.  `dirty_ins` entries for unknown db_ids are skipped.
+    fn apply_in_redo_to_trees(
+        &mut self,
+        scanner: &dyn LogScanner,
+        analysis: &AnalysisResult,
+        trees: &mut HashMap<u64, noxu_tree::Tree>,
+    ) {
+        // Collect the db_ids we know about; borrow-checker needs them separate.
+        let db_ids: Vec<u64> = trees.keys().copied().collect();
+        for db_id in db_ids {
+            if let Some(t) = trees.get_mut(&db_id) {
+                self.apply_in_redo_to_tree(scanner, analysis, t);
+            }
+        }
+    }
+
     fn run_redo(
         &mut self,
         scanner: &dyn LogScanner,
@@ -1328,153 +1483,13 @@ impl RecoveryManager {
         // if a CkptEnd record covered it (checkpoint_end_lsn > entry_lsn,
         // i.e., the checkpoint completed).  This mirrors JE's
         // INFileReader.isProvisional() check.
-        let ckpt_end_lsn = analysis.checkpoint_end_lsn;
-        let in_count = analysis.dirty_ins.len() as u64;
         if let Some(t) = tree.as_deref_mut() {
-            // Collect and sort by level descending (roots first).
-            let mut in_entries_sorted: Vec<_> = analysis
-                .dirty_ins
-                .values()
-                .filter(|e| e.record.db_id == t.get_database_id())
-                .collect();
-            in_entries_sorted
-                .sort_unstable_by_key(|b| std::cmp::Reverse(b.record.level));
-
-            for entry in in_entries_sorted {
-                let rec = &entry.record;
-                let log_lsn = entry.lsn;
-                let Some(ref node_data) = rec.node_data else {
-                    continue; // no bytes (stub scanner used in unit tests)
-                };
-                // Stage 2 (DRIFT-3): provisional filter.
-                // JE INFileReader.isProvisional(): skip PROVISIONAL_ALWAYS (0x80);
-                // skip PROVISIONAL_BEFORE_CKPT_END (0x40) unless CkptEnd covers it.
-                if rec.is_provisional {
-                    // is_provisional covers both 0x80 and 0x40 bits.
-                    // We distinguish: if CkptEnd is present and log_lsn < ckpt_end_lsn,
-                    // the entry is covered (safe to replay).  Otherwise skip.
-                    // For simplicity we treat both bits as "skip unless covered"
-                    // which is conservative and correct (may miss some BeforeCkptEnd
-                    // entries if CkptEnd is absent, but that is safe).
-                    if ckpt_end_lsn == NULL_LSN || log_lsn >= ckpt_end_lsn {
-                        // Provisional, not covered by a completed checkpoint — skip.
-                        // JE INFileReader.isProvisional() returns true → skip.
-                        continue;
-                    }
-                    // Covered by CkptEnd: fall through and replay.
-                }
-                // Discriminate BIN vs upper IN from level.
-                // file_manager_scanner sets level = BIN_LEVEL (0x10001) for
-                // LogEntryType::BIN and BINDelta; upper INs have level >= MAIN_LEVEL.
-                // Deltas are handled in Stage 3; skip here.
-                if rec.is_delta {
-                    // Stage 3 (DRIFT-10): BIN-delta reconstitution.
-                    // JE BINDelta.reconstituteBIN: read the last full BIN at
-                    // prev_full_lsn, merge the delta slots onto it, then splice.
-                    // RecoveryManager.java replayOneIN path through INFileReader
-                    // which calls reconstituteBIN before recoverIN.
-                    let prev_lsn = rec.prev_full_lsn;
-                    if prev_lsn == NULL_LSN {
-                        // No full BIN ever logged — treat delta as the full BIN.
-                        // This is the degenerate first-write case.
-                        if let Some(bin) =
-                            noxu_tree::Tree::deserialize_bin(node_data)
-                        {
-                            let result = t.recover_in_redo(
-                                log_lsn,
-                                rec.is_root,
-                                true,
-                                node_data,
-                            );
-                            if let noxu_tree::InRedoResult::Inserted
-                            | noxu_tree::InRedoResult::Replaced = result
-                            {
-                                self.stats.ins_replayed += 1;
-                            }
-                            let _ = bin;
-                        }
-                        continue;
-                    }
-                    // Read the full BIN at prev_full_lsn.
-                    // scanner.read_at_lsn returns the LogEntry at that LSN.
-                    let base_bytes = match scanner.read_at_lsn(prev_lsn) {
-                        Some(LogEntry::In(base_rec)) if !base_rec.is_delta => {
-                            base_rec.node_data.unwrap_or_default()
-                        }
-                        _ => {
-                            // Full BIN not available (may have been cleaned
-                            // away or is before the scan range).  Graceful
-                            // degrade: treat the delta as the full BIN.  The
-                            // BIN will be re-logged as a full entry at the
-                            // next checkpoint.
-                            log::debug!(
-                                "noxu-recovery: BIN-delta reconstitution: \
-                                     full BIN at prev_lsn={prev_lsn:?} not found; \
-                                     treating delta as full (node_id={})",
-                                rec.node_id,
-                            );
-                            // Use the delta bytes directly as a stub BIN
-                            // (partial data, will be fixed at next checkpoint).
-                            // This is the graceful degradation path.
-                            node_data.to_vec()
-                        }
-                    };
-                    // Reconstitute: merge delta onto base.
-                    if let Some(reconstituted) =
-                        noxu_tree::Tree::reconstitute_bin_delta(
-                            &base_bytes,
-                            node_data,
-                        )
-                    {
-                        let recon_bytes = reconstituted.serialize_full();
-                        let result = t.recover_in_redo(
-                            log_lsn,
-                            rec.is_root,
-                            true,
-                            &recon_bytes,
-                        );
-                        if let noxu_tree::InRedoResult::Inserted
-                        | noxu_tree::InRedoResult::Replaced = result
-                        {
-                            self.stats.ins_replayed += 1;
-                        }
-                    } else {
-                        log::warn!(
-                            "noxu-recovery: BIN-delta reconstitution failed at \
-                             lsn={log_lsn:?} node_id={} db_id={}",
-                            rec.node_id,
-                            rec.db_id,
-                        );
-                    }
-                    continue;
-                }
-                // noxu_tree::BIN_LEVEL = 0x10001; anything higher is an upper IN.
-                let is_bin = rec.level <= 0x10001;
-                let result =
-                    t.recover_in_redo(log_lsn, rec.is_root, is_bin, node_data);
-                match result {
-                    noxu_tree::InRedoResult::Inserted
-                    | noxu_tree::InRedoResult::Replaced => {
-                        self.stats.ins_replayed += 1;
-                    }
-                    noxu_tree::InRedoResult::Skipped
-                    | noxu_tree::InRedoResult::NotInTree => {}
-                    noxu_tree::InRedoResult::DeserializeFailed => {
-                        log::warn!(
-                            "noxu-recovery: IN-redo deserialize failed at \
-                             lsn={log_lsn:?} node_id={} db_id={} is_bin={is_bin}",
-                            rec.node_id,
-                            rec.db_id,
-                        );
-                    }
-                }
-            }
+            self.apply_in_redo_to_tree(scanner, analysis, t);
         }
         // (legacy dirty_in_map drain; keeps stats consistent)
         while let Some(level) = self.dirty_in_map.get_lowest_level() {
             self.dirty_in_map.select_dirty_ins_for_level(level);
         }
-        let _ = in_count; // reported below via ins_replayed
 
         // ---- Recovery alloc optimisation: pre-warm BIN capacity before LN redo ----
         //
