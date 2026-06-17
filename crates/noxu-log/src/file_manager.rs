@@ -529,6 +529,83 @@ impl FileManager {
     ///
     /// # Returns
     /// The file number that was actually written to.
+    /// Writes `data` at `file_offset` within log file `file_num`.
+    ///
+    /// JE faithfulness: JE `FileManager.writeLogBuffer` uses
+    /// `fullBuffer.getFirstLsn()` to determine which file to write to, not
+    /// `currentFileNum`.  This method mirrors that by accepting an explicit
+    /// `file_num` parameter so `write_dirty` and `fill_flush_pending` can
+    /// write dirty buffers to the file their `first_lsn` belongs to.
+    ///
+    /// The auto-flip (check `file_len >= max_file_size` and call `flip_file`)
+    /// has been removed: file flips are managed exclusively by
+    /// `LogManager::log_internal` via the `flipped` flag and
+    /// `get_write_buffer`/`sync_log_end_and_finish_file`.  Auto-flip in this
+    /// method would race with the explicit flip and double-create files.
+    pub fn write_buffer_to_file(
+        &self,
+        file_num: u32,
+        data: &[u8],
+        file_offset: u64,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(LogError::WriteFailed(
+                "Cannot write in read-only mode".to_string(),
+            ));
+        }
+
+        // Obtain (or create) the file handle under `file_latch`.
+        //
+        // We MUST hold `file_latch` for the entire exists-check → get/create
+        // sequence to avoid a TOCTOU race:
+        //
+        //   Thread A: inside create_file_internal (created empty file, writing
+        //             header but not done yet)
+        //   Thread B: file_path.exists()=true → get_file_handle → tries to
+        //             read the header from an empty file → "failed to fill
+        //             whole buffer" (UnexpectedEof)
+        //
+        // Holding file_latch serialises creation and subsequent opens so that
+        // Thread B waits until Thread A's create_file_internal (which also
+        // holds file_latch) has written and fsynced the full header.
+        let handle = {
+            let _guard = self
+                .file_latch
+                .acquire()
+                .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
+
+            if self.file_path(file_num).exists() {
+                self.get_file_handle(file_num)?
+            } else {
+                // create_file_internal (called here directly, since we already
+                // hold file_latch) creates the file, writes the header, fsyncs.
+                self.create_file_internal(file_num)?
+            }
+        };
+
+        {
+            let mut guard = handle.acquire()?;
+            guard.write_at(file_offset, data)?;
+        }
+
+        self.n_sequential_writes.fetch_add(1, Ordering::Relaxed);
+        self.n_sequential_write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Writes `data` at `file_offset` within the CURRENT log file.
+    ///
+    /// For new entries written by `LogManager::log_internal` when the entry is
+    /// too large for the buffer pool (temp-buffer path). The current file is
+    /// always correct here because `set_last_position` has already advanced
+    /// `current_file_num` to the file that holds `current_lsn`.
+    ///
+    /// Callers that write data belonging to a SPECIFIC file (dirty buffer
+    /// flush in `write_dirty` / `fill_flush_pending`) must use
+    /// [`write_buffer_to_file`] instead to avoid writing old data to the
+    /// wrong file after a flip.
     pub fn write_buffer(&self, data: &[u8], file_offset: u64) -> Result<u32> {
         if self.read_only {
             return Err(LogError::WriteFailed(
@@ -537,40 +614,7 @@ impl FileManager {
         }
 
         let file_num = self.current_file_num.load(Ordering::Acquire);
-
-        // Obtain (or create) the file handle for the current file.
-        // If no log file exists yet, create the first one.
-        let handle = if self.file_path(file_num).exists() {
-            self.get_file_handle(file_num)?
-        } else {
-            self.create_file(file_num)?
-        };
-
-        // Write the data at the specified offset.
-        {
-            let mut guard = handle.acquire()?;
-            guard.write_at(file_offset, data)?;
-        }
-
-        // Do NOT update next_available_lsn or last_used_lsn here.
-        // Those are managed exclusively by set_last_position() under the LWL
-        // in LogManager::log().  flush_dirty_buffers() writes pool buffers in
-        // pool-index order (not temporal/LSN order); unconditionally storing
-        // file_offset+len here would set next_available_lsn backward whenever
-        // an older buffer is written after a newer one (ring-wrapped pool).
-
-        // Track sequential-write stats.
-        self.n_sequential_writes.fetch_add(1, Ordering::Relaxed);
-        self.n_sequential_write_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-        // Check whether we need to flip to a new file.
-        let path = self.file_path(file_num);
-        let file_len = path.metadata().map(|m| m.len()).unwrap_or(0);
-        if file_len >= self.max_file_size {
-            self.flip_file()?;
-        }
-
+        self.write_buffer_to_file(file_num, data, file_offset)?;
         Ok(file_num)
     }
 

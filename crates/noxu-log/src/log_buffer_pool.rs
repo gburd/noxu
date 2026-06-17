@@ -308,6 +308,9 @@ impl LogBufferPool {
 
                 // Write unflushed bytes to disk — JE `writeBufferToFile` →
                 // `fileManager.writeLogBuffer` → pwrite.
+                // Use write_buffer_to_file(first_lsn.file_number()) so dirty
+                // buffers from the OLD file are written to the OLD file even
+                // after current_file_num has advanced to the new file.
                 let first_lsn = buffer.get_first_lsn();
                 if !first_lsn.is_null() {
                     let unflushed = buffer.get_unflushed_data();
@@ -320,7 +323,11 @@ impl LogBufferPool {
                         buffer.release();
                         drop(buffer);
 
-                        self.file_manager.write_buffer(&data, offset)?;
+                        self.file_manager.write_buffer_to_file(
+                            first_lsn.file_number(),
+                            &data,
+                            offset,
+                        )?;
                     } else {
                         buffer.release();
                         drop(buffer);
@@ -417,10 +424,14 @@ mod tests {
     use tempfile::TempDir;
 
     /// Create a pool backed by a real (but temp-dir) FileManager.
-    fn make_pool(num_buffers: usize, buffer_size: usize) -> (LogBufferPool, TempDir) {
+    fn make_pool(
+        num_buffers: usize,
+        buffer_size: usize,
+    ) -> (LogBufferPool, TempDir) {
         let dir = TempDir::new().unwrap();
-        let fm =
-            Arc::new(FileManager::new(dir.path(), false, 100_000_000, 10).unwrap());
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 100_000_000, 10).unwrap(),
+        );
         let pool = LogBufferPool::new(num_buffers, buffer_size, fm);
         (pool, dir)
     }
@@ -543,13 +554,7 @@ mod tests {
         let mut lsns = Vec::new();
         for i in 0u8..20 {
             let lsn = lm
-                .log(
-                    LogEntryType::Trace,
-                    &[i],
-                    Provisional::No,
-                    false,
-                    false,
-                )
+                .log(LogEntryType::Trace, &[i], Provisional::No, false, false)
                 .expect("log() must not panic (DRIFT-2 fix)");
             lsns.push((lsn, i));
         }

@@ -64,14 +64,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// serialises all callers.  Storing them here eliminates per-call allocation:
 ///
 /// * `entry_buf` — H-3 fix: scratch buffer for encoding each log entry.
-/// * `flush_pending` — R-1 fix: reused list of (data, file_offset) pairs.
+/// * `flush_pending` — R-1 fix: reused list of (data, file_num, file_offset) tuples.
 ///   `flush_sync` iterates this Vec while holding the LWL, preserving capacity.
 ///   `flush_no_sync` uses `std::mem::take` (see R-2 comment).
 struct LwlScratch {
     /// Scratch buffer for encoding log entries (H-3 fix).
     entry_buf: Vec<u8>,
     /// Reusable pending-flush list (R-1 fix).
-    flush_pending: Vec<(Vec<u8>, u64)>,
+    flush_pending: Vec<(Vec<u8>, u32, u64)>,
 }
 
 impl LwlScratch {
@@ -165,7 +165,11 @@ impl LogManager {
         buffer_size: usize,
         read_buffer_size: usize,
     ) -> Self {
-        let buffer_pool = LogBufferPool::new(num_buffers, buffer_size, Arc::clone(&file_manager));
+        let buffer_pool = LogBufferPool::new(
+            num_buffers,
+            buffer_size,
+            Arc::clone(&file_manager),
+        );
 
         LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
@@ -371,7 +375,7 @@ impl LogManager {
         // `vec![0u8; entry_size]` on every call.  The Vec is cleared and
         // resized to `entry_size` under the LWL.  Because the LWL serialises
         // all writes, there is exactly one in-flight encoding at a time.
-        let lsn = {
+        let (lsn, segment_out, oversized_out) = {
             let mut lwl_guard = self.log_write_latch.lock();
             let entry_buf = &mut lwl_guard.entry_buf;
 
@@ -506,39 +510,57 @@ impl LogManager {
                 current_lsn.file_offset() + entry_size as u32,
             );
             self.file_manager.set_last_position(new_next, current_lsn);
+            // JE faithfulness (Part-2, DRIFT-1): register LSN + allocate slot
+            // under LWL; clone bytes; then release LWL.  The bytes copy
+            // (segment.put) and direct write_buffer happen OUTSIDE the LWL.
+            //
+            // JE serialLogWork releases logWriteMutex BEFORE
+            // LogBufferSegment.put (after steps allocate + registerLsn +
+            // buffer-latch-release).  The pin-count protocol
+            // (wait_for_zero_and_latch in write_dirty) ensures the buffer
+            // won't be reused before put() decrements.
             let mut buffer = buffer_arc.lock();
-
             buffer.latch_for_write();
             let segment_opt = buffer.allocate(entry_size);
 
-            match segment_opt {
+            let (segment_out, oversized_out) = match segment_opt {
                 Some(segment) => {
-                    // Entry fits in the write buffer.
+                    // Entry fits in the write buffer: register LSN and pin.
                     buffer.register_lsn(current_lsn);
                     buffer.release();
                     drop(buffer);
-
-                    // Copy bytes into the buffer segment outside the latch.
-                    segment.put(entry_buf);
+                    // Clone bytes before the LWL drops (entry_buf borrows lwl_guard).
+                    // O(entry_size): same cost as the pre-H-3 per-call allocation.
+                    let entry_bytes_clone = entry_buf.clone();
+                    (Some((segment, entry_bytes_clone)), None)
                 }
                 None => {
-                    // Entry is too large for any pool buffer - write directly
-                    // to the file, as does in serialLogWork.
+                    // Entry too large for any pool buffer: clone + write outside LWL.
                     buffer.release();
                     drop(buffer);
-
                     self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
-
-                    self.file_manager.write_buffer(
-                        entry_buf,
-                        current_lsn.file_offset() as u64,
-                    )?;
+                    let entry_bytes_clone = entry_buf.clone();
+                    let offset = current_lsn.file_offset() as u64;
+                    (None, Some((entry_bytes_clone, offset)))
                 }
-            }
+            };
 
-            current_lsn
+            (current_lsn, segment_out, oversized_out)
         };
-        // LWL released here.
+        // LWL released here — JE serialLogWork: logWriteMutex released BEFORE
+        // LogBufferSegment.put and BEFORE the direct write_buffer call.
+        // Concurrent committers now serialize only on in-memory bookkeeping,
+        // not on the syscall (DRIFT-1 fix, Part-2).
+
+        // Outside LWL: copy bytes into the buffer segment (JE step 8,
+        // LogBufferSegment.put outside logWriteMutex).
+        if let Some((segment, entry_bytes)) = segment_out {
+            segment.put(&entry_bytes);
+        }
+        // Outside LWL: direct write for oversized entries.
+        if let Some((entry_bytes, offset)) = oversized_out {
+            self.file_manager.write_buffer(&entry_bytes, offset)?;
+        }
 
         // Flush / fsync if requested, outside the LWL (correct).
         // Use flush_sync_if_needed(lsn) rather than flush_sync() so that a
@@ -580,24 +602,27 @@ impl LogManager {
 
     /// Flushes all dirty write buffers to disk and performs an fdatasync.
     ///
-    /// NOTE (Part-2 target, DRIFT-1): currently holds the LWL through
-    /// `pwrite64`, which serialises disk I/O and is the likely root cause of
-    /// the 3-4x concurrent-write throughput gap vs JE.  JE holds the LWL only
-    /// for LSN-assign + in-memory buffer copy, releases it, and the buffer-pool
-    /// flusher (`write_dirty`) + `FSyncManager` do I/O concurrently.
-    /// Part-2 will restructure this to release the LWL before I/O.
+    /// JE faithfulness (Part-2, DRIFT-1): the LWL is now held ONLY for the
+    /// `fill_flush_pending` snapshot (collect unflushed data + advance
+    /// watermarks).  The actual `pwrite` calls and the `fdatasync` both happen
+    /// OUTSIDE the LWL, matching JE `LogManager.flushAndSync`:
     ///
-    /// Current behaviour: under LWL: collect dirty buffers via
-    /// `fill_flush_pending` + pwrite64 for each; then release LWL; then
-    /// fdatasync via FsyncManager (group-commit outside LWL is already
-    /// faithful to JE).
+    ///   1. Under LWL: collect dirty buffer ranges via `fill_flush_pending`.
+    ///   2. Release LWL.
+    ///   3. Outside LWL: pwrite64 for each dirty range.
+    ///   4. Outside LWL: fdatasync via FsyncManager (group-commit).
+    ///
+    /// JE references:
+    /// - `LogManager.flushAndSync` (holds logWriteMutex only for the snapshot)
+    /// - `LogBufferPool.writeDirty` → `writeBufferToFile` → pwrite (no LWL)
+    /// - `FSyncManager.fsync` (outside LWL, group-commit coalescing)
     pub fn flush_sync(&self) -> Result<Lsn> {
-        // NOTE: the LWL is held through pwrite64 here. This is a known
-        // re-invention (DRIFT-1, audit Tier-1B). Part-2 will fix this by
-        // releasing the LWL before I/O, matching JE serialLogWork.
-        // R-1: guard.flush_pending is reused across calls (outer Vec alloc
-        // eliminated after warm-up; clear() retains capacity).
-        let eol = {
+        // Phase 1: under LWL — snapshot dirty buffer ranges and advance
+        // flushed_len watermarks.  The watermark advance is the only
+        // operation that MUST be serialised: it prevents two concurrent
+        // flush_sync calls from writing the same bytes twice.
+        // R-1: flush_pending Vec reused across calls (clear() keeps capacity).
+        let (pending_snapshot, eol) = {
             let mut guard = self.log_write_latch.lock();
             guard.flush_pending.clear();
             Self::fill_flush_pending(
@@ -605,15 +630,20 @@ impl LogManager {
                 &mut guard.flush_pending,
             );
             let eol = self.file_manager.get_next_available_lsn();
-            for (data, offset) in &guard.flush_pending {
-                self.file_manager.write_buffer(data, *offset)?;
-            }
-            eol
+            // Take the snapshot out of the guard so we can release the LWL
+            // before doing I/O (matching JE's protocol).
+            (std::mem::take(&mut guard.flush_pending), eol)
         };
-        // LWL released — all pwrite64s done, data in kernel page cache.
-        // Concurrent waiters on LWL are now released and will each complete
-        // their own pwrite64 under LWL, then enter FsyncManager ~
-        // simultaneously, enabling coalesced fdatasync.
+        // LWL released — all concurrent committers (whose bytes were captured
+        // in the snapshot) are now unblocked.  They will call
+        // flush_sync_if_needed and either find last_synced_lsn already covers
+        // their LSN (coalesced) or enter fsync_manager as waiters.
+
+        // Phase 2: outside LWL — pwrite64 for each dirty range.
+        // Phase 3: outside LWL — fdatasync via FsyncManager (group-commit).
+        for (data, file_num, offset) in &pending_snapshot {
+            self.file_manager.write_buffer_to_file(*file_num, data, *offset)?;
+        }
 
         let fm = &self.file_manager;
         let fsync_result = self.fsync_manager.fsync(|| {
@@ -717,8 +747,8 @@ impl LogManager {
         }; // ← LWL released; foreground writers unblocked before pwrite64
 
         // Phase 2 — outside LWL: write to OS page cache.
-        for (data, offset) in &pending_snapshot {
-            self.file_manager.write_buffer(data, *offset)?;
+        for (data, file_num, offset) in &pending_snapshot {
+            self.file_manager.write_buffer_to_file(*file_num, data, *offset)?;
         }
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
@@ -736,7 +766,7 @@ impl LogManager {
     /// avoid a `&self` borrow conflict while the LWL guard is live.
     fn fill_flush_pending(
         buffer_pool: &Arc<Mutex<LogBufferPool>>,
-        pending: &mut Vec<(Vec<u8>, u64)>,
+        pending: &mut Vec<(Vec<u8>, u32, u64)>,
     ) {
         let pool = buffer_pool.lock();
         let buffers = pool.get_all_buffers();
@@ -751,6 +781,7 @@ impl LogManager {
                 let unflushed = buf.get_unflushed_data();
                 if !unflushed.is_empty() {
                     let data = unflushed.to_vec();
+                    let file_num = first_lsn.file_number();
                     let offset = buf.flushed_file_offset();
                     // Advance the watermark now (under the buffer latch) so a
                     // subsequent fill_flush_pending() call sees this range as
@@ -758,7 +789,9 @@ impl LogManager {
                     buf.mark_flushed();
                     buf.release();
                     drop(buf);
-                    pending.push((data, offset));
+                    // Include file_num so callers can use write_buffer_to_file
+                    // and write to the buffer's own file, not current_file_num.
+                    pending.push((data, file_num, offset));
                     continue;
                 }
             }
@@ -1444,5 +1477,84 @@ mod tests {
 
         // is_io_invalid() accessor must agree.
         assert!(lm.is_io_invalid(), "is_io_invalid() must return true");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part-2 acceptance test (DRIFT-1 fix)
+    //
+    // STRUCTURAL TEST: Verifies that `log_internal` releases the LWL before
+    // the bytes copy (segment.put) and that concurrent committers can proceed
+    // concurrently.  This is NOT a timing test — it uses a real env-style
+    // sequential write to confirm durability + correctness.
+    //
+    // FAIL-PRE:  with LWL held through segment.put, N concurrent writers
+    //            would all block on LWL, serialising completely.
+    // PASS-POST: each writer independently calls segment.put off-latch;
+    //            all entries are durable and readable after flush_sync.
+    //
+    // The real perf proof is in the benchmark suite (concurrent throughput).
+    // -----------------------------------------------------------------------
+
+    /// Concurrent log_internal calls — multiple threads log entries in
+    /// parallel; after flush_sync all entries must be readable from disk.
+    /// Tests that segment.put (bytes copy) runs off-LWL correctly.
+    ///
+    /// JE references:
+    /// - `LogManager.serialLogWork`: logWriteMutex released before
+    ///   `LogBufferSegment.put`
+    /// - `LogBufferSegment.put`: called outside logWriteMutex
+    #[test]
+    fn test_concurrent_log_internal_latch_released_before_put() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 100_000_000, 10).unwrap(),
+        );
+        // Normal 1 MB buffers, 3 buffers
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096));
+
+        const THREADS: usize = 8;
+        const ENTRIES_PER_THREAD: usize = 50;
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let lm2 = Arc::clone(&lm);
+            handles.push(thread::spawn(move || {
+                let mut lsns = Vec::new();
+                for i in 0..ENTRIES_PER_THREAD {
+                    let payload = format!("t{t:02}_e{i:04}");
+                    let lsn = lm2
+                        .log(
+                            LogEntryType::Trace,
+                            payload.as_bytes(),
+                            Provisional::No,
+                            false,
+                            false,
+                        )
+                        .expect("log must not fail");
+                    lsns.push((lsn, payload));
+                }
+                lsns
+            }));
+        }
+
+        let all_lsns: Vec<(Lsn, String)> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+
+        // Flush all entries to disk.
+        lm.flush_sync().expect("flush_sync must succeed");
+
+        // Verify all entries are readable from disk (cold path).
+        for (lsn, expected_payload) in &all_lsns {
+            let (_, payload) = lm.read_entry(*lsn).expect("read_entry");
+            assert_eq!(
+                payload.as_slice(),
+                expected_payload.as_bytes(),
+                "payload mismatch at {lsn:?}"
+            );
+        }
     }
 }

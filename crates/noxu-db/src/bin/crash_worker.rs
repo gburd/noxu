@@ -258,8 +258,9 @@ fn main() {
             let env =
                 noxu_db::Environment::open(env_config).expect("open env flip");
             let db_config = DatabaseConfig::new().with_allow_create(true);
-            let db =
-                env.open_database(None, "test", &db_config).expect("open db flip");
+            let db = env
+                .open_database(None, "test", &db_config)
+                .expect("open db flip");
 
             // Write enough records to guarantee at least one file flip.
             for i in 0u32..200 {

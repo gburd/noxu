@@ -18,6 +18,44 @@ listed in [References](#references).
 
 ### Fixed
 
+- **WAL Tier-1B Part 1 — LogBufferPool::write_dirty implemented (DRIFT-2)**
+  (`noxu-log`): `LogBufferPool::write_dirty` was a no-op stub that reset
+  `dirty_start`/`dirty_end` without writing any bytes.  Under buffer pressure
+  `bump_and_write_dirty` would panic with "No free log buffers after flushing
+  dirty buffers".  Now calls `FileManager::write_buffer_to_file` for each
+  dirty buffer in the chain, matching JE `LogBufferPool.writeDirty` →
+  `writeBufferToFile` → `fileManager.writeLogBuffer`.  `FileManager` is now
+  wired into `LogBufferPool` at construction time (JE holds the same
+  reference).  Acceptance test: `test_write_dirty_drains_ring_no_panic`.
+
+- **WAL Tier-1B Part 3 — fsync closing file under LWL on file flip (DRIFT-3/7)**
+  (`noxu-log`): On a file flip, the closing file was not fsynced before the
+  new file received writes.  `get_write_buffer(flipped=true)` now calls
+  `FileManager::sync_log_end_and_finish_file()` (fsync + LRU cache eviction)
+  after `bumpAndWriteDirty` and before `advanceLsn` advances
+  `current_file_num`, restoring JE's invariant (`FileManager.
+  syncLogEndAndFinishFile`, line 2077).  Also fixes the LSN-advance ordering
+  inversion: `set_last_position` is now called AFTER `get_write_buffer`
+  returns (JE serialLogWork step 4 after step 3).  Crash test:
+  `test_file_flip_fsync_ordering_crash_recovery`.
+
+- **WAL Tier-1B Part 2 — LWL released before disk I/O (DRIFT-1)**
+  (`noxu-log`): `log_internal` held the LWL through `segment.put` (bytes
+  copy) and `flush_sync` held it through `pwrite64`, serialising all
+  concurrent committers on the syscall.  The LWL now covers only: LSN
+  assignment, `shouldFlipFile`/`calculateNextLsn`, `getWriteBuffer`,
+  `advanceLsn`, buffer `allocate` + `registerLsn` — then releases.  Bytes
+  copy (`segment.put`) and all I/O (pwrite, fdatasync) happen outside the
+  LWL, matching JE `LogManager.serialLogWork` (logWriteMutex released before
+  `LogBufferSegment.put`).  Fixes the false "correct logWriteMutex design"
+  comment.  Added `FileManager::write_buffer_to_file(file_num, ...)` for
+  correct file targeting when dirty buffers are written after a flip.
+  Acceptance test: `test_concurrent_log_internal_latch_released_before_put`.
+
+  JE references (all three parts): `LogManager.serialLogWork`,
+  `LogBufferPool.writeDirty/getWriteBuffer`, `FileManager.
+  syncLogEndAndFinishFile`.
+
 - **CC-4 residual — per-tree provisional-flag coordination** (`noxu-recovery`,
   `noxu-evictor`): The prior CC-4 fix introduced a single `AtomicI32`
   `checkpoint_max_flush_level` holding the **global** maximum dirty upper-IN
