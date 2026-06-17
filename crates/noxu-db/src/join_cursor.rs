@@ -366,9 +366,8 @@ mod tests {
         fn insert(&self, pk: &[u8], val: &[u8]) {
             let k = DatabaseEntry::from_bytes(pk);
             let v = DatabaseEntry::from_bytes(val);
+            // primary.put() auto-maintains both secondaries via registered hooks.
             self.primary.lock().put(None, &k, &v).unwrap();
-            self.sec1.update_secondary(None, &k, None, Some(&v)).unwrap();
-            self.sec2.update_secondary(None, &k, None, Some(&v)).unwrap();
         }
     }
 

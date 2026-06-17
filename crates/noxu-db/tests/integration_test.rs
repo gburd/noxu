@@ -1789,18 +1789,16 @@ fn open_pri_sec(
 /// Helper: write to primary then manually update the secondary.
 fn pri_put_and_index(
     primary: &Arc<Mutex<noxu_db::Database>>,
-    secondary: &SecondaryDatabase,
+    _secondary: &SecondaryDatabase,
     k: &[u8],
     v: &[u8],
-    old_v: Option<&[u8]>,
+    _old_v: Option<&[u8]>,
 ) {
     let pk = DatabaseEntry::from_bytes(k);
     let new_data = DatabaseEntry::from_bytes(v);
+    // primary.put() auto-maintains the secondary via the registered hook.
+    // No explicit update_secondary call needed (would double-process).
     primary.lock().put(None, &pk, &new_data).unwrap();
-    let old_entry = old_v.map(DatabaseEntry::from_bytes);
-    secondary
-        .update_secondary(None, &pk, old_entry.as_ref(), Some(&new_data))
-        .unwrap();
 }
 
 /// put to primary → get from secondary returns primary_key + data.
@@ -2169,7 +2167,7 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let pv = DatabaseEntry::from_bytes(b"AB");
     primary.lock().put(None, &pk, &pv).unwrap();
-    secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
+    // Auto-hook maintains secondary.
 
     // Both 'A' and 'B' should map to pk1.
     for sec_byte in [b"A" as &[u8], b"B"] {
@@ -2342,7 +2340,7 @@ fn sec_num_recs_put_get_round_trip() {
         let pk = DatabaseEntry::from_bytes(&pri_key_bytes);
         let pv = DatabaseEntry::from_bytes(&data_bytes);
         primary.lock().put(None, &pk, &pv).unwrap();
-        secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
+        // Auto-hook maintains secondary.
     }
 
     // SecondaryDatabase.get(): look up by sec_key = i + KEY_OFFSET for i in 0..NUM_RECS.

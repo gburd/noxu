@@ -53,13 +53,13 @@ pub struct SecondaryCursor<'a> {
     inner: Cursor,
     /// Back-reference to the owning SecondaryDatabase (for primary lookups).
     secondary_db: &'a SecondaryDatabase,
-    /// Transaction handle the cursor was opened under.  Every primary
-    /// lookup, primary delete, and secondary-cleanup call performed by
-    /// the cursor is forwarded under this txn so the whole cursor —
-    /// including the [`SecondaryCursor::delete`] cascade — participates
-    /// in the caller's transaction.  `None` selects auto-commit
-    /// behaviour.
+    /// Transaction handle the cursor was opened under.
     txn: Option<&'a Transaction>,
+    /// Whether this cursor runs in read-uncommitted (dirty-read) mode.
+    /// When true, a missing primary during read-through is skipped rather
+    /// than raising SecondaryIntegrityException.  D8 fix.
+    /// Ref: JE SecondaryCursor getNextWithKeySearch() dirty-read skip.
+    read_uncommitted: bool,
 }
 
 impl<'a> SecondaryCursor<'a> {
@@ -82,8 +82,10 @@ impl<'a> SecondaryCursor<'a> {
         txn: Option<&'a Transaction>,
         config: Option<&CursorConfig>,
     ) -> Result<Self> {
+        let read_uncommitted =
+            config.map_or(false, |c| c.read_uncommitted);
         let inner = secondary_db.inner_db().open_cursor(txn, config)?;
-        Ok(Self { inner, secondary_db, txn })
+        Ok(Self { inner, secondary_db, txn, read_uncommitted })
     }
 
     // ------------------------------------------------------------------
@@ -169,19 +171,11 @@ impl<'a> SecondaryCursor<'a> {
         };
 
         if pri_get_status == OperationStatus::Success {
-            // Remove every secondary index entry this primary record
-            // produced — atomic with the primary delete below because
-            // both run under `self.txn` (Wave 1B).
-            let old_data = pri_data.clone();
-            self.secondary_db.delete_all_for_primary(
-                self.txn,
-                &pri_key,
-                Some(&old_data),
-            )?;
+            // primary.delete() auto-maintains secondary entries via the hook.
+            // Do NOT call delete_all_for_primary first (would trigger D7).
         }
 
-        // Delete the primary record under the same txn so the cascade
-        // and the primary delete commit / abort together.
+        // Delete the primary; the auto-hook removes all secondary entries.
         let del_status = {
             let primary = self.secondary_db.primary_db().lock();
             primary.delete(self.txn, &pri_key)?
@@ -326,6 +320,13 @@ impl<'a> SecondaryCursor<'a> {
         let primary = self.secondary_db.primary_db().lock();
         let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
         if pri_status != OperationStatus::Success {
+            // D8: if running in dirty-read (read-uncommitted) mode, skip
+            // the record rather than raising SecondaryIntegrityException.
+            // JE SecondaryCursor dirty-read primary-missing skip.
+            // Ref: SecondaryCursor.java getWithPrimaryData() dirty-read path.
+            if self.read_uncommitted {
+                return Ok(OperationStatus::NotFound);
+            }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
                 self.secondary_db.get_database_name()
@@ -369,6 +370,10 @@ impl<'a> SecondaryCursor<'a> {
         let primary = self.secondary_db.primary_db().lock();
         let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
         if pri_status != OperationStatus::Success {
+            // D8: dirty-read skip (see get_search_key site for full comment).
+            if self.read_uncommitted {
+                return Ok(OperationStatus::NotFound);
+            }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
                 self.secondary_db.get_database_name()
@@ -538,10 +543,16 @@ impl<'a> SecondaryCursor<'a> {
         let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
 
         if pri_status != OperationStatus::Success {
-            // Secondary refers to a missing primary — integrity issue.
-            // In this causes the cursor to skip the record (in
-            // READ_UNCOMMITTED mode) or throws an exception.  We return
-            // SecondaryIntegrityException to match the non-transactional path.
+            // D8: dirty-read (read-uncommitted) mode — skip the record
+            // instead of raising SecondaryIntegrityException.  The primary
+            // may have been concurrently deleted; under dirty-read we return
+            // NotFound and let the caller advance.
+            // Non-dirty-read: raise SecondaryIntegrityException (secondary
+            // index is inconsistent).
+            // Ref: SecondaryCursor.java getNextWithKeySearch() dirty-read path.
+            if self.read_uncommitted {
+                return Ok(OperationStatus::NotFound);
+            }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
                 self.secondary_db.get_database_name()
@@ -665,8 +676,11 @@ mod tests {
     ) {
         let pk = DatabaseEntry::from_bytes(key);
         let pv = DatabaseEntry::from_bytes(value);
+        // The secondary is registered with the primary via the auto-hook;
+        // primary.put() already triggers update_secondary.  Don't call
+        // update_secondary manually or the same (sec_key, pri_key) pair
+        // will be inserted twice → D6 SecondaryIntegrityException.
         primary.lock().put(None, &pk, &pv).unwrap();
-        secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
     }
 
     #[test]

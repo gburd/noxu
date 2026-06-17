@@ -1471,8 +1471,8 @@ mod secondary_cursor_txn {
         // Seed: primary record + matching secondary entry.
         let pk = DatabaseEntry::from_bytes(b"pk1");
         let pv = DatabaseEntry::from_bytes(b"Apple");
+        // Auto-hook maintains secondary via primary.put().
         primary.lock().put(None, &pk, &pv).unwrap();
-        secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
 
         // Open a secondary cursor under a txn with a non-default config.
         let txn = env.begin_transaction(None).unwrap();

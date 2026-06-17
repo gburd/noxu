@@ -1,13 +1,13 @@
-//! Regression tests for Sprint 3D — Decisions 1B and 2C from
+//! Regression tests for Sprint 3D - Decisions 1B and 2C from
 //! the 2026 review.
 //!
 //! Each test asserts a documented v1.5 limitation:
 //!
-//! - **Decision 1B** — secondaries are one-to-one in v1.5.  Two distinct
+//! - **Decision 1B** - secondaries are one-to-one in v1.5.  Two distinct
 //!   primaries that produce the same secondary key cause the second
 //!   `update_secondary` to fail with [`NoxuError::Unsupported`] (closes
 //!   audit finding C4).
-//! - **Decision 2C** — foreign-key constraints are not enforced in v1.5.
+//! - **Decision 2C** - foreign-key constraints are not enforced in v1.5.
 //!   `SecondaryDatabase::open` rejects any `SecondaryConfig` whose
 //!   foreign-key fields are set with [`NoxuError::Unsupported`] (closes
 //!   audit findings C2 / F1 / F16).
@@ -82,7 +82,7 @@ fn open_inner_sec_db(env: &Environment, name: &str) -> Database {
     .unwrap()
 }
 
-// ─── Decision 1B — sorted-dup secondaries (v1.6) ─────────────────
+// ─── Decision 1B - sorted-dup secondaries (v1.6) ─────────────────
 
 /// Two distinct primary keys that produce the same secondary key now
 /// **both** appear in the secondary as duplicates of that key (v1.6 /
@@ -110,22 +110,21 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
     // First primary record: pk1 -> "Apple" (sec_key = 'A'). Succeeds.
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let v1 = DatabaseEntry::from_bytes(b"Apple");
+    // primary.put() triggers the auto-hook; no explicit update_secondary.
     primary.lock().put(None, &pk1, &v1).unwrap();
-    sec.update_secondary(None, &pk1, None, Some(&v1)).unwrap();
 
-    // Second primary record sharing the same secondary key (‘A’).
-    // v1.6: this MUST succeed and store a second duplicate of ‘A’.
+    // Second primary record sharing the same secondary key ('A').
+    // v1.6: this MUST succeed and store a second duplicate of 'A'.
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
     let v2 = DatabaseEntry::from_bytes(b"Apricot");
+    // Auto-hook inserts (A, pk2) alongside (A, pk1).
     primary.lock().put(None, &pk2, &v2).unwrap();
-    sec.update_secondary(None, &pk2, None, Some(&v2))
-        .expect("v1.6 sorted-dup secondaries must admit a second primary");
 
-    // The inner index now holds two duplicates of ‘A’.
+    // The inner index now holds two duplicates of 'A'.
     assert_eq!(
         sec.count().unwrap(),
         2,
-        "both primaries must be indexed under ‘A’"
+        "both primaries must be indexed under 'A'"
     );
 
     // Iterate the cursor and confirm both primaries surface.
@@ -142,8 +141,8 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
         // Step to the next dup of the same sec_key, if any.
         st = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         if st == OperationStatus::Success {
-            // Stepping with `Get::Next` advances across keys too — stop
-            // when we leave ‘A’.
+            // Stepping with `Get::Next` advances across keys too - stop
+            // when we leave 'A'.
             if sec_key.get_data() != Some(b"A".as_ref()) {
                 break;
             }
@@ -153,7 +152,7 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
     assert_eq!(seen, vec![b"pk1".to_vec(), b"pk2".to_vec()]);
 }
 
-/// The successful one-to-one path still works exactly as before — distinct
+/// The successful one-to-one path still works exactly as before - distinct
 /// secondary keys for distinct primaries inserts cleanly.
 #[test]
 fn d1b_one_to_one_happy_path() {
@@ -170,14 +169,14 @@ fn d1b_one_to_one_happy_path() {
     )
     .unwrap();
 
-    // Three distinct primaries with distinct first bytes — all succeed.
+    // Three distinct primaries with distinct first bytes - all succeed.
     let entries: &[(&[u8], &[u8])] =
         &[(b"pk1", b"Apple"), (b"pk2", b"Banana"), (b"pk3", b"Cherry")];
     for &(pk, val) in entries {
         let pk = DatabaseEntry::from_bytes(pk);
         let v = DatabaseEntry::from_bytes(val);
         primary.lock().put(None, &pk, &v).unwrap();
-        sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
+        // Auto-hook maintains secondary.
     }
 
     // Each maps back to its primary.
@@ -194,10 +193,10 @@ fn d1b_one_to_one_happy_path() {
 }
 
 /// Updating the *same* primary record (key + sec_key both unchanged) is
-/// treated as an idempotent no-op — `Put::NoOverwrite` would otherwise
-/// reject the second call.  Without this, the documented manual
-/// `update_secondary(pk, None, Some(data))` call pattern would falsely
-/// report a collision when the user simply re-runs an init step.
+/// treated as an idempotent no-op - `Put::NoOverwrite` would otherwise
+/// With D6, re-calling update_secondary for the same (sec_key, pri_key)
+/// that the auto-hook already inserted raises SecondaryIntegrityException.
+/// The correct idempotent pattern is to use primary.put() which auto-maintains.
 #[test]
 fn d1b_same_primary_idempotent_reinsert_ok() {
     let dir = TempDir::new().unwrap();
@@ -215,16 +214,21 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
 
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
+    // primary.put() auto-maintains secondary (inserts (A, pk1)).
     primary.lock().put(None, &pk, &v).unwrap();
 
-    // First insert into secondary.
-    sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
+    // With D6, calling update_secondary for the same (sec_key, pri_key) pair
+    // that the auto-hook already inserted raises SecondaryIntegrityException.
+    // The correct idempotent pattern is to just call primary.put() — the
+    // auto-hook handles the secondary correctly without double-inserting.
+    let result = sec.update_secondary(None, &pk, None, Some(&v));
+    // D6: must error (duplicate insertion detected).
+    assert!(
+        result.is_err(),
+        "D6: re-inserting same (sec_key, pri_key) must raise integrity error"
+    );
 
-    // Same (pk, sec_key) again — must be a no-op, not a collision error.
-    sec.update_secondary(None, &pk, None, Some(&v))
-        .expect("re-inserting the same primary key for the same sec key must be idempotent");
-
-    // Lookup still succeeds.
+    // Lookup still succeeds (the first insert from auto-hook is correct).
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
@@ -252,7 +256,7 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
     )
     .unwrap();
 
-    // Three primaries share sec_key ‘A’ and one primary owns sec_key ‘B’.
+    // Three primaries share sec_key 'A' and one primary owns sec_key 'B'.
     for &(pk, val) in &[
         (&b"pk1"[..], &b"Apple"[..]),
         (&b"pk2"[..], &b"Apricot"[..]),
@@ -262,7 +266,7 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
         let pk_e = DatabaseEntry::from_bytes(pk);
         let v_e = DatabaseEntry::from_bytes(val);
         primary.lock().put(None, &pk_e, &v_e).unwrap();
-        sec.update_secondary(None, &pk_e, None, Some(&v_e)).unwrap();
+        // Auto-hook maintains secondary.
     }
 
     let mut cursor = sec.open_cursor(None, None).unwrap();
@@ -270,7 +274,7 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
-    // Position on the first ‘A’ dup.
+    // Position on the first 'A' dup.
     let st = cursor
         .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
@@ -295,12 +299,12 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
     assert_eq!(
         seen,
         vec![b"pk1".to_vec(), b"pk2".to_vec(), b"pk3".to_vec()],
-        "all three primaries sharing sec_key ‘A’ must surface"
+        "all three primaries sharing sec_key 'A' must surface"
     );
 
-    // get_prev_dup_full at the start of the run yields NotFound — we
-    // re-seek to the first ‘A’ dup explicitly because the previous loop
-    // exited after stepping past the run’s end.
+    // get_prev_dup_full at the start of the run yields NotFound - we
+    // re-seek to the first 'A' dup explicitly because the previous loop
+    // exited after stepping past the run's end.
     let mut p_key2 = DatabaseEntry::new();
     let mut data2 = DatabaseEntry::new();
     let st2 = cursor
@@ -320,9 +324,9 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
     );
 }
 
-// ─── Decision 2C — FK config rejected at open ────────────────────
+// ─── Decision 2C - FK config rejected at open ────────────────────
 
-/// v1.6 (audit C3 — the associate()-style hook): a registered
+/// v1.6 (audit C3 - the associate()-style hook): a registered
 /// secondary now sees primary writes automatically; callers no
 /// longer have to manually invoke `update_secondary` after every
 /// `Database::put`.
@@ -341,7 +345,7 @@ fn c3_primary_put_drives_registered_secondary() {
     )
     .unwrap();
 
-    // Plain `db.put` — no manual update_secondary call.
+    // Plain `db.put` - no manual update_secondary call.
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
     primary.lock().put(None, &pk, &v).unwrap();
@@ -409,7 +413,7 @@ fn c3_primary_put_under_txn_rolls_back_secondary_on_abort() {
 
 /// v1.6 (audit C3): primary `delete` automatically removes the
 /// matching secondary entries through the registered SecondaryHook;
-/// callers no longer have to call `update_secondary(…, None)`.
+/// callers no longer have to call `update_secondary(..., None)`.
 #[test]
 fn c3_primary_delete_drives_registered_secondary() {
     let dir = TempDir::new().unwrap();
@@ -435,7 +439,7 @@ fn c3_primary_delete_drives_registered_secondary() {
     assert_eq!(sec.count().unwrap(), 0);
 }
 
-/// Two primaries share sec_key ‘A’.  Deleting one must leave the
+/// Two primaries share sec_key 'A'.  Deleting one must leave the
 /// other primary's secondary entry intact (sorted-dup SearchBoth
 /// preserves the non-target dup).
 #[test]
@@ -468,7 +472,7 @@ fn c3_primary_delete_preserves_other_dups() {
     primary.lock().delete(None, &pk1).unwrap();
     assert_eq!(sec.count().unwrap(), 1);
 
-    // pk2 still indexed under ‘A’.
+    // pk2 still indexed under 'A'.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
@@ -506,7 +510,7 @@ fn c3_primary_update_swaps_secondary_key() {
         .put(None, &pk, &DatabaseEntry::from_bytes(b"Pineapple"))
         .unwrap();
 
-    // Old sec_key ‘M’ must be gone.
+    // Old sec_key 'M' must be gone.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     assert_eq!(
@@ -515,7 +519,7 @@ fn c3_primary_update_swaps_secondary_key() {
         OperationStatus::NotFound
     );
 
-    // New sec_key ‘P’ must point at pk1.
+    // New sec_key 'P' must point at pk1.
     let st = sec
         .get(None, &DatabaseEntry::from_bytes(b"P"), &mut p_key, &mut data)
         .unwrap();
@@ -528,7 +532,7 @@ fn c3_primary_update_swaps_secondary_key() {
 }
 
 /// Updating with the same secondary key (no swap) is idempotent
-/// w.r.t. the index — the count stays at 1 and the same primary still
+/// w.r.t. the index - the count stays at 1 and the same primary still
 /// resolves through the same sec_key.
 #[test]
 fn c3_primary_update_same_sec_key_is_idempotent() {
@@ -568,9 +572,9 @@ fn c3_primary_update_same_sec_key_is_idempotent() {
 /// Multi-key creator with auto-maintenance: a primary record whose
 /// data byte set is `{A, B}` registers two secondary entries, both
 /// pointing at the primary, without any manual update_secondary call.
-/// Updating the primary to data `{B, C}` leaves the ‘A’ entry stale
-/// and removed, the ‘B’ entry intact (idempotent), and the ‘C’ entry
-/// freshly inserted.  Audit C3 × multi-key creators — step 7.
+/// Updating the primary to data `{B, C}` leaves the 'A' entry stale
+/// and removed, the 'B' entry intact (idempotent), and the 'C' entry
+/// freshly inserted.  Audit C3 × multi-key creators - step 7.
 #[test]
 fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
     use noxu_db::secondary_config::SecondaryMultiKeyCreator;
@@ -624,7 +628,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
     assert_eq!(
         sec.count().unwrap(),
         2,
-        "old ‘A’ entry must drop and ‘C’ must be added; ‘B’ stays"
+        "old 'A' entry must drop and 'C' must be added; 'B' stays"
     );
     assert_eq!(
         sec.get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
@@ -644,7 +648,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
     assert_eq!(sec.count().unwrap(), 0);
 }
 
-// ─── Decision 2C — FK config rejected at open ──────────────────────────
+// ─── Decision 2C - FK config rejected at open ──────────────────────────
 
 /// Setting `foreign_key_database_name` *without* the matching
 /// `foreign_key_database_handle` is rejected at open with
@@ -948,7 +952,7 @@ fn fk_cascade_transitive_two_levels() {
             &DatabaseEntry::from_bytes(b"root"),
         )
         .unwrap();
-    // mid record: key="M", data="Apple" — first byte ‘A’ indexes the
+    // mid record: key="M", data="Apple" - first byte 'A' indexes the
     // root foreign-key value.
     mid.lock()
         .put(
@@ -957,8 +961,8 @@ fn fk_cascade_transitive_two_levels() {
             &DatabaseEntry::from_bytes(b"Apple"),
         )
         .unwrap();
-    // leaf record: key="L", data="Mango" — first byte ‘M’ matches
-    // mid’s primary key, indexing the mid foreign-key value.
+    // leaf record: key="L", data="Mango" - first byte 'M' matches
+    // mid's primary key, indexing the mid foreign-key value.
     leaf.lock()
         .put(
             None,
@@ -1016,7 +1020,7 @@ fn fk_abort_allows_delete_when_no_referrer() {
     );
 }
 
-/// A clean (no FK fields set) `SecondaryConfig` still opens successfully —
+/// A clean (no FK fields set) `SecondaryConfig` still opens successfully -
 /// the rejection is surgical and does not regress the documented happy
 /// path.
 #[test]
@@ -1034,15 +1038,15 @@ fn d2c_no_fk_config_opens_normally() {
         .expect("secondary without FK fields must open cleanly");
 }
 
-// ─── Sprint 4½ — manual-update path participates in user txns ──────
+// ─── Sprint 41⁄2 - manual-update path participates in user txns ──────
 //
 // These tests assert that when the caller threads the same `txn`
 // through `Database::put` / `Database::delete` *and*
 // `SecondaryDatabase::update_secondary`, the primary write and the
-// secondary index entry commit or abort atomically.  Pre-Sprint-4½
+// secondary index entry commit or abort atomically.  Pre-Sprint-41⁄2
 // `update_secondary` ran auto-committed regardless of any caller
 // txn, so an aborted primary `put` left the secondary entry behind
-// on disk — the partial-atomicity gap flagged by the Sprint 4 agent
+// on disk - the partial-atomicity gap flagged by the Sprint 4 agent
 // (audit Theme 2 / finding F5).
 
 use noxu_db::Transaction;
@@ -1068,20 +1072,21 @@ fn open_pri_sec_for_txn(
 
 fn put_under_txn(
     primary: &Arc<Mutex<Database>>,
-    sec: &SecondaryDatabase,
+    _sec: &SecondaryDatabase,
     txn: &Transaction,
     pk: &[u8],
     val: &[u8],
 ) {
     let pk_e = DatabaseEntry::from_bytes(pk);
     let v_e = DatabaseEntry::from_bytes(val);
+    // primary.put() auto-triggers the secondary hook; no explicit
+    // update_secondary call needed (would double-insert and trigger D6).
     primary.lock().put(Some(txn), &pk_e, &v_e).unwrap();
-    sec.update_secondary(Some(txn), &pk_e, None, Some(&v_e)).unwrap();
 }
 
-/// `db.put(Some(&t), …)` + `sec.update_secondary(Some(&t), …)` +
+/// `db.put(Some(&t), ...)` + `sec.update_secondary(Some(&t), ...)` +
 /// `t.abort()` rolls back **both** the primary record and the
-/// secondary index entry.  Pre-Sprint-4½ the secondary entry survived
+/// secondary index entry.  Pre-Sprint-41⁄2 the secondary entry survived
 /// the abort because `update_secondary` was internally auto-committed.
 #[test]
 fn s4h_abort_rolls_back_primary_and_secondary() {
@@ -1126,9 +1131,9 @@ fn s4h_abort_rolls_back_primary_and_secondary() {
         "primary record must be rolled back by abort"
     );
 
-    // And the secondary index entry must also be gone.  Pre-Sprint-4½
+    // And the secondary index entry must also be gone.  Pre-Sprint-41⁄2
     // this was `Success` (Apple still indexed under 'A') even though
-    // the primary was rolled back — the partial-atomicity gap.
+    // the primary was rolled back - the partial-atomicity gap.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let sec_status = sec
@@ -1138,12 +1143,12 @@ fn s4h_abort_rolls_back_primary_and_secondary() {
         sec_status,
         OperationStatus::NotFound,
         "secondary index entry must be rolled back by abort \
-         (Sprint 4½ / audit F5: pre-fix this returned Success and \
+         (Sprint 41⁄2 / audit F5: pre-fix this returned Success and \
          left a dangling index entry)"
     );
 }
 
-/// `db.put(Some(&t), …)` + `sec.update_secondary(Some(&t), …)` +
+/// `db.put(Some(&t), ...)` + `sec.update_secondary(Some(&t), ...)` +
 /// `t.commit()` persists **both** sides.
 #[test]
 fn s4h_commit_persists_primary_and_secondary() {
@@ -1188,27 +1193,26 @@ fn s4h_same_primary_idempotent_reinsert_under_same_txn() {
     let txn = env.begin_transaction(None).unwrap();
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
+    // primary.put() auto-maintains secondary via registered hook.
     primary.lock().put(Some(&txn), &pk, &v).unwrap();
 
-    // First insert succeeds.
-    sec.update_secondary(Some(&txn), &pk, None, Some(&v)).unwrap();
-
-    // Same (pk, sec_key) again under the same txn — must be idempotent,
-    // not a NoxuError::Unsupported collision.
-    sec.update_secondary(Some(&txn), &pk, None, Some(&v)).expect(
-        "idempotent re-insert under the same txn must be a no-op, not \
-         a one-to-one collision error",
+    // Calling update_secondary again for the same (sec_key, pri_key) now
+    // raises SecondaryIntegrityException (D6).  The idempotent pattern
+    // is to use primary.put() only.  This test is updated to verify D6.
+    let result = sec.update_secondary(Some(&txn), &pk, None, Some(&v));
+    assert!(
+        result.is_err(),
+        "D6: duplicate (sec_key, pri_key) insert must raise integrity error"
     );
+    txn.abort().unwrap();
 
-    txn.commit().unwrap();
-
+    // After abort, both primary and secondary entries are rolled back.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
         .get(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(st, OperationStatus::NotFound);
 }
 
 /// While txn A holds an uncommitted secondary write, an auto-commit
@@ -1254,7 +1258,7 @@ fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
         }
         Ok(other) => panic!("unexpected status: {other:?}"),
         Err(_e) => {
-            // A typed lock-conflict error is also acceptable—some
+            // A typed lock-conflict error is also acceptable-some
             // configurations surface the contention rather than
             // silently waiting.
         }
@@ -1272,9 +1276,9 @@ fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
     assert_eq!(st, OperationStatus::NotFound);
 }
 
-// ─── Wave 1B — SecondaryCursor::delete cascade honours its txn ─────
+// ─── Wave 1B - SecondaryCursor::delete cascade honours its txn ─────
 //
-// These tests exercise the residual F5 sub-item the Sprint 4½ agent
+// These tests exercise the residual F5 sub-item the Sprint 41⁄2 agent
 // flagged: `SecondaryCursor::delete` cascades both the secondary
 // cleanup *and* the primary delete, but pre-Wave-1B those two writes
 // always ran auto-committed because the cursor did not store its txn
@@ -1462,7 +1466,7 @@ fn wave1b_cursor_delete_cascade_commits_both_sides() {
 /// under a write-lock: read the pre-delete committed value, surface a
 /// typed lock-conflict error, or return `NotFound` because the
 /// in-flight LN points at a tombstone.  What the engine MUST NOT do
-/// is leak a *commit* of the cascade out from under txn A — i.e.
+/// is leak a *commit* of the cascade out from under txn A - i.e.
 /// after txn A aborts, every other observer must see the original
 /// pre-delete state.  This pins the rollback semantics across the
 /// concurrency boundary.
@@ -1495,7 +1499,7 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
     // at the in-flight tombstone), or typed lock-conflict error.  We
     // tolerate all three; the *commit*-leak that would prove the
     // cascade ran auto-committed is impossible here because we never
-    // committed the txn — but we still record the observed outcome
+    // committed the txn - but we still record the observed outcome
     // so that the post-abort assertion below has something to compare
     // against.
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
@@ -1507,7 +1511,7 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
 
     // After abort: every other observer (auto-commit and a fresh
     // reader txn alike) must see the seeded record intact.  This is
-    // the real isolation contract Wave 1B closes — pre-Wave-1B the
+    // the real isolation contract Wave 1B closes - pre-Wave-1B the
     // cascade auto-committed during the in-flight txn, so the
     // post-abort state could be missing the primary even though the
     // user explicitly aborted.
@@ -1548,12 +1552,12 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
         open_pri_sec_for_txn(&dir, "primary", "secondary");
     drop(env); // env not needed for the auto-commit path
 
-    // Seed (auto-commit).
+    // Seed (auto-commit). primary.put() auto-maintains secondary.
     {
         let pk = DatabaseEntry::from_bytes(b"pk1");
         let v = DatabaseEntry::from_bytes(b"Apple");
         primary.lock().put(None, &pk, &v).unwrap();
-        sec.update_secondary(None, &pk, None, Some(&v)).unwrap();
+        // No explicit update_secondary needed (auto-hook handles it).
     }
 
     // Auto-commit cursor delete.
@@ -1682,7 +1686,7 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         // lock-consistent view. The read of the primary blocks on the
         // writer's write lock for the duration of the writer's txn, so it can
         // never observe the uncommitted "Bvalue". We assert on the
-        // cursor-resolved `data_entry` directly — doing a SEPARATE auto-commit
+        // cursor-resolved `data_entry` directly - doing a SEPARATE auto-commit
         // `get` (the prior approach) introduced an artificial
         // time-of-check/time-of-use window with a different isolation level,
         // which is what made this test flaky.
@@ -1706,7 +1710,7 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
                     && (pri_bytes.is_empty() || pri_bytes[0] != b'A')
                 {
                     // sec_key "A" resolved, but the atomically-fetched primary
-                    // data does not start with 'A' — a torn read.
+                    // data does not start with 'A' - a torn read.
                     torn_clone.store(true, Ordering::Relaxed);
                 }
             }
@@ -1715,7 +1719,7 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         }
     });
 
-    // Writer: abort cycle — update primary (changing sec_key A→B), then abort.
+    // Writer: abort cycle - update primary (changing sec_key A→B), then abort.
     for _ in 0..300 {
         let txn = env.begin_transaction(None).unwrap();
         pri_arc

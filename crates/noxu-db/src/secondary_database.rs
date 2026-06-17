@@ -273,7 +273,22 @@ impl SecondaryHookState {
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         match status {
             OperationStatus::Success => Ok(()),
-            OperationStatus::KeyExists => Ok(()),
+            OperationStatus::KeyExists => {
+                // D6: duplicate (sec_key, pri_key) pair already in the index.
+                // When fully populated this indicates a corrupt/inconsistent
+                // secondary index.  Raise SecondaryIntegrityException.
+                // Ref: SecondaryDatabase.java insertSecKey() KEYEXIST branch.
+                if self.is_fully_populated.load(std::sync::atomic::Ordering::Acquire) {
+                    Err(NoxuError::SecondaryIntegrityException(format!(
+                        "duplicate (sec_key, pri_key) already in secondary index; \
+                         secondary index is inconsistent"
+                    )))
+                } else {
+                    // Not fully populated: during populate(), duplicates can
+                    // legitimately exist if the index was partially built.
+                    Ok(())
+                }
+            }
             other => Err(NoxuError::OperationNotAllowed(format!(
                 "unexpected put status from secondary index insert: {other:?}"
             ))),
@@ -302,6 +317,17 @@ impl SecondaryHookState {
             cursor
                 .delete()
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        } else {
+            // D7: (sec_key, pri_key) pair not found in the secondary index.
+            // When fully populated this means the index is missing an entry
+            // that should be there (corrupt secondary index).
+            // Ref: SecondaryDatabase.java deleteSecKey() missing-entry branch.
+            if self.is_fully_populated.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(NoxuError::SecondaryIntegrityException(format!(
+                    "(sec_key, pri_key) pair not found in secondary index during delete; \
+                     secondary index is missing a required entry"
+                )));
+            }
         }
         Ok(())
     }
@@ -937,22 +963,18 @@ impl SecondaryDatabase {
             let pri_key_bytes = p_key.get_data().unwrap_or(&[]).to_vec();
             let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
 
-            // 1. Remove all secondary entries for this primary record first.
-            //    This includes the current secondary key entry we found.
-            //    UpdateSecondaryOnDelete calls updateSecondary.  Sprint 4½
-            //    forwards `txn` so the cleanup is atomic with the primary
-            //    delete below.
-            let old_data = data.clone();
-            self.delete_all_for_primary(txn, &pri_key_entry, Some(&old_data))?;
-
-            // 2. Delete the primary record.
+            // Delete the primary record.  The auto-hook registered with the
+            // primary will remove all secondary index entries for this primary
+            // (including the current secondary key entry we found) atomically.
+            // Do NOT call delete_all_for_primary first — that would cause D7
+            // (double-delete: auto-hook tries to remove entries already gone).
             {
                 let primary = self.state.primary.lock();
                 let _ = primary.delete(txn, &pri_key_entry)?;
             }
 
             // Re-search for the key to find any remaining duplicates.
-            // Since delete_all_for_primary cleaned up secondary entries,
+            // Since primary.delete() cleaned up secondary entries via auto-hook,
             // this should return NotFound when no more duplicates exist.
             p_key = DatabaseEntry::new();
             data = DatabaseEntry::new();
@@ -1329,20 +1351,14 @@ mod tests {
         let primary = Arc::new(Mutex::new(open_primary(&env, "primary")));
         let secondary = open_secondary(Arc::clone(&primary), &env, "secondary");
 
-        // Write to primary; secondary is not auto-updated here because
-        // Database::put does not know about secondaries by default.
-        // We manually call update_secondary for this test.
+        // primary.put() automatically maintains the secondary via the
+        // registered hook (v1.6 auto-maintenance).
         let pri_key = DatabaseEntry::from_bytes(b"pk1");
         let pri_data = DatabaseEntry::from_bytes(b"Avalon");
         {
             let primary = primary.lock();
             primary.put(None, &pri_key, &pri_data).unwrap();
         }
-
-        // Update the secondary index manually (mimics the integration layer).
-        secondary
-            .update_secondary(None, &pri_key, None, Some(&pri_data))
-            .unwrap();
 
         // Retrieve by secondary key (first byte of "Avalon" = 'A' = 0x41).
         let sec_key = DatabaseEntry::from_bytes(b"A");
@@ -1374,7 +1390,7 @@ mod tests {
             {
                 primary.lock().put(None, &pk, &pv).unwrap();
             }
-            secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
+            // Auto-hook maintains secondary; no explicit update_secondary needed.
         }
 
         // Search by secondary key 'B'.
@@ -1404,10 +1420,8 @@ mod tests {
         let pri_data = DatabaseEntry::from_bytes(b"Cherry");
         {
             primary.lock().put(None, &pri_key, &pri_data).unwrap();
+            // Auto-hook maintains secondary.
         }
-        secondary
-            .update_secondary(None, &pri_key, None, Some(&pri_data))
-            .unwrap();
 
         // Delete via secondary key.
         let sec_key = DatabaseEntry::from_bytes(b"C");
@@ -1432,18 +1446,14 @@ mod tests {
 
         {
             primary.lock().put(None, &pri_key, &old_data).unwrap();
+            // Auto-hook inserts (M, pk1) into secondary.
         }
-        secondary
-            .update_secondary(None, &pri_key, None, Some(&old_data))
-            .unwrap();
 
         // Now update the primary; the secondary key 'M' should be replaced by 'P'.
+        // Auto-hook fetches old_data, deletes (M, pk1), inserts (P, pk1).
         {
             primary.lock().put(None, &pri_key, &new_data).unwrap();
         }
-        secondary
-            .update_secondary(None, &pri_key, Some(&old_data), Some(&new_data))
-            .unwrap();
 
         // Old key 'M' should no longer be in the secondary.
         let old_sec = DatabaseEntry::from_bytes(b"M");
@@ -1472,7 +1482,7 @@ mod tests {
             let pk = DatabaseEntry::from_bytes(k);
             let pv = DatabaseEntry::from_bytes(v);
             primary.lock().put(None, &pk, &pv).unwrap();
-            secondary.update_secondary(None, &pk, None, Some(&pv)).unwrap();
+            // Auto-hook maintains secondary.
         }
 
         // Iterate via SecondaryCursor and collect all secondary keys encountered.
@@ -1588,7 +1598,7 @@ mod tests {
             let pk_e = DatabaseEntry::from_bytes(pk);
             let pv_e = DatabaseEntry::from_bytes(pv);
             primary.lock().put(None, &pk_e, &pv_e).unwrap();
-            secondary.update_secondary(None, &pk_e, None, Some(&pv_e)).unwrap();
+            // Auto-hook maintains secondary.
         }
 
         assert_eq!(secondary.count().unwrap(), 3);
