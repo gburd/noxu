@@ -155,7 +155,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
     // Verify secondary has ([A], k1).
     let mut p_key = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
-    let s = sec.get(None, &de(&[b'A']), &mut p_key, &mut d).unwrap();
+    let s = sec.get(None, &de(b"A"), &mut p_key, &mut d).unwrap();
     assert_eq!(s, OperationStatus::Success, "initial secondary lookup");
     assert_eq!(p_key.get_data().unwrap_or(&[]), b"k1");
 
@@ -165,7 +165,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
     primary.lock().put(None, &pk, &de(b"B_v2")).unwrap();
 
     // Old secondary entry ([A], k1) must be gone.
-    let s_old = sec.get(None, &de(&[b'A']), &mut p_key, &mut d).unwrap();
+    let s_old = sec.get(None, &de(b"A"), &mut p_key, &mut d).unwrap();
     assert_eq!(
         s_old,
         OperationStatus::NotFound,
@@ -173,7 +173,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
     );
 
     // New secondary entry ([B], k1) must exist.
-    let s_new = sec.get(None, &de(&[b'B']), &mut p_key, &mut d).unwrap();
+    let s_new = sec.get(None, &de(b"B"), &mut p_key, &mut d).unwrap();
     assert_eq!(
         s_new,
         OperationStatus::Success,
@@ -212,7 +212,7 @@ fn d8_dirty_read_missing_primary_skips_record() {
     // Open a dirty-read secondary cursor.
     let dirty_cfg = CursorConfig::read_uncommitted();
     let mut sec_cursor = sec.open_cursor(None, Some(&dirty_cfg)).unwrap();
-    let sec_key = de(&[b'A']);
+    let sec_key = de(b"A");
     let mut p_key_out = DatabaseEntry::new();
     let mut data_out = DatabaseEntry::new();
 
@@ -224,19 +224,17 @@ fn d8_dirty_read_missing_primary_skips_record() {
         sec_cursor.get_search_key(&sec_key, &mut p_key_out, &mut data_out);
     // We don't assert a specific result since k1 has a valid primary and
     // might be returned.  We only verify no SecondaryIntegrityException fired.
-    match &result {
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("missing primary") {
-                panic!(
-                    "D8: dirty-read secondary cursor must NOT raise \
-                     SecondaryIntegrityException for missing primary: {e}"
-                );
-            }
-            // Other errors are re-panic'd.
-            panic!("D8: unexpected error: {e}");
+    // Success or NotFound is fine; only an error is examined.
+    if let Err(e) = &result {
+        let msg = e.to_string();
+        if msg.contains("missing primary") {
+            panic!(
+                "D8: dirty-read secondary cursor must NOT raise \
+                 SecondaryIntegrityException for missing primary: {e}"
+            );
         }
-        Ok(_) => {} // Success or NotFound: fine
+        // Other errors are re-panic'd.
+        panic!("D8: unexpected error: {e}");
     }
     drop(sec_cursor);
 }

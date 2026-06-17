@@ -19,7 +19,7 @@
 //!     fail-pre: returned NotFound.
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus, Put,
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
 };
 use tempfile::TempDir;
 

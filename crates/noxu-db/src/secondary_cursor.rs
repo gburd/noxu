@@ -669,7 +669,7 @@ mod tests {
 
     fn insert_and_index(
         primary: &Arc<Mutex<Database>>,
-        secondary: &SecondaryDatabase,
+        _secondary: &SecondaryDatabase,
         key: &[u8],
         value: &[u8],
     ) {
