@@ -175,10 +175,14 @@ impl FileSelector {
         self.force_cleaning
     }
 
-    /// Selects the next file for cleaning from the queue.
+    /// Drains the next explicitly-queued TO_BE_CLEANED file.
     ///
-    /// Returns the file number and optional required utilization, or None if no file is available.
-    pub fn select_file_for_cleaning(&mut self) -> Option<(u32, Option<i32>)> {
+    /// Private helper used by `select_file_for_cleaning`.  Corresponds to the
+    /// `if (!toBeCleaned.isEmpty())` branch at the top of JE
+    /// `FileSelector.selectFileForCleaning` (FileSelector.java ~line 175).
+    ///
+    /// Returns `(file_number, required_util)` or `None` if the queue is empty.
+    pub fn select_from_queue(&mut self) -> Option<(u32, Option<i32>)> {
         if let Some(file_number) = self.to_be_cleaned.pop_front() {
             self.being_cleaned.insert(file_number);
 
@@ -190,10 +194,81 @@ impl FileSelector {
         None
     }
 
+    /// Selects the best file for cleaning.
+    ///
+    /// Faithful port of JE `FileSelector.selectFileForCleaning`
+    /// (FileSelector.java ~line 170):
+    ///
+    /// 1. If any files are already queued as TO_BE_CLEANED, dequeue and
+    ///    return the first one (FIFO drain).
+    /// 2. Otherwise fall through to `select_file_for_cleaning_with_policy`
+    ///    (`UtilizationCalculator.getBestFile`) to score all candidate
+    ///    files by TTL-adjusted utilization and pick the best one.
+    ///
+    /// JE: `fileSelector.selectFileForCleaning(calculator, fileSummaryMap,
+    ///   forceCleaning)` (FileProcessor.java doClean ~line 393).
+    ///
+    /// # Arguments
+    /// * `file_summary_map` – merged per-file summaries (profile + tracker),
+    ///   equivalent to JE `fileSummaryMap` from `getFileSummaryMap(true)`.
+    /// * `min_utilization_pct` – minimum utilization threshold (0-100).
+    /// * `min_age` – minimum age in files before cleaning.
+    /// * `force_cleaning` – bypass utilization threshold.
+    /// * `first_active_txn_file` – CLN-4 clamping: exclude files >=
+    ///   `firstActiveTxnFile`.
+    pub fn select_file_for_cleaning(
+        &mut self,
+        file_summary_map: &BTreeMap<u32, FileSummary>,
+        min_utilization_pct: u32,
+        min_age: u32,
+        force_cleaning: bool,
+        first_active_txn_file: Option<u32>,
+    ) -> Option<(u32, Option<i32>)> {
+        // JE FileSelector.java ~line 175:
+        // if (!toBeCleaned.isEmpty()) { return first queued file }
+        if let Some(result) = self.select_from_queue() {
+            return Some(result);
+        }
+
+        // JE FileSelector.java ~line 184:
+        // result = calculator.getBestFile(fileSummaryMap, forceCleaning)
+        // Noxu equivalent: select_file_for_cleaning_with_policy.
+        self.select_file_for_cleaning_with_policy(
+            file_summary_map,
+            min_utilization_pct,
+            min_age,
+            force_cleaning,
+            first_active_txn_file,
+            None, // predicted_total_threshold: not wired at this call site
+            None, // min_file_utilization_pct: not wired at this call site
+        )
+    }
+
+    /// Removes a file from the cleaning pipeline without putting it back.
+    ///
+    /// Called after a two-pass (revisalRun) skip: the file's true utilization
+    /// was above the threshold so it should not be re-scanned on the next
+    /// pass.
+    ///
+    /// Faithful port of JE `FileSelector.removeFile` (FileSelector.java
+    /// ~line 325), which removes the file from `fileInfoMap` entirely so it
+    /// is rescored fresh on the next call to `selectFileForCleaning`.
+    ///
+    /// CLN NEW-3: use this instead of `put_back_file_for_cleaning` after a
+    /// two-pass skip so the file is not re-enqueued and rescanned.
+    pub fn remove_file_from_cleaning(&mut self, file_number: u32) {
+        self.being_cleaned.remove(&file_number);
+        self.file_info.remove(&file_number);
+    }
+
     /// Selects the best file for cleaning using cost/benefit scoring.
     ///
     /// Convenience wrapper that calls `select_file_for_cleaning_with_profile_and_txn`
     /// with `first_active_txn_file = None` (no transaction-window clamping).
+    ///
+    /// NOTE: This is a lower-level helper used by tests. Production code should
+    /// call the unified `select_file_for_cleaning` which also drains the
+    /// TO_BE_CLEANED queue first (JE faithful structure).
     pub fn select_file_for_cleaning_with_profile(
         &mut self,
         file_summaries: &BTreeMap<u32, FileSummary>,
@@ -239,6 +314,10 @@ impl FileSelector {
     /// description.  This variant adds the `first_active_txn_file` guard:
     /// if `Some(n)`, files with `file_number >= n` are excluded because
     /// they may still be needed by the oldest open transaction.
+    ///
+    /// NOTE: This is a lower-level helper. Production code should call
+    /// the unified `select_file_for_cleaning` which also drains the
+    /// TO_BE_CLEANED queue first (JE faithful structure).
     ///
     /// JE: `UtilizationCalculator.getBestFile` clamps
     /// `firstActiveFile = min(fileSummaryMap.lastKey(), firstActiveTxnFile)`
@@ -290,7 +369,7 @@ impl FileSelector {
         // Step 1 -- if a file is already queued (from a previous scoring pass
         // that enqueued it but didn't immediately return), dequeue it now.
         if !self.to_be_cleaned.is_empty() {
-            return self.select_file_for_cleaning();
+            return self.select_from_queue();
         }
 
         if file_summaries.is_empty() {
@@ -800,7 +879,7 @@ mod tests {
         selector.add_file_to_clean(1);
         selector.add_file_to_clean(2);
 
-        let result = selector.select_file_for_cleaning();
+        let result = selector.select_from_queue();
         assert_eq!(result, Some((1, None)));
         assert!(selector.is_being_cleaned(1));
         assert_eq!(selector.get_file_status(1), Some(FileStatus::BeingCleaned));
@@ -813,7 +892,7 @@ mod tests {
     #[test]
     fn test_select_file_empty() {
         let mut selector = FileSelector::new();
-        let result = selector.select_file_for_cleaning();
+        let result = selector.select_from_queue();
         assert_eq!(result, None);
     }
 
@@ -821,7 +900,7 @@ mod tests {
     fn test_mark_file_cleaned() {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
 
         selector.mark_file_cleaned(1);
 
@@ -837,7 +916,7 @@ mod tests {
     fn test_mark_file_checkpointed() {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(1);
 
         selector.mark_file_checkpointed(1);
@@ -853,7 +932,7 @@ mod tests {
     fn test_mark_file_fully_processed() {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(1);
         selector.mark_file_checkpointed(1);
 
@@ -875,7 +954,7 @@ mod tests {
 
         for i in 1..=3 {
             selector.add_file_to_clean(i);
-            selector.select_file_for_cleaning();
+            selector.select_from_queue();
             selector.mark_file_cleaned(i);
             selector.mark_file_checkpointed(i);
             selector.mark_file_fully_processed(i);
@@ -889,7 +968,7 @@ mod tests {
     fn test_remove_deleted_file() {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(1);
         selector.mark_file_checkpointed(1);
         selector.mark_file_fully_processed(1);
@@ -905,11 +984,11 @@ mod tests {
         let mut selector = FileSelector::new();
 
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(1);
 
         selector.add_file_to_clean(2);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(2);
 
         let state = selector.get_checkpoint_state();
@@ -921,7 +1000,7 @@ mod tests {
         let mut selector = FileSelector::new();
 
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(1);
 
         let state = selector.get_checkpoint_state();
@@ -949,7 +1028,7 @@ mod tests {
         let mut selector = FileSelector::new();
 
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
         selector.mark_file_cleaned(1);
 
         // Simulate a pending LN — this sets any_pending_during_checkpoint.
@@ -979,7 +1058,7 @@ mod tests {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean_with_util(1, Some(50));
 
-        let result = selector.select_file_for_cleaning();
+        let result = selector.select_from_queue();
         assert_eq!(result, Some((1, Some(50))));
     }
 
@@ -990,9 +1069,9 @@ mod tests {
         selector.add_file_to_clean(2);
         selector.add_file_to_clean(3);
 
-        assert_eq!(selector.select_file_for_cleaning(), Some((1, None)));
-        assert_eq!(selector.select_file_for_cleaning(), Some((2, None)));
-        assert_eq!(selector.select_file_for_cleaning(), Some((3, None)));
+        assert_eq!(selector.select_from_queue(), Some((1, None)));
+        assert_eq!(selector.select_from_queue(), Some((2, None)));
+        assert_eq!(selector.select_from_queue(), Some((3, None)));
     }
 
     #[test]
@@ -1009,7 +1088,7 @@ mod tests {
     fn test_clear() {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean(1);
-        selector.select_file_for_cleaning();
+        selector.select_from_queue();
 
         selector.clear();
 
@@ -1028,7 +1107,7 @@ mod tests {
         assert_eq!(selector.get_file_status(42), Some(FileStatus::ToBeCleaned));
 
         // Select for cleaning
-        let result = selector.select_file_for_cleaning();
+        let result = selector.select_from_queue();
         assert_eq!(result, Some((42, None)));
         assert_eq!(
             selector.get_file_status(42),
@@ -1508,7 +1587,7 @@ mod tests {
     fn test_cln5_required_util_is_returned() {
         let mut selector = FileSelector::new();
         selector.add_file_to_clean_with_util(42, Some(60));
-        let result = selector.select_file_for_cleaning();
+        let result = selector.select_from_queue();
         assert_eq!(
             result,
             Some((42, Some(60))),
