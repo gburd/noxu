@@ -209,6 +209,11 @@ impl NetworkRestoreServer {
                 ))
             })?;
             let mut remaining = file_size as usize;
+            // D10: compute a CRC32 over the file bytes and send it as a 4-byte
+            // trailer after the data, so the client can detect truncation or
+            // corruption in transit (JE NetworkBackup sends a MessageDigest
+            // with FileEnd; we use the project-wide CRC32 from crc32fast).
+            let mut digest = crc32fast::Hasher::new();
             while remaining > 0 {
                 let to_read = remaining.min(chunk.len());
                 let n = file.read(&mut chunk[..to_read]).map_err(|e| {
@@ -221,6 +226,7 @@ impl NetworkRestoreServer {
                 if n == 0 {
                     break; // Unexpected EOF — file may have been truncated.
                 }
+                digest.update(&chunk[..n]);
                 out.write_all(&chunk[..n]).map_err(|e| {
                     RepError::NetworkRestoreError(format!(
                         "sending data for '{}': {}",
@@ -229,6 +235,13 @@ impl NetworkRestoreServer {
                 })?;
                 remaining -= n;
             }
+            // Send the CRC32 trailer.
+            out.write_all(&digest.finalize().to_le_bytes()).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "sending digest for '{}': {}",
+                    name, e
+                ))
+            })?;
 
             log::debug!(
                 "NetworkRestoreServer: sent '{}' ({} bytes)",
@@ -342,6 +355,10 @@ impl ServiceHandler for NetworkRestoreServer {
                 ))
             })?;
             let mut remaining = file_size as usize;
+            // D10: append a CRC32 trailer per file (same layout as the
+            // raw-TCP send_files_to path) so execute_via_dispatcher can verify
+            // integrity before accepting the file.
+            let mut digest = crc32fast::Hasher::new();
             while remaining > 0 {
                 let to_read = remaining.min(chunk.len());
                 let n = file.read(&mut chunk[..to_read]).map_err(|e| {
@@ -354,9 +371,11 @@ impl ServiceHandler for NetworkRestoreServer {
                 if n == 0 {
                     break;
                 }
+                digest.update(&chunk[..n]);
                 payload.extend_from_slice(&chunk[..n]);
                 remaining -= n;
             }
+            payload.extend_from_slice(&digest.finalize().to_le_bytes());
         }
 
         channel.send(&payload)?;
@@ -423,6 +442,47 @@ mod tests {
             .collect();
         assert_eq!(received.len(), 0);
         server.stop();
+    }
+
+    #[test]
+    fn test_restore_digest_detects_corruption() {
+        // D10: send a file into an in-memory buffer via send_files_to, which
+        // appends a CRC32 trailer; flip one data byte; confirm the recomputed
+        // CRC over the corrupted body no longer matches the trailer (the exact
+        // condition the client verify rejects on).
+        use std::io::Cursor;
+        let content = b"the quick brown fox jumps over the lazy dog";
+        let dir = make_env_home(&[("00000001.ndb", content)]);
+        let server = NetworkRestoreServer::new(dir.path());
+        let mut buf = Cursor::new(Vec::new());
+        server.send_files_to(&mut buf).expect("send into buffer");
+        let mut wire = buf.into_inner();
+
+        // Locate the file body: skip count(4) + name_len(4) + name + size(8).
+        // count
+        let mut off = 4usize;
+        let name_len =
+            u16::from_le_bytes(wire[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + name_len;
+        let file_size =
+            u64::from_le_bytes(wire[off..off + 8].try_into().unwrap()) as usize;
+        off += 8;
+        let body_start = off;
+        let trailer_start = body_start + file_size;
+
+        // The trailer must match the clean body.
+        let want = u32::from_le_bytes(
+            wire[trailer_start..trailer_start + 4].try_into().unwrap(),
+        );
+        assert_eq!(want, crc32fast::hash(&wire[body_start..trailer_start]));
+
+        // Flip one body byte; the CRC must now mismatch (client rejects).
+        wire[body_start] ^= 0xFF;
+        let got = crc32fast::hash(&wire[body_start..trailer_start]);
+        assert_ne!(
+            want, got,
+            "D10: corrupted body must fail the CRC32 trailer check"
+        );
     }
 
     #[test]

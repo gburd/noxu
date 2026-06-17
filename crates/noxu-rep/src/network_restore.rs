@@ -294,6 +294,10 @@ impl NetworkRestore {
 
             let mut remaining = file_size;
             let mut chunk = vec![0u8; 65536];
+            // D10: recompute the CRC32 over received bytes and verify against
+            // the 4-byte trailer the server appends, to reject a truncated or
+            // corrupted transfer before it is accepted as a valid log file.
+            let mut digest = crc32fast::Hasher::new();
             while remaining > 0 {
                 let to_read = (remaining as usize).min(chunk.len());
                 stream.read_exact(&mut chunk[..to_read]).map_err(|e| {
@@ -302,6 +306,7 @@ impl NetworkRestore {
                         filename, e
                     ))
                 })?;
+                digest.update(&chunk[..to_read]);
                 out.write_all(&chunk[..to_read]).map_err(|e| {
                     RepError::NetworkRestoreError(format!(
                         "writing '{}': {}",
@@ -311,6 +316,23 @@ impl NetworkRestore {
                 })?;
                 remaining -= to_read as u64;
                 total_bytes += to_read as u64;
+            }
+            // Verify the CRC32 trailer.
+            let mut crc_buf = [0u8; 4];
+            stream.read_exact(&mut crc_buf).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading digest for '{}': {}",
+                    filename, e
+                ))
+            })?;
+            let want = u32::from_le_bytes(crc_buf);
+            let got = digest.finalize();
+            if want != got {
+                let _ = std::fs::remove_file(&dest_path);
+                return Err(RepError::NetworkRestoreError(format!(
+                    "digest mismatch for '{}': expected {:#010x}, got {:#010x}                      (file corrupted or truncated in transit)",
+                    filename, want, got
+                )));
             }
 
             files_done += 1;
@@ -472,13 +494,29 @@ impl NetworkRestore {
             buf8.copy_from_slice(&payload[off..off + 8]);
             off += 8;
             let file_size = u64::from_le_bytes(buf8) as usize;
-            if off + file_size > payload.len() {
+            // D10: file body is followed by a 4-byte CRC32 trailer.
+            if off + file_size + 4 > payload.len() {
                 return Err(RepError::NetworkRestoreError(format!(
                     "truncated restore payload at file body for {:?} \
-                     (need {} bytes, have {})",
+                     (need {} bytes + 4 digest, have {})",
                     filename,
                     file_size,
                     payload.len() - off,
+                )));
+            }
+            // Verify the CRC32 trailer before accepting the file.
+            let body = &payload[off..off + file_size];
+            let want = u32::from_le_bytes(
+                payload[off + file_size..off + file_size + 4]
+                    .try_into()
+                    .expect("4-byte CRC slice"),
+            );
+            let got = crc32fast::hash(body);
+            if want != got {
+                return Err(RepError::NetworkRestoreError(format!(
+                    "digest mismatch for '{}': expected {:#010x}, got {:#010x} \
+                     (file corrupted or truncated in transit)",
+                    filename, want, got
                 )));
             }
 
@@ -488,15 +526,14 @@ impl NetworkRestore {
                 let _ = std::fs::rename(&dest_path, &backup);
             }
 
-            std::fs::write(&dest_path, &payload[off..off + file_size])
-                .map_err(|e| {
-                    RepError::NetworkRestoreError(format!(
-                        "writing '{}': {}",
-                        dest_path.display(),
-                        e
-                    ))
-                })?;
-            off += file_size;
+            std::fs::write(&dest_path, body).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "writing '{}': {}",
+                    dest_path.display(),
+                    e
+                ))
+            })?;
+            off += file_size + 4;
             total_bytes += file_size as u64;
             files_done += 1;
             self.update_progress(total_bytes, files_done);

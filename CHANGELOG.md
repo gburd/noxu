@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (replication — network restore integrity)
+
+- **Network restore had no per-file integrity check** (`noxu-rep`, D10): a
+  truncated or bit-flipped log file transferred during a network restore was
+  written to the replica's disk and accepted as valid, surfacing only later as
+  a recovery-level CRC failure. The restore protocol now appends a CRC32
+  trailer per file (JE `NetworkBackup` sends a `MessageDigest` with `FileEnd`;
+  Noxu uses the project-wide `crc32fast`); the client recomputes the CRC while
+  receiving and rejects (and removes) a file on mismatch. Applied to BOTH
+  transfer paths — the raw-TCP `send_files_to`/`execute` and the dispatcher
+  `payload`/`execute_via_dispatcher`. Regression test
+  `test_restore_digest_detects_corruption`; the auto-bootstrap and dispatcher
+  integration tests exercise the symmetric round-trip.
+
 ### Changed (replication — ack-quorum)
 
 - **Durable-commit ack wait no longer spin-polls** (`noxu-rep`, D6): the master
