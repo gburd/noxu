@@ -726,3 +726,74 @@ fn aborted_then_committed_same_key_recovers_committed_value() {
         "K must hold T3's committed value 'v3', not T1's aborted before-image"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Part-3 acceptance test (DRIFT-3/7 fix): file-flip fsync ordering
+//
+// FAIL-PRE:  without sync_log_end_and_finish_file, the old file may not be
+//            durably closed before the new file takes writes; on crash right
+//            after the flip, the old file's last entries could be missing.
+// PASS-POST: the old file is fsynced under the LWL before advanceLsn;
+//            recovery reads all committed entries across the file boundary.
+// ---------------------------------------------------------------------------
+
+/// Crash right after a log file flip; verify all committed entries are
+/// recoverable from BOTH the old and the new log file.
+///
+/// Tests JE faithfulness invariant:
+///   `syncLogEndAndFinishFile()` called after `bumpAndWriteDirty()`, under
+///   the LWL, before `advanceLsn` advances to the new file — ensuring the
+///   old file is durably closed before any write goes to the new file.
+///
+/// References: JE `LogBufferPool.getWriteBuffer(flippedFile=true)`,
+///             `FileManager.syncLogEndAndFinishFile` (line 2077).
+#[test]
+fn test_file_flip_fsync_ordering_crash_recovery() {
+    let dir = TempDir::new().expect("tempdir");
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "file_flip")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    // Wait for the worker to commit all records (including those spanning
+    // the file boundary) before we kill it.
+    assert!(
+        wait_for_flag(&dir_path, "flip_committed", Duration::from_secs(60)),
+        "worker did not signal flip_committed within timeout"
+    );
+
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    // Verify that at least 2 log files were created (flip occurred).
+    let ndb_files = log_files(&dir_path);
+    assert!(
+        ndb_files.len() >= 2,
+        "expected at least 2 log files after flip, found {}",
+        ndb_files.len()
+    );
+
+    // Recovery: reopen the environment; all 200 committed records must be
+    // present.
+    let (_env, db) = reopen_db(&dir_path);
+
+    let mut missing = Vec::new();
+    for i in 0u32..200 {
+        let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+        let mut val = DatabaseEntry::new();
+        let status = db.get(None, &key, &mut val).expect("get");
+        if status != OperationStatus::Success {
+            missing.push(i);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "recovery missing {} committed keys after file-flip crash: {:?}…",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+}

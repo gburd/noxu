@@ -18,16 +18,19 @@
 //!    into the segment under the LWL.
 //!    If the entry is too large for any pool buffer, write directly to the
 //!    file via FileManager (also under LWL).
-//! 7. Advance next_available_lsn / last_used_lsn in the FileManager.
+//! 7. After `get_write_buffer` returns, advance `next_available_lsn` /
+//!    `last_used_lsn` in the FileManager (`advanceLsn` / `setLastPosition`).
 //! 8. Return the assigned LSN.
 //!
 //! # Flush/fsync path (flush_sync)
 //!
-//! Under LWL: collect dirty buffers + pwrite64 ( logWriteMutex design).
+//! NOTE (Part-2 target, DRIFT-1): the LWL currently covers pwrite64, which
+//! serialises disk I/O and is the root cause of the 3-4x concurrency gap
+//! vs JE.  JE releases the LWL before the pwrite and relies on the pool's
+//! write_dirty (called inside get_write_buffer / bumpAndWriteDirty) to drain
+//! buffers.  Part-2 will restructure flush_sync to match JE.
+//! Current (pre-Part-2): Under LWL: collect dirty buffers + pwrite64.
 //! Outside LWL: fdatasync via FsyncManager leader/waiter (group-commit).
-//! Holding LWL through pwrite64 ensures concurrent threads complete their
-//! kernel writes before releasing, so they arrive at FsyncManager
-//! simultaneously and coalesce into a single fdatasync.
 //!
 //! # Read path (getLogEntryFromLogSource -> Rust LogManager::read_entry)
 //!
@@ -444,15 +447,24 @@ impl LogManager {
             );
             entry_buf[0..4].copy_from_slice(&crc.to_le_bytes());
 
-            // Advance LSN bookkeeping in the FileManager so that the next
-            // call to get_next_available_lsn() returns the correct value.
-            // We do this before the actual file write (correct).
-            let new_next = Lsn::new(
-                file_num,
-                current_lsn.file_offset() + entry_size as u32,
-            );
-            self.file_manager.set_last_position(new_next, current_lsn);
-
+            // JE faithfulness (Part-3, DRIFT-3/7): `getWriteBuffer` must be
+            // called BEFORE `advanceLsn` / `setLastPosition`.  When
+            // `flippedFile=true`, `getWriteBuffer` calls `bumpAndWriteDirty`
+            // (drains old-file dirty buffers) and then
+            // `syncLogEndAndFinishFile` (fsyncs + closes the old file) while
+            // `current_file_num` still points to the OLD file.  Only after
+            // that does `advanceLsn` advance the bookkeeping to the new file.
+            //
+            // Prior code called `set_last_position` here, advancing
+            // `current_file_num` BEFORE `get_write_buffer`, so the fsync
+            // would have targeted the (not yet created) new file instead of
+            // the old one (DRIFT-3 ordering inversion).
+            //
+            // Reference: JE `LogManager.serialLogWork` steps:
+            //   (3) getWriteBuffer(entrySize, flippedFile)  <- bumpAndWriteDirty
+            //                                                 + syncLogEndAndFinishFile
+            //   (4) advanceLsn(currentLsn, entrySize, flippedFile)  <- setLastPosition
+            //
             // Utilization tracking — called under the LWL, matching the
             // serialLogWork() tracker calls.
             if let Some(obs) = &self.write_observer {
@@ -478,10 +490,22 @@ impl LogManager {
             }
 
             // Obtain a write buffer that can hold entry_size bytes.
+            // When flipped=true this drains dirty buffers (bumpAndWriteDirty)
+            // AND fsyncs/closes the old file (syncLogEndAndFinishFile) while
+            // current_file_num still points to the old file.
             let buffer_arc = {
                 let mut pool = self.buffer_pool.lock();
                 pool.get_write_buffer(entry_size, flipped)?
             };
+
+            // Advance LSN bookkeeping AFTER get_write_buffer returns.
+            // JE serialLogWork step (4): advanceLsn called after getWriteBuffer.
+            // This is the corrected ordering (DRIFT-3 fix).
+            let new_next = Lsn::new(
+                file_num,
+                current_lsn.file_offset() + entry_size as u32,
+            );
+            self.file_manager.set_last_position(new_next, current_lsn);
             let mut buffer = buffer_arc.lock();
 
             buffer.latch_for_write();
@@ -554,27 +578,23 @@ impl LogManager {
         self.fsync_manager.fsync_count()
     }
 
-    /// → `FSyncManager.fsync()`.
+    /// Flushes all dirty write buffers to disk and performs an fdatasync.
     ///
-    /// Three-phase write coalescing:
+    /// NOTE (Part-2 target, DRIFT-1): currently holds the LWL through
+    /// `pwrite64`, which serialises disk I/O and is the likely root cause of
+    /// the 3-4x concurrent-write throughput gap vs JE.  JE holds the LWL only
+    /// for LSN-assign + in-memory buffer copy, releases it, and the buffer-pool
+    /// flusher (`write_dirty`) + `FSyncManager` do I/O concurrently.
+    /// Part-2 will restructure this to release the LWL before I/O.
     ///
-    /// Phase 1 — under LWL (includes pwrite64, correct logWriteMutex):
-    ///   snapshot each dirty buffer's pending bytes, do pwrite64 while still
-    ///   holding the LWL, then release the LWL.  Holding the LWL through
-    ///   pwrite64 means that all concurrent committers complete their kernel
-    ///   writes before the next thread acquires LWL, so they all arrive at
-    ///   `FsyncManager` nearly simultaneously — enabling fsync coalescing
-    ///   without a separate group-commit window.
-    ///
-    /// Phase 2 — outside LWL (fdatasync via FsyncManager): multiple concurrent
-    ///   callers elect one leader; the leader calls fdatasync once while waiters
-    ///   piggyback, correct's FSyncManager group-commit flow.
+    /// Current behaviour: under LWL: collect dirty buffers via
+    /// `fill_flush_pending` + pwrite64 for each; then release LWL; then
+    /// fdatasync via FsyncManager (group-commit outside LWL is already
+    /// faithful to JE).
     pub fn flush_sync(&self) -> Result<Lsn> {
-        // Under LWL: snapshot dirty buffers and pwrite64 ( logWriteMutex
-        // design).  Holding through pwrite64 ensures threads serialise their
-        // Under LWL: collect dirty buffers and pwrite64 (correct logWriteMutex
-        // design).  Holding through pwrite64 ensures threads serialise kernel
-        // writes and arrive at FsyncManager simultaneously for coalescing.
+        // NOTE: the LWL is held through pwrite64 here. This is a known
+        // re-invention (DRIFT-1, audit Tier-1B). Part-2 will fix this by
+        // releasing the LWL before I/O, matching JE serialLogWork.
         // R-1: guard.flush_pending is reused across calls (outer Vec alloc
         // eliminated after warm-up; clear() retains capacity).
         let eol = {

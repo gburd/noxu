@@ -139,6 +139,20 @@ impl LogBufferPool {
         // If we've flipped to a new file or the current buffer is full, handle it
         if flipped_file {
             self.bump_and_write_dirty(size_needed, true)?;
+
+            // JE faithfulness (Part-3, DRIFT-3/7): after flushing all dirty
+            // buffers to the old file, fsync and "close" the old file BEFORE
+            // the LSN bookkeeping is advanced to the new file.  This mirrors
+            // JE `LogBufferPool.getWriteBuffer(flippedFile=true)` which calls
+            // `fileManager.syncLogEndAndFinishFile()` after `bumpAndWriteDirty`.
+            //
+            // At this point `file_manager.current_file_num` still points to
+            // the OLD file because `set_last_position` in `log_internal` is
+            // called AFTER `get_write_buffer` returns (corrected ordering).
+            //
+            // Reference: JE `LogBufferPool.getWriteBuffer` (flippedFile=true
+            //   branch calls bumpAndWriteDirty then syncLogEndAndFinishFile).
+            self.file_manager.sync_log_end_and_finish_file()?;
         } else {
             let current = self.buffers[self.current_write_buffer_index].lock();
             let has_room = current.has_room(size_needed);

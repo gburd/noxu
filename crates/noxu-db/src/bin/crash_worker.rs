@@ -240,6 +240,42 @@ fn main() {
             }
         }
 
+        // Part-3 acceptance test (DRIFT-3/7 fix): exercise the file-flip path.
+        //
+        // Writes enough data to force a file flip (tiny max_file_size), commits
+        // all records, signals readiness, then loops.  The parent SIGKILLs right
+        // after the flip, and recovery must find all committed records in BOTH
+        // the old and new files.
+        "file_flip" => {
+            // Re-open with a tiny max-file-size so a flip is forced after a
+            // small number of writes.
+            drop(db);
+            drop(env);
+            let env_config = EnvironmentConfig::new(dir.clone())
+                .with_allow_create(true)
+                .with_transactional(true)
+                .with_log_file_max_bytes(65_536); // 64 KiB — forces flip quickly
+            let env =
+                noxu_db::Environment::open(env_config).expect("open env flip");
+            let db_config = DatabaseConfig::new().with_allow_create(true);
+            let db =
+                env.open_database(None, "test", &db_config).expect("open db flip");
+
+            // Write enough records to guarantee at least one file flip.
+            for i in 0u32..200 {
+                let txn = env.begin_transaction(None).expect("begin txn");
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(&[0u8; 256]); // 256-byte values
+                db.put(Some(&txn), &key, &val).expect("put");
+                txn.commit().expect("commit");
+            }
+
+            flag(&dir, "flip_committed");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }
