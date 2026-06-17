@@ -797,6 +797,26 @@ impl Bin {
     ///
     /// A delta is logged when <= 25% of slots are dirty.
     pub fn should_log_delta(&self) -> bool {
+        // Backward-compatible wrapper; uses the JE default of 25.
+        // Ref: BIN.java shouldLogDelta ~line 1892, TREE_BIN_DELTA param.
+        self.should_log_delta_pct(25)
+    }
+
+    /// Config-driven BIN-delta threshold check.
+    ///
+    /// Returns `true` if the number of dirty slots is at or below
+    /// `(n_entries * bin_delta_percent) / 100`, matching the JE integer
+    /// formula exactly.
+    ///
+    /// `bin_delta_percent` should be the value of the `TREE_BIN_DELTA`
+    /// config parameter (default 25).  The no-arg `should_log_delta()`
+    /// wrapper calls this with 25.
+    ///
+    /// Ref: `BIN.java shouldLogDelta` ~line 1892:
+    ///   `final int deltaLimit =
+    ///       (getNEntries() * databaseImpl.getBinDeltaPercent()) / 100;
+    ///   return numDeltas <= deltaLimit;`
+    pub fn should_log_delta_pct(&self, bin_delta_percent: u8) -> bool {
         // JE guard 1 (`BIN.shouldLogDelta` line 1892): if this node is
         // already a BIN-delta, always re-log it as a delta — do not
         // revert to a full BIN based on the dirty-ratio heuristic.
@@ -827,8 +847,10 @@ impl Bin {
             return false;
         }
         let total = self.inner.get_n_entries();
-        // Default threshold: 25%
-        dirty_count <= total / 4
+        // JE integer formula: deltaLimit = (nEntries * binDeltaPercent) / 100.
+        // Using integer division throughout (no float), matching JE exactly.
+        let delta_limit = (total * bin_delta_percent as usize) / 100;
+        dirty_count <= delta_limit
     }
 
     /// Counts the number of dirty slots.
@@ -3715,4 +3737,102 @@ mod tests {
         bin.set_bloom_filter(None);
         assert!(bin.get_bloom_filter().is_none());
     }
+
+    // --- Part 3 acceptance tests: config-driven BIN-delta threshold (DRIFT-4) ---
+    //
+    // JE BIN.shouldLogDelta uses the integer formula:
+    //   deltaLimit = (getNEntries() * binDeltaPercent) / 100
+    // The noxu-tree side was hardcoded to total/4. should_log_delta_pct(pct)
+    // now implements the JE formula faithfully.
+    //
+    // Ref: BIN.java shouldLogDelta ~line 1892.
+
+    fn make_full_bin_with_dirty(n_entries: usize, n_dirty: usize) -> Bin {
+        let mut bin = Bin::new(1, n_entries + 4);
+        // set last_full_version to something non-null so the guard passes.
+        bin.last_full_version = noxu_util::Lsn::new(1, 1);
+        for i in 0..n_entries {
+            let k = vec![i as u8];
+            bin.insert_entry(k, noxu_util::Lsn::new(1, i as u32 + 1), 0, None)
+                .expect("insert");
+        }
+        // mark first n_dirty slots dirty
+        for i in 0..n_dirty {
+            bin.inner.states[i] |= DIRTY_BIT;
+        }
+        bin
+    }
+
+    /// At the JE default of 25%, threshold = n/4 (integer).
+    /// Dirty count at or below threshold → delta OK; above → full BIN.
+    #[test]
+    fn test_should_log_delta_pct_default_25() {
+        // 100 entries; threshold = 25.
+        let bin25 = make_full_bin_with_dirty(100, 25);
+        assert!(
+            bin25.should_log_delta_pct(25),
+            "25 dirty out of 100 at pct=25 should be delta"
+        );
+
+        let bin26 = make_full_bin_with_dirty(100, 26);
+        assert!(
+            !bin26.should_log_delta_pct(25),
+            "26 dirty out of 100 at pct=25 should be full BIN"
+        );
+    }
+
+    /// At 50%, threshold = n/2.
+    #[test]
+    fn test_should_log_delta_pct_50() {
+        let bin50 = make_full_bin_with_dirty(100, 50);
+        assert!(
+            bin50.should_log_delta_pct(50),
+            "50 dirty at pct=50 should be delta"
+        );
+
+        let bin51 = make_full_bin_with_dirty(100, 51);
+        assert!(
+            !bin51.should_log_delta_pct(50),
+            "51 dirty at pct=50 should be full BIN"
+        );
+    }
+
+    /// Integer rounding: for small BINs the threshold rounds DOWN
+    /// (matching JE's integer division). E.g. n=7, pct=25: limit = 7*25/100 = 1.
+    #[test]
+    fn test_should_log_delta_pct_integer_rounding() {
+        // n=7, pct=25 → limit = 7*25/100 = 175/100 = 1 (integer div)
+        let bin_1d = make_full_bin_with_dirty(7, 1);
+        assert!(
+            bin_1d.should_log_delta_pct(25),
+            "1 dirty out of 7 at pct=25 should be delta (limit=1)"
+        );
+        let bin_2d = make_full_bin_with_dirty(7, 2);
+        assert!(
+            !bin_2d.should_log_delta_pct(25),
+            "2 dirty out of 7 at pct=25 should be full BIN (limit=1)"
+        );
+    }
+
+    /// Hardcoded 25% (total/4) diverges from JE formula at values
+    /// not divisible by 4. This test confirms the new formula matches JE:
+    /// n=10, pct=25: JE limit = 10*25/100 = 2; old code: 10/4 = 2 (same).
+    /// n=11, pct=25: JE limit = 11*25/100 = 2; old code: 11/4 = 2 (same).
+    /// n=13, pct=25: JE limit = 13*25/100 = 3; old code: 13/4 = 3 (same).
+    /// n=14, pct=25: JE limit = 14*25/100 = 3; old code: 14/4 = 3 (same).
+    /// They diverge at pct ≠ 25 — e.g. pct=30, n=10:
+    ///   JE: 10*30/100 = 3; old: 10/4 = 2.
+    #[test]
+    fn test_should_log_delta_pct_vs_old_formula_at_pct30() {
+        // n=10, pct=30: JE limit = 3; old hardcoded limit = 2.
+        let bin3 = make_full_bin_with_dirty(10, 3);
+        assert!(
+            bin3.should_log_delta_pct(30),
+            "3 dirty out of 10 at pct=30 should be delta (JE limit=3)"
+        );
+        // Old formula (total/4 = 2) would have returned false here:
+        // 3 > 2 → full BIN. The new formula returns true: 3 <= 3.
+        // This confirms the fix is observable.
+    }
 }
+
