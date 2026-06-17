@@ -329,8 +329,8 @@ impl Cursor {
             Put::NoOverwrite => PutMode::NoOverwrite,
             // NoDupData inserts only if the exact (key, data) pair does not
             // already exist.  For sorted-dup databases this checks the full
-            // two-part composite key; for non-dup databases it behaves
-            // identically to NoOverwrite.
+            // two-part composite key.  On a non-dup database NoDupData is
+            // not permitted (JE throws UnsupportedOperationException; D11 fix).
             Put::NoDupData => PutMode::NoDupData,
             Put::Current => {
                 self.check_initialized()?;
@@ -345,6 +345,10 @@ impl Cursor {
         {
             noxu_dbi::OperationStatus::KeyExist => {
                 Ok(OperationStatus::KeyExists)
+            }
+            noxu_dbi::OperationStatus::KeyEmpty => {
+                // D4: putCurrent on a defunct slot (JE KEYEMPTY).
+                Ok(OperationStatus::KeyEmpty)
             }
             _ => {
                 self.state = CursorState::Initialized;
@@ -368,7 +372,12 @@ impl Cursor {
             ));
         }
 
-        self.inner.delete().map_err(map_cursor_err)?;
+        let inner_status = self.inner.delete().map_err(map_cursor_err)?;
+        // D3: inner returns KeyEmpty when the slot was concurrently deleted.
+        if inner_status == noxu_dbi::OperationStatus::KeyEmpty {
+            // Stay in current state (still positioned on defunct slot).
+            return Ok(OperationStatus::KeyEmpty);
+        }
         // JE CursorImpl.deleteCurrentRecord(): keep position at the gap so
         // Next/Prev yields the successor/predecessor (D1 fix).
         // Ref: CursorImpl.java deleteCurrentRecord() + getNext() PD check.
@@ -1003,26 +1012,25 @@ mod tests {
     /// Put::NoDupData on a non-dup database inserts when the key is new.
     ///
     /// `Cursor.putNoDupData()`: for a non-dup database NoDupData
-    /// behaves like NoOverwrite (returns KeyExists if the key is already
-    /// present, Success otherwise).
+    /// D11: Put::NoDupData on a non-dup DB must return an error.
+    /// JE throws UnsupportedOperationException; Noxu maps to OperationNotAllowed.
+    /// Ref: Cursor.java putNoDupData() non-dup guard.
     #[test]
     fn test_put_no_dup_data_inserts_new_key() {
         let mut cursor = make_cursor(false);
 
-        let mut key = DatabaseEntry::from_bytes(b"k");
+        let key = DatabaseEntry::from_bytes(b"k");
         let data = DatabaseEntry::from_bytes(b"v");
 
-        let status = cursor.put(&key, &data, Put::NoDupData).unwrap();
-        assert_eq!(status, OperationStatus::Success);
-
-        // Verify the record is readable.
-        let mut out = DatabaseEntry::new();
-        let s = cursor.get(&mut key, &mut out, Get::Search, None).unwrap();
-        assert_eq!(s, OperationStatus::Success);
-        assert_eq!(out.get_data().unwrap(), b"v");
+        // D11: must error on non-dup DB (was: silently insert like NoOverwrite).
+        let result = cursor.put(&key, &data, Put::NoDupData);
+        assert!(
+            result.is_err(),
+            "D11: NoDupData on non-dup DB must return an error, got: {result:?}"
+        );
     }
 
-    /// Put::NoDupData returns KeyExists when the key already exists (non-dup DB).
+    /// D11: Put::NoDupData on a non-dup DB errors even when key exists.
     #[test]
     fn test_put_no_dup_data_key_exists() {
         let mut cursor = make_cursor_with(vec![(b"k", b"v")]);
@@ -1030,8 +1038,12 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"k");
         let data = DatabaseEntry::from_bytes(b"v2");
 
-        let status = cursor.put(&key, &data, Put::NoDupData).unwrap();
-        assert_eq!(status, OperationStatus::KeyExists);
+        // D11: must error regardless of whether the key exists.
+        let result = cursor.put(&key, &data, Put::NoDupData);
+        assert!(
+            result.is_err(),
+            "D11: NoDupData on non-dup DB must return an error, got: {result:?}"
+        );
     }
 
     /// Put::Current when cursor is not initialized returns an error.

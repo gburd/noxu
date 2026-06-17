@@ -232,6 +232,7 @@ where
             }
             OperationStatus::NotFound => Ok(None),
             OperationStatus::KeyExists => Ok(None),
+            OperationStatus::KeyEmpty => Ok(None),
         }
     }
 

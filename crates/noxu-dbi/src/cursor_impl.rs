@@ -2438,6 +2438,13 @@ impl CursorImpl {
         match put_mode {
             PutMode::Current => {
                 self.check_initialized()?;
+                // D4: return KEYEMPTY if the current slot has been deleted
+                // by a concurrent operation (JE Cursor.putCurrent() KEYEMPTY).
+                // Ref: CursorImpl.java getCurrentLN() — returns KEYEMPTY when
+                // the slot is PD-flagged or absent.
+                if self.is_current_slot_deleted() {
+                    return Ok(OperationStatus::KeyEmpty);
+                }
                 let current_key = self
                     .current_key
                     .clone()
@@ -2507,36 +2514,17 @@ impl CursorImpl {
                 self.state = CursorState::Initialized;
                 Ok(OperationStatus::Success)
             }
-            // NoDupData on a non-dup database behaves like NoOverwrite:
-            // returns KeyExist if the key already exists, otherwise inserts.
-            // `Cursor.putNoDupData()` non-dup branch.
+            // D11: NoDupData on a non-dup database is invalid.
+            // JE Cursor.putNoDupData() throws UnsupportedOperationException
+            // when the DB does not support duplicates.
+            // Map to DbiError::OperationFailed.
+            // Ref: Cursor.java putNoDupData() non-dup guard.
             PutMode::NoDupData => {
-                if self.key_exists_in_view(key) {
-                    return Ok(OperationStatus::KeyExist);
-                }
-                let (old_data, old_lsn) = self.get_slot_before_image(key);
-                // T-F2: same as NoOverwrite path.
-                self.lock_range_insert(key, old_lsn)?;
-                self.lock_write_before_log(old_lsn, key)?;
-                // See the NoOverwrite re-check above for rationale.
-                if self.key_exists_in_view(key) {
-                    return Ok(OperationStatus::KeyExist);
-                }
-                let new_lsn =
-                    self.log_ln_write(key, Some(data), self.locker_id)?;
-                self.finalize_write_lock(
-                    old_lsn,
-                    new_lsn,
-                    Some(key.to_vec()),
-                    old_data,
-                )?;
-                self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
-                self.current_key = Some(key.to_vec());
-                self.current_data = Some(data.to_vec());
-                self.current_lsn = new_lsn.as_u64();
-                self.current_index = 0;
-                self.state = CursorState::Initialized;
-                Ok(OperationStatus::Success)
+                return Err(DbiError::OperationFailed(
+                    "putNoDupData is not supported on a non-duplicate database; \
+                     use put(NoOverwrite) for key-only uniqueness enforcement"
+                        .into(),
+                ));
             }
             PutMode::Overwrite => {
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
@@ -2805,6 +2793,8 @@ impl CursorImpl {
     /// # Returns
     ///
     /// * `Success` if the record was deleted
+    /// * `KeyEmpty` if the current slot has already been deleted by a
+    ///   concurrent operation (JE: `OperationStatus.KEYEMPTY`).
     ///
     /// # Errors
     ///
@@ -2812,6 +2802,14 @@ impl CursorImpl {
     /// * `CursorClosed` if cursor has been closed
     pub fn delete(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_initialized()?;
+
+        // D3: if the slot has already been deleted by a concurrent operation,
+        // return KEYEMPTY (JE CursorImpl.deleteCurrentRecord() PD-flag check).
+        // Ref: CursorImpl.java deleteCurrentRecord() — returns KEYEMPTY when
+        // getCurrentLN() finds a PD-flagged or absent slot.
+        if self.is_current_slot_deleted() {
+            return Ok(OperationStatus::KeyEmpty);
+        }
 
         // For sorted-dup databases, current_key IS the two-part composite key
         // stored in the tree.  For non-dup databases it is the plain key.

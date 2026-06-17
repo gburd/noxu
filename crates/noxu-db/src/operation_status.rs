@@ -11,4 +11,8 @@ pub enum OperationStatus {
     NotFound,
     /// Key already exists (for NoOverwrite operations).
     KeyExists,
+    /// The record at the cursor position was deleted by another operation
+    /// while the cursor was positioned on it.  JE: `OperationStatus.KEYEMPTY`.
+    /// Returned by `putCurrent` / `delete` when the current slot is defunct.
+    KeyEmpty,
 }
