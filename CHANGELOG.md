@@ -18,6 +18,82 @@ listed in [References](#references).
 
 ### Fixed
 
+- **B-tree DRIFT-1 — splitSpecial heuristic** (`noxu-tree`): Sequential-append
+  and sequential-prepend workloads now use JE's `IN.splitSpecial` split-index
+  selection. When all routing decisions during the top-down descent are
+  leftmost (`AllLeft`, prepend) or rightmost (`AllRight`, append), the split
+  index is forced to `1` or `n-1` respectively instead of `n/2`. The left BIN
+  stays near-full after each split, cutting BIN count and write amplification
+  roughly in half for sequential workloads while leaving random-insert balance
+  unchanged.  New descent-tracking booleans `all_left_so_far` /
+  `all_right_so_far` thread through `insert_recursive_inner` and
+  `redo_insert_recursive_inner`.  Acceptance tests:
+  `test_split_special_ascending_fewer_bins_than_midpoint`,
+  `test_split_special_descending_fewer_bins_than_midpoint`,
+  `test_split_special_random_inserts_stay_balanced`.
+  Ref: `IN.java splitSpecial` ~line 4129, `Tree.java forceSplit` ~line 1907.
+
+- **B-tree DRIFT-2 — idKeyIndex comment** (`noxu-tree`): The `split_child`
+  rustdoc previously claimed `idKeyIndex` determines which half keeps the
+  identifier key; the code always keeps the left half. The comment now
+  accurately documents that left-only is a correct safe simplification under
+  preemptive-split discipline, with a reference to `IN.java splitInternal`
+  ~line 4172 for the full JE logic.
+
+- **B-tree DRIFT-3 — key_prefixing flag** (`noxu-tree`): Noxu was always
+  applying BIN key-prefix compression, ignoring the `DatabaseConfig.
+  setKeyPrefixing` flag. Fixed: `Tree` now has a `key_prefixing: bool` field
+  (default `false`, matching JE `KEY_PREFIXING_DEFAULT`). When `false`,
+  `BinStub::insert_raw` stores full keys without any prefix; `split_child`
+  skips `recompute_key_prefix` on both halves. Custom-comparator (sorted-dup)
+  databases are unaffected. A `Tree::set_key_prefixing()` setter is provided;
+  wiring from `DatabaseImpl` to `Tree` is a follow-up in `noxu-dbi`.  New
+  method `BinStub::insert_raw`. Acceptance tests:
+  `test_key_prefixing_false_stores_full_keys`,
+  `test_key_prefixing_true_compresses_keys`,
+  `test_key_prefixing_custom_comparator_no_prefix`.
+  Ref: `IN.java computeKeyPrefix` ~line 2456.
+
+- **B-tree DRIFT-4 — BIN-delta threshold (noxu-tree side)** (`noxu-tree`):
+  `Bin::should_log_delta` was hardcoded to `dirty <= total / 4` (always 25%).
+  JE uses the configurable integer formula
+  `deltaLimit = (nEntries * binDeltaPercent) / 100`.  New method
+  `Bin::should_log_delta_pct(bin_delta_percent: u8)` implements the JE
+  formula exactly; `should_log_delta()` is kept as a backward-compatible
+  no-arg wrapper calling `should_log_delta_pct(25)`.  **Note:** the
+  `noxu-recovery::checkpointer` has a separate hardcoded
+  `const TREE_BIN_DELTA: f64 = 0.25` — unifying that with the config
+  parameter is a follow-up task (out of scope for this PR; noxu-recovery
+  is off-limits).  Acceptance tests:
+  `test_should_log_delta_pct_default_25`,
+  `test_should_log_delta_pct_50`,
+  `test_should_log_delta_pct_integer_rounding`,
+  `test_should_log_delta_pct_vs_old_formula_at_pct30`.
+  Ref: `BIN.java shouldLogDelta` ~line 1892.
+
+- **B-tree DRIFT-5 — reconstituteBIN pre-compression + resize** (`noxu-tree`):
+  `Bin::mutate_to_full_bin` now matches JE `BIN.reconstituteBIN` ~line 2383:
+  (1) compress non-dirty deleted slots on the full BIN before applying the
+  delta (handles slots compressed away after the last full write but before
+  the delta); (2) count new insertions and resize the full BIN if
+  `n_insertions + n_entries > max_entries`, preventing spurious
+  `SplitRequired` errors and oversized BINs. New method `Bin::resize(new_max)`.
+  Acceptance tests:
+  `test_mutate_to_full_bin_resize_for_new_insertion`,
+  `test_mutate_to_full_bin_resize_enlarges_bin`.
+  Ref: `BIN.java reconstituteBIN` ~line 2383, `mutateToFullBIN` ~line 2195.
+
+### Changed
+
+- **TOMBSTONE_BIT (0x80) — documented as intentional Noxu extension**
+  (`noxu-tree`, DRIFT-7): `TOMBSTONE_BIT` is NOT in JE `EntryStates.java`.
+  Noxu uses it for blind-deletion tombstones (`ExtinctionScanner`). It is
+  intentionally persisted (NOT in `TRANSIENT_BITS`) so tombstones survive
+  checkpoints and can be reclaimed by the cleaner. A JE-format reader
+  encountering 0x80 set will ignore it safely (JE processes state bits
+  independently by masking). Expanded rustdoc on `TOMBSTONE_BIT` and
+  `TRANSIENT_BITS` to record this analysis.
+
 - **Cursor D1/D5 — delete cursor position + adjustCursorsForInsert** (`noxu-dbi`,
   `noxu-db`): After `cursor.delete()`, subsequent `Next`/`Prev` now returns
   the successor/predecessor rather than `NotFound`.  A new `PendingDeleted`

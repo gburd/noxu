@@ -2450,7 +2450,7 @@ impl Tree {
             self.max_entries_per_node,
             lsn,
             SplitHint::Normal,
-            &[],              // no insertion key at root-init time
+            &[], // no insertion key at root-init time
             self.key_comparator.as_ref(),
             self.key_prefixing,
         )?;
@@ -2594,13 +2594,8 @@ impl Tree {
                 let mut idx = 0usize;
                 for i in 1..n_entries {
                     let ord = match key_comparator {
-                        Some(cmp) => cmp(
-                            all_entries.get_key(i),
-                            insert_key,
-                        ),
-                        None => all_entries
-                            .get_key(i)
-                            .cmp(insert_key),
+                        Some(cmp) => cmp(all_entries.get_key(i), insert_key),
+                        None => all_entries.get_key(i).cmp(insert_key),
                     };
                     if ord != std::cmp::Ordering::Greater {
                         idx = i;
@@ -2782,8 +2777,8 @@ impl Tree {
             max_entries,
             key_comparator,
             key_prefixing,
-            true,  // all_left_so_far
-            true,  // all_right_so_far
+            true, // all_left_so_far
+            true, // all_right_so_far
         )
     }
 
@@ -2863,8 +2858,7 @@ impl Tree {
                         // JE: IN.computeKeyPrefix returns null when
                         // databaseImpl.getKeyPrefixing() is false.
                         // Ref: IN.java computeKeyPrefix ~line 2456.
-                        let (_idx, new) =
-                            bin.insert_raw(key, lsn, Some(data));
+                        let (_idx, new) = bin.insert_raw(key, lsn, Some(data));
                         new
                     };
                     // Mark dirty after any modification.
@@ -2889,16 +2883,13 @@ impl Tree {
                                 idx = 0;
                             } else {
                                 let ord = match key_comparator {
-                                    Some(cmp) => {
-                                        cmp(
-                                            entry.key.as_slice(),
-                                            key.as_slice(),
-                                        )
+                                    Some(cmp) => cmp(
+                                        entry.key.as_slice(),
+                                        key.as_slice(),
+                                    ),
+                                    None => {
+                                        entry.key.as_slice().cmp(key.as_slice())
                                     }
-                                    None => entry
-                                        .key
-                                        .as_slice()
-                                        .cmp(key.as_slice()),
                                 };
                                 if ord != std::cmp::Ordering::Greater {
                                     idx = i;
@@ -2915,7 +2906,7 @@ impl Tree {
                         (idx, n.entries.len(), child)
                     }
                     TreeNode::Bottom(_) => {
-                        return Err(TreeError::SplitRequired)
+                        return Err(TreeError::SplitRequired);
                     }
                 };
 
@@ -3089,9 +3080,7 @@ impl Tree {
                                 idx = 0;
                             } else {
                                 let ord = match key_comparator {
-                                    Some(cmp) => {
-                                        cmp(entry.key.as_slice(), key)
-                                    }
+                                    Some(cmp) => cmp(entry.key.as_slice(), key),
                                     None => entry.key.as_slice().cmp(key),
                                 };
                                 if ord != std::cmp::Ordering::Greater {
@@ -3109,7 +3098,7 @@ impl Tree {
                         (idx, n.entries.len(), child)
                     }
                     TreeNode::Bottom(_) => {
-                        return Err(TreeError::SplitRequired)
+                        return Err(TreeError::SplitRequired);
                     }
                 };
 
@@ -9679,8 +9668,17 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
     *tree.root.write() = Some(Arc::clone(&root));
 
     // Trigger split_child on the root.
-    Tree::split_child(&root, 0, 4, Lsn::new(1, 500), SplitHint::Normal, &[], None, false)
-        .expect("split_child should succeed");
+    Tree::split_child(
+        &root,
+        0,
+        4,
+        Lsn::new(1, 500),
+        SplitHint::Normal,
+        &[],
+        None,
+        false,
+    )
+    .expect("split_child should succeed");
 
     // After the split: root has two children — left BIN and right sibling.
     let root_guard = root.read();
@@ -9907,9 +9905,9 @@ mod key_prefixing_tests {
             let g = node.read();
             match &*g {
                 TreeNode::Bottom(_) => None,
-                TreeNode::Internal(n) => {
-                    Some(Arc::clone(n.entries[0].child.as_ref().expect("child")))
-                }
+                TreeNode::Internal(n) => Some(Arc::clone(
+                    n.entries[0].child.as_ref().expect("child"),
+                )),
             }
         };
         match child_opt {
@@ -9946,7 +9944,10 @@ mod key_prefixing_tests {
         );
         assert_eq!(bin.entries.len(), 8);
         // Keys must be stored as full keys.
-        assert_eq!(bin.entries[0].key, vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', 0]);
+        assert_eq!(
+            bin.entries[0].key,
+            vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', 0]
+        );
     }
 
     /// With `key_prefixing = true`, keys with a common prefix are compressed:
@@ -10056,8 +10057,7 @@ mod split_special_tests {
         match &*g {
             TreeNode::Bottom(b) => b.entries.len(),
             TreeNode::Internal(n) => {
-                let first_child =
-                    n.entries[0].child.as_ref().expect("child");
+                let first_child = n.entries[0].child.as_ref().expect("child");
                 leftmost_bin_size(first_child)
             }
         }
@@ -10098,29 +10098,21 @@ mod split_special_tests {
         let lsn = noxu_util::Lsn::new(1, 100);
         for i in 0u32..n_keys as u32 {
             let key = i.to_be_bytes().to_vec();
-            tree_special
-                .insert(key, vec![0u8], lsn)
-                .expect("insert");
+            tree_special.insert(key, vec![0u8], lsn).expect("insert");
         }
 
-        let root_special = tree_special
-            .get_root()
-            .expect("root must exist");
+        let root_special = tree_special.get_root().expect("root must exist");
         let bins_special = count_bins(&root_special);
         let keys_special = count_keys(&root_special);
 
         // All keys must be present.
-        assert_eq!(
-            keys_special, n_keys,
-            "all keys must be stored"
-        );
+        assert_eq!(keys_special, n_keys, "all keys must be stored");
 
         // With splitSpecial, each right-side split keeps n-1 entries in the
         // left BIN. Ideal: ceil(n_keys / (max_entries - 1)) BINs.
         // Without splitSpecial (midpoint): ceil(n_keys / (max_entries / 2)).
         // We assert the actual count is below the midpoint-split upper bound.
-        let midpoint_upper_bound =
-            (n_keys + max_entries / 2 - 1) / (max_entries / 2);
+        let midpoint_upper_bound = n_keys.div_ceil(max_entries / 2);
         assert!(
             bins_special < midpoint_upper_bound,
             "splitSpecial should produce fewer BINs than midpoint split: \
@@ -10132,8 +10124,7 @@ mod split_special_tests {
         // The IMPORTANT property: rightmost BIN started with exactly 1 entry
         // (its first entry was the split-off singleton) then filled up.
         // We just verify overall key density > midpoint baseline.
-        let avg_fill =
-            keys_special as f64 / bins_special as f64;
+        let avg_fill = keys_special as f64 / bins_special as f64;
         let midpoint_fill = (max_entries / 2) as f64;
         assert!(
             avg_fill > midpoint_fill,
@@ -10156,21 +10147,16 @@ mod split_special_tests {
         let lsn = noxu_util::Lsn::new(1, 100);
         for i in (0u32..n_keys as u32).rev() {
             let key = i.to_be_bytes().to_vec();
-            tree_special
-                .insert(key, vec![0u8], lsn)
-                .expect("insert");
+            tree_special.insert(key, vec![0u8], lsn).expect("insert");
         }
 
-        let root_special = tree_special
-            .get_root()
-            .expect("root must exist");
+        let root_special = tree_special.get_root().expect("root must exist");
         let bins_special = count_bins(&root_special);
         let keys_special = count_keys(&root_special);
 
         assert_eq!(keys_special, n_keys, "all keys must be stored");
 
-        let midpoint_upper_bound =
-            (n_keys + max_entries / 2 - 1) / (max_entries / 2);
+        let midpoint_upper_bound = n_keys.div_ceil(max_entries / 2);
         assert!(
             bins_special < midpoint_upper_bound,
             "splitSpecial descending should produce fewer BINs: \

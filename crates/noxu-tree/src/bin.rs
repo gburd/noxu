@@ -3935,13 +3935,14 @@ mod tests {
         // Build a BIN-delta with ONE new key that is NOT in the full BIN.
         let mut delta = Bin::new(2, 4);
         delta.last_full_version = noxu_util::Lsn::new(1, 10);
-        delta.insert_entry(
-            vec![100u8],
-            noxu_util::Lsn::new(1, 20),
-            DIRTY_BIT,
-            None,
-        )
-        .expect("insert delta");
+        delta
+            .insert_entry(
+                vec![100u8],
+                noxu_util::Lsn::new(1, 20),
+                DIRTY_BIT,
+                None,
+            )
+            .expect("insert delta");
         delta.inner.set_bin_delta(true);
 
         // Merge: delta.mutate_to_full_bin(&mut full).
@@ -3990,13 +3991,14 @@ mod tests {
         let mut delta = Bin::new(2, 4);
         delta.last_full_version = noxu_util::Lsn::new(1, 10);
         for k in [100u8, 101u8] {
-            delta.insert_entry(
-                vec![k],
-                noxu_util::Lsn::new(1, 20),
-                DIRTY_BIT,
-                None,
-            )
-            .expect("insert delta");
+            delta
+                .insert_entry(
+                    vec![k],
+                    noxu_util::Lsn::new(1, 20),
+                    DIRTY_BIT,
+                    None,
+                )
+                .expect("insert delta");
         }
         delta.inner.set_bin_delta(true);
 
@@ -4012,4 +4014,3 @@ mod tests {
         assert!(!delta.is_bin_delta());
     }
 }
-
