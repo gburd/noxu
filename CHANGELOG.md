@@ -16,6 +16,23 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (replication — split-brain)
+
+- **Paxos Phase-2 acceptor admitted an unpromised higher term** (`noxu-rep`,
+  D1): the election acceptor accepted a phase-2 `Accept` whenever its term was
+  `>= promised` (and the phase-2 guard used `term >= phase1_term`). JE
+  `Acceptor.process(Accept)` (Acceptor.java:210-211) rejects unless the
+  Accept's proposal EQUALS the promised proposal
+  (`promisedProposal.compareTo(accept.getProposal()) != 0` → Reject) — there is
+  no implicit promise-bump on accept. The `>=` admitted a proposer that got a
+  phase-1 promise at term T1 then sent a phase-2 Accept at T2 > T1 without a
+  fresh phase 1, letting two proposers reach phase-2 quorum at different terms
+  (classic split-brain). Now `try_accept` and the phase-2 guard require exact
+  equality with the promised term. Regression tests
+  `try_accept_higher_term_than_promise_rejected_split_brain_guard`,
+  `test_acceptor_rejects_accept_at_unpromised_term`, and the
+  `prop_acceptor_accept_contract` property model (corrected to JE semantics).
+
 ### Fixed (production-wiring gaps found by fix-verification audit)
 
 - **key_prefixing lost on recovery** (`noxu-dbi`): `DatabaseImpl::set_recovered_tree`

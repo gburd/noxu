@@ -209,13 +209,18 @@ impl PersistentAcceptorState {
 
     /// Try to accept that `master` won at term `t`.
     ///
-    /// Returns `true` (with the new state flushed to disk) iff
-    /// `t >= self.promised_term()`.  Persists the new
+    /// Returns `true` (with the new state flushed to disk) iff `t` EXACTLY
+    /// equals `self.promised_term()`.  JE Acceptor.process(Accept) rejects
+    /// unless the Accept's proposal equals the promised proposal
+    /// (`promisedProposal.compareTo(accept.getProposal()) == 0`) — an Accept
+    /// at a higher term that was never promised in phase 1 must be rejected
+    /// to preserve the Paxos invariant that the phase-2 value is fixed to the
+    /// specific phase-1 round (split-brain otherwise). Persists the new
     /// (accepted_term, accepted_master) on success.
     pub fn try_accept(&self, t: u64, master: &str) -> bool {
         let _guard = self.flush_lock.lock().unwrap();
         let promised = self.promised_term.load(Ordering::SeqCst);
-        if t < promised {
+        if t != promised {
             return false;
         }
         let prev_accepted_term = self.accepted_term.load(Ordering::SeqCst);
@@ -405,6 +410,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let s = PersistentAcceptorState::load_or_default(dir.path());
+            // Must promise before accepting at the same term (D1 faithful
+            // semantics: accept only at the promised term).
+            assert!(s.try_promise(3));
             assert!(s.try_accept(3, "x"));
         }
         // Corrupt the file.
@@ -429,12 +437,38 @@ mod tests {
     }
 
     #[test]
-    fn try_accept_implicitly_bumps_promise() {
+    fn try_accept_requires_matching_promise() {
+        // JE Acceptor.process(Accept) rejects unless the Accept's proposal
+        // equals the promised proposal. An accept at a term we never promised
+        // (here: no prior promise -> promised == 0) must be rejected.
         let dir = TempDir::new().unwrap();
         let s = PersistentAcceptorState::load_or_default(dir.path());
+        assert!(!s.try_accept(7, "winner"), "accept without matching promise");
+        assert_eq!(s.accepted_term(), 0);
+        // After promising 7, accept at 7 succeeds.
+        assert!(s.try_promise(7));
         assert!(s.try_accept(7, "winner"));
-        assert_eq!(s.promised_term(), 7);
-        // Subsequent lower promise rejected.
-        assert!(!s.try_promise(6));
+        assert_eq!(s.accepted_term(), 7);
+    }
+
+    #[test]
+    fn try_accept_higher_term_than_promise_rejected_split_brain_guard() {
+        // D1 split-brain regression: a proposer that obtained a phase-1
+        // promise at term T1 but then sends a phase-2 Accept at T2 > T1
+        // (without a fresh phase 1) MUST be rejected. Accepting T2 here would
+        // let two proposers at different terms both reach phase-2 quorum.
+        let dir = TempDir::new().unwrap();
+        let s = PersistentAcceptorState::load_or_default(dir.path());
+        assert!(s.try_promise(5));
+        assert!(
+            !s.try_accept(6, "intruder"),
+            "D1: accept at term > promised must be rejected (split-brain)"
+        );
+        assert_eq!(s.accepted_term(), 0, "no acceptance recorded");
+        // The promised term is unchanged, so the legitimate proposer at 5 can
+        // still complete phase 2.
+        assert_eq!(s.promised_term(), 5);
+        assert!(s.try_accept(5, "legit"));
+        assert_eq!(s.accepted_term(), 5);
     }
 }

@@ -209,10 +209,13 @@ proptest! {
         }
     }
 
-    /// Paxos safety: `try_accept(t, m)` returning `true` implies
-    /// `t >= prev_promised_term`.  A successful accept also implicitly bumps
-    /// promised_term to t.  Returning `false` MUST leave (accepted_term,
-    /// accepted_master) unchanged.
+    /// Paxos safety (JE Acceptor.process(Accept), Acceptor.java:210-211):
+    /// `try_accept(t, m)` returns `true` IFF `t == prev_promised_term` — an
+    /// Accept is honoured only at the exact term that was promised in phase 1.
+    /// An Accept at any other term (higher OR lower) is rejected; accepting at
+    /// a higher-but-unpromised term would admit two proposers reaching phase-2
+    /// quorum at different terms (split-brain). Returning `false` MUST leave
+    /// (accepted_term, accepted_master) AND promised_term unchanged.
     #[test]
     fn prop_acceptor_accept_contract(
         msgs in prop::collection::vec(acceptor_msg_strategy(50), 0..16),
@@ -236,14 +239,18 @@ proptest! {
 
         let result = acceptor.try_accept(probe_term, &probe_master);
         if result {
-            prop_assert!(probe_term >= before_promised);
+            prop_assert_eq!(probe_term, before_promised,
+                "accept succeeds only at the exact promised term");
             prop_assert_eq!(acceptor.accepted_term(), probe_term);
             prop_assert_eq!(acceptor.accepted_master(), Some(probe_master));
-            prop_assert_eq!(acceptor.promised_term(), probe_term);
+            // promised_term is unchanged (already == probe_term).
+            prop_assert_eq!(acceptor.promised_term(), before_promised);
         } else {
-            prop_assert!(probe_term < before_promised);
+            prop_assert!(probe_term != before_promised);
             prop_assert_eq!(acceptor.accepted_term(), before_accepted);
             prop_assert_eq!(acceptor.accepted_master(), before_master);
+            prop_assert_eq!(acceptor.promised_term(), before_promised,
+                "rejected accept must not mutate the promise");
         }
     }
 

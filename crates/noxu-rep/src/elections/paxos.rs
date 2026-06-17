@@ -466,10 +466,15 @@ pub fn run_acceptor_with_state(
 
     match phase2 {
         ProtocolMessage::ElectionResult { master, term } => {
-            // Accept iff the result term is at least our promised term and
-            // matches phase 1's term (proposer must not switch terms
-            // mid-round).
-            if term >= phase1_term && state.try_accept(term, &master) {
+            // Accept iff the result term EXACTLY equals the term we promised
+            // in phase 1 (JE Acceptor.process(Accept): reject unless
+            // promisedProposal.compareTo(accept.getProposal()) == 0). A
+            // proposer that switched to a higher term mid-round (got a
+            // phase-1 promise at T1, then sent a phase-2 Accept at T2 > T1
+            // without a fresh phase 1) MUST be rejected — accepting it admits
+            // two proposers reaching phase-2 quorum at different terms, the
+            // classic split-brain failure mode.
+            if term == phase1_term && state.try_accept(term, &master) {
                 send_message(
                     channel,
                     &ProtocolMessage::ElectionVote {

@@ -120,19 +120,29 @@ fn test_acceptor_persisted_promise_survives_reload() {
     assert!(!acc2.try_accept(41, "loser"));
 }
 
-/// Adapted from JE's AcceptorTest end-to-end protocol invariant:
-/// `Accept(t, V)` when t > promised must atomically bump promised to t
-/// (JE: AcceptorImpl bumps highestPromisedProposal inside the accept path).
+/// JE Acceptor.process(Accept) (Acceptor.java:210-211): an Accept is rejected
+/// unless its proposal EQUALS the promised proposal
+/// (`promisedProposal.compareTo(accept.getProposal()) != 0` -> Reject). There
+/// is NO implicit promise-bump on accept — an Accept at a term higher than the
+/// promise (never promised in a phase 1) must be rejected. Accepting it would
+/// admit two proposers at different terms both reaching phase-2 quorum
+/// (split-brain). (Previously this test asserted the opposite, citing an
+/// implicit-bump that JE does not perform — a re-invention; corrected here.)
 #[test]
-fn test_acceptor_accept_implicitly_promises() {
+fn test_acceptor_rejects_accept_at_unpromised_term() {
     let dir = TempDir::new().unwrap();
     let acc = PersistentAcceptorState::load_or_default(dir.path());
 
     assert!(acc.try_promise(10));
-    // Accept at term 20 (> promised) succeeds and must implicitly bump
-    // promised_term to 20.  JE's AcceptorImpl does this implicitly.
-    assert!(acc.try_accept(20, "n2"));
-    assert_eq!(acc.promised_term(), 20);
-    // Now a Propose at 15 must be rejected, even though 15 > original 10.
-    assert!(!acc.try_promise(15));
+    // Accept at term 20 (> promised 10) must be REJECTED: 20 was never
+    // promised in a phase 1, so the phase-2 value is not fixed to it.
+    assert!(
+        !acc.try_accept(20, "n2"),
+        "JE: accept at a term != promised must be rejected"
+    );
+    assert_eq!(acc.promised_term(), 10, "promise unchanged by rejected accept");
+    assert_eq!(acc.accepted_term(), 0, "nothing accepted");
+    // Accept at the promised term 10 succeeds.
+    assert!(acc.try_accept(10, "n2"));
+    assert_eq!(acc.accepted_term(), 10);
 }
