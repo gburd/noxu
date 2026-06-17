@@ -400,6 +400,7 @@ mod tests {
             is_root,
             is_delta: false,
             node_data: None,
+            prev_full_lsn: noxu_util::NULL_LSN,
         }
     }
 

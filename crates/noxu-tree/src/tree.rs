@@ -102,6 +102,16 @@ pub struct Tree {
     /// Must be held when changing the root pointer.
     root_latch: SharedLatch,
 
+    /// LSN at which the current root IN/BIN was last logged.
+    ///
+    /// Used by the IN-redo currency check (`recover_root_bin` /
+    /// `recover_root_upper_in`) to decide whether a logged root replaces the
+    /// in-memory one.  Updated whenever a new root is installed via
+    /// `set_root_with_lsn` or the IN-redo recover-root path.
+    ///
+    /// JE `RootUpdater.originalLsn` / `ChildReference.getLsn()` for the root.
+    root_log_lsn: RwLock<noxu_util::Lsn>,
+
     /// Statistics: number of times the root has been split.
     root_splits: AtomicU64,
 
@@ -1392,6 +1402,7 @@ impl Tree {
             max_entries_per_node,
             root: RwLock::new(None),
             root_latch: SharedLatch::new(LatchContext::new("TreeRoot"), false),
+            root_log_lsn: RwLock::new(noxu_util::NULL_LSN),
             root_splits: AtomicU64::new(0),
             relatches_required: AtomicU64::new(0),
             key_comparator: None,
@@ -1424,6 +1435,7 @@ impl Tree {
             max_entries_per_node,
             root: RwLock::new(None),
             root_latch: SharedLatch::new(LatchContext::new("TreeRoot"), false),
+            root_log_lsn: RwLock::new(noxu_util::NULL_LSN),
             root_splits: AtomicU64::new(0),
             relatches_required: AtomicU64::new(0),
             key_comparator: Some(comparator),
@@ -4589,6 +4601,273 @@ impl Tree {
             Self::propagate_dirty_to_root(&parent_arc);
         }
     }
+
+    // ========================================================================
+    // IN-redo: JE RecoveryManager.recoverIN / recoverRootIN / recoverChildIN
+    // ========================================================================
+
+    /// Deserialise an upper-IN node from bytes produced by
+    /// `TreeNode::write_to_bytes()` / `flush_one_tree_upper_ins`.
+    ///
+    /// Format: node_id(u64BE) | level(i32BE) | n_entries(u32BE) | dirty(u8)
+    ///   | per-entry: key_len(u16BE) | key | lsn(u64BE)
+    ///
+    /// JE `INFileReader.getIN(db)` / `IN.readFromLog`.
+    pub fn deserialize_upper_in(bytes: &[u8]) -> Option<InNodeStub> {
+        if bytes.len() < 13 {
+            return None;
+        }
+        let node_id = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
+        let level = i32::from_be_bytes(bytes[8..12].try_into().ok()?);
+        let n_entries = u32::from_be_bytes(bytes[12..16].try_into().ok()?) as usize;
+        // dirty byte (1 byte after n_entries)
+        if bytes.len() < 17 {
+            return None;
+        }
+        let mut pos = 17usize; // skip node_id(8) + level(4) + n_entries(4) + dirty(1)
+        let mut entries = Vec::with_capacity(n_entries);
+        for _ in 0..n_entries {
+            if pos + 2 > bytes.len() {
+                return None;
+            }
+            let key_len =
+                u16::from_be_bytes(bytes[pos..pos + 2].try_into().ok()?) as usize;
+            pos += 2;
+            if pos + key_len > bytes.len() {
+                return None;
+            }
+            let key = bytes[pos..pos + key_len].to_vec();
+            pos += key_len;
+            if pos + 8 > bytes.len() {
+                return None;
+            }
+            let lsn = noxu_util::Lsn::from_u64(
+                u64::from_be_bytes(bytes[pos..pos + 8].try_into().ok()?),
+            );
+            pos += 8;
+            entries.push(InEntry { key, lsn, child: None });
+        }
+        Some(InNodeStub { node_id, level, entries, dirty: false, generation: 0, parent: None })
+    }
+
+    /// Deserialise a BIN from bytes produced by `BinStub::serialize_full()`.
+    ///
+    /// Thin wrapper so the recovery path does not need to import `BinStub`
+    /// directly from callers that only have the raw bytes.
+    ///
+    /// JE `INFileReader.getIN(db)` for a BIN entry.
+    pub fn deserialize_bin(bytes: &[u8]) -> Option<BinStub> {
+        let mut bin = BinStub::deserialize_full(bytes)?;
+        bin.dirty = false; // freshly loaded from log — clean for now
+        Some(bin)
+    }
+
+    /// Apply a logged IN/BIN to the in-memory tree during the recovery redo pass.
+    ///
+    /// Implements JE `RecoveryManager.recoverIN`:
+    /// - `is_root` nodes are handled by `recover_root_in`.
+    /// - non-root nodes are handled by `recover_child_in`.
+    ///
+    /// `log_lsn` is the LSN at which this IN/BIN was logged.  The currency
+    /// check in `recover_child_in` uses this to decide whether to replace the
+    /// in-memory slot (tree slot LSN < log_lsn → replace; equal → noop;
+    /// greater → skip).
+    ///
+    /// JE `RecoveryManager.recoverIN` / `replayOneIN`
+    /// (RecoveryManager.java ~lines 1200–1280).
+    pub fn recover_in_redo(
+        &self,
+        log_lsn: noxu_util::Lsn,
+        is_root: bool,
+        is_bin: bool,
+        node_data: &[u8],
+    ) -> InRedoResult {
+        if is_bin {
+            let Some(bin) = Self::deserialize_bin(node_data) else {
+                return InRedoResult::DeserializeFailed;
+            };
+            if is_root {
+                self.recover_root_bin(log_lsn, bin)
+            } else {
+                self.recover_child_bin(log_lsn, bin)
+            }
+        } else {
+            let Some(upper) = Self::deserialize_upper_in(node_data) else {
+                return InRedoResult::DeserializeFailed;
+            };
+            if is_root {
+                self.recover_root_upper_in(log_lsn, upper)
+            } else {
+                self.recover_child_upper_in(log_lsn, upper)
+            }
+        }
+    }
+
+    /// Recover a root BIN.
+    ///
+    /// If no root exists or the existing root is older (lower LSN), install
+    /// this BIN as the new root.
+    ///
+    /// JE `RecoveryManager.recoverRootIN` / `RootUpdater.doWork`
+    /// (RecoveryManager.java ~lines 1293–1410).
+    fn recover_root_bin(&self, log_lsn: noxu_util::Lsn, bin: BinStub) -> InRedoResult {
+        let mut root_guard = self.root.write();
+        let existing_lsn = *self.root_log_lsn.read();
+        match &*root_guard {
+            None => {
+                // No root — install this BIN as the root.
+                // JE: `root == null` case in `RootUpdater.doWork`.
+                let node = TreeNode::Bottom(bin);
+                *root_guard = Some(Arc::new(RwLock::new(node)));
+                *self.root_log_lsn.write() = log_lsn;
+                InRedoResult::Inserted
+            }
+            Some(_) => {
+                // JE: `originalLsn = root.getLsn()`; replace if logLsn > originalLsn.
+                if log_lsn > existing_lsn {
+                    let node = TreeNode::Bottom(bin);
+                    *root_guard = Some(Arc::new(RwLock::new(node)));
+                    *self.root_log_lsn.write() = log_lsn;
+                    InRedoResult::Replaced
+                } else {
+                    InRedoResult::Skipped
+                }
+            }
+        }
+    }
+
+    /// Recover a root upper IN.
+    ///
+    /// JE `RecoveryManager.recoverRootIN` for a non-BIN root.
+    fn recover_root_upper_in(
+        &self,
+        log_lsn: noxu_util::Lsn,
+        upper: InNodeStub,
+    ) -> InRedoResult {
+        let mut root_guard = self.root.write();
+        let existing_lsn = *self.root_log_lsn.read();
+        match &*root_guard {
+            None => {
+                let node = TreeNode::Internal(upper);
+                *root_guard = Some(Arc::new(RwLock::new(node)));
+                *self.root_log_lsn.write() = log_lsn;
+                InRedoResult::Inserted
+            }
+            Some(_) => {
+                if log_lsn > existing_lsn {
+                    let node = TreeNode::Internal(upper);
+                    *root_guard = Some(Arc::new(RwLock::new(node)));
+                    *self.root_log_lsn.write() = log_lsn;
+                    InRedoResult::Replaced
+                } else {
+                    InRedoResult::Skipped
+                }
+            }
+        }
+    }
+
+    /// Recover a non-root BIN.
+    ///
+    /// Implements the three-case currency check from JE
+    /// `RecoveryManager.recoverChildIN`
+    /// (RecoveryManager.java lines 1412–1500):
+    ///
+    /// 1. Node not in tree: skip (parent logged a later structure that already
+    ///    omits this node, or node was deleted).
+    /// 2. Physical match (slot LSN == log_lsn): noop — already current.
+    /// 3. Logical match: another version of the node is in the slot.
+    ///    Replace if tree slot LSN < log_lsn (tree is older), skip otherwise.
+    fn recover_child_bin(
+        &self,
+        log_lsn: noxu_util::Lsn,
+        bin: BinStub,
+    ) -> InRedoResult {
+        let node_id = bin.node_id;
+        let Some((parent_arc, slot)) = self.get_parent_in_for_child_in(node_id)
+        else {
+            // Case 1: not in tree.
+            return InRedoResult::NotInTree;
+        };
+        let mut parent = parent_arc.write();
+        let TreeNode::Internal(ref mut p) = *parent else {
+            return InRedoResult::NotInTree;
+        };
+        let tree_lsn = p.entries[slot].lsn;
+        if tree_lsn == log_lsn {
+            // Case 2: physical match — noop.
+            InRedoResult::Skipped
+        } else if tree_lsn < log_lsn {
+            // Case 3: logical match, tree is older — replace.
+            // JE `parent.recoverIN(idx, inFromLog, logLsn, lastLoggedSize)`.
+            let new_arc = Arc::new(RwLock::new(TreeNode::Bottom(bin)));
+            // Set parent back-pointer on the new node.
+            {
+                let mut ng = new_arc.write();
+                if let TreeNode::Bottom(ref mut b) = *ng {
+                    b.parent = Some(Arc::downgrade(&parent_arc));
+                }
+            }
+            p.entries[slot].child = Some(new_arc);
+            p.entries[slot].lsn = log_lsn;
+            InRedoResult::Replaced
+        } else {
+            // tree_lsn > log_lsn: tree already holds a newer version.
+            InRedoResult::Skipped
+        }
+    }
+
+    /// Recover a non-root upper IN.
+    ///
+    /// JE `RecoveryManager.recoverChildIN` for a non-BIN node.
+    fn recover_child_upper_in(
+        &self,
+        log_lsn: noxu_util::Lsn,
+        upper: InNodeStub,
+    ) -> InRedoResult {
+        let node_id = upper.node_id;
+        let Some((parent_arc, slot)) = self.get_parent_in_for_child_in(node_id)
+        else {
+            return InRedoResult::NotInTree;
+        };
+        let mut parent = parent_arc.write();
+        let TreeNode::Internal(ref mut p) = *parent else {
+            return InRedoResult::NotInTree;
+        };
+        let tree_lsn = p.entries[slot].lsn;
+        if tree_lsn == log_lsn {
+            InRedoResult::Skipped
+        } else if tree_lsn < log_lsn {
+            let new_arc = Arc::new(RwLock::new(TreeNode::Internal(upper)));
+            {
+                let mut ng = new_arc.write();
+                if let TreeNode::Internal(ref mut n) = *ng {
+                    n.parent = Some(Arc::downgrade(&parent_arc));
+                }
+            }
+            p.entries[slot].child = Some(new_arc);
+            p.entries[slot].lsn = log_lsn;
+            InRedoResult::Replaced
+        } else {
+            InRedoResult::Skipped
+        }
+    }
+}
+
+/// Result of a single `recover_in_redo` call.
+///
+/// JE traces the same outcomes in `RecoveryManager` debug logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InRedoResult {
+    /// Node was inserted as the new root.
+    Inserted,
+    /// Node replaced an older version in the tree.
+    Replaced,
+    /// Node not applied: tree already holds an equal or newer version.
+    Skipped,
+    /// Node not found in tree (parent logged later structure that excludes it).
+    NotInTree,
+    /// Deserialisation of `node_data` bytes failed.
+    DeserializeFailed,
 }
 
 /// Global node ID counter for generating unique node IDs.
@@ -9101,4 +9380,132 @@ fn test_hours_value_is_expired_only_with_false_flag() {
         "exp_hours={exp_hours} should be expired when in_hours=false \
              (St-H6 demonstrates the wrong-flag scenario)"
     );
+}
+
+// =============================================================================
+// IN-redo unit tests (DRIFT-1 / Stage 1)
+// =============================================================================
+
+#[cfg(test)]
+mod in_redo_tests {
+    use super::*;
+
+    /// Build a BinStub with `n` entries (key = [i as u8], lsn = lsn(1, i))
+    /// and serialise it.  Returns (node_id, node_data_bytes).
+    fn make_bin_bytes(node_id: u64, n: usize) -> Vec<u8> {
+        let mut bin = BinStub {
+            node_id,
+            level: BIN_LEVEL,
+            entries: Vec::new(),
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: noxu_util::NULL_LSN,
+            last_delta_lsn: noxu_util::NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+        };
+        for i in 0..n {
+            bin.entries.push(BinEntry {
+                key: vec![i as u8],
+                lsn: Lsn::new(1, i as u32),
+                data: Some(vec![i as u8]),
+                known_deleted: false,
+                dirty: false,
+                expiration_time: 0,
+            });
+        }
+        bin.serialize_full()
+    }
+
+    /// Verify that recover_in_redo inserts a BIN as root when the tree is empty.
+    ///
+    /// JE RecoveryManager.recoverRootIN: `root == null` path.
+    #[test]
+    fn test_recover_in_redo_root_bin_inserted_into_empty_tree() {
+        let tree = Tree::new(42, 128);
+        assert!(tree.is_empty());
+        let bytes = make_bin_bytes(1, 3);
+        let log_lsn = Lsn::new(1, 100);
+        let result = tree.recover_in_redo(log_lsn, /*is_root=*/true, /*is_bin=*/true, &bytes);
+        assert_eq!(result, InRedoResult::Inserted, "expected Inserted");
+        // Tree should now have 3 entries.
+        assert_eq!(tree.count_entries(), 3);
+    }
+
+    /// Verify that recover_in_redo replaces a root BIN when the logged version is newer.
+    ///
+    /// JE RootUpdater.doWork: `DbLsn.compareTo(originalLsn, lsn) < 0` path.
+    #[test]
+    fn test_recover_in_redo_root_bin_replaced_when_log_newer() {
+        let tree = Tree::new(42, 128);
+        // Install an old root (2 entries, older LSN).
+        let old_bytes = make_bin_bytes(1, 2);
+        let old_lsn = Lsn::new(1, 50);
+        tree.recover_in_redo(old_lsn, true, true, &old_bytes);
+        assert_eq!(tree.count_entries(), 2);
+        // Replay with newer LSN and 4 entries.
+        let new_bytes = make_bin_bytes(1, 4);
+        let new_lsn = Lsn::new(1, 100);
+        let result = tree.recover_in_redo(new_lsn, true, true, &new_bytes);
+        assert_eq!(result, InRedoResult::Replaced);
+        assert_eq!(tree.count_entries(), 4);
+    }
+
+    /// Verify that an older logged BIN does NOT replace a newer in-memory root.
+    ///
+    /// JE RootUpdater.doWork: `DbLsn.compareTo(originalLsn, lsn) >= 0` skip path.
+    #[test]
+    fn test_recover_in_redo_root_bin_skipped_when_tree_newer() {
+        let tree = Tree::new(42, 128);
+        // Install a newer root.
+        let new_bytes = make_bin_bytes(1, 4);
+        let new_lsn = Lsn::new(1, 200);
+        tree.recover_in_redo(new_lsn, true, true, &new_bytes);
+        // Attempt to replay an older version.
+        let old_bytes = make_bin_bytes(1, 2);
+        let old_lsn = Lsn::new(1, 100);
+        let result = tree.recover_in_redo(old_lsn, true, true, &old_bytes);
+        assert_eq!(result, InRedoResult::Skipped);
+        // Tree still holds the newer 4-entry version.
+        assert_eq!(tree.count_entries(), 4);
+    }
+
+    /// deserialize_bin round-trips through serialize_full.
+    #[test]
+    fn test_deserialize_bin_round_trip() {
+        let bytes = make_bin_bytes(99, 5);
+        let bin = Tree::deserialize_bin(&bytes).expect("must deserialize");
+        assert_eq!(bin.node_id, 99);
+        assert_eq!(bin.entries.len(), 5);
+        for (i, e) in bin.entries.iter().enumerate() {
+            assert_eq!(e.key, vec![i as u8]);
+        }
+    }
+
+    /// deserialize_upper_in round-trips through write_to_bytes (Internal).
+    #[test]
+    fn test_deserialize_upper_in_round_trip() {
+        // Build an InNodeStub and serialize via write_to_bytes.
+        let node = TreeNode::Internal(InNodeStub {
+            node_id: 77,
+            level: 0x10002,
+            entries: vec![
+                InEntry { key: vec![1, 2, 3], lsn: Lsn::new(1, 10), child: None },
+                InEntry { key: vec![4, 5, 6], lsn: Lsn::new(1, 20), child: None },
+            ],
+            dirty: false,
+            generation: 0,
+            parent: None,
+        });
+        let bytes = node.write_to_bytes();
+        let restored = Tree::deserialize_upper_in(&bytes).expect("must deserialize");
+        assert_eq!(restored.node_id, 77);
+        assert_eq!(restored.level, 0x10002);
+        assert_eq!(restored.entries.len(), 2);
+        assert_eq!(restored.entries[0].key, vec![1, 2, 3]);
+        assert_eq!(restored.entries[1].key, vec![4, 5, 6]);
+    }
 }

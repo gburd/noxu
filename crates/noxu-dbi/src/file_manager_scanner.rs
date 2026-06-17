@@ -190,21 +190,45 @@ impl FileManagerLogScanner {
             // IN / BIN entries ────────────────────────────────────────
             LogEntryType::IN | LogEntryType::BIN => {
                 let e = InLogEntry::read_from_log(&payload).ok()?;
-                // Extract node_id from the serialized node_data so the
-                // recovery redo pass can key on it.  The format written by
-                // BinStub::serialize_full() starts with node_id(u64BE).
+                // Extract node_id and level from the serialized node_data.
+                //
+                // BIN entries (LogEntryType::BIN): node_data is produced by
+                // `BinStub::serialize_full()` — format: node_id(u64BE) |
+                // num_entries(u32BE) | per-slot data.  Level = BIN_LEVEL.
+                //
+                // Upper-IN entries (LogEntryType::IN): node_data is produced by
+                // `TreeNode::write_to_bytes()` — format: node_id(u64BE) |
+                // level(i32BE) | n_entries(u32BE) | dirty(u8) | per-entry data.
+                // Level is read from bytes[8..12].
+                //
+                // Recovery.recoverChildIN currency check (DRIFT-9) uses the level
+                // to distinguish BIN vs upper-IN during recover_in_redo.
+                // JE RecoveryManager.replayOneIN / IN.postRecoveryInit.
                 let node_id = if e.node_data.len() >= 8 {
                     u64::from_be_bytes(e.node_data[0..8].try_into().ok()?)
                 } else {
                     0
                 };
+                // noxu_tree::BIN_LEVEL = 0x10001; MAIN_LEVEL = 0x10000.
+                // Upper-IN level bytes[8..12] will be >= MAIN_LEVEL (0x10000).
+                // BIN serialize_full has num_entries there (always < 0x10000).
+                let level = if entry_type == LogEntryType::BIN {
+                    // BIN_LEVEL = 0x10001
+                    0x10001i32
+                } else if e.node_data.len() >= 12 {
+                    i32::from_be_bytes(e.node_data[8..12].try_into().ok()?)
+                } else {
+                    // Upper IN, level unknown — use sentinel above BIN.
+                    0x10002i32
+                };
                 Some(LogEntry::In(InRecord {
                     db_id: e.db_id,
                     node_id,
-                    level: 0, // level not embedded in this format; 0 = BIN
+                    level,
                     is_root: false,
                     is_delta: false,
                     node_data: Some(e.node_data),
+                    prev_full_lsn: e.prev_full_lsn,
                 }))
             }
             LogEntryType::BINDelta => {
@@ -217,10 +241,11 @@ impl FileManagerLogScanner {
                 Some(LogEntry::In(InRecord {
                     db_id: e.db_id,
                     node_id,
-                    level: 0,
+                    level: 0x10001i32, // BIN_LEVEL
                     is_root: false,
                     is_delta: true,
                     node_data: Some(e.delta_data),
+                    prev_full_lsn: e.prev_full_lsn,
                 }))
             }
 

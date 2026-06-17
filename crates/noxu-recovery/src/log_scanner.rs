@@ -124,6 +124,13 @@ pub struct InRecord {
     /// / `BINDeltaLogEntry.getMainItem()`
     /// in — the deserialized IN/BIN object available after `readEntry()`.
     pub node_data: Option<Vec<u8>>,
+    /// LSN of the previous full BIN/IN version on disk.
+    ///
+    /// Used during BIN-delta reconstitution (Stage 3 / DRIFT-10):
+    /// to reconstitute a BIN-delta we must read the full BIN at this LSN and
+    /// merge the delta onto it.  Mirrors `BINDeltaLogEntry.prev_full_lsn` /
+    /// `INLogEntry.prev_full_lsn` in JE `BINDelta.reconstituteBIN`.
+    pub prev_full_lsn: Lsn,
 }
 
 /// A checkpoint-start record.
@@ -614,6 +621,7 @@ mod tests {
             is_root: true,
             is_delta: false,
             node_data: None,
+            prev_full_lsn: NULL_LSN,
         };
         assert_eq!(rec.level, 2);
         assert!(rec.is_root);

@@ -240,6 +240,45 @@ fn main() {
             }
         }
 
+        // in_redo_bin_flushed_by_checkpoint:
+        //
+        // 50 keys are committed and a checkpoint is forced (flushing BINs to
+        // WAL).  Then 1 more key is committed (so the log has a post-checkpoint
+        // LN).  Signal ready; parent SIGKILLs.
+        //
+        // After recovery:
+        //   - All 50 pre-checkpoint keys MUST be present (via IN-redo OR LN-redo).
+        //   - The 1 post-checkpoint key MUST also be present (via LN-redo).
+        //   - A marker file records how many INs were replayed (checked by test).
+        "in_redo_bin_flushed_by_checkpoint" => {
+            use noxu_db::CheckpointConfig;
+
+            // Phase 1: write 50 committed keys.
+            for i in 0u32..50 {
+                let k = i.to_be_bytes();
+                let key = DatabaseEntry::from_bytes(&k);
+                let val = DatabaseEntry::from_bytes(b"before_ckpt");
+                db.put(None, &key, &val).expect("put");
+            }
+
+            // Force a checkpoint so the BINs are flushed to the WAL.
+            // At this point, the 50 keys are represented in logged BIN entries.
+            env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                .expect("forced checkpoint");
+
+            // Write 1 post-checkpoint key.
+            let post_key = DatabaseEntry::from_bytes(b"post_ckpt");
+            let post_val = DatabaseEntry::from_bytes(b"after_ckpt");
+            db.put(None, &post_key, &post_val).expect("put post");
+
+            flag(&dir, "phase1_done");
+
+            // Hang until killed.
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

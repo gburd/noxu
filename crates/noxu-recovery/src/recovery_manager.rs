@@ -1298,34 +1298,68 @@ impl RecoveryManager {
         //
         // RecoveryManager.redoDirtyNodes() +
         //          INFileReader + INLogEntry.getMainItem() + IN.postFetchInit().
-        let in_entries: Vec<_> = {
-            // Collect In records from what was stashed during analysis.
-            // We drain the dirty_in_map levels in order (bottom-up).
-            let mut levels = Vec::new();
-            while let Some(level) = self.dirty_in_map.get_lowest_level() {
-                let refs = self.dirty_in_map.select_dirty_ins_for_level(level);
-                for r in refs {
-                    levels.push((level, r));
+        //
+        // DRIFT-1 fix (JE RecoveryManager.buildINs / recoverChildIN, ~lines 915–1500):
+        // Iterate the dirty-IN map, deserialise each InRecord.node_data, and splice
+        // the node into the in-memory tree using the three-case LSN currency check
+        // (RecoveryManager.recoverChildIN, RecoveryManager.java ~line 1412):
+        //   tree slot LSN == logLsn → noop (case 2)
+        //   tree slot LSN <  logLsn → replace (case 3, logical match, tree older)
+        //   tree slot LSN >  logLsn → skip (tree already holds newer version)
+        // Root nodes use recoverRootIN semantics (insert if absent, replace if older).
+        //
+        // Stage 1: roots are processed in the same pass as non-roots.  The two-pass
+        // root-before-non-root ordering (DRIFT-4) is deferred to Stage 2.
+        //
+        // dirty_ins is keyed by (db_id, node_id) and deduped to the latest logged
+        // version, so each node is replayed at most once.
+        let in_count = analysis.dirty_ins.len() as u64;
+        if let Some(t) = tree.as_deref_mut() {
+            for (_key, entry) in &analysis.dirty_ins {
+                let rec = &entry.record;
+                let log_lsn = entry.lsn;
+                // Only replay entries that belong to this tree's database.
+                if rec.db_id != t.get_database_id() {
+                    continue;
+                }
+                let Some(ref node_data) = rec.node_data else {
+                    continue; // no bytes (stub scanner used in unit tests)
+                };
+                // Discriminate BIN vs upper IN from level.
+                // file_manager_scanner sets level = BIN_LEVEL (0x10001) for
+                // LogEntryType::BIN and BINDelta; upper INs have level >= MAIN_LEVEL.
+                // Deltas are handled in Stage 3; skip here.
+                if rec.is_delta {
+                    // ponytail: BIN-deltas deferred to Stage 3 (DRIFT-10).
+                    // They need last-full-BIN reconstitution before splicing.
+                    continue;
+                }
+                // noxu_tree::BIN_LEVEL = 0x10001; anything higher is an upper IN.
+                let is_bin = rec.level <= 0x10001;
+                let result = t.recover_in_redo(log_lsn, rec.is_root, is_bin, node_data);
+                match result {
+                    noxu_tree::InRedoResult::Inserted
+                    | noxu_tree::InRedoResult::Replaced => {
+                        self.stats.ins_replayed += 1;
+                    }
+                    noxu_tree::InRedoResult::Skipped
+                    | noxu_tree::InRedoResult::NotInTree => {}
+                    noxu_tree::InRedoResult::DeserializeFailed => {
+                        log::warn!(
+                            "noxu-recovery: IN-redo deserialize failed at \
+                             lsn={log_lsn:?} node_id={} db_id={} is_bin={is_bin}",
+                            rec.node_id,
+                            rec.db_id,
+                        );
+                    }
                 }
             }
-            levels
-        };
-        // Apply BIN log entries to the tree.
-        // We use the analysis redo_entries (all LogEntry::In items collected
-        // during run_analysis) to drive this.  These are stored in redo_entries
-        // interleaved with LnRecords.
-        //
-        // For now, replay all In entries found during the analysis scan.
-        // The dirty_in_map ordering (bottom-up) is the correct sequence;
-        // however we apply In entries as we encounter them in redo_entries
-        // (which is forward-LSN order, equivalent to bottom-up for a single
-        // checkpoint interval).
-        //
-        // This handles the key H-6 requirement: BIN log entries are
-        // deserialized and re-inserted rather than silently dropped.
-        //
-        // Track the count from the drain above.
-        self.stats.ins_replayed += in_entries.len() as u64;
+        }
+        // (legacy dirty_in_map drain; keeps stats consistent)
+        while let Some(level) = self.dirty_in_map.get_lowest_level() {
+            self.dirty_in_map.select_dirty_ins_for_level(level);
+        }
+        let _ = in_count; // reported below via ins_replayed
 
         // ---- Recovery alloc optimisation: pre-warm BIN capacity before LN redo ----
         //
@@ -1924,6 +1958,7 @@ mod tests {
             is_root,
             is_delta: false,
             node_data: None,
+            prev_full_lsn: noxu_util::NULL_LSN,
         }
     }
 
@@ -2149,9 +2184,11 @@ mod tests {
         let mut mgr = RecoveryManager::new();
         mgr.recover(&mut scanner, None, false).unwrap();
 
-        // All three INs should have been replayed (redo pass)
+        // All three INs should have been read during analysis.
+        // ins_replayed is 0 when tree=None (no tree to splice into).
         assert_eq!(mgr.get_stats().ins_read, 3);
-        assert_eq!(mgr.get_stats().ins_replayed, 3);
+        // With tree=None, IN-redo is skipped entirely (nothing to splice into).
+        assert_eq!(mgr.get_stats().ins_replayed, 0);
     }
 
     #[test]

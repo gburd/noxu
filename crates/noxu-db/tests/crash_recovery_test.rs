@@ -726,3 +726,77 @@ fn aborted_then_committed_same_key_recovers_committed_value() {
         "K must hold T3's committed value 'v3', not T1's aborted before-image"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 1 acceptance test: IN-redo applies BINs flushed by checkpoint
+// ---------------------------------------------------------------------------
+
+/// Verify that data committed before a checkpoint and flushed into logged
+/// BIN records survives a crash and recovery.
+///
+/// The scenario exercises both the IN-redo path (BINs written by the
+/// checkpoint) and the LN-redo path (the post-checkpoint LN).
+///
+/// Stage 1 of fix/recovery-faithful-in-redo (DRIFT-1):
+/// JE `RecoveryManager.recoverIN` / `recoverChildIN` currency check
+/// (RecoveryManager.java ~lines 1237-1500).
+#[test]
+fn in_redo_bin_flushed_by_checkpoint_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "in_redo_bin_flushed_by_checkpoint")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    assert!(
+        wait_for_flag(&dir_path, "phase1_done", Duration::from_secs(60)),
+        "worker did not complete phase1 within timeout"
+    );
+
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    // Reopen triggers crash recovery.  All 50 pre-checkpoint keys and
+    // the 1 post-checkpoint key must survive.
+    let (_env, db) = reopen_db(&dir_path);
+
+    // All 50 pre-checkpoint committed keys must be present.
+    let mut missing = 0u32;
+    for i in 0u32..50 {
+        let k = i.to_be_bytes();
+        let key = DatabaseEntry::from_bytes(&k);
+        let mut val = DatabaseEntry::new();
+        match db.get(None, &key, &mut val).unwrap() {
+            OperationStatus::Success => {
+                assert_eq!(
+                    val.data(),
+                    b"before_ckpt",
+                    "key {i} has wrong value after crash+recovery"
+                );
+            }
+            OperationStatus::NotFound => {
+                missing += 1;
+            }
+            other => panic!("unexpected status {other:?} for key {i}"),
+        }
+    }
+    assert_eq!(
+        missing, 0,
+        "{missing} pre-checkpoint committed keys lost after crash recovery \
+         (IN-redo or LN-redo must restore them)"
+    );
+
+    // The 1 post-checkpoint key must also survive (LN-redo).
+    let post_key = DatabaseEntry::from_bytes(b"post_ckpt");
+    let mut post_val = DatabaseEntry::new();
+    let status = db.get(None, &post_key, &mut post_val).unwrap();
+    assert_eq!(
+        status,
+        OperationStatus::Success,
+        "post-checkpoint key must survive crash recovery (LN-redo)"
+    );
+    assert_eq!(post_val.data(), b"after_ckpt");
+}
