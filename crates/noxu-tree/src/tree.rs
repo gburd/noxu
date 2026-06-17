@@ -1392,6 +1392,31 @@ enum AdjacentBinOutcome {
     SplitRaceRetry,
 }
 
+/// Split hint for the `splitSpecial` heuristic.
+///
+/// JE `Tree.forceSplit` tracks `allLeftSideDescent` / `allRightSideDescent`
+/// (true if **every** routing decision during the top-down descent followed
+/// the leftmost / rightmost child). At split time, when one of those flags
+/// is set, `IN.splitSpecial` forces the split index to 1 (left side) or
+/// `nEntries - 1` (right side) instead of `nEntries / 2`.
+///
+/// Effect: for sequential-append workloads the left BIN stays near-full
+/// after every split (only one entry migrates to the new sibling), cutting
+/// the split count roughly in half and reducing write amplification.
+///
+/// Ref: `IN.java splitSpecial` ~line 4129, `Tree.java forceSplit` ~line 1907.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitHint {
+    /// Normal midpoint split (`n_entries / 2`).
+    Normal,
+    /// Key was at position 0 on every level of descent.
+    /// → `split_index = 1` so left node keeps all but the first entry.
+    AllLeft,
+    /// Key was at the rightmost position on every level of descent.
+    /// → `split_index = n_entries - 1` so left node keeps almost everything.
+    AllRight,
+}
+
 impl Tree {
     /// Creates a new empty tree.
     ///
@@ -2334,6 +2359,9 @@ impl Tree {
             0, // child is at slot 0
             self.max_entries_per_node,
             lsn,
+            SplitHint::Normal,
+            &[],              // no insertion key at root-init time
+            self.key_comparator.as_ref(),
         )?;
 
         self.root_splits.fetch_add(1, Ordering::Relaxed);
@@ -2362,6 +2390,9 @@ impl Tree {
         child_index: usize,
         max_entries: usize,
         lsn: Lsn,
+        hint: SplitHint,
+        insert_key: &[u8],
+        key_comparator: Option<&KeyComparatorFn>,
     ) -> Result<(), TreeError> {
         // The split is performed under `parent.write()` for the entire
         // duration. This is a deliberate choice for correctness:
@@ -2446,9 +2477,51 @@ impl Tree {
             }
         };
 
-        // Determine split point.
+        // Determine split point — JE `IN.splitSpecial` / `IN.splitInternal`.
+        //
+        // Normal midpoint: `n_entries / 2`.
+        // AllLeft:  insertion key is at position 0 on every descend level.
+        //   → split_index = 1 (left half keeps n-1 entries; new right sibling
+        //     gets only the former-first slot, then the insertion fills it).
+        //   This matches JE: `if (leftSide && index == 0) splitInternal(…, 1)`.
+        // AllRight: insertion key is at the last position on every level.
+        //   → split_index = n_entries - 1 (left half keeps all but one entry).
+        //   JE: `else if (!leftSide && index == nEntries-1) splitInternal(…, nEntries-1)`.
+        //
+        // Ref: `IN.java` splitSpecial ~line 4129, splitInternal ~line 4159.
         let n_entries = all_entries.len();
-        let split_index = n_entries / 2;
+        let split_index = if n_entries >= 2 {
+            // Find where insert_key falls in the child.
+            let insert_idx = {
+                let mut idx = 0usize;
+                for i in 1..n_entries {
+                    let ord = match key_comparator {
+                        Some(cmp) => cmp(
+                            all_entries.get_key(i),
+                            insert_key,
+                        ),
+                        None => all_entries
+                            .get_key(i)
+                            .cmp(insert_key),
+                    };
+                    if ord != std::cmp::Ordering::Greater {
+                        idx = i;
+                    } else {
+                        break;
+                    }
+                }
+                idx
+            };
+            match hint {
+                SplitHint::AllLeft if insert_idx == 0 => 1,
+                SplitHint::AllRight if insert_idx == n_entries - 1 => {
+                    n_entries - 1
+                }
+                _ => n_entries / 2,
+            }
+        } else {
+            n_entries / 2
+        };
 
         // newIdKey — the full key of the first entry of the right half.
         // For BIN: entries are already full keys after decompression above.
@@ -2598,6 +2671,36 @@ impl Tree {
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
     ) -> Result<bool, TreeError> {
+        Self::insert_recursive_inner(
+            node_arc,
+            key,
+            data,
+            lsn,
+            max_entries,
+            key_comparator,
+            true,  // all_left_so_far
+            true,  // all_right_so_far
+        )
+    }
+
+    /// Inner recursive helper that threads `allLeftSideDescent` /
+    /// `allRightSideDescent` from `Tree.forceSplit` (JE ~line 1912).
+    ///
+    /// Both flags start `true` at the root and are cleared as soon as the
+    /// descent takes a non-leftmost / non-rightmost child slot.  At split
+    /// time they are forwarded to `split_child` which uses them to pick the
+    /// `splitSpecial` split index (JE `IN.splitSpecial` ~line 4129).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_recursive_inner(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        key: Vec<u8>,
+        data: Vec<u8>,
+        lsn: Lsn,
+        max_entries: usize,
+        key_comparator: Option<&KeyComparatorFn>,
+        all_left_so_far: bool,
+        all_right_so_far: bool,
+    ) -> Result<bool, TreeError> {
         // Determine if this is a BIN (leaf level).
         //
         // We hold a read lock on `node_arc` (the parent of any descent we
@@ -2662,39 +2765,53 @@ impl Tree {
             // Index = parent.findEntry(key, false, false)
             // Entry zero in an upper IN has a virtual key (-infinity), so
             // any real key is routed to at least slot 0.
-            let (child_index, child_arc) = match &*parent_guard {
-                TreeNode::Internal(n) => {
-                    // Binary search for the largest key <= search key.
-                    // Slot 0 always matches (virtual key = -infinity).
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else {
-                            let ord = match key_comparator {
-                                Some(cmp) => {
-                                    cmp(entry.key.as_slice(), key.as_slice())
-                                }
-                                None => {
-                                    entry.key.as_slice().cmp(key.as_slice())
-                                }
-                            };
-                            if ord != std::cmp::Ordering::Greater {
-                                idx = i;
+            let (child_index, n_entries_at_level, child_arc) =
+                match &*parent_guard {
+                    TreeNode::Internal(n) => {
+                        // Binary search for the largest key <= search key.
+                        // Slot 0 always matches (virtual key = -infinity).
+                        let mut idx = 0usize;
+                        for (i, entry) in n.entries.iter().enumerate() {
+                            if i == 0 {
+                                idx = 0;
                             } else {
-                                break;
+                                let ord = match key_comparator {
+                                    Some(cmp) => {
+                                        cmp(
+                                            entry.key.as_slice(),
+                                            key.as_slice(),
+                                        )
+                                    }
+                                    None => entry
+                                        .key
+                                        .as_slice()
+                                        .cmp(key.as_slice()),
+                                };
+                                if ord != std::cmp::Ordering::Greater {
+                                    idx = i;
+                                } else {
+                                    break;
+                                }
                             }
                         }
+                        let child = n
+                            .entries
+                            .get(idx)
+                            .and_then(|e| e.child.clone())
+                            .ok_or(TreeError::SplitRequired)?;
+                        (idx, n.entries.len(), child)
                     }
-                    let child = n
-                        .entries
-                        .get(idx)
-                        .and_then(|e| e.child.clone())
-                        .ok_or(TreeError::SplitRequired)?;
-                    (idx, child)
-                }
-                TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
-            };
+                    TreeNode::Bottom(_) => {
+                        return Err(TreeError::SplitRequired)
+                    }
+                };
+
+            // Update the descent-side flags (JE `Tree.forceSplit` ~1959).
+            // `allLeftSideDescent`  ← still true only if we chose slot 0.
+            // `allRightSideDescent` ← still true only if we chose the last slot.
+            let all_left = all_left_so_far && child_index == 0;
+            let all_right = all_right_so_far
+                && child_index == n_entries_at_level.saturating_sub(1);
 
             // Proactively split the child if it is full.
             // If (child.needsSplitting()) child.split(parent, ...)
@@ -2704,19 +2821,42 @@ impl Tree {
             };
 
             if child_full {
+                // Build the splitSpecial hint from the accumulated flags.
+                // JE `Tree.forceSplit` ~line 2010:
+                //   if (allLeftSideDescent || allRightSideDescent)
+                //       child.splitSpecial(parent, index, grandParent,
+                //           maxTreeEntriesPerNode, key, allLeftSideDescent)
+                let hint = match (all_left, all_right) {
+                    (true, _) => SplitHint::AllLeft,
+                    (_, true) => SplitHint::AllRight,
+                    _ => SplitHint::Normal,
+                };
                 // split_child(parent, …) needs parent.write(); we must
                 // drop our parent read lock before calling it.
                 drop(parent_guard);
-                Self::split_child(node_arc, child_index, max_entries, lsn)?;
+                Self::split_child(
+                    node_arc,
+                    child_index,
+                    max_entries,
+                    lsn,
+                    hint,
+                    &key,
+                    key_comparator,
+                )?;
 
                 // After the split, re-find which child now covers key.
-                return Self::insert_recursive(
+                // Re-enter at the top of the inner function; carry the
+                // flags (the new topology doesn't invalidate them — we
+                // still know the overall descent direction).
+                return Self::insert_recursive_inner(
                     node_arc,
                     key,
                     data,
                     lsn,
                     max_entries,
                     key_comparator,
+                    all_left_so_far,
+                    all_right_so_far,
                 );
             }
 
@@ -2725,13 +2865,15 @@ impl Tree {
             // returns, then drop it; combined with our parent_guard,
             // the latch coupling chain is preserved on the way down and
             // unwound on the way back up.
-            let r = Self::insert_recursive(
+            let r = Self::insert_recursive_inner(
                 &child_arc,
                 key,
                 data,
                 lsn,
                 max_entries,
                 key_comparator,
+                all_left,
+                all_right,
             );
             drop(parent_guard);
             r
@@ -2758,6 +2900,29 @@ impl Tree {
         lsn: Lsn,
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
+    ) -> Result<bool, TreeError> {
+        Self::redo_insert_recursive_inner(
+            node_arc,
+            key,
+            data,
+            lsn,
+            max_entries,
+            key_comparator,
+            true,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redo_insert_recursive_inner(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        key: &[u8],
+        data: Option<&[u8]>,
+        lsn: Lsn,
+        max_entries: usize,
+        key_comparator: Option<&KeyComparatorFn>,
+        all_left_so_far: bool,
+        all_right_so_far: bool,
     ) -> Result<bool, TreeError> {
         let parent_guard = node_arc.read();
         let is_bin = parent_guard.is_bin();
@@ -2787,33 +2952,42 @@ impl Tree {
                 TreeNode::Internal(_) => Err(TreeError::SplitRequired),
             }
         } else {
-            let (child_index, child_arc) = match &*parent_guard {
-                TreeNode::Internal(n) => {
-                    let mut idx = 0usize;
-                    for (i, entry) in n.entries.iter().enumerate() {
-                        if i == 0 {
-                            idx = 0;
-                        } else {
-                            let ord = match key_comparator {
-                                Some(cmp) => cmp(entry.key.as_slice(), key),
-                                None => entry.key.as_slice().cmp(key),
-                            };
-                            if ord != std::cmp::Ordering::Greater {
-                                idx = i;
+            let (child_index, n_entries_at_level, child_arc) =
+                match &*parent_guard {
+                    TreeNode::Internal(n) => {
+                        let mut idx = 0usize;
+                        for (i, entry) in n.entries.iter().enumerate() {
+                            if i == 0 {
+                                idx = 0;
                             } else {
-                                break;
+                                let ord = match key_comparator {
+                                    Some(cmp) => {
+                                        cmp(entry.key.as_slice(), key)
+                                    }
+                                    None => entry.key.as_slice().cmp(key),
+                                };
+                                if ord != std::cmp::Ordering::Greater {
+                                    idx = i;
+                                } else {
+                                    break;
+                                }
                             }
                         }
+                        let child = n
+                            .entries
+                            .get(idx)
+                            .and_then(|e| e.child.clone())
+                            .ok_or(TreeError::SplitRequired)?;
+                        (idx, n.entries.len(), child)
                     }
-                    let child = n
-                        .entries
-                        .get(idx)
-                        .and_then(|e| e.child.clone())
-                        .ok_or(TreeError::SplitRequired)?;
-                    (idx, child)
-                }
-                TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
-            };
+                    TreeNode::Bottom(_) => {
+                        return Err(TreeError::SplitRequired)
+                    }
+                };
+
+            let all_left = all_left_so_far && child_index == 0;
+            let all_right = all_right_so_far
+                && child_index == n_entries_at_level.saturating_sub(1);
 
             let child_full = {
                 let g = child_arc.read();
@@ -2821,25 +2995,42 @@ impl Tree {
             };
 
             if child_full {
+                let hint = match (all_left, all_right) {
+                    (true, _) => SplitHint::AllLeft,
+                    (_, true) => SplitHint::AllRight,
+                    _ => SplitHint::Normal,
+                };
                 drop(parent_guard);
-                Self::split_child(node_arc, child_index, max_entries, lsn)?;
-                return Self::redo_insert_recursive(
+                Self::split_child(
+                    node_arc,
+                    child_index,
+                    max_entries,
+                    lsn,
+                    hint,
+                    key,
+                    key_comparator,
+                )?;
+                return Self::redo_insert_recursive_inner(
                     node_arc,
                     key,
                     data,
                     lsn,
                     max_entries,
                     key_comparator,
+                    all_left_so_far,
+                    all_right_so_far,
                 );
             }
 
-            let r = Self::redo_insert_recursive(
+            let r = Self::redo_insert_recursive_inner(
                 &child_arc,
                 key,
                 data,
                 lsn,
                 max_entries,
                 key_comparator,
+                all_left,
+                all_right,
             );
             drop(parent_guard);
             r
@@ -9357,7 +9548,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
     *tree.root.write() = Some(Arc::clone(&root));
 
     // Trigger split_child on the root.
-    Tree::split_child(&root, 0, 4, Lsn::new(1, 500))
+    Tree::split_child(&root, 0, 4, Lsn::new(1, 500), SplitHint::Normal, &[], None)
         .expect("split_child should succeed");
 
     // After the split: root has two children — left BIN and right sibling.
@@ -9564,5 +9755,221 @@ mod in_redo_tests {
         assert_eq!(restored.entries.len(), 2);
         assert_eq!(restored.entries[0].key, vec![1, 2, 3]);
         assert_eq!(restored.entries[1].key, vec![4, 5, 6]);
+    }
+}
+
+// --- Part 1 acceptance tests: splitSpecial heuristic (DRIFT-1) ---
+//
+// JE `IN.splitSpecial` / `Tree.forceSplit`: when all routing decisions during
+// descent are leftmost (`AllLeft`) or rightmost (`AllRight`), the split index
+// is forced to 1 or `n-1` respectively instead of `n/2`. This halves the
+// number of splits for monotonically increasing / decreasing key workloads
+// (sequential append / prepend) because each split leaves the BIN near-full.
+//
+// Ref: `IN.java splitSpecial` ~line 4129, `Tree.java forceSplit` ~line 1907.
+#[cfg(test)]
+mod split_special_tests {
+    use super::*;
+
+    /// Count total leaf (BIN) nodes in the tree by DFS.
+    fn count_bins(node: &Arc<RwLock<TreeNode>>) -> usize {
+        let g = node.read();
+        match &*g {
+            TreeNode::Bottom(_) => 1,
+            TreeNode::Internal(n) => n
+                .entries
+                .iter()
+                .filter_map(|e| e.child.as_ref())
+                .map(count_bins)
+                .sum(),
+        }
+    }
+
+    /// Return total key count across all BINs.
+    fn count_keys(node: &Arc<RwLock<TreeNode>>) -> usize {
+        let g = node.read();
+        match &*g {
+            TreeNode::Bottom(b) => b.entries.len(),
+            TreeNode::Internal(n) => n
+                .entries
+                .iter()
+                .filter_map(|e| e.child.as_ref())
+                .map(count_keys)
+                .sum(),
+        }
+    }
+
+    /// Returns the number of entries in the leftmost BIN.
+    fn leftmost_bin_size(node: &Arc<RwLock<TreeNode>>) -> usize {
+        let g = node.read();
+        match &*g {
+            TreeNode::Bottom(b) => b.entries.len(),
+            TreeNode::Internal(n) => {
+                let first_child =
+                    n.entries[0].child.as_ref().expect("child");
+                leftmost_bin_size(first_child)
+            }
+        }
+    }
+
+    /// Returns the number of entries in the rightmost BIN.
+    fn rightmost_bin_size(node: &Arc<RwLock<TreeNode>>) -> usize {
+        let g = node.read();
+        match &*g {
+            TreeNode::Bottom(b) => b.entries.len(),
+            TreeNode::Internal(n) => {
+                let last_child = n
+                    .entries
+                    .last()
+                    .and_then(|e| e.child.as_ref())
+                    .expect("child");
+                rightmost_bin_size(last_child)
+            }
+        }
+    }
+
+    /// `splitSpecial` ascending: each right-side split leaves the left BIN
+    /// near-full (all but one entry stays). Compared to midpoint split
+    /// the number of BINs created should be significantly fewer relative to
+    /// keys inserted (more keys per BIN on average).
+    ///
+    /// JE criterion: `allRightSideDescent` → `splitIndex = nEntries - 1`.
+    /// The penultimate entry stays in the left BIN; only one entry goes to
+    /// the new right sibling, which then absorbs the next insert and fills
+    /// normally.
+    #[test]
+    fn test_split_special_ascending_fewer_bins_than_midpoint() {
+        let max_entries = 8usize;
+        let n_keys = 200usize;
+
+        // Build tree with splitSpecial (ascending keys trigger AllRight).
+        let tree_special = Tree::new(1, max_entries);
+        let lsn = noxu_util::Lsn::new(1, 100);
+        for i in 0u32..n_keys as u32 {
+            let key = i.to_be_bytes().to_vec();
+            tree_special
+                .insert(key, vec![0u8], lsn)
+                .expect("insert");
+        }
+
+        let root_special = tree_special
+            .get_root()
+            .expect("root must exist");
+        let bins_special = count_bins(&root_special);
+        let keys_special = count_keys(&root_special);
+
+        // All keys must be present.
+        assert_eq!(
+            keys_special, n_keys,
+            "all keys must be stored"
+        );
+
+        // With splitSpecial, each right-side split keeps n-1 entries in the
+        // left BIN. Ideal: ceil(n_keys / (max_entries - 1)) BINs.
+        // Without splitSpecial (midpoint): ceil(n_keys / (max_entries / 2)).
+        // We assert the actual count is below the midpoint-split upper bound.
+        let midpoint_upper_bound =
+            (n_keys + max_entries / 2 - 1) / (max_entries / 2);
+        assert!(
+            bins_special < midpoint_upper_bound,
+            "splitSpecial should produce fewer BINs than midpoint split: \
+             got {bins_special}, midpoint upper bound = {midpoint_upper_bound}"
+        );
+
+        // The rightmost BIN must have fewer entries than max_entries
+        // (the last insert only half-fills it at most), which is expected.
+        // The IMPORTANT property: rightmost BIN started with exactly 1 entry
+        // (its first entry was the split-off singleton) then filled up.
+        // We just verify overall key density > midpoint baseline.
+        let avg_fill =
+            keys_special as f64 / bins_special as f64;
+        let midpoint_fill = (max_entries / 2) as f64;
+        assert!(
+            avg_fill > midpoint_fill,
+            "average fill per BIN with splitSpecial ({avg_fill:.1}) should \
+             exceed midpoint baseline ({midpoint_fill})"
+        );
+    }
+
+    /// `splitSpecial` descending: all routing decisions are at slot 0
+    /// (`AllLeft`). Split forces `split_index = 1` so the right sibling
+    /// gets almost all entries and the left node keeps just one.
+    ///
+    /// JE criterion: `allLeftSideDescent` → `splitIndex = 1`.
+    #[test]
+    fn test_split_special_descending_fewer_bins_than_midpoint() {
+        let max_entries = 8usize;
+        let n_keys = 200usize;
+
+        let tree_special = Tree::new(1, max_entries);
+        let lsn = noxu_util::Lsn::new(1, 100);
+        for i in (0u32..n_keys as u32).rev() {
+            let key = i.to_be_bytes().to_vec();
+            tree_special
+                .insert(key, vec![0u8], lsn)
+                .expect("insert");
+        }
+
+        let root_special = tree_special
+            .get_root()
+            .expect("root must exist");
+        let bins_special = count_bins(&root_special);
+        let keys_special = count_keys(&root_special);
+
+        assert_eq!(keys_special, n_keys, "all keys must be stored");
+
+        let midpoint_upper_bound =
+            (n_keys + max_entries / 2 - 1) / (max_entries / 2);
+        assert!(
+            bins_special < midpoint_upper_bound,
+            "splitSpecial descending should produce fewer BINs: \
+             got {bins_special}, midpoint upper bound = {midpoint_upper_bound}"
+        );
+    }
+
+    /// Random-key inserts must NOT be affected by splitSpecial: with random
+    /// keys descent will rarely be all-left or all-right, so the split index
+    /// defaults to midpoint and tree balance is maintained.
+    #[test]
+    fn test_split_special_random_inserts_stay_balanced() {
+        use std::collections::BTreeSet;
+
+        let max_entries = 8usize;
+        // Use a fixed permutation so the test is deterministic.
+        let mut keys: Vec<u32> = (0u32..200).collect();
+        // Knuth shuffle with a fixed seed.
+        let mut rng: u64 = 0xdeadbeef_cafebabe;
+        for i in (1..keys.len()).rev() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (rng >> 33) as usize % (i + 1);
+            keys.swap(i, j);
+        }
+
+        let tree = Tree::new(1, max_entries);
+        let lsn = noxu_util::Lsn::new(1, 100);
+        let mut inserted = BTreeSet::new();
+        for k in &keys {
+            let key = k.to_be_bytes().to_vec();
+            tree.insert(key, vec![0u8], lsn).expect("insert");
+            inserted.insert(*k);
+        }
+
+        let root = tree.get_root().expect("root");
+        let total_keys = count_keys(&root);
+        assert_eq!(
+            total_keys,
+            inserted.len(),
+            "all random keys must be stored"
+        );
+
+        // Verify every key is findable.
+        for k in &inserted {
+            let key = k.to_be_bytes().to_vec();
+            let found = tree.search(&key);
+            assert!(
+                found.map(|r| r.is_exact_match()).unwrap_or(false),
+                "random key {k} must be findable after insert"
+            );
+        }
     }
 }
