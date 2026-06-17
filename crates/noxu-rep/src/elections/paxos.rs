@@ -105,6 +105,37 @@ pub fn run_election_with_phi(
     phi_detector: Option<&PhiAccrualDetector>,
     fallback_timeout: Duration,
 ) -> Option<NodeId> {
+    run_election_with_phi_dtvlsn(
+        node_id,
+        node_name,
+        group,
+        channels,
+        proposed_vlsn,
+        priority,
+        term,
+        0,
+        phi_detector,
+        fallback_timeout,
+    )
+}
+
+/// As `run_election_with_phi`, but with the node's own DTVLSN as the major
+/// election-ranking key (D2, JE Ranking(major=dtvlsn, minor=vlsn)). Production
+/// passes `ReplicatedEnvironment::get_dtvlsn()`; the legacy entry points pass
+/// 0 (UNINITIALIZED -> falls back to VLSN ordering, JE pre-DTVLSN behavior).
+#[allow(clippy::too_many_arguments)]
+pub fn run_election_with_phi_dtvlsn(
+    node_id: NodeId,
+    node_name: &str,
+    group: &RepGroup,
+    channels: &[Arc<dyn Channel>],
+    proposed_vlsn: u64,
+    priority: u32,
+    term: u64,
+    own_dtvlsn: u64,
+    phi_detector: Option<&PhiAccrualDetector>,
+    fallback_timeout: Duration,
+) -> Option<NodeId> {
     // ---------------------------------------------------------------
     // F22 guard: a node that cannot be master (Arbiter, Monitor,
     // Secondary) must NOT propose itself as master, nor count a
@@ -151,13 +182,15 @@ pub fn run_election_with_phi(
     // -------------------------------------------------------------------------
     // Build our proposal.
     let our_proposal =
-        Proposal::new(node_name.to_string(), proposed_vlsn, priority, term);
+        Proposal::new(node_name.to_string(), proposed_vlsn, priority, term)
+            .with_dtvlsn(own_dtvlsn);
 
     let phase1_msg = ProtocolMessage::ElectionProposal {
         node_name: node_name.to_string(),
         vlsn: proposed_vlsn,
         priority,
         term,
+        dtvlsn: own_dtvlsn,
     };
 
     // Broadcast to all peers.
@@ -181,6 +214,7 @@ pub fn run_election_with_phi(
                     vlsn: peer_vlsn,
                     priority: peer_priority,
                     term: peer_term,
+                    dtvlsn: peer_dtvlsn,
                 })) => {
                     // F22: a counter-proposal from a peer that cannot be
                     // master (Arbiter / Monitor / Secondary) is treated
@@ -199,7 +233,8 @@ pub fn run_election_with_phi(
                             peer_vlsn,
                             peer_priority,
                             peer_term,
-                        );
+                        )
+                        .with_dtvlsn(peer_dtvlsn);
                         if peer_p.is_better_than(&best_proposal) {
                             best_proposal = peer_p;
                         }
@@ -290,6 +325,8 @@ pub fn run_acceptor(
     own_priority: u32,
     own_term: u64,
 ) -> Result<Option<String>> {
+    // Legacy entry point: no DTVLSN (pre-DTVLSN -> ranking falls back to VLSN).
+    let own_dtvlsn: u64 = 0;
     let timeout = Duration::from_millis(500);
 
     let mut promised_term: Option<u64> = None;
@@ -308,6 +345,7 @@ pub fn run_acceptor(
             vlsn: _vlsn,
             priority: _priority,
             term,
+            dtvlsn: _dtvlsn,
         } => {
             // acceptor: reject only if a higher-numbered proposal was
             // already promised. Accept/promise the first proposal regardless
@@ -329,6 +367,7 @@ pub fn run_acceptor(
                         vlsn: own_vlsn,
                         priority: own_priority,
                         term: own_term,
+                        dtvlsn: own_dtvlsn,
                     },
                 )?;
             } else {
@@ -405,12 +444,14 @@ pub fn run_acceptor(
 /// restarts.  This variant calls `state.try_promise(t)` and
 /// `state.try_accept(t, master)` so every state change is fsynced before
 /// the response goes back to the proposer.
+#[allow(clippy::too_many_arguments)]
 pub fn run_acceptor_with_state(
     channel: &dyn Channel,
     node_name: &str,
     own_vlsn: u64,
     own_priority: u32,
     own_term: u64,
+    own_dtvlsn: u64,
     state: &crate::elections::acceptor_state::PersistentAcceptorState,
 ) -> Result<Option<String>> {
     let timeout = Duration::from_millis(500);
@@ -427,6 +468,7 @@ pub fn run_acceptor_with_state(
             vlsn: _vlsn,
             priority: _priority,
             term,
+            dtvlsn: _dtvlsn,
         } => {
             if state.try_promise(term) {
                 send_message(
@@ -436,6 +478,7 @@ pub fn run_acceptor_with_state(
                         vlsn: own_vlsn,
                         priority: own_priority,
                         term: own_term,
+                        dtvlsn: own_dtvlsn,
                     },
                 )?;
                 term

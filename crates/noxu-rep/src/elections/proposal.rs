@@ -4,7 +4,11 @@
 //! candidate's bid to become master and defines the total ordering used to
 //! decide which candidate wins.
 //!
-//! ## Ordering rules
+//! ## Ordering rules (JE Ranking, major=DTVLSN, minor=VLSN)
+//!
+//! 0. **Higher DTVLSN wins** - the node with the most *durable* transactions
+//!    (replicated to a majority) is preferred over one with a higher raw VLSN
+//!    but uncommitted tail. DTVLSN 0 = UNINITIALIZED -> falls back to VLSN.
 //!
 //! Proposals are compared in the following order (each tiebreaker is consulted
 //! only when the previous field is equal):
@@ -29,7 +33,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Proposal {
     /// Name of the candidate node.
     pub node_name: String,
-    /// Highest VLSN this node has acknowledged.
+    /// Durable Transaction VLSN (the MAJOR ranking key, JE Ranking.major).
+    /// The highest VLSN known durable on a majority of nodes. 0 means
+    /// UNINITIALIZED (pre-DTVLSN), in which case ranking falls back to `vlsn`
+    /// (JE MasterSuggestionGenerator.getRanking: `if dtvlsn == UNINITIALIZED
+    /// return Ranking(vlsn, 0)`). Defaults to 0 for back-compat constructors.
+    pub dtvlsn: u64,
+    /// Highest VLSN this node has acknowledged (the MINOR ranking key).
     pub vlsn: u64,
     /// Election priority assigned to this node (higher = preferred).
     pub priority: u32,
@@ -47,7 +57,7 @@ impl Proposal {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        Self { node_name, vlsn, priority, term, timestamp_ms }
+        Self { node_name, dtvlsn: 0, vlsn, priority, term, timestamp_ms }
     }
 
     /// Create a proposal with an explicit timestamp (useful for tests and
@@ -59,7 +69,7 @@ impl Proposal {
         term: u64,
         timestamp_ms: u64,
     ) -> Self {
-        Self { node_name, vlsn, priority, term, timestamp_ms }
+        Self { node_name, dtvlsn: 0, vlsn, priority, term, timestamp_ms }
     }
 
     /// Returns `true` if this proposal is strictly better than `other`
@@ -67,18 +77,32 @@ impl Proposal {
     pub fn is_better_than(&self, other: &Proposal) -> bool {
         self.cmp(other) == Ordering::Greater
     }
+
+    /// Builder: set the DTVLSN (the major ranking key). The election driver
+    /// populates this from `ReplicatedEnvironment::get_dtvlsn()` so the most
+    /// durable node, not merely the highest-raw-VLSN node, wins (D2).
+    pub fn with_dtvlsn(mut self, dtvlsn: u64) -> Self {
+        self.dtvlsn = dtvlsn;
+        self
+    }
 }
 
 impl Ord for Proposal {
     fn cmp(&self, other: &Self) -> Ordering {
-        // 1. Higher VLSN wins.
-        self.vlsn
-            .cmp(&other.vlsn)
-            // 2. Higher priority wins.
+        // JE Ranking(major=dtvlsn, minor=vlsn), then priority / term / name.
+        // 1. Higher DTVLSN wins (the most-durable node). When both DTVLSNs are
+        //    0 (UNINITIALIZED / pre-DTVLSN), this is a tie and the comparison
+        //    falls through to VLSN — exactly JE getRanking's pre-DTVLSN
+        //    fallback `Ranking(vlsn, 0)`.
+        self.dtvlsn
+            .cmp(&other.dtvlsn)
+            // 2. Higher VLSN wins.
+            .then_with(|| self.vlsn.cmp(&other.vlsn))
+            // 3. Higher priority wins.
             .then_with(|| self.priority.cmp(&other.priority))
-            // 3. Higher term wins.
+            // 4. Higher term wins.
             .then_with(|| self.term.cmp(&other.term))
-            // 4. Lexicographic node name tiebreaker.
+            // 5. Lexicographic node name tiebreaker.
             .then_with(|| self.node_name.cmp(&other.node_name))
     }
 }
@@ -120,6 +144,39 @@ mod tests {
     }
 
     // --- VLSN ordering ---
+
+    #[test]
+    fn test_higher_dtvlsn_wins_over_higher_vlsn() {
+        // D2: a node with a higher DTVLSN (more durable txns) beats a node
+        // with a higher raw VLSN but uncommitted tail. JE Ranking(major=dtvlsn).
+        let durable = Proposal::with_timestamp("durable".into(), 100, 1, 1, 0)
+            .with_dtvlsn(90);
+        let laggard_tail =
+            Proposal::with_timestamp("laggard".into(), 200, 1, 1, 0)
+                .with_dtvlsn(50);
+        assert!(
+            durable.is_better_than(&laggard_tail),
+            "higher DTVLSN must win over higher raw VLSN"
+        );
+        assert!(!laggard_tail.is_better_than(&durable));
+    }
+
+    #[test]
+    fn test_dtvlsn_tie_falls_back_to_vlsn() {
+        // Equal (or both-zero/UNINITIALIZED) DTVLSN -> compare by VLSN, the
+        // JE pre-DTVLSN fallback Ranking(vlsn, 0).
+        let a =
+            Proposal::with_timestamp("a".into(), 200, 1, 1, 0).with_dtvlsn(0);
+        let b =
+            Proposal::with_timestamp("b".into(), 100, 1, 1, 0).with_dtvlsn(0);
+        assert!(a.is_better_than(&b), "dtvlsn tie -> higher vlsn wins");
+        // Same with equal non-zero dtvlsn.
+        let c =
+            Proposal::with_timestamp("c".into(), 200, 1, 1, 0).with_dtvlsn(50);
+        let d =
+            Proposal::with_timestamp("d".into(), 100, 1, 1, 0).with_dtvlsn(50);
+        assert!(c.is_better_than(&d));
+    }
 
     #[test]
     fn test_higher_vlsn_wins() {

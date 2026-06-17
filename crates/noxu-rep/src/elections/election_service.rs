@@ -32,6 +32,9 @@ pub struct ElectionAcceptorState {
     pub node_name: String,
     /// Current VLSN this node would advertise as a candidate.
     pub own_vlsn: AtomicU64,
+    /// Current DTVLSN this node would advertise (the major election-ranking
+    /// key, D2). Updated by the driver from `ReplicatedEnvironment::get_dtvlsn`.
+    pub own_dtvlsn: AtomicU64,
     /// This node's election priority (immutable).
     pub own_priority: u32,
     /// Current election term as observed by the local driver.
@@ -52,6 +55,7 @@ impl ElectionAcceptorState {
         Self {
             node_name,
             own_vlsn: AtomicU64::new(0),
+            own_dtvlsn: AtomicU64::new(0),
             own_priority,
             own_term: AtomicU64::new(0),
             persistent: Arc::new(PersistentAcceptorState::in_memory()),
@@ -68,6 +72,7 @@ impl ElectionAcceptorState {
         Self {
             node_name,
             own_vlsn: AtomicU64::new(0),
+            own_dtvlsn: AtomicU64::new(0),
             own_priority,
             own_term: AtomicU64::new(0),
             persistent: Arc::new(PersistentAcceptorState::load_or_default(
@@ -86,12 +91,18 @@ impl ElectionAcceptorState {
         self.own_term.store(term, Ordering::SeqCst);
     }
 
-    /// Snapshot (vlsn, priority, term) for a single acceptor call.
-    pub fn snapshot(&self) -> (u64, u32, u64) {
+    /// Update the DTVLSN that subsequent acceptor sessions will report (D2).
+    pub fn set_dtvlsn(&self, dtvlsn: u64) {
+        self.own_dtvlsn.store(dtvlsn, Ordering::SeqCst);
+    }
+
+    /// Snapshot (vlsn, priority, term, dtvlsn) for a single acceptor call.
+    pub fn snapshot(&self) -> (u64, u32, u64, u64) {
         (
             self.own_vlsn.load(Ordering::SeqCst),
             self.own_priority,
             self.own_term.load(Ordering::SeqCst),
+            self.own_dtvlsn.load(Ordering::SeqCst),
         )
     }
 }
@@ -110,7 +121,7 @@ impl ElectionService {
 
 impl ServiceHandler for ElectionService {
     fn handle(&self, channel: Box<dyn Channel>) -> Result<()> {
-        let (vlsn, priority, term) = self.state.snapshot();
+        let (vlsn, priority, term, dtvlsn) = self.state.snapshot();
         // F5/F31: route the acceptor through the persistent state so
         // promises and accepts survive process restarts.
         match run_acceptor_with_state(
@@ -119,6 +130,7 @@ impl ServiceHandler for ElectionService {
             vlsn,
             priority,
             term,
+            dtvlsn,
             &self.state.persistent,
         ) {
             Ok(_) => Ok(()),
@@ -199,10 +211,11 @@ mod tests {
     #[test]
     fn election_service_state_snapshot_consistency() {
         let s = ElectionAcceptorState::new("n".into(), 5);
-        assert_eq!(s.snapshot(), (0, 5, 0));
+        assert_eq!(s.snapshot(), (0, 5, 0, 0));
         s.set_vlsn(42);
         s.set_term(7);
-        assert_eq!(s.snapshot(), (42, 5, 7));
+        s.set_dtvlsn(40);
+        assert_eq!(s.snapshot(), (42, 5, 7, 40));
     }
 
     // Suppress unused-import warning in non-test compilations.

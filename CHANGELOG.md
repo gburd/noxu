@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (replication — election ranking, D2)
+
+- **Elections now rank by DTVLSN, not raw VLSN** (`noxu-rep`, D2): the election
+  proposal ordering was `(vlsn, priority, term, name)`. JE ranks by
+  `Ranking(major=DTVLSN, minor=VLSN)` (`MasterSuggestionGenerator.getRanking`)
+  so the most *durable* node (highest VLSN replicated to a majority) wins over a
+  node with a higher raw VLSN but an uncommitted tail — preventing a
+  data-laggard or speculative-tail node from being elected and then losing
+  those writes on a subsequent failover. `Proposal` gained a `dtvlsn` major key
+  (0 = UNINITIALIZED → falls back to VLSN, JE's pre-DTVLSN behavior); the
+  `ElectionProposal` wire message now carries `dtvlsn`; the election driver and
+  acceptor thread the node's live DTVLSN (`get_dtvlsn`) through
+  `run_election_with_phi_dtvlsn` / `run_acceptor_with_state`. Builds on the
+  DTVLSN substrate (D7) and authoritative-master detection (D4). Tests
+  `test_higher_dtvlsn_wins_over_higher_vlsn`,
+  `test_dtvlsn_tie_falls_back_to_vlsn`, and the ElectionProposal wire
+  round-trip.
+
 ### Added (replication — authoritative-master detection, D4)
 
 - **`is_authoritative_master`** (`noxu-rep`, JE

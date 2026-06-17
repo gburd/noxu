@@ -51,7 +51,14 @@ pub enum ProtocolMessage {
 
     // --- Election ---
     /// An election proposal from a candidate.
-    ElectionProposal { node_name: String, vlsn: u64, priority: u32, term: u64 },
+    ElectionProposal {
+        node_name: String,
+        vlsn: u64,
+        priority: u32,
+        term: u64,
+        /// DTVLSN (the major election-ranking key, D2). 0 = UNINITIALIZED.
+        dtvlsn: u64,
+    },
     /// A vote in response to an election proposal.
     ElectionVote { voter: String, granted: bool, term: u64 },
     /// The result of an election.
@@ -143,12 +150,14 @@ impl ProtocolMessage {
                 vlsn,
                 priority,
                 term,
+                dtvlsn,
             } => {
                 buf.push(TAG_ELECTION_PROPOSAL);
                 encode_string(&mut buf, node_name);
                 buf.extend_from_slice(&vlsn.to_le_bytes());
                 buf.extend_from_slice(&priority.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
+                buf.extend_from_slice(&dtvlsn.to_le_bytes());
             }
             ProtocolMessage::ElectionVote { voter, granted, term } => {
                 buf.push(TAG_ELECTION_VOTE);
@@ -240,11 +249,13 @@ impl ProtocolMessage {
                 let vlsn = decode_u64(data, &mut pos)?;
                 let priority = decode_u32(data, &mut pos)?;
                 let term = decode_u64(data, &mut pos)?;
+                let dtvlsn = decode_u64(data, &mut pos)?;
                 Ok(ProtocolMessage::ElectionProposal {
                     node_name,
                     vlsn,
                     priority,
                     term,
+                    dtvlsn,
                 })
             }
             TAG_ELECTION_VOTE => {
@@ -573,6 +584,7 @@ mod tests {
             vlsn: 5000,
             priority: 10,
             term: 3,
+            dtvlsn: 4900,
         });
     }
 
@@ -695,6 +707,7 @@ mod tests {
             vlsn: u64::MAX,
             priority: u32::MAX,
             term: u64::MAX,
+            dtvlsn: u64::MAX,
         });
     }
 

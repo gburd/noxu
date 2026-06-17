@@ -824,6 +824,8 @@ impl ReplicatedEnvironment {
             let our_vlsn = self.vlsn_index.get_latest_vlsn();
             self.election_state.set_vlsn(our_vlsn);
             self.election_state.set_term(term);
+            // D2: advertise our DTVLSN as the major election-ranking key.
+            self.election_state.set_dtvlsn(self.get_dtvlsn());
 
             // Connect to each peer's ELECTION service.  Failures are
             // tolerated: a peer that doesn't answer simply contributes
@@ -875,7 +877,7 @@ impl ReplicatedEnvironment {
                 term,
                 channels.len(),
             );
-            let outcome = crate::elections::paxos::run_election(
+            let outcome = crate::elections::paxos::run_election_with_phi_dtvlsn(
                 self_node_id,
                 &self.config.node_name,
                 &group,
@@ -883,6 +885,10 @@ impl ReplicatedEnvironment {
                 our_vlsn,
                 /* priority */ 1,
                 term,
+                /* own_dtvlsn (D2 major ranking key) */
+                self.get_dtvlsn(),
+                None,
+                std::time::Duration::from_millis(500),
             );
 
             match outcome {
