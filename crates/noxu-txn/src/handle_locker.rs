@@ -333,18 +333,36 @@ mod tests {
 
         struct FakeNonTxnLocker(i64);
         impl Locker for FakeNonTxnLocker {
-            fn id(&self) -> i64 { self.0 }
-            fn lock(&mut self, _: u64, _: LockType, _: bool)
-                -> Result<crate::LockResult, TxnError> {
+            fn id(&self) -> i64 {
+                self.0
+            }
+            fn lock(
+                &mut self,
+                _: u64,
+                _: LockType,
+                _: bool,
+            ) -> Result<crate::LockResult, TxnError> {
                 unimplemented!()
             }
-            fn release_lock(&mut self, _: u64) -> Result<(), TxnError> { Ok(()) }
-            fn owns_write_lock(&self, _: u64) -> bool { false }
-            fn is_transactional(&self) -> bool { false } // ← non-txn
-            fn lock_timeout_ms(&self) -> u64 { 0 }
+            fn release_lock(&mut self, _: u64) -> Result<(), TxnError> {
+                Ok(())
+            }
+            fn owns_write_lock(&self, _: u64) -> bool {
+                false
+            }
+            fn is_transactional(&self) -> bool {
+                false
+            } // ← non-txn
+            fn lock_timeout_ms(&self) -> u64 {
+                0
+            }
             fn close(&mut self) {}
-            fn is_open(&self) -> bool { true }
-            fn shares_locks_with(&self, _: i64) -> bool { false }
+            fn is_open(&self) -> bool {
+                true
+            }
+            fn shares_locks_with(&self, _: i64) -> bool {
+                false
+            }
         }
 
         let lm = Arc::new(LockManager::new());

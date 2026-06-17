@@ -897,7 +897,11 @@ impl CursorImpl {
                                 let db = self.db_impl.read();
                                 db.get_real_tree().and_then(|tree| {
                                     tree.get_root().and_then(|r| {
-                                        Self::find_bin_for_key(r, &k, tree.get_comparator())
+                                        Self::find_bin_for_key(
+                                            r,
+                                            &k,
+                                            tree.get_comparator(),
+                                        )
                                     })
                                 })
                             };
@@ -1049,7 +1053,9 @@ impl CursorImpl {
             // NONE returns NoneNeeded immediately from the lock manager but
             // first runs checkState/checkPreempted.
             if guard.is_read_uncommitted_default() {
-                guard.lock(lsn, LockType::None, false).map_err(DbiError::TxnError)?;
+                guard
+                    .lock(lsn, LockType::None, false)
+                    .map_err(DbiError::TxnError)?;
                 return Ok(false);
             }
             // T-F2: SERIALIZABLE cursors acquire RangeRead to protect against
@@ -1340,7 +1346,8 @@ impl CursorImpl {
         let in_current: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
             let root = tree.get_root()?;
             // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-            let bin_arc = Self::find_bin_for_key(root, key, tree.get_comparator())?;
+            let bin_arc =
+                Self::find_bin_for_key(root, key, tree.get_comparator())?;
             let guard = bin_arc.read();
             match &*guard {
                 TreeNode::Bottom(bin) => {
@@ -1795,7 +1802,11 @@ impl CursorImpl {
                     let db = self.db_impl.read();
                     let tree = db.get_real_tree()?;
                     let root = tree.get_root()?;
-                    let found_arc = Self::find_bin_for_key(root, ck, tree.get_comparator())?;
+                    let found_arc = Self::find_bin_for_key(
+                        root,
+                        ck,
+                        tree.get_comparator(),
+                    )?;
                     let idx = {
                         let g = found_arc.read();
                         if let TreeNode::Bottom(bin) = &*g {
@@ -1887,9 +1898,11 @@ impl CursorImpl {
                 } else if let (Some(current_key), Some(root)) =
                     (current_key_slice_opt.as_deref(), tree.get_root())
                 {
-                    if let Some(bin_arc) =
-                        Self::find_bin_for_key(root, current_key, tree.get_comparator())
-                    {
+                    if let Some(bin_arc) = Self::find_bin_for_key(
+                        root,
+                        current_key,
+                        tree.get_comparator(),
+                    ) {
                         // Clone so we can move the arc after the read guard is dropped.
                         let arc_to_save = bin_arc.clone();
                         {
@@ -2013,7 +2026,11 @@ impl CursorImpl {
                     let db = self.db_impl.read();
                     db.get_real_tree().and_then(|tree| {
                         tree.get_root().and_then(|r| {
-                            Self::find_bin_for_key(r, &new_key_ref, tree.get_comparator())
+                            Self::find_bin_for_key(
+                                r,
+                                &new_key_ref,
+                                tree.get_comparator(),
+                            )
                         })
                     })
                 };
@@ -2119,8 +2136,11 @@ impl CursorImpl {
                                 use noxu_tree::tree::TreeNode;
                                 tree.get_root().and_then(|r| {
                                     // Use the current raw_key to find the BIN.
-                                    let bin_arc =
-                                        Self::find_bin_for_key(r, &raw_key, tree.get_comparator())?;
+                                    let bin_arc = Self::find_bin_for_key(
+                                        r,
+                                        &raw_key,
+                                        tree.get_comparator(),
+                                    )?;
                                     let g = bin_arc.read();
                                     match &*g {
                                         TreeNode::Bottom(bin) => {
@@ -2260,7 +2280,9 @@ impl CursorImpl {
                                     idx = 0;
                                 } else {
                                     let ord = match key_comparator {
-                                        Some(cmp) => cmp(entry.key.as_slice(), key),
+                                        Some(cmp) => {
+                                            cmp(entry.key.as_slice(), key)
+                                        }
                                         None => entry.key.as_slice().cmp(key),
                                     };
                                     if ord != std::cmp::Ordering::Greater {

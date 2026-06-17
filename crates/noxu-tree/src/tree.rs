@@ -3913,7 +3913,8 @@ impl Tree {
                     // that custom-comparator / sorted-dup databases descend
                     // to the correct child. Mirrors JE Tree.getNextIN which
                     // uses IN.findEntry (comparator-aware) not raw byte order.
-                    let idx = self.upper_in_floor_index(&n.entries, current_key);
+                    let idx =
+                        self.upper_in_floor_index(&n.entries, current_key);
                     let child = match n
                         .entries
                         .get(idx)
@@ -6587,11 +6588,15 @@ mod tests {
 
         // Insert keys that are ascending in byte order ("a" < "b" < … < "i")
         // but descending in comparator order (i > h > … > a).
-        let keys: &[&[u8]] = &[b"a", b"b", b"c", b"d", b"e", b"f",
-                                b"g", b"h", b"i"];
+        let keys: &[&[u8]] =
+            &[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i"];
         for (i, k) in keys.iter().enumerate() {
-            tree.insert(k.to_vec(), vec![i as u8], Lsn::from_u64((i + 1) as u64))
-                .unwrap();
+            tree.insert(
+                k.to_vec(),
+                vec![i as u8],
+                Lsn::from_u64((i + 1) as u64),
+            )
+            .unwrap();
         }
 
         // Collect all BINs by walking from the comparator-smallest key ("i"

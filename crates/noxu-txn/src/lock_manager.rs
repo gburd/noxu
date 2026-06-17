@@ -938,25 +938,24 @@ impl LockManager {
                 break;
             }
 
-            if timed_out {
-                if timeout_ms > 0
-                    && start.elapsed().as_millis() as u64 >= timeout_ms
-                {
-                    drop(granted_guard);
-                    // H-2: shard before waiter_graph.
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-                    self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
-                    return Err(TxnError::LockTimeout {
-                        timeout_ms,
-                        lsn,
-                        owner: format!(
-                            "[{}] on LSN {lsn}",
-                            self.format_lockers(&owner_ids)
-                        ),
-                        requested_type: lock_type,
-                        requester: self.format_locker(locker_id),
-                    });
-                }
+            if timed_out
+                && timeout_ms > 0
+                && start.elapsed().as_millis() as u64 >= timeout_ms
+            {
+                drop(granted_guard);
+                // H-2: shard before waiter_graph.
+                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err(TxnError::LockTimeout {
+                    timeout_ms,
+                    lsn,
+                    owner: format!(
+                        "[{}] on LSN {lsn}",
+                        self.format_lockers(&owner_ids)
+                    ),
+                    requested_type: lock_type,
+                    requester: self.format_locker(locker_id),
+                });
             }
 
             // Spurious wakeup or slice expired; loop.
@@ -2175,8 +2174,12 @@ mod tests {
         let handle = thread::spawn(move || {
             barrier_b.wait();
             lm_b.lock_with_sharing_and_timeout(
-                L1, LOCKER_B, LockType::Write,
-                false, false, TIMEOUT_MS,
+                L1,
+                LOCKER_B,
+                LockType::Write,
+                false,
+                false,
+                TIMEOUT_MS,
             )
         });
 
@@ -2185,8 +2188,12 @@ mod tests {
         // Small yield to let B enter the wait loop before we enqueue ourselves.
         std::thread::sleep(Duration::from_millis(5));
         let result_a = lm.lock_with_sharing_and_timeout(
-            L2, LOCKER_A, LockType::Write,
-            false, false, TIMEOUT_MS,
+            L2,
+            LOCKER_A,
+            LockType::Write,
+            false,
+            false,
+            TIMEOUT_MS,
         );
 
         let result_b = handle.join().expect("thread B panicked");
