@@ -30,7 +30,7 @@ fn file_selector_required_util_none_initially() {
 #[test]
 fn file_selector_select_on_empty_returns_none() {
     let mut fs = FileSelector::new();
-    let result = fs.select_file_for_cleaning();
+    let result = fs.select_from_queue();
     assert!(result.is_none());
 }
 
@@ -47,7 +47,7 @@ fn file_selector_add_file_to_clean() {
 fn file_selector_select_returns_added_file() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(42);
-    let selected = fs.select_file_for_cleaning();
+    let selected = fs.select_from_queue();
     assert_eq!(selected, Some((42, None)));
 }
 
@@ -55,7 +55,7 @@ fn file_selector_select_returns_added_file() {
 fn file_selector_is_being_cleaned_after_select() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(10);
-    fs.select_file_for_cleaning();
+    fs.select_from_queue();
     assert!(fs.is_being_cleaned(10));
 }
 
@@ -78,9 +78,9 @@ fn file_selector_select_multiple_files_in_order() {
     fs.add_file_to_clean(1);
     fs.add_file_to_clean(2);
     fs.add_file_to_clean(3);
-    let f1 = fs.select_file_for_cleaning().map(|(n, _)| n);
-    let f2 = fs.select_file_for_cleaning().map(|(n, _)| n);
-    let f3 = fs.select_file_for_cleaning().map(|(n, _)| n);
+    let f1 = fs.select_from_queue().map(|(n, _)| n);
+    let f2 = fs.select_from_queue().map(|(n, _)| n);
+    let f3 = fs.select_from_queue().map(|(n, _)| n);
     // All three should be returned in some order.
     let mut selected =
         [f1, f2, f3].iter().filter_map(|&x| x).collect::<Vec<_>>();
@@ -94,7 +94,7 @@ fn file_selector_select_multiple_files_in_order() {
 fn file_selector_mark_cleaned_after_being_cleaned() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(10);
-    fs.select_file_for_cleaning();
+    fs.select_from_queue();
     fs.mark_file_cleaned(10);
     assert_eq!(fs.get_file_status(10), Some(FileStatus::Cleaned));
 }
@@ -103,7 +103,7 @@ fn file_selector_mark_cleaned_after_being_cleaned() {
 fn file_selector_mark_checkpointed() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(10);
-    fs.select_file_for_cleaning();
+    fs.select_from_queue();
     fs.mark_file_cleaned(10);
     fs.mark_file_checkpointed(10);
     assert_eq!(fs.get_file_status(10), Some(FileStatus::Checkpointed));
@@ -113,7 +113,7 @@ fn file_selector_mark_checkpointed() {
 fn file_selector_mark_fully_processed() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(10);
-    fs.select_file_for_cleaning();
+    fs.select_from_queue();
     fs.mark_file_cleaned(10);
     fs.mark_file_checkpointed(10);
     fs.mark_file_fully_processed(10);
@@ -124,7 +124,7 @@ fn file_selector_mark_fully_processed() {
 fn file_selector_safe_to_delete_after_fully_processed() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(10);
-    fs.select_file_for_cleaning();
+    fs.select_from_queue();
     fs.mark_file_cleaned(10);
     fs.mark_file_checkpointed(10);
     fs.mark_file_fully_processed(10);
@@ -136,7 +136,7 @@ fn file_selector_safe_to_delete_after_fully_processed() {
 fn file_selector_remove_deleted_file() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(10);
-    fs.select_file_for_cleaning();
+    fs.select_from_queue();
     fs.mark_file_cleaned(10);
     fs.mark_file_checkpointed(10);
     fs.mark_file_fully_processed(10);
@@ -360,7 +360,7 @@ fn x5_file_not_safe_to_delete_before_checkpoint() {
 
     // Simulate: file 1 is tracked and cleaned.
     fs.add_file_to_clean(1);
-    let _ = fs.select_file_for_cleaning(); // transitions to BeingCleaned
+    let _ = fs.select_from_queue(); // transitions to BeingCleaned
     fs.mark_file_cleaned(1);
 
     // Before any checkpoint: safe_to_delete must be empty.
@@ -407,7 +407,7 @@ fn x5_file_cleaned_after_checkpoint_start_waits() {
 
     // File 2 is cleaned AFTER the checkpoint start snapshot.
     fs.add_file_to_clean(2);
-    let _ = fs.select_file_for_cleaning(); // transitions to BeingCleaned
+    let _ = fs.select_from_queue(); // transitions to BeingCleaned
     fs.mark_file_cleaned(2);
 
     fs.process_checkpoint_end(&state1);
@@ -458,7 +458,7 @@ fn cln1_pending_ln_gates_file_deletion() {
 
     // ── Step 1: file 10 is cleaned.
     fs.add_file_to_clean(10);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(10);
 
     // ── Step 2: during processing, one LN lock was denied.  Add to pending.
@@ -521,7 +521,7 @@ fn cln1_no_pending_lns_fast_path_one_checkpoint() {
     let mut fs = FileSelector::new();
 
     fs.add_file_to_clean(5);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(5);
 
     // No pending LNs: one checkpoint is enough (JE's anyPendingDuringCheckpoint = false path).
@@ -545,7 +545,7 @@ fn cln1_pending_ln_added_mid_checkpoint_keeps_file_blocked() {
     let mut fs = FileSelector::new();
 
     fs.add_file_to_clean(7);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(7);
 
     // Snapshot checkpoint start — no pending yet.
@@ -594,7 +594,7 @@ fn cln3_failed_processing_puts_file_back_for_retry() {
 
     // File is queued and selected (now BEING_CLEANED).
     fs.add_file_to_clean(20);
-    let selected = fs.select_file_for_cleaning();
+    let selected = fs.select_from_queue();
     assert_eq!(selected, Some((20, None)));
     assert_eq!(fs.get_file_status(20), Some(FileStatus::BeingCleaned));
 
@@ -613,7 +613,7 @@ fn cln3_failed_processing_puts_file_back_for_retry() {
     );
 
     // File can be re-selected on the next pass.
-    let retry = fs.select_file_for_cleaning();
+    let retry = fs.select_from_queue();
     assert_eq!(
         retry,
         Some((20, None)),
@@ -653,7 +653,7 @@ fn cln2_checkpoint_state_captures_fully_processed_files() {
 
     // File 30: advance to FullyProcessed.
     fs.add_file_to_clean(30);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(30);
     let state = fs.get_checkpoint_state();
     fs.process_checkpoint_end(&state); // no pending → goes to FullyProcessed
@@ -662,7 +662,7 @@ fn cln2_checkpoint_state_captures_fully_processed_files() {
 
     // File 31: cleaned but not yet checkpointed.
     fs.add_file_to_clean(31);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(31);
 
     // Snapshot: should capture file 30 in fully_processed_files and file 31 in cleaned_files.
@@ -688,7 +688,7 @@ fn cln2_fully_processed_files_always_safe_to_delete() {
 
     // File 32: advance to FullyProcessed.
     fs.add_file_to_clean(32);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(32);
     let s = fs.get_checkpoint_state();
     fs.process_checkpoint_end(&s);
@@ -714,7 +714,7 @@ fn cln2_two_checkpoint_barrier_only_needed_when_pending() {
     let mut fs = FileSelector::new();
 
     fs.add_file_to_clean(40);
-    let _ = fs.select_file_for_cleaning();
+    let _ = fs.select_from_queue();
     fs.mark_file_cleaned(40);
 
     // One checkpoint, no pending items → immediately FullyProcessed.
@@ -893,4 +893,163 @@ fn cln4_txn_window_excludes_best_candidate() {
         Some(1),
     );
     assert_eq!(r2, None, "all files excluded: txn window covers everything");
+}
+
+// ─── Autonomous file selection acceptance test (Part 3) ───────────────────────
+//
+// Demonstrates that do_clean autonomously selects low-utilization files via
+// the unified selectFileForCleaning path (JE FileProcessor.doClean ~line 393)
+// WITHOUT any manual add_file_to_clean call.
+//
+// Pre-fix behaviour (origin/main): do_clean called select_file_for_cleaning()
+// (FIFO-only) which returned None immediately with an empty queue — the
+// cleaner was inert.
+// Post-fix behaviour: do_clean calls the unified select_file_for_cleaning
+// which calls getBestFile on the merged fileSummaryMap, selecting the
+// lowest-utilization file autonomously.
+
+/// Builds a FileSummary with explicit total/obsolete sizes.
+fn make_summary_for_map(total: i32, obsolete_ln: i32) -> FileSummary {
+    FileSummary {
+        total_count: 10,
+        total_size: total,
+        total_ln_count: 10,
+        total_ln_size: total,
+        obsolete_ln_count: 1,
+        obsolete_ln_size: obsolete_ln,
+        obsolete_ln_size_counted: 1,
+        ..Default::default()
+    }
+}
+
+/// Proves that select_file_for_cleaning (the unified JE-faithful method) selects
+/// a low-utilization file from a profile map WITHOUT the file being in the
+/// TO_BE_CLEANED queue first.
+///
+/// This is the key acceptance criterion: pre-fix code only drained the FIFO
+/// queue; post-fix code also calls getBestFile on the summary map.
+#[test]
+fn autonomous_selection_from_profile_without_manual_enqueue() {
+    use std::collections::BTreeMap;
+
+    // Build a file summary map: file 1 is very low utilization (10%),
+    // file 2 is the newest and will be excluded by the age filter.
+    let mut map = BTreeMap::new();
+    map.insert(1u32, make_summary_for_map(1000, 900)); // 10% util — best candidate
+    map.insert(2u32, make_summary_for_map(1000, 100)); // 90% util — newest, age-excluded
+
+    let mut selector = FileSelector::new();
+
+    // Pre-condition: the TO_BE_CLEANED queue is empty.
+    assert!(
+        !selector.has_files_to_clean(),
+        "queue must be empty to prove autonomous selection"
+    );
+
+    // Call the unified JE-faithful select_file_for_cleaning.
+    // With an empty queue it falls through to getBestFile.
+    let result = selector.select_file_for_cleaning(
+        &map, 50,    // min_utilization_pct — file 1 at 10% qualifies
+        1,     // min_age — exclude file 2 (newest)
+        false, // force
+        None,  // no txn clamping
+    );
+
+    // Must select file 1 autonomously from the profile.
+    assert_eq!(
+        result.map(|(f, _)| f),
+        Some(1),
+        "FAIL-PRE / PASS-POST: autonomous selection must choose file 1 (10% util) \
+         without manual add_file_to_clean — pre-fix would return None here"
+    );
+}
+
+/// Verifies that the FIFO queue is drained first (JE line ~175), and only
+/// if empty does the selector fall through to getBestFile (JE line ~184).
+#[test]
+fn fifo_queue_drained_before_profile_scoring() {
+    use std::collections::BTreeMap;
+
+    let mut map = BTreeMap::new();
+    map.insert(1u32, make_summary_for_map(1000, 900)); // best by score
+    map.insert(2u32, make_summary_for_map(1000, 500)); // also qualifies
+    map.insert(3u32, make_summary_for_map(1000, 100)); // newest, excluded
+
+    let mut selector = FileSelector::new();
+
+    // Explicitly enqueue file 2 (not the best by score).
+    selector.add_file_to_clean(2);
+
+    // Unified selection: must drain the queue first, returning file 2.
+    let result = selector.select_file_for_cleaning(&map, 50, 1, false, None);
+    assert_eq!(
+        result.map(|(f, _)| f),
+        Some(2),
+        "JE line ~175: FIFO queue must be drained before calling getBestFile"
+    );
+}
+
+/// Part 2 acceptance: get_file_summary_map with include_tracked=true merges
+/// the profile's cached summaries with live tracker data.
+///
+/// JE: UtilizationProfile.getFileSummaryMap(true) ~line 210.
+#[test]
+fn get_file_summary_map_merges_tracker_data() {
+    use noxu_cleaner::{UtilizationProfile, UtilizationTracker};
+
+    let mut profile = UtilizationProfile::new();
+    // Profile has file 1 with 200 obsolete bytes.
+    let cached = make_summary_for_map(1000, 200);
+    profile.update_file_summary(1, &cached);
+
+    let mut tracker = UtilizationTracker::new(true);
+    // Tracker adds 100 more obsolete LN bytes to file 1 (live write path).
+    tracker.track_obsolete(1, 300, 100, true);
+    // Tracker also has file 2 (not in profile yet — tracked-only file).
+    tracker.count_new_log_entry(2, 500, true, false);
+
+    // include_tracked=true: merge profile + tracker.
+    let merged = profile.get_file_summary_map(true, &tracker);
+
+    // File 1: profile(200) + tracker(100) = 300 total obsolete.
+    let f1 = merged.get(&1).expect("file 1 must be in merged map");
+    assert_eq!(
+        f1.obsolete_ln_size, 300,
+        "file 1: profile(200) + tracker(100) = 300 obsolete bytes"
+    );
+
+    // File 2: only in tracker, must appear in the merged map.
+    let f2 =
+        merged.get(&2).expect("file 2 (tracker-only) must be in merged map");
+    assert_eq!(f2.total_ln_size, 500, "file 2: tracker data must be present");
+
+    // include_tracked=false: only profile data.
+    let profile_only = profile.get_file_summary_map(false, &tracker);
+    assert!(profile_only.contains_key(&1), "file 1 in profile-only map");
+    assert!(
+        !profile_only.contains_key(&2),
+        "file 2 absent from profile-only map (tracker-only)"
+    );
+}
+
+/// CLN NEW-3: remove_file_from_cleaning removes the file entirely so it is
+/// NOT re-enqueued for rescanning on the next pass (unlike put_back).
+#[test]
+fn remove_file_from_cleaning_does_not_reenqueue() {
+    let mut selector = FileSelector::new();
+    selector.add_file_to_clean(5);
+    let _ = selector.select_from_queue(); // moves to BeingCleaned
+
+    // CLN NEW-3: remove (not put-back).
+    selector.remove_file_from_cleaning(5);
+
+    // File must NOT be tracked or queued any longer.
+    assert!(
+        !selector.is_tracked(5),
+        "CLN NEW-3: remove_file_from_cleaning must erase the file from tracking"
+    );
+    assert!(
+        !selector.has_files_to_clean(),
+        "CLN NEW-3: file must not be re-enqueued after remove"
+    );
 }

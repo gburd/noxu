@@ -4,7 +4,9 @@
 //! and provides methods for selecting files to clean based on utilization.
 
 use crate::file_summary::FileSummary;
+use crate::utilization_tracker::UtilizationTracker;
 use hashbrown::HashMap;
+use std::collections::BTreeMap;
 
 /// Stores persistent file summaries and selects files for cleaning.
 ///
@@ -36,6 +38,60 @@ impl UtilizationProfile {
     ) -> Option<&mut FileSummary> {
         self.modified = true;
         self.file_summaries.get_mut(&file_number)
+    }
+
+    /// Returns a merged copy of the file summary map, optionally including
+    /// live-tracked summary information.
+    ///
+    /// Faithful port of JE `UtilizationProfile.getFileSummaryMap(
+    ///   boolean includeTrackedFiles)` (UtilizationProfile.java ~line 210).
+    ///
+    /// When `include_tracked` is `true`:
+    /// 1. For each file already in the profile's `file_summaries` map, the
+    ///    tracked obsolete counts from the `UtilizationTracker` are merged
+    ///    on top of the cached summary (JE `getFileSummary(file)` adds the
+    ///    tracked delta inside the loop).
+    /// 2. Files that appear only in the tracker (not yet flushed to the
+    ///    profile) are added to the returned map from the tracker directly.
+    ///
+    /// When `include_tracked` is `false`, returns a plain copy of the
+    /// profile's cached summaries (no live tracking data merged in).
+    ///
+    /// NOTE: The persistent `FileSummaryDB` storage (CLN-11) is deferred;
+    /// this implementation is faithful to the in-memory subset used during
+    /// normal operation between checkpoints.
+    ///
+    /// JE: `UtilizationProfile.getFileSummaryMap` (~line 210).
+    pub fn get_file_summary_map(
+        &self,
+        include_tracked: bool,
+        tracker: &UtilizationTracker,
+    ) -> BTreeMap<u32, FileSummary> {
+        if include_tracked {
+            // JE: copy fileSummaryMap, adding tracked summary for each entry.
+            let mut map = BTreeMap::new();
+            for (&file_num, cached) in &self.file_summaries {
+                // Merge the tracked delta on top of the cached summary.
+                // JE: `FileSummary summary = getFileSummary(file);` inside
+                // the loop, which calls tracker.getTrackedSummary(file) and
+                // adds it (UtilizationProfile.java ~line 225).
+                let mut merged = cached.clone();
+                if let Some(tracked) = tracker.get_tracked_summary(file_num) {
+                    merged.add(tracked.get_summary());
+                }
+                map.insert(file_num, merged);
+            }
+            // JE: add tracked files that are not yet in fileSummaryMap.
+            // (~line 233: for (TrackedFileSummary s : tracker.getTrackedFiles()))
+            for (&file_num, tracked) in tracker.get_tracked_files() {
+                map.entry(file_num)
+                    .or_insert_with(|| tracked.get_summary().clone());
+            }
+            map
+        } else {
+            // Plain copy of the cached profile.
+            self.file_summaries.iter().map(|(&k, v)| (k, v.clone())).collect()
+        }
     }
 
     /// Populates the profile with the given summaries.

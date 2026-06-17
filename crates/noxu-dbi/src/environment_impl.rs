@@ -638,20 +638,29 @@ impl EnvironmentImpl {
             // Pass the environment's shared LockManager so that cleaner-held
             // locks contend with user transactions for correct deadlock
             // detection. The cleaner uses the environment's shared lock manager.
-            Arc::new(
-                Cleaner::with_file_manager_tree_and_lock_manager(
-                    cfg.cleaner_min_utilization as u32,
-                    cfg.cleaner_min_file_count,
-                    cfg.cleaner_min_age as u64,
-                    fm,
-                    Arc::clone(&primary_tree),
-                    Arc::clone(lm),
-                    Arc::clone(&lock_manager),
-                )
-                // X-7: wire the shared db-tree registry so the cleaner
-                // dispatches secondary-LN liveness checks to the correct tree.
-                .with_tree_registry(Arc::clone(&db_trees_registry)),
+            let mut c = Cleaner::with_file_manager_tree_and_lock_manager(
+                cfg.cleaner_min_utilization as u32,
+                cfg.cleaner_min_file_count,
+                cfg.cleaner_min_age as u64,
+                fm,
+                Arc::clone(&primary_tree),
+                Arc::clone(lm),
+                Arc::clone(&lock_manager),
             )
+            // X-7: wire the shared db-tree registry so the cleaner
+            // dispatches secondary-LN liveness checks to the correct tree.
+            .with_tree_registry(Arc::clone(&db_trees_registry));
+            // Wire the live UtilizationTracker so that do_clean can build
+            // the merged fileSummaryMap autonomously without needing manual
+            // add_file_to_clean calls.
+            // JE: FileProcessor.doClean calls
+            //   profile.getFileSummaryMap(true /*includeTrackedFiles*/)
+            //   which merges UtilizationProfile + UtilizationTracker
+            //   (FileProcessor.java doClean ~line 340).
+            if let Some(ref tracker) = utilization_tracker {
+                c = c.with_utilization_tracker(Arc::clone(tracker));
+            }
+            Arc::new(c)
         });
 
         // Build the checkpointer, wired to the LogManager and the primary

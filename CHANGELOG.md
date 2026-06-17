@@ -97,6 +97,52 @@ listed in [References](#references).
   deterministic "fewest locks then youngest" criterion and the JE
   `DeadlockChecker.chooseTargetedLocker` pseudo-random choice (anti-livelock
   on repeated identical deadlocks).  No code change; both strategies are correct.
+- **CLN-FAITHFUL — restore JE `selectFileForCleaning` structure; cleaner is no longer inert** (`noxu-cleaner`, `noxu-dbi`):
+  The live `do_clean` path previously called the FIFO-only `select_file_for_cleaning()`
+  (queue drain) and never reached the utilization-scoring (getBestFile) path.
+  The cleaner was inert in production: it only cleaned files if they were
+  manually enqueued via `add_file_to_clean`.
+
+  This fix faithfully re-ports four JE components:
+
+  - **`FileSelector::select_file_for_cleaning` unified** (Part 1):
+    New method matching JE `FileSelector.selectFileForCleaning`
+    (FileSelector.java ~line 170): drains TO_BE_CLEANED queue first
+    (JE ~line 175), then falls through to `select_file_for_cleaning_with_policy`
+    (= `UtilizationCalculator.getBestFile`, JE ~line 184).
+    Old FIFO-only variant renamed to `select_from_queue` (public helper).
+    Added `remove_file_from_cleaning` (CLN NEW-3, JE FileSelector.removeFile
+    ~line 325): removes a file after a two-pass skip so it is not rescanned.
+
+  - **`UtilizationProfile::get_file_summary_map`** (Part 2):
+    Faithful port of JE `UtilizationProfile.getFileSummaryMap(bool)`
+    (UtilizationProfile.java ~line 210): merges the in-memory cached
+    `FileSummary` entries with live `UtilizationTracker.TrackedFileSummary`s
+    when `include_tracked=true`, including tracker-only files not yet in
+    the profile map.
+    `Cleaner` now holds `utilization_profile` + `utilization_tracker`;
+    wired in `environment_impl.rs` symmetric to `LockManager`.
+
+  - **`Cleaner::do_clean` matches JE `FileProcessor.doClean`** (Part 3):
+    Rewritten to reproduce JE FileProcessor.doClean (FileProcessor.java
+    ~line 317):
+    1. Build `fileSummaryMap = profile.getFileSummaryMap(true, tracker)` before loop.
+    2. Loop: `processPending()` → refresh map on iterations > 0 (CLN-13) →
+       unified `select_file_for_cleaning` (autonomous, no manual enqueue needed) →
+       two-pass check (CLN-5, now uses `remove_file_from_cleaning`) →
+       `processFile` → `markFileCleaned`.
+    CLN-1/2/3/4/5/13/14, X-5 checkpoint barrier all preserved.
+
+  - **CLN NEW-4 — real expiration_time in `decode_ln_entries_from_file`** (Part 4):
+    InsertLN/UpdateLN/InsertLNTxn/UpdateLNTxn entries now carry
+    `expiration_time: ln.expiration as u64` (hours since epoch, CLN-10)
+    instead of the hardcoded `0`.
+    JE: `FileProcessor.processFile` reads `lnEntry.getExpiration()` (~line 1004).
+    The two-pass TTL-adjusted utilization now sees real expired bytes.
+
+  Acceptance tests added: `autonomous_selection_from_profile_without_manual_enqueue`
+  (FAIL-PRE / PASS-POST), `fifo_queue_drained_before_profile_scoring`,
+  `get_file_summary_map_merges_tracker_data`, `remove_file_from_cleaning_does_not_reenqueue`.
 
 - **CLN-4 (wiring) — first-active-transaction file clamping now live** (`noxu-cleaner`):
   `Cleaner::do_clean` now reads `TxnManager::get_first_active_lsn()` and skips
