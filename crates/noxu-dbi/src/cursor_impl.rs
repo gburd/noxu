@@ -41,10 +41,25 @@ use crate::{
 };
 
 /// Cursor states.
+///
+/// `PendingDeleted` is the JE post-delete position: the cursor's current slot
+/// has been physically removed from the BIN, but the cursor remembers the
+/// slot index so that the next `Next`/`Prev` call advances to the correct
+/// successor/predecessor rather than returning `NotFound`.
+///
+/// JE equivalent: `CursorImpl` keeps the cursor on the PD-flagged slot and
+/// `getNextNoDup`/`getNext` skip it.  Noxu physically removes the slot, so we
+/// store the *gap index* (= index of the slot that was immediately after the
+/// deleted slot) and let `retrieve_next(Next)` start from that index directly.
+///
+/// Ref: `CursorImpl.java` `deleteCurrentRecord()` / `getNext()` PD check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorState {
     NotInitialized,
     Initialized,
+    /// Cursor positioned after a delete; `current_index` is the gap index
+    /// (the slot that was the successor before the delete).
+    PendingDeleted,
     Closed,
 }
 
@@ -733,7 +748,9 @@ impl CursorImpl {
         }
         match self.state {
             CursorState::Closed => Err(DbiError::CursorClosed),
-            CursorState::NotInitialized => Err(DbiError::CursorNotInitialized),
+            CursorState::NotInitialized | CursorState::PendingDeleted => {
+                Err(DbiError::CursorNotInitialized)
+            }
             CursorState::Initialized => Ok(()),
         }
     }
@@ -1657,6 +1674,11 @@ impl CursorImpl {
     ///
     /// : analogous to checking KNOWN_DELETED_BIT / entry removal on
     /// Cursor.getCurrentLN() path — returns KEYEMPTY when the record is gone.
+    ///
+    /// If the key at `current_index` has shifted (e.g. due to a concurrent
+    /// insert before this position — D5), the key still exists in the tree.
+    /// In that case this method re-anchors the cursor so `get_current()` then
+    /// returns the correct record.  Ref: JE CursorImpl.getCurrentLN().
     pub fn is_current_slot_deleted(&self) -> bool {
         use noxu_tree::tree::TreeNode;
         let current_key = match &self.current_key {
@@ -1671,7 +1693,9 @@ impl CursorImpl {
         let guard = bin_arc.read();
         if let TreeNode::Bottom(bin) = &*guard {
             if idx >= bin.entries.len() {
-                return true; // entry was removed
+                // Out-of-bounds: slot was removed (split or delete).
+                // The caller (Get::Current) will re-anchor or return NotFound.
+                return true;
             }
             let plen = bin.key_prefix.len();
             let expected_suffix: &[u8] =
@@ -1682,7 +1706,22 @@ impl CursorImpl {
                 };
             let stored = bin.entries[idx].key.as_slice();
             if stored != expected_suffix {
-                return true; // different key at this index = deleted and shifted
+                // Key mismatch at current_index.  This can mean either:
+                //   (a) the record was deleted (key no longer in tree), or
+                //   (b) a concurrent insert shifted this cursor's slot.
+                // Search the tree to distinguish the two cases.
+                // We must drop the guard before calling into the tree.
+                drop(guard);
+                let db = self.db_impl.read();
+                if let Some(tree) = db.get_real_tree() {
+                    if tree.search_with_data(current_key).is_some_and(|s| s.found) {
+                        // Key still exists: insert-shifted position.  NOT deleted.
+                        // (The cursor will be re-anchored by retrieve_next /
+                        // the CC-1+D5 extension on next traversal.)
+                        return false;
+                    }
+                }
+                return true; // key gone = deleted
             }
             bin.entries[idx].known_deleted
         } else {
@@ -1718,6 +1757,17 @@ impl CursorImpl {
         if self.state == CursorState::NotInitialized {
             return Ok(OperationStatus::NotFound);
         }
+        // PendingDeleted: the cursor's slot was just physically removed.
+        // Treat it like Initialized for traversal — current_index is already
+        // the gap index (= successor slot).  If the caller asks Prev from this
+        // state we back up one from the gap.  See CursorState::PendingDeleted.
+        // Ref: CursorImpl.java getNext() PD-flag skip / getNextNoDup().
+        let pending_deleted = self.state == CursorState::PendingDeleted;
+        if pending_deleted {
+            // Restore Initialized so the rest of the traversal logic works
+            // normally; we'll adjust next_index below.
+            self.state = CursorState::Initialized;
+        }
 
         let is_dup = self.is_sorted_dup();
 
@@ -1743,7 +1793,18 @@ impl CursorImpl {
         };
 
         let forward = mode.is_forward();
-        let next_index = if forward {
+        // JE CursorImpl.deleteCurrentRecord(): the slot is physically removed
+        // so current_index is already the gap (= next slot after deletion).
+        // For Next we start from that gap index directly; for Prev we back up
+        // one from it (gap - 1 = predecessor of the deleted slot).
+        // Ref: CursorImpl.java adjustCursorsForDelete() + getNext() PD check.
+        let next_index = if pending_deleted {
+            if forward {
+                self.current_index     // gap IS the next slot
+            } else {
+                self.current_index - 1 // predecessor of the deleted slot
+            }
+        } else if forward {
             self.current_index + 1
         } else {
             self.current_index - 1
@@ -1783,10 +1844,28 @@ impl CursorImpl {
             let stale_split: bool = {
                 let g = bin_arc.read();
                 if let TreeNode::Bottom(bin) = &*g {
-                    // current_index beyond current BIN length means the BIN
-                    // shrank due to a split (legitimate exhaustion never sets
-                    // current_index to a value >= the BIN's entry count).
-                    self.current_index >= bin.entries.len() as i32
+                    // Two conditions require re-anchoring via key lookup:
+                    //
+                    // 1. CC-1 split-adjustment (JE BIN.adjustCursors /
+                    //    IN.split): current_index >= len means the BIN
+                    //    shrank and our slot moved to the new sibling.
+                    //
+                    // 2. D5 insert-shift (JE BIN.adjustCursorsForInsert ~line
+                    //    997): a concurrent in-place insert at an index <=
+                    //    current_index shifts all higher slots up by one, so
+                    //    the key stored at current_index is now a different
+                    //    key.  Detect by comparing the key at current_index
+                    //    against current_key.
+                    //    Ref: CursorImpl.java adjustCursorsForInsert.
+                    let out_of_bounds =
+                        self.current_index >= bin.entries.len() as i32;
+                    let idx = self.current_index as usize;
+                    let key_mismatch = !out_of_bounds
+                        && self.current_key.as_deref().is_some_and(|ck| {
+                            bin.get_full_key(idx)
+                                .is_none_or(|k| k != ck)
+                        });
+                    out_of_bounds || key_mismatch
                 } else {
                     false
                 }
@@ -2703,7 +2782,14 @@ impl CursorImpl {
     /// 1. Checks that the cursor is initialized.
     /// 2. Writes a DeleteLN log entry to the WAL (if log manager is present).
     /// 3. Calls `Tree::delete(key)` to remove the entry from the BIN.
-    /// 4. Resets cursor to NotInitialized (matching behaviour).
+    /// 4. Transitions to `PendingDeleted` (JE semantics): the cursor remains
+    ///    positioned at the gap index so that a subsequent `Next` or `Prev`
+    ///    call yields the correct successor or predecessor.
+    ///
+    /// JE reference: `CursorImpl.deleteCurrentRecord()` sets the PD flag on
+    /// the slot and retains the cursor index.  Noxu physically removes the
+    /// slot, so `current_index` becomes the gap (= index of the former
+    /// successor), and `retrieve_next(Next)` starts from that index directly.
     ///
     /// # Returns
     ///
@@ -2737,11 +2823,15 @@ impl CursorImpl {
             self.apply_tree_delete(tree_key, del_lsn);
         }
 
+        // JE CursorImpl.deleteCurrentRecord(): keep cursor positioned at the
+        // gap so Next/Prev advances correctly (D1).
+        // current_index now points to the slot that was the successor; leave
+        // it unchanged.  Clear key/data/lsn since the record is gone.
         self.current_key = None;
         self.current_data = None;
         self.current_lsn = noxu_util::NULL_LSN.as_u64();
-        self.current_index = -1;
-        self.state = CursorState::NotInitialized;
+        // current_index stays; it is the gap index (former successor's slot).
+        self.state = CursorState::PendingDeleted;
 
         Ok(OperationStatus::Success)
     }

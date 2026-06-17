@@ -31,6 +31,10 @@ pub enum CursorState {
     NotInitialized,
     /// Cursor is positioned on a record.
     Initialized,
+    /// Cursor's current record was just deleted; `Next`/`Prev` should
+    /// advance from the gap position rather than calling `get_first`/`get_last`.
+    /// Matches the inner `CursorState::PendingDeleted` semantics.
+    PendingDeleted,
     /// Cursor has been closed.
     Closed,
 }
@@ -141,6 +145,9 @@ impl Cursor {
                     // Next from uninitialized positions at the first record.
                     self.inner.get_first().map_err(map_cursor_err)?
                 } else {
+                    // PendingDeleted is also handled here: the inner cursor's
+                    // retrieve_next detects PendingDeleted and starts from the
+                    // gap index (= former successor slot) directly.
                     self.inner
                         .retrieve_next(GetMode::Next)
                         .map_err(map_cursor_err)?
@@ -151,6 +158,7 @@ impl Cursor {
                     // Prev from uninitialized positions at the last record.
                     self.inner.get_last().map_err(map_cursor_err)?
                 } else {
+                    // PendingDeleted is also handled here.
                     self.inner
                         .retrieve_next(GetMode::Prev)
                         .map_err(map_cursor_err)?
@@ -361,7 +369,10 @@ impl Cursor {
         }
 
         self.inner.delete().map_err(map_cursor_err)?;
-        self.state = CursorState::NotInitialized;
+        // JE CursorImpl.deleteCurrentRecord(): keep position at the gap so
+        // Next/Prev yields the successor/predecessor (D1 fix).
+        // Ref: CursorImpl.java deleteCurrentRecord() + getNext() PD check.
+        self.state = CursorState::PendingDeleted;
         Ok(OperationStatus::Success)
     }
 
@@ -470,8 +481,8 @@ impl Drop for Cursor {
     fn drop(&mut self) {
         // Audit cursor F15 (Wave 2C-4): only warn for genuinely-leaked
         // cursors that were positioned on a record at drop time.
-        // `NotInitialized` covers freshly-opened cursors and cursors
-        // that just had their record deleted (Finding 7); warning in
+        // `NotInitialized` and `PendingDeleted` cover freshly-opened cursors
+        // and cursors that just had their record deleted (D1 fix); warning in
         // those cases is noise that masks real leaks.
         if self.state == CursorState::Initialized {
             log::warn!("Cursor dropped without close (still positioned)");
@@ -755,7 +766,10 @@ mod tests {
 
         let status = cursor.delete().unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        // D1 fix: after delete the cursor is in PendingDeleted state, not
+        // NotInitialized, so that Next/Prev can advance to the successor.
+        // Ref: CursorImpl.java deleteCurrentRecord() / getNext() PD check.
+        assert_eq!(cursor.get_state(), CursorState::PendingDeleted);
 
         // Verify deleted
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -923,7 +937,8 @@ mod tests {
         assert_eq!(cursor.get_state(), CursorState::Initialized);
 
         cursor.delete().unwrap();
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        // D1 fix: PendingDeleted after delete, not NotInitialized.
+        assert_eq!(cursor.get_state(), CursorState::PendingDeleted);
 
         cursor.close().unwrap();
         assert_eq!(cursor.get_state(), CursorState::Closed);
