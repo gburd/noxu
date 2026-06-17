@@ -149,6 +149,13 @@ impl DatabaseImpl {
         } else {
             Tree::new(id.id() as u64, max_entries)
         };
+        // Wire the DatabaseConfig.key_prefixing flag into the tree so the
+        // BIN prefix-compression path honours it (JE DatabaseImpl.getKeyPrefixing
+        // -> IN.computeKeyPrefix). Sorted-dup DBs use a custom comparator and
+        // bypass prefix compression regardless; for the default-comparator case
+        // this enables/disables prefixing per the config.
+        let mut real_tree = real_tree;
+        real_tree.set_key_prefixing(config.key_prefixing);
         DatabaseImpl {
             id,
             name,
