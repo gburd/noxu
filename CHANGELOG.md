@@ -16,6 +16,18 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Documented (known limitations surfaced to users)
+
+- Added user-facing `known-limitations.md` rows for limitations already noted
+  in code: DPL secondary indexes are in-memory and not transactional (DPL-1;
+  the lower-level `noxu-db` `SecondaryDatabase` is atomic), collections
+  iterators are snapshots not live cursors (COL-1), tuple string encoding is
+  not wire-compatible with JE (TB-1, deliberate — Noxu uses a Rust-native
+  format), and the replication HA protocol is incomplete (election ranking,
+  authoritative-master partition detection, syncup matchpoint, DTVLSN,
+  master-transfer — D2/D3/D4/D5/D7/D9): do not rely on automatic failover for
+  correctness; operator-supervised failover only.
+
 ### Fixed (replication — network restore integrity)
 
 - **Network restore had no per-file integrity check** (`noxu-rep`, D10): a
