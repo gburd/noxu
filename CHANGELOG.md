@@ -18,7 +18,80 @@ listed in [References](#references).
 
 ### Fixed
 
-- **Recovery IN-redo (DRIFT-1/3/4/9/10)** (`noxu-recovery`, `noxu-tree`,
+- **Cursor D1/D5 — delete cursor position + adjustCursorsForInsert** (`noxu-dbi`,
+  `noxu-db`): After `cursor.delete()`, subsequent `Next`/`Prev` now returns
+  the successor/predecessor rather than `NotFound`.  A new `PendingDeleted`
+  cursor state retains the gap index (= former successor slot) after physical
+  removal, matching JE `CursorImpl.deleteCurrentRecord()` PD-flag semantics.
+  Also, `Get::Current` on a cursor whose slot was shifted by a concurrent
+  insert now re-anchors correctly instead of returning `NotFound`/wrong key
+  (CC-1 re-anchor extended to detect key mismatch at `current_index`).
+  Acceptance tests: `d1_delete_then_next_returns_successor`,
+  `d1_iterate_and_delete_all_records`, `d5_insert_before_positioned_cursor`.
+  Ref: `CursorImpl.java adjustCursorsForInsert` ~line 997,
+  `deleteCurrentRecord()` PD-flag, `getNext()` PD-check.
+
+- **Cursor D2 — BOTH_RANGE on non-dup DB** (`noxu-dbi`): On a non-duplicate
+  database, `SearchMode::BothRange` is now converted to `SearchMode::Both`
+  (exact key+data match), matching JE `Cursor.java search()` conversion.
+  Previously did a range search ignoring the `data` argument.
+  Acceptance tests: `d2_both_range_non_dup_non_matching_data_returns_not_found`.
+  Ref: `Cursor.java search()` BOTH_RANGE → BOTH conversion.
+
+- **Cursor D3/D4 — KEYEMPTY for defunct slots** (`noxu-dbi`, `noxu-db`):
+  `cursor.delete()` and `cursor.put(Put::Current)` on a slot already deleted
+  by a concurrent operation now return `OperationStatus::KeyEmpty` instead of
+  silently succeeding.  New `OperationStatus::KeyEmpty` variant added to the
+  public API.  Acceptance tests: `d3_delete_on_defunct_slot_returns_key_empty`,
+  `d4_put_current_on_defunct_slot_returns_key_empty`.
+  Ref: `CursorImpl.java deleteCurrentRecord()`, `Cursor.java putCurrent()`
+  KEYEMPTY paths.
+
+- **Cursor D10 — SearchGte writes back found key** (`noxu-db`): Already
+  implemented; added explicit acceptance test
+  `d10_search_gte_writes_back_found_key` confirming the behavior.
+  Ref: `Cursor.java getSearchKeyRange()` key input/output param.
+
+- **Cursor D11 — putNoDupData on non-dup DB is an error** (`noxu-dbi`,
+  `noxu-db`): `Put::NoDupData` on a non-duplicate database now returns
+  `Err(OperationNotAllowed)` with a clear message, matching JE's
+  `UnsupportedOperationException` from `Cursor.putNoDupData()`.
+  Acceptance test: `d11_put_no_dup_data_on_non_dup_db_errors`.
+  Ref: `Cursor.java putNoDupData()` non-dup guard.
+
+- **Secondary D6/D7 — integrity errors on corrupt secondary index**
+  (`noxu-db`): `insert_sec_key()` now raises `SecondaryIntegrityException`
+  when a duplicate `(sec_key, pri_key)` pair is detected in a fully-populated
+  index.  `delete_sec_key()` raises it when the `(sec_key, pri_key)` pair is
+  missing.  Matches JE `SecondaryDatabase.java insertSecKey()`/`deleteSecKey()`
+  integrity checks.  Acceptance tests: `d6_duplicate_sec_key_insert_raises_integrity_error`,
+  `d7_missing_sec_entry_on_delete_raises_integrity_error`.
+
+- **Secondary D8 — dirty-read missing primary skip** (`noxu-db`): Secondary
+  cursors opened with `CursorConfig::read_uncommitted()` now return `NotFound`
+  (skip the record) instead of raising `SecondaryIntegrityException` when the
+  primary record is missing.  Matches JE `SecondaryCursor.java`
+  `getWithPrimaryData()` dirty-read skip.  Acceptance test:
+  `d8_dirty_read_missing_primary_skips_record`.
+
+- **Secondary D9 — auto-maintenance removes old secondary key on overwrite**
+  (`noxu-db`): Already implemented via `Database::put` fetching `old_data`
+  before the write.  Acceptance test `d9_overwrite_changing_sec_key_removes_old_entry`
+  added to confirm.
+
+- **Secondary cascade delete double-delete fix** (`noxu-db`):
+  `SecondaryDatabase::delete()` and `SecondaryCursor::delete()` no longer
+  call `delete_all_for_primary` before `primary.delete()`.  The auto-hook
+  registered with the primary handles secondary cleanup; the prior double-call
+  triggered D7 errors on every cascade delete.
+
+- **Part 5 — D12 dupsPutNoOverwrite concurrent lock**: Documented as a known
+  gap.  JE's `BuddyLocker` next-key lock for concurrent `NoDupData` inserts
+  is approximated by the existing synthetic-key lock + B-tree latch
+  serialization.  Full BuddyLocker wiring deferred; see
+  `docs/d12-dupsPutNoOverwrite-gap.md`.
+
+ (`noxu-recovery`, `noxu-tree`,
   `noxu-dbi`): Previously the recovery redo pass discarded the dirty-IN map
   after building it, rebuilding user trees purely from committed LN replay.
   This diverged from JE's algorithm (`RecoveryManager.buildINs`/`recoverIN`/

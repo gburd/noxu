@@ -861,7 +861,6 @@ fn in_redo_bin_delta_reconstituted_survives_crash() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // Part-3 acceptance test (DRIFT-3/7 fix): file-flip fsync ordering
 //

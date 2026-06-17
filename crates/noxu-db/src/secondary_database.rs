@@ -278,11 +278,15 @@ impl SecondaryHookState {
                 // When fully populated this indicates a corrupt/inconsistent
                 // secondary index.  Raise SecondaryIntegrityException.
                 // Ref: SecondaryDatabase.java insertSecKey() KEYEXIST branch.
-                if self.is_fully_populated.load(std::sync::atomic::Ordering::Acquire) {
-                    Err(NoxuError::SecondaryIntegrityException(format!(
+                if self
+                    .is_fully_populated
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Err(NoxuError::SecondaryIntegrityException(
                         "duplicate (sec_key, pri_key) already in secondary index; \
                          secondary index is inconsistent"
-                    )))
+                            .into(),
+                    ))
                 } else {
                     // Not fully populated: during populate(), duplicates can
                     // legitimately exist if the index was partially built.
@@ -322,11 +326,15 @@ impl SecondaryHookState {
             // When fully populated this means the index is missing an entry
             // that should be there (corrupt secondary index).
             // Ref: SecondaryDatabase.java deleteSecKey() missing-entry branch.
-            if self.is_fully_populated.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(NoxuError::SecondaryIntegrityException(format!(
+            if self
+                .is_fully_populated
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(NoxuError::SecondaryIntegrityException(
                     "(sec_key, pri_key) pair not found in secondary index during delete; \
                      secondary index is missing a required entry"
-                )));
+                        .into(),
+                ));
             }
         }
         Ok(())

@@ -82,8 +82,7 @@ impl<'a> SecondaryCursor<'a> {
         txn: Option<&'a Transaction>,
         config: Option<&CursorConfig>,
     ) -> Result<Self> {
-        let read_uncommitted =
-            config.map_or(false, |c| c.read_uncommitted);
+        let read_uncommitted = config.is_some_and(|c| c.read_uncommitted);
         let inner = secondary_db.inner_db().open_cursor(txn, config)?;
         Ok(Self { inner, secondary_db, txn, read_uncommitted })
     }

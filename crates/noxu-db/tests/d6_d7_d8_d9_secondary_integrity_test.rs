@@ -52,7 +52,10 @@ fn open_env(dir: &TempDir) -> noxu_db::Environment {
     .unwrap()
 }
 
-fn open_primary(env: &noxu_db::Environment, name: &str) -> Arc<Mutex<Database>> {
+fn open_primary(
+    env: &noxu_db::Environment,
+    name: &str,
+) -> Arc<Mutex<Database>> {
     let db = env
         .open_database(
             None,
@@ -162,8 +165,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
     primary.lock().put(None, &pk, &de(b"B_v2")).unwrap();
 
     // Old secondary entry ([A], k1) must be gone.
-    let s_old =
-        sec.get(None, &de(&[b'A']), &mut p_key, &mut d).unwrap();
+    let s_old = sec.get(None, &de(&[b'A']), &mut p_key, &mut d).unwrap();
     assert_eq!(
         s_old,
         OperationStatus::NotFound,
@@ -171,8 +173,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
     );
 
     // New secondary entry ([B], k1) must exist.
-    let s_new =
-        sec.get(None, &de(&[b'B']), &mut p_key, &mut d).unwrap();
+    let s_new = sec.get(None, &de(&[b'B']), &mut p_key, &mut d).unwrap();
     assert_eq!(
         s_new,
         OperationStatus::Success,
@@ -205,8 +206,7 @@ fn d8_dirty_read_missing_primary_skips_record() {
     // Use update_secondary directly so auto-hook isn't involved.
     let orphan_pk = de(b"orphan");
     let orphan_data = de(b"A_orphan"); // sec_key = [A], different pri_key
-    sec.update_secondary(None, &orphan_pk, None, Some(&orphan_data))
-        .unwrap();
+    sec.update_secondary(None, &orphan_pk, None, Some(&orphan_data)).unwrap();
     // Note: we do NOT insert orphan_pk into the primary — it has no primary record.
 
     // Open a dirty-read secondary cursor.

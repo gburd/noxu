@@ -1724,13 +1724,15 @@ impl CursorImpl {
                 // We must drop the guard before calling into the tree.
                 drop(guard);
                 let db = self.db_impl.read();
-                if let Some(tree) = db.get_real_tree() {
-                    if tree.search_with_data(current_key).is_some_and(|s| s.found) {
-                        // Key still exists: insert-shifted position.  NOT deleted.
-                        // (The cursor will be re-anchored by retrieve_next /
-                        // the CC-1+D5 extension on next traversal.)
-                        return false;
-                    }
+                if let Some(tree) = db.get_real_tree()
+                    && tree
+                        .search_with_data(current_key)
+                        .is_some_and(|s| s.found)
+                {
+                    // Key still exists: insert-shifted position.  NOT deleted.
+                    // (The cursor will be re-anchored by retrieve_next /
+                    // the CC-1+D5 extension on next traversal.)
+                    return false;
                 }
                 return true; // key gone = deleted
             }
@@ -1811,7 +1813,7 @@ impl CursorImpl {
         // Ref: CursorImpl.java adjustCursorsForDelete() + getNext() PD check.
         let next_index = if pending_deleted {
             if forward {
-                self.current_index     // gap IS the next slot
+                self.current_index // gap IS the next slot
             } else {
                 self.current_index - 1 // predecessor of the deleted slot
             }
@@ -1873,8 +1875,7 @@ impl CursorImpl {
                     let idx = self.current_index as usize;
                     let key_mismatch = !out_of_bounds
                         && self.current_key.as_deref().is_some_and(|ck| {
-                            bin.get_full_key(idx)
-                                .is_none_or(|k| k != ck)
+                            bin.get_full_key(idx).is_none_or(|k| k != ck)
                         });
                     out_of_bounds || key_mismatch
                 } else {
@@ -2519,13 +2520,11 @@ impl CursorImpl {
             // when the DB does not support duplicates.
             // Map to DbiError::OperationFailed.
             // Ref: Cursor.java putNoDupData() non-dup guard.
-            PutMode::NoDupData => {
-                return Err(DbiError::OperationFailed(
-                    "putNoDupData is not supported on a non-duplicate database; \
-                     use put(NoOverwrite) for key-only uniqueness enforcement"
-                        .into(),
-                ));
-            }
+            PutMode::NoDupData => Err(DbiError::OperationFailed(
+                "putNoDupData is not supported on a non-duplicate database; \
+                 use put(NoOverwrite) for key-only uniqueness enforcement"
+                    .into(),
+            )),
             PutMode::Overwrite => {
                 let (old_data, old_lsn) = self.get_slot_before_image(key);
                 // T-F2: acquire RangeInsert if this is a brand-new key
