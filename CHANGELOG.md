@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (replication — authoritative-master detection, D4)
+
+- **`is_authoritative_master`** (`noxu-rep`, JE
+  `ElectionQuorum.isAuthoritativeMaster`): returns true only when this node is
+  the group master AND is still connected to enough electable replicas that,
+  including itself, a SIMPLE_MAJORITY quorum is present
+  (`(active_electable_replicas + 1) >= electable_total / 2 + 1`). A master on
+  the minority side of a partition is non-authoritative — the building block
+  for suppressing its `MASTER_RANKING` so the majority side can elect a fresh
+  master without split-brain. Pure quorum logic extracted as
+  `authoritative_quorum_met` for testing. Tests
+  `test_authoritative_quorum_met`,
+  `test_is_authoritative_master_requires_master_role`.
+
 ### Added (replication — DTVLSN substrate, D7 part 1)
 
 - **In-memory Durable Transaction VLSN tracking** (`noxu-rep`): added the

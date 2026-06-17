@@ -1078,6 +1078,65 @@ impl ReplicatedEnvironment {
         self.node_state.get_state() == NodeState::Master
     }
 
+    /// Returns true if this node is an *authoritative* master (D4, JE
+    /// `ElectionQuorum.isAuthoritativeMaster`): it is the group master AND it
+    /// is still connected to enough replicas that, including itself, a
+    /// SIMPLE_MAJORITY quorum is present.
+    ///
+    /// A master on the minority side of a network partition is NOT
+    /// authoritative — it must not claim the special election ranking
+    /// (`MASTER_RANKING`) nor (eventually) continue accepting writes, so the
+    /// majority side can elect a fresh master without it competing
+    /// (split-brain prevention).
+    ///
+    /// "Active replica count" = the number of currently-connected push-feeder
+    /// runners serving *electable* peers (Monitors/Secondaries do not count
+    /// toward the election quorum). `+ 1` for this master itself.
+    pub fn is_authoritative_master(&self) -> bool {
+        if !self.is_master() {
+            return false;
+        }
+        let group = self.get_rep_group();
+        // Total electable nodes (incl. self) — peers + this master.
+        let electable_total: usize = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
+            .count()
+            + 1; // +1 for self/master (not registered as a peer)
+
+        // Active replicas = connected feeder runners whose peer is electable.
+        let active_electable_replicas: usize = {
+            let runners = self.active_feeder_runners.lock().unwrap();
+            runners
+                .keys()
+                .filter(|name| {
+                    group
+                        .get_node(name)
+                        .map(|n| {
+                            n.node_type == crate::node_type::NodeType::Electable
+                        })
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        Self::authoritative_quorum_met(
+            active_electable_replicas,
+            electable_total,
+        )
+    }
+
+    /// Pure SIMPLE_MAJORITY quorum check for `is_authoritative_master` (JE
+    /// `ElectionQuorum.isAuthoritativeMaster`): `(activeReplicas + 1) >=
+    /// quorumSize` where `quorumSize = electableTotal / 2 + 1`.
+    fn authoritative_quorum_met(
+        active_electable_replicas: usize,
+        electable_total: usize,
+    ) -> bool {
+        let quorum_size = electable_total / 2 + 1;
+        (active_electable_replicas + 1) >= quorum_size
+    }
+
     /// Check if this node is a replica.
     ///
     /// Returns true if the node's current state is Replica.
@@ -2809,6 +2868,32 @@ mod tests {
         // An unknown replica likewise does not qualify.
         env.record_ack(1, "ghost");
         assert!(!env.get_ack_tracker().is_satisfied(1));
+    }
+
+    #[test]
+    fn test_authoritative_quorum_met() {
+        // 1-node group (electable_total=1): master alone IS authoritative
+        // (quorum_size = 1/2+1 = 1; 0 replicas + 1 >= 1).
+        assert!(ReplicatedEnvironment::authoritative_quorum_met(0, 1));
+        // 3-node group (electable_total=3, quorum_size=2): master with 0
+        // connected replicas is the minority -> NOT authoritative.
+        assert!(!ReplicatedEnvironment::authoritative_quorum_met(0, 3));
+        // 3-node group with 1 connected electable replica -> 1+1=2 >= 2 -> yes.
+        assert!(ReplicatedEnvironment::authoritative_quorum_met(1, 3));
+        // 5-node group (quorum_size=3): need 2 connected replicas.
+        assert!(!ReplicatedEnvironment::authoritative_quorum_met(1, 5));
+        assert!(ReplicatedEnvironment::authoritative_quorum_met(2, 5));
+    }
+
+    #[test]
+    fn test_is_authoritative_master_requires_master_role() {
+        // A non-master is never authoritative regardless of connections.
+        let env = ReplicatedEnvironment::new(test_config("node1")).unwrap();
+        assert!(!env.is_master());
+        assert!(!env.is_authoritative_master());
+        // A single-node master (no peers) IS authoritative.
+        env.become_master(1).unwrap();
+        assert!(env.is_authoritative_master());
     }
 
     #[test]
