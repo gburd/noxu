@@ -511,6 +511,12 @@ impl Cleaner {
         self
     }
 
+    /// Returns true if a `TxnManager` has been wired (CLN-4 first-active-txn
+    /// clamp is active). Used to verify production wiring in tests.
+    pub fn has_txn_manager(&self) -> bool {
+        self.txn_manager.is_some()
+    }
+
     /// Wire a checkpoint wakeup callback for CLN-14 (`wakeupAfterNoWrites`).
     ///
     /// The callback is invoked at the end of a cleaning pass when no active

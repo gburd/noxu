@@ -1330,3 +1330,22 @@ fn test_commit_pending_concurrent_open_no_duplicate_db_id() {
 
     env.close().unwrap();
 }
+
+/// GAP-8 regression: the cleaner built by EnvironmentImpl must have the
+/// TxnManager wired so do_clean clamps file selection to the first-active-txn
+/// window (CLN-4). Before the fix, EnvironmentImpl wired the tree-registry and
+/// utilization-tracker but NOT the txn_manager, leaving first_active_txn_file
+/// permanently None and the clamp inert.
+#[test]
+fn gap8_production_cleaner_has_txn_manager_wired() {
+    use noxu_dbi::EnvironmentImpl;
+    let dir = tempfile::tempdir().unwrap();
+    // EnvironmentImpl::new(path, read_only=false, transactional=true)
+    let env = EnvironmentImpl::new(dir.path(), false, true).expect("open env");
+    let cleaner = env.get_cleaner().expect("writable env has a cleaner");
+    assert!(
+        cleaner.has_txn_manager(),
+        "GAP-8: production cleaner must have TxnManager wired for the \
+         first-active-txn clamp (CLN-4)"
+    );
+}

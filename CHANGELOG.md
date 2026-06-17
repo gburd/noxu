@@ -16,6 +16,26 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (production-wiring gaps found by fix-verification audit)
+
+- **key_prefixing lost on recovery** (`noxu-dbi`): `DatabaseImpl::set_recovered_tree`
+  (the crash-reopen path) replaced the tree without re-applying the key_prefixing
+  flag, so a `key_prefixing=true` database silently disabled prefix compression
+  for all inserts after any reopen. Now re-applies the flag (JE
+  DatabaseImpl.getKeyPrefixing survives recovery via persistent DB metadata).
+  Regression test `test_set_recovered_tree_preserves_key_prefixing` (fail-pre/pass-post).
+- **CLN-4 cleaner txn-window clamp was inert** (`noxu-dbi`): `EnvironmentImpl`
+  wired the cleaner's tree-registry and utilization-tracker but NOT its
+  `TxnManager`, so `do_clean`'s first-active-transaction clamp
+  (`first_active_txn_file`) was always `None` — the cleaner could select files
+  whose log entries an open transaction still needed (JE
+  `UtilizationCalculator.getBestFile` clamps to `min(newestFile,
+  firstActiveTxnFile)`). Now wires `with_txn_manager` onto the production cleaner.
+  Regression test `gap8_production_cleaner_has_txn_manager_wired` (fail-pre/pass-post).
+- Corrected stale `log_manager.rs` doc comments that still described the
+  pre-fix "LWL covers pwrite64" design; the LWL is released before pwrite
+  (DRIFT-1, already fixed) and the comments now describe the JE-faithful state.
+
 ### Fixed
 
 - **B-tree DRIFT-1 — splitSpecial heuristic** (`noxu-tree`): Sequential-append

@@ -660,6 +660,13 @@ impl EnvironmentImpl {
             if let Some(ref tracker) = utilization_tracker {
                 c = c.with_utilization_tracker(Arc::clone(tracker));
             }
+            // CLN-4: wire the TxnManager so do_clean clamps file selection to
+            // the first-active-transaction window — the cleaner must not clean
+            // a file whose log entries an open transaction may still need.
+            // JE: UtilizationCalculator.getBestFile uses
+            //   firstActiveFile = min(newestFile, firstActiveTxnFile).
+            // Without this the clamp is inert (first_active_txn_file == None).
+            c = c.with_txn_manager(Arc::clone(&txn_manager));
             Arc::new(c)
         });
 

@@ -358,6 +358,13 @@ impl DatabaseImpl {
         {
             tree.set_comparator(cmp);
         }
+        // Re-apply the key-prefixing flag to the recovered tree.  The
+        // recovered Tree is built by RecoveryManager with key_prefixing=false
+        // (JE default); without this the flag set in `new()` is lost on reopen
+        // and a key_prefixing=true DB silently disables prefix compression for
+        // all post-recovery inserts. (JE DatabaseImpl.getKeyPrefixing is read
+        // from persistent DB metadata, so it survives recovery.)
+        tree.set_key_prefixing(self.flags & PREFIXING_ENABLED != 0);
         self.real_tree = Some(Arc::new(RwLock::new(tree)));
     }
 
@@ -569,6 +576,33 @@ mod tests {
             &config,
         );
         assert!(db2.get_key_prefixing());
+    }
+
+    #[test]
+    fn test_set_recovered_tree_preserves_key_prefixing() {
+        // GAP-5 regression: set_recovered_tree (the reopen/recovery path)
+        // must re-apply the key_prefixing flag to the recovered tree, which
+        // RecoveryManager builds with key_prefixing=false. Without this, a
+        // key_prefixing=true DB silently disables prefix compression after
+        // every crash/reopen.
+        let mut config = DatabaseConfig::default();
+        config.key_prefixing = true;
+        let mut db = DatabaseImpl::new(
+            DatabaseId::new(7),
+            "kp_recover".to_string(),
+            DbType::User,
+            &config,
+        );
+        // A freshly-recovered tree defaults to key_prefixing=false.
+        let recovered = Tree::new(7, 256);
+        assert!(!recovered.key_prefixing, "recovered tree starts false");
+        db.set_recovered_tree(recovered);
+        // After set_recovered_tree, the tree must honour the DB's flag.
+        let t = db.get_real_tree_arc().expect("real tree");
+        assert!(
+            t.read().unwrap().key_prefixing,
+            "GAP-5: set_recovered_tree must preserve key_prefixing=true"
+        );
     }
 
     #[test]

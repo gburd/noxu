@@ -24,13 +24,13 @@
 //!
 //! # Flush/fsync path (flush_sync)
 //!
-//! NOTE (Part-2 target, DRIFT-1): the LWL currently covers pwrite64, which
-//! serialises disk I/O and is the root cause of the 3-4x concurrency gap
-//! vs JE.  JE releases the LWL before the pwrite and relies on the pool's
-//! write_dirty (called inside get_write_buffer / bumpAndWriteDirty) to drain
-//! buffers.  Part-2 will restructure flush_sync to match JE.
-//! Current (pre-Part-2): Under LWL: collect dirty buffers + pwrite64.
-//! Outside LWL: fdatasync via FsyncManager leader/waiter (group-commit).
+//! LWL discipline (JE LogManager.serialLogWork, DRIFT-1 fixed): the log-write
+//! latch covers ONLY LSN assignment, buffer-slot allocation, and the in-memory
+//! copy of the entry bytes. flush_sync RELEASES the LWL before pwrite64, and
+//! the fdatasync runs outside the LWL via FsyncManager leader/waiter
+//! (group-commit). Concurrent committers serialise only on the in-memory
+//! bookkeeping, not on the syscall — matching JE and closing the prior
+//! concurrency gap.
 //!
 //! # Read path (getLogEntryFromLogSource -> Rust LogManager::read_entry)
 //!
@@ -90,10 +90,11 @@ pub struct LogManager {
     /// Serializes all log writes so entries appear in LSN order.
     /// this the "Log Write Latch" (LWL).
     ///
-    /// **Foreground commit path (`flush_sync`)**: held through LSN assignment,
-    /// memcpy into the write buffer, AND the pwrite64 syscall.  Holding through
-    /// pwrite64 ensures all concurrent committers complete kernel writes before
-    /// entering `FsyncManager` together → fsync coalescing (correct design).
+    /// **Foreground commit path (`flush_sync`)**: held through LSN assignment
+    /// and the in-memory memcpy into the write buffer, then RELEASED before the
+    /// pwrite64 syscall (JE LogManager.serialLogWork). Concurrent committers
+    /// each pwrite off-latch and then coalesce their fdatasync via
+    /// `FsyncManager` leader/waiter group-commit.
     ///
     /// **Background flush path (`flush_no_sync`, R-2 fix)**: the LWL is
     /// released BEFORE pwrite64.  Background flush has no coalescing
