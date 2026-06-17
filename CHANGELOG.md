@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (replication — VLSN range semantics)
+
+- **`lastSync` / `lastTxnEnd` doc-comment inversion** (`noxu-rep`, D8): the
+  `VlsnRange` field comments described `commit_vlsn` as the "sync matchpoint"
+  and `sync_vlsn` as the "transaction end" — transposed from JE. JE
+  `VLSNRange` keeps two distinct concepts: `lastSync` (highest sync-point VLSN,
+  the matchpoint candidate) and `lastTxnEnd` (highest commit/abort VLSN, the
+  rollback boundary). Corrected the field/getter semantics, added JE-faithful
+  aliases `get_last_sync` / `get_last_txn_end`, and added
+  `update_for_new_mapping` mirroring `VLSNRange.getUpdateForNewMapping`
+  (entry-type dispatch so a Matchpoint advances `lastSync` ahead of
+  `lastTxnEnd`). The syncup matchpoint protocol that consumes these fields
+  remains a tracked parity gap (D5).
+
 ### Fixed (replication — split-brain)
 
 - **Paxos Phase-2 acceptor admitted an unpromised higher term** (`noxu-rep`,

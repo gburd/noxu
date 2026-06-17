@@ -4,6 +4,8 @@
 //! VLSNs available on this node, including the first and last VLSN in the
 //! contiguous range, as well as the last committed and last synced VLSNs.
 
+use noxu_log::LogEntryType;
+
 /// Tracks the range of VLSNs available on this node.
 ///
 /// All range values must be viewed together to ensure a consistent set of
@@ -15,11 +17,17 @@ pub struct VlsnRange {
     first: u64,
     /// Last available VLSN (inclusive). 0 means empty.
     last: u64,
-    /// Last committed VLSN (last sync matchpoint).
-    /// Field.
+    /// `lastTxnEnd` (JE VLSNRange.lastTxnEnd): the highest VLSN of a
+    /// commit/abort log entry. This is the rollback safety boundary used by
+    /// the syncup `verifyRollback` decision (a replica must not roll back
+    /// past a transaction end it has acknowledged). NOT the same as the sync
+    /// matchpoint — see `sync_vlsn`.
     commit_vlsn: u64,
-    /// Last synced-to-disk VLSN (last transaction end).
-    /// Field.
+    /// `lastSync` (JE VLSNRange.lastSync): the highest VLSN of a sync-point
+    /// log entry. This is the initial matchpoint candidate in
+    /// `ReplicaFeederSyncup.findMatchpoint`. JE notes lastSync and lastTxnEnd
+    /// are currently the same value but are kept distinct because the
+    /// Matchpoint log entry may make lastSync run ahead of lastTxnEnd.
     sync_vlsn: u64,
 }
 
@@ -57,13 +65,23 @@ impl VlsnRange {
         self.last
     }
 
-    /// Return the last committed VLSN (sync matchpoint).
+    /// Return `lastTxnEnd`: the highest commit/abort VLSN (rollback boundary).
     pub fn get_commit_vlsn(&self) -> u64 {
         self.commit_vlsn
     }
 
-    /// Return the last synced-to-disk VLSN (transaction end).
+    /// JE-faithful alias for `get_commit_vlsn` (JE VLSNRange.getLastTxnEnd).
+    pub fn get_last_txn_end(&self) -> u64 {
+        self.commit_vlsn
+    }
+
+    /// Return `lastSync`: the highest sync-point VLSN (matchpoint candidate).
     pub fn get_sync_vlsn(&self) -> u64 {
+        self.sync_vlsn
+    }
+
+    /// JE-faithful alias for `get_sync_vlsn` (JE VLSNRange.getLastSync).
+    pub fn get_last_sync(&self) -> u64 {
         self.sync_vlsn
     }
 
@@ -121,23 +139,51 @@ impl VlsnRange {
         }
     }
 
-    /// Update the commit VLSN (sync matchpoint).
+    /// Update `lastTxnEnd` (the commit/abort boundary).
     ///
-    /// The commit VLSN can only advance forward. If the given VLSN is
-    /// less than the current commit VLSN, this is a no-op.
+    /// Advances forward only; a VLSN below the current value is a no-op.
     pub fn update_commit(&mut self, vlsn: u64) {
         if vlsn > self.commit_vlsn {
             self.commit_vlsn = vlsn;
         }
     }
 
-    /// Update the sync VLSN (last transaction end).
+    /// Update `lastSync` (the sync-point matchpoint candidate).
     ///
-    /// The sync VLSN can only advance forward. If the given VLSN is
-    /// less than the current sync VLSN, this is a no-op.
+    /// Advances forward only; a VLSN below the current value is a no-op.
     pub fn update_sync(&mut self, vlsn: u64) {
         if vlsn > self.sync_vlsn {
             self.sync_vlsn = vlsn;
+        }
+    }
+
+    /// JE-faithful update: extend the range for a new (vlsn, entry-type)
+    /// mapping, dispatching `lastSync`/`lastTxnEnd` by entry type.
+    ///
+    /// Mirrors `VLSNRange.getUpdateForNewMapping` (VLSNRange.java:162-190):
+    ///   - always extend `first`/`last`;
+    ///   - if `entry_type.is_sync_point()` advance `lastSync` (`sync_vlsn`);
+    ///   - if the entry is a commit or abort advance `lastTxnEnd`
+    ///     (`commit_vlsn`).
+    ///
+    /// This is the canonical path that keeps `lastSync` and `lastTxnEnd`
+    /// distinct as JE intends; the syncup matchpoint protocol (the consumer)
+    /// is tracked separately as a parity gap.
+    pub fn update_for_new_mapping(
+        &mut self,
+        vlsn: u64,
+        entry_type: LogEntryType,
+    ) {
+        self.extend(vlsn);
+        if entry_type.is_sync_point() && vlsn > self.sync_vlsn {
+            self.sync_vlsn = vlsn;
+        }
+        if matches!(
+            entry_type,
+            LogEntryType::TxnCommit | LogEntryType::TxnAbort
+        ) && vlsn > self.commit_vlsn
+        {
+            self.commit_vlsn = vlsn;
         }
     }
 
@@ -219,6 +265,34 @@ impl std::fmt::Display for VlsnRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_for_new_mapping_dispatch() {
+        use noxu_log::LogEntryType;
+        let mut r = VlsnRange::new();
+        // A non-txn insert LN: extends first/last only, leaves lastSync /
+        // lastTxnEnd at 0.
+        r.update_for_new_mapping(5, LogEntryType::InsertLN);
+        assert_eq!(r.get_last(), 5);
+        assert_eq!(r.get_last_sync(), 0, "InsertLN is not a sync point");
+        assert_eq!(r.get_last_txn_end(), 0, "InsertLN is not a commit/abort");
+        // A commit: advances BOTH lastTxnEnd and lastSync (commit is a sync
+        // point in JE — is_sync_point() includes TxnCommit).
+        r.update_for_new_mapping(8, LogEntryType::TxnCommit);
+        assert_eq!(r.get_last(), 8);
+        assert_eq!(r.get_last_txn_end(), 8, "commit advances lastTxnEnd");
+        assert_eq!(r.get_last_sync(), 8, "commit is a sync point -> lastSync");
+        // A Matchpoint at 12: a sync point but NOT a commit/abort, so lastSync
+        // runs AHEAD of lastTxnEnd (the exact JE scenario the two distinct
+        // fields exist for).
+        r.update_for_new_mapping(12, LogEntryType::Matchpoint);
+        assert_eq!(r.get_last_sync(), 12, "matchpoint advances lastSync");
+        assert_eq!(
+            r.get_last_txn_end(),
+            8,
+            "matchpoint is not a txn end -> lastTxnEnd unchanged"
+        );
+    }
 
     #[test]
     fn test_new_empty() {
