@@ -43,6 +43,45 @@ listed in [References](#references).
   (entry-type dispatch so a Matchpoint advances `lastSync` ahead of
   `lastTxnEnd`). The syncup matchpoint protocol that consumes these fields
   remains a tracked parity gap (D5).
+### Fixed (tree — compressor TOCTOU / production panic)
+
+- **IC-1 — empty-BIN prune could remove a LIVE entry** (`noxu-tree`):
+  `Tree::compress_bin`'s prune step read `now_empty` under a FRESH read lock
+  taken *after* the compression write lock was dropped, then called
+  `self.delete(&id_key)`, which re-descends by key. Between the `now_empty`
+  read and the delete, a concurrent insert could repopulate the BIN, and
+  `self.delete(&id_key)` then removed whatever LIVE entry matched `id_key` —
+  tree corruption / lost write. Replaced with a new `Tree::prune_empty_bin`
+  that re-descends to the specific empty BIN and, **under the parent IN write
+  latch**, re-validates `n_entries == 0`, not-a-delta, and `cursor_count == 0`
+  before removing the BIN's parent slot; if any check fails it removes NOTHING.
+  This is the faithful port of JE `Tree.delete(idKey)` /
+  `Tree.searchDeletableSubTree` (Tree.java ~line 755-800,
+  `NodeNotEmptyException` / `CursorsExistException`) as called by
+  `INCompressor.pruneBIN` (INCompressor.java ~line 502-510). Regression tests
+  `test_ic1_prune_empty_bin_aborts_when_repopulated`,
+  `test_ic1_prune_empty_bin_aborts_with_cursor`,
+  `test_ic1_prune_empty_bin_succeeds_when_truly_empty` (fail-pre/pass-post).
+- **IC-2 — `BIN::compress` aborted the process on a live cursor** (`noxu-tree`):
+  `Bin::compress` had `assert!(self.n_cursors() == 0, "compress called with
+  active cursors")`, which panics (aborts) in production. JE never panics here
+  — `INCompressor.compress`/`pruneBIN` (INCompressor.java ~line 465-466, 587)
+  checks `bin.nCursors() > 0` and REQUEUES the BIN for a later pass. Now
+  `compress` returns `false` ("nothing compressed, try later") and leaves the
+  BIN untouched when cursors are present. Regression test
+  `test_ic2_compress_with_cursor_is_noop_not_panic` (fail-pre/pass-post).
+
+### Documented (tree)
+
+- **IC-3 — compressor BIN slot removal does not consult the lock manager**
+  (`noxu-tree`): documented as a known limitation
+  (`docs/src/operations/known-limitations.md`). The lock manager lives in a
+  different crate (`noxu-txn`); the tree layer has no access to it. This is
+  safe in the current design because the compressor only ever sees committed
+  defunct slots (the dbi write path physically removes slots under the txn
+  write lock; the only writer of `BinStub.known_deleted = true` is
+  BIN-delta/recovery replay of committed deletes). A `ponytail:` code comment
+  in `compress_bin` records the ceiling and upgrade path.
 
 ### Fixed (replication — split-brain)
 

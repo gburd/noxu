@@ -1194,12 +1194,22 @@ impl Bin {
     /// removed — this design to allow delta logging after
     /// compression of clean slots.
     ///
-    /// Returns `true` always (locking checks are no-ops in this implementation).
+    /// Returns `true` if compression ran (the BIN was eligible), `false` if it
+    /// was skipped because the BIN currently has active cursors.
     ///
-    ///
+    /// IC-2: JE never panics when a cursor is present.  JE
+    /// `INCompressor.compress` / `pruneBIN` (INCompressor.java ~line 465-466,
+    /// 587) checks `bin.nCursors() > 0` and REQUEUES the BIN for a later pass.
+    /// A production `assert!(n_cursors() == 0)` that aborts the process on a
+    /// live cursor is a re-invention; we return `false` ("nothing compressed,
+    /// try later") instead so callers can skip / requeue.
     pub fn compress(&mut self, compress_dirty_slots: bool) -> bool {
         assert!(!self.is_bin_delta(), "compress called on BIN-delta");
-        assert!(self.n_cursors() == 0, "compress called with active cursors");
+        // IC-2: no-op (do NOT panic) when cursors are present, mirroring JE's
+        // requeue-for-later behaviour (INCompressor.java ~line 465-466, 587).
+        if self.n_cursors() != 0 {
+            return false;
+        }
 
         let mut i = 0;
         while i < self.get_n_entries() {
@@ -2625,6 +2635,42 @@ mod tests {
 
         bin.compress(true);
         assert_eq!(bin.get_n_entries(), 0);
+    }
+
+    /// IC-2 (fail-pre / pass-post): compress() with an active cursor must NOT
+    /// panic.  The old code had `assert!(self.n_cursors() == 0, ...)` which
+    /// aborts the process in production.  JE never panics here —
+    /// `INCompressor.compress`/`pruneBIN` (INCompressor.java ~line 465-466,
+    /// 587) checks `bin.nCursors() > 0` and requeues for later.  Our fix
+    /// returns `false` ("nothing compressed") and leaves the BIN untouched.
+    #[test]
+    fn test_ic2_compress_with_cursor_is_noop_not_panic() {
+        let mut bin = Bin::new(1, 128);
+        bin.insert_entry(b"k:a".to_vec(), Lsn::from_u64(1), 0, None).unwrap();
+        bin.insert_entry(b"k:b".to_vec(), Lsn::from_u64(2), 0, None).unwrap();
+        // Mark slot 0 known-deleted (non-dirty) so compress WOULD remove it.
+        bin.inner.states[0] = crate::entry_states::KNOWN_DELETED_BIT;
+
+        // Park a cursor on the BIN.
+        bin.add_cursor(42);
+        assert_eq!(bin.n_cursors(), 1);
+
+        // Must return false and NOT panic, and must NOT remove the slot.
+        let progressed = bin.compress(true);
+        assert!(
+            !progressed,
+            "IC-2: compress with active cursor must report no progress"
+        );
+        assert_eq!(
+            bin.get_n_entries(),
+            2,
+            "IC-2: compress with active cursor must leave the BIN untouched"
+        );
+
+        // After the cursor leaves, compress proceeds normally.
+        bin.remove_cursor(42);
+        assert!(bin.compress(true), "compress must run once cursors are gone");
+        assert_eq!(bin.get_n_entries(), 1, "deleted slot removed after unpin");
     }
 
     // ========================================================================
