@@ -695,9 +695,34 @@ impl FileManager {
         }
     }
 
+    /// Fsyncs the current log file to stable storage and removes it from the
+    /// file-handle cache, making the old file handle eligible for GC.
+    ///
+    /// JE faithfulness (Part-3, DRIFT-3/7): mirrors
+    /// `FileManager.syncLogEndAndFinishFile()` which calls `syncLogEnd()` then
+    /// `endOfLog.close()`.  Called by `LogBufferPool.getWriteBuffer` when
+    /// `flippedFile=true`, under the LWL, BEFORE `advanceLsn` advances the
+    /// LSN bookkeeping to the new file.  This establishes the JE invariant
+    /// that the OLD file is durably closed before any entry is written to the
+    /// NEW file.
+    ///
+    /// References:
+    /// - JE `FileManager.syncLogEndAndFinishFile` (line 2077)
+    /// - JE `LogBufferPool.getWriteBuffer` (called after `bumpAndWriteDirty`
+    ///   when `flippedFile=true`)
+    pub fn sync_log_end_and_finish_file(&self) -> Result<()> {
+        self.sync_log_end()?;
+        // Evict the current (old) file from the LRU cache so its OS file
+        // descriptor is released promptly — JE `endOfLog.close()`.
+        let file_num = self.current_file_num.load(Ordering::Acquire);
+        let mut cache = self.file_cache.lock();
+        cache.pop(&file_num);
+        Ok(())
+    }
+
     /// Fsyncs the current log file to stable storage.
     ///
-    ///
+    /// JE: `FileManager.syncLogEnd()` (called from `syncLogEndAndFinishFile`).
     pub fn sync_log_end(&self) -> Result<()> {
         if self.read_only {
             return Ok(());

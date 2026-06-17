@@ -162,7 +162,7 @@ impl LogManager {
         buffer_size: usize,
         read_buffer_size: usize,
     ) -> Self {
-        let buffer_pool = LogBufferPool::new(num_buffers, buffer_size);
+        let buffer_pool = LogBufferPool::new(num_buffers, buffer_size, Arc::clone(&file_manager));
 
         LogManager {
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),

@@ -1,29 +1,46 @@
 //! Pool of log buffers for managing write buffering.
 //!
+//! `LogBufferPool` manages a circular pool of [`LogBuffer`]s.
+//! The `currentWriteBuffer` is the buffer that is currently used to add data.
+//! When the buffer is full, the next (adjacent) buffer is made available for
+//! writing. The buffer pool has a dirty list of buffers. A buffer becomes a
+//! member of the dirty list when the `currentWriteBuffer` is moved to another
+//! buffer. Buffers are removed from the dirty list when they are written.
 //!
-//! LogBufferPool manages a circular pool of LogBuffers. The currentWriteBuffer
-//! is the buffer that is currently used to add data. When the buffer is full,
-//! the next (adjacent) buffer is made available for writing. The buffer pool
-//! has a dirty list of buffers. A buffer becomes a member of the dirty list
-//! when the currentWriteBuffer is moved to another buffer. Buffers are removed
-//! from the dirty list when they are written.
-//!
-//! The dirtyStart/dirtyEnd variables indicate the list of dirty buffers.
+//! The `dirtyStart`/`dirtyEnd` variables indicate the list of dirty buffers.
 //! A value of -1 for either variable indicates that there are no dirty buffers.
-//! These variables are synchronized via the bufferPoolLatch. The
-//! LogManager.logWriteLatch (aka LWL) is used to serialize access to the
-//! currentWriteBuffer, so that entries are added in write/LSN order.
+//! These variables are synchronized via the `bufferPoolLatch`. The
+//! `LogManager.logWriteLatch` (aka LWL) is used to serialize access to the
+//! `currentWriteBuffer`, so that entries are added in write/LSN order.
+//!
+//! # JE faithfulness note (Part 1 — DRIFT-2)
+//!
+//! `write_dirty` now calls [`FileManager::write_buffer`] for every dirty buffer
+//! in the dirty chain, mirroring `LogBufferPool.writeDirty` →
+//! `writeBufferToFile` → `fileManager.writeLogBuffer` in JE.  Prior to this
+//! fix the method was a no-op stub that reset the dirty indices without
+//! writing any bytes, causing a latent panic ("No free log buffers") under
+//! buffer pressure.
+//!
+//! References:
+//! - JE `LogBufferPool.writeDirty` (calls `writeBufferToFile`)
+//! - JE `LogBufferPool.writeBufferToFile` (calls `fileManager.writeLogBuffer`)
+//! - JE `FileManager.writeLogBuffer` (pwrite via `writeToFile`)
 
 use crate::error::{LogError, Result};
+use crate::file_manager::FileManager;
 use crate::log_buffer::LogBuffer;
 use noxu_latch::ExclusiveLatch;
 use noxu_sync::Mutex;
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 
-/// Manages a circular pool of LogBuffers.
+/// Manages a circular pool of [`LogBuffer`]s.
 ///
+/// Ported from `LogBufferPool.java` in JE.
 ///
+/// Holds a reference to the [`FileManager`] so that `write_dirty` can issue
+/// the actual `pwrite` calls (JE `writeBufferToFile` → `fileManager.writeLogBuffer`).
 pub struct LogBufferPool {
     /// The pool of buffers (typically 3 buffers).
     buffers: Vec<Arc<Mutex<LogBuffer>>>,
@@ -55,11 +72,28 @@ pub struct LogBufferPool {
     n_not_resident: u64,
     n_cache_miss: u64,
     n_no_free_buffer: u64,
+
+    /// Reference to the FileManager for issuing the actual pwrite calls in
+    /// `write_dirty`.
+    ///
+    /// JE: `LogBufferPool` holds a reference to the `FileManager` (passed via
+    /// the `EnvironmentImpl`) and calls `fileManager.writeLogBuffer()` from
+    /// `writeBufferToFile()`.
+    file_manager: Arc<FileManager>,
 }
 
 impl LogBufferPool {
-    /// Creates a new LogBufferPool with the specified number of buffers and buffer size.
-    pub fn new(num_buffers: usize, buffer_size: usize) -> Self {
+    /// Creates a new `LogBufferPool` with the given number of buffers and buffer
+    /// size, wired to `file_manager` for actual disk writes.
+    ///
+    /// JE: the pool receives the `FileManager` via `EnvironmentImpl` at
+    /// construction time; it calls `fileManager.writeLogBuffer()` from
+    /// `writeBufferToFile()`.
+    pub fn new(
+        num_buffers: usize,
+        buffer_size: usize,
+        file_manager: Arc<FileManager>,
+    ) -> Self {
         let mut buffers = Vec::with_capacity(num_buffers);
         for _ in 0..num_buffers {
             buffers.push(Arc::new(Mutex::new(LogBuffer::new(buffer_size))));
@@ -77,6 +111,7 @@ impl LogBufferPool {
             n_not_resident: 0,
             n_cache_miss: 0,
             n_no_free_buffer: 0,
+            file_manager,
         }
     }
 
@@ -220,11 +255,20 @@ impl LogBufferPool {
         if slot_number < self.buffers.len() - 1 { slot_number + 1 } else { 0 }
     }
 
-    /// Writes the dirty log buffers.
+    /// Writes the dirty log buffers to disk.
     ///
-    /// Iterates the dirty buffer chain and flushes each buffer to the
-    /// FileManager write queue.
-    /// .
+    /// Iterates the dirty buffer chain and, for each buffer, calls
+    /// [`FileManager::write_buffer`] to issue the actual `pwrite` — matching
+    /// JE `LogBufferPool.writeDirty` → `writeBufferToFile` →
+    /// `fileManager.writeLogBuffer`.
+    ///
+    /// Prior to Part-1 (DRIFT-2 fix) this was a no-op stub that reset the
+    /// dirty indices without writing any bytes, causing a latent panic ("No
+    /// free log buffers") under buffer pressure.
+    ///
+    /// # Safety / locking
+    /// The LWL must be held by the caller.  The `bufferPoolLatch` is acquired
+    /// internally for the duration of the dirty-list traversal.
     fn write_dirty(&mut self, _flush_write_queue: bool) -> Result<()> {
         let _guard = self
             .buffer_pool_latch
@@ -236,21 +280,47 @@ impl LogBufferPool {
         }
 
         let mut current_dirty = self.dirty_start as usize;
+        // JE: `writeDirty` iterates [dirtyStart..dirtyEnd], writes each buffer
+        // via `writeBufferToFile` → `fileManager.writeLogBuffer`, then resets
+        // dirtyStart/dirtyEnd to -1.  We replicate that exactly here.
         loop {
-            let buffer = self.buffers[current_dirty].lock();
-            buffer.wait_for_zero_and_latch();
+            let is_last = current_dirty == self.dirty_end as usize;
 
-            // Flush the buffer to disk via the FileManager.
-            // The FileManager integration is handled at the LogManager layer;
-            // here we simply release the latch so the buffer can be reused.
-            buffer.release();
-            drop(buffer);
+            {
+                let mut buffer = self.buffers[current_dirty].lock();
+                // Wait for all writers to drain their pin counts and latch the
+                // buffer — JE `lb.waitForZeroAndLatch()`.
+                buffer.wait_for_zero_and_latch();
 
-            if current_dirty == self.dirty_end as usize {
-                break;
-            } else {
-                current_dirty = self.get_next_slot(current_dirty);
+                // Write unflushed bytes to disk — JE `writeBufferToFile` →
+                // `fileManager.writeLogBuffer` → pwrite.
+                let first_lsn = buffer.get_first_lsn();
+                if !first_lsn.is_null() {
+                    let unflushed = buffer.get_unflushed_data();
+                    if !unflushed.is_empty() {
+                        let offset = buffer.flushed_file_offset();
+                        // Clone to avoid holding the buffer borrow across the
+                        // write call (FileManager may acquire internal locks).
+                        let data = unflushed.to_vec();
+                        buffer.mark_flushed();
+                        buffer.release();
+                        drop(buffer);
+
+                        self.file_manager.write_buffer(&data, offset)?;
+                    } else {
+                        buffer.release();
+                        drop(buffer);
+                    }
+                } else {
+                    buffer.release();
+                    drop(buffer);
+                }
             }
+
+            if is_last {
+                break;
+            }
+            current_dirty = self.get_next_slot(current_dirty);
         }
 
         self.dirty_start = -1;
@@ -329,17 +399,28 @@ pub struct BufferPoolStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_manager::FileManager;
+    use tempfile::TempDir;
+
+    /// Create a pool backed by a real (but temp-dir) FileManager.
+    fn make_pool(num_buffers: usize, buffer_size: usize) -> (LogBufferPool, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let fm =
+            Arc::new(FileManager::new(dir.path(), false, 100_000_000, 10).unwrap());
+        let pool = LogBufferPool::new(num_buffers, buffer_size, fm);
+        (pool, dir)
+    }
 
     #[test]
     fn test_new_pool() {
-        let pool = LogBufferPool::new(3, 1024);
+        let (pool, _dir) = make_pool(3, 1024);
         assert_eq!(pool.get_log_buffer_size(), 1024);
         assert_eq!(pool.num_buffers, 3);
     }
 
     #[test]
     fn test_get_write_buffer() {
-        let mut pool = LogBufferPool::new(3, 1024);
+        let (mut pool, _dir) = make_pool(3, 1024);
         let buffer =
             pool.get_write_buffer(100, false).expect("get_write_buffer");
         let buf = buffer.lock();
@@ -348,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_buffer_cycling() {
-        let mut pool = LogBufferPool::new(3, 100);
+        let (mut pool, _dir) = make_pool(3, 100);
 
         // Fill first buffer
         {
@@ -372,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_get_next_slot() {
-        let pool = LogBufferPool::new(3, 1024);
+        let (pool, _dir) = make_pool(3, 1024);
         assert_eq!(pool.get_next_slot(0), 1);
         assert_eq!(pool.get_next_slot(1), 2);
         assert_eq!(pool.get_next_slot(2), 0); // Wrap around
@@ -380,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_stats_initial() {
-        let pool = LogBufferPool::new(3, 1024);
+        let (pool, _dir) = make_pool(3, 1024);
         let stats = pool.get_stats();
         assert_eq!(stats.num_buffers, 3);
         assert_eq!(stats.buffer_size, 1024);
@@ -391,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_read_buffer_lsn_below_min_is_miss() {
-        let mut pool = LogBufferPool::new(3, 1024);
+        let (mut pool, _dir) = make_pool(3, 1024);
         // min_buffer_lsn starts at 0, so any LSN >= Lsn(0,0) could be
         // searched. We force a cache miss by searching for a high LSN
         // in a pool whose buffers have no registered LSNs yet.
@@ -404,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_write_buffer_has_enough_space() {
-        let mut pool = LogBufferPool::new(3, 512);
+        let (mut pool, _dir) = make_pool(3, 512);
         let buf = pool.get_write_buffer(256, false).expect("get_write_buffer");
         let inner = buf.lock();
         assert!(inner.has_room(256));
@@ -412,8 +493,60 @@ mod tests {
 
     #[test]
     fn test_two_buffers_pool_wraps_around() {
-        let pool = LogBufferPool::new(2, 64);
+        let (pool, _dir) = make_pool(2, 64);
         assert_eq!(pool.get_next_slot(0), 1);
         assert_eq!(pool.get_next_slot(1), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part-1 acceptance test (DRIFT-2 fix)
+    //
+    // FAIL-PRE : before this fix `write_dirty` was a no-op; under buffer
+    //            pressure `bump_and_write_dirty` panicked with
+    //            "No free log buffers after flushing dirty buffers".
+    // PASS-POST: `write_dirty` drains real bytes via `FileManager`; the ring
+    //            wraps successfully with no panic and all data is durable.
+    // -----------------------------------------------------------------------
+    /// Fill all 3 log buffers (tiny 64-byte buffers, 6-byte entries) so the
+    /// ring MUST wrap.  Confirmed via `LogManager::read_entry` after flush.
+    #[test]
+    fn test_write_dirty_drains_ring_no_panic() {
+        use crate::entry_type::LogEntryType;
+        use crate::log_manager::LogManager;
+        use crate::provisional::Provisional;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 100_000_000, 10).unwrap(),
+        );
+        // Very small buffers: 3 × 64 bytes.  Each log entry is at least
+        // MIN_HEADER_SIZE (14) + payload bytes.  With a 1-byte payload each
+        // entry is 15 bytes; ~4 entries per buffer, ~12 before the ring wraps.
+        // Writing 20 forces multiple ring-wraps — exactly the pressure path
+        // that previously panicked.
+        let lm = LogManager::new(Arc::clone(&fm), 3, 64, 4096);
+
+        let mut lsns = Vec::new();
+        for i in 0u8..20 {
+            let lsn = lm
+                .log(
+                    LogEntryType::Trace,
+                    &[i],
+                    Provisional::No,
+                    false,
+                    false,
+                )
+                .expect("log() must not panic (DRIFT-2 fix)");
+            lsns.push((lsn, i));
+        }
+
+        // Flush to disk so we can read back from the cold path.
+        lm.flush_no_sync().expect("flush_no_sync");
+
+        // Verify a few entries are readable back.
+        for (lsn, expected) in &lsns[..5] {
+            let (_, payload) = lm.read_entry(*lsn).expect("read_entry");
+            assert_eq!(payload, &[*expected], "payload mismatch at {lsn:?}");
+        }
     }
 }
