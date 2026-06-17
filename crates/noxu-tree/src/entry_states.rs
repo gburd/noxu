@@ -30,11 +30,39 @@ pub const UPDATE_KEY_WHEN_LOGGED: u8 = 0x40;
 
 /// Tombstone bit - slot is a blind-deletion tombstone.
 ///
+/// **Noxu-only extension bit — NOT present in JE.**
+///
+/// JE `EntryStates.java` uses bits 0x01–0x40 only; 0x80 is unused in JE.
+/// In Noxu, TOMBSTONE_BIT marks a slot as a blind-deletion marker:
+/// the key exists in the BIN but its LN has been deleted without a
+/// full transaction (used by `ExtinctionScanner` / `discard_extinct_records`).
+///
+/// This bit IS persisted to disk (it is NOT in `TRANSIENT_BITS`). This is
+/// intentional: a tombstone must survive checkpoints so that the cleaner
+/// can reclaim the space on the next log cleaning pass.
+///
+/// Compatibility note: a JE-format reader encountering a slot with 0x80 set
+/// will see an unknown bit in the state byte. JE processes
+/// `KNOWN_DELETED_BIT`, `DIRTY_BIT`, `PENDING_DELETED_BIT`, `EMBEDDED_LN_BIT`,
+/// and `NO_DATA_LN_BIT` independently by bit-masking; it does not reject
+/// unknown bits, so a slot with TOMBSTONE_BIT set is safe to read by JE
+/// (the bit is simply ignored). No JE-compat concern exists for read paths.
+///
+/// DRIFT-7 audit finding disposition: TOMBSTONE_BIT is a deliberate
+/// Noxu extension, not a missing transient-mask entry.
 pub const TOMBSTONE_BIT: u8 = 0x80;
 
 /// Mask for transient state bits (not logged to disk).
 ///
-/// Bit 0x04 (MIGRATE_BIT) is always transient; UPDATE_KEY_WHEN_LOGGED is also transient.
+/// JE `EntryStates.TRANSIENT_BITS = OFFHEAP_DIRTY_BIT | OFFHEAP_PRI2_BIT`.
+/// Noxu maps those off-heap bits to different purposes but preserves the
+/// transient semantics:
+///   - `MIGRATE_BIT (0x04)` ≈ JE `OFFHEAP_DIRTY_BIT (0x04)` — always transient.
+///   - `UPDATE_KEY_WHEN_LOGGED (0x40)` ≈ JE `OFFHEAP_PRI2_BIT (0x40)` — transient.
+///
+/// `TOMBSTONE_BIT (0x80)` is intentionally NOT in TRANSIENT_BITS:
+/// it is a Noxu-only persisted bit for blind-deletion markers.
+/// See `TOMBSTONE_BIT` documentation.
 pub const TRANSIENT_BITS: u8 = MIGRATE_BIT | UPDATE_KEY_WHEN_LOGGED;
 
 /// A newtype wrapper around slot state flags.
