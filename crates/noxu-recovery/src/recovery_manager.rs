@@ -35,7 +35,9 @@
 use crate::analysis_result::AnalysisResult;
 use crate::dirty_in_map::{CheckpointReference, DirtyINMap};
 use crate::error::Result;
-use crate::log_scanner::{LnOperation, LnRecord, LogEntry, LogScanner};
+use crate::log_scanner::{
+    LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
+};
 use crate::recovery_info::RecoveryInfo;
 use crate::rollback_tracker::RollbackTracker;
 use hashbrown::HashMap;
@@ -1022,30 +1024,43 @@ impl RecoveryManager {
 
         let scan_end = self.info.next_available_lsn;
 
-        let entries = scanner.scan_forward(scan_start, scan_end);
-
-        // Consume entries by value to avoid `LnRecord::clone()` (which bumps
-        // the `Bytes` Arc refcount for key and data on every LN record).
-        // Moving the LnRecord directly into `redo_entries` eliminates the
-        // `bytes::owned_clone` / `owned_drop` allocation profile cost.
+        // Stream entries one at a time through the file-backed scanner's
+        // callback path (JE `LNFileReader`/`INFileReader` read loop) instead
+        // of materialising the bounded range into a `Vec<PositionedEntry>`
+        // (with cloned `LnRecord` / `Bytes`) just to iterate it once.
         //
-        // Recovery alloc optimisation:
-        for pe in entries {
+        // Consume each entry by value inside the closure to avoid
+        // `LnRecord::clone()` (which bumps the `Bytes` Arc refcount for key
+        // and data on every LN record).  Moving the LnRecord directly into
+        // `redo_entries` eliminates the `bytes::owned_clone` / `owned_drop`
+        // allocation profile cost.
+        //
+        // Borrow the pieces of `self` and `result` the closure mutates up
+        // front so the closure does not need a `&mut self` capture.
+        let stats = &mut self.stats;
+        let dirty_in_map = &mut self.dirty_in_map;
+        let redo_entries = &mut self.redo_entries;
+        let per_db_redo_count = &mut self.per_db_redo_count;
+        let rollback_tracker = &mut self.rollback_tracker;
+        let result_ref = &mut result;
+
+        let mut process = |pe: PositionedEntry| {
             let entry_lsn = pe.lsn;
             match pe.entry {
                 // ----------------------------------------------------------
                 // IN/BIN entries → build dirty-IN map
                 // ----------------------------------------------------------
                 LogEntry::In(rec) => {
-                    self.stats.ins_read += 1;
+                    stats.ins_read += 1;
 
                     // Only include INs logged at or after the checkpoint start
                     // (non-provisional).  INs before the checkpoint are already
                     // represented in the tree loaded from the checkpoint.
                     //
                     // Reader.isProvisional checks in INFileReader.
-                    let after_ckpt = result.checkpoint_start_lsn == NULL_LSN
-                        || entry_lsn >= result.checkpoint_start_lsn;
+                    let after_ckpt = result_ref.checkpoint_start_lsn
+                        == NULL_LSN
+                        || entry_lsn >= result_ref.checkpoint_start_lsn;
                     if after_ckpt {
                         // Extract fields before moving rec into record_dirty_in.
                         let node_id = rec.node_id;
@@ -1053,17 +1068,15 @@ impl RecoveryManager {
                         let is_delta = rec.is_delta;
                         let level = rec.level;
 
-                        result.record_dirty_in(rec, entry_lsn);
+                        result_ref.record_dirty_in(rec, entry_lsn);
 
                         // Track in the DirtyINMap (for bottom-up redo ordering).
-                        self.dirty_in_map.add_dirty_in(
-                            CheckpointReference::new(
-                                node_id,
-                                db_id as i64,
-                                is_delta,
-                                level,
-                            ),
-                        );
+                        dirty_in_map.add_dirty_in(CheckpointReference::new(
+                            node_id,
+                            db_id as i64,
+                            is_delta,
+                            level,
+                        ));
                     }
                 }
 
@@ -1075,15 +1088,15 @@ impl RecoveryManager {
                     let txn_id = rec.txn_id;
 
                     // Move rec into redo_entries — no clone, no Arc bump.
-                    self.redo_entries.push((entry_lsn, rec));
+                    redo_entries.push((entry_lsn, rec));
 
                     // Track per-db count for BIN capacity pre-warming (Fix 3).
-                    *self.per_db_redo_count.entry(db_id).or_insert(0) += 1;
+                    *per_db_redo_count.entry(db_id).or_insert(0) += 1;
 
                     if let Some(txn_id) = txn_id {
                         // Track this txn as active until we see its commit/abort.
                         // record_active_txn() also updates max_txn_id.
-                        result.record_active_txn(txn_id);
+                        result_ref.record_active_txn(txn_id);
                     }
                     // Non-transactional LNs (txn_id == None) need no extra
                     // tracking; they are always redo'd after checkpoint start.
@@ -1094,28 +1107,30 @@ impl RecoveryManager {
                 // ----------------------------------------------------------
                 LogEntry::TxnCommit(rec) => {
                     // CommittedTxnIds.put(reader.getTxnCommitId(), ...)
-                    result.record_commit(rec.txn_id, rec.lsn);
-                    self.stats.committed_txns += 1;
+                    result_ref.record_commit(rec.txn_id, rec.lsn);
+                    stats.committed_txns += 1;
                     // R-3: collect TxnCommit dtvlsn for VLSN index rebuild.
                     // Only non-zero for recovered XA commits written with the
                     // R-3 fix; ignored for normal commits and old WAL files.
                     if let Some(vlsn) = rec.dtvlsn
                         && vlsn > 0
                     {
-                        result.txncommit_vlsns.push((vlsn, rec.lsn.as_u64()));
+                        result_ref
+                            .txncommit_vlsns
+                            .push((vlsn, rec.lsn.as_u64()));
                     }
                 }
                 LogEntry::TxnAbort(rec) => {
                     // AbortedTxnIds.add(reader.getTxnAbortId())
-                    result.record_abort(rec.txn_id);
-                    self.stats.aborted_txns += 1;
+                    result_ref.record_abort(rec.txn_id);
+                    stats.aborted_txns += 1;
                 }
                 LogEntry::TxnPrepare(rec) => {
                     // XA two-phase commit, phase 1 (wave 3-2).
                     // Move the txn from active→prepared.  If a later
                     // TxnCommit or TxnAbort is seen, `record_commit` /
                     // `record_abort` will remove the entry.
-                    result.record_prepare(
+                    result_ref.record_prepare(
                         crate::analysis_result::PreparedTxnInfo {
                             txn_id: rec.txn_id,
                             prepare_lsn: rec.lsn,
@@ -1126,7 +1141,7 @@ impl RecoveryManager {
                             xid_bqual: rec.xid_bqual,
                         },
                     );
-                    self.stats.prepared_txns += 1;
+                    stats.prepared_txns += 1;
                 }
 
                 // ----------------------------------------------------------
@@ -1138,27 +1153,28 @@ impl RecoveryManager {
                     // Use >= so that we process the CkptEnd even when
                     // result.checkpoint_end_lsn was already set to this same LSN
                     // by find_last_checkpoint (their LSNs are equal).
-                    let is_latest = result.checkpoint_end_lsn == NULL_LSN
-                        || entry_lsn >= result.checkpoint_end_lsn;
+                    let is_latest = result_ref.checkpoint_end_lsn == NULL_LSN
+                        || entry_lsn >= result_ref.checkpoint_end_lsn;
                     if is_latest {
-                        result.checkpoint_end_lsn = entry_lsn;
-                        result.checkpoint_start_lsn = rec.checkpoint_start_lsn;
-                        result.first_active_lsn = rec.first_active_lsn;
+                        result_ref.checkpoint_end_lsn = entry_lsn;
+                        result_ref.checkpoint_start_lsn =
+                            rec.checkpoint_start_lsn;
+                        result_ref.first_active_lsn = rec.first_active_lsn;
                         if rec.root_lsn != NULL_LSN {
-                            result.use_root_lsn = rec.root_lsn;
+                            result_ref.use_root_lsn = rec.root_lsn;
                         }
                     }
                     // Always update ID counters from every CkptEnd seen —
                     // the counters are monotonically increasing max values so
                     // processing the same record twice is safe.
-                    if rec.last_local_node_id > result.max_node_id {
-                        result.max_node_id = rec.last_local_node_id;
+                    if rec.last_local_node_id > result_ref.max_node_id {
+                        result_ref.max_node_id = rec.last_local_node_id;
                     }
-                    if rec.last_local_db_id > result.max_db_id {
-                        result.max_db_id = rec.last_local_db_id;
+                    if rec.last_local_db_id > result_ref.max_db_id {
+                        result_ref.max_db_id = rec.last_local_db_id;
                     }
-                    if rec.last_local_txn_id > result.max_txn_id {
-                        result.max_txn_id = rec.last_local_txn_id;
+                    if rec.last_local_txn_id > result_ref.max_txn_id {
+                        result_ref.max_txn_id = rec.last_local_txn_id;
                     }
                 }
 
@@ -1167,12 +1183,12 @@ impl RecoveryManager {
                 // ----------------------------------------------------------
                 LogEntry::RollbackStart(rec) => {
                     // RollbackTracker.register(RollbackStart, lsn)
-                    self.rollback_tracker
+                    rollback_tracker
                         .register_rollback_start(rec.matchpoint_lsn, rec.lsn);
                 }
                 LogEntry::RollbackEnd(rec) => {
                     // RollbackTracker.register(RollbackEnd, lsn)
-                    self.rollback_tracker
+                    rollback_tracker
                         .register_rollback_end(rec.matchpoint_lsn, rec.lsn);
                 }
 
@@ -1181,17 +1197,19 @@ impl RecoveryManager {
                 // ----------------------------------------------------------
                 LogEntry::NameLn(rec) => {
                     if rec.is_deleted {
-                        result.recovered_db_names.remove(&rec.name);
-                        result.recovered_db_txn_ids.remove(&rec.name);
+                        result_ref.recovered_db_names.remove(&rec.name);
+                        result_ref.recovered_db_txn_ids.remove(&rec.name);
                     } else {
-                        result
+                        result_ref
                             .recovered_db_names
                             .insert(rec.name.clone(), rec.db_id);
                         // C-6: record the creating txn_id so that
                         // run_mapping_tree_undo_pass can undo NameLNs whose
                         // transaction aborted.
                         if let Some(tid) = rec.txn_id {
-                            result.recovered_db_txn_ids.insert(rec.name, tid);
+                            result_ref
+                                .recovered_db_txn_ids
+                                .insert(rec.name, tid);
                         }
                     }
                 }
@@ -1200,7 +1218,7 @@ impl RecoveryManager {
                 // DbTree (mapping-tree root)
                 // ----------------------------------------------------------
                 LogEntry::DbTree(rec) => {
-                    result.use_root_lsn = rec.lsn;
+                    result_ref.use_root_lsn = rec.lsn;
                 }
 
                 LogEntry::CkptStart(_) => {
@@ -1208,7 +1226,9 @@ impl RecoveryManager {
                     // not need to act on it again during analysis.
                 }
             }
-        }
+        };
+
+        scanner.scan_forward_fn(scan_start, scan_end, &mut process);
 
         Ok(result)
     }

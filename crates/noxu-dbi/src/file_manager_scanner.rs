@@ -435,13 +435,34 @@ impl FileManagerLogScanner {
         end_lsn: Lsn,
     ) -> Vec<PositionedEntry> {
         let mut results = Vec::new();
+        self.scan_files_forward_cb(start_lsn, end_lsn, &mut |pe| {
+            results.push(pe)
+        });
+        results
+    }
 
+    /// Streaming core of the forward scan: walk every log file from
+    /// `start_lsn` up to (but not including) `end_lsn`, invoking `cb` for
+    /// each parsed entry **inline** — no intermediate `Vec`.
+    ///
+    /// Both `scan_files_forward` (which collects) and the `scan_forward_fn`
+    /// trait override (which streams) drive off this single loop, so the
+    /// parse/LSN-stamp/bounds logic stays in one place.  This mirrors JE's
+    /// `LNFileReader`/`INFileReader` read loop (`FileReader.readNextEntry`):
+    /// the recovery passes pull one entry at a time through a callback rather
+    /// than materialising the whole bounded range.
+    fn scan_files_forward_cb(
+        &self,
+        start_lsn: Lsn,
+        end_lsn: Lsn,
+        cb: &mut dyn FnMut(PositionedEntry),
+    ) {
         let file_nums = match self.file_manager.list_file_numbers() {
             Ok(nums) => nums,
-            Err(_) => return results,
+            Err(_) => return,
         };
         if file_nums.is_empty() {
-            return results;
+            return;
         }
 
         let start_file = if start_lsn == NULL_LSN {
@@ -489,7 +510,7 @@ impl FileManagerLogScanner {
                 if end_lsn != NULL_LSN {
                     let cur_lsn = Lsn::new(file_num, offset as u32);
                     if cur_lsn >= end_lsn {
-                        return results;
+                        return;
                     }
                 }
 
@@ -511,9 +532,7 @@ impl FileManagerLogScanner {
                                 }
                                 _ => {}
                             }
-                            results.push(PositionedEntry::new(
-                                entry_lsn, log_entry,
-                            ));
+                            cb(PositionedEntry::new(entry_lsn, log_entry));
                         }
 
                         offset += entry_size;
@@ -521,8 +540,6 @@ impl FileManagerLogScanner {
                 }
             }
         }
-
-        results
     }
 }
 
@@ -651,6 +668,23 @@ impl LogScanner for FileManagerLogScanner {
         end_lsn: Lsn,
     ) -> Vec<PositionedEntry> {
         self.scan_files_forward(start_lsn, end_lsn)
+    }
+
+    /// Streaming forward scan: parse entries from the mmap'd/read file bytes
+    /// and invoke `cb` per entry, never building the intermediate `Vec`.
+    ///
+    /// This is the recovery-analysis hot path (JE `LNFileReader`/`INFileReader`
+    /// read loop): `RecoveryManager.run_analysis` drives a single forward pass
+    /// through this callback, so the bounded scan range is no longer
+    /// materialised into a `Vec<PositionedEntry>` (with cloned `LnRecord` /
+    /// `Bytes`) only to be iterated once.
+    fn scan_forward_fn(
+        &self,
+        start_lsn: Lsn,
+        end_lsn: Lsn,
+        cb: &mut dyn FnMut(PositionedEntry),
+    ) {
+        self.scan_files_forward_cb(start_lsn, end_lsn, cb);
     }
 
     fn scan_backward(
