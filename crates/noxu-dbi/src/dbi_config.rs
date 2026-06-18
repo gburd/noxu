@@ -145,6 +145,9 @@ pub struct DbiEnvConfig {
     pub evictor_evict_bytes: u64,
     pub evictor_critical_percentage: u32,
     pub evictor_lru_only: bool,
+    /// JE EVICTOR_USE_DIRTY_LRU (default true). Forced false when off-heap is
+    /// enabled.
+    pub evictor_use_dirty_lru: bool,
     pub evictor_n_lru_lists: u32,
     pub evictor_deadlock_retry: u32,
     pub evictor_core_threads: usize,
@@ -309,6 +312,7 @@ impl Default for DbiEnvConfig {
             evictor_evict_bytes: 512 * 1024,
             evictor_critical_percentage: 5,
             evictor_lru_only: false,
+            evictor_use_dirty_lru: true,
             evictor_n_lru_lists: 4,
             evictor_deadlock_retry: 3,
             evictor_core_threads: 1,

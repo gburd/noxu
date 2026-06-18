@@ -166,6 +166,11 @@ pub struct Evictor {
     max_batch_size: usize,
     /// When true, skip the pri2 dirty-node staging list (lru_only mode).
     lru_only: bool,
+    /// Whether to stage dirty INs in the pri2 LRU set (JE
+    /// `EVICTOR_USE_DIRTY_LRU`). Defaults to `!lru_only`; forced false when an
+    /// off-heap cache is configured (JE Evictor.java:1705). Override via
+    /// `with_use_dirty_lru`.
+    use_dirty_lru: bool,
 
     next_pri1_index: AtomicU64,
     next_pri2_index: AtomicU64,
@@ -227,6 +232,7 @@ impl Evictor {
             shutdown: AtomicBool::new(false),
             max_batch_size,
             lru_only,
+            use_dirty_lru: !lru_only,
             next_pri1_index: AtomicU64::new(0),
             next_pri2_index: AtomicU64::new(0),
             log_manager: None,
@@ -301,7 +307,27 @@ impl Evictor {
     }
 
     /// Wire an off-heap cache.
+    /// Returns whether dirty INs are staged in the pri2 LRU set.
+    pub fn use_dirty_lru(&self) -> bool {
+        self.use_dirty_lru
+    }
+
+    /// Set whether dirty INs are staged in the pri2 LRU set (JE
+    /// `EVICTOR_USE_DIRTY_LRU`). JE forces this false when an off-heap cache is
+    /// configured (Evictor.java:1705); callers should pass
+    /// `cfg.evictor_use_dirty_lru && off_heap_disabled`.
+    pub fn with_use_dirty_lru(mut self, use_dirty_lru: bool) -> Self {
+        self.use_dirty_lru = use_dirty_lru;
+        self
+    }
+
     pub fn with_off_heap(mut self, cache: Arc<OffHeapCache>) -> Self {
+        // JE forces useDirtyLRU = false when an off-heap cache is ENABLED
+        // (Evictor.java:1705). A disabled off-heap wrapper must not disable
+        // the dirty-LRU staging.
+        if cache.is_enabled() {
+            self.use_dirty_lru = false;
+        }
         self.off_heap = Some(cache);
         self
     }
@@ -546,9 +572,8 @@ impl Evictor {
                 }
             };
 
-            let use_dirty_lru = !self.lru_only;
             let decision =
-                decide_eviction(info.as_ref(), from_pri2, use_dirty_lru);
+                decide_eviction(info.as_ref(), from_pri2, self.use_dirty_lru);
 
             match decision {
                 EvictionDecision::Skip => {
@@ -1356,6 +1381,46 @@ mod tests {
     // -----------------------------------------------------------------------
     // Construction / algorithm selection
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_use_dirty_lru_config_and_offheap_override() {
+        // JE EVICTOR_USE_DIRTY_LRU (default true); off-heap forces it false.
+        let counter = Arc::new(AtomicI64::new(0));
+        let arbiter = Arbiter::new(1024, Arc::clone(&counter), 100, 200);
+        // Default (lru_only=false): use_dirty_lru defaults to !lru_only = true.
+        let e = Evictor::new(arbiter, 100, false);
+        assert!(e.use_dirty_lru(), "default !lru_only -> use_dirty_lru true");
+
+        // Explicit config false is honored.
+        let counter2 = Arc::new(AtomicI64::new(0));
+        let arb2 = Arbiter::new(1024, Arc::clone(&counter2), 100, 200);
+        let e2 = Evictor::new(arb2, 100, false).with_use_dirty_lru(false);
+        assert!(!e2.use_dirty_lru(), "explicit config false honored");
+
+        // An ENABLED off-heap cache forces use_dirty_lru false (JE rule).
+        let counter3 = Arc::new(AtomicI64::new(0));
+        let arb3 = Arbiter::new(1024, Arc::clone(&counter3), 100, 200);
+        let oh = Arc::new(OffHeapCache::new(true, 1024 * 1024));
+        let e3 = Evictor::new(arb3, 100, false)
+            .with_use_dirty_lru(true)
+            .with_off_heap(oh);
+        assert!(
+            !e3.use_dirty_lru(),
+            "enabled off-heap forces use_dirty_lru false"
+        );
+
+        // A DISABLED off-heap cache must NOT disable use_dirty_lru.
+        let counter4 = Arc::new(AtomicI64::new(0));
+        let arb4 = Arbiter::new(1024, Arc::clone(&counter4), 100, 200);
+        let oh_off = Arc::new(OffHeapCache::new(false, 0));
+        let e4 = Evictor::new(arb4, 100, false)
+            .with_use_dirty_lru(true)
+            .with_off_heap(oh_off);
+        assert!(
+            e4.use_dirty_lru(),
+            "disabled off-heap leaves use_dirty_lru true"
+        );
+    }
 
     #[test]
     fn test_default_algorithm_is_lru() {

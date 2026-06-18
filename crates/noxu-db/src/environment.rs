@@ -323,6 +323,7 @@ impl Environment {
             evictor_evict_bytes: config.evictor_evict_bytes,
             evictor_critical_percentage: config.evictor_critical_percentage,
             evictor_lru_only: config.evictor_lru_only,
+            evictor_use_dirty_lru: config.evictor_use_dirty_lru,
             evictor_n_lru_lists: config.evictor_n_lru_lists,
             evictor_deadlock_retry: config.evictor_deadlock_retry,
             evictor_core_threads: config.evictor_core_threads,

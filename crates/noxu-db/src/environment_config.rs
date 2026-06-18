@@ -511,6 +511,8 @@ pub struct EnvironmentConfig {
     /// Use LRU-only eviction (no priority-1 / priority-2 split).
     /// Mirrors `EVICTOR_LRU_ONLY` / default false.
     pub evictor_lru_only: bool,
+    /// JE EVICTOR_USE_DIRTY_LRU (default true). Forced false when off-heap is enabled.
+    pub evictor_use_dirty_lru: bool,
 
     /// Number of LRU lists (increases parallelism under contention).
     /// Mirrors `EVICTOR_N_LRU_LISTS` / default 4.
@@ -885,6 +887,7 @@ impl EnvironmentConfig {
             evictor_evict_bytes: 512 * 1024,
             evictor_critical_percentage: 5,
             evictor_lru_only: false,
+            evictor_use_dirty_lru: true,
             evictor_n_lru_lists: 4,
             evictor_deadlock_retry: 3,
             evictor_core_threads: 1,
@@ -1457,6 +1460,11 @@ impl EnvironmentConfig {
         self.evictor_critical_percentage = pct;
         self
     }
+    pub fn set_evictor_use_dirty_lru(&mut self, v: bool) -> &mut Self {
+        self.evictor_use_dirty_lru = v;
+        self
+    }
+
     pub fn set_evictor_lru_only(&mut self, v: bool) -> &mut Self {
         self.evictor_lru_only = v;
         self

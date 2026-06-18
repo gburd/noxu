@@ -611,6 +611,9 @@ impl EnvironmentImpl {
             cfg.evictor_nodes_per_scan,
             cfg.evictor_lru_only,
         )
+        // JE EVICTOR_USE_DIRTY_LRU; with_off_heap below forces it false if the
+        // off-heap cache is enabled (JE Evictor.java:1705).
+        .with_use_dirty_lru(cfg.evictor_use_dirty_lru)
         .with_off_heap(Arc::clone(&off_heap_cache));
         let evictor = Arc::new(evictor_builder);
 

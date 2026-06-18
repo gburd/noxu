@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (evictor config — EVICTOR_USE_DIRTY_LRU wired; dead config documented)
+
+- **`EVICTOR_USE_DIRTY_LRU` is now read from config** (`noxu-evictor` /
+  `noxu-dbi` / `noxu-db`): the evictor derived dirty-LRU staging from
+  `!lru_only` and ignored the `EVICTOR_USE_DIRTY_LRU` parameter (default true).
+  Now wired end-to-end (`EnvironmentConfig.evictor_use_dirty_lru` →
+  `DbiEnvConfig` → `Evictor::with_use_dirty_lru`), and forced false when an
+  *enabled* off-heap cache is present (JE Evictor.java:1705). Test
+  `test_use_dirty_lru_config_and_offheap_override`.
+- Documented the remaining not-yet-wired cleaner/evictor tuning parameters
+  (`CLEANER_TWO_PASS_GAP/THRESHOLD`, `BIN_DELTA_BLIND_OPS/PUTS`,
+  `EVICTOR_MUTATE_BINS/FORCED_YIELD`, `CLEANER_RMW_FIX/GRADUAL_EXPIRATION`,
+  `RESERVED_DISK`) in known-limitations: their underlying features/models are
+  not fully ported, so the params are accepted but ignored (tuning knobs, no
+  correctness impact). The two-pass case uses a functional-but-different
+  `required_util` heuristic pending the min/max-utilization uncertainty band.
+
+
 ### Fixed (secondary / join — JE-fidelity F1/F3)
 
 - **Foreign-key constraint now enforced on secondary INSERT** (`noxu-db`, F3):
