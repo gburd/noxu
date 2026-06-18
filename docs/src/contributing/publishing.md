@@ -89,13 +89,15 @@ cargo publish -p noxu-tree
 sleep 60
 cargo publish -p noxu-txn
 sleep 60
-cargo publish -p noxu-evictor
-sleep 60
 
-# Layer 4 — depends on layers 0-3
+# Layer 4 — depends on layers 0-3.
+# NOTE: noxu-evictor depends on noxu-recovery which depends on noxu-cleaner,
+# so cleaner and recovery MUST be published BEFORE evictor.
 cargo publish -p noxu-cleaner
 sleep 60
 cargo publish -p noxu-recovery
+sleep 60
+cargo publish -p noxu-evictor
 sleep 60
 cargo publish -p noxu-dbi
 sleep 60
@@ -232,7 +234,7 @@ To add all 19 crates to an owner in one shot:
 
 ```bash
 for crate in noxu-util noxu-sync noxu-latch noxu-config noxu-log \
-             noxu-tree noxu-txn noxu-evictor noxu-cleaner noxu-recovery \
+             noxu-tree noxu-txn noxu-cleaner noxu-recovery noxu-evictor \
              noxu-dbi noxu-engine noxu-db noxu-bind noxu-collections \
              noxu-persist-derive noxu-persist noxu-xa noxu-rep; do
   cargo owner --add <username> -p "$crate"
