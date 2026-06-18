@@ -16,6 +16,27 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Performance (recovery — streaming analysis scan, JE-fidelity)
+
+- **Recovery analysis no longer materialises the bounded log range into an
+  intermediate `Vec`** (`noxu-recovery` / `noxu-dbi`). `RecoveryManager::run_analysis`
+  previously called `scanner.scan_forward(start, end)`, which parsed every
+  entry in the post-checkpoint range into a `Vec<PositionedEntry>` (each LN
+  entry cloning its key/data `Bytes`) only to iterate it once. It now drives a
+  single forward pass through the new `LogScanner::scan_forward_fn(start, end,
+  cb)` streaming callback, which the file-backed `FileManagerLogScanner`
+  overrides to invoke the per-entry closure inline from the mmap'd/read file
+  bytes — eliminating the O(N) intermediate allocation. This mirrors JE's
+  `LNFileReader` / `INFileReader` read loop (`FileReader.readNextEntry`), which
+  pulls one entry at a time rather than building the whole range. The redo-LN,
+  IN-redo, and undo passes are unchanged (they iterate in-memory state or read
+  backward, matching JE's multi-pass structure — only the single-forward-scan
+  analysis pass was streamed). Measured recovery `Environment::open()` of a
+  100k-record crash log: ~273 ms → ~264 ms (~3%, interleaved 8-round mean) —
+  the intermediate `Vec` was a real but minor cost; the redo/tree-splice/fsync
+  path dominates recovery time at this scale. Semantics are byte-for-byte
+  identical; all recovery, crash-recovery, and JE-recovery suites stay green.
+
 ### Fixed (cache evictor — keystone wiring, JE-fidelity)
 
 - **The cache evictor is no longer inert in production** (`noxu-tree` /
