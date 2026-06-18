@@ -33,6 +33,28 @@ listed in [References](#references).
   correctness impact). The two-pass case uses a functional-but-different
   `required_util` heuristic pending the min/max-utilization uncertainty band.
 
+### Changed (BREAKING — persist composite-key on-disk format, PERSIST-COMP-1)
+
+- **Composite (multi-field) primary-key on-disk encoding changed; existing
+  composite-key DPL databases must be rebuilt.** `#[derive(PrimaryKey)]` for a
+  multi-field key struct previously encoded each field as
+  `[4-byte BE length][field bytes]`. The length prefix made the on-disk key
+  sort by `(len(field0), field0, len(field1), …)` instead of the logical tuple
+  order `(field0, field1, …)`, so ordered iteration and `PrimaryIndex` range
+  scans over any multi-field primary key returned records in the WRONG order
+  (silent ordering corruption). The encoding is now order-preserving and
+  self-delimiting with NO length prefix, matching JE's tuple key format
+  (`com.sleepycat.bind.tuple.TupleOutput`): fixed-width numerics keep their
+  big-endian / sign-flipped big-endian bytes and decode by width; `String` and
+  `Vec<u8>` are written as a `0x00`-terminated, escaped byte string (data
+  `0x00` → `0x00 0x01`, terminator `0x00 0x00`) — the same idea as JE
+  `TupleOutput.writeString`'s null-terminated UTF-8. Byte-lexicographic order
+  of the concatenation now equals logical tuple order.
+  - **Migration**: dump and reload any DPL store whose entities use a
+    multi-field `#[derive(PrimaryKey)]`. Single-field newtype keys (e.g.
+    `struct UserId(u64);`) are byte-compatible and need no action.
+  - There are no known production users on v4.x, so no in-place converter is
+    provided.
 
 ### Fixed (secondary / join — JE-fidelity F1/F3)
 

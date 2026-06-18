@@ -327,10 +327,19 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
 /// 1. **Newtype** — `struct UserId(u64);` — delegates `to_bytes` /
 ///    `from_bytes` to the inner field's `PrimaryKey` impl.
 ///
-/// 2. **Composite (named fields)** — each field is encoded by its
-///    `PrimaryKey::to_bytes()` and length-prefixed (4-byte big-endian
-///    `u32`) so decoding is unambiguous.  Field order in the struct
-///    determines byte-lex sort order.
+/// 2. **Composite (named or tuple fields, N>1)** — each field is encoded by
+///    its `PrimaryKey::to_sortable_bytes()` and the results are concatenated
+///    with NO length prefix. Each field's encoding is order-preserving and
+///    self-delimiting (fixed-width numerics decode by width; `String` /
+///    `Vec<u8>` use a `0x00`-terminated, escaped byte string), so the
+///    byte-lexicographic order of the concatenation equals the logical tuple
+///    order `(field0, field1, ...)`. This matches JE's tuple key format
+///    (`com.sleepycat.bind.tuple.TupleOutput`). Field order in the struct
+///    determines sort order.
+///
+///    NOTE: A length-prefix scheme was used before v4.x and is NOT
+///    compatible — composite-key DPL databases created with the old encoding
+///    must be rebuilt. See CHANGELOG (PERSIST-COMP-1).
 ///
 /// The user must separately derive `Clone + PartialEq + Eq + Hash` to
 /// satisfy the `PrimaryKey` trait bounds; the macro does not emit those
@@ -427,9 +436,9 @@ fn composite_to_bytes_tuple(
 ) -> TokenStream2 {
     let pieces = idxs.iter().zip(tys.iter()).map(|(i, ty)| {
         quote! {
-            let part = <#ty as #krate::PrimaryKey>::to_bytes(&self.#i);
-            buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&part);
+            buf.extend_from_slice(
+                &<#ty as #krate::PrimaryKey>::to_sortable_bytes(&self.#i),
+            );
         }
     });
     quote! {
@@ -449,34 +458,13 @@ fn composite_from_bytes_tuple(
         let var = format_ident!("_part_{}", i);
         let ty = tys[i];
         quote! {
-            let len = read_u32(bytes, &mut pos)? as usize;
-            check_remaining(bytes, pos, len)?;
-            let #var = <#ty as #krate::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
-            pos += len;
+            let (#var, consumed) =
+                <#ty as #krate::PrimaryKey>::from_sortable_bytes(&bytes[pos..])?;
+            pos += consumed;
         }
     });
     let var_uses = (0..n).map(|i| format_ident!("_part_{}", i));
     quote! {
-        fn read_u32(bytes: &[u8], pos: &mut usize) -> #krate::Result<u32> {
-            if bytes.len() < *pos + 4 {
-                return Err(#krate::PersistError::SerializationError(
-                    "short read decoding composite key length prefix".into(),
-                ));
-            }
-            let v = u32::from_be_bytes([
-                bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3],
-            ]);
-            *pos += 4;
-            Ok(v)
-        }
-        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> #krate::Result<()> {
-            if bytes.len() < pos + need {
-                return Err(#krate::PersistError::SerializationError(
-                    "short read decoding composite key field".into(),
-                ));
-            }
-            Ok(())
-        }
         let mut pos: usize = 0;
         #(#var_decls)*
         Ok(Self(#(#var_uses,)*))
@@ -490,9 +478,9 @@ fn composite_to_bytes_named(
 ) -> TokenStream2 {
     let pieces = idents.iter().zip(tys.iter()).map(|(name, ty)| {
         quote! {
-            let part = <#ty as #krate::PrimaryKey>::to_bytes(&self.#name);
-            buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&part);
+            buf.extend_from_slice(
+                &<#ty as #krate::PrimaryKey>::to_sortable_bytes(&self.#name),
+            );
         }
     });
     quote! {
@@ -509,33 +497,12 @@ fn composite_from_bytes_named(
 ) -> TokenStream2 {
     let var_decls = idents.iter().zip(tys.iter()).map(|(name, ty)| {
         quote! {
-            let len = read_u32(bytes, &mut pos)? as usize;
-            check_remaining(bytes, pos, len)?;
-            let #name = <#ty as #krate::PrimaryKey>::from_bytes(&bytes[pos..pos + len])?;
-            pos += len;
+            let (#name, consumed) =
+                <#ty as #krate::PrimaryKey>::from_sortable_bytes(&bytes[pos..])?;
+            pos += consumed;
         }
     });
     quote! {
-        fn read_u32(bytes: &[u8], pos: &mut usize) -> #krate::Result<u32> {
-            if bytes.len() < *pos + 4 {
-                return Err(#krate::PersistError::SerializationError(
-                    "short read decoding composite key length prefix".into(),
-                ));
-            }
-            let v = u32::from_be_bytes([
-                bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3],
-            ]);
-            *pos += 4;
-            Ok(v)
-        }
-        fn check_remaining(bytes: &[u8], pos: usize, need: usize) -> #krate::Result<()> {
-            if bytes.len() < pos + need {
-                return Err(#krate::PersistError::SerializationError(
-                    "short read decoding composite key field".into(),
-                ));
-            }
-            Ok(())
-        }
         let mut pos: usize = 0;
         #(#var_decls)*
         Ok(Self { #(#idents,)* })

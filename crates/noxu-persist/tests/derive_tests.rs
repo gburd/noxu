@@ -101,6 +101,69 @@ struct CompositeKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
 struct NewtypeKey(u64);
 
+// PERSIST-COMP-1 round-trip matrix: every field-type combination must
+// round-trip AND preserve order under the new no-length-prefix encoding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
+struct FixedFixedKey(u64, i32); // fixed + fixed
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
+struct FixedVarKey(u32, String); // fixed + var
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
+struct VarVarKey(String, Vec<u8>); // var + var
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, PrimaryKey)]
+struct ThreeFieldKey {
+    a: String,
+    b: u32,
+    c: Vec<u8>,
+}
+
+fn assert_rt_and_order<K: PrimaryKey + Ord + std::fmt::Debug>(
+    mut keys: Vec<K>,
+) {
+    // Round-trip every key.
+    for k in &keys {
+        let enc = k.to_bytes();
+        let dec = K::from_bytes(&enc).unwrap();
+        assert_eq!(*k, dec, "round-trip mismatch");
+    }
+    // Encoded byte order must equal logical (derived Ord) order.
+    keys.sort();
+    let mut enc: Vec<Vec<u8>> = keys.iter().map(K::to_bytes).collect();
+    let logical = enc.clone();
+    enc.sort();
+    assert_eq!(enc, logical, "encoded order must match logical order");
+}
+
+#[test]
+fn composite_key_matrix_round_trip_and_order() {
+    assert_rt_and_order(vec![
+        FixedFixedKey(1, -5),
+        FixedFixedKey(1, 5),
+        FixedFixedKey(2, i32::MIN),
+        FixedFixedKey(0, i32::MAX),
+    ]);
+    assert_rt_and_order(vec![
+        FixedVarKey(1, "b".into()),
+        FixedVarKey(1, "aa".into()),
+        FixedVarKey(1, "a".into()),
+        FixedVarKey(2, "a".into()),
+        FixedVarKey(0, "zzz".into()),
+    ]);
+    assert_rt_and_order(vec![
+        VarVarKey("a".into(), vec![2]),
+        VarVarKey("a".into(), vec![1]),
+        VarVarKey("aa".into(), vec![0]),
+        VarVarKey("b".into(), vec![]),
+        VarVarKey("".into(), vec![255]),
+    ]);
+    assert_rt_and_order(vec![
+        ThreeFieldKey { a: "x".into(), b: 1, c: vec![1] },
+        ThreeFieldKey { a: "x".into(), b: 1, c: vec![2] },
+        ThreeFieldKey { a: "x".into(), b: 2, c: vec![] },
+        ThreeFieldKey { a: "xx".into(), b: 0, c: vec![] },
+        ThreeFieldKey { a: "y".into(), b: 0, c: vec![] },
+    ]);
+}
+
 #[derive(Clone, Debug, PartialEq, Entity)]
 struct Order {
     #[primary_key]
@@ -248,6 +311,41 @@ fn derived_composite_primary_key_round_trip() {
     assert_eq!(key, decoded);
 }
 
+/// PERSIST-COMP-1 regression: the on-disk byte order of a composite key must
+/// match the logical tuple order `(region, customer_id)`. With the old
+/// length-prefix encoding, `("aa", 1)` sorted AFTER `("b", 1)` because the
+/// 4-byte length prefix `len("aa")=2 > len("b")=1` dominated the comparison —
+/// silently corrupting ordered iteration / range scans.
+#[test]
+fn composite_primary_key_encoded_order_matches_logical_order() {
+    // Keys chosen so the variable-length first field has DIFFERENT lengths
+    // that would invert order under a length-prefix scheme.
+    let mut keys = [
+        CompositeKey { region: "b".into(), customer_id: 1 },
+        CompositeKey { region: "aa".into(), customer_id: 1 },
+        CompositeKey { region: "a".into(), customer_id: 9 },
+        CompositeKey { region: "a".into(), customer_id: 1 },
+        CompositeKey { region: "aaa".into(), customer_id: 0 },
+    ];
+    // Logical order via derived Ord on (region, customer_id).
+    keys.sort();
+
+    // Encoded order must equal logical order.
+    let mut encoded: Vec<Vec<u8>> =
+        keys.iter().map(CompositeKey::to_bytes).collect();
+    let logical_then_encoded = encoded.clone();
+    encoded.sort();
+    assert_eq!(
+        encoded, logical_then_encoded,
+        "encoded composite-key byte order must match logical tuple order"
+    );
+
+    // Explicit ladder check: ("aa",1) must encode BEFORE ("b",1).
+    let aa = CompositeKey { region: "aa".into(), customer_id: 1 }.to_bytes();
+    let b = CompositeKey { region: "b".into(), customer_id: 1 }.to_bytes();
+    assert!(aa < b, "(\"aa\",1) must sort before (\"b\",1)");
+}
+
 #[test]
 fn derived_newtype_primary_key_round_trip() {
     let key = NewtypeKey(0xCAFEBABE);
@@ -260,8 +358,9 @@ fn derived_newtype_primary_key_round_trip() {
 
 #[test]
 fn derived_composite_primary_key_short_input_errors() {
-    // Truncated bytes — should fail cleanly, not panic.
-    let result = CompositeKey::from_bytes(&[0u8, 0, 0, 5, b'h']);
+    // Truncated bytes — should fail cleanly, not panic. A single 0x00 byte
+    // is an incomplete string terminator (terminator is 0x00 0x00).
+    let result = CompositeKey::from_bytes(&[0u8]);
     assert!(matches!(result, Err(PersistError::SerializationError(_))));
 }
 
