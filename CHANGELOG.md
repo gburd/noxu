@@ -16,6 +16,19 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C1: structural post-recovery verification)
+
+- **Recovery tests now assert STRUCTURAL integrity, not just data equality**
+  (JE `CheckBase.recoverAndLoadData` runs `env.verify()` + `checkLsns()` after
+  every recovery). The Noxu recovery suites
+  (`recovery_correctness_test.rs::recover_and_collect`,
+  `crash_recovery_test.rs::reopen_db`) asserted only `BTreeMap` data equality;
+  they now also run `Environment::verify` and require zero structural errors
+  after every clean-recover and crash-recover scenario. All 15 correctness +
+  11 crash tests pass with the stronger check (Noxu's recovery produces
+  structurally-sound trees, not merely correct data).
+
+
 ### Security / Rust-quality (jonhoo review + cargo-deny)
 
 - **Bumped `lru` 0.12 → 0.16** (`noxu-log`, `noxu-evictor`): resolves

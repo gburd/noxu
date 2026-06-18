@@ -150,6 +150,21 @@ fn force_checkpoint_reopen(
 fn recover_and_collect(dir: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let env = open_env(dir);
     let db = open_db(&env);
+    // C1 (JE CheckBase.recoverAndLoadData): after recovery, assert STRUCTURAL
+    // integrity — not just data equality. JE runs env.verify() + checkLsns()
+    // after every recovery to catch a tree/utilization-profile that recovered
+    // to correct data but a corrupt structure. We run the engine verifier and
+    // require zero structural errors.
+    let vresult = env
+        .verify(&noxu_db::VerifyConfig::new())
+        .expect("verify after recovery");
+    assert_eq!(
+        vresult.error_count(),
+        0,
+        "post-recovery structural verification found {} error(s): {:?}",
+        vresult.error_count(),
+        vresult.errors,
+    );
     let result = collect_all(&db);
     drop(db);
     drop(env);

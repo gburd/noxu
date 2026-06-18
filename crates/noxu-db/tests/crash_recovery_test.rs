@@ -123,6 +123,19 @@ fn reopen_db(dir: &Path) -> (noxu_db::Environment, noxu_db::Database) {
     let db = env
         .open_database(None, "test", &db_config)
         .expect("reopen database after crash");
+    // C1 (JE CheckBase.recoverAndLoadData): after crash recovery, assert
+    // STRUCTURAL integrity, not just data. A crash that recovers correct data
+    // but a corrupt tree/utilization state would otherwise pass silently.
+    let vresult = env
+        .verify(&noxu_db::VerifyConfig::new())
+        .expect("verify after crash recovery");
+    assert_eq!(
+        vresult.error_count(),
+        0,
+        "post-crash-recovery structural verification found {} error(s): {:?}",
+        vresult.error_count(),
+        vresult.errors,
+    );
     (env, db)
 }
 
