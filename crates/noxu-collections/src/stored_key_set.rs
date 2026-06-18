@@ -67,15 +67,16 @@ where
             return Err(CollectionError::ReadOnly);
         }
         let key_entry = encode_key(&self.key_binding, key)?;
-        let mut data_entry = noxu_db::DatabaseEntry::new();
-        let already = matches!(
-            self.db.get(txn, &key_entry, &mut data_entry)?,
-            OperationStatus::Success,
-        );
+        // JE StoredKeySet.add uses putNoOverwrite — a single ATOMIC op that
+        // returns whether the key was new. The prior get-then-put was a TOCTOU
+        // (two threads could both observe "absent" and both return true).
         // Empty value payload; `StoredKeySet` is set-of-keys.
         let empty = noxu_db::DatabaseEntry::from_bytes(b"");
-        self.db.put(txn, &key_entry, &empty)?;
-        Ok(!already)
+        match self.db.put_no_overwrite(txn, &key_entry, &empty)? {
+            OperationStatus::Success => Ok(true),
+            // KeyExists => already present; Set.add returns false (unchanged).
+            _ => Ok(false),
+        }
     }
 
     /// Returns whether `key` is in the set.

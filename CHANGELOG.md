@@ -16,6 +16,17 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (collections — atomic StoredKeySet.add, JE-fidelity COL-KEYSET-1)
+
+- **`StoredKeySet::add` is now an atomic `putNoOverwrite`** (`noxu-collections`):
+  it did a non-atomic get-then-put (a TOCTOU where two concurrent adds could
+  both observe "absent" and both report the key as newly-added). JE
+  `StoredKeySet.add` uses a single `putNoOverwrite` that atomically reports
+  whether the key was new. Now matches JE. (The prior put could not actually
+  clobber user data — a key-set's value is always empty — so this is a
+  race-correctness fix, not data-loss.)
+
+
 ### Testing (JE test-fidelity — C1: structural post-recovery verification)
 
 - **Recovery tests now assert STRUCTURAL integrity, not just data equality**
