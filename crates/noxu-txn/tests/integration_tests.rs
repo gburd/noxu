@@ -258,6 +258,54 @@ fn deadlock_three_locker_cycle_detected() {
     assert_eq!(c.len(), 4); // 3, 1, 2, 3
 }
 
+// C8 (JE DeadlockTest.testDeadlockAmongFourTxns): T1->T2->T3->T4->T1 ring.
+#[test]
+fn deadlock_four_locker_cycle_detected() {
+    let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
+    waits_for.insert(1, HashSet::from([2]));
+    waits_for.insert(2, HashSet::from([3]));
+    waits_for.insert(3, HashSet::from([4]));
+    // The detector is invoked when T4 requests a lock owned by T1, closing
+    // the ring T4->T1->T2->T3->T4.
+    let cycle = DeadlockDetector::detect(4, &[1], &waits_for);
+    assert!(cycle.is_some(), "should detect four-locker deadlock ring");
+    let c = cycle.unwrap();
+    // detect() returns [requester, owner, ..., requester]; here T4 requests a
+    // lock owned by T1, so the ring is 4,1,2,3,4.
+    assert_eq!(c[0], 4, "cycle should start at the requester T4");
+    assert_eq!(*c.last().unwrap(), 4, "cycle must close back on T4");
+    assert_eq!(c.len(), 5, "ring path is 4,1,2,3,4");
+}
+
+// C8 (JE DeadlockTest.testDeadlockIntersectionWithOneCommonLocker): two
+// cycles that intersect at a common locker (T2).
+//   Cycle A: T1<->T2 (via L1/L2).  Cycle B: T2<->T3 (via L1/L3).
+// Modelled at the waits-for-graph level: T1 waits for T2; T3 waits for T2;
+// T2 (the common locker) requests L1, whose owners are the two readers T1
+// and T3. The detector must find a cycle back to T2 through either branch.
+#[test]
+fn deadlock_intersection_one_common_locker_detected() {
+    let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
+    // T1 owns L1, waits for L2 (held by T2).
+    waits_for.insert(1, HashSet::from([2]));
+    // T3 owns L1, waits for L3 (held by T2).
+    waits_for.insert(3, HashSet::from([2]));
+    // T2 is the requester of L1, whose owners are T1 and T3.
+    let cycle = DeadlockDetector::detect(2, &[1, 3], &waits_for);
+    assert!(
+        cycle.is_some(),
+        "intersecting cycles with one common locker must be detected"
+    );
+    let c = cycle.unwrap();
+    // The cycle must close on the common locker T2.
+    assert_eq!(*c.last().unwrap(), 2, "cycle must close back on common T2");
+    // It must route through one of the two readers (T1 or T3).
+    assert!(
+        c.contains(&1) || c.contains(&3),
+        "cycle must pass through a reader (T1 or T3): {c:?}"
+    );
+}
+
 #[test]
 fn deadlock_no_cycle_linear_chain() {
     // T1->T2->T3 (no cycle). New requester T4 requests lock held by T1.

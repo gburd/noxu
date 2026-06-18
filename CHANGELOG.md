@@ -16,6 +16,21 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C8: deadlock 4-locker + intersecting cycles)
+
+- **Ports JE `DeadlockTest` 4-locker and intersecting-cycle cases** beyond the
+  existing 2/3-locker coverage:
+  - `noxu-txn/tests/integration_tests.rs` (graph-level, deterministic via
+    `DeadlockDetector::detect`): `deadlock_four_locker_cycle_detected`
+    (T1→T2→T3→T4→T1 ring, JE `testDeadlockAmongFourTxns`) and
+    `deadlock_intersection_one_common_locker_detected` (two cycles sharing a
+    common locker, JE `testDeadlockIntersectionWithOneCommonLocker`).
+  - `noxu-txn/tests/lock_manager_test.rs` (end-to-end threaded via
+    `LockManager::lock`): `je_deadlock_among_four_txns` (4-thread ring) and
+    `je_deadlock_intersection_one_common_locker` (3-thread intersecting cycle
+    with a shared read lock). Each asserts the cycle is broken — at least one
+    waiter surfaces `TxnError::Deadlock` and no thread hangs (all join).
+
 ### Testing (JE test-fidelity — C7: RMW locking core invariant) — FINDING
 
 - **New `je_rmw_locking_test.rs`** ports the core `LockMode.RMW` contract from
