@@ -35,6 +35,7 @@ impl fmt::Debug for ExceptionListenerHolder {
 /// Use the builder pattern (`set_*` / `with_*`) to configure individual
 /// parameters; all fields have -identical defaults unless noted.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Core / environment lifecycle

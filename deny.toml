@@ -1,14 +1,18 @@
 # cargo-deny configuration for Noxu DB
-# Run: cargo deny check
+# Run: cargo deny check  (or `make deny`)
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+# Security vulnerabilities are always denied (the default in current
+# cargo-deny when an advisory matches; severity strings were removed from the
+# schema). `unmaintained` accepts "all"/"workspace"/"transitive"/"none".
+unmaintained = "workspace"
+yanked = "deny"
+# Advisory IDs to ignore (none currently).
+ignore = []
 
 [licenses]
-unlicensed = "deny"
+# version = 2 schema: an empty/unknown license is denied by default; only the
+# allow-list below is permitted.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,7 +37,7 @@ multiple-versions = "warn"
 wildcards = "allow"
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []

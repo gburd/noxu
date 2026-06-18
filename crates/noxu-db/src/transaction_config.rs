@@ -9,6 +9,7 @@ use crate::durability::Durability;
 ///
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub struct TransactionConfig {
     /// Durability for this transaction.
     pub durability: Durability,

@@ -10,6 +10,7 @@ use crate::cache_mode::CacheMode;
 ///
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub struct DatabaseConfig {
     /// Allow creation of a new database if it doesn't exist.
     pub allow_create: bool,

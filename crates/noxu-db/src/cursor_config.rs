@@ -28,6 +28,7 @@
 ///   engine's BIN-level prefix is independent of the user's
 ///   range-scan termination condition.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[must_use]
 pub struct CursorConfig {
     /// Use read-uncommitted isolation (dirty reads).
     ///

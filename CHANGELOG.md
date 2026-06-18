@@ -16,6 +16,23 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Security / Rust-quality (jonhoo review + cargo-deny)
+
+- **Bumped `lru` 0.12 → 0.16** (`noxu-log`, `noxu-evictor`): resolves
+  RUSTSEC-2026-0002 (an `IterMut` Stacked-Borrows unsoundness in `lru` ≤ 0.16.2).
+  Noxu never calls the affected `iter_mut` path, but the dependency is upgraded
+  to the patched version regardless. API-compatible; all tests green.
+- **`cargo deny` is now a CI gate** (GitHub workflow) and a `make deny` target:
+  the `deny.toml` existed but was wired into nothing. Modernised its schema to
+  the current cargo-deny format; supply-chain + license checks now pass and run
+  on every push.
+- **`#[must_use]` on the public config types** (`EnvironmentConfig`,
+  `DatabaseConfig`, `TransactionConfig`, `CursorConfig`): the owned-`self`
+  `with_*` builders silently no-op'd when used as a statement; the attribute
+  makes that a warning.
+- Removed the tracked empty `CHANGELOG.md.tmp` (repo hygiene).
+
+
 ## [4.1.0] - 2026-06-18
 
 ### Performance (recovery — streaming analysis scan, JE-fidelity)

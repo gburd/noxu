@@ -13,6 +13,9 @@ check: fmt-check clippy
 clippy:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+deny:
+	cargo deny check
+
 fmt:
 	cargo fmt --all
 

@@ -23,7 +23,7 @@ crc32fast = { workspace = true }
 byteorder = { workspace = true }
 fs2 = { workspace = true }
 memmap2 = { workspace = true }
-lru = "0.12"
+lru = "0.16"
 
 [lints]
 workspace = true
