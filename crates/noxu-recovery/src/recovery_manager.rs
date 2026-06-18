@@ -2643,7 +2643,7 @@ mod tests {
         //
         // Direct check of the guard: a slot at LSN 300 is NOT current for an
         // undo whose log_lsn is 100, so the undo is skipped.
-        let mut tree = make_tree();
+        let tree = make_tree();
         // Crash state after redo: slot holds the committed version at LSN 300.
         tree.insert(b"K".to_vec(), b"committed".to_vec(), lsn(0, 300)).unwrap();
 
