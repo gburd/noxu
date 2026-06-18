@@ -2633,6 +2633,38 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_write_survives_undo_of_earlier_uncommitted_same_key() {
+        // Recovery-audit Finding 2 regression: Noxu redoes BEFORE undoing
+        // (inverted vs JE). The safety hinge is undo_slot_is_current's LSN
+        // currency check. Adversarial scenario: key K was written by an
+        // uncommitted txn (LSN 100) and LATER overwritten by a committed txn
+        // (LSN 300). After redo the slot holds the committed version (LSN 300);
+        // undoing the uncommitted LSN-100 record must NOT clobber it.
+        //
+        // Direct check of the guard: a slot at LSN 300 is NOT current for an
+        // undo whose log_lsn is 100, so the undo is skipped.
+        let mut tree = make_tree();
+        // Crash state after redo: slot holds the committed version at LSN 300.
+        tree.insert(b"K".to_vec(), b"committed".to_vec(), lsn(0, 300)).unwrap();
+
+        // The uncommitted record logged at LSN 100 must NOT be applied,
+        // because the slot is now at LSN 300 (a later committed version).
+        assert!(
+            !RecoveryManager::undo_slot_is_current(&tree, b"K", lsn(0, 100)),
+            "undo of the uncommitted LSN-100 write must be skipped — the slot              holds the committed LSN-300 version"
+        );
+        // Sanity: the guard IS current for the version actually in the slot.
+        assert!(
+            RecoveryManager::undo_slot_is_current(&tree, b"K", lsn(0, 300)),
+            "guard must be current for the version the slot holds"
+        );
+        // The committed value is intact.
+        let sf = tree.search_with_data(b"K").unwrap();
+        assert!(sf.found);
+        assert_eq!(sf.data.as_deref(), Some(b"committed".as_ref()));
+    }
+
+    #[test]
     fn test_undo_skips_non_txnal_ln() {
         let mut scanner = InMemoryLogScanner::new();
         scanner.push(
