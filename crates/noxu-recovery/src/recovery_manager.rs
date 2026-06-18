@@ -917,40 +917,48 @@ impl RecoveryManager {
             return Ok(());
         }
 
-        // Forward scan (backward scan from end to beginning, but we model
-        // it as forward scan of all entries and pick the last CkptEnd seen —
-        // equivalent to CheckpointFileReader backward scan).
-        let all = scanner.scan_forward(NULL_LSN, next_available);
-
+        // Finding 5 (JE CheckpointFileReader): find the most recent CkptEnd by
+        // a BOUNDED backward scan instead of materialising the whole log with
+        // scan_forward(NULL_LSN, ..). Then do a SHORT forward scan from that
+        // CkptEnd onward to pick up the partial-checkpoint start and any later
+        // DbTree root — only the entries after the last checkpoint, exactly
+        // the bounded region JE processes.
         let mut ckpt_end_lsn = NULL_LSN;
         let mut ckpt_start_lsn_from_end = NULL_LSN;
         let mut first_active_from_end = NULL_LSN;
         let mut root_lsn = NULL_LSN;
         let mut partial_start_lsn = NULL_LSN;
 
-        for pe in &all {
+        if let Some(pe) = scanner.find_last_checkpoint_entry()
+            && let LogEntry::CkptEnd(rec) = &pe.entry
+        {
+            ckpt_end_lsn = pe.lsn;
+            ckpt_start_lsn_from_end = rec.checkpoint_start_lsn;
+            first_active_from_end = rec.first_active_lsn;
+            if rec.root_lsn != NULL_LSN {
+                root_lsn = rec.root_lsn;
+            }
+        }
+
+        // Bounded forward scan from the last CkptEnd to end-of-log: the
+        // partial CkptStart (first CkptStart after the CkptEnd) and any DbTree
+        // root logged after the checkpoint. If no CkptEnd was found, fall back
+        // to scanning from the start (no checkpoint => full recovery anyway).
+        let tail_start =
+            if ckpt_end_lsn != NULL_LSN { ckpt_end_lsn } else { NULL_LSN };
+        let tail = scanner.scan_forward(tail_start, next_available);
+        for pe in &tail {
             match &pe.entry {
-                LogEntry::CkptEnd(rec) => {
-                    // Keep the last (latest) checkpoint end seen.
-                    ckpt_end_lsn = pe.lsn;
-                    ckpt_start_lsn_from_end = rec.checkpoint_start_lsn;
-                    first_active_from_end = rec.first_active_lsn;
-                    // Reset partial start tracking after a complete checkpoint.
-                    partial_start_lsn = NULL_LSN;
-                    if rec.root_lsn != NULL_LSN {
-                        root_lsn = rec.root_lsn;
-                    }
-                }
                 LogEntry::CkptStart(_)
                     if partial_start_lsn == NULL_LSN
-                        && ckpt_end_lsn != NULL_LSN =>
+                        && pe.lsn > ckpt_end_lsn =>
                 {
                     // First CkptStart after the last CkptEnd is the partial one.
                     partial_start_lsn = pe.lsn;
                 }
                 LogEntry::CkptStart(_) => {}
                 LogEntry::DbTree(rec) => {
-                    // Always keep the latest root seen.
+                    // Keep the latest root seen after the checkpoint.
                     root_lsn = rec.lsn;
                 }
                 _ => {}

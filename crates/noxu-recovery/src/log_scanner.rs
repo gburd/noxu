@@ -370,6 +370,21 @@ pub trait LogScanner {
     /// directly from the log when it is not embedded in the LN log entry.
     fn read_at_lsn(&self, lsn: Lsn) -> Option<LogEntry>;
 
+    /// Find the most recent `CkptEnd` entry by scanning **backward** from the
+    /// end of the log, stopping at the first one found (JE
+    /// `CheckpointFileReader` reads backward from the end to the last
+    /// checkpoint). Returns `(lsn, CkptEnd entry)` or `None` if no complete
+    /// checkpoint exists.
+    ///
+    /// The default implementation falls back to a full forward scan picking
+    /// the last `CkptEnd` (correct but O(log-size)); the file-backed scanner
+    /// overrides this with a bounded backward scan that does not materialise
+    /// the whole log — this is the recovery-speed path (Finding 5).
+    fn find_last_checkpoint_entry(&self) -> Option<PositionedEntry> {
+        let all = self.scan_forward(NULL_LSN, NULL_LSN);
+        all.into_iter().rfind(|pe| matches!(pe.entry, LogEntry::CkptEnd(_)))
+    }
+
     /// Scan **forward** from `start_lsn` to `end_lsn`, invoking `cb` for each
     /// entry without collecting into an intermediate `Vec`.
     ///

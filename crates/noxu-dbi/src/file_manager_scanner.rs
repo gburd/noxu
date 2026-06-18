@@ -690,6 +690,57 @@ impl LogScanner for FileManagerLogScanner {
         let entries = self.scan_files_forward(target_lsn, end_lsn);
         entries.into_iter().find(|e| e.lsn == target_lsn).map(|e| e.entry)
     }
+
+    /// Bounded backward search for the most recent `CkptEnd` (Finding 5, JE
+    /// `CheckpointFileReader` reads backward from the end to the last
+    /// checkpoint). Walks log files newest-first; the first file that contains
+    /// any `CkptEnd` yields its LAST `CkptEnd`, and we stop — never
+    /// materialising the whole log (the prior recovery path did a full forward
+    /// scan just to find this).
+    fn find_last_checkpoint_entry(&self) -> Option<PositionedEntry> {
+        let mut file_nums = self.file_manager.list_file_numbers().ok()?;
+        // Newest file first.
+        file_nums.sort_unstable_by(|a, b| b.cmp(a));
+        for file_num in file_nums {
+            let file_len = self.file_manager.get_file_length(file_num).ok()?;
+            if file_len == 0 {
+                continue;
+            }
+            let file_bytes = match self.load_file_bytes(file_num, file_len) {
+                Some(b) => b,
+                None => continue,
+            };
+            let file_header_size = self
+                .file_manager
+                .file_header_size_for(file_num)
+                .unwrap_or(FILE_HEADER_SIZE);
+            // Scan this file forward, remembering the last CkptEnd seen.
+            let mut offset = file_header_size;
+            let mut last_ckpt: Option<PositionedEntry> = None;
+            while offset < file_bytes.len() {
+                match Self::parse_entry_from_bytes(&file_bytes, offset) {
+                    None => break, // torn / end of valid data in this file
+                    Some((entry_size, maybe_entry)) => {
+                        if let Some(entry) = maybe_entry
+                            && matches!(entry, LogEntry::CkptEnd(_))
+                        {
+                            last_ckpt = Some(PositionedEntry::new(
+                                Lsn::new(file_num, offset as u32),
+                                entry,
+                            ));
+                        }
+                        offset += entry_size;
+                    }
+                }
+            }
+            // If this (newer-or-equal) file had a CkptEnd, it is the most
+            // recent — return it and stop scanning older files.
+            if last_ckpt.is_some() {
+                return last_ckpt;
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
