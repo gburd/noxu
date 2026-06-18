@@ -91,7 +91,6 @@ fn put_committed(
 /// transaction's duration, so a concurrent no_wait writer to the same key must
 /// receive a lock conflict (unlike a plain read, which releases its lock).
 #[test]
-#[ignore = "FINDING: LockMode::Rmw does not acquire a write lock in Noxu; see module header. Run with --ignored."]
 fn rmw_read_holds_write_lock_no_wait_writer_conflicts() {
     let (_dir, env, db) = setup();
     put_committed(&env, &db, b"key", b"v1");
@@ -186,7 +185,6 @@ fn plain_read_committed_releases_lock_writer_succeeds() {
 /// B's write to the same key must BLOCK until A commits, then proceed. We
 /// detect the block by timing: B must not complete until A releases.
 #[test]
-#[ignore = "FINDING: LockMode::Rmw does not acquire a write lock in Noxu; see module header. Run with --ignored."]
 fn rmw_read_blocks_concurrent_writer_until_commit() {
     let (_dir, env, db) = setup();
     put_committed(&env, &db, b"key", b"v1");

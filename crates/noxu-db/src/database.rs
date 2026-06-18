@@ -609,6 +609,14 @@ impl Database {
                 let (_, value) = cursor.get_current().map_err(|e| {
                     NoxuError::OperationNotAllowed(e.to_string())
                 })?;
+                // JE LockMode.RMW (Cursor.java:5281): an RMW read takes a WRITE
+                // lock on the record so a later update in the same txn cannot
+                // deadlock and a concurrent writer blocks at read time.
+                if matches!(opts.lock_mode, LockMode::Rmw) {
+                    cursor.upgrade_current_to_write_lock().map_err(|e| {
+                        NoxuError::OperationNotAllowed(e.to_string())
+                    })?;
+                }
                 if data.is_partial() {
                     let off = data.get_partial_offset();
                     let len = data.get_partial_length();

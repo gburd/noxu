@@ -16,6 +16,20 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (isolation — LockMode::Rmw takes a write lock, C7)
+
+- **`LockMode::Rmw` now acquires a WRITE lock on read** (`noxu-db` / `noxu-dbi`):
+  found by the JE-fidelity test port (C7) — Noxu accepted `LockMode::Rmw` but
+  the cursor/get read paths ignored it, so an RMW read behaved like a plain read
+  and did NOT block a concurrent writer (JE `Cursor.java:5281` maps RMW → WRITE
+  lock so a later same-txn update cannot deadlock and a concurrent writer blocks
+  at read time). Added `CursorImpl::upgrade_current_to_write_lock` and wired it
+  into both `Cursor::get` (on `LockMode::Rmw`) and
+  `Database::get_with_options` (on `ReadOptions::read_modify_write`). The
+  faithful `je_rmw_locking_test.rs` tests are now un-ignored and pass
+  (RMW read blocks a no_wait writer and a concurrent writer until commit).
+
+
 ### Testing (JE test-fidelity — C8: deadlock 4-locker + intersecting cycles)
 
 - **Ports JE `DeadlockTest` 4-locker and intersecting-cycle cases** beyond the

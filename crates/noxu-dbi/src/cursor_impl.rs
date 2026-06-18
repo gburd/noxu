@@ -790,6 +790,29 @@ impl CursorImpl {
         }
     }
 
+    /// Upgrade the lock on the cursor's current record to a WRITE lock.
+    ///
+    /// JE `LockMode.RMW` (Cursor.java:5281): a read that takes a write lock so
+    /// a later update in the same transaction cannot deadlock and a concurrent
+    /// writer is blocked at read time. Called after a successful get when the
+    /// caller requested RMW. No-op when not positioned.
+    pub fn upgrade_current_to_write_lock(&self) -> Result<(), DbiError> {
+        let lsn = self.current_lsn;
+        if lsn == noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+        if let Some(txn) = &self.txn_ref {
+            txn.lock()
+                .unwrap()
+                .lock(lsn, LockType::Write, false)
+                .map_err(DbiError::TxnError)?;
+        } else if let Some(lm) = &self.lock_manager {
+            lm.lock(lsn, self.id, LockType::Write, false, false)
+                .map_err(DbiError::TxnError)?;
+        }
+        Ok(())
+    }
+
     /// Positions the cursor at a specific key.
     ///
     /// / `CursorImpl.searchRange()`.

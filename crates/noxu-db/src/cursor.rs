@@ -113,7 +113,7 @@ impl Cursor {
         key: &mut DatabaseEntry,
         data: &mut DatabaseEntry,
         get_type: Get,
-        _lock_mode: Option<LockMode>,
+        lock_mode: Option<LockMode>,
     ) -> Result<OperationStatus> {
         self.check_open()?;
 
@@ -259,6 +259,15 @@ impl Cursor {
                 // `key` is always an output parameter for positioning ops.
                 key.set_data(&k);
                 self.state = CursorState::Initialized;
+                // JE LockMode.RMW (Cursor.java:5281): a read that requests RMW
+                // takes a WRITE lock on the current record so a later update in
+                // the same transaction cannot deadlock and a concurrent writer
+                // blocks at read time.
+                if matches!(lock_mode, Some(LockMode::Rmw)) {
+                    self.inner
+                        .upgrade_current_to_write_lock()
+                        .map_err(map_cursor_err)?;
+                }
                 Ok(OperationStatus::Success)
             }
             _ => {
