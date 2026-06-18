@@ -254,6 +254,11 @@ impl FileManager {
     }
 
     /// Returns the configured maximum log file size in bytes.
+    /// Returns true if this FileManager was opened read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn max_file_size(&self) -> u64 {
         self.max_file_size
     }
@@ -513,6 +518,62 @@ impl FileManager {
     /// Clears the file handle cache.
     pub fn clear_cache(&self) {
         self.file_cache.lock().clear();
+    }
+
+    /// Physically truncate log file `file_num` to `offset` bytes (JE
+    /// `FileManager.truncateSingleFile`, FileManager.java:2345). Used at
+    /// recovery to remove a torn / half-written trailing entry so it cannot
+    /// be misread on a later scan. Evicts the cached handle first so a stale
+    /// open handle does not see the old length.
+    pub fn truncate_single_file(
+        &self,
+        file_num: u32,
+        offset: u64,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(LogError::WriteFailed(
+                "Cannot truncate file in read-only mode".to_string(),
+            ));
+        }
+        // Drop any cached handle so the next open sees the truncated length.
+        self.file_cache.lock().pop(&file_num);
+        let path = self.file_path(file_num);
+        if path.exists() {
+            let f = fs::OpenOptions::new().write(true).open(&path)?;
+            f.set_len(offset)?;
+            f.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Truncate the log at (`file_num`, `offset`): truncate `file_num` to
+    /// `offset` and delete every higher-numbered file, in descending order to
+    /// avoid a log-entry gap (JE `FileManager.truncateLog`, FileManager.java:2374,
+    /// SR [#19463]). If `offset == 0` the file header itself is gone, so the
+    /// whole file is deleted too.
+    pub fn truncate_log(&self, file_num: u32, offset: u64) -> Result<()> {
+        if self.read_only {
+            return Err(LogError::WriteFailed(
+                "Cannot truncate log in read-only mode".to_string(),
+            ));
+        }
+        let last = self.get_last_file_num()?.unwrap_or(file_num);
+        let mut i = last as i64;
+        while i >= file_num as i64 {
+            let fnum = i as u32;
+            if self.file_path(fnum).exists() {
+                if fnum == file_num {
+                    self.truncate_single_file(fnum, offset)?;
+                    if offset != 0 {
+                        i -= 1;
+                        continue;
+                    }
+                }
+                self.delete_file(fnum)?;
+            }
+            i -= 1;
+        }
+        Ok(())
     }
 
     /// Writes `data` to the current log file at the given file offset.

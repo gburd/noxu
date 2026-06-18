@@ -16,6 +16,28 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (recovery — physical log truncation, JE-fidelity log audit)
+
+- **Torn trailing log entry is now physically truncated at recovery**
+  (`noxu-log` / `noxu-dbi`, log-audit F-1): `find_end_of_log` detected the last
+  valid entry and repositioned the write cursor after it, but left the torn /
+  half-written trailing bytes (and any higher-numbered orphan files) on disk —
+  relying on overwrite-on-next-write. JE `RecoveryManager.setEndOfFile` →
+  `FileManager.truncateLog` physically `ftruncate`s the file to the recovery
+  point and deletes higher orphan files (descending, to avoid a log gap, SR
+  [#19463]). Added `FileManager::truncate_single_file` / `truncate_log` and
+  call them from `find_end_of_log` (read-write only). Regression test
+  `test_find_end_of_log_physically_truncates_torn_tail` (fail-pre/pass-post).
+
+### Fixed (lock-table config plumbing — follow-up to the DRIFT-2 fix)
+
+- **`lock_n_lock_tables` now flows from the public API to the LockManager**
+  (`noxu-db`): the prior DRIFT-2 commit added `DbiEnvConfig.n_lock_tables` but a
+  `DbiEnvConfig` struct literal in `noxu-db` did not set it. Wired
+  `EnvironmentConfig.lock_n_lock_tables` → `DbiEnvConfig.n_lock_tables` →
+  `LockManager::with_config`, and aligned the public default to 64 (was a third
+  inconsistent value, 16). The shard count is now consistent end-to-end.
+
 ### Fixed (lock manager — JE-fidelity, deep audit)
 
 - **`rangeInsertConflict` now honors `sharesLocksWith`** (`noxu-txn`): JE

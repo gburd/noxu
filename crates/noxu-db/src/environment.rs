@@ -341,6 +341,7 @@ impl Environment {
             lock_timeout_ms: config.lock_timeout_ms,
             lock_deadlock_detect: config.lock_deadlock_detect,
             lock_deadlock_detect_delay_ms: config.lock_deadlock_detect_delay_ms,
+            n_lock_tables: config.lock_n_lock_tables as usize,
             // Transactions
             txn_timeout_ms: config.txn_timeout_ms,
             txn_serializable_isolation: config.txn_serializable_isolation,

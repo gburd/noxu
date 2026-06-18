@@ -614,6 +614,29 @@ impl LogScanner for FileManagerLogScanner {
                 self.file_manager
                     .set_last_position(next_available_lsn, last_used_lsn);
 
+                // F-1 (JE RecoveryManager.setEndOfFile ->
+                // FileManager.truncateLog): physically truncate the torn
+                // trailing bytes after the last valid entry, and delete any
+                // higher-numbered orphan files, so a half-written entry cannot
+                // be misread on a later scan and no log-entry gap remains.
+                // Only when there is something to truncate, and only R/W.
+                let has_torn_tail = end_offset < file_bytes.len();
+                let has_orphan_files =
+                    file_nums.last().copied() != Some(file_num);
+                if (has_torn_tail || has_orphan_files)
+                    && !self.file_manager.is_read_only()
+                    && let Err(e) = self
+                        .file_manager
+                        .truncate_log(file_num, end_offset as u64)
+                {
+                    log::warn!(
+                        "recovery: truncate_log({}, {}) failed: {}",
+                        file_num,
+                        end_offset,
+                        e
+                    );
+                }
+
                 break 'outer;
             }
             // This file had no valid entries; check the previous file.
@@ -718,6 +741,55 @@ mod tests {
         let (last, next) = scanner.find_end_of_log();
         assert_ne!(last, NULL_LSN, "after write: last_used should be non-null");
         assert!(next > last, "next_available must be after last_used");
+    }
+
+    #[test]
+    fn test_find_end_of_log_physically_truncates_torn_tail() {
+        // F-1 regression (JE RecoveryManager.setEndOfFile -> truncateLog): a
+        // torn / half-written entry at the tail must be PHYSICALLY removed,
+        // not merely skipped, so it cannot be misread on a later scan.
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_manager(dir.path());
+
+        // Write one valid commit and sync.
+        let entry = TxnEndEntry::new_commit(7, NULL_LSN, 0, 0, NULL_VLSN);
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, true, false)
+            .unwrap();
+        lm.flush_sync().unwrap();
+        let file_num = 0u32;
+        drop(lm);
+
+        // Determine the valid file length, then append garbage (a torn tail).
+        let valid_len = fm.get_file_length(file_num).unwrap();
+        {
+            use std::io::Write;
+            let path = dir.path().join(format!("{:08x}.ndb", file_num));
+            let mut f =
+                std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            // 64 bytes of non-zero garbage that does not parse as a valid entry.
+            f.write_all(&[0xABu8; 64]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let torn_len = fm.get_file_length(file_num).unwrap();
+        assert!(torn_len > valid_len, "garbage must have grown the file");
+
+        // Recover: find_end_of_log must physically truncate the torn tail.
+        let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
+        let (_last, next) = scanner.find_end_of_log();
+
+        let after_len = fm.get_file_length(file_num).unwrap();
+        assert_eq!(
+            after_len, valid_len,
+            "F-1: torn tail must be physically truncated to the recovery point              (was {}, valid {}, after {})",
+            torn_len, valid_len, after_len
+        );
+        assert_eq!(
+            next,
+            Lsn::new(file_num, valid_len as u32),
+            "next_available must be at the truncation point"
+        );
     }
 
     #[test]

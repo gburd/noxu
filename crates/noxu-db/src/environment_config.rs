@@ -899,7 +899,7 @@ impl EnvironmentConfig {
             offheap_keep_alive_ms: 60_000,
             // Locking
             lock_timeout_ms: 500,
-            lock_n_lock_tables: 16, // Noxu default; is 1
+            lock_n_lock_tables: 64, // Noxu default (documented deviation from JE default 1)
             lock_deadlock_detect: true,
             lock_deadlock_detect_delay_ms: 0,
             // Transactions
@@ -1903,7 +1903,7 @@ mod tests {
     fn test_defaults_locking() {
         let c = EnvironmentConfig::default();
         assert_eq!(c.lock_timeout_ms, 500);
-        assert_eq!(c.lock_n_lock_tables, 16);
+        assert_eq!(c.lock_n_lock_tables, 64);
         assert!(c.lock_deadlock_detect);
         assert_eq!(c.lock_deadlock_detect_delay_ms, 0);
     }
