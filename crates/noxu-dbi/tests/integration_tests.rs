@@ -1349,3 +1349,163 @@ fn gap8_production_cleaner_has_txn_manager_wired() {
          first-active-txn clamp (CLN-4)"
     );
 }
+
+// ─── Evictor F1 + F2: keystone cache-evictor wiring ──────────────────────────
+//
+// F1: the evictor's LRU policy lists must be populated through the production
+//     insert/access path (JE INList → Evictor.addBack/moveBack), otherwise
+//     evict_batch's phase quotas are all 0 and it selects nothing.
+// F2: eviction must decrement the shared cache_usage counter the Arbiter reads
+//     (JE IN.updateMemorySize(-bytes) → MemoryBudget.updateTreeMemoryUsage),
+//     otherwise the engine can never get back under budget by evicting.
+//
+// These tests FAIL against current main (evictor inert) and pass after the fix.
+
+/// Build a tiny-cache, daemon-free environment for deterministic eviction.
+fn small_cache_env(dir: &std::path::Path) -> EnvironmentImpl {
+    use noxu_dbi::DbiEnvConfig;
+    let cfg = DbiEnvConfig {
+        // Small total budget. The arbiter floors at 1 MiB, so use a 1-buffer
+        // 64 KiB log pool and a 1.5 MiB cache -> arbiter budget ~1.4 MiB.
+        cache_size: 3 * 1024 * 1024 / 2, // 1.5 MiB
+        log_num_buffers: 1,
+        log_buffer_size: 64 * 1024,
+        max_off_heap_memory: 0,
+        transactional: true,
+        // Disable the *background* daemons that would prune/move nodes and
+        // confound the counter assertions; we drive eviction (and the
+        // checkpoint that cleans dirty slots) manually.
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        log_flush_no_sync_interval_ms: 0,
+        // LRU-only so dirty nodes are stripped/evicted without needing a
+        // checkpointer daemon to log them first.
+        evictor_lru_only: true,
+        ..DbiEnvConfig::default()
+    };
+    EnvironmentImpl::from_dbi_config(dir, &cfg).unwrap()
+}
+
+/// F1: inserting records through the production cursor path must populate the
+/// evictor's LRU lists (note_ins_* wired). Against main the lists stay empty.
+#[test]
+fn evictor_f1_lru_lists_populated_by_production_inserts() {
+    let dir = TempDir::new().unwrap();
+    let env = small_cache_env(dir.path());
+
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
+    let db = env.open_database("f1_db", &db_cfg).unwrap();
+
+    let evictor = env.get_evictor();
+    let (before_pri, before_scan, _before_pri2) = evictor.get_policy_sizes();
+    let before = before_pri + before_scan;
+
+    // Insert enough records to create several BINs (node_max_entries=128).
+    let mut cursor = CursorImpl::new(Arc::clone(&db), 1);
+    for i in 0..1000u32 {
+        let key = format!("key-{i:08}");
+        let val = vec![b'v'; 256];
+        cursor.put(key.as_bytes(), &val, PutMode::Overwrite).unwrap();
+    }
+
+    let (after_pri, after_scan, _after_pri2) = evictor.get_policy_sizes();
+    let after = after_pri + after_scan;
+
+    assert!(
+        after > before,
+        "F1: production inserts must populate the evictor LRU lists \
+         (note_ins_* wired). before={before} after={after}. \
+         If after==0 the evictor is still inert."
+    );
+    // Multiple BINs should be tracked after 1000 inserts.
+    assert!(after > 1, "F1: expected several BINs tracked, got {after}");
+
+    env.close().unwrap();
+}
+
+/// F1 + F2: insert past the cache budget, run eviction, and assert that
+/// (a) the evictor actually evicted > 0 bytes AND (b) the shared cache_usage
+/// counter dropped after eviction.
+#[test]
+fn evictor_f1_f2_eviction_reduces_cache_usage() {
+    let dir = TempDir::new().unwrap();
+    let env = small_cache_env(dir.path());
+
+    let db_cfg = {
+        let mut c = DatabaseConfig::new();
+        c.set_allow_create(true);
+        c
+    };
+    let db = env.open_database("f2_db", &db_cfg).unwrap();
+
+    // Insert enough data to exceed the (~1.4 MiB) arbiter budget. Each entry
+    // accounts key+data+48 ~ 1 KiB; 4000 entries ~ 4 MiB >> budget.
+    let mut cursor = CursorImpl::new(Arc::clone(&db), 1);
+    for i in 0..4000u32 {
+        let key = format!("key-{i:08}");
+        let val = vec![b'v'; 1000];
+        cursor.put(key.as_bytes(), &val, PutMode::Overwrite).unwrap();
+    }
+
+    let budget = env.get_arbiter_max_memory();
+    let usage_before = env.get_cache_usage();
+    assert!(
+        usage_before > budget,
+        "precondition: cache usage ({usage_before}) must exceed the budget \
+         ({budget}) so eviction is warranted"
+    );
+
+    // Run a checkpoint so the freshly inserted (dirty) BIN slots are logged
+    // and marked clean; the evictor's PartialEvict path only strips clean
+    // LN data (stripping a dirty, unlogged slot would lose the write).
+    // JE: the checkpointer logs dirty BINs, after which the evictor can free
+    // their in-memory LN bytes.
+    env.run_checkpoint().unwrap();
+
+    // Drive eviction manually. The background daemon may also run; either
+    // way we assert on the cumulative evictor stats (which count every
+    // source) plus the shared counter, so the test is robust to the daemon
+    // racing us.
+    for _ in 0..200 {
+        env.evict_memory();
+        if env.get_cache_usage() <= budget {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    let usage_after = env.get_cache_usage();
+
+    // Cumulative work done by the evictor across all sources (daemon +
+    // manual). nodes_stripped counts PartialEvict (LN strip), nodes_evicted
+    // counts full evicts.
+    let evictor = env.get_evictor();
+    let st = evictor.get_stats();
+    let nodes_worked = st.get(&st.nodes_stripped) + st.get(&st.nodes_evicted);
+
+    assert!(
+        nodes_worked > 0,
+        "F1: the evictor must actually evict/strip > 0 nodes once the LRU \
+         lists are populated (against main: 0 — lists empty, quotas 0). \
+         stripped={} evicted={}",
+        st.get(&st.nodes_stripped),
+        st.get(&st.nodes_evicted),
+    );
+    assert!(
+        usage_after < usage_before,
+        "F2: eviction must reduce the shared cache_usage counter the Arbiter \
+         reads. before={usage_before} after={usage_after} \
+         (against main: unchanged — eviction never fetch_sub's the counter)"
+    );
+    assert!(
+        usage_after >= 0,
+        "F2: the counter must be clamped at >= 0, got {usage_after}"
+    );
+
+    env.close().unwrap();
+}

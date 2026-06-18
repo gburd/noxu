@@ -16,6 +16,42 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (cache evictor — keystone wiring, JE-fidelity)
+
+- **The cache evictor is no longer inert in production** (`noxu-tree` /
+  `noxu-evictor` / `noxu-dbi`, evictor F1+F2). Two confirmed Critical gaps:
+  - **F1 — LRU policy lists were never populated.** The evictor's
+    `note_ins_added` / `note_ins_accessed` / `note_ins_removed` had zero
+    callers outside the crate's own tests, so `evict_batch`'s phase quotas
+    (`policy.len()`) were always 0 and the evictor selected nothing. Added an
+    `InListListener` trait in `noxu-tree` (the tree's analogue of JE's `INList`
+    feeding the evictor's `LRUList`s) which `Evictor` implements. The tree now
+    notifies the listener on the production paths: BIN/root creation in
+    `Tree::insert` (JE `IN.fetchTarget`/initial build → `Evictor.addBack`),
+    every BIN reached during `Tree::search` descent (JE access →
+    `Evictor.moveBack`, add-if-absent so freshly split BINs register on first
+    touch), and BIN prune in `Tree::prune_empty_bin` (JE node removal →
+    `Evictor.remove`). `EnvironmentImpl::open_database` installs the `Evictor`
+    as each database tree's listener and points the evictor's eviction walk at
+    that tree.
+  - **F2 — eviction never decremented the shared budget counter.** The
+    evictor shares `cache_usage: Arc<AtomicI64>` with `Tree::memory_counter`;
+    inserts `fetch_add` to it but eviction only *accounted* `bytes_evicted`
+    and never subtracted, so the engine could never get back under budget by
+    evicting. Added `Arbiter::release_memory` (clamped at `>= 0`) and call it
+    from `do_evict_with_callbacks` after each batch — JE
+    `IN.updateMemorySize(-bytes)` →
+    `MemoryBudget.updateTreeMemoryUsage(-bytes)`.
+  - Reproduce-first regression tests (`noxu-dbi`
+    `evictor_f1_lru_lists_populated_by_production_inserts`,
+    `evictor_f1_f2_eviction_reduces_cache_usage`): open a small-cache env,
+    insert past the budget, evict, and assert the LRU lists grow, the evictor
+    evicts/strips > 0 nodes, and `cache_usage` drops. Both FAIL against the
+    pre-fix code (lists empty, 0 evicted, counter unchanged) and pass after.
+  - Deferred to follow-on waves (F4): multi-database round-robin eviction —
+    the evictor currently walks the last database tree installed; the
+    single-database case is fully covered.
+
 ### Fixed (recovery — physical log truncation, JE-fidelity log audit)
 
 - **Torn trailing log entry is now physically truncated at recovery**

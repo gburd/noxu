@@ -866,6 +866,13 @@ impl Evictor {
 
         let result = self.evict_batch(source, node_info_fn, node_size_fn);
 
+        // F2: decrement the shared budget counter by the bytes just freed.
+        // evict_batch only *accounts* bytes_evicted; without this the counter
+        // (incremented on insert) never drops and the engine can't get back
+        // under budget.  JE: every eviction calls IN.updateMemorySize(-bytes)
+        // → MemoryBudget.updateTreeMemoryUsage(-bytes).
+        self.arbiter.release_memory(result.bytes_evicted);
+
         match source {
             EvictionSource::Daemon => self
                 .stats
