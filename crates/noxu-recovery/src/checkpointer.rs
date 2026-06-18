@@ -361,6 +361,41 @@ impl Checkpointer {
         }
     }
 
+    /// Whether a periodic (daemon) checkpoint should run now (JE
+    /// `Checkpointer.isRunnable`). Without this gate the daemon wrote a
+    /// checkpoint on every wakeup tick even on a fully idle environment
+    /// (wasted I/O). Returns true if:
+    ///   - `force`, OR
+    ///   - bytes written since the last checkpoint >= the byte interval, OR
+    ///   - the time interval elapsed AND something was written since the last
+    ///     checkpoint (`bytes_since_checkpoint > 0` — JE's `lastUsedLsn !=
+    ///     lastCheckpointEnd` idle-guard).
+    pub fn is_runnable(&self, force: bool) -> bool {
+        if force {
+            return true;
+        }
+        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
+        if self.checkpoint_bytes_interval != 0
+            && bytes_since >= self.checkpoint_bytes_interval
+        {
+            return true;
+        }
+        // Time-cadence branch: the caller (the daemon) only invokes this once
+        // per wakeup interval, so reaching here means the time interval has
+        // elapsed. JE's idle-guard (`lastUsedLsn != lastCheckpointEnd`) maps to
+        // "something was written since the last checkpoint" — i.e.
+        // bytes_since > 0. Skip the checkpoint entirely on an idle environment.
+        bytes_since > 0
+    }
+
+    /// Test-only: bump `bytes_since_checkpoint` without triggering a
+    /// checkpoint (wakeup_after_write would fire do_checkpoint at the
+    /// threshold). Used to exercise `is_runnable`.
+    #[cfg(test)]
+    pub fn note_bytes_for_test(&self, bytes: u64) {
+        self.bytes_since_checkpoint.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Returns `true` if the given BIN node has been checkpointed at least
     /// once (its `last_full_lsn` is not NULL_LSN).
     ///
@@ -588,6 +623,8 @@ impl Checkpointer {
         // Step 6: Update statistics
         *self.last_checkpoint_start.lock() = start_lsn;
         *self.last_checkpoint_end.lock() = end_lsn;
+        // Reset the runnable-gate state: bytes written since this checkpoint.
+        self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
 
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
@@ -1403,6 +1440,29 @@ mod tests {
 
     /// `is_checkpointed` returns `false` for a BIN whose `last_full_lsn` is
     /// NULL_LSN (never checkpointed) and `true` after setting a non-NULL LSN.
+    #[test]
+    fn test_is_runnable_idle_guard() {
+        // Finding 9 regression: the daemon must NOT checkpoint an idle
+        // environment every wakeup. is_runnable(false) is false until bytes
+        // are written; force is always true.
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(1024);
+        // Idle: nothing written since the last checkpoint.
+        assert!(!cp.is_runnable(false), "idle env must not be runnable");
+        // Force always runs (JE config.getForce()).
+        assert!(cp.is_runnable(true), "force must always be runnable");
+        // After a sub-interval write, the time-cadence idle-guard makes it
+        // runnable (something was written), even below the byte interval.
+        cp.note_bytes_for_test(100);
+        assert!(
+            cp.is_runnable(false),
+            "runnable once something was written since the last checkpoint"
+        );
+        // Above the byte interval is also runnable.
+        cp.note_bytes_for_test(2000);
+        assert!(cp.is_runnable(false));
+    }
+
     #[test]
     fn test_is_checkpointed() {
         use noxu_tree::tree::{BinStub, TreeNode};

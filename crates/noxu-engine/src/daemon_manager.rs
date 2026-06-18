@@ -215,6 +215,12 @@ impl DaemonManager {
                         break;
                     }
 
+                    // JE Checkpointer.isRunnable: skip the periodic checkpoint
+                    // on an idle environment (nothing written since the last
+                    // one) instead of writing a CheckpointEnd every wakeup.
+                    if !checkpointer.is_runnable(false) {
+                        continue;
+                    }
                     // Perform checkpoint
                     match checkpointer.do_checkpoint("daemon") {
                         Ok(result) => {
