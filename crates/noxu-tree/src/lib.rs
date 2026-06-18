@@ -78,6 +78,7 @@ pub mod tree;
 // Re-exports for convenience
 pub use error::TreeError;
 pub use ln::Ln;
+pub use tree::InListListener;
 
 // Re-export from other agent modules (if they compile)
 pub use file_summary_ln::{FileSummary, FileSummaryLn};

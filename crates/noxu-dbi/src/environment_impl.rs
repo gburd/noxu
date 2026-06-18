@@ -1137,10 +1137,31 @@ impl EnvironmentImpl {
         // cleaner can dispatch secondary-LN liveness checks to the correct
         // tree.  Since the cleaner holds an Arc clone of db_trees_registry,
         // it will automatically see this tree on its next clean cycle.
-        if let Some(tree_arc) = db.read().get_real_tree_arc()
-            && let Ok(mut reg) = self.db_trees_registry.lock()
-        {
-            reg.insert(db_id.id(), tree_arc);
+        if let Some(tree_arc) = db.read().get_real_tree_arc() {
+            if let Ok(mut reg) = self.db_trees_registry.lock() {
+                reg.insert(db_id.id(), Arc::clone(&tree_arc));
+            }
+
+            // F1: feed this database tree's node add/access/remove events to
+            // the evictor's LRU lists, and point the evictor's eviction walk
+            // at this tree, so that nodes inserted/accessed through the
+            // production cursor path actually populate the lists the evictor
+            // drains.  Without this the policy lists stay empty, every
+            // evict_batch phase quota is 0, and the evictor selects nothing.
+            //
+            // JE: the database's INs are registered in the environment-wide
+            // INList, which feeds Evictor.addBack/moveBack/remove and which
+            // evictBatch drains.
+            //
+            // ponytail: single-tree wiring — the evictor walks the last tree
+            // installed here.  The single-database case (the common one, and
+            // the F1/F2 test) is fully covered; per-database round-robin
+            // eviction across all registry trees is follow-on wave F4.
+            if let Ok(mut tree_guard) = tree_arc.write() {
+                tree_guard.set_in_list_listener(Arc::clone(&self.evictor)
+                    as Arc<dyn noxu_tree::InListListener>);
+            }
+            self.evictor.set_tree(tree_arc, db_id.id() as u64);
         }
 
         self.db_map.write().insert(db_id, db.clone());
@@ -1480,6 +1501,19 @@ impl EnvironmentImpl {
             // continue to update the Arbiter / cleaner budget.
             // `set_recovered_tree` does not preserve the counter wiring.
             db_guard.set_memory_counter(Arc::clone(&self.cache_usage));
+            // F1: `set_recovered_tree` also drops the evictor listener wiring;
+            // re-install it on the fresh tree (and re-point the evictor walk)
+            // so eviction keeps working after a truncate.
+            if let Some(tree_arc) = db_guard.get_real_tree_arc() {
+                if let Ok(mut reg) = self.db_trees_registry.lock() {
+                    reg.insert(db_id.as_i64(), Arc::clone(&tree_arc));
+                }
+                if let Ok(mut tg) = tree_arc.write() {
+                    tg.set_in_list_listener(Arc::clone(&self.evictor)
+                        as Arc<dyn noxu_tree::InListListener>);
+                }
+                self.evictor.set_tree(tree_arc, db_id.as_i64() as u64);
+            }
             old_count
         };
 
@@ -1631,6 +1665,14 @@ impl EnvironmentImpl {
     /// Used in tests to assert the allocation formula is correct.
     pub fn get_arbiter_max_memory(&self) -> i64 {
         self.evictor.get_arbiter().get_max_memory()
+    }
+
+    /// Returns the current shared cache-usage counter (bytes), the value the
+    /// Arbiter reads to decide whether to evict.  Inserts `fetch_add` to it;
+    /// eviction `fetch_sub`s from it (F2).  Used by tests to assert eviction
+    /// actually drives usage down.
+    pub fn get_cache_usage(&self) -> i64 {
+        self.evictor.get_arbiter().get_cache_usage()
     }
     ///
     /// Returns `None` for read-only environments.

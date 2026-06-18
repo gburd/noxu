@@ -29,6 +29,27 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+/// Observer that mirrors JE's `INList` feeding the evictor's `LRUList`s.
+///
+/// The tree owns no eviction policy of its own; instead it notifies a
+/// registered listener whenever an IN/BIN node enters the resident cache, is
+/// accessed, or is removed.  The `Evictor` (in `noxu-evictor`) implements this
+/// trait, but the dependency is one-way (`noxu-evictor` → `noxu-tree`), so the
+/// tree refers to the listener only through this trait object — avoiding a
+/// circular crate dependency.
+///
+/// JE reference: `IN.fetchTarget` / split / `rebuildINList` call
+/// `Evictor.addBack`; node access calls `Evictor.moveBack`; node removal
+/// calls `Evictor.remove`.
+pub trait InListListener: Send + Sync {
+    /// A node has just become resident in the cache (JE `Evictor.addBack`).
+    fn note_ins_added(&self, node_id: u64);
+    /// A resident node was accessed (JE `Evictor.moveBack` — LRU touch).
+    fn note_ins_accessed(&self, node_id: u64);
+    /// A node was removed from the cache (JE `Evictor.remove`).
+    fn note_ins_removed(&self, node_id: u64);
+}
+
 // Level and flag constants re-exported here for tree-internal use.
 pub const DBMAP_LEVEL: i32 = 0x20000;
 pub const MAIN_LEVEL: i32 = 0x10000;
@@ -138,6 +159,18 @@ pub struct Tree {
     /// `Arc<AtomicI64>` shared with the `Arbiter` (and later `MemoryBudget`)
     /// to avoid a circular crate dependency (`noxu-tree` → `noxu-dbi`).
     pub memory_counter: Option<Arc<AtomicI64>>,
+
+    /// Optional listener fed on node add/access/remove, mirroring JE's
+    /// `INList` feeding the evictor's `LRUList`s.
+    ///
+    /// When `None` (the default — used by unit tests with no environment),
+    /// the notifications are no-ops.  `EnvironmentImpl` installs the
+    /// `Evictor` here so production inserts/accesses populate the LRU lists
+    /// the evictor drains.
+    ///
+    /// JE reference: `IN.fetchTarget`/split/`rebuildINList` → `addBack`,
+    /// access → `moveBack`, removal → `remove`.
+    pub in_list_listener: Option<Arc<dyn InListListener>>,
 
     /// Capacity hint for the recovery redo path.
     ///
@@ -1505,6 +1538,7 @@ impl Tree {
             relatches_required: AtomicU64::new(0),
             key_comparator: None,
             memory_counter: None,
+            in_list_listener: None,
             redo_capacity_hint: 0,
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
         }
@@ -1516,6 +1550,38 @@ impl Tree {
     ///.  The counter is updated on every BIN entry insert/delete.
     pub fn set_memory_counter(&mut self, counter: Arc<AtomicI64>) {
         self.memory_counter = Some(counter);
+    }
+
+    /// Installs the [`InListListener`] (the evictor) so node add/access/remove
+    /// feed the LRU lists.  JE: `INList` registration that feeds
+    /// `Evictor.addBack`/`moveBack`/`remove`.
+    pub fn set_in_list_listener(&mut self, listener: Arc<dyn InListListener>) {
+        self.in_list_listener = Some(listener);
+    }
+
+    /// Notify the listener that a node became resident (JE `Evictor.addBack`).
+    #[inline]
+    fn note_added(&self, node_id: u64) {
+        if let Some(l) = &self.in_list_listener {
+            l.note_ins_added(node_id);
+        }
+    }
+
+    /// Notify the listener that a resident node was accessed
+    /// (JE `Evictor.moveBack` — LRU touch).
+    #[inline]
+    fn note_accessed(&self, node_id: u64) {
+        if let Some(l) = &self.in_list_listener {
+            l.note_ins_accessed(node_id);
+        }
+    }
+
+    /// Notify the listener that a node was removed (JE `Evictor.remove`).
+    #[inline]
+    fn note_removed(&self, node_id: u64) {
+        if let Some(l) = &self.in_list_listener {
+            l.note_ins_removed(node_id);
+        }
     }
 
     /// Creates a new empty tree with a custom key comparator.
@@ -1539,6 +1605,7 @@ impl Tree {
             relatches_required: AtomicU64::new(0),
             key_comparator: Some(comparator),
             memory_counter: None,
+            in_list_listener: None,
             redo_capacity_hint: 0,
             key_prefixing: false,
         }
@@ -1721,6 +1788,13 @@ impl Tree {
 
         loop {
             if guard.is_bin() {
+                // JE: IN.fetchTarget / CursorImpl access moves the reached
+                // BIN toward the hot end of the evictor's LRU list
+                // (Evictor.moveBack).  A freshly split BIN that has not yet
+                // been registered is added here (moveBack is add-if-absent).
+                if let TreeNode::Bottom(bin) = &*guard {
+                    self.note_accessed(bin.node_id);
+                }
                 // Reached a BIN: final key lookup within the same guard.
                 // Use indicate_if_duplicate=true so an exact match sets
                 // EXACT_MATCH in the return value.  Guard against -1 (not
@@ -2167,8 +2241,10 @@ impl Tree {
         {
             let mut root_guard = self.root.write();
             if root_guard.is_none() {
+                let bin_node_id = generate_node_id();
+                let root_node_id = generate_node_id();
                 let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
-                    node_id: generate_node_id(),
+                    node_id: bin_node_id,
                     level: BIN_LEVEL,
                     entries: vec![BinEntry {
                         key,
@@ -2195,7 +2271,7 @@ impl Tree {
                 // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
                 let root_arc =
                     Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
-                        node_id: generate_node_id(),
+                        node_id: root_node_id,
                         level: MAIN_LEVEL | 2,
                         entries: vec![InEntry {
                             key: vec![], // virtual key for slot 0 in upper IN
@@ -2214,6 +2290,11 @@ impl Tree {
                 }
 
                 *root_guard = Some(root_arc);
+
+                // JE: IN.fetchTarget / initial tree build registers the new
+                // resident nodes with the evictor (Evictor.addBack).
+                self.note_added(root_node_id);
+                self.note_added(bin_node_id);
 
                 // Count the first entry.
                 if let Some(counter) = &self.memory_counter {
@@ -3919,6 +4000,7 @@ impl Tree {
         // parent.read()), so the BIN cannot be repopulated between the
         // re-check and the slot removal.
         let mut parent_guard = parent_arc.write();
+        let pruned_bin_id;
         let removed_key_len = match &mut *parent_guard {
             TreeNode::Internal(p) => {
                 let child = match p.entries.get(child_index) {
@@ -3945,6 +4027,7 @@ impl Tree {
                             if b.cursor_count > 0 {
                                 return false;
                             }
+                            pruned_bin_id = b.node_id;
                         }
                         // A concurrent split could in principle have replaced
                         // the child with an IN; never prune in that case.
@@ -3961,6 +4044,10 @@ impl Tree {
             TreeNode::Bottom(_) => return false,
         };
         drop(parent_guard);
+
+        // JE: removing the BIN slot detaches the BIN from the tree; the
+        // evictor must drop it from its LRU lists (Evictor.remove).
+        self.note_removed(pruned_bin_id);
 
         // Preserve the memory-counter bookkeeping that `self.delete` performed
         // (IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage).
