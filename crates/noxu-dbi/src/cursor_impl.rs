@@ -741,6 +741,41 @@ impl CursorImpl {
     }
 
     /// Checks the cursor is initialized.
+    /// Re-fetch a stripped LN's data from the log (JE `IN.fetchTarget`).
+    ///
+    /// The evictor's `strip_lns` drops a resident LN's in-memory data while
+    /// keeping the slot and its `lsn` (the data is recoverable from the log).
+    /// When a `get` finds such a slot (`data == None`) we must read the LN
+    /// back from the log at its `lsn` rather than return empty data. Without
+    /// this, a read of an evicted record silently returns no data.
+    fn fetch_ln_data_from_log(&self, lsn: u64) -> Option<Vec<u8>> {
+        use noxu_log::entry::LnLogEntry;
+        let lm = self.log_manager.as_ref()?;
+        let lsn = noxu_util::Lsn::from_u64(lsn);
+        let (entry_type, bytes) = lm.read_entry(lsn).ok()?;
+        if !entry_type.is_ln_type() {
+            return None;
+        }
+        let is_txnal = entry_type.is_transactional();
+        let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal).ok()?;
+        ln.data.map(|d| d.to_vec())
+    }
+
+    /// If `current_data` is empty/None but `current_lsn` is valid, the LN was
+    /// stripped by the evictor — re-fetch it from the log (JE
+    /// `IN.fetchTarget`). Idempotent; cheap when data is resident.
+    fn rehydrate_current_data(&mut self) {
+        let needs =
+            self.current_data.as_ref().map(|d| d.is_empty()).unwrap_or(true);
+        if needs
+            && self.current_lsn != 0
+            && let Some(d) = self.fetch_ln_data_from_log(self.current_lsn)
+            && !d.is_empty()
+        {
+            self.current_data = Some(d);
+        }
+    }
+
     fn check_initialized(&self) -> Result<(), DbiError> {
         #[cfg(any(test, feature = "testing"))]
         if tick_fail() {
@@ -846,6 +881,16 @@ impl CursorImpl {
                     } else {
                         slot_data
                     };
+                    // JE IN.fetchTarget: a found slot whose in-memory data was
+                    // stripped by the evictor (data == None) must be
+                    // re-fetched from the log at its LSN, not returned empty.
+                    let final_data = match final_data {
+                        Some(d) => Some(d),
+                        None if slot_lsn != 0 => {
+                            self.fetch_ln_data_from_log(slot_lsn)
+                        }
+                        none => none,
+                    };
                     // Audit Finding 4: BDB-JE's SearchBoth is exact-match on
                     // (key, data) regardless of duplicate-set membership; on a
                     // non-dup DB it must still validate that the slot's data
@@ -899,6 +944,16 @@ impl CursorImpl {
                     } else {
                         slot_data
                     };
+                    // JE IN.fetchTarget: a found slot whose in-memory data was
+                    // stripped by the evictor (data == None) must be
+                    // re-fetched from the log at its LSN, not returned empty.
+                    let final_data = match final_data {
+                        Some(d) => Some(d),
+                        None if slot_lsn != 0 => {
+                            self.fetch_ln_data_from_log(slot_lsn)
+                        }
+                        none => none,
+                    };
                     self.current_key = Some(key.to_vec());
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
@@ -936,6 +991,7 @@ impl CursorImpl {
                             self.current_key = Some(k);
                             self.current_data = Some(v);
                             self.current_lsn = lsn;
+                            self.rehydrate_current_data();
                             self.current_index = slot_idx as i32;
                             self.state = CursorState::Initialized;
                             self.update_bin_pin(bin_arc);
@@ -1013,6 +1069,9 @@ impl CursorImpl {
                     self.current_key = Some(raw_key);
                     self.current_data = None; // decoded lazily in get_current()
                     self.current_lsn = slot_lsn;
+                    // If the slot was stripped by the evictor, re-hydrate from
+                    // the log now (get_current is &self and cannot fetch).
+                    self.rehydrate_current_data();
                     // Wave 11-N Bug 2 fix: store the actual BIN index, not
                     // a hard-coded 0.  Pre-fix the cursor reported
                     // current_index = 0 after every dup search, which made
@@ -1564,6 +1623,7 @@ impl CursorImpl {
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
+                self.rehydrate_current_data();
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
@@ -1644,6 +1704,7 @@ impl CursorImpl {
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
+                self.rehydrate_current_data();
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
@@ -2060,6 +2121,7 @@ impl CursorImpl {
             self.current_key = Some(key);
             self.current_data = Some(data);
             self.current_lsn = lsn;
+            self.rehydrate_current_data();
             self.current_index = idx;
             return Ok(OperationStatus::Success);
         }
@@ -2128,6 +2190,7 @@ impl CursorImpl {
                 self.current_key = Some(raw_key);
                 self.current_data = Some(raw_data);
                 self.current_lsn = lsn;
+                self.rehydrate_current_data();
                 self.current_index = idx;
                 self.update_bin_pin(bin_arc);
                 Ok(OperationStatus::Success)
@@ -2188,6 +2251,7 @@ impl CursorImpl {
                         self.current_key = Some(raw_key);
                         self.current_data = Some(raw_data);
                         self.current_lsn = lsn;
+                        self.rehydrate_current_data();
                         self.current_index = idx;
                         self.update_bin_pin(bin_arc);
                         return Ok(OperationStatus::Success);
@@ -2207,6 +2271,7 @@ impl CursorImpl {
                         self.current_key = Some(raw_key);
                         self.current_data = Some(raw_data);
                         self.current_lsn = lsn;
+                        self.rehydrate_current_data();
                         self.current_index = idx;
                         self.update_bin_pin(bin_arc);
                         return Ok(OperationStatus::Success);
