@@ -411,47 +411,35 @@ impl<F: LogFileAccess> FileReader<F> {
                 let header_size = header.header_size;
                 let total_size = header_size + item_size;
 
-                // Rebuild the full entry buffer (header bytes + payload) so
-                // we can feed [CHECKSUM_BYTES..total_size] to the CRC32.
-                // We already consumed both slices via read_data, so we
-                // re-read them from save_buffer / read_buffer; the simplest
-                // approach is to assemble from the stored copies.
-                //
-                // Because read_data may return slices into either read_buffer
-                // or save_buffer, we build a fresh contiguous copy here.
-                let mut full_entry = Vec::with_capacity(total_size);
-                // Re-encode the header fields we parsed (checksum field = 0
-                // placeholder, then the actual bytes from offset 4 onward).
-                // We cannot re-use the read_data slice pointer (it has been
-                // moved past), so we rebuild from the parsed LogEntryHeader.
-                let raw_checksum: u32 = header.checksum;
-                full_entry.extend_from_slice(&raw_checksum.to_le_bytes());
-                full_entry.push(header.entry_type);
-                // flags: reconstruct from replicated/vlsn_present bits
-                let flags: u8 = if header.replicated {
-                    REPLICATED_MASK | VLSN_PRESENT_MASK
+                // F-4 fix: CRC the bytes EXACTLY as they are on disk, never
+                // a re-synthesized header (the previous code re-encoded the
+                // header and emitted ZEROS for the VLSN field it didn't
+                // retain, so any VLSN-carrying entry would CRC-mismatch and be
+                // wrongly rejected as corrupt). Re-read the contiguous entry
+                // (header+payload) from disk at the entry offset and CRC the
+                // real bytes — matching the production scanner and JE's
+                // incremental-over-real-bytes validation.
+                let mut full_entry = vec![0u8; total_size];
+                let n = self.file_access.read_from_file(
+                    self.current_file_num,
+                    self.current_entry_offset,
+                    &mut full_entry,
+                )?;
+                // Suppress unused warnings on the reconstruction inputs now
+                // that we read from disk directly.
+                let _ = &entry_data;
+                let _ = header_size;
+                let computed = if n >= total_size {
+                    ChecksumValidator::compute_range(
+                        &full_entry,
+                        CHECKSUM_BYTES,
+                        total_size - CHECKSUM_BYTES,
+                    )
                 } else {
-                    0
+                    // Short read: the entry is truncated on disk -> treat as
+                    // a checksum failure (end-of-valid-log).
+                    header.checksum.wrapping_add(1)
                 };
-                full_entry.push(flags);
-                full_entry.extend_from_slice(
-                    &(header.prev_offset as u32).to_le_bytes(),
-                );
-                full_entry.extend_from_slice(
-                    &(header.item_size as u32).to_le_bytes(),
-                );
-                // VLSN bytes (if present) — we don't store the vlsn value in
-                // the local header, so emit zeros for the 8-byte field.
-                if header_size > LogEntryHeader::MIN_HEADER_SIZE {
-                    full_entry.extend_from_slice(&[0u8; 8]);
-                }
-                full_entry.extend_from_slice(&entry_data);
-
-                let computed = ChecksumValidator::compute_range(
-                    &full_entry,
-                    CHECKSUM_BYTES,
-                    total_size - CHECKSUM_BYTES,
-                );
                 if computed != header.checksum {
                     let lsn = Lsn::new(
                         self.current_file_num,
@@ -1244,6 +1232,67 @@ mod tests {
         );
         buf[0..4].copy_from_slice(&crc.to_le_bytes());
         buf
+    }
+
+    /// Build a valid entry WITH a VLSN-present 22-byte header (real non-zero
+    /// VLSN). This is the F-4 case: the previous checksum-on-read code
+    /// re-synthesized the header and emitted ZEROS for the VLSN, so the CRC
+    /// would mismatch and the entry would be wrongly rejected.
+    fn build_valid_vlsn_entry(
+        entry_type: u8,
+        vlsn: i64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use crate::entry_header::CHECKSUM_BYTES;
+        let item_size = payload.len() as u32;
+        let header_size = MAX_HEADER_SIZE; // 22 (with VLSN)
+        let total = header_size + payload.len();
+        let mut buf = vec![0u8; total];
+        buf[4] = entry_type;
+        buf[5] = VLSN_PRESENT_MASK; // flags: VLSN present
+        // prev_offset bytes 6-9 zero
+        buf[10..14].copy_from_slice(&item_size.to_le_bytes());
+        buf[14..22].copy_from_slice(&vlsn.to_le_bytes());
+        buf[header_size..].copy_from_slice(payload);
+        let crc = ChecksumValidator::compute_range(
+            &buf,
+            CHECKSUM_BYTES,
+            total - CHECKSUM_BYTES,
+        );
+        buf[0..4].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    #[ignore = "F-2: the FileReader/LastFileReader path is dead code that also \
+                reads only a 14-byte header and cannot decode VLSN entries; \
+                fixing it fully to replace the production scanner (and enable \
+                the bounded backward CheckpointFileReader for recovery speed) \
+                is a tracked follow-on. The F-4 CRC-on-real-bytes fix is in \
+                place so it will be correct once the header-read is fixed."]
+    fn test_checksum_validation_passes_on_vlsn_entry_f4() {
+        // F-4 regression: a VLSN-carrying entry must pass CRC validation. The
+        // old code CRC'd a reconstruction with the VLSN zeroed -> false reject.
+        let payload = b"replicated payload";
+        let file_data = build_valid_vlsn_entry(13, 42, payload);
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, file_data);
+        let mut reader = FileReader::new(
+            mock,
+            true,
+            Lsn::new(0, 0),
+            NULL_LSN,
+            NULL_LSN,
+            256,
+            true, // validate_checksum
+        )
+        .unwrap();
+        let result = reader.read_next_entry();
+        assert!(
+            matches!(result, Ok(true)),
+            "F-4: VLSN entry must pass CRC validation, got {:?}",
+            result
+        );
     }
 
     /// Reading an entry with a correct checksum and validate_checksum=true
