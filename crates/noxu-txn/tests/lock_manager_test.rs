@@ -591,3 +591,122 @@ fn je_lock_test_conflicts_matrix() {
     );
     let _ = lm.release(l, 1);
 }
+
+// ─── C8: DeadlockTest 4-locker + intersecting-cycle ports ───────────────────
+//
+// JE invariant (DeadlockTest.testDeadlockAmongFourTxns):
+//   Txn1 owns L1 waits L2; Txn2 owns L2 waits L3; Txn3 owns L3 waits L4;
+//   Txn4 owns L4 waits L1 — a 4-locker ring. Exactly one locker is chosen as
+//   the deadlock victim (surfaces TxnError::Deadlock); the others proceed
+//   once the victim releases.
+//
+// Noxu adaptation: drive the same scenario via four threads using
+// `LockManager::lock` directly, as the existing 2-locker port does. We assert
+// that AT LEAST ONE waiter surfaces a deadlock (the detector breaks the
+// cycle) and that no thread hangs (all join). JE's "exactly one victim" is the
+// strong form; with concurrent detection more than one waiter can occasionally
+// observe a deadlock if cycles are detected from multiple entry points, so we
+// assert >= 1 (the safety property: the ring is broken, nothing hangs).
+#[test]
+fn je_deadlock_among_four_txns() {
+    let lm = Arc::new(LockManager::with_lock_timeout(2000));
+
+    let (l1, l2, l3, l4) = (101u64, 102u64, 103u64, 104u64);
+    let (t1, t2, t3, t4) = (1i64, 2i64, 3i64, 4i64);
+
+    // Each txn first grabs its own lock (always granted).
+    lm.lock(l1, t1, LockType::Write, false, false).unwrap();
+    lm.lock(l2, t2, LockType::Write, false, false).unwrap();
+    lm.lock(l3, t3, LockType::Write, false, false).unwrap();
+    lm.lock(l4, t4, LockType::Write, false, false).unwrap();
+
+    // Then each waits for the next locker's lock, forming the ring
+    // t1->l2, t2->l3, t3->l4, t4->l1.
+    let mk = |lm: &Arc<LockManager>, lsn: u64, t: i64| {
+        let lm = Arc::clone(lm);
+        thread::spawn(move || lm.lock(lsn, t, LockType::Write, false, false))
+    };
+    let h1 = mk(&lm, l2, t1);
+    let h2 = mk(&lm, l3, t2);
+    let h3 = mk(&lm, l4, t3);
+    let h4 = mk(&lm, l1, t4);
+
+    let rs = [
+        h1.join().unwrap(),
+        h2.join().unwrap(),
+        h3.join().unwrap(),
+        h4.join().unwrap(),
+    ];
+
+    let deadlocks =
+        rs.iter().filter(|r| matches!(r, Err(TxnError::Deadlock(_)))).count();
+    // No thread may hang (all joined above); the ring must be broken by at
+    // least one deadlock victim. A timeout would also break it, but JE's
+    // contract is deadlock detection — assert at least one Deadlock.
+    assert!(
+        deadlocks >= 1,
+        "4-locker ring must surface at least one deadlock victim; results={rs:?}"
+    );
+
+    // Cleanup: release everything for all lockers.
+    for t in [t1, t2, t3, t4] {
+        lm.release_all_for_locker(t);
+    }
+}
+
+// JE invariant (DeadlockTest.testDeadlockIntersectionWithOneCommonLocker):
+//   Two deadlock cycles intersect at one common locker (Txn2).
+//     Txn1 owns L1(read), waits L2(write)
+//     Txn2 owns L2,L3(write), waits L1(write)   <- common locker
+//     Txn3 owns L1(read), waits L3(write)
+//   Cycle A: Txn1<->Txn2 (via L1/L2). Cycle B: Txn2<->Txn3 (via L1/L3).
+//   The detector must break the intersecting cycles: at least one locker is a
+//   victim and no thread hangs.
+#[test]
+fn je_deadlock_intersection_one_common_locker() {
+    let lm = Arc::new(LockManager::with_lock_timeout(2000));
+
+    let (l1, l2, l3) = (201u64, 202u64, 203u64);
+    let (t1, t2, t3) = (11i64, 12i64, 13i64);
+
+    // Txn1 and Txn3 share a READ lock on L1.
+    lm.lock(l1, t1, LockType::Read, false, false).unwrap();
+    lm.lock(l1, t3, LockType::Read, false, false).unwrap();
+    // Txn2 owns L2 and L3 (write).
+    lm.lock(l2, t2, LockType::Write, false, false).unwrap();
+    lm.lock(l3, t2, LockType::Write, false, false).unwrap();
+
+    // Now the blocking requests that form the two intersecting cycles:
+    //   Txn1 -> L2 (held by Txn2 write)
+    //   Txn3 -> L3 (held by Txn2 write)
+    //   Txn2 -> L1 (held by Txn1+Txn3 read) — write request conflicts.
+    let lm1 = Arc::clone(&lm);
+    let lm2 = Arc::clone(&lm);
+    let lm3 = Arc::clone(&lm);
+    let h1 =
+        thread::spawn(move || lm1.lock(l2, t1, LockType::Write, false, false));
+    let h3 =
+        thread::spawn(move || lm3.lock(l3, t3, LockType::Write, false, false));
+    // Let the two waiters enqueue first, then Txn2 closes both cycles.
+    thread::sleep(Duration::from_millis(60));
+    let h2 =
+        thread::spawn(move || lm2.lock(l1, t2, LockType::Write, false, false));
+
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    let r3 = h3.join().unwrap();
+
+    let deadlocks = [&r1, &r2, &r3]
+        .iter()
+        .filter(|r| matches!(r, Err(TxnError::Deadlock(_))))
+        .count();
+    assert!(
+        deadlocks >= 1,
+        "intersecting cycles (one common locker) must surface at least one \
+         deadlock victim; r1={r1:?} r2={r2:?} r3={r3:?}"
+    );
+
+    for t in [t1, t2, t3] {
+        lm.release_all_for_locker(t);
+    }
+}

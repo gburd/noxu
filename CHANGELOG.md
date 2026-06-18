@@ -16,6 +16,156 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C8: deadlock 4-locker + intersecting cycles)
+
+- **Ports JE `DeadlockTest` 4-locker and intersecting-cycle cases** beyond the
+  existing 2/3-locker coverage:
+  - `noxu-txn/tests/integration_tests.rs` (graph-level, deterministic via
+    `DeadlockDetector::detect`): `deadlock_four_locker_cycle_detected`
+    (T1→T2→T3→T4→T1 ring, JE `testDeadlockAmongFourTxns`) and
+    `deadlock_intersection_one_common_locker_detected` (two cycles sharing a
+    common locker, JE `testDeadlockIntersectionWithOneCommonLocker`).
+  - `noxu-txn/tests/lock_manager_test.rs` (end-to-end threaded via
+    `LockManager::lock`): `je_deadlock_among_four_txns` (4-thread ring) and
+    `je_deadlock_intersection_one_common_locker` (3-thread intersecting cycle
+    with a shared read lock). Each asserts the cycle is broken — at least one
+    waiter surfaces `TxnError::Deadlock` and no thread hangs (all join).
+
+### Testing (JE test-fidelity — C7: RMW locking core invariant) — FINDING
+
+- **New `je_rmw_locking_test.rs`** ports the core `LockMode.RMW` contract from
+  JE (`RMWLockingTest` / `Cursor.get(..., LockMode.RMW)`): a read with
+  `LockMode::Rmw` must take a WRITE lock and block a concurrent writer.
+- **FINDING (real Noxu divergence):** `LockMode::Rmw` is *defined* but its
+  write-lock-on-read semantics are NOT implemented. `Cursor::get`'s
+  `lock_mode` parameter is `_lock_mode` (ignored); `get_with_options` routes
+  `Rmw` through the same plain-read `cursor.search` path as `Default`; and
+  `noxu-dbi`'s `CursorImpl::search` / `get_current` never acquire a write lock
+  for a read. An RMW read therefore behaves like a plain read and does NOT
+  block a concurrent writer.
+- The two faithful RMW tests
+  (`rmw_read_holds_write_lock_no_wait_writer_conflicts`,
+  `rmw_read_blocks_concurrent_writer_until_commit`) are `#[ignore]`d (NOT
+  weakened) to document the gap; they pass once RMW write-locking is wired.
+  The control test `plain_read_committed_releases_lock_writer_succeeds` runs
+  in the default suite and validates the harness. Run the ignored tests with
+  `cargo test -p noxu-db --test je_rmw_locking_test -- --ignored`.
+
+### Testing (JE test-fidelity — C6: log-file corruption detection)
+
+- **New `log_corruption_test.rs`** — faithful in spirit to JE
+  `com.sleepycat.je.util.LogFileCorruptionTest.testDataCorruptWithVerifier`
+  (which flips a byte at `fileLength/2` and expects
+  `EnvironmentFailureException`):
+  - `byte_flip_in_committed_entry_is_detected`: write a committed workload
+    spanning several log files, flip one byte (all 8 bits) at the midpoint of
+    a non-final committed `.ndb` file, reopen, and assert the corruption is
+    DETECTED — the recovered set is a strict prefix of the committed set (the
+    corrupt entry + tail are dropped at the CRC/torn boundary) and NO
+    garbage/wrong value is ever returned. Proves the per-entry CRC32 catches a
+    flipped committed entry rather than silently returning it.
+  - `mid_entry_truncation_torn_tail_not_returned`: truncate the last file
+    mid-entry; the torn tail must be treated as end-of-log and never surfaced
+    as data (recovered set is a subset of the committed set, no garbage).
+
+### Added (API parity — `Environment::clean_log`)
+
+- **`Environment::clean_log()`** — public synchronous log-cleaning trigger
+  mirroring JE `Environment.cleanLog()`. Forwards to the cleaner and returns
+  the number of files cleaned. Needed for deterministic cleaner regression
+  tests (C5) and for applications that reclaim space on demand rather than
+  relying on the background daemon. (Previously only the read-only-rejection
+  variant was covered; the working manual-clean path was unexposed.)
+
+### Testing (JE test-fidelity — C5: cleaner SR regressions)
+
+- **New `je_cleaner_sr_test.rs` ports two high-signal JE cleaner SR
+  regressions** (`com/sleepycat/je/cleaner/SR10553Test`, `SR12885Test`):
+  - `sr10553_clean_then_scan_deleted_does_not_fail`: put duplicates, delete
+    all, checkpoint, `clean_log()`, evict, scan — the scan must complete
+    without a LogFileNotFound-style error (JE: cleaner must set knownDeleted
+    for deleted records). Asserts `cleaned > 0`.
+  - `sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data`: drive the
+    cleaner LN-migration + txn slot-reuse + abort sequence; the surviving key
+    must still fetch SUCCESS (data not lost to a cleaned file).
+  Adaptation note: JE's specific SR12885 node-ID bug is, per JE's own comment,
+  not applicable to LSN-locking engines — Noxu locks LSNs and LNs have no node
+  IDs (AGENTS.md "Lock-based, NOT MVCC"), so the still-applicable data-safety
+  invariant is ported.
+- **SR13061 (`FileSummaryLN.hasStringKey`) SKIPPED** (documented in the test
+  module): it guards a JE log-version-migration bug where an old STRING
+  file-summary key was misread as an 8-byte integer key. Noxu has a single
+  binary `.ndb` format with no legacy string-key path, so the bug class cannot
+  exist — not a fidelity gap.
+
+### Testing (JE test-fidelity — C4: RecoveryDeltaTest testCompress + testKnownDeleted)
+
+- **`recovery_correctness_test.rs` now ports JE
+  `com.sleepycat.je.recovery.RecoveryDeltaTest`** (`testCompress`,
+  `testKnownDeleted`):
+  - `delta_test_compress_recovers_surviving_set`: insert, delete every other,
+    `env.compress()`, force checkpoint, recover, assert the recovered set ==
+    the surviving committed set (+ structural `env.verify()`). Authorized
+    deviation: the JE `NDeltaINFlush == 0` ("compress forces a full BIN")
+    invariant tests JE's deferred-compression mechanic; Noxu deletes
+    PHYSICALLY (IC-3, `tree.rs::compress_bin`), so `env.compress()` is a no-op
+    for committed deletes and the stat invariant does not apply — the
+    data-correctness half is ported faithfully.
+  - `delta_test_known_deleted_replays`: drive a checkpoint that writes
+    BIN-deltas whose base BINs carry known-deleted tombstone slots (from
+    aborted inserts), then recover and assert every committed key is present
+    and no tombstone key leaks (BIN-delta reconstitution clears stale KD).
+    Asserts `checkpoint.delta_in_flush > 0` (JE `getNDeltaINFlush() > 0`).
+    Authorized deviation: the Noxu checkpointer hardcodes the BIN-delta dirty
+    threshold at 25% (`checkpointer.rs` const `TREE_BIN_DELTA`) and does not
+    read the config param, so JE's `BIN_DELTA_PERCENT = 75` cannot be set; the
+    KD churn / committed mutation are applied to small per-BIN subsets to stay
+    under 25% while still producing KD-bearing deltas. Asserted property
+    (KD-delta replay correctness) is preserved.
+
+### Testing (JE test-fidelity — C3: forced split-recovery topologies)
+
+- **New `forced_split_recovery_test.rs` ports three JE recovery topology
+  suites** — each deliberately drives a specific B-tree topology, then
+  recovers and asserts BOTH data equality AND structural integrity
+  (`env.verify()` zero errors, per JE `CheckBase.recoverAndLoadData`):
+  - `new_root_via_split_recovers` / `change_and_evict_root_recovers`
+    (JE `CheckNewRootTest.testWrittenBySplit` / `testChangeAndEvictRoot`):
+    new-root creation via ascending right-splits + checkpoint, and root
+    survival across eviction + checkpoint.
+  - `split_aunt_recovers` (JE `CheckSplitAuntTest.testSplitAunt`): deep tree,
+    dirty the left branch, checkpoint to level 2 leaving an ancestor dirty,
+    then split the right branch ("split-aunt"), close w/out checkpoint,
+    recover.
+  - `reverse_split_recovers` / `complete_removal_recovers`
+    (JE `CheckReverseSplitsTest.testReverseSplit` / `testCompleteRemoval`):
+    empty the leftmost BIN, checkpoint, compress out the empty BIN (reverse
+    split / subtree removal), then split/insert and recover; complete-removal
+    additionally asserts a single surviving BIN after compress.
+  Adaptation: ASCII keys instead of JE `IntegerBinding`, `env.evict_memory()`
+  instead of JE's evictor `TestHook`, `env.checkpoint(force)` for JE
+  `env.sync()`; split/merge geometry preserved via matching NODE_MAX and
+  insert/delete counts.
+
+### Testing (JE test-fidelity — C2: deterministic stepwise truncation sweep)
+
+- **New `stepwise_truncation_test.rs` ports JE `CheckBase.stepwiseLoop`**
+  (driven by `CheckSplitsTest.testBasicInsert` and the
+  `recovery/stepwise` support classes `EntryTrackerReader` / `LogEntryInfo` /
+  `TestData`). Where `power_loss_sweep.rs` only sampled RANDOM kill points,
+  this is JE's deterministic EXHAUSTIVE torn-write boundary sweep: write a
+  known 21-key ascending autocommit workload with `NODE_MAX = 4` (forcing BIN
+  splits), walk every log-entry boundary in every `.ndb` file with the
+  production header/LN parsers (`noxu_log::LogEntryHeader`,
+  `LnLogEntry::parse_from_slice` — the analogue of JE's `EntryTrackerReader`),
+  truncate at each boundary, recover, and assert the recovered set equals the
+  EXACT surviving subset (independently computed by replaying the surviving
+  log prefix, mirroring JE's `updateExpectedSet`). Same exact-set assertion
+  strength as JE `CheckBase.validate`; `env.verify()` runs after each
+  recovery (C1). Adaptation: ASCII `key_NNNN` keys instead of JE
+  `IntegerBinding` 4-byte keys; scenario and assertion strength preserved.
+
+
 ### Fixed (evictor config — EVICTOR_USE_DIRTY_LRU wired; dead config documented)
 
 - **`EVICTOR_USE_DIRTY_LRU` is now read from config** (`noxu-evictor` /

@@ -1456,6 +1456,30 @@ impl Environment {
         Ok(n)
     }
 
+    /// Explicitly clean (garbage-collect) log files, returning the number of
+    /// files that were cleaned.
+    ///
+    /// Mirrors `Environment.cleanLog()` in JE (`Environment.java`). Drives the
+    /// log cleaner synchronously to migrate live LNs forward and mark
+    /// low-utilization files for deletion. This is the manual counterpart to
+    /// the background cleaner daemon, used to reclaim space on demand.
+    ///
+    /// Unlike the throttled daemon pass, this performs a forced cleaning pass
+    /// (JE's `cleanLog()` likewise cleans regardless of the daemon's
+    /// utilization budget), so callers can deterministically reclaim obsolete
+    /// files in tests and batch maintenance.
+    ///
+    /// Returns `Ok(files_cleaned)`. Returns `Err` if the environment is closed
+    /// or read-only (no cleaner is available).
+    pub fn clean_log(&self) -> Result<u32> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let result = env_impl
+            .run_cleaner(u32::MAX, true)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        Ok(result.files_cleaned)
+    }
+
     /// Explicitly trigger the memory evictor.
     ///
     /// Mirrors `Environment.evictMemory()` in JE (`Environment.java:1860`).
