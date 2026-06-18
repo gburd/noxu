@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-06-18
+
 ### Performance (recovery — streaming analysis scan, JE-fidelity)
 
 - **Recovery analysis no longer materialises the bounded log range into an
