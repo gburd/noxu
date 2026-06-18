@@ -16,6 +16,26 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C7: RMW locking core invariant) — FINDING
+
+- **New `je_rmw_locking_test.rs`** ports the core `LockMode.RMW` contract from
+  JE (`RMWLockingTest` / `Cursor.get(..., LockMode.RMW)`): a read with
+  `LockMode::Rmw` must take a WRITE lock and block a concurrent writer.
+- **FINDING (real Noxu divergence):** `LockMode::Rmw` is *defined* but its
+  write-lock-on-read semantics are NOT implemented. `Cursor::get`'s
+  `lock_mode` parameter is `_lock_mode` (ignored); `get_with_options` routes
+  `Rmw` through the same plain-read `cursor.search` path as `Default`; and
+  `noxu-dbi`'s `CursorImpl::search` / `get_current` never acquire a write lock
+  for a read. An RMW read therefore behaves like a plain read and does NOT
+  block a concurrent writer.
+- The two faithful RMW tests
+  (`rmw_read_holds_write_lock_no_wait_writer_conflicts`,
+  `rmw_read_blocks_concurrent_writer_until_commit`) are `#[ignore]`d (NOT
+  weakened) to document the gap; they pass once RMW write-locking is wired.
+  The control test `plain_read_committed_releases_lock_writer_succeeds` runs
+  in the default suite and validates the harness. Run the ignored tests with
+  `cargo test -p noxu-db --test je_rmw_locking_test -- --ignored`.
+
 ### Testing (JE test-fidelity — C6: log-file corruption detection)
 
 - **New `log_corruption_test.rs`** — faithful in spirit to JE
