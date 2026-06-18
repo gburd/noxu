@@ -60,6 +60,11 @@ pub struct SecondaryCursor<'a> {
     /// than raising SecondaryIntegrityException.  D8 fix.
     /// Ref: JE SecondaryCursor getNextWithKeySearch() dirty-read skip.
     read_uncommitted: bool,
+    /// F1: the secondary key this cursor is parked on for a JoinCursor probe,
+    /// captured on the first `has_candidate_primary_key` call. Subsequent
+    /// probes SearchBoth against THIS key (not the cursor's live position,
+    /// which the SearchBoth itself moves within the dup set).
+    join_probe_key: Option<Vec<u8>>,
 }
 
 impl<'a> SecondaryCursor<'a> {
@@ -84,7 +89,13 @@ impl<'a> SecondaryCursor<'a> {
     ) -> Result<Self> {
         let read_uncommitted = config.is_some_and(|c| c.read_uncommitted);
         let inner = secondary_db.inner_db().open_cursor(txn, config)?;
-        Ok(Self { inner, secondary_db, txn, read_uncommitted })
+        Ok(Self {
+            inner,
+            secondary_db,
+            txn,
+            read_uncommitted,
+            join_probe_key: None,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -490,9 +501,44 @@ impl<'a> SecondaryCursor<'a> {
         &mut self,
         candidate: &[u8],
     ) -> Result<bool> {
-        match self.get_current_primary_key_only()? {
-            Some(pk) => Ok(pk == candidate),
-            None => Ok(false),
+        // F1 (JE JoinCursor.retrieveNext): probe whether THIS secondary index
+        // contains the pair (current secondary key, candidate primary key).
+        // JE issues `secCursor.search(secKey, candidatePK, SearchMode.BOTH)` —
+        // an exact (sec_key, pk) lookup that scans the whole duplicate set, NOT
+        // a comparison against the single PK the cursor happens to sit on.
+        // Reading only Get::Current drops valid matches whenever a secondary
+        // key maps to more than one primary record.
+        //
+        // Read the secondary key the join parked this cursor on, then do a
+        // SearchBoth(sec_key, candidate) on the underlying secondary-index
+        // storage (sec_key -> pri_key).
+        // Capture the join secondary key ONCE (the SearchBoth below moves the
+        // cursor within the dup set, so we must not re-read Get::Current on a
+        // later probe — it would no longer be the join key).
+        if self.join_probe_key.is_none() {
+            let mut cur_sec_key = DatabaseEntry::new();
+            let mut cur_pk = DatabaseEntry::new();
+            let st = match self.inner.get(
+                &mut cur_sec_key,
+                &mut cur_pk,
+                Get::Current,
+                None,
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(false),
+            };
+            if st != OperationStatus::Success {
+                return Ok(false);
+            }
+            self.join_probe_key = Some(cur_sec_key.data().to_vec());
+        }
+        let sec_key = self.join_probe_key.clone().unwrap();
+        // SearchBoth: exact (sec_key, candidate-pk) match in the dup set.
+        let mut k = DatabaseEntry::from_bytes(&sec_key);
+        let mut d = DatabaseEntry::from_bytes(candidate);
+        match self.inner.get(&mut k, &mut d, Get::SearchBoth, None) {
+            Ok(OperationStatus::Success) => Ok(true),
+            _ => Ok(false),
         }
     }
 

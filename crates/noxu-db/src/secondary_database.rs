@@ -266,6 +266,37 @@ impl SecondaryHookState {
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
     ) -> Result<()> {
+        // F3 (JE SecondaryDatabase.insertKey): when a foreign-key database is
+        // configured, the new secondary key MUST exist as a key in that foreign
+        // DB, else the referential constraint is violated. JE enforces this on
+        // every secondary insert (not just on delete). Check before the index
+        // put.
+        //
+        // EXCEPT when we are inside an FK cascade/nullify (the thread-local
+        // guard is non-empty): the nullify-rewrite re-maintains the secondary
+        // with the nullified key, which is an internal integrity operation, not
+        // a user insert — re-checking it would (a) wrongly reject the nullified
+        // key and (b) re-lock the foreign DB we are already holding (deadlock).
+        let in_cascade = FK_CASCADE_GUARD.with(|g| !g.borrow().is_empty());
+        if !in_cascade
+            && let Some(foreign_db) = &self.config.foreign_key_database
+        {
+            let fdb = foreign_db.lock();
+            let mut scratch = DatabaseEntry::new();
+            let found = matches!(
+                fdb.get(txn, sec_key, &mut scratch).map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?,
+                OperationStatus::Success,
+            );
+            drop(fdb);
+            if !found {
+                return Err(NoxuError::ForeignConstraintViolation(format!(
+                    "foreign key not allowed: {:?} is not present in the                      foreign database",
+                    sec_key.data()
+                )));
+            }
+        }
         let mut cursor = self.make_inner_cursor(txn)?;
         let status =
             cursor

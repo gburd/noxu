@@ -16,6 +16,31 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (secondary / join — JE-fidelity F1/F3)
+
+- **Foreign-key constraint now enforced on secondary INSERT** (`noxu-db`, F3):
+  JE `SecondaryDatabase.insertKey` rejects (`ForeignConstraintException`) a
+  secondary insert whose key is absent from the configured foreign-key
+  database. Noxu enforced this only on the foreign-DELETE side (Abort/Cascade/
+  Nullify); the INSERT side silently accepted dangling references. Added the
+  per-key foreign-DB existence check in `insert_sec_key`, skipped inside an FK
+  cascade/nullify (the thread-local guard) so the nullify-rewrite isn't
+  re-checked and the foreign DB isn't re-locked (deadlock). Regression test
+  `fk_insert_rejects_secondary_key_absent_from_foreign_db`; corrected
+  `fk_nullify_multi_key_nullifier_path` to populate all referenced foreign keys
+  (JE applies the FK check per generated multi-key, so the prior fixture was
+  JE-invalid).
+- **JoinCursor probe now uses SearchBoth, not the cursor's current position**
+  (`noxu-db`, F1): JE `JoinCursor.retrieveNext` probes each secondary with
+  `search(secKey, candidatePK, SearchMode.BOTH)` — an exact lookup that scans
+  the whole duplicate set. Noxu read only the single primary key the cursor was
+  parked on (`Get::Current`), silently dropping join matches whenever a
+  secondary key maps to more than one primary. Now captures the join secondary
+  key once and `SearchBoth`-probes against it. (Fully exercised only with
+  sorted-dup secondaries, a v1.6 deferred feature; correct for the current
+  one-to-one model and faithful for when sorted-dup lands.)
+
+
 ### Fixed (collections — atomic StoredKeySet.add, JE-fidelity COL-KEYSET-1)
 
 - **`StoredKeySet::add` is now an atomic `putNoOverwrite`** (`noxu-collections`):

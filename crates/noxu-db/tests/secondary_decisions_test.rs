@@ -833,6 +833,55 @@ fn fk_abort_blocks_delete_of_referenced_foreign_record() {
     );
 }
 
+/// F3 (JE SecondaryDatabase.insertKey): inserting a child primary record whose
+/// secondary key is NOT present in the configured foreign-key database must be
+/// rejected with ForeignConstraintViolation — enforced on INSERT, not only on
+/// the foreign DELETE side.
+#[test]
+fn fk_insert_rejects_secondary_key_absent_from_foreign_db() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_pri(&env, "primary");
+    let inner = open_inner_sec_db(&env, "secondary");
+    let foreign = open_pri(&env, "foreign");
+
+    let cfg = SecondaryConfig::new()
+        .with_allow_create(true)
+        .with_key_creator(Box::new(FirstByteCreator))
+        .with_foreign_key_database_handle(Arc::clone(&foreign));
+    let _sec =
+        SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
+
+    // Foreign DB contains key "A" only.
+    foreign
+        .lock()
+        .put(
+            None,
+            &DatabaseEntry::from_bytes(b"A"),
+            &DatabaseEntry::from_bytes(b"x"),
+        )
+        .unwrap();
+
+    // A child whose secondary key (first byte) IS in the foreign DB: allowed.
+    let ok_pk = DatabaseEntry::from_bytes(b"pk_ok");
+    primary
+        .lock()
+        .put(None, &ok_pk, &DatabaseEntry::from_bytes(b"Apple"))
+        .unwrap();
+
+    // A child whose secondary key (first byte 'Z') is ABSENT from the foreign
+    // DB: must be rejected with ForeignConstraintViolation.
+    let bad_pk = DatabaseEntry::from_bytes(b"pk_bad");
+    let res =
+        primary.lock().put(None, &bad_pk, &DatabaseEntry::from_bytes(b"Zebra"));
+    match res {
+        Err(NoxuError::ForeignConstraintViolation(_)) => {}
+        other => panic!(
+            "F3: insert with absent foreign key must be ForeignConstraintViolation, got {other:?}"
+        ),
+    }
+}
+
 /// FK Nullify with the multi-key variant: every secondary key in a
 /// multi-key index is nullified individually via
 /// [`ForeignMultiKeyNullifier`].  v1.6 step 10.
@@ -900,12 +949,27 @@ fn fk_nullify_multi_key_nullifier_path() {
     let _sec =
         SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
+    // F3 (JE insertKey applies the foreign-key check per generated secondary
+    // key): the multi-key value "ABC" produces secondary keys A, B, C — ALL of
+    // which must exist in the foreign DB for the insert to be allowed (JE would
+    // throw ForeignConstraintException otherwise). Populate all three.
+    for b in [b"A".as_ref(), b"B", b"C"] {
+        foreign
+            .lock()
+            .put(
+                None,
+                &DatabaseEntry::from_bytes(b),
+                &DatabaseEntry::from_bytes(b"x"),
+            )
+            .unwrap();
+    }
     let fk_a = DatabaseEntry::from_bytes(b"A");
-    foreign.lock().put(None, &fk_a, &DatabaseEntry::from_bytes(b"x")).unwrap();
 
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     primary.lock().put(None, &pk1, &DatabaseEntry::from_bytes(b"ABC")).unwrap();
 
+    // Deleting foreign key A nullifies the 'A' secondary key from the child via
+    // the multi-key nullifier, leaving data "BC".
     foreign.lock().delete(None, &fk_a).unwrap();
     let mut child = DatabaseEntry::new();
     primary.lock().get(None, &pk1, &mut child).unwrap();
