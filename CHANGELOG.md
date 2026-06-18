@@ -16,6 +16,31 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C4: RecoveryDeltaTest testCompress + testKnownDeleted)
+
+- **`recovery_correctness_test.rs` now ports JE
+  `com.sleepycat.je.recovery.RecoveryDeltaTest`** (`testCompress`,
+  `testKnownDeleted`):
+  - `delta_test_compress_recovers_surviving_set`: insert, delete every other,
+    `env.compress()`, force checkpoint, recover, assert the recovered set ==
+    the surviving committed set (+ structural `env.verify()`). Authorized
+    deviation: the JE `NDeltaINFlush == 0` ("compress forces a full BIN")
+    invariant tests JE's deferred-compression mechanic; Noxu deletes
+    PHYSICALLY (IC-3, `tree.rs::compress_bin`), so `env.compress()` is a no-op
+    for committed deletes and the stat invariant does not apply — the
+    data-correctness half is ported faithfully.
+  - `delta_test_known_deleted_replays`: drive a checkpoint that writes
+    BIN-deltas whose base BINs carry known-deleted tombstone slots (from
+    aborted inserts), then recover and assert every committed key is present
+    and no tombstone key leaks (BIN-delta reconstitution clears stale KD).
+    Asserts `checkpoint.delta_in_flush > 0` (JE `getNDeltaINFlush() > 0`).
+    Authorized deviation: the Noxu checkpointer hardcodes the BIN-delta dirty
+    threshold at 25% (`checkpointer.rs` const `TREE_BIN_DELTA`) and does not
+    read the config param, so JE's `BIN_DELTA_PERCENT = 75` cannot be set; the
+    KD churn / committed mutation are applied to small per-BIN subsets to stay
+    under 25% while still producing KD-bearing deltas. Asserted property
+    (KD-delta replay correctness) is preserved.
+
 ### Testing (JE test-fidelity — C3: forced split-recovery topologies)
 
 - **New `forced_split_recovery_test.rs` ports three JE recovery topology
