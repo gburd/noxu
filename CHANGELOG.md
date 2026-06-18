@@ -16,6 +16,25 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C2: deterministic stepwise truncation sweep)
+
+- **New `stepwise_truncation_test.rs` ports JE `CheckBase.stepwiseLoop`**
+  (driven by `CheckSplitsTest.testBasicInsert` and the
+  `recovery/stepwise` support classes `EntryTrackerReader` / `LogEntryInfo` /
+  `TestData`). Where `power_loss_sweep.rs` only sampled RANDOM kill points,
+  this is JE's deterministic EXHAUSTIVE torn-write boundary sweep: write a
+  known 21-key ascending autocommit workload with `NODE_MAX = 4` (forcing BIN
+  splits), walk every log-entry boundary in every `.ndb` file with the
+  production header/LN parsers (`noxu_log::LogEntryHeader`,
+  `LnLogEntry::parse_from_slice` — the analogue of JE's `EntryTrackerReader`),
+  truncate at each boundary, recover, and assert the recovered set equals the
+  EXACT surviving subset (independently computed by replaying the surviving
+  log prefix, mirroring JE's `updateExpectedSet`). Same exact-set assertion
+  strength as JE `CheckBase.validate`; `env.verify()` runs after each
+  recovery (C1). Adaptation: ASCII `key_NNNN` keys instead of JE
+  `IntegerBinding` 4-byte keys; scenario and assertion strength preserved.
+
+
 ### Fixed (evictor config — EVICTOR_USE_DIRTY_LRU wired; dead config documented)
 
 - **`EVICTOR_USE_DIRTY_LRU` is now read from config** (`noxu-evictor` /
