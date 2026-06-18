@@ -248,6 +248,41 @@ fn derived_composite_primary_key_round_trip() {
     assert_eq!(key, decoded);
 }
 
+/// PERSIST-COMP-1 regression: the on-disk byte order of a composite key must
+/// match the logical tuple order `(region, customer_id)`. With the old
+/// length-prefix encoding, `("aa", 1)` sorted AFTER `("b", 1)` because the
+/// 4-byte length prefix `len("aa")=2 > len("b")=1` dominated the comparison —
+/// silently corrupting ordered iteration / range scans.
+#[test]
+fn composite_primary_key_encoded_order_matches_logical_order() {
+    // Keys chosen so the variable-length first field has DIFFERENT lengths
+    // that would invert order under a length-prefix scheme.
+    let mut keys = vec![
+        CompositeKey { region: "b".into(), customer_id: 1 },
+        CompositeKey { region: "aa".into(), customer_id: 1 },
+        CompositeKey { region: "a".into(), customer_id: 9 },
+        CompositeKey { region: "a".into(), customer_id: 1 },
+        CompositeKey { region: "aaa".into(), customer_id: 0 },
+    ];
+    // Logical order via derived Ord on (region, customer_id).
+    keys.sort();
+
+    // Encoded order must equal logical order.
+    let mut encoded: Vec<Vec<u8>> =
+        keys.iter().map(CompositeKey::to_bytes).collect();
+    let logical_then_encoded = encoded.clone();
+    encoded.sort();
+    assert_eq!(
+        encoded, logical_then_encoded,
+        "encoded composite-key byte order must match logical tuple order"
+    );
+
+    // Explicit ladder check: ("aa",1) must encode BEFORE ("b",1).
+    let aa = CompositeKey { region: "aa".into(), customer_id: 1 }.to_bytes();
+    let b = CompositeKey { region: "b".into(), customer_id: 1 }.to_bytes();
+    assert!(aa < b, "(\"aa\",1) must sort before (\"b\",1)");
+}
+
 #[test]
 fn derived_newtype_primary_key_round_trip() {
     let key = NewtypeKey(0xCAFEBABE);
@@ -260,8 +295,9 @@ fn derived_newtype_primary_key_round_trip() {
 
 #[test]
 fn derived_composite_primary_key_short_input_errors() {
-    // Truncated bytes — should fail cleanly, not panic.
-    let result = CompositeKey::from_bytes(&[0u8, 0, 0, 5, b'h']);
+    // Truncated bytes — should fail cleanly, not panic. A single 0x00 byte
+    // is an incomplete string terminator (terminator is 0x00 0x00).
+    let result = CompositeKey::from_bytes(&[0u8]);
     assert!(matches!(result, Err(PersistError::SerializationError(_))));
 }
 
