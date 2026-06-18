@@ -16,6 +16,23 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C6: log-file corruption detection)
+
+- **New `log_corruption_test.rs`** — faithful in spirit to JE
+  `com.sleepycat.je.util.LogFileCorruptionTest.testDataCorruptWithVerifier`
+  (which flips a byte at `fileLength/2` and expects
+  `EnvironmentFailureException`):
+  - `byte_flip_in_committed_entry_is_detected`: write a committed workload
+    spanning several log files, flip one byte (all 8 bits) at the midpoint of
+    a non-final committed `.ndb` file, reopen, and assert the corruption is
+    DETECTED — the recovered set is a strict prefix of the committed set (the
+    corrupt entry + tail are dropped at the CRC/torn boundary) and NO
+    garbage/wrong value is ever returned. Proves the per-entry CRC32 catches a
+    flipped committed entry rather than silently returning it.
+  - `mid_entry_truncation_torn_tail_not_returned`: truncate the last file
+    mid-entry; the torn tail must be treated as end-of-log and never surfaced
+    as data (recovered set is a subset of the committed set, no garbage).
+
 ### Added (API parity — `Environment::clean_log`)
 
 - **`Environment::clean_log()`** — public synchronous log-cleaning trigger
