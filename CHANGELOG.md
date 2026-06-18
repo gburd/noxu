@@ -16,6 +16,28 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (lock manager — JE-fidelity, deep audit)
+
+- **`rangeInsertConflict` now honors `sharesLocksWith`** (`noxu-txn`): JE
+  `LockImpl.rangeInsertConflict` skips a RANGE_INSERT owner that shares locks
+  with the waiter (`!ownerLocker.sharesLocksWith(waiterLocker)`); Noxu's
+  `range_insert_conflict` dropped that clause, so a RESTART waiter could be
+  spuriously kept blocked one extra cycle when a same-sharing-group locker held
+  a RANGE_INSERT. Added `range_insert_conflict_with_sharing` /
+  `release_with_sharing` and wired the production `LockManager::release` /
+  `release_all_for_locker` to pass the share-group predicate. No correctness or
+  isolation impact (transient blocking only). Test
+  `test_range_insert_conflict_honors_sharing`.
+- **`LOCK_N_LOCK_TABLES` config now wired** (`noxu-txn` / `noxu-dbi` /
+  `noxu-engine`): the lock-table shard count was a hardcoded constant (64); the
+  `LOCK_N_LOCK_TABLES` config parameter was defined but never read, and the
+  engine reported a third inconsistent value (16) in its stats. The shard count
+  is now an instance field set via `LockManager::with_config`, populated from
+  `DbiEnvConfig.n_lock_tables` (default 64 — a documented deviation from JE's
+  default of 1, for write concurrency); the engine stat reports the LIVE shard
+  count. Tuning/observability fidelity only — lock semantics are identical for
+  any fixed shard count. Test `test_with_config_shard_count_honored`.
+
 ### Added (replication — commit freeze latch primitive, D3)
 
 - **`CommitFreezeLatch`** (`noxu-rep`, JE `CommitFreezeLatch`): a freeze

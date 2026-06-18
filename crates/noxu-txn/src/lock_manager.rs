@@ -40,7 +40,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// on locks in different tables.  64 shards provide good distribution across
 /// multi-core systems under high concurrency (16+ threads).  The hash
 /// function spreads LSNs uniformly so collision probability is low.
-const N_LOCK_TABLES: usize = 64;
+/// Default number of lock-table shards when not explicitly configured.
+/// Noxu deliberately defaults to 64 (a documented deviation from JE's default
+/// of 1) for higher write concurrency; the count is configurable via
+/// `LOCK_N_LOCK_TABLES` (`noxu.lock.nLockTables`).
+const DEFAULT_N_LOCK_TABLES: usize = 64;
 
 /// The LockManager manages all locks in the system.
 ///
@@ -72,6 +76,9 @@ const N_LOCK_TABLES: usize = 64;
 pub struct LockManager {
     /// Sharded lock tables, keyed by LSN.
     lock_tables: Vec<Mutex<HashMap<u64, Lock>>>,
+    /// Number of shards (== lock_tables.len()); configurable via
+    /// `LOCK_N_LOCK_TABLES`. Cached so get_table_index avoids a Vec len read.
+    n_lock_tables: usize,
 
     /// Statistics tracking.
     stats: LockManagerStats,
@@ -146,13 +153,23 @@ impl LockManager {
     ///
     /// Call this from `EnvironmentImpl` after reading `EnvironmentConfig.lock_timeout_ms`.
     pub fn with_lock_timeout(timeout_ms: u64) -> Self {
-        let mut lock_tables = Vec::with_capacity(N_LOCK_TABLES);
-        for _ in 0..N_LOCK_TABLES {
+        Self::with_config(timeout_ms, DEFAULT_N_LOCK_TABLES)
+    }
+
+    /// Creates a new LockManager with an explicit shard count (JE
+    /// `LOCK_N_LOCK_TABLES` / `noxu.lock.nLockTables`) and lock timeout.
+    /// Production (`EnvironmentImpl`) passes the configured value; `0` or
+    /// values are clamped to at least 1 shard.
+    pub fn with_config(timeout_ms: u64, n_lock_tables: usize) -> Self {
+        let n_lock_tables = n_lock_tables.max(1);
+        let mut lock_tables = Vec::with_capacity(n_lock_tables);
+        for _ in 0..n_lock_tables {
             lock_tables.push(Mutex::new(HashMap::new()));
         }
 
         Self {
             lock_tables,
+            n_lock_tables,
             stats: LockManagerStats {
                 lock_requests: AtomicU64::new(0),
                 lock_waits: AtomicU64::new(0),
@@ -521,12 +538,25 @@ impl LockManager {
     ///
     pub fn release(&self, lsn: u64, locker_id: i64) -> Result<(), TxnError> {
         let table_idx = self.get_table_index(lsn);
+        // Snapshot this locker's share group so the RANGE_INSERT restart-wake
+        // check in LockImpl::release_with_sharing can honor sharesLocksWith
+        // (JE rangeInsertConflict) without holding the registry across the
+        // table borrow.
+        let my_group =
+            self.share_registry.read().unwrap().get(&locker_id).copied();
+        let registry = &self.share_registry;
+        let shares_fn = |owner: i64| -> bool {
+            match my_group {
+                Some(g) => registry.read().unwrap().get(&owner) == Some(&g),
+                None => false,
+            }
+        };
         let mut table = self.lock_tables[table_idx].lock();
 
         if let Some(lock) = table.get_mut(&lsn) {
             // release() moves eligible waiters to owners and signals each
             // granted waiter's condvar inside LockImpl::release().
-            let _notify_ids = lock.release(locker_id);
+            let _notify_ids = lock.release_with_sharing(locker_id, &shares_fn);
 
             // If the lock has no owners and no waiters, remove it from the
             // table to free memory.
@@ -572,6 +602,17 @@ impl LockManager {
     /// purpose.
     pub fn release_all_for_locker(&self, locker_id: i64) -> usize {
         let mut released = 0usize;
+        // Snapshot this locker's share group for the RANGE_INSERT restart-wake
+        // check (JE rangeInsertConflict / sharesLocksWith).
+        let my_group =
+            self.share_registry.read().unwrap().get(&locker_id).copied();
+        let registry = &self.share_registry;
+        let shares_fn = |owner: i64| -> bool {
+            match my_group {
+                Some(g) => registry.read().unwrap().get(&owner) == Some(&g),
+                None => false,
+            }
+        };
         for table in &self.lock_tables {
             let mut table = table.lock();
             // Collect target LSNs first to avoid mutating the map
@@ -588,7 +629,8 @@ impl LockManager {
                 .collect();
             for lsn in target_lsns {
                 if let Some(lock) = table.get_mut(&lsn) {
-                    let _notify_ids = lock.release(locker_id);
+                    let _notify_ids =
+                        lock.release_with_sharing(locker_id, &shares_fn);
                     released += 1;
                     if lock.n_owners() == 0 && lock.n_waiters() == 0 {
                         table.remove(&lsn);
@@ -983,8 +1025,13 @@ impl LockManager {
     ///
     ///
     #[inline]
+    /// Returns the configured number of lock-table shards.
+    pub fn n_lock_tables(&self) -> usize {
+        self.n_lock_tables
+    }
+
     fn get_table_index(&self, lsn: u64) -> usize {
-        ((lsn as usize) & 0x7fff_ffff) % N_LOCK_TABLES
+        ((lsn as usize) & 0x7fff_ffff) % self.n_lock_tables
     }
 
     /// Records that `locker_id` is now waiting on `owner_ids` in the
@@ -1221,8 +1268,8 @@ mod tests {
 
         let idx1 = lm.get_table_index(1000);
         let idx2 = lm.get_table_index(2000);
-        assert!(idx1 < N_LOCK_TABLES);
-        assert!(idx2 < N_LOCK_TABLES);
+        assert!(idx1 < lm.n_lock_tables);
+        assert!(idx2 < lm.n_lock_tables);
     }
 
     #[test]
@@ -1578,14 +1625,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockManagerTest — 16 lock table shards
+    // Ported from LockManagerTest — distinct-LSN distribution across shards
     // -----------------------------------------------------------------------
 
-    /// The LockManager uses N_LOCK_TABLES (16) shards; verify the constant.
+    /// Verify shard distribution: distinct LSNs are independently managed
+    /// regardless of the configured shard count (default 64).
+    #[test]
+    fn test_with_config_shard_count_honored() {
+        // DRIFT-2 regression: the shard count must come from config, not a
+        // hardcoded constant. default new() = 64; with_config respects N.
+        assert_eq!(LockManager::new().n_lock_tables(), 64);
+        assert_eq!(LockManager::with_config(500, 8).n_lock_tables(), 8);
+        // Clamped to at least 1.
+        assert_eq!(LockManager::with_config(500, 0).n_lock_tables(), 1);
+        // get_table_index stays within the configured shard count.
+        let lm = LockManager::with_config(500, 8);
+        for lsn in [1u64, 7, 64, 1000, u64::MAX] {
+            assert!(lm.get_table_index(lsn) < 8);
+        }
+    }
+
     #[test]
     fn test_je_sixteen_lock_tables() {
-        // N_LOCK_TABLES is a private const, but we can verify the behaviour
-        // by distributing 16 distinct LSNs and checking all are managed.
+        // Distribute 16 distinct LSNs and check all are independently managed
+        // (shard count is an instance field, default 64).
         let lm = LockManager::new();
         for i in 0..16u64 {
             lm.lock(i, 1, LockType::Write, false, false).unwrap();

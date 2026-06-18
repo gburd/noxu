@@ -138,6 +138,20 @@ impl Lock {
         }
     }
 
+    /// As `release`, but threads a lock-sharing predicate so the RANGE_INSERT
+    /// restart-wake check honors `sharesLocksWith` (JE `rangeInsertConflict`).
+    /// A `Thin` lock has no waiters, so the predicate is irrelevant there.
+    pub fn release_with_sharing<F: Fn(i64) -> bool>(
+        &mut self,
+        locker_id: i64,
+        shares_fn: &F,
+    ) -> Option<Vec<i64>> {
+        match self {
+            Lock::Thin(thin) => thin.release(locker_id),
+            Lock::Full(full) => full.release_with_sharing(locker_id, shares_fn),
+        }
+    }
+
     /// Downgrade a write lock to a read lock.
     pub fn demote(&mut self, locker_id: i64) {
         match self {

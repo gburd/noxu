@@ -169,6 +169,10 @@ pub struct DbiEnvConfig {
     pub lock_timeout_ms: u64,
     pub lock_deadlock_detect: bool,
     pub lock_deadlock_detect_delay_ms: u64,
+    /// Number of lock-table shards (JE `LOCK_N_LOCK_TABLES`). Noxu defaults to
+    /// 64 (a documented deviation from JE's default of 1) for write
+    /// concurrency. Clamped to >= 1 by the LockManager.
+    pub n_lock_tables: usize,
 
     // -----------------------------------------------------------------------
     // Transactions
@@ -321,6 +325,7 @@ impl Default for DbiEnvConfig {
             offheap_keep_alive_ms: 60_000,
             // Locking
             lock_timeout_ms: 500,
+            n_lock_tables: 64,
             lock_deadlock_detect: true,
             lock_deadlock_detect_delay_ms: 0,
             // Transactions

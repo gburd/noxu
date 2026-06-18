@@ -364,8 +364,10 @@ impl EnvironmentImpl {
         let transactional = cfg.transactional;
         let checkpoint_interval_ms = cfg.checkpointer_wakeup_interval_ms;
         let env_home = env_home.into();
-        let lock_manager = Arc::new(LockManager::new());
-        lock_manager.set_lock_timeout(cfg.lock_timeout_ms);
+        let lock_manager = Arc::new(LockManager::with_config(
+            cfg.lock_timeout_ms,
+            cfg.n_lock_tables,
+        ));
         let txn_manager = Arc::new(TxnManager::new(lock_manager.clone()));
 
         // Ensure the environment directory exists (create if needed).

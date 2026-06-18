@@ -363,6 +363,8 @@ impl Engine {
         let n_databases = env_impl.n_databases() as u32;
         let log_stats = env_impl.get_log_manager().map(|lm| lm.get_stats());
         let lock_stats = env_impl.get_lock_manager().get_stats();
+        let real_n_lock_tables =
+            env_impl.get_lock_manager().n_lock_tables() as u64;
         let txn_stats = env_impl.get_txn_manager().get_stats();
         let throughput = env_impl.get_throughput_snapshot();
         drop(env_impl);
@@ -377,7 +379,10 @@ impl Engine {
                 .map(LogStatsSnapshot::from)
                 .unwrap_or_default(),
             lock: LockStatsSnapshot {
-                n_lock_tables: self.config.lock_table_count as u64,
+                // Report the ACTUAL shard count from the live LockManager, not
+                // a decoupled config echo (was reporting config.lock_table_count
+                // which the LockManager never received). See JE-fidelity DRIFT-2.
+                n_lock_tables: real_n_lock_tables,
                 ..LockStatsSnapshot::from(&lock_stats)
             },
             txn: TxnStatsSnapshot::from(&txn_stats),
@@ -569,7 +574,9 @@ mod tests {
 
         let stats = engine.get_stats();
         assert_eq!(stats.cache_size, 10 * 1024 * 1024);
-        assert_eq!(stats.lock.n_lock_tables, 16);
+        // The engine reports the LIVE LockManager shard count (default 64),
+        // not the decoupled engine_config.lock_table_count (DRIFT-2 fix).
+        assert_eq!(stats.lock.n_lock_tables, 64);
     }
 
     #[test]

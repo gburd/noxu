@@ -174,6 +174,20 @@ impl LockImpl {
     /// Returns the locker IDs of all waiters that were promoted to owners, or
     /// `None` if the given locker was not an owner.
     pub fn release(&mut self, locker_id: i64) -> Option<Vec<i64>> {
+        // No lock-sharing groups by default (preserves prior behavior for
+        // callers without a sharing registry).
+        self.release_with_sharing(locker_id, &|_| false)
+    }
+
+    /// As `release`, but consults `shares_fn` when deciding whether a
+    /// RANGE_INSERT owner conflicts with a RESTART waiter being woken
+    /// (JE `rangeInsertConflict` uses `sharesLocksWith`). `shares_fn(owner_id)`
+    /// returns true when the owner is in the woken waiter's lock-sharing group.
+    pub fn release_with_sharing<F: Fn(i64) -> bool>(
+        &mut self,
+        locker_id: i64,
+        shares_fn: &F,
+    ) -> Option<Vec<i64>> {
         let removed_lock = self.flush_owner(locker_id);
         removed_lock.as_ref()?;
 
@@ -224,7 +238,10 @@ impl LockImpl {
                     let notify_pair = w.notify.clone();
                     let grant = if waiter_type == LockType::Restart {
                         // Special case for restarts: see rangeInsertConflict.
-                        if self.range_insert_conflict(waiter_locker) {
+                        if self.range_insert_conflict_with_sharing(
+                            waiter_locker,
+                            shares_fn,
+                        ) {
                             LockGrantType::WaitNew
                         } else {
                             LockGrantType::New
@@ -801,6 +818,19 @@ impl LockImpl {
     /// any RANGE_INSERT owners exist. We can't call try_lock for a RESTART
     /// lock because it must never be granted.
     fn range_insert_conflict(&self, waiter_locker: i64) -> bool {
+        // Default: no lock-sharing groups (callers without a sharing registry).
+        self.range_insert_conflict_with_sharing(waiter_locker, &|_| false)
+    }
+
+    /// As `range_insert_conflict`, but skips an owner that shares locks with
+    /// the waiter (JE `rangeInsertConflict`, LockImpl.java:719:
+    /// `!ownerLocker.sharesLocksWith(waiterLocker)`). `shares_fn(owner_id)`
+    /// returns true when the owner is in the waiter's lock-sharing group.
+    fn range_insert_conflict_with_sharing<F: Fn(i64) -> bool>(
+        &self,
+        waiter_locker: i64,
+        shares_fn: &F,
+    ) -> bool {
         let mut owner_idx = 0;
         loop {
             let owner = if owner_idx == 0 {
@@ -815,6 +845,7 @@ impl LockImpl {
                 Some(o) => {
                     let owner_locker = o.locker_id;
                     if owner_locker != waiter_locker
+                        && !shares_fn(owner_locker)
                         && o.lock_type == LockType::RangeInsert
                     {
                         return true;
@@ -838,6 +869,28 @@ impl Default for LockImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_range_insert_conflict_honors_sharing() {
+        // DRIFT-1 regression (JE rangeInsertConflict / sharesLocksWith): a
+        // RANGE_INSERT owner that shares locks with the waiter must NOT be
+        // reported as a conflict.
+        let mut lock = LockImpl::new();
+        assert_eq!(
+            lock.lock(LockType::RangeInsert, 1, false, false).grant_type,
+            LockGrantType::New
+        );
+        // Different, non-sharing locker -> conflict.
+        assert!(lock.range_insert_conflict(2));
+        // Same locker never conflicts with itself.
+        assert!(!lock.range_insert_conflict(1));
+        // A waiter that SHARES locks with owner 1 -> no conflict (the JE
+        // sharesLocksWith clause DRIFT-1 had dropped).
+        assert!(
+            !lock.range_insert_conflict_with_sharing(2, &|owner| owner == 1),
+            "a sharing-group owner must not conflict (DRIFT-1)"
+        );
+    }
 
     #[test]
     fn test_single_owner_lock_release() {
