@@ -16,6 +16,30 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (JE test-fidelity — C3: forced split-recovery topologies)
+
+- **New `forced_split_recovery_test.rs` ports three JE recovery topology
+  suites** — each deliberately drives a specific B-tree topology, then
+  recovers and asserts BOTH data equality AND structural integrity
+  (`env.verify()` zero errors, per JE `CheckBase.recoverAndLoadData`):
+  - `new_root_via_split_recovers` / `change_and_evict_root_recovers`
+    (JE `CheckNewRootTest.testWrittenBySplit` / `testChangeAndEvictRoot`):
+    new-root creation via ascending right-splits + checkpoint, and root
+    survival across eviction + checkpoint.
+  - `split_aunt_recovers` (JE `CheckSplitAuntTest.testSplitAunt`): deep tree,
+    dirty the left branch, checkpoint to level 2 leaving an ancestor dirty,
+    then split the right branch ("split-aunt"), close w/out checkpoint,
+    recover.
+  - `reverse_split_recovers` / `complete_removal_recovers`
+    (JE `CheckReverseSplitsTest.testReverseSplit` / `testCompleteRemoval`):
+    empty the leftmost BIN, checkpoint, compress out the empty BIN (reverse
+    split / subtree removal), then split/insert and recover; complete-removal
+    additionally asserts a single surviving BIN after compress.
+  Adaptation: ASCII keys instead of JE `IntegerBinding`, `env.evict_memory()`
+  instead of JE's evictor `TestHook`, `env.checkpoint(force)` for JE
+  `env.sync()`; split/merge geometry preserved via matching NODE_MAX and
+  insert/delete counts.
+
 ### Testing (JE test-fidelity — C2: deterministic stepwise truncation sweep)
 
 - **New `stepwise_truncation_test.rs` ports JE `CheckBase.stepwiseLoop`**
