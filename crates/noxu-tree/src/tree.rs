@@ -3383,13 +3383,26 @@ impl Tree {
             None => return false,
         };
 
+        // F8 consistency: insert accounts key + data + 48; delete must
+        // subtract the SAME (data_len was previously omitted, leaking
+        // data_len from the cache counter on every delete and biasing the
+        // evictor's over-budget view). Peek the data length before deleting.
+        let data_len = if self.memory_counter.is_some() {
+            self.search_with_data(key)
+                .filter(|sf| sf.found)
+                .and_then(|sf| sf.data.as_ref().map(|d| d.len()))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let deleted =
             Self::delete_recursive(&root, key, self.key_comparator.as_ref());
 
         // Update the memory counter when an entry is removed.
         // IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
         if deleted && let Some(counter) = &self.memory_counter {
-            let delta = (key.len() + 48) as i64;
+            let delta = (key.len() + data_len + 48) as i64;
             counter.fetch_sub(delta, Ordering::Relaxed);
         }
 
@@ -5727,6 +5740,38 @@ mod tests {
         let sr = tree.search(&key);
         assert!(sr.is_some(), "key3 must be searchable after split");
         assert!(sr.unwrap().exact_parent_found, "key3 must be found exactly");
+    }
+
+    #[test]
+    fn test_memory_counter_balanced_on_insert_delete_f8() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        // F8 regression: insert accounts key+data+48; delete must subtract the
+        // SAME, so an insert+delete of the same record returns the counter to
+        // its starting value (previously delete omitted data_len -> the counter
+        // leaked data_len per delete, biasing the evictor over-budget view).
+        let mut tree = Tree::new(1, 16);
+        let counter = Arc::new(AtomicI64::new(0));
+        tree.set_memory_counter(Arc::clone(&counter));
+
+        let key = b"a-key".to_vec();
+        let data = vec![0u8; 200]; // non-trivial data length
+        tree.insert(key.clone(), data.clone(), Lsn::new(0, 10)).unwrap();
+        let after_insert = counter.load(Ordering::Relaxed);
+        assert!(after_insert > 0, "insert must increase the counter");
+        assert_eq!(
+            after_insert,
+            (key.len() + data.len() + 48) as i64,
+            "insert accounts key + data + 48"
+        );
+
+        let deleted = tree.delete(&key);
+        assert!(deleted);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "F8: delete must subtract key + data + 48, returning the counter              to its pre-insert value (no data_len leak)"
+        );
     }
 
     #[test]

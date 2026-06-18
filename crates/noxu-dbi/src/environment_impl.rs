@@ -584,11 +584,21 @@ impl EnvironmentImpl {
         // sets a cache_size smaller than the buffer + off-heap reservations.
         let arbiter_budget = (cache_bytes - log_buf_total - off_heap_reserved)
             .max(1024 * 1024_i64);
+        // F10 (JE EVICTOR_EVICT_BYTES / EVICTOR_CRITICAL_PERCENTAGE): read the
+        // eviction hysteresis and critical threshold from config instead of
+        // hardcoding 128 KiB / budget/16. Default evict_bytes = 512 KiB
+        // (matches JE's EVICTOR_EVICT_BYTES default); critical_threshold =
+        // budget * critical_percentage / 100 (JE
+        // `maxMemory * criticalPercentage / 100`).
+        let evict_bytes = (cfg.evictor_evict_bytes as i64).max(1024);
+        let critical_threshold = arbiter_budget
+            .saturating_mul(cfg.evictor_critical_percentage as i64)
+            / 100;
         let arbiter = Arbiter::new(
             arbiter_budget,
             Arc::clone(&cache_usage),
-            128 * 1024_i64,      // 128 KiB hysteresis (fixed)
-            arbiter_budget / 16, // critical threshold: 1/16 of arbiter budget
+            evict_bytes,
+            critical_threshold,
         );
         // Build optional off-heap cache from config ( MAX_OFF_HEAP_MEMORY).
         let off_heap_cache = Arc::new(noxu_evictor::OffHeapCache::new(
