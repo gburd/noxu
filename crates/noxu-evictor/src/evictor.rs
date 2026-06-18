@@ -39,6 +39,7 @@ use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{LogEntryType, LogManager, Provisional};
 use noxu_recovery::Checkpointer;
 use noxu_sync::Mutex;
+use noxu_tree::InListListener;
 use noxu_tree::NodeRwLock;
 use noxu_tree::tree::{BinEntry, BinStub, InEntry, InNodeStub, Tree, TreeNode};
 use noxu_util::NULL_LSN;
@@ -170,8 +171,18 @@ pub struct Evictor {
     next_pri2_index: AtomicU64,
 
     log_manager: Option<Arc<LogManager>>,
-    tree: Option<Arc<RwLock<Tree>>>,
-    db_id: u64,
+    /// The B-tree the evictor walks to find/evict nodes.
+    ///
+    /// Interior-mutable so `EnvironmentImpl` can install the user database's
+    /// tree *after* the evictor `Arc` is constructed (databases are opened
+    /// later).  JE: the global `INList` is registered with the environment at
+    /// startup; here a single tree is wired for the single-database case.
+    ///
+    /// ponytail: single tree slot, not the full multi-database INList. The
+    /// daemon evicts from whichever tree was installed last. Multi-database
+    /// eviction (iterate `db_trees_registry`) is follow-on wave F4.
+    tree: RwLock<Option<Arc<RwLock<Tree>>>>,
+    db_id: AtomicU64,
     off_heap: Option<Arc<OffHeapCache>>,
     /// Optional checkpointer reference for CC-4: provisional-flag coordination.
     ///
@@ -219,8 +230,8 @@ impl Evictor {
             next_pri1_index: AtomicU64::new(0),
             next_pri2_index: AtomicU64::new(0),
             log_manager: None,
-            tree: None,
-            db_id: 0,
+            tree: RwLock::new(None),
+            db_id: AtomicU64::new(0),
             off_heap: None,
             checkpointer: None,
         }
@@ -244,7 +255,10 @@ impl Evictor {
             scan,
         )
         .with_opt_log_manager(self.log_manager)
-        .with_opt_tree(self.tree, self.db_id)
+        .with_opt_tree(
+            self.tree.into_inner().expect("evictor tree lock poisoned"),
+            self.db_id.load(Ordering::Relaxed),
+        )
         .with_opt_off_heap(self.off_heap)
         .with_opt_checkpointer(self.checkpointer)
     }
@@ -265,10 +279,25 @@ impl Evictor {
     }
 
     /// Wire the B-tree and database ID for real node-info/size callbacks.
-    pub fn with_tree(mut self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
-        self.tree = Some(tree);
-        self.db_id = db_id;
+    pub fn with_tree(self, tree: Arc<RwLock<Tree>>, db_id: u64) -> Self {
+        self.set_tree(tree, db_id);
         self
+    }
+
+    /// Install (or replace) the tree the evictor walks, after the evictor
+    /// `Arc` has been constructed.  Used by `EnvironmentImpl::open_database`
+    /// to point the evictor at the user database's tree.
+    ///
+    /// JE: equivalent to the database's INs being registered in the
+    /// environment-wide `INList` that the evictor drains.
+    pub fn set_tree(&self, tree: Arc<RwLock<Tree>>, db_id: u64) {
+        *self.tree.write().expect("evictor tree lock poisoned") = Some(tree);
+        self.db_id.store(db_id, Ordering::Relaxed);
+    }
+
+    /// Clone the currently installed eviction tree, if any.
+    fn current_tree(&self) -> Option<Arc<RwLock<Tree>>> {
+        self.tree.read().expect("evictor tree lock poisoned").clone()
     }
 
     /// Wire an off-heap cache.
@@ -294,12 +323,12 @@ impl Evictor {
         self
     }
     fn with_opt_tree(
-        mut self,
+        self,
         tree: Option<Arc<RwLock<Tree>>>,
         db_id: u64,
     ) -> Self {
-        self.tree = tree;
-        self.db_id = db_id;
+        *self.tree.write().expect("evictor tree lock poisoned") = tree;
+        self.db_id.store(db_id, Ordering::Relaxed);
         self
     }
     fn with_opt_off_heap(mut self, oh: Option<Arc<OffHeapCache>>) -> Self {
@@ -583,8 +612,9 @@ impl Evictor {
 
                 EvictionDecision::Evict => {
                     let mut stored_off_heap = false;
+                    let cur_tree = self.current_tree();
                     if let (Some(oh), Some(tree_arc)) =
-                        (&self.off_heap, &self.tree)
+                        (&self.off_heap, &cur_tree)
                         && oh.is_enabled()
                         && let Ok(tree_guard) = tree_arc.read()
                         && let Some(serialized) =
@@ -639,8 +669,8 @@ impl Evictor {
     /// `evict_batch` always calls `node_info_fn` before `node_size_fn` for
     /// the same node, and the calls are serialised within a single thread.
     pub fn do_evict(&self, source: EvictionSource) -> EvictResult {
-        if let Some(tree_arc) = &self.tree {
-            let tree_clone = Arc::clone(tree_arc);
+        if let Some(tree_arc) = self.current_tree() {
+            let tree_clone = Arc::clone(&tree_arc);
 
             // St-H2: one unified O(tree) walk per candidate instead of two.
             // The size discovered during the info walk is cached here and
@@ -689,8 +719,8 @@ impl Evictor {
     /// `latchNoWait`-style non-blocking latch attempt before any eviction
     /// mutation (CC-6 fix).
     fn flush_dirty_node_to_log(&self, node_id: u64) -> bool {
-        let tree_arc = match &self.tree {
-            Some(t) => Arc::clone(t),
+        let tree_arc = match self.current_tree() {
+            Some(t) => t,
             None => return true, // no tree — nothing to flush
         };
 
@@ -748,19 +778,16 @@ impl Evictor {
         //
         // JE ref: Checkpointer.coordinateEvictionWithCheckpoint /
         // DirtyINMap.coordinateEvictionWithCheckpoint.
+        let db_id = self.db_id.load(Ordering::Relaxed);
         let provisional = self
             .checkpointer
             .as_ref()
-            .map(|c| c.get_eviction_provisional(self.db_id, bin.level))
+            .map(|c| c.get_eviction_provisional(db_id, bin.level))
             .unwrap_or(Provisional::No);
 
         let full_bytes = bin.serialize_full();
-        let entry = InLogEntry::new(
-            self.db_id,
-            bin.last_full_lsn,
-            NULL_LSN,
-            full_bytes,
-        );
+        let entry =
+            InLogEntry::new(db_id, bin.last_full_lsn, NULL_LSN, full_bytes);
         let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
@@ -787,8 +814,8 @@ impl Evictor {
     /// JE reference: `Evictor.java` `isPinned()` + `latchNoWait`-style
     /// non-blocking latch (CC-6 fix).
     fn strip_lns_from_node(&self, node_id: u64) -> Option<usize> {
-        let tree_arc = match &self.tree {
-            Some(t) => Arc::clone(t),
+        let tree_arc = match self.current_tree() {
+            Some(t) => t,
             None => return Some(0),
         };
         let node_arc: Arc<NodeRwLock<TreeNode>> = {
@@ -838,6 +865,13 @@ impl Evictor {
         }
 
         let result = self.evict_batch(source, node_info_fn, node_size_fn);
+
+        // F2: decrement the shared budget counter by the bytes just freed.
+        // evict_batch only *accounts* bytes_evicted; without this the counter
+        // (incremented on insert) never drops and the engine can't get back
+        // under budget.  JE: every eviction calls IN.updateMemorySize(-bytes)
+        // → MemoryBudget.updateTreeMemoryUsage(-bytes).
+        self.arbiter.release_memory(result.bytes_evicted);
 
         match source {
             EvictionSource::Daemon => self
@@ -929,6 +963,37 @@ impl Evictor {
     }
 }
 
+/// JE `INList` → `Evictor` feed.  `EnvironmentImpl` installs the `Evictor` as
+/// each database tree's [`InListListener`] so production inserts/accesses
+/// populate the LRU lists that `evict_batch` drains.
+///
+/// Without this wiring the policy lists stay empty, every phase quota is 0,
+/// and `evict_batch` selects nothing (F1).
+impl InListListener for Evictor {
+    /// JE `Evictor.addBack`: a node became resident.
+    fn note_ins_added(&self, node_id: u64) {
+        // Default cache mode → hot end of the primary policy.
+        self.note_ins_added(node_id, CacheMode::Default);
+    }
+
+    /// JE `Evictor.moveBack`: LRU touch on access.  Move the node toward the
+    /// hot end if it is already tracked; otherwise add it (a freshly split
+    /// BIN is first seen here).  `moveBack` in JE is add-if-absent.
+    fn note_ins_accessed(&self, node_id: u64) {
+        if !self.primary_policy.touch(node_id)
+            && !self.scan_policy.touch(node_id)
+        {
+            self.primary_policy.insert(node_id);
+        }
+    }
+
+    /// JE `Evictor.remove`: node left the cache.
+    fn note_ins_removed(&self, node_id: u64) {
+        // Forward to the inherent method (clears all three policies).
+        Evictor::note_ins_removed(self, node_id);
+    }
+}
+
 impl std::fmt::Debug for Evictor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Evictor")
@@ -937,7 +1002,7 @@ impl std::fmt::Debug for Evictor {
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
             .field("primary_algo", &self.primary_policy.name())
             .field("scan_algo", &self.scan_policy.name())
-            .field("db_id", &self.db_id)
+            .field("db_id", &self.db_id.load(Ordering::Relaxed))
             .finish()
     }
 }

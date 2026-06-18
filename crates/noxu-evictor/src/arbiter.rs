@@ -110,6 +110,35 @@ impl Arbiter {
         self.cache_usage.load(Ordering::Relaxed)
     }
 
+    /// Subtract `bytes` of freed cache memory from the shared usage counter.
+    ///
+    /// Called by the evictor after a node is evicted or stripped so the
+    /// budget the arbiter reads actually drops — mirroring JE
+    /// `IN.updateMemorySize(-bytes)` →
+    /// `MemoryBudget.updateTreeMemoryUsage(-bytes)`.  Without this the
+    /// counter only ever grows (insert `fetch_add`) and the engine can
+    /// never get back under budget by evicting (F2).
+    ///
+    /// The counter is clamped at `>= 0`: the evictor's per-node byte size
+    /// formula (struct overhead + slot bytes) is an *approximation* of what
+    /// insert added (`key + data + 48`), so the two accountings can diverge
+    /// slightly.  Clamping prevents a transient over-subtraction from
+    /// driving usage negative, which would make `is_over_budget` and
+    /// `still_needs_eviction` read a nonsensical value.
+    pub fn release_memory(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let delta = bytes as i64;
+        // fetch_update with clamp at 0; relaxed is fine — the counter is an
+        // advisory budget signal, not a synchronization point.
+        let _ = self.cache_usage.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some((cur - delta).max(0)),
+        );
+    }
+
     /// Get the maximum memory budget in bytes.
     pub fn get_max_memory(&self) -> i64 {
         self.max_memory.load(Ordering::Relaxed)
