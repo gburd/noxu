@@ -16,6 +16,36 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (API parity — `Environment::clean_log`)
+
+- **`Environment::clean_log()`** — public synchronous log-cleaning trigger
+  mirroring JE `Environment.cleanLog()`. Forwards to the cleaner and returns
+  the number of files cleaned. Needed for deterministic cleaner regression
+  tests (C5) and for applications that reclaim space on demand rather than
+  relying on the background daemon. (Previously only the read-only-rejection
+  variant was covered; the working manual-clean path was unexposed.)
+
+### Testing (JE test-fidelity — C5: cleaner SR regressions)
+
+- **New `je_cleaner_sr_test.rs` ports two high-signal JE cleaner SR
+  regressions** (`com/sleepycat/je/cleaner/SR10553Test`, `SR12885Test`):
+  - `sr10553_clean_then_scan_deleted_does_not_fail`: put duplicates, delete
+    all, checkpoint, `clean_log()`, evict, scan — the scan must complete
+    without a LogFileNotFound-style error (JE: cleaner must set knownDeleted
+    for deleted records). Asserts `cleaned > 0`.
+  - `sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data`: drive the
+    cleaner LN-migration + txn slot-reuse + abort sequence; the surviving key
+    must still fetch SUCCESS (data not lost to a cleaned file).
+  Adaptation note: JE's specific SR12885 node-ID bug is, per JE's own comment,
+  not applicable to LSN-locking engines — Noxu locks LSNs and LNs have no node
+  IDs (AGENTS.md "Lock-based, NOT MVCC"), so the still-applicable data-safety
+  invariant is ported.
+- **SR13061 (`FileSummaryLN.hasStringKey`) SKIPPED** (documented in the test
+  module): it guards a JE log-version-migration bug where an old STRING
+  file-summary key was misread as an 8-byte integer key. Noxu has a single
+  binary `.ndb` format with no legacy string-key path, so the bug class cannot
+  exist — not a fidelity gap.
+
 ### Testing (JE test-fidelity — C4: RecoveryDeltaTest testCompress + testKnownDeleted)
 
 - **`recovery_correctness_test.rs` now ports JE
