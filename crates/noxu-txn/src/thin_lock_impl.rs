@@ -106,9 +106,21 @@ impl ThinLockImpl {
     /// Remove all owners except the given one (lock stealing for HA).
     /// Returns the list of locker IDs that were preempted.
     pub fn steal_lock(&mut self, locker_id: i64) -> Vec<i64> {
+        self.steal_lock_preemptable(locker_id, &|_| true)
+    }
+
+    /// As `steal_lock`, but only preempts the owner when `preemptable_fn`
+    /// returns true for it (JE `LockImpl.stealLock` skips non-preemptable
+    /// owners).
+    pub fn steal_lock_preemptable<F: Fn(i64) -> bool>(
+        &mut self,
+        locker_id: i64,
+        preemptable_fn: &F,
+    ) -> Vec<i64> {
         let mut preempted = Vec::new();
         if let Some(ref owner) = self.owner
             && owner.locker_id != locker_id
+            && preemptable_fn(owner.locker_id)
         {
             preempted.push(owner.locker_id);
             self.owner = None;

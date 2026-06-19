@@ -587,8 +587,19 @@ impl Txn {
     }
 
     /// Sets whether this transaction is importunate.
+    ///
+    /// An importunate locker is non-preemptable (`is_preemptable()` returns
+    /// `!importunate`).  Mirror that into the lock manager's non-preemptable
+    /// registry so a *different* importunate locker's steal leaves this
+    /// txn's locks alone (JE `LockImpl.stealLock` skips non-preemptable
+    /// owners, LockImpl.java:543).
     pub fn set_importunate(&mut self, v: bool) {
         self.importunate = v;
+        if v {
+            self.lock_manager.register_non_preemptable(self.id);
+        } else {
+            self.lock_manager.unregister_non_preemptable(self.id);
+        }
     }
 
     /// Configures serializable (repeatable-read) isolation.
@@ -1324,14 +1335,29 @@ impl Locker for Txn {
     ) -> Result<LockResult, TxnError> {
         self.check_state()?;
 
-        let grant = self.lock_manager.lock_with_timeout(
-            lsn,
-            self.id,
-            lock_type,
-            non_blocking || self.no_wait,
-            self.importunate,
-            self.lock_timeout_ms,
-        )?;
+        // Normal Locker.lock always passes jumpAheadOfWaiters=false
+        // (Locker.java:503).  Importunate (HA ReplayTxn) is NOT jump-ahead:
+        // it is handled by the lock-steal path inside the lock manager
+        // (LockManager.waitForLock -> stealLock, LockManager.java:552), so
+        // route importunate requests through `lock_importunate_with_timeout`.
+        let grant = if self.importunate {
+            self.lock_manager.lock_importunate_with_timeout(
+                lsn,
+                self.id,
+                lock_type,
+                non_blocking || self.no_wait,
+                self.lock_timeout_ms,
+            )?
+        } else {
+            self.lock_manager.lock_with_timeout(
+                lsn,
+                self.id,
+                lock_type,
+                non_blocking || self.no_wait,
+                false, // jumpAheadOfWaiters
+                self.lock_timeout_ms,
+            )?
+        };
 
         // Track the lock.
         // NoneNeeded means lock_type was None — check_state ran above but

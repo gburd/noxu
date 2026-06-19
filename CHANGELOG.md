@@ -75,6 +75,61 @@ listed in [References](#references).
     used at every user-facing read/scan site. The compressor / recovery KD
     iteration paths (`collect_bins_with_known_deleted`, `prune_empty_bin`,
     recovery undo) are unchanged and still observe KD slots on purpose.
+### Fixed (txn — locker lock-sharing on the acquisition path, TXN-F2)
+
+- **`LockManager::lock` / `lock_with_timeout` now consult the lock-sharing
+  registry on every acquisition.** Previously the production acquisition path
+  (used by every locker: `ThreadLocker`, `HandleLocker`, `BasicLocker`,
+  `Txn`) called `LockImpl::lock`, which hard-wired sharing off
+  (`try_lock_with_sharing(..., &|_| false)`). The `lock_with_sharing*` family
+  that *did* honor the registry was only ever reached from its own unit test.
+  `ThreadLocker::new` and `HandleLocker::with_buddy` faithfully populate the
+  registry, but acquisition never read it — so two `ThreadLocker`s on the same
+  thread (e.g. two cursors under auto-commit) or a `HandleLocker` + its buddy
+  txn requesting conflicting locks on the same LSN would self-deadlock or
+  spuriously `LockTimeout`, which JE never does. JE `LockImpl.tryLock` checks
+  `!locker.sharesLocksWith(ownerLocker) && !ownerLocker.sharesLocksWith(locker)`
+  on **every** acquisition (LockImpl.java:647-648). The production path now
+  builds the `sharesLocksWith` predicate from the registry and routes through
+  `LockImpl::lock_with_sharing`; the `lock_with_sharing` /
+  `lock_with_sharing_and_timeout` methods are now thin deprecated forwarders.
+  This also corrects a doc-bug (TXN-F6) that claimed the plain `lock()` path
+  already used the registry — now true.
+
+### Fixed (txn — restart-conflict scan honors lock sharing, TXN-F1)
+
+- **`LockImpl`'s restart-conflict waiter scan now skips a waiter the
+  requestor shares locks with.** JE `LockImpl.lock` checks `waiterType !=
+  RESTART && locker != waiterLocker && !locker.sharesLocksWith(waiterLocker)`
+  (LockImpl.java:395) in the waiter scan that runs when a restart-causing
+  request (RANGE_READ / RANGE_WRITE) has to wait. The Rust
+  `lock_with_sharing` received the `shares_fn` for `try_lock` but did not
+  thread it into the restart loop, so a requestor sharing locks with a
+  RANGE_INSERT waiter would spuriously restart instead of waiting normally.
+  Added the `!shares_fn(w.locker_id)` clause; `LockImpl::lock` now delegates
+  to `lock_with_sharing(..., &|_| false)` so a single implementation carries
+  the restart scan (mirroring how `try_lock` delegates to
+  `try_lock_with_sharing`).
+
+### Fixed (txn — importunate lock steal in the wait path, TXN-F3, rep-only)
+
+- **Importunate (HA `ReplayTxn`) lock requests now steal a held conflicting
+  lock instead of being conflated with `jumpAheadOfWaiters`.** `Txn::lock`
+  passed `self.importunate` into the `jump_ahead_of_waiters` slot of
+  `lock_with_timeout`, but jumping ahead of *waiters* never removes a
+  conflicting *owner* — so an importunate replay would block / time out
+  against a non-importunate owner. JE: normal `Locker.lock` always passes
+  `jumpAheadOfWaiters=false` (Locker.java:503); importunate is handled inside
+  `LockManager.waitForLock` by `if (isImportunate) { result =
+  stealLock(...) }` (LockManager.java:552), letting HA replay preempt a
+  preemptable owner. `Txn::lock` now passes `false` for jump-ahead and routes
+  importunate requests through a new `lock_importunate_with_timeout`, which
+  steals from preemptable owners (mirroring `stealLockInternal`,
+  LockManager.java:1599) and re-attempts. A non-preemptable owner (another
+  importunate locker, tracked in a new non-preemptable registry) blocks the
+  steal, falling back to a normal wait (JE's `continue`, LockManager.java:556).
+  `LockImpl::steal_lock` gained a `steal_lock_preemptable` variant honoring
+  `getPreemptable()` (LockImpl.java:543).
 
 ## [6.0.0] - 2026-06-19
 
