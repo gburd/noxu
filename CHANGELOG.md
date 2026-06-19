@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-06-19
+
 ### Changed (BREAKING) (engine — remove fake-passing verify stubs)
 
 - **Removed `noxu_engine::verify_environment(&VerifyConfig)` and
