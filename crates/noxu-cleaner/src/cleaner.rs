@@ -506,6 +506,14 @@ impl Cleaner {
     /// JE: `UtilizationCalculator.getBestFile` reads
     /// `env.getTxnManager().getFirstActiveLsn()` and sets
     /// `firstActiveFile = min(newest, firstActiveTxnFile)`.
+    /// Configure the two-pass cleaning gate from
+    /// `CLEANER_TWO_PASS_GAP` / `CLEANER_TWO_PASS_THRESHOLD` (JE). A
+    /// `threshold` of 0 resolves to `minUtilization - 5` at gate time.
+    pub fn with_two_pass_params(self, gap: i32, threshold: i32) -> Self {
+        self.file_selector.lock().set_two_pass_params(gap, threshold);
+        self
+    }
+
     pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
         self.txn_manager = Some(txn_manager);
         self
@@ -1227,6 +1235,34 @@ impl Cleaner {
             }
 
             offset += (header_size + item_size) as u64;
+        }
+
+        // Populate the expiration uncertainty band (lower = definitely
+        // expired, gradual upper = + prorated current-interval) so the
+        // FileSelector's two-pass gate (JE getBestFile) can compute this
+        // file's min/max utilization. CLN-9 / CFG-TWOPASS-1.
+        {
+            let mut tracker = crate::ExpirationTracker::new(file_number);
+            let entries = self.decode_ln_entries_from_file(fm, file_number);
+            for entry in &entries {
+                if let LogEntryType::Ln {
+                    expiration_time, entry_size, ..
+                } = entry.entry_type
+                {
+                    tracker.track(expiration_time, entry_size);
+                }
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let hours_now = now_ms / 3_600_000;
+            let sub_hour_ms = now_ms % 3_600_000;
+            let (lower, gradual) =
+                tracker.get_expired_bytes_band(hours_now, sub_hour_ms);
+            summary.obsolete_expired_size = lower.min(i32::MAX as i64) as i32;
+            summary.obsolete_expired_gradual_size =
+                gradual.min(i32::MAX as i64) as i32;
         }
 
         summary

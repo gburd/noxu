@@ -287,6 +287,10 @@ impl Environment {
             // Cleaner
             run_cleaner: config.run_cleaner,
             cleaner_min_utilization: config.cleaner_min_utilization,
+
+            cleaner_two_pass_gap: config.cleaner_two_pass_gap,
+
+            cleaner_two_pass_threshold: config.cleaner_two_pass_threshold,
             cleaner_min_file_utilization: config.cleaner_min_file_utilization,
             cleaner_threads: config.cleaner_threads,
             cleaner_min_file_count: config.cleaner_min_file_count,

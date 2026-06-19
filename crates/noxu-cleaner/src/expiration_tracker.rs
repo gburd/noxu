@@ -88,6 +88,49 @@ impl ExpirationTracker {
         expired_size
     }
 
+    /// Returns the (lower, upper) expired-bytes uncertainty band as of
+    /// `current_time` (hours since epoch) and `current_sub_hour_ms` (millis
+    /// elapsed within the current hour, 0..3_600_000).
+    ///
+    /// Mirrors JE `ExpirationProfile.getExpiredBytes` (which returns a
+    /// `Pair<lower, gradual-upper>`):
+    ///   - **lower** = bytes whose expiration window has FULLY passed
+    ///     (`expiration_time <= current_time` for hours-granularity, i.e. the
+    ///     bin expired in a prior hour) — definitely obsolete.
+    ///   - **upper (gradual)** = lower PLUS a prorated fraction of the bytes
+    ///     expiring within the CURRENT hour
+    ///     (`expiration_time == current_time`): `newly * elapsed_ms / hour_ms`.
+    ///     These bytes are the uncertainty — they may or may not be obsolete
+    ///     yet within the current interval.
+    ///
+    /// The width `upper - lower` is the two-pass uncertainty band JE's cleaner
+    /// gates on (`CLEANER_TWO_PASS_GAP`).
+    pub fn get_expired_bytes_band(
+        &self,
+        current_time: u64,
+        current_sub_hour_ms: u64,
+    ) -> (i64, i64) {
+        const HOUR_MS: u64 = 3_600_000;
+        let elapsed = current_sub_hour_ms.min(HOUR_MS);
+        let mut lower = 0i64;
+        let mut newly = 0i64;
+        for bin in self.bins.values() {
+            if bin.expiration_time == 0 {
+                continue;
+            }
+            if bin.expiration_time < current_time {
+                // Expired in a prior interval: fully obsolete.
+                lower += bin.size as i64;
+            } else if bin.expiration_time == current_time {
+                // Expiring within the current interval: the uncertain part.
+                newly += bin.size as i64;
+            }
+        }
+        // gradual = lower + prorated fraction of the current-interval bytes.
+        let gradual = lower + (newly * elapsed as i64) / HOUR_MS as i64;
+        (lower, gradual)
+    }
+
     /// Returns the total tracked size (all bins).
     pub fn get_total_tracked_size(&self) -> i64 {
         self.bins.values().map(|bin| bin.size as i64).sum()
@@ -112,6 +155,24 @@ impl ExpirationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_expired_bytes_band_uncertainty() {
+        let mut t = ExpirationTracker::new(0);
+        t.track(5, 100);
+        t.track(10, 200);
+        t.track(20, 400);
+        let (lower, upper) = t.get_expired_bytes_band(10, 1_800_000);
+        assert_eq!(lower, 100, "lower = fully-elapsed bins only");
+        assert_eq!(upper, 200, "upper = lower + prorated current-interval bin");
+        assert_eq!(upper - lower, 100);
+        let (lo0, up0) = t.get_expired_bytes_band(10, 0);
+        assert_eq!(lo0, 100);
+        assert_eq!(up0, 100);
+        let (lo1, up1) = t.get_expired_bytes_band(10, 3_600_000);
+        assert_eq!(lo1, 100);
+        assert_eq!(up1, 300);
+    }
 
     #[test]
     fn test_new_tracker() {

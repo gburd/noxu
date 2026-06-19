@@ -85,6 +85,12 @@ pub struct FileSelector {
     checkpointed: HashSet<u32>,
     /// Files that are safe to delete.
     safe_to_delete: HashSet<u32>,
+    /// Two-pass cleaning gate (JE CLEANER_TWO_PASS_GAP / TWO_PASS_THRESHOLD):
+    /// when the chosen file's max utilization exceeds `two_pass_threshold` AND
+    /// its (max - min) utilization uncertainty band is >= `two_pass_gap`, a
+    /// dry-run first pass is requested (required_util = two_pass_threshold).
+    two_pass_gap: i32,
+    two_pass_threshold: i32,
     /// Two-pass cleaning: required utilization threshold for next selection pass.
     ///
     /// When a first pass fails to reclaim enough space, `check_for_required_util`
@@ -132,6 +138,8 @@ impl FileSelector {
             checkpointed: HashSet::new(),
             safe_to_delete: HashSet::new(),
             required_util: None,
+            two_pass_gap: 10, // JE CLEANER_TWO_PASS_GAP default
+            two_pass_threshold: 0, // JE default 0 => minUtilization - 5
             force_cleaning: false,
             pending_lns: HashMap::new(),
             pending_dbs: HashSet::new(),
@@ -146,6 +154,13 @@ impl FileSelector {
     /// `force_cleaning` for the next pass.
     ///
     ///
+    /// Configure the two-pass gate (JE CLEANER_TWO_PASS_GAP / TWO_PASS_THRESHOLD).
+    /// A `threshold` of 0 means "use minUtilization - 5" (resolved at gate time).
+    pub fn set_two_pass_params(&mut self, gap: i32, threshold: i32) {
+        self.two_pass_gap = gap;
+        self.two_pass_threshold = threshold;
+    }
+
     pub fn check_for_required_util(
         &mut self,
         actual_util: i32,
@@ -471,14 +486,47 @@ impl FileSelector {
 
         let file_num = best_file?;
 
+        // Two-pass gate (JE UtilizationCalculator.getBestFile, ~line 447-457):
+        // if the chosen file's MAX utilization exceeds twoPassThreshold AND its
+        // (max - min) utilization uncertainty band is >= twoPassGap, request a
+        // first (dry-run) pass that recomputes true utilization, with
+        // pass1RequiredUtil = twoPassThreshold. The band comes from the
+        // file's lower (definite) vs gradual (upper) expired-bytes bounds.
+        let chosen_required_util = if !self.force_cleaning {
+            if let Some(summary) = file_summaries.get(&file_num) {
+                let this_min = Self::min_utilization_pct(summary);
+                let this_max = Self::max_utilization_pct(summary);
+                // threshold 0 => minUtilization - 5 (JE Cleaner.java:421-422).
+                let threshold = if self.two_pass_threshold == 0 {
+                    (min_utilization_pct as i32 - 5).max(0)
+                } else {
+                    self.two_pass_threshold
+                };
+                if this_max > threshold
+                    && (this_max - this_min) >= self.two_pass_gap
+                {
+                    Some(threshold)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Step 3 -- mark the chosen file as being cleaned.
         self.being_cleaned.insert(file_num);
         self.file_info.insert(
             file_num,
-            FileInfo { status: FileStatus::BeingCleaned, required_util: None },
+            FileInfo {
+                status: FileStatus::BeingCleaned,
+                required_util: chosen_required_util,
+            },
         );
 
-        Some((file_num, None))
+        Some((file_num, chosen_required_util))
     }
 
     ///
@@ -513,6 +561,38 @@ impl FileSelector {
         let adjusted = summary.get_adjusted_active_size();
         ((adjusted as i64 * 100) / summary.total_size as i64).clamp(0, 100)
             as i32
+    }
+
+    /// MIN utilization for the two-pass gate (JE `thisMinUtil`): utilization
+    /// after subtracting the UPPER (gradual) expired-bytes bound — the most
+    /// optimistic (lowest) utilization, since the gradual bound counts the most
+    /// bytes as expired. `utilization(obsolete + expiredGradual, total)`.
+    fn min_utilization_pct(summary: &FileSummary) -> i32 {
+        if summary.total_size <= 0 {
+            return 0;
+        }
+        let obsolete = summary.get_obsolete_size() as i64;
+        let expired_gradual = (summary.obsolete_expired_gradual_size as i64)
+            .min(summary.total_size as i64);
+        let active =
+            (summary.total_size as i64 - obsolete - expired_gradual).max(0);
+        ((active * 100) / summary.total_size as i64).clamp(0, 100) as i32
+    }
+
+    /// MAX utilization for the two-pass gate (JE `thisMaxUtil`): utilization
+    /// after subtracting only the LOWER (definite) expired-bytes bound — the
+    /// most pessimistic (highest) utilization.
+    /// `utilization(obsolete + expiredLower, total)`.
+    fn max_utilization_pct(summary: &FileSummary) -> i32 {
+        if summary.total_size <= 0 {
+            return 0;
+        }
+        let obsolete = summary.get_obsolete_size() as i64;
+        let expired_lower = (summary.obsolete_expired_size as i64)
+            .min(summary.total_size as i64);
+        let active =
+            (summary.total_size as i64 - obsolete - expired_lower).max(0);
+        ((active * 100) / summary.total_size as i64).clamp(0, 100) as i32
     }
 
     /// Adds a file to the cleaning queue.
@@ -1479,6 +1559,49 @@ mod tests {
     /// `check_for_required_util` with actual > target sets force_cleaning and
     /// raises required_util by the shortfall, then a second profile scan
     /// selects a file that would otherwise be above the normal threshold.
+    #[test]
+    fn test_two_pass_gate_fires_on_uncertainty_band() {
+        // CFG-TWOPASS-1: when the chosen file's (max-min) utilization band
+        // (driven by the lower vs gradual expired bounds) is >= twoPassGap and
+        // its max-util > twoPassThreshold, selection requests a dry-run pass
+        // (required_util = threshold). JE getBestFile two-pass gate.
+        let mut sel = FileSelector::new();
+        // gap=10, threshold=20 (explicit).
+        sel.set_two_pass_params(10, 20);
+
+        // File 0: total 1000, no obsolete, but a WIDE expiration band:
+        //   lower (definite) expired = 100  -> max_util = (1000-0-100)/1000 = 90
+        //   gradual (upper) expired  = 400  -> min_util = (1000-0-400)/1000 = 60
+        //   band = 90 - 60 = 30 >= gap(10); max_util 90 > threshold(20) -> fire.
+        let mut summaries = std::collections::BTreeMap::new();
+        let mut fs = FileSummary::new();
+        fs.total_size = 1000;
+        fs.total_count = 10;
+        fs.total_ln_count = 10;
+        fs.total_ln_size = 1000;
+        fs.obsolete_expired_size = 100; // lower bound
+        fs.obsolete_expired_gradual_size = 400; // upper (gradual) bound
+        summaries.insert(0u32, fs);
+
+        // min_utilization 95 so the file (max_util 90 < 95) qualifies for cleaning.
+        let result = sel.select_file_for_cleaning_with_policy(
+            &summaries,
+            95,
+            0,
+            false,
+            Some(1_000_000),
+            None,
+            None,
+        );
+        let (file, required_util) = result.expect("a file must be selected");
+        assert_eq!(file, 0);
+        assert_eq!(
+            required_util,
+            Some(20),
+            "two-pass gate must request a dry-run pass (required_util=threshold)              when the uncertainty band >= gap and max_util > threshold"
+        );
+    }
+
     #[test]
     fn test_two_pass_cleaning_triggers_second_pass() {
         let mut selector = FileSelector::new();

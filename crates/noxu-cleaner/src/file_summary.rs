@@ -43,6 +43,12 @@ pub struct FileSummary {
     /// Used together with `obsolete_expired_lns` to compute the adjusted
     /// utilization in `FileSelector::adjusted_utilization_pct()`.
     pub obsolete_expired_size: i32,
+    /// Upper-bound (gradual) expired size: `obsolete_expired_size` plus a
+    /// prorated fraction of bytes expiring within the CURRENT interval (JE
+    /// ExpirationProfile gradual band). The width
+    /// `obsolete_expired_gradual_size - obsolete_expired_size` is the two-pass
+    /// uncertainty band (CLEANER_TWO_PASS_GAP). 0 when no TTL data.
+    pub obsolete_expired_gradual_size: i32,
 }
 
 impl FileSummary {
@@ -74,6 +80,7 @@ impl FileSummary {
         self.obsolete_ln_size_counted = 0;
         self.obsolete_expired_lns = 0;
         self.obsolete_expired_size = 0;
+        self.obsolete_expired_gradual_size = 0;
     }
 
     /// Adds the totals of the given summary object to the totals of this object.
@@ -93,6 +100,8 @@ impl FileSummary {
         self.obsolete_ln_size_counted += other.obsolete_ln_size_counted;
         self.obsolete_expired_lns += other.obsolete_expired_lns;
         self.obsolete_expired_size += other.obsolete_expired_size;
+        self.obsolete_expired_gradual_size +=
+            other.obsolete_expired_gradual_size;
     }
 
     /// Returns the average size for LNs with sizes not counted, or NaN if there are no such LNs.

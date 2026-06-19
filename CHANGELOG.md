@@ -16,6 +16,25 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (cleaner — two-pass gate keys on the utilization uncertainty band, CFG-TWOPASS-1)
+
+- **`CLEANER_TWO_PASS_GAP` / `CLEANER_TWO_PASS_THRESHOLD` are now wired and gate
+  on the per-file (min, max) utilization uncertainty band** (`noxu-cleaner` /
+  `noxu-dbi` / `noxu-db`), faithfully porting JE
+  `UtilizationCalculator.getBestFile`. Added
+  `ExpirationTracker::get_expired_bytes_band` returning the (lower, gradual-upper)
+  expired-bytes pair (JE `ExpirationProfile.getExpiredBytes`): lower = bytes
+  whose expiration interval fully passed; gradual-upper = + a prorated fraction
+  of bytes expiring within the current interval. `scan_file_summary` populates
+  both bounds on the `FileSummary` (new `obsolete_expired_gradual_size`);
+  `FileSelector` computes `min_utilization_pct` / `max_utilization_pct` from the
+  band and requests a two-pass dry-run (`required_util = twoPassThreshold`,
+  threshold 0 → `minUtilization − 5`) exactly when `maxUtil > twoPassThreshold
+  && (maxUtil − minUtil) >= twoPassGap`. Wired end-to-end from
+  `EnvironmentConfig.cleaner_two_pass_gap/threshold`. Tests
+  `test_expired_bytes_band_uncertainty`, `test_two_pass_gate_fires_on_uncertainty_band`.
+
+
 ### Testing (Margo JE test-accuracy review — txn/bind/rep/XA)
 
 - Verdict: the transaction, binding, collections, persist, XA, and

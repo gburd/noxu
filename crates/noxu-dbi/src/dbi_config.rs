@@ -107,6 +107,10 @@ pub struct DbiEnvConfig {
     // -----------------------------------------------------------------------
     pub run_cleaner: bool,
     pub cleaner_min_utilization: u8,
+    /// JE CLEANER_TWO_PASS_GAP (default 10) — two-pass uncertainty-band width.
+    pub cleaner_two_pass_gap: i32,
+    /// JE CLEANER_TWO_PASS_THRESHOLD (default 0 => minUtilization - 5).
+    pub cleaner_two_pass_threshold: i32,
     pub cleaner_min_file_utilization: u8,
     pub cleaner_threads: u32,
     pub cleaner_min_file_count: u32,
@@ -290,6 +294,8 @@ impl Default for DbiEnvConfig {
             cleaner_adjust_utilization: false,
             cleaner_deadlock_retry: 3,
             cleaner_lock_timeout_ms: 500,
+            cleaner_two_pass_gap: 10,
+            cleaner_two_pass_threshold: 0,
             cleaner_expunge: true,
             cleaner_use_deleted_dir: false,
             cleaner_max_batch_files: 0,

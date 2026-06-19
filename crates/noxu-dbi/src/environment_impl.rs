@@ -682,6 +682,11 @@ impl EnvironmentImpl {
             //   firstActiveFile = min(newestFile, firstActiveTxnFile).
             // Without this the clamp is inert (first_active_txn_file == None).
             c = c.with_txn_manager(Arc::clone(&txn_manager));
+            // CFG-TWOPASS-1: wire the two-pass cleaning gate config.
+            c = c.with_two_pass_params(
+                cfg.cleaner_two_pass_gap,
+                cfg.cleaner_two_pass_threshold,
+            );
             Arc::new(c)
         });
 

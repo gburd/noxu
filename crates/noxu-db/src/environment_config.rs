@@ -387,6 +387,10 @@ pub struct EnvironmentConfig {
     /// Minimum log utilization percentage; cleaning triggers when below this.
     /// Mirrors `CLEANER_MIN_UTILIZATION` / default 50.
     pub cleaner_min_utilization: u8,
+    /// JE CLEANER_TWO_PASS_GAP (default 10).
+    pub cleaner_two_pass_gap: i32,
+    /// JE CLEANER_TWO_PASS_THRESHOLD (default 0 => minUtilization - 5).
+    pub cleaner_two_pass_threshold: i32,
 
     /// Minimum per-file utilization; files below this are always candidates.
     /// Mirrors `CLEANER_MIN_FILE_UTILIZATION` / default 5.
@@ -856,6 +860,8 @@ impl EnvironmentConfig {
             compressor_purge_root: false,
             // Cleaner
             cleaner_min_utilization: 50,
+            cleaner_two_pass_gap: 10,
+            cleaner_two_pass_threshold: 0,
             cleaner_min_file_utilization: 5,
             cleaner_threads: 1,
             cleaner_min_file_count: 2,
@@ -1306,6 +1312,16 @@ impl EnvironmentConfig {
     // -----------------------------------------------------------------------
     // Cleaner setters
     // -----------------------------------------------------------------------
+
+    pub fn set_cleaner_two_pass_gap(&mut self, gap: i32) -> &mut Self {
+        self.cleaner_two_pass_gap = gap;
+        self
+    }
+
+    pub fn set_cleaner_two_pass_threshold(&mut self, t: i32) -> &mut Self {
+        self.cleaner_two_pass_threshold = t;
+        self
+    }
 
     pub fn set_cleaner_min_utilization(&mut self, pct: u8) -> &mut Self {
         self.cleaner_min_utilization = pct;
