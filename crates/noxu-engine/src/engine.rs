@@ -166,11 +166,15 @@ impl Engine {
     /// Closes the environment.
     ///
     /// Performs orderly shutdown:
-    /// 1. Stop daemon threads
+    /// 1. Stop engine daemon threads
     /// 2. Flush final checkpoint
-    /// 3. Close EnvironmentImpl
+    /// 3. Close `EnvironmentImpl` (stops its own daemons, forces a final
+    ///    checkpoint, and fsyncs the WAL)
     ///
-    /// After close(), the Engine cannot be used.
+    /// After close(), the Engine cannot be used. Dropping the `Engine`
+    /// afterwards relies on `EnvironmentImpl`'s own RAII `Drop` as a backstop;
+    /// `EnvironmentImpl::close` is idempotent, so the explicit call here and
+    /// the eventual `Drop` do not conflict.
     pub fn close(&self) -> Result<()> {
         if !self.is_open() {
             return Err(EngineError::EnvironmentClosed);
@@ -192,8 +196,12 @@ impl Engine {
             log::warn!("Final checkpoint failed: {}", e);
         }
 
-        // Close environment impl
-        // (EnvironmentImpl doesn't have explicit close yet - would be added in full implementation)
+        // Close the environment impl: stops the dbi-layer daemons, forces a
+        // final checkpoint, and fsyncs the WAL. Idempotent and best-effort on
+        // shutdown; log (don't propagate) so the rest of close still runs.
+        if let Err(e) = self.env_impl.lock().close() {
+            log::warn!("EnvironmentImpl close failed: {}", e);
+        }
 
         log::info!("Engine closed successfully");
         Ok(())
@@ -439,9 +447,16 @@ mod tests {
         let (_dir, config) = temp_config();
         let engine = Engine::open(config).unwrap();
         assert!(engine.is_open());
+        assert!(engine.get_env_impl().lock().is_open());
 
         engine.close().unwrap();
         assert!(!engine.is_open());
+        // Item 2: Engine::close must actually close the EnvironmentImpl, not
+        // leave it running and rely solely on a later Drop.
+        assert!(
+            !engine.get_env_impl().lock().is_open(),
+            "EnvironmentImpl must be closed after Engine::close"
+        );
     }
 
     #[test]

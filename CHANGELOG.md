@@ -37,6 +37,20 @@ listed in [References](#references).
   structural fault (a non-deleted BIN slot carrying a NULL LSN) rather than
   silently passing.
 
+### Fixed (engine — `Engine::close` now closes `EnvironmentImpl`)
+
+- **`Engine::close` now calls `EnvironmentImpl::close()`** (`noxu-engine`),
+  completing step 3 of its documented shutdown sequence. Previously the body
+  carried a TODO ("EnvironmentImpl doesn't have explicit close yet - would be
+  added in full implementation") and skipped the step, so the dbi-layer daemons
+  (evictor / checkpointer / INCompressor / cleaner / log-flush) and the final
+  forced checkpoint + WAL fsync owned by `EnvironmentImpl` only ran later via
+  `Drop`. `EnvironmentImpl::close()` is idempotent (early-returns when already
+  closed), so the explicit call and the `Drop` backstop do not conflict. The
+  close-path doc comment was corrected to describe the real behaviour. Test
+  `test_engine_open_and_close` now asserts `get_env_impl().lock().is_open()` is
+  false after `Engine::close`.
+
 ### Fixed (cleaner — two-pass gate keys on the utilization uncertainty band, CFG-TWOPASS-1)
 
 - **`CLEANER_TWO_PASS_GAP` / `CLEANER_TWO_PASS_THRESHOLD` are now wired and gate
