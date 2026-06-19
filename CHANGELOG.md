@@ -16,6 +16,32 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (evictor — CLN-F2 regression)
+
+- **CLN-F2 regression: dirty strip-0 BINs no longer cycle in pri2 forever
+  under LRU-only, so eviction reclaims memory again.**  Commit 29119ca
+  ("fall through to full BIN eviction when strip frees 0 bytes") changed the
+  `evict_batch` strip-returns-0 path so that a *dirty* BIN was always routed
+  to the priority-2 dirty-LRU (`pri2.add_front`).  But under
+  `EVICTOR_LRU_ONLY` the `evict_batch` phase machine returns at phase 1 and
+  **never drains pri2**, so a dirty strip-0 BIN was parked there forever and
+  its memory was never reclaimed — the shared `cache_usage` counter never
+  dropped and the engine could not get back under budget
+  (`evictor_f1_f2_eviction_reduces_cache_usage` regressed:
+  `usage_before == usage_after`).  The fix splits the two strip-0 cases
+  faithfully to JE `Evictor.processTarget` (`Evictor.java` ~2755-2795):
+  a **clean** strip-0 BIN falls through to `evict(target, parent, index)` and
+  is fully evicted with its node bytes credited (the original CLN-F2 goal,
+  preserved); a **dirty** strip-0 BIN gets the JE `moveToPri2LRU` one-time
+  second chance only when the dirty-LRU set is actually in use
+  (`use_dirty_lru && !lru_only`, mirroring JE's `useDirtyLRUSet` guard at
+  ~2758-2766), and otherwise reverts to the pre-CLN-F2 put-back so a later
+  pass can strip its now-clean slots once a checkpoint has logged+cleaned
+  them — which is where a dirty BIN's reclaimable memory (the LN value heap)
+  actually lives.  The CLN-F2 unit test (`test_evict_batch_partial_evict_
+  path`, clean BINs -> `nodes_evicted == 3`) and the integration test (real
+  tree, dirty-then-checkpointed BINs -> `cache_usage` drops) both pass.
+
 ### Fixed (recovery durability — REC-F1/REC-F2)
 
 - **REC-F1: checkpoint `CkptEnd` is now fsync'd on every path.**
