@@ -412,6 +412,16 @@ impl LockManager {
             // We are the chosen victim.  Flush from waiter list and throw.
             // H-2: use flush_and_clear_waiter to acquire shard before
             // waiter_graph (canonical lock ordering).
+            //
+            // TXN-F4 (design point, intentionally NOT changed): JE
+            // `LockManager.waitForLock` proactively wakes the victim via
+            // `notifyVictim` so it exits its own `wait()` promptly; here the
+            // selected victim returns synchronously the moment its own check
+            // detects the cycle, so no cross-thread victim notify is needed.
+            // This assumes every waiter on a cycle reaches the same
+            // victim-consistency conclusion on its next check slice (≤50 ms),
+            // which holds because all checks read the same `waiter_graph`
+            // snapshot and use the same deterministic victim selection.
             self.flush_and_clear_waiter(table_idx, lsn, locker_id);
             return Err(deadlock_err);
         }
