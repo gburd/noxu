@@ -151,9 +151,12 @@ fn recover_and_collect(dir: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let env = open_env(dir);
     let db = open_db(&env);
     // C1 (JE CheckBase.recoverAndLoadData): after recovery, assert STRUCTURAL
-    // integrity — not just data equality. JE runs env.verify() + checkLsns()
-    // after every recovery to catch a tree/utilization-profile that recovered
-    // to correct data but a corrupt structure. We run the engine verifier and
+    // integrity — not just data equality. JE runs env.verify() AND
+    // VerifyUtils.checkLsns(). We run env.verify() (the live-tree structural
+    // walk: child accessibility, key-range containment, non-deleted-slot LSN
+    // validity). The LSN<->utilization-profile overlap half of checkLsns is a
+    // tracked residue (it needs the UP threaded into the verifier). We run the
+    // engine verifier and
     // require zero structural errors.
     let vresult = env
         .verify(&noxu_db::VerifyConfig::new())

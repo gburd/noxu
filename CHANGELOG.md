@@ -16,6 +16,28 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (Keith JE test-accuracy review — W1/W2/D1/M1)
+
+- Verdict: the storage-engine core is faithfully ported at ~100% on the
+  consistency-critical paths (recovery equality, stepwise torn-write sweep,
+  forced split topologies, BIN-delta/known-deleted, cleaner SR regressions,
+  log-corruption detection, post-recovery structural verify) — zero outright
+  WEAKENED ports. The corrections:
+- **W1**: raised the dup-cursor test scale (~5 keys → ~300 keys / 2000 inserts,
+  2-byte keys) so the duplicate walk crosses BIN boundaries (multi-BIN dup
+  traversal + BIN-split-under-dups), which the prior 5-key fixture could not
+  exercise.
+- **W2**: restored the "large delete" cursor tests to multi-BIN scale
+  (N 100 → 300, above one BIN at fanout 128) so delete-then-walk spans BINs.
+- **D1**: replaced the stale `je_rmw_locking_test.rs` header (it still claimed
+  RMW was unimplemented / tests `#[ignore]`d — false since the C7 fix) with
+  accurate prose.
+- **M1**: corrected recovery-test comments that overclaimed `VerifyUtils.checkLsns`;
+  documented the LSN↔utilization-profile-overlap check as a tracked residue
+  (env.verify()'s structural tree walk IS run after every recovery; the
+  LSN↔UP half needs the UP threaded into the verifier).
+
+
 ## [5.0.0] - 2026-06-18
 
 ### Fixed (isolation — LockMode::Rmw takes a write lock, C7)

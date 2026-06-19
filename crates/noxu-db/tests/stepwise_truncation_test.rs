@@ -40,8 +40,10 @@
 //!     JE `CheckBase.validate`).
 //!
 //! `recover_and_collect` (shared with `recovery_correctness_test.rs`) already
-//! runs `env.verify()` after every recovery — this is JE's
-//! `recoverAndLoadData` calling `env.verify()` + `VerifyUtils.checkLsns`.
+//! runs `env.verify()` after every recovery — the live-tree structural walk
+//! half of JE's `recoverAndLoadData`. (JE additionally runs
+//! `VerifyUtils.checkLsns` for LSN<->utilization-profile overlap; that half is
+//! a tracked residue — see known-limitations.)
 //!
 //! Deviation note: JE's `CheckSplitsTest.testBasicInsert` uses
 //! `IntegerBinding` 4-byte keys; Noxu uses ASCII `key_NNNN` keys. The

@@ -15,28 +15,18 @@
 //! Under the default serializable isolation a plain read already blocks
 //! writers, so it would not distinguish RMW from a normal read.
 //!
-//! ## FINDING (C7): LockMode::Rmw does not acquire a write lock
+//! ## LockMode::Rmw write-lock-on-read (JE Cursor.java:5281)
 //!
-//! As of this port, Noxu defines `LockMode::Rmw` (and
-//! `ReadOptions::read_modify_write()`) but the read path does NOT implement
-//! its write-lock-on-read semantics:
-//!   - `noxu_db::Cursor::get`'s `lock_mode` parameter is `_lock_mode`
-//!     (ignored);
-//!   - `Database::get_with_options` routes `LockMode::Rmw` through the same
-//!     plain-read `cursor.search` path as `LockMode::Default`; and
-//!   - `noxu-dbi`'s `CursorImpl::search` / `get_current` never acquire a
-//!     `LockType::Write` for a read.
+//! An RMW read takes a WRITE lock on the record so a subsequent modify in the
+//! same transaction is conflict-free and a concurrent writer blocks at read
+//! time. Implemented via `CursorImpl::upgrade_current_to_write_lock`, wired
+//! into both `noxu_db::Cursor::get` (on `LockMode::Rmw`) and
+//! `Database::get_with_options` (on `ReadOptions::read_modify_write()`).
 //!
-//! So an RMW read behaves like a plain read: it does NOT block a concurrent
-//! writer. JE's contract (and the two RMW tests below) require the RMW read
-//! to take a WRITE lock so the subsequent modify is conflict-free.
-//!
-//! The two RMW tests below are therefore `#[ignore]`d as documenting this
-//! divergence; they are written FAITHFULLY (assertions NOT weakened) and will
-//! pass once RMW write-locking is wired into the cursor read path. The
-//! control test `plain_read_committed_releases_lock_writer_succeeds` runs in
-//! the default suite and validates the harness. Run the ignored tests with:
-//!   `cargo test -p noxu-db --test je_rmw_locking_test -- --ignored`
+//! These tests are active (not ignored) and assert the lock-blocking contract:
+//! the RMW read blocks a no_wait writer and a concurrent writer until commit.
+//! The control test `plain_read_committed_releases_lock_writer_succeeds`
+//! confirms a plain read (no RMW) does NOT block, isolating the RMW effect.
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,

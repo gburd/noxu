@@ -27,7 +27,12 @@ fn open_env_db(
 }
 
 fn build_random_dup_data(seed: u64) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
-    // Pseudo-random distinct dup payload.  Generates ~5 keys × ~5 dups each.
+    // Pseudo-random distinct dup payload. Generates ~300 distinct keys
+    // (2-byte big-endian) with several dups each, so the dup walk crosses
+    // BIN boundaries (default fanout 128) and exercises multi-BIN dup
+    // traversal — W1: JE DbCursorDuplicateTest uses thousands of keys; Noxu
+    // has no DBIN dup-subtree, but a few hundred keys still drives the
+    // BIN-split-under-dups path that a handful of keys cannot.
     let mut state = seed;
     let mut next = || {
         state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -35,11 +40,11 @@ fn build_random_dup_data(seed: u64) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     };
 
     let mut out: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    for _ in 0..30 {
-        let k = (next() % 5) as u8;
-        let d = (next() % 100) as u8;
-        let key = vec![k];
-        let data = vec![d];
+    for _ in 0..2000 {
+        let k = (next() % 300) as u16;
+        let d = (next() % 1000) as u16;
+        let key = k.to_be_bytes().to_vec();
+        let data = d.to_be_bytes().to_vec();
         out.entry(key).or_default().push(data);
     }
     for v in out.values_mut() {
@@ -348,7 +353,9 @@ fn dup_cursor_abort_after_dup_creation_keeps_committed_only() {
 
 #[test]
 fn cursor_delete_first_via_walk_keeps_rest() {
-    const N: u32 = 100;
+    // W2: > one BIN's worth (default fanout 128) so the delete-then-walk
+    // crosses multiple BINs — JE's "testLargeDelete" variant.
+    const N: u32 = 300;
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
@@ -403,7 +410,9 @@ fn cursor_delete_first_via_walk_keeps_rest() {
 
 #[test]
 fn cursor_delete_last_via_walk_keeps_rest() {
-    const N: u32 = 100;
+    // W2: > one BIN's worth (default fanout 128) so the delete-then-walk
+    // crosses multiple BINs — JE's "testLargeDelete" variant.
+    const N: u32 = 300;
     let dir = TempDir::new().unwrap();
     let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
