@@ -96,6 +96,21 @@ listed in [References](#references).
   This also corrects a doc-bug (TXN-F6) that claimed the plain `lock()` path
   already used the registry — now true.
 
+### Fixed (txn — restart-conflict scan honors lock sharing, TXN-F1)
+
+- **`LockImpl`'s restart-conflict waiter scan now skips a waiter the
+  requestor shares locks with.** JE `LockImpl.lock` checks `waiterType !=
+  RESTART && locker != waiterLocker && !locker.sharesLocksWith(waiterLocker)`
+  (LockImpl.java:395) in the waiter scan that runs when a restart-causing
+  request (RANGE_READ / RANGE_WRITE) has to wait. The Rust
+  `lock_with_sharing` received the `shares_fn` for `try_lock` but did not
+  thread it into the restart loop, so a requestor sharing locks with a
+  RANGE_INSERT waiter would spuriously restart instead of waiting normally.
+  Added the `!shares_fn(w.locker_id)` clause; `LockImpl::lock` now delegates
+  to `lock_with_sharing(..., &|_| false)` so a single implementation carries
+  the restart scan (mirroring how `try_lock` delegates to
+  `try_lock_with_sharing`).
+
 ## [6.0.0] - 2026-06-19
 
 ### Changed (BREAKING) (engine — remove fake-passing verify stubs)

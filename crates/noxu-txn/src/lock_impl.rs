@@ -75,6 +75,7 @@ impl LockImpl {
     /// 4. If conflict or waiters exist -> WAIT_NEW or DENIED
     ///
     /// Assumes we hold the lockTableLatch when entering this method.
+    #[inline]
     pub fn lock(
         &mut self,
         request_type: LockType,
@@ -82,86 +83,17 @@ impl LockImpl {
         non_blocking: bool,
         jump_ahead_of_waiters: bool,
     ) -> LockAttemptResult {
-        // Request an ordinary lock by checking the owners list.
-        let new_lock = LockInfo::new(locker_id, request_type);
-        let mut grant = self.try_lock(
-            new_lock.clone(),
-            jump_ahead_of_waiters || self.n_waiters() == 0,
-        );
-
-        // Do we have to wait for this lock?
-        if grant == LockGrantType::WaitNew
-            || grant == LockGrantType::WaitPromotion
-            || grant == LockGrantType::WaitRestart
-        {
-            // If the request type can cause a restart and a restart conflict
-            // does not already exist, then we have to check the waiters list
-            // for restart conflicts. A restart conflict must take precedence
-            // or it may be missed.
-            if request_type.causes_restart()
-                && grant != LockGrantType::WaitRestart
-            {
-                let mut waiter_idx = 0;
-                loop {
-                    let waiter = if waiter_idx == 0 {
-                        self.first_waiter.as_ref()
-                    } else if let Some(ref list) = self.waiter_list {
-                        list.get(waiter_idx - 1)
-                    } else {
-                        None
-                    };
-
-                    match waiter {
-                        Some(w) => {
-                            // Check for a restart conflict. Ignore LockType::Restart
-                            // in the waiter list when checking for conflicts.
-                            if w.lock_type != LockType::Restart
-                                && locker_id != w.locker_id
-                            {
-                                let conflict =
-                                    w.lock_type.get_conflict(request_type);
-                                if conflict == LockConflict::Restart {
-                                    grant = LockGrantType::WaitRestart;
-                                    break;
-                                }
-                            }
-                            waiter_idx += 1;
-                        }
-                        None => break,
-                    }
-                }
-            }
-
-            // Add the waiter or deny the lock as appropriate.
-            if non_blocking {
-                grant = LockGrantType::Denied;
-            } else {
-                if grant == LockGrantType::WaitPromotion {
-                    // By moving our waiter to the top of the list we reduce
-                    // the time window where deadlocks can occur due to the promotion.
-                    self.add_waiter_to_head_of_list(new_lock);
-                } else {
-                    debug_assert!(
-                        grant == LockGrantType::WaitNew
-                            || grant == LockGrantType::WaitRestart
-                    );
-
-                    // If waiting to restart, change the lock type to RESTART
-                    // to avoid granting the lock later. We wait until the
-                    // RESTART waiter moves to the head of waiter list to
-                    // prevent the requester from spinning performing repeated
-                    // restarts, but we don't grant the lock.
-                    let mut waiter = new_lock;
-                    if grant == LockGrantType::WaitRestart {
-                        waiter.lock_type = LockType::Restart;
-                    }
-
-                    self.add_waiter_to_end_of_list(waiter);
-                }
-            }
-        }
-
-        LockAttemptResult::new(grant)
+        // No lock-sharing groups by default; delegate to the sharing variant
+        // with a predicate that never shares.  This keeps a single canonical
+        // implementation (including the restart-conflict waiter scan) and
+        // mirrors how `try_lock` delegates to `try_lock_with_sharing`.
+        self.lock_with_sharing(
+            request_type,
+            locker_id,
+            non_blocking,
+            jump_ahead_of_waiters,
+            &|_| false,
+        )
     }
 
     /// Releases a lock held by the given locker.
@@ -613,8 +545,14 @@ impl LockImpl {
                     };
                     match waiter {
                         Some(w) => {
+                            // Ignore LockType::Restart in the waiter list and
+                            // skip a waiter the requestor shares locks with.
+                            // JE: `waiterType != RESTART && locker !=
+                            // waiterLocker && !locker.sharesLocksWith(
+                            // waiterLocker)` (LockImpl.java:395).
                             if w.lock_type != LockType::Restart
                                 && locker_id != w.locker_id
+                                && !shares_fn(w.locker_id)
                             {
                                 let conflict =
                                     w.lock_type.get_conflict(request_type);
@@ -1553,6 +1491,53 @@ mod tests {
         // txn2 waits as RANGE_INSERT; txn3 is stored as RESTART
         assert_eq!(waiters[0].lock_type, LockType::RangeInsert);
         assert_eq!(waiters[1].lock_type, LockType::Restart);
+
+        lock.release(1);
+        lock.release(2);
+        lock.release(3);
+    }
+
+    /// TXN-F1 regression: the restart-conflict waiter scan must skip a waiter
+    /// the requestor shares locks with.  JE `LockImpl.lock` checks
+    /// `waiterType != RESTART && locker != waiterLocker &&
+    /// !locker.sharesLocksWith(waiterLocker)` (LockImpl.java:395) — the third
+    /// clause was missing from `lock_with_sharing`'s restart loop, so a
+    /// requestor sharing locks with the RANGE_INSERT waiter would spuriously
+    /// restart instead of waiting normally.
+    ///
+    /// Same setup as `test_je_range_insert_waiter_causes_restart`, but txn3
+    /// shares locks with txn2 (the RANGE_INSERT waiter).  With sharing
+    /// honored in the restart loop, txn3 must get WAIT_NEW, not WAIT_RESTART.
+    #[test]
+    fn test_txn_f1_restart_loop_skips_shared_waiter() {
+        let mut lock = LockImpl::new();
+        // txn1 holds RANGE_READ.
+        assert_eq!(
+            lock.lock(LockType::RangeRead, 1, false, false).grant_type,
+            LockGrantType::New
+        );
+        // txn2 waits with RANGE_INSERT (blocked by txn1's RANGE_READ).
+        assert_eq!(
+            lock.lock(LockType::RangeInsert, 2, false, false).grant_type,
+            LockGrantType::WaitNew
+        );
+        // txn3 requests RANGE_READ and SHARES LOCKS WITH txn2 only.
+        let shares = |owner: i64| owner == 2;
+        let r = lock.lock_with_sharing(
+            LockType::RangeRead,
+            3,
+            false,
+            false,
+            &shares,
+        );
+        // JE skips the shared RANGE_INSERT waiter in the restart scan, so no
+        // spurious restart: txn3 waits as a normal new waiter.
+        assert_eq!(r.grant_type, LockGrantType::WaitNew);
+
+        let waiters = lock.get_waiters_clone();
+        assert_eq!(waiters[0].lock_type, LockType::RangeInsert);
+        // txn3 stored as RANGE_READ (a normal waiter), NOT downgraded to RESTART.
+        assert_eq!(waiters[1].lock_type, LockType::RangeRead);
 
         lock.release(1);
         lock.release(2);
