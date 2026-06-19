@@ -2,8 +2,6 @@
 //!
 
 /// Status returned by cursor and database operations.
-///
-///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStatus {
     /// Operation succeeded.

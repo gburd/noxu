@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [6.1.0] - 2026-06-19
+
 ### Fixed (evictor — CLN-F2 regression)
 
 - **CLN-F2 regression: dirty strip-0 BINs no longer cycle in pri2 forever
