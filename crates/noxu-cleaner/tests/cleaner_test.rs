@@ -145,32 +145,10 @@ fn file_selector_remove_deleted_file() {
 }
 
 // ─── 4. FileSelector: two-pass cleaning ──────────────────────────────────────
-
-#[test]
-fn file_selector_check_for_required_util_sets_force_cleaning() {
-    let mut fs = FileSelector::new();
-    // best-candidate util (70) > threshold (50): even the dirtiest file is above
-    // the normal threshold, so no files qualify for regular cleaning — second pass needed.
-    fs.check_for_required_util(70, 50);
-    assert!(fs.is_force_cleaning());
-}
-
-#[test]
-fn file_selector_check_for_required_util_already_met_no_force() {
-    let mut fs = FileSelector::new();
-    // best-candidate util (30) < threshold (50): the dirtiest file is already
-    // below the threshold and will be cleaned normally — no second pass needed.
-    fs.check_for_required_util(30, 50);
-    assert!(!fs.is_force_cleaning());
-}
-
-#[test]
-fn file_selector_required_util_set_by_check() {
-    let mut fs = FileSelector::new();
-    // best-candidate util (70) > threshold (50) → required_util raised.
-    fs.check_for_required_util(70, 50);
-    assert!(fs.required_util().is_some());
-}
+//
+// CLN-F6: the reinvented `check_for_required_util` shortfall heuristic was
+// removed.  The production two-pass path is `Cleaner::two_pass_check` +
+// `FileSelector::remove_file_from_cleaning` (CLN-5), covered elsewhere.
 
 // ─── 5. FileSelector: utilization scoring ────────────────────────────────────
 
@@ -241,7 +219,6 @@ fn file_selector_clear_resets_all_state() {
     let mut fs = FileSelector::new();
     fs.add_file_to_clean(1);
     fs.add_file_to_clean(2);
-    fs.check_for_required_util(10, 50);
     fs.clear();
     assert!(!fs.has_files_to_clean());
     assert!(!fs.is_force_cleaning());
@@ -829,8 +806,10 @@ fn cln4_txn_window_excludes_best_candidate() {
     use std::collections::BTreeMap;
 
     // File 1: 10% util (best candidate), but inside txn window.
-    // File 2: 50% util, outside txn window.
-    // File 3: newest (95% util).
+    // File 2: 10% util, outside txn window (heavily obsolete so the aggregate
+    //         stays below threshold — this test isolates the CLN-4 txn-window
+    //         boundary, not the CLN-F1 aggregate gate).
+    // File 3: newest (100% util).
     let mut profile: BTreeMap<u32, FileSummary> = BTreeMap::new();
     profile.insert(
         1,
@@ -852,9 +831,9 @@ fn cln4_txn_window_excludes_best_candidate() {
             total_size: 1000,
             total_ln_count: 10,
             total_ln_size: 1000,
-            obsolete_ln_count: 5,
-            obsolete_ln_size: 500,
-            obsolete_ln_size_counted: 5,
+            obsolete_ln_count: 9,
+            obsolete_ln_size: 900,
+            obsolete_ln_size_counted: 9,
             ..Default::default()
         },
     );
@@ -936,7 +915,7 @@ fn autonomous_selection_from_profile_without_manual_enqueue() {
     // file 2 is the newest and will be excluded by the age filter.
     let mut map = BTreeMap::new();
     map.insert(1u32, make_summary_for_map(1000, 900)); // 10% util — best candidate
-    map.insert(2u32, make_summary_for_map(1000, 100)); // 90% util — newest, age-excluded
+    map.insert(2u32, make_summary_for_map(1000, 800)); // 20% util — newest, age-excluded
 
     let mut selector = FileSelector::new();
 
@@ -949,10 +928,12 @@ fn autonomous_selection_from_profile_without_manual_enqueue() {
     // Call the unified JE-faithful select_file_for_cleaning.
     // With an empty queue it falls through to getBestFile.
     let result = selector.select_file_for_cleaning(
-        &map, 50,    // min_utilization_pct — file 1 at 10% qualifies
+        &map,
+        50,    // min_utilization_pct — aggregate util 15% < 50% qualifies
         1,     // min_age — exclude file 2 (newest)
         false, // force
         None,  // no txn clamping
+        5,     // min_file_utilization_pct
     );
 
     // Must select file 1 autonomously from the profile.
@@ -981,7 +962,7 @@ fn fifo_queue_drained_before_profile_scoring() {
     selector.add_file_to_clean(2);
 
     // Unified selection: must drain the queue first, returning file 2.
-    let result = selector.select_file_for_cleaning(&map, 50, 1, false, None);
+    let result = selector.select_file_for_cleaning(&map, 50, 1, false, None, 5);
     assert_eq!(
         result.map(|(f, _)| f),
         Some(2),
