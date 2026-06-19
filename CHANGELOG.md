@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-06-18
+
 ### Fixed (isolation — LockMode::Rmw takes a write lock, C7)
 
 - **`LockMode::Rmw` now acquires a WRITE lock on read** (`noxu-db` / `noxu-dbi`):
