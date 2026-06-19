@@ -93,9 +93,10 @@ pub struct FileSelector {
     two_pass_threshold: i32,
     /// Two-pass cleaning: required utilization threshold for next selection pass.
     ///
-    /// When a first pass fails to reclaim enough space, `check_for_required_util`
-    /// raises this threshold and sets `force_cleaning=true` to force a second pass
-    /// targeting lower-utilization files.
+    /// When the chosen file's utilization uncertainty band is wide enough
+    /// (CFG-TWOPASS-1, JE `getBestFile`), selection raises this threshold to
+    /// `twoPassThreshold` so a dry-run pass re-measures the file before it is
+    /// committed for cleaning.
     ///
     ///
     required_util: Option<i32>,
@@ -1600,9 +1601,9 @@ mod tests {
 
     // ── Two-pass cleaning tests ───────────────────────────────────────────────
 
-    /// `check_for_required_util` with actual > target sets force_cleaning and
-    /// raises required_util by the shortfall, then a second profile scan
-    /// selects a file that would otherwise be above the normal threshold.
+    /// CFG-TWOPASS-1: when the chosen file's (max-min) utilization band is at
+    /// least twoPassGap and its max-util exceeds twoPassThreshold, selection
+    /// requests a dry-run pass (required_util = threshold), matching JE `getBestFile`.
     #[test]
     fn test_two_pass_gate_fires_on_uncertainty_band() {
         // CFG-TWOPASS-1: when the chosen file's (max-min) utilization band
